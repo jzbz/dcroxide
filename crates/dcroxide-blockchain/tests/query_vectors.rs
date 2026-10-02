@@ -9,6 +9,28 @@
 //! the stake difficulty estimators over a regnet fake chain that runs
 //! the DCP0001 agenda through Started, LockedIn, and Active with real
 //! votes, plus the forced-choice fast paths on simnet.
+//!
+//! Two rows, `ntse id` and `slce id`, were re-expected from
+//! `ErrUnknownDeploymentID` to `ErrUnknownAgendaID` when the pin moved
+//! to `6f6cf21b`, rather than regenerated.  The new kind is derived from
+//! dcrd's source, not judged:
+//!
+//! 1. Both rows query the regnet tip with the ID `bogusagenda`, which no
+//!    network defines, through `NextThresholdState` and
+//!    `StateLastChangedHeight`.
+//! 2. At `6f6cf21b` both look the block up first and then the ID in the
+//!    chain's agendas, returning `contextError(ErrUnknownAgendaID,
+//!    "agenda ID bogusagenda does not exist")` for a missing one
+//!    (`internal/blockchain/thresholdstate.go:519-523` and `:558-562`,
+//!    from `476d2da3`).  The tip is known and validated, so control
+//!    reaches that lookup.
+//! 3. `GetVoteCounts` still scans the deployments and returns
+//!    `ErrUnknownDeploymentID` (`thresholdstate.go:639-651`), so the
+//!    `gvc 5 bogusagenda` row keeps its kind.
+//!
+//! The exporter that produced this file was never committed, so a
+//! regeneration means writing one from scratch; for these two rows it
+//! would only reproduce what the steps above already determine.
 
 // Test-harness arithmetic over bounded lengths.
 #![allow(clippy::arithmetic_side_effects)]
@@ -216,10 +238,10 @@ fn query_vectors() {
                     .next_threshold_state(&hash, f[2], params)
                     .unwrap_or_else(|e| panic!("{line}: {e:?}"));
                 assert_eq!(state.state.go_name(), f[3], "{line}: state");
-                let choice = state
-                    .choice
-                    .as_ref()
-                    .map_or("-".to_string(), |c| c.id.to_string());
+                let choice = match state.choice_id {
+                    "" => "-",
+                    id => id,
+                };
                 assert_eq!(choice, f[4], "{line}: choice");
                 counts[7] += 1;
             }
@@ -236,18 +258,22 @@ fn query_vectors() {
                     "hash" => (unknown, "sdiffalgorithm"),
                     other => panic!("unknown error case {other}"),
                 };
-                let kind = if f[0] == "ntse" {
+                let err = if f[0] == "ntse" {
                     chain
                         .next_threshold_state(&hash, id, params)
                         .expect_err("must fail")
-                        .kind
                 } else {
                     chain
                         .state_last_changed_height(&hash, id, params)
                         .expect_err("must fail")
-                        .kind
                 };
-                assert_eq!(kind.kind_name(), f[2], "{line}");
+                assert_eq!(err.kind.kind_name(), f[2], "{line}");
+                if f[1] == "id" {
+                    assert_eq!(
+                        err.description, "agenda ID bogusagenda does not exist",
+                        "{line}"
+                    );
+                }
                 counts[8] += 1;
             }
             "slc" => {
@@ -303,10 +329,10 @@ fn query_vectors() {
                             .iter()
                             .zip(&vi.agenda_status)
                             .map(|(agenda, status)| {
-                                let choice = status
-                                    .choice
-                                    .as_ref()
-                                    .map_or("-".to_string(), |c| c.id.to_string());
+                                let choice = match status.choice_id {
+                                    "" => "-",
+                                    id => id,
+                                };
                                 format!("{}:{}:{}", agenda.vote.id, status.state.go_name(), choice)
                             })
                             .collect::<Vec<_>>()

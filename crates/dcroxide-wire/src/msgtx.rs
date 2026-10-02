@@ -174,6 +174,49 @@ impl fmt::Display for OutPoint {
     }
 }
 
+/// Read an outpoint (dcrd `ReadOutPoint`, `wire/msgtx.go:1174-1197`):
+/// the hash, index and tree, then the tree check.
+///
+/// A negative tree fails with [`WireError::NegativeTxTree`] once its
+/// byte is read, before anything after the outpoint; a read cut short
+/// at an earlier field fails with that read's own io error, as dcrd's
+/// does.
+pub fn read_out_point(r: &mut Cursor<'_>) -> Result<OutPoint, WireError> {
+    let hash = Hash(r.take_array()?);
+    let index = r.read_u32()?;
+    let tree = r.read_u8()? as i8;
+    if tree < 0 {
+        return Err(WireError::NegativeTxTree {
+            op: "ReadOutPoint",
+            tree,
+        });
+    }
+    Ok(OutPoint { hash, index, tree })
+}
+
+/// Append an outpoint (dcrd `WriteOutPoint`, `wire/msgtx.go:1201-1218`).
+///
+/// A negative tree fails with [`WireError::NegativeTxTree`] before
+/// anything is written, as dcrd's check precedes its first write.
+pub fn write_out_point(w: &mut Vec<u8>, op: &OutPoint) -> Result<(), WireError> {
+    if op.tree < 0 {
+        return Err(WireError::NegativeTxTree {
+            op: "WriteOutPoint",
+            tree: op.tree,
+        });
+    }
+    put_out_point(w, op);
+    Ok(())
+}
+
+/// Append an outpoint's 37 bytes whatever its tree, for the infallible
+/// encoders ([`MsgTx::serialize`] and the hashes).
+fn put_out_point(w: &mut Vec<u8>, op: &OutPoint) {
+    w.extend_from_slice(op.hash.as_bytes());
+    w.extend_from_slice(&op.index.to_le_bytes());
+    w.push(op.tree as u8);
+}
+
 /// A Decred transaction input: prefix fields plus witness fields.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct TxIn {
@@ -337,12 +380,11 @@ impl MsgTx {
         // dcrd's `make([]TxIn, count)`, capped by the bytes left.
         self.tx_in = Vec::with_capacity(capped_capacity(count, r.remaining(), PREFIX_TX_IN_SIZE));
         for _ in 0..count {
-            let hash = Hash(r.take_array()?);
-            let index = r.read_u32()?;
-            let tree = r.read_u8()? as i8;
+            // dcrd `readTxInPrefix`: the outpoint, then the sequence.
+            let previous_out_point = read_out_point(r)?;
             let sequence = r.read_u32()?;
             self.tx_in.push(TxIn {
-                previous_out_point: OutPoint { hash, index, tree },
+                previous_out_point,
                 sequence,
                 ..TxIn::default()
             });
@@ -435,15 +477,35 @@ impl MsgTx {
         Ok(())
     }
 
-    /// Append the prefix serialization (dcrd `encodePrefix`).
-    fn encode_prefix(&self, w: &mut Vec<u8>) {
+    /// Append the prefix serialization (dcrd `encodePrefix`), each input
+    /// as dcrd's `writeTxInPrefix` writes it: the outpoint through
+    /// [`write_out_point`], then the sequence.  An input with a negative
+    /// tree fails there, after the input count and the inputs before it
+    /// are written.
+    fn encode_prefix(&self, w: &mut Vec<u8>) -> Result<(), WireError> {
         write_var_int(w, self.tx_in.len() as u64);
         for ti in &self.tx_in {
-            w.extend_from_slice(ti.previous_out_point.hash.as_bytes());
-            w.extend_from_slice(&ti.previous_out_point.index.to_le_bytes());
-            w.push(ti.previous_out_point.tree as u8);
+            write_out_point(w, &ti.previous_out_point)?;
             w.extend_from_slice(&ti.sequence.to_le_bytes());
         }
+        self.encode_prefix_outputs(w);
+        Ok(())
+    }
+
+    /// The prefix serialization with every tree written as its byte, for
+    /// the infallible forms.
+    fn encode_prefix_unchecked(&self, w: &mut Vec<u8>) {
+        write_var_int(w, self.tx_in.len() as u64);
+        for ti in &self.tx_in {
+            put_out_point(w, &ti.previous_out_point);
+            w.extend_from_slice(&ti.sequence.to_le_bytes());
+        }
+        self.encode_prefix_outputs(w);
+    }
+
+    /// The rest of the prefix after its inputs: the outputs, lock time
+    /// and expiry.
+    fn encode_prefix_outputs(&self, w: &mut Vec<u8>) {
         write_var_int(w, self.tx_out.len() as u64);
         for to in &self.tx_out {
             w.extend_from_slice(&(to.value as u64).to_le_bytes());
@@ -465,30 +527,64 @@ impl MsgTx {
         }
     }
 
-    /// Append the serialization for an explicit serialization type.
-    fn encode_with_type(&self, ser_type: TxSerializeType, w: &mut Vec<u8>) {
-        let version_field = u32::from(self.version) | (u32::from(ser_type.to_u16()) << 16);
-        w.extend_from_slice(&version_field.to_le_bytes());
-        match ser_type {
-            TxSerializeType::NoWitness => self.encode_prefix(w),
+    /// The on-wire version field: the version in the lower 16 bits, the
+    /// serialization type in the upper 16.
+    fn version_field(&self, ser_type: TxSerializeType) -> [u8; 4] {
+        (u32::from(self.version) | (u32::from(ser_type.to_u16()) << 16)).to_le_bytes()
+    }
+
+    /// Append the serialization using [`Self::ser_type`] (dcrd
+    /// `MsgTx.BtcEncode` / `Serialize`).
+    ///
+    /// Fails as dcrd's does on a prefix input whose outpoint names a
+    /// negative tree ([`WireError::NegativeTxTree`] from
+    /// [`write_out_point`]), with the version field, the input count and
+    /// the inputs before it already appended.  A witness-only
+    /// serialization writes no outpoints and cannot fail.
+    pub fn encode_into(&self, w: &mut Vec<u8>) -> Result<(), WireError> {
+        w.extend_from_slice(&self.version_field(self.ser_type));
+        match self.ser_type {
+            TxSerializeType::NoWitness => self.encode_prefix(w)?,
             TxSerializeType::OnlyWitness => self.encode_witness(w),
             TxSerializeType::Full => {
-                self.encode_prefix(w);
+                self.encode_prefix(w)?;
+                self.encode_witness(w);
+            }
+        }
+        Ok(())
+    }
+
+    /// Append the serialization for an explicit serialization type, every
+    /// outpoint tree written as its byte.
+    ///
+    /// This is the encoding behind the infallible [`Self::serialize`] and
+    /// the hashes.  It differs from [`Self::encode_into`] only for a
+    /// transaction with a negative input tree, which dcrd's `Bytes`
+    /// refuses with `ErrNegativeTxTree` and its `TxHash` and `TxHashFull`
+    /// panic on (`mustHash`, `wire/msgtx.go:418-429`).  No decoder
+    /// produces one ([`read_out_point`] refuses it), and every RPC that
+    /// builds an input checks its tree first, so only a transaction
+    /// assembled in memory can tell the two apart.
+    pub(crate) fn encode_unchecked(&self, ser_type: TxSerializeType, w: &mut Vec<u8>) {
+        w.extend_from_slice(&self.version_field(ser_type));
+        match ser_type {
+            TxSerializeType::NoWitness => self.encode_prefix_unchecked(w),
+            TxSerializeType::OnlyWitness => self.encode_witness(w),
+            TxSerializeType::Full => {
+                self.encode_prefix_unchecked(w);
                 self.encode_witness(w);
             }
         }
     }
 
-    /// Append the serialization using [`Self::ser_type`] (dcrd
-    /// `MsgTx.BtcEncode` / `Serialize`).
-    pub fn encode_into(&self, w: &mut Vec<u8>) {
-        self.encode_with_type(self.ser_type, w);
-    }
-
     /// The serialization using [`Self::ser_type`] (dcrd `Bytes`).
+    ///
+    /// Infallible: a negative input tree, which dcrd's `Bytes` refuses,
+    /// is written as its byte (see [`Self::encode_into`] for the checked
+    /// form, which [`crate::write_message`] uses).
     pub fn serialize(&self) -> Vec<u8> {
         let mut w = Vec::with_capacity(self.serialize_size());
-        self.encode_into(&mut w);
+        self.encode_unchecked(self.ser_type, &mut w);
         w
     }
 
@@ -534,10 +630,14 @@ impl MsgTx {
     /// The transaction hash: BLAKE-256 over the prefix (no-witness)
     /// serialization (dcrd `TxHash`, which preallocates via
     /// `SerializeSize` in `serialize`).
+    ///
+    /// Total: an input with a negative tree, on which dcrd's `TxHash`
+    /// panics, is hashed with the tree's byte, as [`Self::serialize`]
+    /// writes it.
     pub fn tx_hash(&self) -> Hash {
         let ser_type = TxSerializeType::NoWitness;
         let mut w = Vec::with_capacity(self.serialize_size_with_type(ser_type));
-        self.encode_with_type(ser_type, &mut w);
+        self.encode_unchecked(ser_type, &mut w);
         hash_h(&w)
     }
 
@@ -546,12 +646,13 @@ impl MsgTx {
     pub fn tx_hash_witness(&self) -> Hash {
         let ser_type = TxSerializeType::OnlyWitness;
         let mut w = Vec::with_capacity(self.serialize_size_with_type(ser_type));
-        self.encode_with_type(ser_type, &mut w);
+        self.encode_unchecked(ser_type, &mut w);
         hash_h(&w)
     }
 
     /// The full hash: BLAKE-256 over the concatenated prefix and witness
     /// hashes — not over the full serialization (dcrd `TxHashFull`).
+    /// Total, as [`Self::tx_hash`] is.
     pub fn tx_hash_full(&self) -> Hash {
         let mut buf = [0u8; 64];
         buf[..32].copy_from_slice(self.tx_hash().as_bytes());
@@ -828,5 +929,271 @@ mod tests {
         assert_eq!(decoded.tx_in[0].value_in, 0);
         assert!(decoded.tx_in[0].signature_script.is_empty());
         assert_eq!(decoded.serialize(), bytes);
+    }
+
+    /// The raw bytes, not the byte-reversed string form, of the hash
+    /// dcrd's `TestOutPointSerialize` uses.
+    const OUT_POINT_HASH_HEX: &str =
+        "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20";
+
+    fn out_point_hash() -> Hash {
+        let bytes = dcroxide_testutil::unhex(OUT_POINT_HASH_HEX);
+        Hash(bytes.try_into().expect("32 bytes"))
+    }
+
+    /// The bytes of `OUT_POINT_HASH_HEX` followed by `rest`.
+    fn after_hash(rest: &str) -> Vec<u8> {
+        dcroxide_testutil::unhex(&alloc::format!("{OUT_POINT_HASH_HEX}{rest}"))
+    }
+
+    /// dcrd's `TestOutPointSerialize` read cases
+    /// (`wire/msgtx_test.go:717-776`): both valid trees, a negative one,
+    /// and a cut at and inside each field, which fails with Go's
+    /// `io.EOF` or `io.ErrUnexpectedEOF` for the field it reached.  Only
+    /// a complete tree byte reaches the tree check.  The last three rows
+    /// are the port's: the negative tree nearest zero, the largest valid
+    /// tree, and a negative tree with more bytes behind it, which are not
+    /// read.
+    #[test]
+    fn read_out_point_matches_dcrd() {
+        let hash = out_point_hash();
+        let negative = |tree| {
+            Err(WireError::NegativeTxTree {
+                op: "ReadOutPoint",
+                tree,
+            })
+        };
+        let cases = [
+            (
+                "normal regular tree",
+                after_hash("0a00000000"),
+                Ok(OutPoint {
+                    hash,
+                    index: 10,
+                    tree: TX_TREE_REGULAR,
+                }),
+            ),
+            (
+                "normal stake tree",
+                after_hash("0800000001"),
+                Ok(OutPoint {
+                    hash,
+                    index: 8,
+                    tree: TX_TREE_STAKE,
+                }),
+            ),
+            ("negative tree", after_hash("0800000080"), negative(-128)),
+            ("no data", Vec::new(), Err(WireError::Eof)),
+            (
+                // dcrd slices the hex string, so this is 15 bytes.
+                "partial hash",
+                dcroxide_testutil::unhex(&OUT_POINT_HASH_HEX[..dcroxide_chainhash::HASH_SIZE - 2]),
+                Err(WireError::UnexpectedEof),
+            ),
+            ("missing index", after_hash(""), Err(WireError::Eof)),
+            (
+                "partial index",
+                after_hash("080000"),
+                Err(WireError::UnexpectedEof),
+            ),
+            ("missing tree", after_hash("08000000"), Err(WireError::Eof)),
+            ("tree -1", after_hash("08000000ff"), negative(-1)),
+            (
+                "tree 127",
+                after_hash("080000007f"),
+                Ok(OutPoint {
+                    hash,
+                    index: 8,
+                    tree: 127,
+                }),
+            ),
+            (
+                "negative tree, then a sequence",
+                after_hash("0800000080ffffffff"),
+                negative(-128),
+            ),
+        ];
+        for (name, buf, want) in cases {
+            let mut r = Cursor::new(&buf);
+            assert_eq!(read_out_point(&mut r), want, "{name}");
+            if want.is_ok() || matches!(want, Err(WireError::NegativeTxTree { .. })) {
+                assert_eq!(r.position(), 37, "{name}: consumed");
+            }
+        }
+        let err = WireError::NegativeTxTree {
+            op: "ReadOutPoint",
+            tree: -128,
+        };
+        assert_eq!(err.kind_name(), "ErrNegativeTxTree");
+        assert_eq!(
+            err.to_string(),
+            "ReadOutPoint: negative transaction tree: -128"
+        );
+    }
+
+    /// dcrd's `TestOutPointSerialize` write cases
+    /// (`wire/msgtx_test.go:778-836`).  A negative tree is refused
+    /// before anything is written, so a buffer that already holds bytes
+    /// keeps exactly those.
+    ///
+    /// dcrd's three short-write rows cap a `fixedWriter` at 31, 35 and
+    /// 36 bytes, so the write fails at the hash, the index and the tree,
+    /// and check what the writer holds: nothing, the hash, then the hash
+    /// and index (`fixedIO_test.go`'s `Bytes` returns only what was
+    /// written as of `6f6cf21b`).  The port writes into a `Vec<u8>`,
+    /// which cannot fail short, so the rows reduce to those field
+    /// boundaries of the complete encoding.
+    #[test]
+    fn write_out_point_matches_dcrd() {
+        let hash = out_point_hash();
+        for (index, tree, want) in [
+            (1, TX_TREE_REGULAR, after_hash("0100000000")),
+            (2, TX_TREE_STAKE, after_hash("0200000001")),
+        ] {
+            let mut w = Vec::new();
+            assert_eq!(
+                write_out_point(&mut w, &OutPoint { hash, index, tree }),
+                Ok(())
+            );
+            assert_eq!(w, want, "tree {tree}");
+        }
+
+        for tree in [-1, i8::MIN] {
+            let mut w = alloc::vec![0xaa];
+            let err = write_out_point(
+                &mut w,
+                &OutPoint {
+                    hash,
+                    index: 3,
+                    tree,
+                },
+            )
+            .expect_err("negative tree");
+            assert_eq!(
+                err,
+                WireError::NegativeTxTree {
+                    op: "WriteOutPoint",
+                    tree
+                }
+            );
+            assert_eq!(err.kind_name(), "ErrNegativeTxTree");
+            assert_eq!(w, [0xaa], "tree {tree}: nothing written");
+            assert_eq!(
+                err.to_string(),
+                alloc::format!("WriteOutPoint: negative transaction tree: {tree}")
+            );
+        }
+
+        for (index, written, want) in [
+            (4, 0, Vec::new()),
+            (5, 32, after_hash("")),
+            (6, 36, after_hash("06000000")),
+        ] {
+            let mut w = Vec::new();
+            write_out_point(
+                &mut w,
+                &OutPoint {
+                    hash,
+                    index,
+                    tree: TX_TREE_REGULAR,
+                },
+            )
+            .expect("valid tree");
+            assert_eq!(w[..written], want[..], "index {index}");
+        }
+    }
+
+    /// A transaction with two inputs, the second one's tree replaced.
+    fn two_input_tx(ser_type: TxSerializeType, second_tree: i8) -> MsgTx {
+        let mut tx = multi_tx();
+        tx.ser_type = ser_type;
+        let mut second = tx.tx_in[0].clone();
+        second.previous_out_point.tree = second_tree;
+        tx.tx_in.push(second);
+        tx
+    }
+
+    /// Where the second input's tree byte sits: the version field, the
+    /// input count and the first input, then the second outpoint's hash
+    /// and index.
+    const SECOND_TREE_AT: usize = 4 + 1 + PREFIX_TX_IN_SIZE + 32 + 4;
+
+    /// A prefix input naming a negative tree fails the decode in dcrd's
+    /// `ReadOutPoint` as soon as its tree byte is read, before the
+    /// sequence, in both serializations that carry a prefix.  Every cut
+    /// up to that byte still fails with the short read's own error.
+    #[test]
+    fn negative_input_tree_fails_decode_at_the_tree() {
+        for ser_type in [TxSerializeType::Full, TxSerializeType::NoWitness] {
+            let mut bytes = two_input_tx(ser_type, TX_TREE_REGULAR).serialize();
+            for (byte, tree) in [(0x80, -128), (0xff, -1)] {
+                bytes[SECOND_TREE_AT] = byte;
+                let want = WireError::NegativeTxTree {
+                    op: "ReadOutPoint",
+                    tree,
+                };
+                let mut r = Cursor::new(&bytes);
+                assert_eq!(MsgTx::decode(&mut r).err(), Some(want), "{ser_type:?}");
+                assert_eq!(r.position(), SECOND_TREE_AT + 1, "{ser_type:?}");
+                assert_eq!(
+                    MsgTx::from_bytes(&bytes[..=SECOND_TREE_AT]).err(),
+                    Some(want),
+                    "{ser_type:?}: nothing after the tree is needed"
+                );
+                for cut in 0..=SECOND_TREE_AT {
+                    let err = MsgTx::from_bytes(&bytes[..cut]).expect_err("short");
+                    assert!(
+                        matches!(err, WireError::Eof | WireError::UnexpectedEof),
+                        "{ser_type:?} cut at {cut}: {err:?}"
+                    );
+                }
+            }
+
+            // The largest positive tree is valid and round-trips.
+            bytes[SECOND_TREE_AT] = 0x7f;
+            let (tx, consumed) = MsgTx::from_bytes(&bytes).expect("tree 127 decodes");
+            assert_eq!(consumed, bytes.len());
+            assert_eq!(tx.tx_in[1].previous_out_point.tree, 127);
+            assert_eq!(tx.serialize(), bytes);
+        }
+    }
+
+    /// [`MsgTx::encode_into`], dcrd's `BtcEncode`, refuses a negative
+    /// input tree in `WriteOutPoint`, holding what dcrd's writer would:
+    /// the version field, the input count and the inputs before it.  A
+    /// witness-only serialization writes no outpoints and succeeds.  The
+    /// infallible forms write the tree's byte, and the hashes stay total.
+    #[test]
+    fn encode_into_refuses_a_negative_input_tree() {
+        for ser_type in [TxSerializeType::Full, TxSerializeType::NoWitness] {
+            let tx = two_input_tx(ser_type, -1);
+            let mut w = Vec::new();
+            assert_eq!(
+                tx.encode_into(&mut w),
+                Err(WireError::NegativeTxTree {
+                    op: "WriteOutPoint",
+                    tree: -1
+                }),
+                "{ser_type:?}"
+            );
+            let unchecked = tx.serialize();
+            assert_eq!(w, unchecked[..4 + 1 + PREFIX_TX_IN_SIZE], "{ser_type:?}");
+            assert_eq!(unchecked[SECOND_TREE_AT], 0xff, "{ser_type:?}");
+
+            let mut prefix = Vec::new();
+            tx.encode_unchecked(TxSerializeType::NoWitness, &mut prefix);
+            assert_eq!(tx.tx_hash(), hash_h(&prefix), "{ser_type:?}");
+        }
+
+        let tx = two_input_tx(TxSerializeType::OnlyWitness, -1);
+        let mut w = Vec::new();
+        assert_eq!(tx.encode_into(&mut w), Ok(()));
+        assert_eq!(w, tx.serialize());
+
+        // A valid transaction encodes the same either way.
+        let tx = two_input_tx(TxSerializeType::Full, TX_TREE_STAKE);
+        let mut w = Vec::new();
+        assert_eq!(tx.encode_into(&mut w), Ok(()));
+        assert_eq!(w, tx.serialize());
     }
 }

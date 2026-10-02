@@ -11,11 +11,20 @@
 //! state where the begin time is not yet reached) is recorded.  A view
 //! that leaves the hooks at their defaults recomputes from the
 //! deployment start on every call, which is result-identical.
+//!
+//! The view also carries the per-chain activation anchors dcrd keeps on
+//! each agenda (`consensusAgenda.activeAnchor`): the tally records the
+//! first LockedIn to Active boundary it computes for an agenda without
+//! a hard-coded historical activation, and [`agenda_state`] answers
+//! active for every descendant of a recorded anchor without tallying.
 
 use alloc::vec;
 use alloc::vec::Vec;
 
-use dcroxide_chaincfg::{Choice, ConsensusDeployment, Params};
+use dcroxide_chaincfg::{ConsensusDeployment, Params};
+use dcroxide_wire::CurrencyNet;
+
+use crate::agendas::{ConsensusAgenda, HistoricalActivationState};
 
 use crate::stakever::{
     VersionChainView, VersionNode, calc_past_median_time, calc_stake_version, calc_want_height,
@@ -53,16 +62,32 @@ impl ThresholdState {
 
 /// A threshold state along with the winning choice, when one exists
 /// (dcrd `ThresholdStateTuple`).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct ThresholdStateTuple {
     /// The current state.
     pub state: ThresholdState,
-    /// The choice that locked in or failed the agenda, when decided.
-    pub choice: Option<Choice>,
+    /// The ID of the choice that received the majority vote for the
+    /// locked in and active states (dcrd `ChoiceID`).
+    ///
+    /// It is the majority no choice for the failed state only when the
+    /// vote failed by a majority no vote, and empty when it failed by
+    /// expiring, which lets callers tell the two apart.  It is empty
+    /// for every other state.  A forced state carries the forced choice
+    /// ID, and the default state of a required agenda that the network
+    /// defines no deployment for carries none.
+    pub choice_id: &'static str,
 }
 
-fn tuple(state: ThresholdState, choice: Option<Choice>) -> ThresholdStateTuple {
-    ThresholdStateTuple { state, choice }
+/// A threshold state tuple (dcrd `newThresholdState`).
+pub const fn new_threshold_state(
+    state: ThresholdState,
+    choice_id: &'static str,
+) -> ThresholdStateTuple {
+    ThresholdStateTuple { state, choice_id }
+}
+
+fn tuple(state: ThresholdState, choice_id: &'static str) -> ThresholdStateTuple {
+    new_threshold_state(state, choice_id)
 }
 
 /// A node carrying the full vote data the state machine tallies.
@@ -128,6 +153,49 @@ pub trait VoteChainView: VersionChainView {
         _state: ThresholdStateTuple,
     ) {
     }
+
+    /// The hard-coded historical agenda activations for the network
+    /// the view's chain belongs to: dcrd `makeHistoricalAgendas`, which
+    /// `New` attaches to the chain's agendas (`chain.go:2151`).
+    ///
+    /// The default is the network's table, which the block index view
+    /// keeps.  A view that models a synthetic main or version 3 test
+    /// network chain whose votes activate an agenda below its historical
+    /// anchor overrides this to return a reduced table, the counterpart
+    /// of dcrd's `removeHistoricalConsensusChange` test helper
+    /// (`common_test.go`).
+    fn historical_agendas(&self, net: CurrencyNet) -> &[(&'static str, HistoricalActivationState)] {
+        crate::agendas::historical_agendas(net)
+    }
+
+    /// The hash of the node at the given height along this branch,
+    /// for matching a hard-coded historical anchor (dcrd's
+    /// `prevNode.Ancestor(height).hash`); `None` when the view cannot
+    /// resolve it, which the positional agenda query treats like a
+    /// hash that does not match.
+    fn ancestor_hash(&self, _height: i64) -> Option<[u8; 32]> {
+        None
+    }
+
+    /// The winning choice ID of the agenda's cached activation anchor
+    /// when the anchor is an ancestor of (or is) the node at the given
+    /// height along this branch (dcrd's `activeAnchor` load and its
+    /// `IsAncestorOf` check).
+    fn active_anchor_cached(&self, _agenda_id: &str, _prev_height: i64) -> Option<&'static str> {
+        None
+    }
+
+    /// Whether an activation anchor is cached for the agenda on any
+    /// branch (dcrd `agenda.activeAnchor != nil`).
+    fn has_active_anchor(&self, _agenda_id: &str) -> bool {
+        false
+    }
+
+    /// Cache the node at the given height along this branch as the
+    /// agenda's activation anchor, replacing any earlier one (dcrd's
+    /// `agenda.activeAnchor` assignment).  The anchor is per chain,
+    /// not per view: every later query on any branch consults it.
+    fn cache_active_anchor(&self, _agenda_id: &str, _height: i64, _choice_id: &'static str) {}
 }
 
 /// The highest deployment version defined by the network (dcrd
@@ -155,11 +223,53 @@ pub fn next_deployment_version(params: &Params, version: u32) -> u32 {
 
 /// The next threshold state for the deployment at the block AFTER the
 /// given previous node (dcrd `nextThresholdState`).
+///
+/// As in dcrd, computing the LockedIn to Active boundary caches it as
+/// the agenda's activation anchor (see
+/// [`VoteChainView::cache_active_anchor`]) when the view holds no
+/// anchor for the agenda yet and the agenda has no hard-coded
+/// historical activation on the view's network.
 pub fn next_threshold_state(
     view: &impl VoteChainView,
     prev_height: Option<i64>,
     deployment_version: u32,
     deployment: &ConsensusDeployment,
+    params: &Params,
+) -> ThresholdStateTuple {
+    let has_historical_state = has_historical_activation(view, deployment, params);
+    next_threshold_state_with(
+        view,
+        prev_height,
+        deployment_version,
+        deployment,
+        has_historical_state,
+        params,
+    )
+}
+
+/// Whether the deployment's agenda carries a historical activation on
+/// the view's network, exactly as [`crate::agendas::make_agendas`]
+/// attaches one (dcrd `agenda.historicalState != nil`).
+fn has_historical_activation(
+    view: &impl VoteChainView,
+    deployment: &ConsensusDeployment,
+    params: &Params,
+) -> bool {
+    matches!(
+        crate::agendas::resolve_historical_state(view.historical_agendas(params.net), deployment),
+        Ok(Some(_))
+    )
+}
+
+/// [`next_threshold_state`] with the agenda's historical activation
+/// status already known (dcrd `nextThresholdState`, which reads it from
+/// the agenda).
+fn next_threshold_state_with(
+    view: &impl VoteChainView,
+    prev_height: Option<i64>,
+    deployment_version: u32,
+    deployment: &ConsensusDeployment,
+    has_historical_state: bool,
     params: &Params,
 ) -> ThresholdStateTuple {
     // The threshold state for the window that contains the genesis
@@ -168,7 +278,7 @@ pub fn next_threshold_state(
     let confirmation_window = rule_change_interval;
     let svh = params.stake_validation_height;
     let Some(prev_height) = prev_height else {
-        return tuple(ThresholdState::Defined, None);
+        return tuple(ThresholdState::Defined, "");
     };
     #[allow(
         clippy::arithmetic_side_effects,
@@ -176,7 +286,7 @@ pub fn next_threshold_state(
                   plus the u32 confirmation_window is a sum of network parameters"
     )]
     if prev_height + 1 < svh + confirmation_window {
-        return tuple(ThresholdState::Defined, None);
+        return tuple(ThresholdState::Defined, "");
     }
 
     // Get the ancestor that is the last block of the previous
@@ -218,7 +328,7 @@ pub fn next_threshold_state(
                     deployment_version,
                     vote_id,
                     hash,
-                    tuple(ThresholdState::Defined, None),
+                    tuple(ThresholdState::Defined, ""),
                 );
             }
             break;
@@ -235,7 +345,7 @@ pub fn next_threshold_state(
     // The starting state is defined (dcrd seeds its cache with Defined
     // at the node whose median time is before the begin time) unless a
     // cached boundary supplied it.
-    let mut state = seed_state.unwrap_or_else(|| tuple(ThresholdState::Defined, None));
+    let mut state = seed_state.unwrap_or_else(|| tuple(ThresholdState::Defined, ""));
 
     // Replay the state transitions forward through the collected
     // boundary nodes.
@@ -332,7 +442,7 @@ pub fn next_threshold_state(
                             } else {
                                 state.state = ThresholdState::LockedIn;
                             }
-                            state.choice = Some(choice.clone());
+                            state.choice_id = choice.id;
                             break;
                         }
                     }
@@ -342,6 +452,21 @@ pub fn next_threshold_state(
                 // The new rule becomes active when its previous state
                 // was locked in.
                 state.state = ThresholdState::Active;
+
+                // Cache the resolved activation point as an anchor when
+                // it is the first one discovered and there is no
+                // hard-coded historical activation point, which has its
+                // own handling (dcrd `thresholdstate.go:377-415`).
+                //
+                // Only the first discovered activation is kept even
+                // though competing side chain blocks can each become the
+                // parent of the block where the agenda activates.  An
+                // anchor on an abandoned side chain is merely never an
+                // ancestor of later queries, which then fall back to
+                // the threshold state cache, as dcrd accepts.
+                if !has_historical_state && !view.has_active_anchor(vote_id) {
+                    view.cache_active_anchor(vote_id, h, state.choice_id);
+                }
             }
             // Nothing to do for the terminal states.
             ThresholdState::Active | ThresholdState::Failed => {}
@@ -350,45 +475,53 @@ pub fn next_threshold_state(
         // Record the boundary's state (dcrd updates the deployment
         // cache as it ascends).
         if let Some(hash) = hash {
-            view.cache_threshold_state(deployment_version, vote_id, hash, state.clone());
+            view.cache_threshold_state(deployment_version, vote_id, hash, state);
         }
     }
 
     state
 }
 
-/// The threshold state for the deployment for the block AFTER the given
-/// node, honoring test networks' forced choices (dcrd
-/// `deploymentState`).
-pub fn deployment_state(
+/// The threshold state of the agenda for the block AFTER the given
+/// node (dcrd `agendaState`): the forced state when the agenda has one,
+/// active with the anchor's choice for any descendant of (or the) cached
+/// activation anchor, and otherwise the tallied state.
+///
+/// An agenda without a forced state always has its deployment (dcrd's
+/// `makeAgendas` attaches one to every unforced agenda).
+pub fn agenda_state(
     view: &impl VoteChainView,
     prev_height: Option<i64>,
-    deployment_version: u32,
-    deployment: &ConsensusDeployment,
+    agenda_id: &str,
+    agenda: &ConsensusAgenda<'_>,
     params: &Params,
 ) -> ThresholdStateTuple {
-    // Networks may force an outcome for an agenda (used on test
-    // networks for already-decided agendas); dcrd resolves this into a
-    // forced state at chain construction.
-    if !deployment.forced_choice_id.is_empty() {
-        let choice = deployment
-            .vote
-            .choices
-            .iter()
-            .find(|c| c.id == deployment.forced_choice_id)
-            .cloned();
-        let state = match &choice {
-            Some(c) if c.is_no => ThresholdState::Failed,
-            Some(_) => ThresholdState::Active,
-            // A forced choice id that does not exist is a chaincfg data
-            // error; dcrd validates this at startup and the ported
-            // chaincfg sanity tests do the same.
-            None => unreachable!("forced choice id must exist in the vote choices"),
-        };
-        return tuple(state, choice);
+    // Forced states take precedence.
+    if let Some(forced) = agenda.forced_state {
+        return forced;
     }
 
-    next_threshold_state(view, prev_height, deployment_version, deployment, params)
+    // Use the previously cached anchor when it exists and is actually
+    // an ancestor of the queried block (which includes the anchor block
+    // itself).  It may come from a known historical fact or have been
+    // discovered while tallying votes.
+    if let Some(prev) = prev_height
+        && let Some(choice_id) = view.active_anchor_cached(agenda_id, prev)
+    {
+        return tuple(ThresholdState::Active, choice_id);
+    }
+
+    let (version, deployment) = agenda
+        .deployment
+        .expect("an agenda without a forced state has a deployment");
+    next_threshold_state_with(
+        view,
+        prev_height,
+        version,
+        deployment,
+        agenda.historical_state.is_some(),
+        params,
+    )
 }
 
 /// Compacted vote counts for a deployment over the current rule change
@@ -424,6 +557,7 @@ pub fn state_last_changed(
     if node_height < svh + confirmation_interval {
         return None;
     }
+    let has_historical_state = has_historical_activation(view, deployment, params);
 
     // Determine the current state.  Notice that nextThresholdState
     // always calculates the state for the block after the provided
@@ -432,11 +566,12 @@ pub fn state_last_changed(
         clippy::arithmetic_side_effects,
         reason = "node_height >= svh + confirmation_interval >= 1 after the early return"
     )]
-    let cur_state = next_threshold_state(
+    let cur_state = next_threshold_state_with(
         view,
         Some(node_height - 1),
         deployment_version,
         deployment,
+        has_historical_state,
         params,
     );
 
@@ -461,11 +596,12 @@ pub fn state_last_changed(
         // As previously mentioned, nextThresholdState always
         // calculates the state for the block after the provided one,
         // so use the parent to get the state of the block itself.
-        let state = next_threshold_state(
+        let state = next_threshold_state_with(
             view,
             Some(walk_height - 1),
             deployment_version,
             deployment,
+            has_historical_state,
             params,
         );
         if state.state != cur_state.state {

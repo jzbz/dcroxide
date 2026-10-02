@@ -324,16 +324,20 @@ impl MsgBlock {
         })
     }
 
-    pub(crate) fn encode(&self, w: &mut Vec<u8>) {
+    /// dcrd `MsgBlock.BtcEncode`: each transaction through
+    /// [`MsgTx::encode_into`], so the first input in block order whose
+    /// outpoint names a negative tree fails the encode.
+    pub(crate) fn encode(&self, w: &mut Vec<u8>) -> Result<(), WireError> {
         w.extend_from_slice(&self.header.serialize());
         write_var_int(w, self.transactions.len() as u64);
         for tx in &self.transactions {
-            tx.encode_into(w);
+            tx.encode_into(w)?;
         }
         write_var_int(w, self.stransactions.len() as u64);
         for tx in &self.stransactions {
-            tx.encode_into(w);
+            tx.encode_into(w)?;
         }
+        Ok(())
     }
 
     /// Decode from a byte slice, returning the block and bytes consumed
@@ -346,9 +350,20 @@ impl MsgBlock {
 
     /// The serialization (dcrd `Bytes`, which preallocates via
     /// `SerializeSize`).
+    ///
+    /// Infallible as [`MsgTx::serialize`] is: a negative input tree,
+    /// which dcrd's `Bytes` refuses, is written as its byte.
     pub fn serialize(&self) -> Vec<u8> {
         let mut w = Vec::with_capacity(self.serialize_size());
-        self.encode(&mut w);
+        w.extend_from_slice(&self.header.serialize());
+        write_var_int(&mut w, self.transactions.len() as u64);
+        for tx in &self.transactions {
+            tx.encode_unchecked(tx.ser_type, &mut w);
+        }
+        write_var_int(&mut w, self.stransactions.len() as u64);
+        for tx in &self.stransactions {
+            tx.encode_unchecked(tx.ser_type, &mut w);
+        }
         w
     }
 

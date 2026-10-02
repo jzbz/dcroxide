@@ -20,7 +20,9 @@ use dcroxide_blockchain::RuleErrorKind;
 use dcroxide_blockchain::difficulty::{ChainView, DiffNode};
 use dcroxide_blockchain::stakever::VersionNode;
 use dcroxide_blockchain::thresholdstate::{VoteChainView, VoteNode};
-use dcroxide_blockchain::validate::{check_block_context, determine_check_tx_flags};
+use dcroxide_blockchain::validate::{
+    NoMerkleCheckCache, check_block_context, determine_check_tx_flags,
+};
 use dcroxide_chaincfg::{Params, simnet_params};
 use dcroxide_chainhash::Hash;
 use dcroxide_stake::ticketnode::{Node, StakeNodeParams};
@@ -167,6 +169,7 @@ impl Fixture {
             self.parent_pool_size,
             self.parent_final_state,
             Some(&self.stake_node),
+            &mut NoMerkleCheckCache,
             params,
         )
         .map_err(|e| e.kind)

@@ -26,6 +26,11 @@ const ATOMS_PER_COIN: i64 = 100_000_000;
 /// `maxAtoms`).
 const MAX_ATOMS: i64 = 21_000_000 * ATOMS_PER_COIN;
 
+/// [`MAX_ATOMS`] as dcrd's messages print it.  dcrd's `maxAtoms` is an
+/// untyped floating-point constant (`tx.go:33-34`), so `%v` formats it
+/// as a `float64`, in exponent form.
+const MAX_ATOMS_TEXT: &str = "2.1e+15";
+
 /// The treasury transaction version (dcrd `wire.TxVersionTreasury`).
 const TX_VERSION_TREASURY: u16 = 3;
 
@@ -169,7 +174,7 @@ pub fn check_transaction_sanity(tx: &MsgTx, max_tx_size: u64) -> Result<(), Rule
         if atoms > MAX_ATOMS {
             let str = format!(
                 "transaction output value of {atoms} is higher than max allowed value \
-                 of {MAX_ATOMS}"
+                 of {MAX_ATOMS_TEXT}"
             );
             return Err(rule_error(ErrorKind::BadTxOutValue, str));
         }
@@ -181,14 +186,14 @@ pub fn check_transaction_sanity(tx: &MsgTx, max_tx_size: u64) -> Result<(), Rule
         if total_atoms < 0 {
             let str = format!(
                 "total value of all transaction outputs exceeds max allowed value of \
-                 {MAX_ATOMS}"
+                 {MAX_ATOMS_TEXT}"
             );
             return Err(rule_error(ErrorKind::BadTxOutValue, str));
         }
         if total_atoms > MAX_ATOMS {
             let str = format!(
                 "total value of all transaction outputs is {total_atoms} which is \
-                 higher than max allowed value of {MAX_ATOMS}"
+                 higher than max allowed value of {MAX_ATOMS_TEXT}"
             );
             return Err(rule_error(ErrorKind::BadTxOutValue, str));
         }
@@ -206,7 +211,7 @@ pub fn check_transaction_sanity(tx: &MsgTx, max_tx_size: u64) -> Result<(), Rule
         if atoms > MAX_ATOMS {
             let str = format!(
                 "transaction input value {atoms} is higher than max allowed value \
-                 of {MAX_ATOMS}"
+                 of {MAX_ATOMS_TEXT}"
             );
             return Err(rule_error(ErrorKind::FraudAmountIn, str));
         }

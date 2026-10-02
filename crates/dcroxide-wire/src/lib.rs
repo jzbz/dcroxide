@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: ISC
 //! Decred P2P wire protocol types and codecs, mirroring dcrd's `wire`
-//! package at master `b9634e01` (the parity pin; wire protocol 12).
-//! Its only code change since the earlier `452c1a6c` target is
+//! package at master `6f6cf21b` (the parity pin; wire protocol 12).
+//! Its code changes since the earlier `452c1a6c` target are
 //! `SerializeSize` on every message, ported as
-//! [`Message::serialize_size`].
+//! [`Message::serialize_size`], and the refusal of a negative outpoint
+//! tree (`3dde63a8`, `ErrNegativeTxTree`), ported as [`read_out_point`]
+//! and [`write_out_point`].
 //!
 //! Implemented: variable-length integers, transactions ([`MsgTx`])
 //! with all three serialization types and their BLAKE-256 hashes, the
@@ -98,7 +100,7 @@ pub use msgtx::{
     MAX_TX_OUT_PER_MESSAGE, MsgTx, NO_EXPIRY_VALUE, NULL_BLOCK_HEIGHT, NULL_BLOCK_INDEX,
     NULL_VALUE_IN, OutPoint, SEQUENCE_LOCK_TIME_DISABLED, SEQUENCE_LOCK_TIME_GRANULARITY,
     SEQUENCE_LOCK_TIME_IS_SECONDS, SEQUENCE_LOCK_TIME_MASK, TX_TREE_REGULAR, TX_TREE_STAKE,
-    TX_TREE_UNKNOWN, TX_VERSION, TxIn, TxOut, TxSerializeType,
+    TX_TREE_UNKNOWN, TX_VERSION, TxIn, TxOut, TxSerializeType, read_out_point, write_out_point,
 };
 pub use netaddress::{
     MAX_NET_ADDRESS_PAYLOAD, MAX_NET_ADDRESS_PAYLOAD_V2, NetAddress, NetAddressType, NetAddressV2,

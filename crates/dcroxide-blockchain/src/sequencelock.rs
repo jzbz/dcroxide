@@ -86,19 +86,16 @@ pub fn calc_sequence_lock<V: VoteChainView>(
     is_active: bool,
     params: &Params,
 ) -> Result<SequenceLock, RuleError> {
-    // dcrd derives the flag from the node's parent; a genesis tip
-    // nil-derefs there and is unreachable in practice.
+    // dcrd derives the flag from the node's parent, which the genesis
+    // block lacks; the treasury agenda is inactive for it
+    // (`agendas.go:882-890`).
     #[allow(
         clippy::arithmetic_side_effects,
-        reason = "node_height is a block height (a u32 header height widened to i64)"
+        reason = "node_height is a block height (a u32 header height widened to i64) and is \
+                  positive in the subtraction"
     )]
-    let is_treasury_enabled = is_treasury_agenda_active(view, Some(node_height - 1), params)
-        .map_err(|_| {
-            rule_error(
-                RuleErrorKind::UnknownDeploymentID,
-                "treasury deployment not defined on this network",
-            )
-        })?;
+    let prev_height = (node_height > 0).then(|| node_height - 1);
+    let is_treasury_enabled = is_treasury_agenda_active(view, prev_height, params)?;
 
     // A value of -1 for each lock type allows a transaction to be
     // included in a block at any given height or time.

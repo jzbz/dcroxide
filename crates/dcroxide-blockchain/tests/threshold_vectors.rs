@@ -90,7 +90,10 @@ fn threshold_vectors() {
                     want_state,
                     "{line} (scenario {scenarios})"
                 );
-                let got_choice = got.choice.as_ref().map_or("-", |c| c.id);
+                let got_choice = match got.choice_id {
+                    "" => "-",
+                    id => id,
+                };
                 assert_eq!(got_choice, want_choice, "{line} (scenario {scenarios})");
                 thresholds += 1;
             }

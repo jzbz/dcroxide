@@ -110,6 +110,7 @@ fn coded_tx_errors_match_dcrd_text() {
     // The version field (version 1, serialization type in the upper
     // half), an eight-byte zero amount, and a four-byte zero field.
     const FULL: &str = "01000000";
+    const NO_WITNESS: &str = "01000100";
     const WITNESS_ONLY: &str = "01000200";
     const AMOUNT: &str = "0000000000000000";
     const U32: &str = "00000000";
@@ -117,6 +118,8 @@ fn coded_tx_errors_match_dcrd_text() {
     const TOO_LONG: &str = "fe01000002";
     // A canonical varint of 2^32, past every count limit.
     const TOO_MANY: &str = "ff0000000001000000";
+    // An outpoint's hash and index, short of its tree byte.
+    let outpoint = "00".repeat(32 + 4);
     let cases = [
         // Empty input and a bare version, both cut at a field boundary.
         String::new(),
@@ -138,6 +141,13 @@ fn coded_tx_errors_match_dcrd_text() {
         // maximum message payload.
         format!("{FULL}0001{AMOUNT}0000{TOO_LONG}"),
         format!("{WITNESS_ONLY}01{AMOUNT}{U32}{U32}{TOO_LONG}"),
+        // A prefix input naming a negative tree, which dcrd's
+        // `ReadOutPoint` refuses once the tree byte is read: cut right
+        // after it, inside a whole transaction, and in a prefix-only
+        // serialization.
+        format!("{FULL}01{outpoint}80"),
+        format!("{FULL}01{outpoint}ff{U32}00{U32}{U32}01{AMOUNT}{U32}{U32}00"),
+        format!("{NO_WITNESS}02{outpoint}00{U32}{outpoint}fe{U32}00{U32}{U32}"),
     ];
     for case in &cases {
         let bytes = unhex(case);
@@ -145,6 +155,49 @@ fn coded_tx_errors_match_dcrd_text() {
         let theirs =
             oracle_tx_error(&mut oracle, &bytes).unwrap_or_else(|| panic!("dcrd decoded {case}"));
         assert_eq!(ours.to_string(), theirs, "{case}");
+    }
+}
+
+/// A negative tree written over any prefix input's tree byte fails with
+/// dcrd's `ReadOutPoint` text, `ReadOutPoint: negative transaction tree:
+/// <tree>`, over the whole range of negative trees.
+#[test]
+fn negative_tree_errors_match_dcrd_text() {
+    let Some(mut oracle) = oracle_or_skip() else {
+        return;
+    };
+    let mut rng = SplitMix64::from_entropy("tx negative tree text differential");
+    for i in 0..200 {
+        let ser_type = if rng.below(2) == 0 {
+            TxSerializeType::Full
+        } else {
+            TxSerializeType::NoWitness
+        };
+        let tx = random_tx(&mut rng, ser_type);
+        let mut bytes = tx.serialize();
+        // The version, the one-byte input count, the inputs before this
+        // one, then its outpoint's hash and index.
+        let k = rng.below(tx.tx_in.len() as u64) as usize;
+        let at = 4 + 1 + 41 * k + 32 + 4;
+        let tree = if i == 0 {
+            i8::MIN
+        } else if i == 1 {
+            -1
+        } else {
+            (0x80 | rng.next_u64() as u8) as i8
+        };
+        bytes[at] = tree as u8;
+        let ours = MsgTx::from_bytes(&bytes).expect_err("negative tree");
+        assert_eq!(
+            ours,
+            WireError::NegativeTxTree {
+                op: "ReadOutPoint",
+                tree
+            }
+        );
+        let theirs = oracle_tx_error(&mut oracle, &bytes)
+            .unwrap_or_else(|| panic!("dcrd decoded {}", hex(&bytes)));
+        assert_eq!(ours.to_string(), theirs, "{ser_type:?} input {k}");
     }
 }
 
@@ -256,12 +309,33 @@ fn block_errors_match_dcrd_text() {
             hex(&payload[180..])
         );
     }
+
+    // A negative tree on the first input of the regular transaction and
+    // of the stake transaction: the header, a one-byte count, then the
+    // transaction's version, one-byte input count, hash and index.
+    let regular_tree = 180 + 1 + 4 + 1 + 32 + 4;
+    let stake_tree = 180 + 1 + block.transactions[0].serialize_size() + 1 + 4 + 1 + 32 + 4;
+    for (at, tree) in [(regular_tree, -1i8), (stake_tree, -128)] {
+        let mut payload = bytes.clone();
+        assert_eq!(payload[at], 0, "tree byte at {at}");
+        payload[at] = tree as u8;
+        let ours = decode(&payload);
+        assert_eq!(
+            ours,
+            WireError::NegativeTxTree {
+                op: "ReadOutPoint",
+                tree
+            }
+        );
+        assert_eq!(ours.to_string(), oracle_block_error(&mut oracle, &payload));
+    }
 }
 
 /// The coded errors of the eight mixing message decoders print dcrd's
 /// `MessageError` text, which `sendrawmixmessage` returns: one row per
 /// check each `BtcDecode` (and `readMixVects`, `readMixVect`,
-/// `ReadVarBytes`, `ReadAsciiVarString`, `readTxOut`) makes, plus the
+/// `ReadVarBytes`, `ReadAsciiVarString`, `readTxOut`, `ReadOutPoint`)
+/// makes, plus the
 /// one encode check a decodable message can fail, a `mixdcnet` with no
 /// mixed messages, which dcrd's `WriteMessage` rejects.
 #[test]
@@ -303,6 +377,7 @@ fn coded_mix_errors_match_dcrd_text() {
             format!("{sig_id}{}{amount}00{}{negative}", zeros(4), zeros(10)),
         ),
         ("mixpairreq", format!("{pr_head}{peers}")),
+        ("mixpairreq", format!("{pr_head}01{}80", zeros(32 + 4))),
         ("mixpairreq", format!("{pr_head}01{outpoint}fd0140")),
         ("mixpairreq", format!("{pr_head}01{outpoint}0022")),
         ("mixpairreq", format!("{pr_head}01{outpoint}000041")),
@@ -325,6 +400,10 @@ fn coded_mix_errors_match_dcrd_text() {
         ("mixdcnet", format!("{session_run}00{peers}")),
         ("mixdcnet", format!("{session_run}0000")),
         ("mixconfirm", format!("{session_run}01000300")),
+        (
+            "mixconfirm",
+            format!("{session_run}0100000001{}ff", zeros(32 + 4)),
+        ),
         ("mixconfirm", format!("{session_run}{empty_tx}{peers}")),
         ("mixsecrets", format!("{secrets_head}{mcount}")),
         ("mixsecrets", format!("{secrets_head}0121")),

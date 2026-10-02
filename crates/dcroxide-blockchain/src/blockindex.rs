@@ -329,6 +329,15 @@ pub struct NodeStore {
     /// dcrd's `cachedBlake3WorkDiffCandidateAnchor`: the candidate
     /// anchor the positional difficulty check last matched.
     pub(crate) blake3_work_diff_candidate_anchor: core::cell::Cell<Option<NodeId>>,
+    /// dcrd's per-agenda `activeAnchor` (`agendas.go:420-429`): the
+    /// parent of the block at which each agenda activated, with the
+    /// winning choice ID, keyed by agenda ID.  An anchor is set from a
+    /// resolved historical activation or the first LockedIn to Active
+    /// boundary a tally computes, and like the BLAKE3 anchors above it
+    /// only counts for queries it is an ancestor of.
+    pub(crate) agenda_active_anchors: core::cell::RefCell<
+        alloc::collections::BTreeMap<alloc::string::String, (NodeId, &'static str)>,
+    >,
     /// The node a branch view last served, with that branch's tip.  It
     /// is not a dcrd cache: dcrd's walks step `node.parent`, and a
     /// height-indexed view that resumes from this node does the same

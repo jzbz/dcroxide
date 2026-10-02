@@ -25,60 +25,24 @@ use dcroxide_node::bgtemplate::{NodeRpcBlockTemplater, start_generator};
 use dcroxide_node::mediantime::{adjusted_time_unix, server_time_source};
 use dcroxide_node::mining::{NodeTemplateChain, NodeTemplateTxSource};
 use dcroxide_rpc::server::RpcBlockTemplater;
-use dcroxide_testutil::unhex;
-use dcroxide_wire::MsgBlock;
 
-/// The leading consecutive main-chain prefix of accepted blocks from
-/// dcrd's `fullblocktests.Generate` battery, with the generation time.
-fn accepted_prefix(limit: usize) -> (i64, Vec<MsgBlock>) {
-    let path = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../dcroxide-blockchain/tests/data/fullblock_vectors.txt"
-    );
-    let data = std::fs::read_to_string(path).expect("fullblock vectors");
-    let mut now: i64 = 0;
-    let mut tip = dcroxide_chaincfg::regnet_params().genesis_hash;
-    let mut blocks = Vec::new();
-    for line in data.lines() {
-        let f: Vec<&str> = line.split(' ').collect();
-        match f[0] {
-            "now" => now = f[1].parse().expect("generation time"),
-            "accept" => {
-                let (block, _) = MsgBlock::from_bytes(&unhex(f[4])).expect("block");
-                if f[2] != "true" || block.header.prev_block != tip {
-                    continue;
-                }
-                tip = block.header.block_hash();
-                blocks.push(block);
-                if blocks.len() == limit {
-                    break;
-                }
-            }
-            _ => {}
-        }
-    }
-    assert_eq!(blocks.len(), limit, "battery must provide the prefix");
-    (now, blocks)
-}
-
-/// A regnet chain with the first `history` accepted battery blocks
-/// processed.
-fn regnet_chain(history: usize) -> (tempfile::TempDir, Arc<Mutex<Chain>>) {
+/// A fresh regnet chain holding only the genesis block.
+///
+/// The test mines its own extension block over genesis rather than over
+/// a prefix of dcrd's `fullblocktests.Generate` battery: the battery's
+/// first block is stamped with its generation time, so a battery prefix
+/// has a median time at that moment, and the extension block -- which
+/// must be more than a day older than the wall clock -- could not land
+/// after it until a day after each regeneration.  The regnet genesis
+/// timestamp (2018-10-03) is older than any stamp the test chooses.
+fn regnet_chain() -> (tempfile::TempDir, Arc<Mutex<Chain>>) {
     let params = dcroxide_chaincfg::regnet_params();
-    let (now, blocks) = accepted_prefix(history);
     let dir = tempfile::tempdir().expect("temp dir");
     let opts = Options::new(dir.path().join("blocks"), params.net.0);
     let db = Database::create(&opts).expect("create database");
     let chain = Arc::new(Mutex::new(
         Chain::open(db, &params, params.assume_valid, false, 0).expect("open chain"),
     ));
-    for block in &blocks {
-        let (_, errs) = chain
-            .lock()
-            .expect("chain")
-            .process_block(block, now, &params);
-        assert!(errs.is_empty(), "history block must accept: {errs:?}");
-    }
     (dir, chain)
 }
 
@@ -127,12 +91,14 @@ fn the_generator_gate_reads_the_median_adjusted_time() {
         "the median offset applies: {offset}"
     );
 
-    // Extend the battery chain with a block stamped 23h40m before the
+    // Extend the genesis chain with a block stamped 23h40m before the
     // adjusted time: within a day of the adjusted time, so current by
     // dcrd's rule, but more than a day before the wall clock.  dcrd's
     // `MiningTimeOffset` moves the template timestamp into the past by
-    // that many seconds.
-    let (_dir, chain) = regnet_chain(2);
+    // that many seconds, from the later of the adjusted time and one
+    // second after the tip's median time; genesis keeps that the
+    // adjusted time.
+    let (_dir, chain) = regnet_chain();
     let tx_pool = dcroxide_node::txmempool::new_shared_tx_pool(
         Arc::clone(&chain),
         &params,
@@ -159,7 +125,7 @@ fn the_generator_gate_reads_the_median_adjusted_time() {
             },
         )
         .expect("template")
-        .expect("a template over the battery tip")
+        .expect("a template over genesis")
         .block;
     drop(builder);
     let is_blake3_pow_active = chain
@@ -241,7 +207,7 @@ fn the_generator_gate_reads_the_median_adjusted_time() {
         match templater.current_template() {
             Ok(Some(template)) => {
                 assert_eq!(
-                    template.header.height, 4,
+                    template.header.height, 2,
                     "the generator builds on the new tip"
                 );
                 break;

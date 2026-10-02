@@ -81,7 +81,7 @@ pub fn count_spent_stake_outputs(block: &MsgBlock) -> usize {
         }
         // Exclude treasurybases and treasury spends since neither has
         // any inputs.  dcrd uses the strict stake.IsTreasuryBase here
-        // (chain.go:978), not the minimal standalone check.
+        // (chain.go:966), not the minimal standalone check.
         if dcroxide_stake::is_treasury_base(stx) || dcroxide_stake::is_tspend(stx) {
             continue;
         }
@@ -1078,7 +1078,7 @@ mod tests {
     }
 
     /// dcrd `countSpentStakeOutputs` skips only what the strict
-    /// `stake.IsTreasuryBase` accepts (chain.go:978), so a stake
+    /// `stake.IsTreasuryBase` accepts (chain.go:966), so a stake
     /// transaction that merely passes the minimal check has its input
     /// counted.
     #[test]

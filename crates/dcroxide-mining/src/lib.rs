@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: ISC
 //! Block template mining support, ported from dcrd's
-//! `internal/mining` package at the parity pin, master `b9634e01` (the
+//! `internal/mining` package at the parity pin, master `6f6cf21b` (the
 //! package is unchanged since the 2.2 campaign target `452c1a6c`): the
 //! transaction descriptor types, the dependency graph and mining view
 //! with ancestor statistics tracking, the transaction priority queue

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: ISC
 //! Decred stake transaction primitives and ticket state, mirroring dcrd's
-//! `blockchain/stake` package at the parity pin, master `b9634e01`: stake
+//! `blockchain/stake` package at the parity pin, master `6f6cf21b`: stake
 //! transaction classification and format rule checks (tickets, votes,
 //! revocations, and the treasury transactions),
 //! commitment/vote-bits/block-reference extraction, reward calculation,
@@ -182,6 +182,11 @@ pub const MAX_DATA_CARRIER_SIZE: usize = 256;
 /// The maximum transaction amount in atoms (dcrd `dcrutil.MaxAmount`,
 /// defined here until the dcrutil crate lands).
 pub const MAX_AMOUNT: i64 = 21_000_000 * 100_000_000;
+
+/// [`MAX_AMOUNT`] as dcrd's messages print it.  `dcrutil.MaxAmount` is
+/// an untyped floating-point constant (`dcrutil/const.go:13-16`), so
+/// `%v` formats it as a `float64`, in exponent form.
+pub const MAX_AMOUNT_TEXT: &str = "2.1e+15";
 
 /// Mandatory 2-byte vote bits with optional extended bits (dcrd
 /// `VoteBits`).
@@ -1358,7 +1363,7 @@ pub fn create_revocation_from_ticket(
             return Err(stake_rule_error(
                 ErrorKind::SStxBadCommitAmount,
                 format!(
-                    "invalid output amount: {} (min: 0, max: {MAX_AMOUNT})",
+                    "invalid output amount: {} (min: 0, max: {MAX_AMOUNT_TEXT})",
                     info.amounts[i]
                 ),
             ));

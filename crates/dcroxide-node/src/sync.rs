@@ -571,25 +571,27 @@ mod tests {
 
     /// The split is kind-level, not a one-off for the view assertion.
     ///
-    /// `ErrUnknownDeploymentID` is raised from inside block validation
-    /// and is a `contextError` in dcrd
-    /// (`thresholdstate.go:472` among others), so it carries the same
+    /// `ErrUnknownAgendaID` is what an agenda query inside block
+    /// validation raises (`agendas.go:719-722`), and it and
+    /// `ErrUnknownDeploymentID` (`thresholdstate.go:530-534` among
+    /// others) are `contextError`s in dcrd, so they carry the same
     /// misclassification and the same fix.
     #[test]
     fn a_deployment_context_error_is_not_blamed_on_the_peer() {
-        let failure = combine_process_block_result(
-            0,
-            vec![rule_err(
-                RuleErrorKind::UnknownDeploymentID,
-                "unknown deployment ID",
-            )],
-            false,
-        )
-        .unwrap_err();
-        assert!(
-            !failure.is_rule_error,
-            "a context error must not be reported as a consensus violation"
-        );
+        for (kind, text) in [
+            (
+                RuleErrorKind::UnknownAgendaID,
+                "agenda ID bogusagenda does not exist",
+            ),
+            (RuleErrorKind::UnknownDeploymentID, "unknown deployment ID"),
+        ] {
+            let failure =
+                combine_process_block_result(0, vec![rule_err(kind, text)], false).unwrap_err();
+            assert!(
+                !failure.is_rule_error,
+                "a context error must not be reported as a consensus violation"
+            );
+        }
     }
 
     /// The rule error the chain's `persist_rule_error` makes of a

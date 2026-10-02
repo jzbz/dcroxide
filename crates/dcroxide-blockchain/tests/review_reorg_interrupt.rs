@@ -2,10 +2,10 @@
 //! A shutdown request stops a reorganization before its next block.
 //!
 //! dcrd checks `b.interrupt` before every block `reorganizeChainInternal`
-//! detaches or attaches (`chain.go:1065-1069`, `:1160-1164`) and at the
-//! top of every `reorganizeChain` attempt (`:1293-1297`), and returns
+//! detaches or attaches (`chain.go:1053-1057`, `:1148-1152`) and at the
+//! top of every `reorganizeChain` attempt (`:1281-1285`), and returns
 //! `errInterruptRequested` without trying another candidate
-//! (`:1328-1331`).  The port held the interrupt but checked it only in
+//! (`:1316-1319`).  The port held the interrupt but checked it only in
 //! the startup UTXO catch-up, so a long reorganization ran to the end
 //! after SIGTERM (review finding RG01#4).
 

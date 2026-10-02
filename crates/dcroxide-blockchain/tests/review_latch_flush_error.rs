@@ -4,7 +4,7 @@
 //!
 //! When `reorganizeChain` latches the chain current it forces the UTXO
 //! cache to the backend, and if that flush fails it runs `return err`
-//! (`chain.go:1365-1371`): the result is the flush error alone, and the
+//! (`chain.go:1353-1359`): the result is the flush error alone, and the
 //! errors gathered from failed reorganization attempts before it are
 //! dropped.  The port appended the flush error to those, so a storage
 //! failure came back behind an earlier validation error, which is the

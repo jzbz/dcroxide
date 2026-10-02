@@ -96,6 +96,12 @@ pub enum ChainDbError {
     /// long-running startup step was under way (dcrd
     /// `errInterruptRequested`, `upgrade.go:34-36`).
     Interrupted,
+    /// A consensus rule or context error raised while opening the
+    /// chain, which dcrd's `New` returns unchanged: a deployment or
+    /// historical agenda that `makeAgendas` refuses (`chain.go:2151`),
+    /// or an agenda query failing in the startup state load
+    /// (`chainio.go:1749-1752`).
+    Rule(crate::RuleError),
 }
 
 impl From<dcroxide_database::Error> for ChainDbError {
@@ -120,6 +126,7 @@ impl fmt::Display for ChainDbError {
             ChainDbError::Serial(e) => write!(f, "{e}"),
             ChainDbError::Corrupt(s) => f.write_str(s),
             ChainDbError::Interrupted => f.write_str("interrupt requested"),
+            ChainDbError::Rule(e) => write!(f, "{e}"),
         }
     }
 }

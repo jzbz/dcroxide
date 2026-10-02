@@ -20,7 +20,7 @@ use dcroxide_blockchain::difficulty::{ChainView, DiffNode};
 use dcroxide_blockchain::stakever::VersionNode;
 use dcroxide_blockchain::thresholdstate::{VoteChainView, VoteNode};
 use dcroxide_blockchain::validate::{
-    check_block_header_context, check_coinbase_unique_height, check_merkle_roots,
+    check_block_header_context, check_coinbase_unique_height, check_merkle_roots_context,
     check_proof_of_work_context, check_treasurybase_unique_height,
 };
 use dcroxide_chaincfg::{Params, mainnet_params, regnet_params, simnet_params};
@@ -167,7 +167,9 @@ fn contextual_vectors() {
                 let (block, _) = MsgBlock::from_bytes(&unhex(f[1])).expect("block");
                 let tip_height = chain.0.last().expect("tip").diff.height;
                 assert_eq!(
-                    kind_of(check_merkle_roots(&chain, &block, tip_height, &params)),
+                    kind_of(check_merkle_roots_context(
+                        &chain, &block, tip_height, &params
+                    )),
                     f[2],
                     "{line}"
                 );

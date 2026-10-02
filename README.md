@@ -3,7 +3,7 @@
 A from-scratch Rust implementation of the Decred full-node daemon, built as a
 drop-in replacement for [dcrd](https://github.com/decred/dcrd).
 
-Parity target: **dcrd master `b9634e01`** (version 2.2.0-pre) — wire protocol
+Parity target: **dcrd master `6f6cf21b`** (version 2.2.0-pre) — wire protocol
 12, JSON-RPC API 8.3.0. dcrd's behavior at that commit is the specification; see
 [QUIRKS.md](QUIRKS.md) for deliberate bug-for-bug reproductions and
 [PARITY.md](PARITY.md) for per-package status. The full plan lives in
@@ -179,7 +179,7 @@ work). Currently implemented:
 
   Pinned by dcrd's own test vectors, by synthetic-chain scenarios
   generated inside dcrd's internal package, and end to end by dcrd's
-  own full block test battery (`fullblocktests`): 573 instances of
+  own full block test battery (`fullblocktests`): 577 instances of
   fully signed blocks and invalid variants replayed through the real
   `ProcessBlock` with scripts on, matching every acceptance, rejection
   kind, and expected tip
@@ -360,7 +360,7 @@ work). Currently implemented:
   interval, so an optimization is measured on the same blocks before
   and after
 - `tools/oracle` — Go shim linking dcrd's own packages (pinned to the
-  parity target, master `b9634e01`: each dcrd module at that commit's
+  parity target, master `6f6cf21b`: each dcrd module at that commit's
   pseudo-version or at a tag whose source is byte-identical to it, as the
   header of `tools/oracle/go.mod` records) as a test oracle over
   line-delimited JSON

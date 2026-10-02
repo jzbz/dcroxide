@@ -393,7 +393,8 @@ pub fn check_transaction(tx: &MsgTx, params: &Params, flags: AgendaFlags) -> Res
 
 /// Ensure ticket purchases in the block commit at least the stake
 /// difficulty specified by the header and the network minimum (dcrd
-/// `CheckProofOfStake`).
+/// `checkProofOfStake`; the exported `CheckProofOfStake` wrapper is
+/// gone upstream since `26ea49aa`).
 pub fn check_proof_of_stake(block: &MsgBlock, min_stake_diff: i64) -> Result<(), RuleError> {
     let header = &block.header;
     for stx in &block.stransactions {
@@ -607,17 +608,11 @@ pub fn check_block_header_sanity(
     Ok(())
 }
 
-/// Perform context-free sanity checks on a block and all of its
-/// transactions (dcrd `checkBlockSanity`/`CheckBlockSanity`).
-pub fn check_block_sanity(
-    block: &MsgBlock,
-    adjusted_time_unix: i64,
-    skip_pow_check: bool,
-    params: &Params,
-) -> Result<(), RuleError> {
-    let header = &block.header;
-    check_block_header_sanity(header, adjusted_time_unix, skip_pow_check, params)?;
-
+/// Perform context-free sanity checks on a block's data and all of its
+/// transactions (dcrd `checkBlockDataSanity`, `validate.go:878-965`).
+/// The header is not checked: block processing accepts it to the
+/// block index, sanity checks included, before it looks at the data.
+pub fn check_block_data_sanity(block: &MsgBlock, params: &Params) -> Result<(), RuleError> {
     // All ticket purchases via the stake tree must meet both the
     // stake difficulty committed by the header and the network
     // minimum.
@@ -634,15 +629,8 @@ pub fn check_block_sanity(
     // A block must not exceed the maximum allowed block payload when
     // serialized, and the header commitment to its size must match.
     let serialized_size = block.serialize_size();
-    if serialized_size > dcroxide_wire::MAX_BLOCK_PAYLOAD as usize {
-        return Err(rule_error(
-            RuleErrorKind::BlockTooBig,
-            format!(
-                "serialized block is too big - got {serialized_size}, max {}",
-                dcroxide_wire::MAX_BLOCK_PAYLOAD
-            ),
-        ));
-    }
+    check_block_size_sanity(serialized_size as i64)?;
+    let header = &block.header;
     if header.size != serialized_size as u32 {
         return Err(rule_error(
             RuleErrorKind::WrongBlockSize,
@@ -700,6 +688,20 @@ pub fn check_block_sanity(
     }
 
     Ok(())
+}
+
+/// Perform context-free sanity checks on a block, both its header and
+/// its data (dcrd `checkBlockSanity`/`CheckBlockSanity`,
+/// `validate.go:967-987`): [`check_block_header_sanity`] followed by
+/// [`check_block_data_sanity`].
+pub fn check_block_sanity(
+    block: &MsgBlock,
+    adjusted_time_unix: i64,
+    skip_pow_check: bool,
+    params: &Params,
+) -> Result<(), RuleError> {
+    check_block_header_sanity(&block.header, adjusted_time_unix, skip_pow_check, params)?;
+    check_block_data_sanity(block, params)
 }
 
 /// The vote bit indicating the regular transaction tree of the parent
@@ -1452,14 +1454,7 @@ pub fn check_proof_of_work_context(
     // Choose the proof of work mining algorithm based on the result of
     // the vote for the blake3 proof of work agenda.
     let is_blake3_active =
-        crate::agendas::is_blake3_pow_agenda_active(view, Some(prev_height), params).map_err(
-            |_| {
-                rule_error(
-                    RuleErrorKind::UnknownDeploymentID,
-                    "blake3 pow deployment not defined on this network",
-                )
-            },
-        )?;
+        crate::agendas::is_blake3_pow_agenda_active(view, Some(prev_height), params)?;
     let pow_hash = if is_blake3_active {
         header.pow_hash_v2()
     } else {
@@ -1510,13 +1505,7 @@ pub fn check_block_header_context(
             &prev_node,
             i64::from(header.timestamp),
             params,
-        )
-        .map_err(|_| {
-            rule_error(
-                RuleErrorKind::UnknownDeploymentID,
-                "blake3 pow deployment not defined on this network",
-            )
-        })?;
+        )?;
         if header.bits != exp_diff {
             return Err(rule_error(
                 RuleErrorKind::UnexpectedDifficulty,
@@ -1531,7 +1520,7 @@ pub fn check_block_header_context(
         // matches the calculated difficulty based on the previous
         // block and difficulty retarget rules.
         let exp_sdiff =
-            crate::agendas::calc_next_required_stake_difficulty(view, Some(&prev_node), params);
+            crate::agendas::calc_next_required_stake_difficulty(view, Some(&prev_node), params)?;
         if header.sbits != exp_sdiff {
             return Err(rule_error(
                 RuleErrorKind::UnexpectedDifficulty,
@@ -1927,75 +1916,241 @@ pub fn check_treasurybase_unique_height(
     Ok(())
 }
 
+/// Validate the serialized size of a block against the maximum block
+/// size of the wire protocol (dcrd `checkBlockSizeSanity`,
+/// `validate.go:1852-1877`).  Even though the wire protocol already
+/// prevents blocks bigger than this limit, there are other ways of
+/// receiving a block that might not have been checked already.
+///
+/// This is not the consensus block size limit, which is enforced
+/// separately by [`check_block_context`] and takes the network's block
+/// size and the results of block size votes into account.  This limit
+/// guards against denial of service before the context needed to
+/// determine that one is available.  The check is context free.
+pub fn check_block_size_sanity(serialized_size: i64) -> Result<(), RuleError> {
+    if serialized_size > i64::from(dcroxide_wire::MAX_BLOCK_PAYLOAD) {
+        return Err(rule_error(
+            RuleErrorKind::BlockTooBig,
+            format!(
+                "serialized block is too big - got {serialized_size}, max {}",
+                dcroxide_wire::MAX_BLOCK_PAYLOAD
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// The variants of the merkle root calculation a block header can
+/// commit to (dcrd `merkleRootVariant`, `validate.go:1879-1895`).
+///
+/// dcrd's `checkMerkleRoots` panics on a value outside its two
+/// constants; the enum makes that arm unrepresentable.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum MerkleRootVariant {
+    /// The original semantics in effect at launch: the header's merkle
+    /// root field commits to the regular transaction tree and its stake
+    /// root (also called the commitment root) to the stake transaction
+    /// tree (dcrd `mrvOriginal`).
+    Original,
+    /// The semantics DCP0005 specifies: the header's merkle root field
+    /// commits to both transaction trees (dcrd `mrvDCP0005`).
+    Dcp0005,
+}
+
 /// Validate the merkle root commitments in the block header against
-/// the calculated values, honoring the DCP0005 header commitments
-/// agenda for the combined-vs-dual tree behavior (dcrd
-/// `checkMerkleRoots`).
-pub fn check_merkle_roots(
+/// the values calculated with the given variant (dcrd
+/// `checkMerkleRoots`, `validate.go:1897-1952`).
+///
+/// For [`MerkleRootVariant::Original`] the regular transaction tree
+/// must match the merkle root field and the stake transaction tree the
+/// stake root field.  For [`MerkleRootVariant::Dcp0005`] the merkle
+/// root field must be the root of a merkle tree whose two leaves are
+/// the merkle roots of the two transaction trees.
+pub fn check_merkle_roots(block: &MsgBlock, variant: MerkleRootVariant) -> Result<(), RuleError> {
+    let header = &block.header;
+
+    match variant {
+        MerkleRootVariant::Original => {
+            // Build the merkle tree and ensure the calculated merkle
+            // root matches the entry in the block header.
+            let want_merkle_root =
+                dcroxide_standalone::calc_tx_tree_merkle_root(&block.transactions);
+            if header.merkle_root != want_merkle_root {
+                return Err(rule_error(
+                    RuleErrorKind::BadMerkleRoot,
+                    format!(
+                        "block merkle root is invalid - block header indicates {}, but \
+                         calculated value is {want_merkle_root}",
+                        header.merkle_root
+                    ),
+                ));
+            }
+
+            // Build the stake tx tree merkle root too and check it.
+            let want_stake_root =
+                dcroxide_standalone::calc_tx_tree_merkle_root(&block.stransactions);
+            if header.stake_root != want_stake_root {
+                return Err(rule_error(
+                    RuleErrorKind::BadMerkleRoot,
+                    format!(
+                        "block stake merkle root is invalid - block header indicates {}, but \
+                         calculated value is {want_stake_root}",
+                        header.stake_root
+                    ),
+                ));
+            }
+
+            Ok(())
+        }
+        MerkleRootVariant::Dcp0005 => {
+            // Build the two merkle trees and use their calculated merkle
+            // roots as leaves to another merkle tree and ensure the final
+            // calculated merkle root matches the entry in the block
+            // header.
+            let want_merkle_root = dcroxide_standalone::calc_combined_tx_tree_merkle_root(
+                &block.transactions,
+                &block.stransactions,
+            );
+            if header.merkle_root != want_merkle_root {
+                return Err(rule_error(
+                    RuleErrorKind::BadMerkleRoot,
+                    format!(
+                        "block merkle root is invalid - block header indicates {}, but \
+                         calculated value is {want_merkle_root}",
+                        header.merkle_root
+                    ),
+                ));
+            }
+
+            Ok(())
+        }
+    }
+}
+
+/// Perform the checks that must pass before any further validation of
+/// the block data: the serialized block is within the wire protocol's
+/// size limit, and its header commits to its transactions (dcrd
+/// `checkBlockDataPreconditions`, `validate.go:1954-2049`).  The
+/// returned flag is whether the data commitment is definitively known
+/// to be valid.
+///
+/// `hdr_cmts_positional` is dcrd's `isAgendaActivePositionalByID`
+/// query for the header commitments agenda from the block's parent
+/// (see [`crate::process::Chain::is_agenda_active_positional_by_id`]).
+/// It runs after the size check, where dcrd makes it, and its error is
+/// returned as is.
+///
+/// As dcrd explains, these checks present a circular dependency.  They
+/// must come before further validation of the block data, because
+/// failures in uncommitted data cannot safely be attributed to the
+/// block header.  But until the chain can validate the block, the
+/// agendas needed to apply them cannot necessarily be determined,
+/// because they depend on votes in the block data of ancestors.  Since
+/// the activations of every agenda currently involved are fixed
+/// historical facts, the dependency is resolved with the well-known
+/// activation blocks of each network.  Any future consensus change
+/// affecting these checks needs great care: when a check depends on an
+/// agenda whose state cannot be determined yet, this early path must
+/// conservatively account for every rule that could apply.
+///
+/// [`crate::process::Chain::check_block_data_preconditions`] runs this
+/// for the chain and records a definitive success in its merkle check
+/// cache.
+pub fn check_block_data_preconditions(
+    block: &MsgBlock,
+    hdr_cmts_positional: impl FnOnce() -> Result<crate::agendas::AgendaActiveInfo, RuleError>,
+) -> Result<bool, RuleError> {
+    // A block must not exceed the maximum allowed block payload when
+    // serialized.  This is the quick, context-free check against the
+    // wire protocol's limit; the consensus block size, which depends on
+    // the network and on block size votes, is enforced later.
+    check_block_size_sanity(block.serialize_size() as i64)?;
+
+    // Whether the header commitments agenda is active cannot
+    // necessarily be determined here, so the state is determined from
+    // positional data.  The positional determination makes use of fixed
+    // historical facts, so it always resolves to a known state for the
+    // main and test networks; other networks may or may not resolve,
+    // which is handled below.
+    //
+    // When the state is definitively determined, validate the header's
+    // commitment to the transaction trees with the variant that state
+    // implies, and report the data as definitively known to be valid.
+    let agenda_info = hdr_cmts_positional()?;
+    if agenda_info.is_valid {
+        let variant = if agenda_info.is_active {
+            MerkleRootVariant::Dcp0005
+        } else {
+            MerkleRootVariant::Original
+        };
+        check_merkle_roots(block, variant)?;
+        return Ok(true);
+    }
+
+    // The agenda status could not be definitively determined, so permit
+    // both possibilities and allow the contextual checks that happen
+    // later to ensure validity for the correct variant as determined by
+    // the agenda state (see [`check_merkle_roots_context`]).  The false
+    // return reports the data commitment as not definitively known to
+    // be valid: it is only provisionally valid.  When both variants
+    // fail, the error is the DCP0005 variant's, as dcrd returns it.
+    if check_merkle_roots(block, MerkleRootVariant::Original).is_err() {
+        check_merkle_roots(block, MerkleRootVariant::Dcp0005)?;
+    }
+    Ok(false)
+}
+
+/// Validate the merkle root commitments in the block header against
+/// the calculated values with the variant the header commitments agenda
+/// selects for the block AFTER the given node: the DCP0005 variant when
+/// it is active, and the original one before (dcrd
+/// `checkMerkleRootsContext`, `validate.go:2051-2078`).
+///
+/// An earlier positional check ensures the commitments match at least
+/// one of the possible variants; this ensures they match the correct
+/// one, now that the full context is available to determine the agenda
+/// status.
+pub fn check_merkle_roots_context(
     view: &impl FullChainView,
     block: &MsgBlock,
     prev_height: i64,
     params: &Params,
 ) -> Result<(), RuleError> {
-    let header = &block.header;
+    let hdr_cmts_active =
+        crate::agendas::is_header_commitments_agenda_active(view, Some(prev_height), params)?;
+    let variant = if hdr_cmts_active {
+        MerkleRootVariant::Dcp0005
+    } else {
+        MerkleRootVariant::Original
+    };
+    check_merkle_roots(block, variant)
+}
 
-    let hdr_commitments_active =
-        crate::agendas::is_header_commitments_agenda_active(view, Some(prev_height), params)
-            .map_err(|_| {
-                rule_error(
-                    RuleErrorKind::UnknownDeploymentID,
-                    "header commitments deployment not defined on this network",
-                )
-            })?;
-    if hdr_commitments_active {
-        // Build the two merkle trees and use their calculated merkle
-        // roots as leaves to another merkle tree and ensure the final
-        // calculated merkle root matches the entry in the block
-        // header.
-        let want_merkle_root = dcroxide_standalone::calc_combined_tx_tree_merkle_root(
-            &block.transactions,
-            &block.stransactions,
-        );
-        if header.merkle_root != want_merkle_root {
-            return Err(rule_error(
-                RuleErrorKind::BadMerkleRoot,
-                format!(
-                    "block merkle root is invalid - block header indicates {}, but \
-                     calculated value is {want_merkle_root}",
-                    header.merkle_root
-                ),
-            ));
-        }
-        return Ok(());
+/// The blocks whose header has definitively been proven to commit to
+/// their data, which [`check_block_context`] consults before it checks
+/// the merkle roots and records once they pass (dcrd's
+/// `recentMerkleChecks`, an `lru.Set` of block hashes, `chain.go:205-209`).
+pub trait MerkleCheckCache {
+    /// Whether the block hash is present, refreshing its recency when
+    /// it is (lru `Set.Contains`).
+    fn contains(&mut self, hash: &Hash) -> bool;
+
+    /// Record the block hash as the most recently used (lru `Set.Put`).
+    fn put(&mut self, hash: Hash);
+}
+
+/// A [`MerkleCheckCache`] that holds nothing, for callers without a
+/// chain, such as the vector replays: every check runs, exactly as it
+/// does in dcrd after an eviction.
+#[derive(Copy, Clone, Debug, Default)]
+pub struct NoMerkleCheckCache;
+
+impl MerkleCheckCache for NoMerkleCheckCache {
+    fn contains(&mut self, _hash: &Hash) -> bool {
+        false
     }
 
-    // Fall back to the old behavior: check the regular and stake tree
-    // merkle roots independently.
-    let want_merkle_root = dcroxide_standalone::calc_tx_tree_merkle_root(&block.transactions);
-    if header.merkle_root != want_merkle_root {
-        return Err(rule_error(
-            RuleErrorKind::BadMerkleRoot,
-            format!(
-                "block merkle root is invalid - block header indicates {}, but \
-                 calculated value is {want_merkle_root}",
-                header.merkle_root
-            ),
-        ));
-    }
-
-    let want_stake_root = dcroxide_standalone::calc_tx_tree_merkle_root(&block.stransactions);
-    if header.stake_root != want_stake_root {
-        return Err(rule_error(
-            RuleErrorKind::BadMerkleRoot,
-            format!(
-                "block stake merkle root is invalid - block header indicates {}, but \
-                 calculated value is {want_stake_root}",
-                header.stake_root
-            ),
-        ));
-    }
-
-    Ok(())
+    fn put(&mut self, _hash: Hash) {}
 }
 
 /// The offsets of the commitment hash, amount, and fee limits inside a
@@ -2954,7 +3109,7 @@ pub fn check_treasury_spend_inputs(msg_tx: &MsgTx) -> Result<(), RuleError> {
                 format!(
                     "treasury spend value of {value_in} is higher than max allowed value \
                      of {}",
-                    dcroxide_stake::MAX_AMOUNT
+                    dcroxide_stake::MAX_AMOUNT_TEXT
                 ),
             ));
         }
@@ -3141,7 +3296,7 @@ pub fn check_transaction_inputs<'a, SP: dcroxide_standalone::SubsidyParams>(
                 format!(
                     "total value of all transaction inputs is {total} which is higher \
                      than max allowed value of {}",
-                    dcroxide_stake::MAX_AMOUNT
+                    dcroxide_stake::MAX_AMOUNT_TEXT
                 ),
             ));
         }
@@ -3391,7 +3546,7 @@ pub fn check_transaction_inputs<'a, SP: dcroxide_standalone::SubsidyParams>(
                 format!(
                     "transaction output value of {origin_tx_atom} is higher than max \
                      allowed value of {}",
-                    dcroxide_stake::MAX_AMOUNT
+                    dcroxide_stake::MAX_AMOUNT_TEXT
                 ),
             ));
         }
@@ -3762,42 +3917,12 @@ pub fn determine_check_tx_flags(
     prev_height: Option<i64>,
     params: &Params,
 ) -> Result<AgendaFlags, RuleError> {
-    let unknown = |_| {
-        rule_error(
-            RuleErrorKind::UnknownDeploymentID,
-            "deployment not defined on this network",
-        )
-    };
-    let treasury =
-        crate::agendas::is_treasury_agenda_active(view, prev_height, params).map_err(unknown)?;
-    let explicit = crate::agendas::is_agenda_active(
-        view,
-        prev_height,
-        crate::agendas::VOTE_ID_EXPLICIT_VERSION_UPGRADES,
-        params,
-    )
-    .map_err(unknown)?;
-    let auto_rev = crate::agendas::is_agenda_active(
-        view,
-        prev_height,
-        crate::agendas::VOTE_ID_AUTO_REVOCATIONS,
-        params,
-    )
-    .map_err(unknown)?;
-    let split = crate::agendas::is_agenda_active(
-        view,
-        prev_height,
-        crate::agendas::VOTE_ID_CHANGE_SUBSIDY_SPLIT,
-        params,
-    )
-    .map_err(unknown)?;
-    let split_r2 = crate::agendas::is_agenda_active(
-        view,
-        prev_height,
-        crate::agendas::VOTE_ID_CHANGE_SUBSIDY_SPLIT_R2,
-        params,
-    )
-    .map_err(unknown)?;
+    let treasury = crate::agendas::is_treasury_agenda_active(view, prev_height, params)?;
+    let explicit =
+        crate::agendas::is_explicit_ver_upgrades_agenda_active(view, prev_height, params)?;
+    let auto_rev = crate::agendas::is_auto_revocations_agenda_active(view, prev_height, params)?;
+    let split = crate::agendas::is_subsidy_split_agenda_active(view, prev_height, params)?;
+    let split_r2 = crate::agendas::is_subsidy_split_r2_agenda_active(view, prev_height, params)?;
 
     let mut flags = AgendaFlags::default();
     if treasury {
@@ -3820,10 +3945,12 @@ pub fn determine_check_tx_flags(
 
 /// Perform the validation checks on the block which depend on having
 /// the full block data for all of its ancestors available (dcrd
-/// `checkBlockContext`).  The parent stake node is required once the
-/// stake validation height is reached unless `fast_add` is set.  dcrd's
-/// recent-context-checks short circuit lives with its callers in
-/// `process.rs` (`Chain::recent_context_checks`).
+/// `checkBlockContext`, `validate.go:2080-2534`).  The parent stake node
+/// is required once the stake validation height is reached unless
+/// `fast_add` is set.  dcrd's recent-context-checks short circuit lives
+/// with its callers in `process.rs` (`Chain::recent_context_checks`);
+/// its recent merkle checks are `merkle_checks`, which the vector
+/// replays pass as a [`NoMerkleCheckCache`].
 #[allow(clippy::too_many_arguments)]
 pub fn check_block_context(
     view: &impl FullChainView,
@@ -3834,6 +3961,7 @@ pub fn check_block_context(
     parent_pool_size: u32,
     parent_final_state: [u8; 6],
     parent_stake_node: Option<&dcroxide_stake::ticketnode::Node>,
+    merkle_checks: &mut impl MerkleCheckCache,
     params: &Params,
 ) -> Result<(), RuleError> {
     // The genesis block is valid by definition.
@@ -3855,6 +3983,19 @@ pub fn check_block_context(
         parent_final_state,
         params,
     )?;
+
+    // The calculated merkle root(s) of the transaction trees must match
+    // the associated entries in the header.  This must come before any
+    // further check of the block data, to ensure the data being
+    // validated is actually the data for the claimed header.  There is
+    // no need to check them again once they have been proven valid; a
+    // pass is recorded even if a later check fails, as in dcrd
+    // (`validate.go:2125-2143`).
+    let block_hash = header.block_hash();
+    if !merkle_checks.contains(&block_hash) {
+        check_merkle_roots_context(view, block, prev_height, params)?;
+        merkle_checks.put(block_hash);
+    }
 
     let check_tx_flags = determine_check_tx_flags(view, Some(prev_height), params)?;
     let is_treasury_enabled = check_tx_flags.is_treasury_enabled();
@@ -4130,8 +4271,9 @@ pub fn check_block_context(
     // exempted it until `ead8ba7a`, which moved this and the merkle
     // roots above the `BFFastAdd` gate because the hashing is now cheap
     // enough that keeping them costs little and dropping them invites
-    // harassment during initial sync.
-    let max_block_size = crate::agendas::max_block_size(view, Some(prev_height), params);
+    // harassment during initial sync.  (The merkle roots have since
+    // moved up again, to right after the header checks above.)
+    let max_block_size = crate::agendas::max_block_size(view, Some(prev_height), params)?;
     let serialized_size = i64::from(header.size);
     if serialized_size > max_block_size {
         return Err(rule_error(
@@ -4143,22 +4285,12 @@ pub fn check_block_context(
         ));
     }
 
-    // The merkle root commitments must be valid, likewise on both paths.
-    check_merkle_roots(view, block, prev_height, params)?;
-
     if !fast_add {
         // All transactions must be finalized, relative to the past
         // median time once the LN features agenda is active.
         let mut block_time = i64::from(header.timestamp);
         let ln_features_active =
-            crate::agendas::is_ln_features_agenda_active(view, Some(prev_height), params).map_err(
-                |_| {
-                    rule_error(
-                        RuleErrorKind::UnknownDeploymentID,
-                        "ln features deployment not defined on this network",
-                    )
-                },
-            )?;
+            crate::agendas::is_ln_features_agenda_active(view, Some(prev_height), params)?;
         if ln_features_active {
             block_time = crate::stakever::calc_past_median_time(
                 &crate::sequencelock::AsVersionView(view),
@@ -4275,12 +4407,6 @@ pub fn consensus_script_verify_flags(
     prev_height: Option<i64>,
     params: &Params,
 ) -> Result<dcroxide_txscript::ScriptFlags, RuleError> {
-    let unknown = |_| {
-        rule_error(
-            RuleErrorKind::UnknownDeploymentID,
-            "deployment not defined on this network",
-        )
-    };
     let mut script_flags = dcroxide_txscript::ScriptFlags(
         dcroxide_txscript::ScriptFlags::VERIFY_CLEAN_STACK.0
             | dcroxide_txscript::ScriptFlags::VERIFY_CHECK_LOCK_TIME_VERIFY.0,
@@ -4288,13 +4414,13 @@ pub fn consensus_script_verify_flags(
 
     // Enable enforcement of OP_CSV and OP_SHA256 when the LN features
     // agenda is active.
-    if crate::agendas::is_ln_features_agenda_active(view, prev_height, params).map_err(unknown)? {
+    if crate::agendas::is_ln_features_agenda_active(view, prev_height, params)? {
         script_flags.0 |= dcroxide_txscript::ScriptFlags::VERIFY_CHECK_SEQUENCE_VERIFY.0;
         script_flags.0 |= dcroxide_txscript::ScriptFlags::VERIFY_SHA256.0;
     }
 
     // Enable the treasury opcodes when the treasury agenda is active.
-    if crate::agendas::is_treasury_agenda_active(view, prev_height, params).map_err(unknown)? {
+    if crate::agendas::is_treasury_agenda_active(view, prev_height, params)? {
         script_flags.0 |= dcroxide_txscript::ScriptFlags::VERIFY_TREASURY.0;
     }
     Ok(script_flags)
@@ -5293,15 +5419,8 @@ pub fn check_connect_block<SP: dcroxide_standalone::SubsidyParams>(
     let regular_tx_hashes = crate::utxoview::collect_tx_hashes(&block.transactions);
     let stake_tx_hashes = crate::utxoview::collect_tx_hashes(&block.stransactions);
 
-    let unknown = |_| {
-        rule_error(
-            RuleErrorKind::UnknownDeploymentID,
-            "deployment not defined on this network",
-        )
-    };
     let is_treasury_enabled =
-        crate::agendas::is_treasury_agenda_active(view_chain, Some(prev_height), params)
-            .map_err(unknown)?;
+        crate::agendas::is_treasury_agenda_active(view_chain, Some(prev_height), params)?;
 
     // The treasury subsidy goes to the treasurybase under the agenda
     // and to the organization address before it.  dcrd 2.2 moved the
@@ -5331,13 +5450,8 @@ pub fn check_connect_block<SP: dcroxide_standalone::SubsidyParams>(
         dcroxide_txscript::ScriptFlags(0)
     };
 
-    let is_auto_revocations_enabled = crate::agendas::is_agenda_active(
-        view_chain,
-        Some(prev_height),
-        crate::agendas::VOTE_ID_AUTO_REVOCATIONS,
-        params,
-    )
-    .map_err(unknown)?;
+    let is_auto_revocations_enabled =
+        crate::agendas::is_auto_revocations_agenda_active(view_chain, Some(prev_height), params)?;
 
     // Undo the parent's regular transactions when this block
     // disapproves them.  The parent spend journal is only decoded here,
@@ -5365,20 +5479,10 @@ pub fn check_connect_block<SP: dcroxide_standalone::SubsidyParams>(
     }
 
     // Determine the subsidy split.
-    let split = crate::agendas::is_agenda_active(
-        view_chain,
-        Some(prev_height),
-        crate::agendas::VOTE_ID_CHANGE_SUBSIDY_SPLIT,
-        params,
-    )
-    .map_err(unknown)?;
-    let split_r2 = crate::agendas::is_agenda_active(
-        view_chain,
-        Some(prev_height),
-        crate::agendas::VOTE_ID_CHANGE_SUBSIDY_SPLIT_R2,
-        params,
-    )
-    .map_err(unknown)?;
+    let split =
+        crate::agendas::is_subsidy_split_agenda_active(view_chain, Some(prev_height), params)?;
+    let split_r2 =
+        crate::agendas::is_subsidy_split_r2_agenda_active(view_chain, Some(prev_height), params)?;
     let subsidy_split_variant = if split_r2 {
         dcroxide_standalone::SubsidySplitVariant::Dcp0012
     } else if split {
@@ -5420,8 +5524,7 @@ pub fn check_connect_block<SP: dcroxide_standalone::SubsidyParams>(
 
     // Enforce sequence locks once the LN features agenda is active.
     let ln_features_active =
-        crate::agendas::is_ln_features_agenda_active(view_chain, Some(prev_height), params)
-            .map_err(unknown)?;
+        crate::agendas::is_ln_features_agenda_active(view_chain, Some(prev_height), params)?;
     let mut prev_median_time = 0i64;
     if ln_features_active {
         prev_median_time = crate::stakever::calc_past_median_time(
@@ -5517,8 +5620,7 @@ pub fn check_connect_block<SP: dcroxide_standalone::SubsidyParams>(
     let filter_hash = filter.hash();
 
     let hdr_commitments_active =
-        crate::agendas::is_header_commitments_agenda_active(view_chain, Some(prev_height), params)
-            .map_err(unknown)?;
+        crate::agendas::is_header_commitments_agenda_active(view_chain, Some(prev_height), params)?;
     if hdr_commitments_active {
         let want_commitment_root = calc_commitment_root_v1(filter_hash);
         if block.header.stake_root != want_commitment_root {
@@ -6344,5 +6446,216 @@ mod tests {
     fn ticket_return_amounts_of_no_outputs_are_empty() {
         assert!(calc_ticket_return_amounts(&[], 0, 0, &[], true, false).is_empty());
         assert!(calc_ticket_return_amounts(&[], 0, 0, &[0u8; 180], false, true).is_empty());
+    }
+
+    /// A block of two regular and one stake transaction whose header
+    /// commits to the transaction trees with the given variant.
+    fn merkle_test_block(variant: MerkleRootVariant) -> MsgBlock {
+        let mut block = MsgBlock {
+            header: zero_header(),
+            transactions: vec![spender(1), spender(2)],
+            stransactions: vec![spender(3)],
+        };
+        match variant {
+            MerkleRootVariant::Original => {
+                block.header.merkle_root =
+                    dcroxide_standalone::calc_tx_tree_merkle_root(&block.transactions);
+                block.header.stake_root =
+                    dcroxide_standalone::calc_tx_tree_merkle_root(&block.stransactions);
+            }
+            MerkleRootVariant::Dcp0005 => {
+                block.header.merkle_root = dcroxide_standalone::calc_combined_tx_tree_merkle_root(
+                    &block.transactions,
+                    &block.stransactions,
+                );
+            }
+        }
+        block
+    }
+
+    fn merkle_root_text(header_root: Hash, want: Hash) -> String {
+        format!(
+            "block merkle root is invalid - block header indicates {header_root}, but calculated \
+             value is {want}"
+        )
+    }
+
+    /// dcrd `checkMerkleRoots` (`validate.go:1897-1952`): each variant
+    /// checks only its own commitments, and only the original one reads
+    /// the stake root, with its own text.
+    #[test]
+    fn merkle_root_variants_check_their_own_commitments() {
+        let original = merkle_test_block(MerkleRootVariant::Original);
+        let dcp0005 = merkle_test_block(MerkleRootVariant::Dcp0005);
+        let regular_root = dcroxide_standalone::calc_tx_tree_merkle_root(&original.transactions);
+        let combined_root = dcroxide_standalone::calc_combined_tx_tree_merkle_root(
+            &original.transactions,
+            &original.stransactions,
+        );
+        assert_ne!(regular_root, combined_root);
+
+        assert_eq!(
+            check_merkle_roots(&original, MerkleRootVariant::Original),
+            Ok(())
+        );
+        assert_eq!(
+            check_merkle_roots(&dcp0005, MerkleRootVariant::Dcp0005),
+            Ok(())
+        );
+
+        let err = check_merkle_roots(&original, MerkleRootVariant::Dcp0005).expect_err("dcp0005");
+        assert_eq!(err.kind, RuleErrorKind::BadMerkleRoot);
+        assert_eq!(
+            err.description,
+            merkle_root_text(regular_root, combined_root)
+        );
+        let err = check_merkle_roots(&dcp0005, MerkleRootVariant::Original).expect_err("original");
+        assert_eq!(err.kind, RuleErrorKind::BadMerkleRoot);
+        assert_eq!(
+            err.description,
+            merkle_root_text(combined_root, regular_root)
+        );
+
+        // A wrong stake root fails only the original variant.
+        let want_stake_root = original.header.stake_root;
+        let mut bad_stake = original.clone();
+        bad_stake.header.stake_root = Hash([0x42; 32]);
+        let err = check_merkle_roots(&bad_stake, MerkleRootVariant::Original).expect_err("stake");
+        assert_eq!(err.kind, RuleErrorKind::BadMerkleRoot);
+        assert_eq!(
+            err.description,
+            format!(
+                "block stake merkle root is invalid - block header indicates {}, but calculated \
+                 value is {want_stake_root}",
+                Hash([0x42; 32])
+            )
+        );
+        let mut dcp0005_bad_stake = dcp0005.clone();
+        dcp0005_bad_stake.header.stake_root = Hash([0x42; 32]);
+        assert_eq!(
+            check_merkle_roots(&dcp0005_bad_stake, MerkleRootVariant::Dcp0005),
+            Ok(())
+        );
+    }
+
+    /// dcrd `checkBlockSizeSanity` (`validate.go:1852-1877`) allows
+    /// exactly the wire protocol's maximum block payload.
+    #[test]
+    fn block_size_sanity_allows_the_wire_maximum() {
+        assert_eq!(dcroxide_wire::MAX_BLOCK_PAYLOAD, 1_310_720);
+        assert_eq!(check_block_size_sanity(1_310_720), Ok(()));
+        let err = check_block_size_sanity(1_310_721).expect_err("one over");
+        assert_eq!(err.kind, RuleErrorKind::BlockTooBig);
+        assert_eq!(
+            err.description,
+            "serialized block is too big - got 1310721, max 1310720"
+        );
+    }
+
+    /// The block sanity checks are the header's followed by the data's
+    /// (dcrd `checkBlockSanity`, `validate.go:967-980`), and the data
+    /// checks alone ignore the header (`checkBlockDataSanity`).
+    #[test]
+    fn block_sanity_is_header_then_data_sanity() {
+        let params = mainnet_params();
+        let block = MsgBlock {
+            header: zero_header(),
+            transactions: Vec::new(),
+            stransactions: Vec::new(),
+        };
+        let header_err = check_block_header_sanity(&block.header, 0, false, &params)
+            .expect_err("a zero header is not sane");
+        assert_eq!(
+            check_block_sanity(&block, 0, false, &params).expect_err("sanity"),
+            header_err
+        );
+        assert_eq!(
+            check_block_data_sanity(&block, &params)
+                .expect_err("data sanity")
+                .kind,
+            RuleErrorKind::NoTransactions
+        );
+    }
+
+    /// dcrd `checkBlockDataPreconditions` (`validate.go:1954-2049`): the
+    /// size check comes before the agenda query, a definitive agenda
+    /// state checks its own variant and proves the commitment, and an
+    /// undetermined one accepts either variant without proving it,
+    /// returning the DCP0005 variant's error when neither matches.
+    #[test]
+    fn data_preconditions_follow_the_positional_agenda_state() {
+        use crate::agendas::AgendaActiveInfo;
+        let active = AgendaActiveInfo {
+            is_valid: true,
+            is_active: true,
+        };
+        let inactive = AgendaActiveInfo {
+            is_valid: true,
+            is_active: false,
+        };
+        let unknown = AgendaActiveInfo::default();
+        let original = merkle_test_block(MerkleRootVariant::Original);
+        let dcp0005 = merkle_test_block(MerkleRootVariant::Dcp0005);
+        let regular_root = dcroxide_standalone::calc_tx_tree_merkle_root(&original.transactions);
+        let combined_root = dcroxide_standalone::calc_combined_tx_tree_merkle_root(
+            &original.transactions,
+            &original.stransactions,
+        );
+        let run = |block: &MsgBlock, info: AgendaActiveInfo| {
+            check_block_data_preconditions(block, || Ok(info))
+        };
+
+        assert_eq!(run(&dcp0005, active), Ok(true));
+        assert_eq!(
+            run(&original, active).expect_err("active wants dcp0005"),
+            rule_error(
+                RuleErrorKind::BadMerkleRoot,
+                merkle_root_text(regular_root, combined_root)
+            )
+        );
+        assert_eq!(run(&original, inactive), Ok(true));
+        assert_eq!(
+            run(&dcp0005, inactive).expect_err("inactive wants the original"),
+            rule_error(
+                RuleErrorKind::BadMerkleRoot,
+                merkle_root_text(combined_root, regular_root)
+            )
+        );
+        assert_eq!(run(&original, unknown), Ok(false));
+        assert_eq!(run(&dcp0005, unknown), Ok(false));
+        let mut neither = original.clone();
+        neither.header.merkle_root = Hash([0x42; 32]);
+        assert_eq!(
+            run(&neither, unknown).expect_err("neither variant"),
+            rule_error(
+                RuleErrorKind::BadMerkleRoot,
+                merkle_root_text(Hash([0x42; 32]), combined_root)
+            )
+        );
+
+        // The agenda query's error is returned as is.
+        let unknown_agenda = crate::agendas::unknown_agenda_error("headercommitments");
+        assert_eq!(
+            check_block_data_preconditions(&original, || Err(unknown_agenda.clone())),
+            Err(unknown_agenda)
+        );
+
+        // An oversized block fails before the agenda is even queried.
+        let mut oversized = dcp0005.clone();
+        oversized.transactions[1].tx_out[0].pk_script =
+            vec![0u8; dcroxide_wire::MAX_BLOCK_PAYLOAD as usize];
+        let size = oversized.serialize_size();
+        let queried = core::cell::Cell::new(false);
+        let err = check_block_data_preconditions(&oversized, || {
+            queried.set(true);
+            Ok(active)
+        })
+        .expect_err("oversized");
+        assert_eq!(err.kind, RuleErrorKind::BlockTooBig);
+        assert_eq!(
+            err.description,
+            format!("serialized block is too big - got {size}, max 1310720")
+        );
+        assert!(!queried.get(), "the size check runs first");
     }
 }

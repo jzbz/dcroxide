@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: ISC
 //! Golomb-coded set (GCS) filters, ported from dcrd's `gcs/v4` at the
-//! parity pin, master `b9634e01` (the package is unchanged since the
+//! parity pin, master `6f6cf21b` (the package is unchanged since the
 //! port's original target, `452c1a6c`): the version 1 and version 2
 //! filter formats, matching, serialization, and the DCP0005 version 2
 //! block committed filters in [`blockcf2`].

@@ -29,6 +29,20 @@
 //! the one behind `contextual2_vectors.txt` -- so a regeneration means
 //! writing one from scratch; for these two rows it would only reproduce
 //! what the three steps above already determine.
+//!
+//! At `6f6cf21b` (`ddd3b6d2`) `checkBlockContext` checks the merkle roots
+//! right after `checkBlockHeaderContext` instead of after the consensus
+//! size check, and the file's verdicts stand unchanged without a
+//! regeneration.  Simnet forces the header commitments agenda active,
+//! so the check is the DCP0005 variant on every row.  The two rows
+//! expecting `ErrBadMerkleRoot` passed every check ahead of its old
+//! position, the header checks that still precede it among them, so
+//! they still reach it and return it.  Each of the other 34 `cbc` rows
+//! carries the valid combined root (checked by recomputing
+//! `standalone.CalcCombinedTxTreeMerkleRoot` with dcrd's own code over
+//! each row's block), so the moved check passes on them and the later
+//! verdict is reached as before.  The replay hands `check_block_context`
+//! a `NoMerkleCheckCache`, so the check runs on every row.
 
 // Test-harness arithmetic over bounded lengths.
 #![allow(clippy::arithmetic_side_effects)]
@@ -37,7 +51,7 @@ use dcroxide_blockchain::RuleError;
 use dcroxide_blockchain::difficulty::{ChainView, DiffNode};
 use dcroxide_blockchain::stakever::VersionNode;
 use dcroxide_blockchain::thresholdstate::{VoteChainView, VoteNode};
-use dcroxide_blockchain::validate::check_block_context;
+use dcroxide_blockchain::validate::{NoMerkleCheckCache, check_block_context};
 use dcroxide_chaincfg::simnet_params;
 use dcroxide_chainhash::Hash;
 use dcroxide_stake::ticketnode::{Node, StakeNodeParams};
@@ -184,6 +198,7 @@ fn blockcontext_vectors() {
                         parent_pool_size,
                         parent_final_state,
                         Some(&stake_node),
+                        &mut NoMerkleCheckCache,
                         &params,
                     )),
                     f[3],

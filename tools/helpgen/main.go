@@ -2,7 +2,7 @@
 // The dcrd -h vector generator: renders the help text dcroxide's -h
 // must reproduce, through the exact path dcrd's loadConfig takes — a
 // parser over the config struct (extracted verbatim from dcrd's
-// config.go at the parity target, master b9634e01; the service group is
+// config.go at the parity target, master 6f6cf21b; the service group is
 // NOT added, matching dcrd's dedicated help pre-parse), filled with
 // loadConfig's defaults first so go-flags prints their "(default: X)"
 // notes, with the HelpFlag error written out.
@@ -48,7 +48,7 @@ type config struct {
 	LogSize          string `long:"logsize" description:"Maximum size of log file before it is rotated"`
 	NoFileLogging    bool   `long:"nofilelogging" description:"Disable file logging"`
 	DbType           string `long:"dbtype" description:"Database backend to use for the block chain"`
-	Profile          string `long:"profile" description:"Enable HTTP profiling on given [addr:]port -- NOTE port must be between 1024 and 65536"`
+	Profile          string `long:"profile" description:"Enable HTTP profiling on given [addr:]port -- NOTE port must be between 1024 and 65535"`
 	CPUProfile       string `long:"cpuprofile" description:"Write CPU profile to the specified file"`
 	MemProfile       string `long:"memprofile" description:"Write mem profile to the specified file"`
 	TestNet          bool   `long:"testnet" description:"Use the test network"`

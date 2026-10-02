@@ -361,3 +361,63 @@ fn check_transaction_sanity_vectors() {
         ErrorKind::DuplicateTxInputs
     );
 }
+
+/// The amount range failures print dcrd's `maxAtoms`, an untyped
+/// floating-point constant, the way `%v` formats a `float64`
+/// (`tx.go:33-34`, used at `:179-213`).  The texts are dcrd's own at
+/// `6f6cf21b`, from `CheckTransactionSanity` over transactions with the
+/// same amounts.
+#[test]
+fn check_transaction_sanity_amount_range_texts() {
+    const MAX_TX_SIZE: u64 = 393216;
+    const MAX_ATOMS: i64 = 21_000_000 * 100_000_000;
+
+    let data = include_str!("data/tx_vectors.txt");
+    let base_hex = data
+        .lines()
+        .find_map(|l| l.strip_prefix("sanity_base "))
+        .expect("sanity base tx present");
+    let (base_tx, _) = MsgTx::from_bytes(&unhex(base_hex)).expect("valid tx");
+    assert!(base_tx.tx_out.len() >= 2, "the base tx has two outputs");
+    let text = |tx: &MsgTx| {
+        let err = standalone::check_transaction_sanity(tx, MAX_TX_SIZE).unwrap_err();
+        (err.kind, err.description)
+    };
+
+    let mut tx = base_tx.clone();
+    tx.tx_out[0].value = MAX_ATOMS + 1;
+    assert_eq!(
+        text(&tx),
+        (
+            ErrorKind::BadTxOutValue,
+            "transaction output value of 2100000000000001 is higher than max allowed value \
+             of 2.1e+15"
+                .to_string()
+        )
+    );
+
+    let mut tx = base_tx.clone();
+    tx.tx_out[0].value = MAX_ATOMS;
+    tx.tx_out[1].value = 1;
+    assert_eq!(
+        text(&tx),
+        (
+            ErrorKind::BadTxOutValue,
+            "total value of all transaction outputs is 2100000000000001 which is higher than \
+             max allowed value of 2.1e+15"
+                .to_string()
+        )
+    );
+
+    let mut tx = base_tx.clone();
+    tx.tx_in[0].value_in = MAX_ATOMS + 1;
+    assert_eq!(
+        text(&tx),
+        (
+            ErrorKind::FraudAmountIn,
+            "transaction input value 2100000000000001 is higher than max allowed value of \
+             2.1e+15"
+                .to_string()
+        )
+    );
+}

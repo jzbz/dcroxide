@@ -14,7 +14,7 @@ use dcroxide_chainhash::Hash;
 
 use crate::cursor::Cursor;
 use crate::error::{MessageText, WireError};
-use crate::msgtx::{MsgTx, OutPoint, TxOut, read_script};
+use crate::msgtx::{MsgTx, OutPoint, TxOut, read_out_point, read_script, write_out_point};
 use crate::protocol::{MIX_VERSION, is_strict_ascii};
 use crate::varint::{
     read_ascii_var_string, read_var_bytes, read_var_int, var_int_serialize_size, write_var_bytes,
@@ -138,7 +138,9 @@ fn read_seen_hashes(r: &mut Cursor<'_>, op: &'static str) -> Result<Vec<Hash>, W
 }
 
 /// The seen-hash list without its count check, for the hashing mode
-/// (dcrd's `!hashing && srcount > MaxMixPeers`).
+/// (dcrd's `!hashing && srcount > MaxMixPeers`) and for an encoder that
+/// makes the check ahead of its other fields, as dcrd's
+/// `MsgMixConfirm` does.
 fn write_seen_hashes_unchecked(w: &mut Vec<u8>, seen: &[Hash]) {
     write_var_int(w, seen.len() as u64);
     for hash in seen {
@@ -192,11 +194,7 @@ impl MsgMixPairReq {
         }
         let mut utxos = Vec::new();
         for _ in 0..count {
-            let out_point = OutPoint {
-                hash: Hash(r.take_array()?),
-                index: r.read_u32()?,
-                tree: r.read_u8()? as i8,
-            };
+            let out_point = read_out_point(r)?;
             let script =
                 read_var_bytes(r, MAX_MIX_PAIR_REQ_UTXO_SCRIPT_LEN, "MixPairReqUTXO.Script")?;
             let pub_key = read_var_bytes(
@@ -292,6 +290,9 @@ impl MsgMixPairReq {
         w.extend_from_slice(&(self.input_value as u64).to_le_bytes());
         write_var_int(w, self.utxos.len() as u64);
         for utxo in &self.utxos {
+            // dcrd writes the outpoint before it checks the three
+            // lengths below, so a negative tree is the error that wins.
+            write_out_point(w, &utxo.out_point)?;
             if utxo.script.len() as u64 > MAX_MIX_PAIR_REQ_UTXO_SCRIPT_LEN {
                 return Err(WireError::VarBytesTooLong(
                     MessageText::new(OP, "UTXO script is too long [len %v, max %v]")
@@ -312,9 +313,6 @@ impl MsgMixPairReq {
                     ),
                 ));
             }
-            w.extend_from_slice(utxo.out_point.hash.as_bytes());
-            w.extend_from_slice(&utxo.out_point.index.to_le_bytes());
-            w.push(utxo.out_point.tree as u8);
             write_var_bytes(w, &utxo.script);
             write_var_bytes(w, &utxo.pub_key);
             write_var_bytes(w, &utxo.signature);
@@ -922,15 +920,23 @@ impl MsgMixConfirm {
     }
 
     pub(crate) fn encode(&self, w: &mut Vec<u8>, pver: u32) -> Result<(), WireError> {
+        const OP: &str = "MsgMixConfirm.BtcEncode";
         if pver < MIX_VERSION {
             return Err(WireError::MsgInvalidForPVer);
+        }
+        // dcrd checks the seen count before it writes anything after the
+        // signature, so it wins over a negative tree in the mix
+        // transaction, which fails in `MsgTx.BtcEncode`.
+        if self.seen_dc_nets.len() as u64 > MAX_MIX_PEERS {
+            return Err(too_many_prev_mix_msgs(OP, self.seen_dc_nets.len() as u64));
         }
         w.extend_from_slice(&self.signature);
         w.extend_from_slice(&self.identity);
         w.extend_from_slice(&self.session_id);
         w.extend_from_slice(&self.run.to_le_bytes());
-        self.mix.encode_into(w);
-        write_seen_hashes(w, &self.seen_dc_nets, "MsgMixConfirm.BtcEncode")
+        self.mix.encode_into(w)?;
+        write_seen_hashes_unchecked(w, &self.seen_dc_nets);
+        Ok(())
     }
 
     pub(crate) fn max_payload_length(pver: u32) -> u32 {

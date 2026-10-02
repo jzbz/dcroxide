@@ -8,7 +8,7 @@
 //! index load, the UTXO cache initialization that brackets any catch-up
 //! replay after a crash, and the chain state it arrived at
 //! (`chainio.go:1570-1761`, `utxocache.go:816-1039`,
-//! `chain.go:2486-2537`), and that replay flushes at the configured
+//! `chain.go:2249-2300`), and that replay flushes at the configured
 //! size.  The port's daemon installed its sink and applied
 //! `--utxocachemaxsize` only once `Chain::open` had returned: none of
 //! those lines was emitted, and the replay after a crash ran silently

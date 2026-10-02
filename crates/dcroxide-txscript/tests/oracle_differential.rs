@@ -526,7 +526,10 @@ fn random_tx(rng: &mut SplitMix64) -> MsgTx {
             previous_out_point: OutPoint {
                 hash: Hash(hash),
                 index: rng.next_u64() as u32,
-                tree: (rng.below(3) as i8) - 1,
+                // Regular, stake, or neither.  Not negative: the oracle
+                // deserializes the transaction, and dcrd's `ReadOutPoint`
+                // refuses a negative tree.
+                tree: rng.below(3) as i8,
             },
             sequence: rng.next_u64() as u32,
             value_in: rng.next_u64() as i64,

@@ -191,7 +191,7 @@ fn template_vectors() {
 ///
 /// The state is built rather than replayed because `Chain::new` sets
 /// `allow_old_forks` whenever the network's `assume_valid` is zero, as
-/// simnet's is (dcrd `New`, `chain.go:2433`), so the checkpoint is never
+/// simnet's is (dcrd `New`, `chain.go:2195`), so the checkpoint is never
 /// discovered on simnet.
 #[test]
 fn a_template_forking_before_the_checkpoint_is_rejected() {
@@ -266,7 +266,7 @@ fn a_template_forking_before_the_checkpoint_is_rejected() {
     // the height-13 template is a fully valid block on the tip, so its
     // header is accepted unchanged.
     let node13 = chain
-        .maybe_accept_block_header(&on_tip.header, false, now, &params)
+        .maybe_accept_block_header(&on_tip.header, now, &params)
         .expect("accept the height-13 header");
     assert_eq!(chain.store.node(node13).height, 13);
 

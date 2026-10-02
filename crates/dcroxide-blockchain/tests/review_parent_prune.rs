@@ -5,7 +5,7 @@
 //!
 //! dcrd drops the parent's stake node and ticket info as soon as the
 //! connected block is more than `minMemoryStakeNodes` below the best
-//! header (`chain.go:795-808`), which during initial sync is every
+//! header (`chain.go:783-796`), which during initial sync is every
 //! block.  The port left that out, so everything connected between two
 //! timed prunes -- 300 s of sync on mainnet -- stayed resident with its
 //! stake node, body, journal, filter and ticket rows.

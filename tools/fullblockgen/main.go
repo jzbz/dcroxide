@@ -15,7 +15,11 @@
 // target moves across a commit that touches `blockchain/fullblocktests` —
 // `a38c0195` did, changing two instances from ErrImmatureSpend to
 // ErrMissingTxOut once stake transactions were explicitly barred from spending
-// same-block outputs.
+// same-block outputs. The move from `b9634e01` to `6f6cf21b` did too:
+// `2bd17b22` turned brt7 into a revocation that references its ticket's change
+// output, rejected with ErrInvalidRevokeInput, and renamed the accepted block
+// that follows brt8, while `70ba63ea` and `90accde2` added bti1 (accepted) and
+// bti2 and bti3 (each rejected with ErrTicketInputScript).
 //
 // Rows, one per test instance, mirroring what the replay expects:
 //

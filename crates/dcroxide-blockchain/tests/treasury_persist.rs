@@ -5,7 +5,7 @@
 //! `connect_block` used to commit the best state, spend journal, stake
 //! db, filter and header commitments in one transaction and then open a
 //! *second* one for the treasury rows.  dcrd writes both inside its
-//! single `db.Update` (`internal/blockchain/chain.go:671-719`).  Because
+//! single `db.Update` (`internal/blockchain/chain.go:660-708`).  Because
 //! the metadata cache flushes the preceding window at the *start* of a
 //! commit, the durable boundary could land between the two: a best state
 //! on disk whose treasury row is not.  Nothing repairs that —

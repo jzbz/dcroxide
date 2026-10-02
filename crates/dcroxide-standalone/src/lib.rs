@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: ISC
 //! Standalone Decred consensus functions, ported from dcrd's
 //! `blockchain/standalone/v2` package at the parity pin, master
-//! `b9634e01` (the package's one change since the 2.2 campaign target
+//! `6f6cf21b` (the package's one change since the 2.2 campaign target
 //! `452c1a6c`, `ae4c5818`, is not observable through the port's
 //! subsidy cache; see PARITY.md): merkle root calculations (regular, stake,
 //! and DCP0005 combined), merkle tree

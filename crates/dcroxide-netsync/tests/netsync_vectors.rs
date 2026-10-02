@@ -9,6 +9,56 @@
 //! REAL Rust chain engine with scripted transaction/mixing pools
 //! (both pools are pinned by their own pieces), comparing every
 //! queued message, disconnect, request map, and sync state probe.
+//!
+//! Fifteen rows of steps 84-87 were re-expected by hand when the chain
+//! pin moved to dcrd `6f6cf21b`, rather than regenerated: the dump test
+//! was never committed.  `internal/netsync` itself is byte-identical at
+//! `b9634e01` and `6f6cf21b`; what changed is the chain's answer to the
+//! block step 84 delivers.  That block is block 41 with one byte of its
+//! coinbase output amount changed, so its header, already in the index
+//! from step 83, no longer commits to its data.  The new rows follow
+//! from dcrd's source:
+//!
+//! 1. Chain.  At `6f6cf21b` `ProcessBlock` checks the data's commitment
+//!    first (`checkBlockDataPreconditions`, `validate.go:1978-2049`).
+//!    Regnet's header commitments agenda is neither forced nor
+//!    historical, and no tally has found it active, so both merkle
+//!    variants are tried; both fail and `ErrBadMerkleRoot` is returned
+//!    without marking the header (`process.go:496-499`).  At
+//!    release-v2.1.5 the data was stored and the context checks marked
+//!    the header invalid, which moved the best header back to block 40.
+//!    Block 41's header now stays valid and remains the best header.
+//! 2. Step 84.  `OnBlock` still rejects the best header's block, so it
+//!    resets the sync height to the best header height, now 41, and
+//!    sends `getheaders` from the best header's parent, now block 40
+//!    (`manager.go:1271-1293`, `:547-567`): 40 down to 29, then 27, 23,
+//!    15 and genesis (`chainview.go:362-419`), where the old row started
+//!    at 39.  The best header probe reads block 41.
+//! 3. Step 85.  Block 42's header builds on a valid header, so
+//!    `OnHeaders` accepts it instead of disconnecting p1
+//!    (`manager.go:1505-1788`): p1's last block and best announced block
+//!    become 42, the sync height and best header become 42, and with the
+//!    chain current it sends `getdata` for 42 (`:1751-1776`) and then,
+//!    through `fetchNextBlocks` (`:1780-1787`), `getdata` for 41, which
+//!    is still needed;
+//!    both are recorded as requested from p1.
+//! 4. Steps 86-87.  Disconnecting p1 re-requests its transaction from p4
+//!    as before, and forgets blocks 41 and 42, which no other peer has
+//!    announced (`manager.go:816-947`), so those rows are unchanged; the
+//!    sync height and best header stay at 42.  The p1 rows keep the
+//!    values last read from the manager, at block 42, where the old rows
+//!    had p1 already disconnected at step 85.
+//!
+//! The dump read each peer's state off its own peer object, which
+//! outlives the manager's hold on it, so a removed peer's rows repeat
+//! the values last read through the manager -- except, possibly, its
+//! connection state: whether the dump's harness disconnected a peer's
+//! object before calling `OnPeerDisconnected` is up to that uncommitted
+//! test, not dcrd's code.  The replay therefore compares the
+//! `connected` column only for a peer the manager still holds, and
+//! checks that `OnPeerDisconnected` removes the peer.  The p1 rows at
+//! steps 86-87 record `true`, the last value read from the manager,
+//! and are not compared.
 
 // Index arithmetic over pinned vector rows.
 #![allow(clippy::arithmetic_side_effects)]
@@ -397,6 +447,7 @@ fn netsync_scenario_matches_dcrd() {
     let mut shadows: HashMap<String, PeerShadow> = HashMap::new();
     let mut checked_msgs = 0usize;
     let mut checked_probes = 0usize;
+    let mut skipped_connected = 0usize;
 
     let record = |step_msgs: &mut BTreeMap<i32, Vec<String>>, actions: Vec<Action>| {
         for action in actions {
@@ -475,7 +526,11 @@ fn netsync_scenario_matches_dcrd() {
                         );
                         m.on_peer_connected(peer)
                     }
-                    "onpeerdisconnected" => m.on_peer_disconnected(peer_id),
+                    "onpeerdisconnected" => {
+                        let actions = m.on_peer_disconnected(peer_id);
+                        assert!(m.peer(peer_id).is_none(), "step {step}: {label} removed");
+                        actions
+                    }
                     "onheaders" => {
                         let first: i64 = f[4].parse().unwrap();
                         let last: i64 = f[5].parse().unwrap();
@@ -655,11 +710,19 @@ fn netsync_scenario_matches_dcrd() {
                     "peer" => {
                         let label = f[3];
                         let shadow = shadows.get(label).cloned().unwrap_or_default();
-                        assert_eq!(
-                            shadow.connected.to_string(),
-                            f[5],
-                            "step {step}: {label} connected"
-                        );
+                        // The dump read a removed peer's connection
+                        // state off its own peer object, which the
+                        // manager no longer reaches, so that column is
+                        // compared only for a peer the manager holds.
+                        if m.peer(peer_infos[label].id).is_some() {
+                            assert_eq!(
+                                shadow.connected.to_string(),
+                                f[5],
+                                "step {step}: {label} connected"
+                            );
+                        } else {
+                            skipped_connected += 1;
+                        }
                         assert_eq!(
                             shadow.last_block.to_string(),
                             f[7],
@@ -737,8 +800,14 @@ fn netsync_scenario_matches_dcrd() {
         );
     }
 
-    assert_eq!(checked_msgs, 25, "unexpected message row count");
+    assert_eq!(checked_msgs, 27, "unexpected message row count");
     assert!(checked_probes > 900, "unexpected probe row count");
+    // p2 from step 48, p3 from step 59 and p1 from step 86.
+    assert_eq!(
+        skipped_connected,
+        40 + 29 + 2,
+        "removed peer connection probes"
+    );
 }
 
 #[test]

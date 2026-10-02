@@ -137,7 +137,8 @@ fn agenda_vectors() {
             "sdiff" => {
                 let want: i64 = f[1].parse().expect("want");
                 let t = tip(&chain);
-                let got = calc_next_required_stake_difficulty(&chain, Some(&t), &params);
+                let got = calc_next_required_stake_difficulty(&chain, Some(&t), &params)
+                    .expect("known agenda");
                 assert_eq!(got, want, "{line} (scenario {scenarios})");
                 verdicts += 1;
             }

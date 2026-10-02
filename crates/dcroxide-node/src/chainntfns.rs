@@ -195,7 +195,7 @@ enum PendingBlockEvent {
 /// handles each of them.
 ///
 /// dcrd handles a disconnect with the tip at the disconnected block's
-/// parent (`internal/blockchain/chain.go:929, :943-949`), so when a
+/// parent (`internal/blockchain/chain.go:917, :931-937`), so when a
 /// reorganization or an `invalidateblock` detaches several blocks, the
 /// blocks it has yet to detach are still in the chain while it readmits
 /// the newer ones' transactions: a ticket spending a split transaction

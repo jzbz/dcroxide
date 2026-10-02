@@ -1,6 +1,6 @@
 # Quirks ledger
 
-dcrd's behavior at the pinned upstream (master `b9634e01`, version `2.2.0-pre`)
+dcrd's behavior at the pinned upstream (master `6f6cf21b`, version `2.2.0-pre`)
 is the specification — including where it deviates from written documentation
 (DCPs, `docs/`). Every intentional reproduction of such a deviation is recorded
 here, with a test pinning it so it cannot silently regress; where that test has
@@ -299,7 +299,7 @@ Entry format:
 - **Why it does not matter to dcrd:** height 1 is unreachable on any
   live network. Genesis pays a single zero-value output,
   `createChainState` records no utxo entries for it, and zero-value
-  spends are rejected (`internal/blockchain/validate.go:3399-3402`), so
+  spends are rejected (`internal/blockchain/validate.go:3589-3592`), so
   no chain arrives at height 1 with a spendable parent to chain from.
 - **What this port does:** clones unconditionally
   (`generator.rs`'s copy ahead of both passes), so the source's
@@ -437,14 +437,14 @@ Entry format:
 
 ## QK-0015 — a block linked by a fast-added parent skips the full context checks
 
-- **Where:** dcrd `internal/blockchain/process.go:366-396`
-  (`maybeAcceptBlocks`), `validate.go:1937-1940` (`checkBlockContext`'s
-  cache short circuit) and `chain.go:1219-1230` (the reorganization attach
+- **Where:** dcrd `internal/blockchain/process.go:356-386`
+  (`maybeAcceptBlocks`), `validate.go:2110-2114` (`checkBlockContext`'s
+  cache short circuit) and `chain.go:1207-1218` (the reorganization attach
   loop) / dcroxide-blockchain `process.rs` `maybe_accept_blocks`,
-  `reorganize_chain_internal`, `RecentContextChecks`
+  `reorganize_chain_internal`, `recent_context_checks` (an `LruHashSet`)
 - **What:** `ProcessBlock` sets `BFFastAdd` when the processed block is an
   assumed-valid ancestor or arrives in bulk import mode
-  (`process.go:518-522`), and passes the same flags to `maybeAcceptBlocks`
+  (`process.go:520-524`), and passes the same flags to `maybeAcceptBlocks`
   for every block the new data links, including stored descendants that
   are not assumed-valid ancestors themselves. Each of them is
   context-checked with `BFFastAdd`, which skips transaction finality, vote
@@ -458,7 +458,7 @@ Entry format:
   ran the full-flag checks on attach and could reject a block dcrd
   accepts: a block right after the assume-valid block, stored before that
   block arrived.
-- **Pinned by:** `process::tests::recent_context_checks_is_a_bounded_lru_set`
+- **Pinned by:** `process::tests::recent_check_caches_are_bounded_lru_sets`
   and `process::tests::accepted_blocks_are_recorded_and_invalidation_forgets_them`
   in `crates/dcroxide-blockchain/src/process.rs`, which pin the cache and
   its wiring. The fast-add interaction itself has no crafted-block test.
@@ -466,7 +466,7 @@ Entry format:
 ## QK-0016 — the new-rules unmarking of failed blocks never reaches disk
 
 - **Where:** dcrd `internal/blockchain/chainio.go:1494-1502`
-  (`loadBlockIndex`) and `:1776-1793` (`initChainState`),
+  (`loadBlockIndex`) and `:1779-1796` (`initChainState`),
   `blockindex.go:733-751` (`addNodeFromDB`) and `:1411` (`Flush`) /
   dcroxide-blockchain `process.rs` `load_chain_state`,
   `Chain::open_with_config`

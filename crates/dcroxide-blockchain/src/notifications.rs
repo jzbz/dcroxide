@@ -131,7 +131,7 @@ pub type NotificationCallback = Box<dyn FnMut(&Notification<'_>) + Send>;
 /// mapping is written once instead of growing a variant per ported
 /// line.  `Critical` is deliberately absent -- dcrd's
 /// `internal/blockchain` reaches it only through `panicf`
-/// (`chain.go:57-62`), which logs and then panics, and this port has no
+/// (`chain.go:60-65`), which logs and then panics, and this port has no
 /// ported counterpart of that path to log through; add the variant with
 /// the first one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

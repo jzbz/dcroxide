@@ -2,7 +2,7 @@
 //! Internal test utilities for dcroxide differential tests.
 //!
 //! Provides the harness for `tools/oracle` (the Go shim linking dcrd's own
-//! packages at the parity target, master `b9634e01`; its `go.mod` records how
+//! packages at the parity target, master `6f6cf21b`; its `go.mod` records how
 //! each module is pinned) plus a deterministic PRNG and hex helpers, so every
 //! crate's differential tests share one implementation.
 //!
@@ -294,9 +294,9 @@ impl Drop for Oracle {
 /// At most nine characters: dcrd stamps `revision[:9]` into its version
 /// string (`internal/version/version.go`), and a longer prefix could never
 /// match it.  CI's `DCRD_COMMIT` and the pseudo-versions in
-/// `tools/oracle/go.mod` must name the same commit; a unit test below holds
-/// all three together.
-pub const DCRD_PARITY_COMMIT: &str = "b9634e01";
+/// `tools/oracle/go.mod` and `tools/fullblockgen/go.mod` must name the same
+/// commit; a unit test below holds them all together.
+pub const DCRD_PARITY_COMMIT: &str = "6f6cf21b";
 
 /// A dcrd process running on simnet, for interop tests over a real socket.
 ///
@@ -599,8 +599,9 @@ mod tests {
             .collect()
     }
 
-    /// Whether the oracle links dcrd at `pin`, judged by what the `go.mod`
-    /// `require`s rather than what its comments say: every dcrd module
+    /// Whether a Go tool (the oracle, or the full block battery generator)
+    /// links dcrd at `pin`, judged by what its `go.mod` `require`s rather
+    /// than what its comments say: every dcrd module
     /// pinned by pseudo-version names that commit, at least one is (so a
     /// reformat cannot turn this into a check of nothing), and no
     /// `replace` points a dcrd module somewhere else.  The tag-pinned
@@ -627,7 +628,7 @@ mod tests {
             .collect();
         if !stale.is_empty() {
             return Err(format!(
-                "the oracle links {}, but the harness requires {pin}",
+                "it links {}, but the harness requires {pin}",
                 stale.join(", ")
             ));
         }
@@ -639,31 +640,31 @@ mod tests {
     /// one that pins no module by commit, and a `replace` are all caught.
     #[test]
     fn the_oracle_pin_check_reads_the_linked_versions() {
-        let good = "// Pinned to the parity target, dcrd master commit b9634e01: ...\n\
+        let good = "// Pinned to the parity target, dcrd master commit 6f6cf21b: ...\n\
                     require (\n\
                     \tgithub.com/decred/base58 v1.0.6\n\
                     \tgithub.com/decred/dcrd/chaincfg/chainhash v1.0.5\n\
-                    \tgithub.com/decred/dcrd/wire v1.7.6-0.20260905015707-b9634e01770b\n\
+                    \tgithub.com/decred/dcrd/wire v1.7.6-0.20260927225945-6f6cf21bd26d\n\
                     )\n\
                     require github.com/decred/dcrd/crypto/rand \
-                    v1.0.2-0.20260905015707-b9634e01770b // indirect\n";
-        assert_eq!(check_oracle_links(good, "b9634e01"), Ok(2));
+                    v1.0.2-0.20260927225945-6f6cf21bd26d // indirect\n";
+        assert_eq!(check_oracle_links(good, "6f6cf21b"), Ok(2));
 
-        let stale = good.replacen("b9634e01770b", "29f178940e5b", 1);
-        let err = check_oracle_links(&stale, "b9634e01").expect_err("wire left behind");
+        let stale = good.replacen("6f6cf21bd26d", "29f178940e5b", 1);
+        let err = check_oracle_links(&stale, "6f6cf21b").expect_err("wire left behind");
         assert!(
             err.contains("github.com/decred/dcrd/wire at 29f178940e5b"),
             "{err}"
         );
 
-        let none = "// dcrd master commit b9634e01\nrequire github.com/decred/dcrd/wire v1.7.5\n";
-        assert!(check_oracle_links(none, "b9634e01").is_err());
+        let none = "// dcrd master commit 6f6cf21b\nrequire github.com/decred/dcrd/wire v1.7.5\n";
+        assert!(check_oracle_links(none, "6f6cf21b").is_err());
 
         let replaced = format!("{good}replace github.com/decred/dcrd/wire => ../wire\n");
-        assert!(check_oracle_links(&replaced, "b9634e01").is_err());
+        assert!(check_oracle_links(&replaced, "6f6cf21b").is_err());
 
-        let forms = "\tgithub.com/decred/dcrd/a v0.0.0-20260905015707-b9634e01770b\n\
-                     \tgithub.com/decred/dcrd/b/v2 v2.0.0-pre.0.20260905015707-b9634e01770b\n\
+        let forms = "\tgithub.com/decred/dcrd/a v0.0.0-20260927225945-6f6cf21bd26d\n\
+                     \tgithub.com/decred/dcrd/b/v2 v2.0.0-pre.0.20260927225945-6f6cf21bd26d\n\
                      \tgithub.com/decred/dcrd/c v1.0.0-rc1\n";
         assert_eq!(dcrd_pseudo_pins(forms).len(), 2);
     }
@@ -714,9 +715,12 @@ mod tests {
     }
 
     /// The pin the interop harness enforces is the commit CI builds dcrd
-    /// from and the commit the oracle links: the harness once required
-    /// `29f17894` while everything else had moved to `b9634e01`, so a dcrd
-    /// built at the real pin was refused as "a different specification".
+    /// from and the commit the oracle and the full block battery generator
+    /// link: the harness once required `29f17894` while everything else had
+    /// moved to `b9634e01`, so a dcrd built at the real pin was refused as "a
+    /// different specification", and `tools/fullblockgen` stayed at
+    /// `036b7090` through the whole `b9634e01` bump because nothing read its
+    /// `go.mod`.
     #[test]
     fn the_dcrd_pin_matches_ci_and_the_oracle() {
         assert!(
@@ -737,23 +741,25 @@ mod tests {
             "CI builds dcrd at {ci_commit}, but the harness requires {DCRD_PARITY_COMMIT}"
         );
 
-        let gomod_path = repo_root().join("tools").join("oracle").join("go.mod");
-        let gomod = std::fs::read_to_string(&gomod_path)
-            .unwrap_or_else(|e| panic!("read {}: {e}", gomod_path.display()));
-        let header_pin: String = gomod
-            .split("dcrd master commit ")
-            .nth(1)
-            .expect("tools/oracle/go.mod names the parity commit")
-            .chars()
-            .take_while(char::is_ascii_hexdigit)
-            .collect();
-        assert_eq!(
-            header_pin, DCRD_PARITY_COMMIT,
-            "tools/oracle/go.mod's header names {header_pin}, but the harness requires \
-             {DCRD_PARITY_COMMIT}"
-        );
-        if let Err(why) = check_oracle_links(&gomod, DCRD_PARITY_COMMIT) {
-            panic!("tools/oracle/go.mod: {why}");
+        for tool in ["oracle", "fullblockgen"] {
+            let gomod_path = repo_root().join("tools").join(tool).join("go.mod");
+            let gomod = std::fs::read_to_string(&gomod_path)
+                .unwrap_or_else(|e| panic!("read {}: {e}", gomod_path.display()));
+            let header_pin: String = gomod
+                .split("dcrd master commit ")
+                .nth(1)
+                .unwrap_or_else(|| panic!("tools/{tool}/go.mod names the parity commit"))
+                .chars()
+                .take_while(char::is_ascii_hexdigit)
+                .collect();
+            assert_eq!(
+                header_pin, DCRD_PARITY_COMMIT,
+                "tools/{tool}/go.mod's header names {header_pin}, but the harness requires \
+                 {DCRD_PARITY_COMMIT}"
+            );
+            if let Err(why) = check_oracle_links(&gomod, DCRD_PARITY_COMMIT) {
+                panic!("tools/{tool}/go.mod: {why}");
+            }
         }
     }
 

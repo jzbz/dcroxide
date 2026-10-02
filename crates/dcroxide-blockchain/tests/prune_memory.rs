@@ -348,7 +348,7 @@ fn a_utxo_state_height_disagreeing_with_the_index_stops_the_node() {
 /// check -- is never visited, and before the sweep stayed resident for
 /// the life of the process.  dcrd has nothing to prune here because it
 /// never accumulates them: bodies live in a `recentBlockCacheSize = 12`
-/// LRU (`chain.go:43-48`) and everything else is served from the block
+/// LRU (`chain.go:41-46`) and everything else is served from the block
 /// database.
 ///
 /// The second half of the test is what proves the sweep is safe rather

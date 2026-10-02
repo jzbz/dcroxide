@@ -458,8 +458,8 @@ impl<C: PoolChain> TxPool<C> {
     ///
     /// dcrd runs its block-notification handlers with the chain tip at
     /// the block the event produced -- the block itself for a connect,
-    /// its parent for a disconnect (`internal/blockchain/chain.go:746,
-    /// :775` and `:929, :944`) -- so a transaction a handler admits
+    /// its parent for a disconnect (`internal/blockchain/chain.go:735,
+    /// :764` and `:917, :932`) -- so a transaction a handler admits
     /// records that height (`mp.newTxDesc(tx, txType, bestHeight, ...)`,
     /// `internal/mempool/mempool.go:1747`).  The daemon runs those
     /// handlers after the whole processing call, with the tip already
@@ -480,8 +480,8 @@ impl<C: PoolChain> TxPool<C> {
     /// hand the map back afterwards.
     ///
     /// dcrd readmits a disconnected block's transactions with the chain
-    /// tip at that block's parent (`internal/blockchain/chain.go:929,
-    /// :943-949`), so the outputs of the blocks the same reorganization
+    /// tip at that block's parent (`internal/blockchain/chain.go:917,
+    /// :931-937`), so the outputs of the blocks the same reorganization
     /// disconnects next, and of the fork block's regular tree when the
     /// first new block disapproves it, are still chain outputs when it
     /// does.  The daemon readmits after the whole processing call, with

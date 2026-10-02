@@ -116,5 +116,5 @@ fn fullblock_vectors() {
             other => panic!("unknown row tag {other}"),
         }
     }
-    assert_eq!(counts, [204, 350, 3, 14, 1, 1], "row counts");
+    assert_eq!(counts, [205, 353, 3, 14, 1, 1], "row counts");
 }

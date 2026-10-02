@@ -194,6 +194,17 @@ pub enum WireError {
     },
     /// The transaction serialization type is unknown (`ErrUnknownTxType`).
     UnknownTxType(u16),
+    /// An outpoint named a negative transaction tree
+    /// (`ErrNegativeTxTree`), raised by dcrd's `ReadOutPoint` once the
+    /// tree byte is read and by its `WriteOutPoint` before anything is
+    /// written.
+    NegativeTxTree {
+        /// The dcrd function that checked the tree (`MessageError.Func`):
+        /// `ReadOutPoint` or `WriteOutPoint`.
+        op: &'static str,
+        /// The tree.
+        tree: i8,
+    },
     /// The message structure was invalid (`ErrInvalidMsg`).
     InvalidMsg(MessageText),
     /// The user agent exceeded its maximum length (`ErrUserAgentTooLong`).
@@ -256,6 +267,7 @@ impl WireError {
             WireError::TooManyBlocks { .. } => "ErrTooManyBlocks",
             WireError::MismatchedWitnessCount { .. } => "ErrMismatchedWitnessCount",
             WireError::UnknownTxType(_) => "ErrUnknownTxType",
+            WireError::NegativeTxTree { .. } => "ErrNegativeTxTree",
             WireError::InvalidMsg(_) => "ErrInvalidMsg",
             WireError::TooFewAddrs => "ErrTooFewAddrs",
             WireError::UnknownNetAddrType { .. } => "ErrUnknownNetAddrType",
@@ -342,6 +354,12 @@ impl fmt::Display for WireError {
             // dcrd's description does not name the type.
             WireError::UnknownTxType(_) => {
                 f.write_str("MsgTx.BtcDecode: unsupported transaction type")
+            }
+            // dcrd `ReadOutPoint` and `WriteOutPoint`
+            // (`wire/msgtx.go:1191-1193`, `:1202-1204`): `%d` of the
+            // signed `int8`.
+            WireError::NegativeTxTree { op, tree } => {
+                write!(f, "{op}: negative transaction tree: {tree}")
             }
             other => f.write_str(other.kind_name()),
         }

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: ISC
 //! The transaction memory pool, ported from dcrd's `internal/mempool`
-//! package at the parity pin, master `b9634e01` (the package is
+//! package at the parity pin, master `6f6cf21b` (the package is
 //! unchanged since the 2.2 campaign target `452c1a6c`): the mempool
 //! error kinds, the relay policy layer (`policy.go`) — minimum relay
 //! fees, dust outputs, and the transaction, output script, and input

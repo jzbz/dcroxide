@@ -37,9 +37,7 @@ use crate::notifications::{
 };
 use crate::ruleerror::RuleErrorKind;
 use crate::stakever::calc_want_height;
-use crate::thresholdstate::{
-    ThresholdStateTuple, VoteCounts, deployment_state, state_last_changed,
-};
+use crate::thresholdstate::{ThresholdStateTuple, VoteCounts, agenda_state, state_last_changed};
 use crate::utxoentry::UtxoEntry;
 use crate::utxoview::{OutPointKey, UtxoView, count_spent_outputs};
 use crate::validate::{ForkRejection, check_block_header_positional, check_block_header_sanity};
@@ -317,7 +315,10 @@ pub struct Chain {
     pub sig_cache: Option<Arc<dcroxide_txscript::SigCache>>,
     /// The blocks that recently passed the contextual checks (dcrd
     /// `recentContextChecks`).
-    recent_context_checks: RecentContextChecks,
+    recent_context_checks: LruHashSet,
+    /// The blocks whose header has recently been definitively proven to
+    /// commit to their data (dcrd `recentMerkleChecks`).
+    recent_merkle_checks: LruHashSet,
     /// The shutdown interrupt (dcrd `BlockChain.interrupt`, its
     /// context's `Done` channel), set at open from
     /// [`OpenConfig::interrupt`].  The startup UTXO catch-up checks it,
@@ -352,27 +353,46 @@ const NANOS_PER_SEC: i64 = 1_000_000_000;
 const CACHED_TIPS_PRUNE_INTERVAL_SECS: i64 = 5 * 60;
 
 /// The number of recent successful contextual block checks tracked
-/// (dcrd `contextCheckCacheSize`, `chain.go:50-52`).
+/// (dcrd `contextCheckCacheSize`, `chain.go:48-50`).
 const CONTEXT_CHECK_CACHE_SIZE: usize = 25;
 
-/// The hashes of blocks that recently passed the contextual checks
-/// (dcrd's `recentContextChecks`, an `lru.Set` of
-/// [`CONTEXT_CHECK_CACHE_SIZE`] hashes, `chain.go:219-223`).
+/// The number of recent blocks whose header has definitively been
+/// proven to commit to their data tracked (dcrd `merkleCheckCacheSize`,
+/// `chain.go:52-55`).
+const MERKLE_CHECK_CACHE_SIZE: usize = 25;
+
+/// A bounded set of block hashes with least recently used eviction
+/// (dcrd's `lru.Set[chainhash.Hash]`), the shape of both of dcrd's
+/// recent block check caches (`chain.go:201-209`):
 ///
-/// It is not only an optimization.  dcrd's `checkBlockContext` returns
-/// early on a hit (`validate.go:1937-1940`) whatever flags it is called
-/// with, and `maybeAcceptBlocks` records every block it checks, with
-/// the flags of the block being processed.  A block linked by a
-/// fast-added parent is therefore checked with `BFFastAdd` there and
-/// skips the full-flag context checks when it is attached, although it
-/// was never marked validated itself.
-#[derive(Default)]
-struct RecentContextChecks {
+/// - `recentContextChecks`, the blocks that recently passed the
+///   contextual checks.  It is not only an optimization.  dcrd's
+///   `checkBlockContext` returns early on a hit (`validate.go:2110-2114`)
+///   whatever flags it is called with, and `maybeAcceptBlocks` records
+///   every block it checks, with the flags of the block being
+///   processed.  A block linked by a fast-added parent is therefore
+///   checked with `BFFastAdd` there and skips the full-flag context
+///   checks when it is attached, although it was never marked validated
+///   itself.
+/// - `recentMerkleChecks`, the blocks whose header has definitively
+///   been proven to commit to their data, which only spares hashing the
+///   transaction trees again.
+struct LruHashSet {
     /// The hashes, least recently used first.
     hashes: alloc::collections::VecDeque<[u8; 32]>,
+    /// The number of hashes kept.
+    limit: usize,
 }
 
-impl RecentContextChecks {
+impl LruHashSet {
+    /// An empty set that keeps at most `limit` hashes (lru `NewSet`).
+    fn new(limit: usize) -> LruHashSet {
+        LruHashSet {
+            hashes: alloc::collections::VecDeque::with_capacity(limit),
+            limit,
+        }
+    }
+
     /// Whether the hash is present, making it the most recently used
     /// when it is (lru `Set.Contains`).
     fn contains(&mut self, hash: &Hash) -> bool {
@@ -390,7 +410,7 @@ impl RecentContextChecks {
     fn put(&mut self, hash: Hash) {
         if let Some(pos) = self.hashes.iter().position(|h| *h == hash.0) {
             self.hashes.remove(pos);
-        } else if self.hashes.len() >= CONTEXT_CHECK_CACHE_SIZE {
+        } else if self.hashes.len() >= self.limit {
             self.hashes.pop_front();
         }
         self.hashes.push_back(hash.0);
@@ -401,6 +421,16 @@ impl RecentContextChecks {
         if let Some(pos) = self.hashes.iter().position(|h| *h == hash.0) {
             self.hashes.remove(pos);
         }
+    }
+}
+
+impl crate::validate::MerkleCheckCache for LruHashSet {
+    fn contains(&mut self, hash: &Hash) -> bool {
+        LruHashSet::contains(self, hash)
+    }
+
+    fn put(&mut self, hash: Hash) {
+        LruHashSet::put(self, hash);
     }
 }
 
@@ -502,7 +532,38 @@ impl Chain {
     /// `New` (the fork rejection semantics are disabled when
     /// explicitly requested or the network has no hard-coded assumed
     /// valid hash).
+    ///
+    /// Like `New` (`chain.go:2148-2154`), it first makes the agendas
+    /// for the parameters with the network's historical activations,
+    /// validating every deployment.  `New` returns that error; this
+    /// constructor is infallible and panics with the error's text
+    /// instead, as dcrd's own test chain constructor `newFakeChain`
+    /// does.  [`Chain::open`] and its variants return it as
+    /// [`crate::chaindb::ChainDbError::Rule`].
     pub fn new(params: &Params, config_assume_valid: Hash, config_allow_old_forks: bool) -> Chain {
+        if let Err(err) = Self::make_agendas(params) {
+            panic!("{err}");
+        }
+        Self::new_validated(params, config_assume_valid, config_allow_old_forks)
+    }
+
+    /// Make the agendas for the parameters with the network's
+    /// historical activations, which validates the deployments (dcrd
+    /// `New`, `chain.go:2148-2154`).  The map itself is not kept: each
+    /// agenda query resolves its agenda with
+    /// [`crate::agendas::lookup_agenda`], which builds the same entry.
+    fn make_agendas(params: &Params) -> Result<(), RuleError> {
+        crate::agendas::make_agendas(params, crate::agendas::historical_agendas(params.net))
+            .map(|_| ())
+    }
+
+    /// [`Chain::new`] for parameters whose agendas are already
+    /// validated.
+    fn new_validated(
+        params: &Params,
+        config_assume_valid: Hash,
+        config_allow_old_forks: bool,
+    ) -> Chain {
         const TIME_IN_TWO_WEEKS_SECS: i64 = 14 * 24 * 60 * 60;
         #[allow(
             clippy::arithmetic_side_effects,
@@ -619,7 +680,8 @@ impl Chain {
             sig_cache: Some(Arc::new(dcroxide_txscript::SigCache::new(
                 DEFAULT_SIG_CACHE_MAX_ENTRIES,
             ))),
-            recent_context_checks: RecentContextChecks::default(),
+            recent_context_checks: LruHashSet::new(CONTEXT_CHECK_CACHE_SIZE),
+            recent_merkle_checks: LruHashSet::new(MERKLE_CHECK_CACHE_SIZE),
             interrupt: None,
             cached_tips_last_pruned_nanos: crate::gotime::monotonic_nanos(),
             periodic_clock: crate::gotime::monotonic_nanos,
@@ -689,7 +751,7 @@ impl Chain {
     /// legacy version migration and `upgradeDB` paths are not
     /// applicable to dcroxide's fresh-sync databases).
     ///
-    /// Nor is `New`'s version 3 test network pass (`chain.go:2498-2528`),
+    /// Nor is `New`'s version 3 test network pass (`chain.go:2261-2291`),
     /// which invalidates, with notifications suppressed, every chain
     /// tip whose ancestor at `testNet3MaxDiffActivationHeight` is not
     /// `block962928Hash`.  It cleans up databases that stored the
@@ -719,7 +781,7 @@ impl Chain {
 
     /// [`Chain::open`] with the shutdown interrupt, which dcrd's `New`
     /// takes as its context and keeps as `interrupt: ctx.Done()`
-    /// (`chain.go:2457`).  Setting it stops the startup UTXO catch-up
+    /// (`chain.go:2219`).  Setting it stops the startup UTXO catch-up
     /// replay at the next block with
     /// [`crate::chaindb::ChainDbError::Interrupted`], as dcrd's
     /// `UtxoCache.Initialize` returns `errInterruptRequested`, and any
@@ -751,7 +813,7 @@ impl Chain {
     /// MiB)..." and "UTXO cache initialization completed" around the
     /// catch-up replay (`utxocache.go:816`, `:854`, `:1039`), and the
     /// version, best header and chain state lines that end
-    /// `blockchain.New` (`chain.go:2486-2537`).  A fresh database logs
+    /// `blockchain.New` (`chain.go:2249-2300`).  A fresh database logs
     /// them too, as dcrd's `initChainState` loads the state
     /// `createChainState` has just written.
     pub fn open_with_config(
@@ -761,7 +823,11 @@ impl Chain {
     ) -> Result<Chain, crate::chaindb::ChainDbError> {
         use crate::chaindb;
 
-        let mut chain = Chain::new(params, config.assume_valid, config.allow_old_forks);
+        // Make the agendas for the parameters, validating the
+        // deployments, before anything else (dcrd `New`,
+        // `chain.go:2148-2154`).
+        Self::make_agendas(params).map_err(chaindb::ChainDbError::Rule)?;
+        let mut chain = Chain::new_validated(params, config.assume_valid, config.allow_old_forks);
         chain.interrupt = config.interrupt;
         chain.log_sink = config.log;
         chain.utxo_cache_max_bytes = config.utxo_cache_max_bytes;
@@ -980,7 +1046,7 @@ impl Chain {
     }
 
     /// Log the lines that end dcrd's `blockchain.New` once the UTXO
-    /// cache is initialized (`chain.go:2486-2537`): the block and UTXO
+    /// cache is initialized (`chain.go:2249-2300`): the block and UTXO
     /// database versions, the best known header, and the chain state.
     ///
     /// The UTXO database line carries the versions the port's UTXO rows
@@ -1308,6 +1374,7 @@ impl Chain {
             };
             let node_diff = crate::difficulty::ChainView::node(&view, self.store.node(tip).height);
             crate::agendas::calc_next_required_stake_difficulty(&view, node_diff.as_ref(), params)
+                .map_err(crate::chaindb::ChainDbError::Rule)?
         };
         self.maybe_set_fork_rejection_checkpoint(params);
         self.load_assume_valid_node();
@@ -1441,7 +1508,7 @@ impl Chain {
 
     /// Flush the modified block index rows and warn rather than fail
     /// on the write (dcrd `flushBlockIndexWarnOnly`,
-    /// `chain.go:1516-1520`).
+    /// `chain.go:1504-1508`).
     ///
     /// The administrative paths use this: their work is already done by
     /// the time they reach it, and dcrd does not fail an
@@ -1508,7 +1575,7 @@ impl Chain {
     {
         let modified = self.index.take_modified();
         // Reload any pruned ticket info for the modified nodes that can
-        // be validated (dcrd `flushBlockIndex`, `chain.go:1490-1503`).
+        // be validated (dcrd `flushBlockIndex`, `chain.go:1478-1491`).
         // `can_validate` rather than `have_data` is dcrd's gate: it
         // guarantees every ancestor has its data, which the maturing
         // tickets lookup reads.
@@ -2074,9 +2141,7 @@ impl Chain {
                     tip: parent_id,
                 };
                 crate::agendas::is_treasury_agenda_active(&parent_view, prev_height, params)
-                    .map_err(|_| {
-                        crate::chaindb::ChainDbError::Corrupt("unknown deployment".into())
-                    })?
+                    .map_err(crate::chaindb::ChainDbError::Rule)?
             };
             let stxos = self
                 .fetch_spend_journal(&block, is_treasury_enabled)
@@ -2141,9 +2206,7 @@ impl Chain {
                     tip: parent_id,
                 };
                 crate::agendas::is_treasury_agenda_active(&parent_view, prev_height, params)
-                    .map_err(|_| {
-                        crate::chaindb::ChainDbError::Corrupt("unknown deployment".into())
-                    })?
+                    .map_err(crate::chaindb::ChainDbError::Rule)?
             };
             view.connect_block(
                 &block,
@@ -2325,7 +2388,7 @@ impl Chain {
     /// `bestChain.Tip()` in `FetchUtxoStats` (`utxocache.go:1084`)
     /// without holding `chainLock`, while its connect path commits to
     /// the cache and flushes *before* publishing the tip
-    /// (`chain.go:728`, `:739`, `:746`).  A stats call landing in that
+    /// (`chain.go:717`, `:728`, `:735`).  A stats call landing in that
     /// window force-flushes against the previous tip and leaves a
     /// `lastFlushHash` on disk that is one block behind a backend which
     /// already contains the newer block; the catch-up replay then
@@ -2933,16 +2996,16 @@ impl Chain {
     }
 
     /// Potentially accept the header to the block index and return
-    /// its block node (dcrd `maybeAcceptBlockHeader`).  Performs the
-    /// context-free header sanity checks (unless the caller already
-    /// ran them as part of full block sanity) and the positional
-    /// checks, rejects orphan headers and headers on known invalid
-    /// branches, and updates the assumed valid and fork rejection
+    /// its block node (dcrd `maybeAcceptBlockHeader`,
+    /// `process.go:145-221`).  A header already in the index is only
+    /// checked for being known invalid.  A new one must pass the
+    /// context-free header sanity checks and the positional checks, and
+    /// must neither be an orphan nor extend a known invalid branch;
+    /// accepting it updates the assumed valid and fork rejection
     /// checkpoint tracking.
     pub fn maybe_accept_block_header(
         &mut self,
         header: &BlockHeader,
-        check_header_sanity: bool,
         adjusted_time_unix: i64,
         params: &Params,
     ) -> Result<NodeId, RuleError> {
@@ -2954,9 +3017,8 @@ impl Chain {
             return Ok(node);
         }
 
-        if check_header_sanity {
-            check_block_header_sanity(header, adjusted_time_unix, false, params)?;
-        }
+        // Perform context-free sanity checks on the block header.
+        check_block_header_sanity(header, adjusted_time_unix, false, params)?;
 
         // Orphan headers are not allowed and this function should
         // never be called with the genesis block.
@@ -3021,7 +3083,7 @@ impl Chain {
     /// semantics (dcrd `ProcessBlockHeader`).
     ///
     /// The modified block index entries are flushed after every header,
-    /// since a new header always adds one (`process.go:267-271`).  Like
+    /// since a new header always adds one (`process.go:258-262`).  Like
     /// dcrd's, the flush is a metadata commit into the database's write
     /// cache, which reaches disk only when the cache itself flushes, so
     /// it costs an in-memory overlay commit per header and no sync.
@@ -3039,7 +3101,7 @@ impl Chain {
         adjusted_time_unix: i64,
         params: &Params,
     ) -> Result<(), RuleError> {
-        self.maybe_accept_block_header(header, true, adjusted_time_unix, params)?;
+        self.maybe_accept_block_header(header, adjusted_time_unix, params)?;
         self.flush_block_index(params).map_err(persist_rule_error)?;
         Ok(())
     }
@@ -3115,7 +3177,7 @@ impl Chain {
                 &node_view,
                 node_diff.as_ref(),
                 params,
-            );
+            )?;
             let parent_view = NodeBranchView {
                 store: &self.store,
                 tip: parent_id,
@@ -3124,8 +3186,7 @@ impl Chain {
                 &parent_view,
                 prev_height,
                 params,
-            )
-            .map_err(|_| unknown_deployment_error())?;
+            )?;
             (next_stake_diff, active)
         };
         let hdr_commitment_leaves = if hdr_commitments_active {
@@ -3174,11 +3235,11 @@ impl Chain {
         self.header_commitments
             .insert(node_hash.0, hdr_commitment_leaves.clone());
         // The treasury account and spend rows when the agenda is active
-        // (dcrd `connectBlock` taking the flag once at `chain.go:616`).
+        // (dcrd `connectBlock` taking the flag once at `chain.go:602`).
         // Computed before the transaction opens and published after it
         // commits, so the rows travel with the best state they belong
         // to: dcrd writes both inside its single `db.Update`
-        // (`chain.go:671-719`), and a durable best state whose treasury
+        // (`chain.go:660-708`), and a durable best state whose treasury
         // row is missing reads back as a zero balance that every
         // descendant then inherits.
         let treasury_records = check_tx_flags
@@ -3264,7 +3325,7 @@ impl Chain {
 
         // Optimization: immediately prune the parent's stake node when
         // it is no longer needed due to being too far behind the best
-        // known header (dcrd `connectBlock`, `chain.go:795-808`).
+        // known header (dcrd `connectBlock`, `chain.go:783-796`).
         // During initial sync that is every block, so memory stays flat
         // however fast blocks connect, instead of growing until the
         // next timed prune.  The parent's entries in the port's
@@ -3479,7 +3540,7 @@ impl Chain {
     /// A shutdown requested through the chain's interrupt stops the
     /// reorganization before the next block either loop would detach or
     /// attach, with dcrd's `errInterruptRequested`
-    /// (`chain.go:1065-1069`, `:1160-1164`); the blocks already moved
+    /// (`chain.go:1053-1057`, `:1148-1152`); the blocks already moved
     /// stay moved, as in dcrd.
     pub fn reorganize_chain_internal(
         &mut self,
@@ -3521,8 +3582,7 @@ impl Chain {
             };
             let prev_height = Some(self.store.node(parent_id).height);
             let is_treasury_enabled =
-                crate::agendas::is_treasury_agenda_active(&parent_view, prev_height, params)
-                    .map_err(|_| unknown_deployment_error())?;
+                crate::agendas::is_treasury_agenda_active(&parent_view, prev_height, params)?;
 
             // Load the spent txos for the block from the spend
             // journal and update the view to unspend them.
@@ -3585,8 +3645,7 @@ impl Chain {
                     store: &self.store,
                     tip: parent_id,
                 };
-                crate::agendas::is_treasury_agenda_active(&parent_view, prev_height, params)
-                    .map_err(|_| unknown_deployment_error())?
+                crate::agendas::is_treasury_agenda_active(&parent_view, prev_height, params)?
             };
 
             // Skip validation when the block has already been
@@ -3609,7 +3668,7 @@ impl Chain {
                 // which depend on having the full block data for all
                 // of its ancestors available, unless it recently did
                 // (dcrd's `checkBlockContext` returns early on a
-                // `recentContextChecks` hit, `validate.go:1937-1940`,
+                // `recentContextChecks` hit, `validate.go:2110-2114`,
                 // before it fetches the parent stake node).
                 let node_hash = self.store.node(node).hash;
                 if !self.recent_context_checks.contains(&node_hash) {
@@ -3622,16 +3681,17 @@ impl Chain {
                         &block,
                         &parent_stake_node,
                         false,
+                        &mut self.recent_merkle_checks,
                         params,
                     );
                     if let Err(err) = context_result {
-                        self.mark_block_failed_on_rule_violation(node, &err);
+                        self.mark_block_failed_on_context_violation(node, &err);
                         return Err(err);
                     }
                 }
 
                 // Mark the block as recently checked to avoid checking
-                // it again when processing (dcrd `chain.go:1228-1230`).
+                // it again when processing (dcrd `chain.go:1216-1218`).
                 self.recent_context_checks.put(node_hash);
 
                 let run_scripts = !self.bulk_import_mode && !self.is_assume_valid_ancestor(node);
@@ -3700,7 +3760,7 @@ impl Chain {
     /// before every attempt and ends the call at once with dcrd's
     /// `errInterruptRequested` alone, whether it is seen here or by
     /// [`Self::reorganize_chain_internal`], without trying another
-    /// candidate (`chain.go:1293-1297`, `:1328-1331`): the current
+    /// candidate (`chain.go:1281-1285`, `:1316-1319`): the current
     /// latch update, its flush and the reorganization notification are
     /// skipped, and only the completion event dcrd defers still fires.
     pub fn reorganize_chain(
@@ -3777,7 +3837,7 @@ impl Chain {
                     // the reorganization-outcome notification below
                     // (its deferred completion event still fires), and
                     // it is the whole result: the reorg errors gathered
-                    // above are dropped (`chain.go:1365-1371`).
+                    // above are dropped (`chain.go:1353-1359`).
                     reorg_errs = alloc::vec![persist_rule_error(e)];
                     latch_flush_failed = true;
                 }
@@ -3827,12 +3887,72 @@ impl Chain {
         alloc::vec![interrupt_rule_error()]
     }
 
+    /// Perform the checks that must pass before any further validation
+    /// of the block's data, and return whether its data commitment is
+    /// definitively known to be valid (dcrd
+    /// `checkBlockDataPreconditions`, `validate.go:1954-2049`): the wire
+    /// protocol's size limit, then the header's commitment to the
+    /// transaction trees with the variant the positional state of the
+    /// header commitments agenda after `prev_node` selects (see
+    /// [`crate::validate::check_block_data_preconditions`]).
+    ///
+    /// A definitive success records the block in the recent merkle
+    /// checks, so the contextual checks need not hash the transaction
+    /// trees again.  Resolving a historical activation anchor caches it
+    /// in the store, as dcrd's positional query does.
+    pub fn check_block_data_preconditions(
+        &mut self,
+        block: &MsgBlock,
+        prev_node: Option<NodeId>,
+        params: &Params,
+    ) -> Result<bool, RuleError> {
+        let proven = crate::validate::check_block_data_preconditions(block, || {
+            self.is_agenda_active_positional_by_id(
+                prev_node,
+                crate::agendas::VOTE_ID_HEADER_COMMITMENTS,
+                params,
+            )
+        })?;
+
+        // Mark the header as having definitively been proven to commit
+        // to the data, to avoid computing and checking the merkle roots
+        // again in the typical case.  This must only be set when the
+        // agenda state is definitively known.  An eviction from the
+        // bounded cache only means checking them again later.
+        if proven {
+            self.recent_merkle_checks.put(block.header.block_hash());
+        }
+        Ok(proven)
+    }
+
+    /// Mark the block as having failed validation, and its descendants
+    /// as having an invalid ancestor, when a check of its data in
+    /// [`Self::process_block`] failed with a consensus rule violation
+    /// and its data commitment has definitively been proven (dcrd
+    /// `process.go:505-515`, `:537-547`).  The body is not stored at this
+    /// point, so there is none to drop.
+    fn mark_block_failed_if_data_commit_proven(
+        &mut self,
+        node: NodeId,
+        data_commit_proven: bool,
+        err: &RuleError,
+    ) {
+        if data_commit_proven && err.kind.is_rule_violation() {
+            self.index
+                .mark_block_failed_validation(&mut self.store, node);
+        }
+    }
+
     /// Accept the data for the block, updating the block index state
     /// for the full data now being available, and return the
     /// descendant blocks now eligible for validation (dcrd
-    /// `maybeAcceptBlockData`).  The block is stored to the database and
-    /// to the `blocks` mirror; the stake node pruner dcrd calls here
-    /// runs at the end of `process_block` instead.
+    /// `maybeAcceptBlockData`, `process.go:267-338`).  The block is
+    /// stored to the database and to the `blocks` mirror; the stake node
+    /// pruner dcrd calls here runs at the end of `process_block` instead.
+    ///
+    /// A failed positional check is returned without marking the block:
+    /// whether it may be marked depends on whether its data commitment
+    /// has been proven, which only [`Self::process_block`] knows.
     pub fn maybe_accept_block_data(
         &mut self,
         node: NodeId,
@@ -3845,24 +3965,26 @@ impl Chain {
             return Ok(Vec::new());
         }
 
-        // Populate the prunable ticket and vote information.
+        // Populate the prunable ticket and vote information, marking the
+        // node for the next flush as dcrd's `PopulateTicketInfo` does
+        // (`blockindex.go:955-960`, called at `process.go:296-298`), so
+        // its row is rewritten with the votes even when a check below
+        // rejects the data.
         let info = dcroxide_stake::find_spent_tickets_in_block(block);
         let votes = info.votes.iter().map(|v| (v.version, v.bits)).collect();
         self.store
             .populate_ticket_info(node, info.voted_tickets, info.revoked_tickets, votes);
+        self.index.mark_modified(node);
 
-        // The block data must pass the position-dependent checks.
+        // The block data must pass the position-dependent checks.  This
+        // only checks the block data, not the header, which was checked
+        // when it was accepted to the block index.
         let prev_height = self
             .store
             .node(node)
             .parent
             .map(|p| self.store.node(p).height);
-        if let Err(err) = crate::validate::check_block_data_positional(block, prev_height, fast_add)
-        {
-            self.index
-                .mark_block_failed_validation(&mut self.store, node);
-            return Err(err);
-        }
+        crate::validate::check_block_data_positional(block, prev_height, fast_add)?;
 
         // Store the block and update the index state for the data now
         // being available, which may make descendants fully linked.
@@ -3875,7 +3997,7 @@ impl Chain {
         //
         // This insert is the one copy of the block the chain makes: the
         // caller keeps its own (`process_block` borrows it, where dcrd's
-        // `ProcessBlock` caches the caller's pointer, `process.go:562`),
+        // `ProcessBlock` caches the caller's pointer, `process.go:571`),
         // and every later step shares the mirror's `Arc`.
         self.blocks
             .insert(block.header.block_hash().0, Arc::new(block.clone()));
@@ -3921,13 +4043,13 @@ impl Chain {
             // of it (dcrd's `fetchBlockByNode` hands back its recent
             // block cache's pointer); only a block the mirror no longer
             // holds is read back.  dcrd fetches it first and returns a
-            // failed read as `nodes[:i], err` (`process.go:370-373`).
+            // failed read as `nodes[:i], err` (`process.go:360-363`).
             let block = match self.stored_block_arc(node) {
                 Ok(block) => block,
                 Err(err) => return (nodes[..i].to_vec(), Some(err)),
             };
             // dcrd's `checkBlockContext` returns early on a
-            // `recentContextChecks` hit (`validate.go:1937-1940`).
+            // `recentContextChecks` hit (`validate.go:2110-2114`).
             let parent_stake_node = if self.recent_context_checks.contains(&node_hash) {
                 None
             } else {
@@ -3943,16 +4065,17 @@ impl Chain {
                     &block,
                     parent_stake_node,
                     fast_add,
+                    &mut self.recent_merkle_checks,
                     params,
                 )
             {
-                self.mark_block_failed_on_rule_violation(node, &err);
+                self.mark_block_failed_on_context_violation(node, &err);
                 return (nodes[..i].to_vec(), Some(err));
             }
 
             // Mark the block as recently checked to avoid checking it
             // again when connecting it in the typical case (dcrd
-            // `process.go:385-396`).  The flags it was checked with are
+            // `process.go:376-386`).  The flags it was checked with are
             // not recorded, exactly as in dcrd.
             self.recent_context_checks.put(node_hash);
 
@@ -4006,35 +4129,43 @@ impl Chain {
             return (0, alloc::vec![err]);
         }
 
-        // Perform preliminary sanity checks on the block and its
-        // transactions.
-        if let Err(err) =
-            crate::validate::check_block_sanity(block, adjusted_time_unix, false, params)
-        {
-            if let Some(node) = existing {
-                self.index
-                    .mark_block_failed_validation(&mut self.store, node);
-            }
-            return (0, alloc::vec![err]);
-        }
-
         // Potentially accept the header to the block index when it
-        // does not already exist; the header sanity checks were just
-        // performed as part of the full block sanity checks.
+        // does not already exist.  This fully validates it, with both
+        // the context-free and the positional checks, which include
+        // proof of work, so a significant amount of work must have been
+        // done to add the header to the index.
         let node = match existing {
             Some(node) => node,
-            None => {
-                match self.maybe_accept_block_header(
-                    &block.header,
-                    false,
-                    adjusted_time_unix,
-                    params,
-                ) {
-                    Ok(node) => node,
-                    Err(err) => return (0, alloc::vec![err]),
-                }
-            }
+            None => match self.maybe_accept_block_header(&block.header, adjusted_time_unix, params)
+            {
+                Ok(node) => node,
+                Err(err) => return (0, alloc::vec![err]),
+            },
         };
+
+        // The block must pass all preconditions that are required
+        // before any further validation of the block data.  Notably,
+        // the header must commit to the data, so that the data being
+        // validated is actually the data for the claimed header.  Until
+        // the contextual checks succeed, a failure may only be
+        // attributed to the block when these pass and the data
+        // commitment has definitively been proven (dcrd
+        // `process.go:488-499`).  A failure here never marks the block.
+        let parent = self.store.node(node).parent;
+        let data_commit_proven = match self.check_block_data_preconditions(block, parent, params) {
+            Ok(proven) => proven,
+            Err(err) => return (0, alloc::vec![err]),
+        };
+
+        // Perform preliminary sanity checks on the block data and its
+        // transactions, to quickly eliminate blocks that are obviously
+        // incorrect before any attempt to accept the data.  A rule
+        // violation marks the block and its descendants when the data
+        // commitment has definitively been proven.
+        if let Err(err) = crate::validate::check_block_data_sanity(block, params) {
+            self.mark_block_failed_if_data_commit_proven(node, data_commit_proven, &err);
+            return (0, alloc::vec![err]);
+        }
 
         // Skip the more expensive validation checks when the block is
         // an ancestor of the assumed valid block or a bulk import.
@@ -4046,14 +4177,18 @@ impl Chain {
         }
 
         // Accept the block data and determine the blocks now eligible
-        // for full validation.  dcrd also flushes the block index here
-        // (`process.go:543`); this port does not, because `connect_block`
-        // flushes moments later and the data-stored bits self-heal
-        // through the store-block dedup window, so it would be a write
-        // per block for nothing.
+        // for full validation, marking a rule violation exactly as the
+        // sanity checks above do.  dcrd also flushes the block index here
+        // (`process.go:549-554`); this port does not, because
+        // `connect_block` flushes moments later and the data-stored bits
+        // self-heal through the store-block dedup window, so it would be
+        // a write per block for nothing.
         let linked = match self.maybe_accept_block_data(node, block, fast_add, params) {
             Ok(linked) => linked,
-            Err(err) => return (0, alloc::vec![err]),
+            Err(err) => {
+                self.mark_block_failed_if_data_commit_proven(node, data_commit_proven, &err);
+                return (0, alloc::vec![err]);
+            }
         };
 
         // Tentatively accept the linked blocks, then find the best
@@ -4119,7 +4254,7 @@ impl Chain {
         // Prune old in-memory state on the pruning interval so a
         // sustained sync stays memory-bounded (dcrd
         // `chainPruner.pruneChainIfNeeded`, which `maybeAcceptBlockData`
-        // calls before storing the block, `process.go:320`; here it runs
+        // calls before storing the block, `process.go:310`; here it runs
         // once the call's reorganization is done, which changes nothing
         // but when the memory is released).
         self.prune_if_needed(adjusted_time_unix);
@@ -4167,10 +4302,11 @@ impl Chain {
         }
 
         // Simply mark the block when it is not part of the current
-        // best chain.  Either way it must not pass the contextual
-        // checks on a cache hit again (dcrd `process.go:699`).
+        // best chain.  Either way it must not pass the contextual or
+        // merkle checks on a cache hit again (dcrd `process.go:705-709`).
         let node_hash = self.store.node(node).hash;
         self.recent_context_checks.delete(&node_hash);
+        self.recent_merkle_checks.delete(&node_hash);
         if !self.best_chain.contains(&self.store, node) {
             self.index
                 .mark_block_failed_validation(&mut self.store, node);
@@ -4184,7 +4320,7 @@ impl Chain {
         let errs = self.reorganize_chain(Some(parent), adjusted_time_unix, params);
         if !errs.is_empty() {
             // dcrd flushes warn-only before returning here
-            // (`process.go:715-719`).  The roll-back already moved the
+            // (`process.go:725-729`).  The roll-back already moved the
             // tip and marked descendants, so the modified set holds
             // work that a restart would otherwise redo.
             self.flush_block_index_warn_only(params);
@@ -4284,9 +4420,10 @@ impl Chain {
                     BlockStatus(BlockStatus::VALIDATE_FAILED.0 | BlockStatus::INVALID_ANCESTOR.0),
                 );
                 // Ensure it undergoes full revalidation should that be
-                // necessary (dcrd `process.go:826`).
+                // necessary (dcrd `process.go:836-837`).
                 let hash = self.store.node(id).hash;
                 self.recent_context_checks.delete(&hash);
+                self.recent_merkle_checks.delete(&hash);
             }
 
             if self.index.can_validate(&self.store, id)
@@ -4342,6 +4479,7 @@ impl Chain {
                 );
                 let hash = self.store.node(m).hash;
                 self.recent_context_checks.delete(&hash);
+                self.recent_merkle_checks.delete(&hash);
                 if self.index.can_validate(&self.store, m)
                     && self.store.node(m).work_sum >= cur_best_work
                 {
@@ -4467,7 +4605,7 @@ impl Chain {
         // dcrd flushes warn-only after the reorganization whether or
         // not it succeeded, "as the only time the index will be
         // modified is if the block failed to connect"
-        // (`chain.go:1453-1458`).
+        // (`chain.go:1441-1446`).
         let errs = self.reorganize_chain(Some(new_best_node), adjusted_time_unix, params);
         self.flush_block_index_warn_only(params);
         errs
@@ -4494,15 +4632,27 @@ impl Chain {
             tip_parent.filter(|tp| parent_hash == self.store.node(*tp).hash)
         };
         let Some(prev_node) = prev_node else {
-            return Err(rule_error(
-                RuleErrorKind::InvalidTemplateParent,
-                format!(
-                    "previous block must be the current chain tip {tip_hash} or its parent, \
-                     but got {parent_hash}"
+            // dcrd names the tip's parent when there is one
+            // (`validate.go:4665-4675`).
+            let str = match tip_parent {
+                Some(tp) => format!(
+                    "previous block must be the current chain tip {tip_hash} or its parent \
+                     {}, but got {parent_hash}",
+                    self.store.node(tp).hash
                 ),
-            ));
+                None => format!(
+                    "previous block must be the current chain tip {tip_hash}, but got \
+                     {parent_hash}"
+                ),
+            };
+            return Err(rule_error(RuleErrorKind::InvalidTemplateParent, str));
         };
         let prev_height = self.store.node(prev_node).height;
+
+        // The block must pass all preconditions that are required
+        // before any further validation of the block data (dcrd
+        // `validate.go:4678-4682`, which discards the proven flag).
+        self.check_block_data_preconditions(block, Some(prev_node), params)?;
 
         // Context-free sanity checks, skipping the proof of work.
         crate::validate::check_block_sanity(block, adjusted_time_unix, true, params)?;
@@ -4511,9 +4661,9 @@ impl Chain {
         // `checkBlockPositional` is a method on the chain, and the
         // `checkBlockHeaderPositional` it calls reads the chain's own
         // fork rejection checkpoint and block index, so the check is
-        // live on this path (`validate.go:1302-1316`, reached through
-        // `checkBlockPositional` at `:1393-1414`, whose sole caller is
-        // `CheckConnectBlockTemplate` at `:4491`).  Supplying `None`
+        // live on this path (`validate.go:1298-1312`, reached through
+        // `checkBlockPositional` at `:1380-1412`, whose sole caller is
+        // `CheckConnectBlockTemplate` at `:4693`).  Supplying `None`
         // here made `ErrForkTooOld` structurally unreachable for the
         // one consumer dcrd has.
         //
@@ -4543,7 +4693,7 @@ impl Chain {
 
         // The contextual checks, again skipping the proof of work.
         // dcrd's `checkBlockContext` skips them for a block that
-        // recently passed them (`validate.go:1937-1940`), which a
+        // recently passed them (`validate.go:2110-2114`), which a
         // caller handing over an already processed block can reach.
         if !self
             .recent_context_checks
@@ -4565,6 +4715,7 @@ impl Chain {
                 prev_stake_node.pool_size() as u32,
                 prev_stake_node.final_state(),
                 Some(&prev_stake_node),
+                &mut self.recent_merkle_checks,
                 params,
             )?;
         }
@@ -4578,8 +4729,7 @@ impl Chain {
                 store: &self.store,
                 tip: prev_node,
             };
-            crate::agendas::is_treasury_agenda_active(&view, Some(prev_height), params)
-                .map_err(|_| unknown_deployment_error())?
+            crate::agendas::is_treasury_agenda_active(&view, Some(prev_height), params)?
         };
 
         let mut view = UtxoView::new();
@@ -4600,7 +4750,7 @@ impl Chain {
             // Use the chain state as is when extending the main chain.
             // dcrd wraps a failed parent fetch here, and only here, as
             // `ErrMissingParent` carrying the fetch error's text
-            // (`validate.go:4510-4513`); the tip-parent arm below
+            // (`validate.go:4712-4715`); the tip-parent arm below
             // returns the fetch error itself.
             let parent = self
                 .block_arc(tip)
@@ -5081,7 +5231,7 @@ impl Chain {
     /// nodes and recent-window mirror entries in memory (dcrd
     /// `minMemoryStakeNodes`).  The timed prune measures it below the
     /// best chain tip, but the connect-time prune measures it below the
-    /// best known header (`chain.go:795-808`), so during initial sync,
+    /// best known header (`chain.go:783-796`), so during initial sync,
     /// with the header chain far ahead, each connected block's parent
     /// leaves memory at once and next to nothing stays.
     pub const MIN_MEMORY_STAKE_NODES: i64 = 288;
@@ -5100,7 +5250,7 @@ impl Chain {
 
     /// Prune old in-memory state on the pruning interval — the target
     /// block time (dcrd's `chainPruner.pruneChainIfNeeded`, called from
-    /// `maybeAcceptBlockData`, `process.go:320`), timed on the monotonic
+    /// `maybeAcceptBlockData`, `process.go:310`), timed on the monotonic
     /// clock dcrd's `time.Now()` differences read; `adjusted_time_unix`
     /// stands in only in a build without `std`, which has no such clock.
     /// A chain without a database never prunes: the memory is its only
@@ -5182,24 +5332,35 @@ impl Chain {
         }
     }
 
-    /// Mark a block whose contextual or connect checks failed as
-    /// having failed validation, and drop its body, only when the
-    /// failure is a consensus rule violation.
+    /// Mark a block whose connect checks failed as having failed
+    /// validation, and drop its body, only when the failure is a
+    /// consensus rule violation.
     ///
     /// dcrd marks on `errors.As(err, &RuleError)` alone
-    /// (`chain.go:1220-1243`, `process.go:377-381`).  Database
-    /// corruption, assertion and context errors fail the operation
-    /// without branding the block, so it stays a candidate and is
-    /// retried after a restart or repair.  The port carries those
-    /// failures as the kinds `RuleErrorKind::is_rule_violation`
-    /// excludes -- a corrupt parent spend journal row on the
-    /// disapproval path is `ErrUtxoBackendCorruption` -- so that is the
-    /// test here, as it already is for peer blame.
+    /// (`chain.go:1223-1230`).  Database corruption, assertion and
+    /// context errors fail the operation without branding the block, so
+    /// it stays a candidate and is retried after a restart or repair.
+    /// The port carries those failures as the kinds
+    /// `RuleErrorKind::is_rule_violation` excludes -- a corrupt parent
+    /// spend journal row on the disapproval path is
+    /// `ErrUtxoBackendCorruption` -- so that is the test here, as it
+    /// already is for peer blame.
     fn mark_block_failed_on_rule_violation(&mut self, node: NodeId, err: &RuleError) {
         if err.kind.is_rule_violation() {
             self.index
                 .mark_block_failed_validation(&mut self.store, node);
             self.forget_rejected_block_body(node);
+        }
+    }
+
+    /// [`Self::mark_block_failed_on_rule_violation`] for a block whose
+    /// contextual checks failed, which dcrd's `maybeAcceptBlocks` and
+    /// `reorganizeChainInternal` do not mark when the failure is
+    /// `ErrBadMerkleRoot` (`process.go:367-374`, `chain.go:1208-1214`):
+    /// the header has then not been shown to commit to that data.
+    fn mark_block_failed_on_context_violation(&mut self, node: NodeId, err: &RuleError) {
+        if err.kind != RuleErrorKind::BadMerkleRoot {
+            self.mark_block_failed_on_rule_violation(node, err);
         }
     }
 
@@ -5307,10 +5468,10 @@ impl Chain {
         //
         // dcrd has no equivalent leak to prune, because it never
         // accumulates bodies in the first place: `maybeAcceptBlockData`
-        // stores to the *database* only (`process.go:331-337`, whose
+        // stores to the *database* only (`process.go:321-327`, whose
         // comment says keeping doomed-but-proof-of-work-valid blocks on
         // disk is deliberate), and the sole in-memory copy is a fixed
-        // `recentBlockCacheSize = 12` LRU (`chain.go:43-48`).  Its
+        // `recentBlockCacheSize = 12` LRU (`chain.go:41-46`).  Its
         // steady-state body footprint is 12 whatever the fork history.
         // Its spend journal, filters and header commitments have no
         // in-memory mirror at all.
@@ -5509,7 +5670,7 @@ impl Chain {
 
     /// The main chain block hashes in the half-open height range
     /// `[start_height, end_height)`, with the end limited to the best
-    /// chain height (dcrd `HeightRange`, `chain.go:1775-1823`).  A
+    /// chain height (dcrd `HeightRange`, `chain.go:1762-1810`).  A
     /// negative start or an end below the start is dcrd's plain error,
     /// with its text.
     pub fn height_range(&self, start_height: i64, end_height: i64) -> Result<Vec<Hash>, String> {
@@ -5650,11 +5811,14 @@ impl Chain {
             new_block_time_unix,
             params,
         )
-        .map_err(|_| String::from("deployment ID blake3pow does not exist"))
+        .map_err(|e| e.description)
     }
 
-    /// The rule change threshold state of the given deployment for the
-    /// block AFTER the given block hash (dcrd `NextThresholdState`).
+    /// The rule change threshold state of the given agenda for the
+    /// block AFTER the given block hash (dcrd `NextThresholdState`,
+    /// `thresholdstate.go:552-577`): the forced state of a forced agenda
+    /// (a required agenda's default included), and otherwise the
+    /// agenda's state, which needs its deployment.
     pub fn next_threshold_state(
         &self,
         hash: &Hash,
@@ -5662,30 +5826,87 @@ impl Chain {
         params: &Params,
     ) -> Result<ThresholdStateTuple, RuleError> {
         let node = self.lookup_validatable(hash)?;
-        let (version, deployment) = crate::agendas::find_deployment(params, deployment_id)
-            .ok_or_else(|| {
-                rule_error(
-                    RuleErrorKind::UnknownDeploymentID,
-                    format!("deployment ID {deployment_id} does not exist"),
-                )
-            })?;
         let view = NodeBranchView {
             store: &self.store,
             tip: node,
         };
+        let agenda = crate::agendas::lookup_agenda(
+            params,
+            crate::thresholdstate::VoteChainView::historical_agendas(&view, params.net),
+            deployment_id,
+        )?;
+        if let Some(forced) = agenda.forced_state {
+            return Ok(forced);
+        }
+        if agenda.deployment.is_none() {
+            return Err(agenda_without_deployment_error(deployment_id));
+        }
         let height = self.store.node(node).height;
-        Ok(deployment_state(
+        Ok(agenda_state(
             &view,
             Some(height),
-            version,
-            deployment,
+            deployment_id,
+            &agenda,
             params,
         ))
     }
 
+    /// Whether the agenda with the given ID is active for the block
+    /// AFTER the given node, using only the node's position in the
+    /// chain and its ancestors' headers, or dcrd's `ErrUnknownAgendaID`
+    /// when the network has no such agenda (dcrd
+    /// `isAgendaActivePositionalByID`, `agendas.go:693-702`).
+    ///
+    /// It needs no block data, so the block processing path can ask it
+    /// before an ancestor's data, and therefore its votes, is
+    /// available.  `None` is the genesis block's missing parent, for
+    /// which agendas are never active.  A historical anchor this
+    /// resolves is cached in the store, as is any anchor a tally
+    /// discovers, and either then makes later answers definite for
+    /// its descendants.
+    pub fn is_agenda_active_positional_by_id(
+        &self,
+        prev_node: Option<NodeId>,
+        agenda_id: &str,
+        params: &Params,
+    ) -> Result<crate::agendas::AgendaActiveInfo, RuleError> {
+        let Some(prev) = prev_node else {
+            // dcrd looks the agenda up before handling the genesis
+            // block's nil parent, for which the answer is definitely
+            // inactive.
+            crate::agendas::lookup_agenda(
+                params,
+                crate::agendas::historical_agendas(params.net),
+                agenda_id,
+            )?;
+            return Ok(crate::agendas::AgendaActiveInfo {
+                is_valid: true,
+                is_active: false,
+            });
+        };
+        let view = NodeBranchView {
+            store: &self.store,
+            tip: prev,
+        };
+        crate::agendas::is_agenda_active_positional_by_id(
+            &view,
+            Some(self.store.node(prev).height),
+            agenda_id,
+            params,
+        )
+    }
+
     /// The maximum allowed block size for the block after the given
-    /// one, honoring the max-block-size vote where the network defines
-    /// it (dcrd `BlockChain.MaxBlockSize`).
+    /// one (dcrd `BlockChain.MaxBlockSize`, `chain.go:1640-1656`, over
+    /// `maxBlockSize`, `chain.go:1615-1638`).
+    ///
+    /// The larger size, `MaximumBlockSizes[1]`, applies only when the
+    /// max block size agenda is active for that block and the
+    /// parameters define a second size; otherwise the result is
+    /// `MaximumBlockSizes[0]`.  The agenda can be active by its vote, by
+    /// a forced choice, or by default: a required agenda the network
+    /// defines no deployment for is active on every network but the
+    /// main network (`agendas.go:572-589`).
     pub fn max_block_size(&self, hash: &Hash, params: &Params) -> Result<i64, RuleError> {
         let node = self.lookup_validatable(hash)?;
         let view = NodeBranchView {
@@ -5693,7 +5914,7 @@ impl Chain {
             tip: node,
         };
         let height = self.store.node(node).height;
-        Ok(crate::agendas::max_block_size(&view, Some(height), params))
+        crate::agendas::max_block_size(&view, Some(height), params)
     }
 
     /// Whether the DCP0006 treasury agenda is active for the block
@@ -5704,13 +5925,9 @@ impl Chain {
         prev_hash: &Hash,
         params: &Params,
     ) -> Result<bool, RuleError> {
-        self.is_agenda_active_by_hash_fn(
-            prev_hash,
-            crate::agendas::VOTE_ID_TREASURY,
-            |view, prev_height| {
-                crate::agendas::is_treasury_agenda_active(view, prev_height, params)
-            },
-        )
+        self.is_agenda_active_by_hash_fn(prev_hash, |view, prev_height| {
+            crate::agendas::is_treasury_agenda_active(view, prev_height, params)
+        })
     }
 
     /// Whether the DCP0011 blake3 proof of work agenda is active for
@@ -5744,24 +5961,20 @@ impl Chain {
         vote_id: &'static str,
         params: &Params,
     ) -> Result<bool, RuleError> {
-        self.is_agenda_active_by_hash_fn(prev_hash, vote_id, |view, prev_height| {
+        self.is_agenda_active_by_hash_fn(prev_hash, |view, prev_height| {
             crate::agendas::is_agenda_active(view, prev_height, vote_id, params)
         })
     }
 
     /// The shared body of the by-hash agenda queries (dcrd
-    /// `isAgendaActiveByHash`, `thresholdstate.go:539-554`): inactive
-    /// for the genesis block, the unknown-block error for a block the
-    /// chain cannot validate, and otherwise the agenda's own check
-    /// (dcrd's `isActiveFn`) from the point of view of that block.
+    /// `isAgendaActiveByHash`, `agendas.go:772-786`): inactive for the
+    /// genesis block, the unknown-block error for a block the chain
+    /// cannot validate, and otherwise the agenda's own check (dcrd's
+    /// `isActiveFn`) from the point of view of that block.
     fn is_agenda_active_by_hash_fn(
         &self,
         prev_hash: &Hash,
-        vote_id: &'static str,
-        is_active_fn: impl FnOnce(
-            &NodeBranchView<'_>,
-            Option<i64>,
-        ) -> Result<bool, crate::agendas::UnknownDeployment>,
+        is_active_fn: impl FnOnce(&NodeBranchView<'_>, Option<i64>) -> Result<bool, RuleError>,
     ) -> Result<bool, RuleError> {
         // Agendas are never active for the genesis block.
         if *prev_hash == Hash::ZERO {
@@ -5773,12 +5986,7 @@ impl Chain {
             tip: node,
         };
         let height = self.store.node(node).height;
-        is_active_fn(&view, Some(height)).map_err(|_| {
-            rule_error(
-                RuleErrorKind::UnknownDeploymentID,
-                format!("deployment ID {vote_id} does not exist"),
-            )
-        })
+        is_active_fn(&view, Some(height))
     }
 
     /// Whether the DCP0010 modified subsidy split agenda is active for
@@ -5837,9 +6045,11 @@ impl Chain {
         )
     }
 
-    /// The height at which the given deployment last changed state as
-    /// of the given block hash (dcrd `StateLastChangedHeight`); zero
-    /// when the state has never changed.
+    /// The height at which the given agenda's threshold state last
+    /// changed as of the given block hash (dcrd
+    /// `StateLastChangedHeight`, `thresholdstate.go:513-546`); zero when
+    /// the state has never changed, and 1 for a forced agenda (a
+    /// required agenda's default included).
     pub fn state_last_changed_height(
         &self,
         hash: &Hash,
@@ -5847,28 +6057,26 @@ impl Chain {
         params: &Params,
     ) -> Result<i64, RuleError> {
         let node = self.lookup_validatable(hash)?;
-
-        // Determine the deployment details for the provided deployment
-        // id.
-        let (version, deployment) = crate::agendas::find_deployment(params, deployment_id)
-            .ok_or_else(|| {
-                rule_error(
-                    RuleErrorKind::UnknownDeploymentID,
-                    format!("deployment ID {deployment_id} does not exist"),
-                )
-            })?;
-        if !deployment.forced_choice_id.is_empty() {
+        let view = NodeBranchView {
+            store: &self.store,
+            tip: node,
+        };
+        let agenda = crate::agendas::lookup_agenda(
+            params,
+            crate::thresholdstate::VoteChainView::historical_agendas(&view, params.net),
+            deployment_id,
+        )?;
+        if agenda.forced_state.is_some() {
             // The state change height is 1 since the genesis block
             // never experiences changes regardless of consensus rule
             // changes.
             return Ok(1);
         }
+        let Some((version, deployment)) = agenda.deployment else {
+            return Err(agenda_without_deployment_error(deployment_id));
+        };
 
         // Find the height at which the current state changed.
-        let view = NodeBranchView {
-            store: &self.store,
-            tip: node,
-        };
         let height = self.store.node(node).height;
         Ok(state_last_changed(&view, height, version, deployment, params).unwrap_or(0))
     }
@@ -6435,7 +6643,7 @@ impl Chain {
     /// One divergence follows from that read: a block carrying the same
     /// tspend hash twice yields `[H]` where the mutating form yielded
     /// `[H, H]`.  Consensus cannot produce such a block --
-    /// `check_block_sanity` rejects duplicate transactions -- but
+    /// `check_block_data_sanity` rejects duplicate transactions -- but
     /// [`Self::put_treasury_records`] is public and harnesses drive it
     /// directly.
     fn treasury_records_for_block(
@@ -6487,7 +6695,7 @@ impl Chain {
 
     /// Write the treasury rows for a connected block inside the caller's
     /// transaction (dcrd `connectBlock`'s `dbPutTreasuryBalance` and
-    /// `dbPutTSpend` calls, `chain.go:691-703`).
+    /// `dbPutTSpend` calls, `chain.go:680-692`).
     fn db_write_treasury_records(
         tx: &dcroxide_database::Transaction,
         block_hash: &Hash,
@@ -6817,23 +7025,13 @@ impl Chain {
             store: &self.store,
             tip: pre_tvi_node,
         };
-        let dcp0013_active = crate::agendas::is_agenda_active(
-            &view,
-            prev_height,
-            dcroxide_chaincfg::VOTE_ID_MAX_TREASURY_SPEND,
-            params,
-        )
-        .map_err(|_| unknown_deployment_error())?;
+        let dcp0013_active =
+            crate::agendas::is_max_treasury_spend_agenda_active(&view, prev_height, params)?;
         if dcp0013_active {
             return self.max_treasury_expenditure_dcp0013(pre_tvi_node, params);
         }
-        let revert_active = crate::agendas::is_agenda_active(
-            &view,
-            prev_height,
-            crate::agendas::VOTE_ID_REVERT_TREASURY_POLICY,
-            params,
-        )
-        .map_err(|_| unknown_deployment_error())?;
+        let revert_active =
+            crate::agendas::is_revert_treasury_policy_active(&view, prev_height, params)?;
         if revert_active {
             return self.max_treasury_expenditure_dcp0007(pre_tvi_node, params);
         }
@@ -7062,8 +7260,8 @@ const PERSISTED_DB_ERROR_PREFIX: &str = "chain database failure: Db(Error { kind
 
 /// Convert a persistence failure into a rule error so it flows
 /// through the existing error paths.  dcrd returns these as plain
-/// errors, unchanged out of its database updates (`chain.go:687-690`,
-/// `:878-881`), and Go's `%v` renders a `database.Error` as its bare
+/// errors, unchanged out of its database updates (`chain.go:676-679`,
+/// `:866-869`), and Go's `%v` renders a `database.Error` as its bare
 /// description (`database/error.go:150-152`), so the description here
 /// is the error's own text, the text dcrd's `submitblock` reply and
 /// sync manager log carry.
@@ -7075,6 +7273,10 @@ const PERSISTED_DB_ERROR_PREFIX: &str = "chain database failure: Db(Error { kind
 /// `ChainDbError`'s debug form.  Public so tests can check
 /// [`is_persisted_db_corruption`] against the text this produces.
 pub fn persist_rule_error(err: crate::chaindb::ChainDbError) -> RuleError {
+    // A rule error carried through a database path is returned as is.
+    if let crate::chaindb::ChainDbError::Rule(rule_err) = err {
+        return rule_err;
+    }
     let description = match &err {
         crate::chaindb::ChainDbError::Db(e)
             if e.kind == dcroxide_database::ErrorKind::Corruption =>
@@ -7110,6 +7312,10 @@ pub fn persist_rule_error(err: crate::chaindb::ChainDbError) -> RuleError {
 /// database error, matches neither.  Public so the daemon's tests can
 /// check that split against what this produces.
 pub fn db_read_rule_error(err: crate::chaindb::ChainDbError) -> RuleError {
+    // A rule error carried through a database path is returned as is.
+    if let crate::chaindb::ChainDbError::Rule(rule_err) = err {
+        return rule_err;
+    }
     let kind = match &err {
         crate::chaindb::ChainDbError::Db(e)
             if e.kind != dcroxide_database::ErrorKind::Corruption =>
@@ -7323,7 +7529,7 @@ fn db_driver_error(description: String) -> dcroxide_database::Error {
 /// Convert a ticket database error into a database error for use
 /// inside database transaction closures.  dcrd returns the error of
 /// its `stake` database entry points unchanged (`chainio.go:1360-1363`
-/// and `:1721-1725`, `chain.go:687-690` and `:878-881`), so a database
+/// and `:1721-1725`, `chain.go:676-679` and `:866-869`), so a database
 /// error keeps its kind here (a `database.ErrCorruption` read from the
 /// ticket rows is still one), and a ticket database `DBError` or a
 /// stake `RuleError` carries its bare description, which is all Go's
@@ -7413,22 +7619,27 @@ fn is_interrupt_rule_error(err: &RuleError) -> bool {
     *err == interrupt_rule_error()
 }
 
-fn unknown_deployment_error() -> RuleError {
-    RuleError {
-        kind: RuleErrorKind::UnknownDeploymentID,
-        description: "deployment not defined on this network".into(),
-    }
+/// dcrd's error for an agenda with no deployment where the query needs
+/// one (`thresholdstate.go:530-534`, `:567-571`).  Unreachable with
+/// valid parameters: only forced agendas lack a deployment.
+fn agenda_without_deployment_error(agenda_id: &str) -> RuleError {
+    rule_error(
+        RuleErrorKind::UnknownDeploymentID,
+        format!("agenda ID {agenda_id} does not have associated deployment information"),
+    )
 }
 
-/// Run the contextual block checks for an attach candidate over its
-/// parent branch (the dcrd `checkBlockContext` call inside the reorg
-/// attach loop).
+/// Run the contextual block checks for a linked block or an attach
+/// candidate over its parent branch (the dcrd `checkBlockContext` calls
+/// in `maybeAcceptBlocks` and the reorg attach loop), consulting and
+/// updating the chain's recent merkle checks.
 fn check_block_context_for(
     store: &NodeStore,
     parent_id: NodeId,
     block: &MsgBlock,
     parent_stake_node: &StakeNode,
     fast_add: bool,
+    merkle_checks: &mut LruHashSet,
     params: &Params,
 ) -> Result<(), RuleError> {
     let parent_view = NodeBranchView {
@@ -7445,6 +7656,7 @@ fn check_block_context_for(
         parent_stake_node.pool_size() as u32,
         parent_stake_node.final_state(),
         Some(parent_stake_node),
+        merkle_checks,
         params,
     )
 }
@@ -7536,37 +7748,50 @@ mod tests {
         (blocks, now)
     }
 
-    /// dcrd's `recentContextChecks` is an `lru.Set` of
-    /// `contextCheckCacheSize` hashes whose `Contains` refreshes a hit.
+    /// dcrd's `recentContextChecks` and `recentMerkleChecks` are each an
+    /// `lru.Set` of 25 hashes (`contextCheckCacheSize` and
+    /// `merkleCheckCacheSize`, `chain.go:48-55`) whose `Contains`
+    /// refreshes a hit.
     #[test]
-    fn recent_context_checks_is_a_bounded_lru_set() {
-        let mut cache = RecentContextChecks::default();
-        for n in 0..CONTEXT_CHECK_CACHE_SIZE as u8 {
-            cache.put(hash_of(n));
+    fn recent_check_caches_are_bounded_lru_sets() {
+        assert_eq!(CONTEXT_CHECK_CACHE_SIZE, 25);
+        assert_eq!(MERKLE_CHECK_CACHE_SIZE, 25);
+        for limit in [CONTEXT_CHECK_CACHE_SIZE, MERKLE_CHECK_CACHE_SIZE] {
+            let mut cache = LruHashSet::new(limit);
+            for n in 0..limit as u8 {
+                cache.put(hash_of(n));
+            }
+            // A hit becomes the most recently used, so the next insertion
+            // evicts the second-oldest instead.
+            assert!(cache.contains(&hash_of(0)));
+            cache.put(hash_of(200));
+            assert_eq!(cache.hashes.len(), limit);
+            assert!(cache.contains(&hash_of(0)));
+            assert!(!cache.contains(&hash_of(1)));
+            assert!(cache.contains(&hash_of(200)));
+
+            // Putting a present hash refreshes rather than duplicates it.
+            cache.put(hash_of(2));
+            assert_eq!(cache.hashes.len(), limit);
+            assert_eq!(cache.hashes.back(), Some(&hash_of(2).0));
+
+            cache.delete(&hash_of(2));
+            assert!(!cache.contains(&hash_of(2)));
+            assert_eq!(cache.hashes.len(), limit - 1);
+
+            // The trait the contextual checks consult is the same set.
+            let as_trait: &mut dyn crate::validate::MerkleCheckCache = &mut cache;
+            assert!(as_trait.contains(&hash_of(200)));
+            as_trait.put(hash_of(201));
+            assert_eq!(cache.hashes.back(), Some(&hash_of(201).0));
         }
-        // A hit becomes the most recently used, so the next insertion
-        // evicts the second-oldest instead.
-        assert!(cache.contains(&hash_of(0)));
-        cache.put(hash_of(200));
-        assert_eq!(cache.hashes.len(), CONTEXT_CHECK_CACHE_SIZE);
-        assert!(cache.contains(&hash_of(0)));
-        assert!(!cache.contains(&hash_of(1)));
-        assert!(cache.contains(&hash_of(200)));
-
-        // Putting a present hash refreshes rather than duplicates it.
-        cache.put(hash_of(2));
-        assert_eq!(cache.hashes.len(), CONTEXT_CHECK_CACHE_SIZE);
-        assert_eq!(cache.hashes.back(), Some(&hash_of(2).0));
-
-        cache.delete(&hash_of(2));
-        assert!(!cache.contains(&hash_of(2)));
-        assert_eq!(cache.hashes.len(), CONTEXT_CHECK_CACHE_SIZE - 1);
     }
 
-    /// Accepted blocks are recorded as context-checked (dcrd
-    /// `process.go:396`, `chain.go:1230`), and invalidating a block
-    /// forgets it (`process.go:699`), so it is fully checked again
-    /// should it need to be.
+    /// Accepted blocks are recorded as context-checked and as having
+    /// proven merkle roots (dcrd `process.go:386`, `chain.go:1218`,
+    /// `validate.go:2134-2143`), and invalidating a block forgets both
+    /// (`process.go:708-709`), so it is fully checked again should it
+    /// need to be; reconsidering it records it again.
     #[test]
     fn accepted_blocks_are_recorded_and_invalidation_forgets_them() {
         let params = dcroxide_chaincfg::regnet_params();
@@ -7596,12 +7821,20 @@ mod tests {
             chain.recent_context_checks.hashes.contains(&tip_hash.0),
             "the connected block was not recorded as context-checked"
         );
+        assert!(
+            chain.recent_merkle_checks.hashes.contains(&tip_hash.0),
+            "the connected block's merkle roots were not recorded as proven"
+        );
 
         let errs = chain.invalidate_block(&tip_hash, now, &params);
         assert!(errs.is_empty(), "{errs:?}");
         assert!(
             !chain.recent_context_checks.hashes.contains(&tip_hash.0),
             "an invalidated block must not skip its context checks"
+        );
+        assert!(
+            !chain.recent_merkle_checks.hashes.contains(&tip_hash.0),
+            "an invalidated block must not skip its merkle checks"
         );
 
         // Reconsidering reconnects it, running the checks again since
@@ -7610,6 +7843,179 @@ mod tests {
         assert!(errs.is_empty(), "{errs:?}");
         assert_eq!(chain.best_chain.tip(), Some(tip), "the block reconnects");
         assert!(chain.recent_context_checks.hashes.contains(&tip_hash.0));
+        assert!(chain.recent_merkle_checks.hashes.contains(&tip_hash.0));
+    }
+
+    /// Force the result of the deployment with the given vote ID, as
+    /// dcrd's test helper `forceDeploymentResult` does.
+    fn force_deployment_result(params: &mut Params, vote_id: &str, choice_id: &'static str) {
+        let mut found = false;
+        for (_, deployments) in &mut params.deployments {
+            for deployment in deployments.iter_mut() {
+                if deployment.vote.id == vote_id {
+                    deployment.forced_choice_id = choice_id;
+                    found = true;
+                }
+            }
+        }
+        assert!(found, "no {vote_id} deployment");
+    }
+
+    /// A block whose header commits to its two regular and one stake
+    /// transaction with the given merkle root variant.
+    fn committed_block(variant: crate::validate::MerkleRootVariant) -> MsgBlock {
+        let tx = |n: u8| MsgTx {
+            tx_in: alloc::vec![dcroxide_wire::TxIn {
+                previous_out_point: OutPoint {
+                    hash: hash_of(n),
+                    index: 0,
+                    tree: 0,
+                },
+                sequence: u32::MAX,
+                ..dcroxide_wire::TxIn::default()
+            }],
+            tx_out: alloc::vec![dcroxide_wire::TxOut {
+                value: 1,
+                version: 0,
+                pk_script: alloc::vec![0x51],
+            }],
+            ..MsgTx::default()
+        };
+        let mut block = MsgBlock {
+            header: BlockHeader::from_bytes(&[0u8; 180]).expect("header").0,
+            transactions: alloc::vec![tx(1), tx(2)],
+            stransactions: alloc::vec![tx(3)],
+        };
+        match variant {
+            crate::validate::MerkleRootVariant::Original => {
+                block.header.merkle_root =
+                    dcroxide_standalone::calc_tx_tree_merkle_root(&block.transactions);
+                block.header.stake_root =
+                    dcroxide_standalone::calc_tx_tree_merkle_root(&block.stransactions);
+            }
+            crate::validate::MerkleRootVariant::Dcp0005 => {
+                block.header.merkle_root = dcroxide_standalone::calc_combined_tx_tree_merkle_root(
+                    &block.transactions,
+                    &block.stransactions,
+                );
+            }
+        }
+        block
+    }
+
+    /// The positional state of the header commitments agenda after the
+    /// genesis block decides the data preconditions on each network
+    /// (dcrd `checkBlockDataPreconditions`, `validate.go:1954-2049`).
+    /// Simnet forces the agenda active, and mainnet and testnet3 have it
+    /// inactive below their historical anchors, so each proves the
+    /// commitment with one variant and records it in the recent merkle
+    /// checks.  Regnet can only determine it once a tally discovers an
+    /// activation, so it accepts either variant without proving the
+    /// commitment -- unless the agenda is forced, as dcrd's process
+    /// tests force it to "no" (`process_test.go:223`).
+    #[test]
+    fn data_preconditions_prove_the_commitment_per_network() {
+        use crate::validate::MerkleRootVariant::{Dcp0005, Original};
+        let mut forced_no = dcroxide_chaincfg::regnet_params();
+        force_deployment_result(
+            &mut forced_no,
+            crate::agendas::VOTE_ID_HEADER_COMMITMENTS,
+            "no",
+        );
+        let cases = [
+            ("simnet", dcroxide_chaincfg::simnet_params(), Some(Dcp0005)),
+            (
+                "mainnet",
+                dcroxide_chaincfg::mainnet_params(),
+                Some(Original),
+            ),
+            (
+                "testnet3",
+                dcroxide_chaincfg::testnet3_params(),
+                Some(Original),
+            ),
+            ("regnet", dcroxide_chaincfg::regnet_params(), None),
+            ("regnet forced no", forced_no, Some(Original)),
+        ];
+        for (name, params, proven_variant) in cases {
+            let mut chain = Chain::new(&params, Hash::ZERO, false);
+            let genesis = chain.best_chain.tip();
+            for variant in [Original, Dcp0005] {
+                let block = committed_block(variant);
+                let hash = block.header.block_hash();
+                let result = chain.check_block_data_preconditions(&block, genesis, &params);
+                let proven = result == Ok(true);
+                match proven_variant {
+                    Some(proven_by) if proven_by == variant => {
+                        assert_eq!(result, Ok(true), "{name} {variant:?}");
+                    }
+                    Some(_) => {
+                        let err = result.expect_err("the other variant is refused");
+                        assert_eq!(err.kind, RuleErrorKind::BadMerkleRoot, "{name} {variant:?}");
+                    }
+                    None => assert_eq!(result, Ok(false), "{name} {variant:?}"),
+                }
+                assert_eq!(
+                    chain.recent_merkle_checks.hashes.contains(&hash.0),
+                    proven,
+                    "{name} {variant:?}: only a proven commitment is recorded"
+                );
+            }
+        }
+    }
+
+    /// dcrd records a block in its recent merkle checks once the
+    /// contextual merkle check passes, even when a later contextual
+    /// check fails (`validate.go:2134-2143`), and never for a block
+    /// whose merkle roots fail.  On plain regnet the preconditions prove
+    /// nothing, so the contextual check is what records the battery's
+    /// blocks.
+    #[test]
+    fn the_contextual_merkle_check_records_a_pass_before_later_checks() {
+        let params = dcroxide_chaincfg::regnet_params();
+        let mut chain = Chain::new(&params, Hash::ZERO, false);
+        let mut now = 0;
+        let mut seen = 0;
+        for line in include_str!("../tests/data/fullblock_vectors.txt").lines() {
+            let f: Vec<&str> = line.split(' ').collect();
+            match f[0] {
+                "now" => now = f[1].parse().expect("now"),
+                "accept" => {
+                    let raw = dcroxide_testutil::unhex(f[4]);
+                    let (block, _) = MsgBlock::from_bytes(&raw).expect("block");
+                    let (_, errs) = chain.process_block(&block, now, &params);
+                    assert!(errs.is_empty(), "{}: {errs:?}", f[1]);
+                }
+                "reject" if f[1] == "bmf5" || f[1] == "bmf13" => {
+                    let raw = dcroxide_testutil::unhex(f[3]);
+                    let (block, _) = MsgBlock::from_bytes(&raw).expect("block");
+                    let (_, errs) = chain.process_block(&block, now, &params);
+                    assert_eq!(errs[0].kind.kind_name(), f[2], "{}", f[1]);
+                    let recorded = chain
+                        .recent_merkle_checks
+                        .hashes
+                        .contains(&block.header.block_hash().0);
+                    if f[1] == "bmf13" {
+                        // ErrMultipleCoinbases follows the merkle check.
+                        assert!(recorded, "bmf13 passed the merkle check");
+                    } else {
+                        assert!(!recorded, "bmf5 failed the merkle check");
+                    }
+                    seen += 1;
+                    if seen == 2 {
+                        return;
+                    }
+                }
+                "reject" => {
+                    let raw = dcroxide_testutil::unhex(f[3]);
+                    let (block, _) = MsgBlock::from_bytes(&raw).expect("block");
+                    let (_, errs) = chain.process_block(&block, now, &params);
+                    assert_eq!(errs[0].kind.kind_name(), f[2], "{}", f[1]);
+                }
+                _ => {}
+            }
+        }
+        panic!("bmf5 and bmf13 are in the battery");
     }
 
     /// A database failure on the stake-node paths is local corruption,
@@ -7629,7 +8035,7 @@ mod tests {
     /// Connecting blocks prunes the cached chain tips at most once per
     /// `cachedTipsPruneInterval`, relative to the block just connected
     /// (dcrd `connectBlock` calling `MaybePruneCachedTips`,
-    /// `chain.go:747`).  The port pruned only at load and on reconsider,
+    /// `chain.go:736`).  The port pruned only at load and on reconsider,
     /// so the cached tips never moved past the startup height (review
     /// finding B7-c#4).
     #[test]
@@ -7839,7 +8245,7 @@ mod tests {
     /// `blocks` mirror's own copy, together with its parent's, not as
     /// fresh copies of either: dcrd shares one `*dcrutil.Block` from its
     /// recent block cache and reuses the fork block as the first
-    /// parent (`chain.go:1146-1178`).  The port deep-copied both out of
+    /// parent (`chain.go:1134-1166`).  The port deep-copied both out of
     /// the mirror for every connect (review finding B2-p#4).
     #[test]
     fn connecting_a_block_shares_the_mirrored_block_and_parent() {
@@ -7949,7 +8355,7 @@ mod tests {
     /// `height_range` is dcrd's half-open `[start, end)` range capped at
     /// the best chain height, and a negative start or an end below the
     /// start is dcrd's plain error with its text rather than an empty
-    /// list (`chain.go:1782-1823`; review finding B3-p#8).
+    /// list (`chain.go:1769-1810`; review finding B3-p#8).
     #[test]
     fn height_range_is_half_open_and_rejects_dcrd_argument_errors() {
         let params = dcroxide_chaincfg::regnet_params();

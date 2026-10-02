@@ -1301,10 +1301,10 @@ nts 1104 sdiffalgorithm ThresholdActive yes
 slc 1104 sdiffalgorithm 1104
 nts 1200 sdiffalgorithm ThresholdActive yes
 slc 1200 sdiffalgorithm 1104
-ntse id ErrUnknownDeploymentID
+ntse id ErrUnknownAgendaID
 ntse hash ErrUnknownBlock
 slce hash ErrUnknownBlock
-slce id ErrUnknownDeploymentID
+slce id ErrUnknownAgendaID
 gsv d276c19c8e45e4680591408b4e99b0b60d0fbb465d1c94598cb8d187477a4791 5 d276c19c8e45e4680591408b4e99b0b60d0fbb465d1c94598cb8d187477a4791:1200:6:5:5|1:5|1:5|1:5|1:5|1;dbff5dfc89affe51f8c374dcee24c792288b2484cd72b1b4f1050f0e5e07d92e:1199:6:5:5|1:5|1:5|1:5|1:5|1;6adcd25143047236239d9c531999e4cb4f02aa8b4943fc18d18d0ca34823fdb8:1198:6:5:5|1:5|1:5|1:5|1:5|1;b90bfe364394fd1f3ca1ab30c0bc03c614fc67437c0286cc7ba86888879c21b8:1197:6:5:5|1:5|1:5|1:5|1:5|1;c8095a4f9852fb97ec1352b9341c30577cd6fd3ef6ec3af41eff4837b9ee56e2:1196:6:5:5|1:5|1:5|1:5|1:5|1
 gsv d276c19c8e45e4680591408b4e99b0b60d0fbb465d1c94598cb8d187477a4791 0 -
 gsv d276c19c8e45e4680591408b4e99b0b60d0fbb465d1c94598cb8d187477a4791 -1 err

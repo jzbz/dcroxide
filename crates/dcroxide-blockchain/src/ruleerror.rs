@@ -97,7 +97,6 @@ pub enum RuleErrorKind {
     ForceReorgWrongChain,
     ForceReorgMissingChild,
     BadStakebaseValue,
-    StakeFees,
     NoStakeTx,
     BadBlockHeight,
     BlockOneTx,
@@ -159,6 +158,7 @@ pub enum RuleErrorKind {
     InvalidRevocationTxVersion,
     NoExpiredTicketRevocation,
     NoMissedTicketRevocation,
+    UnknownAgendaID,
     UnknownDeploymentID,
     UnknownDeploymentVersion,
     DuplicateDeployment,
@@ -175,6 +175,7 @@ pub enum RuleErrorKind {
     DeploymentTooManyNo,
     DeploymentChoiceAbstain,
     ForcedMainNetChoice,
+    HistoricalForcedChoice,
 }
 
 impl RuleErrorKind {
@@ -217,11 +218,13 @@ impl RuleErrorKind {
                 | RuleErrorKind::DeploymentTooManyNo
                 | RuleErrorKind::DuplicateDeployment
                 | RuleErrorKind::ForcedMainNetChoice
+                | RuleErrorKind::HistoricalForcedChoice
                 | RuleErrorKind::InvalidateGenesisBlock
                 | RuleErrorKind::NoFilter
                 | RuleErrorKind::NoTreasuryBalance
                 | RuleErrorKind::NotAnAncestor
                 | RuleErrorKind::RequestTooLarge
+                | RuleErrorKind::UnknownAgendaID
                 | RuleErrorKind::UnknownBlock
                 | RuleErrorKind::UnknownDeploymentChoice
                 | RuleErrorKind::UnknownDeploymentID
@@ -318,7 +321,6 @@ impl RuleErrorKind {
             RuleErrorKind::ForceReorgWrongChain => "ErrForceReorgWrongChain",
             RuleErrorKind::ForceReorgMissingChild => "ErrForceReorgMissingChild",
             RuleErrorKind::BadStakebaseValue => "ErrBadStakebaseValue",
-            RuleErrorKind::StakeFees => "ErrStakeFees",
             RuleErrorKind::NoStakeTx => "ErrNoStakeTx",
             RuleErrorKind::BadBlockHeight => "ErrBadBlockHeight",
             RuleErrorKind::BlockOneTx => "ErrBlockOneTx",
@@ -380,6 +382,7 @@ impl RuleErrorKind {
             RuleErrorKind::InvalidRevocationTxVersion => "ErrInvalidRevocationTxVersion",
             RuleErrorKind::NoExpiredTicketRevocation => "ErrNoExpiredTicketRevocation",
             RuleErrorKind::NoMissedTicketRevocation => "ErrNoMissedTicketRevocation",
+            RuleErrorKind::UnknownAgendaID => "ErrUnknownAgendaID",
             RuleErrorKind::UnknownDeploymentID => "ErrUnknownDeploymentID",
             RuleErrorKind::UnknownDeploymentVersion => "ErrUnknownDeploymentVersion",
             RuleErrorKind::DuplicateDeployment => "ErrDuplicateDeployment",
@@ -396,6 +399,7 @@ impl RuleErrorKind {
             RuleErrorKind::DeploymentTooManyNo => "ErrDeploymentTooManyNo",
             RuleErrorKind::DeploymentChoiceAbstain => "ErrDeploymentChoiceAbstain",
             RuleErrorKind::ForcedMainNetChoice => "ErrForcedMainNetChoice",
+            RuleErrorKind::HistoricalForcedChoice => "ErrHistoricalForcedChoice",
         }
     }
 }
@@ -518,6 +522,26 @@ mod tests {
             render_multi_error(&[err("e1"), err("e2"), err("e3"), err("e4"), err("e5")]),
             "multiple errors (5):\n - e1\n - e2\n - e3\n - e4\n - e5\n"
         );
+    }
+
+    /// dcrd's `TestErrorKindStringer` rows for the kinds the agenda
+    /// series added (`error_test.go` at `6f6cf21b`), and the
+    /// `contextError` classification both are raised with
+    /// (`agendas.go:528`, `:534`, `:697`, `:721`).  `ErrStakeFees` is
+    /// gone upstream (`a0cdd433`) and from the enum here, so its
+    /// absence is checked by compilation.
+    #[test]
+    fn agenda_error_kinds() {
+        assert_eq!(
+            RuleErrorKind::UnknownAgendaID.kind_name(),
+            "ErrUnknownAgendaID"
+        );
+        assert_eq!(
+            RuleErrorKind::HistoricalForcedChoice.kind_name(),
+            "ErrHistoricalForcedChoice"
+        );
+        assert!(!RuleErrorKind::UnknownAgendaID.is_rule_violation());
+        assert!(!RuleErrorKind::HistoricalForcedChoice.is_rule_violation());
     }
 
     #[test]

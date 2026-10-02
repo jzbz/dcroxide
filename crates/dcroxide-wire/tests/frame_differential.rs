@@ -59,7 +59,9 @@ fn random_tx(rng: &mut SplitMix64) -> MsgTx {
                 previous_out_point: OutPoint {
                     hash: random_hash(rng),
                     index: rng.next_u64() as u32,
-                    tree: rng.next_u64() as i8,
+                    // Any tree that encodes: dcrd's `WriteOutPoint`
+                    // refuses a negative one.
+                    tree: rng.below(128) as i8,
                 },
                 sequence: rng.next_u64() as u32,
                 value_in: rng.next_u64() as i64,
@@ -205,7 +207,7 @@ fn mix_messages(rng: &mut SplitMix64) -> Vec<(Message, u32)> {
                         out_point: OutPoint {
                             hash: random_hash(rng),
                             index: rng.next_u64() as u32,
-                            tree: rng.next_u64() as i8,
+                            tree: rng.below(128) as i8,
                         },
                         script: rng.bytes(40),
                         pub_key: rng.bytes(33),

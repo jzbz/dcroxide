@@ -647,7 +647,7 @@ pub const HELP_DESCRIPTIONS: [(&str, &str, Option<&str>); 86] = [
     ),
     (
         "profile",
-        "Enable HTTP profiling on given [addr:]port -- NOTE port must be between 1024 and 65536",
+        "Enable HTTP profiling on given [addr:]port -- NOTE port must be between 1024 and 65535",
         None,
     ),
     (

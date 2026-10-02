@@ -120,7 +120,7 @@ jobs:
       # The same commit as DCRD_PARITY_COMMIT in dcroxide-testutil, which
       # refuses any other stamped revision; its unit tests fail when the
       # two drift apart.
-      DCRD_COMMIT: b9634e01770b9035c4f22e0b314e85aada3828cf
+      DCRD_COMMIT: 6f6cf21bd26d523ade261a683e7617a8e3f0ab56
       # A missing binary must fail this job rather than skip its tests.
       DCROXIDE_REQUIRE_DCRD: "1"
     steps:

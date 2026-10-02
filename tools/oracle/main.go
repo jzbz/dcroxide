@@ -7,13 +7,13 @@
 // generation and differential tests.
 //
 // Every dcrd module dependency in go.mod is pinned to the project's parity
-// target, dcrd master b9634e01, so the oracle links the code the dcrd binary
+// target, dcrd master 6f6cf21b, so the oracle links the code the dcrd binary
 // at that commit links: each module sits either at the target's
 // pseudo-version or at a published tag whose source is byte-identical to the
 // target's. The pseudo-versions are not what dcrd's own go.mod requires: it
 // requires published releases and builds most of them from the in-tree
 // source through replace directives. The tag pins, by contrast, are the very
-// releases it requires at b9634e01. go.mod's header records the rule and how
+// releases it requires at 6f6cf21b. go.mod's header records the rule and how
 // each module was placed; dcroxide-testutil's
 // the_dcrd_pin_matches_ci_and_the_oracle checks the pseudo-versions against
 // the harness pin. Do not bump them independently of a parity-target change.

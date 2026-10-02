@@ -221,6 +221,13 @@ pub(crate) fn opcode_n(op: &OpcodeInfo, _data: &[u8], vm: &mut Engine) -> Result
 
 /// The NOP family (dcrd `opcodeNop`); select opcodes error when the flag to
 /// discourage upgradable NOPs is set.
+///
+/// OP_2MUL and OP_2DIV are treated as NOPs, but are intentionally left out
+/// of the discouraged opcodes below to preserve the existing version 0
+/// consensus rules.  Discouraging them would reject scripts that are
+/// currently valid when `DISCOURAGE_UPGRADABLE_NOPS` is set, so implementing
+/// or discouraging them belongs to a future script version, through a
+/// consensus vote (dcrd `b02ffa7b`, `txscript/opcode.go:740-744`).
 pub(crate) fn opcode_nop(
     op: &OpcodeInfo,
     _data: &[u8],

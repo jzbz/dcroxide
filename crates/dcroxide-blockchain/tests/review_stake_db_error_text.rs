@@ -5,7 +5,7 @@
 //! dcrd returns the error of its `stake` database entry points
 //! unchanged: `LoadBestNode` out of `initChainState`
 //! (`chainio.go:1721-1725`) and `WriteConnectedBestNode` out of
-//! `connectBlock`'s update (`chain.go:687-690`).  A ticket database
+//! `connectBlock`'s update (`chain.go:676-679`).  A ticket database
 //! `DBError` and a stake `RuleError` render as their bare description.
 //! The port formatted the `StakeDbError` with `{:?}`, so a chain that
 //! would not open reported `stake node: Rule(RuleError { kind: ... })`

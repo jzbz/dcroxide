@@ -90,14 +90,13 @@ fn treasury_spend_input_battery() {
     assert_eq!(err.kind, RuleErrorKind::BadTxInput);
     assert_eq!(err.description, "treasury spend has negative value of -5");
 
+    // dcrd formats `dcrutil.MaxAmount`, an untyped floating-point
+    // constant, with `%v` (`validate.go:3344-3348`).
     let over = dcroxide_stake::MAX_AMOUNT + 1;
     let err = check_treasury_spend_inputs(&tspend_shape(over, over)).expect_err("over max");
     assert_eq!(err.kind, RuleErrorKind::BadTxInput);
     assert_eq!(
         err.description,
-        format!(
-            "treasury spend value of {over} is higher than max allowed value of {}",
-            dcroxide_stake::MAX_AMOUNT
-        )
+        format!("treasury spend value of {over} is higher than max allowed value of 2.1e+15")
     );
 }

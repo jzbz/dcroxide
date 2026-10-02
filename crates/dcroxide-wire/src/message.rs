@@ -585,8 +585,8 @@ impl Message {
             Message::Inv(m) => encode_inv_message(w, &m.inv_list)?,
             Message::GetData(m) => encode_inv_message(w, &m.inv_list)?,
             Message::NotFound(m) => encode_inv_message(w, &m.inv_list)?,
-            Message::Block(m) => m.encode(w),
-            Message::Tx(m) => m.encode_into(w),
+            Message::Block(m) => m.encode(w)?,
+            Message::Tx(m) => m.encode_into(w)?,
             Message::GetHeaders(m) => m.encode(w)?,
             Message::Headers(m) => m.encode(w)?,
             Message::Ping(m) => w.extend_from_slice(&m.nonce.to_le_bytes()),
@@ -1460,6 +1460,166 @@ mod tests {
         assert_eq!(
             write_message(&addr, ADDR_V2_VERSION, CurrencyNet::MAIN_NET),
             Err(WireError::MsgInvalidForPVer)
+        );
+    }
+
+    /// Every message that carries an outpoint refuses a negative tree in
+    /// both directions, through dcrd's `WriteOutPoint` and
+    /// `ReadOutPoint`: a transaction in both serializations with a
+    /// prefix, a block's regular and stake trees, a pair request's UTXO
+    /// and a mix confirmation's transaction.  The mixing hashes surface
+    /// the encode error.  The decode side patches the one byte that
+    /// differs between the message with the tree at 1 and at 2.
+    #[test]
+    fn negative_outpoint_trees_fail_encode_and_decode() {
+        let pver = PROTOCOL_VERSION;
+        let write_err = WireError::NegativeTxTree {
+            op: "WriteOutPoint",
+            tree: -3,
+        };
+        let read_err = WireError::NegativeTxTree {
+            op: "ReadOutPoint",
+            tree: -3,
+        };
+        let samples = samples();
+        let pair_req = samples
+            .iter()
+            .find_map(|m| match m {
+                Message::MixPairReq(m) if m.utxos.len() == 2 => Some(m.clone()),
+                _ => None,
+            })
+            .expect("a pair request sample with two UTXOs");
+        let confirm = samples
+            .iter()
+            .find_map(|m| match m {
+                Message::MixConfirm(m) => Some(m.clone()),
+                _ => None,
+            })
+            .expect("a mix confirmation sample");
+        // The second input's tree.
+        let with_tree = |mut tx: MsgTx, tree: i8| {
+            tx.tx_in[1].previous_out_point.tree = tree;
+            tx
+        };
+        let builders: Vec<Box<dyn Fn(i8) -> Message>> = vec![
+            Box::new(|t| Message::Tx(with_tree(tx(2, 1), t))),
+            Box::new(|t| {
+                Message::Tx(MsgTx {
+                    ser_type: TxSerializeType::NoWitness,
+                    ..with_tree(tx(2, 1), t)
+                })
+            }),
+            Box::new(|t| {
+                Message::Block(MsgBlock {
+                    header: header(),
+                    transactions: vec![tx(1, 1), with_tree(tx(2, 1), t)],
+                    stransactions: vec![tx(1, 0)],
+                })
+            }),
+            Box::new(|t| {
+                Message::Block(MsgBlock {
+                    header: header(),
+                    transactions: vec![tx(1, 1)],
+                    stransactions: vec![tx(1, 0), with_tree(tx(2, 1), t)],
+                })
+            }),
+            Box::new(|t| {
+                let mut m = pair_req.clone();
+                m.utxos[1].out_point.tree = t;
+                Message::MixPairReq(m)
+            }),
+            Box::new(|t| {
+                Message::MixConfirm(MsgMixConfirm {
+                    mix: with_tree(confirm.mix.clone(), t),
+                    ..confirm.clone()
+                })
+            }),
+        ];
+        for build in &builders {
+            let msg = build(-3);
+            let cmd = msg.command();
+            assert_eq!(
+                write_message(&msg, pver, CurrencyNet::MAIN_NET),
+                Err(write_err),
+                "{cmd}"
+            );
+            assert_eq!(msg.encode_payload(pver), Err(write_err), "{cmd}");
+            if let Some(hash) = msg.mix_hash() {
+                assert_eq!(hash, Err(write_err), "{cmd}");
+            }
+
+            let one = build(1).encode_payload(pver).expect("tree 1 encodes");
+            let two = build(2).encode_payload(pver).expect("tree 2 encodes");
+            assert_eq!(one.len(), two.len(), "{cmd}");
+            let at: Vec<usize> = (0..one.len()).filter(|&i| one[i] != two[i]).collect();
+            assert_eq!(at.len(), 1, "{cmd}: one tree byte");
+            let mut bytes = one;
+            bytes[at[0]] = 0xfd;
+            assert_eq!(
+                decode_message_payload(cmd, &bytes, pver).err(),
+                Some(read_err),
+                "{cmd}"
+            );
+            // The check fires on the tree byte, before anything after it.
+            assert_eq!(
+                decode_message_payload_prefix(cmd, &bytes[..=at[0]], pver).err(),
+                Some(read_err),
+                "{cmd}: cut after the tree"
+            );
+        }
+    }
+
+    /// Where dcrd makes another encode check before it writes an
+    /// outpoint, that check's error wins over a negative tree, and where
+    /// it checks after, the tree's does: a mix confirmation checks its
+    /// seen count before writing its transaction, and a pair request
+    /// writes each UTXO's outpoint before checking its script, public
+    /// key and signature lengths.
+    #[test]
+    fn negative_trees_lose_and_win_where_dcrd_orders_them() {
+        let samples = samples();
+        let mut confirm = samples
+            .iter()
+            .find_map(|m| match m {
+                Message::MixConfirm(m) => Some(m.clone()),
+                _ => None,
+            })
+            .expect("a mix confirmation sample");
+        confirm.mix.tx_in[0].previous_out_point.tree = -1;
+        confirm.seen_dc_nets = hashes(MAX_MIX_PEERS as usize + 1);
+        let err = write_message(
+            &Message::MixConfirm(confirm),
+            PROTOCOL_VERSION,
+            CurrencyNet::MAIN_NET,
+        )
+        .expect_err("refused");
+        assert_eq!(
+            err.to_string(),
+            "MsgMixConfirm.BtcEncode: too many previous referenced messages \
+             [count 513, max 512]"
+        );
+
+        let mut pair_req = samples
+            .iter()
+            .find_map(|m| match m {
+                Message::MixPairReq(m) if !m.utxos.is_empty() => Some(m.clone()),
+                _ => None,
+            })
+            .expect("a pair request sample with a UTXO");
+        pair_req.utxos[0].out_point.tree = -1;
+        pair_req.utxos[0].script = vec![0x51; MAX_MIX_PAIR_REQ_UTXO_SCRIPT_LEN as usize + 1];
+        pair_req.utxos[0].pub_key = vec![0x02; MAX_MIX_PAIR_REQ_UTXO_PUB_KEY_LEN as usize + 1];
+        pair_req.utxos[0].signature = vec![0x30; MAX_MIX_PAIR_REQ_UTXO_SIGNATURE_LEN as usize + 1];
+        assert_eq!(
+            write_message(
+                &Message::MixPairReq(pair_req),
+                PROTOCOL_VERSION,
+                CurrencyNet::MAIN_NET
+            ),
+            Err(WireError::NegativeTxTree {
+                op: "WriteOutPoint",
+                tree: -1
+            })
         );
     }
 

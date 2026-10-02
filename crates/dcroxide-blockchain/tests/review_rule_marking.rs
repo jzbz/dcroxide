@@ -4,7 +4,7 @@
 //!
 //! dcrd's reorganization and acceptance paths call
 //! `MarkBlockFailedValidation` only when `errors.As(err, &RuleError)`
-//! (`chain.go:1220-1243`, `process.go:377-381`).  A corrupt spend
+//! (`chain.go:1208-1231`, `process.go:367-371`).  A corrupt spend
 //! journal row is `database.ErrCorruption`, not a `RuleError`, so the
 //! reorg fails but the block stays a candidate and is retried once the
 //! row is repaired.  The port carries that failure as
@@ -44,14 +44,14 @@ fn a_corrupt_parent_journal_does_not_brand_the_disapproving_child() {
     }
     let bdt6 = bdt6.expect("bdt6 in the battery");
 
-    // bdt4 disapproves brt7, so connecting it reads brt7's spend
+    // bdt4 disapproves brt8, so connecting it reads brt8's spend
     // journal to restore the disapproved regular tree.  Damage that row.
-    let brt7 = by_label["brt7"];
+    let brt8 = by_label["brt8"];
     let row = chain
         .spend_journal
-        .get_mut(&brt7.0)
-        .expect("brt7's journal row");
-    assert!(row.len() > 1, "brt7 spends outputs");
+        .get_mut(&brt8.0)
+        .expect("brt8's journal row");
+    assert!(row.len() > 1, "brt8 spends outputs");
     row.truncate(row.len() / 2);
 
     // bdt6 makes the disapproving branch the most-work chain, so the

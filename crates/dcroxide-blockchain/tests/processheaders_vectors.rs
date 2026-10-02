@@ -3,13 +3,45 @@
 //! internal/blockchain package (`data/processheaders_vectors.txt`):
 //! a 30-header simnet chain fed through `maybeAcceptBlockHeader` over
 //! a real block index, covering acceptance, duplicates, orphan
-//! headers, sanity and positional failures (with and without the
-//! sanity checks), assumed-valid node discovery, automatic fork
-//! rejection checkpoint discovery with `ErrForkTooOld` enforcement,
-//! known-invalid branch short circuits after a mid-chain
-//! invalidation, and the clamped assume-valid ancestry checks —
-//! comparing the verdict, node creation, node status byte, best
-//! header, assumed valid height, and checkpoint height at every step.
+//! headers, sanity and positional failures, assumed-valid node
+//! discovery, automatic fork rejection checkpoint discovery with
+//! `ErrForkTooOld` enforcement, known-invalid branch short circuits
+//! after a mid-chain invalidation, and the clamped assume-valid
+//! ancestry checks — comparing the verdict, node creation, node status
+//! byte, best header, assumed valid height, and checkpoint height at
+//! every step.
+//!
+//! The file was regenerated when the pin moved to `6f6cf21b`, because
+//! `024899e4` removed `maybeAcceptBlockHeader`'s `checkHeaderSanity`
+//! flag: unknown headers are now always sanity checked.  The old file
+//! carried that flag as its second `hdr` field, and six rows (36, 38,
+//! 39, 40, 42 and 46) passed `false` to reach a positional or
+//! known-invalid verdict with a header whose proof of work did not
+//! pass the sanity checks.  Replayed unchanged at `6f6cf21b`, eight
+//! rows change: 36, 38, 40 and 46 become `ErrHighHash`, 39
+//! `ErrMissingParent`, and rows 36-42 carry a different best header,
+//! losing the `ErrUnexpectedDifficulty`, `ErrBadBlockHeight`,
+//! `ErrTimeTooOld` and `ErrInvalidAncestorBlock` coverage.  So:
+//!
+//! 1. Each of those six headers was reground to pass the sanity checks.
+//!    Headers built on a reground one were re-pointed at its new hash;
+//!    row 38's bits `0x1d00ffff`, a target far too hard to grind,
+//!    became `0x207ffffe`, which is cheap to meet on simnet and still
+//!    not what the difficulty retarget expects; and every nonce was
+//!    searched from zero until dcrd's `checkProofOfWorkSanity` passed.
+//!    Row 42's header already passed and is unchanged; the other five
+//!    differ.
+//! 2. The result was replayed through dcrd's own
+//!    `maybeAcceptBlockHeader` at `6f6cf21b` with the exporter's harness,
+//!    which writes every field after the header, and the flag column was
+//!    dropped.  The same harness reproduces the previous file byte for
+//!    byte at `b9634e01` with each row's flag, and replays the new rows
+//!    there (every flag `true`) to the identical output.
+//!
+//! Every verdict, node creation, status byte, assumed valid height and
+//! checkpoint height of the previous file is kept; only the reground
+//! headers' hashes, and the best header in rows 36-42, differ.  The
+//! harness was not committed, like the exporter before it.
 
 // Test-harness arithmetic over bounded lengths.
 #![allow(clippy::arithmetic_side_effects)]
@@ -78,23 +110,22 @@ fn processheaders_vectors() {
                 chain = Some(c);
             }
             "hdr" => {
-                // hdr <checksanity> <hex> <kind> <isnew> <status|->
-                //   <besthdr> <avh|-> <rfcph|->
+                // hdr <hex> <kind> <isnew> <status|-> <besthdr> <avh|->
+                //   <rfcph|->
                 let chain = chain.as_mut().expect("cfg first");
-                let check_sanity: bool = f[1].parse().expect("checksanity");
-                let (header, _) = BlockHeader::from_bytes(&unhex(f[2])).expect("header");
+                let (header, _) = BlockHeader::from_bytes(&unhex(f[1])).expect("header");
                 let hash = header.block_hash();
                 let existed = chain.index.lookup_node(&hash).is_some();
-                let result = chain.maybe_accept_block_header(&header, check_sanity, now, &params);
-                assert_eq!(kind_of(&result), f[3], "{line}");
+                let result = chain.maybe_accept_block_header(&header, now, &params);
+                assert_eq!(kind_of(&result), f[2], "{line}");
                 let node = chain.index.lookup_node(&hash);
                 let is_new = u8::from(!existed && node.is_some());
-                assert_eq!(is_new.to_string(), f[4], "{line}: isnew");
+                assert_eq!(is_new.to_string(), f[3], "{line}: isnew");
                 let status = node
                     .map(|n| chain.store.node(n).status.0.to_string())
                     .unwrap_or_else(|| "-".to_string());
-                assert_eq!(status, f[5], "{line}: status");
-                check_state(chain, &f, 6, line);
+                assert_eq!(status, f[4], "{line}: status");
+                check_state(chain, &f, 5, line);
                 counts[0] += 1;
             }
             "mark" => {

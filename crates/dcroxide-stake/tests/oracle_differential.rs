@@ -390,7 +390,10 @@ fn mutate(rng: &mut SplitMix64, tx: &mut MsgTx) {
         5 => {
             if !tx.tx_in.is_empty() {
                 let i = rng.below(tx.tx_in.len() as u64) as usize;
-                tx.tx_in[i].previous_out_point.tree = (rng.below(3) as i8) - 1;
+                // Regular, stake, or neither.  Not negative: the oracle
+                // deserializes the transaction, and dcrd's `ReadOutPoint`
+                // refuses a negative tree.
+                tx.tx_in[i].previous_out_point.tree = rng.below(3) as i8;
             }
         }
         6 => {
@@ -720,6 +723,68 @@ fn create_revocation_differential() {
             ),
         }
     }
+}
+
+/// A revocation output above the maximum amount fails with dcrd's text,
+/// which formats `dcrutil.MaxAmount`, an untyped floating-point
+/// constant, with `%v` (`staketx.go:1411-1415`): `2.1e+15`.  The ticket
+/// carries a single commitment of one atom more than the maximum, which
+/// the revocation returns whole.
+#[test]
+fn create_revocation_amount_range_text() {
+    let Some(mut oracle) = oracle_or_skip() else {
+        return;
+    };
+    let mut rng = SplitMix64::from_entropy("stake-revocation-amount-text");
+    let params = mainnet_params();
+    let amount = stake::MAX_AMOUNT + 1;
+
+    let mut ticket = base_tx(1);
+    let vote_addr = random_stake_addr(&mut rng, &params);
+    let (_, submission) = vote_addr.voting_rights_script().expect("stake address");
+    ticket.tx_out.push(out(amount, submission));
+    ticket.tx_in.push(funding_input(&mut rng));
+    let commit_addr = random_stake_addr(&mut rng, &params);
+    let (_, commitment) = commit_addr
+        .reward_commitment_script(amount, 0, 0)
+        .expect("stake address");
+    ticket.tx_out.push(out(0, commitment));
+    let change_addr = random_stake_addr(&mut rng, &params);
+    let (_, change) = change_addr.stake_change_script().expect("stake address");
+    ticket.tx_out.push(out(0, change));
+    let ticket_hash = random_hash(&mut rng);
+    let prev_header = rng.bytes(180);
+
+    let min_outs = stake::convert_to_minimal_outputs(&ticket);
+    let ours = stake::create_revocation_from_ticket(
+        &ticket_hash,
+        &min_outs,
+        0,
+        1,
+        &params,
+        &prev_header,
+        false,
+    )
+    .expect_err("an output above the maximum amount");
+    assert_eq!(
+        ours.description,
+        format!("invalid output amount: {amount} (min: 0, max: 2.1e+15)")
+    );
+
+    let mut req = Vec::new();
+    let net = "mainnet";
+    req.push(net.len() as u8);
+    req.extend_from_slice(net.as_bytes());
+    req.extend_from_slice(&0u64.to_be_bytes());
+    req.extend_from_slice(&1u16.to_be_bytes());
+    req.push(0);
+    req.extend_from_slice(&ticket_hash.0);
+    req.extend_from_slice(&(prev_header.len() as u16).to_be_bytes());
+    req.extend_from_slice(&prev_header);
+    req.extend_from_slice(&ticket.serialize());
+    let resp = oracle.call("stake_create_revocation", &req);
+    assert_eq!(resp["kind"].as_str(), Some(ours.kind.kind_name()));
+    assert_eq!(resp["error"].as_str(), Some(ours.description.as_str()));
 }
 
 /// dcrd 2.2's treasurybase failure precedence: the null-outpoint

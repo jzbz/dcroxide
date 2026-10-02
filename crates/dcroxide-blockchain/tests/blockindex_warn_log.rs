@@ -9,7 +9,7 @@
 //! log.Warnf("Unable to flush block index changes to db: %v", err)
 //! ```
 //!
-//! (`internal/blockchain/chain.go:1516-1520`). The port kept the
+//! (`internal/blockchain/chain.go:1504-1508`). The port kept the
 //! control flow and dropped the line, so an operator invalidating a
 //! block against a failing store was told the call succeeded, restarted
 //! into missing index rows, and had nothing naming the flush.

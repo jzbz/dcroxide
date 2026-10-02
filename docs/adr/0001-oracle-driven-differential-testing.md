@@ -92,3 +92,22 @@ ran the interop tests against a daemon two pins behind and a dcrd built at
 the real pin was refused. `the_dcrd_pin_matches_ci_and_the_oracle`
 (`crates/dcroxide-testutil/src/lib.rs`) now fails if the harness pin, CI's
 `DCRD_COMMIT` and the commit `tools/oracle/go.mod` names disagree.
+
+## Addendum, 2026-10-02 — target, oracle and battery generator at `6f6cf21b`
+
+The parity target moved to dcrd master `6f6cf21b` (still 2.2.0-pre), and
+`tools/oracle/go.mod` moved with it. The split was re-derived at the new
+commit rather than carried forward: no module was tagged after `b9634e01`,
+and of the oracle's modules only `txscript` (a comment) and `wire` changed
+between the two pins, both already on pseudo-versions, so the same modules
+sit on the new pseudo-version and the same tags stay. `wire`'s change is a behaviour change the oracle now
+links: `ReadOutPoint` refuses a negative outpoint tree, so the stake, txscript
+and standalone differentials, whose generators drew trees from -1 to 1, now
+draw them from 0 to 2.
+
+The oracle is not the only Go module that links dcrd. `tools/fullblockgen`,
+which dumps dcrd's full block battery from inside `blockchain/fullblocktests`,
+had stayed at `036b7090` through the whole `b9634e01` move, because nothing
+read its `go.mod`. It now links `6f6cf21b` under the oracle's rule, and
+`the_dcrd_pin_matches_ci_and_the_oracle` checks both `go.mod` files against
+the harness pin.

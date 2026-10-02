@@ -9,6 +9,9 @@
 //!   in both implementations (and identical results when both accept);
 //! - garbage: fully random buffers, same verdict comparison.
 
+// Test-harness arithmetic over bounded generator values.
+#![allow(clippy::arithmetic_side_effects)]
+
 use dcroxide_testutil::{Oracle, SplitMix64, hex, oracle_or_skip, unhex};
 use dcroxide_wire::{BlockHeader, MsgTx, OutPoint, TxIn, TxOut, TxSerializeType};
 
@@ -34,7 +37,10 @@ fn random_tx(rng: &mut SplitMix64) -> MsgTx {
                 previous_out_point: OutPoint {
                     hash: random_hash(rng),
                     index: rng.next_u64() as u32,
-                    tree: rng.next_u64() as i8,
+                    // Any tree that encodes: dcrd's `ReadOutPoint` and
+                    // `WriteOutPoint` refuse a negative one, which the
+                    // mutation cases write over the tree byte instead.
+                    tree: rng.below(128) as i8,
                 },
                 sequence: rng.next_u64() as u32,
                 value_in: rng.next_u64() as i64,
@@ -142,10 +148,27 @@ fn msgtx_mutated_matches_dcrd_oracle() {
         return;
     };
     let mut rng = SplitMix64::from_entropy("msgtx mutation differential");
+    let mut negative_trees = 0;
     for i in 0..3_000 {
         let tx = random_tx(&mut rng);
         let mut bytes = tx.serialize();
-        match rng.below(3) {
+        match rng.below(4) {
+            // Give a prefix input a negative tree, which dcrd's
+            // `ReadOutPoint` refuses once the byte is read.  The input
+            // count is a one-byte varint here, so input `k`'s tree sits
+            // after the version, the count, `k` whole inputs and the
+            // outpoint's hash and index.
+            3 if tx.ser_type != TxSerializeType::OnlyWitness && !tx.tx_in.is_empty() => {
+                let k = rng.below(tx.tx_in.len() as u64) as usize;
+                let at = 4 + 1 + 41 * k + 32 + 4;
+                assert_eq!(bytes[at] as i8, tx.tx_in[k].previous_out_point.tree);
+                bytes[at] |= 0x80 | rng.next_u64() as u8;
+                assert!(
+                    MsgTx::from_bytes(&bytes).is_err(),
+                    "case {i}: negative tree accepted"
+                );
+                negative_trees += 1;
+            }
             // Truncate at a random point.
             0 => {
                 let cut = rng.below(bytes.len() as u64 + 1) as usize;
@@ -168,6 +191,10 @@ fn msgtx_mutated_matches_dcrd_oracle() {
         }
         check_tx_bytes(&mut oracle, &bytes, &format!("mutation case {i}"));
     }
+    assert!(
+        negative_trees > 100,
+        "only {negative_trees} negative trees written"
+    );
 }
 
 #[test]

@@ -11,6 +11,13 @@
 //! than a cold one, and the vectors generated from fresh dcrd
 //! processes only ever replay the cold path.  The candidate anchor is
 //! tried before the candidate walk (validate.go:1188-1194).
+//!
+//! The synthetic chains vote BLAKE3 in far below the real main network
+//! activation, so their views drop blake3pow from the network's
+//! hard-coded historical activations, as dcrd's own deployment tests
+//! do with `removeHistoricalConsensusChange` (`common_test.go`).
+//! Otherwise every parent below the real anchor (794367) would read
+//! the agenda as definitively inactive, whatever the votes say.
 
 // Test-harness arithmetic over bounded heights.
 #![allow(clippy::arithmetic_side_effects)]
@@ -18,7 +25,10 @@
 use core::cell::Cell;
 
 use dcroxide_blockchain::RuleErrorKind;
-use dcroxide_blockchain::agendas::calc_next_required_difficulty;
+use dcroxide_blockchain::agendas::{
+    HistoricalActivationState, VOTE_ID_BLAKE3_POW, calc_next_required_difficulty,
+    historical_agendas,
+};
 use dcroxide_blockchain::blockindex::{NodeId, NodeStore};
 use dcroxide_blockchain::chainview_nodes::NodeBranchView;
 use dcroxide_blockchain::difficulty::{
@@ -30,7 +40,7 @@ use dcroxide_blockchain::thresholdstate::{
 };
 use dcroxide_blockchain::validate::check_difficulty_positional;
 use dcroxide_chaincfg::{Params, mainnet_params, regnet_params};
-use dcroxide_wire::BlockHeader;
+use dcroxide_wire::{BlockHeader, CurrencyNet};
 
 const T0: i64 = 1_600_000_000;
 
@@ -47,10 +57,19 @@ struct Synth {
     candidate: Cell<Option<i64>>,
     agenda_lookups: Cell<usize>,
     version_lookups: Cell<usize>,
+    /// The network's historical activations without blake3pow's.
+    historical: Vec<(&'static str, HistoricalActivationState)>,
 }
 
 impl Synth {
-    fn new(tip: i64, spacing: i64, bits: u32, block_version: i32, active_after: i64) -> Synth {
+    fn new(
+        params: &Params,
+        tip: i64,
+        spacing: i64,
+        bits: u32,
+        block_version: i32,
+        active_after: i64,
+    ) -> Synth {
         Synth {
             tip,
             spacing,
@@ -61,6 +80,11 @@ impl Synth {
             candidate: Cell::new(None),
             agenda_lookups: Cell::new(0),
             version_lookups: Cell::new(0),
+            historical: historical_agendas(params.net)
+                .iter()
+                .filter(|(id, _)| *id != VOTE_ID_BLAKE3_POW)
+                .copied()
+                .collect(),
         }
     }
 
@@ -157,8 +181,15 @@ impl VoteChainView for Synth {
         };
         Some(ThresholdStateTuple {
             state,
-            choice: None,
+            choice_id: "",
         })
+    }
+
+    fn historical_agendas(
+        &self,
+        _net: CurrencyNet,
+    ) -> &[(&'static str, HistoricalActivationState)] {
+        &self.historical
     }
 }
 
@@ -183,7 +214,7 @@ fn confirmed_anchor_holds_headers_to_asert() {
     // active with the block after 28287, and the tip is four intervals
     // later so the anchor walk visits several candidates.
     let anchor_height = 28287;
-    let view = Synth::new(60000, 300, 0x1b01ffff, 11, anchor_height);
+    let view = Synth::new(&params, 60000, 300, 0x1b01ffff, 11, anchor_height);
     let prev = ChainView::node(&view, view.tip).expect("tip");
     let anchor = ChainView::node(&view, anchor_height).expect("anchor");
     let ts = i64::from(view.header(0, 0).timestamp);
@@ -249,7 +280,7 @@ fn matched_candidate_anchor_is_tried_first() {
     // Blocks arrive slower than the one-second target, so ASERT from
     // any candidate saturates at the regnet proof of work limit, which
     // nearly every header hash meets.
-    let view = Synth::new(1500, 2, 0x1e0fffff, 11, i64::MAX);
+    let view = Synth::new(&params, 1500, 2, 0x1e0fffff, 11, i64::MAX);
     let prev = ChainView::node(&view, view.tip).expect("tip");
     let limit = params.pow_limit_bits;
     let solved = |nonce_start: u32| {

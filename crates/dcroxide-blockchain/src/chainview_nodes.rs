@@ -457,7 +457,7 @@ impl crate::thresholdstate::VoteChainView for NodeBranchView<'_> {
             .borrow()
             .get(vote_id)?
             .get(&(deployment_version, hash))
-            .cloned()
+            .copied()
     }
 
     fn cache_threshold_state(
@@ -473,5 +473,44 @@ impl crate::thresholdstate::VoteChainView for NodeBranchView<'_> {
             .entry(alloc::string::String::from(vote_id))
             .or_default()
             .insert((deployment_version, hash), state);
+    }
+
+    // The anchor heights can sit far below the tip, so these resolve
+    // ancestors through the skip list directly and leave the branch
+    // cursor where the descending walks put it.
+    fn ancestor_hash(&self, height: i64) -> Option<[u8; 32]> {
+        if height < 0 || height > self.store.node(self.tip).height {
+            return None;
+        }
+        let id = self.store.ancestor(self.tip, height)?;
+        Some(self.store.node(id).hash.0)
+    }
+
+    fn active_anchor_cached(&self, agenda_id: &str, prev_height: i64) -> Option<&'static str> {
+        let (anchor, choice_id) = *self.store.agenda_active_anchors.borrow().get(agenda_id)?;
+        let anchor_height = self.store.node(anchor).height;
+        if anchor_height > prev_height || prev_height > self.store.node(self.tip).height {
+            return None;
+        }
+        (self.store.ancestor(self.tip, anchor_height) == Some(anchor)).then_some(choice_id)
+    }
+
+    fn has_active_anchor(&self, agenda_id: &str) -> bool {
+        self.store
+            .agenda_active_anchors
+            .borrow()
+            .contains_key(agenda_id)
+    }
+
+    fn cache_active_anchor(&self, agenda_id: &str, height: i64, choice_id: &'static str) {
+        if height < 0 || height > self.store.node(self.tip).height {
+            return;
+        }
+        if let Some(id) = self.store.ancestor(self.tip, height) {
+            self.store
+                .agenda_active_anchors
+                .borrow_mut()
+                .insert(alloc::string::String::from(agenda_id), (id, choice_id));
+        }
     }
 }
