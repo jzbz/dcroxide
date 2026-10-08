@@ -215,6 +215,38 @@ is what a flush costs. The earlier 18% figure came from a replay, which
 validates every block where a syncing daemon skips ~93% under assume-valid,
 so it understated the daemon's share.
 
+## The exists-address index: turn it off if no wallet needs it
+
+The exists-address index is on by default, as in dcrd, and it is the
+largest single cost of an initial sync. It is a set of every address ever
+seen in a block or the mempool, and it serves exactly two RPCs,
+`existsaddress` and `existsaddresses`. Wallets that sync over RPC use them
+for address discovery, for example to find which addresses a wallet
+restored from its seed has used. SPV wallets do not: they work from the
+compact block filters.
+
+If no wallet syncs against this node over RPC, start it with
+`--noexistsaddrindex`. On m2 in [bench-ledger.md](bench-ledger.md), with
+the index off, the node synced the 200,000 blocks from 916,000 to
+1,116,035 **3.4x faster**: a median of 262 blocks/s across two runs,
+against 78, writing 21 GB instead of 151 GB. That was measured before the
+2026-10-08 height-first keys. With the index off, both RPCs fail with
+"exists address index disabled", as dcrd's do.
+
+The choice is not permanent, but changing it costs time:
+
+- **Turning it off on a node that already has it** leaves the index's data
+  on disk. To delete it, start once with `--noexistsaddrindex
+  --dropexistsaddrindex`: the node drops the index and exits, with the
+  "Dropping all ..." and "Dropped ..." lines described earlier in this
+  guide. `--dropexistsaddrindex` on its own is refused, as in dcrd. Then
+  run with `--noexistsaddrindex`.
+- **Turning it back on later** builds the index from genesis. The node
+  catches the index up to the chain tip, with the "Catching up from height
+  X to Y" progress lines described earlier. How long that takes on a
+  mainnet-sized chain has not been measured; expect a substantial part of
+  an initial sync.
+
 ## Storage tuning: two knobs help, one hurts, one is untested
 
 Four settings change how the metadata store behaves. Three are measured and
