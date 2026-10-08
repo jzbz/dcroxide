@@ -749,7 +749,10 @@ impl Chain {
     /// block index, best chain state, stake node, and chain data
     /// otherwise (dcrd `createChainState`/`initChainState`; the
     /// legacy version migration and `upgradeDB` paths are not
-    /// applicable to dcroxide's fresh-sync databases).
+    /// applicable to dcroxide's fresh-sync databases).  A database an
+    /// older dcroxide wrote is refused with
+    /// [`crate::chaindb::ChainDbError::OlderVersion`] where dcrd would
+    /// upgrade it (see [`crate::chaindb::CURRENT_DATABASE_VERSION`]).
     ///
     /// Nor is `New`'s version 3 test network pass (`chain.go:2261-2291`),
     /// which invalidates, with notifications suppressed, every chain
@@ -869,6 +872,19 @@ impl Chain {
                     chaindb::CURRENT_BLOCK_INDEX_VERSION
                 )));
             }
+            // Where dcrd upgrades an older database in place (`upgradeDB`,
+            // `chainio.go:1676`), the port refuses it, before it reads
+            // anything else: the only older version a dcroxide ever wrote
+            // is dcrd's 14, whose per-block rows sit under keys this build
+            // does not look them up by (see
+            // `chaindb::CURRENT_DATABASE_VERSION`).  Opening it would miss
+            // those rows -- the chain would take its stored blocks for
+            // blocks it never had -- or read a per-height stake row of
+            // another height, so the operator is told the one remedy
+            // there is.
+            if info.version < chaindb::CURRENT_DATABASE_VERSION {
+                return Err(chaindb::ChainDbError::OlderVersion(info.version));
+            }
         }
 
         let Some(db_info) = db_info else {
@@ -929,7 +945,7 @@ impl Chain {
                 }
                 let genesis_filter = dcroxide_gcs::blockcf2::regular(&genesis_block, &NoScripts)
                     .map_err(|e| db_driver_error(format!("genesis filter: {e:?}")))?;
-                chaindb::db_put_gcs_filter(tx, &genesis_hash, &genesis_filter)
+                chaindb::db_put_gcs_filter(tx, &genesis_hash, 0, &genesis_filter)
                     .map_err(chain_db_to_db_error)?;
                 meta.create_bucket(chaindb::TREASURY_BUCKET_NAME)?;
                 meta.create_bucket(chaindb::TREASURY_TSPEND_BUCKET_NAME)?;
@@ -1301,26 +1317,24 @@ impl Chain {
                 continue;
             }
             let hash = n.hash;
-            let raw = tx.fetch_block(&hash)?;
+            let height = n.height as u32;
+            let raw = tx.fetch_block(&hash, height)?;
             let (block, _) = dcroxide_wire::MsgBlock::from_bytes(&raw).map_err(|e| {
                 crate::chaindb::ChainDbError::Corrupt(format!("bad stored block: {e:?}"))
             })?;
             self.blocks.insert(hash.0, Arc::new(block));
 
-            let meta = tx.metadata();
-            if let Some(bucket) = meta.bucket(crate::chaindb::SPEND_JOURNAL_BUCKET_NAME)
-                && let Some(journal) = bucket.get(&hash.0)
-            {
+            if let Some(journal) = crate::chaindb::db_fetch_spend_journal_entry(tx, &hash, height) {
                 self.spend_journal.insert(hash.0, journal);
             }
-            if let Some(filter) = crate::chaindb::db_fetch_gcs_filter(tx, &hash)? {
+            if let Some(filter) = crate::chaindb::db_fetch_gcs_filter(tx, &hash, height)? {
                 self.filters.insert(hash.0, filter);
             }
-            let commitments = crate::chaindb::db_fetch_header_commitments(tx, &hash)?;
+            let commitments = crate::chaindb::db_fetch_header_commitments(tx, &hash, height)?;
             if !commitments.is_empty() {
                 self.header_commitments.insert(hash.0, commitments);
             }
-            if let Some(ts) = crate::treasurydb::db_fetch_treasury_balance(tx, &hash)? {
+            if let Some(ts) = crate::treasurydb::db_fetch_treasury_balance(tx, &hash, height)? {
                 self.treasury_state.insert(hash.0, ts);
             }
         }
@@ -2617,7 +2631,7 @@ impl Chain {
         // A transaction that cannot be opened fails the operation, as
         // dcrd's `db.View` around `dbFetchSpendJournalEntry` does.
         let serialized = self
-            .spend_journal_row(&block.header.block_hash())
+            .spend_journal_row(&block.header.block_hash(), block.header.height)
             .map_err(db_read_rule_error)?
             .unwrap_or_default();
 
@@ -3261,17 +3275,33 @@ impl Chain {
                     work_sum,
                 )
                 .map_err(chain_db_to_db_error)?;
-                crate::chaindb::db_put_spend_journal_entry(tx, &node_hash, &serialized_journal)
-                    .map_err(chain_db_to_db_error)?;
+                crate::chaindb::db_put_spend_journal_entry(
+                    tx,
+                    &node_hash,
+                    node_height as u32,
+                    &serialized_journal,
+                )
+                .map_err(chain_db_to_db_error)?;
                 dcroxide_stake::stakedb::write_connected_best_node(tx, &stake_node, &node_hash)
                     .map_err(stake_db_to_db_error)?;
                 if let Some((block_hash, ts, tspend_updates)) = &treasury_records {
-                    Self::db_write_treasury_records(tx, block_hash, ts, tspend_updates)?;
+                    Self::db_write_treasury_records(
+                        tx,
+                        block_hash,
+                        node_height as u32,
+                        ts,
+                        tspend_updates,
+                    )?;
                 }
-                crate::chaindb::db_put_gcs_filter(tx, &node_hash, &filter)
+                crate::chaindb::db_put_gcs_filter(tx, &node_hash, node_height as u32, &filter)
                     .map_err(chain_db_to_db_error)?;
-                crate::chaindb::db_put_header_commitments(tx, &node_hash, &hdr_commitment_leaves)
-                    .map_err(chain_db_to_db_error)?;
+                crate::chaindb::db_put_header_commitments(
+                    tx,
+                    &node_hash,
+                    node_height as u32,
+                    &hdr_commitment_leaves,
+                )
+                .map_err(chain_db_to_db_error)?;
                 Ok(())
             })
             .map_err(|e| persist_rule_error(crate::chaindb::ChainDbError::Db(e)))?;
@@ -3487,9 +3517,10 @@ impl Chain {
         // between the best-state write and the flush still finds the
         // journal record it needs to recover.
         let node_hash = self.store.node(node).hash;
+        let journal_height = node_height as u32;
         if let Some(db) = self.db.as_ref() {
             db.update(|tx| {
-                crate::chaindb::db_remove_spend_journal_entry(tx, &node_hash)
+                crate::chaindb::db_remove_spend_journal_entry(tx, &node_hash, journal_height)
                     .map_err(chain_db_to_db_error)?;
                 Ok(())
             })
@@ -4003,7 +4034,7 @@ impl Chain {
             .insert(block.header.block_hash().0, Arc::new(block.clone()));
         if let Some(db) = &self.db {
             let stored = db.update(|tx| {
-                if tx.has_block(&block.header.block_hash())? {
+                if tx.has_block(&block.header.block_hash(), block.header.height)? {
                     return Ok(());
                 }
                 tx.store_block(block)
@@ -5026,8 +5057,12 @@ impl Chain {
     /// there, never as a missing block.  A chain without a database
     /// holds every block in the window, so a block missing from it is
     /// reported with the database's "does not exist" text.
-    fn db_fetch_stored_block(&self, hash: &Hash) -> Result<MsgBlock, crate::chaindb::ChainDbError> {
-        fetch_stored_block(self.db.as_ref(), hash)
+    fn db_fetch_stored_block(
+        &self,
+        hash: &Hash,
+        height: u32,
+    ) -> Result<MsgBlock, crate::chaindb::ChainDbError> {
+        fetch_stored_block(self.db.as_ref(), hash, height)
     }
 
     /// The block data for a node from the recent in-memory window or
@@ -5035,11 +5070,12 @@ impl Chain {
     /// comes back as the mirror's own `Arc`, not a copy, the way dcrd's
     /// recent block cache hands back its pointer.
     fn block_arc(&self, node: NodeId) -> Result<Arc<MsgBlock>, crate::chaindb::ChainDbError> {
-        let hash = self.store.node(node).hash;
+        let (hash, height) = (self.store.node(node).hash, self.store.node(node).height);
         if let Some(block) = self.blocks.get(&hash.0) {
             return Ok(Arc::clone(block));
         }
-        self.db_fetch_stored_block(&hash).map(Arc::new)
+        self.db_fetch_stored_block(&hash, height as u32)
+            .map(Arc::new)
     }
 
     /// [`Self::block_arc`] on the paths that return a rule error: the
@@ -5068,6 +5104,7 @@ impl Chain {
     fn spend_journal_row(
         &self,
         hash: &Hash,
+        height: u32,
     ) -> Result<Option<Vec<u8>>, crate::chaindb::ChainDbError> {
         if let Some(row) = self.spend_journal.get(&hash.0) {
             return Ok(Some(row.clone()));
@@ -5077,10 +5114,7 @@ impl Chain {
         };
         let mut found = None;
         db.view(|tx| {
-            let meta = tx.metadata();
-            if let Some(bucket) = meta.bucket(crate::chaindb::SPEND_JOURNAL_BUCKET_NAME) {
-                found = bucket.get(&hash.0);
-            }
+            found = crate::chaindb::db_fetch_spend_journal_entry(tx, hash, height);
             Ok(())
         })?;
         Ok(found)
@@ -5090,7 +5124,11 @@ impl Chain {
     /// database: `Ok(None)` when no filter is stored, and the error
     /// dcrd's `dbFetchGCSFilter` returns for a failed read or a row
     /// that does not decode.
-    fn gcs_filter(&self, hash: &Hash) -> Result<Option<FilterV2>, crate::chaindb::ChainDbError> {
+    fn gcs_filter(
+        &self,
+        hash: &Hash,
+        height: u32,
+    ) -> Result<Option<FilterV2>, crate::chaindb::ChainDbError> {
         if let Some(filter) = self.filters.get(&hash.0) {
             return Ok(Some(filter.clone()));
         }
@@ -5099,7 +5137,7 @@ impl Chain {
         };
         let mut found = Ok(None);
         db.view(|tx| {
-            found = crate::chaindb::db_fetch_gcs_filter(tx, hash);
+            found = crate::chaindb::db_fetch_gcs_filter(tx, hash, height);
             Ok(())
         })?;
         found
@@ -5108,7 +5146,11 @@ impl Chain {
     /// A block's serialized version 2 GCS filter from the recent window
     /// or the database, without decoding it (dcrd
     /// `dbFetchRawGCSFilter`, which `LocateCFiltersV2` serves from).
-    fn raw_gcs_filter(&self, hash: &Hash) -> Result<Option<Vec<u8>>, crate::chaindb::ChainDbError> {
+    fn raw_gcs_filter(
+        &self,
+        hash: &Hash,
+        height: u32,
+    ) -> Result<Option<Vec<u8>>, crate::chaindb::ChainDbError> {
         if let Some(filter) = self.filters.get(&hash.0) {
             return Ok(Some(filter.bytes().to_vec()));
         }
@@ -5117,7 +5159,7 @@ impl Chain {
         };
         let mut found = Ok(None);
         db.view(|tx| {
-            found = crate::chaindb::db_fetch_raw_gcs_filter(tx, hash);
+            found = crate::chaindb::db_fetch_raw_gcs_filter(tx, hash, height);
             Ok(())
         })?;
         found
@@ -5129,6 +5171,7 @@ impl Chain {
     fn commitments_by_block_hash(
         &self,
         hash: &Hash,
+        height: u32,
     ) -> Result<Vec<Hash>, crate::chaindb::ChainDbError> {
         if let Some(leaves) = self.header_commitments.get(&hash.0) {
             return Ok(leaves.clone());
@@ -5138,13 +5181,13 @@ impl Chain {
         };
         let mut found = Ok(Vec::new());
         db.view(|tx| {
-            found = crate::chaindb::db_fetch_header_commitments(tx, hash);
+            found = crate::chaindb::db_fetch_header_commitments(tx, hash, height);
             Ok(())
         })?;
         found
     }
 
-    /// A block's treasury state row from the recent window or the
+    /// A block node's treasury state row from the recent window or the
     /// database (dcrd reads `dbFetchTreasuryBalance` on every lookup).
     /// `Ok(None)` is dcrd's `errDbTreasury`, the missing key, which
     /// `sumPastTreasuryChanges` reads as the end of the records.  A row
@@ -5153,8 +5196,9 @@ impl Chain {
     /// and only `calculateTreasuryBalance` reads every error as zero.
     fn treasury_state_row(
         &self,
-        hash: &Hash,
+        node: NodeId,
     ) -> Result<Option<alloc::borrow::Cow<'_, crate::treasurydb::TreasuryState>>, String> {
+        let (hash, height) = (self.store.node(node).hash, self.store.node(node).height);
         if let Some(ts) = self.treasury_state.get(&hash.0) {
             return Ok(Some(alloc::borrow::Cow::Borrowed(ts)));
         }
@@ -5163,7 +5207,7 @@ impl Chain {
         };
         let mut found = Ok(None);
         db.view(|tx| {
-            found = crate::treasurydb::db_fetch_treasury_balance(tx, hash);
+            found = crate::treasurydb::db_fetch_treasury_balance(tx, &hash, height as u32);
             Ok(())
         })
         .map_err(|e| format!("{e}"))?;
@@ -6458,25 +6502,26 @@ impl Chain {
     pub fn filter_by_block_hash(&self, hash: &Hash) -> Result<(FilterV2, HeaderProof), RuleError> {
         // Avoid a lookup when there is no way the filter data for the
         // requested block is available.
-        let have_data = self
+        let Some(node) = self
             .index
             .lookup_node(hash)
-            .is_some_and(|node| self.index.node_status(&self.store, node).have_data());
-        if !have_data {
+            .filter(|&node| self.index.node_status(&self.store, node).have_data())
+        else {
             return Err(rule_error(
                 RuleErrorKind::NoFilter,
                 format!("no filter available for block {hash}"),
             ));
-        }
+        };
+        let height = self.store.node(node).height as u32;
 
-        let Some(filter) = self.gcs_filter(hash).map_err(db_read_rule_error)? else {
+        let Some(filter) = self.gcs_filter(hash, height).map_err(db_read_rule_error)? else {
             return Err(rule_error(
                 RuleErrorKind::NoFilter,
                 format!("no filter available for block {hash}"),
             ));
         };
         let leaves = self
-            .commitments_by_block_hash(hash)
+            .commitments_by_block_hash(hash, height)
             .map_err(db_read_rule_error)?;
 
         // Generate the header commitment inclusion proof for the
@@ -6537,34 +6582,37 @@ impl Chain {
         }
         let nb = nb as usize;
 
-        // Fetch the block hashes for the range by walking parents back
-        // from the end node.
-        let mut hashes = alloc::vec![Hash([0u8; 32]); nb];
+        // Fetch the block hashes, with the heights that key their rows,
+        // for the range by walking parents back from the end node.
+        let mut blocks = alloc::vec![(Hash([0u8; 32]), 0u32); nb];
         let mut node = Some(end_node);
-        for slot in hashes.iter_mut().rev() {
+        for slot in blocks.iter_mut().rev() {
             let id = node.expect("the range is bounded by the ancestor check");
-            *slot = self.store.node(id).hash;
+            *slot = (self.store.node(id).hash, self.store.node(id).height as u32);
             node = self.store.node(id).parent;
         }
 
         // Build the per-block filter responses with their inclusion
         // proofs.
         let mut cfilters = Vec::with_capacity(nb);
-        for hash in &hashes {
+        for (hash, height) in &blocks {
             // The recent window or the database, so a pruned range is
             // still served (dcrd reads every filter from its cfilter
             // database).  dcrd serves the stored bytes without decoding
             // them (`dbFetchRawGCSFilter`), but returns a commitments
             // row that fails to read or decode as the error
             // (`headercmt.go:249-268`).
-            let Some(filter) = self.raw_gcs_filter(hash).map_err(db_read_rule_error)? else {
+            let Some(filter) = self
+                .raw_gcs_filter(hash, *height)
+                .map_err(db_read_rule_error)?
+            else {
                 return Err(rule_error(
                     RuleErrorKind::NoFilter,
                     format!("no filter available for block {hash}"),
                 ));
             };
             let leaves = self
-                .commitments_by_block_hash(hash)
+                .commitments_by_block_hash(hash, *height)
                 .map_err(db_read_rule_error)?;
             let proof =
                 dcroxide_standalone::generate_inclusion_proof(&leaves, HEADER_CMT_FILTER_INDEX);
@@ -6617,10 +6665,10 @@ impl Chain {
         };
         // dcrd reads any error from either fetch as a zero balance, not
         // only the missing key.
-        let Ok(Some(ts)) = self.treasury_state_row(&self.store.node(prev_node).hash) else {
+        let Ok(Some(ts)) = self.treasury_state_row(prev_node) else {
             return 0;
         };
-        let Ok(Some(wts)) = self.treasury_state_row(&self.store.node(want_node).hash) else {
+        let Ok(Some(wts)) = self.treasury_state_row(want_node) else {
             return 0;
         };
         let mut net_value = 0i64;
@@ -6699,10 +6747,11 @@ impl Chain {
     fn db_write_treasury_records(
         tx: &dcroxide_database::Transaction,
         block_hash: &Hash,
+        block_height: u32,
         ts: &crate::treasurydb::TreasuryState,
         tspend_updates: &[(Hash, Vec<Hash>)],
     ) -> Result<(), dcroxide_database::Error> {
-        crate::treasurydb::db_put_treasury_balance(tx, block_hash, ts)
+        crate::treasurydb::db_put_treasury_balance(tx, block_hash, block_height, ts)
             .map_err(chain_db_to_db_error)?;
         for (tx_hash, blocks) in tspend_updates {
             crate::treasurydb::db_put_tspend(tx, tx_hash, blocks).map_err(chain_db_to_db_error)?;
@@ -6726,10 +6775,13 @@ impl Chain {
         params: &Params,
     ) -> Result<(), RuleError> {
         let (block_hash, ts, tspend_updates) = self.treasury_records_for_block(node, block, params);
+        let block_height = self.store.node(node).height as u32;
 
         if let Some(db) = &self.db {
-            db.update(|tx| Self::db_write_treasury_records(tx, &block_hash, &ts, &tspend_updates))
-                .map_err(|e| persist_rule_error(crate::chaindb::ChainDbError::Db(e)))?;
+            db.update(|tx| {
+                Self::db_write_treasury_records(tx, &block_hash, block_height, &ts, &tspend_updates)
+            })
+            .map_err(|e| persist_rule_error(crate::chaindb::ChainDbError::Db(e)))?;
         }
         self.apply_treasury_records(block_hash, ts, &tspend_updates);
         Ok(())
@@ -6879,7 +6931,7 @@ impl Chain {
                 break;
             }
             let row = self
-                .treasury_state_row(&self.store.node(id).hash)
+                .treasury_state_row(id)
                 .map_err(|e| rule_error(RuleErrorKind::UtxoBackendCorruption, e))?;
             let Some(ts) = row else {
                 // The record doesn't exist: the end of when treasury
@@ -7336,6 +7388,7 @@ pub fn db_read_rule_error(err: crate::chaindb::ChainDbError) -> RuleError {
 fn fetch_stored_block(
     db: Option<&dcroxide_database::Database>,
     hash: &Hash,
+    height: u32,
 ) -> Result<MsgBlock, crate::chaindb::ChainDbError> {
     let Some(db) = db else {
         return Err(crate::chaindb::ChainDbError::Db(dcroxide_database::Error {
@@ -7345,7 +7398,7 @@ fn fetch_stored_block(
     };
     let mut raw = Vec::new();
     db.view(|tx| {
-        raw = tx.fetch_block(hash)?;
+        raw = tx.fetch_block(hash, height)?;
         Ok(())
     })?;
     let (block, _) = dcroxide_wire::MsgBlock::from_bytes(&raw)
@@ -7406,8 +7459,8 @@ impl TSpendVoteWindow {
             let block = match recent {
                 Some(block) => block.as_ref(),
                 None => {
-                    fetched =
-                        fetch_stored_block(self.db.as_ref(), hash).map_err(|e| format!("{e}"))?;
+                    fetched = fetch_stored_block(self.db.as_ref(), hash, *height as u32)
+                        .map_err(|e| format!("{e}"))?;
                     &fetched
                 }
             };

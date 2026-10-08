@@ -355,16 +355,19 @@ fn cmd_export(args: &Args) -> Result<(), String> {
     // hash sequence.
     let created_unix = now_unix();
     let chain = Chain::open(db.clone(), &params, Hash([0u8; 32]), false, created_unix)
-        .map_err(|e| format!("unable to open chain: {e:?}"))?;
+        .map_err(|e| format!("unable to open chain: {e}"))?;
     let tip_height = chain.best_snapshot().height.min(max);
 
-    let mut hashes = Vec::with_capacity(usize::try_from(tip_height).unwrap_or(0));
+    // Each hash with its height, which keys the block's index row.
+    let mut blocks = Vec::with_capacity(usize::try_from(tip_height).unwrap_or(0));
     let mut height = 1i64;
     while height <= tip_height {
         let hash = chain
             .block_hash_by_height(height)
             .ok_or_else(|| format!("no main chain hash at height {height}"))?;
-        hashes.push(hash);
+        let key_height =
+            u32::try_from(height).map_err(|_| format!("height {height} is beyond a u32"))?;
+        blocks.push((hash, key_height));
         height = height.saturating_add(1);
     }
 
@@ -375,7 +378,7 @@ fn cmd_export(args: &Args) -> Result<(), String> {
     let mut w = BufWriter::new(file);
     let start = Instant::now();
     let exported = db
-        .export_blocks(&mut w, params.net.0, &hashes)
+        .export_blocks(&mut w, params.net.0, &blocks)
         .map_err(|e| e.to_string())?;
     w.flush().map_err(|e| e.to_string())?;
     std::fs::rename(&tmp, &out).map_err(|e| format!("unable to rename {tmp:?}: {e}"))?;
@@ -629,7 +632,7 @@ fn cmd_replay(args: &Args) -> Result<(), String> {
 
     let chain = Arc::new(Mutex::new(
         Chain::open((*db).clone(), &params, assume_valid, false, now_unix())
-            .map_err(|e| format!("unable to initialize chain: {e:?}"))?,
+            .map_err(|e| format!("unable to initialize chain: {e}"))?,
     ));
 
     if let Some(mib) = utxo_cache_mib {
@@ -862,7 +865,7 @@ fn cmd_indexcatchup(args: &Args) -> Result<(), String> {
 
     let chain = Arc::new(Mutex::new(
         Chain::open((*db).clone(), &params, Hash([0u8; 32]), false, now_unix())
-            .map_err(|e| format!("unable to initialize chain: {e:?}"))?,
+            .map_err(|e| format!("unable to initialize chain: {e}"))?,
     ));
     let queryer: Arc<dyn ChainQueryer> = Arc::new(BenchChainQueryer {
         chain: Arc::clone(&chain),

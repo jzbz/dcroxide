@@ -86,10 +86,12 @@ to clear. A free result alongside it: **redb 4.1.0 holds the same content in
 2026-08-11 addendum reports dcrd's payload at matched index composition,
 against the same block bytes: the two implementations store the *same
 payload*, fifteen buckets agreeing to the byte and the whole-store
-difference 54 bytes on 6.06 GB. Two consequences run through everything
-below. First, the density comparison ADR-0009 withdrew is reinstated — the
-premise it was withdrawn on (that dcrd's domain encodings must be denser) is
-measured false. Second, the remaining gap is the storage layer with no
+difference 54 bytes on 6.06 GB. (Since 2026-10-08 five of those buckets
+carry four more key bytes per row than dcrd's, at most about 22 MB at the
+tip; see the addendum of that date at the end.) Two consequences run
+through everything below. First, the density comparison ADR-0009 withdrew
+is reinstated — the premise it was withdrawn on (that dcrd's domain
+encodings must be denser) is measured false. Second, the remaining gap is the storage layer with no
 domain-level component left in it: the same payload occupies 6.10 GiB under
 goleveldb and 9.82 GiB in redb's live tree, 1.08x against 1.74x over each
 store's own payload.
@@ -1405,3 +1407,26 @@ fsync blocking is uninterruptible and counted by the load average, but it is
 not block-device wait. Only a task-state walk sees it.
 
 Full figures, caveats and raw paths in [bench-ledger.md](../bench-ledger.md).
+
+## Addendum, 2026-10-08 — height-first per-block keys, for write shape
+
+[ADR-0010](0010-height-first-block-keys.md) re-keys the seven buckets that gain
+a row per block (the spend journal, GCS filters, header commitments, treasury
+state, the two per-height stake buckets and the internal block index) by
+big-endian height first, and moves the chain database to version 15. It does
+not reopen lever (d) above. The 2026-08-12 addendum closed re-keying
+`spendjournalv3` as a way to reduce slack, a question about size, and the
+data directory is no smaller under the new keys. ADR-0010 re-keys for the
+number of leaves a flush copies, and measured +26% on a 200,000-block sync
+tail and 1.74x from genesis. The fresh-sync stance decided here is what lets
+it ship without a migration: a directory in the old layout is refused with
+the remedy, re-sync, rather than upgraded.
+
+It also qualifies the payload comparison in the findings at the top. The
+2026-08-11 measurement found the two implementations' payloads equal, fifteen
+buckets to the byte. Under the new keys five of those buckets (the spend
+journal, filters, header commitments, treasury state and ffldb's internal
+block index) carry a four-byte height in every key that dcrd's keys do not, at
+most about 22 MB at the mainnet tip, so their payload is no longer exactly
+dcrd's. The row values are unchanged, and the comparison was not
+re-measured.

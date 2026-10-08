@@ -827,3 +827,32 @@ Each from a cost someone else already paid, and each survives the redesign.
   ecosystem-acceptance milestones, and SECURITY.md's standing gaps are all
   unaddressed, and each is closer to making the node usable than a faster
   store is.
+
+## Addendum, 2026-10-08 — the key-order lever, measured and adopted
+
+The 2026-09-23 note above, "Key order is an unmeasured part of that cost", is
+answered by [ADR-0010](0010-height-first-block-keys.md). It keys the seven
+buckets the note named by big-endian height first (height then hash for the
+five hash-keyed ones, the height alone for the two stake buckets) and moves
+the chain database to version 15. The alternating A/B daemon sync the note
+asked for ran on an x86_64 Linux machine with a ZFS mirror of QLC NVMe
+drives: a median of 98.5 against 78.1 blk/s over a 200,000-block mainnet tail
+(+26%, all four re-keyed runs faster than all five base runs), and 336.6
+against 193.0 blk/s from genesis to block 916,000 (1.74x, one run each), with
+about 10% fewer bytes written on the tail. The rows are in
+[bench-ledger.md](../bench-ledger.md), "Height-first per-block keys".
+
+The cost the note predicted did not show. Appending at each bucket's right
+edge was expected to leave leaves near half full and grow the store; the data
+directory measured 24.98 GB against base's 24.96 at about block 916,000, and
+33.22–33.33 GB against 33.26 at the tip.
+
+The note's last condition is met by a resync, not a migration. dcroxide has
+not been released, so the version bump refuses a directory in the old layout
+with the remedy (delete the block database and sync again) instead of
+upgrading it. Two passages above now describe the layout before version 15:
+the withdrawn split design's statements that `spendjournalv3` and
+`ffldb-blockidx` are keyed by block hash, and, under Alternatives, "A row
+re-keying remains untried". Both buckets are now keyed by height and then
+hash, and a row re-keying has been tried, for write shape rather than for the
+slack that alternative was about.

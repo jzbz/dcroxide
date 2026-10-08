@@ -14,7 +14,9 @@ use dcroxide_chainhash::Hash;
 use dcroxide_database::Transaction;
 use dcroxide_wire::MsgBlock;
 
-use crate::chaindb::{ChainDbError, TREASURY_BUCKET_NAME, TREASURY_TSPEND_BUCKET_NAME};
+use crate::chaindb::{
+    ChainDbError, TREASURY_BUCKET_NAME, TREASURY_TSPEND_BUCKET_NAME, block_row_key,
+};
 use crate::compress::{deserialize_vlq, put_vlq, serialize_size_vlq};
 
 /// The known types of values that modify the treasury balance (dcrd
@@ -229,10 +231,13 @@ pub fn deserialize_tspend(data: &[u8]) -> Result<Vec<Hash>, String> {
     Ok(hashes)
 }
 
-/// Store a treasury state row (dcrd `dbPutTreasuryBalance`).
+/// Store a block's treasury state row (dcrd `dbPutTreasuryBalance`),
+/// keyed by the block's height and hash (see
+/// [`crate::chaindb::block_row_key`]) where dcrd keys it by hash.
 pub fn db_put_treasury_balance(
     tx: &Transaction,
     hash: &Hash,
+    height: u32,
     ts: &TreasuryState,
 ) -> Result<(), ChainDbError> {
     let serialized = serialize_treasury_state(ts).map_err(ChainDbError::Corrupt)?;
@@ -240,21 +245,22 @@ pub fn db_put_treasury_balance(
     let bucket = meta
         .bucket(TREASURY_BUCKET_NAME)
         .ok_or_else(|| ChainDbError::Corrupt("missing treasury bucket".into()))?;
-    Ok(bucket.put(&hash.0, &serialized)?)
+    Ok(bucket.put(&block_row_key(hash, height), &serialized)?)
 }
 
-/// Fetch a treasury state row when present (dcrd
+/// Fetch a block's treasury state row when present (dcrd
 /// `dbFetchTreasuryBalance`; a missing row is `None` rather than
 /// dcrd's typed error).
 pub fn db_fetch_treasury_balance(
     tx: &Transaction,
     hash: &Hash,
+    height: u32,
 ) -> Result<Option<TreasuryState>, ChainDbError> {
     let meta = tx.metadata();
     let bucket = meta
         .bucket(TREASURY_BUCKET_NAME)
         .ok_or_else(|| ChainDbError::Corrupt("missing treasury bucket".into()))?;
-    match bucket.get(&hash.0) {
+    match bucket.get(&block_row_key(hash, height)) {
         None => Ok(None),
         Some(v) => Ok(Some(
             deserialize_treasury_state(&v).map_err(ChainDbError::Corrupt)?,

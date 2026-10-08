@@ -21,6 +21,7 @@ is the point of this file.
 | id | CPU | cores/threads | RAM | disk |
 |---|---|---|---|---|
 | m1 | AMD Ryzen AI MAX+ 395 | 16/32 | 64 GB | WD PC SN5000S 1 TB NVMe |
+| m2 | x86_64, a container on a larger host | 4 CPUs for the node, one for the dcrd server and harness | not recorded | ZFS mirror of QLC NVMe drives (recordsize 128K, compression on) |
 
 Hardware was not recorded when the 2026-07 campaign ran; its rows are
 attributed to m1 as the only bench host to date, with specs read on
@@ -1678,3 +1679,54 @@ next experiment on this thread.
 > setting now flush a smaller overlay than the one measured here. The +12.7%
 > and the 130 → 119 flush counts describe the old accounting; re-measure
 > before quoting them for current master.
+
+## Height-first per-block keys (2026-10-07 and 2026-10-08)
+
+The arm [ADR-0010](adr/0010-height-first-block-keys.md) shipped: the seven
+buckets that gain a row per block keyed by big-endian height first, chain
+database version 15. Machine m2, the node on four cores syncing mainnet over
+loopback from a dcrd `6f6cf21b` block server that holds a frozen chain to
+1,116,035 (`--connect` to it, `--nolisten`, `--noseeders`, RPC on loopback
+for the harness's height polls, `DCROXIDE_DB_FLUSHLOG` set, defaults
+otherwise, so the exists-address index is on). Base is
+`5559002`; the arm is `5559002` with the re-keying, the change this section
+lands with. Each arm's tail runs start from its own snapshot at about
+916,000, taken by the arm itself, since the two layouts cannot open each
+other's directories. Tail runs of both arms were interleaved over about 22
+hours with other arms between them.
+
+| arm | runs | blk/s (median, range) | node bytes written, median | CPU time, median |
+|---|---:|---|---:|---:|
+| base, tail 916,041 → 1,116,035 | 5 | **78.1** (72.1–81.6) | 151.6 GB | 1,673 s |
+| re-keyed, tail ~916,050 → 1,116,035 | 4 | **98.5** (95.3–108.1) | 136.6 GB | 1,546 s |
+| base, genesis → 916,261 | 1 | **193.0** (4,747.8 s) | 274.2 GB | 2,147 s |
+| re-keyed, genesis → 916,042 | 1 | **336.6** (2,721.6 s) | 235.0 GB | 1,767 s |
+| dcrd `6f6cf21b`, genesis → 916,233 | 1 | **472.4** (1,939.5 s) | 238.7 GB | 3,005 s |
+
+**+26% on the tail and 1.74x from genesis.** Every re-keyed tail run is faster
+than every base run, and the gap is well outside this storage's noise: five-run
+base calibrations on it spread 15–20% in blk/s (a standard deviation of about
+7%), while bytes written varied by at most 3% from run to run and CPU time by
+at most about 2% (5% in one calibration taken while other virtual machines
+shared the node's cores), which is why the campaign judged arms by repeated,
+interleaved runs and by bytes rather than by any one run. The node wrote 10%
+fewer bytes on the tail, several times that byte jitter, and 14% fewer from
+genesis, and it used 8% and 18% less CPU time. The data directory did not grow: 24.98 GB against
+24.96 at about 916,000, and 33.22–33.33 GB against base's 33.26 at the tip
+(one base run measured 33.50). That answers a prediction made before the
+runs, that appending at each bucket's right edge would leave half-full leaves
+(redb splits a full leaf at its midpoint) and cost some size; at this scale
+it does not show.
+
+Read the genesis rows as n=1 each. Read every absolute against this machine
+only: its storage treats this write pattern very differently from m1's, and
+dcrd syncs 2.45x as fast as base here from genesis where m1 measured 1.29x in
+2026-08. Only the within-session comparison is valid.
+
+Raw: the campaign's `runs.jsonl` rows labelled `flush-base`, `flush-base
+noisy`, `flush-rekey` and `genesis`, with per-run samples (height, core
+clocks, load, pressure) and per-flush logs (`DCROXIDE_DB_FLUSHLOG`). The fifth
+base tail run carries the `noisy` flag because the host's load average was
+1.98, over the harness's 1.5 quiet threshold, when its 15-minute wait for a
+quiet host ran out. It is kept: its 76.45 blk/s falls inside the other four
+runs' range, and the base median and range are the same with or without it.

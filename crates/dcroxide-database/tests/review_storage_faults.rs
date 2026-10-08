@@ -556,13 +556,15 @@ fn store_block_raw_rejects_a_short_block_and_a_mismatched_hash() {
         .expect_err("a hash that is not the header's");
     assert_eq!(err.kind, ErrorKind::DriverSpecific, "{err}");
 
-    // The well-formed pair still stores and reads back.
+    // The well-formed pair still stores and reads back, under the height
+    // its header records (bytes 128..132, all 2s).
     let hash = hash_h(&raw[..180]);
+    let height = 0x0202_0202;
     db.update(|tx| tx.store_block_raw(&hash, raw.clone()))
         .expect("store");
     db.view(|tx| {
-        assert_eq!(tx.fetch_block(&hash)?, raw);
-        assert_eq!(tx.fetch_block_header(&hash)?, raw[..180].to_vec());
+        assert_eq!(tx.fetch_block(&hash, height)?, raw);
+        assert_eq!(tx.fetch_block_header(&hash, height)?, raw[..180].to_vec());
         Ok(())
     })
     .expect("read back");

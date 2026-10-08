@@ -24,9 +24,12 @@
 // The measurement mirrors `dcroxide-bench redbstat --buckets` so the two
 // sides are directly comparable: iterate every key/value pair, attribute it
 // to a bucket by ffldb's four-byte bucket-id prefix, and sum key plus value
-// bytes. ffldb's layout is the one dcroxide ports exactly — `bidx` +
+// bytes. ffldb's bucket layout is the one dcroxide ports — `bidx` +
 // parent id + name for the bucket index, bucket id + key for data — so the
-// same attribution applies to both.
+// same attribution applies to both. The keys inside seven per-block buckets
+// are not dcrd's: since chain database version 15 (ADR-0010) dcroxide keys
+// them by big-endian height first, which adds four bytes to every key of
+// five of them, so those buckets' sums no longer match dcrd's to the byte.
 //
 // The UTXO set lives in a separate goleveldb (`utxodb`) that is not
 // bucketized; it is summed whole.

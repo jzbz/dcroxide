@@ -67,7 +67,11 @@ fn import_export_round_trip() {
 
     // Enough blocks to span several import batches.
     let blocks: Vec<MsgBlock> = (0..600).map(|_| make_block(&mut rng)).collect();
-    let hashes: Vec<Hash> = blocks.iter().map(|b| b.header.block_hash()).collect();
+    // Each hash with the height that keys the block's index row.
+    let hashes: Vec<(Hash, u32)> = blocks
+        .iter()
+        .map(|b| (b.header.block_hash(), b.header.height))
+        .collect();
     let stream = bootstrap_bytes(&blocks, NET);
 
     // Import stores every block.
@@ -100,7 +104,7 @@ fn import_export_round_trip() {
     assert_eq!(exported, stream);
 
     // Exporting an unknown hash errors with ErrBlockNotFound.
-    let unknown = [Hash([0x77; 32])];
+    let unknown = [(Hash([0x77; 32]), 0)];
     assert_eq!(
         db.export_blocks(&mut Vec::new(), NET, &unknown)
             .err()

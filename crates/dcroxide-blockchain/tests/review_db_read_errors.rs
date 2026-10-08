@@ -25,7 +25,9 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use dcroxide_blockchain::RuleErrorKind;
-use dcroxide_blockchain::chaindb::{GCS_FILTER_BUCKET_NAME, HEADER_CMTS_BUCKET_NAME};
+use dcroxide_blockchain::chaindb::{
+    GCS_FILTER_BUCKET_NAME, HEADER_CMTS_BUCKET_NAME, block_row_key,
+};
 use dcroxide_blockchain::process::Chain;
 use dcroxide_chaincfg::{Params, regnet_params};
 use dcroxide_chainhash::Hash;
@@ -108,13 +110,16 @@ fn damage_in_file(path: &Path, raw: &[u8]) -> bool {
 
 /// Replace a block's row in a chain database bucket.
 fn set_row(chain: &Chain, bucket: &[u8], hash: &Hash, row: &[u8]) {
+    // The row is keyed by the block's height and hash.
+    let node = chain.index.lookup_node(hash).expect("indexed block");
+    let key = block_row_key(hash, chain.store.node(node).height as u32);
     chain
         .db
         .as_ref()
         .expect("db")
         .update(|tx| {
             let meta = tx.metadata();
-            meta.bucket(bucket).expect("bucket").put(&hash.0, row)
+            meta.bucket(bucket).expect("bucket").put(&key, row)
         })
         .expect("rewrite the row");
 }

@@ -21,7 +21,7 @@ use std::collections::HashMap;
 
 use dcroxide_blockchain::RuleErrorKind;
 use dcroxide_blockchain::blockindex::BlockStatus;
-use dcroxide_blockchain::chaindb::TREASURY_BUCKET_NAME;
+use dcroxide_blockchain::chaindb::{TREASURY_BUCKET_NAME, block_row_key};
 use dcroxide_blockchain::process::Chain;
 use dcroxide_blockchain::treasurydb::{db_fetch_treasury_balance, serialize_treasury_state};
 use dcroxide_chaincfg::{Params, simnet_params};
@@ -158,9 +158,11 @@ fn treasury_verdicts_hold_with_the_mirror_pruned_to_two_blocks() {
             "trow" => {
                 // The row itself, read where it now lives.
                 let hash = parse_hash(f[1]);
+                let node = chain.index.lookup_node(&hash).expect("indexed block");
+                let height = chain.store.node(node).height as u32;
                 let db = chain.db.as_ref().expect("db-backed");
                 let tx = db.begin(false).expect("begin read");
-                let ts = db_fetch_treasury_balance(&tx, &hash)
+                let ts = db_fetch_treasury_balance(&tx, &hash, height)
                     .expect("read")
                     .expect("treasury state row");
                 tx.rollback().expect("rollback");
@@ -221,7 +223,10 @@ fn a_corrupt_treasury_row_below_the_window_fails_the_expenditure_check() {
         !chain.treasury_state.contains_key(&victim_hash.0),
         "the damaged row must be read from the database"
     );
-    let damage = |chain: &Chain, hash: Hash| {
+    // The row lives under the block's height and hash.
+    let damage = |chain: &Chain, node| {
+        let n = chain.store.node(node);
+        let key = block_row_key(&n.hash, n.height as u32);
         chain
             .db
             .as_ref()
@@ -230,11 +235,11 @@ fn a_corrupt_treasury_row_below_the_window_fails_the_expenditure_check() {
                 tx.metadata()
                     .bucket(TREASURY_BUCKET_NAME)
                     .expect("treasury bucket")
-                    .put(&hash.0, &[])
+                    .put(&key, &[])
             })
             .expect("damage the row");
     };
-    damage(&chain, victim_hash);
+    damage(&chain, victim);
 
     let err = chain
         .max_treasury_expenditure(node, &params)
@@ -259,7 +264,7 @@ fn a_corrupt_treasury_row_below_the_window_fails_the_expenditure_check() {
     // the damaged database row is the one read.
     let own = chain.store.node(node).hash;
     chain.treasury_state.remove(&own.0);
-    damage(&chain, own);
+    damage(&chain, node);
     assert_eq!(chain.calculate_treasury_balance(node, &params), 0);
 }
 

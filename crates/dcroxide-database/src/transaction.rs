@@ -3,7 +3,7 @@
 //! store, reproducing the observable semantics of dcrd's ffldb driver
 //! (database/ffldb `db.go`).
 //!
-//! The key layout is ffldb's exactly:
+//! The key layout is ffldb's, with one exception:
 //!
 //! - key/value rows: `<4-byte bucket ID><key>`; the top-level metadata
 //!   bucket has ID `[0, 0, 0, 0]`.
@@ -11,6 +11,12 @@
 //!   the child's 4-byte ID; the internal block index bucket keeps the
 //!   fixed ID `[0, 0, 0, 1]` under the name `ffldb-blockidx`.
 //! - the current bucket ID counter lives at the raw key `bidx-cbid`.
+//! - the exception: a block's row in the internal block index is keyed
+//!   by its big-endian height and then its hash, where ffldb uses the
+//!   hash alone, so the block lookups take the height beside the hash.
+//!   `block_idx_key` is the one encoder of that key, and
+//!   `serialized_block_height` the one reader of a stored block's
+//!   height; see ADR-0010.
 //!
 //! Because bucket IDs are assigned sequentially from 1 and `bidx`
 //! begins with 0x62, a full-bucket cursor observes all key/value rows
@@ -54,8 +60,55 @@ pub(crate) const BLOCK_IDX_BUCKET_NAME: &[u8] = b"ffldb-blockidx";
 /// block the header occupies (dcrd `blockHdrSize`).
 const BLOCK_HDR_SIZE: usize = 180;
 
+/// Where a serialized block header keeps its little-endian height: after
+/// the version (4 bytes), the previous block, merkle and stake roots (32
+/// each), the vote bits (2), final state (6), voters (2), fresh stake
+/// (1), revocations (1), pool size (4), bits (4) and stake difficulty
+/// (8) (dcrd `wire.BlockHeader`).
+const BLOCK_HDR_HEIGHT_OFFSET: usize = 128;
+
+/// The height a serialized block's header records, or `None` when the
+/// bytes are too short to hold it.  This is the height
+/// [`block_idx_key`] files a block under when only its bytes are at
+/// hand ([`Transaction::store_block_raw`]).
+pub(crate) fn serialized_block_height(raw: &[u8]) -> Option<u32> {
+    let end = BLOCK_HDR_HEIGHT_OFFSET.checked_add(4)?;
+    let bytes: [u8; 4] = raw.get(BLOCK_HDR_HEIGHT_OFFSET..end)?.try_into().ok()?;
+    Some(u32::from_le_bytes(bytes))
+}
+
+/// The raw key of a block's row in the internal block index bucket: the
+/// bucket ID, the block's height big-endian, then its hash.
+///
+/// ffldb keys the row by the hash alone (`ffldb/db.go:1142`, `:1239`,
+/// `:1717`), which scatters the blocks of one metadata flush over the
+/// whole bucket: redb copies one cold leaf, and its branch path, per
+/// block.  Height first files consecutive blocks side by side, so a
+/// flush appends at the bucket's right edge instead, as dcrd's own
+/// `blockidxv3` key does (`blockIndexKey`).  The hash follows so blocks
+/// at one height stay apart.  The cost is that every lookup takes the
+/// block's height beside its hash; every caller has it, from the block
+/// index node or the block's own header, and a lookup under any other
+/// height finds nothing.  The layout is dcroxide's own, and the chain
+/// database's version records it
+/// (`dcroxide_blockchain::chaindb::CURRENT_DATABASE_VERSION`, ADR-0010).
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "constant lengths: 4 + 4 + 32 = 40"
+)]
+fn block_idx_key(hash: &Hash, height: u32) -> Vec<u8> {
+    let mut out = Vec::with_capacity(BLOCK_IDX_BUCKET_ID.len() + 4 + hash.0.len());
+    out.extend_from_slice(&BLOCK_IDX_BUCKET_ID);
+    out.extend_from_slice(&height.to_be_bytes());
+    out.extend_from_slice(&hash.0);
+    out
+}
+
 /// A particular region of a block, identified by hash, offset, and
-/// length (dcrd `BlockRegion`).
+/// length (dcrd `BlockRegion`).  Reading one also takes the block's
+/// height, which keys the block's index row, as a separate argument
+/// (see [`Transaction::fetch_block_region`]): a transaction index entry
+/// carries a region and no height.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct BlockRegion {
     /// The hash of the block the region is part of.
@@ -175,10 +228,10 @@ struct TxState {
     /// table root keeps opening from cache while every uncached page
     /// returns `PreviousIo`, for the rest of the process.
     table: Option<redb::ReadOnlyTable<&'static [u8], &'static [u8]>>,
-    /// Blocks buffered by `store_block` to be written on commit, plus
-    /// an index over them by hash (dcrd `pendingBlocks` /
-    /// `pendingBlockData`).
-    pending_blocks: Vec<(Hash, Vec<u8>)>,
+    /// Blocks buffered by `store_block` to be written on commit, each
+    /// with the height that keys its index row, plus an index over them
+    /// by hash (dcrd `pendingBlocks` / `pendingBlockData`).
+    pending_blocks: Vec<(Hash, u32, Vec<u8>)>,
     pending_index: HashMap<[u8; 32], usize>,
     /// Metadata puts buffered until commit (dcrd `pendingKeys`).
     pending_keys: std::collections::BTreeMap<Vec<u8>, Vec<u8>>,
@@ -604,11 +657,11 @@ impl Transaction {
     // Block storage (dcrd Tx block APIs).
     // ------------------------------------------------------------------
 
-    fn has_block_internal(&self, hash: &Hash) -> bool {
-        if self.state.borrow().pending_index.contains_key(&hash.0) {
+    fn has_block_internal(&self, hash: &Hash, height: u32) -> bool {
+        if self.pending_block_index(hash, height).is_some() {
             return true;
         }
-        self.has_raw(&bucketized_key(BLOCK_IDX_BUCKET_ID, &hash.0))
+        self.has_raw(&block_idx_key(hash, height))
     }
 
     /// Store the provided block (dcrd `StoreBlock`).  The block is
@@ -617,7 +670,11 @@ impl Transaction {
         // A serialization is a whole header by construction and the hash
         // is that header's, so nothing needs checking; the bytes are
         // moved into the pending set rather than copied a second time.
-        self.store_block_with(&block.header.block_hash(), || Ok(block.serialize()))
+        self.store_block_with(
+            &block.header.block_hash(),
+            Some(block.header.height),
+            || Ok(block.serialize()),
+        )
     }
 
     /// Store a block given its hash and raw serialized bytes; the raw
@@ -631,8 +688,13 @@ impl Transaction {
     /// mistake fails with [`ErrorKind::DriverSpecific`] -- the kind
     /// `StoreBlock` gives a block whose bytes it cannot get -- rather
     /// than panicking at commit or filing the block under another hash.
+    ///
+    /// The index row is keyed by the height the header records.  Bytes
+    /// too short to record one cannot be looked up, so they skip the
+    /// existence check and fail on their length.
     pub fn store_block_raw(&self, hash: &Hash, raw: Vec<u8>) -> Result<(), Error> {
-        self.store_block_with(hash, || {
+        let height = serialized_block_height(&raw);
+        self.store_block_with(hash, height, || {
             if raw.len() < BLOCK_HDR_SIZE {
                 return Err(db_error(
                     ErrorKind::DriverSpecific,
@@ -656,10 +718,15 @@ impl Transaction {
     /// The body of [`Self::store_block`] and [`Self::store_block_raw`],
     /// in dcrd `StoreBlock`'s order: the transaction checks and the
     /// existence check, and only then the block's bytes (dcrd
-    /// `block.Bytes()`, whose failure is `ErrDriverSpecific`).
+    /// `block.Bytes()`, whose failure is `ErrDriverSpecific`).  `height`
+    /// is the one the block's header records, for the existence check;
+    /// it is `None` only for bytes that `bytes` refuses as too short to
+    /// hold a header.  The row is filed under the height the stored
+    /// bytes record.
     fn store_block_with(
         &self,
         hash: &Hash,
+        height: Option<u32>,
         bytes: impl FnOnce() -> Result<Vec<u8>, Error>,
     ) -> Result<(), Error> {
         self.check_closed()?;
@@ -671,79 +738,103 @@ impl Transaction {
         }
 
         // Reject the block if it already exists (pending or stored).
-        if self.has_block_internal(hash) {
+        if let Some(height) = height
+            && self.has_block_internal(hash, height)
+        {
             return Err(db_error(
                 ErrorKind::BlockExists,
                 format!("block {hash} already exists"),
             ));
         }
         let raw = bytes()?;
+        // `bytes` refuses anything shorter than a header, and a header
+        // records its height, so this error is never reached.
+        let height = serialized_block_height(&raw).ok_or_else(|| {
+            db_error(
+                ErrorKind::DriverSpecific,
+                format!("block {hash} is too short to record its height"),
+            )
+        })?;
 
         let mut state = self.state.borrow_mut();
         let idx = state.pending_blocks.len();
-        state.pending_blocks.push((*hash, raw));
+        state.pending_blocks.push((*hash, height, raw));
         state.pending_index.insert(hash.0, idx);
         Ok(())
     }
 
-    /// Whether a block with the given hash exists (dcrd `HasBlock`).
-    pub fn has_block(&self, hash: &Hash) -> Result<bool, Error> {
+    /// Whether a block with the given hash and height exists (dcrd
+    /// `HasBlock`).  The height keys the block's index row, so under any
+    /// height but its own a stored block answers `false`.
+    pub fn has_block(&self, hash: &Hash, height: u32) -> Result<bool, Error> {
         self.check_closed()?;
-        Ok(self.has_block_internal(hash))
+        Ok(self.has_block_internal(hash, height))
     }
 
-    /// Whether each of the blocks with the provided hashes exists (dcrd
-    /// `HasBlocks`).
-    pub fn has_blocks(&self, hashes: &[Hash]) -> Result<Vec<bool>, Error> {
+    /// Whether each of the blocks with the provided hashes and heights
+    /// exists (dcrd `HasBlocks`).
+    pub fn has_blocks(&self, blocks: &[(Hash, u32)]) -> Result<Vec<bool>, Error> {
         self.check_closed()?;
-        Ok(hashes.iter().map(|h| self.has_block_internal(h)).collect())
+        Ok(blocks
+            .iter()
+            .map(|(hash, height)| self.has_block_internal(hash, *height))
+            .collect())
     }
 
-    fn fetch_block_row(&self, hash: &Hash) -> Result<Vec<u8>, Error> {
-        self.fetch_raw(&bucketized_key(BLOCK_IDX_BUCKET_ID, &hash.0))
-            .ok_or_else(|| {
-                db_error(
-                    ErrorKind::BlockNotFound,
-                    format!("block {hash} does not exist"),
-                )
-            })
+    fn fetch_block_row(&self, hash: &Hash, height: u32) -> Result<Vec<u8>, Error> {
+        self.fetch_raw(&block_idx_key(hash, height)).ok_or_else(|| {
+            db_error(
+                ErrorKind::BlockNotFound,
+                format!("block {hash} does not exist"),
+            )
+        })
     }
 
-    fn pending_block_bytes(&self, hash: &Hash) -> Option<Vec<u8>> {
+    /// The position in the pending set of the block with the given hash
+    /// and height, when this transaction stored it.
+    fn pending_block_index(&self, hash: &Hash, height: u32) -> Option<usize> {
         let state = self.state.borrow();
         let idx = *state.pending_index.get(&hash.0)?;
-        Some(state.pending_blocks[idx].1.clone())
+        (state.pending_blocks[idx].1 == height).then_some(idx)
+    }
+
+    fn pending_block_bytes(&self, hash: &Hash, height: u32) -> Option<Vec<u8>> {
+        let idx = self.pending_block_index(hash, height)?;
+        Some(self.state.borrow().pending_blocks[idx].2.clone())
     }
 
     /// The raw serialized bytes of the block header for the given hash
-    /// (dcrd `FetchBlockHeader`).  Headers are read from the block
-    /// index row, never the flat files.
-    pub fn fetch_block_header(&self, hash: &Hash) -> Result<Vec<u8>, Error> {
+    /// and height (dcrd `FetchBlockHeader`).  Headers are read from the
+    /// block index row, never the flat files.
+    pub fn fetch_block_header(&self, hash: &Hash, height: u32) -> Result<Vec<u8>, Error> {
         self.check_closed()?;
-        if let Some(bytes) = self.pending_block_bytes(hash) {
+        if let Some(bytes) = self.pending_block_bytes(hash, height) {
             return Ok(bytes[..BLOCK_HDR_SIZE].to_vec());
         }
-        let row = self.fetch_block_row(hash)?;
+        let row = self.fetch_block_row(hash, height)?;
         if row.len() < BLOCK_LOC_SIZE + BLOCK_HDR_SIZE {
             return Err(db_error(ErrorKind::Corruption, "corrupt block index row"));
         }
         Ok(row[BLOCK_LOC_SIZE..BLOCK_LOC_SIZE + BLOCK_HDR_SIZE].to_vec())
     }
 
-    /// The raw block headers for the given hashes (dcrd
+    /// The raw block headers for the given hashes and heights (dcrd
     /// `FetchBlockHeaders`).
-    pub fn fetch_block_headers(&self, hashes: &[Hash]) -> Result<Vec<Vec<u8>>, Error> {
-        hashes.iter().map(|h| self.fetch_block_header(h)).collect()
+    pub fn fetch_block_headers(&self, blocks: &[(Hash, u32)]) -> Result<Vec<Vec<u8>>, Error> {
+        blocks
+            .iter()
+            .map(|(hash, height)| self.fetch_block_header(hash, *height))
+            .collect()
     }
 
-    /// The raw serialized bytes for the block with the given hash (dcrd
-    /// `FetchBlock`).
-    pub fn fetch_block(&self, hash: &Hash) -> Result<Vec<u8>, Error> {
+    /// The raw serialized bytes for the block with the given hash and
+    /// height (dcrd `FetchBlock`).
+    pub fn fetch_block(&self, hash: &Hash, height: u32) -> Result<Vec<u8>, Error> {
         self.check_closed()?;
-        if let Some(bytes) = self.pending_block_bytes(hash) {
+        if let Some(bytes) = self.pending_block_bytes(hash, height) {
             return Ok(bytes);
         }
-        let row = self.fetch_block_row(hash)?;
+        let row = self.fetch_block_row(hash, height)?;
         let loc = BlockLocation::deserialize(&row[..BLOCK_LOC_SIZE]);
         // Only the handle is taken under the store lock; the read runs
         // after it is released, as dcrd's `ReadAt` runs under the file's
@@ -757,19 +848,22 @@ impl Transaction {
         reader.read_block(loc)
     }
 
-    /// The raw serialized bytes for the blocks with the given hashes
-    /// (dcrd `FetchBlocks`).
-    pub fn fetch_blocks(&self, hashes: &[Hash]) -> Result<Vec<Vec<u8>>, Error> {
-        hashes.iter().map(|h| self.fetch_block(h)).collect()
+    /// The raw serialized bytes for the blocks with the given hashes and
+    /// heights (dcrd `FetchBlocks`).
+    pub fn fetch_blocks(&self, blocks: &[(Hash, u32)]) -> Result<Vec<Vec<u8>>, Error> {
+        blocks
+            .iter()
+            .map(|(hash, height)| self.fetch_block(hash, *height))
+            .collect()
     }
 
-    /// The raw bytes of the given block region (dcrd
+    /// The raw bytes of the given region of the block at `height` (dcrd
     /// `FetchBlockRegion`).
-    pub fn fetch_block_region(&self, region: &BlockRegion) -> Result<Vec<u8>, Error> {
+    pub fn fetch_block_region(&self, region: &BlockRegion, height: u32) -> Result<Vec<u8>, Error> {
         self.check_closed()?;
 
         // Pending blocks are served straight from the buffered bytes.
-        if let Some(bytes) = self.pending_block_bytes(&region.hash) {
+        if let Some(bytes) = self.pending_block_bytes(&region.hash, height) {
             let end = region.offset.checked_add(region.len);
             match end {
                 #[allow(
@@ -796,7 +890,7 @@ impl Transaction {
             }
         }
 
-        let row = self.fetch_block_row(&region.hash)?;
+        let row = self.fetch_block_row(&region.hash, height)?;
         let loc = BlockLocation::deserialize(&row[..BLOCK_LOC_SIZE]);
 
         // Ensure the region is within the bounds of the block.  dcrd
@@ -827,10 +921,16 @@ impl Transaction {
         reader.read_block_region(loc, region.offset, region.len)
     }
 
-    /// The raw bytes of the given block regions (dcrd
-    /// `FetchBlockRegions`).
-    pub fn fetch_block_regions(&self, regions: &[BlockRegion]) -> Result<Vec<Vec<u8>>, Error> {
-        regions.iter().map(|r| self.fetch_block_region(r)).collect()
+    /// The raw bytes of the given block regions, each with the height of
+    /// its block (dcrd `FetchBlockRegions`).
+    pub fn fetch_block_regions(
+        &self,
+        regions: &[(BlockRegion, u32)],
+    ) -> Result<Vec<Vec<u8>>, Error> {
+        regions
+            .iter()
+            .map(|(region, height)| self.fetch_block_region(region, *height))
+            .collect()
     }
 
     // ------------------------------------------------------------------
@@ -898,7 +998,7 @@ impl Transaction {
         // then commit it.  A crash between the file writes and the
         // metadata commit leaves orphaned file bytes which are
         // reconciled away on the next open, matching dcrd's ordering.
-        let pending: Vec<(Hash, Vec<u8>)> =
+        let pending: Vec<(Hash, u32, Vec<u8>)> =
             std::mem::take(&mut self.state.borrow_mut().pending_blocks);
         let rollback_pos = {
             let store = self.db.block_store.lock().expect("store lock");
@@ -909,19 +1009,20 @@ impl Transaction {
             let mut locations = Vec::with_capacity(pending.len());
             {
                 let mut store = self.db.block_store.lock().expect("store lock");
-                for (hash, bytes) in &pending {
+                for (hash, height, bytes) in &pending {
                     let loc = store.write_block(bytes)?;
-                    locations.push((*hash, loc, bytes));
+                    locations.push((*hash, *height, loc, bytes));
                 }
                 // The metadata cache flush syncs the files; per-
                 // commit syncing is gone with it (dcrd ffldb).
 
-                // Stage the block index rows: location || header.
-                for (hash, loc, bytes) in &locations {
+                // Stage the block index rows: location || header, keyed
+                // by height || hash.
+                for (hash, height, loc, bytes) in &locations {
                     let mut row = Vec::with_capacity(BLOCK_LOC_SIZE + BLOCK_HDR_SIZE);
                     row.extend_from_slice(&loc.serialize());
                     row.extend_from_slice(&bytes[..BLOCK_HDR_SIZE]);
-                    self.put_raw(bucketized_key(BLOCK_IDX_BUCKET_ID, &hash.0), &row)?;
+                    self.put_raw(block_idx_key(hash, *height), &row)?;
                 }
 
                 // Stage the new write cursor position.
@@ -1729,5 +1830,90 @@ impl Cursor<'_> {
             return None;
         }
         self.tx.fetch_raw(raw)
+    }
+}
+
+#[cfg(test)]
+mod block_idx_key_tests {
+    use dcroxide_chainhash::Hash;
+    use dcroxide_wire::BlockHeader;
+
+    use super::{BLOCK_IDX_BUCKET_ID, block_idx_key, serialized_block_height};
+
+    /// The key is the bucket ID, the height big-endian, then the hash,
+    /// and it reads back into the same pair.
+    #[test]
+    fn the_key_is_the_bucket_id_the_big_endian_height_and_the_hash() {
+        let hash = Hash(core::array::from_fn(|i| i as u8));
+        for height in [0u32, 1, 255, 256, 0x0102_0304, u32::MAX] {
+            let key = block_idx_key(&hash, height);
+            assert_eq!(key.len(), 40);
+            assert_eq!(key[..4], BLOCK_IDX_BUCKET_ID);
+            assert_eq!(key[4..8], height.to_be_bytes());
+            assert_eq!(key[8..], hash.0);
+            let read = u32::from_be_bytes(key[4..8].try_into().expect("four bytes"));
+            assert_eq!(
+                (read, Hash(key[8..].try_into().expect("a hash"))),
+                (height, hash)
+            );
+        }
+    }
+
+    /// Keys sort by height first and then by hash, whatever order the
+    /// heights' little-endian bytes or the hashes would give.
+    #[test]
+    fn keys_sort_by_height_then_hash() {
+        let low = Hash([0x00; 32]);
+        let high = Hash([0xff; 32]);
+        let mut pairs = vec![
+            (65_536u32, low),
+            (1, high),
+            (256, low),
+            (255, high),
+            (7, high),
+            (7, low),
+            (0, high),
+            (16_777_216, low),
+        ];
+        let mut by_key = pairs.clone();
+        by_key.sort_by_key(|(height, hash)| block_idx_key(hash, *height));
+        pairs.sort();
+        assert_eq!(by_key, pairs);
+    }
+
+    /// The height read from a block's bytes is the one its header
+    /// records, at the offset the wire format puts it.
+    #[test]
+    fn the_stored_height_is_the_one_the_header_records() {
+        for height in [0u32, 1, 0x0102_0304, u32::MAX] {
+            // Every neighbour of the height set to bytes it is not.
+            let header = BlockHeader {
+                version: -1,
+                prev_block: Hash([0x11; 32]),
+                merkle_root: Hash([0x22; 32]),
+                stake_root: Hash([0x33; 32]),
+                vote_bits: u16::MAX,
+                final_state: [0x44; 6],
+                voters: u16::MAX,
+                fresh_stake: u8::MAX,
+                revocations: u8::MAX,
+                pool_size: u32::MAX,
+                bits: u32::MAX,
+                sbits: -1,
+                height,
+                size: 0x5555_5555,
+                timestamp: 0x6666_6666,
+                nonce: u32::MAX,
+                extra_data: [0x77; 32],
+                stake_version: 0x0a0b_0c0d,
+            };
+            let mut raw = header.serialize().to_vec();
+            assert_eq!(serialized_block_height(&raw), Some(height));
+            // Trailing transactions change nothing.
+            raw.extend_from_slice(&[0xee; 64]);
+            assert_eq!(serialized_block_height(&raw), Some(height));
+        }
+        assert_eq!(serialized_block_height(&[0u8; 131]), None);
+        assert_eq!(serialized_block_height(&[]), None);
     }
 }

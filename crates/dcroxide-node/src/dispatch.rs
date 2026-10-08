@@ -1613,8 +1613,9 @@ pub(crate) enum BlockRead {
     /// The block was in the chain's recent in-memory window, shared with
     /// it rather than copied under the lock.
     Cached(Arc<MsgBlock>),
-    /// The block has data, held only by the database.
-    Stored(Option<Database>),
+    /// The block has data, held only by the database, with the height
+    /// that keys it there.
+    Stored(Option<Database>, u32),
 }
 
 impl BlockRead {
@@ -1625,7 +1626,7 @@ impl BlockRead {
         if !chain.index.node_status(&chain.store, node).have_data() {
             return None;
         }
-        Some(BlockRead::at(chain, hash))
+        Some(BlockRead::at(chain, node))
     }
 
     /// Look up the main-chain block at a height under the chain lock,
@@ -1634,28 +1635,29 @@ impl BlockRead {
     pub(crate) fn locate_main_chain(chain: &Chain, height: i64) -> Option<(Hash, BlockRead)> {
         let node = chain.best_chain.node_by_height(height)?;
         let hash = chain.store.node(node).hash;
-        Some((hash, BlockRead::at(chain, &hash)))
+        Some((hash, BlockRead::at(chain, node)))
     }
 
-    /// The recent-window copy of a block, or the database to read it
-    /// from.
-    fn at(chain: &Chain, hash: &Hash) -> BlockRead {
-        match chain.blocks.get(&hash.0) {
+    /// The recent-window copy of a node's block, or the database to
+    /// read it from.
+    fn at(chain: &Chain, node: dcroxide_blockchain::blockindex::NodeId) -> BlockRead {
+        let node = chain.store.node(node);
+        match chain.blocks.get(&node.hash.0) {
             Some(block) => BlockRead::Cached(Arc::clone(block)),
-            None => BlockRead::Stored(chain.db.clone()),
+            None => BlockRead::Stored(chain.db.clone(), node.height as u32),
         }
     }
 
     /// The block, reading the database with no chain lock held (dcrd
     /// `fetchBlockByNode`'s `db.View`).
     pub(crate) fn fetch(self, hash: &Hash) -> Option<MsgBlock> {
-        let db = match self {
+        let (db, height) = match self {
             BlockRead::Cached(block) => return Some(Arc::unwrap_or_clone(block)),
-            BlockRead::Stored(db) => db?,
+            BlockRead::Stored(db, height) => (db?, height),
         };
         let mut found = None;
         let _ = db.view(|tx| {
-            if let Ok(raw) = tx.fetch_block(hash)
+            if let Ok(raw) = tx.fetch_block(hash, height)
                 && let Ok((block, _)) = MsgBlock::from_bytes(&raw)
             {
                 found = Some(block);
@@ -1674,13 +1676,13 @@ impl BlockRead {
     /// what `fetch` would decode and a serialize would re-encode; handing
     /// them over skips both.
     pub(crate) fn fetch_bytes(self, hash: &Hash) -> Option<Vec<u8>> {
-        let db = match self {
+        let (db, height) = match self {
             BlockRead::Cached(block) => return Some(block.serialize()),
-            BlockRead::Stored(db) => db?,
+            BlockRead::Stored(db, height) => (db?, height),
         };
         let mut found = None;
         let _ = db.view(|tx| {
-            found = tx.fetch_block(hash).ok();
+            found = tx.fetch_block(hash, height).ok();
             Ok(())
         });
         found
@@ -1740,6 +1742,8 @@ impl std::fmt::Display for FilterFetchError {
 /// in-memory window held it.
 struct FilterRead {
     hash: Hash,
+    /// The block's height, which keys its rows in the database.
+    height: u32,
     /// The serialized filter, when the window held it.
     filter: Option<Vec<u8>>,
     /// The header commitment leaves, when the window held them.
@@ -1762,9 +1766,9 @@ impl FilterRead {
         };
         if self.filter.is_none() {
             let filter = if raw {
-                db_fetch_raw_gcs_filter(tx, &self.hash).map_err(db_error)?
+                db_fetch_raw_gcs_filter(tx, &self.hash, self.height).map_err(db_error)?
             } else {
-                db_fetch_gcs_filter(tx, &self.hash)
+                db_fetch_gcs_filter(tx, &self.hash, self.height)
                     .map_err(db_error)?
                     .map(|filter| filter.bytes().to_vec())
             };
@@ -1774,7 +1778,8 @@ impl FilterRead {
             self.filter = Some(filter);
         }
         if self.leaves.is_none() {
-            self.leaves = Some(db_fetch_header_commitments(tx, &self.hash).map_err(db_error)?);
+            self.leaves =
+                Some(db_fetch_header_commitments(tx, &self.hash, self.height).map_err(db_error)?);
         }
         Ok(())
     }
@@ -1786,17 +1791,18 @@ fn no_filter(hash: &Hash) -> FilterFetchError {
 }
 
 impl FilterReads {
-    /// The recent-window copies for the given blocks, taken under the
-    /// chain lock.
+    /// The recent-window copies for the given blocks (each hash with its
+    /// height), taken under the chain lock.
     fn from_window(
         chain: &Chain,
-        hashes: impl IntoIterator<Item = Hash>,
+        blocks: impl IntoIterator<Item = (Hash, u32)>,
         raw: bool,
     ) -> FilterReads {
-        let blocks = hashes
+        let blocks = blocks
             .into_iter()
-            .map(|hash| FilterRead {
+            .map(|(hash, height)| FilterRead {
                 hash,
+                height,
                 filter: chain
                     .filters
                     .get(&hash.0)
@@ -1831,17 +1837,18 @@ impl FilterReads {
             return None;
         }
 
-        // Fetch the block hashes for the range by walking parents back
-        // from the end node.
-        let mut hashes = Vec::with_capacity(usize::try_from(nb).unwrap_or(0));
+        // Fetch the block hashes, with their heights, for the range by
+        // walking parents back from the end node.
+        let mut blocks = Vec::with_capacity(usize::try_from(nb).unwrap_or(0));
         let mut node = Some(end_node);
         for _ in 0..nb {
             let id = node.expect("the range is bounded by the ancestor check");
-            hashes.push(chain.store.node(id).hash);
-            node = chain.store.node(id).parent;
+            let n = chain.store.node(id);
+            blocks.push((n.hash, n.height as u32));
+            node = n.parent;
         }
-        hashes.reverse();
-        Some(FilterReads::from_window(chain, hashes, true))
+        blocks.reverse();
+        Some(FilterReads::from_window(chain, blocks, true))
     }
 
     /// The single block of a getcfilterv2 request: `None` when its data,
@@ -1852,7 +1859,8 @@ impl FilterReads {
         if !chain.index.node_status(&chain.store, node).have_data() {
             return None;
         }
-        Some(FilterReads::from_window(chain, [*hash], false))
+        let height = chain.store.node(node).height as u32;
+        Some(FilterReads::from_window(chain, [(*hash, height)], false))
     }
 
     /// The filters with their header commitment inclusion proofs, reading
@@ -4944,7 +4952,7 @@ mod tests {
             let chain = chain.lock().expect("chain mutex");
             assert!(matches!(
                 BlockRead::locate(&chain, &genesis),
-                Some(BlockRead::Stored(Some(_)))
+                Some(BlockRead::Stored(Some(_), 0))
             ));
             assert!(BlockRead::locate_main_chain(&chain, 1).is_none());
             assert!(FilterReads::locate_range(&chain, &Hash([7; 32]), &genesis).is_none());
@@ -5041,18 +5049,181 @@ mod tests {
         assert_eq!(miss.message, want_miss.to_string());
     }
 
+    /// The first `count` main chain blocks of dcrd's full block battery
+    /// connected to a regnet chain over a database, and the main chain's
+    /// hashes, genesis first.
+    fn database_battery_chain(count: usize) -> (tempfile::TempDir, Arc<Mutex<Chain>>, Vec<Hash>) {
+        let params = dcroxide_chaincfg::regnet_params();
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../dcroxide-blockchain/tests/data/fullblock_vectors.txt"
+        );
+        let data = std::fs::read_to_string(path).expect("fullblock vectors");
+        let mut now: i64 = 0;
+        let mut hashes = vec![params.genesis_hash];
+        let mut blocks = Vec::new();
+        for line in data.lines() {
+            let f: Vec<&str> = line.split(' ').collect();
+            match f[0] {
+                "now" => now = f[1].parse().expect("generation time"),
+                "accept" if blocks.len() < count => {
+                    let raw = dcroxide_testutil::unhex(f[4]);
+                    let (block, _) = MsgBlock::from_bytes(&raw).expect("block");
+                    if f[2] == "true" && Some(&block.header.prev_block) == hashes.last() {
+                        hashes.push(block.header.block_hash());
+                        blocks.push(block);
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(blocks.len(), count, "the battery provides the prefix");
+        let dir = tempfile::tempdir().expect("temp dir");
+        let opts = dcroxide_database::Options::new(dir.path().join("blocks"), params.net.0);
+        let db = Database::create(&opts).expect("create database");
+        let mut chain =
+            Chain::open(db, &params, params.assume_valid, false, 0).expect("open chain");
+        for block in &blocks {
+            let (_, errs) = chain.process_block(block, now, &params);
+            assert!(errs.is_empty(), "battery block must accept: {errs:?}");
+        }
+        (dir, Arc::new(Mutex::new(chain)), hashes)
+    }
+
+    /// Filter serving reads a filter and its commitments the window no
+    /// longer holds under the block's own height, which keys both rows
+    /// (ADR-0010), and answers what the window answered: getcfilterv2
+    /// from a peer and over RPC, and getcfsv2 ranges, from genesis and
+    /// from above it.  The genesis-only chain above reads height zero
+    /// alone, where a wrong height would go unnoticed.
+    #[test]
+    fn serving_reads_filters_outside_the_window_under_each_blocks_height() {
+        use dcroxide_rpc::server::RpcFiltererV2;
+
+        let (_dir, chain, hashes) = database_battery_chain(40);
+        // The battery predates header commitments, so give every block a
+        // two-leaf commitments row, in the window and the database, for
+        // the proofs to be read from.
+        {
+            let mut chain = chain.lock().expect("chain mutex");
+            let leaves =
+                |height: usize| vec![Hash([height as u8; 32]), Hash([!(height as u8); 32])];
+            let db = chain.db.clone().expect("a database");
+            db.update(|tx| {
+                for (height, hash) in hashes.iter().enumerate() {
+                    dcroxide_blockchain::chaindb::db_put_header_commitments(
+                        tx,
+                        hash,
+                        height as u32,
+                        &leaves(height),
+                    )
+                    .unwrap_or_else(|e| panic!("commitments for {hash}: {e:?}"));
+                }
+                Ok(())
+            })
+            .expect("write the commitments");
+            for (height, hash) in hashes.iter().enumerate() {
+                chain.header_commitments.insert(hash.0, leaves(height));
+            }
+        }
+
+        // What the window serves.
+        let (want, want_range) = {
+            let chain = chain.lock().expect("chain mutex");
+            let want: Vec<MsgCFilterV2> = hashes
+                .iter()
+                .map(|hash| {
+                    let (filter, proof) = chain.filter_by_block_hash(hash).expect("a filter");
+                    MsgCFilterV2 {
+                        block_hash: *hash,
+                        data: filter.bytes().to_vec(),
+                        proof_index: proof.proof_index,
+                        proof_hashes: proof.proof_hashes,
+                    }
+                })
+                .collect();
+            let tip = hashes.last().expect("a tip");
+            let range = chain
+                .locate_cfilters_v2(&hashes[0], tip)
+                .expect("the range");
+            (want, range.cfilters)
+        };
+        assert!(want.iter().all(|filter| !filter.proof_hashes.is_empty()));
+        assert_eq!(want_range, want, "a range serves what single fetches do");
+
+        // Only the database holds them now.
+        {
+            let mut chain = chain.lock().expect("chain mutex");
+            chain.blocks.clear();
+            chain.filters.clear();
+            chain.header_commitments.clear();
+        }
+        let rpc = crate::rpcrun::NodeRpcFiltererV2::new(Arc::clone(&chain));
+        for (height, (hash, want)) in hashes.iter().zip(&want).enumerate() {
+            let (filter, block, own) = {
+                let chain = chain.lock().expect("chain mutex");
+                (
+                    FilterReads::locate_block(&chain, hash).expect("the block has data"),
+                    BlockRead::locate(&chain, hash).expect("the block has data"),
+                    chain
+                        .filter_by_block_hash(hash)
+                        .expect("the chain's own read"),
+                )
+            };
+            assert!(
+                matches!(block, BlockRead::Stored(Some(_), h) if h as usize == height),
+                "block {hash} is read under height {height}"
+            );
+            assert_eq!(
+                block.fetch(hash).map(|block| block.header.block_hash()),
+                Some(*hash)
+            );
+            assert_eq!(
+                filter.fetch(),
+                Ok(vec![want.clone()]),
+                "getcfilterv2 at {height}"
+            );
+            let proof = rpc.filter_by_block_hash(hash).expect("the RPC filter");
+            assert_eq!(proof.filter_bytes, want.data, "RPC filter at {height}");
+            assert_eq!(
+                proof.proof_hashes, want.proof_hashes,
+                "RPC proof at {height}"
+            );
+            assert_eq!(own.0.bytes(), want.data.as_slice(), "the chain at {height}");
+            assert_eq!(
+                own.1.proof_hashes, want.proof_hashes,
+                "the chain at {height}"
+            );
+        }
+        for (start, end) in [(0, hashes.len() - 1), (17, 29), (39, 40)] {
+            let range = {
+                let chain = chain.lock().expect("chain mutex");
+                FilterReads::locate_range(&chain, &hashes[start], &hashes[end])
+                    .expect("a valid range")
+            };
+            assert_eq!(
+                range.fetch(),
+                Ok(want[start..=end].to_vec()),
+                "getcfsv2 from {start} to {end}"
+            );
+        }
+    }
+
     /// Overwrite a block's row in a chain database bucket, as a disk
     /// fault or an unclean shutdown might leave it.
     fn set_chain_row(chain: &Mutex<Chain>, bucket: &[u8], hash: &Hash, row: &[u8]) {
+        let chain = chain.lock().expect("chain mutex");
+        // The row is keyed by the block's height and hash.
+        let node = chain.index.lookup_node(hash).expect("indexed block");
+        let key =
+            dcroxide_blockchain::chaindb::block_row_key(hash, chain.store.node(node).height as u32);
         chain
-            .lock()
-            .expect("chain mutex")
             .db
             .as_ref()
             .expect("a database")
             .update(|tx| {
                 let meta = tx.metadata();
-                meta.bucket(bucket).expect("bucket").put(&hash.0, row)
+                meta.bucket(bucket).expect("bucket").put(&key, row)
             })
             .expect("rewrite the row");
     }

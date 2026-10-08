@@ -45,6 +45,11 @@ fn raw_block(seed: u8, len: usize) -> (Hash, Vec<u8>) {
     (hash_h(&raw[..HDR]), raw)
 }
 
+/// The height a raw block's header records, which keys its index row.
+fn height(raw: &[u8]) -> u32 {
+    u32::from_le_bytes(raw[128..132].try_into().expect("four bytes"))
+}
+
 /// The on-disk length of a stored record: network, length, block, CRC.
 fn record_len(block_len: usize) -> u64 {
     block_len as u64 + 12
@@ -152,7 +157,7 @@ fn create_rolls_back_block_files_already_in_the_directory() {
     drop(db);
     let db = Database::open(&Options::new(&path, NET)).expect("reopen");
     db.view(|tx| {
-        assert_eq!(tx.fetch_block(&hash)?, raw);
+        assert_eq!(tx.fetch_block(&hash, height(&raw))?, raw);
         Ok(())
     })
     .expect("view");
@@ -248,9 +253,9 @@ fn a_failed_rotation_leaves_a_cursor_the_next_open_accepts() {
 
     let db = Database::open(&opts).expect("the store must reopen: no block data was lost");
     db.view(|tx| {
-        assert_eq!(tx.fetch_block(&a)?, raw_a);
-        assert_eq!(tx.fetch_block(&b)?, raw_b);
-        assert!(!tx.has_block(&c)?);
+        assert_eq!(tx.fetch_block(&a, height(&raw_a))?, raw_a);
+        assert_eq!(tx.fetch_block(&b, height(&raw_b))?, raw_b);
+        assert!(!tx.has_block(&c, height(&raw_c))?);
         Ok(())
     })
     .expect("view");
@@ -301,7 +306,7 @@ fn a_rollback_that_fails_at_open_is_logged_and_the_open_goes_on() {
         "ROLLBACK: Failed to delete block file number 1"
     ));
     db.view(|tx| {
-        assert_eq!(tx.fetch_block(&a)?, raw_a);
+        assert_eq!(tx.fetch_block(&a, height(&raw_a))?, raw_a);
         Ok(())
     })
     .expect("view");
@@ -542,8 +547,8 @@ fn torn_write_child() {
         "the rollback must truncate the torn record"
     );
     db.view(|tx| {
-        assert_eq!(tx.fetch_block(&small)?, raw_small);
-        assert!(!tx.has_block(&big)?);
+        assert_eq!(tx.fetch_block(&small, height(&raw_small))?, raw_small);
+        assert!(!tx.has_block(&big, height(&raw_big))?);
         Ok(())
     })
     .expect("view");

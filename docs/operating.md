@@ -100,39 +100,87 @@ deleted and the first is truncated. Syncing from genesis is the accepted
 default (ADR-0004's C6 stance); `addblock`-format import is the bulk path
 when you already have the blocks.
 
-The same holds if a future release changes the metadata store's on-disk
-format. There is no in-place upgrade. An old directory is *refused*, not
-misread — the node stops with a message naming the format it found and
-telling you to sync again, and it says the chain is not damaged, because
-"this predates the upgrade" and "your disk is failing" want opposite
-reactions from you. No released format change has happened, so nothing on
-disk is in that position today.
+The same holds when dcroxide's own on-disk format changes. There is no
+in-place upgrade. An old directory is *refused*, not misread — the node
+stops with a message naming the format it found and telling you to sync
+again, and it says the chain is not damaged, because "this predates the
+upgrade" and "your disk is failing" want opposite reactions from you.
 
-Budget for it: initial block download runs about **1.29x slower than
-dcrd** — roughly 1.15 hours against dcrd's 0.9 for mainnet from genesis
-on the machine in [bench-ledger.md](bench-ledger.md) — and the chain
-costs more on disk, 33.58 GiB against dcrd's 23.69 GiB at the same tip.
-Both were measured 2026-08-15 under redb 4.1.0, with both daemons
-syncing from one shared dcrd server and the index composition verified
-on each side. They replace 2026-07 figures of 2.2x and 32.06 GiB against
-23.73, taken under redb 2.6.3 with the two nodes syncing from each other
-on one machine — a setup that inflated both arms.
+No release has shipped, so no released directory is in that position, but
+one written by a development build from before 2026-10-08 is: the chain
+database moved from version 14 to version 15, which keys the per-block
+rows by height ([ADR-0010](adr/0010-height-first-block-keys.md)). Started
+on such a directory, the node exits with status 1 and leaves every row of
+the database as it found it (opening and closing the database file can
+still rewrite the file itself), and logs (here for mainnet on Linux, with
+the home directory shortened to `~`):
 
-Treat 1.29x as an upper bound on the gap rather than a precise ratio:
-the two arms ran about 12 hours apart under different background load,
-once each. What is not in doubt is the direction — the port has roughly
-halved its distance to dcrd since 2026-07 — and that it does the work at
-about half dcrd's CPU, 0.76 cores against 1.50. If your host is busy
-with other work, expect the sync to stretch more than dcrd's would.
-Both figures come from syncing over loopback from a local dcrd server, and
-neither has been measured over the internet. There, both daemons request
+```text
+[ERR] DCRD: Unable to start server: the blockchain database in '~/.dcroxide/data/mainnet/blocks_ffldb' is version 14, which an older dcroxide wrote, and this version of the software reads only version 15 -- there is no in-place upgrade, and the chain is not damaged: delete '~/.dcroxide/data/mainnet/blocks_ffldb' and start again to build a new one from genesis (see docs/operating.md)
+```
+
+`addblock` stops the same way, with `[ERR] MAIN: Failed create block
+importer:` in front of the same text. To recover:
+
+1. Stop everything using that directory: the node, its supervisor's
+   restart loop, and any `addblock` run.
+2. Delete the directory the message names, and only that one. It is the
+   block database, `blocks_ffldb` under the network's data directory
+   (`--datadir` plus the network name; see the identity table below), and
+   it holds the chain and the transaction and exists-address indexes.
+   Everything else keeps working and should stay: `dcroxide.conf`,
+   `rpc.cert` and `rpc.key` in the home directory, and the other networks'
+   directories beside this one.
+3. Start the node again. It creates a new database and syncs from genesis,
+   rebuilding the indexes you have enabled, so budget the time an initial
+   sync takes (below). If you already have the blocks in `addblock`'s
+   bootstrap format, importing them with `addblock` is the faster path.
+
+The other direction is refused too. A build from before the change,
+started on a directory a current build wrote, stops with "the current
+blockchain database is no longer compatible with this version of the
+software (15 > 14)". Run a current build on it, or give the old build a
+directory of its own. Every start that opens the chain logs its version
+under CHAN, "Blockchain database version info: chain: 15, ...", where
+dcrd prints "chain: 14": the one place the number shows, and the
+difference is expected.
+
+Budget for it: initial block download runs slower than dcrd's, by a
+factor that depends heavily on the storage underneath. On machine m1 in
+[bench-ledger.md](bench-ledger.md), with a single NVMe drive, it ran
+about **1.29x slower than dcrd** — roughly 1.15 hours against dcrd's 0.9
+for mainnet from genesis — and the chain cost more on disk, 33.58 GiB
+against dcrd's 23.69 GiB at the same tip. Both were measured 2026-08-15
+under redb 4.1.0, before the 2026-10-08 height-first keys, with both
+daemons syncing from one shared dcrd server and the index composition
+verified on each side. They replace 2026-07 figures of 2.2x and 32.06 GiB
+against 23.73, taken under redb 2.6.3 with the two nodes syncing from
+each other on one machine — a setup that inflated both arms.
+
+On slower storage the gap is wider. On m2, a ZFS mirror of QLC NVMe
+drives, dcrd synced from genesis to block 916,000 **2.45x** as fast as
+dcroxide did before the height-first keys and **1.40x** as fast as it
+does with them (one run each; bench-ledger.md, "Height-first per-block
+keys"). The keys left the data directory's size unchanged there, and
+they have not been measured on m1.
+
+Treat 1.29x as a rough figure for fast local storage rather than a
+precise ratio, and not as a bound: on m1 the two arms ran about 12 hours
+apart under different background load, once each, and m2 measured gaps
+well above it. What is not in doubt is the direction — the port has
+roughly halved its distance to dcrd on m1 since 2026-07 — and that it
+does the work at less CPU than dcrd: 0.76 cores against 1.50 on m1. If
+your host is busy with other work, or its storage is slower than m1's,
+expect the sync to stretch more than dcrd's would.
+All of these come from syncing over loopback from a local dcrd server,
+and none has been measured over the internet. There, both daemons request
 blocks the same way: through dcrd's window of at most 16 blocks in flight,
 refilled once fewer than 10 remain, from the sync peer only. By that window
 arithmetic (a prediction, not a measurement), once the round trip to the
 sync peer exceeds about nine blocks' processing time, roughly 34 ms for
-dcroxide and 26 ms for dcrd on the bench-ledger machine, the sync should
-wait on the network at about 9-16 blocks per round trip, and the gap between
-the two should narrow toward 1x as latency grows. Budget from your link's
+dcroxide and 26 ms for dcrd on m1, the sync should wait on the network
+at about 9-16 blocks per round trip, and the gap between the two should
+narrow toward 1x as latency grows. Budget from your link's
 latency as well as from these figures; the missing WAN measurement is
 recorded in [bench-ledger.md](bench-ledger.md).
 See [ADR-0004](adr/0004-storage-backend.md).
@@ -142,7 +190,9 @@ The two have different explanations, and only one of them is settled. The
 2026-08-11 both nodes have been measured to store the same payload for the
 same chain at the same index composition — fifteen buckets equal to the
 byte — so the extra space is how redb lays those bytes out, not extra data
-dcroxide keeps. Block files match to within a mebibyte. The **time**
+dcroxide keeps. (The 2026-10-08 key change adds four bytes to the keys of
+five per-block buckets, at most about 22 MB at the tip.) Block files match
+to within a mebibyte. The **time**
 difference is commit shape, and as of 2026-08-15 that is measured rather
 than attributed: the node is fully stalled on storage — nothing runnable at
 all — for **48% of block-sync wall time**, against dcrd's 0.9%. A

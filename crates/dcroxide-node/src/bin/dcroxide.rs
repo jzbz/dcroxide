@@ -19,12 +19,13 @@
 //! subsystem tags, gated by `--debuglevel`, to stdout only — the
 //! rotating file backend remains unwired.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use dcroxide_addrmgr::{AddrManager, PeersLoad};
+use dcroxide_blockchain::chaindb::{ChainDbError, older_version_refusal};
 use dcroxide_blockchain::process::{Chain, OpenConfig};
 use dcroxide_chainhash::Hash;
 use dcroxide_connmgr::DEFAULT_RETRY_DURATION;
@@ -1979,10 +1980,16 @@ fn flush_log_observer() -> Option<dcroxide_database::FlushObserver> {
     ))
 }
 
+/// The block database directory, `<datadir>/blocks_<dbtype>` (dcrd
+/// `blockDbPath`, `blockdb.go:56`).
+fn block_db_path(cfg: &Config) -> PathBuf {
+    Path::new(&cfg.data_dir).join(format!("blocks_{}", cfg.db_type))
+}
+
 /// Open (or create) the block database (dcrd `dcrdMain`'s
 /// `loadBlockDB`).  The block database lives at
-/// `<datadir>/blocks_<dbtype>`; the same handle backs the chain and
-/// the enabled indexes.
+/// [`block_db_path`]; the same handle backs the chain and the enabled
+/// indexes.
 ///
 /// It logs dcrd's two lines around the open (`blockdb.go:139`, `:185`),
 /// so "Block database loaded" precedes everything the chain logs while
@@ -1990,7 +1997,7 @@ fn flush_log_observer() -> Option<dcroxide_database::FlushObserver> {
 /// in `newServer`.
 fn open_block_db(cfg: &Config) -> Result<Database, String> {
     let params = &cfg.params.params;
-    let db_path = Path::new(&cfg.data_dir).join(format!("blocks_{}", cfg.db_type));
+    let db_path = block_db_path(cfg);
     // The regression test network needs a clean database for each run,
     // so remove it now if it already exists; dcrd discards the result
     // (`blockdb.go:121-123`).  The port keeps the UTXO set in this same
@@ -2119,8 +2126,15 @@ fn open_chain(
         },
     )
     // `newServer` returns `blockchain.New`'s error as is, which `%v`
-    // renders as its bare description.
-    .map_err(|e| e.to_string())?;
+    // renders as its bare description.  The refusal of a database an
+    // older dcroxide wrote names the directory to delete, which only the
+    // daemon knows.
+    .map_err(|e| match e {
+        ChainDbError::OlderVersion(version) => {
+            older_version_refusal(version, Some(&block_db_path(cfg).display().to_string()))
+        }
+        e => e.to_string(),
+    })?;
     // dcrd's --sigcachemaxsize bounds the signature verification
     // cache by ENTRY COUNT (server.go passes it to
     // `txscript.NewSigCache`).  The open-time catch-up replay above
@@ -2160,10 +2174,12 @@ fn rpc_config(
     mix_pool: Arc<Mutex<dcroxide_node::mixnode::NodeMixPool>>,
 ) -> dcroxide_rpc::server::Config<dcroxide_node::rpcrun::NodeRpcChain> {
     let params = cfg.params.params.clone();
-    // The version 2 filter source shares the live chain (cloned before it
+    // The version 2 filter source and the database seam, which looks up
+    // block heights in the index, share the live chain (cloned before it
     // is moved into the chain adapter below); the sanity checker keeps the
     // parameters (cloned before they are moved into the subsidy cache).
     let filterer_v2 = dcroxide_node::rpcrun::NodeRpcFiltererV2::new(Arc::clone(&chain));
+    let rpc_db = dcroxide_node::indexes::NodeRpcDb::new(db, Arc::clone(&chain));
     let sanity_checker = dcroxide_node::rpcrun::NodeRpcSanityChecker::new(params.clone());
     dcroxide_rpc::server::Config {
         chain: dcroxide_node::rpcrun::NodeRpcChain::new(chain, params.clone())
@@ -2208,7 +2224,7 @@ fn rpc_config(
         // `panic = "abort"` a failed read there would be an outage.
         rand_u64: Box::new(dcroxide_crypto::rand::uint64),
         tx_indexer,
-        db: Box::new(dcroxide_node::indexes::NodeRpcDb::new(db)),
+        db: Box::new(rpc_db),
         filterer_v2: Box::new(filterer_v2),
         exists_addresser,
         log_manager: Box::new(dcroxide_node::rpcrun::NodeRpcLogManager),

@@ -79,7 +79,9 @@ fn deployment_version(params: &Params) -> Vec<Want> {
 }
 
 /// The lines that end dcrd's `blockchain.New`, from the opened chain's
-/// own state: the version lines carry dcrd's current versions, and
+/// own state: the version lines carry dcrd's current versions, except
+/// the chain database's, which is one past dcrd's 14 for the port's
+/// height-first per-block keys (`chaindb::CURRENT_DATABASE_VERSION`), and
 /// progress is `VerifyProgress`.
 fn chain_opened(chain: &Chain) -> Vec<Want> {
     let (header_hash, header_height) = chain.best_header();
@@ -92,7 +94,7 @@ fn chain_opened(chain: &Chain) -> Vec<Want> {
     };
     vec![
         info(
-            "Blockchain database version info: chain: 14, compression: 1, block index: 3, \
+            "Blockchain database version info: chain: 15, compression: 1, block index: 3, \
              spend journal: 3",
         ),
         info("UTXO database version info: version: 3, compression: 1, utxo set: 3"),

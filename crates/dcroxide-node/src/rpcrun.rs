@@ -318,7 +318,11 @@ fn stored_treasury_balance(
     let mut found = Ok(None);
     if let Some(db) = db {
         db.view(|tx| {
-            found = dcroxide_blockchain::treasurydb::db_fetch_treasury_balance(tx, hash);
+            found = dcroxide_blockchain::treasurydb::db_fetch_treasury_balance(
+                tx,
+                hash,
+                block_height as u32,
+            );
             Ok(())
         })
         .map_err(|e| treasury_failure(false, false, e.to_string()))?;

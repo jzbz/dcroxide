@@ -172,7 +172,7 @@ fn a_prestored_block_still_connects() {
                     .as_ref()
                     .expect("db")
                     .update(|tx| {
-                        if tx.has_block(&block.header.block_hash())? {
+                        if tx.has_block(&block.header.block_hash(), block.header.height)? {
                             return Ok(());
                         }
                         tx.store_block(&block)
@@ -279,6 +279,177 @@ fn an_unflushed_utxo_set_catches_up_on_reopen() {
         tip_hash,
         "the caught-up utxo set state records the tip"
     );
+}
+
+/// The battery's first `count` main chain blocks past genesis, in
+/// order, and the battery's clock.
+fn main_chain_prefix(count: usize) -> (i64, Vec<MsgBlock>) {
+    let mut now: i64 = 0;
+    let mut tip = regnet_params().genesis_hash;
+    let mut blocks = Vec::new();
+    for line in include_str!("data/fullblock_vectors.txt").lines() {
+        let f: Vec<&str> = line.split(' ').collect();
+        match f[0] {
+            "now" => now = f[1].parse().expect("now"),
+            "accept" if blocks.len() < count => {
+                let (block, _) = MsgBlock::from_bytes(&unhex(f[4])).expect("block");
+                if f[2] == "true" && block.header.prev_block == tip {
+                    tip = block.header.block_hash();
+                    blocks.push(block);
+                }
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(blocks.len(), count, "the battery provides the prefix");
+    (now, blocks)
+}
+
+/// A database-backed regnet chain with `blocks` connected and flushed.
+fn flushed_chain(
+    opts: &Options,
+    params: &dcroxide_chaincfg::Params,
+    blocks: &[MsgBlock],
+    now: i64,
+) -> Chain {
+    let db = Database::create(opts).expect("create database");
+    let mut chain = Chain::open(db, params, Hash::ZERO, false, 0).expect("open chain");
+    for block in blocks {
+        let (_, errs) = chain.process_block(block, now, params);
+        assert!(errs.is_empty(), "{}: {errs:?}", block.header.block_hash());
+    }
+    chain.flush(params).expect("flush");
+    chain
+}
+
+/// A disconnect the utxo set never saw is detached again on the next
+/// start.
+///
+/// A disconnect writes the parent's best state and stake rows in one
+/// transaction and only then flushes the utxo cache, removing the
+/// disconnected block's spend journal row after that (dcrd's order, so
+/// the row survives a crash in between).  A crash in that window leaves
+/// the best state at the parent and the utxo set, with its state marker,
+/// at the disconnected block.  The open's catch-up must then detach that
+/// block, from its body and its journal row read back from the database
+/// under the block's height, before replaying forward
+/// (`initialize_utxo_state`, dcrd `UtxoCache.Initialize`).  The forward
+/// replay is covered above; nothing else runs the detach.
+#[test]
+fn a_disconnect_the_utxo_set_never_saw_is_detached_on_reopen() {
+    let params = regnet_params();
+    let (now, blocks) = main_chain_prefix(40);
+    let (parent, tip) = (&blocks[38], &blocks[39]);
+    let (parent_hash, tip_hash) = (parent.header.block_hash(), tip.header.block_hash());
+    let tip_height = tip.header.height;
+    assert!(
+        tip.transactions.len() > 1 || tip.stransactions.len() > 1,
+        "the detached block spends something, so its journal row is needed"
+    );
+
+    // The reference: the same chain built only as far as the parent.
+    let dir_a = TempDir::new().expect("tempdir");
+    let opts_a = Options::new(dir_a.path().join("chain"), params.net.0);
+    let mut reference = flushed_chain(&opts_a, &params, &blocks[..39], now);
+    let at_parent = reference.fetch_utxo_stats().expect("reference stats");
+    let mut parent_state = None;
+    reference
+        .db
+        .as_ref()
+        .expect("db")
+        .view(|tx| {
+            let state = dcroxide_blockchain::chaindb::db_fetch_best_state(tx);
+            parent_state = Some(state.expect("best state"));
+            Ok(())
+        })
+        .expect("read the reference best state");
+    let parent_state = parent_state.expect("best state");
+    assert_eq!(parent_state.hash, parent_hash);
+
+    // The crash run: connected to the tip and flushed, so the utxo set,
+    // its state marker and the tip's journal row are all durable.
+    let dir_b = TempDir::new().expect("tempdir");
+    let opts_b = Options::new(dir_b.path().join("chain"), params.net.0);
+    let mut chain = flushed_chain(&opts_b, &params, &blocks, now);
+    let at_tip = chain.fetch_utxo_stats().expect("tip stats");
+    assert_ne!(at_tip, at_parent, "the tip changes the utxo set");
+    let tip_id = chain.index.lookup_node(&tip_hash).expect("tip node");
+    let parent_id = chain.index.lookup_node(&parent_hash).expect("parent node");
+    let parent_stake = chain
+        .fetch_stake_node(parent_id, &params)
+        .unwrap_or_else(|e| panic!("parent stake node: {e:?}"));
+    let child_undo = chain
+        .store
+        .node(tip_id)
+        .stake_node
+        .as_ref()
+        .expect("the tip's stake node")
+        .undo_data()
+        .to_vec();
+    let tip_work = chain.store.node(tip_id).work_sum;
+    let db = chain.db.as_ref().expect("db").clone();
+
+    // The disconnect's first transaction, as `disconnect_block` writes
+    // it, and then the crash: no utxo flush, no journal removal.
+    db.update(|tx| {
+        dcroxide_blockchain::chaindb::db_put_best_state(
+            tx,
+            parent_hash,
+            parent_state.height,
+            parent_state.total_txns,
+            parent_state.total_subsidy,
+            tip_work,
+        )
+        .unwrap_or_else(|e| panic!("best state: {e:?}"));
+        dcroxide_stake::stakedb::write_disconnected_best_node(
+            tx,
+            &parent_stake,
+            &parent_hash,
+            &child_undo,
+        )
+        .unwrap_or_else(|e| panic!("stake rows: {e:?}"));
+        Ok(())
+    })
+    .expect("write the disconnect's best state");
+    let mut recorded = None;
+    db.view(|tx| {
+        recorded = dcroxide_blockchain::chaindb::db_fetch_utxo_set_state(tx).expect("state");
+        let journal =
+            dcroxide_blockchain::chaindb::db_fetch_spend_journal_entry(tx, &tip_hash, tip_height);
+        assert!(
+            journal.is_some_and(|row| !row.is_empty()),
+            "the tip's journal row"
+        );
+        Ok(())
+    })
+    .expect("read the crash state");
+    assert_eq!(
+        recorded.map(|state| state.last_flush_hash),
+        Some(tip_hash),
+        "the utxo set is still at the disconnected block"
+    );
+    db.close().expect("close");
+    drop((db, chain));
+
+    // The open detaches the tip: the utxo set folds to the parent's.
+    let db = Database::open(&opts_b).expect("reopen database");
+    let mut chain = Chain::open(db, &params, Hash::ZERO, false, 0).expect("reopen chain");
+    assert_eq!(
+        chain.best_snapshot().hash,
+        parent_hash,
+        "the best state's tip"
+    );
+    assert_eq!(
+        chain.fetch_utxo_stats().expect("caught-up stats"),
+        at_parent,
+        "the detached utxo set is the parent's"
+    );
+
+    // And the block connects again from there.
+    let errs = chain.reconsider_block(&tip_hash, now, &params);
+    assert!(errs.is_empty(), "{errs:?}");
+    assert_eq!(chain.best_snapshot().hash, tip_hash);
+    assert_eq!(chain.fetch_utxo_stats().expect("stats"), at_tip);
 }
 
 /// A utxo set state marker whose height disagrees with the block index

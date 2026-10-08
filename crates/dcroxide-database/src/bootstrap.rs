@@ -160,21 +160,21 @@ impl Database {
     /// with this module.
     pub fn import_blocks(&self, r: &mut impl Read, network: u32) -> Result<ImportStats, Error> {
         let mut stats = ImportStats::default();
-        let mut batch: Vec<(dcroxide_chainhash::Hash, Vec<u8>)> = Vec::new();
+        let mut batch: Vec<(dcroxide_chainhash::Hash, u32, Vec<u8>)> = Vec::new();
 
         #[allow(
             clippy::arithmetic_side_effects,
             reason = "one increment per block in the batch: a u64 count of blocks read cannot overflow"
         )]
-        let flush = |batch: &mut Vec<(dcroxide_chainhash::Hash, Vec<u8>)>,
+        let flush = |batch: &mut Vec<(dcroxide_chainhash::Hash, u32, Vec<u8>)>,
                      stats: &mut ImportStats|
          -> Result<(), Error> {
             if batch.is_empty() {
                 return Ok(());
             }
             self.update(|tx| {
-                for (hash, raw) in batch.drain(..) {
-                    if tx.has_block(&hash)? {
+                for (hash, height, raw) in batch.drain(..) {
+                    if tx.has_block(&hash, height)? {
                         stats.skipped += 1;
                         continue;
                     }
@@ -194,14 +194,14 @@ impl Database {
             stats.read += 1;
 
             // Deserialize to check for malformed blocks and to compute
-            // the block hash.
+            // the block hash; the height keys the block's index row.
             let (block, _) = MsgBlock::from_bytes(&raw).map_err(|e| {
                 db_error(
                     ErrorKind::DriverSpecific,
                     format!("failed to deserialize imported block: {e:?}"),
                 )
             })?;
-            batch.push((block.header.block_hash(), raw));
+            batch.push((block.header.block_hash(), block.header.height, raw));
 
             if batch.len() >= IMPORT_BATCH_SIZE {
                 flush(&mut batch, &mut stats)?;
@@ -211,23 +211,23 @@ impl Database {
         Ok(stats)
     }
 
-    /// Export the blocks with the given hashes, in order, to a
-    /// bootstrap-format stream readable by [`read_block`] (and so by the
-    /// daemon's `addblock`) and by dcrd's `addblock`.
+    /// Export the blocks with the given hashes and heights, in order, to
+    /// a bootstrap-format stream readable by [`read_block`] (and so by
+    /// the daemon's `addblock`) and by dcrd's `addblock`.
     #[allow(
         clippy::arithmetic_side_effects,
-        reason = "one increment per hash in a slice: at most hashes.len()"
+        reason = "one increment per block in a slice: at most blocks.len()"
     )]
     pub fn export_blocks(
         &self,
         w: &mut impl Write,
         network: u32,
-        hashes: &[dcroxide_chainhash::Hash],
+        blocks: &[(dcroxide_chainhash::Hash, u32)],
     ) -> Result<u64, Error> {
         let mut exported = 0u64;
         self.view(|tx| {
-            for hash in hashes {
-                let raw = tx.fetch_block(hash)?;
+            for (hash, height) in blocks {
+                let raw = tx.fetch_block(hash, *height)?;
                 write_block(w, network, &raw)?;
                 exported += 1;
             }

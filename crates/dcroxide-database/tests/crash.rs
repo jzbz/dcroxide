@@ -150,8 +150,14 @@ fn reconcile_truncates_orphaned_block_data() {
     db.update(|tx| tx.store_block(&next))
         .expect("store after recovery");
     db.view(|tx| {
-        assert_eq!(tx.fetch_block(&committed_hash)?, committed.serialize());
-        assert_eq!(tx.fetch_block(&next_hash)?, next.serialize());
+        assert_eq!(
+            tx.fetch_block(&committed_hash, committed.header.height)?,
+            committed.serialize()
+        );
+        assert_eq!(
+            tx.fetch_block(&next_hash, next.header.height)?,
+            next.serialize()
+        );
         Ok(())
     })
     .expect("view");
@@ -228,7 +234,7 @@ fn reconcile_random_tear_soak() {
         db.view(|tx| {
             for block in &committed {
                 assert_eq!(
-                    tx.fetch_block(&block.header.block_hash())?,
+                    tx.fetch_block(&block.header.block_hash(), block.header.height)?,
                     block.serialize(),
                     "round {round}: committed block lost after recovery"
                 );
@@ -243,7 +249,7 @@ fn reconcile_random_tear_soak() {
             .expect("store after recovery");
         db.view(|tx| {
             assert_eq!(
-                tx.fetch_block(&extra.header.block_hash())?,
+                tx.fetch_block(&extra.header.block_hash(), extra.header.height)?,
                 extra.serialize()
             );
             Ok(())
@@ -279,8 +285,14 @@ fn unclean_shutdown_loses_only_the_cached_window() {
 
     let db = Database::open(&opts).expect("reopen");
     db.view(|tx| {
-        assert_eq!(tx.fetch_block(&base_hash)?, base.serialize());
-        assert!(!tx.has_block(&lost_hash)?, "cached block must be gone");
+        assert_eq!(
+            tx.fetch_block(&base_hash, base.header.height)?,
+            base.serialize()
+        );
+        assert!(
+            !tx.has_block(&lost_hash, lost.header.height)?,
+            "cached block must be gone"
+        );
         Ok(())
     })
     .expect("view");
@@ -530,12 +542,15 @@ fn block_data_and_its_metadata_roll_back_together() {
         let b = tx.metadata().bucket(IDX_BUCKET).expect("index bucket");
 
         // The durable pair survived intact, both halves.
-        assert_eq!(tx.fetch_block(&kept_hash)?, kept.serialize());
+        assert_eq!(
+            tx.fetch_block(&kept_hash, kept.header.height)?,
+            kept.serialize()
+        );
         assert_eq!(b.get(&kept_hash.0).as_deref(), Some(b"kept".as_slice()));
 
         // The torn pair is gone, both halves. Either half surviving alone
         // is the desync this test exists to catch.
-        let has_block = tx.has_block(&lost_hash)?;
+        let has_block = tx.has_block(&lost_hash, lost.header.height)?;
         let has_meta = b.get(&lost_hash.0).is_some();
         assert!(
             !has_block && !has_meta,
@@ -585,7 +600,10 @@ fn durable_metadata_survives_block_file_truncation() {
     );
     assert_markers_agree_with_rows(&db, "after block-file truncation");
     db.view(|tx| {
-        assert_eq!(tx.fetch_block(&block_hash)?, block.serialize());
+        assert_eq!(
+            tx.fetch_block(&block_hash, block.header.height)?,
+            block.serialize()
+        );
         Ok(())
     })
     .expect("view");
@@ -876,6 +894,71 @@ fn power_loss_before_a_flush_stays_internally_consistent() {
             Ok(())
         })
         .expect("view");
+}
+
+/// Blocks keep to the durable generation across a power cut, each found
+/// under its own height and only there.
+///
+/// The tests above write metadata rows alone.  Storing a block also
+/// writes its row in the internal block index, keyed by its height and
+/// then its hash (ADR-0010), so this stores blocks at heights whose
+/// bytes cross the boundaries a byte-order mistake would show at, some
+/// flushed and some not, and cuts the power.
+#[test]
+fn power_loss_keeps_flushed_blocks_under_their_heights() {
+    let dir = TempDir::new().expect("tempdir");
+    let db_dir = dir.path().join("db");
+    let (opts, backend) = power_loss_opts(&db_dir, true);
+    let mut rng = SplitMix64::from_entropy("db-powerloss-heights");
+    let mut block_at = |height: u32| {
+        let mut block = make_block(&mut rng);
+        block.header.height = height;
+        block
+    };
+    let durable: Vec<MsgBlock> = [255, 256, 65_536, 1]
+        .into_iter()
+        .map(&mut block_at)
+        .collect();
+    let lost: Vec<MsgBlock> = [257, 65_535, 16_777_216, 0]
+        .into_iter()
+        .map(&mut block_at)
+        .collect();
+
+    let db = Database::create(&opts).expect("create");
+    db.update(|tx| durable.iter().try_for_each(|block| tx.store_block(block)))
+        .expect("store the durable blocks");
+    db.flush().expect("flush");
+    // Committed to the cache but never flushed: the window a power cut
+    // eats.
+    db.update(|tx| lost.iter().try_for_each(|block| tx.store_block(block)))
+        .expect("store the lost blocks");
+    drop(db);
+    backend.cut_power();
+
+    let reopened = Database::open(&Options::new(&db_dir, NET)).expect("reopen");
+    reopened
+        .view(|tx| {
+            for block in &durable {
+                let (hash, height) = (block.header.block_hash(), block.header.height);
+                assert!(tx.has_block(&hash, height)?, "{hash} at {height} survives");
+                assert_eq!(tx.fetch_block(&hash, height)?, block.serialize());
+                // Under the height's bytes reversed, it is not there.
+                assert!(!tx.has_block(&hash, height.swap_bytes())?, "{hash}");
+            }
+            for block in &lost {
+                let (hash, height) = (block.header.block_hash(), block.header.height);
+                assert!(!tx.has_block(&hash, height)?, "{hash} at {height} is gone");
+            }
+            Ok(())
+        })
+        .expect("view");
+
+    // The store goes on from the durable generation.
+    let next = block_at(65_537);
+    reopened
+        .update(|tx| tx.store_block(&next))
+        .expect("store after the power cut");
+    reopened.close().expect("close");
 }
 
 /// The rig has teeth.

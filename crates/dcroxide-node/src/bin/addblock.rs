@@ -4,9 +4,10 @@
 //! block through the chain engine with bulk-import mode enabled and
 //! maintaining the enabled indexes.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use dcroxide_blockchain::chaindb::{ChainDbError, older_version_refusal};
 use dcroxide_blockchain::process::{Chain, OpenConfig};
 use dcroxide_chaincfg::Params;
 use dcroxide_chainhash::Hash;
@@ -32,11 +33,17 @@ fn log_error(msg: &str) {
     dcroxide_node::logging::error("MAIN", msg);
 }
 
+/// The block database directory, `<datadir>/blocks_<dbtype>` (dcrd
+/// addblock's `loadBlockDB`, `cmd/addblock/addblock.go:35-36`).
+fn block_db_path(cfg: &AddblockConfig) -> PathBuf {
+    Path::new(&cfg.data_dir).join(format!("blocks_{}", cfg.db_type))
+}
+
 /// Open the block database, creating it when it does not yet exist
 /// (dcrd addblock's `loadBlockDB` over `database.Open` then
 /// `database.Create`).
 fn load_block_db(cfg: &AddblockConfig, net: u32) -> Result<Database, String> {
-    let db_path = Path::new(&cfg.data_dir).join(format!("blocks_{}", cfg.db_type));
+    let db_path = block_db_path(cfg);
     log_info(&format!(
         "Loading block database from '{}'",
         db_path.display()
@@ -202,8 +209,19 @@ fn import_main(cfg: &AddblockConfig, params: &Params) -> Result<(), ()> {
     config.utxo_cache_max_bytes = ADDBLOCK_UTXO_CACHE_MAX_BYTES;
     let chain = match Chain::open_with_config(db.clone(), params, config) {
         Ok(chain) => chain,
+        // dcrd logs `newBlockImporter`'s error with `%v`, its
+        // description.  The refusal of a database an older dcroxide
+        // wrote names the directory to delete.
+        Err(ChainDbError::OlderVersion(version)) => {
+            let dir = block_db_path(cfg).display().to_string();
+            log_error(&format!(
+                "Failed create block importer: {}",
+                older_version_refusal(version, Some(&dir))
+            ));
+            return Err(());
+        }
         Err(e) => {
-            log_error(&format!("Failed create block importer: {e:?}"));
+            log_error(&format!("Failed create block importer: {e}"));
             return Err(());
         }
     };

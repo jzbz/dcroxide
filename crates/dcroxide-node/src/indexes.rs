@@ -366,15 +366,26 @@ impl dcroxide_mempool::UnconfirmedAddrIndexer for NodeUnconfirmedAddrIndexer {
 }
 
 /// The RPC database seam over the daemon's shared block database
-/// (dcrd handing its `database.DB` to the rpcserver config).
+/// (dcrd handing its `database.DB` to the rpcserver config), with the
+/// chain whose block index supplies each block's height.
+///
+/// The database keys a stored block by its height and hash (see
+/// `dcroxide_database::Transaction::fetch_block_region` and ADR-0010),
+/// where dcrd's ffldb keys it by hash, and a transaction index entry
+/// names only the hash.  Every block the index names was connected, so
+/// the block index has its node, and the height comes from there, under
+/// the chain lock for the lookup alone; the read itself runs with the
+/// lock released, as before.  The RPC handler holds no other lock when
+/// it calls this.
 pub struct NodeRpcDb {
     db: Database,
+    chain: Arc<Mutex<Chain>>,
 }
 
 impl NodeRpcDb {
-    /// A seam over the shared database handle.
-    pub fn new(db: Database) -> NodeRpcDb {
-        NodeRpcDb { db }
+    /// A seam over the shared database handle and chain.
+    pub fn new(db: Database, chain: Arc<Mutex<Chain>>) -> NodeRpcDb {
+        NodeRpcDb { db, chain }
     }
 }
 
@@ -385,13 +396,28 @@ impl RpcDb for NodeRpcDb {
         offset: u32,
         len: u32,
     ) -> Result<Vec<u8>, String> {
+        let height = {
+            let chain = self.chain.lock().expect("chain mutex");
+            chain
+                .index
+                .lookup_node(block_hash)
+                .map(|node| chain.store.node(node).height as u32)
+        };
+        // A block the block index does not know is answered as the
+        // database answers a block it does not store.
+        let Some(height) = height else {
+            return Err(format!("block {block_hash} does not exist"));
+        };
         let tx = self.db.begin(false).map_err(|e| e.to_string())?;
         let result = tx
-            .fetch_block_region(&BlockRegion {
-                hash: *block_hash,
-                offset,
-                len,
-            })
+            .fetch_block_region(
+                &BlockRegion {
+                    hash: *block_hash,
+                    offset,
+                    len,
+                },
+                height,
+            )
             .map_err(|e| e.to_string());
         let _ = tx.rollback();
         result
@@ -462,7 +488,7 @@ mod tests {
             .expect("genesis block");
         let serialized = genesis.serialize();
 
-        let rpc_db = NodeRpcDb::new(db);
+        let rpc_db = NodeRpcDb::new(db, Arc::clone(&chain));
         let whole = rpc_db
             .fetch_block_region(&genesis_hash, 0, serialized.len() as u32)
             .expect("whole block region");

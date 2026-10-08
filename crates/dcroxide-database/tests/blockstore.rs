@@ -18,6 +18,15 @@ fn kind_of(err: Error) -> ErrorKind {
     err.kind
 }
 
+/// Each block's hash with the height its header records, the pair that
+/// keys its index row.
+fn keys_of(blocks: &[MsgBlock]) -> Vec<(Hash, u32)> {
+    blocks
+        .iter()
+        .map(|b| (b.header.block_hash(), b.header.height))
+        .collect()
+}
+
 fn make_block(rng: &mut SplitMix64) -> MsgBlock {
     let mut raw_header = [0u8; 180];
     rng.fill(&mut raw_header);
@@ -63,15 +72,16 @@ fn block_store_fetch_round_trip() {
     let mut rng = SplitMix64::from_entropy("db-block-roundtrip");
 
     let blocks: Vec<MsgBlock> = (0..10).map(|_| make_block(&mut rng)).collect();
-    let hashes: Vec<Hash> = blocks.iter().map(|b| b.header.block_hash()).collect();
+    let hashes = keys_of(&blocks);
     let serialized: Vec<Vec<u8>> = blocks.iter().map(MsgBlock::serialize).collect();
 
     db.update(|tx| {
         for (i, block) in blocks.iter().enumerate() {
+            let (hash, height) = hashes[i];
             // Not present before the store.
-            assert!(!tx.has_block(&hashes[i])?);
+            assert!(!tx.has_block(&hash, height)?);
             assert_eq!(
-                tx.fetch_block(&hashes[i]).err().map(kind_of),
+                tx.fetch_block(&hash, height).err().map(kind_of),
                 Some(ErrorKind::BlockNotFound)
             );
 
@@ -84,25 +94,36 @@ fn block_store_fetch_round_trip() {
             );
 
             // Pending blocks are fully visible within the transaction.
-            assert!(tx.has_block(&hashes[i])?);
-            assert_eq!(tx.fetch_block(&hashes[i])?, serialized[i]);
-            assert_eq!(tx.fetch_block_header(&hashes[i])?, serialized[i][..180]);
+            assert!(tx.has_block(&hash, height)?);
+            assert_eq!(tx.fetch_block(&hash, height)?, serialized[i]);
+            assert_eq!(tx.fetch_block_header(&hash, height)?, serialized[i][..180]);
             let region = BlockRegion {
-                hash: hashes[i],
+                hash,
                 offset: 8,
                 len: 12,
             };
-            assert_eq!(tx.fetch_block_region(&region)?, serialized[i][8..20]);
+            assert_eq!(
+                tx.fetch_block_region(&region, height)?,
+                serialized[i][8..20]
+            );
 
             // Out-of-bounds regions on a pending block.
             let bad = BlockRegion {
-                hash: hashes[i],
+                hash,
                 offset: serialized[i].len() as u32 - 4,
                 len: 8,
             };
             assert_eq!(
-                tx.fetch_block_region(&bad).err().map(kind_of),
+                tx.fetch_block_region(&bad, height).err().map(kind_of),
                 Some(ErrorKind::BlockRegionInvalid)
+            );
+
+            // A pending block is not found under another height.
+            let other = height.wrapping_add(1);
+            assert!(!tx.has_block(&hash, other)?);
+            assert_eq!(
+                tx.fetch_block(&hash, other).err().map(kind_of),
+                Some(ErrorKind::BlockNotFound)
             );
         }
         Ok(())
@@ -119,12 +140,15 @@ fn block_store_fetch_round_trip() {
         }
 
         // Regions across several blocks.
-        let regions: Vec<BlockRegion> = hashes
+        let regions: Vec<(BlockRegion, u32)> = hashes
             .iter()
-            .map(|h| BlockRegion {
-                hash: *h,
-                offset: 4,
-                len: 20,
+            .map(|&(hash, height)| {
+                let region = BlockRegion {
+                    hash,
+                    offset: 4,
+                    len: 20,
+                };
+                (region, height)
             })
             .collect();
         let datas = tx.fetch_block_regions(&regions)?;
@@ -137,31 +161,46 @@ fn block_store_fetch_round_trip() {
         // length (raw block + 12 bytes of network/length/checksum
         // overhead), so the first byte past the raw block serves the
         // checksum rather than erroring.
+        let (hash0, height0) = hashes[0];
         let into_overhead = BlockRegion {
-            hash: hashes[0],
+            hash: hash0,
             offset: serialized[0].len() as u32,
             len: 1,
         };
-        assert_eq!(tx.fetch_block_region(&into_overhead)?.len(), 1);
+        assert_eq!(tx.fetch_block_region(&into_overhead, height0)?.len(), 1);
 
         // Past the full record the region is invalid.
         let bad = BlockRegion {
-            hash: hashes[0],
+            hash: hash0,
             offset: serialized[0].len() as u32 + 12,
             len: 1,
         };
         assert_eq!(
-            tx.fetch_block_region(&bad).err().map(kind_of),
+            tx.fetch_block_region(&bad, height0).err().map(kind_of),
             Some(ErrorKind::BlockRegionInvalid)
         );
 
         // Unknown block.
         let unknown = Hash([0x55; 32]);
-        assert!(!tx.has_block(&unknown)?);
+        assert!(!tx.has_block(&unknown, 0)?);
         assert_eq!(
-            tx.fetch_block_header(&unknown).err().map(kind_of),
+            tx.fetch_block_header(&unknown, 0).err().map(kind_of),
             Some(ErrorKind::BlockNotFound)
         );
+
+        // A stored block is not found under another height: the height
+        // is part of its index row's key.
+        let other = height0.wrapping_add(1);
+        assert!(!tx.has_block(&hash0, other)?);
+        for err in [
+            tx.fetch_block(&hash0, other).err(),
+            tx.fetch_block_header(&hash0, other).err(),
+            tx.fetch_block_region(&into_overhead, other).err(),
+        ] {
+            let err = err.expect("no block under another height");
+            assert_eq!(err.kind, ErrorKind::BlockNotFound);
+            assert_eq!(err.description, format!("block {hash0} does not exist"));
+        }
         Ok(())
     })
     .expect("view");
@@ -169,7 +208,7 @@ fn block_store_fetch_round_trip() {
     // Storing an already-committed block in a new tx fails; rolled
     // back stores do not persist.
     let extra = make_block(&mut rng);
-    let extra_hash = extra.header.block_hash();
+    let (extra_hash, extra_height) = (extra.header.block_hash(), extra.header.height);
     db.update(|tx| {
         assert_eq!(
             tx.store_block(&blocks[0]).err().map(kind_of),
@@ -184,7 +223,7 @@ fn block_store_fetch_round_trip() {
         tx.rollback().expect("rollback");
     }
     db.view(|tx| {
-        assert!(!tx.has_block(&extra_hash)?);
+        assert!(!tx.has_block(&extra_hash, extra_height)?);
         Ok(())
     })
     .expect("view");
@@ -220,7 +259,7 @@ fn block_file_rollover_and_record_format() {
     let mut rng = SplitMix64::from_entropy("db-block-rollover");
 
     let blocks: Vec<MsgBlock> = (0..12).map(|_| make_block(&mut rng)).collect();
-    let hashes: Vec<Hash> = blocks.iter().map(|b| b.header.block_hash()).collect();
+    let hashes = keys_of(&blocks);
     let serialized: Vec<Vec<u8>> = blocks.iter().map(MsgBlock::serialize).collect();
 
     for block in &blocks {
@@ -268,7 +307,7 @@ fn corrupted_block_file_detected() {
     let mut rng = SplitMix64::from_entropy("db-block-corrupt");
 
     let block = make_block(&mut rng);
-    let hash = block.header.block_hash();
+    let (hash, height) = (block.header.block_hash(), block.header.height);
     db.update(|tx| tx.store_block(&block)).expect("store");
     db.close().expect("close");
     drop(db);
@@ -283,12 +322,75 @@ fn corrupted_block_file_detected() {
     db.view(|tx| {
         // Full block reads verify the checksum.
         assert_eq!(
-            tx.fetch_block(&hash).err().map(kind_of),
+            tx.fetch_block(&hash, height).err().map(kind_of),
             Some(ErrorKind::Corruption)
         );
         // Headers come from the metadata index and remain intact.
-        assert_eq!(tx.fetch_block_header(&hash)?.len(), 180);
+        assert_eq!(tx.fetch_block_header(&hash, height)?.len(), 180);
         Ok(())
     })
     .expect("view");
+}
+
+/// The internal block index files a block's row under its big-endian
+/// height and then its hash -- dcroxide's layout, where ffldb keys it by
+/// hash -- so the rows of consecutive blocks sit side by side and a walk
+/// meets them in height order, blocks sharing a height by hash.  The row
+/// itself is ffldb's: the block's location, then its header.
+#[test]
+fn block_index_rows_are_keyed_by_height_then_hash() {
+    let dir = TempDir::new().expect("tempdir");
+    let opts = Options::new(dir.path().join("db"), NET);
+    let db = Database::create(&opts).expect("create");
+    let mut rng = SplitMix64::from_entropy("db-block-index-order");
+
+    // Heights that little-endian or hash order would scatter: byte
+    // boundaries, and two blocks at one height.
+    let heights = [65_536u32, 1, 256, 255, 0, 7, 7, 16_777_216];
+    let blocks: Vec<MsgBlock> = heights
+        .iter()
+        .map(|&height| {
+            let mut block = make_block(&mut rng);
+            block.header.height = height;
+            block
+        })
+        .collect();
+    db.update(|tx| blocks.iter().try_for_each(|block| tx.store_block(block)))
+        .expect("store");
+
+    let mut want: Vec<(Vec<u8>, Vec<u8>)> = blocks
+        .iter()
+        .map(|block| {
+            let mut key = block.header.height.to_be_bytes().to_vec();
+            key.extend_from_slice(&block.header.block_hash().0);
+            (key, block.header.serialize().to_vec())
+        })
+        .collect();
+    want.sort();
+
+    // The committed rows, read through the overlay and then the store.
+    assert_eq!(block_index_rows(&db), want, "the overlay");
+    db.close().expect("close");
+    drop(db);
+    let db = Database::open(&opts).expect("reopen");
+    assert_eq!(block_index_rows(&db), want, "the store");
+}
+
+/// Every row of the internal block index in walk order: the key, and
+/// the header that follows the block's 12-byte location.
+fn block_index_rows(db: &Database) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let mut rows: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    db.view(|tx| {
+        let bucket = tx
+            .metadata()
+            .bucket(b"ffldb-blockidx")
+            .expect("block index bucket");
+        bucket.for_each(|key, row| {
+            assert_eq!(row.len(), 12 + 180, "row for {key:02x?}");
+            rows.push((key.to_vec(), row[12..].to_vec()));
+            Ok(())
+        })
+    })
+    .expect("walk the block index");
+    rows
 }

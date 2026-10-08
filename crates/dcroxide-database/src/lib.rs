@@ -8,24 +8,29 @@
 //! crash-safe) rather than goleveldb, with a fresh-sync default and no
 //! in-place dcrd datadir compatibility; the flat `*.fdb` block files do
 //! use dcrd's byte format.  The key layout inside the metadata store is
-//! ffldb's exactly (see the `transaction` module docs), so bucket and
-//! cursor semantics — iteration order, nested-bucket handling, error
-//! kinds, and quirks like `Delete` on an empty key silently succeeding
-//! — match dcrd behavior for behavior, which is pinned by the ported
-//! ffldb interface test battery.
+//! ffldb's (see the `transaction` module docs), so bucket and cursor
+//! semantics — iteration order, nested-bucket handling, error kinds,
+//! and quirks like `Delete` on an empty key silently succeeding — match
+//! dcrd behavior for behavior, which is pinned by the ported ffldb
+//! interface test battery.
 //!
-//! Deliberate divergences from ffldb, all within the interface
+//! One deliberate divergence from ffldb reaches the interface: the
+//! internal block index keys a block by its big-endian height and then
+//! its hash, where ffldb keys it by the hash alone, so the block
+//! lookups (`has_block`, `fetch_block`, `fetch_block_header`,
+//! `fetch_block_region` and their plural forms) take the block's height
+//! beside its hash ([ADR-0010]).  The others stay within the interface
 //! contract: the metadata write cache is a layered overlay rather than
-//! goleveldb's treap pair (see `dbcache`), no LRU
-//! block-file handle cache, cursors materialize their view at creation
-//! (the interface contract already declares cursors invalidated by any
-//! bucket modification other than `Cursor::delete`), and
-//! `Cursor::delete` on a read-only transaction returns the
-//! `ErrTxNotWritable` the contract documents, where ffldb silently
-//! accepts the delete into pending state that the read-only commit
-//! then discards.
+//! goleveldb's treap pair (see `dbcache`), no LRU block-file handle
+//! cache, cursors materialize their view at creation (the interface
+//! contract already declares cursors invalidated by any bucket
+//! modification other than `Cursor::delete`), and `Cursor::delete` on
+//! a read-only transaction returns the `ErrTxNotWritable` the contract
+//! documents, where ffldb silently accepts the delete into pending
+//! state that the read-only commit then discards.
 //!
 //! [ADR-0004]: ../../../docs/adr/0004-storage-backend.md
+//! [ADR-0010]: ../../../docs/adr/0010-height-first-block-keys.md
 
 #![forbid(unsafe_code)]
 
@@ -2104,7 +2109,8 @@ mod late_flush_tests {
         reopened
             .view(|tx| {
                 assert_eq!(tx.metadata().get(b"k").as_deref(), Some(b"v".as_slice()));
-                assert!(tx.has_block(&hash)?);
+                let height = transaction::serialized_block_height(&raw).expect("a header");
+                assert!(tx.has_block(&hash, height)?);
                 Ok(())
             })
             .expect("view");

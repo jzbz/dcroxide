@@ -7,6 +7,15 @@
 //! houses the UTXO set in a separate database with its own backend;
 //! dcroxide colocates it in a dedicated bucket of the one database
 //! using the same pinned row formats (a fresh-sync schema decision).
+//!
+//! The rows are dcrd's, but four of the per-block buckets are keyed
+//! differently.  dcrd keys the spend journal, GCS filter, header
+//! commitment and treasury rows by block hash, and the port keys them by
+//! big-endian height and then hash, as `blockidxv3` is keyed;
+//! [`block_row_key`] is the one encoder of that key, here and in
+//! `treasurydb`.  [`CURRENT_DATABASE_VERSION`] is one past dcrd's to
+//! record it and the other height-first keys, and a database of any
+//! other version is refused (ADR-0010).
 
 use alloc::format;
 use alloc::string::String;
@@ -30,9 +39,39 @@ use crate::utxoio::{
     serialize_utxo_entry, serialize_utxo_set_state,
 };
 
-/// The current chain database version (dcrd
-/// `currentDatabaseVersion`).
-pub const CURRENT_DATABASE_VERSION: u32 = 14;
+/// The current chain database version: dcrd's `currentDatabaseVersion`
+/// (14, `chainio.go:29`) plus one, for dcroxide's height-first
+/// per-block keys (ADR-0010).
+///
+/// dcrd keys seven per-block buckets by block hash or little-endian
+/// height, and the port keys all seven by big-endian height first: the
+/// spend journal, GCS filters, header commitments and treasury state
+/// ([`block_row_key`]), the stake undo data and new tickets
+/// (`dcroxide_stake::stakedb::height_key`), and the database's internal
+/// block index (`dcroxide_database`'s block lookups).  Version 15 is
+/// that layout over dcrd's version 14 rows, which are otherwise
+/// unchanged.  All seven live in the one store this version describes,
+/// and [`crate::process::Chain::open_with_config`] checks it before it
+/// reads any of them.
+///
+/// A database of any other version is refused at open rather than
+/// misread: a lookup under the other layout's key misses its row, or,
+/// for a per-height stake row, can land on the row of the height whose
+/// bytes are this one's reversed.  A newer one gets dcrd's downgrade
+/// message.  An older one, version 14 from a dcroxide built before the
+/// re-keying, gets [`ChainDbError::OlderVersion`], which tells the
+/// operator to delete the block database and sync again: there is no
+/// in-place upgrade (ADR-0004's fresh-sync stance).  Bumping this
+/// number, rather than recording the layout in a row of its own, is
+/// what makes a build from before the change refuse a database written
+/// after it, through the downgrade check that build already has.  The
+/// cost is the startup line "Blockchain database version info: chain:
+/// 15, ...", where dcrd prints 14.
+///
+/// The number is the port's own from here on.  If dcrd ships a version
+/// 15 of its own, port its change and take the next free number here
+/// (16), keeping the refusal of every older version.
+pub const CURRENT_DATABASE_VERSION: u32 = 15;
 /// The current block index version (dcrd
 /// `currentBlockIndexVersion`).
 pub const CURRENT_BLOCK_INDEX_VERSION: u32 = 3;
@@ -102,6 +141,33 @@ pub enum ChainDbError {
     /// or an agenda query failing in the startup state load
     /// (`chainio.go:1749-1752`).
     Rule(crate::RuleError),
+    /// The database is at the given version, older than
+    /// [`CURRENT_DATABASE_VERSION`]: an older dcroxide wrote it, under
+    /// per-block keys this build does not look its rows up by.  dcrd
+    /// upgrades an older database in place (`upgradeDB`,
+    /// `chainio.go:1676`); the port refuses it, and its text says what
+    /// to do (see [`older_version_refusal`]).
+    OlderVersion(u32),
+}
+
+/// The refusal of a database an older dcroxide wrote
+/// ([`ChainDbError::OlderVersion`]): the version found, the one this
+/// build reads, that nothing is damaged, and what to do about it.
+/// `db_dir` names the block database directory, quoted, when the caller
+/// knows its path, as the daemon and addblock do; without it the text
+/// says "the block database directory".
+pub fn older_version_refusal(version: u32, db_dir: Option<&str>) -> String {
+    let (found, remove) = match db_dir {
+        Some(dir) => (format!(" in '{dir}'"), format!("'{dir}'")),
+        None => (String::new(), String::from("the block database directory")),
+    };
+    format!(
+        "the blockchain database{found} is version {version}, which an older dcroxide \
+         wrote, and this version of the software reads only version \
+         {CURRENT_DATABASE_VERSION} -- there is no in-place upgrade, and the chain is not \
+         damaged: delete {remove} and start again to build a new one from genesis (see \
+         docs/operating.md)"
+    )
 }
 
 impl From<dcroxide_database::Error> for ChainDbError {
@@ -127,6 +193,9 @@ impl fmt::Display for ChainDbError {
             ChainDbError::Corrupt(s) => f.write_str(s),
             ChainDbError::Interrupted => f.write_str("interrupt requested"),
             ChainDbError::Rule(e) => write!(f, "{e}"),
+            ChainDbError::OlderVersion(version) => {
+                f.write_str(&older_version_refusal(*version, None))
+            }
         }
     }
 }
@@ -308,18 +377,51 @@ pub fn db_load_block_index(
     }
 }
 
+/// The key of a block's row in the spend journal, GCS filter, header
+/// commitment and treasury buckets: the block's height, big-endian, then
+/// its hash -- the key [`block_index_key`] gives `blockidxv3`.
+///
+/// dcrd keys these rows by the hash alone (`chainio.go:767`, `:814`,
+/// `:821`, `:851`, `:877`, `:885`, `:980`, `:997`; `treasury.go:235`,
+/// `:244`), which scatters the blocks of one metadata flush across each
+/// bucket: the store copies one cold leaf, and its branch path, per
+/// block per bucket.  Keyed by height first, consecutive blocks share
+/// leaves and a flush appends at each bucket's right edge.  The hash
+/// keeps blocks at one height apart.  Every caller has the block's node
+/// or the block itself, so the height is always at hand, and a lookup
+/// under any other height finds nothing.  See
+/// [`CURRENT_DATABASE_VERSION`].
+pub fn block_row_key(block_hash: &Hash, block_height: u32) -> Vec<u8> {
+    block_index_key(block_hash, block_height)
+}
+
 /// Store the serialized spend journal entry for a block (dcrd
 /// `dbPutSpendJournalEntry`).
 pub fn db_put_spend_journal_entry(
     tx: &Transaction,
     block_hash: &Hash,
+    block_height: u32,
     serialized: &[u8],
 ) -> Result<(), ChainDbError> {
     let meta = tx.metadata();
     let bucket = meta
         .bucket(SPEND_JOURNAL_BUCKET_NAME)
         .ok_or_else(|| ChainDbError::Corrupt("missing spend journal bucket".into()))?;
-    Ok(bucket.put(&block_hash.0, serialized)?)
+    Ok(bucket.put(&block_row_key(block_hash, block_height), serialized)?)
+}
+
+/// Fetch the serialized spend journal entry for a block, `None` when
+/// absent (the row read of dcrd `dbFetchSpendJournalEntry`, which
+/// decodes it against the block's spending inputs; the chain does that
+/// in `Chain::fetch_spend_journal`).
+pub fn db_fetch_spend_journal_entry(
+    tx: &Transaction,
+    block_hash: &Hash,
+    block_height: u32,
+) -> Option<Vec<u8>> {
+    tx.metadata()
+        .bucket(SPEND_JOURNAL_BUCKET_NAME)?
+        .get(&block_row_key(block_hash, block_height))
 }
 
 /// Remove the spend journal entry for a block (dcrd
@@ -327,12 +429,13 @@ pub fn db_put_spend_journal_entry(
 pub fn db_remove_spend_journal_entry(
     tx: &Transaction,
     block_hash: &Hash,
+    block_height: u32,
 ) -> Result<(), ChainDbError> {
     let meta = tx.metadata();
     let bucket = meta
         .bucket(SPEND_JOURNAL_BUCKET_NAME)
         .ok_or_else(|| ChainDbError::Corrupt("missing spend journal bucket".into()))?;
-    Ok(bucket.delete(&block_hash.0)?)
+    Ok(bucket.delete(&block_row_key(block_hash, block_height))?)
 }
 
 /// Store the version 2 GCS filter for a block (dcrd
@@ -340,13 +443,14 @@ pub fn db_remove_spend_journal_entry(
 pub fn db_put_gcs_filter(
     tx: &Transaction,
     block_hash: &Hash,
+    block_height: u32,
     filter: &FilterV2,
 ) -> Result<(), ChainDbError> {
     let meta = tx.metadata();
     let bucket = meta
         .bucket(GCS_FILTER_BUCKET_NAME)
         .ok_or_else(|| ChainDbError::Corrupt("missing gcs filter bucket".into()))?;
-    Ok(bucket.put(&block_hash.0, filter.bytes())?)
+    Ok(bucket.put(&block_row_key(block_hash, block_height), filter.bytes())?)
 }
 
 /// Fetch the version 2 GCS filter for a block, `None` when absent
@@ -355,8 +459,9 @@ pub fn db_put_gcs_filter(
 pub fn db_fetch_gcs_filter(
     tx: &Transaction,
     block_hash: &Hash,
+    block_height: u32,
 ) -> Result<Option<FilterV2>, ChainDbError> {
-    let Some(serialized) = db_fetch_raw_gcs_filter(tx, block_hash)? else {
+    let Some(serialized) = db_fetch_raw_gcs_filter(tx, block_hash, block_height)? else {
         return Ok(None);
     };
     let filter = FilterV2::from_bytes(
@@ -374,12 +479,13 @@ pub fn db_fetch_gcs_filter(
 pub fn db_fetch_raw_gcs_filter(
     tx: &Transaction,
     block_hash: &Hash,
+    block_height: u32,
 ) -> Result<Option<Vec<u8>>, ChainDbError> {
     let meta = tx.metadata();
     let bucket = meta
         .bucket(GCS_FILTER_BUCKET_NAME)
         .ok_or_else(|| ChainDbError::Corrupt("missing gcs filter bucket".into()))?;
-    Ok(bucket.get(&block_hash.0))
+    Ok(bucket.get(&block_row_key(block_hash, block_height)))
 }
 
 /// Store the header commitment leaves for a block; nothing is
@@ -387,6 +493,7 @@ pub fn db_fetch_raw_gcs_filter(
 pub fn db_put_header_commitments(
     tx: &Transaction,
     block_hash: &Hash,
+    block_height: u32,
     commitments: &[Hash],
 ) -> Result<(), ChainDbError> {
     if commitments.is_empty() {
@@ -396,7 +503,10 @@ pub fn db_put_header_commitments(
     let bucket = meta
         .bucket(HEADER_CMTS_BUCKET_NAME)
         .ok_or_else(|| ChainDbError::Corrupt("missing header commitments bucket".into()))?;
-    Ok(bucket.put(&block_hash.0, &serialize_header_commitments(commitments))?)
+    Ok(bucket.put(
+        &block_row_key(block_hash, block_height),
+        &serialize_header_commitments(commitments),
+    )?)
 }
 
 /// Fetch the header commitment leaves for a block (dcrd
@@ -404,12 +514,13 @@ pub fn db_put_header_commitments(
 pub fn db_fetch_header_commitments(
     tx: &Transaction,
     block_hash: &Hash,
+    block_height: u32,
 ) -> Result<Vec<Hash>, ChainDbError> {
     let meta = tx.metadata();
     let bucket = meta
         .bucket(HEADER_CMTS_BUCKET_NAME)
         .ok_or_else(|| ChainDbError::Corrupt("missing header commitments bucket".into()))?;
-    match bucket.get(&block_hash.0) {
+    match bucket.get(&block_row_key(block_hash, block_height)) {
         None => Ok(Vec::new()),
         Some(v) => Ok(deserialize_header_commitments(&v)?),
     }
@@ -716,5 +827,73 @@ mod tests {
             "{res:?}"
         );
         assert_eq!(calls, 3);
+    }
+
+    /// A per-block row's key is the block's height big-endian and then
+    /// its hash, and it reads back into the same pair.
+    #[test]
+    fn block_row_key_is_the_big_endian_height_then_the_hash() {
+        let hash = Hash(core::array::from_fn(|i| i as u8));
+        for height in [0u32, 1, 255, 256, 0x0102_0304, u32::MAX] {
+            let key = block_row_key(&hash, height);
+            assert_eq!(key.len(), 36);
+            assert_eq!(key[..4], height.to_be_bytes());
+            assert_eq!(key[4..], hash.0);
+            let read = u32::from_be_bytes(key[..4].try_into().expect("four bytes"));
+            assert_eq!(
+                (read, Hash(key[4..].try_into().expect("a hash"))),
+                (height, hash)
+            );
+        }
+    }
+
+    /// Per-block row keys sort by height and then by hash, whatever
+    /// order the hashes or the heights' little-endian bytes would give.
+    #[test]
+    fn block_row_keys_sort_by_height_then_hash() {
+        let (low, high) = (Hash([0x00; 32]), Hash([0xff; 32]));
+        let mut pairs = alloc::vec![
+            (65_536u32, low),
+            (1, high),
+            (256, low),
+            (255, high),
+            (7, high),
+            (7, low),
+            (0, high),
+            (16_777_216, low),
+        ];
+        let mut by_key = pairs.clone();
+        by_key.sort_by_key(|(height, hash)| block_row_key(hash, *height));
+        pairs.sort();
+        assert_eq!(by_key, pairs);
+    }
+
+    /// The refusal of an older database names the versions, says the
+    /// chain is not damaged and what to delete: the directory by its
+    /// path when the caller knows it.
+    #[test]
+    fn the_older_version_refusal_says_what_to_delete() {
+        let generic = ChainDbError::OlderVersion(14).to_string();
+        assert_eq!(generic, older_version_refusal(14, None));
+        assert_eq!(
+            generic,
+            format!(
+                "the blockchain database is version 14, which an older dcroxide wrote, and \
+                 this version of the software reads only version {CURRENT_DATABASE_VERSION} \
+                 -- there is no in-place upgrade, and the chain is not damaged: delete the \
+                 block database directory and start again to build a new one from genesis \
+                 (see docs/operating.md)"
+            )
+        );
+        assert_eq!(
+            older_version_refusal(14, Some("/data/simnet/blocks_ffldb")),
+            format!(
+                "the blockchain database in '/data/simnet/blocks_ffldb' is version 14, which \
+                 an older dcroxide wrote, and this version of the software reads only version \
+                 {CURRENT_DATABASE_VERSION} -- there is no in-place upgrade, and the chain is \
+                 not damaged: delete '/data/simnet/blocks_ffldb' and start again to build a \
+                 new one from genesis (see docs/operating.md)"
+            )
+        );
     }
 }

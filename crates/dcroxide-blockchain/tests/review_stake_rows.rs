@@ -63,7 +63,7 @@ fn pruned_chain(
 
 /// Replace (or with `None`, delete) a height's row in a ticket bucket.
 fn set_row(chain: &Chain, bucket: &[u8], height: i64, row: Option<&[u8]>) {
-    let key = (height as u32).to_le_bytes();
+    let key = dcroxide_stake::stakedb::height_key(height as u32);
     chain
         .db
         .as_ref()

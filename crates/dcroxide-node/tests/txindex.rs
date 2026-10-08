@@ -184,7 +184,7 @@ fn serve_txindex_rpc(
             Arc::clone(indexes.tx_index.as_ref().expect("tx index enabled")),
             Arc::clone(&indexes.queryer),
         ))),
-        db: Box::new(NodeRpcDb::new(db)),
+        db: Box::new(NodeRpcDb::new(db, Arc::clone(&chain))),
         filterer_v2: Box::new(()),
         exists_addresser: Some(Box::new(NodeRpcExistsAddresser::new(
             Arc::clone(

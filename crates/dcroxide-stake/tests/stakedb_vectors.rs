@@ -10,6 +10,12 @@
 //! bucket row byte for byte at checkpoints (the database info
 //! creation date is masked since dcrd stamps the wall clock) and the
 //! loaded node state including the recomputed lottery final state.
+//!
+//! The per-height buckets are compared under the port's own keys: dcrd
+//! writes the height little-endian and the port big-endian (see
+//! `stakedb::height_key`), so each expected key is converted before the
+//! comparison, and the values -- and every other bucket -- still match
+//! byte for byte.
 
 // Test-harness arithmetic over bounded lengths.
 #![allow(clippy::arithmetic_side_effects)]
@@ -18,8 +24,8 @@ use dcroxide_chainhash::Hash;
 use dcroxide_database::{Database, Options};
 use dcroxide_stake::calc_hash256_prng_iv;
 use dcroxide_stake::stakedb::{
-    db_fetch_block_undo_data, db_fetch_new_tickets, init_database_state, load_best_node,
-    write_connected_best_node, write_disconnected_best_node,
+    db_fetch_block_undo_data, db_fetch_new_tickets, height_key, init_database_state,
+    load_best_node, write_connected_best_node, write_disconnected_best_node,
 };
 use dcroxide_stake::ticketdb::{
     LIVE_TICKETS_BUCKET_NAME, MISSED_TICKETS_BUCKET_NAME, REVOKED_TICKETS_BUCKET_NAME,
@@ -43,6 +49,18 @@ fn parse_hashes(s: &str) -> Vec<Hash> {
         return Vec::new();
     }
     s.split(',').map(parse_hash).collect()
+}
+
+/// The port's key for a row dcrd's dump lists: the per-height buckets'
+/// little-endian heights become big-endian, and every other key stays.
+fn port_key(bucket: &str, dcrd_key: Vec<u8>) -> Vec<u8> {
+    match bucket {
+        "stakeblockundo" | "ticketsinblock" => {
+            let le: [u8; 4] = dcrd_key.as_slice().try_into().expect("a 4-byte height key");
+            height_key(u32::from_le_bytes(le)).to_vec()
+        }
+        _ => dcrd_key,
+    }
 }
 
 fn raw_hex(bytes: &[u8]) -> String {
@@ -198,7 +216,11 @@ fn stakedb_vectors() {
                     }
                     let rf: Vec<&str> = row_line.split(' ').collect();
                     assert_eq!(rf[0], "row", "expected row line");
-                    expected.push((rf[1].to_string(), unhex(rf[2]), unhex(rf[3])));
+                    expected.push((
+                        rf[1].to_string(),
+                        port_key(rf[1], unhex(rf[2])),
+                        unhex(rf[3]),
+                    ));
                 }
                 let mut got = collect_rows(&db);
                 let key = |r: &(String, Vec<u8>, Vec<u8>)| (r.0.clone(), r.1.clone());

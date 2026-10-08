@@ -113,15 +113,18 @@ work). Currently implemented:
 - `dcroxide-database` — block and metadata storage with dcrd's
   `database` interface semantics (buckets, transactions, block storage
   APIs, all error kinds), backed by redb 4.3.0 per ADR-0004 with
-  dcrd's exact ffldb key layout and flat-file block record format, plus
+  dcrd's ffldb key layout and flat-file block record format, except
+  that blocks and the other per-block rows are keyed by height first
+  (ADR-0010, chain database version 15), plus
   bulk block import/export in dcrd's `addblock` bootstrap format, plus
   ffldb's metadata write cache — layered snapshots over one durable
   flush per window — so a sync commits on dcrd's schedule rather than
   per block; pinned by the ported ffldb interface-test battery and a
   crash-consistency rig (fresh-sync stance: no in-place dcrd datadir
-  reuse, and no in-place upgrade across a redb format change either —
-  an older file format is refused with a typed error naming it, and the
-  chain must be re-synced or re-imported)
+  reuse, and no in-place upgrade across a redb format change or a
+  chain database version either — an older format is refused with a
+  typed error naming it, and the chain must be re-synced or
+  re-imported)
 - `dcroxide-blockchain` — the chain engine from dcrd's
   `internal/blockchain`, ported complete.
 
@@ -167,7 +170,9 @@ work). Currently implemented:
   (`InvalidateBlock`/`ReconsiderBlock`/`ForceHeadReorganization`).
 
   Persistence and the consumer surface: the ticket database persistence
-  layer over redb (byte-identical bucket rows against dcrd's ffldb),
+  layer over redb (bucket row values byte-identical to dcrd's ffldb,
+  with the two per-height buckets keyed by big-endian height where
+  dcrd's keys are little-endian, ADR-0010),
   durable chain state (`createChainState`/`initChainState` with restart
   round trips over the reorganization ground truth), mining support
   (`CheckConnectBlockTemplate`, ticket exhaustion checks, and the chain
@@ -498,11 +503,15 @@ an inferred one. Feeding dcrd the identical block bytes and recording
 the index composition on both sides, the two implementations store the
 **same payload** — 6,061,905,929 B against 6,069,302,583 B, fifteen
 buckets equal to the byte, the remainder accounted for by a four-byte
-bucket-id prefix dcroxide adds to each UTXO row. So none of the gap is
-data dcroxide keeps and dcrd does not, and none of it is a denser dcrd
-encoding. Over each store's own payload it is 1.081x under goleveldb
-against 1.738x for redb's live B-tree (1.726x on dcrd's write
-schedule). The full measurement record is in
+bucket-id prefix dcroxide adds to each UTXO row. (That was measured
+before the 2026-10-08 height-first keys, which add four bytes to each
+key in five per-block buckets, at most about 22 MB at the tip, so those
+five are no longer equal to the byte; see
+[ADR-0010](docs/adr/0010-height-first-block-keys.md).) So, those key
+bytes aside, none of the gap is data dcroxide keeps and dcrd does not,
+and none of it is a denser dcrd encoding. Over each store's own payload
+it is 1.081x under goleveldb against 1.738x for redb's live B-tree
+(1.726x on dcrd's write schedule). The full measurement record is in
 [ADR-0004](docs/adr/0004-storage-backend.md); PARITY.md records the
 divergence from dcrd's two-database layout. Measurements are recorded
 per machine, commit, and corpus in

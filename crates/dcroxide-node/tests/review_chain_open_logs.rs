@@ -16,7 +16,10 @@
 //! The expected lines below are what dcrd at the parity pin prints for
 //! the same runs, on a fresh simnet data directory, apart from its
 //! `Loading UTXO database from` and `UTXO database loaded` lines: the
-//! port has no separate UTXO database to load.
+//! port has no separate UTXO database to load.  One number differs as
+//! well: the chain database version is 15 where dcrd's is 14, for the
+//! port's height-first per-block keys
+//! (`dcroxide_blockchain::chaindb::CURRENT_DATABASE_VERSION`).
 
 #![cfg(target_os = "linux")]
 // Test-harness arithmetic over a fixed deadline.
@@ -44,7 +47,7 @@ fn genesis_simnet_chan_lines(max_mib: u64, with_debug: bool) -> Vec<String> {
         format!("[INF] CHAN: Deployment version {deployment} loaded"),
         format!("[INF] CHAN: UTXO cache initializing (max size: {max_mib} MiB)..."),
         "[INF] CHAN: UTXO cache initialization completed".to_string(),
-        "[INF] CHAN: Blockchain database version info: chain: 14, compression: 1, block \
+        "[INF] CHAN: Blockchain database version info: chain: 15, compression: 1, block \
          index: 3, spend journal: 3"
             .to_string(),
         "[INF] CHAN: UTXO database version info: version: 3, compression: 1, utxo set: 3"

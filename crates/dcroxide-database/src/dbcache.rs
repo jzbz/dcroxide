@@ -1384,8 +1384,10 @@ mod tests {
 
         let (_dir, db) = new_db();
         let raw = vec![0x5au8; 300];
-        // The hash is that of the 180-byte header the bytes start with.
+        // The hash is that of the 180-byte header the bytes start with,
+        // and the height the one it records.
         let hash = dcroxide_chainhash::hash_h(&raw[..180]);
+        let height = crate::transaction::serialized_block_height(&raw).expect("a header");
         {
             let tx = db.begin(true).expect("begin write");
             tx.store_block_raw(&hash, raw.clone()).expect("store block");
@@ -1406,14 +1408,15 @@ mod tests {
         db.flush().expect("flush");
         {
             let tx = db.begin(false).expect("begin read");
-            assert_eq!(tx.fetch_block(&hash).expect("fetch block"), raw);
+            assert_eq!(tx.fetch_block(&hash, height).expect("fetch block"), raw);
             let region = crate::BlockRegion {
                 hash,
                 offset: 4,
                 len: 8,
             };
             assert_eq!(
-                tx.fetch_block_region(&region).expect("fetch region"),
+                tx.fetch_block_region(&region, height)
+                    .expect("fetch region"),
                 raw[4..12].to_vec()
             );
         }

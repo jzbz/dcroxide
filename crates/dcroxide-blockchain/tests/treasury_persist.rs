@@ -41,7 +41,9 @@ use dcroxide_wire::{MsgBlock, MsgTx};
 
 /// Replay the treasury corpus into a database-backed chain, exactly as
 /// `treasury_vectors.rs` replays it into a memory one.
-fn replay(chain: &mut Chain, params: &dcroxide_chaincfg::Params) -> (Vec<Hash>, Vec<Hash>) {
+/// The replayed blocks, each hash with its height (which keys the
+/// block's treasury row), and the mined tspends.
+fn replay(chain: &mut Chain, params: &dcroxide_chaincfg::Params) -> (Vec<(Hash, u32)>, Vec<Hash>) {
     let data = include_str!("data/treasury_vectors.txt");
     let mut block_hashes = Vec::new();
     let mut tspend_hashes = Vec::new();
@@ -78,7 +80,7 @@ fn replay(chain: &mut Chain, params: &dcroxide_chaincfg::Params) -> (Vec<Hash>, 
                     .put_treasury_records(id, &block, params)
                     .unwrap_or_else(|e| panic!("{line}: treasury records: {e:?}"));
                 chain.best_chain.set_tip(&chain.store, Some(id));
-                block_hashes.push(block.header.block_hash());
+                block_hashes.push((block.header.block_hash(), block.header.height));
             }
             _ => {}
         }
@@ -127,8 +129,8 @@ fn treasury_rows_reach_the_database() {
     let tx = db.begin(false).expect("begin read");
 
     let mut missing = Vec::new();
-    for hash in &block_hashes {
-        if db_fetch_treasury_balance(&tx, hash)
+    for (hash, height) in &block_hashes {
+        if db_fetch_treasury_balance(&tx, hash, *height)
             .expect("read the treasury bucket")
             .is_none()
         {
@@ -163,7 +165,7 @@ fn treasury_rows_reach_the_database() {
             .unwrap_or_default();
         for b in &blocks {
             assert!(
-                block_hashes.contains(b),
+                block_hashes.iter().any(|(hash, _)| hash == b),
                 "tspend {hash:?} names block {b:?}, which is not in the corpus",
             );
         }
