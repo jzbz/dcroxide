@@ -92,7 +92,7 @@ impl redb::StorageBackend for FaultyBackend {
         }
         let limited = self
             .reads_left
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| match left {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |left| match left {
                 0 => None,
                 n if n > 0 => Some(n - 1),
                 n => Some(n),

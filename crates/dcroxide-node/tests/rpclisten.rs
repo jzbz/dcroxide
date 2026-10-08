@@ -438,14 +438,16 @@ fn unauthenticated_post_is_rejected_before_reading_the_body() {
     // instead of blocking on a body that never arrives.  Before the fix
     // the body was read first, and this connection got no response.
     let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+    // Set before the server can have answered and closed: macOS refuses
+    // SO_RCVTIMEO on a connection the peer has already torn down (EINVAL).
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .expect("read timeout");
     let request = "POST / HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: 4000000\r\nConnection: close\r\n\r\n";
     stream.write_all(request.as_bytes()).expect("write");
     stream
         .shutdown(std::net::Shutdown::Write)
         .expect("half close");
-    stream
-        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
-        .expect("read timeout");
     let mut response = String::new();
     let _ = stream.read_to_string(&mut response);
     assert!(
@@ -2678,13 +2680,15 @@ fn a_websocket_upgrade_declaring_a_body_is_refused() {
 /// answered from the head alone and the connection is then dropped.
 fn send_raw(port: u16, request: &str) -> String {
     let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+    // Set before writing: the server can answer from the head and drop the
+    // connection at once, and macOS then refuses SO_RCVTIMEO with EINVAL.
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .expect("read timeout");
     stream.write_all(request.as_bytes()).expect("write");
     stream
         .shutdown(std::net::Shutdown::Write)
         .expect("half close");
-    stream
-        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
-        .expect("read timeout");
     let mut response = String::new();
     let _ = stream.read_to_string(&mut response);
     response

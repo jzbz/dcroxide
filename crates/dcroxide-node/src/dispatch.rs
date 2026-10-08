@@ -1917,7 +1917,7 @@ fn decrement_usize(counter: &AtomicUsize, by: usize) {
     if by == 0 {
         return;
     }
-    let _ = counter.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+    let _ = counter.try_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
         Some(current.saturating_sub(by))
     });
 }
@@ -1927,7 +1927,7 @@ fn decrement_u32(counter: &AtomicU32, by: u32) {
     if by == 0 {
         return;
     }
-    let _ = counter.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+    let _ = counter.try_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
         Some(current.saturating_sub(by))
     });
 }
