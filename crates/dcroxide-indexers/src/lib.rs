@@ -5,8 +5,9 @@
 //! and drop-marker keys, creation, upgrade, recovery, and the
 //! incremental drop paths), the index update subscriber with
 //! prerequisite/dependent relay and catch-up, the version 2
-//! transaction index, the version 2 exists address index, and the
-//! legacy index drop helpers.
+//! transaction index, the exists address index (version 3: dcrd's
+//! address set in this port's layout 3, written inside the metadata
+//! flush), and the legacy index drop helpers.
 //!
 //! The package's log lines -- the catch-up and recovery with their
 //! periodic progress lines, and every drop -- go to the [`LogSink`] the
@@ -23,6 +24,7 @@
 
 mod common;
 mod error;
+mod existsaddr;
 mod existsaddrindex;
 mod legacydrops;
 mod log;
@@ -32,9 +34,14 @@ mod txindex;
 
 pub use common::{ChainQueryer, Indexer, Interrupt, SyncWaiter};
 pub use error::{ErrorKind, IdxError, IndexerError};
+pub use existsaddr::policy::Policy as ExistsAddrPolicy;
+#[doc(hidden)]
+pub use existsaddr::policy::partition_of as exists_addr_partition_of;
+#[doc(hidden)]
+pub use existsaddr::store::{LayoutCheck, check_layout, stored_keys};
 pub use existsaddrindex::{
-    ADDR_KEY_SIZE, EXISTS_ADDR_INDEX_KEY, EXISTS_ADDRESS_INDEX_NAME, ExistsAddrIndex,
-    ExistsAddrQuery, ExistsAddrUnconfirmed, addr_to_key, drop_exists_addr_index,
+    ADDR_KEY_SIZE, EXISTS_ADDR_INDEX_KEY, EXISTS_ADDR_INDEX_VERSION, EXISTS_ADDRESS_INDEX_NAME,
+    ExistsAddrIndex, ExistsAddrQuery, ExistsAddrUnconfirmed, addr_to_key, drop_exists_addr_index,
 };
 pub use legacydrops::{ADDR_INDEX_KEY, CF_INDEX_PARENT_BUCKET_KEY, drop_addr_index, drop_cf_index};
 pub use log::{LogLevel, LogSink};

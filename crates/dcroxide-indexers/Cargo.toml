@@ -15,6 +15,10 @@ dcroxide-database = { path = "../dcroxide-database" }
 dcroxide-stake = { path = "../dcroxide-stake" }
 dcroxide-txscript = { path = "../dcroxide-txscript" }
 dcroxide-wire = { path = "../dcroxide-wire" }
+# The exists-address index's partition key, drawn once per index.
+getrandom = "0.4"
+# The exists-address index's keyed partition hash (SipHash-2-4).
+siphasher = { version = "1", default-features = false }
 
 [dev-dependencies]
 dcroxide-testutil = { path = "../dcroxide-testutil" }

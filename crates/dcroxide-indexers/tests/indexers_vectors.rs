@@ -9,6 +9,16 @@
 //! kinds — comparing the index tips and the full contents of every
 //! index bucket after each operation against a real redb-backed
 //! database.
+//!
+//! The exists address index stores dcrd's address set in this port's
+//! layout 3 (`EXISTS_ADDR_INDEX_VERSION` 3), so its bucket is compared
+//! by the keys it holds, from `ExistsAddrIndex::logical_keys`, rendered
+//! as dcrd's one-row-per-address dump renders them; its version row is
+//! checked to read 3 and rendered as dcrd's 2.  Every other row is
+//! compared raw.  The whole session runs twice: with the default policy,
+//! and with `ExistsAddrPolicy::tiny` and a flush after every operation,
+//! which runs the journal, both run rewrites and the journal garbage
+//! collection inside dcrd's own scenarios.
 
 // Test-harness arithmetic over bounded lengths.
 #![allow(clippy::arithmetic_side_effects)]
@@ -21,9 +31,9 @@ use dcroxide_chainhash::Hash;
 use dcroxide_database::{Database, Options};
 use dcroxide_indexers::{
     CONNECT_NTFN, ChainQueryer, DISCONNECT_NTFN, EXISTS_ADDR_INDEX_KEY, EXISTS_ADDRESS_INDEX_NAME,
-    ExistsAddrIndex, HASH_BY_ID_INDEX_BUCKET_NAME, ID_BY_HASH_INDEX_BUCKET_NAME, IndexNtfn,
-    IndexNtfnType, IndexSubscriber, Indexer, LogLevel, LogSink, TX_INDEX_KEY, TX_INDEX_NAME,
-    TxIndex,
+    ExistsAddrIndex, ExistsAddrPolicy, HASH_BY_ID_INDEX_BUCKET_NAME, ID_BY_HASH_INDEX_BUCKET_NAME,
+    IndexNtfn, IndexNtfnType, IndexSubscriber, Indexer, LogLevel, LogSink, NO_PREREQS,
+    TX_INDEX_KEY, TX_INDEX_NAME, TxIndex,
 };
 use dcroxide_testutil::unhex;
 use dcroxide_txscript::stdaddr::{Address, decode_address};
@@ -165,10 +175,36 @@ struct Scenario {
     ex_idx: Option<Arc<Mutex<ExistsAddrIndex>>>,
 }
 
+/// What the exists address index's flushes did over a replay, summed
+/// from the flush observer.
+#[derive(Debug, Default, Clone, Copy)]
+struct IndexWork {
+    keys_journaled: u64,
+    merges: u64,
+    base_rewrites: u64,
+    rows_removed: u64,
+    /// Checks after which the journal held fewer keys than at the check
+    /// before: its garbage collection ran.  Counted only with a flush
+    /// after every operation.
+    journal_collections: u64,
+}
+
 impl Scenario {
-    fn new(params: &'static Params) -> Scenario {
+    fn new(params: &'static Params, work: &Arc<Mutex<IndexWork>>) -> Scenario {
         let dir = tempfile::tempdir().expect("tempdir");
-        let opts = Options::new(dir.path().join("db"), params.net.0);
+        let mut opts = Options::new(dir.path().join("db"), params.net.0);
+        let work = Arc::clone(work);
+        opts.flush_observer = Some(Arc::new(
+            move |obs: &dcroxide_database::FlushObservation| {
+                if let Some(p) = obs.participant {
+                    let mut work = work.lock().expect("work");
+                    work.keys_journaled += p.keys_journaled;
+                    work.merges += p.merges;
+                    work.base_rewrites += p.base_rewrites;
+                    work.rows_removed += p.rows_removed;
+                }
+            },
+        ));
         let db = Arc::new(Database::create(&opts).expect("db"));
         Scenario {
             _dir: dir,
@@ -224,11 +260,23 @@ impl Scenario {
                 lines.push(format!("nobkt {name_str}"));
                 continue;
             };
+            if name == EXISTS_ADDR_INDEX_KEY {
+                // Layout 3: the keys the index holds, as dcrd's rows.
+                for key in self.exists_keys() {
+                    lines.push(format!("bkt {name_str} {} -", raw_hex(&key)));
+                }
+                continue;
+            }
             let mut cursor = bucket.cursor();
             let mut ok = cursor.first();
             while ok {
                 let key = cursor.key().expect("cursor key");
-                let value = cursor.value().unwrap_or_default();
+                let mut value = cursor.value().unwrap_or_default();
+                if name == b"idxtips" && key == exists_version_key() {
+                    // The port's index version, 3, where dcrd's is 2.
+                    assert_eq!(value, 3u32.to_le_bytes(), "the exists index version row");
+                    value = 2u32.to_le_bytes().to_vec();
+                }
                 let value_str = if value.is_empty() {
                     "-".to_string()
                 } else {
@@ -241,6 +289,26 @@ impl Scenario {
         db_tx.rollback().expect("rollback");
         lines
     }
+
+    /// The exists address index's keys: the live index's memtable and
+    /// runs, or the store's when no index handle exists.
+    fn exists_keys(&self) -> Vec<[u8; 21]> {
+        match &self.ex_idx {
+            Some(idx) => idx
+                .lock()
+                .expect("indexer lock poisoned")
+                .logical_keys()
+                .expect("logical keys"),
+            None => dcroxide_indexers::stored_keys(&self.db)
+                .expect("stored keys")
+                .unwrap_or_default(),
+        }
+    }
+}
+
+/// The tips bucket row holding the exists address index's version.
+fn exists_version_key() -> Vec<u8> {
+    [b"v".as_slice(), EXISTS_ADDR_INDEX_KEY].concat()
 }
 
 /// Read an index tip directly, mirroring the dump's package-level
@@ -279,31 +347,115 @@ fn parse_block(hex: &str) -> Arc<MsgBlock> {
     Arc::new(block)
 }
 
+/// dcrd's session with the exists address index at its default policy.
 #[test]
 fn indexers_vectors() {
+    let work = replay(ExistsAddrPolicy::default(), false);
+    assert_eq!(work.merges, 0, "the default limits merge nothing here");
+}
+
+/// The partition key of the runs below.  Any key gives the same answers;
+/// on dcrd's small chain the key decides which partitions its few
+/// addresses share, and so which merge paths run.  About one key in four
+/// leaves the tiny limits without a base rewrite here, and this one runs
+/// every path at every setting.
+const VECTOR_PARTITION_KEY: [u8; 16] = *b"dcrd's session a";
+
+/// [`ExistsAddrPolicy::tiny`] under [`VECTOR_PARTITION_KEY`].
+fn tiny() -> ExistsAddrPolicy {
+    ExistsAddrPolicy {
+        partition_key: Some(VECTOR_PARTITION_KEY),
+        ..ExistsAddrPolicy::tiny()
+    }
+}
+
+/// dcrd's session again with tiny merge limits and a flush after every
+/// operation, so the exists address index journals, rewrites delta and
+/// base runs and collects journal garbage throughout; the answers and
+/// the key set must not change.
+#[test]
+fn indexers_vectors_with_tiny_limits_and_a_flush_after_every_operation() {
+    let work = replay(tiny(), true);
+    assert!(work.journal_collections > 0, "{work:?}");
+}
+
+/// dcrd's session again with every partition but the last key's merged at
+/// every flush, so keys are journaled, merged at a later flush and their
+/// journal rows collected, all inside dcrd's scenarios.
+#[test]
+fn indexers_vectors_merging_all_but_one_key_at_every_flush() {
+    let policy = ExistsAddrPolicy {
+        k0: 1,
+        k0_hard: 1,
+        ..tiny()
+    };
+    let work = replay(policy, true);
+    assert!(work.journal_collections > 0, "{work:?}");
+}
+
+/// dcrd's session again with a merge of every partition at every flush,
+/// so every key goes into a run in the flush that first sees it and the
+/// journal is never written.
+#[test]
+fn indexers_vectors_merging_everything_at_every_flush() {
+    let policy = ExistsAddrPolicy {
+        k0: 0,
+        k0_hard: 0,
+        ..tiny()
+    };
+    let work = replay(policy, true);
+    assert!(work.rows_removed > 0, "{work:?}");
+}
+
+/// Replay the dump, creating every exists address index with `policy`
+/// and, when `flush_each` is set, flushing the database after every
+/// operation before its state is compared, and checking the index's rows
+/// against layout 3's invariants.  Returns what the index's flushes did.
+fn replay(policy: ExistsAddrPolicy, flush_each: bool) -> IndexWork {
     let params = leaked_params();
     let data = include_str!("data/indexers_vectors.txt");
     let mut lines = data.lines().peekable();
 
+    let work = Arc::new(Mutex::new(IndexWork::default()));
     let mut scenario: Option<Scenario> = None;
     let mut blocks: HashMap<String, Arc<MsgBlock>> = HashMap::new();
     let mut addrs: HashMap<String, Address> = HashMap::new();
     let mut counts = [0usize; 6];
+    // The journal's size at the scenario's last check.
+    let journal_keys: std::cell::Cell<Option<usize>> = std::cell::Cell::new(None);
 
     // Consume the expected state lines up to `endstate` and compare
     // them against the actual rendered state.
-    let compare_state =
-        |lines: &mut core::iter::Peekable<std::str::Lines<'_>>, sc: &Scenario, context: &str| {
-            let mut want = Vec::new();
-            for line in lines.by_ref() {
-                if line == "endstate" {
-                    break;
+    let compare_state = |lines: &mut core::iter::Peekable<std::str::Lines<'_>>,
+                         sc: &Scenario,
+                         context: &str| {
+        if flush_each {
+            sc.db.flush().expect("flush");
+            if let Some(check) = dcroxide_indexers::check_layout(&sc.db).expect("layout invariants")
+            {
+                if policy.k0 == 0 {
+                    assert_eq!(check.journal_rows, 0, "every flush merges everything");
+                    assert!(check.pending.is_empty());
                 }
-                want.push(line.to_string());
+                if journal_keys
+                    .get()
+                    .is_some_and(|before| check.journal_keys < before)
+                {
+                    work.lock().expect("work").journal_collections += 1;
+                }
+                journal_keys.set(Some(check.journal_keys));
             }
-            let got = sc.render_state();
-            assert_eq!(got, want, "state mismatch after {context}");
-        };
+        }
+        let mut want = Vec::new();
+        for line in lines.by_ref() {
+            if line == "endstate" {
+                break;
+            }
+            want.push(line.to_string());
+        }
+        let got = sc.render_state();
+        assert_eq!(got, want, "state mismatch after {context}");
+    };
 
     let ntfn_for = |blocks: &HashMap<String, Arc<MsgBlock>>,
                     name: &str,
@@ -326,7 +478,8 @@ fn indexers_vectors() {
         let f: Vec<&str> = line.split(' ').collect();
         match f[0] {
             "scenario" => {
-                scenario = Some(Scenario::new(params));
+                scenario = Some(Scenario::new(params, &work));
+                journal_keys.set(None);
                 blocks.clear();
                 addrs.clear();
             }
@@ -354,10 +507,12 @@ fn indexers_vectors() {
             }
             "newexists" => {
                 let sc = scenario.as_mut().expect("scenario");
-                let idx = ExistsAddrIndex::new(
+                let idx = ExistsAddrIndex::new_with_policy(
                     &mut sc.subber,
                     sc.db.clone(),
                     sc.chain.clone() as Arc<dyn ChainQueryer>,
+                    NO_PREREQS,
+                    policy,
                 )
                 .expect("new exists index");
                 sc.ex_idx = Some(idx);
@@ -365,11 +520,12 @@ fn indexers_vectors() {
             }
             "newexistsdep" => {
                 let sc = scenario.as_mut().expect("scenario");
-                let idx = ExistsAddrIndex::new_with_prereq(
+                let idx = ExistsAddrIndex::new_with_policy(
                     &mut sc.subber,
                     sc.db.clone(),
                     sc.chain.clone() as Arc<dyn ChainQueryer>,
                     TX_INDEX_NAME,
+                    policy,
                 )
                 .expect("new dependent exists index");
                 sc.ex_idx = Some(idx);
@@ -494,6 +650,9 @@ fn indexers_vectors() {
                     .lock()
                     .expect("indexer lock poisoned")
                     .add_unconfirmed_tx(&tx);
+                if flush_each {
+                    sc.db.flush().expect("flush");
+                }
                 counts[3] += 1;
             }
             "existsq" => {
@@ -531,6 +690,19 @@ fn indexers_vectors() {
         }
     }
     assert_eq!(counts, [18, 3, 8, 1, 5, 3], "row counts");
+    let work = *work.lock().expect("work");
+    if flush_each {
+        // Small limits must have run the index's flush paths: both delta
+        // and base rewrites, and, unless every key goes into a run in the
+        // flush that first sees it, journaling.
+        assert!(
+            (policy.k0 == 0 || work.keys_journaled > 0)
+                && work.base_rewrites > 0
+                && work.merges > work.base_rewrites,
+            "{work:?}"
+        );
+    }
+    work
 }
 
 /// Native coverage for the pieces the dump cannot observe: the sync
@@ -978,7 +1150,8 @@ fn the_indexers_log_dcrd_lines_to_the_sink() {
         ]
     );
 
-    // The exists address index drops the same way.
+    // The exists address index drops the same way.  Its rows reach the
+    // bucket in a flush, and its drop counts rows, not addresses.
     ExistsAddrIndex::new(
         &mut subber,
         db.clone(),
@@ -986,6 +1159,7 @@ fn the_indexers_log_dcrd_lines_to_the_sink() {
     )
     .expect("exists index");
     subber.catch_up(&*chain).expect("catch up");
+    db.flush().expect("flush");
     captured.lock().expect("lines").clear();
     let rows = bucket_rows(&db, EXISTS_ADDR_INDEX_KEY);
     assert!(rows > 0, "the index holds entries");

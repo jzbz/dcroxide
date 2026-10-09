@@ -42,7 +42,8 @@ use std::time::{Duration, Instant};
 
 use crate::METADATA_TABLE;
 use crate::blockfile::BlockStore;
-use crate::error::Error;
+use crate::error::{Error, ErrorKind, db_error};
+use crate::participant::{FlushWriter, Registration};
 
 /// The default size for the database cache (dcrd `defaultCacheSize`,
 /// 100 MiB).
@@ -109,6 +110,8 @@ pub(crate) struct FlushOutcome {
     block_sync: crate::FlushPhase,
     insert: crate::FlushPhase,
     commit: crate::FlushPhase,
+    /// Set when the flush participant contributed to this flush.
+    participant: Option<crate::ParticipantStats>,
 }
 
 impl FlushOutcome {
@@ -123,6 +126,7 @@ impl FlushOutcome {
             block_sync: crate::FlushPhase::default(),
             insert: crate::FlushPhase::default(),
             commit: crate::FlushPhase::default(),
+            participant: None,
         }
     }
 }
@@ -229,6 +233,16 @@ impl CacheSnapshot {
     /// Whether the overlay holds nothing at all.
     fn is_empty(&self) -> bool {
         self.layers.iter().all(|layer| layer.is_empty())
+    }
+
+    /// Whether any layer holds an entry, a pending deletion included,
+    /// whose key starts with `prefix`: the check that registering a flush
+    /// participant over `prefix` would leave no overlay row to shadow its
+    /// rows.
+    pub(crate) fn holds_prefix(&self, prefix: &[u8]) -> bool {
+        self.merged_from(prefix)
+            .next()
+            .is_some_and(|(key, _)| key.starts_with(prefix))
     }
 
     /// The merged view of every layer, ascending by key: each key once,
@@ -693,10 +707,20 @@ impl DbCache {
 
     /// Persist a captured batch. Runs WITHOUT the cache lock held, so
     /// readers and the overlay's writers proceed while it works.
+    ///
+    /// With a registered flush participant (ADR-0011), the participant is
+    /// asked `has_work` once, after the block sync.  When it has work, it
+    /// contributes its rows inside this flush's write transaction, after
+    /// the overlay's rows and before the commit, so both land in the one
+    /// durable commit, and the flush commits even an empty overlay.
+    /// `contributed` is set just before `contribute` is called, so the
+    /// caller knows to call `finished` whether or not this then fails.
     pub(crate) fn run_flush(
         batch: &FlushBatch,
         kv: &redb::Database,
         block_store: &std::sync::Mutex<BlockStore>,
+        participant: Option<&Registration>,
+        contributed: &mut bool,
     ) -> Result<FlushOutcome, Error> {
         // Block files before metadata, so the metadata never describes
         // bytes that could vanish in a crash.
@@ -722,7 +746,8 @@ impl DbCache {
         let view = CacheSnapshot {
             layers: batch.layers.clone(),
         };
-        if view.is_empty() {
+        let contributing = participant.filter(|r| r.participant.has_work());
+        if view.is_empty() && contributing.is_none() {
             // Nothing to commit, but the block files above still needed
             // their sync -- that is the half of a flush that runs even on
             // an empty overlay.
@@ -733,10 +758,14 @@ impl DbCache {
                 block_sync,
                 insert: crate::FlushPhase::default(),
                 commit: crate::FlushPhase::default(),
+                participant: None,
             });
         }
+        // The participant's prefix, which no overlay row may lie under.
+        let guarded = participant.map(|r| &*r.prefix);
 
         let mut dirty_entries = 0usize;
+        let mut participant_stats = None;
         let mut sampled = None;
         let mut stats_elapsed = Duration::ZERO;
         let timer = PhaseTimer::start(batch.observed);
@@ -747,6 +776,26 @@ impl DbCache {
                 .open_table(METADATA_TABLE)
                 .map_err(crate::storage_error)?;
             for (key, entry) in view.merged() {
+                // An overlay row under the participant's prefix would
+                // shadow the participant's newer rows for every reader.
+                // Registration and commit refuse to create one, so this is
+                // a backstop: it fails the flush, and with it latches the
+                // store, rather than persist a row that should not exist.
+                if let Some(prefix) = guarded {
+                    debug_assert!(
+                        !key.starts_with(prefix),
+                        "an overlay row lies under the flush participant's prefix: {key:02x?}"
+                    );
+                    if key.starts_with(prefix) {
+                        return Err(db_error(
+                            ErrorKind::IncompatibleValue,
+                            format!(
+                                "the metadata overlay holds a row under the flush participant's \
+                                 prefix ({key:02x?}); refusing to flush it"
+                            ),
+                        ));
+                    }
+                }
                 dirty_entries = dirty_entries.saturating_add(1);
                 if let Some(sink) = &batch.write_log {
                     sink(key, entry.as_ref().map(|v| v.as_slice()));
@@ -763,6 +812,16 @@ impl DbCache {
                 }
             }
             insert = timer.finish();
+            if let Some(registered) = contributing {
+                *contributed = true;
+                let timer = PhaseTimer::start(batch.observed);
+                let mut writer =
+                    FlushWriter::new(&mut table, &registered.prefix, batch.write_log.as_ref());
+                let mut stats = registered.participant.contribute(&mut writer)?;
+                writer.fill(&mut stats);
+                stats.contribute = timer.finish();
+                participant_stats = Some(stats);
+            }
             if batch.take_stats {
                 let stats_started = Instant::now();
                 let db_stats = tx.stats().map_err(crate::storage_error)?;
@@ -792,6 +851,7 @@ impl DbCache {
             block_sync,
             insert,
             commit,
+            participant: participant_stats,
         })
     }
 
@@ -829,7 +889,11 @@ impl DbCache {
         layers.truncate(layers.len().saturating_sub(pinned));
         self.publish(layers);
 
-        if outcome.dirty_entries == 0 {
+        // A flush that committed takes a sequence number, including one in
+        // which only the participant wrote: without that, the flushes a
+        // participant drives on its own (an index catch-up, `wants_flush`)
+        // would be invisible to the observer.
+        if outcome.dirty_entries == 0 && outcome.participant.is_none() {
             return;
         }
         self.flush_seq = self.flush_seq.saturating_add(1);
@@ -844,6 +908,7 @@ impl DbCache {
                 insert: outcome.insert,
                 commit: outcome.commit,
                 stats: outcome.sampled,
+                participant: outcome.participant,
             });
         }
     }
@@ -1624,6 +1689,78 @@ mod tests {
              so the stack is pinned near it",
             total as f64 / ROUNDS as f64
         );
+    }
+}
+
+#[cfg(test)]
+mod participant_guard_tests {
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    use tempfile::TempDir;
+
+    use super::DbCache;
+    use crate::participant::Registration;
+    use crate::{Database, Error, FlushParticipant, FlushWriter, Options, ParticipantStats};
+
+    /// A participant that always has work and must never be reached.
+    struct Unreachable;
+
+    impl FlushParticipant for Unreachable {
+        fn wants_flush(&self) -> bool {
+            false
+        }
+
+        fn has_work(&self) -> bool {
+            true
+        }
+
+        fn contribute(&self, _: &mut FlushWriter<'_, '_>) -> Result<ParticipantStats, Error> {
+            panic!("contribute ran after the overlay guard should have failed the flush");
+        }
+
+        fn finished(&self, _: bool) {}
+    }
+
+    /// The flush's backstop against an overlay row under the participant's
+    /// prefix, which would shadow the participant's rows for every reader.
+    ///
+    /// Registration and commit both refuse to create such a row, so no
+    /// public path reaches this; the row is put into the cache directly.
+    /// A debug build stops at the assertion, a release build fails the
+    /// flush before the participant is called -- the error `flush_locked`
+    /// latches.
+    #[test]
+    #[cfg_attr(
+        debug_assertions,
+        should_panic(expected = "an overlay row lies under the flush participant's prefix")
+    )]
+    fn a_flush_refuses_an_overlay_row_under_the_participant_prefix() {
+        let dir = TempDir::new().expect("tempdir");
+        let db =
+            Database::create(&Options::new(dir.path().join("db"), 0x1214_1c16)).expect("create");
+        let prefix: Arc<[u8]> = Arc::from(&[0u8, 0, 0, 9][..]);
+        let mut puts = BTreeMap::new();
+        puts.insert(vec![0u8, 0, 0, 9, b'x'], b"shadow".to_vec());
+        let mut cache = db.inner.cache.lock().expect("cache");
+        cache.commit_pending(puts, std::iter::empty());
+        let batch = cache.begin_flush();
+        let registration = Registration {
+            prefix,
+            participant: Arc::new(Unreachable),
+        };
+        let mut contributed = false;
+        let result = DbCache::run_flush(
+            &batch,
+            &db.inner.kv,
+            &db.inner.block_store,
+            Some(&registration),
+            &mut contributed,
+        );
+        let err = result.err().expect("the flush must fail");
+        assert_eq!(err.kind, crate::ErrorKind::IncompatibleValue, "{err}");
+        assert!(!contributed, "the participant was not called");
+        cache.finish_flush(batch, None);
     }
 }
 

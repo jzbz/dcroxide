@@ -729,7 +729,7 @@ fn run_node(cfg: Config) -> ExitCode {
             indexers: Some(Arc::clone(&indx_log)),
             announce: Some(indx_log),
         };
-        match dcroxide_node::indexes::start_indexes(
+        match dcroxide_node::indexes::start_indexes_with_policy(
             Arc::clone(&interrupt),
             Arc::new(db.clone()),
             Arc::clone(&chain),
@@ -737,6 +737,7 @@ fn run_node(cfg: Config) -> ExitCode {
             cfg.tx_index,
             !cfg.no_exists_addr_index,
             &logs,
+            exists_addr_policy(!cfg.no_exists_addr_index),
         ) {
             Ok(indexes) => Some(indexes),
             Err(e) => {
@@ -1910,6 +1911,34 @@ fn apply_overlay_tuning(opts: &mut Options) {
     }
 }
 
+/// The exists address index's memtable target, from the developer-only
+/// `DCROXIDE_EXISTSADDR_MEMTABLE_KEYS` (keys), with the hard bound one and
+/// a half times it; the defaults when it is unset.
+///
+/// A measurement knob, not an operator setting: it trades the memory the
+/// index holds (21 bytes a key) against the pages its flushes write, and
+/// changes no answer.  An environment variable for `DCROXIDE_DB_CACHE`'s
+/// reason -- dcrd has no counterpart and the `-h` output is pinned to
+/// dcrd's -- and read only when the index is on, so a node without it
+/// logs nothing about it.
+fn exists_addr_policy(enabled: bool) -> dcroxide_indexers::ExistsAddrPolicy {
+    const VAR: &str = "DCROXIDE_EXISTSADDR_MEMTABLE_KEYS";
+    if !enabled {
+        return dcroxide_indexers::ExistsAddrPolicy::default();
+    }
+    match env_tuning_u64(VAR, "keys").and_then(|keys| usize::try_from(keys).ok()) {
+        Some(keys) => {
+            let policy = dcroxide_indexers::ExistsAddrPolicy::with_memtable_keys(keys);
+            log_info(&format!(
+                "Exists address index memtable target set to {} keys (hard bound {}) by {VAR}",
+                policy.k0, policy.k0_hard
+            ));
+            policy
+        }
+        None => dcroxide_indexers::ExistsAddrPolicy::default(),
+    }
+}
+
 /// Record every metadata flush to the JSONL path in
 /// `DCROXIDE_DB_FLUSHLOG`, when one is set.
 ///
@@ -1931,7 +1960,10 @@ fn apply_overlay_tuning(opts: &mut Options) {
 /// waiting on reads: `write_bytes` counts pages when they are dirtied,
 /// not when they are written back, so writeback time shows in a phase's
 /// `ms` and not in its `write_bytes`, and the block-file sync reads
-/// about 0 there however much it flushes.
+/// about 0 there however much it flushes.  `participant` is what the
+/// exists address index wrote inside the flush (its rows, reads, journal
+/// keys, merges and memtable size, and a fourth phase for its time and
+/// I/O), or `null` when it had nothing to write.
 ///
 /// Stats sampling is deliberately left off (`flush_stats_every` stays
 /// 0). redb's `stats()` walks every branch and leaf page, which on a
@@ -1964,7 +1996,7 @@ fn flush_log_observer() -> Option<dcroxide_database::FlushObserver> {
             if let Ok(mut out) = sink.lock() {
                 let _ = writeln!(
                     out,
-                    "{{\"seq\":{},\"end\":{:.3},\"elapsed_ms\":{:.3},\"entries\":{},\"bytes\":{},\"sync\":{},\"insert\":{},\"commit\":{}}}",
+                    "{{\"seq\":{},\"end\":{:.3},\"elapsed_ms\":{:.3},\"entries\":{},\"bytes\":{},\"sync\":{},\"insert\":{},\"commit\":{},\"participant\":{}}}",
                     obs.sequence,
                     end,
                     obs.elapsed.as_secs_f64() * 1000.0,
@@ -1972,7 +2004,9 @@ fn flush_log_observer() -> Option<dcroxide_database::FlushObserver> {
                     obs.dirty_bytes,
                     obs.block_sync.to_json(),
                     obs.insert.to_json(),
-                    obs.commit.to_json()
+                    obs.commit.to_json(),
+                    obs.participant
+                        .map_or_else(|| "null".to_string(), |p| p.to_json())
                 );
                 let _ = out.flush();
             }

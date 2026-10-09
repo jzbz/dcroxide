@@ -21,9 +21,9 @@ use dcroxide_chaincfg::Params;
 use dcroxide_chainhash::Hash;
 use dcroxide_database::{BlockRegion, Database};
 use dcroxide_indexers::{
-    ChainQueryer, EXISTS_ADDRESS_INDEX_NAME, ExistsAddrIndex, ExistsAddrQuery,
-    ExistsAddrUnconfirmed, IdxError, IndexSubscriber, Interrupt, LogLevel, LogSink, TX_INDEX_NAME,
-    TxIndex, TxIndexQuery,
+    ChainQueryer, EXISTS_ADDRESS_INDEX_NAME, ExistsAddrIndex, ExistsAddrPolicy, ExistsAddrQuery,
+    ExistsAddrUnconfirmed, IdxError, IndexSubscriber, Interrupt, LogLevel, LogSink, NO_PREREQS,
+    TX_INDEX_NAME, TxIndex, TxIndexQuery,
 };
 use dcroxide_rpc::server::{RpcDb, RpcExistsAddresser, RpcTxIndexEntry, RpcTxIndexer};
 use dcroxide_txscript::stdaddr::Address;
@@ -162,6 +162,36 @@ pub fn start_indexes(
     exists_addr_index: bool,
     logs: &IndexLogs,
 ) -> Result<NodeIndexes, IdxError> {
+    start_indexes_with_policy(
+        interrupt,
+        db,
+        chain,
+        params,
+        tx_index,
+        exists_addr_index,
+        logs,
+        ExistsAddrPolicy::default(),
+    )
+}
+
+/// [`start_indexes`] with the exists address index's memtable and merge
+/// tuning given: the daemon passes what the developer-only
+/// `DCROXIDE_EXISTSADDR_MEMTABLE_KEYS` sets, which changes the pages its
+/// flushes write and the memory it holds, never an answer.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "start_indexes' arguments plus the one tuning value"
+)]
+pub fn start_indexes_with_policy(
+    interrupt: Interrupt,
+    db: Arc<Database>,
+    chain: Arc<Mutex<Chain>>,
+    params: Params,
+    tx_index: bool,
+    exists_addr_index: bool,
+    logs: &IndexLogs,
+    exists_addr_policy: ExistsAddrPolicy,
+) -> Result<NodeIndexes, IdxError> {
     let queryer = Arc::new(NodeChainQueryer::new(chain, params));
     let mut subscriber = IndexSubscriber::new(interrupt, logs.indexers.clone());
     let tx_index = if tx_index {
@@ -176,10 +206,12 @@ pub fn start_indexes(
     };
     let exists_addr_index = if exists_addr_index {
         logs.announce("Exists address index is enabled");
-        Some(ExistsAddrIndex::new(
+        Some(ExistsAddrIndex::new_with_policy(
             &mut subscriber,
             db,
             Arc::clone(&queryer) as Arc<dyn ChainQueryer>,
+            NO_PREREQS,
+            exists_addr_policy,
         )?)
     } else {
         None

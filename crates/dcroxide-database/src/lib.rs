@@ -29,8 +29,15 @@
 //! documents, where ffldb silently accepts the delete into pending
 //! state that the read-only commit then discards.
 //!
+//! Two hooks have no ffldb counterpart and change nothing for a caller
+//! that does not use them ([ADR-0011]): a [`FlushParticipant`], whose rows
+//! ride inside the metadata flush's own redb transaction beside the
+//! overlay's, and [`Transaction::on_commit`], which runs a closure once a
+//! commit's own flush has succeeded and before its rows are published.
+//!
 //! [ADR-0004]: ../../../docs/adr/0004-storage-backend.md
 //! [ADR-0010]: ../../../docs/adr/0010-height-first-block-keys.md
+//! [ADR-0011]: ../../../docs/adr/0011-exists-address-layout-3-and-the-flush-participant.md
 
 #![forbid(unsafe_code)]
 
@@ -38,6 +45,7 @@ mod blockfile;
 pub mod bootstrap;
 pub(crate) mod dbcache;
 mod error;
+mod participant;
 mod transaction;
 
 use std::path::{Path, PathBuf};
@@ -48,6 +56,12 @@ use std::sync::{Arc, Mutex};
 use blockfile::{BlockStore, deserialize_write_row, serialize_write_row};
 pub use bootstrap::ImportStats;
 pub use error::{Error, ErrorKind};
+pub use participant::{FlushParticipant, FlushWriter, ParticipantStats};
+
+/// A raw key, bucket id included, and its value, as the raw-keyspace
+/// reads return them ([`Transaction::try_first_after`],
+/// [`Transaction::try_scan_after`], [`FlushWriter::range`]).
+pub type RawRow = (Vec<u8>, Vec<u8>);
 use transaction::{
     BLOCK_IDX_BUCKET_ID, BLOCK_IDX_BUCKET_NAME, BUCKET_INDEX_PREFIX, CUR_BUCKET_ID_KEY, KvTxSeed,
     METADATA_BUCKET_ID, WRITE_LOC_KEY,
@@ -164,7 +178,19 @@ impl DbInner {
     /// restarts. That is the right way round for a consensus daemon,
     /// which already runs under a supervisor because release builds abort
     /// on panic (see `docs/operating.md`).
+    ///
+    /// The first cause is kept, and every refusal names it: a flush that
+    /// failed because a flush participant found its own rows damaged
+    /// (ADR-0011) latches the store like a storage fault, and the
+    /// operator reading a later commit's refusal needs that cause and its
+    /// remedy, not only the advice to look at the storage.
     pub(crate) fn mark_fatal(&self, e: Error) -> Error {
+        {
+            let mut cause = self.fatal_cause.lock().expect("fatal cause lock poisoned");
+            if cause.is_none() {
+                *cause = Some(e.description.clone());
+            }
+        }
         self.fatal.store(true, Ordering::SeqCst);
         e
     }
@@ -185,12 +211,22 @@ impl DbInner {
     /// admitted past that would re-run the failed flush.
     pub(crate) fn check_writable(&self) -> Result<(), Error> {
         if self.fatal.load(Ordering::SeqCst) {
-            return Err(db_error(
-                ErrorKind::Fatal,
+            let mut text = String::from(
                 "a durable write to the metadata store failed; this handle refuses \
                  further writes -- stop the node, investigate the storage, and \
                  restart",
-            ));
+            );
+            let cause = self
+                .fatal_cause
+                .lock()
+                .expect("fatal cause lock poisoned")
+                .clone();
+            if let Some(cause) = cause {
+                text.push_str(" (the first failure: ");
+                text.push_str(&cause);
+                text.push(')');
+            }
+            return Err(db_error(ErrorKind::Fatal, text));
         }
         Ok(())
     }
@@ -209,10 +245,40 @@ impl DbInner {
             block_store: Mutex::new(block_store),
             closed: AtomicBool::new(false),
             fatal: AtomicBool::new(false),
+            fatal_cause: Mutex::new(None),
             cache: Mutex::new(cache),
             writer_cv: Condvar::new(),
             writer_busy: Mutex::new(false),
+            participant: Mutex::new(None),
         }
+    }
+
+    /// The registered flush participant, cloned out of its slot so the
+    /// slot's lock is never held while the participant runs.
+    pub(crate) fn registered(&self) -> Option<participant::Registration> {
+        self.participant
+            .lock()
+            .expect("participant lock poisoned")
+            .clone()
+    }
+
+    /// The registered participant's prefix, for the commit-time check
+    /// that no transaction stages a row under it.
+    pub(crate) fn participant_prefix(&self) -> Option<Arc<[u8]>> {
+        self.participant
+            .lock()
+            .expect("participant lock poisoned")
+            .as_ref()
+            .map(|r| Arc::clone(&r.prefix))
+    }
+
+    /// Empty the participant slot, returning what it held.
+    fn take_participant(&self) -> Option<Arc<dyn FlushParticipant>> {
+        self.participant
+            .lock()
+            .expect("participant lock poisoned")
+            .take()
+            .map(|r| r.participant)
     }
 }
 
@@ -231,6 +297,9 @@ pub(crate) struct DbInner {
     /// Set when a durable write has failed. Every later write on this
     /// handle is then refused. See [`DbInner::mark_fatal`].
     fatal: AtomicBool,
+    /// The description of the failure that set `fatal`, which every
+    /// refusal repeats.
+    fatal_cause: Mutex<Option<String>>,
     /// The metadata write cache (dcrd ffldb's `dbCache`).
     pub(crate) cache: Mutex<crate::dbcache::DbCache>,
     /// Serializes writable transactions for their whole lifetime
@@ -238,6 +307,17 @@ pub(crate) struct DbInner {
     /// writes only reach it at flush time.
     pub(crate) writer_cv: Condvar,
     pub(crate) writer_busy: Mutex<bool>,
+    /// The flush participant, if one is registered ([`FlushParticipant`]).
+    ///
+    /// A **strong** reference: the daemon drops its index handles before
+    /// it closes the database, and the close's flush must still reach the
+    /// participant then, or the keys it holds in memory for blocks whose
+    /// tip rows that flush persists would be lost.  Changed only with the
+    /// writer semaphore held ([`Database::set_flush_participant`],
+    /// [`Database::clear_flush_participant`], [`Database::close`]), so a
+    /// flush, which runs under the semaphore, sees one value throughout.
+    /// The lock is a leaf: nothing else is locked while it is held.
+    participant: Mutex<Option<participant::Registration>>,
 }
 
 /// What one metadata flush did, handed to an [`Options::flush_observer`].
@@ -252,9 +332,13 @@ pub(crate) struct DbInner {
 /// power-of-two rounding.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct FlushObservation {
-    /// Flush count since the database was opened, starting at 1.
+    /// Flush count since the database was opened, starting at 1.  Every
+    /// flush that commits takes one; a flush with nothing to commit (an
+    /// empty overlay and no participant work) syncs the block files and
+    /// takes none.
     pub sequence: u64,
-    /// Entries written or removed by this flush.
+    /// Overlay entries written or removed by this flush.  A participant's
+    /// rows are counted in [`Self::participant`] instead.
     pub dirty_entries: usize,
     /// Bytes the overlay was holding when the flush began.
     pub dirty_bytes: u64,
@@ -266,8 +350,10 @@ pub struct FlushObservation {
     /// to the tree, so on a chain-sized store it is minutes and would
     /// otherwise be indistinguishable from the commit cost being measured.
     ///
-    /// The three phases below and the stats walk account for all of it
-    /// but the capture and the handoffs between them.
+    /// The three phases below, the participant's
+    /// [`ParticipantStats::contribute`] when one was called, and the stats
+    /// walk account for all of it but the capture and the handoffs
+    /// between them.
     pub elapsed: std::time::Duration,
     /// Of `elapsed`, the part spent walking the tree for
     /// [`Self::stats`]. Zero on unsampled flushes.
@@ -291,6 +377,14 @@ pub struct FlushObservation {
     /// tree — collecting it per flush would dominate the very timings the
     /// observer exists to measure.
     pub stats: Option<RawStats>,
+    /// What the flush participant wrote in this flush, when one was
+    /// called ([`FlushParticipant::contribute`]); `None` otherwise.
+    ///
+    /// [`Self::dirty_entries`] counts the overlay's entries alone, so a
+    /// flush in which only the participant wrote is observed with zero
+    /// there and this set.  Such a flush commits like any other and takes
+    /// the next [`Self::sequence`].
+    pub participant: Option<ParticipantStats>,
 }
 
 /// One phase of a metadata flush, in a [`FlushObservation`].
@@ -558,19 +652,44 @@ pub const DEFAULT_DB_CACHE_BYTES: usize = 1024 * 1024 * 1024;
 /// unlatched, to re-run the failed flush (see [`DbInner::mark_fatal`]).
 /// Every flush goes through this one helper so that ordering cannot
 /// drift between copies.
+///
+/// A registered [`FlushParticipant`] is driven from here too (ADR-0011).
+/// On the commit path its `wants_flush` can trip a flush the overlay's
+/// thresholds would not.  Inside the flush, `run_flush` asks `has_work`
+/// and calls `contribute` within the write transaction.  After the
+/// retirement, and after a failure has latched the store, this calls
+/// `finished` with the outcome, still under the caller's semaphore.
 pub(crate) fn flush_locked(inner: &DbInner, only_if_needed: bool) -> Result<(), Error> {
+    // One clone for the whole flush: registration changes only under the
+    // writer semaphore the caller holds, so this is the participant the
+    // flush runs with from capture to `finished`.
+    let registered = inner.registered();
+    // Asked before the cache lock is taken, so a participant's own locks
+    // never nest inside it.  Nothing can change the answer between here
+    // and the capture: only an `on_commit` hook adds to a participant's
+    // work, and hooks run under the semaphore this caller holds.
+    let wanted = only_if_needed
+        && registered
+            .as_ref()
+            .is_some_and(|r| r.participant.wants_flush());
     let batch = {
         let mut cache = inner.cache.lock().expect("cache lock poisoned");
-        if only_if_needed && !cache.needs_flush() {
+        if only_if_needed && !cache.needs_flush() && !wanted {
             return Ok(());
         }
         cache.begin_flush()
     };
-    let (outcome, failure) =
-        match crate::dbcache::DbCache::run_flush(&batch, &inner.kv, &inner.block_store) {
-            Ok(outcome) => (Some(outcome), None),
-            Err(e) => (None, Some(e)),
-        };
+    let mut contributed = false;
+    let (outcome, failure) = match crate::dbcache::DbCache::run_flush(
+        &batch,
+        &inner.kv,
+        &inner.block_store,
+        registered.as_ref(),
+        &mut contributed,
+    ) {
+        Ok(outcome) => (Some(outcome), None),
+        Err(e) => (None, Some(e)),
+    };
     // Retire (or restore) under the lock either way: on failure the
     // overlay still holds every captured byte, and the accounting has to
     // go back or the cache never trips its own ceiling again.
@@ -578,8 +697,14 @@ pub(crate) fn flush_locked(inner: &DbInner, only_if_needed: bool) -> Result<(), 
         let mut cache = inner.cache.lock().expect("cache lock poisoned");
         cache.finish_flush(batch, outcome);
     }
+    // Latch before telling the participant, so a participant told its
+    // rows were discarded finds the store already refusing writes.
+    let failure = failure.map(|e| inner.mark_fatal(e));
+    if contributed && let Some(registered) = &registered {
+        registered.participant.finished(failure.is_none());
+    }
     match failure {
-        Some(e) => Err(inner.mark_fatal(e)),
+        Some(e) => Err(e),
         None => Ok(()),
     }
 }
@@ -1539,6 +1664,13 @@ impl Database {
 
     /// Cleanly shut down the database (dcrd `Close`); later operations
     /// error with `ErrDbNotOpen`.
+    ///
+    /// A registered [`FlushParticipant`] contributes to the final flush
+    /// like any other and is released afterwards, whatever the outcome:
+    /// no later flush may run it (see [`Self::flush`] on a flush that
+    /// loses the writer to a close), and a participant kept past the
+    /// close would hold its memory for as long as any clone of this
+    /// handle lives.
     pub fn close(&self) -> Result<(), Error> {
         if self.inner.closed.swap(true, Ordering::SeqCst) {
             return Err(db_error(ErrorKind::DbNotOpen, "database is not open"));
@@ -1551,13 +1683,24 @@ impl Database {
         // likely to be believed.  The handle is still marked closed
         // first, matching dcrd's `Close`, which marks it closed even
         // when the cache close fails (`ffldb/db.go:1978-1989`).
-        self.inner.check_writable()?;
+        if let Err(e) = self.inner.check_writable() {
+            drop(self.inner.take_participant());
+            return Err(e);
+        }
         // Flush the metadata write cache so a clean shutdown persists
         // everything (dcrd `Close` flushes the cache), waiting out any
         // committing transaction first (dcrd's close/write locks) --
         // which can be the one that latches, so look again once it is
         // out of the way.
         let _writer = self.exclusive_writer();
+        let closed = self.close_locked();
+        drop(self.inner.take_participant());
+        closed
+    }
+
+    /// The flush and allocator-state commit of [`Self::close`], with the
+    /// writer semaphore held.
+    fn close_locked(&self) -> Result<(), Error> {
         self.inner.check_writable()?;
         flush_locked(&self.inner, false)?;
         // Then record the allocator state, which redb otherwise does
@@ -1566,6 +1709,99 @@ impl Database {
         // Without it the next open repairs the whole file.
         record_allocator_state(&self.inner.kv).map_err(|e| self.inner.mark_fatal(e))?;
         Ok(())
+    }
+
+    /// Register the flush participant whose rows live under `prefix`
+    /// ([`FlushParticipant`], ADR-0011).
+    ///
+    /// The database holds `participant` by a strong reference until
+    /// [`Self::clear_flush_participant`] or [`Self::close`], so the final
+    /// flush of a close still reaches it after every other owner has
+    /// gone.  It must not hold a clone of this database (see the trait).
+    ///
+    /// Waits out any writable transaction and any flush, as a flush does,
+    /// so a flush runs with one participant from start to end.  Calling it
+    /// from a thread that holds a writable transaction of this database,
+    /// or from a participant or `on_commit` hook, deadlocks.
+    ///
+    /// Refused with:
+    /// - [`ErrorKind::DbNotOpen`] once the database is closed;
+    /// - [`ErrorKind::DriverSpecific`] while a participant is registered
+    ///   (clear it first: replacing one silently would drop whatever the
+    ///   old one held in memory);
+    /// - [`ErrorKind::IncompatibleValue`] for a prefix shorter than a
+    ///   bucket id (four bytes), for one inside the database's own rows
+    ///   (the metadata bucket, the block index or the bucket index), and
+    ///   while the overlay holds a row under the prefix: such a row would
+    ///   shadow the participant's.  Flush first; rows already in the store
+    ///   are no obstacle.
+    pub fn set_flush_participant(
+        &self,
+        prefix: &[u8],
+        participant: Arc<dyn FlushParticipant>,
+    ) -> Result<(), Error> {
+        self.check_open()?;
+        let reserved = [
+            METADATA_BUCKET_ID.as_slice(),
+            BLOCK_IDX_BUCKET_ID.as_slice(),
+            BUCKET_INDEX_PREFIX,
+        ];
+        if prefix.len() < 4 || reserved.iter().any(|r| prefix.starts_with(r)) {
+            return Err(db_error(
+                ErrorKind::IncompatibleValue,
+                format!(
+                    "a flush participant's prefix must be a bucket id of its own, not {prefix:02x?}"
+                ),
+            ));
+        }
+        let _writer = self.exclusive_writer();
+        // The close may have run while this waited.
+        self.check_open()?;
+        if self.inner.registered().is_some() {
+            return Err(db_error(
+                ErrorKind::DriverSpecific,
+                "a flush participant is already registered",
+            ));
+        }
+        let shadowed = self
+            .inner
+            .cache
+            .lock()
+            .expect("cache lock poisoned")
+            .cached
+            .holds_prefix(prefix);
+        if shadowed {
+            return Err(db_error(
+                ErrorKind::IncompatibleValue,
+                format!(
+                    "the metadata overlay holds rows under {prefix:02x?}, which would shadow the \
+                     flush participant's; flush before registering it"
+                ),
+            ));
+        }
+        *self
+            .inner
+            .participant
+            .lock()
+            .expect("participant lock poisoned") = Some(participant::Registration {
+            prefix: Arc::from(prefix),
+            participant,
+        });
+        Ok(())
+    }
+
+    /// Unregister the flush participant, returning it, or `None` when
+    /// none was registered.  Flushes from now on run without it.
+    ///
+    /// Waits out any writable transaction and any flush, as
+    /// [`Self::set_flush_participant`] does, so a flush that started with
+    /// the participant finishes with it, `finished` included.  Allowed on
+    /// a closed database, where it finds nothing.  An index drop calls
+    /// this first, so the flushes its deletions trigger cannot write the
+    /// index's rows back.
+    pub fn clear_flush_participant(&self) -> Option<Arc<dyn FlushParticipant>> {
+        let _writer = self.exclusive_writer();
+        self.inner.take_participant()
     }
 
     /// Write all outstanding cached entries to disk (dcrd `Flush`):
@@ -1584,7 +1820,8 @@ impl Database {
         // above comes before the close in the same way.  Should the
         // close wake first here, it has already flushed and no writer
         // can begin after it, so the flush below is empty and commits
-        // nothing (`DbCache::run_flush`): still dcrd's `Ok`.
+        // nothing (`DbCache::run_flush`; the close released any flush
+        // participant, so none has work for it either): still dcrd's `Ok`.
         // Again with the writer held: the transaction waited out may be
         // the one whose flush failed and latched the store.
         self.inner.check_writable()?;
@@ -1965,7 +2202,9 @@ mod fatal_latch_tests {
 
         // Every write path now refuses, with the fatal kind rather than
         // DbNotOpen -- an operator told "not open" would look in the
-        // wrong place.
+        // wrong place -- and names the first failure, not a later one.
+        db.inner
+            .mark_fatal(db_error(ErrorKind::DriverSpecific, "a later failure"));
         for (what, got) in [
             (
                 "update",
@@ -1979,6 +2218,11 @@ mod fatal_latch_tests {
                 got.kind,
                 ErrorKind::Fatal,
                 "{what} must refuse with ErrorKind::Fatal, got {got}"
+            );
+            assert!(
+                got.description
+                    .ends_with("restart (the first failure: simulated write failure)"),
+                "{what}: {got}"
             );
         }
 
@@ -2115,6 +2359,63 @@ mod late_flush_tests {
             })
             .expect("view");
         drop(db);
+    }
+}
+
+/// `close` releases the flush participant once its final flush is done.
+#[cfg(test)]
+mod participant_close_tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    /// Always has work; counts its contributions.
+    struct Busy(Arc<AtomicUsize>);
+
+    impl FlushParticipant for Busy {
+        fn wants_flush(&self) -> bool {
+            false
+        }
+
+        fn has_work(&self) -> bool {
+            true
+        }
+
+        fn contribute(&self, w: &mut FlushWriter<'_, '_>) -> Result<ParticipantStats, Error> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            let mut key = w.prefix().to_vec();
+            key.push(b'M');
+            w.insert(&key, b"meta")?;
+            Ok(ParticipantStats::default())
+        }
+
+        fn finished(&self, _: bool) {}
+    }
+
+    /// A flush that passed its `closed` check and then lost the writer to
+    /// a close (see `Database::flush`) must commit nothing, as the close
+    /// recorded the allocator state after its own flush.  A participant
+    /// still registered would hand that flush rows to commit, so the
+    /// close releases it.
+    #[test]
+    fn a_flush_that_runs_after_close_does_not_reach_the_participant() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let db =
+            Database::create(&Options::new(tmp.path().join("db"), 0x1214_1c16)).expect("create");
+        let calls = Arc::new(AtomicUsize::new(0));
+        db.set_flush_participant(&[0, 0, 0, 9], Arc::new(Busy(Arc::clone(&calls))))
+            .expect("register");
+        db.close().expect("close");
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "the close's flush ran it");
+        {
+            let _writer = db.exclusive_writer();
+            db.inner.check_writable().expect("not latched");
+            flush_locked(&db.inner, false).expect("the late flush succeeds");
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "the late flush reached a participant the close should have released"
+        );
     }
 }
 

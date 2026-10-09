@@ -244,7 +244,15 @@ struct TxState {
     /// commit, before the cache applies this transaction, so the
     /// cache's newest layer is unshared and takes the write in place.
     cache_snap: Arc<crate::dbcache::CacheSnapshot>,
+    /// Closures to run once a commit's own flush has succeeded and before
+    /// its rows are published, in registration order (see
+    /// [`Transaction::on_commit`]).  Dropped unrun by `close`, so a
+    /// rollback, a drop or a failed commit runs none of them.
+    on_commit: Vec<OnCommit>,
 }
+
+/// A closure registered with [`Transaction::on_commit`].
+type OnCommit = Box<dyn FnOnce() + Send>;
 
 /// A database transaction over the metadata buckets and block storage
 /// (dcrd `database.Tx`).  Read-write transactions buffer all changes
@@ -290,6 +298,7 @@ impl Transaction {
                 pending_keys: std::collections::BTreeMap::new(),
                 pending_removes: std::collections::BTreeSet::new(),
                 cache_snap,
+                on_commit: Vec::new(),
             }),
             writable,
             managed,
@@ -431,13 +440,13 @@ impl Transaction {
     /// `util.BytesPrefix` semantics).  `None` for an all-0xff prefix,
     /// which scans to the end of the keyspace.
     ///
-    /// Shared by the whole-prefix and windowed scans so the two cannot
-    /// drift apart.
+    /// Shared by the whole-prefix and windowed scans, and by the flush
+    /// participant's writer, so none of them can drift apart.
     #[allow(
         clippy::arithmetic_side_effects,
         reason = "end[i] != 0xff is checked before the increment, and i < end.len()"
     )]
-    fn prefix_upper_bound(prefix: &[u8]) -> Option<Vec<u8>> {
+    pub(crate) fn prefix_upper_bound(prefix: &[u8]) -> Option<Vec<u8>> {
         let mut end = prefix.to_vec();
         for i in (0..end.len()).rev() {
             if end[i] != 0xff {
@@ -620,6 +629,49 @@ impl Transaction {
             }
         }
         out
+    }
+
+    /// The first live row whose raw key starts with `prefix` and sorts
+    /// strictly after `after`, with its value, or `None`.
+    ///
+    /// A raw-keyspace read with no ffldb counterpart, for a reader of a
+    /// flush participant's rows (ADR-0011): an index whose rows are chunks
+    /// keyed by their last entry finds the chunk that may hold `k` as the
+    /// first row after `prefix || k`.  It sees what every read of this
+    /// transaction sees, the store merged with the overlay and this
+    /// transaction's pending changes.  Unlike [`Bucket::get`], a store
+    /// read error is returned rather than read as absence, since an index
+    /// that read a failing disk as "no row" would answer a lookup wrongly
+    /// rather than fail it.  `after` below `prefix` starts at the
+    /// prefix's first row.
+    pub fn try_first_after(
+        &self,
+        prefix: &[u8],
+        after: &[u8],
+    ) -> Result<Option<crate::RawRow>, Error> {
+        Ok(self
+            .try_scan_after(prefix, Some(after), 1)?
+            .into_iter()
+            .next())
+    }
+
+    /// Up to `limit` live rows whose raw keys start with `prefix`,
+    /// strictly after `after` when one is given, in raw key order, with
+    /// their values.  [`Self::try_first_after`] for more than one row,
+    /// with the same view and the same error rule; resume a walk from the
+    /// last key returned.
+    pub fn try_scan_after(
+        &self,
+        prefix: &[u8],
+        after: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<Vec<crate::RawRow>, Error> {
+        self.check_closed()?;
+        let window = self.scan_prefix_window(prefix, after, Some(limit), true, true);
+        match window.store_error {
+            Some(e) => Err(e),
+            None => Ok(window.rows),
+        }
     }
 
     /// Allocate the next bucket ID (dcrd `nextBucketID`).
@@ -958,6 +1010,87 @@ impl Transaction {
         state.pending_keys.clear();
         state.pending_removes.clear();
         state.cache_snap = Arc::new(crate::dbcache::CacheSnapshot::default());
+        // Unrun: whatever closed the transaction short of a successful
+        // commit -- a rollback, a drop, a failed commit -- must not run
+        // them.  Dropped after the state is released, in case dropping
+        // what a closure captured reaches back into this transaction.
+        let hooks = std::mem::take(&mut state.on_commit);
+        drop(state);
+        drop(hooks);
+    }
+
+    /// Run `hook` when this transaction commits, once its commit's own
+    /// flush has succeeded and before its rows are published to the
+    /// overlay.  Hooks run in registration order.  There is no dcrd
+    /// counterpart (ADR-0011).
+    ///
+    /// When a hook runs, the writer semaphore is held, so no other commit
+    /// or flush can interleave; any flush this commit triggered has
+    /// completed, so a [`crate::FlushParticipant`]'s `finished` for it has
+    /// been called; and the transaction's rows are not yet visible to any
+    /// other transaction.  That is the placement an index needs to hand
+    /// in-memory state over atomically with its tip row: the commit's own
+    /// flush cannot capture state the hook adds, and no reader can see
+    /// the tip before the hook has run.
+    ///
+    /// A hook never runs if the commit fails, the transaction is rolled
+    /// back, or it is dropped.  After the hooks the commit cannot fail:
+    /// publishing the rows is an in-memory step.
+    ///
+    /// A hook must not begin a writable transaction, flush, close, or
+    /// register or clear a flush participant on this database: each waits
+    /// for the writer semaphore the committing thread holds.  A read-only
+    /// transaction is allowed, and sees the store without this
+    /// transaction's rows.
+    ///
+    /// Errors with [`ErrorKind::TxClosed`] on a closed transaction and
+    /// [`ErrorKind::TxNotWritable`] on a read-only one, which never
+    /// commits.
+    pub fn on_commit(&self, hook: impl FnOnce() + Send + 'static) -> Result<(), Error> {
+        self.check_closed()?;
+        if !self.writable {
+            return Err(db_error(
+                ErrorKind::TxNotWritable,
+                "a commit hook requires a writable database transaction",
+            ));
+        }
+        self.state.borrow_mut().on_commit.push(Box::new(hook));
+        Ok(())
+    }
+
+    /// Refuse a commit that stages a row under the flush participant's
+    /// prefix: in the overlay it would shadow the participant's own rows
+    /// for every reader.  An index drop clears the participant before it
+    /// deletes, so the only writer of those rows left is the participant.
+    fn check_participant_prefix(&self) -> Result<(), Error> {
+        let Some(prefix) = self.db.participant_prefix() else {
+            return Ok(());
+        };
+        let state = self.state.borrow();
+        // An explicit bound pair: `RangeFrom<&T>` cannot carry an unsized
+        // `[u8]` bound.
+        let from = (
+            std::ops::Bound::Included(&*prefix),
+            std::ops::Bound::Unbounded,
+        );
+        let under = |key: Option<&Vec<u8>>| key.is_some_and(|k| k.starts_with(&prefix));
+        let staged = under(
+            state
+                .pending_keys
+                .range::<[u8], _>(from)
+                .next()
+                .map(|(k, _)| k),
+        ) || under(state.pending_removes.range::<[u8], _>(from).next());
+        if staged {
+            return Err(db_error(
+                ErrorKind::IncompatibleValue,
+                format!(
+                    "this transaction writes under {:02x?}, the prefix a flush participant owns",
+                    &*prefix
+                ),
+            ));
+        }
+        Ok(())
     }
 
     /// Commit all changes made to metadata and block storage (dcrd
@@ -988,6 +1121,13 @@ impl Transaction {
         // this cannot fire today; it is here so the latch does not rest
         // on that ordering alone.
         if let Err(e) = self.db.check_writable() {
+            self.close();
+            return Err(e);
+        }
+
+        // Before anything is written: a refused commit leaves no block
+        // bytes to roll back and does not latch the store.
+        if let Err(e) = self.check_participant_prefix() {
             self.close();
             return Err(e);
         }
@@ -1076,6 +1216,15 @@ impl Transaction {
                 .rollback_to(rollback_pos.0, rollback_pos.1);
             self.close();
             return Err(e);
+        }
+
+        // The commit's own flush has succeeded and its rows are not yet
+        // published: the one point at which a hook's in-memory change and
+        // this transaction's rows become visible together, with no flush
+        // able to capture one without the other (see `on_commit`).
+        let hooks = std::mem::take(&mut self.state.borrow_mut().on_commit);
+        for hook in hooks {
+            hook();
         }
 
         let (puts, removes) = {
@@ -1458,6 +1607,14 @@ impl<'tx> Bucket<'tx> {
     /// Whether the bucket is writable (dcrd `Writable`).
     pub fn writable(&self) -> bool {
         self.tx.writable
+    }
+
+    /// The bucket's four-byte id, which starts the raw key of every row in
+    /// it.  No dcrd counterpart: it is the prefix a flush participant
+    /// registers (ADR-0011) and the one [`Transaction::try_first_after`]
+    /// scans.  A deleted and re-created bucket gets a fresh id.
+    pub fn raw_id(&self) -> [u8; 4] {
+        self.id
     }
 
     /// Save the specified key/value pair to the bucket (dcrd `Put`).

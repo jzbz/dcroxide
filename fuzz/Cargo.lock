@@ -473,6 +473,8 @@ dependencies = [
  "dcroxide-stake",
  "dcroxide-txscript",
  "dcroxide-wire",
+ "getrandom 0.4.3",
+ "siphasher",
 ]
 
 [[package]]

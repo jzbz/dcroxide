@@ -333,6 +333,7 @@ dependencies = [
  "dcroxide-blockchain",
  "dcroxide-chaincfg",
  "dcroxide-chainhash",
+ "dcroxide-crypto",
  "dcroxide-database",
  "dcroxide-indexers",
  "dcroxide-wire",
@@ -490,6 +491,8 @@ dependencies = [
  "dcroxide-testutil",
  "dcroxide-txscript",
  "dcroxide-wire",
+ "getrandom 0.4.3",
+ "siphasher",
  "tempfile",
 ]
 
@@ -671,6 +674,7 @@ dependencies = [
 name = "dcroxide-testutil"
 version = "0.1.0"
 dependencies = [
+ "redb",
  "serde_json",
 ]
 

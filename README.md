@@ -217,7 +217,9 @@ work). Currently implemented:
 - `dcroxide-indexers` — the optional block chain indexes from dcrd's
   `internal/blockchain/indexers`: the transaction index with its
   block-ID compaction, the exists address index with the unconfirmed
-  overlay, and the subscriber machinery with dependent relay,
+  overlay (dcrd's address set in this port's own layout: a memtable, a
+  journal and sorted runs, written inside the metadata flush), and the
+  subscriber machinery with dependent relay,
   catch-up, recovery, and incremental drops, replayed against a real
   redb-backed database from a session scripted inside dcrd's own
   package
@@ -475,6 +477,21 @@ threads block at once in only 0.2% of samples, so its storage path is
 serialized — implicating a synchronous fsync on the critical path as
 much as the engine choice. Full figures, and the two weaknesses in the
 method, in the [bench ledger](docs/bench-ledger.md).
+
+**Two storage changes since then were measured on a second machine**,
+m2 in the ledger, whose ZFS mirror of QLC NVMe drives is slower storage,
+over the 200,000-block mainnet tail after block 916,000. Keying the
+per-block rows by height ([ADR-0010](docs/adr/0010-height-first-block-keys.md))
+took that tail from 78.1 to 98.5 blk/s. From genesis on m2, dcrd was
+2.45x as fast before that change and 1.40x after it. Giving the
+exists-address index its own layout
+([ADR-0011](docs/adr/0011-exists-address-layout-3-and-the-flush-participant.md))
+then took the tail from 94.0 to 482.1 blk/s with the index on, against
+501.1 with it off, and cut the bytes written from 137.4 GB to 15.5 GB.
+dcrd ran the same tail there at 146-148 blk/s, but two days earlier, so
+that pair is context, not a ratio. The index layout has not been
+measured from genesis, and neither change has been measured on m1, so
+the 1.29x above predates both.
 
 At the tip the same chain cost 23.73 GiB under dcrd and 32.06 GiB
 under dcroxide, measured 2026-07 under redb 2.6.3. The 2026-08-15 pair

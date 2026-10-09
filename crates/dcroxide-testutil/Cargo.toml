@@ -1,6 +1,6 @@
 [package]
 name = "dcroxide-testutil"
-description = "Internal test utilities: dcrd oracle harness and deterministic PRNG (not for release)"
+description = "Internal test utilities: dcrd oracle harness, deterministic PRNG and a power-loss storage rig (not for release)"
 publish = false
 version.workspace = true
 authors.workspace = true
@@ -10,6 +10,10 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+# For `powerloss::PowerLossBackend`, which implements redb's storage
+# backend trait; the same `redb` the metadata store links, so a backend
+# made here is the one `dcroxide_database::Options::backend` takes.
+redb = "4"
 serde_json = "1"
 
 [lints]

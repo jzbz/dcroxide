@@ -138,6 +138,15 @@ Usage:
       (--appdata is a node data directory, read from
       <dir>/data/<net>/blocks_ffldb, or a replay --workdir, which holds
       blocks_ffldb at its root; whichever exists is used.)
+
+  dcroxide-bench existsaddr-digest --appdata <dir> [--net <name>]
+      Print the exists-address index's key count and the BLAKE-256 of its
+      keys, sorted and concatenated, read from the store alone in either
+      layout: version 2's one row per address, or version 3's runs plus
+      the journaled keys a restart would load.  Equal digests say two
+      stores hold the same address set, whichever layout holds it.
+      --appdata is resolved as for redbstat.  The store must be stopped;
+      opening it runs the node's own startup recovery.
       Decompose the metadata store's footprint into payload, redb
       overhead, intra-page slack and free pages, as one JSON object.
 
@@ -1411,6 +1420,46 @@ fn cmd_redbstat(args: &Args) -> Result<(), String> {
     Ok(())
 }
 
+/// Print the exists-address index's key count and digest.
+fn cmd_existsaddr_digest(args: &Args) -> Result<(), String> {
+    let appdata = PathBuf::from(args.require("appdata")?);
+    let (params, net_dir) = net_params(args.get("net").unwrap_or("mainnet"))?;
+    let data_dir = resolve_store_dir(&appdata, net_dir);
+    let db = open_db(&data_dir, params.net.0, false)?;
+    let version = {
+        let tx = db.begin(false).map_err(|e| e.to_string())?;
+        let mut key = b"v".to_vec();
+        key.extend_from_slice(dcroxide_indexers::EXISTS_ADDR_INDEX_KEY);
+        let version = tx
+            .metadata()
+            .bucket(b"idxtips")
+            .and_then(|b| b.get(&key))
+            .and_then(|v| <[u8; 4]>::try_from(v.as_slice()).ok())
+            .map(u32::from_le_bytes);
+        tx.rollback().map_err(|e| e.to_string())?;
+        version
+    };
+    let keys = dcroxide_indexers::stored_keys(&db)
+        .map_err(|e| e.to_string())?
+        .ok_or("the store holds no exists address index")?;
+    let mut hasher = dcroxide_crypto::blake256::Blake256::new();
+    for key in &keys {
+        hasher.update(key);
+    }
+    let digest: String = hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let version = version.map_or_else(|| "none".to_string(), |v| v.to_string());
+    println!(
+        "existsaddr version {version} keys {} blake256 {digest}",
+        keys.len()
+    );
+    db.close().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 /// What is held open across the probe's flushes.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Hold {
@@ -1645,6 +1694,9 @@ fn main() -> std::process::ExitCode {
         .and_then(|a| cmd_indexcatchup(&a)),
         "redbstat" => {
             Args::parse(rest, &["appdata", "net", "buckets"]).and_then(|a| cmd_redbstat(&a))
+        }
+        "existsaddr-digest" => {
+            Args::parse(rest, &["appdata", "net"]).and_then(|a| cmd_existsaddr_digest(&a))
         }
         "pinprobe" => Args::parse(
             rest,

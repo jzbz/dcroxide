@@ -245,6 +245,40 @@ pub(crate) fn db_put_indexer_version(
     Ok(())
 }
 
+/// The stored version of the given index, as [`db_put_indexer_version`]
+/// writes it, or `None` when it has no version row.  dcrd writes the row
+/// and never reads it back; the exists address index reads it to refuse
+/// a layout it cannot use.
+pub(crate) fn db_fetch_indexer_version(
+    db_tx: &Transaction,
+    idx_key: &[u8],
+) -> Result<Option<u32>, IdxError> {
+    let meta = db_tx.metadata();
+    let indexes_bucket = meta.bucket(INDEX_TIPS_BUCKET_NAME).ok_or_else(|| {
+        make_db_err(
+            dcroxide_database::ErrorKind::BucketNotFound,
+            format!(
+                "{} bucket not found",
+                String::from_utf8_lossy(INDEX_TIPS_BUCKET_NAME)
+            ),
+        )
+    })?;
+    let Some(serialized) = indexes_bucket.try_get(&index_version_key(idx_key))? else {
+        return Ok(None);
+    };
+    let bytes: [u8; 4] = serialized.as_slice().try_into().map_err(|_| {
+        make_db_err(
+            dcroxide_database::ErrorKind::Corruption,
+            format!(
+                "the version of index \"{}\" is {} bytes, not 4",
+                String::from_utf8_lossy(idx_key),
+                serialized.len()
+            ),
+        )
+    })?;
+    Ok(Some(u32::from_le_bytes(bytes)))
+}
+
 /// Whether the index keyed by `idx_key` exists in the database (dcrd
 /// `existsIndex`).
 pub(crate) fn exists_index(db: &Database, idx_key: &[u8]) -> Result<bool, IdxError> {

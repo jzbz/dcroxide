@@ -83,6 +83,9 @@ long catch-up shows its progress. `--droptxindex` and
 a while...", then "Deleted N keys (M total) from <index>" after each batch
 of up to 2,000,000 deletions, then "Dropped <index>". When the index is not
 there they log "Not dropping <index> because it does not exist" instead.
+For the exists-address index those counts are rows of its own layout
+(below), modelled at 0.4-0.5 million on mainnet, not the tens of
+millions of addresses they hold, so a full drop is one batch.
 
 ## Fresh sync only — a dcrd data directory will not work
 
@@ -145,8 +148,9 @@ under CHAN, "Blockchain database version info: chain: 15, ...", where
 dcrd prints "chain: 14": the one place the number shows, and the
 difference is expected.
 
-Budget for it: initial block download runs slower than dcrd's, by a
-factor that depends heavily on the storage underneath. On machine m1 in
+Budget for it: in every sync from genesis measured so far, initial block
+download ran slower than dcrd's, by a factor that depends heavily on the
+storage underneath. On machine m1 in
 [bench-ledger.md](bench-ledger.md), with a single NVMe drive, it ran
 about **1.29x slower than dcrd** — roughly 1.15 hours against dcrd's 0.9
 for mainnet from genesis — and the chain cost more on disk, 33.58 GiB
@@ -162,7 +166,13 @@ drives, dcrd synced from genesis to block 916,000 **2.45x** as fast as
 dcroxide did before the height-first keys and **1.40x** as fast as it
 does with them (one run each; bench-ledger.md, "Height-first per-block
 keys"). The keys left the data directory's size unchanged there, and
-they have not been measured on m1.
+they have not been measured on m1. The exists-address index's own
+layout (2026-10-09, below) then took the 200,000-block tail after block
+916,000 on m2 from a median of 94 to 482 blocks/s with the index on.
+dcrd ran that tail there at 146-148 blocks/s, but on 2026-10-07, in
+another session, so read the two together as context, not as a ratio.
+No sync from genesis, on either machine, has been measured with the new
+layout, so every from-genesis figure here predates it.
 
 Treat 1.29x as a rough figure for fast local storage rather than a
 precise ratio, and not as a bound: on m1 the two arms ran about 12 hours
@@ -217,8 +227,9 @@ so it understated the daemon's share.
 
 ## The exists-address index: turn it off if no wallet needs it
 
-The exists-address index is on by default, as in dcrd, and it is the
-largest single cost of an initial sync. It is a set of every address ever
+The exists-address index is on by default, as in dcrd. In dcrd's layout
+it was the largest single cost of an initial sync; in the port's own
+layout, below, it costs far less. It is a set of every address ever
 seen in a block or the mempool, and it serves exactly two RPCs,
 `existsaddress` and `existsaddresses`. Wallets that sync over RPC use them
 for address discovery, for example to find which addresses a wallet
@@ -226,12 +237,94 @@ restored from its seed has used. SPV wallets do not: they work from the
 compact block filters.
 
 If no wallet syncs against this node over RPC, start it with
-`--noexistsaddrindex`. On m2 in [bench-ledger.md](bench-ledger.md), with
-the index off, the node synced the 200,000 blocks from 916,000 to
-1,116,035 **3.4x faster**: a median of 262 blocks/s across two runs,
-against 78, writing 21 GB instead of 151 GB. That was measured before the
-2026-10-08 height-first keys. With the index off, both RPCs fail with
-"exists address index disabled", as dcrd's do.
+`--noexistsaddrindex`. In dcrd's layout the saving was large: on m2 in
+[bench-ledger.md](bench-ledger.md), with the index off, the node synced
+the 200,000 blocks from 916,000 to 1,116,035 **3.4x faster**, a median of
+262 blocks/s across two runs against 78, writing 21.8 GB instead of
+151.6 GB. That was measured before the 2026-10-08 height-first keys. In
+the current layout it is much smaller (below): on the same tail, with
+those keys, the node ran at a median of 482 blocks/s with the index on
+and 501 with it off, and wrote 15.5 GB against 12.6 GB. With the index
+off, both RPCs fail with "exists address index disabled", as dcrd's do.
+
+### How the index is stored, and what it costs
+
+dcrd stores one row per address. On redb that made every new address
+dirty its own page of a 66-million-row table, which is the cost the 3.4x
+above measured. The index is now stored in its own layout (index version
+3, [ADR-0011](adr/0011-exists-address-layout-3-and-the-flush-participant.md)):
+the addresses of recent blocks in memory, and the rest in sorted runs of
+4 KiB chunks, written inside the metadata flushes that already carry the
+chain's rows, with a journal so a restart can rebuild the memory. It gives
+dcrd's answers with two exceptions, both in
+[PARITY.md](../PARITY.md): a storage read error answers "Could not query
+address: ..." instead of "never seen", and an address seen only in the
+mempool no longer answers "never seen" while its block is being indexed.
+On m2 ([bench-ledger.md](bench-ledger.md), "Exists-address index layout
+3"; six runs with the index on in each layout and three with it off,
+interleaved, all with the height-first keys), the same 200,000-block
+tail synced at a median of 482 blocks/s with the index on, against 94 in
+dcrd's layout and 501 with the index off. The last gap is within that
+storage's run-to-run noise. What the index measurably adds is in the
+counts, which barely move from run to run. It wrote 15.5 GB against
+12.6 GB with the index off (and 137.4 GB in dcrd's layout), and used 9%
+more CPU time. It made the same 31 metadata flushes, where dcrd's layout
+made 58-59.
+
+- **Memory**: the index's in-memory set holds up to about 3 million
+  addresses (about 63 MB) after each flush while syncing, and up to about
+  4 million (84 MB) just before one; a catch-up from genesis peaked at
+  4.5 million (95 MB). It also takes in, at each block, every address the
+  mempool has seen since the last block, so a very large mempool adds to
+  that. The index's pages also fill the metadata page cache
+  (`DCROXIDE_DB_CACHE`, below) up to its configured size. On m2's tail,
+  at the default 1 GiB cache, the node's peak resident memory was about
+  350 MiB above the index-off run's (2,773 against 2,424 MiB). On a
+  development desktop it was about 380 MB above at that cache, and about
+  140 MB above with a 256 MiB cache.
+- **Starting**: the node reads the journal back into memory before the
+  index catches up, modelled at 1-3 s on mainnet, holding one copy of the
+  addresses it reads back, and the journal's pages in the page cache.
+  The read logs no line of its own. On a development desktop, a restart
+  after a kill near block 1,000,000 reloaded about 2.1 million addresses,
+  and the index's startup, from "Exists address index is enabled" to its
+  "Catching up" line, took 0.33 s. A damaged meta or journal row stops
+  startup with an error naming the remedy below; the index never opens
+  empty.
+- **A damaged run row is found later.** Startup does not read the runs,
+  so the first lookup or flush that reads the row finds it. A lookup
+  answers "Could not query address: ..." with the remedy, and lookups of
+  other addresses still answer. The first flush that merges the row's
+  part of the index fails and stops the metadata store taking writes, so
+  the node commits no further blocks; that flush's error, and every
+  write refused after it, name the exists address index and the remedy.
+  Stop the node and apply the remedy below.
+- **Lookups**: an address not seen recently reads up to two 4 KiB pages
+  where it read one, so a large `existsaddresses` costs about twice the
+  I/O.
+
+**A data directory whose index was built before this layout is refused**,
+when the index is on, with:
+
+```text
+[ERR] DCRD: Unable to start the indexes: exists address index: on-disk version 2 is not supported by this build; run once with --noexistsaddrindex --dropexistsaddrindex, then restart to rebuild it from genesis
+```
+
+Nothing is changed. Start once with `--noexistsaddrindex
+--dropexistsaddrindex`, which drops the old index and exits, then start
+normally: the index is rebuilt from genesis during startup, between the
+"Catching up" and "Caught up" lines, before the node serves. Or run with
+`--noexistsaddrindex` and leave the old rows idle.
+
+**Do not run a build from before this layout with the index on over an
+index built in it.** The older build has no check for it: it neither
+refuses the index nor reads it. While it runs it answers "never seen" for
+every address the new layout holds, and it adds rows of its own layout
+and moves the index tip past their blocks. The next start of this build
+finds those rows and refuses, with the same remedy, rather than open
+without them. Before going back to an older build, drop the index with
+`--noexistsaddrindex --dropexistsaddrindex`, or run the older build with
+`--noexistsaddrindex`.
 
 The choice is not permanent, but changing it costs time:
 
@@ -241,11 +334,13 @@ The choice is not permanent, but changing it costs time:
   "Dropping all ..." and "Dropped ..." lines described earlier in this
   guide. `--dropexistsaddrindex` on its own is refused, as in dcrd. Then
   run with `--noexistsaddrindex`.
-- **Turning it back on later** builds the index from genesis. The node
-  catches the index up to the chain tip, with the "Catching up from height
-  X to Y" progress lines described earlier. How long that takes on a
-  mainnet-sized chain has not been measured; expect a substantial part of
-  an initial sync.
+- **Turning it back on later** catches the index up from where it
+  stopped, or builds it from genesis if it was dropped. The node catches
+  the index up to the chain tip during startup, before it serves, with the
+  "Catching up from height X to Y" progress lines described earlier. On
+  m2 a rebuild from genesis to block 916,046, with no blocks arriving,
+  took 157 s on four cores, wrote 3.1 GB and peaked at about 1.7 GiB
+  resident.
 
 ## Storage tuning: two knobs help, one hurts, one is untested
 
@@ -358,15 +453,17 @@ configuration, every name changes.
 | metadata overlay flush size | `DCROXIDE_DB_OVERLAY` (MiB, default 100) | — |
 | metadata overlay flush interval | `DCROXIDE_DB_FLUSH_SECS` (s, default 300) | — |
 | metadata flush log (JSONL path) | `DCROXIDE_DB_FLUSHLOG` (unset = off) | — |
+| exists-address memtable target (developer-only) | `DCROXIDE_EXISTSADDR_MEMTABLE_KEYS` (keys, default 2,000,000) | — |
 
 The chain itself lives under the home directory, not at it: `--datadir`
 defaults to `<home>/data` with the network appended, so on Linux the
 blocks are in `~/.dcroxide/data/mainnet` while `dcroxide.conf`,
 `rpc.cert` and `rpc.key` sit in `~/.dcroxide` itself.
 
-Those six are the only `DCROXIDE_*` variables read; only the first
+Those seven are the only `DCROXIDE_*` variables read; only the first
 two have dcrd counterparts, since the page cache, the overlay and the
-flush log are properties of redb, which dcrd does not use. Of the four
+flush log are properties of redb, which dcrd does not use, and the
+memtable is a property of this port's exists-address layout. Of the four
 storage variables, `DCROXIDE_DB_CACHE` is the one to leave unset, the
 next two are untuned instruments — see the storage tuning above — and
 `DCROXIDE_DB_FLUSHLOG` is diagnostic: it appends one JSON object per
@@ -377,8 +474,16 @@ and, on Linux, the bytes the flushing thread read from storage and the bytes
 it dirtied in that phase. `write_bytes` counts pages when they are dirtied,
 not when they are written back, so writeback time shows in a phase's `ms`
 and not in its `write_bytes`, and the block-file sync always reads about 0
-there. Leave it unset in normal operation; it writes a line inside each
-flush. A malformed or zero value in any of the tuning variables warns and
+there. Each line's `participant` is what the exists-address index wrote
+inside that flush -- its rows, reads, journaled keys, merges, base
+rewrites and memtable size, with its own time and I/O as a fourth phase --
+or `null` when it had nothing to write. Leave it unset in normal operation;
+it writes a line inside each flush. `DCROXIDE_EXISTSADDR_MEMTABLE_KEYS` is
+for measurements only: it sets how many keys the exists-address index
+holds in memory before its flushes merge them into its sorted runs (the
+hard bound is one and a half times it), trading the index's memory, 21
+bytes a key, against the pages its flushes write. It never changes an
+answer; leave it unset. A malformed or zero value in any of the tuning variables warns and
 falls back to the default rather than refusing to start, since they are
 hints. Everything else is a command-line flag or a `dcroxide.conf` entry,
 and the flag set is a verbatim port of dcrd's — same names, same semantics,

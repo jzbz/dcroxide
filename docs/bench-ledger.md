@@ -1730,3 +1730,202 @@ base tail run carries the `noisy` flag because the host's load average was
 1.98, over the harness's 1.5 quiet threshold, when its 15-minute wait for a
 quiet host ran out. It is kept: its 76.45 blk/s falls inside the other four
 runs' range, and the base median and range are the same with or without it.
+
+## Exists-address index layout 3 (2026-10-09)
+
+The arm [ADR-0011](adr/0011-exists-address-layout-3-and-the-flush-participant.md)
+shipped. The exists-address index is stored in the port's own layout,
+index version 3, and its rows are written by a flush participant inside
+the metadata flush. Machine m2, set up as for the height-first runs
+above: the node on four cores, syncing mainnet over loopback from the
+same dcrd `6f6cf21b` block server and frozen chain, with
+`DCROXIDE_DB_FLUSHLOG` set and defaults otherwise. The three arms:
+- **Base** is `6c11a38`, with the height-first keys and the index on in
+  dcrd's layout (index version 2).
+- **Layout 3** is `6c11a38` with the change this section lands with.
+- **The floor** is base with `--noexistsaddrindex`.
+
+Base and the floor start each run from the re-keyed arm's snapshot
+(chain tip 916,046). The floor leaves that snapshot's old index idle.
+Layout 3 starts from a snapshot derived from a block clone of that one
+(below), so its chain state is the same. All runs end at 1,116,035.
+Measuring starts at about 916,050 (916,224 in one run), and the rate
+counts only the blocks measured. There were fifteen runs in the order
+base, layout 3, layout 3, base, floor, repeated three times. Each
+followed a 600 s idle, and the round took about 7.3 hours.
+
+| arm | runs | blk/s (median, range) | node bytes written, median | CPU time, median | flushes | flush time per run, median |
+|---|---:|---|---:|---:|---:|---:|
+| base, index in dcrd's layout | 6 | **94.0** (87.1–108.0) | 137.4 GB | 1,566 s | 58–59 | 1,416 s |
+| layout 3 | 6 | **482.1** (461.8–497.5) | 15.5 GB | 649 s | 31 | 77.8 s |
+| index off (the floor) | 3 | **501.1** (497.2–503.1) | 12.6 GB | 594 s | 31 | 105.5 s |
+
+**5.1x on the tail with the index on, and level with the floor within
+the noise.** Every layout-3 run was more than four times as fast as every
+base run (461.8 blk/s against at most 108.0). Against base, layout 3
+wrote 8.9x fewer bytes, used 2.4x less CPU time and made about half the
+flushes. Against the floor, its median is 3.8% lower, inside the spread
+described below, so wall time does not separate the two; the counts do.
+The index added 2.9 GB of writes (+23%), 55 s of CPU time (+9%) and no
+flush.
+- **Participant work over the 31 flushes:** 484,420 rows put (1.96 GB;
+  9,021–31,136 in a flush) and 302,190 rows read for merges. It
+  journaled 16,676,749 keys and made 852 merges, 218 of them base
+  rewrites.
+- **Commit writes:** the flushes' commit phases wrote 10.03 GB against
+  the floor's 7.99 GB.
+- **Memtable:** 2.38–3.99 million keys when each flush began, so at most
+  84 MB of keys.
+
+These counters were identical in all six runs. The data directory at
+the tip was 29.05 GB, against base's 32.84–33.33 GB. The floor's
+29.81 GB still holds the old index its snapshot had at 916,046, so it is
+not an index-free size. Shutdown took 2.6–3.3 s, against the floor's
+1.5–1.7 s and base's 1.0–22.1 s.
+
+**Against the plan's criteria** (ADR-0011):
+
+| criterion | threshold | layout 3 | result |
+|---|---|---|---|
+| speed | a median of at least 180 blk/s and twice base's (188.1) | 482.1 | pass |
+| bytes written | at most 10 GB over the floor's | 2.9 GB over | pass |
+| flush count | within 2 of the floor's | equal, 31 | pass |
+| index digest at 916,046 | equal to base's | equal (below) | pass |
+| fallback: median | ~180 blk/s or above | 482.1 | not tripped |
+| fallback: flush time | at most 1.15x the floor's total | 0.74x (77.8 s against 105.5 s of flush time per tail, medians; per-flush median 2.34 s against 3.08 s, 0.76x) | not tripped |
+
+Two criteria were **not judged** by the method the plan set for them:
+- **Read syscalls** were to be counted outside the flush windows, which
+  this harness does not separate. Over whole runs, layout 3 made
+  1,051,325 against the floor's 456,877 (base: 41.8–42.6 million). The
+  excess includes the merges' reads inside the flushes and the journal
+  load at start.
+- **Peak memory** was to be compared at a small fixed cache, or with the
+  cache's occupancy subtracted. At the default 1 GiB cache, layout 3
+  peaked at 2,749–2,773 MiB, against the floor's 2,423–2,424 and base's
+  2,504–2,506.
+
+**The flush-time margin is not explained.** Layout 3's flushes wrote
+more than the floor's and took less time. The floor's commit phases read
+14.7–20.4 GB from storage, and layout 3's 1.8–3.6 GB. Base's, on the
+floor's own snapshot with the index on, read under 0.1 GB. Why the
+floor's read so much has not been established. So the fallback test
+passes as specified, but this is not evidence that the index makes a
+flush cheaper. On a desktop, before the implementation review's fixes,
+index-on flushes took 52% longer (ADR-0011).
+
+**Layout 3's snapshot: the refusal, the drop, the rebuild and the digest
+at 916,046.** This snapshot was derived on m2 from a block clone of
+base's snapshot, with layout 3's binary on four cores:
+1. Started with the index on, the binary refused the old index with the
+   version message and exit status 1, after 16 s.
+2. `dcroxide-bench existsaddr-digest` read the old index as 49,318,296
+   keys, BLAKE-256
+   `7d117ab8c54f5605d084912e823a47563255dedca533917409703ef355e50bfd`.
+3. `--noexistsaddrindex --dropexistsaddrindex` removed its 49,318,296
+   rows in 68 s.
+4. Started again with the index on and no reachable peer, the node
+   rebuilt the index from genesis to 916,046 in **157 s**. It made 34
+   flushes, wrote 3.12 GB, used 151.8 s of CPU time and peaked at
+   1,727 MiB resident, then exited cleanly.
+5. The rebuilt index's key count and BLAKE-256 equal the old one's.
+
+A first attempt at this step halted in the harness, which could not read
+the exited process's I/O counters in the container. The harness was
+fixed and the step run again on a fresh clone.
+
+**The end-state checks: the digest at the tip, and a SIGKILL.** These
+ran on a development desktop that is not in the machine table, with the
+same three binaries. They are deterministic checks, and the timings
+below are observations, not measurements. The source was a version-15
+snapshot at 916,546 with a layout-2 index, and a dcrd block server
+running on a clone of the same frozen chain.
+- **The snapshot route, twice.** Layout 3's snapshot route ran twice on
+  the desktop, with the same outcome both times. The old index was
+  refused. Before the drop and after the rebuild, the index held
+  49,362,108 keys, BLAKE-256
+  `2c6cb264eef73aa51a73be7eacd536bcbef644f7378fd34cf5b0182a2e507903`.
+  The rebuild took 34 flushes.
+- **The digest at 1,116,035.** Base, on a clone of the snapshot, and
+  layout 3, on the derived one, each synced to 1,116,035. Each was
+  stopped once `existsaddress` answered at that tip. Each holds
+  67,960,843 keys, BLAKE-256
+  `8b676bdb992c7f5ca0590fd32bbce298816b96a114a34263564cf1af7d2d7b18`.
+- **The SIGKILL.** A third layout-3 node was killed with SIGKILL just
+  after `getblockcount` returned 1,000,009. Its last flush had ended
+  2.1 s before. On restart:
+  - The metadata store logged its unclean-shutdown repair, which took
+    22.6 s.
+  - The chain state came back at 998,896, with dcrd's hash for that
+    height.
+  - The index caught up from 998,895 to 998,896 and no further. Every
+    block above that came from the chain's own re-sync.
+  - The index's startup, from its "enabled" line to its "Catching up"
+    line, took 0.33 s. That includes the journal load, which logs no
+    line of its own
+    (`crates/dcroxide-indexers/src/existsaddrindex.rs:457`).
+  - About 2.1 million keys were reloaded. That count is derived from
+    the first flush's counters: 2,686,176 memtable keys, counted before
+    any merge (`crates/dcroxide-indexers/src/existsaddr/store.rs:214`),
+    less 589,181 journaled.
+
+  The node then synced to 1,116,035 and reached the digest above. A
+  later clean restart left the digest unchanged.
+- **Lookups through it.**
+  - At 998,896, the node was held there with no peer. All 323 addresses
+    of blocks 998,894–998,896 answered `true`. Of 186,624 addresses
+    sampled from blocks 998,897–1,030,000, 97,619 answered `true` and
+    89,005 answered `false`. Whether each `true` address had appeared
+    at or below 998,896 was not checked.
+  - During the re-sync, 125 `existsaddresses` calls each asked for
+    addresses of the blocks around the chain tip read just before the
+    call. None answered `false` for an address of a block at or below
+    that tip. 62 returned "exists address index: index not synced"
+    after the 3 s wait of the readiness gate the port keeps from dcrd.
+    None came at once: the index never lagged six or more blocks.
+  - At 1,116,035, 22,010 addresses were checked: one from each block
+    that had an address answering `false` at 998,896. All of them, and
+    all 653 addresses of eight named blocks, answered `true`, with the
+    same bitsets as dcrd's `existsaddresses`.
+
+**How to read the noise.** On this storage, wall time moves a lot from
+run to run, and by how much depends on the arm:
+- Base's six runs span 87.1–108.0 blk/s, 22% of the median. The round's
+  report-only spread gate for base failed, as five-run base calibrations
+  here did at 15–20%.
+- Layout 3's six runs span 461.8–497.5 blk/s (7%).
+- The floor's three runs span 497.2–503.1 blk/s (1%).
+
+The counts barely move:
+- Every layout-3 run wrote 15,493 MB in 3,245,973–3,245,974 write
+  calls, with the same flush-log counters.
+- Every floor run wrote 12,576 MB.
+- Base's bytes varied over 135.6–138.7 GB (2.3%). It made 58 flushes in
+  one run and 59 in the other five.
+- CPU time varied by 0.2% for layout 3, 0.3% for the floor and 1.1% for
+  base.
+
+So the effect against base is far outside the noise: 5.1x in wall time,
+8.9x in bytes and 2.4x in CPU time. The 3.8% wall-time gap to the floor
+is inside it, and the index's cost against the floor is the bytes and
+CPU figures above.
+
+Six runs carry the `noisy` flag: three of base, two of layout 3 and one
+of the floor. Each time, the host's load average (1.53–5.79) was over
+the harness's 1.5 quiet threshold when its 15-minute wait for a quiet
+host ran out. They are kept. Without them the medians are 89.5, 484.7
+and 500.1 blk/s, and no conclusion changes.
+
+**dcrd, for context only.** dcrd `6f6cf21b` ran the same tail on m2 at
+146.3–148.4 blk/s (median 147.6 over three runs, one flagged noisy) on
+2026-10-07, two days earlier, with other arms between its runs. It was
+not run in this round. Setting layout 3's tail against it is a
+cross-session comparison, which this file does not accept as a ratio.
+
+Raw: the campaign's `runs.jsonl` rows labelled `mm-master`, `mm-exv3`
+and `mm-floor` and their `noisy` variants, with per-run samples and
+per-flush logs (`DCROXIDE_DB_FLUSHLOG`). The snapshot step's record is
+in `snapshots.jsonl`, with its phase logs and rebuild flush log. The
+dcrd rows are labelled `dcrd-ab`. For the end-state checks: the node and
+dcrd logs, the `existsaddr-digest` outputs, and the RPC query logs of
+that check's harness.

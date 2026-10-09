@@ -476,3 +476,117 @@ fn addblock_logs_the_index_startup_under_indx() {
         "{stdout}"
     );
 }
+
+/// An exists address index an older build left -- dcrd's one row per
+/// address, version 2 -- stops the daemon with the remedy and is left as
+/// it was; `--noexistsaddrindex --dropexistsaddrindex` drops it, its
+/// "Deleted" line counting rows; and the next start rebuilds it from
+/// genesis in this build's layout, holding the same addresses.
+#[test]
+fn an_older_exists_address_index_is_refused_until_dropped_then_rebuilt() {
+    let params = dcroxide_chaincfg::simnet_params();
+    let appdata = tempfile::tempdir().expect("appdata");
+    let db_path: PathBuf = appdata
+        .path()
+        .join("data")
+        .join("simnet")
+        .join("blocks_ffldb");
+    build_datadir(&db_path, &params);
+    let opts = Options::new(&db_path, params.net.0);
+    let version_key = [b"v".as_slice(), EXISTS_ADDR_INDEX_KEY].concat();
+    let keys = {
+        let db = Database::open(&opts).expect("reopen");
+        let keys = dcroxide_indexers::stored_keys(&db)
+            .expect("stored keys")
+            .expect("the index exists");
+        assert!(!keys.is_empty());
+        db.update(|tx| {
+            let meta = tx.metadata();
+            meta.delete_bucket(EXISTS_ADDR_INDEX_KEY)?;
+            let bucket = meta.create_bucket(EXISTS_ADDR_INDEX_KEY)?;
+            for key in &keys {
+                bucket.put(key, &[])?;
+            }
+            meta.bucket(b"idxtips")
+                .expect("tips")
+                .put(&version_key, &2u32.to_le_bytes())
+        })
+        .expect("write the older layout");
+        db.close().expect("close");
+        keys
+    };
+    let rows = keys.len();
+    let dump = appdata.path().join("dump.dat");
+    let dump_arg = format!("--dumpblockchain={}", dump.display());
+    let started = ["--nolisten", "--norpc", "--noseeders", dump_arg.as_str()];
+
+    let (code, lines, stdout) = run_bounded(daemon(appdata.path(), &started));
+    assert_eq!(code, Some(1), "{stdout}");
+    assert!(
+        stdout.contains(
+            "[ERR] DCRD: Unable to start the indexes: exists address index: on-disk version 2 \
+             is not supported by this build; run once with --noexistsaddrindex \
+             --dropexistsaddrindex, then restart to rebuild it from genesis"
+        ),
+        "{stdout}"
+    );
+    assert_eq!(
+        indx(&lines),
+        ["Exists address index is enabled"],
+        "{stdout}"
+    );
+    {
+        let db = Database::open(&opts).expect("reopen");
+        assert_eq!(
+            bucket_rows(&db, EXISTS_ADDR_INDEX_KEY),
+            rows,
+            "the refusal changed rows"
+        );
+        assert_eq!(
+            dcroxide_indexers::stored_keys(&db).expect("keys"),
+            Some(keys.clone())
+        );
+        db.close().expect("close");
+    }
+
+    let (code, lines, stdout) = run_bounded(daemon(
+        appdata.path(),
+        &["--noexistsaddrindex", "--dropexistsaddrindex"],
+    ));
+    assert_eq!(code, Some(0), "{stdout}");
+    assert_eq!(
+        indx(&lines),
+        [
+            "Dropping all exists address index entries.  This might take a while...".to_string(),
+            format!("Deleted {rows} keys ({rows} total) from exists address index"),
+            "Dropped exists address index".to_string(),
+        ],
+        "{stdout}"
+    );
+
+    let (code, lines, stdout) = run_bounded(daemon(appdata.path(), &started));
+    assert_eq!(code, Some(1), "the dump stops the daemon: {stdout}");
+    assert_eq!(
+        indx(&lines),
+        [
+            "Exists address index is enabled",
+            "Catching up from height 0 to 4",
+            "Caught up to height 4",
+        ],
+        "{stdout}"
+    );
+    let db = Database::open(&opts).expect("reopen");
+    let tx = db.begin(false).expect("begin");
+    let version = tx
+        .metadata()
+        .bucket(b"idxtips")
+        .and_then(|b| b.get(&version_key));
+    tx.rollback().expect("rollback");
+    assert_eq!(version, Some(3u32.to_le_bytes().to_vec()));
+    assert_eq!(
+        dcroxide_indexers::stored_keys(&db).expect("keys"),
+        Some(keys),
+        "the rebuilt index holds the same addresses"
+    );
+    db.close().expect("close");
+}
