@@ -367,6 +367,18 @@ impl SyncGate {
         }
     }
 
+    /// A gate that has not latched and whose sync peer is at
+    /// `sync_height`: it stays closed while the chain is below that
+    /// height, whatever the age of its tip, and from that height on
+    /// opens, and latches, once the chain itself reports current — the
+    /// manager's state during an initial sync.
+    pub fn syncing_to(sync_height: i64) -> SyncGate {
+        SyncGate {
+            current: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            sync_height: Arc::new(std::sync::atomic::AtomicI64::new(sync_height)),
+        }
+    }
+
     /// dcrd `SyncManager.IsCurrent` over an already-locked chain:
     /// `maybeUpdateIsCurrent` — nothing to do when the flag is already
     /// set; otherwise the chain is considered synced once it believes

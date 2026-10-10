@@ -546,16 +546,15 @@ fn the_pre_current_wait_loop_forwards_reorg_events() {
     // The pre-current startup wait loop must still forward
     // ReorgStarted/ReorgDone to the state machine (P3-12): dcrd's regen
     // handler has no separate pre-current wait and tracks the reorg state
-    // for every event, so a reorg that begins and ends before the chain
-    // is current keeps the stale-template guard balanced and the
+    // for every event, so a reorg that begins and ends before the sync
+    // gate opens keeps the stale-template guard balanced and the
     // reorg-done tip inject rebuilds the template.  If the wait loop
-    // dropped the reorg events (the bug), ReorgStarted would be lost, so
-    // ReorgDone never runs `handle_block_connected` and the generator
-    // stays wedged with no template.
+    // dropped the reorg events (the bug), the reorg-started hold would
+    // never appear and reorg-done would never run
+    // `handle_block_connected`, leaving the generator without a
+    // template; with only the start dropped, the stale-template count
+    // would end below zero.
     let params = dcroxide_chaincfg::regnet_params();
-    // The regnet battery blocks carry old timestamps, so a chain built
-    // from them is never current under is_current_at; with unsynced
-    // mining disallowed the generator sits in the pre-current wait loop.
     let (_dir, chain) = regnet_chain(2);
     let tx_pool = dcroxide_node::txmempool::new_shared_tx_pool(
         Arc::clone(&chain),
@@ -575,10 +574,16 @@ fn the_pre_current_wait_loop_forwards_reorg_events() {
         vec![mining_address()],
         policy.clone(),
         0,
-        // allow_unsynced_mining disabled: stay in the pre-current wait
-        // loop over the not-yet-current battery chain.
+        // allow_unsynced_mining disabled, behind a gate that cannot
+        // open: the sync peer is far above the two-block chain, so the
+        // generator sits in the pre-current wait loop.  The gate, not
+        // the age of the battery's blocks, holds it there: the battery
+        // is stamped with its generation time, so for a day after each
+        // regeneration its chain is current.  An always-current gate
+        // would skip the wait loop and race the startup template
+        // against the assertion below.
         false,
-        dcroxide_node::sync::SyncGate::always_current(),
+        dcroxide_node::sync::SyncGate::syncing_to(i64::MAX),
         None,
         None,
     );
@@ -594,38 +599,73 @@ fn the_pre_current_wait_loop_forwards_reorg_events() {
         0,
     );
 
-    // No startup template while the chain is not current.
+    // No startup template while the gate is closed.
     assert!(
         matches!(templater.current_template(), Ok(None)),
-        "an unsynced chain must not produce a startup template"
+        "a closed sync gate must not produce a startup template"
     );
 
-    // A reorg begins and ends before the chain is current.  The wait
-    // loop forwards both events, so reorg-done runs the tip inject
-    // (dcrd's rtReorgDone runs handleBlockConnected before the IsCurrent
-    // gate) and the generator publishes a template even while syncing.
+    // A reorg begins before the gate opens.  The wait loop forwards the
+    // start, which clears the template and holds retrieval.  Nothing is
+    // being built, so the hold appears exactly when the event is
+    // processed.
     generator.sink().chain_reorg_started();
-    generator.sink().chain_reorg_done();
-
+    let mirror = generator.current_handle();
     let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        match templater.current_template() {
-            Ok(Some(block)) => {
-                assert_eq!(
-                    block.header.height, 3,
-                    "reorg-done rebuilds the tip template pre-current"
-                );
-                break;
-            }
-            Ok(None) => {}
-            Err(err) => panic!("pre-current reorg handling must not error: {err}"),
-        }
+    while !mirror.lock().expect("mirror").is_stale() {
+        assert!(
+            Instant::now() < deadline,
+            "the pre-current wait loop must forward reorg-started"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    // The reorg ends, still before the gate opens.  The wait loop
+    // forwards that too, so reorg-done runs the tip inject (dcrd's
+    // rtReorgDone runs handleBlockConnected before the IsCurrent gate)
+    // and the generator publishes a template even while syncing.  The
+    // wait is on the mirror because a retrieval blocks for as long as
+    // the hold lasts: a lost reorg-done must fail here, not hang.
+    generator.sink().chain_reorg_done();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while mirror.lock().expect("mirror").is_stale() {
         assert!(
             Instant::now() < deadline,
             "the pre-current wait loop must forward reorg-done and rebuild"
         );
-        std::thread::sleep(Duration::from_millis(20));
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    match templater.current_template() {
+        Ok(Some(block)) => assert_eq!(
+            block.header.height, 3,
+            "reorg-done rebuilds the tip template pre-current"
+        ),
+        Ok(None) => panic!("reorg-done must leave a template pre-current"),
+        Err(err) => panic!("pre-current reorg handling must not error: {err}"),
     }
 
     generator.shutdown();
+}
+
+#[test]
+fn a_gate_below_its_sync_height_stays_closed_over_a_current_chain() {
+    // The property the test above leans on, pinned at the battery's own
+    // generation time, when its chain is current: a gate below its sync
+    // height stays closed, and at that height it follows the chain.
+    let (now, _) = accepted_prefix(2);
+    let (_dir, chain) = regnet_chain(2);
+    assert!(
+        chain.lock().expect("chain").is_current_at(now),
+        "the battery chain is current at its generation time"
+    );
+    let behind = dcroxide_node::sync::SyncGate::syncing_to(3);
+    assert!(
+        !behind.is_current(&chain, now),
+        "below the sync height the gate stays closed"
+    );
+    let reached = dcroxide_node::sync::SyncGate::syncing_to(2);
+    assert!(
+        reached.is_current(&chain, now),
+        "at the sync height the gate follows the chain"
+    );
 }
