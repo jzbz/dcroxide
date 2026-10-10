@@ -16,10 +16,12 @@ env:
   # Same rule for fault injection: the ENOSPC test mounts a size-limited
   # tmpfs in a user namespace to prove a real storage failure reaches the
   # fatal latch, the powerloss shim test builds tools/powerloss with cc and
-  # replays its undo log with python3, and a fault-injection test that
-  # skips quietly is worse than none — the suite goes green having checked
-  # nothing. Both tests are Linux-only (`cfg(target_os = "linux")`), so
-  # this has no effect on the macOS and Windows matrix entries.
+  # replays its undo log with python3, the exists-address power-cut test
+  # runs the daemon under that shim and kills it, and a fault-injection
+  # test that skips quietly is worse than none — the suite goes green
+  # having checked nothing. All three tests are Linux-only
+  # (`cfg(target_os = "linux")`), so this has no effect on the macOS and
+  # Windows matrix entries.
   DCROXIDE_REQUIRE_FAULT_INJECTION: "1"
 
 jobs:

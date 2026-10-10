@@ -530,9 +530,10 @@ Every randomized differential prints the seed it drew
 (`<label>: seed 0x…`). To replay a failure without editing the test, set
 `DCROXIDE_TEST_SEED` to that value and run the failing test by name.
 `DCROXIDE_REQUIRE_FAULT_INJECTION=1` does for the Linux fault-injection
-tests (the database ENOSPC test and the `tools/powerloss` shim test) what
-`DCROXIDE_REQUIRE_ORACLE` does for the oracle: a missing prerequisite
-fails the test instead of skipping it. CI sets it too.
+tests (the database ENOSPC test, the `tools/powerloss` shim test and the
+exists-address index's power-cut test, which runs the daemon under that
+shim) what `DCROXIDE_REQUIRE_ORACLE` does for the oracle: a missing
+prerequisite fails the test instead of skipping it. CI sets it too.
 
 `rust-toolchain.toml` pins the toolchain builds actually use, so a commit
 compiles with one rustc everywhere, and the workspace `rust-version` names
