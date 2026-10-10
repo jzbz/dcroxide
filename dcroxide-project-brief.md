@@ -87,9 +87,12 @@ exit criteria have not been demonstrated, and those are listed here too:
 
 What Phase 15 has covered so far:
 
-- **Validation.** testnet and mainnet both synced to the tip from genesis with
-  full consensus validation. The first mainnet run validated 1,098,308 blocks
-  in ~20.4 h over the public network, before the optimization campaign.
+- **Validation.** testnet and mainnet both synced to the tip from genesis. The
+  first mainnet run synced 1,098,308 blocks in ~20.4 h over the public
+  network, before the optimization campaign. A sync at the defaults skips
+  connect validation up to the assume-valid block, as dcrd's does; in 2026-08
+  the replay harness drove mainnet's blocks up to 1,100,392 through full
+  validation.
 - **Performance campaign.** Storage-commit policy, the release build profile,
   script-engine allocation, parallel script validation, per-block hash
   memoization, a `SigCache` port, and a batch of smaller allocation fixes.

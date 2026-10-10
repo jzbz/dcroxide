@@ -37,13 +37,20 @@ the RPC and peer edges: the EMA retarget divided the way Go's
 the in-block fraud proof pass run at height 1, and the block index
 flushed during header sync instead of accumulating a million entries.
 
-It has synced testnet and mainnet to the tip from genesis with full
-consensus validation, and syncs against dcrd in both directions (see
-[Performance](#performance)). That says the consensus rules agree with
-dcrd's across the whole chain; it does not say the node is safe to
-operate. **Do not expose it to the internet and do not use it with
-funds** — see [SECURITY.md](SECURITY.md) for what is known to be
-missing and how to report a vulnerability, and
+It has synced testnet and mainnet to the tip from genesis, and syncs
+against dcrd in both directions (see [Performance](#performance)). A
+sync at the defaults validates in full only the blocks after the
+built-in assume-valid block, as dcrd's does: up to that block both skip
+connect validation, script checks included. In 2026-08 the replay
+harness, `dcroxide-bench` below, drove every mainnet block up to
+1,100,392 through the chain engine with full validation; no full
+replay has been recorded since, so none covers the review fixes above.
+Together that says dcroxide's consensus rules accept every mainnet
+block that dcrd's accepted. That they reject what dcrd's reject rests
+on the test batteries described below, not on a sync, and none of it
+says the node is safe to operate. **Do not expose it to the internet
+and do not use it with funds** — see [SECURITY.md](SECURITY.md) for
+what is known to be missing and how to report a vulnerability, and
 [docs/operating.md](docs/operating.md) for what running it deliberately
 requires (a supervisor is mandatory, and a dcrd data directory will not
 work). Currently implemented:
@@ -362,8 +369,9 @@ work). Currently implemented:
 - `dcroxide-bench` — the block replay harness (no dcrd counterpart):
   `export` writes the main chain of a stopped data directory to a
   bootstrap-format corpus, and `replay` drives that corpus back
-  through the live chain engine with full validation — a network sync
-  without the network — reporting throughput at a fixed block
+  through the live chain engine with full validation of every block,
+  where a network sync skips connect validation up to the
+  assume-valid block — reporting throughput at a fixed block
   interval, so an optimization is measured on the same blocks before
   and after
 - `tools/oracle` — Go shim linking dcrd's own packages (pinned to the
