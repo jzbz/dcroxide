@@ -137,6 +137,18 @@ What Phase 15 has covered so far:
   much as the engine. Chain on disk at tip: dcrd 23.69 GiB,
   dcroxide 33.58 GiB — identical consensus block bytes, the difference is
   metadata.
+- **A separate comparison on 2026-10-09 and 2026-10-10, on another
+  machine and against dcrd's latest release: dcroxide 2.71x as fast.**
+  Each daemon syncing
+  mainnet from genesis to block 1,116,035 over loopback from a block
+  server run by the other, four runs each: dcroxide `c128a93` a median of
+  1,058.6 s (1,054 blk/s) against dcrd v2.1.6's 2,863.9 s (390 blk/s),
+  after the height-first block keys (ADR-0010) and the exists-address
+  index's own layout (ADR-0011). Chain on disk at that block: dcrd
+  24.16 GiB, dcroxide 27.90 GiB. Not a later point on the 2.2x and 1.29x
+  curve above: the machine, the dcrd version and the harness all differ,
+  and the parity commit was not run. Full record in
+  [docs/bench-ledger.md](docs/bench-ledger.md).
 - **Security-blocker campaign.** The release blockers, highs, and mediums from
   an audit of the ported surface: RPC authentication and admission, peer
   message-path bounds (stall deadlines, getdata, queue and write limits),
@@ -156,7 +168,7 @@ Named open items, tracked and not fixed:
   copy-out rebuild packs *worse*, 58.29%, on a larger live tree, 10.92 GiB
   against 9.79. The 1.536 GiB of intra-page slack in `spendjournalv3` is real
   and unreachable inside this engine.
-- The node is flush-bound under fast ingest (the 48%-of-wall stall figure above, 90–98% of it inside a metadata-flush window).
+- The node was flush-bound under fast ingest as measured in 2026-08 (the 48%-of-wall stall figure above, 90–98% of it inside a metadata-flush window). With the height-first block keys and the exists-address index's own layout, metadata flushes took 15–16% of a from-genesis sync on another machine in 2026-10 ([docs/bench-ledger.md](docs/bench-ledger.md), "Daemon against daemon, each from the other").
 
 **The node is still pre-alpha. Do not expose it to the internet and do not use
 it with funds.**

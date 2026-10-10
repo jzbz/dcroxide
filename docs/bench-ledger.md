@@ -14,7 +14,10 @@ figures in this file are the record.** Record a row for every
 storage-rework milestone, so the campaign against the IBD gap produces
 a curve, not before/after anecdotes. That gap was 2.23x when the
 campaign opened in 2026-07 and measured 1.29x on 2026-08-15; the curve
-is the point of this file.
+is the point of this file. A separate comparison on 2026-10-09 and
+2026-10-10, on m3 and against dcrd's latest release, had dcroxide
+syncing 2.71x as fast as dcrd. It is not a later point on that curve:
+the machine, the dcrd version and the harness all differ.
 
 ## Machines
 
@@ -22,10 +25,15 @@ is the point of this file.
 |---|---|---|---|---|
 | m1 | AMD Ryzen AI MAX+ 395 | 16/32 | 64 GB | WD PC SN5000S 1 TB NVMe |
 | m2 | x86_64, a container on a larger host | 4 CPUs for the node, one for the dcrd server and harness | not recorded | ZFS mirror of QLC NVMe drives (recordsize 128K, compression on) |
+| m3 | AMD Ryzen 9 7950X3D | 16/32; 8 cores (16 threads) for the node, 4 others for the block server | 96 GB | Samsung 990 PRO 2 TB NVMe, btrfs (zstd compression on) over an encrypted mapping |
 
 Hardware was not recorded when the 2026-07 campaign ran; its rows are
 attributed to m1 as the only bench host to date, with specs read on
 2026-08-07.
+
+m3 was added on 2026-10-10. It is the development desktop that the
+2026-10-09 end-state checks under "Exists-address index layout 3"
+describe as not in this table.
 
 ## Sync throughput
 
@@ -45,6 +53,7 @@ path) has been measured yet, so this crossover is unconfirmed.
 | 2026-07 | m1 | unrecorded (2.2.0-pre, at the ADR-0004 amendment) | 2.2.0-pre+452c1a6c3 (go1.26.5) | mainnet, ~1,100,400 blocks | syncer dcroxide: 2.47 h — 124 blk/s (from dcroxide), 2.51 h — 122 blk/s (from dcrd); syncer dcrd: 1.11 h — 276 blk/s, 1.02 h — 299 blk/s | ADR-0004 amendment |
 | 2026-08-15 | m1 | `b6d0c63` (fan-out fix `c091b46` **not** in the binary) | 2.2.0-pre+452c1a6c3 (go1.26.5) | mainnet, 1,100,392 blocks | Both daemons from one shared dcrd server, sequential, defaults, exists-address index verified on both: dcroxide 4,153 s — **265.0 blk/s** at 0.76 mean cores; dcrd 3,220.5 s — **341.7 blk/s** at 1.50. **1.29x**, not the 2.23x above. Arms ~12 h apart under unmatched loadavg (4.62 vs 2.45), n=1 — a bound, not a point estimate | this file, below |
 | 2026-08-15 (second) | m1 | `8b27d20` (fan-out fix included) | 2.2.0-pre+452c1a6c3 (go1.26.5) | mainnet, 1,100,392 blocks | Same shared server, arms back to back on a quiet box, page cache pre-warmed before each: dcroxide 4,821.4 s — **228.2 blk/s**; dcrd 3,200.8 s — **343.8 blk/s**. Ratio **1.51x**. dcrd reproduced to 0.6% across the two 2026-08-15 runs; dcroxide fell 14% under higher ambient (a browser active in its arm only). Both runs carried more ambient in the dcroxide arm, so **1.29x above remains the tighter upper bound** — this row is the D-state run's throughput, not a supersession | this file, below |
+| 2026-10-09 and 2026-10-10 | m3 | `c128a93` | release v2.1.6 (go1.25.4) | mainnet, genesis to 1,116,035 | Each daemon from a block server run by the other, four runs each on a quiet machine (three alternated, one from a later round), defaults apart from the flags that point the node at the server, exists-address index on in both; the syncing node's RPC is on for the harness's height polls, so not `--norpc`: dcroxide 1,058.6 s median (1,055.8–1,065.0) — **1,054.3 blk/s** at 1.71–1.72 mean cores; dcrd 2,863.9 s (2,848.8–2,894.8) — **389.7 blk/s** at 1.94–1.95. dcroxide **2.71x** as fast. One same-session run of each daemon from its own kind: 1,072.2 s and 2,872.8 s, so the source moved either by about 1% or less | this file, "Daemon against daemon, each from the other" |
 
 > **The headline 1.29x predates the fan-out fix, so it is conservative for
 > master.** That figure was measured on `b6d0c63`; `c091b46` (one validation
@@ -69,6 +78,14 @@ path) has been measured yet, so this crossover is unconfirmed.
 > Not scheduled: ADR-0009 closed on 2026-08-17, so this number informs no
 > pending decision and is documentation accuracy. Worth running before a
 > release, or after any change expected to move IBD.
+>
+> **Run on 2026-10-09 and 2026-10-10, in a different shape.** Alternating
+> repetitions on a quiet machine, as asked for above, but on m3, against
+> dcrd's latest release instead of 2.2.0-pre, and with each daemon
+> syncing from the other: the last row above, and "Daemon against
+> daemon, each from the other" below. It does not re-measure 1.29x on m1.
+> The README no longer cites 1.29x: its Performance section reports
+> this comparison instead.
 
 **Open arm, unmeasured: the maturing-ticket ancestor read.** Every connect
 past stake-enabled height lists the ticket purchases in the block
@@ -100,6 +117,7 @@ record the result here whether or not it ships.
 | 2026-07 | m1 | unrecorded (2.2.0-pre, at the ADR-0004 amendment) | mainnet tip | dcroxide 32.06 GiB total (17.579 GiB blocks + 14.483 GiB metadata.redb); dcrd 23.73 GiB (17.580 GiB blocks + 6.045 GiB metadata leveldb + 0.108 GiB utxodb) | ADR-0004 amendment |
 | 2026-08-11 | m1 | `6cb2f56` | mainnet tip, both sides fed `mainnet-full.corpus` | **Matched composition, payload measured on both sides.** Metadata store, consumed bytes: dcrd 6.102 GiB (6,552,084,480) against dcroxide 14.505 GiB uncompacted (15,574,482,944) and 12.052 GiB compacted (12,940,464,128); dcroxide's live B-tree 9.823 GiB (10,547,314,688). Payload: dcrd 6,061,905,929 B, dcroxide 6,069,302,583 B. Over each store's *own* payload: dcrd 1.081x, dcroxide 1.738x on the live tree, 2.566x on the uncompacted file. | this file, below |
 | 2026-08-15 | m1 | `b6d0c63` | mainnet tip, both daemons synced from one shared dcrd server, exists-address index on both, no transaction index | **Apparent size**, whole appdata: dcroxide 36,055,044,196 B (33.58 GiB) against dcrd 25,433,938,876 B (23.69 GiB) — 1.42x. Same pair as the 2026-08-15 sync row above; both daemons' own datadirs, not a replay. | this file, below |
+| 2026-10-09 and 2026-10-10 | m3 | `c128a93` | mainnet at block 1,116,035, each daemon synced from the other, exists-address index on both, no transaction index | **Apparent size**, whole appdata, medians of four runs: dcroxide 29,953,302,380 B (27.90 GiB; 17.884 GiB of block files + a 10.012 GiB metadata.redb) against dcrd v2.1.6 25,945,551,274 B (24.16 GiB) — 1.15x. The four runs span 2.6 MB for dcroxide and 27.7 MB for dcrd. | this file, "Daemon against daemon, each from the other" |
 
 > **The 2026-08-11 row's store sizes are CONSUMED BYTES, superseded by the
 > apparent-size rule adopted 2026-08-12.** This file is append-only, so the
@@ -1929,3 +1947,252 @@ in `snapshots.jsonl`, with its phase logs and rebuild flush log. The
 dcrd rows are labelled `dcrd-ab`. For the end-state checks: the node and
 dcrd logs, the `existsaddr-digest` outputs, and the RPC query logs of
 that check's harness.
+
+## Daemon against daemon, each from the other (2026-10-09 and 2026-10-10)
+
+The repetition that the note under the 2026-08-15 rows of "Sync
+throughput" asked for, in a
+different shape: on machine m3, against dcrd's latest release, and with
+each daemon syncing from the other. dcroxide `c128a93` (the height-first
+keys and exists-address layout 3; `cargo build --release` under rustc
+1.98.1) against dcrd `release-v2.1.6` (commit `39e9b9f9`), built with
+go1.25.4 and the flags of its release image (`CGO_ENABLED=0`,
+`-trimpath`, `-tags safe,netgo,timetzdata`, `-ldflags "-s -w"`). Each
+syncs mainnet from genesis to 1,116,035 over loopback from a block
+server:
+
+- **dcrd as the source** is dcrd v2.1.6 serving a frozen chain to
+  1,116,035 that a 2.2.0-pre build wrote. v2.1.6 opens it unchanged
+  (chain database 14).
+- **dcroxide as the source** is the data directory run r1 left, served
+  by the same dcroxide binary.
+
+The server runs isolated: `--connect` to a dead loopback address,
+`--noseeders`, `--norpc`, listening on loopback. It is restarted for
+each run, after its data has been read once into the page cache, and
+the run starts 15 s after it listens.
+
+The syncing node runs with `--connect` to the server, `--nolisten`,
+`--noseeders` and RPC on loopback without TLS for the harness's
+once-a-second `getblockcount` poll, and defaults otherwise. So the
+exists-address index is on in both, and both carry the same assume-valid
+block (`458d6a8e…`, height 1,026,597): up to it they skip connect
+validation, script checks included, and they validate the 89,438
+blocks after it in full.
+`DCROXIDE_DB_FLUSHLOG` is set for dcroxide. The syncing node is pinned to
+eight cores and their SMT siblings (16 threads, the half of the CPU with
+the larger L3; both runtimes size their pools from the affinity mask),
+the server to four others and the harness to four more.
+
+The clock runs from spawning the syncing process to the first poll that
+sees 1,116,035. Node CPU time (`/proc/<pid>/stat`), `wchar` and the
+write-call count (`/proc/<pid>/io`) and peak RSS (`VmHWM`) are read at
+that poll, before SIGINT. The data directory is `du -sb` of the whole
+appdata after exit.
+
+Every run waits for a quiet machine: no compiler or build process, load
+under 2, and the machine and the node's cores each under 5% busy,
+checked twice a minute apart. All but the first run of a queue start
+(r1, c1, q1) also follow a `sync` and a 300 s idle. r1 began 102 s
+after the second of two 20,000-block smoke runs ended, q1 about four
+minutes after c2, and c1 five hours after r6 ended and 2.4 hours after
+a first start of c1 that was stopped by hand 20 s in and is not
+counted. The harness
+marks a run disturbed, and repeats it, if it sees a build process,
+other userland above 3% of the machine's 32 threads, or more than 2 GB
+read from the volume by anything but the node and the server. No run
+was marked.
+
+Twelve runs in three rounds:
+
+- **r1 to r6** alternate the two cross directions over about 3.8 hours.
+- **c1 and c2** are one same-source run of each daemon, five hours later.
+- **q1 to q4** follow at once, back to back over about 2.5 hours: each
+  daemon from its own kind and then from the other.
+
+| run | started | syncer | source | wall | blk/s | node CPU time (user + sys) | written | write calls | peak RSS | data directory | other userland |
+|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| r1 | 10-09 17:33 | dcroxide | dcrd | 1,055.8 s | 1,057.0 | 1,820.9 s (1,698.2 + 122.7) | 51.6 GB | 11,953,169 | 2,129 MiB | 29,953,066,923 B | 0.18% |
+| r2 | 10-09 17:57 | dcrd | dcroxide | 2,854.9 s | 390.9 | 5,569.4 s (4,522.8 + 1,046.6) | 286.1 GB | 61,603,639 | 1,849 MiB | 25,946,723,606 B | 0.15% |
+| r3 | 10-09 18:51 | dcroxide | dcrd | 1,065.0 s | 1,047.9 | 1,821.6 s (1,695.2 + 126.4) | 51.4 GB | 11,916,014 | 2,140 MiB | 29,952,657,393 B | 0.15% |
+| r4 | 10-09 19:16 | dcrd | dcroxide | 2,848.8 s | 391.8 | 5,542.8 s (4,503.4 + 1,039.4) | 280.6 GB | 60,666,375 | 1,851 MiB | 25,930,224,360 B | 0.13% |
+| r5 | 10-09 20:10 | dcroxide | dcrd | 1,056.1 s | 1,056.8 | 1,807.0 s (1,685.8 + 121.2) | 51.4 GB | 11,920,701 | 2,146 MiB | 29,955,270,442 B | 0.16% |
+| r6 | 10-09 20:34 | dcrd | dcroxide | 2,872.8 s | 388.5 | 5,563.7 s (4,510.1 + 1,053.6) | 286.4 GB | 61,445,588 | 1,851 MiB | 25,957,887,733 B | 0.13% |
+| c1 | 10-10 02:21 | dcroxide | dcroxide | 1,087.9 s | 1,025.9 | 1,842.1 s (1,711.9 + 130.2) | 51.4 GB | 11,919,108 | 2,144 MiB | 29,950,384,728 B | 0.97% |
+| c2 | 10-10 02:46 | dcrd | dcrd | 2,947.3 s | 378.7 | 5,660.4 s (4,559.3 + 1,101.1) | 282.5 GB | 60,877,979 | 1,851 MiB | 25,946,378,981 B | 0.97% |
+| q1 | 10-10 03:40 | dcroxide | dcroxide | 1,072.2 s | 1,040.9 | 1,826.4 s (1,700.4 + 126.0) | 51.5 GB | 11,944,390 | 2,142 MiB | 29,949,851,699 B | 0.28% |
+| q2 | 10-10 04:04 | dcroxide | dcrd | 1,061.1 s | 1,051.8 | 1,822.3 s (1,696.0 + 126.3) | 51.5 GB | 11,923,514 | 2,137 MiB | 29,953,537,836 B | 0.15% |
+| q3 | 10-10 04:29 | dcrd | dcrd | 2,872.8 s | 388.5 | 5,589.1 s (4,517.1 + 1,072.0) | 286.6 GB | 61,637,006 | 1,852 MiB | 25,941,613,526 B | 0.13% |
+| q4 | 10-10 05:23 | dcrd | dcroxide | 2,894.8 s | 385.5 | 5,653.8 s (4,549.6 + 1,104.2) | 293.7 GB | 63,367,492 | 1,848 MiB | 25,944,378,941 B | 0.12% |
+
+"Other userland" is the CPU time of every process but the node, the
+server and the harness, as a share of the machine's 32 threads.
+
+**dcroxide synced 2.71x as fast as dcrd v2.1.6.** Over the four
+cross-source runs of each (r1, r3, r5, q2 and r2, r4, r6, q4) the medians
+are 1,058.6 s (17.6 minutes, 1,054.3 blk/s) against 2,863.9 s (47.7
+minutes, 389.7 blk/s). All twelve runs exited 0 on the server's tip,
+`8752fdc9…`.
+
+**CPU.** The dcroxide process used 0.33x dcrd's CPU time, a median of
+1,821.3 s against 5,566.6 s. That is the node process alone. Busy time
+on the machine beyond the node, the server and other userland was
+287.5–306.0 s in dcroxide's four runs and 85.9–97.1 s in dcrd's. The
+harness did not break it down: it is kernel threads and interrupt
+handling, not held to the node's cores, and the busiest threads it
+listed were dm-crypt and btrfs write workers. With it counted the ratio
+is 0.37x.
+
+**Bytes.** dcroxide passed 0.18x the bytes to write calls, 51.4 GB
+against 286.3 GB (the node's `wchar`). At the volume the medians were
+81.0 GB written against 322.9 GB, 0.25x. That counter sits below the
+filesystem, so it takes file data after zstd compression, the
+filesystem's own writes and everything else written to the machine's
+system volume. It is 25–32 GB above the node's own dirtied bytes for
+dcroxide and about 22 GB above for dcrd, and it is specific to this
+filesystem.
+
+**The noise is far below the effect.** The four cross-source wall times
+span 0.9% of their median for dcroxide and 1.6% for dcrd. Node CPU time
+spans 0.8% and 2.0%, and bytes passed to write calls 0.3% and 4.6%. In
+those eight runs other userland was 0.12–0.18% of the machine, no build
+process was seen in any run, and the volume read at most 158 MB that
+neither process asked for. The server used 152–169 s of CPU in every
+run, about 14% of one core while dcroxide synced and under 6% while
+dcrd did. One signal the harness recorded and did not gate on:
+system-wide I/O pressure (`some`, avg10) averaged 48–53% through r2 to
+r6 and read 80–95% at each one's first sample, before the node had done
+any work, against under 1% in dcroxide's other runs and 5–6% in dcrd's.
+Its source was not identified. The measured volume's counters show
+nothing extra in those runs (at most 158 MB read that neither process
+asked for), and wall times do not follow it.
+
+**The source moves the result by about 1% or less.** The q round, one
+run of each pairing:
+
+| syncer | from dcroxide | from dcrd | from dcroxide / from dcrd |
+|---|---:|---:|---:|
+| dcroxide | 1,072.2 s (q1) | 1,061.1 s (q2) | 1.010 |
+| dcrd | 2,894.8 s (q4) | 2,872.8 s (q3) | 1.008 |
+
+Both daemons synced about 1% faster from the dcrd server. For dcrd that
+is inside the cross-source runs' own spread (0.8% against 1.6%). For
+dcroxide it is just outside it (1.0% against 0.9%): q1's 1,072.2 s is
+above all four cross-source runs, and q1 was the least quiet run of the
+round, 0.28% other userland against 0.12–0.15% in the other three, and
+the one that began without the 300 s idle. Swapping the syncer moves
+the result 2.7x. The 2026-07 row found the source moving a run by
+1.6–8.8% against 2.2x for the syncer, though there each daemon was the
+faster from its own kind.
+
+**c1 and c2 are kept, and they are not quiet runs.** They took 1,087.9 s
+and 2,947.3 s, 2.8% and 2.9% over the cross-source medians, and 1.5% and
+2.6% over the same pairings in the q round. Other userland was 0.97% of
+the machine in both, against 0.12–0.28% in the other ten runs: a
+compositor, a browser, chat clients and a system monitor among the
+largest, about a third of one thread in all.
+c1's block server also read 3,142 MB from the volume during the run,
+against at most 181 MB in the other eleven, so c2 is the cleaner of the
+two. The harness's 3% threshold did not flag either. They suggest that
+a machine this lightly used can still cost a sync 1.5–3% (one run of
+each, each the slowest of its syncer's six), and they are the reason
+the q round was run. They do not enter the cross-source medians,
+spreads or ratios above.
+
+**The lead grows along the chain, and most where full validation
+begins.** Seconds to reach each height, the median of each direction's
+four cross-source runs, interpolated between samples taken every 10 s:
+
+| height | dcroxide | dcrd | dcrd / dcroxide |
+|---:|---:|---:|---:|
+| 100,000 | 54.3 | 72.7 | 1.34x |
+| 250,000 | 136.0 | 202.3 | 1.49x |
+| 500,000 | 286.0 | 478.6 | 1.67x |
+| 750,000 | 537.4 | 1,055.7 | 1.96x |
+| 900,000 | 703.2 | 1,526.2 | 2.17x |
+| 1,000,000 | 829.9 | 1,899.8 | 2.29x |
+| 1,026,597 | 864.6 | 2,003.5 | 2.32x |
+| 1,116,035 | 1,058.6 | 2,863.9 | 2.71x |
+
+The step is at the assume-valid block. Over 1,000,000 to 1,026,597 the
+medians were 761 blk/s (739–783) for dcroxide and 254 (250–263) for
+dcrd. Over the 89,438 fully validated blocks after it they were 461.0
+(458.4–463.5) and 104.0 (103.0–104.5), 4.4x apart, and those blocks took
+18% of dcroxide's wall time and 30% of dcrd's. The node's 16 threads
+were 31–33% busy there for dcroxide, about five threads, and 16% for
+dcrd, under three, against 6–7% and 10% just before it. Windows that
+straddle that block mix the two regimes: after 1,000,000 the medians
+were 506.8 and 120.4 blk/s. Over m2's window, 916,000 to the tip,
+dcroxide ran at 593.0 blk/s (584.7–599.2) on m3 and dcrd v2.1.6 at 156.5
+(154.0–157.3). On m2 the layout-3 tail ran at a median of 482.1 blk/s on
+four cores and slower storage, and dcrd `6f6cf21b` at 147.6 two days
+before. That is another machine and other sessions, so none of these
+pairs is a ratio.
+
+**Flushes.** dcroxide made 134 metadata flushes in every run: 133
+during the timed sync and one at shutdown, after the clock stopped. In
+the four cross-source runs the 133 took 159.8–170.5 s in all, 15.1–16.1%
+of wall time. The median flush took 1.30–1.37 s and the longest
+2.44–2.97 s. Of the flush time, the redb commit was 101.7–112.7 s, the
+insert loop 35.7–36.0 s, the block-file sync 3.1–3.4 s and the
+exists-address participant 18.5–19.1 s. On m1 on 2026-08-16 the same
+sync made 130 flushes with a median of 26.9 s, and flush windows
+occupied 68% of wall time.
+
+**Memory and shutdown.** Peak resident memory was 2,129–2,146 MiB for
+dcroxide and 1,848–1,852 MiB for dcrd over all twelve runs. SIGINT at the
+target took 1.0–1.3 s for dcroxide, most of it that last flush, and
+0.2 s for dcrd.
+
+**Storage at 1,116,035** (apparent bytes, whole appdata, medians of the
+four cross-source runs). dcroxide 29,953,302,380 B (27.90 GiB). r1's
+directory holds 19,202,596,910 B of block files (17.884 GiB) and a
+10,750,377,984 B `metadata.redb` (10.012 GiB). dcrd v2.1.6
+25,945,551,274 B (24.16 GiB), so dcroxide's is **1.15x** dcrd's. The dcrd
+run directories were deleted before their split was read. The dcrd
+server's block files total the same 19,202,596,910 B: 35 of the 36
+files are byte-identical to r1's, and the other holds the same blocks
+in a different order over an 8.6 MB span. That leaves about 6.28 GiB for
+v2.1.6's metadata leveldb, `utxodb` and logs. The 2026-08-15 pair on m1
+was 33.58 against 23.69 GiB, 1.42x, at 1,100,392.
+
+**The WAN arithmetic, with these rates.** The preamble of "Sync
+throughput" predicts that the in-flight window caps a sync once the
+round trip passes about nine blocks' processing time. Here a block took
+dcroxide 0.949 ms averaged over the chain and 2.17 ms after the
+assume-valid block, and dcrd 2.566 ms and 9.62 ms, which puts that
+round trip near 8.5 and 19.5 ms for dcroxide and 23.1 and 86.6 ms for
+dcrd. Bandwidth is a second bound: 19.2 GB of blocks in 1,058.6 s is a
+mean of 145 Mbit/s. Still a prediction: no delayed-link arm has been
+run.
+
+**What this does not establish.**
+
+- Nothing about dcrd `6f6cf21b`, the parity target. dcrd here is the
+  release, and the pin was not run on m3.
+- Nothing about m1. This does not re-measure the 1.29x row, and it is
+  not a later point on that row's curve: the machine, the dcrd version
+  and the harness all differ.
+- Not where the difference comes from. dcrd spent 1,039–1,104 s of its
+  CPU time in the kernel against dcroxide's 121–126 s. It passed 5.6x
+  the bytes to write calls, and in each of its six runs it read
+  12.6–12.9 TB through 418–421 million read calls, nearly all of it from
+  the page cache (at most 64 MB came from storage), against dcroxide's
+  25.2–25.3 GB over 2.4–2.5 million. Neither daemon was profiled, and
+  neither was run with `--noexistsaddrindex`, so the index's share of
+  dcrd's time is not known.
+- Nothing about a busy machine, fewer cores or slower storage. m3's
+  volume is btrfs with zstd compression on an encrypted mapping that
+  passes no discards, so the drive is never told that a deleted run's
+  blocks are free. The directions alternated, so both were exposed to
+  any drift from that. dcrd's four cross-source times rise 1.4% from
+  first to last and dcroxide's 0.5%, the second inside those runs' own
+  0.9% spread; four runs cannot tell either from noise, and both are
+  small against 2.7x.
+
+Raw: the comparison's `runs.jsonl` rows labelled `r1` to `r6`, `c1`,
+`c2` and `q1` to `q4`, with per-run samples (height, load, the busy
+share of the node's cores and of the machine, pressure, drive
+temperature), dcroxide's per-flush logs (`DCROXIDE_DB_FLUSHLOG`), both
+daemons' logs, and `smoke.jsonl` for the two 20,000-block runs that
+checked the harness.

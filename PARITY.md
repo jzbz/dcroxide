@@ -725,7 +725,13 @@ against upstream and the port is faithful.
   [ADR-0004](docs/adr/0004-storage-backend.md). At the mainnet tip that costs
   disk: 32.06 GiB against dcrd's 23.73 GiB, measured 2026-07 under redb 2.6.3,
   and 33.58 against 23.69 when the pair was re-measured 2026-08-15 under
-  4.1.0 with composition verified on both sides.
+  4.1.0 with composition verified on both sides. With the height-first
+  keys and the exists-address index's own layout (both below) it was
+  27.90 GiB against dcrd v2.1.6's 24.16 at block 1,116,035 on m3 in
+  [bench-ledger.md](docs/bench-ledger.md)
+  (2026-10), 1.15x, with a 10.01 GiB `metadata.redb`. The breakdown that
+  follows is of the 2026-07 and 2026-08 stores and has not been repeated
+  for the current layout.
   The block bytes are consensus data and match to within a mebibyte
   (17.579 GiB against 17.580), so the whole 8.33 GiB gap is metadata — one
   14.483 GiB `metadata.redb` against dcrd's 6.045 + 0.108 GiB. None of it is
@@ -761,10 +767,11 @@ against upstream and the port is faithful.
   which the 2026-08-12 correction rejects. The throughput cost is a separate
   engine property: a copy-on-write B-tree does no background work, so commit
   cost tracks tree size, where goleveldb's LSM commit is O(dirty) and defers
-  the rest to background compaction. Syncing mainnet from genesis the port
+  the rest to background compaction. Syncing mainnet from genesis in
+  2026-07 the port
   spent 80.1% and 82.4% of wall time (two runs) inside progress stalls over
-  20 s, while dcrd stalled 0 times in 754 windows. The node is flush-bound
-  under fast ingest, which is the leading explanation for the initial block
+  20 s, while dcrd stalled 0 times in 754 windows. The node was flush-bound
+  under fast ingest, which was the leading explanation for the initial block
   download gap — re-measured 2026-08-15 at **1.29x**, superseding the ~2.2x
   quoted through 2026-07. (That is m1, from genesis, with the
   exists-address index in dcrd's layout. On m2, slower storage, dcrd
@@ -773,8 +780,16 @@ against upstream and the port is faithful.
   index's own layout, also below, then took the 200,000-block tail after
   block 916,000 to a median of 482 blk/s with the index on, where dcrd ran
   it at 146–148 blk/s two days earlier. That cross-session pair is
-  context, not a ratio. No from-genesis run has been measured with the
-  new index layout.) A task-state decomposition on 2026-08-15 measured the
+  context, not a ratio. From genesis with both changes, on m3 on
+  2026-10-09 and 2026-10-10, the port synced to block 1,116,035 in a
+  median of 17.6 minutes against 47.7 for dcrd v2.1.6 (the latest
+  release, not the pinned `6f6cf21b`, which was not run there), 2.71x as
+  fast, with 15–16% of its wall time in metadata flushes
+  ([bench-ledger.md](docs/bench-ledger.md), "Daemon against daemon, each
+  from the other"). So the rest of this passage explains the gap as it
+  was measured on m1 in 2026-08. It has not been re-measured there, and
+  on m3 the node is not flush-bound.) A task-state
+  decomposition on 2026-08-15 measured the
   mechanism: the port drives **11.7x** the kernel-side storage work dcrd does
   (mostly dm-crypt writeback) and blocks **30x more per GiB written**, while
   dcrd writes 1.16x more bytes at 1.74x the rate — so it is the write shape,

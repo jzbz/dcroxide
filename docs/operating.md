@@ -148,82 +148,92 @@ under CHAN, "Blockchain database version info: chain: 15, ...", where
 dcrd prints "chain: 14": the one place the number shows, and the
 difference is expected.
 
-Budget for it: in every sync from genesis measured so far, initial block
-download ran slower than dcrd's, by a factor that depends heavily on the
-storage underneath. On machine m1 in
-[bench-ledger.md](bench-ledger.md), with a single NVMe drive, it ran
-about **1.29x slower than dcrd** — roughly 1.15 hours against dcrd's 0.9
-for mainnet from genesis — and the chain cost more on disk, 33.58 GiB
-against dcrd's 23.69 GiB at the same tip. Both were measured 2026-08-15
-under redb 4.1.0, before the 2026-10-08 height-first keys, with both
-daemons syncing from one shared dcrd server and the index composition
-verified on each side. They replace 2026-07 figures of 2.2x and 32.06 GiB
-against 23.73, taken under redb 2.6.3 with the two nodes syncing from
-each other on one machine — a setup that inflated both arms.
+Budget for it: on the one machine where a sync from genesis has been
+measured with the current layout, it took less time than dcrd v2.1.6
+did, and more disk. On machine m3 in
+[bench-ledger.md](bench-ledger.md), a 16-core desktop with one NVMe
+drive and the node held to eight of its cores, mainnet from genesis to
+block 1,116,035 took a median of **17.6 minutes**, against **47.7
+minutes** for dcrd v2.1.6 on the same cores. Those are four runs of each
+on 2026-10-09 and 2026-10-10, each set of four spanning at most 1.6% of
+its median, with each daemon syncing over loopback from the other. Both
+ran at their defaults apart from the flags that point them at the
+server, so the exists-address index was on. Which daemon served the
+blocks moved either figure by about 1% or less. The chain cost more on
+disk: 27.90 GiB against dcrd's 24.16 GiB at that block.
 
-On slower storage the gap is wider. On m2, a ZFS mirror of QLC NVMe
-drives, dcrd synced from genesis to block 916,000 **2.45x** as fast as
-dcroxide did before the height-first keys and **1.40x** as fast as it
-does with them (one run each; bench-ledger.md, "Height-first per-block
-keys"). The keys left the data directory's size unchanged there, and
-they have not been measured on m1. The exists-address index's own
-layout (2026-10-09, below) then took the 200,000-block tail after block
-916,000 on m2 from a median of 94 to 482 blocks/s with the index on.
-dcrd ran that tail there at 146-148 blocks/s, but on 2026-10-07, in
-another session, so read the two together as context, not as a ratio.
-No sync from genesis, on either machine, has been measured with the new
-layout, so every from-genesis figure here predates it.
+The rate falls as the chain grows, and falls again where full
+validation begins: by default both daemons skip connect validation,
+script checks included, up to the built-in assume-valid block,
+1,026,597. On m3 the node reached block 500,000 in
+4.8 minutes, block 1,000,000 in 13.8 and the assume-valid block in 14.4.
+The 89,438 blocks after it took another 3.2 minutes, about 461 blocks/s
+on about five of the node's 16 threads, against 1,054 over the whole
+chain. New blocks are past that point too, so a chain longer than the
+one measured should add time at about that rate on a machine like m3,
+until a release moves the assume-valid block. With `--assumevalid=0`
+every block is validated in full and none of these figures apply.
 
-Treat 1.29x as a rough figure for fast local storage rather than a
-precise ratio, and not as a bound: on m1 the two arms ran about 12 hours
-apart under different background load, once each, and m2 measured gaps
-well above it. What is not in doubt is the direction — the port has
-roughly halved its distance to dcrd on m1 since 2026-07 — and that it
-does the work at less CPU than dcrd: 0.76 cores against 1.50 on m1. If
-your host is busy with other work, or its storage is slower than m1's,
-expect the sync to stretch more than dcrd's would.
-All of these come from syncing over loopback from a local dcrd server,
-and none has been measured over the internet. There, both daemons request
-blocks the same way: through dcrd's window of at most 16 blocks in flight,
-refilled once fewer than 10 remain, from the sync peer only. By that window
-arithmetic (a prediction, not a measurement), once the round trip to the
-sync peer exceeds about nine blocks' processing time, roughly 34 ms for
-dcroxide and 26 ms for dcrd on m1, the sync should wait on the network
-at about 9-16 blocks per round trip, and the gap between the two should
-narrow toward 1x as latency grows. Budget from your link's
-latency as well as from these figures; the missing WAN measurement is
-recorded in [bench-ledger.md](bench-ledger.md).
+On a smaller or slower machine, budget more. On m2, a ZFS mirror of QLC
+NVMe drives with the node on four cores, the 200,000 blocks after
+916,000 synced at a median of 482 blocks/s with the index on
+(2026-10-09, below), where m3 ran the same blocks at about 593. m2 has
+both fewer cores and slower storage, so that difference is not storage
+alone, and no sync from genesis has been measured on m2 with the
+current layout. dcrd ran that tail on m2 at 146-148 blocks/s, but on
+2026-10-07, in another session, so read the two together as context,
+not as a ratio. The m3 figures were taken on a quiet machine. One run
+of each daemon there with a desktop in light use, about a third of one
+thread, came out slower than a quiet run of the same pairing, dcroxide
+by 1.5% and dcrd by 2.6%. That is one run each, but if your host is
+busy with other work, expect the sync to stretch.
+
+All of these come from syncing over loopback from a local server, and
+none has been measured over the internet. There, both daemons request
+blocks the same way: through dcrd's window of at most 16 blocks in
+flight, refilled once fewer than 10 remain, from the sync peer only. By
+that window arithmetic (a prediction, not a measurement), once the
+round trip to the sync peer exceeds about nine blocks' processing time,
+the sync should wait on the network at about 9-16 blocks per round
+trip. On m3 a block took dcroxide 0.95 ms averaged over the chain and
+2.2 ms after the assume-valid block, and dcrd 2.6 ms and 9.6 ms. So the
+network should pace dcroxide's average block once the round trip passes
+about 9 ms and dcrd's past about 23 ms, and the cheap early blocks
+sooner. Only past about 87 ms would it also pace dcrd through the fully
+validated blocks after the assume-valid block, where about 20 ms
+already paces dcroxide, so the lead over dcrd should narrow toward 1x
+as latency grows toward that. Bandwidth binds too: the
+measured 17.6 minutes carried 19.2 GB of blocks, a mean of 145 Mbit/s.
+Budget from your link's latency and bandwidth as well as from these
+figures; the missing WAN measurement is recorded in
+[bench-ledger.md](bench-ledger.md).
+
+The disk difference is all in the metadata store. Block files make up
+17.88 GiB of each data directory at block 1,116,035, and the rest is
+one 10.01 GiB redb file against about 6.28 GiB left for dcrd's two
+leveldb stores. As of 2026-08-11 both nodes had been measured to store
+the same payload for the same chain at the same index composition,
+fifteen buckets equal to the byte, so the extra space then was how redb
+lays those bytes out, not extra data dcroxide keeps. Two changes since
+have not been through that comparison: the 2026-10-08 keys add four
+bytes to the keys of five per-block buckets, at most about 22 MB at the
+tip, and the exists-address index now has a layout of its own (below).
 See [ADR-0004](adr/0004-storage-backend.md).
 
-The two have different explanations, and only one of them is settled. The
-**disk** difference is the storage engine and nothing else: as of
-2026-08-11 both nodes have been measured to store the same payload for the
-same chain at the same index composition — fifteen buckets equal to the
-byte — so the extra space is how redb lays those bytes out, not extra data
-dcroxide keeps. (The 2026-10-08 key change adds four bytes to the keys of
-five per-block buckets, at most about 22 MB at the tip.) Block files match
-to within a mebibyte. The **time**
-difference is commit shape, and as of 2026-08-15 that is measured rather
-than attributed: the node is fully stalled on storage — nothing runnable at
-all — for **48% of block-sync wall time**, against dcrd's 0.9%. A
-2026-08-16 run with the flush observer enabled puts **90–98% of that inside
-a metadata-flush window**, so it is the metadata flush specifically rather
-than storage in general. The flush window holds three phases: the
-block-file fsync, the insert loop, which reads leaves redb has not cached,
-and the redb commit. The flush log records each phase's time and the bytes
-the flushing thread read in it, which separates read waits from writeback
-waits. No mainnet run has been recorded with that split yet, so which phase
-stalls is still open. (An earlier figure of 34.6% for the same runs was
-count-weighted; the sampler is starved during the stalls it measures, and
-weighting by represented time raises it to 48–51%.) How much of it is
-*recoverable* was settled on 2026-08-16: moving the metadata commit off
-the block-connection thread was built, measured at 9.5% slower (232.1 to
-210.0 blk/s, with the stalled share rising from 48.1% to 53.7%), and
-reverted. The stall is real and it is the flush, but it is not
-recoverable by rescheduling *when* the commit runs — the remaining lever
-is what a flush costs. The earlier 18% figure came from a replay, which
-validates every block where a syncing daemon skips ~93% under assume-valid,
-so it understated the daemon's share.
+The earlier gap, when dcrd was the faster, was taken apart thread by
+thread. This one has not been. What the 2026-10 runs record is that
+the node process used a third of dcrd's CPU time (1,821 s
+against 5,567 s) and passed under a fifth of the bytes to write calls
+(51.4 GB against 286.3 GB). Its metadata flushes, 133 per sync with a
+median of about 1.3 s and a longest of 3.0 s, took 15–16% of the wall
+time. This guide used to describe a node fully stalled on storage for
+48% of block-sync wall time, with a median flush of 26.9 s, and a sync
+1.29x slower than dcrd's. Those were measured in 2026-08 on m1 in
+[bench-ledger.md](bench-ledger.md), another machine, against dcrd
+2.2.0-pre, before the height-first keys and the index's own layout.
+They have not been re-measured there, and no run of the current layout,
+m2's tail or m3 from genesis, looks like them. The analysis is in
+[ADR-0009](adr/0009-storage-shape.md).
 
 ## The exists-address index: turn it off if no wallet needs it
 
@@ -348,6 +358,19 @@ Four settings change how the metadata store behaves. Three are measured and
 one is not; the numbers are in [bench-ledger.md](bench-ledger.md) and the
 reasoning in [ADR-0004](adr/0004-storage-backend.md).
 
+Every measurement of the four settings below was taken on m1 in
+2026-08, before the height-first keys and the exists-address index's
+own layout. None
+has been repeated since, so the gains quoted below, about 12% from each
+of two knobs, are unverified for the current layout. Both of those
+knobs work by making flushes rarer, and flushes have less to give now.
+On m2 the index's layout cut the flush time of a 200,000-block tail
+from 1,416 s over 58-59 flushes to 78 s over 31. On m3 in 2026-10 the
+median flush was about 1.3 s and flushes were 15–16% of a sync's wall
+time, where on m1 on 2026-08-16 the median was 26.9 s and flush windows
+occupied 68% of it. m3 is another machine as well as another layout, so
+that pair is not a before and after.
+
 The two that help are the two flush triggers, and they are worth understanding
 together: a durable metadata commit is forced when **either** the UTXO cache
 fills or the metadata overlay fills. Each ceiling governs one of them, raising
@@ -404,12 +427,13 @@ second knob worth raising. Four alternating full-mainnet syncs, 256.1 and
 disjoint, and both adjacent pairs agreeing to 0.2 points. The mechanism is
 visible in the flush count, which drops 130 to 119.
 
-Why it works: the node is *fully stalled* — nothing runnable at all — for
-**48% of block-sync wall time**, and **90–98% of that is inside a
-metadata-flush window**. Flushes are large, a median of 26.9 s and a longest
-of 79.5 s. Cadence decides how many there are, and a durable commit is forced
-by *either* the UTXO cache filling or the overlay filling. Raising one ceiling
-leaves the other still firing, which is why both knobs matter.
+Why it worked: when this was measured the node was *fully stalled* —
+nothing runnable at all — for **48% of block-sync wall time**, and **90–98%
+of that was inside a metadata-flush window**. Flushes were large, a median of
+26.9 s and a longest of 79.5 s. Cadence decides how many there are, and a
+durable commit is forced by *either* the UTXO cache filling or the overlay
+filling. Raising one ceiling leaves the other still firing, which is why both
+knobs matter.
 
 Whether the two **compose** is untested. `--utxocachemaxsize` measures 12% and
 this measures 12.7%, on independent triggers of the same commit; they may
@@ -425,11 +449,17 @@ larger overlay means more of the recent window replays after an unclean stop.
 
 **Neither page-cache knob changes how densely the store packs.** Page fill sits at
 0.62-0.65 regardless of either setting, so neither shrinks the data
-directory. They are throughput settings. The size gap against dcrd is
-settled in cause — the engine's page layout, not extra data dcroxide keeps
-— and nothing above the engine reaches it: all four of ADR-0004's levers
-have now been measured and closed. The engine choice itself was the last
-thing open and is now settled: [ADR-0009](adr/0009-storage-shape.md)
+directory. They are throughput settings. The size gap against dcrd was
+settled in cause on 2026-08-11 — the engine's page layout, not extra data
+dcroxide kept — and none of ADR-0004's four levers reached it: all four
+were measured and closed. The exists-address index's own layout has
+narrowed it since: on m2 it took the data directory at the tip from
+30.58-31.04 GiB to 27.05 GiB. Across machines, heights and dcrd
+versions, so not a before and after, the pair against dcrd was 33.58
+against 23.69 GiB on m1 in 2026-08 and 27.90 against 24.16 GiB on m3 in
+2026-10. The payload comparison has not been repeated for the current
+layout. The engine choice itself was the
+last thing open and is now settled: [ADR-0009](adr/0009-storage-shape.md)
 closed on 2026-08-17 with redb staying. The candidate won on density and
 on write shape and lost on crash safety, so the disk and commit costs
 above are accepted rather than retracted.
@@ -468,7 +498,7 @@ storage variables, `DCROXIDE_DB_CACHE` is the one to leave unset, the
 next two are untuned instruments — see the storage tuning above — and
 `DCROXIDE_DB_FLUSHLOG` is diagnostic: it appends one JSON object per
 metadata flush (sequence, end instant, duration, entries, bytes), which
-is how the 90–98% attribution above was measured, and now also, for each of
+is how the 90–98% attribution above was measured, and also, for each of
 the flush's three phases (block-file sync, insert loop, commit), its time
 and, on Linux, the bytes the flushing thread read from storage and the bytes
 it dirtied in that phase. `write_bytes` counts pages when they are dirtied,

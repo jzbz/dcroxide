@@ -49,19 +49,14 @@ dcrd itself is wrong, report it to
 [dcrd](https://github.com/decred/dcrd/security/policy) instead. Also out
 of scope: resource use under a workload dcrd would also struggle with,
 and anything requiring an already-privileged local attacker (they can
-read the datadir regardless). Throughput is out of scope as well: this
-port syncs about 1.29x slower than dcrd (measured 2026-08-15; the
-2.2x quoted through 2026-07 is superseded) and spends much of an
-initial block download stalled in storage commits. Both are measured
-and self-inflicted. That the cost is the storage engine's commit shape
-rather than validation was measured on 2026-08-15: the port drives
-11.7x the kernel-side storage work dcrd does for the same chain, blocks
-30x more per GiB written, and is fully stalled on storage for roughly
-48% of block-sync wall time against dcrd's 0.9% — 90–98% of that inside
-a metadata-flush window. Either way it is work the node does to itself
-rather
-than work a peer can add to, so there is nothing here for a peer to
-amplify.
+read the datadir regardless). Throughput is out of scope as well. How
+fast the port syncs is measured, in the README's
+[Performance](README.md#performance) section and in
+[docs/bench-ledger.md](docs/bench-ledger.md): on 2026-10-09 and
+2026-10-10 it synced mainnet from genesis 2.71x as fast as dcrd v2.1.6
+on one machine, with 15–16% of that time inside its own metadata
+flushes. Those flushes are work the node does to itself rather than
+work a peer can add to, so there is nothing here for a peer to amplify.
 
 ## Known gaps
 
