@@ -104,8 +104,8 @@ fn the_winning_tickets_drain_never_holds_the_chain_across_the_mixpool() {
         // to queue a lottery lookup at all (dcrd's `s.rpcServer != nil`).
         Some(dcroxide_node::websocket::NodeNtfnMgr::new()),
         gate_params,
-        // Unsynced mining allowed, so the drain clears the sync gate over
-        // this stale genesis-only tip and reaches the refusal check.
+        // Unsynced mining allowed and the sync gate always current:
+        // either lets the drain through to the refusal check.
         true,
         dcroxide_node::sync::SyncGate::always_current(),
         Some(Arc::clone(&mix_pool)),

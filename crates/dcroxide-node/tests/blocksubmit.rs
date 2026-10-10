@@ -182,8 +182,8 @@ fn a_submitted_block_drains_the_chain_handler() {
     // Install the chain handler both as the chain's notification
     // callback (queues events under the chain mutex) and on the sync
     // manager's chain (drains them after process_block), exactly as the
-    // daemon wires it; unsynced mining opens the accepted-block
-    // announcement drain over the stale regnet tip.
+    // daemon wires it; unsynced mining and an always-current sync gate
+    // keep the accepted-block announcement drain open.
     let handler = ChainNtfnHandler::new(
         None,
         params.clone(),

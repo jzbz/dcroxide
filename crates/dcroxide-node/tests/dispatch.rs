@@ -1024,8 +1024,8 @@ fn serves_mempool_requests_over_the_empty_pool() {
 /// A regnet daemon over dcrd's full-block battery announces connected
 /// blocks to its served peers: as an inventory by default, and as the
 /// header itself once the peer sends sendheaders (dcrd's
-/// `RelayBlockAnnouncement` from the accepted case, with unsynced
-/// mining allowed since the battery chain's timestamps are stale).
+/// `RelayBlockAnnouncement` from the accepted case, behind a sync gate
+/// held open).
 #[test]
 fn announces_connected_blocks_to_served_peers() {
     let params = dcroxide_chaincfg::regnet_params();
@@ -1126,7 +1126,8 @@ fn announces_connected_blocks_to_served_peers() {
 
     // The daemon's chain handler wiring: the callback queues the
     // announcements and the sync chain drains them into the fan-out
-    // (unsynced mining allowed so the stale battery chain announces).
+    // (unsynced mining allowed and the sync gate always current, so the
+    // accepted announcement relays).
     let handler = dcroxide_node::chainntfns::ChainNtfnHandler::new(
         None,
         params.clone(),

@@ -1299,6 +1299,12 @@ mod tests {
             .expect("chain")
             .block_by_hash(&params.genesis_hash)
             .expect("genesis block");
+        // A second header with a different hash, so an accepted
+        // announcement for it is a message of its own instead of being
+        // deduped against the checked one (the per-peer dedup has its
+        // own test, `announces_blocks_with_headers_preference_and_dedup`).
+        let mut other = genesis.clone();
+        other.header.version = 0x5eed;
         let now = 2_000_000_000i64; // far past the stale genesis tip
 
         let drive = |allow_unsynced: bool| -> Vec<dcroxide_wire::Message> {
@@ -1330,7 +1336,9 @@ mod tests {
                 None,
                 params.clone(),
                 allow_unsynced,
-                crate::sync::SyncGate::always_current(),
+                // Not latched and no sync peer: closed over the stale
+                // genesis tip, so only unsynced mining opens the gate.
+                crate::sync::SyncGate::unsynced(),
                 None,
                 Arc::clone(&tx_pool),
                 peers,
@@ -1340,7 +1348,7 @@ mod tests {
             handler.handle(&Notification::BlockAccepted(BlockAcceptedNtfnsData {
                 best_height: 0,
                 fork_len: 0,
-                block: &genesis,
+                block: &other,
             }));
             handler.drain_pending_accepted_announcements(&chain, now);
             let mut got = Vec::new();
@@ -1356,11 +1364,13 @@ mod tests {
         assert_eq!(gated.len(), 1, "checked announcement only: {gated:?}");
 
         // Unsynced mining allowed: the accepted announcement relays
-        // too, deduped per peer by the announced-block toggle — the
-        // checked pass announced the same hash, so the accepted pass
-        // clears the marker and both passes produce one message.
+        // too, as a second message for its own hash.
         let allowed = drive(true);
-        assert_eq!(allowed.len(), 1, "toggle dedups the second pass");
+        assert_eq!(
+            allowed.len(),
+            2,
+            "checked and accepted announcements: {allowed:?}"
+        );
     }
 
     /// The combined `drain_pending` entry point drives the whole
@@ -1422,8 +1432,8 @@ mod tests {
             None,
             None,
         );
-        // Unsynced mining allowed so the accepted announcement clears the
-        // is-current gate over the stale genesis tip.
+        // Unsynced mining allowed and the sync gate always current:
+        // either lets the accepted announcement through.
         let handler = ChainNtfnHandler::new(
             None,
             params.clone(),

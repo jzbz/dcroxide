@@ -344,12 +344,25 @@ fn regentemplate_forces_a_new_template() {
         other => panic!("subscription must deliver the current template: {other:?}"),
     }
     templater.force_regen();
-    match subscription.recv_with_timeout() {
-        TemplateRecv::Template(block) => {
-            assert_eq!(block.header.height, 3, "rebuilt template height");
-        }
+    let next_template = || match subscription.recv_with_timeout() {
+        TemplateRecv::Template(block) => block,
         other => panic!("force regen must rebuild a template: {other:?}"),
+    };
+    // The generator publishes a template before it notifies the
+    // subscribers, so the startup build's own notification can still
+    // reach a subscription registered after its publish.  It is the
+    // only stale delivery there can be, and the random extra nonces of
+    // each build keep its hash apart from the rebuild's.
+    let mut rebuilt = next_template();
+    if rebuilt.header.block_hash() == first.header.block_hash() {
+        rebuilt = next_template();
     }
+    assert_eq!(rebuilt.header.height, 3, "rebuilt template height");
+    assert_ne!(
+        rebuilt.header.block_hash(),
+        first.header.block_hash(),
+        "force regen delivers a rebuilt template, not the startup one"
+    );
     subscription.stop();
 
     // The current template stays available after the forced rebuild.
@@ -416,10 +429,15 @@ fn the_drain_hook_runs_after_each_processed_event() {
         "the startup tip inject runs the drain hook"
     );
 
-    // A processed force-regeneration event runs the hook again.
+    // A processed force-regeneration event runs the hook again: once
+    // after its build and once after the event.  Two more calls are
+    // waited for because the startup inject runs the hook once after
+    // it publishes its template, and that call may still be outstanding
+    // when the count above is read; one more call would not show the
+    // event ran it.
     templater.force_regen();
     let deadline = Instant::now() + Duration::from_secs(5);
-    while drains.load(Ordering::SeqCst) <= after_startup {
+    while drains.load(Ordering::SeqCst) < after_startup + 2 {
         assert!(
             Instant::now() < deadline,
             "a processed event must run the drain hook"

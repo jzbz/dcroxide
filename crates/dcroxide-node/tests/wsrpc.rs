@@ -335,8 +335,6 @@ fn the_chain_event_handler_feeds_websocket_subscribers() {
 
     let (_dir, listener, port, ntfn, chain) = serve_ws();
     let params = dcroxide_chaincfg::testnet3_params();
-    // Unsynced mining allowed so the drain's is-current gate stays
-    // open over the genesis-only fixture chain.
     let tx_pool = dcroxide_node::txmempool::new_shared_tx_pool(
         Arc::clone(&chain),
         &params,
@@ -349,6 +347,9 @@ fn the_chain_event_handler_feeds_websocket_subscribers() {
     let handler = dcroxide_node::chainntfns::ChainNtfnHandler::new(
         Some(ntfn.clone()),
         params.clone(),
+        // Unsynced mining allowed and the sync gate always current:
+        // either keeps the drain open over the genesis-only fixture
+        // chain.
         true,
         dcroxide_node::sync::SyncGate::always_current(),
         // A real (empty) mixpool exercises the misbehaving-block gate's
