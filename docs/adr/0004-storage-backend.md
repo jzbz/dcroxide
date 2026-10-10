@@ -15,6 +15,15 @@
 > that motivated the revisit are not retracted — 1.29x dcrd at IBD, ~48% of
 > block-sync wall time stalled on storage, 90–98% of it in the metadata commit
 > — they are accepted.
+>
+> **Note, 2026-10-10.** Those three figures were measured on the ledger's
+> machine m1 on 2026-08-15 and 2026-08-16, against dcrd 2.2.0-pre, and have
+> not been re-measured. A later comparison on another machine, against dcrd
+> release v2.1.6 and with the layouts of ADR-0010 and ADR-0011 in the tree,
+> had dcroxide syncing 2.71x as fast as dcrd, its metadata flushes taking
+> 15–16% of wall time (m1's flush windows took 68%; the stalled share was
+> not sampled). It changes neither the decision nor the 2026-08 record. See
+> the addendum of 2026-10-10 at the end.
 
 ## Context
 
@@ -52,6 +61,19 @@ project brief; fresh sync plus a bulk importer is the accepted default.
 Dated addenda follow the amendment below, and later ones supersede earlier
 ones — including a retraction. This section states what is currently
 believed and points at the evidence; nothing below it has been rewritten.
+
+> **Note, 2026-10-10.** A sync comparison run on 2026-10-09 and 2026-10-10,
+> on another machine and against dcrd release v2.1.6, bears on three things
+> in this section. The 1.29x cited below as the gap to dcrd is the figure of
+> 2026-08-15 from the ledger's machine m1; in the later comparison dcroxide
+> was 2.71x as fast as dcrd. The decomposition table describes the store as
+> it was written before [ADR-0010](0010-height-first-block-keys.md) and
+> [ADR-0011](0011-exists-address-layout-3-and-the-flush-participant.md);
+> the later runs left a 10.012 GiB `metadata.redb` at block 1,116,035,
+> which was not decomposed. And their flush logs give a per-phase split
+> for that machine, one half of what the prefetch idea under Levers waits
+> on. Neither the 1.29x nor the decomposition was re-measured. See the
+> addendum of 2026-10-10 at the end.
 
 **The metadata store now runs redb 4** (addendum, 2026-08-13, which took
 4.1.0; `Cargo.lock` now pins 4.3.0). The on-disk format changed with it:
@@ -306,6 +328,11 @@ the full mainnet chain; the gate asked whether it could sustain the load,
 and it can. The price is ~2.2x dcrd's initial-block-download time and
 8.33 GiB more on disk, all of it metadata. (Re-measured 2026-08-15: **1.29x
 and 9.89 GiB** — see the addendum at the end of this file.)
+(Note, 2026-10-10: that addendum is the first of 2026-08-15, no longer the
+last in this file. The addendum of 2026-10-10 at the end reports a later
+comparison, on another machine and against dcrd release v2.1.6, in which
+dcroxide synced 2.71x as fast as dcrd and its data directory was 1.15x
+dcrd's. It does not re-measure the two figures here.)
 
 How much of that price is inherent to redb is *not* settled, and an earlier
 draft of this section claimed it was. A copy-on-write B-tree costing more
@@ -1430,3 +1457,124 @@ block index) carry a four-byte height in every key that dcrd's keys do not, at
 most about 22 MB at the mainnet tip, so their payload is no longer exactly
 dcrd's. The row values are unchanged, and the comparison was not
 re-measured.
+
+## Addendum, 2026-10-10 — a later sync comparison, on another machine and against dcrd v2.1.6
+
+The status block and the two 2026-08-15 addenda carry this ADR's costs as
+the ledger's machine m1 measured them in 2026-08: 1.29x dcrd's
+initial-block-download time, about 48% of block-sync wall time fully
+stalled, and 90–98% of that stall inside the metadata flush. In a comparison
+run on 2026-10-09 and 2026-10-10 dcroxide was the faster daemon, and its
+metadata flushes took 15–16% of the wall time, where m1's flush windows
+took 68%. That comparison was
+taken on another machine, against another dcrd and with another harness, so
+it stands beside the 2026-08 figures and does not replace them. The record
+is [bench-ledger.md](../bench-ledger.md), "Daemon against daemon, each from
+the other (2026-10-09 and 2026-10-10)".
+
+**What was measured.** dcroxide `c128a93`, with the height-first keys of
+[ADR-0010](0010-height-first-block-keys.md) and the exists-address layout 3
+of [ADR-0011](0011-exists-address-layout-3-and-the-flush-participant.md),
+against dcrd release v2.1.6, on machine m3. Each daemon synced mainnet from
+genesis to block 1,116,035 over loopback from a block server run by the
+other, the node pinned to eight cores and their SMT siblings and the server
+to four other cores: four runs per direction, each on a quiet machine,
+defaults, the exists-address index on in both. Medians of the four:
+
+| | dcroxide | dcrd v2.1.6 | dcroxide against dcrd |
+|---|---:|---:|---|
+| wall time | 1,058.6 s (1,054.3 blk/s) | 2,863.9 s (389.7 blk/s) | 2.71x as fast |
+| node process CPU time | 1,821.3 s | 5,566.6 s | 0.33x |
+| bytes passed to write calls | 51.4 GB | 286.3 GB | 0.18x |
+| bytes written at the volume | 81.0 GB | 322.9 GB | 0.25x |
+| data directory at 1,116,035 | 27.90 GiB | 24.16 GiB | 1.15x |
+
+The four wall times span 0.9% of their median for dcroxide and 1.6% for
+dcrd. One same-session run of each daemon from a server of its own kind
+moved either by about 1% or less, so the 2026-07 amendment's reading, that
+the syncer decides the time and the source barely matters, holds in this
+harness too. The 2026-08-15 addendum faults the 2026-07 harness for two
+nodes contending for one machine; here the server ran on cores of its own
+and used 152–169 s of CPU in a run. The lead grows along the chain: 2.3x
+up to the assume-valid
+block, 1,026,597, and 4.4x over the 89,438 fully validated blocks after it
+(461.0 against 104.0 blk/s).
+
+**The flushes.** dcroxide made 133 metadata flushes during the timed sync.
+They took 159.8–170.5 s in all, 15.1–16.1% of wall time, with a median flush
+of 1.30–1.37 s and a longest of 2.44–2.97 s. On m1 on 2026-08-16 the same
+sync made 130 flushes with a median of 26.9 s, and flush windows occupied
+68% of wall time. (The ledger has read 68% since commit `501cfc2` of
+2026-08-20, which replaced its 59.4% in place; the note of 2026-08-16
+above still quotes 59%.) The 48% is a
+task-state sampler's figure, and the ledger section reports none for these
+runs, so it has no counterpart here.
+
+Of the flush time, the redb commit was 101.7–112.7 s, the insert loop
+35.7–36.0 s, the exists-address participant 18.5–19.1 s and the block-file
+sync 3.1–3.4 s. That is a per-phase split of the kind the findings at the
+top ask for before a prefetch of the insert loop's leaves is built. The
+condition there is the insert phase's time dominating with large
+`read_bytes`. On m3 the insert phase does not dominate: it is about a fifth
+of the flush time and about 3.4% of the wall time. The ledger section does
+not give that phase's read bytes, and m3 is one machine with fast storage.
+
+**What it changes for this ADR.** The price in the verdict, 2.2x and
+8.33 GiB in 2026-07 and 1.29x and 9.89 GiB on 2026-08-15, is not what this
+comparison measured. Against dcrd v2.1.6 on m3, dcroxide took less wall
+time, less CPU time and fewer written bytes, and its data directory was
+about 3.7 GiB larger, where the 2026-08-15 pair on m1 was 33.58 against
+23.69 GiB (1.42x) at block 1,100,392. dcroxide's directory is 17.884 GiB of
+block files and a 10.012 GiB `metadata.redb`. dcrd's run directories were
+deleted before their split was read; its server's block files total the
+same bytes, which leaves about 6.28 GiB for v2.1.6's metadata, `utxodb` and
+logs.
+
+That `metadata.redb` was not decomposed. The table in the findings (payload,
+overhead, slack and free pages of a 14.48 GiB file) describes the store as
+it was written in 2026-07 and 2026-08: under redb 2.6.3, before ADR-0010's
+keys and with the exists-address index in dcrd's layout. The m3 file was
+written by redb 4.3.0, about 15,600 blocks further on, so the two lengths
+differ by engine version and height as well as by the two layouts. This
+addendum adds a file length to the table and no fill, slack or free-page
+figure.
+
+The first 2026-08-15 addendum read 0.76 mean cores against dcrd's 1.50 as a
+node that waits. Here dcroxide averaged 1.71–1.72 cores against dcrd's
+1.94–1.95 over the whole run, a mean that mixes two regimes. Over the fully
+validated blocks after 1,026,597, 18% of its wall time, the node's 16
+threads were 31–33% busy against dcrd's 16%; just before that block they
+were 6–7% busy against dcrd's 10%. No task states were sampled, so these
+runs do not say whether the node still waits.
+
+The second 2026-08-15 addendum found dcrd writing 1.16x the bytes dcroxide
+did; here dcrd passed 5.6x dcroxide's bytes to write calls. The dcrd
+version and the counter both differ, so the two ratios are not a series.
+That addendum also placed most of the storage cost outside the process.
+These runs counted that side only as a total: busy time on the machine
+beyond the node, the server and other userland was 287.5–306.0 s in
+dcroxide's runs and 85.9–97.1 s in dcrd's, with dm-crypt and btrfs write
+workers the busiest threads listed. With it counted the CPU ratio is 0.37x.
+
+**What it does not change.**
+
+- **The decision.** redb stays and the revisit stays closed. ADR-0009 closed
+  it on crash safety, which these runs do not test.
+- **The 2026-08 record.** This does not re-measure the 1.29x row and is not
+  a later point on its curve: the machine, the dcrd version and the harness
+  all differ. Nothing was run on m1, and dcrd `6f6cf21b`, the parity target,
+  was not run on m3. The 1.29x, the 48% and the 90–98% stand as what m1
+  measured.
+- **The attribution.** Neither daemon was profiled and neither was run with
+  the index off, so these runs do not say where the difference comes from,
+  and the index's share of dcrd's time is not known. What ADR-0010 and
+  ADR-0011 each bought is measured in those ADRs, each against its own base
+  on the ledger's machine m2, and not here.
+- **The engine comparison.** This sets one daemon against the other, not
+  redb against goleveldb. The candidate benchmark behind "redb loses on this
+  workload" in the findings was not re-run.
+- **The reach.** One machine with fast storage, over loopback. m3's volume
+  is btrfs with zstd compression over an encrypted mapping, so the question
+  the second 2026-08-15 addendum left, how much of the dm-crypt term
+  survives on a different stack, is still open. Nothing here speaks for
+  fewer cores, slower storage or a busy machine.

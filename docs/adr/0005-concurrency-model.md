@@ -3,7 +3,8 @@
 - **Status:** Accepted (decision D2) — ratified 2026-08-07 as shipped: the
   thread-per-peer fallback, not the tokio proposal; see the addenda
 - **Date:** 2026-07-03 (proposed), 2026-07-26 (addendum: what shipped),
-  2026-08-07 (ratified), 2026-08-13 (addendum: the storage levers closed)
+  2026-08-07 (ratified), 2026-08-13 (addendum: the storage levers closed),
+  2026-10-10 (addendum: a later sync comparison)
 
 ## Context
 
@@ -179,3 +180,69 @@ Also open is the *form* a rework would take: two or more of the port's
 threads block simultaneously in 0.2% of samples, so the storage path is
 serialized, and a synchronous fsync on the critical path is implicated as much
 as the engine choice.
+
+## Addendum, 2026-10-10 — a later sync comparison, on the same thread model
+
+The 2026-08-07 and 2026-08-13 addenda argue from an initial-sync gap,
+~2.2x and then 1.29x behind dcrd, and from a node fully stalled on storage
+for 34.6% and then 48% of block-sync wall time. Those are the 2026-07 and
+2026-08 figures, taken on m1 in [bench-ledger.md](../bench-ledger.md)
+against dcrd 2.2.0-pre. They stand as measured. They are no longer the
+most recent comparison of the two daemons, and "the one open performance
+gap" is to be read with its date.
+
+On 2026-10-09 and 2026-10-10 dcroxide `c128a93` and dcrd release v2.1.6
+each synced mainnet from genesis to block 1,116,035 over loopback on the
+ledger's m3, each from a block server run by the other: four runs per
+direction, at their defaults apart from the flags that point each at its
+server, the exists-address index on in both. The medians are 1,058.6 s
+(1,054.3 blk/s) for dcroxide against 2,863.9 s (389.7 blk/s) for dcrd,
+dcroxide **2.71x** as fast. The lead is 2.3x up to the assume-valid block,
+1,026,597, and 4.4x over the 89,438 blocks after it, which both daemons
+validate in full (461.0 against 104.0 blk/s). Every run ended on the
+server's tip, so the node again synced against dcrd in both directions,
+here v2.1.6. The rows are in [bench-ledger.md](../bench-ledger.md),
+"Daemon against daemon, each from the other".
+
+The binary measured is the model the addenda above describe. `c128a93` has
+no `tokio` or `rayon` in any manifest and no `async fn` in any crate, chain
+state sits behind a single writer, and the validation pool is
+`validate_items` at one worker per core. That width is newer than the 1.29x
+above: the ledger's row for it was measured on `b6d0c63`, before `c091b46`
+took the pool from three workers per core to one on 2026-08-14, so the
+pool's width is among the things that differ between the 1.29x and this
+comparison, which does not separate it. The two changes the ledger names
+in that commit, the height-first keys of ADR-0010 and the exists-address
+layout 3 of ADR-0011, are storage layouts, and neither adds a thread:
+layout 3 writes its rows inside the metadata flush's own write
+transaction. D2 is unchanged, and the comparison gives no reason to
+revisit it.
+
+The stall was not measured again in the form the 2026-08-13 addendum
+quotes. These runs sampled no task states, so the share of wall time with
+nothing runnable (34.6%, then 48%), the 99.4% and the 11.7x have no new
+counterpart. What the runs do record is dcroxide's flush log. In its four
+cross-source runs the 133 metadata flushes of the timed sync took
+159.8–170.5 s in all, 15.1–16.1% of wall time, with a median flush of
+1.30–1.37 s and a longest of 2.44–2.97 s. On m1 on 2026-08-16 a sync made
+130 flushes with a median of 26.9 s, and flush windows occupied 68% of
+wall time.
+
+None of this reaches back into the 2026-08 record. The comparison does not
+re-measure the 1.29x row and is not a later point on its curve: the
+machine, the dcrd version and the harness all differ, and dcrd `6f6cf21b`,
+the parity target, was not run. Neither daemon was profiled and neither was
+run with the index off, so the runs do not say where the difference comes
+from, and they are one machine with fast storage, over loopback. The
+2026-08 attribution stands as the record of m1.
+
+Two questions the 2026-08-13 addendum leaves open were closed in 2026-08,
+not by these runs, and are noted here because this ADR never recorded
+them. ADR-0009's engine decision closed on 2026-08-17 with the engine
+staying redb, and nothing above reopens it. Of the forms a rework could
+take, moving the commit off the critical path was measured on 2026-08-16:
+a committer thread per flush ran 9.5% slower than the synchronous commit
+and was reverted (ledger, "Background commit (2026-08-16)"). A third
+question stays open. Multi-client RPC/websocket concurrency, which the
+2026-08-07 addendum sets aside to be measured, was not measured here: the
+harness's once-a-second `getblockcount` poll is one client.

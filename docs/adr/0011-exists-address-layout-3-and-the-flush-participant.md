@@ -430,3 +430,53 @@ the database itself and reverted; `tests/participant.rs` lists them.
 - **Keep layout 2 and advise `--noexistsaddrindex`.** That advice stands
   for operators whose wallets do not use the two RPCs. It is no answer for
   those whose wallets do.
+
+## Addendum, 2026-10-10 — the first syncs from genesis with the layout
+
+Every sync measured above is a 200,000-block tail, and the figures from
+genesis are index rebuilds over a chain already synced. On 2026-10-09
+and 2026-10-10 commit c128a93, the commit that landed layout 3, and
+dcrd release v2.1.6 each synced mainnet from genesis to block 1,116,035
+on m3 ([bench-ledger.md](../bench-ledger.md), "Daemon against daemon,
+each from the other"): over loopback, each from a block server run by
+the other, four runs per direction, defaults otherwise, so with the
+index on in both. m3 is the development desktop of the end-state checks
+above, in the ledger's machine table since 2026-10-10. The statement
+there that no timing from that host is a measurement holds for those
+checks, and the desktop tail in the bullet after them carries its own
+"desktop timings, not deterministic". Neither is to be set against the
+runs here, which pinned the node to eight cores and each waited for a
+quiet machine.
+
+dcroxide took a median of 1,058.6 s (1,055.8–1,065.0), **1,054.3
+blocks/s**, against dcrd's 2,863.9 s and 389.7 blocks/s: 2.71x as fast.
+It passed 51.4 GB to write calls and used 1,821.3 s of CPU time,
+against 286.3 GB and 5,566.6 s. Over m2's window, 916,000 to the tip,
+it ran at 593.0 blocks/s (584.7–599.2). The 482.1 above is another
+machine, on four cores and slower storage, in another session, so the
+two are not a ratio. Every run made 133 metadata flushes during the
+timed sync and one at shutdown. In the four runs from dcrd's server the
+133 took 159.8–170.5 s, 15.1–16.1% of wall time, with a median flush of
+1.30–1.37 s and a longest of 2.44–2.97 s. The participant's
+`contribute` call took 18.5–19.1 s of that, under 2% of the wall time;
+the commit of the rows it wrote is inside the commit phase
+(101.7–112.7 s) and is not separated. The node peaked at
+2,129–2,146 MiB resident at the default cache, against dcrd's
+1,848–1,852 MiB. Like the rate, that is not to be set against m2's
+figures above.
+
+Apart from that `contribute` time, which is a floor on the index's
+part of a flush and not the whole of it, none of it separates the index
+from the rest of the node. Neither daemon ran with
+`--noexistsaddrindex`, dcroxide was not run with the index in dcrd's
+layout, and neither daemon was profiled. So the 2.71x compares two
+daemons whole, and measures neither the layout nor either storage
+engine. These runs have no floor and no base: none of the plan's
+criteria is judged again, its read and memory criteria stay unjudged,
+and the flush-time margin, the write-buffer overflow and the merge
+tuning stay open. The ledger records no index digest and no lookup for
+these runs, so the end-state checks above remain the evidence for the
+index's contents. dcrd here is its release, not the parity commit
+6f6cf21b, and m3 is one machine with fast storage, over loopback. The
+decision, the hooks and the guardrail table are as accepted: a sync's
+rate tests no durability property.

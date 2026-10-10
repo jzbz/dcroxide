@@ -37,6 +37,13 @@ measured: IBD at 1.29x dcrd, the node fully stalled on storage for ~48% of
 block-sync wall time, 90–98% of that inside a metadata-flush window, and the
 write-shape mechanism above. Staying on redb accepts that cost; it does not
 dispute it.
+*(2026-10-10: those figures are from the ledger's machine m1, in 2026-08,
+against dcrd 2.2.0-pre. On another machine, m3 in the ledger, with the keys
+of ADR-0010 and the index layout of ADR-0011, dcroxide synced 2.71x as fast
+as dcrd v2.1.6, with 15–16% of its wall time in metadata flushes (on m1
+flush windows took 68%; the stalled share was not sampled on m3). That does
+not re-measure m1, and the decision does not turn on it. See the addendum
+of that date at the end.)*
 
 **What would reopen this.** An engine matching fjall's size and write shape
 without #311's failure mode; a fjall release that fixes it; or the
@@ -65,6 +72,15 @@ deliberately. The current position, in four lines:
   indefinitely" alternative argues deferral is cheap because the rework's
   difficulty does not track chain size. Whether 10 GiB of disk is worth a
   storage migration now is a priorities judgement, and it has not been made.
+
+*(2026-10-10: these four lines are the position of 2026-08-13, before the
+decision above, and their sizes are the 2026-08 stores', under redb 2.6.3.
+On the ledger's machine m3 at block 1,116,035, with the keys of ADR-0010
+and the index layout of ADR-0011 under redb 4.3.0, `metadata.redb` was
+10.012 GiB and the data
+directory 27.90 GiB against dcrd v2.1.6's 24.16. The file's payload was not
+measured and the candidate engine was not run again. See the addendum of
+that date at the end.)*
 
 ## Context
 
@@ -856,3 +872,82 @@ the withdrawn split design's statements that `spendjournalv3` and
 re-keying remains untried". Both buckets are now keyed by height and then
 hash, and a row re-keying has been tried, for write shape rather than for the
 slack that alternative was about.
+
+## Addendum, 2026-10-10 — a comparison with dcrd v2.1.6 on m3, and the cost accepted here
+
+"What this does not retract", at the top, names the cost the decision
+accepted: IBD at 1.29x dcrd, with the node fully stalled on storage for about
+48% of block-sync wall time. Those figures are from m1 in
+[bench-ledger.md](../bench-ledger.md), in 2026-08, against
+dcrd 2.2.0-pre. Among the changes since are two to the store's layout, both
+made on redb: the height-first keys of
+[ADR-0010](0010-height-first-block-keys.md), which are big-endian as the
+guardrails above ask, and the exists-address layout 3 of
+[ADR-0011](0011-exists-address-layout-3-and-the-flush-participant.md), which
+records its check against each guardrail.
+
+A comparison on 2026-10-09 and 2026-10-10 ran dcroxide `c128a93`, which has
+both changes, against dcrd release v2.1.6 on the ledger's m3: mainnet from
+genesis to
+block 1,116,035 over loopback, each daemon syncing from a block server run by
+the other, four runs per direction, at their defaults, with the
+exists-address index on in both. dcroxide took a median of 1,058.6 s
+(1,054.3 blk/s) and dcrd 2,863.9 s (389.7 blk/s), so dcroxide was 2.71x as
+fast: 2.3x up to the assume-valid block, 1,026,597, and 4.4x over the 89,438
+fully validated blocks after it (461.0 against 104.0 blk/s). One
+same-session run of each daemon from a server of its own kind moved either
+by about 1% or less. The rows are in [bench-ledger.md](../bench-ledger.md),
+"Daemon against daemon, each from the other".
+
+Against the figures this ADR quotes, none of which those runs re-measure:
+
+- **IBD at 1.29x dcrd, at 0.76 cores against dcrd's 1.50** (m1, 2026-08-15,
+  one run of each). On m3 dcroxide was the faster, by 2.71x, at 1.71–1.72
+  mean cores against 1.94–1.95: 1,821.3 s of node CPU time against 5,566.6 s.
+- **About 48% of wall time fully stalled, 90–98% of that inside a
+  metadata-flush window, with a median flush of 26.9 s and flushes occupying
+  68–71% of wall time** (m1, 2026-08-16; the synchronous run made 130
+  flushes, whose windows occupied 68% of its wall time. The 2026-08-16
+  block above still quotes 59% for that share; the ledger has read 68%
+  since commit `501cfc2` of 2026-08-20). On m3 the 133 flushes of the timed
+  sync took 159.8–170.5 s in all, 15.1–16.1% of wall time, of which the redb
+  commit was 101.7–112.7 s. The median flush took 1.30–1.37 s and the
+  longest 2.44–2.97 s. That share is flush time, which answers to the 68%
+  and not to the 48%. The fully stalled share itself was not measured on m3.
+- **dcrd writing 1.16x the bytes dcroxide did, and dcroxide blocking 30x
+  more per GiB and driving 11.7x the kernel-side storage work** (m1,
+  2026-08-15). On m3 dcrd passed 5.6x the bytes to write calls, 286.3 GB
+  against 51.4, and 322.9 GB were written at the volume against 81.0. Busy
+  time beyond the node, the server and other userland, which is kernel
+  threads and interrupt handling and was not broken down, was 287.5–306.0 s
+  in dcroxide's runs against 85.9–97.1 s in dcrd's. Blocking per GiB and the
+  task-state figure were not taken again.
+- **A `metadata.redb` of 14.48 GiB live-synced and 16.00 GiB replayed,
+  against 6.15 GiB of dcrd metadata** (m1, 2026-07 and 2026-08, redb 2.6.3).
+  At block 1,116,035 on m3 the file was 10.012 GiB under redb 4.3.0, in the
+  one directory whose split was read, and the data directory 27.90 GiB
+  against dcrd v2.1.6's 24.16, 1.15x. dcrd's run directories were deleted
+  before their split was read; its server's block files total the same
+  17.884 GiB as dcroxide's, which leaves about 6.28 GiB for dcrd's
+  metadata, `utxodb` and logs. The file's payload, live tree and free pages
+  were not measured, and the payload comparison has not been repeated since
+  the index changed layout. The same-payload finding and the 1.738x
+  structural figure describe the 2026-08 store.
+
+The decision is not reopened. Crash safety decided it, through fjall #311,
+and nothing here bears on that: no other engine was run, and none of the
+conditions under "What would reopen this" is met by a sync time. Nor does
+the comparison show the 2026-08 analysis wrong. It is not a later point on
+m1's curve, since the machine, the dcrd version and the harness all differ,
+and m1 was not measured again. dcrd here is the release, not the parity
+commit `6f6cf21b`, which was not run. Neither daemon was profiled and
+neither was run with the index off, so the runs do not say where the
+difference comes from, nor how much of it belongs to those two changes, to
+anything else that changed in the tree since 2026-08, to the machine or to
+the dcrd version. It is one machine with fast storage, over loopback.
+
+What it bears on is the cost the decision accepted. Consequences names the
+outcome of no rework as "a larger metadata store than dcrd and a slower
+IBD". On m3, still on redb, the first half held and the second did not,
+against the release. The 1.29x and the 48% stand as m1's measurement of
+2026-08, in the layout of that date, and have not been re-measured there.
