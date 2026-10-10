@@ -7,14 +7,15 @@
 //! the metadata flushing every second and a tiny memtable target, so its
 //! flushes journal, merge and collect the journal all the time.  It mines
 //! blocks over RPC, each carrying a transaction that pays fresh addresses
-//! first seen in the mempool, until a SIGKILL lands at a random moment.
-//! The undo log is replayed, which leaves every file as of its last sync,
-//! as a power cut would, and the daemon restarts without the shim and
-//! catches its index up.  Every address the run ever used, and every
-//! address of the restarted chain, must then answer `existsaddresses`
-//! exactly as the blocks at or below the restarted tip say: present if
-//! one of them pays it, absent otherwise -- the mempool of a killed
-//! process is gone, as dcrd's is.  Four cuts in a row.
+//! first seen in the mempool, until a SIGKILL lands at a random moment
+//! after the first of those transactions.  The undo log is replayed,
+//! which leaves every file as of its last sync, as a power cut would, and
+//! the daemon restarts without the shim and catches its index up.  Every
+//! address the run ever used, and every address of the restarted chain,
+//! must then answer `existsaddresses` exactly as the blocks at or below
+//! the restarted tip say: present if one of them pays it, absent
+//! otherwise -- the mempool of a killed process is gone, as dcrd's is.
+//! Four cuts in a row.
 //!
 //! A mined block is flushed as it connects, so most cuts land between
 //! flushes and some inside one; the database's and the index's
@@ -55,6 +56,21 @@ const REQUIRE: &str = "DCROXIDE_REQUIRE_FAULT_INJECTION";
 
 /// The miner's private key; its pubkey-hash address takes the coinbases.
 const KEY: [u8; 32] = [0x2a; 32];
+
+/// How many cuts in a row: the module comment's four.
+const ROUNDS: i64 = 4;
+
+/// The blocks mined before the first round, enough to mature the first
+/// coinbases.
+const FIRST_BLOCKS: i64 = 18;
+
+/// The height the run stops at: short of the stake validation height,
+/// past which a block needs votes this miner cannot cast.
+const HEIGHT_LIMIT: i64 = 130;
+
+/// The heights kept back for each round still to come: enough for a
+/// coinbase to mature and a few blocks to carry transactions.
+const RESERVE: i64 = 10;
 
 type Key = [u8; ADDR_KEY_SIZE];
 
@@ -262,16 +278,27 @@ struct Coin {
 }
 
 /// Mine and spend until the daemon is gone, which the killer thread
-/// makes happen at a random moment, adding every key the run puts in a
-/// transaction, mined or not, to `used`.  A coinbase once spent, in a
-/// block or only in the mempool, is never offered again.
+/// makes happen at a random moment, or until the chain reaches
+/// `height_cap`, adding every key the run puts in a transaction, mined
+/// or not, to `used`.  A coinbase once spent, in a block or only in the
+/// mempool, is never offered again.  Returns whether it stopped at the
+/// cap, the daemon still running.
+///
+/// `cue` tells the killer thread where the round is: one message when
+/// the round's first transaction is in the mempool, which starts the
+/// countdown to the cut, and its drop when this returns.  Until that
+/// first transaction the round only reads the chain back, every block
+/// from the first, and may have to mine a block or two for a coinbase
+/// to mature; a cut during that puts no fresh address at risk.
 fn mine_until_killed(
     daemon: &Daemon,
     mine: &Address,
     rng: &mut SplitMix64,
     used: &mut BTreeSet<Key>,
     spent: &mut HashSet<(Hash, u32)>,
-) {
+    height_cap: i64,
+    cue: std::sync::mpsc::Sender<()>,
+) -> bool {
     let call = |method: &str, params: &str| match rpc(&daemon.addr, method, params) {
         Ok(body) => Some(body),
         Err(Fail::Gone(why)) => {
@@ -283,17 +310,18 @@ fn mine_until_killed(
     let (_, mine_script) = mine.payment_script();
     let mut coins: Vec<Coin> = Vec::new();
     let mut seen_height = 0i64;
+    let mut cued = false;
     loop {
         // Collect the coinbases of new blocks.
         let Some(tip) = call("getblockcount", "[]") else {
-            return;
+            return false;
         };
         let tip = number_result(&tip);
         while seen_height < tip {
             seen_height += 1;
             let block = match block_at(&daemon.addr, seen_height) {
                 Ok(block) => block,
-                Err(Fail::Gone(_)) => return,
+                Err(Fail::Gone(_)) => return false,
                 Err(Fail::Refused(body)) => panic!("getblock: {body}"),
             };
             let coinbase = &block.transactions[0];
@@ -313,10 +341,9 @@ fn mine_until_killed(
                 }
             }
         }
-        if tip >= 130 {
-            // Short of the stake validation height, past which a block
-            // needs votes this miner cannot cast.
-            return;
+        if tip >= height_cap {
+            // This round's heights are used up.
+            return true;
         }
         // Spend a mature coinbase to fresh addresses, which the mempool
         // records first.
@@ -377,11 +404,15 @@ fn mine_until_killed(
             .expect("sign");
             let hex: String = tx.serialize().iter().map(|b| format!("{b:02x}")).collect();
             if call("sendrawtransaction", &format!(r#"["{hex}"]"#)).is_none() {
-                return;
+                return false;
+            }
+            if !cued {
+                cued = true;
+                let _ = cue.send(());
             }
         }
         if call("generate", "[1]").is_none() {
-            return;
+            return false;
         }
     }
 }
@@ -465,23 +496,47 @@ fn the_index_answers_from_the_blocks_that_survived_a_power_cut() {
     used.insert(addr_to_key(&mine).expect("key"));
     let mut spent = HashSet::new();
     let mut last_tip = 0;
-    for round in 0..4 {
+    for round in 0..ROUNDS {
         let log = work.join(format!("undo-{round}.log"));
         let daemon = start(&appdata, &mine.encode(), Some((&lib, &log)));
         if round == 0 {
-            rpc(&daemon.addr, "generate", "[18]").expect("mature the first coinbases");
+            rpc(&daemon.addr, "generate", &format!("[{FIRST_BLOCKS}]"))
+                .expect("mature the first coinbases");
         }
-        // The cut: a SIGKILL at a random moment of the mining below.
+        // The cut: a SIGKILL a random delay after the round's first
+        // transaction, so that no round is cut before it has put a
+        // fresh address in play, however slow the machine.  It lands
+        // at once if the mining ends first.  The thread hands back
+        // whether it waited the delay out, which is what tells a cut
+        // from a daemon that went on its own.
         let pid = daemon.child.0.id();
         let delay = Duration::from_millis(200 + rng.below(800));
+        let (cue_tx, cue_rx) = std::sync::mpsc::channel::<()>();
         let killer = std::thread::spawn(move || {
-            std::thread::sleep(delay);
+            let waited = cue_rx.recv().is_ok()
+                && matches!(
+                    cue_rx.recv_timeout(delay),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                );
             let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();
+            waited
         });
+        // Every round still to come keeps `RESERVE` heights short of
+        // the limit, so that no round starts with none left to mine.
+        let height_cap = HEIGHT_LIMIT - (ROUNDS - 1 - round) * RESERVE;
         let before = used.len();
-        mine_until_killed(&daemon, &mine, &mut rng, &mut used, &mut spent);
-        killer.join().expect("killer");
+        let capped = mine_until_killed(
+            &daemon, &mine, &mut rng, &mut used, &mut spent, height_cap, cue_tx,
+        );
+        let waited = killer.join().expect("killer");
+        assert!(
+            waited || capped,
+            "round {round}: the daemon went before the cut"
+        );
         assert!(used.len() > before, "round {round} sent no transaction");
+        if capped {
+            println!("round {round}: its heights ran out, so the cut landed on an idle daemon");
+        }
         let Daemon { mut child, .. } = daemon;
         let _ = child.0.wait();
         assert!(
