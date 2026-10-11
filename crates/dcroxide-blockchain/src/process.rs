@@ -8,7 +8,7 @@
 //! (`ProcessBlock` and the reorganization machinery it drives).
 
 use alloc::boxed::Box;
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, VecDeque};
 use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -206,6 +206,24 @@ pub struct Chain {
     /// recent-window mirror of dcrd's ticket database new tickets rows,
     /// kept like [`Chain::stake_undo`].
     pub stake_new_tickets: BTreeMap<i64, Vec<dcroxide_chainhash::Hash>>,
+    /// The ticket purchases of recently accepted blocks by block hash:
+    /// what [`Chain::maybe_fetch_new_tickets`] takes from the block
+    /// `ticket_maturity` below a node.  That block's body has left the
+    /// recent window by then during initial sync (dcrd's recent block
+    /// cache holds twelve), so the lookup used to read it back from the
+    /// block files, checksum it and decode it whole on every connect, to
+    /// list about five hashes.  An entry is that same list, computed
+    /// from the block when its data is accepted -- after its merkle
+    /// roots were checked, so the hash it is filed under commits to its
+    /// stake transactions.  A lookup that misses reads the block as
+    /// before.
+    pub ticket_purchases: BTreeMap<[u8; 32], Vec<dcroxide_chainhash::Hash>>,
+    /// The keys of [`Chain::ticket_purchases`] in arrival order, oldest
+    /// first, so it holds the last `2 * ticket_maturity` blocks accepted.
+    ticket_purchase_order: VecDeque<[u8; 32]>,
+    /// How many [`Chain::maybe_fetch_new_tickets`] lookups found no
+    /// entry and read the block instead.
+    pub ticket_purchase_misses: u64,
 
     /// The flushed UTXO set by outpoint for chains WITHOUT a backing
     /// database: the in-memory utxo backend the pure differential-test
@@ -643,6 +661,9 @@ impl Chain {
             blocks,
             stake_undo: BTreeMap::new(),
             stake_new_tickets: BTreeMap::new(),
+            ticket_purchases: BTreeMap::new(),
+            ticket_purchase_order: VecDeque::new(),
+            ticket_purchase_misses: 0,
             utxo_backend: BTreeMap::new(),
             utxo_cache: RefCell::new(BTreeMap::new()),
             spend_journal: BTreeMap::new(),
@@ -2703,6 +2724,11 @@ impl Chain {
     /// back to the block containing the tickets to mature (dcrd
     /// `maybeFetchNewTickets`).  `None` means never looked up while
     /// an empty list means no tickets mature at this node.
+    ///
+    /// dcrd fetches that block on every lookup (`stakenode.go:43`); the
+    /// port takes the list from [`Chain::ticket_purchases`] when it holds
+    /// one and fetches the block only on a miss, so a block that cannot
+    /// be read back is reported only then.
     pub fn maybe_fetch_new_tickets(
         &mut self,
         node: NodeId,
@@ -2732,15 +2758,37 @@ impl Chain {
                 ),
             });
         };
-        let mature_block = self.stake_block_by_node(mature_node)?;
-        let tickets: Vec<dcroxide_chainhash::Hash> = mature_block
-            .stransactions
-            .iter()
-            .filter(|stx| dcroxide_stake::is_sstx(stx))
-            .map(|stx| stx.tx_hash())
-            .collect();
+        let mature_hash = self.store.node(mature_node).hash;
+        let tickets = match self.ticket_purchases.get(&mature_hash.0) {
+            Some(tickets) => tickets.clone(),
+            None => {
+                self.ticket_purchase_misses = self.ticket_purchase_misses.wrapping_add(1);
+                let mature_block = self.stake_block_by_node(mature_node)?;
+                ticket_purchase_hashes(&mature_block)
+            }
+        };
         self.store.node_mut(node).new_tickets = Some(tickets);
         Ok(())
+    }
+
+    /// File a block's ticket purchases under its hash for
+    /// [`Self::maybe_fetch_new_tickets`], dropping the oldest entries
+    /// past twice the ticket maturity: a block's list is wanted when the
+    /// block `ticket_maturity` above it connects, and the rest is room
+    /// for side chain blocks accepted in between.
+    fn remember_ticket_purchases(&mut self, hash: [u8; 32], block: &MsgBlock, params: &Params) {
+        if self.ticket_purchases.contains_key(&hash) {
+            return;
+        }
+        self.ticket_purchases
+            .insert(hash, ticket_purchase_hashes(block));
+        self.ticket_purchase_order.push_back(hash);
+        let keep = usize::from(params.ticket_maturity).saturating_mul(2);
+        while self.ticket_purchase_order.len() > keep {
+            if let Some(oldest) = self.ticket_purchase_order.pop_front() {
+                self.ticket_purchases.remove(&oldest);
+            }
+        }
     }
 
     /// Load and populate the prunable ticket information in the node
@@ -3978,7 +4026,8 @@ impl Chain {
     /// for the full data now being available, and return the
     /// descendant blocks now eligible for validation (dcrd
     /// `maybeAcceptBlockData`, `process.go:267-338`).  The block is
-    /// stored to the database and to the `blocks` mirror; the stake node
+    /// stored to the database and to the `blocks` mirror, and its ticket
+    /// purchases are filed in [`Chain::ticket_purchases`]; the stake node
     /// pruner dcrd calls here runs at the end of `process_block` instead.
     ///
     /// A failed positional check is returned without marking the block:
@@ -3991,7 +4040,6 @@ impl Chain {
         fast_add: bool,
         params: &Params,
     ) -> Result<Vec<NodeId>, RuleError> {
-        let _ = params;
         if self.index.node_status(&self.store, node).have_data() {
             return Ok(Vec::new());
         }
@@ -4030,11 +4078,12 @@ impl Chain {
         // caller keeps its own (`process_block` borrows it, where dcrd's
         // `ProcessBlock` caches the caller's pointer, `process.go:571`),
         // and every later step shares the mirror's `Arc`.
-        self.blocks
-            .insert(block.header.block_hash().0, Arc::new(block.clone()));
+        let block_hash = block.header.block_hash();
+        self.blocks.insert(block_hash.0, Arc::new(block.clone()));
+        self.remember_ticket_purchases(block_hash.0, block, params);
         if let Some(db) = &self.db {
             let stored = db.update(|tx| {
-                if tx.has_block(&block.header.block_hash(), block.header.height)? {
+                if tx.has_block(&block_hash, block.header.height)? {
                     return Ok(());
                 }
                 tx.store_block(block)
@@ -7378,6 +7427,18 @@ pub fn db_read_rule_error(err: crate::chaindb::ChainDbError) -> RuleError {
         _ => RuleErrorKind::UtxoBackendCorruption,
     };
     rule_error(kind, format!("{err}"))
+}
+
+/// The hashes of a block's ticket purchases in block order: the tickets
+/// that mature `ticket_maturity` blocks later (the list dcrd
+/// `maybeFetchNewTickets` builds from the ancestor's block).
+fn ticket_purchase_hashes(block: &MsgBlock) -> Vec<dcroxide_chainhash::Hash> {
+    block
+        .stransactions
+        .iter()
+        .filter(|stx| dcroxide_stake::is_sstx(stx))
+        .map(|stx| stx.tx_hash())
+        .collect()
 }
 
 /// Read a stored block from the database (the database half of dcrd
