@@ -113,7 +113,7 @@ pub fn addr_to_key(addr: &Address) -> Result<[u8; ADDR_KEY_SIZE], IdxError> {
 /// shares it across threads, which would put every query in the writer's
 /// way — so the overlay is split out here and reached through
 /// [`ExistsAddrQuery`] instead.
-type Unconfirmed = Arc<std::sync::RwLock<HashSet<[u8; ADDR_KEY_SIZE]>>>;
+type Unconfirmed = Arc<crate::existsaddr::overlay::Overlay>;
 
 /// The "ever seen" address index (dcrd `ExistsAddrIndex`).
 pub struct ExistsAddrIndex {
@@ -414,7 +414,7 @@ impl ExistsAddrIndex {
         let idx = Arc::new(std::sync::Mutex::new(ExistsAddrIndex {
             db,
             chain,
-            mp_exists_addr: Arc::new(std::sync::RwLock::new(HashSet::new())),
+            mp_exists_addr: Arc::default(),
             store: Arc::new(AddrStore::new(policy)),
             bucket: Arc::new(AtomicU64::new(NO_BUCKET)),
             subscribers: Vec::new(),
@@ -622,11 +622,11 @@ impl ExistsAddrIndex {
     /// run is merged away as a duplicate later.
     ///
     /// dcrd drains the unconfirmed overlay into the block's keys.  This
-    /// copies it, and the hook removes exactly the copied keys after
-    /// inserting them, so a key is always in one place a lookup reads;
-    /// keys added after the copy stay for the next connect, as they stay
-    /// in dcrd's fresh map, and a rolled-back connect leaves the overlay
-    /// as it was.
+    /// copies it, here or when the connect was queued, and the hook
+    /// removes exactly the copied keys after inserting them, so a key is
+    /// always in one place a lookup reads; keys added after the copy stay
+    /// for the next connect, as they stay in dcrd's fresh map, and a
+    /// rolled-back connect leaves the overlay as it was.
     fn connect_block(&mut self, db_tx: &Transaction, block: &MsgBlock) -> Result<(), IdxError> {
         // NOTE: The fact that the block can disapprove the regular
         // tree of the previous block is ignored for this index: the
@@ -693,13 +693,13 @@ impl ExistsAddrIndex {
         // it already holds, along with any addresses seen in mempool at
         // this time; the hook then removes those from the unconfirmed
         // map.
-        let copied: Vec<[u8; ADDR_KEY_SIZE]> = self
-            .mp_exists_addr
-            .read()
-            .expect("unconfirmed overlay lock poisoned")
-            .iter()
-            .copied()
-            .collect();
+        // The copy made when this connect was queued, when one was
+        // (`ExistsAddrUnconfirmed::with_copy`): the overlay as it stood
+        // then, so a key the pool adds while the connect waits in the
+        // queue stays for the next one.  Otherwise the overlay as it
+        // stands, which is what dcrd's connect drains.
+        let queued = self.mp_exists_addr.take_copy();
+        let copied = queued.unwrap_or_else(|| self.mp_exists_addr.keys());
         used_addrs.extend(copied.iter().copied());
         let part = self.store.partitioner();
         let mut candidates: Vec<(u8, [u8; ADDR_KEY_SIZE])> = used_addrs
@@ -907,4 +907,34 @@ pub fn drop_exists_addr_index(
         EXISTS_ADDRESS_INDEX_NAME,
         log,
     )
+}
+
+/// A copy of the unconfirmed overlay made when a connect is queued for
+/// later processing ([`ExistsAddrUnconfirmed::copy_for_connect`]).  dcrd
+/// has no counterpart: its handler goroutine drains `mpExistsAddr` when
+/// it processes the block, so there the keys that go to disk with a block
+/// depend on how long the block waited in the channel.  With the copy
+/// they are the block's keys plus the overlay as the block connected,
+/// however far the index trails.
+pub struct ExistsAddrOverlayCopy(Vec<[u8; ADDR_KEY_SIZE]>);
+
+impl ExistsAddrUnconfirmed {
+    /// Copy the overlay as it stands, for a connect about to be queued.
+    pub fn copy_for_connect(&self) -> ExistsAddrOverlayCopy {
+        ExistsAddrOverlayCopy(self.mp_exists_addr.keys())
+    }
+
+    /// Run `update` -- the `IndexSubscriber::notify` of the connect `copy`
+    /// was made for -- with `copy` standing in for the copy of the overlay
+    /// that connect would make itself.  The caller holds the subscriber
+    /// for the whole call, so no other update can take the copy.  A copy
+    /// the update did not take (it failed first, or was relayed past this
+    /// index) is dropped; its keys are still in the overlay and go with
+    /// the next connect.
+    pub fn with_copy<R>(&self, copy: ExistsAddrOverlayCopy, update: impl FnOnce() -> R) -> R {
+        self.mp_exists_addr.set_copy(Some(copy.0));
+        let result = update();
+        self.mp_exists_addr.set_copy(None);
+        result
+    }
 }

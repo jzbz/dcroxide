@@ -7,13 +7,38 @@
 //! and `existsaddresses` consume.
 //!
 //! dcrd delivers index notifications through a buffered channel into
-//! the subscriber's handler goroutine; the daemon delivers them
-//! synchronously from the chain handler's post-processing drain with
-//! identical state transitions (see `chainntfns`), so the only
-//! concurrency here is the shared handles crossing the peer, sync,
-//! and RPC threads.
+//! the subscriber's handler goroutine, and so does the daemon.  The
+//! chain handler's post-processing drain (see `chainntfns`) queues each
+//! notification on a bounded first-in, first-out queue of dcrd's depth
+//! ([`INDEX_NTFN_BUFFER_SIZE`]), and one thread named "index"
+//! ([`IndexThread`]) takes them in order and calls the subscriber, whose
+//! state transitions are dcrd's.  The thread that connected the block
+//! only builds the notification, copies the exists address index's
+//! unconfirmed overlay for a connect, and sends; a full queue blocks it,
+//! as dcrd's channel blocks its notification handler.  Index maintenance
+//! therefore overlaps the processing of the blocks that follow, and an
+//! index can trail the chain by a little more than the queue's depth.
+//! The RPC handlers allow for that as dcrd's do: through the seams below
+//! they wait a few seconds for an index within five blocks of the chain
+//! tip, and answer "index not synced" for one further behind.
+//!
+//! Two things are not dcrd's.  The overlay is copied when the connect is
+//! queued, where dcrd's goroutine drains the map when it reaches the
+//! block, so the keys that go to disk with a block do not depend on how
+//! far the index trails.  And the daemon stops and joins the thread
+//! before its final flushes, where dcrd flushes first.  What is still
+//! queued at shutdown is dropped, as dcrd drops it, and the next start's
+//! catch-up indexes those blocks.
+//!
+//! A chain handler given the subscriber itself
+//! (`ChainNtfnHandler::set_index_subscriber`) calls it on the draining
+//! thread instead, with no queue: that is for callers that run no index
+//! thread, which today are in-process tests.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use dcroxide_blockchain::process::Chain;
@@ -21,9 +46,9 @@ use dcroxide_chaincfg::Params;
 use dcroxide_chainhash::Hash;
 use dcroxide_database::{BlockRegion, Database};
 use dcroxide_indexers::{
-    ChainQueryer, EXISTS_ADDRESS_INDEX_NAME, ExistsAddrIndex, ExistsAddrPolicy, ExistsAddrQuery,
-    ExistsAddrUnconfirmed, IdxError, IndexSubscriber, Interrupt, LogLevel, LogSink, NO_PREREQS,
-    TX_INDEX_NAME, TxIndex, TxIndexQuery,
+    CONNECT_NTFN, ChainQueryer, EXISTS_ADDRESS_INDEX_NAME, ExistsAddrIndex, ExistsAddrOverlayCopy,
+    ExistsAddrPolicy, ExistsAddrQuery, ExistsAddrUnconfirmed, IdxError, IndexNtfn, IndexSubscriber,
+    Interrupt, LogLevel, LogSink, NO_PREREQS, TX_INDEX_NAME, TxIndex, TxIndexQuery,
 };
 use dcroxide_rpc::server::{RpcDb, RpcExistsAddresser, RpcTxIndexEntry, RpcTxIndexer};
 use dcroxide_txscript::stdaddr::Address;
@@ -112,8 +137,9 @@ pub struct NodeIndexes {
     pub tx_index: Option<Arc<Mutex<TxIndex>>>,
     /// The shared exists address index, when enabled.
     pub exists_addr_index: Option<Arc<Mutex<ExistsAddrIndex>>>,
-    /// The subscriber feeding the indexes; the chain handler's drain
-    /// notifies through this handle.
+    /// The subscriber feeding the indexes: the index thread calls it for
+    /// each queued notification, and a chain handler set up for inline
+    /// delivery calls it from its drain.
     pub subscriber: Arc<Mutex<IndexSubscriber>>,
     /// The queryer every index consults.
     pub queryer: Arc<NodeChainQueryer>,
@@ -223,6 +249,239 @@ pub fn start_indexes_with_policy(
         subscriber: Arc::new(Mutex::new(subscriber)),
         queryer,
     })
+}
+
+/// How many index notifications queue for the index thread before
+/// [`IndexNotifier::notify`] blocks its caller (dcrd `bufferSize`,
+/// `indexsubscriber.go:34`).
+pub const INDEX_NTFN_BUFFER_SIZE: usize = 128;
+
+/// An entry of the index thread's queue.
+enum IndexMsg {
+    /// A notification and, for a connect, the exists address index's
+    /// unconfirmed overlay as it stood when the connect was queued.
+    Ntfn(IndexNtfn, Option<ExistsAddrOverlayCopy>),
+    /// Answered once everything queued ahead of it has been processed
+    /// (what dcrd's tests use `IndexNtfn.Done` for).
+    Barrier(mpsc::Sender<()>),
+}
+
+/// Hand one notification to the subscribed indexes and log a failed
+/// update (dcrd `handleIndexUpdates`' loop body).  A failed update is
+/// logged and ends this notification's walk over the subscriptions, and
+/// every later notification is still processed, exactly as in dcrd: the
+/// `s.cancel()` there cancels only the context the indexes were
+/// initialized with, while the handler loop runs on the server's context
+/// and keeps consuming notifications.  An index that missed an update
+/// therefore logs dcrd's missing-notification error for each later block
+/// and resumes on its own once the heights line up again (a reorg
+/// replacing the failed block).  The subscriber's `cancelled` latch,
+/// dcrd's cancelled context, is deliberately not consulted.
+///
+/// The indexes need their notifications in the chain's emission order.
+/// Both callers get that from the chain handler's drain lock, which every
+/// production drain holds from taking a batch of block events to handing
+/// over the last of them: the inline path calls this under it, and the
+/// queued path sends under it into one first-in, first-out queue with one
+/// consumer.  `ChainNtfnHandler::drain_pending_block_events` is the one
+/// entry point that drains without that lock; its callers are tests, each
+/// draining from a single thread.
+///
+/// `copy` is the queued path's: the exists address index's unconfirmed
+/// overlay as copied when a connect was queued, which that index's
+/// connect then hands over in place of the overlay as it stands now
+/// (`ExistsAddrUnconfirmed::with_copy`).  The inline path passes `None`
+/// and the connect copies the overlay itself, at the same point of the
+/// drain.
+pub(crate) fn deliver_index_ntfn(
+    subscriber: &Mutex<IndexSubscriber>,
+    ntfn: &IndexNtfn,
+    copy: Option<(&ExistsAddrUnconfirmed, ExistsAddrOverlayCopy)>,
+) {
+    let mut subscriber = subscriber.lock().expect("index subscriber mutex poisoned");
+    let updated = match copy {
+        Some((unconfirmed, copy)) => unconfirmed.with_copy(copy, || subscriber.notify(ntfn)),
+        None => subscriber.notify(ntfn),
+    };
+    if let Err(e) = updated {
+        // dcrd's `log.Error(err)` under the INDX subsystem, once per
+        // failed notification.
+        crate::logging::error("INDX", &e.to_string());
+    }
+}
+
+/// The sending end of the index thread's queue (dcrd
+/// `IndexSubscriber.Notify` sending on the subscriber's channel).
+#[derive(Clone)]
+pub struct IndexNotifier {
+    queue: SyncSender<IndexMsg>,
+    /// The exists address index's unconfirmed overlay, when that index is
+    /// enabled: what [`IndexNotifier::notify`] copies for a connect.
+    unconfirmed: Option<ExistsAddrUnconfirmed>,
+}
+
+impl IndexNotifier {
+    /// Queue a notification for the index thread (dcrd `Notify`).  Blocks
+    /// while the queue is full, as dcrd's send does, and drops the
+    /// notification once the thread has stopped, as dcrd's `quit` case
+    /// does.  A connect's copy of the unconfirmed overlay is made here,
+    /// before the wait, so it is the overlay as the block connected:
+    /// where dcrd's handler goroutine drains the map when it reaches the
+    /// block, the keys that go to disk with a block here do not depend on
+    /// how far the index trails.
+    pub fn notify(&self, ntfn: IndexNtfn) {
+        let copy = match &self.unconfirmed {
+            Some(unconfirmed) if ntfn.ntfn_type == CONNECT_NTFN => {
+                Some(unconfirmed.copy_for_connect())
+            }
+            _ => None,
+        };
+        let _ = self.queue.send(IndexMsg::Ntfn(ntfn, copy));
+    }
+
+    /// Wait until the index thread has processed everything queued before
+    /// this call; `false` when it has stopped instead.
+    pub fn wait_processed(&self) -> bool {
+        let (done, processed) = mpsc::channel();
+        self.queue.send(IndexMsg::Barrier(done)).is_ok() && processed.recv().is_ok()
+    }
+}
+
+/// The daemon's index thread (dcrd's `IndexSubscriber.Run` goroutine and
+/// its `handleIndexUpdates` loop): the one consumer of a bounded queue of
+/// index notifications, each of which it hands to the subscriber the
+/// indexes were created over.
+///
+/// Stopping it is stop-and-join, not a drain: what is still queued is
+/// dropped, as dcrd's handler drops it on `ctx.Done()`, and the next
+/// start's catch-up indexes those blocks.  Dropping the handle stops and
+/// joins the thread too, so it never outlives the index handles or the
+/// database on any return path of its owner.
+pub struct IndexThread {
+    notifier: IndexNotifier,
+    stop: Arc<AtomicBool>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl IndexThread {
+    /// Start the thread over the live indexes with dcrd's queue depth.
+    pub fn start(indexes: &NodeIndexes) -> std::io::Result<IndexThread> {
+        IndexThread::start_with_capacity(indexes, INDEX_NTFN_BUFFER_SIZE)
+    }
+
+    /// [`IndexThread::start`] with the queue depth given (at least one),
+    /// for tests.
+    pub fn start_with_capacity(
+        indexes: &NodeIndexes,
+        capacity: usize,
+    ) -> std::io::Result<IndexThread> {
+        let unconfirmed = indexes.exists_addr_index.as_ref().map(|index| {
+            index
+                .lock()
+                .expect("exists addr index mutex poisoned")
+                .unconfirmed()
+        });
+        IndexThread::start_with(Arc::clone(&indexes.subscriber), unconfirmed, capacity)
+    }
+
+    /// [`IndexThread::start_with_capacity`] over the subscriber and the
+    /// exists address index's unconfirmed overlay (`None` when that index
+    /// is not subscribed), for callers that hold no [`NodeIndexes`].
+    pub fn start_with(
+        subscriber: Arc<Mutex<IndexSubscriber>>,
+        unconfirmed: Option<ExistsAddrUnconfirmed>,
+        capacity: usize,
+    ) -> std::io::Result<IndexThread> {
+        // At least one slot: the wake-up entry `stop_and_join` sends needs
+        // somewhere to wait while the thread is busy.  A rendezvous queue
+        // would refuse it, and the thread would then park in `recv` with
+        // nothing to wake it.
+        let (queue, entries) = mpsc::sync_channel(capacity.max(1));
+        let interrupt = subscriber
+            .lock()
+            .expect("index subscriber mutex poisoned")
+            .interrupt();
+        let stop = Arc::new(AtomicBool::new(false));
+        let (overlay, stopped) = (unconfirmed.clone(), Arc::clone(&stop));
+        let thread = std::thread::Builder::new()
+            .name("index".to_string())
+            .spawn(move || {
+                run_index_thread(
+                    &entries,
+                    &subscriber,
+                    overlay.as_ref(),
+                    &interrupt,
+                    &stopped,
+                );
+            })?;
+        Ok(IndexThread {
+            notifier: IndexNotifier { queue, unconfirmed },
+            stop,
+            thread: Some(thread),
+        })
+    }
+
+    /// A sending end for the chain handler.
+    pub fn notifier(&self) -> IndexNotifier {
+        self.notifier.clone()
+    }
+
+    /// Stop the thread and wait for it.  What is still queued is dropped,
+    /// as dcrd drops it, and the next start's catch-up indexes it.
+    pub fn shutdown(mut self) {
+        self.stop_and_join();
+    }
+
+    fn stop_and_join(&mut self) {
+        let Some(thread) = self.thread.take() else {
+            return;
+        };
+        self.stop.store(true, Ordering::SeqCst);
+        // Wake a thread idle in `recv`.  A full queue refuses this, and
+        // then the thread is busy and reads the flag before its next entry.
+        let (done, _unread) = mpsc::channel();
+        let _ = self.notifier.queue.try_send(IndexMsg::Barrier(done));
+        if thread.join().is_err() {
+            crate::logging::error("INDX", "the index thread panicked");
+        }
+        // dcrd `IndexSubscriber.Run`'s closing line.
+        crate::logging::trace("INDX", "Index subscriber stopped");
+    }
+}
+
+impl Drop for IndexThread {
+    fn drop(&mut self) {
+        self.stop_and_join();
+    }
+}
+
+/// The index thread's body (dcrd `handleIndexUpdates`): take the queue's
+/// entries in order until a stop or the daemon's interrupt is seen, or
+/// until every sending end is gone.  Returning drops the receiving end,
+/// which releases a sender blocked on a full queue and makes every later
+/// send a no-op.
+fn run_index_thread(
+    entries: &Receiver<IndexMsg>,
+    subscriber: &Mutex<IndexSubscriber>,
+    unconfirmed: Option<&ExistsAddrUnconfirmed>,
+    interrupt: &Interrupt,
+    stop: &AtomicBool,
+) {
+    while let Ok(entry) = entries.recv() {
+        // dcrd's `case <-ctx.Done(): return`: nothing more is processed
+        // once shutdown is requested, and what is queued is dropped.
+        if stop.load(Ordering::SeqCst) || interrupt.load(Ordering::SeqCst) {
+            break;
+        }
+        match entry {
+            IndexMsg::Ntfn(ntfn, copy) => {
+                deliver_index_ntfn(subscriber, &ntfn, unconfirmed.zip(copy));
+            }
+            IndexMsg::Barrier(done) => {
+                let _ = done.send(());
+            }
+        }
+    }
 }
 
 /// Whether the index tip matches the chain tip (dcrd
@@ -616,5 +875,142 @@ mod tests {
         assert_send::<NodeIndexes>();
         assert_send::<NodeRpcExistsAddresser>();
         assert_send::<NodeUnconfirmedAddrIndexer>();
+        // The index thread's handle moves to whichever thread shuts the
+        // daemon down, and its sending end is cloned into the chain
+        // handler, which the peer, generator and RPC threads share.
+        assert_send::<IndexThread>();
+        assert_send_sync::<IndexNotifier>();
+    }
+
+    /// Stopping the index thread drops what is queued and releases a
+    /// sender blocked on the full queue, so neither the shutdown nor the
+    /// sender can wait on the other (dcrd's handler returning on
+    /// `ctx.Done()`, and `Notify`'s `quit` case).
+    ///
+    /// One slot, and the thread stalled on the database writer with the
+    /// first notification in hand: the second fills the slot and the third
+    /// blocks its sender.  The stop request is then made through the flag
+    /// itself, before the writer is released, so the thread is certain to
+    /// see it at its next entry; `stop` -- [`IndexThread::shutdown`], or
+    /// dropping the handle -- makes the same request and joins.  The
+    /// notification in hand is not interrupted.
+    ///
+    /// The join is what the daemon's shutdown order rests on: `stop` must
+    /// not return while the thread still has that notification in hand,
+    /// or the thread's last commit could land behind the final chain
+    /// flush and the closing of the database.  So `stop` is watched for
+    /// as long as the writer is held, and must still be waiting.
+    fn assert_stopping_joins_the_thread_and_releases_a_blocked_sender(
+        stop: impl FnOnce(IndexThread) + Send + 'static,
+    ) {
+        let params = dcroxide_chaincfg::simnet_params();
+        let (_dir, db, chain) = open_genesis_chain(&params);
+        let interrupt: Interrupt = Arc::new(AtomicBool::new(false));
+        let indexes = start_indexes(
+            interrupt,
+            Arc::new(db.clone()),
+            chain,
+            params.clone(),
+            false,
+            true,
+            &IndexLogs::default(),
+        )
+        .expect("start");
+        // Taken before the stall: the stalled thread holds the index
+        // mutex while it waits for the writer.
+        let query = indexes
+            .exists_addr_index
+            .as_ref()
+            .expect("exists index enabled")
+            .lock()
+            .expect("exists index")
+            .query();
+        let thread = IndexThread::start_with_capacity(&indexes, 1).expect("index thread");
+        let notifier = thread.notifier();
+        // The update path checks only a notification's height against the
+        // index tip, so the genesis block with its height set stands in
+        // for a block of the chain.
+        let connect_at = |height: u32| {
+            let mut block = params.genesis_block.clone();
+            block.header.height = height;
+            IndexNtfn {
+                ntfn_type: CONNECT_NTFN,
+                block: Arc::new(block),
+                parent: Arc::new(params.genesis_block.clone()),
+                is_treasury_enabled: false,
+            }
+        };
+
+        let hold = db.begin(true).expect("hold the writer");
+        notifier.notify(connect_at(1));
+        notifier.notify(connect_at(2));
+        let (sent, returned) = mpsc::channel();
+        let third = {
+            let (notifier, ntfn) = (notifier.clone(), connect_at(3));
+            std::thread::spawn(move || {
+                notifier.notify(ntfn);
+                let _ = sent.send(());
+            })
+        };
+        assert!(
+            returned.recv_timeout(Duration::from_millis(300)).is_err(),
+            "a send into a full queue returned"
+        );
+
+        // The thread is inside the first update once it holds the index
+        // mutex, which it keeps while it waits for the writer.
+        let index = Arc::clone(
+            indexes
+                .exists_addr_index
+                .as_ref()
+                .expect("exists index enabled"),
+        );
+        let waiting_since = Instant::now();
+        while index.try_lock().is_ok() {
+            assert!(
+                waiting_since.elapsed() < Duration::from_secs(60),
+                "the thread never took the first notification"
+            );
+            std::thread::yield_now();
+        }
+
+        thread.stop.store(true, Ordering::SeqCst);
+        let (joined_tx, joined) = mpsc::channel();
+        let stopper = std::thread::spawn(move || {
+            stop(thread);
+            let _ = joined_tx.send(());
+        });
+        assert!(
+            joined.recv_timeout(Duration::from_millis(300)).is_err(),
+            "the stop returned while the thread still held a notification"
+        );
+        hold.rollback().expect("release the writer");
+        stopper.join().expect("the stop returns");
+        returned
+            .recv_timeout(Duration::from_secs(60))
+            .expect("the blocked sender is released");
+        third.join().expect("sender");
+
+        let tip = query.tip().expect("tip").0;
+        assert!(tip <= 1, "a queued notification was processed: tip {tip}");
+        assert!(!notifier.wait_processed(), "a stopped thread answered");
+        // A send after the stop is dropped without a wait.
+        notifier.notify(connect_at(2));
+        assert_eq!(query.tip().expect("tip").0, tip);
+    }
+
+    /// [`IndexThread::shutdown`] joins the thread (see
+    /// [`assert_stopping_joins_the_thread_and_releases_a_blocked_sender`]).
+    #[test]
+    fn a_stopped_index_thread_releases_a_blocked_sender() {
+        assert_stopping_joins_the_thread_and_releases_a_blocked_sender(IndexThread::shutdown);
+    }
+
+    /// Dropping the handle joins the thread too, which is what every
+    /// early return of the daemon relies on (see
+    /// [`assert_stopping_joins_the_thread_and_releases_a_blocked_sender`]).
+    #[test]
+    fn a_dropped_index_thread_is_joined_and_releases_a_blocked_sender() {
+        assert_stopping_joins_the_thread_and_releases_a_blocked_sender(drop);
     }
 }

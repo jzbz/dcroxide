@@ -762,9 +762,14 @@ fn cmd_replay(args: &Args) -> Result<(), String> {
 
         let block_height = block.header.height;
 
-        // Drive the indexes exactly as the daemon does, with the chain
-        // lock released: the queryer below takes it, and nesting the two
-        // would deadlock the replay.
+        // Drive the indexes with the subscriber the daemon's index thread
+        // calls, inline on this thread: a replay serializes index
+        // maintenance with block connection, which the daemon does not (it
+        // queues each notification for that thread), so a replay's wall
+        // time counts the whole of the index work where a sync overlaps it
+        // with the next block.  The chain lock is released first: the
+        // queryer below takes it, and nesting the two would deadlock the
+        // replay.
         if indexing {
             let prev = block.header.prev_block;
             let parent = queryer
@@ -966,7 +971,8 @@ fn cmd_indexcatchup(args: &Args) -> Result<(), String> {
 }
 
 /// A [`ChainQueryer`] over the replay's chain, so the indexes can be
-/// driven exactly as the daemon drives them.
+/// driven through the subscriber the daemon uses: inline here, where the
+/// daemon queues each notification for its index thread.
 ///
 /// Mirrors `dcroxide-node`'s `NodeChainQueryer`. It is duplicated rather
 /// than shared because the daemon crate carries the whole P2P and RPC

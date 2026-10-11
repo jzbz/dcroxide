@@ -25,6 +25,11 @@
 //! weak registration amounts to), lookups that read the mempool overlay
 //! last, and a hand-over that runs after the tip row is published.
 //!
+//! **The overlay copy.**  A connect queued for the daemon's index thread
+//! brings a copy of the unconfirmed overlay made when it was queued.  It
+//! must hand over exactly what the same connect hands over when it is
+//! processed on the spot, and a copy no connect took must not linger.
+//!
 //! **Keys an adversary grinds** to share a first hash160 byte must still
 //! spread over the partitions, keeping each flush near its page budget
 //! and the journal collectable.
@@ -1000,6 +1005,132 @@ fn control_handing_keys_over_after_the_tip_is_published_misses_them() {
         Duration::from_secs(60),
     );
     assert!(race.falses > 0, "no false in {} lookups", race.lookups);
+}
+
+// ---------------------------------------------------------------------
+// The overlay copy a queued connect brings
+// ---------------------------------------------------------------------
+
+/// The four keys of an [`overlay_run`]: `a` is in the mempool before the
+/// first connect, `b` reaches it once that connect is on its way, and
+/// `c` and `d` are paid by the first and the second block.
+fn overlay_keys() -> [Key; 4] {
+    let mut rng = SplitMix64(11);
+    [0; 4].map(|_| random_key(&mut rng))
+}
+
+/// Two connects with the mempool transaction paying `b` arriving around
+/// the first.  Inline (`queued` false), the first connect copies the
+/// overlay itself and `b` arrives after it.  Queued, the copy is made
+/// first (`copy_for_connect`), `b` arrives while the connect waits, and
+/// the connect then runs under `with_copy`, as the daemon's index thread
+/// runs it.
+///
+/// Returns the index's keys after the first connect, whether a lookup
+/// then finds `b`, and the keys after the second connect.
+fn overlay_run(queued: bool) -> (Vec<Key>, bool, Vec<Key>) {
+    let dir = TempDir::new().expect("tempdir");
+    let db = Arc::new(Database::create(&Options::new(dir.path().join("db"), NET)).expect("create"));
+    let chain = TestChain::new(params());
+    let mut subber = new_subber();
+    let idx = open_index(&mut subber, &db, &chain, Policy::tiny());
+    let unconfirmed = idx.lock().expect("index").unconfirmed();
+    let query = idx.lock().expect("index").query();
+    let [a, b, c, d] = overlay_keys();
+    unconfirmed.add_unconfirmed_tx(&mempool_tx(&[a]));
+    if queued {
+        let copy = unconfirmed.copy_for_connect();
+        // The pool admits `b` while the connect waits in the queue.
+        unconfirmed.add_unconfirmed_tx(&mempool_tx(&[b]));
+        unconfirmed
+            .with_copy(copy, || connect(&chain, &mut subber, 1, &[c]))
+            .expect("connect");
+    } else {
+        connect(&chain, &mut subber, 1, &[c]).expect("connect");
+        unconfirmed.add_unconfirmed_tx(&mempool_tx(&[b]));
+    }
+    let first = idx.lock().expect("index").logical_keys().expect("keys");
+    let b_seen = query
+        .exists_address(&address_of(&b, params()))
+        .expect("lookup");
+    connect(&chain, &mut subber, 2, &[d]).expect("connect");
+    let second = idx.lock().expect("index").logical_keys().expect("keys");
+    (first, b_seen, second)
+}
+
+/// A connect processed after it was queued hands over the overlay as it
+/// stood when it was queued, which is what the same connect processed on
+/// the spot hands over: a key the pool adds in between is not persisted
+/// with that block, is still answered from the overlay, and goes with the
+/// next connect.  A queued connect that read the overlay as it stands
+/// when it is processed would persist `b` with the first block.
+#[test]
+fn a_queued_connect_hands_over_the_overlay_as_copied_when_it_was_queued() {
+    let [a, b, c, d] = overlay_keys();
+    let inline = overlay_run(false);
+    let queued = overlay_run(true);
+    assert_eq!(queued, inline, "queued against inline");
+
+    let (first, b_seen, second) = queued;
+    assert!(first.contains(&a), "the copied mempool key");
+    assert!(first.contains(&c), "the first block's key");
+    assert!(
+        !first.contains(&b),
+        "a key added after the connect was queued went with it"
+    );
+    assert!(b_seen, "the later key is still answered from the overlay");
+    for key in [a, b, c, d] {
+        assert!(second.contains(&key), "{} after the second", hex(&key));
+    }
+}
+
+/// A copy no connect took is withdrawn when `with_copy` returns, whether
+/// the update inside never reached the index or failed before the index's
+/// connect: the next connect copies the overlay as it stands, with the
+/// keys of the dropped copy still in it.  A copy left installed would be
+/// taken by that connect, which would then leave out `b`.
+#[test]
+fn a_copy_no_connect_took_is_withdrawn() {
+    let dir = TempDir::new().expect("tempdir");
+    let db = Arc::new(Database::create(&Options::new(dir.path().join("db"), NET)).expect("create"));
+    let chain = TestChain::new(params());
+    let mut subber = new_subber();
+    let idx = open_index(&mut subber, &db, &chain, Policy::tiny());
+    let unconfirmed = idx.lock().expect("index").unconfirmed();
+    let [a, b, c, d] = overlay_keys();
+    let keys = || idx.lock().expect("index").logical_keys().expect("keys");
+
+    // No update at all.
+    unconfirmed.add_unconfirmed_tx(&mempool_tx(&[a]));
+    unconfirmed.with_copy(unconfirmed.copy_for_connect(), || ());
+    unconfirmed.add_unconfirmed_tx(&mempool_tx(&[b]));
+    connect(&chain, &mut subber, 1, &[]).expect("connect");
+    assert!(
+        keys().contains(&a) && keys().contains(&b),
+        "after no update"
+    );
+
+    // An update the subscriber refuses before the index's connect: a
+    // block two above the index tip.
+    unconfirmed.add_unconfirmed_tx(&mempool_tx(&[c]));
+    let tip = chain.at(chain.tip().0);
+    let skipping = block_on(&block_on(&tip, 7, Vec::new()), 8, Vec::new());
+    let refused = unconfirmed.with_copy(unconfirmed.copy_for_connect(), || {
+        subber.notify(&IndexNtfn {
+            ntfn_type: CONNECT_NTFN,
+            block: skipping,
+            parent: Arc::clone(&tip),
+            is_treasury_enabled: false,
+        })
+    });
+    assert!(refused.is_err(), "the skipped height is refused");
+    assert!(!keys().contains(&c), "a refused update handed keys over");
+    unconfirmed.add_unconfirmed_tx(&mempool_tx(&[d]));
+    connect(&chain, &mut subber, 2, &[]).expect("connect");
+    assert!(
+        keys().contains(&c) && keys().contains(&d),
+        "after a refusal"
+    );
 }
 
 // ---------------------------------------------------------------------

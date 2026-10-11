@@ -27,6 +27,7 @@
 pub(crate) mod journal;
 pub(crate) mod memtable;
 pub(crate) mod meta;
+pub(crate) mod overlay;
 pub(crate) mod policy;
 pub(crate) mod runs;
 pub(crate) mod store;

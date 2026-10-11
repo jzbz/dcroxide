@@ -16,11 +16,16 @@
 //!
 //! dcrd delivers index notifications over a buffered channel
 //! serviced by goroutines and checks sync subscribers on a periodic
-//! ticker; this port delivers synchronously with identical state
-//! transitions, and the daemon calls it on the block-processing
-//! thread.  Moving the updates to a dedicated thread is an open,
-//! unmeasured decision (the `internal/blockchain/indexers` row of
-//! PARITY.md).
+//! ticker.  [`IndexSubscriber::notify`] processes one notification per
+//! call, on the caller's thread, with dcrd's state transitions; the
+//! daemon supplies the channel and the thread (`dcroxide-node`'s
+//! `IndexThread`: a bounded queue of dcrd's depth, and one index thread
+//! that calls `notify` for each entry) and polls where dcrd has the
+//! ticker.  A connect queued that way brings one thing dcrd's does not:
+//! the exists address index's unconfirmed overlay as it stood when the
+//! connect was queued ([`ExistsAddrUnconfirmed::copy_for_connect`],
+//! [`ExistsAddrUnconfirmed::with_copy`]), where dcrd's goroutine drains
+//! the map when it reaches the block.
 
 mod common;
 mod error;
@@ -41,7 +46,8 @@ pub use existsaddr::policy::partition_of as exists_addr_partition_of;
 pub use existsaddr::store::{LayoutCheck, check_layout, stored_keys};
 pub use existsaddrindex::{
     ADDR_KEY_SIZE, EXISTS_ADDR_INDEX_KEY, EXISTS_ADDR_INDEX_VERSION, EXISTS_ADDRESS_INDEX_NAME,
-    ExistsAddrIndex, ExistsAddrQuery, ExistsAddrUnconfirmed, addr_to_key, drop_exists_addr_index,
+    ExistsAddrIndex, ExistsAddrOverlayCopy, ExistsAddrQuery, ExistsAddrUnconfirmed, addr_to_key,
+    drop_exists_addr_index,
 };
 pub use legacydrops::{ADDR_INDEX_KEY, CF_INDEX_PARENT_BUCKET_KEY, drop_addr_index, drop_cf_index};
 pub use log::{LogLevel, LogSink};

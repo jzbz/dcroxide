@@ -925,11 +925,28 @@ fn run_node(cfg: Config) -> ExitCode {
         server.sync_peers.clone(),
         Arc::clone(&server.recently_advertised),
     );
-    // The drained block events also feed the subscribed indexes
-    // (dcrd's handler notifying `s.indexSubscriber`).
-    if let Some(indexes) = &indexes {
-        handler.set_index_subscriber(Arc::clone(&indexes.subscriber));
-    }
+    // The drained block events also feed the subscribed indexes, through
+    // a bounded queue and one index thread (dcrd's handler calling
+    // `s.indexSubscriber.Notify`, and the `s.indexSubscriber.Run`
+    // goroutine the server's `Run` starts).  The sending end is attached
+    // here, before the handler is first cloned, so every clone queues.
+    // The thread is stopped and joined in the shutdown sequence below,
+    // and by its drop on every earlier return, which comes before the
+    // index handles and the database closer drop because it is declared
+    // after both.
+    let index_thread = match &indexes {
+        Some(indexes) => match dcroxide_node::indexes::IndexThread::start(indexes) {
+            Ok(thread) => {
+                handler.set_index_notifier(thread.notifier());
+                Some(thread)
+            }
+            Err(e) => {
+                log_error(&format!("Unable to start server: index thread: {e}"));
+                return ExitCode::FAILURE;
+            }
+        },
+        None => None,
+    };
     // Confirmed transactions feed the recently-confirmed filter the
     // sync manager consults, and — when the RPC server runs — remove
     // their rebroadcast entries and trigger the block-change prunes
@@ -1571,6 +1588,16 @@ fn run_node(cfg: Config) -> ExitCode {
         .save_peers()
     {
         dcroxide_node::logging::error("AMGR", &format!("Unable to save peers: {e}"));
+    }
+
+    // Stop the index thread before the final flushes, so nothing commits
+    // behind them.  dcrd flushes first (`ShutdownUtxoCache`) and then waits
+    // out `indexSubscriber.Run` with its other goroutines (`wg.Wait()`,
+    // server.go:3505-3506); either order is safe here, because the close
+    // flushes again.  What is still queued is dropped, as dcrd's handler
+    // drops it on `ctx.Done()`, and the next start's catch-up indexes it.
+    if let Some(index_thread) = index_thread {
+        index_thread.shutdown();
     }
 
     // Flush the chain's in-memory UTXO cache and modified block index to

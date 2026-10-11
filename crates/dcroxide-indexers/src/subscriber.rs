@@ -5,10 +5,13 @@
 //! update state machine, catch-up to the main chain tip, and index
 //! recovery.  dcrd delivers notifications through a buffered channel
 //! serviced by goroutines and checks sync subscribers on a periodic
-//! ticker; this port delivers synchronously with identical state
-//! transitions, on the daemon's block-processing thread.  A dedicated
-//! index thread is an open, unmeasured decision (the
-//! `internal/blockchain/indexers` row of PARITY.md).
+//! ticker.  The subscriber here has neither: it processes one
+//! notification per [`IndexSubscriber::notify`] call, on the caller's
+//! thread, with dcrd's state transitions.  The channel and the thread
+//! that serves it are the daemon's (`dcroxide-node`'s `IndexThread`: a
+//! bounded queue of dcrd's depth, and one index thread that calls
+//! `notify` for each entry), and nothing runs the ticker: the daemon's
+//! RPC seams poll the index tip instead.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -41,8 +44,10 @@ pub const DISCONNECT_NTFN: IndexNtfnType = IndexNtfnType(1);
 pub const NO_PREREQS: &str = "none";
 
 /// An index notification detailing a block connection or
-/// disconnection (dcrd `IndexNtfn`; the `Done` channel is not needed
-/// with synchronous delivery).
+/// disconnection (dcrd `IndexNtfn`).  It has no `Done` channel:
+/// [`IndexSubscriber::notify`] returns once the notification has been
+/// processed, and where the daemon queues notifications for its index
+/// thread, a barrier entry of that queue does what `Done` does.
 #[derive(Clone)]
 pub struct IndexNtfn {
     /// The notification type.

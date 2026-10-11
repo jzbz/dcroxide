@@ -123,10 +123,10 @@ pub struct ChainNtfnHandler {
     sync_peers: crate::dispatch::SyncPeers,
     /// The recently-advertised cache the cascade feeds.
     recently_advertised: Arc<Mutex<dcroxide_containers::lru::Map<Hash, dcroxide_wire::MsgTx>>>,
-    /// The index subscriber the drained block events feed (dcrd's
+    /// How the drained block events reach the subscribed indexes (dcrd's
     /// `s.indexSubscriber.Notify` at the end of each connect and
     /// disconnect case; `None` when no index is enabled).
-    index_subscriber: Option<Arc<Mutex<dcroxide_indexers::IndexSubscriber>>>,
+    index_delivery: Option<IndexDelivery>,
     /// The recently-confirmed filter every confirmed transaction
     /// feeds (dcrd `TransactionConfirmed` adding to
     /// `recentlyConfirmedTxns`), shared with the netsync manager.
@@ -333,6 +333,17 @@ fn mined_by_later_connects(later: &VecDeque<PendingBlockEvent>) -> HashSet<Hash>
         .collect()
 }
 
+/// How a drained block event's index notification is delivered.
+#[derive(Clone)]
+enum IndexDelivery {
+    /// On the draining thread, before the drain moves on: callers with no
+    /// index thread (tests), with dcrd's state transitions.
+    Inline(Arc<Mutex<dcroxide_indexers::IndexSubscriber>>),
+    /// Through the index thread's queue, as the daemon does (dcrd's
+    /// buffered channel).
+    Queued(crate::indexes::IndexNotifier),
+}
+
 impl ChainNtfnHandler {
     /// A handler forwarding into the given notification manager and
     /// driving the pool's block maintenance through the relay sinks.
@@ -361,7 +372,7 @@ impl ChainNtfnHandler {
             tx_pool,
             sync_peers,
             recently_advertised,
-            index_subscriber: None,
+            index_delivery: None,
             recently_confirmed: None,
             rebroadcast: None,
             generator: None,
@@ -404,14 +415,22 @@ impl ChainNtfnHandler {
         self.fee_estimator = Some(estimator);
     }
 
-    /// Feed the drained block events into the given index subscriber
-    /// (dcrd's server holding its `indexSubscriber`).  Must be set
-    /// before the handler is cloned into the chain callback.
+    /// Feed the drained block events into the given index subscriber on
+    /// the draining thread (dcrd's server holding its `indexSubscriber`,
+    /// without the channel).  Must be set before the handler is cloned
+    /// into the chain callback.
     pub fn set_index_subscriber(
         &mut self,
         subscriber: Arc<Mutex<dcroxide_indexers::IndexSubscriber>>,
     ) {
-        self.index_subscriber = Some(subscriber);
+        self.index_delivery = Some(IndexDelivery::Inline(subscriber));
+    }
+
+    /// Queue the drained block events' index notifications for the index
+    /// thread (dcrd's `s.indexSubscriber.Notify`).  Must be set before the
+    /// handler is cloned into the chain callback.
+    pub fn set_index_notifier(&mut self, notifier: crate::indexes::IndexNotifier) {
+        self.index_delivery = Some(IndexDelivery::Queued(notifier));
     }
 
     /// The chain callback body (dcrd `handleBlockchainNotification`);
@@ -816,7 +835,10 @@ impl ChainNtfnHandler {
     /// [`ChainNtfnHandler::drain_pending`], which every production
     /// caller runs the whole drain through, and which also waits out a
     /// processing call still queueing; this entry point has no chain to
-    /// wait on and takes the queue as it stands.
+    /// wait on and takes the queue as it stands.  It does not take the
+    /// drain lock either, which the index notifications' order relies on
+    /// (`crate::indexes::deliver_index_ntfn`): it is for callers that
+    /// drain from one thread, which today are tests.
     pub fn drain_pending_block_events(&self) {
         let pending = core::mem::take(
             &mut *self
@@ -928,17 +950,14 @@ impl ChainNtfnHandler {
     }
 
     /// Notify the subscribed indexes for a drained block event (dcrd's
-    /// `s.indexSubscriber.Notify` feeding `handleIndexUpdates`).  A
-    /// failed update is logged and ends this notification's walk over
-    /// the subscriptions, and every later notification is still
-    /// processed, exactly as in dcrd: the `s.cancel()` there cancels
-    /// only the context the indexes were initialized with, while the
-    /// handler loop runs on the server's context and keeps consuming
-    /// notifications.  An index that missed an update therefore logs
-    /// dcrd's missing-notification error for each later block and
-    /// resumes on its own once the heights line up again (a reorg
-    /// replacing the failed block).  The subscriber's `cancelled` latch,
-    /// dcrd's cancelled context, is deliberately not consulted.
+    /// `s.indexSubscriber.Notify` feeding `handleIndexUpdates`): build
+    /// the notification and either queue it for the index thread, as the
+    /// daemon does, or hand it to the subscriber on this thread.  What a
+    /// failed update does is the same on both paths and is described at
+    /// `crate::indexes::deliver_index_ntfn`, which both end in.  The
+    /// indexes see the notifications in the order this is called in,
+    /// which is the chain's emission order because each batch of block
+    /// events is drained whole under the drain lock.
     fn notify_index_subscriber(
         &self,
         ntfn_type: dcroxide_indexers::IndexNtfnType,
@@ -946,20 +965,20 @@ impl ChainNtfnHandler {
         parent: Arc<dcroxide_wire::MsgBlock>,
         check_tx_flags: AgendaFlags,
     ) {
-        let Some(subscriber) = &self.index_subscriber else {
+        let Some(delivery) = &self.index_delivery else {
             return;
         };
-        let mut subscriber = subscriber.lock().expect("index subscriber mutex poisoned");
         let ntfn = dcroxide_indexers::IndexNtfn {
             ntfn_type,
             block,
             parent,
             is_treasury_enabled: check_tx_flags.is_treasury_enabled(),
         };
-        if let Err(e) = subscriber.notify(&ntfn) {
-            // dcrd's `log.Error(err)` under the INDX subsystem, once per
-            // failed notification.
-            crate::logging::error("INDX", &e.to_string());
+        match delivery {
+            IndexDelivery::Inline(subscriber) => {
+                crate::indexes::deliver_index_ntfn(subscriber, &ntfn, None);
+            }
+            IndexDelivery::Queued(notifier) => notifier.notify(ntfn),
         }
     }
 
@@ -3098,5 +3117,111 @@ mod tests {
             parent: Arc::new(block),
             check_tx_flags: AgendaFlags::default(),
         }]));
+    }
+
+    /// A failed index update does not stop index maintenance when the
+    /// handler queues its notifications for the index thread, any more
+    /// than when it delivers them itself
+    /// (`a_failed_index_update_leaves_later_updates_running`): the update
+    /// that skips a height fails and latches the subscriber's cancelled
+    /// flag, and the thread goes on to apply the next notification whose
+    /// height lines up with the index tip.
+    ///
+    /// The handler's own delivery step is called directly, the step each
+    /// drained connect and disconnect ends in, so the test sets the order
+    /// of the notifications itself.
+    #[test]
+    fn the_index_thread_carries_on_after_a_failed_update() {
+        use dcroxide_indexers::{ChainQueryer, ExistsAddrIndex, IndexSubscriber, Indexer};
+
+        let params = dcroxide_chaincfg::simnet_params();
+        let dir = tempfile::tempdir().expect("temp dir");
+        let opts = dcroxide_database::Options::new(dir.path().join("blocks"), params.net.0);
+        let db = dcroxide_database::Database::create(&opts).expect("create database");
+        let chain = Arc::new(Mutex::new(
+            dcroxide_blockchain::process::Chain::open(
+                db.clone(),
+                &params,
+                params.assume_valid,
+                false,
+                0,
+            )
+            .expect("open chain"),
+        ));
+        let queryer = Arc::new(crate::indexes::NodeChainQueryer::new(
+            Arc::clone(&chain),
+            params.clone(),
+        ));
+        let mut subscriber = IndexSubscriber::new(dcroxide_indexers::Interrupt::default(), None);
+        let index = ExistsAddrIndex::new(
+            &mut subscriber,
+            Arc::new(db),
+            queryer as Arc<dyn ChainQueryer>,
+        )
+        .expect("exists address index");
+        let subscriber = Arc::new(Mutex::new(subscriber));
+        let unconfirmed = index.lock().expect("index").unconfirmed();
+        let thread = crate::indexes::IndexThread::start_with(
+            Arc::clone(&subscriber),
+            Some(unconfirmed),
+            crate::indexes::INDEX_NTFN_BUFFER_SIZE,
+        )
+        .expect("index thread");
+        let notifier = thread.notifier();
+
+        let tx_pool = crate::txmempool::new_shared_tx_pool(
+            Arc::clone(&chain),
+            &params,
+            false,
+            100,
+            10000,
+            false,
+            false,
+        );
+        let mut handler = ChainNtfnHandler::new(
+            None,
+            params.clone(),
+            false,
+            crate::sync::SyncGate::always_current(),
+            None,
+            tx_pool,
+            crate::dispatch::SyncPeers::new(),
+            crate::dispatch::new_recently_advertised(),
+        );
+        handler.set_index_notifier(thread.notifier());
+
+        let genesis = Arc::new(params.genesis_block.clone());
+        let connect = |height: u32| {
+            let mut block = params.genesis_block.clone();
+            block.header.height = height;
+            handler.notify_index_subscriber(
+                dcroxide_indexers::CONNECT_NTFN,
+                Arc::new(block),
+                Arc::clone(&genesis),
+                AgendaFlags::default(),
+            );
+            assert!(notifier.wait_processed(), "the index thread is running");
+        };
+        let tip = || index.lock().expect("index").tip().expect("index tip").0;
+        assert_eq!(tip(), 0, "the fresh index sits at genesis");
+
+        // Height 2 skips height 1: the update fails and the subscriber
+        // latches dcrd's cancelled context.
+        connect(2);
+        assert_eq!(tip(), 0, "the out-of-order update is refused");
+        assert!(
+            subscriber.lock().expect("subscriber").cancelled(),
+            "the failure cancels the subscriber's context"
+        );
+
+        // The next notification lines up with the index tip again and
+        // the thread applies it, as dcrd's handler loop does.
+        connect(1);
+        assert_eq!(
+            tip(),
+            1,
+            "index maintenance carries on after a failed update"
+        );
+        thread.shutdown();
     }
 }

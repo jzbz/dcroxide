@@ -118,9 +118,11 @@ fn serve_txindex_rpc(
     )
     .expect("start indexes");
 
-    // The chain handler wiring the daemon installs: the callback
-    // queues block events and the sync chain drains them into the
-    // mempool maintenance and the index subscriber.
+    // The chain handler the daemon installs, with one difference: the
+    // index notifications are delivered on the draining thread
+    // (`set_index_subscriber`), where the daemon queues them for its
+    // index thread.  The callback queues block events and the sync chain
+    // drains them into the mempool maintenance and the index subscriber.
     let tx_pool = dcroxide_node::txmempool::new_shared_tx_pool(
         Arc::clone(&chain),
         &params,
