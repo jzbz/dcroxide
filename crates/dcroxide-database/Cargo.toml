@@ -11,11 +11,11 @@ repository.workspace = true
 [dependencies]
 dcroxide-chainhash = { path = "../dcroxide-chainhash" }
 dcroxide-wire = { path = "../dcroxide-wire" }
-crc = "3"
+crc = "3.4"
 redb = "4"
 
 [dev-dependencies]
-crc = "3"
+crc = "3.4"
 dcroxide-testutil = { path = "../dcroxide-testutil" }
 tempfile = "3"
 

@@ -22,7 +22,14 @@ use crate::error::{Error, ErrorKind, db_error};
 use crate::{LogLevel, LogSink, log_line};
 
 /// CRC-32 with the Castagnoli polynomial (dcrd's `castagnoli` table).
-const CASTAGNOLI: crc::Crc<u32> = crc::Crc::<u32>::new(&crc::CRC_32_ISCSI);
+///
+/// The sixteen-table form of the same checksum: it consumes sixteen
+/// bytes a step where the crate's default takes one, and every block is
+/// checksummed whole when it is written and again when it is read.  The
+/// values are identical; `tests/blockstore.rs` checks a record against
+/// the one-table form.
+const CASTAGNOLI: crc::Crc<u32, crc::Table<16>> =
+    crc::Crc::<u32, crc::Table<16>>::new(&crc::CRC_32_ISCSI);
 
 /// The number of overhead bytes in a block record: 4 network + 4 length
 /// + 4 checksum.
@@ -922,5 +929,40 @@ mod tests {
         );
         assert!(!block_file_path(dir.path(), 1).exists());
         store.sync().expect("sync must not fail on a removed file");
+    }
+
+    /// The sixteen-table checksum is the one-table checksum: at every
+    /// length around its sixteen-byte step, in one call and fed in the
+    /// three pieces a block record is written in.  A record's bytes on
+    /// disk depend on it.
+    #[test]
+    fn the_wide_table_checksum_matches_the_one_table_form() {
+        let reference = crc::Crc::<u32>::new(&crc::CRC_32_ISCSI);
+        let data: Vec<u8> = (0..4096u32)
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 24) as u8)
+            .collect();
+        for len in (0..=100).chain([255, 256, 257, 1023, 1024, 1025, 4095, 4096]) {
+            let bytes = &data[..len];
+            assert_eq!(
+                CASTAGNOLI.checksum(bytes),
+                reference.checksum(bytes),
+                "one call, {len} bytes"
+            );
+            if len >= 8 {
+                let mut digest = CASTAGNOLI.digest();
+                digest.update(&bytes[0..4]);
+                digest.update(&bytes[4..8]);
+                digest.update(&bytes[8..]);
+                assert_eq!(
+                    digest.finalize(),
+                    reference.checksum(bytes),
+                    "three pieces, {len} bytes"
+                );
+            }
+        }
+        // Anchored absolutely as well: the check value, and thirty-two
+        // zero bytes (RFC 3720, B.4), which take two sixteen-byte steps.
+        assert_eq!(CASTAGNOLI.checksum(b"123456789"), 0xe306_9283);
+        assert_eq!(CASTAGNOLI.checksum(&[0u8; 32]), 0x8a91_36aa);
     }
 }
