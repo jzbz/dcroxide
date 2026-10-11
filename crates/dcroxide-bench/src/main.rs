@@ -108,21 +108,45 @@ Usage:
                               [--txindex] [--addrindex] [--metacache <mib>]
       Build an index over a FINISHED store in one pass, as dcrd does.
 
-      `replay --addrindex` interleaves index rows across every block
-      commit.  dcrd cannot: `addblock` enables indexes without building
-      them, so the daemon adds them afterwards in a dedicated catch-up
-      pass over a complete database.  That difference is not cosmetic
-      for a copy-on-write B-tree, where insertion order drives leaf fill
-      and free-page retention, and it confounded the 2026-08-11 payload
-      comparison -- which established that the two implementations store
-      the same bytes, but could not say how much of the on-disk gap was
-      the engine and how much was the write schedule.
+      Until index version 3 (2026-10-09), `replay --addrindex`
+      interleaved index rows across every block commit.  dcrd cannot:
+      `addblock` enables indexes without building them, so the daemon
+      adds them afterwards in a dedicated catch-up pass over a complete
+      database.  That difference was not cosmetic for a copy-on-write
+      B-tree, where insertion order drives leaf fill and free-page
+      retention, and it confounded the 2026-08-11 payload comparison --
+      which established that the two implementations stored the same
+      bytes, but could not say how much of the on-disk gap was the
+      engine and how much was the write schedule.
 
-      `replay` with no index flags, then this, reproduces dcrd's
-      schedule.  Comparing that against `replay --addrindex` isolates
-      the schedule term; comparing it against dcrd isolates the engine.
+      `replay` with no index flags, then this, reproduced dcrd's
+      schedule.  Comparing that against `replay --addrindex` isolated
+      the schedule term; comparing it against dcrd isolated the engine.
+      Measured 2026-08-12, the schedule term was second-order: 0.68% of
+      the live tree.
+
+      None of the three comparisons has been repeated, and the same-bytes
+      finding predates two changes.  The per-block buckets have had
+      height-first keys, not dcrd's, since 2026-10-08 (ADR-0010).  And
+      under index version 3 (ADR-0011) the exists-address index no longer
+      stores dcrd's one row per address: each block's index commit
+      carries only the index's tip row, and the keys are held in memory
+      and written, as a journal and sorted runs, inside the metadata
+      flushes -- in a replay and in this pass alike.  So with --addrindex
+      this is still one pass over a finished store, but it reproduces
+      neither dcrd's rows nor dcrd's schedule, and comparing it against
+      dcrd does not isolate the engine.  With --txindex the index's rows
+      and the pass are still dcrd's.
 
   dcroxide-bench redbstat --appdata <dir> [--net <name>] [--buckets]
+      Decompose the metadata store's footprint into payload, redb
+      overhead, intra-page slack and free pages, as one JSON object.
+
+      This OPENS THE DATABASE FOR WRITING: redb exposes stats() only on
+      a write transaction, and opening can repair.  Point it at a copy.
+      On btrfs, `cp -a --reflink=always <datadir> <copy>` clones in
+      seconds at no space cost.
+
       --buckets additionally reports each bucket's rows, payload and
       row-size DISTRIBUTION -- mean, p50, p90, p99 and largest.
 
@@ -147,13 +171,6 @@ Usage:
       stores hold the same address set, whichever layout holds it.
       --appdata is resolved as for redbstat.  The store must be stopped;
       opening it runs the node's own startup recovery.
-      Decompose the metadata store's footprint into payload, redb
-      overhead, intra-page slack and free pages, as one JSON object.
-
-      This OPENS THE DATABASE FOR WRITING: redb exposes stats() only on
-      a write transaction, and opening can repair.  Point it at a copy.
-      On btrfs, `cp -a --reflink=always <datadir> <copy>` clones in
-      seconds at no space cost.
 
   dcroxide-bench pinprobe --appdata <dir> [--net <name>] [--writes <n>]
                           [--commits <n>] [--hold <mode>] [--cachemib <n>]
@@ -848,9 +865,21 @@ fn cmd_replay(args: &Args) -> Result<(), String> {
 /// largely erased by compaction in an LSM, so the two stores were not
 /// comparable on schedule even though they were comparable on content.
 ///
-/// `replay` with no index flags followed by this subcommand reproduces
-/// dcrd's schedule exactly, which is what makes the difference between the
+/// `replay` with no index flags followed by this subcommand reproduced
+/// dcrd's schedule exactly, which is what made the difference between the
 /// two runs the engine term rather than the schedule term.
+///
+/// That was the exists-address index in dcrd's layout. Under index
+/// version 3 (2026-10-09, ADR-0011) a connect commits only the index's
+/// tip row, and the keys are held in memory and written, as a journal and
+/// sorted runs, by the flush participant inside the metadata flushes, in
+/// a replay and in this pass alike. With `--addrindex` this is therefore
+/// still one pass over a finished store, but it reproduces neither dcrd's
+/// rows nor dcrd's schedule, and its difference from a dcrd store is no
+/// longer the engine term alone. With `--txindex` the index's rows and
+/// the pass are still dcrd's. The 2026-08-11 payload comparison also
+/// predates the height-first block keys (2026-10-08, ADR-0010), and
+/// neither it nor the schedule comparison has been repeated.
 fn cmd_indexcatchup(args: &Args) -> Result<(), String> {
     let workdir = PathBuf::from(args.require("workdir")?);
     let (params, _net_dir) = net_params(args.get("net").unwrap_or("mainnet"))?;
