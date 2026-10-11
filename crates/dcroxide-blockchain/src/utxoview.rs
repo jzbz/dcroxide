@@ -129,10 +129,11 @@ pub fn entry_to_spent_tx_out(entry: &UtxoEntry) -> SpentTxOut {
 }
 
 /// Compute the transaction hash of every transaction in the slice, in
-/// order.  The connect and disconnect paths compute these once per
-/// block tree and thread them through the helpers so no transaction
-/// is re-serialized and re-hashed per use (dcrd wraps transactions in
-/// `dcrutil.Tx`, which memoizes the hash).
+/// order.  The disconnect paths compute these once per block tree and
+/// thread them through the helpers so no transaction is re-serialized
+/// and re-hashed per use (dcrd wraps transactions in `dcrutil.Tx`,
+/// which memoizes the hash).  The connect paths are handed a
+/// [`crate::blockhashes::BlockTxHashes`] instead.
 pub fn collect_tx_hashes(txs: &[MsgTx]) -> Vec<Hash> {
     txs.iter().map(|tx| tx.tx_hash()).collect()
 }
@@ -919,9 +920,37 @@ impl UtxoView {
         parent: &MsgBlock,
         parent_stxos: impl FnOnce() -> Result<Vec<SpentTxOut>, RuleError>,
         resolver: &impl UtxoResolver,
+        stxos: Option<&mut Vec<SpentTxOut>>,
+        is_treasury_enabled: bool,
+    ) -> Result<(), RuleError> {
+        let tx_hashes = crate::blockhashes::BlockTxHashes::compute(block);
+        self.connect_block_with_hashes(
+            block,
+            &tx_hashes,
+            parent,
+            parent_stxos,
+            resolver,
+            stxos,
+            is_treasury_enabled,
+        )
+    }
+
+    /// [`Self::connect_block`] given the hashes of the block's
+    /// transactions (dcrd `connectBlock` reading them from its
+    /// `dcrutil.Block`), which must have been computed from this very
+    /// block.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn connect_block_with_hashes(
+        &mut self,
+        block: &MsgBlock,
+        tx_hashes: &crate::blockhashes::BlockTxHashes,
+        parent: &MsgBlock,
+        parent_stxos: impl FnOnce() -> Result<Vec<SpentTxOut>, RuleError>,
+        resolver: &impl UtxoResolver,
         mut stxos: Option<&mut Vec<SpentTxOut>>,
         is_treasury_enabled: bool,
     ) -> Result<(), RuleError> {
+        tx_hashes.assert_for(block);
         if !crate::validate::header_approves_parent(&block.header) {
             let parent_stxos = parent_stxos()?;
             self.disconnect_disapproved_block(
@@ -931,16 +960,14 @@ impl UtxoView {
                 is_treasury_enabled,
             )?;
         }
-        let regular_tx_hashes = collect_tx_hashes(&block.transactions);
-        let stake_tx_hashes = collect_tx_hashes(&block.stransactions);
-        self.fetch_input_utxos(block, &regular_tx_hashes, resolver, is_treasury_enabled);
+        self.fetch_input_utxos(block, tx_hashes.regular(), resolver, is_treasury_enabled);
         self.connect_stake_transactions(
             block,
-            &stake_tx_hashes,
+            tx_hashes.stake(),
             stxos.as_deref_mut(),
             is_treasury_enabled,
         )?;
-        self.connect_regular_transactions(block, &regular_tx_hashes, stxos, is_treasury_enabled)?;
+        self.connect_regular_transactions(block, tx_hashes.regular(), stxos, is_treasury_enabled)?;
         self.set_best_hash(block.header.block_hash());
         Ok(())
     }

@@ -154,12 +154,17 @@ pub struct ChainNtfnHandler {
 /// blocks are shared `Arc`s: the whole fan-out — generator feed,
 /// mempool maintenance, websocket notify, index notify — clones
 /// pointers to the one block the chain connected, like dcrd passing
-/// the same `*dcrutil.Block` to every observer.
+/// the same `*dcrutil.Block` to every observer.  A connected block
+/// comes with the hashes of its transactions as the chain computed
+/// them, which dcrd's observers read from that block's hash cache.
 enum PendingBlockEvent {
     /// A block connected to the main chain.
     Connected {
         block: Arc<dcroxide_wire::MsgBlock>,
         parent: Arc<dcroxide_wire::MsgBlock>,
+        /// The hashes of the block's transactions, as the chain sent
+        /// them with the block.
+        tx_hashes: Arc<dcroxide_blockchain::BlockTxHashes>,
         check_tx_flags: AgendaFlags,
     },
     /// A block disconnected from the main chain.
@@ -464,6 +469,7 @@ impl ChainNtfnHandler {
                     .push(PendingBlockEvent::Connected {
                         block: Arc::clone(&data.block),
                         parent: Arc::clone(&data.parent_block),
+                        tx_hashes: Arc::clone(data.tx_hashes()),
                         check_tx_flags: data.check_tx_flags,
                     });
             }
@@ -838,6 +844,7 @@ impl ChainNtfnHandler {
                 PendingBlockEvent::Connected {
                     block,
                     parent,
+                    tx_hashes,
                     check_tx_flags,
                 } => {
                     // What the batch's later connects mined, which dcrd,
@@ -848,7 +855,13 @@ impl ChainNtfnHandler {
                             .get_or_init(|| mined_by_later_connects(&pending))
                             .contains(hash)
                     };
-                    self.handle_connected_block(&block, &parent, check_tx_flags, &mined_later);
+                    self.handle_connected_block(
+                        &block,
+                        &parent,
+                        &tx_hashes,
+                        check_tx_flags,
+                        &mined_later,
+                    );
                     if let Some(rebroadcast) = &self.rebroadcast {
                         rebroadcast.prune_rebroadcast_inventory();
                     }
@@ -955,21 +968,26 @@ impl ChainNtfnHandler {
     /// the pool without touching its now-valid redeemers, unstage
     /// dependents, evict double spends and matching orphans, and
     /// process newly acceptable orphans with the announce cascade.
-    /// `mined_later` names the transactions later connects of the same
-    /// drained batch mined (`TxPool::process_orphans_accepted_in_batch`).
+    /// `tx_hashes` are the hashes of the block's transactions that came
+    /// with it on the connected event.  `mined_later` names the
+    /// transactions later connects of the same drained batch mined
+    /// (`TxPool::process_orphans_accepted_in_batch`).
     fn handle_connected_block(
         &self,
         block: &dcroxide_wire::MsgBlock,
         parent: &dcroxide_wire::MsgBlock,
+        tx_hashes: &dcroxide_blockchain::BlockTxHashes,
         check_tx_flags: AgendaFlags,
         mined_later: &dyn Fn(&Hash) -> bool,
     ) {
-        // Hash every transaction in the block exactly once up front:
-        // the fee-estimator feed and the per-transaction pool
-        // maintenance below both key on the hashes, and dcrd pays for
-        // them only once via the `dcrutil.Block` hash cache.
-        let regular_hashes: Vec<Hash> = block.transactions.iter().map(|tx| tx.tx_hash()).collect();
-        let stake_hashes: Vec<Hash> = block.stransactions.iter().map(|tx| tx.tx_hash()).collect();
+        // The chain hashed every transaction of the block and sent the
+        // hashes with the event: the fee-estimator feed and the
+        // per-transaction pool maintenance below both key on them, and
+        // nothing is hashed again here (dcrd reads them from the
+        // `dcrutil.Block` hash cache).
+        tx_hashes.assert_for(block);
+        let regular_hashes = tx_hashes.regular();
+        let stake_hashes = tx_hashes.stake();
 
         // Feed the connected block into the fee estimator before the
         // mempool removal.  dcrd runs `ProcessBlock` first because the
@@ -980,8 +998,8 @@ impl ChainNtfnHandler {
             crate::fees::process_connected_block(
                 estimator,
                 i64::from(block.header.height),
-                &regular_hashes,
-                &stake_hashes,
+                regular_hashes,
+                stake_hashes,
             );
         }
 
@@ -997,8 +1015,16 @@ impl ChainNtfnHandler {
                 stake_hashes.get(1..).unwrap_or(&[]),
             )
         } else {
-            (&block.stransactions[..], &stake_hashes[..])
+            (&block.stransactions[..], stake_hashes)
         };
+        // The transactions and their hashes are walked side by side
+        // below: each skip above must have dropped one of each, or every
+        // transaction would be paired with its neighbour's hash and the
+        // last one left out.
+        assert!(
+            regular.len() == regular_tail_hashes.len() && stake.len() == stake_tail_hashes.len(),
+            "connected block's transactions and hashes were not skipped together"
+        );
         for (tx, tx_hash) in regular
             .iter()
             .zip(regular_tail_hashes)
@@ -1706,11 +1732,11 @@ mod tests {
             Arc::new(block)
         };
         let connect = |block: Arc<dcroxide_wire::MsgBlock>| {
-            handler.handle(&Notification::BlockConnected(BlockConnectedNtfnsData {
+            handler.handle(&Notification::BlockConnected(BlockConnectedNtfnsData::new(
                 block,
-                parent_block: Arc::clone(&genesis),
-                check_tx_flags: AgendaFlags::default(),
-            }));
+                Arc::clone(&genesis),
+                AgendaFlags::default(),
+            )));
             handler.drain_pending_block_events();
         };
         let tip = || index.lock().expect("index").tip().expect("index tip").0;
@@ -2570,6 +2596,7 @@ mod tests {
             // A lone disconnect that does not continue the run.
             disconnect(&d0, &d1),
             PendingBlockEvent::Connected {
+                tx_hashes: Arc::new(dcroxide_blockchain::BlockTxHashes::compute(&d0)),
                 block: Arc::new(d0.clone()),
                 parent: Arc::new(d1.clone()),
                 check_tx_flags: AgendaFlags::default(),
@@ -2646,10 +2673,14 @@ mod tests {
                 check_tx_flags: AgendaFlags::default(),
             }
         };
-        let connect = |vote_bits: u16, prev_block: Hash| PendingBlockEvent::Connected {
-            block: Arc::new(run_block(11, vote_bits, prev_block, 5)),
-            parent: Arc::new(fork.clone()),
-            check_tx_flags: AgendaFlags::default(),
+        let connect = |vote_bits: u16, prev_block: Hash| {
+            let block = run_block(11, vote_bits, prev_block, 5);
+            PendingBlockEvent::Connected {
+                tx_hashes: Arc::new(dcroxide_blockchain::BlockTxHashes::compute(&block)),
+                block: Arc::new(block),
+                parent: Arc::new(fork.clone()),
+                check_tx_flags: AgendaFlags::default(),
+            }
         };
         // Drive the queue's disconnects, returning what the run holds at
         // each.
@@ -2976,11 +3007,11 @@ mod tests {
                 check_tx_flags: AgendaFlags::default(),
             },
         ));
-        handler.handle(&Notification::BlockConnected(BlockConnectedNtfnsData {
-            block: Arc::new(connected),
-            parent_block: Arc::new(fork),
-            check_tx_flags: AgendaFlags::default(),
-        }));
+        handler.handle(&Notification::BlockConnected(BlockConnectedNtfnsData::new(
+            Arc::new(connected),
+            Arc::new(fork),
+            AgendaFlags::default(),
+        )));
         handler.drain_pending_block_events();
 
         let pool = tx_pool.lock().expect("tx pool");
@@ -3009,6 +3040,7 @@ mod tests {
                 check_tx_flags: AgendaFlags::default(),
             },
             PendingBlockEvent::Connected {
+                tx_hashes: Arc::new(dcroxide_blockchain::BlockTxHashes::compute(&next)),
                 block: Arc::new(next.clone()),
                 parent: Arc::new(tip.clone()),
                 check_tx_flags: AgendaFlags::default(),
@@ -3031,5 +3063,40 @@ mod tests {
             assert!(!mined.contains(&tx.tx_hash()));
         }
         assert!(mined_by_later_connects(&VecDeque::new()).is_empty());
+    }
+
+    /// The connected-block maintenance refuses hashes that are not its
+    /// block's -- here those of a block with one more stake transaction
+    /// -- with `assert_for`'s own message, before it reads any of them.
+    #[test]
+    #[should_panic(expected = "transaction hashes are not one per transaction")]
+    fn the_connected_block_maintenance_refuses_hashes_of_another_shape() {
+        let params = dcroxide_chaincfg::simnet_params();
+        let dir = tempfile::tempdir().expect("temp dir");
+        let opts = dcroxide_database::Options::new(dir.path().join("blocks"), params.net.0);
+        let db = dcroxide_database::Database::create(&opts).expect("create database");
+        let chain = Arc::new(Mutex::new(
+            Chain::open(db, &params, params.assume_valid, false, 0).expect("open chain"),
+        ));
+        let tx_pool = crate::txmempool::new_shared_tx_pool(
+            Arc::clone(&chain),
+            &params,
+            false,
+            100,
+            10000,
+            false,
+            false,
+        );
+        let handler = maintenance_handler(&params, &tx_pool);
+
+        let block = params.genesis_block.clone();
+        let mut other = block.clone();
+        other.stransactions.push(other.transactions[0].clone());
+        handler.drain_block_events(VecDeque::from(vec![PendingBlockEvent::Connected {
+            tx_hashes: Arc::new(dcroxide_blockchain::BlockTxHashes::compute(&other)),
+            block: Arc::new(block.clone()),
+            parent: Arc::new(block),
+            check_tx_flags: AgendaFlags::default(),
+        }]));
     }
 }

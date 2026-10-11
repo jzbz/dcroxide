@@ -27,6 +27,7 @@ use dcroxide_uint256::Uint256;
 use dcroxide_wire::{MsgBlock, MsgTx, OutPoint};
 
 use crate::RuleError;
+use crate::blockhashes::{BlockMerkleLeaves, BlockTxHashes};
 use crate::blockindex::{BlockIndex, BlockStatus, NodeId, NodeStore};
 use crate::chainio::SpentTxOut;
 use crate::chainview_nodes::{NodeBranchView, NodeChainView};
@@ -337,6 +338,20 @@ pub struct Chain {
     /// The blocks whose header has recently been definitively proven to
     /// commit to their data (dcrd `recentMerkleChecks`).
     recent_merkle_checks: LruHashSet,
+    /// The transaction hashes of the block `process_block` is
+    /// processing, beside the `blocks` mirror's own `Arc` of that block,
+    /// from the moment its data is accepted until the call returns.  The
+    /// connect that follows in the same call takes them from here -- for
+    /// that very allocation only (`tx_hashes_for` compares the
+    /// pointers), never by block hash.  `process_block` empties it on
+    /// entry and again on every return, so it is empty outside that
+    /// call.
+    accepted_tx_hashes: Option<(Arc<MsgBlock>, Arc<BlockTxHashes>)>,
+    /// How many connects hashed their block's transactions again
+    /// because the block was not the one being processed: the other
+    /// blocks a reorganization attaches, a block linked by a later
+    /// block's data, an invalidate or reconsider.
+    pub tx_hash_recomputes: u64,
     /// The shutdown interrupt (dcrd `BlockChain.interrupt`, its
     /// context's `Done` channel), set at open from
     /// [`OpenConfig::interrupt`].  The startup UTXO catch-up checks it,
@@ -703,6 +718,8 @@ impl Chain {
             ))),
             recent_context_checks: LruHashSet::new(CONTEXT_CHECK_CACHE_SIZE),
             recent_merkle_checks: LruHashSet::new(MERKLE_CHECK_CACHE_SIZE),
+            accepted_tx_hashes: None,
+            tx_hash_recomputes: 0,
             interrupt: None,
             cached_tips_last_pruned_nanos: crate::gotime::monotonic_nanos(),
             periodic_clock: crate::gotime::monotonic_nanos,
@@ -2775,13 +2792,32 @@ impl Chain {
     /// [`Self::maybe_fetch_new_tickets`], dropping the oldest entries
     /// past twice the ticket maturity: a block's list is wanted when the
     /// block `ticket_maturity` above it connects, and the rest is room
-    /// for side chain blocks accepted in between.
-    fn remember_ticket_purchases(&mut self, hash: [u8; 32], block: &MsgBlock, params: &Params) {
+    /// for side chain blocks accepted in between.  `stake_hashes`, when
+    /// the caller has them, are the hashes of `block`'s stake
+    /// transactions in order, so the purchases are not hashed again.
+    fn remember_ticket_purchases(
+        &mut self,
+        hash: [u8; 32],
+        block: &MsgBlock,
+        stake_hashes: Option<&[dcroxide_chainhash::Hash]>,
+        params: &Params,
+    ) {
         if self.ticket_purchases.contains_key(&hash) {
             return;
         }
-        self.ticket_purchases
-            .insert(hash, ticket_purchase_hashes(block));
+        let tickets = match stake_hashes {
+            // One hash per stake transaction: `assert_for` checked it
+            // where the hashes were filed.
+            Some(hashes) if hashes.len() == block.stransactions.len() => block
+                .stransactions
+                .iter()
+                .zip(hashes)
+                .filter(|(stx, _)| dcroxide_stake::is_sstx(stx))
+                .map(|(_, hash)| *hash)
+                .collect(),
+            _ => ticket_purchase_hashes(block),
+        };
+        self.ticket_purchases.insert(hash, tickets);
         self.ticket_purchase_order.push_back(hash);
         let keep = usize::from(params.ticket_maturity).saturating_mul(2);
         while self.ticket_purchase_order.len() > keep {
@@ -3192,6 +3228,29 @@ impl Chain {
         filter: FilterV2,
         params: &Params,
     ) -> Result<(), RuleError> {
+        let tx_hashes = Arc::new(BlockTxHashes::compute(block));
+        self.connect_block_with_hashes(node, block, parent, tx_hashes, view, stxos, filter, params)
+    }
+
+    /// [`Self::connect_block`] given the hashes of the block's
+    /// transactions, which must have been computed from this very
+    /// block.  They are sent with the block on the connected event, for
+    /// the daemon's observers (dcrd's read them from the
+    /// `*dcrutil.Block` the event carries).
+    #[allow(clippy::too_many_arguments)]
+    fn connect_block_with_hashes(
+        &mut self,
+        node: NodeId,
+        block: &Arc<MsgBlock>,
+        parent: &Arc<MsgBlock>,
+        tx_hashes: Arc<BlockTxHashes>,
+        view: &mut UtxoView,
+        stxos: Vec<SpentTxOut>,
+        filter: FilterV2,
+        params: &Params,
+    ) -> Result<(), RuleError> {
+        tx_hashes.assert_for(block);
+
         // Make sure it's extending the end of the best chain.
         let tip = self.best_chain.tip().expect("best chain tip");
         assert_eq!(
@@ -3386,6 +3445,7 @@ impl Chain {
             &Notification::BlockConnected(BlockConnectedNtfnsData {
                 block: Arc::clone(block),
                 parent_block: Arc::clone(parent),
+                tx_hashes,
                 check_tx_flags,
             }),
         );
@@ -3706,6 +3766,10 @@ impl Chain {
                 return Err(interrupt_rule_error());
             }
             let block = self.stored_block_arc(node)?;
+            // This block's transaction hashes: the ones `process_block`
+            // computed when it is the block being processed, fresh ones
+            // for any other.
+            let tx_hashes = self.tx_hashes_for(&block);
             let parent_id = self.store.node(node).parent.expect("attach parent");
             let parent = match prev_block_attached.take().or_else(|| fork_block.take()) {
                 Some(parent) => parent,
@@ -3733,8 +3797,9 @@ impl Chain {
             let mut stxos: Vec<SpentTxOut> = Vec::with_capacity(count_spent_outputs(&block));
             let filter;
             if self.index.node_status(&self.store, node).has_validated() {
-                view.connect_block(
+                view.connect_block_with_hashes(
                     &block,
+                    &tx_hashes,
                     &parent,
                     || self.fetch_spend_journal(&parent, is_treasury_enabled),
                     &ChainUtxoResolver { chain: self },
@@ -3784,7 +3849,7 @@ impl Chain {
                         store: &self.store,
                         tip: parent_id,
                     };
-                    crate::validate::check_connect_block(
+                    crate::validate::check_connect_block_with_hashes(
                         &parent_view,
                         &mut subsidy_cache,
                         node_info.0,
@@ -3792,6 +3857,7 @@ impl Chain {
                         node_info.2,
                         node_info.3,
                         &block,
+                        &tx_hashes,
                         &parent,
                         || self.fetch_spend_journal(&parent, is_treasury_enabled),
                         &mut view,
@@ -3820,7 +3886,9 @@ impl Chain {
 
             // Update the chain state and drop any best chain
             // candidates that now have less work than the new tip.
-            self.connect_block(node, &block, &parent, &mut view, stxos, filter, params)?;
+            self.connect_block_with_hashes(
+                node, &block, &parent, tx_hashes, &mut view, stxos, filter, params,
+            )?;
             self.index.remove_less_work_candidates(&self.store, node);
         }
 
@@ -3985,13 +4053,27 @@ impl Chain {
         prev_node: Option<NodeId>,
         params: &Params,
     ) -> Result<bool, RuleError> {
-        let proven = crate::validate::check_block_data_preconditions(block, || {
-            self.is_agenda_active_positional_by_id(
-                prev_node,
-                crate::agendas::VOTE_ID_HEADER_COMMITMENTS,
-                params,
-            )
-        })?;
+        let leaves = BlockMerkleLeaves::compute(block);
+        self.check_block_data_preconditions_with_leaves(block, &leaves, prev_node, params)
+    }
+
+    /// [`Self::check_block_data_preconditions`] given the block's merkle
+    /// leaves, which must have been computed from this very block.
+    fn check_block_data_preconditions_with_leaves(
+        &mut self,
+        block: &MsgBlock,
+        leaves: &BlockMerkleLeaves,
+        prev_node: Option<NodeId>,
+        params: &Params,
+    ) -> Result<bool, RuleError> {
+        let proven =
+            crate::validate::check_block_data_preconditions_with_leaves(block, leaves, || {
+                self.is_agenda_active_positional_by_id(
+                    prev_node,
+                    crate::agendas::VOTE_ID_HEADER_COMMITMENTS,
+                    params,
+                )
+            })?;
 
         // Mark the header as having definitively been proven to commit
         // to the data, to avoid computing and checking the merkle roots
@@ -4040,6 +4122,23 @@ impl Chain {
         fast_add: bool,
         params: &Params,
     ) -> Result<Vec<NodeId>, RuleError> {
+        self.maybe_accept_block_data_with_hashes(node, block, None, fast_add, params)
+    }
+
+    /// [`Self::maybe_accept_block_data`] for [`Self::process_block`],
+    /// which hands in the hashes it computed from `block`.  They are
+    /// filed beside the `blocks` mirror's `Arc` of the block, where the
+    /// connect that follows in the same call finds them
+    /// (`tx_hashes_for`).  Without hashes nothing is filed, and that
+    /// connect hashes the block itself.
+    fn maybe_accept_block_data_with_hashes(
+        &mut self,
+        node: NodeId,
+        block: &MsgBlock,
+        tx_hashes: Option<&Arc<BlockTxHashes>>,
+        fast_add: bool,
+        params: &Params,
+    ) -> Result<Vec<NodeId>, RuleError> {
         if self.index.node_status(&self.store, node).have_data() {
             return Ok(Vec::new());
         }
@@ -4079,8 +4178,21 @@ impl Chain {
         // `ProcessBlock` caches the caller's pointer, `process.go:571`),
         // and every later step shares the mirror's `Arc`.
         let block_hash = block.header.block_hash();
-        self.blocks.insert(block_hash.0, Arc::new(block.clone()));
-        self.remember_ticket_purchases(block_hash.0, block, params);
+        let mirrored = Arc::new(block.clone());
+        // The hashes go with the allocation the mirror holds, which is
+        // the one the connect that follows in this call is handed.  The
+        // copy is field for field, so they are its hashes too.
+        self.accepted_tx_hashes = tx_hashes.map(|tx_hashes| {
+            tx_hashes.assert_for(&mirrored);
+            (Arc::clone(&mirrored), Arc::clone(tx_hashes))
+        });
+        self.blocks.insert(block_hash.0, mirrored);
+        self.remember_ticket_purchases(
+            block_hash.0,
+            block,
+            tx_hashes.map(|tx_hashes| tx_hashes.stake()),
+            params,
+        );
         if let Some(db) = &self.db {
             let stored = db.update(|tx| {
                 if tx.has_block(&block_hash, block.header.height)? {
@@ -4186,6 +4298,23 @@ impl Chain {
         adjusted_time_unix: i64,
         params: &Params,
     ) -> (i64, Vec<RuleError>) {
+        // An earlier call's hashes are that call's.
+        self.accepted_tx_hashes = None;
+        let result = self.process_block_inner(block, adjusted_time_unix, params);
+        // However the call ended, nothing outlives it.
+        self.accepted_tx_hashes = None;
+        result
+    }
+
+    /// The body of [`Self::process_block`], which wraps it so that the
+    /// transaction hashes filed for the block while it is processed are
+    /// dropped on every return.
+    fn process_block_inner(
+        &mut self,
+        block: &MsgBlock,
+        adjusted_time_unix: i64,
+        params: &Params,
+    ) -> (i64, Vec<RuleError>) {
         self.observe_adjusted_time(adjusted_time_unix);
 
         // The block must not already exist in the main chain or side
@@ -4232,7 +4361,20 @@ impl Chain {
         // commitment has definitively been proven (dcrd
         // `process.go:488-499`).  A failure here never marks the block.
         let parent = self.store.node(node).parent;
-        let data_commit_proven = match self.check_block_data_preconditions(block, parent, params) {
+        // Hash the block's transactions once.  The merkle roots, the
+        // duplicate check and the connect below all read these, and the
+        // connected-block event carries them to the daemon (dcrd hashes
+        // each transaction once in `dcrutil.NewTx` and again in
+        // `TxHashFull`).  They belong to this block instance: computed
+        // from `block` and only ever used with it.
+        let (tx_hashes, merkle_leaves) = BlockTxHashes::compute_with_merkle_leaves(block);
+        let tx_hashes = Arc::new(tx_hashes);
+        let data_commit_proven = match self.check_block_data_preconditions_with_leaves(
+            block,
+            &merkle_leaves,
+            parent,
+            params,
+        ) {
             Ok(proven) => proven,
             Err(err) => return (0, alloc::vec![err]),
         };
@@ -4242,7 +4384,9 @@ impl Chain {
         // incorrect before any attempt to accept the data.  A rule
         // violation marks the block and its descendants when the data
         // commitment has definitively been proven.
-        if let Err(err) = crate::validate::check_block_data_sanity(block, params) {
+        if let Err(err) =
+            crate::validate::check_block_data_sanity_with_hashes(block, &tx_hashes, params)
+        {
             self.mark_block_failed_if_data_commit_proven(node, data_commit_proven, &err);
             return (0, alloc::vec![err]);
         }
@@ -4263,7 +4407,13 @@ impl Chain {
         // `connect_block` flushes moments later and the data-stored bits
         // self-heal through the store-block dedup window, so it would be
         // a write per block for nothing.
-        let linked = match self.maybe_accept_block_data(node, block, fast_add, params) {
+        let linked = match self.maybe_accept_block_data_with_hashes(
+            node,
+            block,
+            Some(&tx_hashes),
+            fast_add,
+            params,
+        ) {
             Ok(linked) => linked,
             Err(err) => {
                 self.mark_block_failed_if_data_commit_proven(node, data_commit_proven, &err);
@@ -5136,6 +5286,21 @@ impl Chain {
     /// nor blames the peer for it.
     fn stored_block_arc(&self, node: NodeId) -> Result<Arc<MsgBlock>, RuleError> {
         self.block_arc(node).map_err(db_read_rule_error)
+    }
+
+    /// The transaction hashes of a block about to be connected: the
+    /// ones `process_block` computed when `block` is the very allocation
+    /// they were filed with (the pointers are compared, never the block
+    /// hashes), and freshly computed ones for any other block, counted
+    /// in [`Chain::tx_hash_recomputes`].
+    fn tx_hashes_for(&mut self, block: &Arc<MsgBlock>) -> Arc<BlockTxHashes> {
+        if let Some((accepted, tx_hashes)) = &self.accepted_tx_hashes
+            && Arc::ptr_eq(accepted, block)
+        {
+            return Arc::clone(tx_hashes);
+        }
+        self.tx_hash_recomputes = self.tx_hash_recomputes.wrapping_add(1);
+        Arc::new(BlockTxHashes::compute(block))
     }
 
     /// The block data for a node as an owned block, for the public
@@ -8416,6 +8581,241 @@ mod tests {
             }
         }
         assert_eq!(checked, 20, "the battery extends the tip often enough");
+    }
+
+    /// The connect takes the filed transaction hashes for the very
+    /// allocation they were filed with and for nothing else: not for an
+    /// equal block in another allocation, not for a block with the same
+    /// header -- so the same block hash -- and other transactions, and
+    /// not for another block.  Nothing is keyed by block hash.
+    #[test]
+    fn hashes_are_only_reused_for_the_very_block_they_were_filed_with() {
+        let params = dcroxide_chaincfg::regnet_params();
+        let mut chain = Chain::new(&params, Hash::ZERO, false);
+
+        // Two blocks of the battery: the first with a stake tree, and
+        // the one after it.
+        let mut accepted = include_str!("../tests/data/fullblock_vectors.txt")
+            .lines()
+            .map(|line| line.split(' ').collect::<Vec<&str>>())
+            .filter(|f| f[0] == "accept")
+            .map(|f| {
+                MsgBlock::from_bytes(&dcroxide_testutil::unhex(f[4]))
+                    .expect("block")
+                    .0
+            })
+            .skip_while(|block| block.stransactions.is_empty());
+        let a = accepted.next().expect("a block with a stake tree");
+        let b = accepted.next().expect("the block after it");
+
+        let filed = Arc::new(BlockTxHashes::compute(&a));
+        let arc_a = Arc::new(a.clone());
+        chain.accepted_tx_hashes = Some((Arc::clone(&arc_a), Arc::clone(&filed)));
+
+        // The very allocation: the filed hashes, and nothing is hashed.
+        let got = chain.tx_hashes_for(&arc_a);
+        assert!(Arc::ptr_eq(&got, &filed));
+        assert_eq!(chain.tx_hash_recomputes, 0);
+
+        // An equal block in another allocation: equal hashes, computed
+        // again.
+        let got = chain.tx_hashes_for(&Arc::new(a.clone()));
+        assert!(!Arc::ptr_eq(&got, &filed));
+        assert_eq!(*got, *filed);
+        assert_eq!(chain.tx_hash_recomputes, 1);
+
+        // The same header, hence the same block hash, over one stake
+        // transaction fewer.
+        let mut shorter = a.clone();
+        shorter.stransactions.pop();
+        assert_eq!(shorter.header.block_hash(), a.header.block_hash());
+        let got = chain.tx_hashes_for(&Arc::new(shorter.clone()));
+        assert_eq!(*got, BlockTxHashes::compute(&shorter));
+        assert_ne!(*got, *filed);
+        assert_eq!(chain.tx_hash_recomputes, 2);
+
+        // The same header over the same number of transactions, one of
+        // them altered: the case a length check alone would let through.
+        let mut altered = a.clone();
+        altered.transactions[0].lock_time ^= 1;
+        assert_eq!(altered.header.block_hash(), a.header.block_hash());
+        assert!(filed.fits(&altered) && !filed.is_for(&altered));
+        let got = chain.tx_hashes_for(&Arc::new(altered.clone()));
+        assert_eq!(*got, BlockTxHashes::compute(&altered));
+        assert_ne!(*got, *filed);
+        assert_eq!(chain.tx_hash_recomputes, 3);
+
+        // Another block.
+        let got = chain.tx_hashes_for(&Arc::new(b.clone()));
+        assert_eq!(*got, BlockTxHashes::compute(&b));
+        assert_eq!(chain.tx_hash_recomputes, 4);
+
+        // None of that disturbed the slot.
+        assert!(Arc::ptr_eq(&chain.tx_hashes_for(&arc_a), &filed));
+        assert_eq!(chain.tx_hash_recomputes, 4);
+
+        // With nothing filed, every block is hashed.
+        chain.accepted_tx_hashes = None;
+        let got = chain.tx_hashes_for(&arc_a);
+        assert!(!Arc::ptr_eq(&got, &filed));
+        assert_eq!(*got, *filed);
+        assert_eq!(chain.tx_hash_recomputes, 5);
+    }
+
+    /// The network's genesis block, and the hashes of a block with one
+    /// more stake transaction.
+    fn genesis_and_another_shape(params: &Params) -> (Arc<MsgBlock>, BlockTxHashes) {
+        let genesis = params.genesis_block.clone();
+        let mut other = genesis.clone();
+        other.stransactions.push(other.transactions[0].clone());
+        (Arc::new(genesis), BlockTxHashes::compute(&other))
+    }
+
+    /// The chain's connect refuses hashes that are not its block's, with
+    /// `assert_for`'s own message and before anything else.
+    #[test]
+    #[should_panic(expected = "transaction hashes are not one per transaction")]
+    fn the_chain_connect_refuses_hashes_of_another_shape() {
+        let params = dcroxide_chaincfg::regnet_params();
+        let mut chain = Chain::new(&params, Hash::ZERO, false);
+        let (genesis, wrong) = genesis_and_another_shape(&params);
+        let tip = chain.best_chain.tip().expect("tip");
+        let mut view = UtxoView::new();
+        let filter =
+            dcroxide_gcs::blockcf2::regular(&genesis, &crate::validate::ViewScripts(&view))
+                .expect("filter");
+        let _ = chain.connect_block_with_hashes(
+            tip,
+            &genesis,
+            &genesis,
+            Arc::new(wrong),
+            &mut view,
+            Vec::new(),
+            filter,
+            &params,
+        );
+    }
+
+    /// The connect checks refuse hashes that are not their block's, with
+    /// `assert_for`'s own message.
+    #[test]
+    #[should_panic(expected = "transaction hashes are not one per transaction")]
+    fn the_connect_check_refuses_hashes_of_another_shape() {
+        let params = dcroxide_chaincfg::regnet_params();
+        let chain = Chain::new(&params, Hash::ZERO, false);
+        let (genesis, wrong) = genesis_and_another_shape(&params);
+        let tip = chain.best_chain.tip().expect("tip");
+        // A fresh view's best hash is zero, the genesis block's
+        // `prev_block`, so the check that runs before the hashes are
+        // read passes.
+        let mut view = UtxoView::new();
+        let mut subsidy_cache = dcroxide_standalone::SubsidyCache::new(&params);
+        let _ = crate::validate::check_connect_block_with_hashes(
+            &NodeBranchView {
+                store: &chain.store,
+                tip,
+            },
+            &mut subsidy_cache,
+            1,
+            genesis.header.block_hash(),
+            0,
+            0,
+            &genesis,
+            &wrong,
+            &genesis,
+            || Ok(Vec::new()),
+            &mut view,
+            &|_: &OutPoint| -> Option<UtxoEntry> { None },
+            None,
+            false,
+            None,
+            &|_: &MsgBlock| Ok(()),
+            &params,
+        );
+    }
+
+    /// A block that extends the tip is hashed into a `BlockTxHashes`
+    /// exactly once by the whole call, with and without full validation:
+    /// no step falls back to a function that hashes for itself.  (The
+    /// merkle context check builds `BlockMerkleLeaves`, which this does
+    /// not count.)
+    #[test]
+    fn a_tip_extension_builds_its_hashes_exactly_once() {
+        let params = dcroxide_chaincfg::regnet_params();
+        for bulk_import in [false, true] {
+            let mut chain = Chain::new(&params, Hash::ZERO, false);
+            chain.bulk_import_mode = bulk_import;
+            let (mut now, mut checked) = (0, 0);
+            for line in include_str!("../tests/data/fullblock_vectors.txt").lines() {
+                let f: Vec<&str> = line.split(' ').collect();
+                match f[0] {
+                    "now" => now = f[1].parse().expect("now"),
+                    "accept" if f[2] == "true" && checked < 30 => {
+                        let (block, _) =
+                            MsgBlock::from_bytes(&dcroxide_testutil::unhex(f[4])).expect("block");
+                        let tip_before = chain.best_chain.tip();
+                        let before = crate::blockhashes::BLOCKS_HASHED.get();
+                        let (_, errs) = chain.process_block(&block, now, &params);
+                        assert!(errs.is_empty(), "{}: {errs:?}", f[1]);
+                        let tip = chain.best_chain.tip().expect("tip");
+                        let tip_node = chain.store.node(tip);
+                        assert!(
+                            tip_node.hash == block.header.block_hash()
+                                && tip_node.parent == tip_before,
+                            "{}: not a tip extension",
+                            f[1]
+                        );
+                        assert_eq!(
+                            crate::blockhashes::BLOCKS_HASHED.get().wrapping_sub(before),
+                            1,
+                            "{} (bulk import: {bulk_import}): hashed more than once",
+                            f[1]
+                        );
+                        checked += 1;
+                    }
+                    "accept" => break,
+                    _ => {}
+                }
+            }
+            assert_eq!(checked, 30);
+        }
+    }
+
+    /// The hashes filed while a block is processed do not outlive the
+    /// call, whether it accepts the block or refuses it.
+    #[test]
+    fn the_filed_hashes_do_not_outlive_the_processing_call() {
+        let params = dcroxide_chaincfg::regnet_params();
+        let mut chain = Chain::new(&params, Hash::ZERO, false);
+        let (mut now, mut accepted, mut refused) = (0, 0usize, 0usize);
+        for line in include_str!("../tests/data/fullblock_vectors.txt").lines() {
+            let f: Vec<&str> = line.split(' ').collect();
+            let hex = match f[0] {
+                "now" => {
+                    now = f[1].parse().expect("now");
+                    continue;
+                }
+                "accept" => f[4],
+                "reject" => f[3],
+                _ => continue,
+            };
+            let (block, _) = MsgBlock::from_bytes(&dcroxide_testutil::unhex(hex)).expect("block");
+            let (_, errs) = chain.process_block(&block, now, &params);
+            assert!(
+                chain.accepted_tx_hashes.is_none(),
+                "{}: the slot outlived the call",
+                f[1]
+            );
+            if errs.is_empty() {
+                accepted += 1;
+            } else {
+                refused += 1;
+            }
+        }
+        assert!(
+            accepted > 0 && refused > 0,
+            "{accepted} accepted, {refused} refused"
+        );
     }
 
     /// `prune_chain_memory` is `pub`, and on a chain without a database

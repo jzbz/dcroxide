@@ -390,11 +390,11 @@ fn the_chain_event_handler_feeds_websocket_subscribers() {
     // mempool maintenance, so txaccepted precedes blockconnected), so
     // the callback only queues and the drain delivers the frame.
     let genesis = Arc::new(params.genesis_block.clone());
-    handler.handle(&Notification::BlockConnected(BlockConnectedNtfnsData {
-        block: Arc::clone(&genesis),
-        parent_block: Arc::clone(&genesis),
-        check_tx_flags: AgendaFlags::default(),
-    }));
+    handler.handle(&Notification::BlockConnected(BlockConnectedNtfnsData::new(
+        Arc::clone(&genesis),
+        Arc::clone(&genesis),
+        AgendaFlags::default(),
+    )));
     handler.drain_pending_block_events();
     let frame = read_server_frame(&mut ws);
     assert!(frame.contains("\"method\":\"blockconnected\""), "{frame}");

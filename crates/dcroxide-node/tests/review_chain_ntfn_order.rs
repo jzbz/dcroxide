@@ -274,11 +274,11 @@ fn a_reorg_reaches_a_client_in_dcrds_frame_order() {
             check_tx_flags: AgendaFlags::default(),
         },
     ));
-    handler.handle(&Notification::BlockConnected(BlockConnectedNtfnsData {
-        block: Arc::clone(&new_tip),
-        parent_block: Arc::clone(&old_tip),
-        check_tx_flags: AgendaFlags::default(),
-    }));
+    handler.handle(&Notification::BlockConnected(BlockConnectedNtfnsData::new(
+        Arc::clone(&new_tip),
+        Arc::clone(&old_tip),
+        AgendaFlags::default(),
+    )));
     handler.handle(&Notification::NewTickets(TicketNotificationsData {
         hash: new_tip.header.block_hash(),
         height: 0,

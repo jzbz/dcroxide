@@ -116,11 +116,11 @@ fn confirmed_transactions_feed_the_shared_filter() {
         transactions: Vec::new(),
         stransactions: Vec::new(),
     };
-    handler.handle(&Notification::BlockConnected(BlockConnectedNtfnsData {
-        block: Arc::new(block),
-        parent_block: Arc::new(parent),
-        check_tx_flags: AgendaFlags(0),
-    }));
+    handler.handle(&Notification::BlockConnected(BlockConnectedNtfnsData::new(
+        Arc::new(block),
+        Arc::new(parent),
+        AgendaFlags(0),
+    )));
     handler.drain_pending_block_events();
 
     let filter = filter.lock().expect("filter");
@@ -132,6 +132,99 @@ fn confirmed_transactions_feed_the_shared_filter() {
         filter.contains(&stake.tx_hash().0),
         "the stake transaction must be recorded as confirmed (no \
          treasury: the whole stake tree counts)"
+    );
+    assert!(
+        !filter.contains(&coinbase.tx_hash().0),
+        "the coinbase is never recorded"
+    );
+    drop(filter);
+
+    rebroadcaster.shutdown();
+}
+
+/// With the treasury agenda active the first stake transaction is the
+/// treasurybase, which the maintenance skips like the coinbase --
+/// together with its hash.  The stake transactions and the hashes that
+/// came with the block on the connected event are walked side by side,
+/// so skipping one without the other would handle every stake
+/// transaction under its neighbour's hash.
+#[test]
+fn the_treasurybase_is_skipped_together_with_its_hash() {
+    let params = dcroxide_chaincfg::testnet3_params();
+    let dir = tempfile::tempdir().expect("temp dir");
+    let opts = Options::new(dir.path().join("blocks"), params.net.0);
+    let db = Database::create(&opts).expect("create database");
+    let chain = Arc::new(Mutex::new(
+        Chain::open(db, &params, params.assume_valid, false, 0).expect("open chain"),
+    ));
+    let tx_pool = dcroxide_node::txmempool::new_shared_tx_pool(
+        Arc::clone(&chain),
+        &params,
+        false,
+        100,
+        10000,
+        false,
+        false,
+    );
+    let filter = Arc::new(Mutex::new(dcroxide_containers::apbf::new_filter(
+        23000, 0.000001,
+    )));
+    let rebroadcaster = dcroxide_node::rebroadcast::start_rebroadcaster(
+        Arc::clone(&chain),
+        dcroxide_node::dispatch::SyncPeers::new(),
+        dcroxide_node::dispatch::new_recently_advertised(),
+    );
+    let mut handler = dcroxide_node::chainntfns::ChainNtfnHandler::new(
+        None,
+        params.clone(),
+        false,
+        dcroxide_node::sync::SyncGate::always_current(),
+        None,
+        tx_pool,
+        dcroxide_node::dispatch::SyncPeers::new(),
+        dcroxide_node::dispatch::new_recently_advertised(),
+    );
+    handler.set_recently_confirmed(Arc::clone(&filter));
+    handler.set_rebroadcast(rebroadcaster.sink());
+
+    // A connected block whose stake tree leads with a treasurybase,
+    // followed by two more stake transactions.
+    let coinbase = tagged_tx(1);
+    let regular = tagged_tx(2);
+    let (treasurybase, vote, ticket) = (tagged_tx(3), tagged_tx(4), tagged_tx(5));
+    let block = MsgBlock {
+        header: zero_header(),
+        transactions: vec![coinbase.clone(), regular.clone()],
+        stransactions: vec![treasurybase.clone(), vote.clone(), ticket.clone()],
+    };
+    let parent = MsgBlock {
+        header: zero_header(),
+        transactions: Vec::new(),
+        stransactions: Vec::new(),
+    };
+    handler.handle(&Notification::BlockConnected(BlockConnectedNtfnsData::new(
+        Arc::new(block),
+        Arc::new(parent),
+        AgendaFlags::TREASURY_ENABLED,
+    )));
+    handler.drain_pending_block_events();
+
+    let filter = filter.lock().expect("filter");
+    assert!(
+        filter.contains(&regular.tx_hash().0),
+        "the regular transaction must be recorded as confirmed"
+    );
+    assert!(
+        filter.contains(&vote.tx_hash().0),
+        "the stake transaction after the treasurybase must be recorded"
+    );
+    assert!(
+        filter.contains(&ticket.tx_hash().0),
+        "the last stake transaction must be recorded"
+    );
+    assert!(
+        !filter.contains(&treasurybase.tx_hash().0),
+        "the treasurybase is skipped with its hash"
     );
     assert!(
         !filter.contains(&coinbase.tx_hash().0),

@@ -613,6 +613,22 @@ pub fn check_block_header_sanity(
 /// The header is not checked: block processing accepts it to the
 /// block index, sanity checks included, before it looks at the data.
 pub fn check_block_data_sanity(block: &MsgBlock, params: &Params) -> Result<(), RuleError> {
+    let tx_hashes = crate::blockhashes::BlockTxHashes::compute(block);
+    check_block_data_sanity_with_hashes(block, &tx_hashes, params)
+}
+
+/// [`check_block_data_sanity`] given the hashes of the block's
+/// transactions: dcrd `checkBlockDataSanity` reading the hashes its
+/// `dcrutil.Block` caches for the duplicate check
+/// (`validate.go:951-961`).  The hashes must have been computed from
+/// this very block.
+pub(crate) fn check_block_data_sanity_with_hashes(
+    block: &MsgBlock,
+    tx_hashes: &crate::blockhashes::BlockTxHashes,
+    params: &Params,
+) -> Result<(), RuleError> {
+    tx_hashes.assert_for(block);
+
     // All ticket purchases via the stake tree must meet both the
     // stake difficulty committed by the header and the network
     // minimum.
@@ -674,11 +690,11 @@ pub fn check_block_data_sanity(block: &MsgBlock, params: &Params) -> Result<(), 
         ));
     }
 
-    // Check for duplicate transactions.
+    // Check for duplicate transactions: the regular tree's hashes, then
+    // the stake tree's, in block order.
     let mut existing_tx_hashes: alloc::collections::BTreeSet<[u8; 32]> =
         alloc::collections::BTreeSet::new();
-    for tx in block.transactions.iter().chain(&block.stransactions) {
-        let hash = tx.tx_hash();
+    for hash in tx_hashes.regular().iter().chain(tx_hashes.stake()) {
         if !existing_tx_hashes.insert(hash.0) {
             return Err(rule_error(
                 RuleErrorKind::DuplicateTx,
@@ -1967,14 +1983,29 @@ pub enum MerkleRootVariant {
 /// root field must be the root of a merkle tree whose two leaves are
 /// the merkle roots of the two transaction trees.
 pub fn check_merkle_roots(block: &MsgBlock, variant: MerkleRootVariant) -> Result<(), RuleError> {
+    let leaves = crate::blockhashes::BlockMerkleLeaves::compute(block);
+    check_merkle_roots_with_leaves(block, &leaves, variant)
+}
+
+/// [`check_merkle_roots`] given the full hash of each of the block's
+/// transactions, the leaves of its two transaction merkle trees (dcrd
+/// `checkMerkleRoots`, `validate.go:1897-1952`, which has
+/// `CalcTxTreeMerkleRoot` and `CalcCombinedTxTreeMerkleRoot` hash the
+/// transactions).  The leaves must have been computed from this very
+/// block.
+pub(crate) fn check_merkle_roots_with_leaves(
+    block: &MsgBlock,
+    leaves: &crate::blockhashes::BlockMerkleLeaves,
+    variant: MerkleRootVariant,
+) -> Result<(), RuleError> {
+    leaves.assert_for(block);
     let header = &block.header;
 
     match variant {
         MerkleRootVariant::Original => {
             // Build the merkle tree and ensure the calculated merkle
             // root matches the entry in the block header.
-            let want_merkle_root =
-                dcroxide_standalone::calc_tx_tree_merkle_root(&block.transactions);
+            let want_merkle_root = dcroxide_standalone::calc_merkle_root(leaves.regular());
             if header.merkle_root != want_merkle_root {
                 return Err(rule_error(
                     RuleErrorKind::BadMerkleRoot,
@@ -1987,8 +2018,7 @@ pub fn check_merkle_roots(block: &MsgBlock, variant: MerkleRootVariant) -> Resul
             }
 
             // Build the stake tx tree merkle root too and check it.
-            let want_stake_root =
-                dcroxide_standalone::calc_tx_tree_merkle_root(&block.stransactions);
+            let want_stake_root = dcroxide_standalone::calc_merkle_root(leaves.stake());
             if header.stake_root != want_stake_root {
                 return Err(rule_error(
                     RuleErrorKind::BadMerkleRoot,
@@ -2006,11 +2036,13 @@ pub fn check_merkle_roots(block: &MsgBlock, variant: MerkleRootVariant) -> Resul
             // Build the two merkle trees and use their calculated merkle
             // roots as leaves to another merkle tree and ensure the final
             // calculated merkle root matches the entry in the block
-            // header.
-            let want_merkle_root = dcroxide_standalone::calc_combined_tx_tree_merkle_root(
-                &block.transactions,
-                &block.stransactions,
-            );
+            // header.  dcrd `CalcCombinedTxTreeMerkleRoot` hashes the
+            // concatenation of the two roots, which is the root of a
+            // tree of those two leaves.
+            let regular_root = dcroxide_standalone::calc_merkle_root(leaves.regular());
+            let stake_root = dcroxide_standalone::calc_merkle_root(leaves.stake());
+            let want_merkle_root =
+                dcroxide_standalone::calc_merkle_root(&[regular_root, stake_root]);
             if header.merkle_root != want_merkle_root {
                 return Err(rule_error(
                     RuleErrorKind::BadMerkleRoot,
@@ -2060,6 +2092,19 @@ pub fn check_block_data_preconditions(
     block: &MsgBlock,
     hdr_cmts_positional: impl FnOnce() -> Result<crate::agendas::AgendaActiveInfo, RuleError>,
 ) -> Result<bool, RuleError> {
+    let leaves = crate::blockhashes::BlockMerkleLeaves::compute(block);
+    check_block_data_preconditions_with_leaves(block, &leaves, hdr_cmts_positional)
+}
+
+/// [`check_block_data_preconditions`] given the block's merkle leaves
+/// (dcrd `checkBlockDataPreconditions`, `validate.go:1954-2049`, whose
+/// `checkMerkleRoots` calls hash the transactions).  The leaves must
+/// have been computed from this very block.
+pub(crate) fn check_block_data_preconditions_with_leaves(
+    block: &MsgBlock,
+    leaves: &crate::blockhashes::BlockMerkleLeaves,
+    hdr_cmts_positional: impl FnOnce() -> Result<crate::agendas::AgendaActiveInfo, RuleError>,
+) -> Result<bool, RuleError> {
     // A block must not exceed the maximum allowed block payload when
     // serialized.  This is the quick, context-free check against the
     // wire protocol's limit; the consensus block size, which depends on
@@ -2083,7 +2128,7 @@ pub fn check_block_data_preconditions(
         } else {
             MerkleRootVariant::Original
         };
-        check_merkle_roots(block, variant)?;
+        check_merkle_roots_with_leaves(block, leaves, variant)?;
         return Ok(true);
     }
 
@@ -2094,8 +2139,8 @@ pub fn check_block_data_preconditions(
     // return reports the data commitment as not definitively known to
     // be valid: it is only provisionally valid.  When both variants
     // fail, the error is the DCP0005 variant's, as dcrd returns it.
-    if check_merkle_roots(block, MerkleRootVariant::Original).is_err() {
-        check_merkle_roots(block, MerkleRootVariant::Dcp0005)?;
+    if check_merkle_roots_with_leaves(block, leaves, MerkleRootVariant::Original).is_err() {
+        check_merkle_roots_with_leaves(block, leaves, MerkleRootVariant::Dcp0005)?;
     }
     Ok(false)
 }
@@ -5395,6 +5440,51 @@ pub fn check_connect_block<SP: dcroxide_standalone::SubsidyParams>(
     parent_stxos: impl FnOnce() -> Result<Vec<crate::chainio::SpentTxOut>, RuleError>,
     view: &mut crate::utxoview::UtxoView,
     resolver: &impl crate::utxoview::UtxoResolver,
+    stxos: Option<&mut Vec<crate::chainio::SpentTxOut>>,
+    run_scripts: bool,
+    sig_cache: Option<&dcroxide_txscript::SigCache>,
+    full_tspend_checks: FullTspendChecks<'_>,
+    params: &Params,
+) -> Result<dcroxide_gcs::FilterV2, RuleError> {
+    let tx_hashes = crate::blockhashes::BlockTxHashes::compute(block);
+    check_connect_block_with_hashes(
+        view_chain,
+        subsidy_cache,
+        node_height,
+        node_hash,
+        node_voters,
+        node_vote_bits,
+        block,
+        &tx_hashes,
+        parent,
+        parent_stxos,
+        view,
+        resolver,
+        stxos,
+        run_scripts,
+        sig_cache,
+        full_tspend_checks,
+        params,
+    )
+}
+
+/// [`check_connect_block`] given the hashes of the block's transactions
+/// (dcrd `checkConnectBlock` reading them from its `dcrutil.Block`),
+/// which must have been computed from this very block.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn check_connect_block_with_hashes<SP: dcroxide_standalone::SubsidyParams>(
+    view_chain: &impl FullChainView,
+    subsidy_cache: &mut dcroxide_standalone::SubsidyCache<SP>,
+    node_height: i64,
+    node_hash: Hash,
+    node_voters: u16,
+    node_vote_bits: u16,
+    block: &MsgBlock,
+    tx_hashes: &crate::blockhashes::BlockTxHashes,
+    parent: &MsgBlock,
+    parent_stxos: impl FnOnce() -> Result<Vec<crate::chainio::SpentTxOut>, RuleError>,
+    view: &mut crate::utxoview::UtxoView,
+    resolver: &impl crate::utxoview::UtxoResolver,
     mut stxos: Option<&mut Vec<crate::chainio::SpentTxOut>>,
     run_scripts: bool,
     sig_cache: Option<&dcroxide_txscript::SigCache>,
@@ -5413,11 +5503,13 @@ pub fn check_connect_block<SP: dcroxide_standalone::SubsidyParams>(
         "inconsistent view when checking block connection"
     );
 
-    // Compute each tree's transaction hashes once and thread them
-    // through the connect helpers below (dcrd's `dcrutil.Tx` wrapper
-    // memoizes the hash; `MsgTx::tx_hash` re-serializes per call).
-    let regular_tx_hashes = crate::utxoview::collect_tx_hashes(&block.transactions);
-    let stake_tx_hashes = crate::utxoview::collect_tx_hashes(&block.stransactions);
+    // Each tree's transaction hashes come from the caller, computed
+    // once for the block, and are threaded through the connect helpers
+    // below (dcrd's `dcrutil.Tx` wrapper memoizes the hash;
+    // `MsgTx::tx_hash` re-serializes per call).
+    tx_hashes.assert_for(block);
+    let regular_tx_hashes: &[Hash] = tx_hashes.regular();
+    let stake_tx_hashes: &[Hash] = tx_hashes.stake();
 
     let is_treasury_enabled =
         crate::agendas::is_treasury_agenda_active(view_chain, Some(prev_height), params)?;
@@ -5466,7 +5558,7 @@ pub fn check_connect_block<SP: dcroxide_standalone::SubsidyParams>(
 
     // Load all of the utxos referenced by the block that are not
     // already in the view.
-    view.fetch_input_utxos(block, &regular_tx_hashes, resolver, is_treasury_enabled);
+    view.fetch_input_utxos(block, regular_tx_hashes, resolver, is_treasury_enabled);
 
     // Add utxo entries that were valid under old consensus rules but
     // are no longer valid and would therefore cause the block to be
@@ -5504,7 +5596,7 @@ pub fn check_connect_block<SP: dcroxide_standalone::SubsidyParams>(
         block.header.vote_bits,
         prev_header,
         &block.stransactions,
-        &stake_tx_hashes,
+        stake_tx_hashes,
         view,
         stxos.as_deref_mut(),
         true,
@@ -5574,7 +5666,7 @@ pub fn check_connect_block<SP: dcroxide_standalone::SubsidyParams>(
         block.header.vote_bits,
         prev_header,
         &block.transactions,
-        &regular_tx_hashes,
+        regular_tx_hashes,
         view,
         stxos,
         false,

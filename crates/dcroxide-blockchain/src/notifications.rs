@@ -18,6 +18,7 @@ use alloc::vec::Vec;
 use dcroxide_chainhash::Hash;
 use dcroxide_wire::MsgBlock;
 
+use crate::blockhashes::BlockTxHashes;
 use crate::validate::AgendaFlags;
 
 /// A block accepted into the block index (dcrd
@@ -38,14 +39,49 @@ pub struct BlockAcceptedNtfnsData<'a> {
 /// `BlockConnectedNtfnsData`).  The blocks are shared as `Arc`s so
 /// the daemon's notification fan-out clones a pointer per consumer,
 /// like dcrd handing the same `*dcrutil.Block` to every observer.
+///
+/// The event also carries the hashes of the connected block's
+/// transactions, which dcrd's observers read from that
+/// `*dcrutil.Block`'s hash cache.  They are private to the crate, so
+/// outside it an event is only built by
+/// [`BlockConnectedNtfnsData::new`], which hashes the block it is
+/// given, and the chain sends the ones it computed from the very block
+/// it connected.  `block` stays a public field: replacing it on an
+/// event already built would leave these behind, and nothing does.
 pub struct BlockConnectedNtfnsData {
     /// The connected block.
     pub block: Arc<MsgBlock>,
     /// The connected block's parent.
     pub parent_block: Arc<MsgBlock>,
+    /// The hashes of the connected block's transactions, computed from
+    /// `block` itself.
+    pub(crate) tx_hashes: Arc<BlockTxHashes>,
     /// The agendas active when checking the connected block's
     /// transactions.
     pub check_tx_flags: AgendaFlags,
+}
+
+impl BlockConnectedNtfnsData {
+    /// The event for a block, hashing its transactions here.
+    pub fn new(
+        block: Arc<MsgBlock>,
+        parent_block: Arc<MsgBlock>,
+        check_tx_flags: AgendaFlags,
+    ) -> Self {
+        let tx_hashes = Arc::new(BlockTxHashes::compute(&block));
+        Self {
+            block,
+            parent_block,
+            tx_hashes,
+            check_tx_flags,
+        }
+    }
+
+    /// The hashes of the connected block's transactions, computed from
+    /// [`Self::block`] itself.
+    pub fn tx_hashes(&self) -> &Arc<BlockTxHashes> {
+        &self.tx_hashes
+    }
 }
 
 /// A block disconnected from the main chain (dcrd
