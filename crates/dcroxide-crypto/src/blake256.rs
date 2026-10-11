@@ -103,6 +103,13 @@ impl Blake256 {
     /// Compress one 64-byte block. `counter` is the total message bit length
     /// this block commits to (0 for a padding-only final block — the BLAKE
     /// edge case).
+    ///
+    /// The fourteen rounds are written out, each with its permutation row
+    /// as a constant, so every message word is read from a fixed slot and
+    /// every round constant is an immediate.  A loop over `SIGMA` loads
+    /// sixteen indices a round and reaches the message and the constants
+    /// through them: on m3 on 2026-10-11 that form hashed 16 KiB inputs
+    /// at 343 MB/s and 250-byte ones at 264, and this one at 560 and 429.
     fn compress(&mut self, block: &[u8; BLOCK_LEN], counter: u64) {
         let mut m = [0u32; 16];
         for i in 0..16 {
@@ -118,50 +125,82 @@ impl Blake256 {
         let t1 = (counter >> 32) as u32;
 
         // salt is always zero in Decred's usage.
-        let mut v = [0u32; 16];
-        v[..8].copy_from_slice(&self.h);
-        v[8] = C[0];
-        v[9] = C[1];
-        v[10] = C[2];
-        v[11] = C[3];
-        v[12] = C[4] ^ t0;
-        v[13] = C[5] ^ t0;
-        v[14] = C[6] ^ t1;
-        v[15] = C[7] ^ t1;
+        let [
+            mut v0,
+            mut v1,
+            mut v2,
+            mut v3,
+            mut v4,
+            mut v5,
+            mut v6,
+            mut v7,
+        ] = self.h;
+        let mut v8 = C[0];
+        let mut v9 = C[1];
+        let mut v10 = C[2];
+        let mut v11 = C[3];
+        let mut v12 = C[4] ^ t0;
+        let mut v13 = C[5] ^ t0;
+        let mut v14 = C[6] ^ t1;
+        let mut v15 = C[7] ^ t1;
 
-        #[inline(always)]
-        fn g(v: &mut [u32; 16], a: usize, b: usize, c: usize, d: usize, x: u32, y: u32) {
-            v[a] = v[a].wrapping_add(v[b]).wrapping_add(x);
-            v[d] = (v[d] ^ v[a]).rotate_right(16);
-            v[c] = v[c].wrapping_add(v[d]);
-            v[b] = (v[b] ^ v[c]).rotate_right(12);
-            v[a] = v[a].wrapping_add(v[b]).wrapping_add(y);
-            v[d] = (v[d] ^ v[a]).rotate_right(8);
-            v[c] = v[c].wrapping_add(v[d]);
-            v[b] = (v[b] ^ v[c]).rotate_right(7);
+        macro_rules! g {
+            ($a:ident, $b:ident, $c:ident, $d:ident, $x:expr, $y:expr) => {
+                $a = $a.wrapping_add($b).wrapping_add($x);
+                $d = ($d ^ $a).rotate_right(16);
+                $c = $c.wrapping_add($d);
+                $b = ($b ^ $c).rotate_right(12);
+                $a = $a.wrapping_add($b).wrapping_add($y);
+                $d = ($d ^ $a).rotate_right(8);
+                $c = $c.wrapping_add($d);
+                $b = ($b ^ $c).rotate_right(7);
+            };
         }
 
+        // One round with permutation row `$r`.  Each G mixes in
+        // m[S[2i]] ^ C[S[2i+1]] then m[S[2i+1]] ^ C[S[2i]].  The row is
+        // bound by reference so an unoptimized build indexes the table
+        // in place and does not copy the row to the stack at every use.
         #[rustfmt::skip]
-        fn rounds(v: &mut [u32; 16], m: &[u32; 16]) {
-            for r in 0..14 {
-                let s = &SIGMA[r % 10];
-                // Each G mixes in m[s[2i]] ^ C[s[2i+1]] then m[s[2i+1]] ^ C[s[2i]].
-                g(v, 0, 4,  8, 12, m[s[0]]  ^ C[s[1]],  m[s[1]]  ^ C[s[0]]);
-                g(v, 1, 5,  9, 13, m[s[2]]  ^ C[s[3]],  m[s[3]]  ^ C[s[2]]);
-                g(v, 2, 6, 10, 14, m[s[4]]  ^ C[s[5]],  m[s[5]]  ^ C[s[4]]);
-                g(v, 3, 7, 11, 15, m[s[6]]  ^ C[s[7]],  m[s[7]]  ^ C[s[6]]);
-                g(v, 0, 5, 10, 15, m[s[8]]  ^ C[s[9]],  m[s[9]]  ^ C[s[8]]);
-                g(v, 1, 6, 11, 12, m[s[10]] ^ C[s[11]], m[s[11]] ^ C[s[10]]);
-                g(v, 2, 7,  8, 13, m[s[12]] ^ C[s[13]], m[s[13]] ^ C[s[12]]);
-                g(v, 3, 4,  9, 14, m[s[14]] ^ C[s[15]], m[s[15]] ^ C[s[14]]);
-            }
+        macro_rules! round {
+            ($r:expr) => {{
+                const S: &[usize; 16] = &SIGMA[$r];
+                g!(v0, v4, v8,  v12, m[S[0]]  ^ C[S[1]],  m[S[1]]  ^ C[S[0]]);
+                g!(v1, v5, v9,  v13, m[S[2]]  ^ C[S[3]],  m[S[3]]  ^ C[S[2]]);
+                g!(v2, v6, v10, v14, m[S[4]]  ^ C[S[5]],  m[S[5]]  ^ C[S[4]]);
+                g!(v3, v7, v11, v15, m[S[6]]  ^ C[S[7]],  m[S[7]]  ^ C[S[6]]);
+                g!(v0, v5, v10, v15, m[S[8]]  ^ C[S[9]],  m[S[9]]  ^ C[S[8]]);
+                g!(v1, v6, v11, v12, m[S[10]] ^ C[S[11]], m[S[11]] ^ C[S[10]]);
+                g!(v2, v7, v8,  v13, m[S[12]] ^ C[S[13]], m[S[13]] ^ C[S[12]]);
+                g!(v3, v4, v9,  v14, m[S[14]] ^ C[S[15]], m[S[15]] ^ C[S[14]]);
+            }};
         }
-        rounds(&mut v, &m);
 
-        for i in 0..8 {
-            // salt == 0, so the salt XOR terms vanish.
-            self.h[i] ^= v[i] ^ v[i + 8];
-        }
+        // Fourteen rounds: the ten rows, then the first four again.
+        round!(0);
+        round!(1);
+        round!(2);
+        round!(3);
+        round!(4);
+        round!(5);
+        round!(6);
+        round!(7);
+        round!(8);
+        round!(9);
+        round!(0);
+        round!(1);
+        round!(2);
+        round!(3);
+
+        // salt == 0, so the salt XOR terms vanish.
+        self.h[0] ^= v0 ^ v8;
+        self.h[1] ^= v1 ^ v9;
+        self.h[2] ^= v2 ^ v10;
+        self.h[3] ^= v3 ^ v11;
+        self.h[4] ^= v4 ^ v12;
+        self.h[5] ^= v5 ^ v13;
+        self.h[6] ^= v6 ^ v14;
+        self.h[7] ^= v7 ^ v15;
     }
 
     /// Absorb message bytes. May be called any number of times.
@@ -393,5 +432,36 @@ mod tests {
     fn double_hash_kat() {
         // blake256d("") == blake256(blake256("")).
         assert_eq!(sum256d(b""), sum256(&sum256(b"")));
+    }
+
+    /// The counter's high word.  `t1` stays zero until 2^32 bits
+    /// (512 MiB) have gone through one hasher, so no vector above reaches
+    /// the two state words it is mixed into, and neither does the oracle
+    /// test, whose inputs stop at 4096 bytes.  Each case starts from the
+    /// IV with the bit count preset, as if that much had been compressed
+    /// already: 100 bytes then take a data block and one padding block,
+    /// 120 bytes a data block and two, and every block but the last of
+    /// the second case carries a nonzero `t1`.  The digests are dcrd's:
+    /// `crypto/blake256` v1.1.0, a `Hasher256` unmarshalled from a fresh
+    /// state with its counter set to the same value.
+    #[test]
+    fn counter_high_word_is_mixed_in() {
+        const PRESET_BITS: u64 = 0x0123_4567_0000_0000;
+        const WANT: &[(usize, &str)] = &[
+            (
+                100,
+                "85a10ef230333bbbeac87954dcd32fdaaf688df953e5921ffc8ea735894e3903",
+            ),
+            (
+                120,
+                "a28af7595426f09407906dffba0872dbbcdfa3edba307da49830427c67ae62b6",
+            ),
+        ];
+        for &(n, want) in WANT {
+            let mut h = Blake256::new();
+            h.compressed_bits = PRESET_BITS;
+            h.update(&pattern(n));
+            assert_eq!(hex(&h.finalize()), want, "preset counter, len {n}");
+        }
     }
 }
