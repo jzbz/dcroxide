@@ -44,7 +44,11 @@ built-in assume-valid block, as dcrd's does: up to that block both skip
 connect validation, script checks included. On 2026-10-10 the replay
 harness, `dcroxide-bench` below, drove every mainnet block up to
 1,116,035 through the chain engine with full validation, at commit
-`337779d`, which has the review fixes above.
+`337779d`, which has the review fixes above, and did so again on
+2026-10-11 on the code with the five changes described under
+Performance. That replay does not exercise the fifth, the indexes on a
+thread of their own: a replay updates the indexes inline, on the thread
+that connects the blocks.
 Together that says dcroxide's consensus rules accept every mainnet
 block that dcrd's accepted. That they reject what dcrd's reject rests
 on the test batteries described below, not on a sync, and none of it
@@ -423,6 +427,20 @@ holds in both directions: dcrd accepts
 `/dcrwire:1.0.0/dcroxide:2.2.0(pre)/` and dcroxide accepts
 `/dcrwire:1.0.0/dcrd:2.1.6/`.
 
+**Five changes on 2026-10-11 took dcroxide's sync to under 13 minutes.**
+They are a wider table for the block-file checksum, the BLAKE-256
+rounds written out, the tickets each block purchased kept in memory for
+the block that matures them, a block's transaction hashes computed
+once as it is processed where four steps each computed them, and the
+indexes on a thread of their own. One sync was run as each was
+added, in the harness above, and one of the code before them later the
+same day: 1,058.3 s, where the median above is 1,058.6 s. With all five
+the sync took 759.1 s and 756.2 s in two runs, 28.3% and 28.5% less,
+and ended on the same block. dcrd was not run again that day, so the 3.77x and 3.79x
+those make against its median above are figures across sessions, and
+the rest of this section describes `c128a93`. The
+[bench ledger](docs/bench-ledger.md) has each step.
+
 **The commit dcroxide ports syncs like the release.** dcrd master
 `6f6cf21b` (2.2.0-pre), the parity target, built under go1.26.2 with the
 flags of its release image, took 2,909.8 s and 2,869.8 s from the
@@ -496,8 +514,9 @@ time, and its peak resident memory was 2.09 GiB against dcrd's 1.81 GiB.
 
 What these figures do not say:
 
-- **Where the rest of the difference comes from.** Neither daemon was
-  profiled. Why dcrd is ahead up to the assume-valid block with the
+- **Where the rest of the difference comes from.** dcrd was not
+  profiled, and dcroxide only on 2026-10-11, in one sync of the code
+  before the changes above (user-space time only). Why dcrd is ahead up to the assume-valid block with the
   index off, and dcroxide ahead after it, has not been taken apart.
 - **It is loopback.** Over the internet both daemons request blocks
   through dcrd's window of 16 in flight, refilled once fewer than 10

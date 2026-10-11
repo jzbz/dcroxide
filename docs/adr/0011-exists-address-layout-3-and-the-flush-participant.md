@@ -523,3 +523,64 @@ measured from genesis against dcrd's layout on redb, and none of the
 plan's criteria is judged again; its read and memory criteria stay
 unjudged. Neither daemon was profiled, and m2's flush-time margin, the
 write-buffer overflow and the merge tuning stay open.
+
+## Addendum, 2026-10-11 — the indexes on their own thread
+
+Since 2026-10-11 the daemon no longer updates the indexes on the
+block-processing thread. Each drained block event's notification goes
+onto a 128-deep bounded queue served by one thread, as dcrd's subscriber
+does with its channel and goroutine ([PARITY.md](../../PARITY.md), the
+`internal/blockchain/indexers` row). Three statements above are no
+longer exact for the daemon:
+
+- **"The tip row, its timing, the subscriber, catch-up and recovery are
+  unchanged."** The subscriber, catch-up and recovery are. The timing is
+  not: a block's index update, its tip row included, is committed by the
+  index thread after the block has connected, and the index can trail
+  the chain by a little more than the queue's depth. The keys are still
+  visible no later than the tip, since the hook still runs inside that
+  commit before the tip row is published.
+- **The copy of the mempool's addresses at connect** (the mempool race
+  under Consequences). The copy is made when the connect is queued, on
+  the thread that drained the event, and installed for the index thread's
+  update; under inline delivery (in-process tests, catch-up, the vectors,
+  `dcroxide-bench replay`) it is made at the connect as before. A mempool
+  address is therefore persisted with the first block connected after it
+  was seen and not with an earlier one still queued, which dcrd's
+  goroutine would do.
+- **"The daemon drops its index handles before it closes the
+  database."** It first stops and joins the index thread, before its
+  final chain flush, so the thread's last commit is inside the shutdown
+  flushes; what is still queued is dropped, and the next start's
+  catch-up indexes it.
+
+The two database hooks and their contract are untouched. Commits still
+serialize on the writer semaphore, the participant still contributes
+inside the flush under it, and the hand-over still runs between the
+commit's own flush and the publication of its tip row. What changed is
+which thread a flush runs on: one tripped by an index commit now runs on
+the index thread, with the block-processing thread free until it needs
+the writer. On disk the index tip is still never ahead of the chain,
+because a block's index commit follows its connect and a flush captures
+a prefix of the commit order. A crash now leaves the index up to the
+queue's depth plus two blocks behind (128 queued, one the index thread
+has taken and not yet committed, one connected and not yet queued), or
+more when one processing call connected several blocks, where it was at
+most the blocks of one call, normally one; catch-up repairs any lag.
+That bound is read from the code and was not tested. The daemon's
+power-cut test (`crates/dcroxide-node/tests/existsaddr_powerloss.rs`:
+four SIGKILLs of a mining simnet daemon under `tools/powerloss`) runs
+the daemon, so it now exercises the queued path. The `PowerLossBackend`
+sweeps do not: the index's (`existsaddr/tests.rs`) call the subscriber
+directly, and the database's (`tests/participant.rs`) use a stand-in
+participant with no index.
+
+On m3 two default syncs took 759.1 s and 756.2 s with the thread where
+one of the commit before it, without, took 820.3 s
+([bench-ledger.md](../bench-ledger.md), "Five changes on the
+block-processing thread"). Node CPU time did not fall (the work moved),
+and peak resident memory rose from 2,146 MiB to 2,621 and 2,624 MiB,
+which was not examined. How long the block-processing thread and the index thread
+wait for each other at the writer was not measured, the fallback's
+flush-time test was not run again, and none of the plan's criteria is
+judged again.

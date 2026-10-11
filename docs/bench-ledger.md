@@ -57,6 +57,7 @@ path) has been measured yet, so this crossover is unconfirmed.
 | 2026-08-15 (second) | m1 | `8b27d20` (fan-out fix included) | 2.2.0-pre+452c1a6c3 (go1.26.5) | mainnet, 1,100,392 blocks | Same shared server, arms back to back on a quiet box, page cache pre-warmed before each: dcroxide 4,821.4 s — **228.2 blk/s**; dcrd 3,200.8 s — **343.8 blk/s**. Ratio **1.51x**. dcrd reproduced to 0.6% across the two 2026-08-15 runs; dcroxide fell 14% under higher ambient (a browser active in its arm only). Both runs carried more ambient in the dcroxide arm, so **1.29x above remains the tighter upper bound** — this row is the D-state run's throughput, not a supersession | this file, below |
 | 2026-10-09 and 2026-10-10 | m3 | `c128a93` | release v2.1.6 (go1.25.4) | mainnet, genesis to 1,116,035 | Each daemon from a block server run by the other, four runs each on a quiet machine (three alternated, one from a later round), defaults apart from the flags that point the node at the server, exists-address index on in both; the syncing node's RPC is on for the harness's height polls, so not `--norpc`: dcroxide 1,058.6 s median (1,055.8–1,065.0) — **1,054.3 blk/s** at 1.71–1.72 mean cores; dcrd 2,863.9 s (2,848.8–2,894.8) — **389.7 blk/s** at 1.94–1.95. dcroxide **2.71x** as fast. One same-session run of each daemon from its own kind: 1,072.2 s and 2,872.8 s, so the source moved either by about 1% or less | this file, "Daemon against daemon, each from the other" |
 | 2026-10-10 | m3 | `c128a93` | master `6f6cf21b` (2.2.0-pre, go1.26.2, release image flags) | mainnet, genesis to 1,116,035 | The parity commit, in the harness of the row above: dcrd from a dcroxide block server, two runs, 2,909.8 s and 2,869.8 s — **383.5 and 388.9 blk/s** at 1.90–1.92 mean cores, against v2.1.6's 2,848.8–2,894.8 s. dcroxide's median of 1,058.6 s is **2.73x** as fast as their mean. With `--noexistsaddrindex` in both, one run each: dcroxide 880.8 s — **1,267.0 blk/s**; dcrd v2.1.6 1,247.8 s — **894.4 blk/s**; **1.42x** | this file, "The parity commit, the index off, two levers and a full replay" |
+| 2026-10-11 | m3 | `74168e8` and the five changes that follow it, added one at a time | not run in this session | mainnet, genesis to 1,116,035 | dcroxide from the dcrd v2.1.6 block server at the defaults, in the harness of the two rows above. `74168e8` itself: 1,058.3 s in one run, made after the first of the others, where the median two rows above is 1,058.6 s. One run per cumulative change: 1,015.3 s, 912.8 s, 893.7 s, 820.3 s and, with all five, 759.1 s and 756.2 s in two runs — **1,470.3 and 1,475.9 blk/s** at 1.93–1.94 mean cores. That is 28.3% and 28.5% under the same session's 1,058.3 s. Set against dcrd's 2,863.9 s of 2026-10-09 and 2026-10-10 it is 3.77x and 3.79x, across sessions | this file, "Five changes on the block-processing thread" |
 
 > **The headline 1.29x predates the fan-out fix, so it is conservative for
 > master.** That figure was measured on `b6d0c63`; `c091b46` (one validation
@@ -112,6 +113,22 @@ ms/block above; nothing here has been measured. What decides it is a mainnet
 sync, or a long simnet sync past stake-enabled height, with and without a
 prototype of the hash ring, the arms alternated as in the overlay sweep below;
 record the result here whether or not it ships.
+
+> **Note (2026-10-11): taken, as the second of the two fixes, and measured
+> on m3.** The chain records each block's ticket-purchase hashes when its
+> data is accepted, in a list of the last `2 * ticket_maturity` blocks
+> accepted (512 on mainnet; the half past `ticket_maturity` is room for
+> side chain blocks), and `maybe_fetch_new_tickets` reads the block back
+> only when the list has no entry for it. It was measured with one mainnet
+> sync from genesis before and one after, not with alternated arms:
+> 912.8 s without it and 893.7 s with it, 19.1 s or 2.1%, where five
+> default runs of the earlier code spanned 9.2 s. The bytes the node read
+> fell from 25.3 GB in 2.45 million calls to 6.1 GB in 1.33 million. The
+> 19.2 GB between them is the chain's blocks, read once each. The run
+> without it already had the faster block-file checksum, so the read cost
+> less than it did when the estimate above was written, and that estimate
+> was for m1. The treasury row's database view is unchanged. See "Five
+> changes on the block-processing thread" below.
 
 ## Storage at tip
 
@@ -196,6 +213,7 @@ campaign exported.
 | date | machine | dcroxide commit | corpus | result | raw run |
 |---|---|---|---|---|---|
 | 2026-10-10 | m3 | `337779d` | mainnet, blocks 1 to 1,116,035 (19,198,132,458 B), exported from a data directory synced the same day | `replay --addrindex` at the tool's default caches, pinned to 16 threads: 1,909.41 s — **584.5 blk/s**, every block validated in full, exit 0 at tip height 1,116,035, 11,875 MiB peak RSS | this file, "The parity commit, the index off, two levers and a full replay" |
+| 2026-10-11 | m3 | `74168e8` and the five changes that follow it | the corpus of the row above | `replay --addrindex` at the tool's default caches, pinned to 16 threads: 1,746.67 s — **638.9 blk/s**, every block validated in full, exit 0 at tip height 1,116,035, 12,607 MiB peak RSS. Not a clean timing: compilers and test runs used the machine's other 16 threads during it, so it is not to be set against the row above as a measured gain | this file, "Five changes on the block-processing thread" |
 
 ## Free-page probes (`dcroxide-bench pinprobe`)
 
@@ -2408,3 +2426,207 @@ Raw: the comparison's `runs.jsonl` rows labelled `p0`, `par1`, `par2`,
 samples, dcroxide's per-flush logs and both daemons' logs as above;
 `replays.jsonl` and the replay's own output; and `smoke2.jsonl` for the
 three 20,000-block runs that checked the new variants.
+
+## Five changes on the block-processing thread (2026-10-11)
+
+"The parity commit, the index off, two levers and a full replay" above
+left the two regimes of a sync unexplained and neither daemon profiled.
+On 2026-10-11 five changes were made to what a reading of the code
+showed on the one thread that carries a sync up to the assume-valid
+block, and the code before them was profiled on m3. The five were
+chosen, and the first three built, before the profile was taken; what it
+shows is under "The profile" below.
+
+Each was measured with one default sync, and the last with two, in the
+harness of the two sections above: mainnet from genesis to 1,116,035 over loopback from the
+dcrd v2.1.6 block server, the same pinning, clock and quiet gate, and a
+300 s idle before every run but pf-base, s-AGBC and s-base, each the
+first of the batch it was queued in. The steps are cumulative, so each
+run is set against the one before it. Three runs were added at the end
+of the session, after a review of this section: the `74168e8` binary
+without the profiler (s-base), the fourth change as committed
+(s-AGBC-2), and the last binary a second time (s-final-2).
+
+The changes, in the order measured, all on base `74168e8` (the commits
+that carry them follow it):
+
+1. **The block-file checksum.** The CRC-32C over a block record used the
+   `crc` crate's one-table form, a byte a step. It now uses the same
+   crate's sixteen-table form. The values are identical.
+2. **The BLAKE-256 rounds.** The compression function looped over the
+   permutation table. Its fourteen rounds are now written out with each
+   row a constant. A microbenchmark (one thread, `sum256` over a fixed
+   buffer, three passes, thin LTO and one codegen unit as the node is
+   built; the program is not in the tree) measured 343.0–343.3 MB/s
+   before and 559.6–560.2 after on 16 KiB inputs, 263.7–263.9 and
+   428.4–428.7 on 250-byte inputs, and 168.0–168.1 and 267.2–267.5 on
+   64-byte inputs.
+3. **The ticket-purchase list.** During initial sync, every connect
+   past stake-enabled height read the block `ticket_maturity` below it
+   back from the block files to list its ticket purchases, that block's
+   body having already left the recent window (the open arm under "Sync
+   throughput"). The chain now keeps that list for the last
+   `2 * ticket_maturity` blocks accepted.
+4. **One hash per transaction.** A block's transactions were serialized
+   and hashed four times between `Chain::process_block` and the node's
+   connected-block handling. For a block connected by the call that
+   delivered its data, as the blocks of a sync are, they are hashed once
+   and the hashes handed down. PARITY.md lists what is still hashed
+   again.
+5. **The index thread.** The optional indexes were updated on the
+   block-processing thread. The daemon now queues each block's
+   notification for one index thread, as dcrd does.
+
+| run | started | changes in the binary | wall | blk/s | node CPU time (user + sys) | bytes read, in calls | peak RSS | to block 1,026,597 | after it | flush time | other userland |
+|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| pf-base | 03:51 | none (profiled) | 1,110.9 s | 1,004.7 | 2,075.0 s (1,654.8 + 420.2) | 25.3 GB in 2.44 million | 2,142 MiB | 880.0 s | 230.9 s | 133 in 169.3 s | 0.46% |
+| s-base | 08:39 | none | 1,058.3 s | 1,054.5 | 1,820.9 s (1,695.3 + 125.6) | 25.2 GB in 2.44 million | 2,147 MiB | 866.0 s | 192.3 s | 133 in 163.2 s | 0.06% |
+| s-A | 04:16 | the checksum table | 1,015.3 s | 1,099.2 | 1,769.0 s (1,642.0 + 127.0) | 25.3 GB in 2.44 million | 2,146 MiB | 824.9 s | 190.4 s | 133 in 172.5 s | 0.10% |
+| s-AG | 04:39 | + the BLAKE-256 rounds | 912.8 s | 1,222.7 | 1,550.4 s (1,424.9 + 125.5) | 25.3 GB in 2.45 million | 2,140 MiB | 740.8 s | 172.0 s | 133 in 172.9 s | 0.07% |
+| s-AGB | 05:01 | + the ticket-purchase list | 893.7 s | 1,248.8 | 1,529.3 s (1,404.4 + 124.9) | 6.1 GB in 1.33 million | 2,145 MiB | 724.0 s | 169.7 s | 133 in 175.9 s | 0.07% |
+| s-AGBC | 06:41 | + one hash per transaction, as first built | 836.6 s | 1,334.0 | 1,471.7 s (1,347.7 + 124.0) | 6.1 GB in 1.34 million | 2,139 MiB | 673.2 s | 163.4 s | 133 in 173.2 s | 0.06% |
+| s-AGBC-2 | 09:03 | the same four, as committed | 820.3 s | 1,360.5 | 1,462.8 s (1,341.3 + 121.5) | 6.1 GB in 1.34 million | 2,146 MiB | 659.6 s | 160.7 s | 133 in 162.1 s | 0.07% |
+| s-final | 07:01 | + the index thread | 759.1 s | 1,470.3 | 1,465.5 s (1,340.7 + 124.8) | 6.1 GB in 1.32 million | 2,621 MiB | 604.1 s | 155.0 s | 133 in 167.9 s | 0.06% |
+| s-final-2 | 09:24 | the same binary again | 756.2 s | 1,475.9 | 1,468.1 s (1,343.6 + 124.5) | 6.1 GB in 1.33 million | 2,624 MiB | 603.0 s | 153.2 s | 133 in 163.2 s | 0.07% |
+
+Every run exited 0 on the server's tip, `8752fdc9…`, and none was marked
+disturbed. pf-base is the `74168e8` binary under two `perf record`
+recorders and is not a timing: the node's system time was 420.2 s where
+the other runs have 121.5–127.0 s. The bytes-read column is `rchar` and
+`syscr`; the bytes passed to write calls were 51.5–51.6 GB in every run.
+The time to block 1,026,597 is interpolated between the two samples
+either side of it, as in the two sections above: the samples are about
+10 s apart, timed to the whole second, with heights from a once-a-second
+poll. "After it" is the wall time less that. Neither column is good to
+the 0.1 s shown.
+
+**The sync went from 1,058.3 s to 759.1 s and 756.2 s, 28.3% and 28.5%
+less, in one session.** By step:
+
+| change | this run | the one before | gain |
+|---|---:|---:|---:|
+| the checksum table | 1,015.3 s | 1,058.3 s (s-base) | 43.0 s |
+| the BLAKE-256 rounds | 912.8 s | 1,015.3 s | 102.5 s |
+| the ticket-purchase list | 893.7 s | 912.8 s | 19.1 s |
+| one hash per transaction | 820.3 s (s-AGBC-2) | 893.7 s | 73.4 s |
+| the index thread | 759.1 s and 756.2 s | 820.3 s | 61.2 s and 64.1 s |
+
+Each gain is one run against one run, the last two runs against one, all
+in one session. Four things bear on how far one run can be trusted
+here. s-base, the code before the changes run without the profiler, took
+1,058.3 s, where the four runs of 2026-10-09 and 2026-10-10 that the
+sections above rest on have a median of 1,058.6 s and five default runs
+spanned 9.2 s. The two runs of the last binary are 2.9 s apart. And the
+fourth change was run in two forms. s-AGBC is that change as first
+built, 836.6 s. Review then made the ticket-purchase list take the
+hashes already computed, where it had hashed each block's purchases
+again, and added an assertion to the connected-block handling. s-AGBC-2
+is a build of the fourth commit's tree, which has both: 820.3 s. The
+16.3 s between the two forms is one run against one run. Of it, node CPU
+time accounts for 8.9 s (1,471.7 s and 1,462.8 s), and the summed flush
+time differs by 11.1 s (173.2 s and 162.1 s). Last, the three runs added
+at the end have the three lowest flush sums of the eight, 162.1–163.2 s
+against 167.9–175.9 s in the five before them, so the fourth step's
+73.4 s, which sets a run of the last batch against one four hours
+earlier, may carry some of that difference. The last binary also has a
+floor of one on the index queue's depth, which a sync does not reach.
+
+s-AGBC-2 was built from the tree of the fourth commit. Every other
+binary was built from the working tree as its change was finished,
+before the commits that carry the changes were made. s-A and s-AG
+predate the review of the first two changes, which added tests and
+comments, moved the `crc` requirement to 3.4 and bound the BLAKE-256
+round's permutation row by reference instead of by value. The
+microbenchmark's program was built before that review too. None of it
+changed the code the runs measure: disassembled, the compression
+function is the same 2,327 instructions in the s-AG binary, built
+before, and in the s-AGB, s-AGBC and s-final binaries, built after, and
+the lock file already held `crc` 3.4.0. What changed after the s-final
+binary is tests, comments and a counter compiled only into the
+blockchain crate's unit tests.
+
+Up to the assume-valid block the sync took 604.1 s and 603.0 s where
+s-base took 866.0 s, and the fully validated blocks after it 155.0 s and
+153.2 s against 192.3 s. Node CPU time fell from 1,820.9 s to 1,465.5 s
+and 1,468.1 s. The index thread moved work and did not remove it: CPU
+time is the same without it (1,462.8 s in s-AGBC-2), and up to the
+assume-valid block an average of 1.15 and 1.17 of the node's 16 threads
+were busy where s-AGBC-2 had 1.06. The ticket-purchase list shows in the
+read counters: 25.3 GB in 2.45 million calls before it, 6.1 GB in 1.33
+million after, the difference being one read of every block file record.
+The 133 flushes are unchanged in number and took 162.1–175.9 s in the
+eight timed runs, which in the two runs of the last binary is 22% of the
+sync.
+
+Peak resident memory rose with the index thread, from 2,139–2,147 MiB in
+the seven runs without it to 2,621 and 2,624 MiB. What holds it was not
+examined.
+
+**The profile.** pf-base recorded user-space cycles at 499 Hz
+(`perf_event_paranoid` is 2, so kernel time is not in it). From the
+start of the recording up to the assume-valid block: BLAKE-256
+compression 27.1%, `memcmp` 14.6%, the allocator 13.5%, reading a block
+back 3.8%, the block-store commit 3.8%, `memcpy` 3.2%, and nothing else
+above 2%. Those were recomputed from the recording during review. The
+saved aggregate leaves out the first 11 s and the allocator's `realloc`
+and `calloc`, and gives 14.7% for `memcmp` and 13.2% for the allocator.
+Over the fully validated blocks, on all threads: BLAKE-256
+compression 48.4%, secp256k1 about 38%. A second recorder took DWARF
+call chains at 49 Hz, and they almost never reached the node's own code:
+up to the assume-valid block, 5,523 of the 5,551 `memcmp` samples carry
+no caller frame. Why the chains end there was not established. It is not
+a lack of unwind tables, which the profiled binary has. So the callers
+of `memcmp` and the allocator were not established.
+
+**A full replay.** `dcroxide-bench replay --addrindex`, built from the
+sources of the s-final binary, drove the corpus of 2026-10-10 (blocks 1
+to 1,116,035, 19,198,132,458 B) into a fresh chain on the node's 16
+threads. A replay cannot use assume-valid, so every block is validated
+in full:
+
+| date | machine | commit | corpus | result |
+|---|---|---|---|---|
+| 2026-10-11 | m3 | `74168e8` and the five changes | mainnet, blocks 1 to 1,116,035, 8,034,100 regular transactions | **1,746.67 s, 638.9 blk/s**, exit 0 at tip height 1,116,035. Exists-address index on; the tool's default caches (100 MiB overlay ceiling, 1,024 MiB page cache, default UTXO cache). 4.4 of the 16 threads busy on average, 12,607 MiB peak RSS, 51.1 GB passed to write calls, work directory 29,986,390,062 B (27.93 GiB) |
+
+It is the check that the five changes accept the whole chain with
+nothing skipped: every script ran over the rewritten BLAKE-256 rounds,
+and every block went through `Chain::process_block`, so through the
+handed-down hashes and the ticket-purchase list. It does not exercise
+the index thread, because a replay calls the index subscriber inline, on
+the thread that connects the blocks. It is not a clean timing. Compilers
+and test runs used the machine's other 16 threads during it, and the
+harness saw one in about a third of its 10-second samples. So the
+1,746.67 s is not to be set against the 1,909.41 s of 2026-10-10 as a
+measured gain, and the bytes written at the volume, which include
+theirs, are left out. Its 50,000-block intervals fell from 1,541.4 blk/s
+over the first to 412.6–509.5 over the last five.
+
+**What this does not establish.**
+
+- Nothing about m1 or m2, fewer cores, slower storage or a delayed
+  link. dcrd was not run in this session: set against its 2,863.9 s
+  above, 759.1 s and 756.2 s are 3.77x and 3.79x, across sessions.
+- Each step is one run against one run, and the last is two runs
+  against one. The order of the steps matters to their sizes:
+  the checksum table and the ticket-purchase list both remove checksum
+  work, and with the faster hash already in, the fourth step is expected
+  to be smaller than it would have measured first; no other order was
+  run.
+- Not where the rest goes. The profile names `memcmp` and the allocator
+  without their callers, and the flushes, 22% of the sync now, were not
+  touched.
+- Not the index thread's cost to the block thread. Both commit under the
+  database's writer, and how long each waits for the other was not
+  measured.
+- Not a sync with `--noexistsaddrindex` or `--assumevalid=0`, and no
+  repeat of the tuning levers, on this code.
+
+Raw: the comparison's `runs.jsonl` rows labelled `pf-base`, `s-base`,
+`s-A`, `s-AG`, `s-AGB`, `s-AGBC`, `s-AGBC-2`, `s-final` and `s-final-2`,
+with per-run samples, flush logs and node logs as above; the `perf record` data of pf-base and its
+flat reports; the microbenchmark's two outputs; `replays.jsonl` and the
+replay's own output; and `smoke3.jsonl` for the short runs, which
+checked the binaries of pf-base, s-AG, s-AGBC and s-final and two builds
+that were not measured: an earlier one of the third step and an earlier
+one with all five changes. The binaries of s-A, s-AGB and s-AGBC-2 had
+no short run.

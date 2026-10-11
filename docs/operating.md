@@ -170,6 +170,16 @@ runs above; whether that slowed dcrd was not measured. At the defaults
 the chain cost more on
 disk: 27.90 GiB against dcrd's 24.16 GiB at that block.
 
+Five changes to block processing on 2026-10-11 shortened dcroxide's
+sync. Two runs of the same sync with all five, at the defaults, took
+**12.6 and 12.7 minutes** (756.2 s and 759.1 s) and ended on the same
+block, where the code before them took 17.6 minutes (1,058.3 s) in one
+run the same day. Their peak resident memory was 2.56 GiB, where the
+runs above peaked at about 2.1. dcrd was not run again in that session,
+so no new ratio to dcrd was measured.
+The ledger's section "Five changes on the block-processing thread" has
+each step.
+
 The rate falls as the chain grows, and falls again where full
 validation begins: by default both daemons skip connect validation,
 script checks included, up to the built-in assume-valid block,
@@ -177,9 +187,13 @@ script checks included, up to the built-in assume-valid block,
 4.8 minutes, block 1,000,000 in 13.8 and the assume-valid block in 14.4.
 The 89,438 blocks after it took another 3.2 minutes, about 461 blocks/s
 on about five of the node's 16 threads, against 1,054 over the whole
-chain. New blocks are past that point too, so a chain longer than the
-one measured should add time at about that rate on a machine like m3,
-until a release moves the assume-valid block. With `--assumevalid=0`
+chain. (The two 2026-10-11 runs above reached the assume-valid block in
+about 10.1 minutes and took 2.6 for the blocks after it, about 580
+blocks/s.) New blocks are past that point too, so a chain longer than
+the one measured should add time at about 580 blocks/s on a machine
+like m3 (two runs on 2026-10-11; the four earlier runs, before that
+day's changes, gave a median of about 461), until a release moves the
+assume-valid block. With `--assumevalid=0`
 every block is validated in full and none of these figures apply.
 
 On a smaller or slower machine, budget more. On m2, a ZFS mirror of QLC
@@ -235,14 +249,20 @@ index. One run of each daemon with the index off, on 2026-10-10, puts
 dcrd's sync and 17% of dcroxide's. With it off dcrd took 20.8 minutes
 to dcroxide's 14.7, and was the first to the assume-valid block, in
 10.3 minutes against 11.8. dcroxide made that up over the fully
-validated blocks after it, 2.9 minutes against 10.5. Neither daemon was
-profiled, so what those two stretches consist of is not known. What the
-2026-10 runs record besides is that at the defaults
+validated blocks after it, 2.9 minutes against 10.5. dcrd was not
+profiled, and dcroxide only on 2026-10-11, in one sync with the index on
+and before the five changes above (user-space time only; the ledger's
+"Five changes on the block-processing thread" has it), so why dcrd is
+ahead up to the assume-valid block with the index off, and dcroxide
+after it, has not been taken apart. What the runs of 2026-10-09 and
+2026-10-10 record besides is that at the defaults
 the node process used a third of dcrd's CPU time (1,821 s
 against 5,567 s) and passed under a fifth of the bytes to write calls
 (51.4 GB against 286.3 GB). Its metadata flushes, 133 per sync with a
 median of about 1.3 s and a longest of 3.0 s, took 15–16% of the wall
-time. This guide used to describe a node fully stalled on storage for
+time. In the two runs of 2026-10-11 with all five changes the same 133
+flushes took 167.9 s and 163.2 s, 22% of each: the flush time did not
+grow, the sync got shorter. This guide used to describe a node fully stalled on storage for
 48% of block-sync wall time, with a median flush of 26.9 s, and a sync
 1.29x slower than dcrd's. Those were measured in 2026-08 on m1 in
 [bench-ledger.md](bench-ledger.md), another machine, against dcrd
@@ -274,7 +294,14 @@ and 501 with it off, and wrote 15.5 GB against 12.6 GB. From genesis on
 m3 it showed more: one sync with the index off took 14.7 minutes
 against 17.6 with it on, and left a data directory 2.0 GiB smaller.
 With the index off, both RPCs fail with "exists address index
-disabled", as dcrd's do.
+disabled", as dcrd's do. With it on, the index is updated on a thread of
+its own and can trail the chain by a little more than 128 blocks while
+the node syncs. While it is more than five blocks behind the tip both
+RPCs answer at once that the index is not synced; within five blocks
+they wait for it to catch up, and answer that only if it still has not
+after about three seconds, as dcrd's do. A node stopped during a sync
+indexes the blocks it had not reached when it next starts, and logs
+that catch-up.
 
 ### How the index is stored, and what it costs
 
@@ -326,7 +353,11 @@ of its sync, for 1.97 GiB on disk.
   development desktop it was about 380 MB above at that cache over a
   similar tail, and about 140 MB above with a 256 MiB cache. From
   genesis on m3 it was about 140 MiB above at the default cache
-  (above).
+  (above). That was on 2026-10-10, before the index thread. With the
+  thread, two default syncs on 2026-10-11 peaked at 2,621 and 2,624
+  MiB, where the seven that day without it peaked at 2,139–2,147 MiB.
+  The sync with the index off was not repeated on that code, so what
+  the index adds to peak memory now has not been measured.
 - **Starting**: the node reads the journal back into memory before the
   index catches up, modelled at 1-3 s on mainnet, holding one copy of the
   addresses it reads back, and the journal's pages in the page cache.
@@ -415,9 +446,11 @@ over to a default sync on it, not to rank the settings on another. The
 UTXO cache and the overlay both
 work by making flushes rarer, and flushes have less to give now.
 On m2 the index's layout cut the flush time of a 200,000-block tail
-from 1,416 s over 58-59 flushes to 78 s over 31. On m3 in 2026-10 the
-median flush was about 1.3 s and flushes were 15–16% of a sync's wall
-time, where on m1 on 2026-08-16 the median was 26.9 s and flush windows
+from 1,416 s over 58-59 flushes to 78 s over 31. On m3 on 2026-10-09
+and 2026-10-10 the median flush was about 1.3 s and flushes were 15–16%
+of a sync's wall time (22% in the two runs of 2026-10-11 with all five
+changes, where the flush time was the same and the sync shorter), where
+on m1 on 2026-08-16 the median was 26.9 s and flush windows
 occupied 68% of it. m3 is another machine as well as another layout, so
 that pair is not a before and after.
 

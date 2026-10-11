@@ -5,7 +5,8 @@
 - **Date:** 2026-07-03 (proposed), 2026-07-26 (addendum: what shipped),
   2026-08-07 (ratified), 2026-08-13 (addendum: the storage levers closed),
   2026-10-10 (addendum: a later sync comparison; second addendum: the
-  parity commit and the index off)
+  parity commit and the index off), 2026-10-11 (addendum: one more
+  thread, for the indexes)
 
 ## Context
 
@@ -273,3 +274,23 @@ one run each, on one machine, over loopback. In the three dcrd runs of
 that session the dcroxide server read its block files from the drive as it
 served them, which it had not before; whether that cost dcrd anything was
 not measured. D2 is unchanged.
+
+## Addendum, 2026-10-11 — one more thread: the indexes
+
+The daemon gained one long-lived thread on 2026-10-11. Index
+notifications, which the block-processing thread delivered inline, now
+go through a bounded `std::sync::mpsc::sync_channel` of 128 entries to a
+thread named "index" that runs the unchanged subscriber
+([ADR-0011](0011-exists-address-layout-3-and-the-flush-participant.md),
+addendum of the same date). It is the shape dcrd has, a channel and a
+goroutine, and the shape this ADR ratified: an OS thread over a std
+channel, no runtime, no pool. A full queue blocks the sender, so the
+block-processing thread is paced by the index when the index is the
+slower, as dcrd's is.
+
+On m3 two default syncs with the thread took 759.1 s and 756.2 s where
+one of the commit before it took 820.3 s, with node CPU time unchanged
+([bench-ledger.md](../bench-ledger.md), "Five changes on the
+block-processing thread"). Up to the assume-valid block an average of
+1.15 and 1.17 of the node's 16 threads were busy where 1.06 were
+before, so that stretch is still close to one thread. D2 is unchanged.

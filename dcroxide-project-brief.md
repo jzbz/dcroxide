@@ -155,6 +155,21 @@ What Phase 15 has covered so far:
   off in both, one run each, dcroxide took 880.8 s against dcrd v2.1.6's
   1,247.8 s, 1.42x: most of the lead at the defaults is that index. Full
   record in [docs/bench-ledger.md](docs/bench-ledger.md).
+- **Five changes on 2026-10-11 took that sync from 1,058.3 s to
+  756.2–759.1 s, 28.3–28.5% less, in one session.**
+  A wider table for the block-file checksum, the BLAKE-256 rounds
+  written out, the tickets each block purchased kept in memory for the
+  block that matures them, a block's transaction hashes computed once
+  as it is processed where four steps each computed them, and the
+  indexes on a thread of their own as in dcrd. One sync on the same
+  machine for each cumulative step, and one of the code before them run
+  later the same day (1,058.3 s): 1,015.3 s, 912.8 s, 893.7 s, 820.3 s
+  and, in two runs, 759.1 s and 756.2 s (1,470 and 1,476 blk/s), every
+  one ending on the same block. dcrd was not run again that day. A profile of the code before them put 27% of
+  the user-space time up to the assume-valid block in BLAKE-256, 15% in
+  `memcmp` and 13.5% in the allocator. The callers of the last two were
+  not established, and the sync was not profiled again after the
+  changes.
 - **Security-blocker campaign.** The release blockers, highs, and mediums from
   an audit of the ported surface: RPC authentication and admission, peer
   message-path bounds (stall deadlines, getdata, queue and write limits),
