@@ -1806,7 +1806,7 @@ fn bind_p2p_listeners(
 /// (`docs/bench-ledger.md`), before ADR-0010 and ADR-0011, 8192 MiB was
 /// 50% slower, 5125-6294 s against 3866-3888 s, and 256 and 512 MiB
 /// overlapped their own sweep's baseline. The 2026-07 probe that
-/// motivated the knob (78.6 s at 1 GiB against 16.1 s at 8 GiB, 2,000,000
+/// came with the knob (78.6 s at 1 GiB against 16.1 s at 8 GiB, 2,000,000
 /// scattered writes into the 14.48 GiB metadata store) is superseded: the
 /// replays reversed it, and its 8 GiB arm raised the flush cadence too.
 /// In the replays cadence was the half that paid, 11-12%, in reach of

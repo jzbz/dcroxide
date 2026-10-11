@@ -933,16 +933,16 @@ impl RawStats {
     /// per-pair and branch overhead, and the slack between them.
     ///
     /// Deliberately *not* `(leaf_pages + branch_pages) * page_size`, which
-    /// on the mainnet store reports 8.46 GiB where the tree really occupies
-    /// 9.79 — a 1.42 GiB shortfall. The reason is that `leaf_pages` counts
+    /// on m1's mainnet store as of 2026-08-07 gave 8.46 GiB against a true
+    /// 9.79 — a 1.32 GiB shortfall. The reason is that `leaf_pages` counts
     /// leaf *nodes*, one per node, while a node's allocation is rounded to
     /// a power-of-two run of pages (`required_order = ceil_log2`), so a
     /// single row too large to share a leaf can occupy 2, 4 or 32 pages and
     /// still be counted once. (An earlier version of this comment blamed
     /// "overflow pages"; redb 2.6.3 has no such mechanism, and the real one
-    /// is the allocator rounding — which is also where 14% of this store's
-    /// slack comes from.) Summing the three measured components is the
-    /// honest figure.
+    /// is the allocator rounding — also the source of roughly 14% of the
+    /// slack in `spendjournalv3`, by ADR-0004's addendum of 2026-08-12.)
+    /// Summing the three measured components is the honest figure.
     pub fn live_tree_bytes(&self) -> u64 {
         self.stored_leaf_bytes
             .saturating_add(self.metadata_bytes)

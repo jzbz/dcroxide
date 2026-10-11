@@ -828,6 +828,15 @@ sequential sync does not reuse, while the LRU accounting grows with it. The
 microbenchmark measured a workload whose working set fits; a sync's does not.
 **Lever (b) is closed, in the opposite direction to its premise.**
 
+> **Note, 2026-10-11.** "Its entire basis" describes the lever as this ADR
+> recorded it. The same setting had a second microbenchmark behind it by
+> then, one this ADR did not cite: commit `ad0f133` added
+> `DCROXIDE_DB_CACHE` on 2026-07-26 and reported 2,000,000 scattered writes
+> against the mainnet metadata store at three cache sizes and two commit
+> sizes, reading 2.7x from the cache alone. The source keeps that table,
+> marked superseded, beside `DEFAULT_DB_CACHE_BYTES`. The replays above
+> supersede both.
+
 **Lever (c) is a real 11% gain** — the first lever to show a measured
 throughput benefit, and modest against the 2.2x gap as it stood when this was
 written. Against the 1.29x measured 2026-08-15 it is a materially larger
@@ -1228,6 +1237,11 @@ and redb 2.6.3 has no overflow-page mechanism at all — the 1.42 GiB
 discrepancy this file previously attributed to overflow pages is the
 allocator's power-of-two rounding, which is the same mechanism lever (d)
 turns on. Both doc comments in `dcroxide-database` are fixed.
+(Note, 2026-10-11: the 1.42 above is GB, not GiB. On the store read on
+2026-08-07, `(leaf_pages + branch_pages) * page_size` gave 9,087,451,136 B
+(8.46 GiB) against a live tree of 10,506,801,152 B (9.79 GiB), which is
+1,419,350,016 B short: 1.32 GiB. The doc comment of
+`RawStats::live_tree_bytes` now says 1.32 GiB.)
 
 ### The model is deleted
 

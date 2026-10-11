@@ -69,8 +69,8 @@ pub(crate) type CacheLayer = BTreeMap<Vec<u8>, Option<Vec<u8>>>;
 /// (bytes requested from the allocator, before its own overhead), for
 /// live values and deletions alike.  Counting key and value bytes alone
 /// put the figure 2-4x under the memory held for the small rows that
-/// dominate this store: an `existsaddridx` row is a 25-byte key and an
-/// empty value.
+/// dominated this store then: before ADR-0011, an `existsaddridx` row
+/// went through the overlay as a 25-byte key and an empty value.
 const NODE_FIELDS_SIZE: u64 = 72;
 
 /// The size one entry is counted at (dcrd treap `nodeSize`).

@@ -707,8 +707,8 @@ against upstream and the port is faithful.
   key and value. Counting a rewritten key once (as a single treap legitimately
   does) put the figure ~5× under the bytes actually held. Counting key and
   value bytes without the per-entry term put small-row overlays 2–4× under (an
-  `existsaddridx` row is a 25-byte key and an empty value). Pinned by
-  `dbcache.rs`'s own suite, which sizes entries as treap nodes
+  `existsaddridx` row was a 25-byte key and an empty value before layout 3).
+  Pinned by `dbcache.rs`'s own suite, which sizes entries as treap nodes
   (`entries_are_sized_as_dcrds_treap_nodes`), asserts the running total
   against what the layers hold, exercises the flush against a genuinely
   three-deep stack, and fails if the merge rule is deleted. One boundary: a

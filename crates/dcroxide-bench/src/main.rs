@@ -100,9 +100,9 @@ Usage:
       --txindex and --addrindex build the optional indexes the daemon
       builds when configured, which Chain::open does not.  Without them
       a replayed store is materially smaller than a synced one -- the
-      address index alone is around 3 GiB of tree at mainnet tip -- so
-      absolute totals are only comparable to a real datadir when the
-      same indexes are enabled.
+      address index alone was about 2 GiB on disk at mainnet block
+      1,116,035 (index version 3, 2026-10-10) -- so absolute totals are
+      only comparable to a real datadir when the same indexes are enabled.
 
   dcroxide-bench indexcatchup --workdir <dir> [--net <name>]
                               [--txindex] [--addrindex] [--metacache <mib>]

@@ -448,8 +448,11 @@ in MiB, defaulting to 1024. Raising it to 8192 made a full-chain replay
 **50% slower** — 5125-6294 s against a 3866-3888 s baseline, in an earlier
 sweep on m1, again with non-overlapping ranges. That is the opposite of
 what the setting
-suggests, and the opposite of what a 500,000-key microbenchmark predicted
-when the knob was added. There is no fixed split to reason from: redb 4.3.0
+suggests, and the opposite of what two microbenchmarks of 2026-07
+predicted: the 500,000-key insert loop that was the premise of ADR-0004's
+lever (b), and the 2,000,000-write grid reported when the knob was added,
+which the source comments still carry, marked superseded. There is no
+fixed split to reason from: redb 4.3.0
 keeps a single cache figure and partitions it on demand, holding the write
 buffer at or below half of it, best effort, and letting the read cache grow
 into all of it. The advice rests on the full-chain measurement, not on a
