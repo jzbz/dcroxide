@@ -167,3 +167,29 @@ At block 1,116,035 the data directory was 27.90 GiB against dcrd v2.1.6's
 The comparison that found no growth from the keys, 24.98 against 24.96 GB
 at block 916,000, was not run again. Nothing decided here changes: the key
 formats, version 15 and the refusal of older directories are as written.
+
+## Addendum, 2026-10-10 (second) — dcrd `6f6cf21b` on m3; the index's share of the gap
+
+The parity target has now run on m3. Later on 2026-10-10, in the same
+harness, dcrd `6f6cf21b` synced the same chain from a dcroxide block
+server in 2,909.8 s and 2,869.8 s, a mean 0.9% above v2.1.6's median;
+dcroxide is 2.73x as fast as that mean. Of the four differences the
+addendum above lists between m2's pair and m3's, the dcrd version
+therefore accounts for about 1% of dcrd's time on m3 at most, inside the
+release's own 1.6% spread, and the other three remain.
+
+One run of each daemon with `--noexistsaddrindex` took 880.8 s for
+dcroxide and 1,247.8 s for dcrd v2.1.6 (1.42x), so the index accounts for
+1,438.3 s of the 1,805.3 s between the two at their defaults, 80%. The
+other 367.0 s is a net: with the index off dcrd reached the assume-valid
+block first (618.5 s against 708.1 s) and dcroxide was the faster after it
+(172.7 s against 629.3 s). The rows are in
+[bench-ledger.md](../bench-ledger.md), "The parity commit, the index off,
+two levers and a full replay".
+
+These keys' share is still not separated: no run used chain database
+version 14, neither daemon was profiled and m2 was not run again, so +26%
+and 1.74x stand as measured there. In the three dcrd runs of that session
+the dcroxide server read its block files from the drive as it served
+them, which it had not before; whether that cost dcrd anything was not
+measured. Nothing decided here changes.

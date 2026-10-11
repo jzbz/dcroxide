@@ -951,3 +951,31 @@ outcome of no rework as "a larger metadata store than dcrd and a slower
 IBD". On m3, still on redb, the first half held and the second did not,
 against the release. The 1.29x and the 48% stand as m1's measurement of
 2026-08, in the layout of that date, and have not been re-measured there.
+
+## Addendum, 2026-10-10 (second) — the parity commit and the index off, on m3
+
+Later the same day, in the same harness on m3, the two runs the addendum
+above names as missing were made ([bench-ledger.md](../bench-ledger.md),
+"The parity commit, the index off, two levers and a full replay"). dcrd at
+the parity commit `6f6cf21b` took 2,909.8 s and 2,869.8 s, a mean 0.9% above
+the release's median. dcroxide's 1,058.6 s is 2.73x as fast as that mean, so
+the "slower IBD" of Consequences did not hold on m3 against the commit this
+port tracks either. With the index off, one run each, dcroxide took 880.8 s
+and dcrd v2.1.6 1,247.8 s, 1.42x: of the 1,805.3 s between them at their
+defaults, 1,438.3 s (80%) is the difference in what the index costs each.
+Without it dcrd was the faster up to the assume-valid block, 618.5 s against
+708.1 s, and dcroxide over the fully validated blocks after it, 172.7 s
+against 629.3 s. The 11% this ADR calls the only tuning gain measured
+anywhere is lever (c) over replays on m1, with both of its settings raised.
+Each had one sync on m3: `--utxocachemaxsize=1200` took 1,019.5 s and
+`DCROXIDE_DB_OVERLAY=800` 1,068.3 s, against 1,055.8–1,065.0 s over five
+default runs.
+
+The decision is unchanged: no other engine was run and crash safety was not
+tested. Neither daemon was profiled, so whether dcrd's lead up to the
+assume-valid block is the storage cost this ADR accepted is not known. The
+index-off and lever figures are one run each, dcroxide was not run in the
+earlier keys or index layout, and m1 was not measured again. In the three
+dcrd runs of that session the dcroxide server read its block files from the
+drive as it served them, which it had not before; whether that cost dcrd
+anything was not measured.

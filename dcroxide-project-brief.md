@@ -92,7 +92,7 @@ What Phase 15 has covered so far:
   network, before the optimization campaign. A sync at the defaults skips
   connect validation up to the assume-valid block, as dcrd's does; in 2026-08
   the replay harness drove mainnet's blocks up to 1,100,392 through full
-  validation.
+  validation, and on 2026-10-10 every block up to 1,116,035 at `337779d`.
 - **Performance campaign.** Storage-commit policy, the release build profile,
   script-engine allocation, parallel script validation, per-block hash
   memoization, a `SigCache` port, and a batch of smaller allocation fixes.
@@ -149,9 +149,12 @@ What Phase 15 has covered so far:
   after the height-first block keys (ADR-0010) and the exists-address
   index's own layout (ADR-0011). Chain on disk at that block: dcrd
   24.16 GiB, dcroxide 27.90 GiB. Not a later point on the 2.2x and 1.29x
-  curve above: the machine, the dcrd version and the harness all differ,
-  and the parity commit was not run. Full record in
-  [docs/bench-ledger.md](docs/bench-ledger.md).
+  curve above: the machine, the dcrd version and the harness all differ.
+  Later on 2026-10-10 the parity commit `6f6cf21b` took 2,909.8 s and
+  2,869.8 s there, like the release, and with the exists-address index
+  off in both, one run each, dcroxide took 880.8 s against dcrd v2.1.6's
+  1,247.8 s, 1.42x: most of the lead at the defaults is that index. Full
+  record in [docs/bench-ledger.md](docs/bench-ledger.md).
 - **Security-blocker campaign.** The release blockers, highs, and mediums from
   an audit of the ported surface: RPC authentication and admission, peer
   message-path bounds (stall deadlines, getdata, queue and write limits),

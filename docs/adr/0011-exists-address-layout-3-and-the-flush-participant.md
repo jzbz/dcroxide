@@ -480,3 +480,46 @@ index's contents. dcrd here is its release, not the parity commit
 6f6cf21b, and m3 is one machine with fast storage, over loopback. The
 decision, the hooks and the guardrail table are as accepted: a sync's
 rate tests no durability property.
+
+## Addendum, 2026-10-10 (second) — the same syncs with the index off
+
+Later the same day the two binaries of the addendum above each synced
+once more on m3 with `--noexistsaddrindex`, in the same harness
+([bench-ledger.md](../bench-ledger.md), "The parity commit, the index
+off, two levers and a full replay"). dcroxide took 880.8 s (1,267.0
+blocks/s) against the 1,058.6 s median with the index on: layout 3
+costs 177.8 s, 16.8% of the sync, where five default runs span 9.2 s.
+On m2's tail the gap to the floor was 3.8%, inside that storage's
+spread. Here it is 11% even over the 89,438 fully validated blocks
+after the assume-valid block, 461.0 blocks/s against 517.9.
+
+The index added 164.8 s of CPU time (+10%), 7.6 GB passed to write
+calls (+17%) and no flush: 133 either way. At the default cache the
+node peaked at 1,996 MiB without it against 2,129–2,148 MiB, and its
+data directory was 2.01 GiB smaller. The 133 flushes took 115.5 s
+without it against 159.8–170.5 s, so the index's part of them is
+44.3–55.0 s, `contribute` being 18.5–19.1 s of that. With the index
+on, the 133 flushes took 1.38–1.48x the floor's one run. The
+fallback's test allows 1.15x, m2's tail measured 0.74x, and the
+desktop tail above had +52%. The test is set on m2's tail and was not
+run again: this is one floor run over a whole chain on another
+machine, so the status line's "tripped neither fallback test" is not
+judged again. More than two thirds of the 177.8 s is outside the
+flushes and is not attributed.
+
+dcrd v2.1.6 took 1,247.8 s against 2,863.9 s: at its defaults the
+index in its own layout costs it 1,616.1 s, 56% of its sync. The
+Context's "goleveldb absorbs that cheaply" was not a measurement. With
+the index off dcroxide is 1.42x as fast, and 1,438.3 s of the
+1,805.3 s between the two at their defaults (80%) is the difference in
+what the index costs each.
+
+Each floor is one run, and dcrd's is its release's: the parity commit
+ran only with the index on (2,909.8 s and 2,869.8 s, a mean 0.9% over
+the release's median). In dcrd's floor run the dcroxide server read its
+block files from the drive as it served them; if that slowed dcrd, the
+index costs it more than 56%. No base arm ran on m3, so layout 3 is still not
+measured from genesis against dcrd's layout on redb, and none of the
+plan's criteria is judged again; its read and memory criteria stay
+unjudged. Neither daemon was profiled, and m2's flush-time margin, the
+write-buffer overflow and the merge tuning stay open.

@@ -4,7 +4,8 @@
   thread-per-peer fallback, not the tokio proposal; see the addenda
 - **Date:** 2026-07-03 (proposed), 2026-07-26 (addendum: what shipped),
   2026-08-07 (ratified), 2026-08-13 (addendum: the storage levers closed),
-  2026-10-10 (addendum: a later sync comparison)
+  2026-10-10 (addendum: a later sync comparison; second addendum: the
+  parity commit and the index off)
 
 ## Context
 
@@ -246,3 +247,29 @@ and was reverted (ledger, "Background commit (2026-08-16)"). A third
 question stays open. Multi-client RPC/websocket concurrency, which the
 2026-08-07 addendum sets aside to be measured, was not measured here: the
 harness's once-a-second `getblockcount` poll is one client.
+
+## Addendum, 2026-10-10 (second) — the parity commit, and the index off
+
+Two things the addendum above lists as not run were run later that day, in
+the same harness on m3 ([bench-ledger.md](../bench-ledger.md), "The parity
+commit, the index off, two levers and a full replay"). dcrd `6f6cf21b`
+synced in 2,909.8 s and 2,869.8 s, a mean 0.9% over v2.1.6's median, so the
+2.71x above holds against the parity target, where it is 2.73x. With
+`--noexistsaddrindex`, one run each, dcroxide took 880.8 s and dcrd v2.1.6
+1,247.8 s, dcroxide 1.42x as fast: 1,438.3 s of the 1,805.3 s between the
+daemons at their defaults (80%) is the difference in what that index costs
+each. The other 367.0 s is a net, and dcroxide earns it after the
+assume-valid block. With the index off dcrd is the faster up to that block,
+618.5 s against 708.1 s, and dcroxide over the 89,438 fully validated
+blocks after it, 517.9 against 142.1 blk/s. Those are the blocks whose
+scripts are checked, the validation pool's work, and where the ledger has
+the runs above, index on, at about five of the node's 16 threads busy for
+dcroxide and under three for dcrd.
+
+Neither daemon was profiled, so this places the remaining lead without
+explaining it: nothing here says the pool is why dcroxide is faster after
+that block, or what makes dcrd faster before it. The index-off figures are
+one run each, on one machine, over loopback. In the three dcrd runs of
+that session the dcroxide server read its block files from the drive as it
+served them, which it had not before; whether that cost dcrd anything was
+not measured. D2 is unchanged.

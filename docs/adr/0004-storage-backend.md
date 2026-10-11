@@ -74,6 +74,12 @@ believed and points at the evidence; nothing below it has been rewritten.
 > for that machine, one half of what the prefetch idea under Levers waits
 > on. Neither the 1.29x nor the decomposition was re-measured. See the
 > addendum of 2026-10-10 at the end.
+>
+> **Note, 2026-10-10 (second).** The 11% and 12.7% this section gives for
+> flush cadence are m1's of 2026-08. On m3 later that day, one sync each
+> with the current layout, the larger UTXO cache came 3.7% under the
+> default median and the larger overlay no faster. See the second addendum
+> of 2026-10-10 at the end.
 
 **The metadata store now runs redb 4** (addendum, 2026-08-13, which took
 4.1.0; `Cargo.lock` now pins 4.3.0). The on-disk format changed with it:
@@ -1578,3 +1584,56 @@ workers the busiest threads listed. With it counted the CPU ratio is 0.37x.
   the second 2026-08-15 addendum left, how much of the dm-crypt term
   survives on a different stack, is still open. Nothing here speaks for
   fewer cores, slower storage or a busy machine.
+
+## Addendum, 2026-10-10 (second) — the parity commit, the index off and lever (c) on m3
+
+The addendum above records that dcrd `6f6cf21b` was not run on m3 and that
+neither daemon was run with the index off, and the findings at the top
+carry lever (c) as m1 measured it in 2026-08. All three were run on m3
+later the same day, in the same harness, and every run exited on the
+server's tip undisturbed. The record is
+[bench-ledger.md](../bench-ledger.md), "The parity commit, the index off,
+two levers and a full replay".
+
+**The parity commit.** dcrd `6f6cf21b` (2.2.0-pre) synced from the dcroxide
+server in 2,909.8 s and 2,869.8 s: a mean of 2,889.8 s, 0.9% above v2.1.6's
+median, with one run inside v2.1.6's range and one 0.5% above its slowest.
+dcroxide's median is 2.73x as fast as that mean, against 2.71x for the
+release.
+
+**The index off**, one run of each daemon under `--noexistsaddrindex`:
+dcroxide 880.8 s and dcrd v2.1.6 1,247.8 s, so dcroxide is 1.42x as fast
+without the index and 2.71x with it. The index costs dcrd 1,616.1 s of
+2,863.9 s (56%) and dcroxide 177.8 s of 1,058.6 s (17%): of the 1,805.3 s
+between the daemons at their defaults, 1,438.3 s (80%) is the index and
+367.0 s is not. Without it dcrd was the faster daemon up to the
+assume-valid block (618.5 s against 708.1 s) and dcroxide over the 89,438
+fully validated blocks after it (172.7 s against 629.3 s). dcroxide's 133
+flushes took 115.5 s, against 159.8–170.5 s with the index on. By
+difference of data directories (25.884 and 22.190 GiB without it) the
+index is 2.01 GiB of dcroxide's and 1.97 GiB of dcrd's, so dcroxide's
+directory is about 3.7 GiB the larger either way.
+
+**Lever (c)**, one run of each of its two ceilings, against five default
+runs spanning 1,055.8–1,065.0 s, one of them (1,060.4 s) from this session.
+`--utxocachemaxsize=1200` took 1,019.5 s, 3.7% under the earlier four runs'
+median of 1,058.6 s, in 92 flushes taking 82.3 s and at a peak of 3,857 MiB
+resident against 2,129–2,148 MiB. `DCROXIDE_DB_OVERLAY=800` took 1,068.3 s,
+slower than each of the five: 121 flushes, so the setting engaged, but
+taking 182.3 s, with 99.8 GB written at the volume against 81.0 GB, the
+median of those four. On m1 in 2026-08 the two measured 12% (the ledger's
+"Lever sweeps", in replay) and 12.7% (the figure in the findings; the
+ledger's "Overlay flush cadence: +12.7% on IBD", under an overlay accounting
+that changed on 2026-09-23), and both together 11% (the 2026-08-10
+addendum).
+
+**What it does not establish.** The decision and the 2026-08 record stand
+as the addendum above leaves them; nothing was run on m1. The index-off and
+lever figures are one run each, on one machine with fast storage, over
+loopback. In the three dcrd runs the dcroxide server read its block files
+from the drive as it served them, which it did not in the addendum above;
+whether that cost dcrd anything was not measured. Neither daemon was
+profiled, so what the 367.0 s and the two regimes consist of is not known,
+and none of this sets redb against goleveldb. (The same ledger section
+records a full replay on m3, blocks 1 to 1,116,035 validated in full in
+1,909.41 s.)

@@ -41,10 +41,10 @@ It has synced testnet and mainnet to the tip from genesis, and syncs
 against dcrd in both directions (see [Performance](#performance)). A
 sync at the defaults validates in full only the blocks after the
 built-in assume-valid block, as dcrd's does: up to that block both skip
-connect validation, script checks included. In 2026-08 the replay
+connect validation, script checks included. On 2026-10-10 the replay
 harness, `dcroxide-bench` below, drove every mainnet block up to
-1,100,392 through the chain engine with full validation; no full
-replay has been recorded since, so none covers the review fixes above.
+1,116,035 through the chain engine with full validation, at commit
+`337779d`, which has the review fixes above.
 Together that says dcroxide's consensus rules accept every mainnet
 block that dcrd's accepted. That they reject what dcrd's reject rests
 on the test batteries described below, not on a sync, and none of it
@@ -398,10 +398,14 @@ work). Currently implemented:
 
 dcroxide `c128a93` synced mainnet from genesis to block 1,116,035 in a
 median of 17.6 minutes, where dcrd release v2.1.6 (go1.25.4) took 47.7:
-**2.71x as fast**. Measured on 2026-10-09 and 2026-10-10 on one machine
-over loopback, each daemon syncing from a block server run by the other.
-Four runs per direction, three alternated on the first day and one more
-of each in a later round on the next, a fresh data directory per run.
+**2.71x as fast**. Most of that lead is the exists-address index, which
+both daemons build by default: with it off in both, dcroxide took 14.7
+minutes and dcrd 20.8, **1.42x**. Measured on 2026-10-09 and 2026-10-10
+on one machine over loopback, each daemon syncing from a block server
+run by the other. Four runs per direction at the defaults, three
+alternated on the first day and one more of each in a later round on
+the next, a fresh data directory per run. The index-off figures are one
+run each, from a third session later on 2026-10-10.
 
 | syncer | source | wall time, median (range) | mean rate | node CPU time | written by the node |
 |---|---|---|---|---|---|
@@ -419,7 +423,31 @@ holds in both directions: dcrd accepts
 `/dcrwire:1.0.0/dcroxide:2.2.0(pre)/` and dcroxide accepts
 `/dcrwire:1.0.0/dcrd:2.1.6/`.
 
-**The syncer decides the time, not the source.** That later round also
+**The commit dcroxide ports syncs like the release.** dcrd master
+`6f6cf21b` (2.2.0-pre), the parity target, built under go1.26.2 with the
+flags of its release image, took 2,909.8 s and 2,869.8 s from the
+dcroxide server in two runs in that third session. One is inside the
+release's range above and the other 0.5% over its slowest run. Against
+their mean dcroxide is 2.73x as fast.
+
+**Most of the lead is the exists-address index.** One run of each daemon
+with `--noexistsaddrindex`, in the same third session, set against the
+medians above:
+
+| | index on | index off | the index costs |
+|---|---:|---:|---:|
+| dcroxide | 17.6 min (1,058.6 s) | 14.7 min (880.8 s) | 17% of its sync |
+| dcrd v2.1.6 | 47.7 min (2,863.9 s) | 20.8 min (1,247.8 s) | 56% of its sync |
+| dcrd / dcroxide | 2.71x | 1.42x | |
+
+Of the 30 minutes between the two at their defaults, 80% is the
+difference in what the index costs each. With it off the two halves of
+the chain go different ways: dcrd reached the assume-valid block first,
+in 10.3 minutes against dcroxide's 11.8, and dcroxide ran the fully
+validated blocks after it 3.6x as fast, in 2.9 minutes against 10.5.
+
+**The syncer decides the time, not the source.** The round that supplied
+each direction's fourth run also
 ran each daemon from a server of its own kind, back to back with its
 cross-source run counted above: dcroxide took 1,072.2 s from a dcroxide
 server against 1,061.1 s from dcrd's, and dcrd 2,872.8 s from a dcrd
@@ -430,8 +458,10 @@ same-source runs, taken with more activity on the machine, is in the
 ledger with the rest.
 
 Both daemons ran at their defaults, apart from the flags that point
-them at the block server and open RPC for the height poll. So the
-exists-address index is on in each, and both carry the same assume-valid
+them at the block server and open RPC for the height poll, and
+`--noexistsaddrindex` in the index-off pair. So the
+exists-address index is on in every other run, and both carry the same
+assume-valid
 block, 1,026,597: up to it they skip connect validation, script checks
 included, and they validate the 89,438 blocks after it in full. The
 syncing node was pinned to eight
@@ -439,9 +469,14 @@ cores (16 threads) of a 16-core desktop with one NVMe drive, m3 in the
 [bench ledger](docs/bench-ledger.md), and the serving node to four
 others, with its data read into the page cache before each run. The
 clock runs from the syncing process's start to the first once-a-second
-`getblockcount` poll that reports the target height.
+`getblockcount` poll that reports the target height. In the three dcrd
+runs of the third session, the two of `6f6cf21b` and the one with the
+index off, the page cache did not keep the dcroxide server's block
+files and it read them from the drive as it served them. Whether that
+cost dcrd anything was not measured.
 
-The lead grows along the chain, and most where full validation
+At the defaults the lead grows along the chain, and most where full
+validation
 begins. Time to reach each height, the median of the four runs,
 interpolated between samples taken every 10 s:
 
@@ -454,16 +489,16 @@ interpolated between samples taken every 10 s:
 | 1,026,597 (assume-valid) | 14.4 min | 33.4 min |
 | 1,116,035 | 17.6 min | 47.7 min |
 
-Up to the assume-valid block dcroxide led 2.3x. Over the 89,438 blocks
-after it dcroxide ran at about 461 blk/s against dcrd's 104, 4.4x. dcroxide's
-metadata flushes took 15–16% of its wall time, and its peak resident
-memory was 2.09 GiB against dcrd's 1.81 GiB.
+Up to the assume-valid block dcroxide led 2.3x with the index on. Over
+the 89,438 blocks after it dcroxide ran at about 461 blk/s against
+dcrd's 104, 4.4x. dcroxide's metadata flushes took 15–16% of its wall
+time, and its peak resident memory was 2.09 GiB against dcrd's 1.81 GiB.
 
 What these figures do not say:
 
-- **dcrd is its latest release, not the commit dcroxide ports.** The
-  parity target is dcrd master `6f6cf21b` (2.2.0-pre), which was not run
-  in this round.
+- **Where the rest of the difference comes from.** Neither daemon was
+  profiled. Why dcrd is ahead up to the assume-valid block with the
+  index off, and dcroxide ahead after it, has not been taken apart.
 - **It is loopback.** Over the internet both daemons request blocks
   through dcrd's window of 16 in flight, refilled once fewer than 10
   remain. That predicts (it is not a measurement) that the network
@@ -478,13 +513,13 @@ What these figures do not say:
   same storage layout ran the 200,000 blocks after 916,000 at a median
   of 482 blk/s, where m3 ran them at about 593. No sync from genesis
   has been measured on m2 with that layout.
-- **The index is on in both.** Neither daemon was run here with
-  `--noexistsaddrindex`.
 
 At block 1,116,035 the data directory is 27.90 GiB under dcroxide and
 24.16 GiB under dcrd, 1.15x. Block files make up 17.88 GiB of each. The
 rest is metadata: one 10.01 GiB `metadata.redb`, against about 6.28 GiB left
-for dcrd's two leveldb stores. Neither side compresses. A 2026-08-11
+for dcrd's two leveldb stores. The exists-address index is about 2.0 GiB
+of either: with it off the directories were 25.88 and 22.19 GiB. Neither
+side compresses. A 2026-08-11
 measurement found the two implementations storing the same payload for
 the same chain, so the difference then was redb's page layout and not
 extra data. The exists-address index has since moved to a layout of its
