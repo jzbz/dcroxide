@@ -15,10 +15,11 @@
 //
 // Results that depend on this tool, all in docs/bench-ledger.md: fjall
 // surviving 10 rounds of real power loss, and dcroxide's own block files
-// surviving 3 -- the latter showing that only metadata.redb ever has
-// anything to undo, because DbCache::run_flush syncs the block files first and
-// the metadata commit is 68-71% of block-sync wall time, so a kill at an
-// arbitrary instant lands inside it. Both ran on a shim that recorded no
+// surviving 3 -- the latter showing that only metadata.redb had anything
+// to undo, because DbCache::run_flush syncs the block files first, and
+// flushes were 68-71% of block-sync wall time (m1, 2026-08-16; 15-16% on
+// m3 in 2026-10), so a kill at an arbitrary instant usually landed
+// inside the metadata commit. Both ran on a shim that recorded no
 // ftruncate64 (Rust's File::set_len), writev, pwritev or fallocate, dropped
 // any overwrite of 64 KiB or more, put zeros back where a shrink had cut
 // bytes off, and never recorded a file as created; none is re-run yet.

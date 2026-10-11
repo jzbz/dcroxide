@@ -1801,18 +1801,18 @@ fn bind_p2p_listeners(
 ///
 /// The default leaves redb's own 1 GiB in place, so an untouched node
 /// keeps exactly the resident footprint it had before this was
-/// configurable. Leave it there: this is the one storage knob that
-/// hurts. Over a full mainnet replay 8192 MiB measured 50% slower —
-/// 5125-6294 s against a 3866-3888 s baseline, ranges disjoint — while
-/// 256 and 512 MiB are indistinguishable from the default, ranges
-/// overlapping it. The probe that motivated the knob (78.6 s at 1 GiB
-/// against 16.1 s at 8 GiB, 2,000,000 scattered writes into the
-/// 14.48 GiB mainnet metadata store) is superseded: the full chain
-/// reverses it, and its 8 GiB arm raised the flush cadence as well, so
-/// it never isolated the cache. Cadence is the half that pays, at
-/// 11-12%, and dcrd's own `--utxocachemaxsize` already reaches it. The
-/// cache is a ceiling filled on demand and bounded by the file size,
-/// so a small chain does not pay for a large setting.
+/// configurable. Leave it there: it is the one storage knob that has
+/// measured a loss. In full mainnet replays on m1 in 2026-08
+/// (`docs/bench-ledger.md`), before ADR-0010 and ADR-0011, 8192 MiB was
+/// 50% slower, 5125-6294 s against 3866-3888 s, and 256 and 512 MiB
+/// overlapped their own sweep's baseline. The 2026-07 probe that
+/// motivated the knob (78.6 s at 1 GiB against 16.1 s at 8 GiB, 2,000,000
+/// scattered writes into the 14.48 GiB metadata store) is superseded: the
+/// replays reversed it, and its 8 GiB arm raised the flush cadence too.
+/// In the replays cadence was the half that paid, 11-12%, in reach of
+/// dcrd's own `--utxocachemaxsize`; one sync on m3 on 2026-10-10 gained
+/// 3.7% from it. The cache is a ceiling filled on demand and bounded by
+/// the file size, so a small chain does not pay for a large setting.
 ///
 /// A value that does not parse, or is zero, is ignored with a warning
 /// rather than being fatal: it is a tuning hint, and refusing to start
@@ -1871,22 +1871,22 @@ fn env_tuning_u64(var: &str, unit: &str) -> Option<u64> {
 /// Apply the metadata overlay's size and time flush triggers from
 /// `DCROXIDE_DB_OVERLAY` (MiB) and `DCROXIDE_DB_FLUSH_SECS` (seconds).
 ///
-/// These are the second of the two flush triggers, and until now the
+/// These are the second of the two flush triggers, and until 2026-08 the
 /// unreachable one. Connecting a block flushes the UTXO cache when it
 /// fills, and `--utxocachemaxsize` governs that; the overlay has its own
 /// independent ceiling (100 MiB) and interval (300 s) that no flag or
 /// variable reached, so half the cadence lever was fixed at compile time.
 ///
-/// Cadence is the half that pays. `--utxocachemaxsize` alone measured
-/// **12% faster** over a full chain at 1200 MiB and 7% at 600 MiB, three
-/// repetitions each with ranges disjoint from the baseline's — the only
-/// defensible IBD gain any tuning has produced. What makes the overlay
-/// worth reaching is the 2026-08-15 measurement: the node is *fully
-/// stalled*, with nothing runnable, for 34.6% of block-sync wall time,
-/// and that time is spent in a small number of very large durable
-/// commits rather than many small ones. Both triggers force such a
-/// commit, so leaving one of them unreachable caps what cadence tuning
-/// can be asked to do.
+/// Cadence was the half that paid when these were added. On m1 in 2026-08
+/// (`docs/bench-ledger.md`), before the keys of ADR-0010 and the index
+/// layout of ADR-0011, `--utxocachemaxsize` alone measured **12% faster**
+/// over full-validation replays at 1200 MiB and 7% at 600 MiB, and a sync
+/// sampled on 2026-08-15 was *fully stalled*, with nothing runnable, for
+/// 34.6% of block-sync wall time (51.1% weighted by time), in a small
+/// number of very large durable commits. Both triggers force one, so an
+/// unreachable trigger capped cadence tuning; an 800 MiB overlay then
+/// gained 12.7% over four syncs on m1. On m3 on 2026-10-10, one sync each,
+/// the larger UTXO cache gained 3.7% and the same overlay setting nothing.
 ///
 /// Environment variables rather than flags, for `DCROXIDE_DB_CACHE`'s
 /// reason: dcrd has no counterpart, and the generated `-h` output is
@@ -1942,13 +1942,13 @@ fn exists_addr_policy(enabled: bool) -> dcroxide_indexers::ExistsAddrPolicy {
 /// Record every metadata flush to the JSONL path in
 /// `DCROXIDE_DB_FLUSHLOG`, when one is set.
 ///
-/// Exists to settle what the 2026-08-15 D-state measurement could not.
-/// That run found the node fully stalled for 34.6% of block-sync wall
-/// time, but the sampler reads kernel wait channels rather than user
-/// stacks, so it cannot say whether a stalled thread is inside the
-/// metadata commit or writing a block file. The observer knows exactly,
-/// and pairing its windows against the sampler's timestamps attributes
-/// the stall directly instead of by inference.
+/// Exists to settle what m1's D-state measurement of 2026-08-15 could
+/// not. That run found the node fully stalled for 34.6% of block-sync
+/// wall time (51.1% weighted by time), but its sampler reads kernel
+/// wait channels, not user stacks, so it cannot say whether a stalled
+/// thread is inside the metadata commit or writing a block file. The
+/// observer knows exactly, and pairing its windows against the sampler's
+/// timestamps attributes the stall directly instead of by inference.
 ///
 /// One line per flush: the sequence, the wall-clock instant the flush
 /// ENDED, and its duration. The observer fires after the commit, so
@@ -1968,8 +1968,8 @@ fn exists_addr_policy(enabled: bool) -> dcroxide_indexers::ExistsAddrPolicy {
 /// Stats sampling is deliberately left off (`flush_stats_every` stays
 /// 0). redb's `stats()` walks every branch and leaf page, which on a
 /// chain-sized tree cost 442.5 s against the flushes' own 260.9 s in the
-/// replay that motivated this — enabling it here would swamp the
-/// quantity being measured.
+/// 2026-08-08 replay on m1 that motivated this — enabling it here would
+/// swamp the quantity being measured.
 fn flush_log_observer() -> Option<dcroxide_database::FlushObserver> {
     let path = std::env::var("DCROXIDE_DB_FLUSHLOG").ok()?;
     let file = match std::fs::File::create(&path) {

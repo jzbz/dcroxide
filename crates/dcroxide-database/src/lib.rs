@@ -607,15 +607,15 @@ impl redb::StorageBackend for SharedBackendHandle {
 ///
 /// Kept as the default so raising it is an operator's decision rather
 /// than a silent change in resident memory — and the decision is to
-/// leave it where it is. Over full mainnet replays an 8192 MiB cache
-/// measured 50% slower (5125-6294 s against a 3866-3888 s baseline,
-/// disjoint), while 256 and 512 MiB both overlap the baseline, so this
-/// value is correctly sized in both directions (the 2026-08-10 and
-/// 2026-08-11 sweeps in `docs/bench-ledger.md`).
+/// leave it where it is. Over full mainnet replays on m1 an 8192 MiB
+/// cache measured 50% slower (5125-6294 s against 3866-3888 s) and 256
+/// and 512 MiB overlapped their own baseline: the 2026-08-10 and
+/// 2026-08-11 sweeps in `docs/bench-ledger.md`, both before ADR-0010's
+/// block keys and ADR-0011's index layout, and not measured again since.
 ///
-/// The table below is the superseded microbenchmark those replays
-/// reversed: 2,000,000 scattered writes against the mainnet metadata
-/// store (14.48 GiB).
+/// The table below is the superseded 2026-07 microbenchmark those
+/// replays reversed: 2,000,000 scattered writes against the mainnet
+/// metadata store (14.48 GiB).
 ///
 /// | cache | 250k per commit | 2M per commit |
 /// |---|---|---|
@@ -625,8 +625,8 @@ impl redb::StorageBackend for SharedBackendHandle {
 ///
 /// Its multiplicative reading — 1.8x from batching alone, 2.7x from
 /// cache alone, 4.9x together — is withdrawn. Only the flush-cadence
-/// half survived the full chain, at 11-12%, and that half is reachable
-/// through dcrd's own `--utxocachemaxsize`.
+/// half survived those replays, at 11-12% on m1, in reach of dcrd's own
+/// `--utxocachemaxsize`; one sync on m3 on 2026-10-10 gained 3.7% from it.
 pub const DEFAULT_DB_CACHE_BYTES: usize = 1024 * 1024 * 1024;
 
 /// Run one flush with the cache lock released across the commit.
@@ -635,8 +635,8 @@ pub const DEFAULT_DB_CACHE_BYTES: usize = 1024 * 1024 * 1024;
 /// serialises flushes against each other; the cache lock only has to be
 /// held for the capture and the retirement. Holding it across the commit
 /// as well — which is what this code used to do — blocks every reader in
-/// the process for an fsync that the 2026-08-16 measurement puts at a
-/// median of 26.9 s.
+/// the process for the commit's fsync. The median flush took 26.9 s in
+/// m1's sync of 2026-08-16 (about 1.3 s on m3 in 2026-10).
 ///
 /// Synchronous to durability: it returns only once the data is on disk,
 /// because `Database::flush` and `Database::close` are the chain's
