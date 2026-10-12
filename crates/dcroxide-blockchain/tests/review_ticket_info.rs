@@ -78,7 +78,7 @@ fn stake_view(chain: &mut Chain, hash: &Hash, params: &Params) -> StakeView {
         revoked: stake_node.revoked_tickets(),
         live: stake_node.live_tickets(),
         undo: format!("{:?}", stake_node.undo_data()),
-        snapshot_missed: chain.state_snapshot.missed_tickets.clone(),
+        snapshot_missed: chain.state_snapshot.missed_tickets.to_vec(),
     }
 }
 
@@ -163,7 +163,8 @@ fn a_child_stored_before_a_restart_connects_with_its_votes() {
     drop(chain);
     let chain = open(&opts, &params, false);
     assert_eq!(
-        chain.state_snapshot.missed_tickets, want.snapshot_missed,
+        chain.state_snapshot.missed_tickets.to_vec(),
+        want.snapshot_missed,
         "the persisted missed-ticket set diverged"
     );
 }

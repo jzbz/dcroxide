@@ -118,6 +118,58 @@ pub fn fetch_winners(idxs: &[usize], t: &Immutable) -> Result<Vec<Key>, RuleErro
     Ok(winners)
 }
 
+/// The missed tickets as of one stake node, without the list having
+/// been built: what dcrd's `MissedTickets` returns, held as the node's
+/// immutable missed treap.
+///
+/// Taking one is a reference-count increment, and the set it names
+/// never changes: the treap is persistent, so the node's later
+/// transitions build new treaps and leave this one as it was.  The
+/// list is built by [`MissedTickets::to_vec`], and membership answered
+/// by [`MissedTickets::contains`], when a caller asks.
+#[derive(Clone, Default)]
+pub struct MissedTickets(Immutable);
+
+impl MissedTickets {
+    /// The number of missed tickets.
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Whether there are no missed tickets.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Whether the ticket is in the missed set (dcrd
+    /// `ExistsMissedTicket`).
+    pub fn contains(&self, ticket: &Hash) -> bool {
+        self.0.has(&ticket.0)
+    }
+
+    /// All missed tickets in key order (dcrd `MissedTickets`).
+    pub fn to_vec(&self) -> Vec<Hash> {
+        let mut tickets = Vec::with_capacity(self.0.len());
+        self.0.for_each(|k, _| {
+            tickets.push(Hash(*k));
+            true
+        });
+        tickets
+    }
+}
+
+/// Formats as the list [`MissedTickets::to_vec`] returns does.
+impl core::fmt::Debug for MissedTickets {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let mut list = f.debug_list();
+        self.0.for_each(|k, _| {
+            list.entry(&Hash(*k));
+            true
+        });
+        list.finish()
+    }
+}
+
 impl core::fmt::Debug for Node {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("Node")
@@ -220,6 +272,13 @@ impl Node {
             true
         });
         tickets
+    }
+
+    /// The missed tickets of this node as a handle on its missed
+    /// treap, for a holder that may never need the list
+    /// [`Node::missed_tickets`] walks the whole treap to build.
+    pub fn missed_ticket_set(&self) -> MissedTickets {
+        MissedTickets(self.missed_tickets.clone())
     }
 
     /// Whether the ticket is in the revoked set (dcrd

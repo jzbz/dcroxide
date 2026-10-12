@@ -22,7 +22,7 @@ use dcroxide_wire::BlockHeader;
 
 use dcroxide_gcs::FilterV2;
 use dcroxide_stake::ticketdb::UndoTicketData;
-use dcroxide_stake::ticketnode::{Node as StakeNode, StakeNodeParams};
+use dcroxide_stake::ticketnode::{MissedTickets, Node as StakeNode, StakeNodeParams};
 use dcroxide_uint256::Uint256;
 use dcroxide_wire::{MsgBlock, MsgTx, OutPoint};
 
@@ -507,8 +507,14 @@ pub struct BestState {
     pub next_expiring_tickets: Vec<Hash>,
     /// The eligible tickets to vote on the next block.
     pub next_winning_tickets: Vec<Hash>,
-    /// The missed tickets set to be revoked.
-    pub missed_tickets: Vec<Hash>,
+    /// The missed tickets set to be revoked, held as the stake node's
+    /// immutable missed treap.  dcrd builds the list for every
+    /// connected block (`chain.go:654-658`), a walk of the whole treap
+    /// whose only reader is template generation
+    /// (`mining.go:1649-1650`); the handle costs a reference-count
+    /// increment per block, and a reader builds the same list, or
+    /// tests membership, from it.
+    pub missed_tickets: MissedTickets,
     /// The lottery state for the next block.
     pub next_final_state: [u8; 6],
 }
@@ -652,7 +658,7 @@ impl Chain {
             total_subsidy: 0,
             next_expiring_tickets: Vec::new(),
             next_winning_tickets: Vec::new(),
-            missed_tickets: Vec::new(),
+            missed_tickets: MissedTickets::default(),
             next_final_state: [0u8; 6],
         };
 
@@ -1458,7 +1464,7 @@ impl Chain {
             total_subsidy: state.total_subsidy,
             next_expiring_tickets: stake_node.expiring_next_block(),
             next_winning_tickets: stake_node.winners().to_vec(),
-            missed_tickets: stake_node.missed_tickets(),
+            missed_tickets: stake_node.missed_ticket_set(),
             next_final_state: stake_node.final_state(),
         };
         Ok(new_rules_start_time)
@@ -3416,7 +3422,7 @@ impl Chain {
             total_subsidy: self.state_snapshot.total_subsidy.wrapping_add(subsidy),
             next_expiring_tickets: stake_node.expiring_next_block(),
             next_winning_tickets: stake_node.winners().to_vec(),
-            missed_tickets: stake_node.missed_tickets(),
+            missed_tickets: stake_node.missed_ticket_set(),
             next_final_state: stake_node.final_state(),
         };
         let tickets_new = stake_node.new_tickets().to_vec();
@@ -3632,7 +3638,7 @@ impl Chain {
             total_subsidy: self.state_snapshot.total_subsidy.wrapping_sub(subsidy),
             next_expiring_tickets: parent_stake_node.expiring_next_block(),
             next_winning_tickets: parent_stake_node.winners().to_vec(),
-            missed_tickets: parent_stake_node.missed_tickets(),
+            missed_tickets: parent_stake_node.missed_ticket_set(),
             next_final_state: parent_stake_node.final_state(),
         };
 

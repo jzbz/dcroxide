@@ -66,7 +66,7 @@ impl TemplateChain for NodeTemplateChain {
     fn best_snapshot(&self) -> TemplateBest {
         let chain = self.locked();
         let best = chain.best_snapshot();
-        TemplateBest {
+        let mut template_best = TemplateBest {
             hash: best.hash,
             prev_hash: best.prev_hash,
             height: best.height,
@@ -76,8 +76,15 @@ impl TemplateChain for NodeTemplateChain {
             next_pool_size: best.next_pool_size,
             next_winning_tickets: best.next_winning_tickets.clone(),
             next_expiring_tickets: best.next_expiring_tickets.clone(),
-            missed_tickets: best.missed_tickets.clone(),
-        }
+            missed_tickets: Vec::new(),
+        };
+        // The chain keeps the missed tickets as a handle on the tip's
+        // immutable treap; the list the generator reads is built here,
+        // from that block's set, after the chain is released.
+        let missed_tickets = best.missed_tickets.clone();
+        drop(chain);
+        template_best.missed_tickets = missed_tickets.to_vec();
+        template_best
     }
 
     fn block_by_hash(&self, hash: &Hash) -> Result<MsgBlock, String> {
