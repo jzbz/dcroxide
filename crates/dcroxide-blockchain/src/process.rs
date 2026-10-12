@@ -40,7 +40,7 @@ use crate::ruleerror::RuleErrorKind;
 use crate::stakever::calc_want_height;
 use crate::thresholdstate::{ThresholdStateTuple, VoteCounts, agenda_state, state_last_changed};
 use crate::utxoentry::UtxoEntry;
-use crate::utxoview::{OutPointKey, UtxoView, count_spent_outputs};
+use crate::utxoview::{OutPointKey, UtxoKey, UtxoView, count_spent_outputs};
 use crate::validate::{ForkRejection, check_block_header_positional, check_block_header_sanity};
 
 /// Statistics on the current UTXO set (dcrd `UtxoStats`).
@@ -159,6 +159,47 @@ impl crate::utxoview::UtxoResolver for ChainUtxoResolver<'_> {
     }
 }
 
+/// The entries of the UTXO cache in outpoint key order (the map behind
+/// dcrd's `UtxoCache.entries`).
+///
+/// The map holds each [`OutPointKey`] in the wrapper the per-block view
+/// holds its keys in, which orders exactly as the key itself does and
+/// whose comparison needs no library call, so a flush still walks the
+/// entries in outpoint key order.  The chain works on the map itself;
+/// the methods are the outpoint-keyed operations code outside the crate
+/// reads and seeds the cache with.
+#[derive(Default)]
+pub struct UtxoCacheMap(pub(crate) BTreeMap<UtxoKey, Option<UtxoEntry>>);
+
+impl UtxoCacheMap {
+    /// The number of outpoints the cache holds a state for.
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Whether the cache holds no outpoint.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// What the cache holds for the outpoint: nothing, an entry, or an
+    /// explicit `None` for an output known to be absent from the
+    /// backend.
+    pub fn get(&self, key: &OutPointKey) -> Option<&Option<UtxoEntry>> {
+        self.0.get(&UtxoKey(*key))
+    }
+
+    /// Set what the cache holds for the outpoint, returning what it
+    /// held before.
+    pub fn insert(
+        &mut self,
+        key: OutPointKey,
+        entry: Option<UtxoEntry>,
+    ) -> Option<Option<UtxoEntry>> {
+        self.0.insert(UtxoKey(key), entry)
+    }
+}
+
 /// The growing chain state: the block tree arena and index together
 /// with the chain state and configuration (the subset of dcrd's
 /// `BlockChain` struct this port reads).  dcrd's locks are not
@@ -243,7 +284,7 @@ pub struct Chain {
     /// observable through the entry fields that survive
     /// reorganizations.  Interior mutability lets `&self` reads cache
     /// their misses like dcrd's mutex-guarded cache does.
-    pub utxo_cache: RefCell<BTreeMap<OutPointKey, Option<UtxoEntry>>>,
+    pub utxo_cache: RefCell<UtxoCacheMap>,
     /// The transaction spend journal by block hash, in dcrd's
     /// serialized journal format: a recent-window mirror of dcrd's
     /// spend journal bucket, which `connect_block` writes; evicted with
@@ -696,7 +737,7 @@ impl Chain {
             ticket_purchase_order: VecDeque::new(),
             ticket_purchase_misses: 0,
             utxo_backend: BTreeMap::new(),
-            utxo_cache: RefCell::new(BTreeMap::new()),
+            utxo_cache: RefCell::new(UtxoCacheMap::default()),
             spend_journal: BTreeMap::new(),
             filters,
             header_commitments: BTreeMap::new(),
@@ -1707,7 +1748,12 @@ impl Chain {
         let entry_size = utxo_entry_size(&entry);
         let mut total = self.utxo_total_entry_size.get();
         // One descent of the map for the probe and the store alike.
-        let slot = self.utxo_cache.get_mut().entry(key).or_insert(None);
+        let slot = self
+            .utxo_cache
+            .get_mut()
+            .0
+            .entry(UtxoKey(key))
+            .or_insert(None);
         match slot {
             Some(existing) => {
                 if existing.is_fresh() {
@@ -1742,7 +1788,7 @@ impl Chain {
             Tombstone(u64),
             BackendLookup,
         }
-        let action = match self.utxo_cache.get_mut().get_mut(&key) {
+        let action = match self.utxo_cache.get_mut().0.get_mut(&UtxoKey(key)) {
             Some(slot) => match slot {
                 None => SpendAction::Done,
                 Some(entry) => {
@@ -2031,7 +2077,7 @@ impl Chain {
     /// [`utxo_flush_rows`] inside their flush transaction instead.
     fn utxo_flush_to_memory_backend(&mut self) {
         let mut memory_writes: Vec<(OutPointKey, Option<UtxoEntry>)> = Vec::new();
-        for (key, entry) in self.utxo_cache.get_mut().iter() {
+        for (key, entry) in self.utxo_cache.get_mut().0.iter() {
             let Some(entry) = entry else {
                 continue;
             };
@@ -2039,11 +2085,11 @@ impl Chain {
                 continue;
             }
             if entry.is_spent() {
-                memory_writes.push((*key, None));
+                memory_writes.push((key.0, None));
             } else {
                 let mut cleaned = entry.clone();
                 cleaned.set_state_bits(0);
-                memory_writes.push((*key, Some(cleaned)));
+                memory_writes.push((key.0, Some(cleaned)));
             }
         }
         for (key, write) in memory_writes {
@@ -2064,7 +2110,7 @@ impl Chain {
     /// everything retained has its modified and fresh flags cleared.
     fn utxo_flush_finish(&mut self, eviction_height: u32, last_flush_hash: Hash) {
         let mut total = self.utxo_total_entry_size.get();
-        self.utxo_cache.get_mut().retain(|_, entry| {
+        self.utxo_cache.get_mut().0.retain(|_, entry| {
             let evict = match entry {
                 None => true,
                 Some(e) => e.is_spent() || e.block_height() < i64::from(eviction_height),
@@ -2497,7 +2543,8 @@ impl Chain {
         for (&i, entry) in missing.iter().zip(fetched) {
             let op = &outpoints[i];
             let key = (op.hash.0, op.index, op.tree);
-            if let alloc::collections::btree_map::Entry::Vacant(slot) = cache.entry(key) {
+            if let alloc::collections::btree_map::Entry::Vacant(slot) = cache.0.entry(UtxoKey(key))
+            {
                 if let Some(entry) = &entry {
                     self.utxo_total_entry_size.set(
                         self.utxo_total_entry_size
@@ -7921,18 +7968,17 @@ fn chain_db_to_db_error(err: crate::chaindb::ChainDbError) -> dcroxide_database:
 /// for unmodified entries or absent markers, a delete for spent ones,
 /// and the entry itself otherwise, whose serialization ignores the
 /// cache state bits.
-fn utxo_flush_rows(
-    cache: &BTreeMap<OutPointKey, Option<UtxoEntry>>,
-) -> impl Iterator<Item = (OutPoint, Option<&UtxoEntry>)> {
-    cache.iter().filter_map(|(key, entry)| {
+fn utxo_flush_rows(cache: &UtxoCacheMap) -> impl Iterator<Item = (OutPoint, Option<&UtxoEntry>)> {
+    cache.0.iter().filter_map(|(key, entry)| {
         let entry = entry.as_ref()?;
         if !entry.is_modified() {
             return None;
         }
+        let (hash, index, tree) = key.0;
         let outpoint = OutPoint {
-            hash: Hash(key.0),
-            index: key.1,
-            tree: key.2,
+            hash: Hash(hash),
+            index,
+            tree,
         };
         Some((outpoint, (!entry.is_spent()).then_some(entry)))
     })
@@ -8876,6 +8922,189 @@ mod tests {
             Some(60 * NANOS_PER_SEC),
             "a flush with no write cache to wait in was not stamped"
         );
+    }
+
+    /// A chain without a database whose backend, cache and a view over
+    /// them hold every combination a commit meets, built the same way
+    /// for the same seed.
+    ///
+    /// Per outpoint the backend holds a row or not; the cache holds
+    /// nothing, a clean copy of the row, an entry the backend has never
+    /// seen, a changed copy of the row, a spent tombstone or an absent
+    /// marker; and the view holds nothing or an entry in one of the
+    /// states a commit handles.
+    fn chain_and_view_to_commit(seed: u64) -> (Chain, UtxoView) {
+        use crate::utxoentry::{
+            UTXO_STATE_FRESH, UTXO_STATE_MODIFIED, UTXO_STATE_SPENT, UTXO_STATE_SPENT_BY_ZERO_CONF,
+        };
+
+        let mut rng = dcroxide_testutil::SplitMix64(seed);
+        let entry = |n: u64, state: u8| {
+            let mut entry = UtxoEntry::new(
+                n as i64,
+                alloc::vec![0x51; 1 + (n % 40) as usize],
+                (n % 7) as u32,
+                0,
+                0,
+                false,
+                false,
+                dcroxide_stake::TxType::Regular,
+                None,
+            );
+            entry.set_state_bits(state);
+            entry
+        };
+
+        let params = dcroxide_chaincfg::regnet_params();
+        let mut chain = Chain::new(&params, Hash::ZERO, false);
+        let mut view = UtxoView::new();
+        let mut cached_size = 0u64;
+        let mut hash = [0u8; 32];
+        for n in 0..600u64 {
+            // Three outputs to a transaction, so keys differ in the
+            // index and the tree alone too.
+            if n % 3 == 0 {
+                rng.fill(&mut hash);
+            }
+            let outpoint = OutPoint {
+                hash: Hash(hash),
+                index: (n % 3) as u32,
+                tree: (n % 2) as i8,
+            };
+            let key = (outpoint.hash.0, outpoint.index, outpoint.tree);
+
+            let in_backend = rng.below(2) == 0;
+            if in_backend {
+                chain.utxo_backend.insert(key, entry(n, 0));
+            }
+            let cached = match (rng.below(6), in_backend) {
+                (0, _) => None,
+                (1, true) => Some(Some(entry(n, 0))),
+                (2, true) => Some(Some(entry(n + 1000, UTXO_STATE_MODIFIED))),
+                (3, true) => Some(Some(entry(n, UTXO_STATE_MODIFIED | UTXO_STATE_SPENT))),
+                (4, false) => Some(Some(entry(n, UTXO_STATE_MODIFIED | UTXO_STATE_FRESH))),
+                (5, false) => Some(None),
+                _ => None,
+            };
+            let cache_spent = matches!(&cached, Some(Some(e)) if e.is_spent());
+            if let Some(cached) = cached {
+                cached_size += cached.as_ref().map_or(0, utxo_entry_size);
+                chain.utxo_cache.get_mut().insert(key, cached);
+            }
+
+            let view_state = match rng.below(8) {
+                0 => continue,
+                1 => 0,
+                2 => UTXO_STATE_SPENT,
+                3 => UTXO_STATE_MODIFIED,
+                4 => UTXO_STATE_MODIFIED | UTXO_STATE_FRESH,
+                5 => UTXO_STATE_MODIFIED | UTXO_STATE_SPENT | UTXO_STATE_SPENT_BY_ZERO_CONF,
+                // The cache refuses to spend an output twice.
+                _ if cache_spent => UTXO_STATE_MODIFIED,
+                _ => UTXO_STATE_MODIFIED | UTXO_STATE_SPENT,
+            };
+            view.insert_entry(&outpoint, entry(n + 2000, view_state));
+        }
+        chain.utxo_total_entry_size.set(cached_size);
+        (chain, view)
+    }
+
+    /// What a chain's UTXO state is made of, for comparing two chains.
+    fn utxo_state_of(chain: &Chain) -> impl PartialEq + core::fmt::Debug {
+        (
+            chain
+                .utxo_cache
+                .borrow()
+                .0
+                .iter()
+                .map(|(key, entry)| (key.0, entry.clone()))
+                .collect::<Vec<_>>(),
+            chain.utxo_backend.clone(),
+            chain.utxo_total_entry_size.get(),
+            chain.utxo_cache_hits.get(),
+            chain.utxo_cache_misses.get(),
+        )
+    }
+
+    /// Committing a view leaves the cache, its accounting and the view
+    /// exactly as the commit that searched the view did: that one
+    /// copied the view's keys, looked each entry up again, removed it
+    /// and applied it to the cache, in outpoint key order (dcrd
+    /// `UtxoCache.Commit`, `utxocache.go:548-625`).  The flush that
+    /// follows then writes the same rows.
+    #[test]
+    fn committing_a_view_leaves_the_cache_as_the_searching_commit_did() {
+        let mut tally = [0usize; 3];
+        for seed in 1..=4 {
+            let (mut chain, mut view) = chain_and_view_to_commit(seed);
+            let (mut reference, mut reference_view) = chain_and_view_to_commit(seed);
+            assert!(
+                utxo_state_of(&chain) == utxo_state_of(&reference),
+                "seed {seed}: the two chains start alike"
+            );
+            let in_view = view.entries().count();
+
+            chain.commit_view(&mut view);
+
+            let keys: Vec<OutPointKey> = reference_view.entries().map(|(key, _)| *key).collect();
+            let mut applied = 0;
+            for key in keys {
+                let outpoint = OutPoint {
+                    hash: Hash(key.0),
+                    index: key.1,
+                    tree: key.2,
+                };
+                let entry = reference_view.lookup_entry(&outpoint).expect("present");
+                if !entry.is_modified() {
+                    continue;
+                }
+                let entry = entry.clone();
+                reference_view.remove_entry(&outpoint);
+                if entry.is_spent_by_zero_conf() {
+                    continue;
+                }
+                applied += 1;
+                if entry.is_spent() {
+                    reference.cache_spend_entry(key);
+                } else {
+                    reference.cache_add_entry(key, entry);
+                }
+            }
+
+            assert_eq!(
+                utxo_state_of(&chain),
+                utxo_state_of(&reference),
+                "seed {seed}: the cache after the commit"
+            );
+            assert!(
+                view.entries().eq(reference_view.entries()),
+                "seed {seed}: what stays in the view"
+            );
+            let stayed = view.entries().count();
+            tally[0] += applied;
+            tally[1] += stayed;
+            tally[2] += in_view - applied - stayed;
+
+            // The cache is walked in the order of the outpoint tuple.
+            let cached: Vec<OutPointKey> =
+                chain.utxo_cache.borrow().0.keys().map(|k| k.0).collect();
+            assert!(
+                cached.windows(2).all(|pair| pair[0] < pair[1]),
+                "seed {seed}: the cache is not in outpoint key order"
+            );
+
+            let tip = hash_of(seed as u8);
+            chain.flush_utxo_cache(tip, 5).expect("flush");
+            reference.flush_utxo_cache(tip, 5).expect("flush");
+            assert_eq!(
+                utxo_state_of(&chain),
+                utxo_state_of(&reference),
+                "seed {seed}: the backend and the cache after the flush"
+            );
+        }
+        // Changes applied, entries kept, zero-confirmation spends
+        // dropped: the seeds exercised all three.
+        assert!(tally.iter().all(|&entries| entries >= 200), "{tally:?}");
     }
 
     /// A forced flush whose durable database flush fails returns the

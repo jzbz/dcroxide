@@ -12,6 +12,7 @@
 
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
+use core::cmp::Ordering;
 
 use dcroxide_chainhash::Hash;
 use dcroxide_stake::TxType;
@@ -27,8 +28,49 @@ use crate::{RuleError, RuleErrorKind};
 /// The key identifying an outpoint within the view.
 pub type OutPointKey = ([u8; 32], u32, i8);
 
-fn key(op: &OutPoint) -> OutPointKey {
-    (op.hash.0, op.index, op.tree)
+/// An [`OutPointKey`] as the UTXO maps hold it: the same key, with the
+/// comparison their searches run written out.
+///
+/// The order is the tuple's own: the hash bytes, then the output index,
+/// then the tree.  It has to be, because both maps are walked in it:
+/// the view hands its changes to the cache in key order, and the cache
+/// writes the rows of a flush in key order.  The tuple's derived
+/// comparison goes through the C library's `memcmp` for the 32 hash
+/// bytes, a call for every key that a descent of either map visits.
+/// This one reads the hash as four big-endian words, which compare as
+/// the bytes they are made of do, and is inlined into the search.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct UtxoKey(pub(crate) OutPointKey);
+
+impl Ord for UtxoKey {
+    #[inline]
+    fn cmp(&self, other: &Self) -> Ordering {
+        let (hash, index, tree) = &self.0;
+        let (other_hash, other_index, other_tree) = &other.0;
+        let (words, _) = hash.as_chunks::<8>();
+        let (other_words, _) = other_hash.as_chunks::<8>();
+        for (word, other_word) in words.iter().zip(other_words) {
+            // Big-endian, so the first byte that differs decides, as
+            // it does between the byte strings.
+            let word = u64::from_be_bytes(*word);
+            let other_word = u64::from_be_bytes(*other_word);
+            if word != other_word {
+                return word.cmp(&other_word);
+            }
+        }
+        index.cmp(other_index).then(tree.cmp(other_tree))
+    }
+}
+
+impl PartialOrd for UtxoKey {
+    #[inline]
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+fn key(op: &OutPoint) -> UtxoKey {
+    UtxoKey((op.hash.0, op.index, op.tree))
 }
 
 /// A resolver for entries missing from the view, standing in for
@@ -142,7 +184,7 @@ pub fn collect_tx_hashes(txs: &[MsgTx]) -> Vec<Hash> {
 /// point of view in the chain (dcrd `UtxoViewpoint`).
 #[derive(Default, Clone)]
 pub struct UtxoView {
-    entries: BTreeMap<OutPointKey, UtxoEntry>,
+    entries: BTreeMap<UtxoKey, UtxoEntry>,
     best_hash: Hash,
 }
 
@@ -190,11 +232,15 @@ impl UtxoView {
     /// the view with no backing set effect, and unmodified entries
     /// stay in the view untouched.
     pub fn commit(&mut self) -> Vec<(OutPointKey, UtxoEntry)> {
-        let mut updates = Vec::new();
-        let keys: Vec<OutPointKey> = self.entries.keys().copied().collect();
-        for key in keys {
-            let entry = &self.entries[&key];
+        // One pass over the map in key order, taking each entry out as
+        // it is reached, so no entry is searched for and the map is not
+        // rebalanced around each removal.  The view of a connected
+        // block holds little but modified entries; the unmodified ones
+        // go back in, in the order they came out.
+        let mut updates = Vec::with_capacity(self.entries.len());
+        for (key, entry) in core::mem::take(&mut self.entries) {
             if !entry.is_modified() {
+                self.entries.insert(key, entry);
                 continue;
             }
             if entry.is_spent_by_zero_conf() {
@@ -202,11 +248,9 @@ impl UtxoView {
                     entry.is_spent(),
                     "zero confirmation spend not also marked spent"
                 );
-                self.entries.remove(&key);
                 continue;
             }
-            let entry = self.entries.remove(&key).expect("present");
-            updates.push((key, entry));
+            updates.push((key.0, entry));
         }
         updates
     }
@@ -219,7 +263,7 @@ impl UtxoView {
 
     /// All entries in the view in key order, with their outpoints.
     pub fn entries(&self) -> impl Iterator<Item = (&OutPointKey, &UtxoEntry)> {
-        self.entries.iter()
+        self.entries.iter().map(|(key, entry)| (&key.0, entry))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -591,7 +635,7 @@ impl UtxoView {
             (stxos.len() as i64 - 1, &block.transactions)
         };
 
-        let mut spends_in_flight: BTreeMap<OutPointKey, usize> = BTreeMap::new();
+        let mut spends_in_flight: BTreeMap<UtxoKey, usize> = BTreeMap::new();
         for tx_idx in (0..transactions.len()).rev() {
             let tx = &transactions[tx_idx];
             let tx_hash = tx_hashes[tx_idx];
@@ -1014,10 +1058,15 @@ impl UtxoView {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "test arithmetic over small fixed values"
+)]
 mod tests {
     use super::*;
 
     use core::cell::RefCell;
+    use dcroxide_testutil::SplitMix64;
     use dcroxide_wire::{BlockHeader, TxIn, TxOut};
 
     /// A block with the given stake tree and an empty regular tree.
@@ -1141,6 +1190,276 @@ mod tests {
                 "output 0 script version {version}"
             );
         }
+    }
+
+    /// A value in `0..n`.
+    fn below(rng: &mut SplitMix64, n: usize) -> usize {
+        rng.below(n as u64) as usize
+    }
+
+    fn random_hash(rng: &mut SplitMix64) -> [u8; 32] {
+        let mut hash = [0u8; 32];
+        rng.fill(&mut hash);
+        hash
+    }
+
+    /// Indexes and trees on both sides of every signed and unsigned
+    /// boundary of their types.
+    const EDGE_INDEXES: [u32; 6] = [0, 1, 2, 0x7fff_ffff, 0x8000_0000, u32::MAX];
+    const EDGE_TREES: [i8; 5] = [i8::MIN, -1, 0, 1, i8::MAX];
+
+    /// Keys chosen to separate the tuple order from every near miss of
+    /// it, then random ones.
+    fn order_test_keys() -> Vec<OutPointKey> {
+        let mut keys: Vec<OutPointKey> = Vec::new();
+        // One byte set to each boundary value at each position of an
+        // all-zero and an all-one hash.  A pair of these differs in one
+        // or two bytes, so it tells a big-endian word from a
+        // little-endian one, an unsigned byte from a signed one, and
+        // the first word from the last.
+        for base in [0x00u8, 0xff] {
+            for position in 0..32 {
+                for value in [0x00u8, 0x01, 0x7f, 0x80, 0xff] {
+                    let mut hash = [base; 32];
+                    hash[position] = value;
+                    keys.push((hash, 0, 0));
+                }
+            }
+        }
+        // Equal hashes, so the index and then the tree decide.
+        for hash in [[0x00u8; 32], [0x5a; 32], [0xff; 32]] {
+            for index in EDGE_INDEXES {
+                for tree in EDGE_TREES {
+                    keys.push((hash, index, tree));
+                }
+            }
+        }
+        // Random keys, half of them sharing a prefix of random length
+        // with the key before, so later words and the tie-breakers
+        // decide as often as the first word does.
+        let mut rng = SplitMix64::from_entropy("utxo map key order");
+        for _ in 0..600 {
+            let mut hash = random_hash(&mut rng);
+            if below(&mut rng, 2) == 0 {
+                let previous = keys.last().expect("keys above").0;
+                let shared = below(&mut rng, 33);
+                hash[..shared].copy_from_slice(&previous[..shared]);
+            }
+            let index = match below(&mut rng, 3) {
+                0 => EDGE_INDEXES[below(&mut rng, EDGE_INDEXES.len())],
+                1 => below(&mut rng, 4) as u32,
+                _ => rng.next_u64() as u32,
+            };
+            let tree = match below(&mut rng, 3) {
+                0 => EDGE_TREES[below(&mut rng, EDGE_TREES.len())],
+                1 => below(&mut rng, 2) as i8,
+                _ => rng.next_u64() as i8,
+            };
+            keys.push((hash, index, tree));
+        }
+        keys
+    }
+
+    /// The UTXO maps are walked in key order, by the commit of a view
+    /// into the cache and by a flush of the cache, so the key they are
+    /// held under must order exactly as the outpoint tuple does.
+    #[test]
+    fn the_map_key_orders_exactly_as_the_outpoint_tuple() {
+        let keys = order_test_keys();
+        let mut decided_by = [0usize; 3];
+        for a in &keys {
+            for b in &keys {
+                let want = a.cmp(b);
+                let (ka, kb) = (UtxoKey(*a), UtxoKey(*b));
+                assert_eq!(ka.cmp(&kb), want, "{a:?} against {b:?}");
+                assert_eq!(ka.partial_cmp(&kb), Some(want), "{a:?} against {b:?}");
+                assert_eq!(ka == kb, a == b, "{a:?} against {b:?}");
+                if a.0 != b.0 {
+                    decided_by[0] += 1;
+                } else if a.1 != b.1 {
+                    decided_by[1] += 1;
+                } else if a.2 != b.2 {
+                    decided_by[2] += 1;
+                }
+            }
+        }
+        // Each part of the key decided some of the pairs.
+        assert!(
+            decided_by.iter().all(|&pairs| pairs >= 500),
+            "{decided_by:?}"
+        );
+
+        // And so the maps iterate alike.
+        let by_tuple: BTreeMap<OutPointKey, usize> =
+            keys.iter().enumerate().map(|(i, k)| (*k, i)).collect();
+        let by_key: BTreeMap<UtxoKey, usize> = keys
+            .iter()
+            .enumerate()
+            .map(|(i, k)| (UtxoKey(*k), i))
+            .collect();
+        assert!(by_tuple.len() > 900, "{} distinct keys", by_tuple.len());
+        assert!(
+            by_tuple
+                .iter()
+                .map(|(k, v)| (*k, *v))
+                .eq(by_key.iter().map(|(k, v)| (k.0, *v))),
+            "the two maps iterate in different orders"
+        );
+    }
+
+    /// The commit as it was before it stopped searching the view: copy
+    /// the keys, then look each entry up again and remove it.
+    fn commit_by_search(view: &mut UtxoView) -> Vec<(OutPointKey, UtxoEntry)> {
+        let mut updates = Vec::new();
+        let keys: Vec<UtxoKey> = view.entries.keys().copied().collect();
+        for key in keys {
+            let entry = &view.entries[&key];
+            if !entry.is_modified() {
+                continue;
+            }
+            if entry.is_spent_by_zero_conf() {
+                assert!(
+                    entry.is_spent(),
+                    "zero confirmation spend not also marked spent"
+                );
+                view.entries.remove(&key);
+                continue;
+            }
+            let entry = view.entries.remove(&key).expect("present");
+            updates.push((key.0, entry));
+        }
+        updates
+    }
+
+    /// Every state a view entry reaches a commit in.
+    const COMMIT_STATES: [u8; 9] = [
+        // Loaded and left alone, as it was or as a spent tombstone.
+        0,
+        UTXO_STATE_SPENT,
+        UTXO_STATE_SPENT | UTXO_STATE_SPENT_BY_ZERO_CONF,
+        // Created or restored.
+        UTXO_STATE_MODIFIED,
+        UTXO_STATE_MODIFIED | crate::utxoentry::UTXO_STATE_FRESH,
+        // Spent.
+        UTXO_STATE_MODIFIED | UTXO_STATE_SPENT,
+        UTXO_STATE_MODIFIED | UTXO_STATE_SPENT | crate::utxoentry::UTXO_STATE_FRESH,
+        // Created and spent within the block.
+        UTXO_STATE_MODIFIED | UTXO_STATE_SPENT | UTXO_STATE_SPENT_BY_ZERO_CONF,
+        UTXO_STATE_MODIFIED
+            | UTXO_STATE_SPENT
+            | UTXO_STATE_SPENT_BY_ZERO_CONF
+            | crate::utxoentry::UTXO_STATE_FRESH,
+    ];
+
+    /// A view of `len` entries over random keys, each in the state
+    /// `state_of` picks from [`COMMIT_STATES`] and each distinguishable
+    /// from the others.
+    fn commit_test_view(
+        len: usize,
+        rng: &mut SplitMix64,
+        state_of: impl Fn(&mut SplitMix64) -> u8,
+    ) -> UtxoView {
+        let mut view = UtxoView::new();
+        view.set_best_hash(Hash([0x77; 32]));
+        while view.entries.len() < len {
+            let n = view.entries.len();
+            let mut hash = random_hash(rng);
+            // A few outputs of one transaction, so keys differ in the
+            // index and the tree alone too.
+            if n > 0 && below(rng, 4) == 0 {
+                hash = view.entries.keys().next_back().expect("an entry").0.0;
+            }
+            let outpoint = OutPoint {
+                hash: Hash(hash),
+                index: below(rng, 6) as u32,
+                tree: below(rng, 2) as i8,
+            };
+            let mut entry = UtxoEntry::new(
+                n as i64,
+                alloc::vec![0x51; 1 + n % 40],
+                n as u32,
+                below(rng, 8) as u32,
+                0,
+                false,
+                false,
+                TxType::Regular,
+                None,
+            );
+            entry.set_state_bits(state_of(rng));
+            view.insert_entry(&outpoint, entry);
+        }
+        view
+    }
+
+    /// The commit hands the cache the same entries in the same order,
+    /// and leaves the same entries in the view, as the commit that
+    /// looked every key up again (dcrd `UtxoCache.Commit`,
+    /// `utxocache.go:548-625`: unmodified entries are skipped and stay,
+    /// zero-confirmation spends are deleted from the view, the rest are
+    /// spent or added in the cache and deleted from the view).
+    #[test]
+    fn commit_drains_the_view_as_the_searching_commit_did() {
+        let mut rng = SplitMix64::from_entropy("utxo view commit");
+        let any = |rng: &mut SplitMix64| COMMIT_STATES[below(rng, COMMIT_STATES.len())];
+        let modified = |rng: &mut SplitMix64| COMMIT_STATES[3 + below(rng, 4)];
+        let unmodified = |rng: &mut SplitMix64| COMMIT_STATES[below(rng, 3)];
+        let mut tally = [0usize; 3];
+        for round in 0..60 {
+            let len = [0, 1, 2, 3, 17, 150, 400][round % 7];
+            let mut view = match round % 4 {
+                // The shape of a connected block: everything modified.
+                0 => commit_test_view(len, &mut rng, modified),
+                1 => commit_test_view(len, &mut rng, unmodified),
+                _ => commit_test_view(len, &mut rng, any),
+            };
+            let mut reference = view.clone();
+            let before = view.entries.len();
+
+            let got = view.commit();
+            let want = commit_by_search(&mut reference);
+            assert_eq!(got, want, "round {round}: the changes and their order");
+            assert!(
+                view.entries().eq(reference.entries()),
+                "round {round}: what stays in the view"
+            );
+            assert_eq!(view.best_hash(), reference.best_hash(), "round {round}");
+            assert!(
+                got.windows(2).all(|pair| pair[0].0 < pair[1].0),
+                "round {round}: the changes are in outpoint key order"
+            );
+            assert!(
+                view.entries().all(|(_, entry)| !entry.is_modified()),
+                "round {round}: only unmodified entries stay"
+            );
+            tally[0] += got.len();
+            tally[1] += view.entries.len();
+            tally[2] += before - got.len() - view.entries.len();
+
+            // What stayed is still a working view: a second commit has
+            // nothing to hand over and removes nothing.
+            let stayed = view.clone();
+            assert!(view.commit().is_empty(), "round {round}: a second commit");
+            assert!(view.entries().eq(stayed.entries()), "round {round}");
+        }
+        // Changes handed over, entries kept, zero-confirmation spends
+        // dropped: the rounds exercised all three.
+        assert!(tally.iter().all(|&entries| entries >= 300), "{tally:?}");
+    }
+
+    /// dcrd fails the commit on a zero-confirmation spend that is not
+    /// marked spent (`utxocache.go:590-597`), which the port asserts;
+    /// the commit still checks every such entry.
+    #[test]
+    #[should_panic(expected = "zero confirmation spend not also marked spent")]
+    fn commit_refuses_a_zero_conf_spend_that_is_not_spent() {
+        let mut rng = SplitMix64(3);
+        let mut view = commit_test_view(20, &mut rng, |_| UTXO_STATE_MODIFIED);
+        let last = *view.entries.keys().next_back().expect("an entry");
+        view.entries
+            .get_mut(&last)
+            .expect("the entry")
+            .set_state_bits(UTXO_STATE_MODIFIED | UTXO_STATE_SPENT_BY_ZERO_CONF);
+        view.commit();
     }
 
     /// dcrd `utxoEntryToSpentTxOut` encodes `encodeFlags(IsCoinBase(),
