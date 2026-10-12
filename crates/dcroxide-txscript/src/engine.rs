@@ -12,6 +12,7 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
+use dcroxide_chainhash::Hash;
 use dcroxide_wire::MsgTx;
 
 use crate::error::{ErrorKind, ScriptError, script_error};
@@ -112,6 +113,10 @@ pub struct Engine<'a> {
     /// attached one (dcrd `Engine.sigCache`); `None` verifies every
     /// signature directly, byte-identical to the pre-cache engine.
     pub(crate) sig_cache: Option<&'a crate::SigCache>,
+    /// The hash of `tx`, when the caller supplied it
+    /// ([`Engine::set_tx_hash`]); `None` has every signature hash
+    /// serialize and hash the transaction's prefix itself.
+    pub(crate) tx_hash: Option<Hash>,
 
     // Current execution state.
     pub(crate) scripts: Vec<ExecScript<'a>>,
@@ -156,6 +161,29 @@ impl<'a> Engine<'a> {
     /// result.
     pub fn set_sig_cache(&mut self, sig_cache: &'a crate::SigCache) {
         self.sig_cache = Some(sig_cache);
+    }
+
+    /// Give the engine the hash of the transaction it executes
+    /// ([`MsgTx::tx_hash`]), which the caller has already computed.  A
+    /// signature of hash type `SigHashAll` without `SigHashAnyOneCanPay`
+    /// then takes the prefix hash of its signature hash from it, rather
+    /// than serializing and hashing the whole prefix once more for every
+    /// signature (dcrd reads `vm.tx.CachedTxHash()` at the same three
+    /// opcodes behind `optimizeSigVerification`, `opcode.go:2484-2487`,
+    /// `2717-2720` and `2865-2871`, a constant it ships as `false`).
+    /// Every result is the one the engine gives without it.
+    ///
+    /// The hash must be that of the transaction the engine was created
+    /// with: given another, the engine checks signatures against a
+    /// digest that is not the transaction's signature hash.  Debug
+    /// builds check the hash here; release builds trust the caller.
+    pub fn set_tx_hash(&mut self, tx_hash: &Hash) {
+        debug_assert_eq!(
+            *tx_hash,
+            self.tx.tx_hash(),
+            "the transaction hash handed to the script engine is not its transaction's"
+        );
+        self.tx_hash = Some(*tx_hash);
     }
 
     /// Verify a signature through the optional signature cache,
@@ -609,6 +637,7 @@ impl<'a> Engine<'a> {
             version: script_version,
             is_p2sh: false,
             sig_cache: None,
+            tx_hash: None,
             scripts: Vec::new(),
             script_idx: 0,
             opcode_idx: 0,

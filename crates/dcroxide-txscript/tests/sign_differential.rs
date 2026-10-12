@@ -294,7 +294,10 @@ fn compare_sign(
     }
 }
 
-/// Execute the signed input through our engine and require success.
+/// Execute the signed input through our engine and require success:
+/// once as dcrd's engine runs it, and once with the transaction's hash
+/// handed to the engine, which a SigHashAll signature then verifies
+/// against in place of the prefix hash the signer computed.
 fn engine_verify(pk_script: &[u8], tx: &MsgTx, sig_script: Vec<u8>, treasury: bool, context: &str) {
     let mut tx = tx.clone();
     tx.tx_in[0].signature_script = sig_script;
@@ -303,9 +306,21 @@ fn engine_verify(pk_script: &[u8], tx: &MsgTx, sig_script: Vec<u8>, treasury: bo
     } else {
         ScriptFlags::default()
     };
-    Engine::new(pk_script, &tx, 0, flags, 0)
-        .and_then(|mut vm| vm.execute())
-        .unwrap_or_else(|e| panic!("{context}: signed input failed to verify: {e}"));
+    for with_tx_hash in [false, true] {
+        Engine::new(pk_script, &tx, 0, flags, 0)
+            .and_then(|mut vm| {
+                if with_tx_hash {
+                    vm.set_tx_hash(&tx.tx_hash());
+                }
+                vm.execute()
+            })
+            .unwrap_or_else(|e| {
+                panic!(
+                    "{context}: signed input failed to verify (transaction hash handed in: \
+                     {with_tx_hash}): {e}"
+                )
+            });
+    }
 }
 
 #[test]

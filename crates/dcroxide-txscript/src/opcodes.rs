@@ -26,7 +26,7 @@ use crate::scriptnum::{
     ALT_SIG_SUITES_MAX_SCRIPT_NUM_LEN, CLTV_MAX_SCRIPT_NUM_LEN, CSV_MAX_SCRIPT_NUM_LEN,
     MATH_OP_CODE_MAX_SCRIPT_NUM_LEN, ScriptNum,
 };
-use crate::sighash::{SigHashType, calc_signature_hash};
+use crate::sighash::{SigHashType, calc_signature_hash_with_prefix};
 use crate::{MAX_OPS_PER_SCRIPT, MAX_PUB_KEYS_PER_MULTI_SIG, MAX_SCRIPT_ELEMENT_SIZE};
 
 /// The signature type identifiers redeemable by OP_CHECKSIGALT (dcrd
@@ -1572,8 +1572,16 @@ pub(crate) fn opcode_check_sig(
     // itself.
     let sub_script = remove_opcode_by_data(vm.sub_script(), &full_sig_bytes);
 
-    // Generate the signature hash based on the signature hash type.
-    let hash = match calc_signature_hash(&sub_script, hash_type, vm.tx, vm.tx_idx) {
+    // Generate the signature hash based on the signature hash type, its
+    // prefix hash from the transaction hash when the engine was given
+    // one (dcrd `opcode.go:2484-2489`).
+    let hash = match calc_signature_hash_with_prefix(
+        &sub_script,
+        hash_type,
+        vm.tx,
+        vm.tx_idx,
+        vm.tx_hash.as_ref(),
+    ) {
         Ok(hash) => hash,
         Err(_) => {
             vm.dstack.push_bool(false);
@@ -1786,8 +1794,16 @@ pub(crate) fn opcode_check_multi_sig(
             Err(_) => continue,
         };
 
-        // Generate the signature hash based on the signature hash type.
-        let hash = calc_signature_hash(&script, hash_type, vm.tx, vm.tx_idx)?;
+        // Generate the signature hash based on the signature hash type,
+        // its prefix hash from the transaction hash when the engine was
+        // given one (dcrd `opcode.go:2717-2722`).
+        let hash = calc_signature_hash_with_prefix(
+            &script,
+            hash_type,
+            vm.tx,
+            vm.tx_idx,
+            vm.tx_hash.as_ref(),
+        )?;
 
         let valid = vm.verify_sig_with_cache(
             crate::SigCacheSuite::EcdsaSecp256k1,
@@ -1896,8 +1912,16 @@ pub(crate) fn opcode_check_sig_alt(
     // a signature to sign itself.
     let sub_script = remove_opcode_by_data(vm.sub_script(), &full_sig_bytes);
 
-    // Generate the signature hash based on the signature hash type.
-    let hash = match calc_signature_hash(&sub_script, hash_type, vm.tx, vm.tx_idx) {
+    // Generate the signature hash based on the signature hash type, its
+    // prefix hash from the transaction hash when the engine was given
+    // one (dcrd `opcode.go:2865-2873`).
+    let hash = match calc_signature_hash_with_prefix(
+        &sub_script,
+        hash_type,
+        vm.tx,
+        vm.tx_idx,
+        vm.tx_hash.as_ref(),
+    ) {
         Ok(hash) => hash,
         Err(_) => {
             vm.dstack.push_bool(false);
@@ -2039,9 +2063,11 @@ mod tests {
 
     use crate::engine::{Engine, ScriptFlags};
     use crate::error::ErrorKind;
-    use crate::opcode_table::{OP_1, OP_2, OP_CHECKSIG, OP_CHECKSIGALT};
+    use crate::opcode_table::{OP_1, OP_2, OP_3, OP_CHECKMULTISIG, OP_CHECKSIG, OP_CHECKSIGALT};
     use crate::sighash::{SigHashType, calc_signature_hash};
+    use crate::sign::{SignatureType, raw_tx_in_signature};
     use crate::{ScriptBuilder, SigCache, SigCacheSuite};
+    use dcroxide_chainhash::Hash;
     use dcroxide_wire::{MsgTx, OutPoint, TxIn, TxOut, TxSerializeType};
 
     /// A secp256k1 x coordinate with no point on the curve.
@@ -2169,6 +2195,306 @@ mod tests {
                 Ok(()),
                 "{suite:?}: a cache hit answers before the parse"
             );
+        }
+    }
+
+    /// A transaction with three inputs and three outputs, so that every
+    /// hash type commits to something different at input 1, with empty
+    /// signature scripts.
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "test arithmetic over small fixed values"
+    )]
+    fn three_in_three_out() -> MsgTx {
+        MsgTx {
+            ser_type: TxSerializeType::Full,
+            version: 1,
+            tx_in: (0u8..3)
+                .map(|i| TxIn {
+                    previous_out_point: OutPoint {
+                        hash: Hash([0x30 + i; 32]),
+                        index: u32::from(i),
+                        tree: (i % 2) as i8,
+                    },
+                    sequence: 0xffff_fff0 + u32::from(i),
+                    value_in: 0,
+                    block_height: 0,
+                    block_index: !0u32,
+                    signature_script: Vec::new(),
+                })
+                .collect(),
+            tx_out: (0u8..3)
+                .map(|i| TxOut {
+                    value: 1000 + i64::from(i),
+                    version: 0,
+                    pk_script: vec![OP_1, i],
+                })
+                .collect(),
+            lock_time: 7,
+            expiry: 9,
+        }
+    }
+
+    /// A secp256k1 private key and its compressed public key.
+    fn secp_key(tag: u8) -> ([u8; 32], Vec<u8>) {
+        let mut priv_key = [tag; 32];
+        priv_key[0] = 0x01;
+        let pub_key = dcroxide_dcrec::secp256k1::PrivateKey::from_bytes(&priv_key)
+            .expect("valid key")
+            .public_key()
+            .serialize_compressed()
+            .to_vec();
+        (priv_key, pub_key)
+    }
+
+    /// How a run of input 1 learns the transaction's hash.
+    enum TxHash {
+        /// It does not: every signature hash computes its prefix hash.
+        NotGiven,
+        /// Through [`Engine::set_tx_hash`].
+        Given(Hash),
+        /// Written to the engine's field, past the setter's debug
+        /// assertion: only a test in this crate can hand the engine a
+        /// hash that is not its transaction's in a debug build.
+        Planted(Hash),
+    }
+
+    fn run_input_1(pk_script: &[u8], tx: &MsgTx, tx_hash: TxHash) -> Result<(), ErrorKind> {
+        let mut vm =
+            Engine::new(pk_script, tx, 1, ScriptFlags::default(), 0).map_err(|e| e.kind)?;
+        match tx_hash {
+            TxHash::NotGiven => {}
+            TxHash::Given(hash) => {
+                vm.set_tx_hash(&hash);
+                assert_eq!(
+                    vm.tx_hash,
+                    Some(hash),
+                    "the engine keeps the hash it is given"
+                );
+            }
+            TxHash::Planted(hash) => vm.tx_hash = Some(hash),
+        }
+        vm.execute().map_err(|e| e.kind)
+    }
+
+    /// Each of the three signature opcodes hands the engine's
+    /// transaction hash to the signature hash (dcrd `opcode.go:2484-2489`,
+    /// `2717-2722` and `2865-2873`), across the three signature suites.
+    /// A spend signed over the signature hash computed without it
+    /// verifies with the transaction's hash given.  With another hash
+    /// planted in the engine a `SigHashAll` signature no longer
+    /// verifies, which is what shows the opcode read it, and a
+    /// signature of any other hash type still does, because those never
+    /// read it.
+    #[test]
+    fn each_signature_opcode_takes_the_prefix_hash_from_the_engine() {
+        let keys = [secp_key(0x41), secp_key(0x42), secp_key(0x43)];
+        let ed_seed = [0x09u8; 32];
+        let ed_pub = dcroxide_dcrec::edwards::SecretKey::from_seed(ed_seed)
+            .public_key()
+            .serialize();
+        let ed_key = [ed_seed.as_slice(), ed_pub.as_slice()].concat();
+
+        let script = |builder: ScriptBuilder| builder.script().expect("builds");
+        // The key and the suite of one pushed signature.
+        type Signer<'a> = (&'a [u8], SignatureType);
+        // The opcode, the public key script, and the signers in order.
+        let cases: [(&str, Vec<u8>, Vec<Signer<'_>>); 4] = [
+            (
+                "OP_CHECKSIG",
+                script(
+                    ScriptBuilder::new()
+                        .add_data(&keys[0].1)
+                        .add_op(OP_CHECKSIG),
+                ),
+                vec![(&keys[0].0, SignatureType::EcdsaSecp256k1)],
+            ),
+            (
+                "OP_CHECKMULTISIG",
+                script(
+                    ScriptBuilder::new()
+                        .add_op(OP_2)
+                        .add_data(&keys[0].1)
+                        .add_data(&keys[1].1)
+                        .add_data(&keys[2].1)
+                        .add_op(OP_3)
+                        .add_op(OP_CHECKMULTISIG),
+                ),
+                vec![
+                    (&keys[0].0, SignatureType::EcdsaSecp256k1),
+                    (&keys[2].0, SignatureType::EcdsaSecp256k1),
+                ],
+            ),
+            (
+                "OP_CHECKSIGALT (Ed25519)",
+                script(
+                    ScriptBuilder::new()
+                        .add_data(&ed_pub)
+                        .add_op(OP_1)
+                        .add_op(OP_CHECKSIGALT),
+                ),
+                vec![(&ed_key, SignatureType::Ed25519)],
+            ),
+            (
+                "OP_CHECKSIGALT (Schnorr)",
+                script(
+                    ScriptBuilder::new()
+                        .add_data(&keys[1].1)
+                        .add_op(OP_2)
+                        .add_op(OP_CHECKSIGALT),
+                ),
+                vec![(&keys[1].0, SignatureType::SchnorrSecp256k1)],
+            ),
+        ];
+
+        let wrong = Hash([0x5a; 32]);
+        for (name, pk_script, signers) in &cases {
+            for hash_type in [0x01u8, 0x02, 0x03, 0x81, 0x82, 0x83] {
+                let mut tx = three_in_three_out();
+                let mut sig_script = ScriptBuilder::new();
+                for (key, sig_type) in signers {
+                    let sig = raw_tx_in_signature(
+                        &tx,
+                        1,
+                        pk_script,
+                        SigHashType(hash_type),
+                        key,
+                        *sig_type,
+                    )
+                    .expect("signs");
+                    sig_script = sig_script.add_data(&sig);
+                }
+                tx.tx_in[1].signature_script = script(sig_script);
+                let tx_hash = tx.tx_hash();
+                assert_ne!(tx_hash, wrong);
+
+                let at = format!("{name}, hash type {hash_type:#04x}");
+                assert_eq!(
+                    run_input_1(pk_script, &tx, TxHash::NotGiven),
+                    Ok(()),
+                    "{at}"
+                );
+                assert_eq!(
+                    run_input_1(pk_script, &tx, TxHash::Given(tx_hash)),
+                    Ok(()),
+                    "{at}: with the transaction hash"
+                );
+                let planted = run_input_1(pk_script, &tx, TxHash::Planted(wrong));
+                if hash_type == 0x01 {
+                    assert_eq!(planted, Err(ErrorKind::EvalFalse), "{at}: another hash");
+                } else {
+                    assert_eq!(planted, Ok(()), "{at}: another hash is never read");
+                }
+            }
+        }
+    }
+
+    /// What the hash's pairing with its transaction protects.  An engine
+    /// that holds another transaction's hash checks a `SigHashAll`
+    /// signature as though its own transaction had that prefix, so a
+    /// signature made for the other transaction, at the same input index
+    /// and script and with as many inputs, verifies.  Without the hash,
+    /// or with its own, the engine rejects it.  Only a test in this
+    /// crate can plant such a hash in a debug build; a release build
+    /// keeps whatever [`Engine::set_tx_hash`] is given.
+    #[test]
+    fn a_planted_hash_of_another_transaction_accepts_its_signature() {
+        let (priv_key, pub_key) = secp_key(0x45);
+        let pk_script = ScriptBuilder::new()
+            .add_data(&pub_key)
+            .add_op(OP_CHECKSIG)
+            .script()
+            .expect("builds");
+        let mut signed = three_in_three_out();
+        let sig = raw_tx_in_signature(
+            &signed,
+            1,
+            &pk_script,
+            SigHashType(0x01),
+            &priv_key,
+            SignatureType::EcdsaSecp256k1,
+        )
+        .expect("signs");
+        signed.tx_in[1].signature_script = ScriptBuilder::new()
+            .add_data(&sig)
+            .script()
+            .expect("builds");
+
+        // The same inputs and the same signature, paying something else.
+        let mut other = signed.clone();
+        other.tx_out[0].value = 1;
+        assert_ne!(other.tx_hash(), signed.tx_hash());
+
+        assert_eq!(
+            run_input_1(&pk_script, &other, TxHash::NotGiven),
+            Err(ErrorKind::EvalFalse)
+        );
+        assert_eq!(
+            run_input_1(&pk_script, &other, TxHash::Given(other.tx_hash())),
+            Err(ErrorKind::EvalFalse)
+        );
+        assert_eq!(
+            run_input_1(&pk_script, &other, TxHash::Planted(signed.tx_hash())),
+            Ok(())
+        );
+    }
+
+    /// The engine refuses a hash that is not its transaction's where
+    /// debug assertions are on, before it executes anything.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "handed to the script engine is not its transaction's")]
+    fn set_tx_hash_refuses_another_hash_under_debug_assertions() {
+        let tx = three_in_three_out();
+        let mut vm = Engine::new(&[OP_1], &tx, 1, ScriptFlags::default(), 0).expect("engine");
+        vm.set_tx_hash(&Hash([0x5a; 32]));
+    }
+
+    /// A signature cached by a run without the transaction hash answers
+    /// a run with it, and the reverse: both runs look the cache up under
+    /// one signature hash.
+    #[test]
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "the signature ends with its hash type byte, so len() - 1 >= 0"
+    )]
+    fn runs_with_and_without_the_transaction_hash_share_cache_entries() {
+        let (priv_key, pub_key) = secp_key(0x44);
+        let pk_script = ScriptBuilder::new()
+            .add_data(&pub_key)
+            .add_op(OP_CHECKSIG)
+            .script()
+            .expect("builds");
+        let mut tx = three_in_three_out();
+        let sig = raw_tx_in_signature(
+            &tx,
+            1,
+            &pk_script,
+            SigHashType(0x01),
+            &priv_key,
+            SignatureType::EcdsaSecp256k1,
+        )
+        .expect("signs");
+        tx.tx_in[1].signature_script = ScriptBuilder::new()
+            .add_data(&sig)
+            .script()
+            .expect("builds");
+        let tx_hash = tx.tx_hash();
+        let sig_hash = calc_signature_hash(&pk_script, SigHashType(0x01), &tx, 1).expect("hash");
+        let body = &sig[..sig.len() - 1];
+
+        for given_first in [false, true] {
+            let cache = SigCache::new(10);
+            for given in [given_first, !given_first] {
+                let mut vm =
+                    Engine::new(&pk_script, &tx, 1, ScriptFlags::default(), 0).expect("engine");
+                vm.set_sig_cache(&cache);
+                if given {
+                    vm.set_tx_hash(&tx_hash);
+                }
+                assert_eq!(vm.execute(), Ok(()));
+                assert!(cache.exists(&sig_hash, SigCacheSuite::EcdsaSecp256k1, body, &pub_key));
+            }
         }
     }
 

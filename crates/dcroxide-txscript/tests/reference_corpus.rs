@@ -4,6 +4,10 @@
 //! corpus), `tx_valid.json`/`tx_invalid.json` (whole-transaction spends),
 //! and `sighash.json` (signature hash vectors). The JSON files are
 //! byte-identical copies of dcrd's `testdata/`.
+//!
+//! Every engine run is made twice, without the transaction's hash and
+//! with it handed to the engine (`Engine::set_tx_hash`), and the two
+//! results must be the same before either is compared with dcrd's.
 
 // Test-harness arithmetic over bounded indices and lengths.
 #![allow(clippy::arithmetic_side_effects)]
@@ -13,7 +17,9 @@ use std::collections::HashMap;
 
 use common::{create_spending_tx, parse_expected_result, parse_script_flags, parse_short_form_v0};
 use dcroxide_chainhash::Hash;
-use dcroxide_txscript::{Engine, ErrorKind, SigHashType, calc_signature_hash_checked};
+use dcroxide_txscript::{
+    Engine, ErrorKind, ScriptError, ScriptFlags, SigHashType, calc_signature_hash_checked,
+};
 use dcroxide_wire::{MsgTx, OutPoint};
 
 fn testdata(name: &str) -> String {
@@ -21,15 +27,37 @@ fn testdata(name: &str) -> String {
     std::fs::read_to_string(format!("{path}{name}")).expect("testdata file readable")
 }
 
+/// Create an engine for one input and execute it, twice: as dcrd does,
+/// and with the transaction's hash handed to the engine.  The two
+/// results must be one, error text included.
+fn execute_both_ways(
+    pk_script: &[u8],
+    tx: &MsgTx,
+    idx: usize,
+    flags: ScriptFlags,
+    name: &str,
+) -> Result<(), ScriptError> {
+    let result = Engine::new(pk_script, tx, idx, flags, 0).and_then(|mut vm| vm.execute());
+    let with_tx_hash = Engine::new(pk_script, tx, idx, flags, 0).and_then(|mut vm| {
+        vm.set_tx_hash(&tx.tx_hash());
+        vm.execute()
+    });
+    assert_eq!(
+        with_tx_hash, result,
+        "{name}: the transaction hash changed the result"
+    );
+    result
+}
+
 /// Run the engine for one reference script test and return the result kind.
 fn execute_reference_case(
     sig_script: &[u8],
     pk_script: &[u8],
-    flags: dcroxide_txscript::ScriptFlags,
+    flags: ScriptFlags,
+    name: &str,
 ) -> Result<(), ErrorKind> {
     let tx = create_spending_tx(sig_script, pk_script);
-    let result = Engine::new(pk_script, &tx, 0, flags, 0).and_then(|mut vm| vm.execute());
-    result.map_err(|err| err.kind)
+    execute_both_ways(pk_script, &tx, 0, flags, name).map_err(|err| err.kind)
 }
 
 #[test]
@@ -61,7 +89,7 @@ fn script_tests_corpus() {
         let flags = parse_script_flags(&test[2]).unwrap_or_else(|e| panic!("{name}: {e}"));
         let allowed = parse_expected_result(&test[3]).unwrap_or_else(|e| panic!("{name}: {e}"));
 
-        let result = execute_reference_case(&sig_script, &pk_script, flags);
+        let result = execute_reference_case(&sig_script, &pk_script, flags, &name);
         match (&allowed, &result) {
             (None, Ok(())) => {}
             (None, Err(kind)) => {
@@ -150,10 +178,8 @@ fn tx_valid_corpus() {
             let pk_script = prev_outs
                 .get(&prevout_key(&tx_in.previous_out_point))
                 .unwrap_or_else(|| panic!("bad test (missing {k}th input) {i}"));
-            let mut vm = Engine::new(pk_script, &tx, k, flags, 0)
-                .unwrap_or_else(|e| panic!("test {i}:{k} failed to create engine: {e}"));
-            vm.execute()
-                .unwrap_or_else(|e| panic!("test {i}:{k} failed to execute: {e}"));
+            execute_both_ways(pk_script, &tx, k, flags, &format!("test {i}:{k}"))
+                .unwrap_or_else(|e| panic!("test {i}:{k} failed to create or execute: {e}"));
         }
     }
 }
@@ -175,10 +201,7 @@ fn tx_invalid_corpus() {
             // These are meant to fail, so as soon as the first input fails
             // the transaction has failed (some test txns have good inputs
             // too).
-            let Ok(mut vm) = Engine::new(pk_script, &tx, k, flags, 0) else {
-                continue 'testloop;
-            };
-            if vm.execute().is_err() {
+            if execute_both_ways(pk_script, &tx, k, flags, &format!("test {i}:{k}")).is_err() {
                 continue 'testloop;
             }
         }

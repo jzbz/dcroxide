@@ -44,6 +44,23 @@
 //! assertions.  The length check is not optional: the connect helpers
 //! walk the transactions and the hashes together, and a short list
 //! would skip transactions silently.
+//!
+//! # The script check reads them too
+//!
+//! The block script check of the connect checks
+//! (`validate::check_block_scripts_with_hashes`) hands each hash to the
+//! script engines of its transaction, where it stands in for the prefix
+//! hash of every `SigHashAll` signature hash
+//! (`dcroxide_txscript::Engine::set_tx_hash`).  dcrd's script check
+//! reads no cached hash: it carries that path switched off
+//! (`txscript/opcode.go:27-32`).  So the rule above is what those
+//! signature hashes rest on, as the keys of the block's new outputs do.
+//! Under debug assertions each engine also compares the hash it is
+//! handed with its transaction's.  A release build checks only that
+//! there is one hash per transaction: there an engine handed another
+//! transaction's hash would check its `SigHashAll` signatures as though
+//! its own transaction had that prefix, rejecting the transaction's own
+//! and passing one made for the other transaction at the same input.
 
 use alloc::vec::Vec;
 
@@ -172,7 +189,8 @@ impl BlockTxHashes {
     ///
     /// Every consumer of the hashes calls this first.  A failure is a
     /// pairing fault inside the node, and continuing would file outputs
-    /// under the wrong transaction.
+    /// under the wrong transaction and check signatures against another
+    /// transaction's hash.
     #[track_caller]
     pub fn assert_for(&self, block: &MsgBlock) {
         assert!(
@@ -420,6 +438,7 @@ mod tests {
 
     /// A block of the same shape as [`one_transaction_block`] whose
     /// transaction is another one.
+    #[cfg(debug_assertions)]
     fn another_block_of_the_same_shape() -> MsgBlock {
         let mut block = one_transaction_block();
         block.transactions[0].lock_time ^= 1;
@@ -500,6 +519,23 @@ mod tests {
             &|_: &dcroxide_wire::OutPoint| -> Option<crate::utxoentry::UtxoEntry> { None },
             None,
             false,
+        );
+    }
+
+    // The script check reads nothing of this block (its one input is a
+    // coinbase's), so the count of the hashes is all that can refuse it.
+    #[test]
+    #[should_panic(expected = "transaction hashes are not one per transaction")]
+    fn the_script_check_refuses_hashes_of_another_shape() {
+        let hashes = BlockTxHashes::compute(&a_block_of_another_shape());
+        let _ = crate::validate::check_block_scripts_with_hashes(
+            &one_transaction_block(),
+            &hashes,
+            &crate::utxoview::UtxoView::new(),
+            true,
+            dcroxide_txscript::ScriptFlags(0),
+            None,
+            true,
         );
     }
 

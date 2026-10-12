@@ -104,6 +104,17 @@ jobs:
           cache-dependency-path: tools/oracle/go.sum
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace
+      # The script engine and the block script check once more with debug
+      # assertions off as well, which no other run does. Under them the
+      # engine refuses a transaction hash that is not its transaction's
+      # and the block script check re-hashes its block, so a test that
+      # hands over a wrong hash can show only the refusal there. What the
+      # shipped build does with one (its `SigHashAll` signatures stop
+      # verifying, and nothing panics) is in the arms of those tests that
+      # run only here.
+      - run: cargo test -p dcroxide-txscript -p dcroxide-blockchain --features dcroxide-blockchain/std
+        env:
+          CARGO_PROFILE_DEV_DEBUG_ASSERTIONS: "false"
 
   dcrd-interop:
     name: dcrd interop (live socket)

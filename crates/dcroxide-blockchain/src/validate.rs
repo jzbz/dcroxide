@@ -5103,6 +5103,11 @@ pub fn tspend_checks_stateless(
 /// referenced output's script (dcrd `txValidateItem`).
 struct ValidateItem<'a> {
     tx: &'a dcroxide_wire::MsgTx,
+    /// The hash of `tx`, on the block path that has it from the block's
+    /// [`BlockTxHashes`](crate::blockhashes::BlockTxHashes); the engine
+    /// then takes the prefix hash of a `SigHashAll` signature hash from
+    /// it.  `None` has the engine hash the prefix for every signature.
+    tx_hash: Option<&'a Hash>,
     tx_in_idx: usize,
     pk_script: &'a [u8],
     script_version: u16,
@@ -5160,6 +5165,9 @@ fn validate_item(
     })?;
     if let Some(sig_cache) = sig_cache {
         engine.set_sig_cache(sig_cache);
+    }
+    if let Some(tx_hash) = item.tx_hash {
+        engine.set_tx_hash(tx_hash);
     }
     engine.execute().map_err(|e| {
         rule_error(
@@ -5335,6 +5343,10 @@ fn validate_items(
 /// up front and validate across the worker pool, each engine sharing
 /// the optional signature verification cache exactly as dcrd threads
 /// its `sigCache` into `NewEngine`).
+///
+/// Every signature hash serializes and hashes its transaction's prefix,
+/// as dcrd's does.  The connect checks call the crate's own form, which
+/// is given the hashes of the block's transactions.
 pub fn check_block_scripts(
     block: &MsgBlock,
     view: &crate::utxoview::UtxoView,
@@ -5343,13 +5355,92 @@ pub fn check_block_scripts(
     sig_cache: Option<&dcroxide_txscript::SigCache>,
     is_auto_revocations_enabled: bool,
 ) -> Result<(), RuleError> {
-    let txs = if tx_tree_regular {
-        &block.transactions
+    check_block_scripts_inner(
+        block,
+        None,
+        view,
+        tx_tree_regular,
+        script_flags,
+        sig_cache,
+        is_auto_revocations_enabled,
+    )
+}
+
+/// [`check_block_scripts`] given the hashes of the block's transactions,
+/// which must have been computed from this very block: each engine is
+/// handed the hash of the transaction it executes, so a `SigHashAll`
+/// signature hash takes its prefix hash from it rather than hashing
+/// the transaction's prefix once per signature
+/// (`dcroxide_txscript::Engine::set_tx_hash`; dcrd has this switched
+/// off, `txscript/opcode.go:27-32`).  The verdict and the error are
+/// those of [`check_block_scripts`].
+///
+/// Under debug assertions the hashes are checked against the block
+/// here and each one against its transaction where it enters the
+/// engine.  A release build checks only that there is one hash per
+/// transaction, so the signature hashes rest on the pairing rule of
+/// [`crate::blockhashes`], as the keys of the block's new outputs do.
+pub(crate) fn check_block_scripts_with_hashes(
+    block: &MsgBlock,
+    tx_hashes: &crate::blockhashes::BlockTxHashes,
+    view: &crate::utxoview::UtxoView,
+    tx_tree_regular: bool,
+    script_flags: dcroxide_txscript::ScriptFlags,
+    sig_cache: Option<&dcroxide_txscript::SigCache>,
+    is_auto_revocations_enabled: bool,
+) -> Result<(), RuleError> {
+    tx_hashes.assert_for(block);
+    check_block_scripts_inner(
+        block,
+        Some(tx_hashes),
+        view,
+        tx_tree_regular,
+        script_flags,
+        sig_cache,
+        is_auto_revocations_enabled,
+    )
+}
+
+#[cfg(test)]
+std::thread_local! {
+    /// The script items this thread has collected from block trees: first
+    /// those that carried their transaction's hash, then those that did
+    /// not.  It exists in this crate's unit-test builds only, where the
+    /// tests read it to tell which form of the block script check a
+    /// processing call ran.
+    pub(crate) static BLOCK_SCRIPT_ITEMS: core::cell::Cell<(u64, u64)> =
+        const { core::cell::Cell::new((0, 0)) };
+}
+
+/// The body of [`check_block_scripts`] and
+/// [`check_block_scripts_with_hashes`].
+fn check_block_scripts_inner(
+    block: &MsgBlock,
+    tx_hashes: Option<&crate::blockhashes::BlockTxHashes>,
+    view: &crate::utxoview::UtxoView,
+    tx_tree_regular: bool,
+    script_flags: dcroxide_txscript::ScriptFlags,
+    sig_cache: Option<&dcroxide_txscript::SigCache>,
+    is_auto_revocations_enabled: bool,
+) -> Result<(), RuleError> {
+    // The tree's transactions and their hashes are chosen together, and
+    // a hash is read by its transaction's own position in the tree
+    // (never by walking the two lists side by side, which would stop at
+    // the shorter one and leave transactions unchecked).
+    let (txs, hashes) = if tx_tree_regular {
+        (
+            &block.transactions,
+            tx_hashes.map(crate::blockhashes::BlockTxHashes::regular),
+        )
     } else {
-        &block.stransactions
+        (
+            &block.stransactions,
+            tx_hashes.map(crate::blockhashes::BlockTxHashes::stake),
+        )
     };
     let mut items = Vec::new();
-    for tx in txs {
+    for (tx_idx, tx) in txs.iter().enumerate() {
+        let tx_hash = hashes.map(|hashes| &hashes[tx_idx]);
         // Skip version 2+ revocations under the automatic revocations
         // agenda since consensus already enforces their outputs.
         if is_auto_revocations_enabled
@@ -5377,11 +5468,24 @@ pub fn check_block_scripts(
             };
             items.push(ValidateItem {
                 tx,
+                tx_hash,
                 tx_in_idx,
                 pk_script: entry.pk_script(),
                 script_version: entry.script_version(),
             });
         }
+    }
+    #[cfg(test)]
+    {
+        // Counted from what each item holds, not from whether hashes
+        // were handed in, so that an item left without its hash shows.
+        let (with_hash, without) = BLOCK_SCRIPT_ITEMS.get();
+        let carrying = items.iter().filter(|item| item.tx_hash.is_some()).count() as u64;
+        let collected = items.len() as u64;
+        BLOCK_SCRIPT_ITEMS.set((
+            with_hash.wrapping_add(carrying),
+            without.wrapping_add(collected.wrapping_sub(carrying)),
+        ));
     }
     validate_items(&items, script_flags, sig_cache)
 }
@@ -5643,8 +5747,9 @@ pub(crate) fn check_connect_block_with_hashes<SP: dcroxide_standalone::SubsidyPa
     }
 
     if run_scripts {
-        check_block_scripts(
+        check_block_scripts_with_hashes(
             block,
+            tx_hashes,
             view,
             false,
             script_flags,
@@ -5728,8 +5833,9 @@ pub(crate) fn check_connect_block_with_hashes<SP: dcroxide_standalone::SubsidyPa
     }
 
     if run_scripts {
-        check_block_scripts(
+        check_block_scripts_with_hashes(
             block,
+            tx_hashes,
             view,
             true,
             script_flags,
@@ -5803,6 +5909,7 @@ pub fn validate_transaction_scripts<'a>(
         };
         items.push(ValidateItem {
             tx,
+            tx_hash: None,
             tx_in_idx,
             pk_script: entry.pk_script(),
             script_version: entry.script_version(),
@@ -5917,6 +6024,7 @@ mod tests {
             .expect_err("script fails");
             let items = [ValidateItem {
                 tx: &tx,
+                tx_hash: None,
                 tx_in_idx: 0,
                 pk_script: entry.pk_script(),
                 script_version: 0,
@@ -6000,6 +6108,7 @@ mod tests {
             (0..tx.tx_in.len())
                 .map(|i| ValidateItem {
                     tx: &tx,
+                    tx_hash: None,
                     tx_in_idx: i,
                     pk_script: if Some(i) == bad_idx {
                         bad.pk_script()
@@ -6749,5 +6858,520 @@ mod tests {
             format!("serialized block is too big - got {size}, max 1310720")
         );
         assert!(!queried.get(), "the size check runs first");
+    }
+
+    // The block script check with the block's transaction hashes, on
+    // blocks whose inputs carry real signatures.
+
+    use crate::blockhashes::BlockTxHashes;
+    use crate::utxoview::UtxoView;
+    use dcroxide_txscript::sign::{SignatureType, raw_tx_in_signature};
+    use dcroxide_txscript::{
+        OP_1, OP_2, OP_3, OP_CHECKMULTISIG, OP_CHECKSIG, OP_CHECKSIGALT, OP_DUP, OP_EQUALVERIFY,
+        OP_HASH160, OP_SSGEN, OP_SSRTX, OP_SSTX, ScriptBuilder, ScriptFlags, SigHashType,
+    };
+
+    /// The secp256k1 private key of a tag and its compressed public key.
+    fn secp_key(tag: u8) -> ([u8; 32], Vec<u8>) {
+        let mut priv_key = [tag; 32];
+        priv_key[0] = 0x01;
+        let pub_key = dcroxide_dcrec::secp256k1::PrivateKey::from_bytes(&priv_key)
+            .expect("valid key")
+            .public_key()
+            .serialize_compressed()
+            .to_vec();
+        (priv_key, pub_key)
+    }
+
+    /// How a spent output is locked.  Each lock signs through a
+    /// different signature opcode or suite.
+    #[derive(Clone, Copy)]
+    enum Lock {
+        /// Pay to the hash of the key's public key, behind a stake
+        /// opcode when one is given: OP_CHECKSIG.
+        PubKeyHash(u8, Option<u8>),
+        /// Two of the three keys from this tag on, signed by the first
+        /// and the third: OP_CHECKMULTISIG.
+        TwoOfThree(u8),
+        /// An Ed25519 key of this seed: OP_CHECKSIGALT.
+        Ed25519(u8),
+        /// The key's public key under Schnorr: OP_CHECKSIGALT.
+        Schnorr(u8),
+    }
+
+    impl Lock {
+        /// The Ed25519 public key of the seed and the `seed || pubkey`
+        /// form the signer takes.
+        fn ed25519_key(seed: u8) -> ([u8; 32], Vec<u8>) {
+            let seed = [seed; 32];
+            let pub_key = dcroxide_dcrec::edwards::SecretKey::from_seed(seed)
+                .public_key()
+                .serialize();
+            (pub_key, [seed.as_slice(), pub_key.as_slice()].concat())
+        }
+
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "key tags are small fixed test values"
+        )]
+        fn pk_script(self) -> Vec<u8> {
+            let builder = match self {
+                Lock::PubKeyHash(key, stake_tag) => {
+                    let hash = dcroxide_txscript::stdaddr::hash160(&secp_key(key).1);
+                    let builder = match stake_tag {
+                        Some(tag) => ScriptBuilder::new().add_op(tag),
+                        None => ScriptBuilder::new(),
+                    };
+                    builder
+                        .add_op(OP_DUP)
+                        .add_op(OP_HASH160)
+                        .add_data(&hash)
+                        .add_op(OP_EQUALVERIFY)
+                        .add_op(OP_CHECKSIG)
+                }
+                Lock::TwoOfThree(key) => ScriptBuilder::new()
+                    .add_op(OP_2)
+                    .add_data(&secp_key(key).1)
+                    .add_data(&secp_key(key + 1).1)
+                    .add_data(&secp_key(key + 2).1)
+                    .add_op(OP_3)
+                    .add_op(OP_CHECKMULTISIG),
+                Lock::Ed25519(seed) => ScriptBuilder::new()
+                    .add_data(&Self::ed25519_key(seed).0)
+                    .add_op(OP_1)
+                    .add_op(OP_CHECKSIGALT),
+                Lock::Schnorr(key) => ScriptBuilder::new()
+                    .add_data(&secp_key(key).1)
+                    .add_op(OP_2)
+                    .add_op(OP_CHECKSIGALT),
+            };
+            builder.script().expect("builds")
+        }
+
+        /// The signature script that spends the lock from input `idx`
+        /// of `tx`, signed over the signature hash the signer computes
+        /// in full.
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "key tags are small fixed test values"
+        )]
+        fn sig_script(self, tx: &MsgTx, idx: usize, hash_type: SigHashType) -> Vec<u8> {
+            let pk_script = self.pk_script();
+            let sign = |key: &[u8], sig_type| {
+                raw_tx_in_signature(tx, idx, &pk_script, hash_type, key, sig_type).expect("signs")
+            };
+            let ecdsa = |key: u8| sign(&secp_key(key).0, SignatureType::EcdsaSecp256k1);
+            let builder = match self {
+                Lock::PubKeyHash(key, _) => ScriptBuilder::new()
+                    .add_data(&ecdsa(key))
+                    .add_data(&secp_key(key).1),
+                Lock::TwoOfThree(key) => ScriptBuilder::new()
+                    .add_data(&ecdsa(key))
+                    .add_data(&ecdsa(key + 2)),
+                Lock::Ed25519(seed) => ScriptBuilder::new()
+                    .add_data(&sign(&Self::ed25519_key(seed).1, SignatureType::Ed25519)),
+                Lock::Schnorr(key) => ScriptBuilder::new()
+                    .add_data(&sign(&secp_key(key).0, SignatureType::SchnorrSecp256k1)),
+            };
+            builder.script().expect("builds")
+        }
+    }
+
+    /// A transaction that spends one fresh output per lock from the
+    /// given tree, each input signed with the hash type beside its
+    /// lock, with as many outputs as inputs.  The spent outputs are
+    /// added to the view.
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "test arithmetic over small fixed values"
+    )]
+    fn signed_tx(fill: u8, tree: i8, spends: &[(Lock, u8)], view: &mut UtxoView) -> MsgTx {
+        let mut tx = MsgTx {
+            tx_in: (0..spends.len())
+                .map(|i| TxIn {
+                    previous_out_point: OutPoint {
+                        hash: Hash([fill; 32]),
+                        index: i as u32,
+                        tree,
+                    },
+                    sequence: u32::MAX - i as u32,
+                    ..TxIn::default()
+                })
+                .collect(),
+            tx_out: (0..spends.len())
+                .map(|i| TxOut {
+                    value: 1_000 + i as i64,
+                    version: 0,
+                    pk_script: vec![dcroxide_txscript::OP_TRUE, fill],
+                })
+                .collect(),
+            lock_time: u32::from(fill),
+            ..MsgTx::default()
+        };
+        for (idx, (lock, hash_type)) in spends.iter().enumerate() {
+            tx.tx_in[idx].signature_script = lock.sig_script(&tx, idx, SigHashType(*hash_type));
+            view.insert_entry(
+                &tx.tx_in[idx].previous_out_point,
+                entry(lock.pk_script(), TxType::Regular, None),
+            );
+        }
+        tx
+    }
+
+    /// A transaction whose only input is coinbase-style, so the script
+    /// check collects nothing from it.
+    fn unchecked_tx(fill: u8) -> MsgTx {
+        let mut tx = spender(1);
+        tx.tx_in[0].previous_out_point = OutPoint {
+            hash: Hash::ZERO,
+            index: u32::MAX,
+            tree: 0,
+        };
+        tx.lock_time = u32::from(fill);
+        tx
+    }
+
+    /// A version 2 revocation, which the script check skips under the
+    /// automatic revocations agenda: its input is unsigned, and the
+    /// view holds nothing for it.
+    fn auto_revocation() -> MsgTx {
+        let mut tx = spender(1);
+        tx.version = dcroxide_stake::TX_VERSION_AUTO_REVOCATIONS;
+        tx.tx_in[0].previous_out_point = OutPoint {
+            hash: Hash([0x3f; 32]),
+            index: 0,
+            tree: dcroxide_wire::TX_TREE_STAKE,
+        };
+        tx.tx_out[0].pk_script = Lock::PubKeyHash(0x7f, Some(OP_SSRTX)).pk_script();
+        assert!(dcroxide_stake::is_ssrtx(&tx));
+        tx
+    }
+
+    /// The index of the 20-input transaction in the regular tree of
+    /// [`signed_block`], of the one that signs through every opcode and
+    /// suite, and of the two signed transactions of the stake tree.
+    const MANY_INPUTS: usize = 1;
+    const EVERY_OPCODE: usize = 2;
+    const STAKE_FIRST: usize = 1;
+    const STAKE_LAST: usize = 3;
+
+    /// A block whose two trees each hold several transactions with
+    /// several signed inputs, and the view of the outputs they spend.
+    ///
+    /// The regular tree: a coinbase; a transaction of 20 pay-to-pubkey-
+    /// hash inputs, enough for the script check to fan out; one that
+    /// signs through every signature opcode and suite, and with hash
+    /// types other than `SigHashAll`; one more of two inputs.  The stake
+    /// tree: a stakebase; a transaction of three inputs; a version 2
+    /// revocation, which is skipped; a transaction spending stake-tagged
+    /// outputs.  Each transaction is preceded by ones the check collects
+    /// nothing from or by ones with other hashes, so an engine handed
+    /// the hash of a neighbor or of the other tree's transaction at its
+    /// position does not verify.
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "key tags are small fixed test values"
+    )]
+    fn signed_block() -> (MsgBlock, UtxoView) {
+        let mut view = UtxoView::new();
+        let pkh = |key: u8| Lock::PubKeyHash(key, None);
+        let many: Vec<(Lock, u8)> = (0..20u8).map(|i| (pkh(0x40 + i), 0x01)).collect();
+        let transactions = vec![
+            unchecked_tx(1),
+            signed_tx(0x21, 0, &many, &mut view),
+            signed_tx(
+                0x22,
+                0,
+                &[
+                    (pkh(0x60), 0x01),
+                    (Lock::TwoOfThree(0x61), 0x01),
+                    (pkh(0x64), 0x02),
+                    (pkh(0x65), 0x83),
+                    (Lock::Ed25519(0x66), 0x01),
+                    (Lock::Schnorr(0x67), 0x01),
+                    (pkh(0x68), 0x81),
+                    (Lock::TwoOfThree(0x69), 0x03),
+                ],
+                &mut view,
+            ),
+            signed_tx(0x23, 0, &[(pkh(0x6c), 0x01), (pkh(0x6d), 0x01)], &mut view),
+        ];
+        let stransactions = vec![
+            unchecked_tx(2),
+            signed_tx(
+                0x31,
+                0,
+                &[(pkh(0x70), 0x01), (pkh(0x71), 0x01), (pkh(0x72), 0x01)],
+                &mut view,
+            ),
+            auto_revocation(),
+            signed_tx(
+                0x32,
+                dcroxide_wire::TX_TREE_STAKE,
+                &[
+                    (Lock::PubKeyHash(0x73, Some(OP_SSGEN)), 0x01),
+                    (Lock::PubKeyHash(0x74, Some(OP_SSTX)), 0x01),
+                    (Lock::Schnorr(0x75), 0x01),
+                ],
+                &mut view,
+            ),
+        ];
+        let block = MsgBlock {
+            header: zero_header(),
+            transactions,
+            stransactions,
+        };
+        (block, view)
+    }
+
+    /// Both forms of the block script check on one tree: dcrd's, which
+    /// hashes each transaction's prefix for every signature, and the one
+    /// given the block's transaction hashes.  They must agree, down to
+    /// the error text; the shared verdict is returned.
+    fn check_both_ways(block: &MsgBlock, view: &UtxoView, regular: bool) -> Result<(), RuleError> {
+        let flags = ScriptFlags(0);
+        let plain = check_block_scripts(block, view, regular, flags, None, true);
+        let tx_hashes = BlockTxHashes::compute(block);
+        let with_hashes =
+            check_block_scripts_with_hashes(block, &tx_hashes, view, regular, flags, None, true);
+        assert_eq!(with_hashes, plain, "regular tree: {regular}");
+        plain
+    }
+
+    /// A block with several signatures per transaction in both trees
+    /// passes the script check given its transaction hashes exactly as
+    /// it does without them, and every item of the check given them
+    /// carries one.
+    #[test]
+    fn a_signed_block_passes_the_script_check_with_and_without_its_hashes() {
+        let (block, view) = signed_block();
+        // 20, 8 and 2 inputs in the regular tree; 3 and 3 in the stake
+        // tree, the revocation's skipped.
+        for (regular, items) in [(true, 30), (false, 6)] {
+            let before = BLOCK_SCRIPT_ITEMS.get();
+            assert_eq!(check_both_ways(&block, &view, regular), Ok(()));
+            let after = BLOCK_SCRIPT_ITEMS.get();
+            assert_eq!(
+                (
+                    after.0.wrapping_sub(before.0),
+                    after.1.wrapping_sub(before.1)
+                ),
+                (items, items),
+                "regular tree: {regular}"
+            );
+        }
+
+        // The signature cache answers either form from the other's
+        // entries.
+        let cache = dcroxide_txscript::SigCache::new(100);
+        let tx_hashes = BlockTxHashes::compute(&block);
+        for regular in [true, false] {
+            let flags = ScriptFlags(0);
+            assert_eq!(
+                check_block_scripts(&block, &view, regular, flags, Some(&cache), true),
+                Ok(())
+            );
+            assert_eq!(
+                check_block_scripts_with_hashes(
+                    &block,
+                    &tx_hashes,
+                    &view,
+                    regular,
+                    flags,
+                    Some(&cache),
+                    true
+                ),
+                Ok(())
+            );
+        }
+    }
+
+    /// A signature that does not verify is rejected with the same error
+    /// by both forms, whichever tree, transaction and input it sits in
+    /// and whatever its hash type: one tampered in place, and one that
+    /// is a good signature of another transaction.
+    #[test]
+    fn a_bad_signature_is_rejected_alike_with_and_without_the_block_hashes() {
+        let (block, view) = signed_block();
+        // (regular tree, transaction, input)
+        let places = [
+            (true, MANY_INPUTS, 0),
+            (true, MANY_INPUTS, 19),
+            (true, EVERY_OPCODE, 0),
+            (true, EVERY_OPCODE, 1),
+            (true, EVERY_OPCODE, 2),
+            (true, EVERY_OPCODE, 3),
+            (true, EVERY_OPCODE, 4),
+            (true, EVERY_OPCODE, 5),
+            (true, EVERY_OPCODE, 6),
+            (true, EVERY_OPCODE, 7),
+            (true, 3, 1),
+            (false, STAKE_FIRST, 0),
+            (false, STAKE_FIRST, 2),
+            (false, STAKE_LAST, 0),
+            (false, STAKE_LAST, 1),
+            (false, STAKE_LAST, 2),
+        ];
+        fn txs_mut(block: &mut MsgBlock, regular: bool) -> &mut Vec<MsgTx> {
+            if regular {
+                &mut block.transactions
+            } else {
+                &mut block.stransactions
+            }
+        }
+        for (regular, tx_idx, tx_in_idx) in places {
+            // A bit of the first signature's body flipped: the encoding
+            // stays strict and the signature no longer verifies.
+            let mut tampered = block.clone();
+            let tx = &mut txs_mut(&mut tampered, regular)[tx_idx];
+            tx.tx_in[tx_in_idx].signature_script[10] ^= 0x01;
+            let tx_hash = tx.tx_hash();
+            let err = check_both_ways(&tampered, &view, regular).expect_err("tampered signature");
+            assert_eq!(err.kind, RuleErrorKind::ScriptValidation);
+            assert!(
+                err.description
+                    .starts_with(&format!("failed to validate input {tx_hash}:{tx_in_idx} ")),
+                "{}",
+                err.description
+            );
+
+            // The transaction changed after it was signed: every
+            // signature in it is a good signature of the transaction it
+            // was, and none of this one, whatever its hash type.  Which
+            // failing input is reported depends on the workers, so only
+            // the transaction is compared.
+            let mut resigned = block.clone();
+            let tx = &mut txs_mut(&mut resigned, regular)[tx_idx];
+            tx.lock_time ^= 0x0100;
+            let tx_hash = tx.tx_hash();
+            let flags = ScriptFlags(0);
+            let plain = check_block_scripts(&resigned, &view, regular, flags, None, true)
+                .expect_err("signed for another lock time");
+            let with_hashes = check_block_scripts_with_hashes(
+                &resigned,
+                &BlockTxHashes::compute(&resigned),
+                &view,
+                regular,
+                flags,
+                None,
+                true,
+            )
+            .expect_err("signed for another lock time");
+            for err in [plain, with_hashes] {
+                assert_eq!(err.kind, RuleErrorKind::ScriptValidation);
+                assert!(
+                    err.description
+                        .starts_with(&format!("failed to validate input {tx_hash}:")),
+                    "{}",
+                    err.description
+                );
+            }
+        }
+    }
+
+    /// The outcome of a call that panics under debug assertions and
+    /// returns in a release build: the panic's message, or the value.
+    fn outcome_or_panic_message<T>(call: impl FnOnce() -> T) -> Result<T, String> {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(call)).map_err(|panic| {
+            panic
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| panic.downcast_ref::<&str>().map(|s| (*s).to_string()))
+                .unwrap_or_default()
+        })
+    }
+
+    /// The hashes of another block of the same shape do not pass this
+    /// block through the script check.  Under debug assertions the check
+    /// refuses them before it reads one.  A release build checks only
+    /// their number, and then each engine verifies its `SigHashAll`
+    /// signatures against a signature hash built on a hash that is not
+    /// its transaction's, which this block's signatures were not made
+    /// for, so the block is rejected.
+    #[test]
+    fn another_blocks_hashes_do_not_pass_the_script_check() {
+        let (block, view) = signed_block();
+        let mut other = block.clone();
+        other.transactions[MANY_INPUTS].expiry ^= 1;
+        other.stransactions[STAKE_FIRST].expiry ^= 1;
+        let wrong = BlockTxHashes::compute(&other);
+        assert!(wrong.fits(&block) && !wrong.is_for(&block));
+
+        for regular in [true, false] {
+            let outcome = outcome_or_panic_message(|| {
+                check_block_scripts_with_hashes(
+                    &block,
+                    &wrong,
+                    &view,
+                    regular,
+                    ScriptFlags(0),
+                    None,
+                    true,
+                )
+            });
+            if cfg!(debug_assertions) {
+                assert_eq!(
+                    outcome.expect_err("refused under debug assertions"),
+                    "transaction hashes do not match the block's transactions"
+                );
+            } else {
+                let err = outcome
+                    .expect("no check to panic")
+                    .expect_err("the signatures do not verify");
+                assert_eq!(err.kind, RuleErrorKind::ScriptValidation);
+            }
+        }
+    }
+
+    /// An item's hash reaches its engine.  With the hash of another
+    /// transaction the engine refuses it under debug assertions, and in
+    /// a release build the item's `SigHashAll` signature fails; an item
+    /// signed with another hash type passes in a release build, since
+    /// its engine never reads the hash.
+    #[test]
+    fn a_script_item_hands_its_transaction_hash_to_the_engine() {
+        let (block, view) = signed_block();
+        let tx = &block.transactions[EVERY_OPCODE];
+        let item = |tx_in_idx: usize, tx_hash: Option<&'static Hash>| {
+            let entry = view
+                .lookup_entry(&tx.tx_in[tx_in_idx].previous_out_point)
+                .expect("entry");
+            ValidateItem {
+                tx,
+                tx_hash,
+                tx_in_idx,
+                pk_script: entry.pk_script(),
+                script_version: entry.script_version(),
+            }
+        };
+        static WRONG: Hash = Hash([0x5a; 32]);
+        // Inputs 0 and 1 sign with SigHashAll (OP_CHECKSIG and
+        // OP_CHECKMULTISIG), input 2 with SigHashNone.
+        for (tx_in_idx, reads_hash) in [(0, true), (1, true), (2, false)] {
+            assert_eq!(
+                validate_item(&item(tx_in_idx, None), ScriptFlags(0), None),
+                Ok(())
+            );
+            let outcome = outcome_or_panic_message(|| {
+                validate_item(&item(tx_in_idx, Some(&WRONG)), ScriptFlags(0), None)
+            });
+            if cfg!(debug_assertions) {
+                let message = outcome.expect_err("refused under debug assertions");
+                assert!(
+                    message.contains(
+                        "the transaction hash handed to the script engine is not its \
+                         transaction's"
+                    ),
+                    "{message}"
+                );
+            } else if reads_hash {
+                let err = outcome
+                    .expect("no check to panic")
+                    .expect_err("the signature does not verify");
+                assert_eq!(err.kind, RuleErrorKind::ScriptValidation);
+            } else {
+                assert_eq!(outcome.expect("no check to panic"), Ok(()));
+            }
+        }
     }
 }

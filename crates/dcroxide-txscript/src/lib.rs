@@ -13,8 +13,12 @@
 //! - dcrd's `SigCache` is ported (behind the `std` feature) as a
 //!   result-invariant memoization of successful verifications; the
 //!   no-cache path verifies directly, byte-identical to before.
-//! - dcrd's `optimizeSigVerification` prefix-hash cache is permanently
-//!   disabled dead code at the parity tag and is not reproduced.
+//! - The prefix hash of a `SigHashAll` signature hash is taken from the
+//!   transaction hash when the caller supplies it
+//!   ([`Engine::set_tx_hash`]): the path dcrd carries behind
+//!   `optimizeSigVerification` and ships switched off.  The hash is an
+//!   argument, never a cache on the transaction, and without it every
+//!   signature hash is computed as dcrd computes it.
 //!
 //! The `stdaddr`, `stdscript` and `sign` subpackages live in the modules
 //! of the same names.

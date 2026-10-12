@@ -6,6 +6,11 @@
 //! over random transactions. This is the in-tree slice of the brief's
 //! always-on differential script fuzzer.
 //!
+//! Our engine runs every script pair twice, without the transaction's
+//! hash and with it handed in (`Engine::set_tx_hash`), and the two
+//! results must agree with each other before they are compared with
+//! dcrd, whose engine computes every signature hash in full.
+//!
 //! The text is compared because it is observable: dcrd's script validator
 //! formats it into the rule error (`internal/blockchain/scriptval.go`), and
 //! `sendrawtransaction` hands that to the client as
@@ -128,9 +133,18 @@ fn random_flags(rng: &mut SplitMix64) -> ScriptFlags {
 }
 
 /// Run one script pair through our engine, returning "ok" or the kind
-/// name and the error text.
+/// name and the error text.  The pair runs a second time with the
+/// transaction's hash handed to the engine, and must give the same.
 fn ours_exec(pk_script: &[u8], tx: &MsgTx, flags: ScriptFlags, version: u16) -> String {
     let result = Engine::new(pk_script, tx, 0, flags, version).and_then(|mut vm| vm.execute());
+    let with_tx_hash = Engine::new(pk_script, tx, 0, flags, version).and_then(|mut vm| {
+        vm.set_tx_hash(&tx.tx_hash());
+        vm.execute()
+    });
+    assert_eq!(
+        with_tx_hash, result,
+        "the transaction hash changed the result"
+    );
     match result {
         Ok(()) => "ok".to_string(),
         Err(err) => format!("{}: {err}", err.kind.kind_name()),

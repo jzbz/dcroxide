@@ -9501,6 +9501,72 @@ mod tests {
         }
     }
 
+    /// A block validated in full has its scripts checked with the hashes
+    /// computed for it, in both trees: every input the script check
+    /// collects while the battery's first run of tip extensions is
+    /// processed carries its transaction's hash, so each engine is
+    /// handed one (and under debug assertions checks it against its
+    /// transaction).  A bulk import runs no scripts and collects nothing.
+    ///
+    /// None of these blocks' scripts executes a signature opcode, so
+    /// this shows that the hashes reach every item, not that a signature
+    /// hash was built on one.  That is shown by the signed block of
+    /// `validate::tests`, and by the battery's later blocks, whose
+    /// signatures verify through the same call wherever the whole
+    /// battery is processed (in this module,
+    /// `the_contextual_merkle_check_records_a_pass_before_later_checks`).
+    #[test]
+    fn a_fully_validated_block_checks_its_scripts_with_its_hashes() {
+        let params = dcroxide_chaincfg::regnet_params();
+        // The inputs of a tree that are not coinbase-style: the ones the
+        // script check collects, there being no revocation to skip.
+        let spends = |txs: &[dcroxide_wire::MsgTx]| -> u64 {
+            assert!(!txs.iter().any(dcroxide_stake::is_ssrtx));
+            txs.iter()
+                .flat_map(|tx| &tx.tx_in)
+                .filter(|tx_in| tx_in.previous_out_point.index != u32::MAX)
+                .count() as u64
+        };
+        for bulk_import in [false, true] {
+            let mut chain = Chain::new(&params, Hash::ZERO, false);
+            chain.bulk_import_mode = bulk_import;
+            let before = crate::validate::BLOCK_SCRIPT_ITEMS.get();
+            let (mut now, mut regular_spends, mut stake_spends) = (0, 0u64, 0u64);
+            for line in include_str!("../tests/data/fullblock_vectors.txt").lines() {
+                let f: Vec<&str> = line.split(' ').collect();
+                match f[0] {
+                    "now" => now = f[1].parse().expect("now"),
+                    "accept" if f[2] == "true" => {
+                        let (block, _) =
+                            MsgBlock::from_bytes(&dcroxide_testutil::unhex(f[4])).expect("block");
+                        let (_, errs) = chain.process_block(&block, now, &params);
+                        assert!(errs.is_empty(), "{}: {errs:?}", f[1]);
+                        regular_spends = regular_spends.wrapping_add(spends(&block.transactions));
+                        stake_spends = stake_spends.wrapping_add(spends(&block.stransactions));
+                    }
+                    "accept" => break,
+                    _ => {}
+                }
+            }
+            assert!(
+                regular_spends > 0 && stake_spends > 0,
+                "{regular_spends} regular and {stake_spends} stake inputs to check"
+            );
+            let after = crate::validate::BLOCK_SCRIPT_ITEMS.get();
+            let with_hash = after.0.wrapping_sub(before.0);
+            let without = after.1.wrapping_sub(before.1);
+            if bulk_import {
+                assert_eq!((with_hash, without), (0, 0));
+            } else {
+                assert_eq!(
+                    (with_hash, without),
+                    (regular_spends.wrapping_add(stake_spends), 0),
+                    "{regular_spends} regular and {stake_spends} stake inputs"
+                );
+            }
+        }
+    }
+
     /// The hashes filed while a block is processed do not outlive the
     /// call, whether it accepts the block or refuses it.
     #[test]
