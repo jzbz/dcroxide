@@ -19,12 +19,18 @@
 //! adversary crowds costs n log n, not n squared, under the writer
 //! semaphore.  Every vector is grown by exact-capacity merges, so the
 //! memtable costs 21 bytes a key plus a transient copy of one partition.
+//!
+//! Sorted is by the keys' bytes.  The searches, merges and sorts of a
+//! lookup, a connect and a flush compare with [`super::cmp_keys`], which
+//! gives that order without a call to the C library for each comparison.
+//! [`Memtable::snapshot`], which is for tests and diagnostics, sorts by
+//! the array type's own comparison, the same order.
 
 use std::sync::RwLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use super::Key;
 use super::policy::PARTITIONS;
+use super::{Key, cmp_keys};
 
 /// One partition's keys.  The vectors are pairwise disjoint.
 #[derive(Default)]
@@ -40,8 +46,8 @@ struct Part {
 
 impl Part {
     fn contains(&self, key: &Key) -> bool {
-        self.journaled.binary_search(key).is_ok()
-            || self.fresh.iter().any(|run| run.binary_search(key).is_ok())
+        let holds = |keys: &[Key]| keys.binary_search_by(|held| cmp_keys(held, key)).is_ok();
+        holds(&self.journaled) || self.fresh.iter().any(|run| holds(run))
     }
 
     fn len(&self) -> usize {
@@ -91,7 +97,7 @@ pub(crate) fn merge_sorted(a: &[Key], b: &[Key]) -> Vec<Key> {
     let mut out = Vec::with_capacity(a.len().saturating_add(b.len()));
     let (mut i, mut j) = (0usize, 0usize);
     while i < a.len() && j < b.len() {
-        if a[i] <= b[j] {
+        if cmp_keys(&a[i], &b[j]).is_le() {
             out.push(a[i]);
             i = i.saturating_add(1);
         } else {
@@ -186,7 +192,7 @@ impl Memtable {
             if run.is_empty() {
                 continue;
             }
-            run.sort_unstable();
+            run.sort_unstable_by(cmp_keys);
             run.dedup();
             added = added.saturating_add(run.len());
             copied = copied.saturating_add(part.add_run(run));
@@ -370,6 +376,35 @@ mod tests {
         let all = m.all_sorted(7);
         assert_eq!(all.len(), 201 + 512);
         assert!(all.windows(2).all(|w| w[0] < w[1]));
+    }
+
+    /// A partition's keys need not arrive in order: the insert sorts the
+    /// run they go in as, and every later search and merge rests on that.
+    /// A connect hands its keys sorted, so no other test shows the sort.
+    #[test]
+    fn a_partitions_keys_are_sorted_however_they_are_handed() {
+        let m = Memtable::new();
+        let ascending: Vec<Key> = (0..4u8)
+            .flat_map(|t| (0..60u8).map(move |r| key(t, 9, r)))
+            .collect();
+        assert!(ascending.windows(2).all(|w| w[0] < w[1]));
+        // Every other key, last first; then the rest, last first, which
+        // merges with the run the first batch left.
+        for batch in [0usize, 1] {
+            let handed: Vec<(u8, Key)> = ascending
+                .iter()
+                .rev()
+                .filter(|k| usize::from(k[2]) % 2 == batch)
+                .map(|k| (9u8, *k))
+                .collect();
+            assert_eq!(m.insert_candidates(&handed), handed.len());
+        }
+        assert_eq!(m.all_sorted(9), ascending);
+        for k in &ascending {
+            assert!(m.contains(9, k));
+        }
+        assert!(!m.contains(9, &key(0, 9, 60)));
+        assert_eq!(m.insert_candidates(&cands(&ascending)), 0);
     }
 
     /// Inserting n keys into one partition copies O(n log n) keys,

@@ -10,7 +10,7 @@
 use dcroxide_database::{Error, FlushWriter, Transaction};
 
 use super::policy::{CHUNK, Partitioner};
-use super::{ADDR_KEY_SIZE, Key, corrupt};
+use super::{ADDR_KEY_SIZE, Key, cmp_keys, corrupt};
 
 /// The run rows' suffix under the bucket id.
 pub(crate) const RUN_TAG: u8 = b'R';
@@ -65,7 +65,7 @@ pub(crate) fn decode_keys(value: &[u8], max: usize, what: &str) -> Result<Vec<Ke
     }
     let mut keys: Vec<Key> = Vec::with_capacity(n);
     for key in value.as_chunks::<ADDR_KEY_SIZE>().0 {
-        if keys.last().is_some_and(|prev| prev >= key) {
+        if keys.last().is_some_and(|prev| cmp_keys(prev, key).is_ge()) {
             return Err(corrupt(format!("{what} holds keys out of order")));
         }
         keys.push(*key);
@@ -182,7 +182,7 @@ pub(crate) fn union(a: &[Key], b: &[Key]) -> Vec<Key> {
     let mut out = Vec::with_capacity(a.len().saturating_add(b.len()));
     let (mut i, mut j) = (0usize, 0usize);
     while i < a.len() && j < b.len() {
-        match a[i].cmp(&b[j]) {
+        match cmp_keys(&a[i], &b[j]) {
             core::cmp::Ordering::Less => {
                 out.push(a[i]);
                 i = i.saturating_add(1);

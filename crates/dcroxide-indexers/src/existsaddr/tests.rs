@@ -42,6 +42,10 @@
 //! the two must lose no key.  The power cuts, the lookup races and the
 //! hand-over control run both ways.
 //!
+//! **The key order.**  Keys are compared by an inline comparison of three
+//! words, not by the array type's own; the two must be one order, in the
+//! comparison itself and in every row a flush writes.
+//!
 //! **Keys an adversary grinds** to share a first hash160 byte must still
 //! spread over the partitions, keeping each flush near its page budget
 //! and the journal collectable.
@@ -2521,6 +2525,246 @@ fn a_full_journal_row_fills_one_leaf() {
         after.live_tree_bytes(),
         (after.leaf_pages + after.branch_pages) * after.page_size
     );
+}
+
+// ---------------------------------------------------------------------
+// The key order
+// ---------------------------------------------------------------------
+
+/// Pairs `(a, b)` with `a` before `b` in byte order, chosen so that a
+/// comparison by words gets them wrong if it reads a word little-endian,
+/// compares words as signed integers, takes the words out of order, or
+/// leaves a byte out.  For each byte position: the keys agree before it,
+/// differ at it, and after it either agree or disagree the other way in
+/// every byte.
+fn ordered_pairs() -> Vec<(Key, Key)> {
+    let mut pairs = Vec::new();
+    for at in 0..21 {
+        for (lo, hi) in [(0x00, 0x01), (0x7f, 0x80), (0x00, 0xff), (0xfe, 0xff)] {
+            for before in [0x00, 0x5a, 0xff] {
+                for (after_a, after_b) in [(0x33, 0x33), (0xff, 0x00), (0x80, 0x7f)] {
+                    let (mut a, mut b) = ([before; 21], [before; 21]);
+                    a[at] = lo;
+                    b[at] = hi;
+                    a[at + 1..].fill(after_a);
+                    b[at + 1..].fill(after_b);
+                    pairs.push((a, b));
+                }
+            }
+        }
+    }
+    pairs
+}
+
+/// Random keys, many of them a copy of the one before with a byte, or
+/// everything from a byte on, changed: keys that agree for a random
+/// number of bytes.
+fn clustered_keys(rng: &mut SplitMix64, n: usize) -> Vec<Key> {
+    let mut keys: Vec<Key> = Vec::with_capacity(n);
+    while keys.len() < n {
+        let key = match (keys.last(), rng.below(4)) {
+            (Some(&last), 0) => {
+                let mut key = last;
+                key[rng.below(21) as usize] = rng.next_u64() as u8;
+                key
+            }
+            (Some(&last), 1) => {
+                let mut key = random_key(rng);
+                let agree = rng.below(22) as usize;
+                key[..agree].copy_from_slice(&last[..agree]);
+                key
+            }
+            (Some(&last), 2) => last,
+            _ => random_key(rng),
+        };
+        keys.push(key);
+    }
+    keys
+}
+
+/// The inline comparison is the order of the keys' bytes, the one the
+/// array type itself has: on every adversarial pair in both directions,
+/// on equal keys, on random and clustered keys, and as a sort.  It is
+/// the order of every sorted row on disk, so any difference would be a
+/// format change.
+#[test]
+fn the_inline_key_comparison_is_the_byte_order() {
+    use core::cmp::Ordering::{Equal, Greater, Less};
+
+    for (a, b) in ordered_pairs() {
+        assert!(a < b, "the pair is not ordered: {} {}", hex(&a), hex(&b));
+        assert_eq!(super::cmp_keys(&a, &b), Less, "{} {}", hex(&a), hex(&b));
+        assert_eq!(super::cmp_keys(&b, &a), Greater, "{} {}", hex(&b), hex(&a));
+        assert_eq!(super::cmp_keys(&a, &a), Equal, "{}", hex(&a));
+        assert_eq!(super::cmp_keys(&b, &b), Equal, "{}", hex(&b));
+    }
+
+    let mut rng = SplitMix64::from_entropy("the_inline_key_comparison_is_the_byte_order");
+    let keys = clustered_keys(&mut rng, 200_000);
+    for pair in keys.windows(2) {
+        let (a, b) = (pair[0], pair[1]);
+        assert_eq!(
+            super::cmp_keys(&a, &b),
+            a.cmp(&b),
+            "{} {}",
+            hex(&a),
+            hex(&b)
+        );
+        assert_eq!(
+            super::cmp_keys(&b, &a),
+            b.cmp(&a),
+            "{} {}",
+            hex(&b),
+            hex(&a)
+        );
+    }
+    for _ in 0..200_000 {
+        let a = keys[rng.below(keys.len() as u64) as usize];
+        let b = keys[rng.below(keys.len() as u64) as usize];
+        assert_eq!(
+            super::cmp_keys(&a, &b),
+            a.cmp(&b),
+            "{} {}",
+            hex(&a),
+            hex(&b)
+        );
+    }
+
+    let mut by_bytes = keys.clone();
+    by_bytes.sort_unstable();
+    let mut inline = keys;
+    inline.sort_unstable_by(super::cmp_keys);
+    assert!(inline == by_bytes, "the two orders sort differently");
+}
+
+/// Every place that compares keys with the inline comparison gives what
+/// the byte order gives: the memtable's lookup and merge, the runs' union
+/// and the rows' order check, here; and the journal's sort and the
+/// chunks a flush writes, as bytes on disk.
+#[test]
+fn every_place_that_compares_keys_keeps_the_byte_order() {
+    let mut rng = SplitMix64(0x6f72_6465_7201);
+    let mut keys = clustered_keys(&mut rng, 3_000);
+    for (a, b) in ordered_pairs() {
+        keys.extend([a, b]);
+    }
+    let all: BTreeSet<Key> = keys.iter().copied().collect();
+    let sorted_all: Vec<Key> = all.iter().copied().collect();
+
+    // The merge of two disjoint sorted halves, and the union of two
+    // sorted lists that share a third of their keys.
+    let evens: Vec<Key> = sorted_all.iter().copied().step_by(2).collect();
+    let odds: Vec<Key> = sorted_all.iter().copied().skip(1).step_by(2).collect();
+    assert_eq!(super::memtable::merge_sorted(&evens, &odds), sorted_all);
+    assert_eq!(super::memtable::merge_sorted(&odds, &evens), sorted_all);
+    let low: Vec<Key> = sorted_all
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| i % 3 != 0)
+        .map(|(_, k)| *k)
+        .collect();
+    let high: Vec<Key> = sorted_all
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| i % 3 != 1)
+        .map(|(_, k)| *k)
+        .collect();
+    assert_eq!(runs::union(&low, &high), sorted_all);
+    assert_eq!(runs::union(&high, &low), sorted_all);
+
+    // A row's order check: ascending keys pass, and a pair out of order
+    // or repeated does not.
+    for row in sorted_all.chunks(CHUNK) {
+        let value = runs::encode_chunk(row);
+        assert_eq!(
+            runs::decode_keys(&value, CHUNK, "a row").expect("ascending"),
+            row
+        );
+    }
+    for (a, b) in ordered_pairs() {
+        assert!(runs::decode_keys(&runs::encode_chunk(&[a, b]), CHUNK, "a row").is_ok());
+        assert!(runs::decode_keys(&runs::encode_chunk(&[b, a]), CHUNK, "a row").is_err());
+        assert!(runs::decode_keys(&runs::encode_chunk(&[a, a]), CHUNK, "a row").is_err());
+    }
+
+    // The memtable's lookup, over journaled keys and unjournaled runs:
+    // every key held is found, and for every adversarial pair the key
+    // left out is not, though its neighbour is held.
+    let rig = StoreRig::new(Policy {
+        k0: usize::MAX,
+        k0_hard: usize::MAX,
+        u_max: usize::MAX,
+        ..Policy::tiny()
+    });
+    let part = rig.store.partitioner();
+    let holds = |key: &Key| rig.store.mem.contains(part.of(key), key);
+    let (journaled, unjournaled) = keys.split_at(keys.len() / 2);
+    rig.insert(journaled.to_vec());
+    rig.flush();
+    for batch in unjournaled.chunks(97) {
+        rig.insert(batch.to_vec());
+    }
+    for key in &sorted_all {
+        assert!(holds(key), "{} is held", hex(key));
+    }
+    for _ in 0..3_000 {
+        let key = random_key(&mut rng);
+        assert_eq!(holds(&key), all.contains(&key), "{}", hex(&key));
+    }
+    for (a, b) in ordered_pairs() {
+        for mut near in [a, b] {
+            near[20] ^= 1;
+            assert_eq!(holds(&near), all.contains(&near), "{}", hex(&near));
+            near[0] ^= 0x80;
+            assert_eq!(holds(&near), all.contains(&near), "{}", hex(&near));
+        }
+    }
+
+    // The journal's rows of the first flush hold exactly the first half
+    // of the keys in byte order, as one sorted batch cut into rows.
+    let rows = rig.rows();
+    let journal: Vec<Key> = rows
+        .iter()
+        .filter(|(row, _)| row[4] == super::journal::JOURNAL_TAG)
+        .flat_map(|(_, value)| value.chunks(21).map(|k| Key::try_from(k).expect("a key")))
+        .collect();
+    let want: BTreeSet<Key> = journaled.iter().copied().collect();
+    assert!(want.len() > CHUNK, "the batch fills more than one row");
+    assert!(
+        journal == want.iter().copied().collect::<Vec<Key>>(),
+        "the journal's rows are not the batch in byte order"
+    );
+
+    // Merged into runs, every level's chunks hold its keys in byte
+    // order, chunk after chunk.
+    let rig = StoreRig::new(Policy {
+        k0: 0,
+        k0_hard: 0,
+        ..Policy::tiny()
+    });
+    rig.insert(keys.clone());
+    rig.flush();
+    let part = rig.store.partitioner();
+    let mut levels: std::collections::BTreeMap<(u8, u8), Vec<Key>> = Default::default();
+    for (row, value) in rig.rows() {
+        if row[4] == runs::RUN_TAG {
+            levels
+                .entry((row[5], row[6]))
+                .or_default()
+                .extend(value.chunks(21).map(|k| Key::try_from(k).expect("a key")));
+        }
+    }
+    let mut in_runs = 0usize;
+    for ((p, _), level) in &levels {
+        let want: Vec<Key> = sorted_all
+            .iter()
+            .copied()
+            .filter(|key| part.of(key) == *p)
+            .collect();
+        assert!(*level == want, "partition {p}'s run is not in byte order");
+        in_runs += level.len();
+    }
+    assert_eq!(in_runs, sorted_all.len());
 }
 
 // ---------------------------------------------------------------------

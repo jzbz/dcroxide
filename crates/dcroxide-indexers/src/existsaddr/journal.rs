@@ -13,7 +13,7 @@ use dcroxide_database::{Error, FlushWriter, Transaction};
 
 use super::policy::{CHUNK, PARTITIONS};
 use super::runs::{decode_keys, encode_chunk, hex};
-use super::{Key, corrupt};
+use super::{Key, cmp_keys, corrupt};
 
 /// Keys a flush gathers before it sorts and writes them: 256 full rows,
 /// about 1 MB.
@@ -107,7 +107,7 @@ impl Appender {
 
     /// Sort the batch and write it as rows of [`CHUNK`] keys.
     fn write_batch(&mut self, w: &mut FlushWriter<'_, '_>) -> Result<(), Error> {
-        self.batch.sort_unstable();
+        self.batch.sort_unstable_by(cmp_keys);
         debug_assert!(self.batch.windows(2).all(|pair| pair[0] < pair[1]));
         for row in self.batch.chunks(CHUNK) {
             w.insert(

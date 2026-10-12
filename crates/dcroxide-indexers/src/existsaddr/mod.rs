@@ -42,6 +42,36 @@ pub(crate) use crate::existsaddrindex::ADDR_KEY_SIZE;
 /// An address key, dcrd's `addrToKey` form: type byte plus hash160.
 pub(crate) type Key = [u8; ADDR_KEY_SIZE];
 
+// `cmp_keys` reads a key as three 8-byte words, the last ending at byte 21.
+const _: () = assert!(ADDR_KEY_SIZE == 21);
+
+/// Compare two keys as their bytes compare, first byte first: the order
+/// of every sorted vector of the memtable and of the keys in every chunk
+/// and journal row, and so part of the on-disk format.
+///
+/// It is the order `Key`'s own `Ord` gives, computed another way.  That
+/// one compares arrays of this length by calling the C library's
+/// `memcmp`, once for every step of every binary search and merge.  This
+/// one compares up to three pairs of words inline.  A word is read
+/// big-endian, which makes comparing two as integers the same as
+/// comparing their bytes in order; the third overlaps the second by three
+/// bytes, which are equal whenever it is looked at.
+#[inline]
+pub(crate) fn cmp_keys(a: &Key, b: &Key) -> core::cmp::Ordering {
+    be_word(&a[..8])
+        .cmp(&be_word(&b[..8]))
+        .then_with(|| be_word(&a[8..16]).cmp(&be_word(&b[8..16])))
+        .then_with(|| be_word(&a[13..]).cmp(&be_word(&b[13..])))
+}
+
+/// Eight bytes as a big-endian word.
+#[inline]
+fn be_word(bytes: &[u8]) -> u64 {
+    let mut word = [0u8; 8];
+    word.copy_from_slice(bytes);
+    u64::from_be_bytes(word)
+}
+
 /// The remedy every corruption error names: the index cannot repair
 /// itself, and must not open silently empty.
 pub(crate) const REMEDY: &str = "run once with --noexistsaddrindex --dropexistsaddrindex, then \
