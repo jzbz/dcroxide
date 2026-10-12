@@ -450,7 +450,9 @@ impl Node {
     /// Connect `block` as the sync manager does: the processing call,
     /// then the handler's drain.
     fn connect(&mut self, block: &MsgBlock) {
-        self.sync_chain.process_block(block).expect("live block");
+        self.sync_chain
+            .process_block(&Arc::new(block.clone()))
+            .expect("live block");
     }
 
     /// Run a manual reorganization and the drain that follows it, as the

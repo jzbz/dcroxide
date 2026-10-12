@@ -2452,6 +2452,30 @@ impl ServerPeerHandler {
             .execute_sync(&self.ctx.sync_manager, actions);
     }
 
+    /// Hand a block the peer delivered to the sync manager (dcrd
+    /// `serverPeer.OnBlock`).
+    ///
+    /// The block is shared by reference count from here to the chain,
+    /// which keeps this allocation: dcrd passes one `*dcrutil.Block`
+    /// the same way, and nothing on the way copies the block.
+    fn on_block(&mut self, block: Arc<MsgBlock>) -> ServeSignal {
+        // The block the peer delivered is known to it, so the
+        // announcement fan-out never echoes the inventory back (dcrd
+        // `OnBlock`'s `AddKnownInventory` before the sync-manager
+        // hand-off).
+        if let Some(id) = self.sync_peer_id {
+            self.ctx.sync_peers.mark_known_inventory(
+                id,
+                InvVect {
+                    inv_type: dcroxide_wire::InvType::BLOCK,
+                    hash: block.header.block_hash(),
+                },
+            );
+        }
+        self.drive_sync(|manager, id| manager.on_block(id, &block));
+        ServeSignal::Continue
+    }
+
     /// Dispatch one incoming message to its server handler, queueing
     /// any responses to the peer (the `serverPeer` message listeners
     /// dcrd registers on the peer).  `mix_hash` is the mixing identity
@@ -2471,6 +2495,12 @@ impl ServerPeerHandler {
         outbound: &OutboundQueue,
     ) -> ServeSignal {
         let lock_peer = || peer.lock().expect("peer mutex poisoned");
+        // A block is taken out of the message by value, so that the
+        // allocation it was decoded into is the one the chain keeps.
+        let msg = match msg {
+            Message::Block(block) => return self.on_block(Arc::new(block)),
+            msg => msg,
+        };
         match &msg {
             Message::GetHeaders(get_headers) => {
                 self.on_get_headers(&get_headers.0, outbound);
@@ -2567,23 +2597,6 @@ impl ServerPeerHandler {
                 self.drive_sync(|manager, id| manager.on_headers(id, headers));
                 ServeSignal::Continue
             }
-            Message::Block(block) => {
-                // The block the peer delivered is known to it, so the
-                // announcement fan-out never echoes the inventory back
-                // (dcrd `OnBlock`'s `AddKnownInventory` before the
-                // sync-manager hand-off).
-                if let Some(id) = self.sync_peer_id {
-                    self.ctx.sync_peers.mark_known_inventory(
-                        id,
-                        InvVect {
-                            inv_type: dcroxide_wire::InvType::BLOCK,
-                            hash: block.header.block_hash(),
-                        },
-                    );
-                }
-                self.drive_sync(|manager, id| manager.on_block(id, block));
-                ServeSignal::Continue
-            }
             Message::Tx(tx) => {
                 // Blocks-only mode ignores an unsolicited transaction push
                 // entirely (dcrd `OnTx`'s bare return under
@@ -2595,7 +2608,7 @@ impl ServerPeerHandler {
                 // the relay fan-out never echoes it back — marked up front
                 // with the delivered hash regardless of the acceptance
                 // outcome (dcrd `OnTx`'s `AddKnownInventory` before the
-                // sync-manager hand-off), mirroring the Block arm above.
+                // sync-manager hand-off), mirroring `on_block` above.
                 let tx_hash = tx.tx_hash();
                 if let Some(id) = self.sync_peer_id {
                     self.ctx.sync_peers.mark_known_inventory(

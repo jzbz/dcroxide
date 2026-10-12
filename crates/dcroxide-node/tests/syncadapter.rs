@@ -64,7 +64,7 @@ fn adapts_a_genesis_chain_for_the_sync_manager() {
 
     // A duplicate genesis submission reports dcrd's duplicate-block
     // classification.
-    let genesis_block = params.genesis_block.clone();
+    let genesis_block = Arc::new(params.genesis_block.clone());
     let failure = sync_chain
         .process_block(&genesis_block)
         .expect_err("genesis is already present");

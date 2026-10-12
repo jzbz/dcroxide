@@ -14,6 +14,8 @@
 //!   caller can release the manager's lock across the validation the
 //!   way dcrd's `OnTx` and `OnMixMsg` hold only `requestMtx`.
 
+use std::sync::Arc;
+
 use dcroxide_chainhash::Hash;
 use dcroxide_containers::apbf;
 use dcroxide_netsync::{
@@ -89,7 +91,7 @@ impl SyncChain for StubChain {
             None => Ok(()),
         }
     }
-    fn process_block(&mut self, _block: &MsgBlock) -> Result<i64, ProcessBlockFailure> {
+    fn process_block(&mut self, _block: &Arc<MsgBlock>) -> Result<i64, ProcessBlockFailure> {
         match &self.block_failure {
             Some(failure) => Err(failure.clone()),
             None => Ok(0),
@@ -407,7 +409,7 @@ fn a_corrupt_block_failure_logs_the_critical_failure() {
     });
     assert!(requested, "{actions:?}");
 
-    let actions = m.on_block(7, &block);
+    let actions = m.on_block(7, &Arc::new(block));
     assert_eq!(
         error_lines(&actions),
         vec![

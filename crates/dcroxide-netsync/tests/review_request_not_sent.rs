@@ -12,6 +12,7 @@
 //! block, transaction or mix message was skipped as already requested.
 
 use std::collections::BTreeSet;
+use std::sync::Arc;
 
 use dcroxide_chainhash::Hash;
 use dcroxide_containers::apbf;
@@ -72,7 +73,7 @@ impl SyncChain for StubChain {
     fn process_block_header(&mut self, _header: &BlockHeader) -> Result<(), ProcessBlockFailure> {
         Ok(())
     }
-    fn process_block(&mut self, _block: &MsgBlock) -> Result<i64, ProcessBlockFailure> {
+    fn process_block(&mut self, _block: &Arc<MsgBlock>) -> Result<i64, ProcessBlockFailure> {
         Err(ProcessBlockFailure {
             is_duplicate_block: false,
             is_rule_error: true,

@@ -429,6 +429,41 @@ pub struct Chain {
     periodic_clock: fn() -> Option<i64>,
 }
 
+/// A block on its way into the chain, as the caller of
+/// [`Chain::process_block`] or [`Chain::process_shared_block`] holds it.
+///
+/// dcrd's `ProcessBlock` takes a `*dcrutil.Block` and caches that very
+/// pointer (`process.go:571`).  A caller here either lends the block and
+/// keeps its own, in which case the `blocks` mirror gets a copy, or
+/// shares the allocation, in which case the mirror holds the same one and
+/// nothing is copied.
+#[derive(Clone, Copy)]
+enum ArrivingBlock<'a> {
+    /// The caller keeps the block.
+    Borrowed(&'a MsgBlock),
+    /// The caller shares the block by reference count.
+    Shared(&'a Arc<MsgBlock>),
+}
+
+impl<'a> ArrivingBlock<'a> {
+    /// The block, to read.
+    fn block(self) -> &'a MsgBlock {
+        match self {
+            ArrivingBlock::Borrowed(block) => block,
+            ArrivingBlock::Shared(block) => block,
+        }
+    }
+
+    /// The `Arc` the `blocks` mirror holds for the block: the caller's
+    /// allocation when it arrived shared, and otherwise a copy made here.
+    fn shared(self) -> Arc<MsgBlock> {
+        match self {
+            ArrivingBlock::Borrowed(block) => Arc::new(block.clone()),
+            ArrivingBlock::Shared(block) => Arc::clone(block),
+        }
+    }
+}
+
 /// Nanoseconds per second, for the periodic intervals.
 const NANOS_PER_SEC: i64 = 1_000_000_000;
 
@@ -4251,23 +4286,30 @@ impl Chain {
         fast_add: bool,
         params: &Params,
     ) -> Result<Vec<NodeId>, RuleError> {
-        self.maybe_accept_block_data_with_hashes(node, block, None, fast_add, params)
+        self.maybe_accept_block_data_with_hashes(
+            node,
+            ArrivingBlock::Borrowed(block),
+            None,
+            fast_add,
+            params,
+        )
     }
 
-    /// [`Self::maybe_accept_block_data`] for [`Self::process_block`],
-    /// which hands in the hashes it computed from `block`.  They are
-    /// filed beside the `blocks` mirror's `Arc` of the block, where the
-    /// connect that follows in the same call finds them
-    /// (`tx_hashes_for`).  Without hashes nothing is filed, and that
-    /// connect hashes the block itself.
+    /// [`Self::maybe_accept_block_data`] for [`Self::process_block`] and
+    /// [`Self::process_shared_block`], which hand in the hashes they
+    /// computed from the block.  They are filed beside the `blocks`
+    /// mirror's `Arc` of the block, where the connect that follows in
+    /// the same call finds them (`tx_hashes_for`).  Without hashes
+    /// nothing is filed, and that connect hashes the block itself.
     fn maybe_accept_block_data_with_hashes(
         &mut self,
         node: NodeId,
-        block: &MsgBlock,
+        arriving: ArrivingBlock<'_>,
         tx_hashes: Option<&Arc<BlockTxHashes>>,
         fast_add: bool,
         params: &Params,
     ) -> Result<Vec<NodeId>, RuleError> {
+        let block = arriving.block();
         if self.index.node_status(&self.store, node).have_data() {
             return Ok(Vec::new());
         }
@@ -4302,15 +4344,17 @@ impl Chain {
         // that window rather than be rejected on the database's
         // block-exists error.
         //
-        // This insert is the one copy of the block the chain makes: the
-        // caller keeps its own (`process_block` borrows it, where dcrd's
-        // `ProcessBlock` caches the caller's pointer, `process.go:571`),
-        // and every later step shares the mirror's `Arc`.
+        // A block that arrived shared goes into the mirror as the
+        // caller's own allocation, as dcrd's `ProcessBlock` caches the
+        // caller's pointer (`process.go:571`).  A borrowed one is copied
+        // here, the one copy of it the chain makes, because its caller
+        // keeps its own.  Every later step shares the mirror's `Arc`.
         let block_hash = block.header.block_hash();
-        let mirrored = Arc::new(block.clone());
+        let mirrored = arriving.shared();
         // The hashes go with the allocation the mirror holds, which is
-        // the one the connect that follows in this call is handed.  The
-        // copy is field for field, so they are its hashes too.
+        // the one the connect that follows in this call is handed.  It
+        // is the block they were computed from or a field for field copy
+        // of it, so they are its hashes either way.
         self.accepted_tx_hashes = tx_hashes.map(|tx_hashes| {
             tx_hashes.assert_for(&mirrored);
             (Arc::clone(&mirrored), Arc::clone(tx_hashes))
@@ -4421,29 +4465,62 @@ impl Chain {
     /// the fork the block
     /// extended alongside any errors; the fork length is zero when
     /// the block extended or became the best chain tip.
+    ///
+    /// The block is borrowed, so the chain copies it once it accepts the
+    /// data; a caller that holds the block in an `Arc` and has no further
+    /// use for a copy of its own calls [`Self::process_shared_block`].
     pub fn process_block(
         &mut self,
         block: &MsgBlock,
         adjusted_time_unix: i64,
         params: &Params,
     ) -> (i64, Vec<RuleError>) {
+        self.process_arriving_block(ArrivingBlock::Borrowed(block), adjusted_time_unix, params)
+    }
+
+    /// [`Self::process_block`] for a block the caller shares by
+    /// reference count: the same checks in the same order and the same
+    /// results, with the caller's own allocation kept in the `blocks`
+    /// mirror in place of a copy of it (dcrd `ProcessBlock` caching the
+    /// `*dcrutil.Block` it was handed, `process.go:571`).
+    ///
+    /// Nothing depends on the `Arc` being the only one: the caller, and
+    /// anyone it shares the block with, may keep theirs.
+    pub fn process_shared_block(
+        &mut self,
+        block: &Arc<MsgBlock>,
+        adjusted_time_unix: i64,
+        params: &Params,
+    ) -> (i64, Vec<RuleError>) {
+        self.process_arriving_block(ArrivingBlock::Shared(block), adjusted_time_unix, params)
+    }
+
+    /// [`Self::process_block_inner`], wrapped so that the transaction
+    /// hashes filed for the block while it is processed are dropped on
+    /// every return.
+    fn process_arriving_block(
+        &mut self,
+        arriving: ArrivingBlock<'_>,
+        adjusted_time_unix: i64,
+        params: &Params,
+    ) -> (i64, Vec<RuleError>) {
         // An earlier call's hashes are that call's.
         self.accepted_tx_hashes = None;
-        let result = self.process_block_inner(block, adjusted_time_unix, params);
+        let result = self.process_block_inner(arriving, adjusted_time_unix, params);
         // However the call ended, nothing outlives it.
         self.accepted_tx_hashes = None;
         result
     }
 
-    /// The body of [`Self::process_block`], which wraps it so that the
-    /// transaction hashes filed for the block while it is processed are
-    /// dropped on every return.
+    /// The body of [`Self::process_block`] and
+    /// [`Self::process_shared_block`].
     fn process_block_inner(
         &mut self,
-        block: &MsgBlock,
+        arriving: ArrivingBlock<'_>,
         adjusted_time_unix: i64,
         params: &Params,
     ) -> (i64, Vec<RuleError>) {
+        let block = arriving.block();
         self.observe_adjusted_time(adjusted_time_unix);
 
         // The block must not already exist in the main chain or side
@@ -4538,7 +4615,7 @@ impl Chain {
         // a write per block for nothing.
         let linked = match self.maybe_accept_block_data_with_hashes(
             node,
-            block,
+            arriving,
             Some(&tx_hashes),
             fast_add,
             params,

@@ -2698,6 +2698,6 @@ mod tests {
             manager.process_block(&block).is_ok(),
             "a stopped manager drops the block unprocessed"
         );
-        assert!(manager.on_block(1, &block).is_empty());
+        assert!(manager.on_block(1, &Arc::new(block)).is_empty());
     }
 }

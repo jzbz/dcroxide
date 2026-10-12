@@ -570,8 +570,10 @@ pub trait SyncChain {
     /// only feeds logs, so it is classified like a block's).
     fn process_block_header(&mut self, header: &BlockHeader) -> Result<(), ProcessBlockFailure>;
     /// Process the block, returning the fork length on success (dcrd
-    /// `ProcessBlock`).
-    fn process_block(&mut self, block: &MsgBlock) -> Result<i64, ProcessBlockFailure>;
+    /// `ProcessBlock`).  The block is shared by reference count, as
+    /// dcrd's is a `*dcrutil.Block`, so a chain that keeps it keeps the
+    /// caller's allocation and copies nothing.
+    fn process_block(&mut self, block: &Arc<MsgBlock>) -> Result<i64, ProcessBlockFailure>;
 }
 
 /// The transaction pool operations the manager performs (the used
@@ -2086,7 +2088,10 @@ impl<C: SyncChain, T: SyncTxPool, M: SyncMixPool> SyncManager<C, T, M> {
 
     /// Process the provided block using the internal chain instance
     /// (dcrd unexported `processBlock`).
-    fn process_block_internal(&mut self, block: &MsgBlock) -> Result<i64, ProcessBlockFailure> {
+    fn process_block_internal(
+        &mut self,
+        block: &Arc<MsgBlock>,
+    ) -> Result<i64, ProcessBlockFailure> {
         // Process the block to include validation, best chain
         // selection, etc.
         let fork_len = self.cfg.chain.process_block(block)?;
@@ -2104,7 +2109,11 @@ impl<C: SyncChain, T: SyncTxPool, M: SyncMixPool> SyncManager<C, T, M> {
     }
 
     /// Process a block received from a remote peer (dcrd `OnBlock`).
-    pub fn on_block(&mut self, peer_id: i32, block: &MsgBlock) -> Vec<Action> {
+    ///
+    /// The block is the allocation the message was decoded into, shared
+    /// by reference count, and it is handed to the chain as it is: no
+    /// step between the peer and the chain copies it.
+    pub fn on_block(&mut self, peer_id: i32, block: &Arc<MsgBlock>) -> Vec<Action> {
         let mut actions = Vec::new();
         if self.shutdown {
             return actions;
@@ -3386,12 +3395,16 @@ impl<C: SyncChain, T: SyncTxPool, M: SyncMixPool> SyncManager<C, T, M> {
     /// Process a block from a local source such as the RPC server or
     /// the CPU miner through the same code paths as blocks received
     /// from the network (dcrd `ProcessBlock`).
+    ///
+    /// The caller keeps its block, so the chain is handed a copy of it:
+    /// the one copy a local block costs, which the chain made itself
+    /// before it took blocks by reference count.
     pub fn process_block(&mut self, block: &MsgBlock) -> Result<(), ProcessBlockFailure> {
         if self.shutdown {
             return Ok(());
         }
 
-        let fork_len = self.process_block_internal(block)?;
+        let fork_len = self.process_block_internal(&Arc::new(block.clone()))?;
 
         let on_main_chain = fork_len == 0;
         if on_main_chain {

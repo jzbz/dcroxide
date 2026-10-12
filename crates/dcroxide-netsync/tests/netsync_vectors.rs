@@ -64,6 +64,7 @@
 #![allow(clippy::arithmetic_side_effects)]
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::Arc;
 
 use dcroxide_blockchain::RuleErrorKind;
 use dcroxide_blockchain::process::Chain;
@@ -180,10 +181,10 @@ impl SyncChain for ChainAdapter {
             })
     }
 
-    fn process_block(&mut self, block: &MsgBlock) -> Result<i64, ProcessBlockFailure> {
+    fn process_block(&mut self, block: &Arc<MsgBlock>) -> Result<i64, ProcessBlockFailure> {
         let now = self.now;
         let params = self.params.clone();
-        let (fork_len, errs) = self.chain.process_block(block, now, &params);
+        let (fork_len, errs) = self.chain.process_shared_block(block, now, &params);
         if errs.is_empty() {
             return Ok(fork_len);
         }
@@ -317,7 +318,7 @@ impl SyncChain for StubChain {
             message: "stub".to_string(),
         })
     }
-    fn process_block(&mut self, _block: &MsgBlock) -> Result<i64, ProcessBlockFailure> {
+    fn process_block(&mut self, _block: &Arc<MsgBlock>) -> Result<i64, ProcessBlockFailure> {
         Err(ProcessBlockFailure {
             is_duplicate_block: false,
             is_rule_error: true,
@@ -546,10 +547,10 @@ fn netsync_scenario_matches_dcrd() {
                             let _ = result;
                             Vec::new()
                         } else {
-                            m.on_block(peer_id, block)
+                            m.on_block(peer_id, &Arc::new(block.clone()))
                         }
                     }
-                    "onblockcorrupt" => m.on_block(peer_id, &corrupt_block),
+                    "onblockcorrupt" => m.on_block(peer_id, &Arc::new(corrupt_block.clone())),
                     "oninv" => {
                         let (inv_type, hash) = match f[4] {
                             "blockunknown" => (InvType::BLOCK, hashes["unknownblock"]),
@@ -957,7 +958,7 @@ impl SyncChain for ScriptedHeaderChain {
             })
         }
     }
-    fn process_block(&mut self, _block: &MsgBlock) -> Result<i64, ProcessBlockFailure> {
+    fn process_block(&mut self, _block: &Arc<MsgBlock>) -> Result<i64, ProcessBlockFailure> {
         self.block_results
             .pop_front()
             .unwrap_or(Err(ProcessBlockFailure {
@@ -1289,7 +1290,7 @@ fn block_path_log_lines() {
     assert_eq!(m.sync_peer_id(), 8);
 
     // Initial chain sync in progress: the periodic accumulation.
-    let actions = m.on_block(8, &blocks[0]);
+    let actions = m.on_block(8, &Arc::new(blocks[0].clone()));
     assert!(
         actions.iter().any(|a| {
             matches!(
@@ -1308,7 +1309,7 @@ fn block_path_log_lines() {
     // The chain becoming current forces the line and completes the
     // initial chain sync.
     m.chain_mut().current = true;
-    let actions = m.on_block(8, &blocks[1]);
+    let actions = m.on_block(8, &Arc::new(blocks[1].clone()));
     assert!(
         actions.iter().any(|a| {
             matches!(
@@ -1336,7 +1337,7 @@ fn block_path_log_lines() {
     let mut prev_header = headers[1];
     prev_header.timestamp = headers[2].timestamp - 300;
     m.chain_mut().prev_header = Some(prev_header);
-    let actions = m.on_block(8, &blocks[2]);
+    let actions = m.on_block(8, &Arc::new(blocks[2].clone()));
     assert!(
         log_lines(&actions).contains(&(
             LogLevel::Info,
@@ -1350,7 +1351,7 @@ fn block_path_log_lines() {
     );
 
     // A rejected block logs the rule failure.
-    let actions = m.on_block(8, &blocks[3]);
+    let actions = m.on_block(8, &Arc::new(blocks[3].clone()));
     assert!(
         log_lines(&actions).contains(&(
             LogLevel::Info,
@@ -1370,7 +1371,7 @@ fn block_path_log_lines() {
         transactions: Vec::new(),
         stransactions: Vec::new(),
     };
-    let actions = m.on_block(8, &stray_block);
+    let actions = m.on_block(8, &Arc::new(stray_block));
     assert!(
         log_lines(&actions).contains(&(
             LogLevel::Warn,

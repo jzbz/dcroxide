@@ -279,8 +279,8 @@ fn serves_getrawtransaction_over_the_live_txindex() {
     // Connect the next battery block through the live path: the chain
     // callback queues the event and the sync-chain drain feeds the
     // index subscriber, exactly like a block arriving from a peer.
-    let live = &blocks[2];
-    let fork_len = sync_chain.process_block(live).expect("live block accepts");
+    let live = Arc::new(blocks[2].clone());
+    let fork_len = sync_chain.process_block(&live).expect("live block accepts");
     assert_eq!(fork_len, 0, "extends the main chain");
     let live_hash = live.header.block_hash();
 
@@ -368,8 +368,8 @@ fn serves_existsaddress_over_the_live_index() {
 
     // Connect the next battery block through the live path so the
     // exists index records its coinbase addresses through the drain.
-    let live = &blocks[2];
-    sync_chain.process_block(live).expect("live block accepts");
+    let live = Arc::new(blocks[2].clone());
+    sync_chain.process_block(&live).expect("live block accepts");
 
     // The dev-subsidy and pay-to-OP_TRUE script-hash addresses from
     // the live block's coinbase, and a premine pay-to-pubkey-hash
@@ -495,7 +495,9 @@ fn indexes_follow_blocks_without_the_rpc_stack() {
         dcroxide_node::sync::NodeSyncChain::new(Arc::clone(&chain), params.clone());
     sync_chain.set_chain_ntfn_handler(handler);
 
-    sync_chain.process_block(&blocks[1]).expect("live block");
+    sync_chain
+        .process_block(&Arc::new(blocks[1].clone()))
+        .expect("live block");
 
     use dcroxide_indexers::Indexer;
     let live_hash = blocks[1].header.block_hash();

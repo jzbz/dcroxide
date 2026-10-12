@@ -11,8 +11,9 @@ use std::time::Duration;
 use dcroxide_blockchain::process::Chain;
 use dcroxide_chainhash::Hash;
 use dcroxide_database::{Database, Options};
-use dcroxide_node::dispatch::ServerContext;
+use dcroxide_node::dispatch::{ServerContext, ServerPeerHandler};
 use dcroxide_node::peerconn::NodePeerEnv;
+use dcroxide_node::peerloop::{OutboundQueue, ServeSignal};
 use dcroxide_node::runtime::{ConnectedPeers, ListenerRuntime, PeerTemplate, inbound_peer_handler};
 use dcroxide_node::transport::WireTransport;
 use dcroxide_peer::{Config, MAX_PROTOCOL_VERSION, MsgTransport, Peer, PeerGlobals};
@@ -1203,8 +1204,11 @@ fn announces_connected_blocks_to_served_peers() {
     );
 
     // The first connected block announces as an inventory.
-    let fork_len = dcroxide_netsync::manager::SyncChain::process_block(&mut sync_chain, &blocks[0])
-        .expect("first block accepts");
+    let fork_len = dcroxide_netsync::manager::SyncChain::process_block(
+        &mut sync_chain,
+        &Arc::new(blocks[0].clone()),
+    )
+    .expect("first block accepts");
     assert_eq!(fork_len, 0);
     match transport.read_message().expect("read announcement") {
         Message::Inv(msg) => assert_eq!(
@@ -1228,8 +1232,11 @@ fn announces_connected_blocks_to_served_peers() {
         transport.read_message().expect("read pong"),
         Message::Pong(dcroxide_wire::MsgPong { nonce: 8 })
     );
-    dcroxide_netsync::manager::SyncChain::process_block(&mut sync_chain, &blocks[1])
-        .expect("second block accepts");
+    dcroxide_netsync::manager::SyncChain::process_block(
+        &mut sync_chain,
+        &Arc::new(blocks[1].clone()),
+    )
+    .expect("second block accepts");
     match transport.read_message().expect("read headers announcement") {
         Message::Headers(msg) => assert_eq!(msg.headers, vec![blocks[1].header]),
         other => panic!("expected headers, got {other:?}"),
@@ -1288,4 +1295,287 @@ fn sync_gate_latches_over_the_manager_state() {
         gate.is_current(&chain, stale_now),
         "the manager latch keeps the gate open over a stale tip"
     );
+}
+
+/// The first `limit` blocks of dcrd's full block battery that extend
+/// the regnet main chain one after another.
+fn battery_prefix(limit: usize) -> Vec<dcroxide_wire::MsgBlock> {
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../dcroxide-blockchain/tests/data/fullblock_vectors.txt"
+    );
+    let data = std::fs::read_to_string(path).expect("fullblock vectors");
+    let mut tip = dcroxide_chaincfg::regnet_params().genesis_hash;
+    let mut blocks = Vec::new();
+    for line in data.lines() {
+        let f: Vec<&str> = line.split(' ').collect();
+        // accept <name> <mainchain> <orphan> <blockhex>
+        if f[0] != "accept" {
+            continue;
+        }
+        let (block, _) =
+            dcroxide_wire::MsgBlock::from_bytes(&dcroxide_testutil::unhex(f[4])).expect("block");
+        if f[2] != "true" || block.header.prev_block != tip {
+            continue;
+        }
+        tip = block.header.block_hash();
+        blocks.push(block);
+        if blocks.len() == limit {
+            break;
+        }
+    }
+    assert_eq!(blocks.len(), limit, "the battery provides the prefix");
+    blocks
+}
+
+/// A server context over a fresh regnet chain, for driving a
+/// [`ServerPeerHandler`] directly: the sync manager is the daemon's, so
+/// a handler's peer becomes the sync peer and has blocks requested from
+/// it as a served connection's does.
+fn regnet_server() -> (tempfile::TempDir, Arc<ServerContext>) {
+    let params = dcroxide_chaincfg::regnet_params();
+    let dir = tempfile::tempdir().expect("temp dir");
+    let opts = Options::new(dir.path().join("blocks"), params.net.0);
+    let db = Database::create(&opts).expect("create database");
+    let chain = Arc::new(Mutex::new(
+        Chain::open(db, &params, params.assume_valid, false, 0).expect("open chain"),
+    ));
+    let addr_manager = Arc::new(Mutex::new(dcroxide_addrmgr::AddrManager::new(dir.path())));
+    let tx_pool = dcroxide_node::txmempool::new_shared_tx_pool(
+        Arc::clone(&chain),
+        &params,
+        false,
+        100,
+        10000,
+        false,
+        false,
+    );
+    let server = Arc::new(ServerContext {
+        external_addr_candidates: std::sync::Mutex::new(Default::default()),
+        external_addr_facts: dcroxide_node::server::ExternalAddrFacts {
+            listeners: Vec::new(),
+            has_proxy: false,
+            no_discover_ip: true,
+            has_external_ips: false,
+            listen_disabled: true,
+            sim_or_reg_net: true,
+            services: dcroxide_wire::ServiceFlag::NODE_NETWORK,
+            target_outbound: 8,
+        },
+        lookup: Box::new(|_| Err("no resolver in tests".to_string())),
+        target_outbound: 8,
+        chain: Arc::clone(&chain),
+        min_known_work: params.min_known_chain_work,
+        params: params.clone(),
+        disable_banning: false,
+        ban_threshold: 100,
+        whitelists: Vec::new(),
+        banned_hosts: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+        ban_duration_nanos: 24 * 60 * 60 * 1_000_000_000,
+        addr_manager,
+        sim_or_reg_net: true,
+        stake_validation_height: params.stake_validation_height,
+        blocks_only: false,
+        sync_manager: Arc::new(Mutex::new(dcroxide_node::sync::new_sync_manager(
+            Arc::clone(&chain),
+            &params,
+            false,
+            8,
+            1000,
+            Arc::clone(&tx_pool),
+            dcroxide_node::mixnode::shared_mix_pool(Arc::clone(&chain), params.clone(), &tx_pool),
+        ))),
+        sync_peers: dcroxide_node::dispatch::SyncPeers::new(),
+        net_totals: std::sync::Arc::new(dcroxide_node::transport::NetByteTotals::new()),
+        disable_listen: false,
+        tx_pool: Arc::clone(&tx_pool),
+        ntfn: None,
+        recently_advertised: dcroxide_node::dispatch::new_recently_advertised(),
+
+        mix_pool: dcroxide_node::mixnode::shared_mix_pool(
+            Arc::clone(&chain),
+            params.clone(),
+            &tx_pool,
+        ),
+    });
+    (dir, server)
+}
+
+/// Hands a handshake its scripted replies and swallows what it writes.
+struct ScriptedHandshake(std::vec::IntoIter<Message>);
+
+impl MsgTransport for ScriptedHandshake {
+    fn read_message(&mut self) -> Result<Message, dcroxide_peer::ReadError> {
+        self.0
+            .next()
+            .ok_or_else(|| dcroxide_peer::ReadError::io("end of script"))
+    }
+    fn write_message(&mut self, _msg: &Message) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+/// A peer of a [`regnet_server`] context with its handler registered,
+/// and the receiving end of its outbound queue.
+struct HandledPeer {
+    handler: ServerPeerHandler,
+    peer: Arc<Mutex<Peer>>,
+    queue: OutboundQueue,
+    sent: dcroxide_node::peerloop::OutboundReceiver,
+    id: i32,
+}
+
+impl HandledPeer {
+    /// Hand the handler a message from the peer.
+    fn deliver(&mut self, msg: Message) -> ServeSignal {
+        self.handler
+            .handle_message(&self.peer, msg, None, &self.queue)
+    }
+
+    /// Everything queued for the peer since the last call.
+    fn take_sent(&self) -> Vec<Message> {
+        std::iter::from_fn(|| self.sent.try_recv().ok()).collect()
+    }
+
+    /// The blocks the node has asked this peer for since the last call,
+    /// in request order.
+    fn take_requested_blocks(&self) -> Vec<Hash> {
+        self.take_sent()
+            .into_iter()
+            .filter_map(|msg| match msg {
+                Message::GetData(get_data) => Some(get_data.inv_list),
+                _ => None,
+            })
+            .flatten()
+            .filter(|inv| inv.inv_type == InvType::BLOCK)
+            .map(|inv| inv.hash)
+            .collect()
+    }
+}
+
+/// Connect an inbound full node at `addr` whose version message claims
+/// a chain of `last_block` blocks, as far as the server's connection
+/// hook.
+fn handled_peer(ctx: &Arc<ServerContext>, addr: &str, last_block: i32) -> HandledPeer {
+    let net = ctx.params.net;
+    let mut peer = Peer::new_inbound(Config {
+        net,
+        services: ServiceFlag::NODE_NETWORK,
+        user_agent_name: "dispatch".to_string(),
+        user_agent_version: "0.1.0".to_string(),
+        protocol_version: 0,
+        ..Config::default()
+    });
+    let na = dcroxide_node::peerconn::net_address_v2_from_socket(
+        addr.parse().expect("socket address"),
+        ServiceFlag(0),
+    )
+    .expect("net address");
+    let mut env = NodePeerEnv::new();
+    peer.associate(addr, na, dcroxide_peer::PeerEnv::now_nanos(&mut env));
+
+    let mut ip = [0u8; 16];
+    ip[10] = 0xff;
+    ip[11] = 0xff;
+    ip[12..16].copy_from_slice(&[127, 0, 0, 1]);
+    let wire_addr = dcroxide_wire::NetAddress {
+        timestamp: 0,
+        services: ServiceFlag::NODE_NETWORK,
+        ip,
+        port: 18655,
+    };
+    let version = dcroxide_wire::MsgVersion {
+        protocol_version: dcroxide_wire::PROTOCOL_VERSION as i32,
+        services: ServiceFlag::NODE_NETWORK,
+        timestamp: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0),
+        addr_you: wire_addr,
+        addr_me: wire_addr,
+        nonce: 0x5eed_0000 + u64::from(last_block as u32),
+        user_agent: "/dispatch:0.1.0/".to_string(),
+        last_block,
+        disable_relay_tx: false,
+    };
+    let mut handshake =
+        ScriptedHandshake(vec![Message::Version(version.clone()), Message::VerAck].into_iter());
+    let mut handler =
+        ServerPeerHandler::new(Arc::clone(ctx), false, None, false, None, addr.to_string());
+    peer.negotiate_inbound_protocol(&mut handshake, &mut env, &PeerGlobals::new(), None)
+        .expect("a current full node is accepted");
+    handler
+        .on_version(&peer, &version)
+        .expect("the server accepts the version");
+    let id = peer.id();
+
+    let peer = Arc::new(Mutex::new(peer));
+    let (queue, sent) = OutboundQueue::channel();
+    handler.on_connected(&peer, &queue, false);
+    HandledPeer {
+        handler,
+        peer,
+        queue,
+        sent,
+        id,
+    }
+}
+
+/// A block a peer delivers reaches the chain as the allocation the
+/// message was decoded into: no step from the dispatch through the sync
+/// manager to the chain's mirror of recent blocks copies it (dcrd hands
+/// one `*dcrutil.Block` from `OnBlock` to `ProcessBlock`, which caches
+/// that pointer, `process.go:571`).
+#[test]
+fn a_delivered_block_reaches_the_chain_without_a_copy() {
+    let blocks = battery_prefix(3);
+    let (_dir, ctx) = regnet_server();
+    let mut sync_peer = handled_peer(&ctx, "127.0.0.1:18655", blocks.len() as i32);
+    assert_eq!(
+        ctx.sync_manager.lock().expect("manager").sync_peer_id(),
+        sync_peer.id
+    );
+
+    // The headers complete the initial header sync, and the node asks
+    // its sync peer for every block.
+    let headers = dcroxide_wire::MsgHeaders {
+        headers: blocks.iter().map(|block| block.header).collect(),
+    };
+    assert_eq!(
+        sync_peer.deliver(Message::Headers(headers)),
+        ServeSignal::Continue
+    );
+    let wanted: Vec<Hash> = blocks.iter().map(|b| b.header.block_hash()).collect();
+    assert_eq!(sync_peer.take_requested_blocks(), wanted);
+
+    for block in &blocks {
+        // The message owns the block; where its transaction lists live
+        // is all that is kept of it here.
+        let delivered = block.clone();
+        let regular_at = delivered.transactions.as_ptr();
+        let stake_at = delivered.stransactions.as_ptr();
+        assert_eq!(
+            sync_peer.deliver(Message::Block(delivered)),
+            ServeSignal::Continue
+        );
+
+        let chain = ctx.chain.lock().expect("chain");
+        let hash = block.header.block_hash();
+        assert_eq!(chain.best_snapshot().hash, hash, "the block connected");
+        let mirrored = chain
+            .blocks
+            .get(&hash.0)
+            .expect("the chain keeps its recent blocks");
+        assert_eq!(**mirrored, *block);
+        assert_eq!(
+            mirrored.transactions.as_ptr(),
+            regular_at,
+            "the chain keeps a copy of the block's regular transactions"
+        );
+        assert_eq!(
+            mirrored.stransactions.as_ptr(),
+            stake_at,
+            "the chain keeps a copy of the block's stake transactions"
+        );
+    }
 }

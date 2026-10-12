@@ -159,10 +159,14 @@ impl SyncChain for NodeSyncChain {
         })
     }
 
-    fn process_block(&mut self, block: &MsgBlock) -> Result<i64, ProcessBlockFailure> {
+    fn process_block(&mut self, block: &Arc<MsgBlock>) -> Result<i64, ProcessBlockFailure> {
+        // The chain keeps this very allocation in its mirror of recent
+        // blocks (dcrd's `ProcessBlock` caching the `*dcrutil.Block` it
+        // is handed), so a block is not copied between the peer that
+        // sent it and the chain.
         let (fork_len, errs) =
             self.locked()
-                .process_block(block, adjusted_time_unix(), &self.params);
+                .process_shared_block(block, adjusted_time_unix(), &self.params);
 
         // Run the deferred mempool maintenance and winning-tickets
         // lookups the callback queued, now that the chain mutex is

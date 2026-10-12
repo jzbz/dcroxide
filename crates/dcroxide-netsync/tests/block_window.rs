@@ -24,6 +24,7 @@
 #![allow(clippy::arithmetic_side_effects)]
 
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::sync::Arc;
 
 use dcroxide_chainhash::Hash;
 use dcroxide_containers::apbf;
@@ -209,7 +210,7 @@ impl SyncChain for WindowChain {
         }
         Ok(())
     }
-    fn process_block(&mut self, block: &MsgBlock) -> Result<i64, ProcessBlockFailure> {
+    fn process_block(&mut self, block: &Arc<MsgBlock>) -> Result<i64, ProcessBlockFailure> {
         let i = self.by_hash[&block.header.block_hash()];
         if self.reject_once.remove(&i) {
             return Err(ProcessBlockFailure {
@@ -431,7 +432,7 @@ fn deliver(m: &mut Manager, peer: i32, index: usize) -> Vec<Action> {
         transactions: Vec::new(),
         stransactions: Vec::new(),
     };
-    m.on_block(peer, &block)
+    m.on_block(peer, &Arc::new(block))
 }
 
 /// Whether the actions carry dcrd's line for a block that failed
