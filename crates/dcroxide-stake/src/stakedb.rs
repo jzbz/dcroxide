@@ -16,7 +16,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use dcroxide_chainhash::Hash;
-use dcroxide_database::Transaction;
+use dcroxide_database::{Bucket, Transaction};
 
 use crate::ticketdb::{
     BestChainState, CURRENT_DATABASE_VERSION, DatabaseInfo, LIVE_TICKETS_BUCKET_NAME,
@@ -215,7 +215,11 @@ pub fn db_delete_ticket(
     let bucket = meta
         .bucket(ticket_bucket)
         .ok_or_else(|| missing_bucket(ticket_bucket))?;
+    delete_ticket(&bucket, hash)
+}
 
+/// [`db_delete_ticket`] once the ticket bucket is in hand.
+fn delete_ticket(bucket: &Bucket<'_>, hash: &Hash) -> Result<(), StakeDbError> {
     // Check to see if the value exists before we delete it.
     if bucket.get(&hash.0).is_none() {
         return Err(ticket_db_error(
@@ -244,10 +248,78 @@ pub fn db_put_ticket(
     let bucket = meta
         .bucket(ticket_bucket)
         .ok_or_else(|| missing_bucket(ticket_bucket))?;
+    put_ticket(&bucket, hash, height, missed, revoked, spent, expired)
+}
+
+/// [`db_put_ticket`] once the ticket bucket is in hand.
+fn put_ticket(
+    bucket: &Bucket<'_>,
+    hash: &Hash,
+    height: u32,
+    missed: bool,
+    revoked: bool,
+    spent: bool,
+    expired: bool,
+) -> Result<(), StakeDbError> {
     Ok(bucket.put(
         &hash.0,
         &serialize_ticket_value(height, missed, revoked, spent, expired),
     )?)
+}
+
+/// The live, missed and revoked ticket buckets of one best-node write,
+/// each looked up by name when a ticket first needs it and not again.
+///
+/// dcrd's `DbPutTicket` and `DbDeleteTicket` look their bucket up on
+/// every call (`internal/ticketdb/chainio.go:609`, `:625`), which here is
+/// a keyed read of the bucket index for every ticket a block moves.  No
+/// step of a best-node write creates or removes a bucket, so within one
+/// the first answer is every later one's.  A bucket is still looked up
+/// only once a ticket needs it, so a missing one is reported where it
+/// always was: at the first ticket that needs it, with the rows of the
+/// tickets before it already staged, and never by a write that does not
+/// need it.
+struct TicketBuckets<'tx> {
+    meta: Bucket<'tx>,
+    live: Option<Bucket<'tx>>,
+    missed: Option<Bucket<'tx>>,
+    revoked: Option<Bucket<'tx>>,
+}
+
+impl<'tx> TicketBuckets<'tx> {
+    fn new(tx: &'tx Transaction) -> TicketBuckets<'tx> {
+        TicketBuckets {
+            meta: tx.metadata(),
+            live: None,
+            missed: None,
+            revoked: None,
+        }
+    }
+
+    fn live(&mut self) -> Result<Bucket<'tx>, StakeDbError> {
+        Self::resolve(&self.meta, &mut self.live, LIVE_TICKETS_BUCKET_NAME)
+    }
+
+    fn missed(&mut self) -> Result<Bucket<'tx>, StakeDbError> {
+        Self::resolve(&self.meta, &mut self.missed, MISSED_TICKETS_BUCKET_NAME)
+    }
+
+    fn revoked(&mut self) -> Result<Bucket<'tx>, StakeDbError> {
+        Self::resolve(&self.meta, &mut self.revoked, REVOKED_TICKETS_BUCKET_NAME)
+    }
+
+    fn resolve(
+        meta: &Bucket<'tx>,
+        resolved: &mut Option<Bucket<'tx>>,
+        name: &[u8],
+    ) -> Result<Bucket<'tx>, StakeDbError> {
+        if let Some(bucket) = *resolved {
+            return Ok(bucket);
+        }
+        let bucket = meta.bucket(name).ok_or_else(|| missing_bucket(name))?;
+        *resolved = Some(bucket);
+        Ok(bucket)
+    }
 }
 
 /// Load every ticket row in the bucket into a treap (dcrd
@@ -421,13 +493,13 @@ pub fn write_connected_best_node(
     node: &Node,
     hash: &Hash,
 ) -> Result<(), StakeDbError> {
+    let mut buckets = TicketBuckets::new(tx);
     for undo in node.undo_data() {
         match (undo.missed, undo.revoked, undo.spent) {
             // A newly added ticket enters the live bucket.
             (false, false, false) => {
-                db_put_ticket(
-                    tx,
-                    LIVE_TICKETS_BUCKET_NAME,
+                put_ticket(
+                    &buckets.live()?,
                     &undo.ticket_hash,
                     undo.ticket_height,
                     undo.missed,
@@ -438,10 +510,9 @@ pub fn write_connected_best_node(
             }
             // Missed and revoked: move from missed to revoked.
             (true, true, _) => {
-                db_delete_ticket(tx, MISSED_TICKETS_BUCKET_NAME, &undo.ticket_hash)?;
-                db_put_ticket(
-                    tx,
-                    REVOKED_TICKETS_BUCKET_NAME,
+                delete_ticket(&buckets.missed()?, &undo.ticket_hash)?;
+                put_ticket(
+                    &buckets.revoked()?,
                     &undo.ticket_hash,
                     undo.ticket_height,
                     undo.missed,
@@ -452,10 +523,9 @@ pub fn write_connected_best_node(
             }
             // Missed and previously live: move from live to missed.
             (true, false, _) => {
-                db_delete_ticket(tx, LIVE_TICKETS_BUCKET_NAME, &undo.ticket_hash)?;
-                db_put_ticket(
-                    tx,
-                    MISSED_TICKETS_BUCKET_NAME,
+                delete_ticket(&buckets.live()?, &undo.ticket_hash)?;
+                put_ticket(
+                    &buckets.missed()?,
                     &undo.ticket_hash,
                     undo.ticket_height,
                     true,
@@ -466,7 +536,7 @@ pub fn write_connected_best_node(
             }
             // Spent: remove from the live bucket.
             (false, _, true) => {
-                db_delete_ticket(tx, LIVE_TICKETS_BUCKET_NAME, &undo.ticket_hash)?;
+                delete_ticket(&buckets.live()?, &undo.ticket_hash)?;
             }
             _ => {
                 return Err(stake_rule_error(
@@ -528,18 +598,18 @@ pub fn write_disconnected_best_node(
 
     // Apply the child undo data in reverse order since there may be
     // multiple changes for the same ticket.
+    let mut buckets = TicketBuckets::new(tx);
     for undo in child_undo_data.iter().rev() {
         match (undo.missed, undo.revoked, undo.spent) {
             // A newly added ticket: remove it from the live bucket.
             (false, false, false) => {
-                db_delete_ticket(tx, LIVE_TICKETS_BUCKET_NAME, &undo.ticket_hash)?;
+                delete_ticket(&buckets.live()?, &undo.ticket_hash)?;
             }
             // Missed and revoked: move from revoked back to missed.
             (true, true, _) => {
-                db_delete_ticket(tx, REVOKED_TICKETS_BUCKET_NAME, &undo.ticket_hash)?;
-                db_put_ticket(
-                    tx,
-                    MISSED_TICKETS_BUCKET_NAME,
+                delete_ticket(&buckets.revoked()?, &undo.ticket_hash)?;
+                put_ticket(
+                    &buckets.missed()?,
                     &undo.ticket_hash,
                     undo.ticket_height,
                     undo.missed,
@@ -551,10 +621,9 @@ pub fn write_disconnected_best_node(
             // Missed and previously live: move from missed back to
             // live; the expired flag is unknown so it is cleared.
             (true, false, _) => {
-                db_delete_ticket(tx, MISSED_TICKETS_BUCKET_NAME, &undo.ticket_hash)?;
-                db_put_ticket(
-                    tx,
-                    LIVE_TICKETS_BUCKET_NAME,
+                delete_ticket(&buckets.missed()?, &undo.ticket_hash)?;
+                put_ticket(
+                    &buckets.live()?,
                     &undo.ticket_hash,
                     undo.ticket_height,
                     false,
@@ -565,9 +634,8 @@ pub fn write_disconnected_best_node(
             }
             // Spent: reinsert into the live bucket.
             (false, _, true) => {
-                db_put_ticket(
-                    tx,
-                    LIVE_TICKETS_BUCKET_NAME,
+                put_ticket(
+                    &buckets.live()?,
                     &undo.ticket_hash,
                     undo.ticket_height,
                     undo.missed,
