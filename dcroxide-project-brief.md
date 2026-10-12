@@ -42,8 +42,8 @@ assembles them end to end: config and CLI, the chain engine with full
 consensus validation, mempool and fee estimation, mining and the CPU miner, the
 P2P server with sync, relay, and StakeShuffle mixing message relay, the
 JSON-RPC/websocket server, the tool commands, the pipe IPC lifecycle, and the
-Windows service wrapper. The gate runs 847 tests across 257 suites, most of them
-differential against dcrd or replaying sessions generated inside dcrd's own
+Windows service wrapper. The gate runs 2,124 tests across 423 suites on Linux,
+most of them differential against dcrd or replaying sessions generated inside dcrd's own
 packages. The parity target moved five times during the port, from
 `release-v2.1.5` to upstream master `452c1a6c` and then through `29f17894`,
 `036b7090` and `b9634e01` to `6f6cf21b` (2.2.0-pre); the oracle rig was
@@ -183,7 +183,8 @@ What Phase 15 has covered so far:
   3.96x the 728.7 s in one session; 3.93x and 2.04x against its figures
   above are across sessions. On a data directory without
   copy-on-write the code before the change took 5.0% less time, one run
-  each.
+  each, and on 2026-10-12 the code with it 2.0% less (714.1 s against
+  728.5 s), one run each.
 - **A delayed link was measured for the first time on 2026-10-11.**
   Through a relay that delays every chunk, at a 50 ms round trip
   dcroxide `7d31abb` synced the early chain at 260 blk/s and dcrd
@@ -192,6 +193,39 @@ What Phase 15 has covered so far:
   pass those blocks at about 3,200 and 1,500 blk/s. Over those blocks
   that window set the pace and the lead over dcrd was gone; no delayed
   run of that day went past block 237,870.
+- **Eleven commits to the node's code followed on 2026-10-12, each step
+  measured in one or two syncs and none against dcrd.** The same sync on
+  the same machine and in the same harness, from the dcrd server, on a
+  quiet machine, one run each: 728.5 s for the code before them
+  (`b4a5d2d`'s); 673.8 s with four small changes (through `a83f9a1`: the
+  best state's missed tickets kept as a handle on the stake node's
+  treap, the UTXO maps' keys compared inline and a view committed in one
+  pass, one write per block record, and a timer on the waits for the
+  database writer, which put those of the threads other than the index
+  thread at 74.9 s of that sync); 628.0 s with three more (through
+  `6271436`: the exists-address index's per-block work done before it
+  takes the writer, its keys compared inline, each ticket bucket looked
+  up once per best-node write), those waits then at 30.7 s; 607.7 s with
+  a `SigHashAll` signature hash's prefix hash taken from the block's
+  transaction hashes while a block is connected (`3a367e5`), a path dcrd
+  ships switched off and PARITY.md records as a step past it; and
+  612.4 s with the download window of the next bullet (`540b203`). The
+  last two, a peer's block handed to the chain without a copy
+  (`5cf9e04`) and a thread that reads the sync peer's connection up to
+  four messages ahead of the block handler during the initial sync
+  (`b4ceb1c`; PARITY.md, *Reading ahead of the block handler*), were
+  measured in one binary run four times: 597.6 s and 599.0 s with
+  `DCROXIDE_READ_AHEAD=off`, and 494.6 s and 490.8 s with the read-ahead
+  on, 17.2% and 18.1% less. Those four runs are of the build made before
+  the review of the read-ahead and its fixes, so `b4ceb1c` as committed
+  has not been run in a sync, and the hand-off was not measured alone.
+  dcrd's last run is the 2,883.9 s of the evening before: against it,
+  across sessions, 612.4 s is 4.71x and the two read-ahead runs 5.83x
+  and 5.88x. Not measured for any of the eleven: the index off, another
+  machine or filesystem, a whole sync over a delayed or a real link, the
+  changes within the two batches one at a time, and a replay with full
+  validation. The [bench ledger](docs/bench-ledger.md) has every run,
+  and what else was measured that day and is not in the repository.
 - **The daemon's default download window is now its own, not dcrd's,
   and was measured on 2026-10-12 in short runs only** (PARITY.md,
   *Block download window*). It keeps up to 128 blocks requested from
@@ -241,7 +275,7 @@ Named open items, tracked and not fixed:
   copy-out rebuild packs *worse*, 58.29%, on a larger live tree, 10.92 GiB
   against 9.79. The 1.536 GiB of intra-page slack in `spendjournalv3` is real
   and unreachable inside this engine.
-- The node was flush-bound under fast ingest as measured in 2026-08 (the 48%-of-wall stall figure above, 90–98% of it inside a metadata-flush window). With the height-first block keys and the exists-address index's own layout, metadata flushes took 15–16% of a from-genesis sync on another machine in 2026-10 ([docs/bench-ledger.md](docs/bench-ledger.md), "Daemon against daemon, each from the other").
+- The node was flush-bound under fast ingest as measured in 2026-08 (the 48%-of-wall stall figure above, 90–98% of it inside a metadata-flush window). With the height-first block keys and the exists-address index's own layout, metadata flushes took 15–16% of a from-genesis sync on another machine in 2026-10 ([docs/bench-ledger.md](docs/bench-ledger.md), "Daemon against daemon, each from the other"). In the nine syncs of 2026-10-12 listed above with the eleven commits they took 104.3–111.4 s whichever code ran, so their share grew as the rest shrank: 14.7% of the 728.5 s run and 21.3% of each of the two runs with the read-ahead on.
 
 **The node is still pre-alpha. Do not expose it to the internet and do not use
 it with funds.**

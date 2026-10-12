@@ -17,8 +17,8 @@ JSON-RPC/websocket server, the tool commands, the pipe IPC lifecycle,
 and the Windows service wrapper. The deliberate non-ports are small
 and documented in PARITY.md (Go GC tuning, the pprof servers, UPnP,
 the Windows event log, and the wallet-side mixclient). The test suite
-runs 847 tests across 258 suites, most differential against dcrd
-itself or replaying sessions generated inside dcrd's own packages.
+runs 2,124 tests across 423 suites on Linux, most differential against
+dcrd itself or replaying sessions generated inside dcrd's own packages.
 
 Since the surface completed, four rounds of work have landed on it. A
 performance campaign: ffldb's metadata write cache, block scripts
@@ -49,8 +49,15 @@ harness, `dcroxide-bench` below, drove every mainnet block up to
 Performance. That replay does not exercise the fifth, the indexes on a
 thread of their own: a replay updates the indexes inline, on the thread
 that connects the blocks.
-Together that says dcroxide's consensus rules accept every mainnet
-block that dcrd's accepted. That they reject what dcrd's reject rests
+Together that says the consensus rules of the code that was replayed
+accept every mainnet block that dcrd's accepted. No replay has been run
+of later code: the sixth change and the eleven commits to the node's
+code after it, which Performance describes, have been run in syncs
+only, each of which validated in full only the blocks after the
+assume-valid block. One of the eleven changes how a `SigHashAll`
+signature hash is computed while a block is connected, and the syncs
+made with it put that to the 89,438 blocks after the assume-valid block
+and to none before it. That the rules reject what dcrd's reject rests
 on the test batteries described below, not on a sync, and none of it
 says the node is safe to operate. **Do not expose it to the internet
 and do not use it with funds** — see [SECURITY.md](SECURITY.md) for
@@ -405,9 +412,139 @@ work). Currently implemented:
 
 ## Performance
 
-dcroxide `b4a5d2d` synced mainnet from genesis to block 1,116,035 in a
-median of 12.1 minutes over three runs on 2026-10-11. dcrd release
-v2.1.6 (go1.25.4) took 48.1 minutes in one run that evening, so
+The figures here are of two kinds. The last complete comparison, with
+three runs of dcroxide, a run with the exists-address index off and
+dcrd in the same session, is of dcroxide `b4a5d2d` on 2026-10-11: a
+median of 12.1 minutes against dcrd's 48.1, 3.96x. Eleven commits that
+change the node's code have followed it. Their steps were measured on
+2026-10-12 in one or two syncs each, dcrd was not run that day, and the
+last step was measured in a build that is not the code as committed. So
+what is known of the code as it stands comes first. From *The last
+complete comparison* on, every table, and every measurement of dcroxide
+not dated 2026-10-12, is of `b4a5d2d` or of the code before it. Every
+sync time on this page is from one machine, over loopback, into a fresh
+data directory.
+
+**Eleven commits to the node's code since `b4a5d2d`, measured a step at
+a time on 2026-10-12.** Each run was a sync of mainnet from genesis to
+block 1,116,035 from a dcrd v2.1.6 server, at the defaults but for the
+one setting named below, on a quiet machine, with the machine, the
+harness and the pinning of the comparison further down. Each ended on
+the server's tip, and the harness marked none as disturbed. One run of
+the code of each commit that was run:
+
+| dcroxide | what it adds to the row above | wall time, one run | node CPU time |
+|---|---|---:|---:|
+| `b4a5d2d` | (the code of the complete comparison) | 12.1 min (728.5 s) | 1,458 s |
+| `a83f9a1` | four small changes | 11.2 min (673.8 s) | 1,401 s |
+| `6271436` | three on the exists-address index and the ticket database | 10.5 min (628.0 s) | 1,394 s |
+| `3a367e5` | the `SigHashAll` prefix hash taken from the block's transaction hashes | 10.1 min (607.7 s) | 1,152 s |
+| `540b203` | the block download window | 10.2 min (612.4 s) | 1,160 s |
+
+The first three steps are 54.7 s (7.5%), 45.8 s (6.8%) and 20.3 s
+(3.2%) less than the run before them. The window's run is 4.7 s (0.8%)
+more than the one before it, and one run each does not settle whether
+the window costs anything over loopback; what it is for is a link with
+a round trip, under *What these figures do not say*. Every step is one
+run against one run. For scale, the three runs of `b4a5d2d` on
+2026-10-11 spanned 3.5 s.
+
+The last two commits were measured in one binary, run four times in
+the order off, on, off, on, with other runs between the two pairs.
+With `DCROXIDE_READ_AHEAD=off`, which leaves the block hand-off of
+`5cf9e04` and reads every connection as dcrd does, a sync took 597.6 s
+and 599.0 s. With the read-ahead of `b4ceb1c` on, which is the default,
+it took 494.6 s and 490.8 s, 8.2 minutes: 103.0 s and 108.2 s less,
+17.2% and 18.1%. **That binary is the build made before the review of
+the read-ahead and its fixes. Those four runs are of no commit, and
+`b4ceb1c` as committed has not been run in a sync.** The hand-off was
+not measured alone: the 14.8 s and 13.4 s between the window's run and
+the two with the read-ahead off are not attributed.
+
+What the eleven are, in the order they were made:
+
+- **Four small changes, measured together: 673.8 s against 728.5 s.**
+  - `7f99184` — the best state holds its missed tickets as a handle on
+    the tip stake node's treap, where every connect walked that whole
+    treap to fill a list that only the mining template reads.
+  - `a65d647` — the keys of the UTXO view and of the UTXO cache are
+    compared inline, where each key a search visited cost a call to the
+    C library's `memcmp`, and a view is committed to the cache in one
+    pass.
+  - `7c6ec9a` — a block record is written with one positioned write,
+    where it took a seek and four writes; dcrd makes the four
+    (`database/ffldb/blockio.go:466-489`). The node made 5.86 million
+    write calls in the sync with it and 9.15 million in the one before.
+  - `a83f9a1` — the waits for the database's writer are timed and
+    reported in the flush log. It is a measurement and changes no
+    behaviour: in that sync the threads other than the index thread
+    waited 74.9 s for the writer.
+- **Three on the exists-address index and the ticket database, measured
+  together: 628.0 s against 673.8 s**, with those threads' wait for the
+  writer at 30.7 s.
+  - `1d5d8a9` — the index computes a connected block's keys before it
+    takes the database's writer (the address extraction, the partition
+    hashes, a first filter against its memtable, the sort), where it
+    computed them inside its write transaction, as dcrd does
+    (`internal/blockchain/indexers/existsaddrindex.go:383-444`).
+  - `4535d1e` — the index's 21-byte keys are compared inline, as the
+    UTXO maps' keys are.
+  - `6271436` — a best-node write of the ticket database looks each
+    ticket bucket up once, where it looked one up for every ticket, as
+    dcrd does (`blockchain/stake/internal/ticketdb/chainio.go:609`,
+    `:625`).
+- **`3a367e5`, a step past dcrd: 607.7 s against 628.0 s.** While a
+  block is connected, a `SigHashAll` signature hash takes its prefix
+  hash from the block's transaction hashes, which are already computed,
+  where dcrd serializes and hashes the transaction's prefix again for
+  every signature. dcrd carries the shortcut in its source and ships it
+  switched off, with a warning that it has not been vetted
+  (`txscript/opcode.go:27-32`); [PARITY.md](PARITY.md) records it under
+  the accepted departures, with its tests. The 89,438 blocks validated
+  in full took 121.6 s against 140.3 s, and the node's user CPU time
+  was 1,058.0 s against 1,298.6 s.
+- **`540b203`, the block download window: 612.4 s against 607.7 s over
+  loopback.** During the initial sync the node keeps up to 128 blocks
+  requested from its sync peer, within a byte budget, where dcrd keeps
+  16 ([PARITY.md](PARITY.md), *Block download window*). Its
+  measurements over a delayed link are below.
+- **`5cf9e04`, not measured alone.** A block a peer delivers is handed
+  to the chain as the allocation its message was decoded into, where
+  the chain copied it once as it accepted it; dcrd copies nothing there
+  (`internal/blockchain/process.go:571`).
+- **`b4ceb1c`, the read-ahead: 494.6 s and 490.8 s against 597.6 s and
+  599.0 s, in the build before its review's fixes.** During the initial
+  sync a thread of its own reads the sync peer's connection up to four
+  messages ahead of the thread that connects blocks, checks each
+  checksum, decodes and, for a block, hashes its transactions. dcrd has
+  no such thread and holds further reads back on purpose
+  (`server.go:1365-1369`). [PARITY.md](PARITY.md), *Reading ahead of
+  the block handler*, has the rule and what a peer can see of it, and
+  [SECURITY.md](SECURITY.md) what it gives a hostile sync peer.
+
+**dcrd was not run on 2026-10-12, so there is no ratio for this code
+from one session.** dcrd's last run, on the evening of 2026-10-11 on
+the same machine and in the same harness, took 2,883.9 s. Set against
+it across sessions, the 612.4 s of `540b203`, the last commit whose
+code was run, is 4.71x, and the two runs with the read-ahead on are
+5.83x and 5.88x, of a build that is not the committed code. Neither is
+a figure of the kind the 3.96x below is.
+
+Not measured for any of the eleven: a sync with the exists-address
+index off, so what the index costs this code, and how much of the lead
+it is, is not known; a second run of any step but the last; the four
+changes of the first batch and the three of the second one at a time;
+any other machine or filesystem; and a whole sync over a delayed or a
+real link, where the round trip and not the thread that connects
+blocks may set the pace. The tables of the index's cost and of the
+time to each height below are of `b4a5d2d` and were not redone. The
+[bench ledger](docs/bench-ledger.md) has every run of the day, with
+what else was measured then and is not in the repository.
+
+**The last complete comparison is of `b4a5d2d`, on 2026-10-11.** It
+synced mainnet from genesis to block 1,116,035 in a median of 12.1
+minutes over three runs that day. dcrd release v2.1.6 (go1.25.4) took
+48.1 minutes in one run that evening, so
 dcroxide was **3.96x as fast** in one session. dcrd's median over four
 runs on 2026-10-09 and 2026-10-10, on the same machine and in the same
 harness, is 47.7 minutes, and the tables below use it: against it the
@@ -416,9 +553,9 @@ together, at dcroxide `c128a93`, it was 17.6 minutes against 47.7,
 **2.71x**. Much of the lead is the exists-address index,
 which both daemons build by default: with it off dcroxide took 10.2
 minutes in one run on 2026-10-11 and dcrd 20.8 on 2026-10-10, 2.04x
-across sessions. Everything here is one machine over loopback, the
-syncing daemon taking its blocks from a server run by the other daemon,
-with a fresh data directory per run.
+across sessions. In the tables below the syncing daemon took its
+blocks from a server run by the other daemon; dcrd's one run of the
+evening of 2026-10-11 took them from a dcrd server.
 
 | syncer | source | runs | wall time, median (range) | mean rate | node CPU time | written by the node |
 |---|---|---|---|---|---|---|
@@ -429,12 +566,13 @@ with a fresh data directory per run.
 Each figure is the median of its runs. The rate is 1,116,035 blocks over
 the wall time. CPU time is the node process's own, user plus system.
 "Written" is the bytes the process passed to write calls, in GB of 10^9
-bytes, not what reached the drive. So dcroxide now takes about a quarter
-of dcrd's node CPU time and passes about a seventh of its bytes to write
-calls. The three runs of `b4a5d2d` span 0.5% of their median, and every
-run on this page ended on the server's tip. Interop holds in both
-directions: dcrd accepts `/dcrwire:1.0.0/dcroxide:2.2.0(pre)/` and
-dcroxide accepts `/dcrwire:1.0.0/dcrd:2.1.6/`.
+bytes, not what reached the drive. So at `b4a5d2d` dcroxide took about
+a quarter of dcrd's node CPU time and passed about a seventh of its
+bytes to write calls. The three runs of `b4a5d2d` span 0.5% of their
+median, and every sync timed on this page ended on the server's tip.
+Interop holds in both directions: dcrd accepts
+`/dcrwire:1.0.0/dcroxide:2.2.0(pre)/` and dcroxide accepts
+`/dcrwire:1.0.0/dcrd:2.1.6/`.
 
 **Six changes since `c128a93` account for the difference.** Five are on
 the block-processing path: a wider table for the block-file checksum,
@@ -483,8 +621,9 @@ cross-source run: dcroxide took 1,072.2 s from a dcroxide server against
 2,894.8 s from dcroxide's. That is one run of each, and the source moved
 either by about 1% or less, the size of the run-to-run spread. An
 earlier pair of same-source runs, taken with more activity on the
-machine, is in the ledger with the rest. Every 2026-10-11 run of
-dcroxide took its blocks from the dcrd server.
+machine, is in the ledger with the rest. Every sync of dcroxide on
+2026-10-11 and 2026-10-12, and every run through the relay, took its
+blocks from the dcrd server.
 
 Both daemons ran at their defaults, apart from the flags that point them
 at the block server and open RPC for the height poll, and
@@ -519,6 +658,10 @@ Up to the assume-valid block dcroxide led 3.5x with the index on. Over
 the 89,438 blocks after it dcroxide ran at about 586 blk/s against
 dcrd's 104, 5.6x. dcroxide's metadata flushes took 15% of its wall time,
 and its peak resident memory was 3.16 GiB against dcrd's 1.81 GiB.
+Those are of `b4a5d2d`. In the nine syncs of 2026-10-12 described at
+the top of this section the flushes took 104.3–111.4 s whichever code
+ran, so their share grew as the rest shrank: 21.3% of each of the two
+runs with the read-ahead on.
 
 What these figures do not say:
 
@@ -565,9 +708,9 @@ What these figures do not say:
   machine, one sync to block 1,116,035 took 612.4 s with the window and
   607.7 s with the code before it (`3a367e5`), one run each that day:
   0.8% more, and one run each does not settle whether the window costs
-  anything over loopback. Both are of code later than
-  the tables above. Not measured: a whole sync over a delayed or a real
-  link, and the two cases in which the wider window can cost sync
+  anything over loopback. Both are in the table of 2026-10-12 at the
+  top of this section. Not measured: a whole sync over a delayed or a
+  real link, and the two cases in which the wider window can cost sync
   peers. No sync was run over a link held to a set rate or with a
   reader made to stop for 20 s or more: the public-network starts ran
   over whatever links their peers had, at rates that were not recorded,
@@ -575,13 +718,50 @@ What these figures do not say:
   adds loss and a bandwidth limit that the relay does not;
   [docs/operating.md](docs/operating.md) has the budget and the setting
   that puts dcrd's window back.
+- **The read-ahead was measured over loopback only, and not as
+  committed.** dcrd reads one message from a connection, handles it
+  and only then reads the next (`inHandler`,
+  `peer/peer.go:1535-1598`). During the initial sync dcroxide now
+  reads its sync peer's connection up to four messages ahead of the
+  thread that connects blocks, on a thread of its own, and reads as
+  dcrd does when started with `DCROXIDE_READ_AHEAD=off`
+  ([PARITY.md](PARITY.md), *Reading ahead of the block handler*). The
+  494.6 s and 490.8 s at the top of this section, against 597.6 s and
+  599.0 s with it off, are of 2026-10-12 on m3, on a quiet machine
+  with the node on eight cores, and of the build made before the
+  review of the read-ahead and its fixes. The node's own line at
+  shutdown put the checksum and decode work that left the block thread
+  at 45.8 s and 45.9 s and the hashing at 47.2 s in both runs, 93 s of
+  the 103.0 s and 108.2 s gained; the socket reads moved too and are
+  not timed, and what the rest is was not established. The reader
+  thread was parked on a full queue for 382.4 s and 378.7 s of those
+  runs, and the block thread waited on an empty one for 0.27 s: over
+  loopback the next block was nearly always there, which a link with a
+  round trip need not give. Peak resident memory was 2,967 and
+  2,921 MiB with it on against 3,273 and 3,256 MiB with it off, which
+  is not explained. Not measured: the code as committed; a sync with
+  it over a delayed or a real link, where the round trip and not the
+  thread that connects blocks may set the pace and reading ahead may
+  gain nothing; a node on fewer than eight cores; and a sync with
+  `--noexistsaddrindex`. It costs one more thread and one more
+  descriptor on that connection and the memory of up to four decoded
+  messages held there, which was not measured. By estimates from the
+  sizes of the structures those are about 150 kB for four main network
+  blocks of mean size, and at worst, from a hostile sync peer, the
+  connection holds about 57 MB against about 12.5 MB without the
+  read-ahead ([SECURITY.md](SECURITY.md), *Known gaps*).
+  [docs/operating.md](docs/operating.md) has the setting and how to
+  read the shutdown line.
 - **It is one machine with fast storage.** On m2 in the ledger, a
   container on a ZFS
   mirror of QLC drives with the node on four cores, dcroxide with the
   same storage layout ran the 200,000 blocks after 916,000 at a median
   of 482 blk/s, where m3 ran them at about 593, both before the changes
   of 2026-10-11. No sync from genesis has been measured on m2 with that
-  layout.
+  layout, and the eleven commits of 2026-10-12 have been run on m3
+  only. One run that day, of `b4a5d2d`, was on a data directory
+  without copy-on-write: 714.1 s, against 728.5 s on the directory as
+  created. None of the eleven was run that way.
 
 At block 1,116,035 the data directory is 27.90 GiB under dcroxide and
 24.16 GiB under dcrd, 1.15x. Block files make up 17.88 GiB of each. The
@@ -598,9 +778,8 @@ and that payload comparison has not been repeated.
 layout.
 
 Earlier measurements are kept in the
-[bench ledger](docs/bench-ledger.md), which records every figure
-through 2026-10-11 per machine, commit and corpus, with the storage
-analysis behind them in
+[bench ledger](docs/bench-ledger.md), which records every figure per
+machine, commit and corpus, with the storage analysis behind them in
 [ADR-0004](docs/adr/0004-storage-backend.md) and
 [ADR-0009](docs/adr/0009-storage-shape.md). The 2026-07 and 2026-08
 figures there were taken against dcrd 2.2.0-pre on m1, before the
@@ -608,8 +787,7 @@ height-first block keys
 ([ADR-0010](docs/adr/0010-height-first-block-keys.md)) and the
 exists-address layout, so they are not earlier points on the same curve
 as the headline figures above. The 2026-10 rows on m2 measure those two
-changes, on slower storage and four cores. The runs of 2026-10-12 cited
-above are recorded in [PARITY.md](PARITY.md), *Block download window*.
+changes, on slower storage and four cores.
 
 ## Layout
 

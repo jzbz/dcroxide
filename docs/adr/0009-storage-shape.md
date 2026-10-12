@@ -1005,3 +1005,39 @@ much of the flush time is m3's filesystem and not the engine: on a data
 directory without copy-on-write, checksums or compression the code
 before the change took 736.8 s where it took 775.6 s on the directory as
 created, its 133 flushes 144.0 s against 177.8 s. One run each.
+
+## Addendum, 2026-10-12 — the filesystem's share again, and the commit's schedule
+
+Two measurements of 2026-10-12 on m3 bear on statements in this ADR.
+[ADR-0004](0004-storage-backend.md), addendum of the same date, has
+their figures, and [bench-ledger.md](../bench-ledger.md), "Eleven
+changes, a background commit not kept and a pool gate", the runs.
+Neither moves the decision or a guardrail.
+
+The addendum above gives the filesystem's share for the code before
+that day's change, 5.0% of a sync. The code with the change, `b4a5d2d`,
+was run the same way: on a data directory without copy-on-write,
+checksums or compression it took 714.1 s where it took 728.5 s on the
+directory as created, 2.0% less, its 55 flushes 97.1 s against 107.4 s
+for 54. One run each.
+
+"The 'restructure the commit' branch is now closed by measurement" is
+the result of 2026-08-16 on m1, where flushes occupied 68–71% of a sync
+and commits ran nearly back to back. On m3 on 2026-10-12 flushes were
+15% of a sync of `b4a5d2d` and 21% of one of the read-ahead build
+before its review's fixes, and a reduced background commit, built in a
+scratch tree and not in the repository, was 28.3 s and 30.5 s faster
+than its own control in one pair of syncs on each of two builds (4.7%
+and 6.1%), one run against one run, at 981 and 748 MiB more peak
+resident memory. The second control took 3.9 s and 7.7 s longer than
+its build's own default runs, so the 30.5 s may overstate that gain
+(ADR-0004's addendum). It was not adopted. Its power-cut sweeps are
+not built and its memory is not explained; and it reports a failed
+commit to the next write, flush or close and not to the commit that
+tripped the flush, which has returned by then, as have any commits made
+while the failing one was under way. Condition 1's rule, "Once a
+durable write fails, no later write on that store can report success",
+would have to be reworded for that, and the rewording, like the
+daemon's default, is the project owner's to decide. So the branch stays
+closed for m1's layout of 2026-08, and for the layout of 2026-10 it has
+been measured once and not decided.

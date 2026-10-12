@@ -55,6 +55,19 @@ path) has been measured yet, so this crossover is unconfirmed.
 > and 13.6 blocks per round trip, and dcrd v2.1.6 at 12.6 at 50 ms, in
 > fixed-time runs over the early chain on m3. See "Shared commits for
 > UTXO-cache flushes, the filesystem's share and a delayed link" below.
+>
+> **Note (2026-10-12): the daemon's default window is no longer
+> dcrd's.** Since `540b203` the daemon keeps up to 128 blocks and, past
+> 16 of them, 3,145,728 bytes requested from its sync peer during the
+> initial sync (`BUDGET_WINDOW_BLOCKS` and `MAX_BUDGET_WINDOW_BYTES`,
+> `crates/dcroxide-netsync/src/manager.rs:49`, `:81`). dcrd's window is
+> still in the port and is what `DCROXIDE_BLOCK_WINDOW=dcrd` selects,
+> so the paragraph above and the note of 2026-10-11 describe dcrd and
+> that setting. Through the same relay on m3, one run of 300 s an arm,
+> one binary: 13.1 blocks per round trip under dcrd's rule and 102
+> under the default at a 50 ms round trip, and 13.6 and 117 at 150 ms.
+> See "Eleven changes, a background commit not kept and a pool gate"
+> below.
 
 | date | machine | dcroxide commit | vs dcrd | corpus | result | source |
 |---|---|---|---|---|---|---|
@@ -65,6 +78,8 @@ path) has been measured yet, so this crossover is unconfirmed.
 | 2026-10-10 | m3 | `c128a93` | master `6f6cf21b` (2.2.0-pre, go1.26.2, release image flags) | mainnet, genesis to 1,116,035 | The parity commit, in the harness of the row above: dcrd from a dcroxide block server, two runs, 2,909.8 s and 2,869.8 s — **383.5 and 388.9 blk/s** at 1.90–1.92 mean cores, against v2.1.6's 2,848.8–2,894.8 s. dcroxide's median of 1,058.6 s is **2.73x** as fast as their mean. With `--noexistsaddrindex` in both, one run each: dcroxide 880.8 s — **1,267.0 blk/s**; dcrd v2.1.6 1,247.8 s — **894.4 blk/s**; **1.42x** | this file, "The parity commit, the index off, two levers and a full replay" |
 | 2026-10-11 | m3 | `74168e8` and the five changes that follow it, added one at a time | not run in this session | mainnet, genesis to 1,116,035 | dcroxide from the dcrd v2.1.6 block server at the defaults, in the harness of the two rows above. `74168e8` itself: 1,058.3 s in one run, made after the first of the others, where the median two rows above is 1,058.6 s. One run per cumulative change: 1,015.3 s, 912.8 s, 893.7 s, 820.3 s and, with all five, 759.1 s and 756.2 s in two runs — **1,470.3 and 1,475.9 blk/s** at 1.93–1.94 mean cores. That is 28.3% and 28.5% under the same session's 1,058.3 s. Set against dcrd's 2,863.9 s of 2026-10-09 and 2026-10-10 it is 3.77x and 3.79x, across sessions | this file, "Five changes on the block-processing thread" |
 | 2026-10-11, afternoon | m3 | `b4a5d2d` (shared commits for UTXO-cache flushes, overlay default 300 MiB), and `7d31abb` before it | release v2.1.6 (go1.25.4), one run | mainnet, genesis to 1,116,035 | dcroxide from the dcrd v2.1.6 block server at the defaults, in the same harness. `7d31abb` itself: 775.6 s in one run that afternoon. With the change: 725.9 s, 728.7 s and 729.4 s, median 728.7 s — **1,531.6 blk/s** at 2.0 mean cores, 6.0% under the 775.6 s, with 54 flushes where there were 133. With `--noexistsaddrindex`, one run: 610.2 s — **1,829.1 blk/s**. dcrd from the same block server, one run that evening: 2,883.9 s — **387.0 blk/s**, so the change's median is **3.96x** as fast in one session. Set against dcrd's 2,863.9 s and 1,247.8 s of 2026-10-09 and 2026-10-10 it is 3.93x and 2.04x, across sessions | this file, "Shared commits for UTXO-cache flushes, the filesystem's share and a delayed link" |
+| 2026-10-12 | m3 | `a83f9a1`, `6271436`, `3a367e5` and `540b203`, one run each | not run in this session | mainnet, genesis to 1,116,035 | dcroxide from the dcrd v2.1.6 block server at the defaults, in the same harness. The binary of the row above again: 728.5 s in one run, where its three runs above have a median of 728.7 s. Then one run per state, each holding the changes before it: `a83f9a1` (the missed-ticket handle, the UTXO maps' key comparison, one write per block record, the writer-wait timer) 673.8 s — 1,656.2 blk/s; `6271436` (three changes to the exists-address index and the ticket buckets) 628.0 s — 1,777.2 blk/s; `3a367e5` (the SigHashAll prefix hash) 607.7 s — **1,836.6 blk/s** at 1.9 mean cores; `540b203` (the block download window) 612.4 s — **1,822.3 blk/s** at 1.9 mean cores. The last two are 16.6% and 15.9% under the same session's 728.5 s. Set against dcrd's 2,883.9 s of the evening of 2026-10-11 and its 2,863.9 s of 2026-10-09 and 2026-10-10, the 612.4 s is 4.71x and 4.68x, across sessions | this file, "Eleven changes, a background commit not kept and a pool gate" |
+| 2026-10-12 | m3 | the read-ahead build before its review's fixes, which became `b4ceb1c` and also holds `5cf9e04`; neither commit was run as committed | not run in this session | mainnet, genesis to 1,116,035 | One binary in the same harness, two runs under each setting, alternated. With `DCROXIDE_READ_AHEAD=off`: 597.6 s and 599.0 s. At the defaults: 494.6 s and 490.8 s — **2,256.3 and 2,273.9 blk/s** at 2.26–2.28 mean cores, 103.0 s and 108.2 s less than with read-ahead off and 32.1% and 32.6% under the same session's 728.5 s for `b4a5d2d`. `b4ceb1c` differs from the binary's code in one condition of the reader's idle budget and one private function, and has not been run in a sync. Set against dcrd's 2,883.9 s and 2,863.9 s as in the row above, the 494.6 s and 490.8 s are 5.83x and 5.88x, and 5.79x and 5.84x, across sessions | this file, "Eleven changes, a background commit not kept and a pool gate" |
 
 > **The headline 1.29x predates the fan-out fix, so it is conservative for
 > master.** That figure was measured on `b6d0c63`; `c091b46` (one validation
@@ -546,6 +561,21 @@ keep the full width without the per-call spawns, each batch reaching it
 through the same shared index and first-failure slot. This arm has not been
 measured; record it here whether or not it ships. `validate_items` carries
 the same note.
+
+> **Note (2026-10-12): gated by a replay benchmark, built outside the
+> tree, and not measured in a sync.** A replay of every 20th fully
+> validated block's script batches, in a benchmark outside the
+> repository, put a persistent pool that takes batches of four or more
+> items at 19.8 to 20.2 s saved over the validated part of a sync on
+> m3, one that takes eight or more at 10.6 to 11.3 s and one that takes
+> sixteen or more at 4.1 to 4.9 s, against these scoped workers. Those
+> are estimates from a replay, at three settings of the work between
+> batches. A pool was then built and reviewed in a scratch tree. It is
+> not in the repository and no sync of it has been run, so this arm is
+> still unmeasured in a sync, and `validate_items` still creates its
+> workers on every call
+> (`crates/dcroxide-blockchain/src/validate.rs:5280`). See "Eleven
+> changes, a background commit not kept and a pool gate" below.
 
 ## IBD profiling attempt (2026-08-14) — and why replay cannot proxy for it
 
@@ -1216,6 +1246,20 @@ off the block-connection thread to recover the 48% of wall time the node
 spends fully stalled in it. **It was built, measured, and reverted: it is
 9.5% slower, and the reason is structural rather than a bug in the
 implementation.**
+
+> **Note (2026-10-12): built again in another form, on m3, and it
+> gained.** With the storage engine's commit on a second thread for
+> the flushes a commit trips, a default sync took 579.6 s against
+> 607.9 s on the code of `3a367e5` and 468.0 s against 498.5 s on a
+> build with read-ahead: 28.3 s and 30.5 s less, one run against one
+> run each, for 981 and 748 MiB more peak resident memory. In those
+> two control runs the flushes were 17.6% and 21.7% of the wall time,
+> where they are 68–71% in the runs below. That experiment is not in
+> the repository either: it was built as far as the measurement and no
+> further. So what follows is the record of this design on m1 in
+> 2026-08, and "cannot work" and "closed by measurement" below are
+> statements about it. See "Eleven changes, a background commit not
+> kept and a pool gate" below.
 
 The design: a committer thread per flush, holding an `Arc<DbInner>` so the
 database cannot be destroyed mid-commit; the previous commit joined before the
@@ -2364,6 +2408,21 @@ this is another machine, a whole chain and one index-off run. More than
 two thirds of the 177.8 s the index costs here is outside the flushes
 and is not attributed.
 
+> **Note (2026-10-12): a wait that is likely part of it has since
+> been timed, on later code.** The indexes moved to a thread of their
+> own on 2026-10-11, and a timer added on 2026-10-12 (`a83f9a1`) totals
+> the waits for the database's writer. In one default sync of that code
+> the threads other than the index thread waited 74.9 s of 673.8 s for
+> the writer, at least 62.0 s of it not behind a flush the index thread
+> ran. The timer does not record who held the writer; the index
+> thread's per-block transactions are the likely holder. With the
+> index's per-block work done before its thread takes the writer
+> (`6271436` and the two commits before it) the wait was 30.7 s and the
+> sync 628.0 s. What the index costs a sync on that code was not
+> measured: no run with `--noexistsaddrindex` was made on 2026-10-12.
+> See "Eleven changes, a background commit not kept and a pool gate"
+> below.
+
 For scale, on m2's 200,000-block tail the same layout ran 3.8% slower
 with the index on than off (482.1 against 501.1 blk/s), a gap that
 section called inside its noise. From genesis on m3 the index is 16.8%
@@ -2628,6 +2687,15 @@ over the first to 412.6–509.5 over the last five.
 - Not a sync with `--noexistsaddrindex` or `--assumevalid=0`, and no
   repeat of the tuning levers, on this code.
 
+> **Note (2026-10-12), on the index thread's cost to the block
+> thread:** measured from `a83f9a1` on, which times every wait for the
+> database's writer. In one default sync of that code the threads
+> other than the index thread waited 74.9 s for the writer in 401,906
+> waits, and the index thread 0.02 s in 295. With the three commits
+> that follow it, which end at `6271436`, the two waited 30.7 s and
+> 30.4 s. See "Eleven changes, a background commit not kept and a pool
+> gate" below.
+
 Raw: the comparison's `runs.jsonl` rows labelled `pf-base`, `s-base`,
 `s-A`, `s-AG`, `s-AGB`, `s-AGBC`, `s-AGBC-2`, `s-final` and `s-final-2`,
 with per-run samples, flush logs and node logs as above; the `perf record` data of pf-base and its
@@ -2793,6 +2861,16 @@ bandwidth limit. Each run was stopped after a fixed time and the height
 at each 10 s sample kept, so these are rates under a known round trip
 and not sync times. The dcroxide runs used `7d31abb`.
 
+> **Note (2026-10-12):** "both daemons download through dcrd's
+> window" is true of the runs below, of `7d31abb` and dcrd v2.1.6.
+> Since `540b203` the daemon's default window is up to 128 blocks and,
+> past 16 of them, 3,145,728 bytes, and dcrd's rule is what
+> `DCROXIDE_BLOCK_WINDOW=dcrd` selects. Through this relay on
+> 2026-10-12 the default window moved 102 blocks per round trip at
+> 50 ms and 117 at 150 ms, where dcrd's rule in the same binary moved
+> 13.1 and 13.6, one run of 300 s each. See "Eleven changes, a
+> background commit not kept and a pool gate" below.
+
 | run | started | syncer | one-way delay | round trip | run length | height reached | first block after | rate once blocks flow | blocks per round trip | node CPU time |
 |---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
 | dl-dcroxide-50 | 16:00 | dcroxide-head | 25 ms | 50 ms | 600 s | 144,821 | 51 s | 260 blk/s over blocks 4,851–143,004 | 13.0 | 84 s |
@@ -2824,6 +2902,13 @@ and not sync times. The dcroxide runs used `7d31abb`.
   at about 586 blk/s. No delayed run went past block 237,870, and the
   blocks there are small.
 
+> **Note (2026-10-12):** the implication above, "for either daemon
+> wherever it can process faster than that", holds for dcrd's window:
+> for dcrd, and for dcroxide under `DCROXIDE_BLOCK_WINDOW=dcrd`. What
+> a whole sync takes over a delayed link with the default window has
+> not been measured. The relay runs of 2026-10-12 lasted 300 s and
+> reached block 532,079 at 50 ms and block 158,440 at 150 ms.
+
 These runs were not on a quiet machine: other work went on on it
 throughout, and a build was running at the end of the 20 ms and 0 ms
 runs, which is the one time the harness looks. It was held to other
@@ -2852,6 +2937,14 @@ are the link's.
   the same machine.
 - Not `--assumevalid=0`, the tuning levers, m1 or m2 on this code.
 
+> **Note (2026-10-12):** the final code has since been run on a data
+> directory without copy-on-write: 714.1 s against 728.5 s for the
+> same binary on the directory as created, 14.4 s or 2.0% less, one
+> run each on 2026-10-12. Five starts of 300 s against the public main
+> network were made that day too, of the code of `540b203`; they are
+> not a sync over a real link. See "Eleven changes, a background
+> commit not kept and a pool gate" below.
+
 Raw: the comparison's `runs.jsonl` rows labelled `f-head`, `f-proto`,
 `f-proto-200`, `f-proto-nocow`, `f-head-nocow`, `g-1`, `g-2`, `g-3`,
 `g-off` and `g-dcrd`, with per-run samples, flush logs and node logs as
@@ -2860,3 +2953,514 @@ above;
 script that drove them; the prototype's patch; and `smoke4.jsonl` and
 `delay-smoke.jsonl` for the short runs that checked the prototype, the
 no-copy-on-write option and the relay.
+
+## Eleven changes, a background commit not kept and a pool gate (2026-10-12)
+
+"Shared commits for UTXO-cache flushes, the filesystem's share and a
+delayed link" above left a default sync at a median of 728.7 s, and
+earlier sections left three things open: what the index thread costs
+the thread that connects blocks, the download window that sets the pace
+over a delayed link, and the persistent validation pool. On 2026-10-12
+eleven changes were made and measured on m3 in five builds, each
+holding the ones before it, and three things that are not in the
+repository were measured, gated or designed: a background commit, a
+persistent validation pool and the coalescing of the storage engine's
+page writes. dcrd was not run.
+
+The syncs are in the harness of the sections above: mainnet from
+genesis to 1,116,035 over loopback from the dcrd v2.1.6 block server,
+at the defaults but for the setting a row names, with the same pinning,
+clock and quiet gate, and a 300 s idle before every run but h-nocow and
+h-rabg-sync-1, each the first of the batch it was queued in. The relay
+runs and the pool gate were steps of the same queue, between the syncs.
+The starts against the public network were made before it, on a machine
+that was not quiet.
+
+The changes, in the order made and measured. The commits were made
+afterwards, one per change, on `b212a0a`:
+
+1. **The small batch**, four commits measured together. The best
+   state keeps the tip's missed tickets as a handle on the stake node's
+   treap, where every connect listed the whole set, as dcrd does
+   (`chain.go:658`, `:857`), for a list only the mining template reads
+   (`7f99184`). The keys of the UTXO view and the UTXO cache are
+   compared as four big-endian words in a comparison written into the
+   search, where the tuple's derived comparison went through `memcmp`,
+   and a view is committed to the cache in one pass (`a65d647`). A
+   block record is written with one positioned write, where it was a
+   seek and then four writes, one for each field as in dcrd's
+   `writeBlock` (`blockio.go:466-489`) (`7c6ec9a`). And a caller that
+   finds the database's writer held is timed until it holds it, with
+   the totals in the flush log (`a83f9a1`).
+2. **The index batch**, three commits measured together. The
+   exists-address index does a queued block's extraction, hashing,
+   filtering and sorting before its thread takes the writer, where it
+   did them holding it (`1d5d8a9`). Its 21-byte keys are compared
+   inline (`4535d1e`). A best-node write looks each ticket bucket up
+   once, where it looked one up for every ticket (`6271436`).
+3. **The SigHashAll prefix hash** (`3a367e5`). At block connect the
+   prefix hash of a `SigHashAll` signature hash is taken from the
+   transaction hashes the chain has already computed, a path dcrd
+   carries and ships switched off (`optimizeSigVerification`,
+   `opcode.go:27-32`).
+4. **The download window** (`540b203`). During the initial sync the
+   daemon keeps up to 128 blocks and, past 16 of them, 3,145,728 bytes
+   requested from its sync peer, where dcrd keeps 16
+   (`internal/netsync/manager.go:32-38`). `DCROXIDE_BLOCK_WINDOW=dcrd`
+   selects dcrd's rule.
+5. **The block hand-off** (`5cf9e04`). A block a peer delivers reaches
+   the chain in the allocation it was decoded into, without the copy
+   the chain made when it accepted the block's data.
+6. **Read-ahead** (`b4ceb1c`). On the sync peer's connection a
+   `peer-reader` thread reads up to four frames ahead of the thread
+   that connects blocks, and there checks each frame's checksum,
+   decodes it and hashes a block's transactions. dcrd has no such
+   thread. `DCROXIDE_READ_AHEAD=off` reads every connection as dcrd
+   does.
+
+PARITY.md states all six.
+
+| run | started | code | setting | wall | to block 1,026,597 | after it | node CPU time (user + sys) | peak RSS | flushes | flush time | passed to write calls | write calls |
+|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| h-nocow | 06:54 | `b4a5d2d` | data directory without copy-on-write | 714.1 s | 562.8 s | 151.3 s | 1,442.9 s (1,356.1 + 86.8) | 3,246 MiB | 55 | 97.1 s | 40.1 GB | 9.25 million |
+| h-base | 07:12 | `b4a5d2d` | defaults | 728.5 s | 574.6 s | 153.9 s | 1,458.3 s (1,361.0 + 97.3) | 3,278 MiB | 54 | 107.4 s | 39.7 GB | 9.15 million |
+| h-small | 07:31 | `a83f9a1` | defaults | 673.8 s | 524.6 s | 149.2 s | 1,400.9 s (1,308.3 + 92.6) | 3,299 MiB | 56 | 111.4 s | 40.0 GB | 5.86 million |
+| h-index | 07:49 | `6271436` | defaults | 628.0 s | 487.7 s | 140.3 s | 1,393.8 s (1,298.6 + 95.2) | 3,224 MiB | 56 | 107.9 s | 40.0 GB | 5.87 million |
+| h-sighash | 08:06 | `3a367e5` | defaults | 607.7 s | 486.1 s | 121.6 s | 1,152.2 s (1,058.0 + 94.2) | 3,234 MiB | 54 | 105.7 s | 39.6 GB | 5.78 million |
+| h-window | 08:23 | `540b203` | defaults | 612.4 s | 489.3 s | 123.1 s | 1,160.0 s (1,065.8 + 94.2) | 3,204 MiB | 56 | 105.7 s | 40.3 GB | 5.94 million |
+| h-ra-off-1 | 09:09 | read-ahead build | `DCROXIDE_READ_AHEAD=off` | 597.6 s | 472.7 s | 124.9 s | 1,141.6 s (1,045.2 + 96.4) | 3,273 MiB | 55 | 108.1 s | 40.3 GB | 5.95 million |
+| h-ra-on-1 | 09:25 | read-ahead build | defaults | 494.6 s | 386.3 s | 108.3 s | 1,118.7 s (1,028.3 + 90.4) | 2,967 MiB | 55 | 105.3 s | 39.8 GB | 5.83 million |
+| h-bg-sync-1 | 09:40 | background commit on `3a367e5` | `DCROXIDE_DB_SYNC_COMMIT=1` | 607.9 s | 484.3 s | 123.6 s | 1,149.6 s (1,054.5 + 95.1) | 3,207 MiB | 55 | 107.2 s | 39.9 GB | 5.84 million |
+| h-bg-on-1 | 09:57 | background commit on `3a367e5` | commits in the background | 579.6 s | 458.1 s | 121.5 s | 1,181.9 s (1,078.1 + 103.8) | 4,188 MiB | 54 | 112.6 s | 41.5 GB | 6.16 million |
+| h-ra-off-2 | 10:25 | read-ahead build | `DCROXIDE_READ_AHEAD=off` | 599.0 s | 473.0 s | 126.0 s | 1,139.3 s (1,042.5 + 96.8) | 3,256 MiB | 55 | 110.1 s | 40.3 GB | 5.93 million |
+| h-ra-on-2 | 10:42 | read-ahead build | defaults | 490.8 s | 381.1 s | 109.7 s | 1,118.2 s (1,027.6 + 90.6) | 2,921 MiB | 55 | 104.3 s | 39.9 GB | 5.84 million |
+| h-rabg-sync-1 | 10:54 | background commit on the read-ahead build | `DCROXIDE_DB_SYNC_COMMIT=1` | 498.5 s | 389.0 s | 109.5 s | 1,124.7 s (1,030.8 + 93.9) | 3,025 MiB | 55 | 107.9 s | 39.7 GB | 5.80 million |
+| h-rabg-on-1 | 11:09 | background commit on the read-ahead build | commits in the background | 468.0 s | 362.7 s | 105.3 s | 1,154.3 s (1,053.9 + 100.4) | 3,773 MiB | 54 | 113.1 s | 41.4 GB | 6.13 million |
+
+Every run exited 0 on the server's tip, `8752fdc9…`, and none was
+marked disturbed. The harness's other-userland share is 0.21–0.22% in
+every run, where the afternoon before had 0.07% and a run is marked at
+0.5%: one desktop process, by its name a resource monitor left open,
+used 14–21 s of the 33–49 s of other userland CPU time a run (15–17 s
+the afternoon before), and the rest of the rise is not attributed. The time to block 1,026,597 is
+interpolated between two samples about 10 s apart, as in the sections
+above, and "after it" is the wall time less that. The flush columns
+count the flushes of the sync and leave out the one the close makes at
+shutdown, as the tables of 2026-10-11 do. The last two columns are
+`wchar` and `syscw`. From `7c6ec9a` on a block record is one write call
+where it was four, so the write-call counts from h-small down are not to
+be set against the two above them. h-window, the read-ahead build and
+the background-commit build made on it have the download window, and the
+background-commit build on `3a367e5` does not. No run logged a narrowed
+or widened window or a stalled peer.
+
+h-nocow and h-base ran the binary of g-1 to g-3 above, which that
+section describes. The four binaries after them were built from
+working trees before the commits were made. Applied to `b212a0a`, the
+patches saved of those trees at the time give the trees of `a83f9a1`
+and `6271436` exactly, the tree of `3a367e5` but for PARITY.md, and
+the tree of `540b203` but for five documents. The read-ahead build and
+the two background-commit builds are described under their own
+headings below.
+
+**A default sync went from 728.5 s to 612.4 s on the code of
+`540b203`, 15.9% less, and to 494.6 s and 490.8 s on the read-ahead
+build, 32.1% and 32.6% less, in one session.** By step:
+
+| step | this run | the one before | gain |
+|---|---:|---:|---:|
+| the small batch | 673.8 s | 728.5 s (h-base) | 54.7 s, 7.5% |
+| the index batch | 628.0 s | 673.8 s | 45.8 s, 6.8% |
+| the SigHashAll prefix hash | 607.7 s | 628.0 s | 20.3 s, 3.2% |
+| the download window | 612.4 s | 607.7 s | 4.7 s more, 0.8% |
+| the block hand-off, in the read-ahead build with read-ahead off | 597.6 s and 599.0 s | 612.4 s | 14.8 s and 13.4 s |
+| read-ahead | 494.6 s and 490.8 s | 597.6 s and 599.0 s, the same binary | 103.0 s and 108.2 s, 17.2% and 18.1% |
+
+Each gain is one run against one run, in the order the changes were
+made. No step but the last was run twice, and no other order was run.
+
+**The session's base, and the filesystem's share of it.** h-base is the
+binary of the afternoon before, run again: 728.5 s, where its three
+runs there took 725.9 s, 728.7 s and 729.4 s. h-nocow is the same
+binary in a data directory made with the no-copy-on-write attribute,
+which the section above listed as not run on that code: 714.1 s, 14.4 s
+or 2.0% less. Its 55 flushes took 97.1 s against 54 in 107.4 s, the
+node's system time was 86.8 s against 97.3 s, and the volume took
+41.6 GB against 53.2 GB for the 40.1 GB and 39.7 GB passed to write
+calls. On `7d31abb`, with 133 flushes, the same comparison came to
+38.8 s or 5.0% on 2026-10-11. Both are one run against one run, and
+h-nocow was the first run of its batch, with no idle before it.
+
+**The small batch.** With the four the sync took 673.8 s against
+728.5 s, 54.7 s or 7.5% less: 524.6 s against 574.6 s up to the
+assume-valid block and 149.2 s against 153.9 s after it. The node's
+user CPU time fell from 1,361.0 s to 1,308.3 s. It made 5.86 million
+write calls where h-base made 9.15 million, 3.29 million fewer, for
+40.0 GB and 39.7 GB passed to them; three fewer calls for each of the
+1,116,035 block records would be 3.35 million. The four were not
+measured apart, so the 54.7 s is not divided among them. The profile
+of 2026-10-11 put `memcmp` at 14.6% of the cycles up to the
+assume-valid block without its callers. The second commit replaces
+the key comparison of the two UTXO maps, which went through `memcmp`;
+no profile was taken on 2026-10-12, so what part of the 14.6% those
+searches were is not established.
+
+**The waits for the writer.** Every writable transaction, flush and
+close takes the database's writer, and since the index thread of
+2026-10-11 two threads take it for every block. From `a83f9a1` a
+caller that finds it held is timed until it holds it (`acquire_writer`,
+`crates/dcroxide-database/src/lib.rs:263`); one that finds it free
+reads no clock and is not counted. The waits are totalled for the
+thread named `index` and for all other threads together, and each
+flush-log line carries the totals since the database was opened and
+the name of the thread that ran the flush. The totals below are those
+of each run's last line, which the close writes at shutdown. The flush
+counts are of the sync, as in the table above. `peer-outbound` is the
+thread that connects blocks in these runs.
+
+| run | other threads: waits | waited | index thread: waits | waited | flushes run by `peer-outbound` | by `index` |
+|---|---:|---:|---:|---:|---:|---:|
+| h-small | 401,906 | 74.9 s | 295 | 0.02 s | 48 in 98.5 s | 8 in 12.9 s |
+| h-index | 166,810 | 30.7 s | 97,538 | 30.4 s | 43 in 85.1 s | 13 in 22.8 s |
+| h-sighash | 167,161 | 30.3 s | 99,862 | 39.0 s | 42 in 83.0 s | 12 in 22.6 s |
+| h-window | 165,394 | 23.2 s | 98,041 | 51.0 s | 46 in 90.0 s | 10 in 15.8 s |
+| h-ra-off-1 | 160,617 | 33.4 s | 115,449 | 44.3 s | 40 in 82.5 s | 15 in 25.6 s |
+| h-ra-on-1 | 197,790 | 31.2 s | 305,825 | 53.1 s | 43 in 83.1 s | 12 in 22.2 s |
+| h-bg-sync-1 | 165,886 | 35.0 s | 97,045 | 32.7 s | 40 in 80.3 s | 15 in 26.9 s |
+| h-bg-on-1 | 174,103 | 16.4 s | 104,567 | 22.0 s | 4 in 6.6 s | none; 50 on `dbcommit` |
+| h-ra-off-2 | 159,734 | 29.0 s | 112,774 | 38.9 s | 42 in 88.6 s | 13 in 21.4 s |
+| h-ra-on-2 | 198,074 | 20.1 s | 304,294 | 73.3 s | 49 in 92.7 s | 6 in 11.7 s |
+| h-rabg-sync-1 | 196,631 | 19.8 s | 306,257 | 71.9 s | 48 in 96.5 s | 7 in 11.4 s |
+| h-rabg-on-1 | 202,815 | 15.9 s | 312,474 | 51.9 s | 3 in 4.4 s | none; 51 on `dbcommit` |
+
+- **In the tree of `a83f9a1` the threads other than the index thread
+  waited 74.9 s of a 673.8 s sync for the writer**, in 401,906 waits,
+  and the index thread 295 times for 0.02 s in all. The index thread
+  took the writer first and did a block's index work holding it. At
+  most 12.9 s of the 74.9 s can have been spent behind the eight
+  flushes the index thread ran. The other 62.0 s or more was not
+  behind an index-thread flush. The timer does not record who held the
+  writer, and a flush-log line names only the thread that ran a flush.
+  In these single-peer syncs the index thread is the only thread known
+  to take the writer for every block besides the one that connects
+  them, so its per-block transactions are the likely holder, which the
+  fall to 30.7 s with the index batch is consistent with. The two
+  totals are the nearest measure there is of what "Five changes on the
+  block-processing thread" above listed as not measured, how long the
+  two threads wait for each other.
+- **With the index batch it was 30.7 s**, in 166,810 waits: 44.3 s
+  less, where the sync took 45.8 s less and the node's CPU time moved
+  by 7.1 s (1,393.8 s against 1,400.9 s). The index thread, which now
+  does a block's work before it asks for the writer, found it held
+  97,538 times and waited 30.4 s, where it had hardly waited at all.
+- **Less the flushes the index thread ran, what is left is 7.5–9.1 s
+  a sync.** A flush holds the writer for about 1.8 s at the median,
+  whichever thread's commit trips it. In the nine later runs that
+  commit on the committing thread the index thread ran 6 to 15 of the
+  54 to 56 flushes, in 11.4–26.9 s, and the other threads waited
+  19.8–35.0 s; less the index thread's flush time that is 7.5–9.1 s in
+  every one of them, against 62.0 s in h-small. The total moves with
+  where the flushes fall. The two runs of one binary with read-ahead
+  on differ by 11.1 s in the other threads' wait and by 10.5 s in the
+  index thread's flush time. So a difference in this total between two
+  runs is not by itself a difference between their builds.
+- **With read-ahead on the index thread waits more than two and a
+  half times as often**: 305,825 and 304,294 waits, for 53.1 s and
+  73.3 s, against 115,449 and 112,774, for 44.3 s and 38.9 s, in the
+  same binary with it off. The index thread's waiting holds the block
+  thread up only when its queue of 128 notifications is full, which
+  the read-ahead build counts in its shutdown line: 3.2 s and 3.3 s in
+  those two runs. Earlier builds, and a run with read-ahead off, have
+  no such count.
+
+The totals do not say what the index costs a sync on this code: no run
+with `--noexistsaddrindex` was made on 2026-10-12. The last is g-off,
+on `b4a5d2d`: 610.2 s against a median of 728.7 s. `other` is every
+thread not named `index`, so it bounds the block thread's wait from
+above and does not single it out. A wait that has not ended when a
+line is written is not in that line, and nothing a thread does while
+it holds the writer is in any of them.
+
+**The index batch.** 628.0 s against 673.8 s, 45.8 s or 6.8% less:
+487.7 s against 524.6 s up to the assume-valid block and 140.3 s
+against 149.2 s after it. The node's CPU time is 7.1 s lower and the
+other threads' wait for the writer 44.3 s lower, as above. The three
+were not measured apart.
+
+**The SigHashAll prefix hash.** 607.7 s against 628.0 s, 20.3 s or 3.2%
+less. Scripts run only after the assume-valid block, and that is where
+it shows: 486.1 s against 487.7 s up to it, and 121.6 s against 140.3 s
+for the 89,438 blocks after it, 735 blk/s against 638. The node's user
+CPU time fell from 1,298.6 s to 1,058.0 s, 240.6 s: after the
+assume-valid block an average of 4.7 of the node's 16 threads were
+busy where h-index had 5.7.
+
+**The download window.** Over loopback one default sync with it took
+612.4 s against 607.7 s for the code before it, 4.7 s or 0.8% more,
+with 7.8 s more user CPU time. That is one run against one run and
+does not settle whether the window costs anything over loopback: later
+that day two runs of one binary differed by 1.4 s, and two of the same
+binary under its other setting by 3.8 s.
+
+Through the relay of 2026-10-11, which holds every chunk for a fixed
+time in each direction and does not limit bandwidth, the binary of
+h-window ran for 300 s from the start of the process under dcrd's rule
+(`DCROXIDE_BLOCK_WINDOW=dcrd`) and at its default, at two round trips,
+one run an arm, as one step of the quiet queue:
+
+| run | started | window | one-way delay | round trip | run length | height reached | first block after | rate once blocks flow | blocks per round trip | node CPU time |
+|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| dl2-dcrdrule-50 | 08:40 | dcrd's rule | 25 ms | 50 ms | 300.9 s | 68,031 | 50.4 s | 262 blk/s over blocks 4,921–65,908 | 13.1 | 38 s |
+| dl2-budget-50 | 08:46 | default | 25 ms | 50 ms | 300.9 s | 532,079 | 50.5 s | 2,043 blk/s over blocks 41,560–530,087 | 102.2 | 217 s |
+| dl2-dcrdrule-150 | 08:51 | dcrd's rule | 75 ms | 150 ms | 300.9 s | 18,445 | 101.1 s | 91 blk/s over blocks 1,204–17,608 | 13.6 | 20 s |
+| dl2-budget-150 | 08:57 | default | 75 ms | 150 ms | 300.5 s | 158,440 | 100.2 s | 779 blk/s over blocks 9,956–151,894 | 116.9 | 71 s |
+
+- **Under dcrd's rule the binary repeats 2026-10-11**: 13.1 and 13.6
+  blocks per round trip at 50 and 150 ms, where `7d31abb` moved 13.0
+  and 13.6.
+- **The default window moved 102 and 117 blocks per round trip.** It
+  reached block 532,079 where dcrd's rule reached 68,031, and block
+  158,440 where dcrd's rule reached 18,445: 7.8 and 8.6 times the
+  height, at 7.8 and 8.6 times the rate once blocks flow.
+- **What set the pace at 50 ms was not established.** Over loopback
+  the same binary passed blocks 41,560–530,087 at 3,138 blk/s
+  (h-window) and blocks 9,956–151,894 at 3,719 blk/s, so through the
+  relay it ran at 65% of that pace at 50 ms and 21% at 150 ms. The
+  node used 217 s of CPU time in the 301 s at 50 ms. A relay run gives
+  the node four cores where a sync gives it eight, and with no delay
+  the relay passed 2,575 blk/s on 2026-10-11, of `7d31abb` and with a
+  build running at the time. Which of the window, the relay and the
+  node was the limit at 50 ms is not known.
+- **No arm logged a narrowed or widened window or a stalled peer.**
+  The first block arrived about 50 s and 100 s in, as on 2026-10-11:
+  the window does not touch the header sync.
+
+Against the public main network, five outbound-only starts of 300 s,
+each on a fresh data directory, between 06:05 and 06:32 with builds
+running on the machine. Under dcrd's rule the node was at block 24,455
+and at block 41,191 when stopped, 180.7 s and 220.3 s after its first
+block arrived: 135 and 187 blk/s. Under the default window it was at
+188,469 and at 93,095 after 215.7 s and 161.8 s, 874 and 575 blk/s,
+and a third start under the default fetched no block in its 300 s.
+None logged a narrowed window or a stalled peer. The peers and links
+were whatever the network offered each start, so these show the window
+working against real peers and are not figures to set against another
+day's. PARITY.md, *Block download window*, has the rule, these runs
+and the costs read from the code.
+
+**The block hand-off** was not measured alone. The next binary holds
+it together with the read-ahead code, and with read-ahead switched off
+it took 597.6 s and 599.0 s where h-window took 612.4 s, 14.8 s and
+13.4 s less. That is the hand-off and whatever else the read-ahead
+build changes with its reader thread off, not divided.
+
+**Read-ahead.** One binary, two runs with `DCROXIDE_READ_AHEAD=off`
+and two at the default, alternated, with the background-commit pair
+and the pool gate between the two pairs:
+
+| | read-ahead off | read-ahead on | less |
+|---|---:|---:|---:|
+| first pair, wall | 597.6 s | 494.6 s | 103.0 s, 17.2% |
+| second pair, wall | 599.0 s | 490.8 s | 108.2 s, 18.1% |
+| to block 1,026,597 | 472.7 s and 473.0 s | 386.3 s and 381.1 s | |
+| after it | 124.9 s and 126.0 s | 108.3 s and 109.7 s | |
+| node CPU time | 1,141.6 s and 1,139.3 s | 1,118.7 s and 1,118.2 s | 22.9 s and 21.1 s |
+| peak RSS | 3,273 and 3,256 MiB | 2,967 and 2,921 MiB | 306 and 335 MiB |
+
+The node's own line at shutdown (`shutdown_line`,
+`crates/dcroxide-node/src/readahead.rs:892`) in the two runs with
+read-ahead on:
+
+| | h-ra-on-1 | h-ra-on-2 |
+|---|---:|---:|
+| blocks the reader thread read | 1,116,034 (19,215,875,473 B) | 1,116,034 (19,215,875,473 B) |
+| checksum and decode, done off the block thread | 45.829 s | 45.886 s |
+| hashing, done off the block thread | 47.209 s | 47.246 s |
+| the reader waited for the block thread | 382.350 s | 378.719 s |
+| the block thread waited for the reader | 0.271 s | 0.273 s |
+| most items queued | 4 | 4 |
+| index queue full | 3.191 s | 3.265 s |
+
+- **The sync took 103.0 s and 108.2 s less, and the work the line
+  times is 93.0 s and 93.1 s.** The socket reads moved to the reader
+  thread too and are not timed. What else is in the 10.0 s and 15.1 s
+  between them was not established.
+- **The block thread still sets the pace over loopback.** It waited
+  0.27 s for the reader in a whole sync, and the reader waited 382 s
+  and 379 s for it, 77% of the run, with the queue at its bound of
+  four.
+- **The reader thread read all but the first block**: it is started
+  once the connection has had a block handled.
+- **Node CPU time and peak resident memory are both lower with it
+  on**, by 22.9 s and 21.1 s and by 306 and 335 MiB. Neither was
+  explained.
+
+These four runs are of the build before the review's fixes, which is
+not the code of any commit. Rebuilt from the patch saved with the
+binary, its tree differs from `b4ceb1c` in production code in two
+places. One is a condition in `Shared::waiting_since`
+(`crates/dcroxide-node/src/readahead.rs:387`): before it, a frame the
+reader began behind a block that was still queued took over the wait
+for that block and could time out early. The other is a private
+`hash_block` in `crates/dcroxide-blockchain/src/blockhashes.rs:308`,
+which the merkle-leaf pass now goes through so that unit-test builds
+can count its calls. The rest is tests, comments and documents.
+`b4ceb1c` itself has not been run in a sync.
+
+**A background commit, measured and not kept.** "Background commit
+(2026-08-16)" above built one on m1, measured it 9.5% slower and
+closed the question. One was built again on 2026-10-12, in another
+form and in a scratch tree outside the repository, as far as the stage
+that makes it measurable. By the experiment's own account: for a flush
+that a commit's own check trips, the committing thread captures the
+cache, syncs the block files and puts the overlay's and the index's
+rows into the storage engine's write transaction; the engine's commit
+then runs on a second thread, `dbcommit`, one at a time; and an
+explicit flush and the close still commit on the calling thread.
+`DCROXIDE_DB_SYNC_COMMIT=1` puts every commit back on the committing
+thread and is the control arm. It is a variable of the experiment's
+build; no build of the repository reads it. Two pairs, one binary each:
+the experiment on the code of `3a367e5`, and on the read-ahead build.
+No patch was kept of the tree either binary was built from. That the
+first holds the changes through `3a367e5` and not the download window
+is read from the binary, which holds a string of the SigHashAll change
+that the builds before it lack and none of the window's, and from its
+control arm's user CPU time: 1,054.5 s, where h-sighash used 1,058.0 s
+and h-index 1,298.6 s.
+
+| run | commits run on | wall | peak RSS | written at the volume | the engine's commits wrote | flushes committed on `dbcommit` | time the threads that trip flushes spent in them |
+|---|---|---:|---:|---:|---:|---:|---:|
+| h-bg-sync-1 | the committing thread | 607.9 s | 3,207 MiB | 53.3 GB | 20.7 GB | 0 of 55 | 107.2 s |
+| h-bg-on-1 | `dbcommit` | 579.6 s | 4,188 MiB | 59.9 GB | 23.3 GB | 50 of 54 | 50.7 s |
+| h-rabg-sync-1 | the committing thread | 498.5 s | 3,025 MiB | 53.3 GB | 20.6 GB | 0 of 55 | 107.9 s |
+| h-rabg-on-1 | `dbcommit` | 468.0 s | 3,773 MiB | 58.2 GB | 24.8 GB | 51 of 54 | 48.9 s |
+
+- **It gained 28.3 s or 4.7% on `3a367e5` and 30.5 s or 6.1% on the
+  read-ahead build**, one run against one run each. Nearly all of it
+  is before the assume-valid block: 26.2 s and 26.3 s of it.
+- **The control arms, against the code each was built on.**
+  h-bg-sync-1 took 607.9 s where h-sighash took 607.7 s.
+  h-rabg-sync-1 took 498.5 s where the read-ahead build took 494.6 s
+  and 490.8 s, 3.9 s and 7.7 s more. It is the one run of the four
+  with no idle before it, and the difference was not examined.
+- **The threads whose commits trip flushes spent 50.7 s and 48.9 s in
+  them**, the wait for the commit before included, where the control
+  arms' flushes took 107.2 s and 107.9 s. About half of the 57 s and
+  59 s between them came out as wall time.
+- **It cost 981 and 748 MiB of peak resident memory**, 32.3 s and
+  29.6 s more node CPU time, and more writing: the engine's commits
+  wrote 23.3 GB and 24.8 GB against 20.7 GB and 20.6 GB, 13 and 16 of
+  them over 512 MiB against 4 and 2, and 1.7 GB more went to write
+  calls in each pair. What holds the memory and why more is written
+  were not established.
+- **The flushes are a smaller part of the wall time than in
+  2026-08.** On m1 they filled 68–71% of it and one commit followed
+  another. In these two control arms they are 17.6% and 21.7%.
+
+It is not in the repository. The stage after the measurement was not
+built: the sweeps of unclean stops with a commit in the background,
+the rest of its tests and its mutation tests. The memory was not
+explained. And two decisions were not taken: whether it would be the
+default, and how ADR-0009's rule for a durable write that fails would
+read when the failure reaches the next write, flush or close and not
+the commit that tripped the flush.
+
+**A persistent validation pool: the gate.** "Script validation fan-out
+(2026-08-14)" above has asked for this arm to be measured. On
+2026-10-12 it was put through a replay benchmark that is not in the
+repository, and what follows is that benchmark's result and not a
+sync's. The benchmark replays every 20th of the 89,438 blocks after
+the assume-valid block, 4,472 of them, as the two script batches a
+block makes, the stake tree's and the regular tree's, with the item
+counts of the chain's blocks: 456,672 items. The items are signed
+pay-to-pubkey-hash inputs made for the benchmark and checked through
+the script engine with a warm signature cache. The benchmark links
+the script engine of `b212a0a` with the SigHashAll change, the same
+five crates as `3a367e5` (`dcroxide-txscript`, `-wire`, `-chainhash`,
+`-dcrec` and `-crypto`), and none of the node's block-connect code,
+for which it has stand-ins of its own. A fixed amount of hashing stands
+in for the rest of a block's work: 0.2 ms after the stake batch and
+0.45, 0.65 or 0.9 ms after the regular one. Five arms, three cycles a
+setting, on the node's 16 threads, as a step of the quiet queue:
+
+- **A**, today's rule: a batch under 16 items on the calling thread,
+  a larger one on scoped threads made for the call
+  (`MIN_PARALLEL_ITEMS`,
+  `crates/dcroxide-blockchain/src/validate.rs:5232`).
+- **B**, the same with fewer threads made: none once every item is
+  claimed, and the caller works too.
+- **C4, C8 and C16**, a pool of 15 threads that outlive the call, for
+  batches of at least 4, 8 and 16 items.
+
+| gap after the regular batch | A, the whole replay | B saves | C4 saves | C8 saves | C16 saves |
+|---|---:|---:|---:|---:|---:|
+| 0.45 ms | 5.747 s | 1.4 s | 19.8 s | 11.3 s | 4.9 s |
+| 0.65 ms | 6.695 s | 1.5 s | 20.2 s | 11.3 s | 4.5 s |
+| 0.9 ms | 7.857 s | 1.0 s | 19.8 s | 10.6 s | 4.1 s |
+
+A saving is A's replay time less the arm's, times 20 for the blocks
+left out, at the median of the three cycles. So it is an estimate of
+seconds saved over the validated part of a sync, made from a replay.
+The gate's rule was to go ahead at 9 s or more at every gap setting,
+and the pool for batches of four or more met it at all three. What
+C4 does and C16 does not is hand batches of 4 to 15 items to the pool,
+which today's rule checks on the calling thread: 3,454 of the 4,472
+stake batches replayed are of that size, and 744 of the regular ones.
+No batch failed in any cycle. The serial cost of an item measured
+28.3 µs, just outside the 19–28 µs the benchmark took as its sanity
+range.
+
+The pool was then built with that threshold and reviewed, in a scratch
+tree outside the repository. It is not in the repository, and no sync
+of it has been run, so no part of the saving above has been seen in a
+sync.
+
+**Coalescing the storage engine's page writes: designed, not built.**
+A storage backend that holds a commit's page writes and issues
+adjacent ones as one write before the sync was designed and reviewed
+on paper. Nothing was built and nothing measured. The design's
+estimate for a default sync on m3 is about no gain, between 9 s lost
+and 10 s gained, for 0.4–0.6 GiB more resident memory, and its
+recommendation is not to build it. Its main reason is read from the
+runs of 2026-10-11 with and without copy-on-write: over matched
+flushes the copy-on-write premium grows through a sync at an unchanged
+size of write call, so the design takes it to be unlikely to be a cost
+per call that fewer, larger calls would remove; what the premium is
+paid for was not identified. That is an estimate from those records.
+
+**What was not measured.**
+
+- dcrd, on 2026-10-12. Its last runs are 2,883.9 s in one run on the
+  evening of 2026-10-11 and a median of 2,863.9 s over four runs of
+  2026-10-09 and 2026-10-10, on the same machine and harness. Set
+  against them, across sessions, the 612.4 s of `540b203` is 4.71x and
+  4.68x, and the 494.6 s and 490.8 s of the read-ahead build are 5.83x
+  and 5.88x, and 5.79x and 5.84x.
+- The code of `b4ceb1c` as committed, in any sync.
+- `5cf9e04` alone, and the changes within the small batch and within
+  the index batch one at a time.
+- Any of the eleven with `--noexistsaddrindex`, so not what the index
+  costs a sync now; with `--assumevalid=0` or the tuning levers; on
+  another filesystem, on m1 or m2, or on fewer cores than the eight
+  the node had. Only the code of `b4a5d2d` ran without copy-on-write.
+- A whole sync over a delayed or a real link, with either window or
+  with read-ahead; a link held to a set rate; a narrowing or a
+  widening of the window in a run of the daemon.
+- A replay that validates every block. The syncs run scripts over the
+  89,438 blocks after the assume-valid block, so in these runs the
+  SigHashAll path ran over those blocks and not over the ones before
+  them.
+- A profile of any of this code.
+- The validation pool in a sync, and the background commit in more
+  than the two pairs above.
+
+Raw: the comparison's `runs.jsonl` rows labelled `h-nocow`, `h-base`,
+`h-small`, `h-index`, `h-sighash`, `h-window`, `h-ra-off-1`,
+`h-ra-on-1`, `h-bg-sync-1`, `h-bg-on-1`, `h-ra-off-2`, `h-ra-on-2`,
+`h-rabg-sync-1` and `h-rabg-on-1`, with per-run samples, flush logs
+and node logs as above; `delay.jsonl` rows `dl2-dcrdrule-50`,
+`dl2-budget-50`, `dl2-dcrdrule-150` and `dl2-budget-150`, and
+`mainnet.jsonl`, with the scripts that drove them; `pool-gate.jsonl`
+with the replay benchmark's source; the patches of the measured trees
+and of the two experiments; and the designs of the pool, the
+background commit and the coalesced writes.

@@ -626,3 +626,178 @@ The line numbers cited in the text above are those of the commit this
 ADR was accepted at. The change of 2026-10-11 moved the cited lines of
 `dcroxide-database`'s `lib.rs` and `dbcache.rs` down by four to six and
 those of `policy.rs` by three; the functions they name are unchanged.
+
+## Addendum, 2026-10-12 — a queued connect is prepared before it takes the writer
+
+Since 2026-10-12 the index does the part of a queued connect that needs
+no transaction before the update's write transaction begins. A connect
+that the daemon's index thread delivers comes with the copy of the
+mempool overlay made when it was queued (the first addendum of
+2026-10-11; `crates/dcroxide-node/src/indexes.rs:303`). For such a
+connect the subscriber takes the index's mutex, has the index extract
+the block's addresses, add the copied keys, hash each key to its
+partition, filter the keys against the memtable, sort them and hash the
+header (`Indexer::prepare_notification`, called at
+`crates/dcroxide-indexers/src/subscriber.rs:294`), and only then begins
+the write transaction (`:295`), which is where the writer semaphore is
+claimed. dcrd does all of it inside the notification's `dbTx`
+(`existsaddrindex.go:383-444`, `:451-456`), and until this change so
+did the port. The bucket check, the tip row and the `on_commit` hook
+stay in the transaction. Every other connect has no copy to bring
+(catch-up, inline delivery, a direct call): it takes the overlay as it
+stands once it has the writer and filters inside its transaction, as
+before. A disconnect only moves the tip. What was prepared goes back to
+the index through `Indexer::process_prepared_notification`
+(`crates/dcroxide-indexers/src/common.rs:149`) and is used only for the
+connect of the very block it was made for, the same allocation
+(`existsaddrindex.rs:793`). Handed to any other notification it is
+dropped whole, and the work is done inside the transaction.
+
+Decision part 2's sentence on a connect ("copies the mempool overlay,
+filters its candidates against the memtable without a store read, puts
+the tip row as today, and registers an `on_commit` hook") still lists
+what a connect does. What moved for a queued connect is its first
+filter, which is now made under the index's mutex and without the
+writer, and that filter is advisory. Nothing enters the memtable before
+the commit hook, and the hook checks each key again under its
+partition's write lock (`Memtable::insert_candidates`,
+`existsaddr/memtable.rs:174`), which is what keeps a partition's
+vectors disjoint. A transaction that fails, or one that never begins,
+therefore leaves nothing in the index to undo, and the copied keys are
+still in the overlay for the next connect. The two database hooks and
+their contract are untouched: the hand-over still runs between the
+commit's own flush and the publication of the tip row, the participant
+still contributes inside the flush under the writer, and the lock order
+is still the index's mutex and then the writer.
+
+The filter made before the transaction is still good when the hook runs
+because of where keys enter and leave the memtable (the comment on
+`prepare_connect`, `existsaddrindex.rs:746`, carries the argument).
+They enter it only in this index's commit hooks and in the load when
+the index is opened. A hook exists only for a transaction that this
+index's connect ran in, which needs the index's mutex, and it runs
+under the writer; the subscriber holds the mutex from before the
+prepare until the connect has returned, and the writer from its `begin`
+until its own hook has run. They leave it only when a committed flush
+clears the partitions it merged, whose keys are by then in the runs
+that commit wrote, and when the index is reloaded or dropped, which
+needs the mutex. So a key the filter left out as held is, at the hook,
+still held or in a run, and a key it kept is inserted unless the hook
+finds it held. A caller outside the subscriber could commit a connect
+of its own between a prepare and its hook, and the hook's check skips
+what that added.
+
+One thing differs, and it depends on timing. When another thread's
+commit flushes between the filter and the transaction, a key of a
+partition that flush merged has been left out by the filter, as held. A
+filter made inside the transaction finds the partition empty and hands
+the key over again, a duplicate of its run's key for a later merge to
+drop. So the memtable and the journal can hold one duplicate fewer than
+before; the set of keys the index holds, and every answer, are the
+same. A flush on another thread is the ordinary case and not a rare
+interleaving: in the 628.0 s sync below, by the flush log's `thread`,
+43 of the 56 flushes ran on the thread that connects blocks and 13 on
+the index thread. How many keys the difference kept out of that sync's
+journal was not counted.
+
+The index's keys are compared inline since the same day. The memtable's
+lookups, merges and per-partition sort, the journal's batch sort, the
+union of runs in a merge and the order check on a decoded row use
+`cmp_keys` (`crates/dcroxide-indexers/src/existsaddr/mod.rs:60`), which
+reads a key as three big-endian words, the third overlapping the second
+by three bytes, and compares them in place. That is the order of the
+keys' bytes, which the array type's own comparison gave through a call
+to the C library's `memcmp` at every step of a search or a merge. The
+order is part of the on-disk format, and the format and every answer
+are unchanged. The connect's sort of its candidates, the load's sort at
+a restart and a lookup's search of a chunk still use the array type's
+comparison, in the same order. So "Hooks and `contribute` run under the
+writer semaphore" stands as written, with a cheaper comparison inside
+both.
+
+On m3 on 2026-10-12, on a quiet machine, the two changes were measured
+together with a third that is not the index's, one lookup of each
+ticket bucket per best-node write in the stake database, and not one at
+a time ([bench-ledger.md](../bench-ledger.md), "Eleven changes, a
+background commit not kept and a pool gate"). One
+default sync to block 1,116,035 took 628.0 s on the tree of `6271436`,
+which holds the three, where the run before it, on the tree of
+`a83f9a1`, took 673.8 s: 45.8 s or 6.8% less, one run each. `a83f9a1`
+had added a timer on the writer semaphore to the flush log
+(`writer_wait`, [operating.md](../operating.md)), which answers what
+the first addendum of 2026-10-11 left unmeasured, how long the two
+threads wait for each other. From the opening of the database to its
+last flush, the threads other than the index thread waited 74.9 s for
+the writer in the 673.8 s sync, in 401,906 waits, and the index thread
+0.02 s in 295. In the 628.0 s sync the others waited 30.7 s in 166,810
+waits and the index thread 30.4 s in 97,538. The participant's
+`contribute` took 12.3 s over 54 flushes where it had taken 15.2 s over
+53, node CPU time was 1,393.8 s against 1,400.9 s, and peak resident
+memory 3,224 MiB against 3,299 MiB.
+
+Those figures do not separate the three changes. No sync ran with the
+prepare alone, the comparison alone or the bucket lookups alone, so
+what each is worth is not known, and neither is how the 44.3 s by which
+the other threads' wait fell divides between them. `other` is every
+thread but the one named `index`, the close and any RPC that writes
+among them, so it bounds from above what the thread that connects
+blocks waited. It is one run against one run on one machine, over
+loopback. No sync of that day ran with the index off, so the index's
+share of a sync (16% on 2026-10-11) and of its peak memory are not
+known for the code as it stands; the fallback's flush-time test was not
+run again, and none of the plan's criteria is judged again.
+
+The tests are in `crates/dcroxide-indexers/src/existsaddr/tests.rs`. A
+queued connect is prepared while another transaction holds the writer
+(`a_queued_connect_is_prepared_before_the_subscriber_claims_the_writer`),
+no other thread finds the index's mutex free between a prepare and its
+connect (`the_index_lock_is_held_from_a_prepare_until_its_connect`), a
+connect without a copy takes the overlay only once it has the writer
+(`a_connect_with_no_copy_takes_the_overlay_once_it_has_the_writer`), a
+prepared connect leaves the index as one inside its transaction does
+(`a_prepared_connect_leaves_the_index_as_a_connect_inside_its_transaction_does`),
+a flush placed between the prepare and the transaction of every
+connect loses no key
+(`a_flush_between_a_prepare_and_its_transaction_loses_no_key`), what
+was prepared for one connect is dropped when it is handed to the
+connect of another block or to a disconnect, as is a result that is not
+this index's
+(`what_was_prepared_for_one_connect_is_not_used_for_another_notification`),
+an update that fails after the prepare, by a rollback, a failed commit
+or a transaction that never begins, leaves the index as it was
+(`an_update_that_fails_after_the_prepare_leaves_the_index_as_it_was`),
+and a connect delivered again after its update rolled back is done
+afresh inside its transaction
+(`a_connect_delivered_again_after_its_update_rolled_back_starts_afresh`).
+The first addendum of 2026-10-11 says the index's `PowerLossBackend`
+sweeps call the subscriber directly and so do not exercise the queued
+path.
+They now run a second time with every connect delivered with its copy
+and prepared before its transaction
+(`a_power_cut_at_every_storage_operation_of_prepared_connects_keeps_index_and_tip_together`
+and its random companion), from the test's own thread and not through
+the daemon's queue. The comparison is held to the byte order by
+`the_inline_key_comparison_is_the_byte_order` and
+`every_place_that_compares_keys_keeps_the_byte_order`.
+
+The line numbers cited above this addendum stay those of the commit
+the ADR was accepted at, and the commits of 2026-10-12 moved more of
+them. In `existsaddrindex.rs` the version refusal's `:472` is at
+`:489`, the lookup's `:212` and `:250` at `:229` and `:267`, the load
+and registration's `:498` and `:522` at `:515` and `:539`, the drops'
+`:853` and `:897` at `:999` and `:1043`, and the journal load's `:457`
+at `:474`. The connect row's `:630` and `:755` named one function that
+is now several: the address extraction is at `:630`, the candidates and
+their filter at `:697`, `prepare_connect` at `:746`, `connect_block` at
+`:786`, and the hook at `:841`, registered at `:862`. In
+`existsaddr/store.rs`, `:205`, `:213`, `:324` and `:367` are at `:211`,
+`:219`, `:330` and `:373`. In `dcroxide-database`, the wait timer moved
+the cited lines of `lib.rs` from `:320` on: `:320` is at `:359`,
+`:662`, `:674` and `:704` at `:784`, `:796` and `:829`, `:1674-1698` at
+`:1782-1806`, `:1738` at `:1846` and `:1802` at `:1910`; and those of
+`dbcache.rs` by four more, nine in all (`:749`, `:784`, `:820`, `:845`
+and `:896` are at `:758`, `:793`, `:829`, `:854` and `:905`). The cited
+lines of `lib.rs` before `:320`, of `transaction.rs`, `participant.rs`
+and `dcroxide.rs`, and of `policy.rs` since 2026-10-11, did not move.
+The functions named are unchanged but for the connect, divided as
+above.

@@ -1700,3 +1700,81 @@ exists-address index off, where the index-off sync of `c128a93` peaked
 at 1,996 MiB on 2026-10-10. So nearly all of it appears to come with the
 index, though the code before the change was not run with the index off.
 What in the index's path holds it was not established.
+
+## Addendum, 2026-10-12 — the filesystem's share on the code of `b4a5d2d`, and a background commit measured and not adopted
+
+Two questions the addenda above leave standing were measured on m3 on
+2026-10-12, in the harness of the 2026-10-11 runs: each run a sync to
+block 1,116,035 from the dcrd v2.1.6 server over loopback, at the
+defaults but for what is named below, which exited on the server's tip
+and was not marked disturbed ([bench-ledger.md](../bench-ledger.md),
+"Eleven changes, a background commit not kept and a pool gate").
+Neither changes what this ADR decided.
+
+**The filesystem's share.** The first addendum of 2026-10-10 records
+that m3's volume is btrfs with zstd compression over an encrypted
+mapping, and leaves open what that stack costs. One part of it was
+measured on 2026-10-11: the code before that day's change to commits,
+`7d31abb`, took 736.8 s on a data directory created without
+copy-on-write, which also turns off the filesystem's checksums and
+compression there, against 775.6 s on one created as usual, 5.0% less
+([ADR-0009](0009-storage-shape.md), addendum of that date). The code
+with the change, `b4a5d2d`, was run the same way on 2026-10-12, one run
+each: 714.1 s without copy-on-write against 728.5 s, 14.4 s or 2.0%
+less. Its 55 flushes took 97.1 s against 107.4 s for 54, the commit
+phase alone 51.8 s against 62.5 s; the node's system time was 86.8 s
+against 97.3 s; and 41.6 GB reached the volume against 53.2 GB, for
+40.1 GB and 39.7 GB passed to write calls. So with 54 commits a sync,
+10.3 s of the 107.4 s of flush time on m3, 9.6%, is what the attribute
+turns off on this volume, where with 133 it was 33.8 s of 177.8 s,
+19.0%. That is one run against one run, and it measures this stack.
+The encrypted mapping was under both directories, so its share is in
+neither difference; no other filesystem was run; and none of the code
+after `b4a5d2d` was run without copy-on-write.
+
+**A background commit.** The correction of 2026-08-16 in the second
+addendum of 2026-08-15 says a background committer relocates the CPU
+half of a flush rather than removing it, and the committer built on m1
+that day was 9.5% slower and was reverted (ADR-0009; the ledger's
+"Background commit (2026-08-16)"). Flushes then occupied 68–71% of a
+sync, so commits ran nearly back to back. On m3 on 2026-10-12 they
+were 15% of a sync of `b4a5d2d` and 21% of one of the read-ahead build
+before its review's fixes (17.6% and 21.7% in the two control arms
+below), and the question was put again in a reduced form. A flush that a
+transaction's commit trips is captured on the committing thread, which
+syncs the block files and puts the rows into redb's write transaction;
+the redb commit then runs on a second thread, one at a time, while
+`Database::flush` and the close still commit on the calling thread. A
+failed commit latches the store and is reported by the next write,
+flush or close. It was built in a scratch tree, only as far as the
+stage of its design at which it can be measured, and is not in the
+repository. One binary a pair, the control arm committing on the
+calling thread through a switch, one sync each:
+
+| built on | commit on the calling thread | commit on the second thread | gain | peak resident memory |
+|---|---:|---:|---:|---:|
+| a build holding the changes through `3a367e5` | 607.9 s | 579.6 s | 28.3 s, 4.7% | 3,207 MiB and 4,188 MiB, 981 more |
+| the read-ahead build of 2026-10-12, before its review's fixes | 498.5 s | 468.0 s | 30.5 s, 6.1% | 3,025 MiB and 3,773 MiB, 748 more |
+
+The control arm on the read-ahead build took 3.9 s and 7.7 s longer
+than that build's own two default runs (494.6 s and 490.8 s) and was
+the one run of the four with no idle before it. The difference was not
+examined, so the 30.5 s may overstate the gain: against those two runs
+the 468.0 s is 26.6 s and 22.8 s less. No patch of the tree either
+binary was built from was kept; that the first holds the changes
+through `3a367e5` and not the download window is read from the binary's
+strings and its control arm's CPU time (the ledger has both).
+
+With the second thread, 50 and 51 of the 54 flushes of each sync
+committed on it. The time a flush held the writer or waited for the
+commit before it fell from 107.2 s to 50.7 s and from 107.9 s to
+48.9 s, and 59.9 GB and 58.2 GB reached the volume where 53.3 GB did in
+each control. It was not adopted. The power-cut sweeps and the mutants
+its design calls for are not built, so its durable-prefix and latch
+properties rest on reading and on single cases; the added memory is not
+explained; and two decisions it needs are the project owner's, whether
+it would be the daemon's default and the rewording of ADR-0009's
+fail-closed condition that a failure reported after the tripping commit
+has returned requires. So the result of 2026-08-16 stands as m1's of
+that date and is no longer the only measurement of the idea, and
+nothing in the tree commits off the committing thread.

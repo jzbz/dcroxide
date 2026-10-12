@@ -169,6 +169,24 @@ evaluating this code.
   failing then latches the database fatal: the node keeps running and
   answering RPC, but stops connecting blocks until it is restarted.
   Details are in PARITY.md's open gaps.
+- **The sync peer's connection is read ahead of its block handler.**
+  During the initial sync a thread of its own reads the sync peer's
+  connection up to four frames ahead of the thread that handles that
+  peer's blocks. dcrd holds further receives back until a block is
+  known good or bad, so that a malicious peer cannot queue up bad
+  blocks and waste memory (`server.go:1365-1369`). Here up to four
+  frames from the sync peer are checksummed, decoded and, for blocks,
+  hashed before the frame ahead of them has been judged, and they are
+  held decoded until their turn. None is acted on early: each is
+  handled in the order it arrived by the code that handled it before,
+  and nothing queued is handled once the connection is being torn
+  down. So what a hostile sync peer gains is the work and the memory:
+  at worst about 57 MB held on that connection against about 12.5 MB
+  without the read-ahead, an estimate from struct layouts and not a
+  measurement. It also costs one more thread and one more descriptor
+  on that connection. `DCROXIDE_READ_AHEAD=off` removes it: every
+  connection is then read as dcrd reads. Details are in PARITY.md,
+  *Reading ahead of the block handler*.
 - **Fuzzing reaches the stateless parsers, not the state machines.**
   Seventeen `cargo-fuzz` targets run for 60 seconds apiece on every push
   to `master` and every pull request, and for ten minutes apiece
