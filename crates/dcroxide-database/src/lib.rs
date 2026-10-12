@@ -50,7 +50,7 @@ mod transaction;
 
 use std::path::{Path, PathBuf};
 use std::sync::Condvar;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use blockfile::{BlockStore, deserialize_write_row, serialize_write_row};
@@ -249,7 +249,39 @@ impl DbInner {
             cache: Mutex::new(cache),
             writer_cv: Condvar::new(),
             writer_busy: Mutex::new(false),
+            writer_waits_index: WaitTotal::default(),
+            writer_waits_other: WaitTotal::default(),
             participant: Mutex::new(None),
+        }
+    }
+
+    /// Take the writer semaphore, waiting out whoever holds it.
+    ///
+    /// A caller that finds it held is timed until it holds it, and the
+    /// wait is added to the total for its kind of thread
+    /// ([`WriterWaits`]).  One that finds it free reads no clock.
+    fn acquire_writer(&self) {
+        let mut busy = self.writer_busy.lock().expect("writer flag poisoned");
+        if *busy {
+            let started = std::time::Instant::now();
+            while *busy {
+                busy = self.writer_cv.wait(busy).expect("writer flag poisoned");
+            }
+            let total = if std::thread::current().name() == Some(INDEX_THREAD_NAME) {
+                &self.writer_waits_index
+            } else {
+                &self.writer_waits_other
+            };
+            total.add(started.elapsed());
+        }
+        *busy = true;
+    }
+
+    /// The waits for the writer semaphore so far.
+    fn writer_waits(&self) -> WriterWaits {
+        WriterWaits {
+            index: self.writer_waits_index.get(),
+            other: self.writer_waits_other.get(),
         }
     }
 
@@ -307,6 +339,13 @@ pub(crate) struct DbInner {
     /// writes only reach it at flush time.
     pub(crate) writer_cv: Condvar,
     pub(crate) writer_busy: Mutex<bool>,
+    /// What the thread named [`INDEX_THREAD_NAME`], and every other
+    /// thread, has spent waiting for the writer semaphore
+    /// ([`WriterWaits`]).  Added to only by a thread that is taking the
+    /// semaphore and read by a flush, which holds it, so a flush reads
+    /// counts and times that belong together.
+    writer_waits_index: WaitTotal,
+    writer_waits_other: WaitTotal,
     /// The flush participant, if one is registered ([`FlushParticipant`]).
     ///
     /// A **strong** reference: the daemon drops its index handles before
@@ -318,6 +357,74 @@ pub(crate) struct DbInner {
     /// flush, which runs under the semaphore, sees one value throughout.
     /// The lock is a leaf: nothing else is locked while it is held.
     participant: Mutex<Option<participant::Registration>>,
+}
+
+/// The name of the thread whose waits for the writer semaphore are
+/// totalled apart from every other thread's ([`WriterWaits`]): the
+/// daemon's index thread, which holds the semaphore for each block's
+/// index update while the thread connecting blocks wants it for the
+/// next block.
+pub const INDEX_THREAD_NAME: &str = "index";
+
+/// The running total of one kind of thread's waits for the writer
+/// semaphore.
+#[derive(Default)]
+struct WaitTotal {
+    count: AtomicU64,
+    nanos: AtomicU64,
+}
+
+impl WaitTotal {
+    fn add(&self, waited: std::time::Duration) {
+        let nanos = u64::try_from(waited.as_nanos()).unwrap_or(u64::MAX);
+        self.count.fetch_add(1, Ordering::Relaxed);
+        self.nanos.fetch_add(nanos, Ordering::Relaxed);
+    }
+
+    fn get(&self) -> WriterWait {
+        WriterWait {
+            count: self.count.load(Ordering::Relaxed),
+            nanos: self.nanos.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// What one kind of thread has spent waiting for the writer semaphore.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct WriterWait {
+    /// How many times a thread of this kind found the semaphore held.
+    pub count: u64,
+    /// The time those waits took in all, in nanoseconds.
+    pub nanos: u64,
+}
+
+/// The waits for the writer semaphore since the database was opened, in
+/// a [`FlushObservation`].
+///
+/// The semaphore serializes writable transactions, flushes and the
+/// close (dcrd's `writeLock`).  A caller that finds it held is timed
+/// from then until it holds it; one that finds it free is neither timed
+/// nor counted.  The waits are totalled for two kinds of thread, the
+/// one named [`INDEX_THREAD_NAME`] and every other, because the time one
+/// of them spends waiting is time the other spent holding: the totals
+/// say how much of each thread's time went to the other's transactions
+/// and flushes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct WriterWaits {
+    /// The waits of the thread named [`INDEX_THREAD_NAME`].
+    pub index: WriterWait,
+    /// The waits of every other thread.
+    pub other: WriterWait,
+}
+
+impl WriterWaits {
+    /// Render as one JSON object.
+    pub fn to_json(&self) -> String {
+        format!(
+            "{{\"index\":{{\"count\":{},\"ns\":{}}},\"other\":{{\"count\":{},\"ns\":{}}}}}",
+            self.index.count, self.index.nanos, self.other.count, self.other.nanos,
+        )
+    }
 }
 
 /// What one metadata flush did, handed to an [`Options::flush_observer`].
@@ -385,6 +492,15 @@ pub struct FlushObservation {
     /// there and this set.  Such a flush commits like any other and takes
     /// the next [`Self::sequence`].
     pub participant: Option<ParticipantStats>,
+    /// The waits for the writer semaphore from the opening of the
+    /// database to this flush, the flushing thread's own wait for it
+    /// included.  Running totals, so the difference between two
+    /// observations is what was waited between the two flushes.
+    ///
+    /// The observer is called on the thread that ran the flush, so
+    /// `std::thread::current()` there says which of the two kinds of
+    /// thread held the semaphore for [`Self::elapsed`].
+    pub writer_waits: WriterWaits,
 }
 
 /// One phase of a metadata flush, in a [`FlushObservation`].
@@ -678,13 +794,16 @@ pub(crate) fn flush_locked(inner: &DbInner, only_if_needed: bool) -> Result<(), 
         && registered
             .as_ref()
             .is_some_and(|r| r.participant.wants_flush());
-    let batch = {
+    let mut batch = {
         let mut cache = inner.cache.lock().expect("cache lock poisoned");
         if only_if_needed && !cache.needs_flush() && !wanted {
             return Ok(());
         }
         cache.begin_flush()
     };
+    // Final for this flush already: a wait ends when the semaphore is
+    // taken, and the caller holds it until the flush is over.
+    batch.writer_waits = inner.writer_waits();
     let mut contributed = false;
     let (outcome, failure) = match crate::dbcache::DbCache::run_flush(
         &batch,
@@ -1524,16 +1643,7 @@ impl Database {
             inner.writer_cv.notify_one();
         };
         if writable {
-            let mut busy = self.inner.writer_busy.lock().expect("writer flag poisoned");
-            while *busy {
-                busy = self
-                    .inner
-                    .writer_cv
-                    .wait(busy)
-                    .expect("writer flag poisoned");
-            }
-            *busy = true;
-            drop(busy);
+            self.inner.acquire_writer();
             // The database may have closed while this writer waited
             // (dcrd re-checks `closed` after taking its write lock).
             if self.inner.closed.load(Ordering::SeqCst) {
@@ -1608,15 +1718,7 @@ impl Database {
     /// changes nor frees, so nothing it sees depends on the wait; a
     /// long-lived reader just does not hold up a flush or a close.
     fn exclusive_writer(&self) -> WriterGuard<'_> {
-        let mut busy = self.inner.writer_busy.lock().expect("writer flag poisoned");
-        while *busy {
-            busy = self
-                .inner
-                .writer_cv
-                .wait(busy)
-                .expect("writer flag poisoned");
-        }
-        *busy = true;
+        self.inner.acquire_writer();
         WriterGuard { db: &self.inner }
     }
 

@@ -1083,6 +1083,47 @@ mod daemon {
             .sum()
     }
 
+    /// What a line of the metadata flush log ends with: the name of the
+    /// thread that ran the flush, if it has one, and the waits for the
+    /// database's writer so far as the index thread's count and
+    /// nanoseconds, then every other thread's.
+    fn flush_log_tail(line: &str) -> (Option<&str>, [u64; 4]) {
+        fn field<'a>(text: &'a str, key: &str) -> (&'a str, &'a str) {
+            text.split_once(key)
+                .unwrap_or_else(|| panic!("no {key} in {text}"))
+        }
+        let (_, tail) = field(line, r#","thread":"#);
+        let (thread, waits) = field(tail, r#","writer_wait":{"index":{"count":"#);
+        let thread = match thread {
+            "null" => None,
+            quoted => Some(
+                quoted
+                    .strip_prefix('"')
+                    .and_then(|name| name.strip_suffix('"'))
+                    .unwrap_or_else(|| panic!("an unquoted thread name in {line}")),
+            ),
+        };
+        let (index_count, waits) = field(waits, r#","ns":"#);
+        let (index_ns, waits) = field(waits, r#"},"other":{"count":"#);
+        let (other_count, waits) = field(waits, r#","ns":"#);
+        let other_ns = waits
+            .strip_suffix("}}}")
+            .unwrap_or_else(|| panic!("the waits do not end {line}"));
+        let number = |text: &str| -> u64 {
+            text.parse()
+                .unwrap_or_else(|_| panic!("{text} is not a count in {line}"))
+        };
+        (
+            thread,
+            [
+                number(index_count),
+                number(index_ns),
+                number(other_count),
+                number(other_ns),
+            ],
+        )
+    }
+
     /// The daemon's own wiring: both indexes follow the chain while the
     /// node runs, with no restart to catch them up.
     ///
@@ -1103,6 +1144,10 @@ mod daemon {
     /// have blocked more often after the blocks than before them, which
     /// a thread left asleep by a handler that delivers on the draining
     /// thread would not have.
+    ///
+    /// The daemon is also asked for its metadata flush log
+    /// (`DCROXIDE_DB_FLUSHLOG`), which must come out with a line for
+    /// every flush.
     #[test]
     fn the_daemon_index_follows_the_chain_without_a_restart() {
         const BLOCKS: usize = 8;
@@ -1114,6 +1159,7 @@ mod daemon {
         .expect("mining address")
         .encode();
         let appdata = tempfile::tempdir().expect("appdata");
+        let flush_log = appdata.path().join("flushes.jsonl");
         let mut child = Command::new(env!("CARGO_BIN_EXE_dcroxide"))
             .arg("--simnet")
             .arg(format!("--appdata={}", appdata.path().display()))
@@ -1131,6 +1177,7 @@ mod daemon {
             ])
             .arg(format!("--miningaddr={mining_addr}"))
             .env_remove("DCRD_APPDATA")
+            .env("DCROXIDE_DB_FLUSHLOG", &flush_log)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -1237,5 +1284,32 @@ mod daemon {
             .filter(|line| line.contains("[ERR] INDX: ") && !line.contains("interrupt requested"))
             .collect();
         assert!(index_errors.is_empty(), "{index_errors:?} in: {output}");
+
+        // The flush log has a line for each flush in order, ending in
+        // the thread that ran it and the running totals of the waits
+        // for the database's writer.
+        let flushes = std::fs::read_to_string(&flush_log).expect("the flush log");
+        assert!(flushes.ends_with("}\n"), "whole lines: {flushes:?}");
+        let mut totals = [0u64; 4];
+        for (i, line) in flushes.lines().enumerate() {
+            assert!(
+                line.starts_with(&format!(r#"{{"seq":{},"end":"#, i + 1)),
+                "flush {}: {line}",
+                i + 1
+            );
+            let (thread, waits) = flush_log_tail(line);
+            if let Some(name) = thread {
+                // A name that reads the same quoted as JSON.
+                assert!(
+                    !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'),
+                    "the thread of flush {}: {line}",
+                    i + 1
+                );
+            }
+            for (now, before) in waits.iter().zip(totals) {
+                assert!(*now >= before, "a total ran backwards: {flushes}");
+            }
+            totals = waits;
+        }
     }
 }

@@ -105,6 +105,9 @@ pub(crate) struct FlushBatch {
     /// counters of [`crate::FlushPhase`] are read for.
     observed: bool,
     started: Instant,
+    /// The waits for the writer semaphore as of this flush, for the
+    /// observer; set by the flush's caller, which holds the semaphore.
+    pub(crate) writer_waits: crate::WriterWaits,
 }
 
 /// What a completed commit reports back for the observer.
@@ -707,6 +710,7 @@ impl DbCache {
             take_stats: take_stats && self.observer.is_some(),
             observed: self.observer.is_some(),
             started: Instant::now(),
+            writer_waits: crate::WriterWaits::default(),
         }
     }
 
@@ -914,6 +918,7 @@ impl DbCache {
                 commit: outcome.commit,
                 stats: outcome.sampled,
                 participant: outcome.participant,
+                writer_waits: batch.writer_waits,
             });
         }
     }

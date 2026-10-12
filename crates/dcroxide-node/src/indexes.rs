@@ -403,8 +403,10 @@ impl IndexThread {
             .interrupt();
         let stop = Arc::new(AtomicBool::new(false));
         let (overlay, stopped) = (unconfirmed.clone(), Arc::clone(&stop));
+        // The name the database totals this thread's waits for its
+        // writer under.
         let thread = std::thread::Builder::new()
-            .name("index".to_string())
+            .name(dcroxide_database::INDEX_THREAD_NAME.to_string())
             .spawn(move || {
                 run_index_thread(
                     &entries,

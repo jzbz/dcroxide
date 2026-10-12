@@ -2007,6 +2007,18 @@ fn exists_addr_policy(enabled: bool) -> dcroxide_indexers::ExistsAddrPolicy {
 /// keys, merges and memtable size, and a fourth phase for its time and
 /// I/O), or `null` when it had nothing to write.
 ///
+/// `thread` is the name of the thread that ran the flush, which held
+/// the database's writer for the flush's `elapsed_ms`.  `writer_wait`
+/// is what threads have spent waiting for that writer from the opening
+/// of the database to this flush: for the thread named `index`, which
+/// updates the indexes, and for every other thread together, the number
+/// of times one found the writer held and the nanoseconds it then
+/// waited.  The threads that connect blocks are among the others, so
+/// the growth of `other` over a sync bounds what block processing spent
+/// waiting for the index thread's transactions and flushes; the flushes
+/// among them are the lines whose `thread` is `index`, each of which
+/// held the writer for its `elapsed_ms`.
+///
 /// Stats sampling is deliberately left off (`flush_stats_every` stays
 /// 0). redb's `stats()` walks every branch and leaf page, which on a
 /// chain-sized tree cost 442.5 s against the flushes' own 260.9 s in the
@@ -2024,36 +2036,55 @@ fn flush_log_observer() -> Option<dcroxide_database::FlushObserver> {
         }
     };
     log_info(&format!("Logging metadata flushes to {path}"));
-    let sink = std::sync::Mutex::new(std::io::BufWriter::new(file));
-    Some(std::sync::Arc::new(
-        move |obs: &dcroxide_database::FlushObservation| {
-            use std::io::Write as _;
-            let end = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs_f64())
-                .unwrap_or(0.0);
-            // A few hundred bytes per flush, and a full mainnet sync makes
-            // only a few hundred of them, so the write is far below the
-            // seconds-long commit it describes.
-            if let Ok(mut out) = sink.lock() {
-                let _ = writeln!(
-                    out,
-                    "{{\"seq\":{},\"end\":{:.3},\"elapsed_ms\":{:.3},\"entries\":{},\"bytes\":{},\"sync\":{},\"insert\":{},\"commit\":{},\"participant\":{}}}",
-                    obs.sequence,
-                    end,
-                    obs.elapsed.as_secs_f64() * 1000.0,
-                    obs.dirty_entries,
-                    obs.dirty_bytes,
-                    obs.block_sync.to_json(),
-                    obs.insert.to_json(),
-                    obs.commit.to_json(),
-                    obs.participant
-                        .map_or_else(|| "null".to_string(), |p| p.to_json())
-                );
-                let _ = out.flush();
-            }
-        },
-    ))
+    Some(flush_log_writer(std::io::BufWriter::new(file)))
+}
+
+/// The observer that writes each flush to `out` as one line
+/// ([`flush_log_line`]), ended at the instant it is called and run by
+/// the thread it is called on, and flushes `out` after it.
+fn flush_log_writer(out: impl std::io::Write + Send + 'static) -> dcroxide_database::FlushObserver {
+    let sink = std::sync::Mutex::new(out);
+    std::sync::Arc::new(move |obs: &dcroxide_database::FlushObservation| {
+        let end = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0);
+        // A few hundred bytes per flush, and a full mainnet sync makes
+        // only a few hundred of them, so the write is far below the
+        // seconds-long commit it describes.
+        if let Ok(mut out) = sink.lock() {
+            // The observer runs on the thread that ran the flush.
+            let line = flush_log_line(obs, end, std::thread::current().name());
+            let _ = writeln!(out, "{line}");
+            let _ = out.flush();
+        }
+    })
+}
+
+/// One line of the metadata flush log: the flush that ended at `end`,
+/// in seconds since the Unix epoch, on the thread named `thread`.
+fn flush_log_line(
+    obs: &dcroxide_database::FlushObservation,
+    end: f64,
+    thread: Option<&str>,
+) -> String {
+    format!(
+        "{{\"seq\":{},\"end\":{:.3},\"elapsed_ms\":{:.3},\"entries\":{},\"bytes\":{},\"sync\":{},\"insert\":{},\"commit\":{},\"participant\":{},\"thread\":{},\"writer_wait\":{}}}",
+        obs.sequence,
+        end,
+        obs.elapsed.as_secs_f64() * 1000.0,
+        obs.dirty_entries,
+        obs.dirty_bytes,
+        obs.block_sync.to_json(),
+        obs.insert.to_json(),
+        obs.commit.to_json(),
+        obs.participant
+            .map_or_else(|| "null".to_string(), |p| p.to_json()),
+        // The daemon's thread names are plain ASCII words, which Rust
+        // quotes as JSON does.
+        thread.map_or_else(|| "null".to_string(), |name| format!("{name:?}")),
+        obs.writer_waits.to_json(),
+    )
 }
 
 /// The block database directory, `<datadir>/blocks_<dbtype>` (dcrd
@@ -2381,8 +2412,153 @@ fn log_error(msg: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::{passwd_home, signal_line, stop_block_processing};
+    use super::{flush_log_line, passwd_home, signal_line, stop_block_processing};
     use std::sync::{Arc, Mutex};
+
+    /// A flush observation with a value of its own in every field the
+    /// flush log writes.
+    fn a_flush_observation() -> dcroxide_database::FlushObservation {
+        use dcroxide_database::{FlushObservation, FlushPhase, WriterWait, WriterWaits};
+        use std::time::Duration;
+
+        let phase = |ms, read_bytes, write_bytes| FlushPhase {
+            elapsed: Duration::from_millis(ms),
+            read_bytes,
+            write_bytes,
+        };
+        FlushObservation {
+            sequence: 7,
+            dirty_entries: 1200,
+            dirty_bytes: 345_678,
+            elapsed: Duration::from_micros(1_234_500),
+            stats_elapsed: Duration::ZERO,
+            block_sync: phase(3, Some(0), Some(0)),
+            insert: phase(400, Some(8192), Some(4096)),
+            commit: phase(800, None, None),
+            stats: None,
+            participant: None,
+            writer_waits: WriterWaits {
+                index: WriterWait {
+                    count: 3,
+                    nanos: 1_500_000,
+                },
+                other: WriterWait {
+                    count: 41,
+                    nanos: 73_000_000_000,
+                },
+            },
+        }
+    }
+
+    /// A line of the metadata flush log is what it was, with the name of
+    /// the thread that ran the flush and the waits for the database's
+    /// writer after it.
+    #[test]
+    fn a_flush_log_line_names_the_flushing_thread_and_the_writer_waits() {
+        let obs = a_flush_observation();
+        assert_eq!(
+            flush_log_line(&obs, 1_790_000_000.25, Some("index")),
+            concat!(
+                r#"{"seq":7,"end":1790000000.250,"elapsed_ms":1234.500,"entries":1200,"bytes":345678,"#,
+                r#""sync":{"ms":3.000,"read_bytes":0,"write_bytes":0},"#,
+                r#""insert":{"ms":400.000,"read_bytes":8192,"write_bytes":4096},"#,
+                r#""commit":{"ms":800.000,"read_bytes":null,"write_bytes":null},"#,
+                r#""participant":null,"thread":"index","#,
+                r#""writer_wait":{"index":{"count":3,"ns":1500000},"other":{"count":41,"ns":73000000000}}}"#,
+            )
+        );
+        // A thread without a name.
+        assert!(
+            flush_log_line(&obs, 0.0, None)
+                .contains(r#""participant":null,"thread":null,"writer_wait":{"#)
+        );
+    }
+
+    /// What the flush log's observer has written, and how much of it
+    /// it has flushed.
+    #[derive(Clone, Default)]
+    struct LogSink(Arc<Mutex<(Vec<u8>, usize)>>);
+
+    impl std::io::Write for LogSink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("sink").0.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            let mut sink = self.0.lock().expect("sink");
+            sink.1 = sink.0.len();
+            Ok(())
+        }
+    }
+
+    /// The flush log's observer writes one line per flush, names in it
+    /// the thread it was called on, which is the one that ran the
+    /// flush, stamps it with the instant of the call, and flushes each
+    /// line out as it is written: a line left in a buffer would be
+    /// lost with a daemon that is killed.
+    #[test]
+    fn the_flush_log_observer_writes_a_line_naming_its_own_thread() {
+        let obs = a_flush_observation();
+        let sink = LogSink::default();
+        let observer = super::flush_log_writer(sink.clone());
+        let now = || {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("a clock past 1970")
+                .as_secs_f64()
+        };
+
+        // A flush on the index thread, then one on a thread with no
+        // name, each written out before the next call.
+        let before = now();
+        let on_index = {
+            let observer = Arc::clone(&observer);
+            std::thread::Builder::new()
+                .name("index".to_string())
+                .spawn(move || observer(&obs))
+                .expect("spawn the index thread")
+        };
+        on_index.join().expect("the index thread's flush");
+        let (written, flushed) = sink.0.lock().expect("sink").clone();
+        assert_eq!(flushed, written.len(), "the first line is flushed");
+        assert_eq!(written.iter().filter(|&&b| b == b'\n').count(), 1);
+        let unnamed = {
+            let observer = Arc::clone(&observer);
+            std::thread::Builder::new()
+                .spawn(move || observer(&obs))
+                .expect("spawn a thread without a name")
+        };
+        unnamed.join().expect("the unnamed thread's flush");
+        let after = now();
+
+        let (written, flushed) = sink.0.lock().expect("sink").clone();
+        assert_eq!(flushed, written.len(), "every line is flushed");
+        let text = String::from_utf8(written).expect("the log is text");
+        assert!(text.ends_with('\n'), "the last line is ended: {text:?}");
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 2, "one line per flush: {text:?}");
+        for (line, thread) in lines.into_iter().zip([Some("index"), None]) {
+            // The line is the one for this observation and thread, at
+            // an instant between the calls.
+            let (start, rest) = line
+                .split_once(r#","elapsed_ms":"#)
+                .unwrap_or_else(|| panic!("no duration in {line:?}"));
+            let end: f64 = start
+                .strip_prefix(r#"{"seq":7,"end":"#)
+                .unwrap_or_else(|| panic!("no end instant in {line:?}"))
+                .parse()
+                .expect("the end instant");
+            // Written to the millisecond.
+            assert!(
+                before - 0.001 <= end && end <= after + 0.001,
+                "{end} is not between {before} and {after}"
+            );
+            let want = flush_log_line(&obs, 0.0, thread);
+            let (_, want_rest) = want.split_once(r#","elapsed_ms":"#).expect("a duration");
+            assert_eq!(rest, want_rest, "the line of a flush on {thread:?}");
+        }
+    }
 
     /// A Windows console close, logoff or shutdown is logged as dcrd's
     /// `shutdownListener` logs the SIGTERM Go's runtime makes of it
