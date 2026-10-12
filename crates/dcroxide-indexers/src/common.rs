@@ -76,6 +76,15 @@ pub trait ChainQueryer: Send + Sync {
     fn is_treasury_agenda_active(&self, hash: &Hash) -> Result<bool, String>;
 }
 
+/// What an index computed for one notification before that
+/// notification's write transaction began
+/// ([`Indexer::prepare_notification`]).  Opaque to the subscriber, which
+/// only carries it from that call to
+/// [`Indexer::process_prepared_notification`] and never keeps it: it is
+/// good for that one notification, under that one hold of the index's
+/// lock.
+pub type PreparedNtfn = Box<dyn core::any::Any + Send>;
+
 /// A generic indexer (dcrd `Indexer`).  dcrd's `Init` is realized by
 /// the index constructors together with
 /// [`IndexSubscriber::subscribe`](crate::IndexSubscriber::subscribe),
@@ -112,6 +121,40 @@ pub trait Indexer: Send {
         db_tx: &Transaction,
         ntfn: &IndexNtfn,
     ) -> Result<(), IdxError>;
+
+    /// Do whatever part of the notification's work needs no database
+    /// transaction, and return it for
+    /// [`process_prepared_notification`](Self::process_prepared_notification).
+    /// `None`, the default, prepares nothing.
+    ///
+    /// dcrd has no counterpart: its indexes do all of a notification's
+    /// work inside the notification's `dbTx`.  The subscriber calls this
+    /// with the index's lock held and before it claims the database's
+    /// writer, so that what is done here is not time every other
+    /// committer in the process waits.  It must change nothing a failed or
+    /// abandoned update would have to undo: the transaction that follows
+    /// may never begin.
+    fn prepare_notification(&self, _ntfn: &IndexNtfn) -> Option<PreparedNtfn> {
+        None
+    }
+
+    /// [`process_notification`](Self::process_notification), given what
+    /// [`prepare_notification`](Self::prepare_notification) returned for
+    /// this notification under this hold of the index's lock.
+    ///
+    /// The index must end as `process_notification` would leave it.  It
+    /// uses `prepared` only if that is its own and was made for this very
+    /// notification, and otherwise does the work here; the default drops
+    /// it.
+    fn process_prepared_notification(
+        &mut self,
+        db_tx: &Transaction,
+        ntfn: &IndexNtfn,
+        prepared: Option<PreparedNtfn>,
+    ) -> Result<(), IdxError> {
+        drop(prepared);
+        self.process_notification(db_tx, ntfn)
+    }
 
     /// Subscribe for the next index sync update.
     fn wait_for_sync(&mut self) -> SyncWaiter;

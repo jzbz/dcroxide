@@ -25,7 +25,11 @@
 //! the exists address index's unconfirmed overlay as it stood when the
 //! connect was queued ([`ExistsAddrUnconfirmed::copy_for_connect`],
 //! [`ExistsAddrUnconfirmed::with_copy`]), where dcrd's goroutine drains
-//! the map when it reaches the block.
+//! the map when it reaches the block.  With the block and that copy both
+//! in hand, the index does the part of such a connect that needs no
+//! transaction before the subscriber claims the database's writer
+//! ([`Indexer::prepare_notification`]), where dcrd does all of it inside
+//! the update's `dbTx`.
 
 mod common;
 mod error;
@@ -37,7 +41,7 @@ mod progresslog;
 mod subscriber;
 mod txindex;
 
-pub use common::{ChainQueryer, Indexer, Interrupt, SyncWaiter};
+pub use common::{ChainQueryer, Indexer, Interrupt, PreparedNtfn, SyncWaiter};
 pub use error::{ErrorKind, IdxError, IndexerError};
 pub use existsaddr::policy::Policy as ExistsAddrPolicy;
 #[doc(hidden)]

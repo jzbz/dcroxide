@@ -80,6 +80,12 @@ pub(crate) struct Faults {
     pub(crate) fail_contribute: std::sync::atomic::AtomicBool,
     /// Every `finished` outcome, in order.
     pub(crate) finished: Mutex<Vec<bool>>,
+    /// Not a fault: the connects whose work was prepared before their
+    /// transaction began, counted as each prepare returns.
+    pub(crate) prepares: std::sync::atomic::AtomicUsize,
+    /// Not a fault: the connects that used what was prepared for them
+    /// rather than doing that work inside their transaction.
+    pub(crate) prepared_connects: std::sync::atomic::AtomicUsize,
 }
 
 /// The exists-address index's in-memory state and flush participant.

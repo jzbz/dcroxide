@@ -23,8 +23,8 @@ use dcroxide_txscript::stdscript;
 use dcroxide_wire::{MsgBlock, MsgTx};
 
 use crate::common::{
-    ChainQueryer, Indexer, Interrupt, SyncWaiter, db_fetch_indexer_version, db_put_indexer_tip,
-    drop_flat_index, notify_sync_subscribers, tip,
+    ChainQueryer, Indexer, Interrupt, PreparedNtfn, SyncWaiter, db_fetch_indexer_version,
+    db_put_indexer_tip, drop_flat_index, notify_sync_subscribers, tip,
 };
 use crate::error::{ErrorKind, IdxError, indexer_error};
 use crate::existsaddr::policy::Policy;
@@ -138,6 +138,23 @@ pub struct ExistsAddrIndex {
 /// [`ExistsAddrIndex::bucket`] when no bucket is open.
 const NO_BUCKET: u64 = u64::MAX;
 
+/// The part of one connect that needs no transaction, done before the
+/// connect's transaction began (`ExistsAddrIndex::prepare_connect`).
+struct PreparedConnect {
+    /// The block this was made for.  A connect uses it for this very
+    /// allocation and no other, and holding the block here keeps the
+    /// allocation from being reused for another while this lives.
+    block: Arc<MsgBlock>,
+    /// The block's hash, for the tip row.
+    hash: Hash,
+    /// The keys to hand to the memtable, each with its partition, sorted,
+    /// less those the memtable held when they were filtered.
+    candidates: Vec<(u8, [u8; ADDR_KEY_SIZE])>,
+    /// The copy of the unconfirmed overlay the connect was queued with:
+    /// what its hook removes from the overlay.
+    copied: Vec<[u8; ADDR_KEY_SIZE]>,
+}
+
 /// Everything a lookup needs, detached from the index mutex: the shared
 /// database handle, the unconfirmed overlay and the memtable (dcrd's
 /// `idx.db` plus the map behind `unconfirmedLock`).
@@ -148,13 +165,13 @@ const NO_BUCKET: u64 = u64::MAX;
 /// `Arc<Mutex<ExistsAddrIndex>>` can release the index guard before doing
 /// any database work and reach the same behaviour.  That matters because
 /// the index writer takes this mutex *before* it opens its write
-/// transaction (`subscriber.rs`, pinned by `b6_indexlock`): the writer's
-/// semaphore is claimed last and never held while it waits here, so a
-/// query that held the mutex across its database reads would stall the
-/// indexer without stalling every other commit in the process.  The
-/// other direction matters as much: the writer holds the mutex through
-/// its wait for the database writer and a block's index work, so the
-/// daemon's RPC seam takes one of these once, at startup, and never
+/// transaction (`subscriber.rs`, pinned in `existsaddr/tests.rs`): the
+/// writer's semaphore is claimed last and never held while it waits
+/// here, so a query that held the mutex across its database reads would
+/// stall the indexer without stalling every other commit in the process.
+/// The other direction matters as much: the writer holds the mutex
+/// through its wait for the database writer and a block's index work, so
+/// the daemon's RPC seam takes one of these once, at startup, and never
 /// waits on the writer to answer a lookup or report the tip.
 ///
 /// **Lookup order.**  A key moves from the unconfirmed overlay to the
@@ -607,27 +624,10 @@ impl ExistsAddrIndex {
         self.query().exists_addresses(addrs)
     }
 
-    /// Add all addresses associated with transactions in the provided
-    /// block and flush the unconfirmed overlay (dcrd
-    /// `ExistsAddrIndex.connectBlock`).
-    ///
-    /// The address extraction and the tip row are dcrd's.  The keys do
-    /// not go through the transaction: they are handed to the memtable by
-    /// an `on_commit` hook, which runs once the commit's own flush has
-    /// succeeded and before the tip row is published.  So no flush can
-    /// journal them without their tip row or persist the tip row without
-    /// them, a reader that sees the tip finds them, and a commit that
-    /// fails hands nothing over.  The block's candidates are filtered
-    /// against the memtable only, with no store read; a key already in a
-    /// run is merged away as a duplicate later.
-    ///
-    /// dcrd drains the unconfirmed overlay into the block's keys.  This
-    /// copies it, here or when the connect was queued, and the hook
-    /// removes exactly the copied keys after inserting them, so a key is
-    /// always in one place a lookup reads; keys added after the copy stay
-    /// for the next connect, as they stay in dcrd's fresh map, and a
-    /// rolled-back connect leaves the overlay as it was.
-    fn connect_block(&mut self, db_tx: &Transaction, block: &MsgBlock) -> Result<(), IdxError> {
+    /// The address keys of every transaction in the block: the address
+    /// extraction of dcrd `ExistsAddrIndex.connectBlock`
+    /// (`existsaddrindex.go:383-444`).
+    fn used_addrs(&self, block: &MsgBlock) -> HashSet<[u8; ADDR_KEY_SIZE]> {
         // NOTE: The fact that the block can disapprove the regular
         // tree of the previous block is ignored for this index: the
         // primary purpose is to track whether or not addresses have
@@ -688,18 +688,17 @@ impl ExistsAddrIndex {
                 }
             }
         }
+        used_addrs
+    }
 
-        // Hand all the newly used addresses to the memtable, skipping any
-        // it already holds, along with any addresses seen in mempool at
-        // this time; the hook then removes those from the unconfirmed
-        // map.
-        // The copy made when this connect was queued, when one was
-        // (`ExistsAddrUnconfirmed::with_copy`): the overlay as it stood
-        // then, so a key the pool adds while the connect waits in the
-        // queue stays for the next one.  Otherwise the overlay as it
-        // stands, which is what dcrd's connect drains.
-        let queued = self.mp_exists_addr.take_copy();
-        let copied = queued.unwrap_or_else(|| self.mp_exists_addr.keys());
+    /// The keys a connect hands to the memtable: the block's and the
+    /// copied overlay's, each with its partition, less those the memtable
+    /// holds now, sorted.
+    fn candidates(
+        &self,
+        mut used_addrs: HashSet<[u8; ADDR_KEY_SIZE]>,
+        copied: &[[u8; ADDR_KEY_SIZE]],
+    ) -> Vec<(u8, [u8; ADDR_KEY_SIZE])> {
         used_addrs.extend(copied.iter().copied());
         let part = self.store.partitioner();
         let mut candidates: Vec<(u8, [u8; ADDR_KEY_SIZE])> = used_addrs
@@ -710,6 +709,113 @@ impl ExistsAddrIndex {
         // By partition, so the hook takes each partition's lock once and
         // hashes nothing under the writer semaphore.
         candidates.sort_unstable();
+        candidates
+    }
+
+    /// A connect's work for `block` that needs no transaction, with
+    /// `copied` the copy of the unconfirmed overlay the connect was queued
+    /// with.  Nothing here changes the index: the keys are handed over,
+    /// and the copied ones leave the overlay, only in the commit hook
+    /// [`connect_block`](Self::connect_block) registers.
+    ///
+    /// **Why a filter made before the transaction is still good at the
+    /// hook.**  Keys enter the memtable in this index's commit hooks, and
+    /// in a load when the index is opened.  A hook exists only for a
+    /// transaction this index's connect ran in, which needs the index's
+    /// lock, and runs only under the database's writer.  The subscriber
+    /// holds the lock from this call until the connect has returned, and
+    /// the writer from before the connect until its own hook has run, so
+    /// no key arrives between this filter and that hook; a caller outside
+    /// the subscriber could commit a connect of its own in between, and
+    /// then the hook's check, made under each partition's write lock,
+    /// skips what that connect added.  Keys leave the memtable when a
+    /// committed flush clears the partitions it merged, whose keys are by
+    /// then in the runs that commit wrote, and when the index is reloaded
+    /// or dropped, which needs the index's lock.  So a key left out here
+    /// as held is, at the hook, still held or in a run, and a key kept
+    /// here is inserted unless the hook finds it held.  The filter a
+    /// connect makes inside its transaction stands on the same argument:
+    /// that commit's own flush can follow it too.
+    ///
+    /// A flush between this filter and the transaction, which another
+    /// thread's commit can make, does change one thing.  A key of a
+    /// partition it merged is left out here, where the filter made inside
+    /// the transaction would find it gone and hand it over again, a
+    /// duplicate of its run's key that a later merge drops.  The index
+    /// holds the same keys either way.
+    fn prepare_connect(
+        &self,
+        block: &Arc<MsgBlock>,
+        copied: Vec<[u8; ADDR_KEY_SIZE]>,
+    ) -> PreparedConnect {
+        let candidates = self.candidates(self.used_addrs(block), &copied);
+        PreparedConnect {
+            block: Arc::clone(block),
+            hash: block.header.block_hash(),
+            candidates,
+            copied,
+        }
+    }
+
+    /// Add all addresses associated with transactions in the provided
+    /// block and flush the unconfirmed overlay (dcrd
+    /// `ExistsAddrIndex.connectBlock`).
+    ///
+    /// The address extraction and the tip row are dcrd's.  The keys do
+    /// not go through the transaction: they are handed to the memtable by
+    /// an `on_commit` hook, which runs once the commit's own flush has
+    /// succeeded and before the tip row is published.  So no flush can
+    /// journal them without their tip row or persist the tip row without
+    /// them, a reader that sees the tip finds them, and a commit that
+    /// fails hands nothing over.  The block's candidates are filtered
+    /// against the memtable only, with no store read; a key already in a
+    /// run is merged away as a duplicate later.
+    ///
+    /// dcrd drains the unconfirmed overlay into the block's keys.  This
+    /// copies it, here or when the connect was queued, and the hook
+    /// removes exactly the copied keys after inserting them, so a key is
+    /// always in one place a lookup reads; keys added after the copy stay
+    /// for the next connect, as they stay in dcrd's fresh map, and a
+    /// rolled-back connect leaves the overlay as it was.
+    ///
+    /// `prepared` is the part of this that needs no transaction, when the
+    /// subscriber had it done before the transaction began
+    /// ([`Indexer::prepare_notification`]).  It is used only for the very
+    /// block it was made for; without one, all of it is done here.  The
+    /// bucket check, the tip row and the hook are the same either way.
+    fn connect_block(
+        &mut self,
+        db_tx: &Transaction,
+        block: &Arc<MsgBlock>,
+        prepared: Option<PreparedConnect>,
+    ) -> Result<(), IdxError> {
+        let (hash, candidates, copied) = match prepared {
+            Some(prepared) if Arc::ptr_eq(&prepared.block, block) => {
+                #[cfg(test)]
+                self.store
+                    .faults
+                    .prepared_connects
+                    .fetch_add(1, Ordering::SeqCst);
+                (prepared.hash, prepared.candidates, prepared.copied)
+            }
+            _ => {
+                let used_addrs = self.used_addrs(block);
+                // Hand all the newly used addresses to the memtable,
+                // skipping any it already holds, along with any addresses
+                // seen in mempool at this time; the hook then removes
+                // those from the unconfirmed map.
+                // The copy made when this connect was queued, when one
+                // was (`ExistsAddrUnconfirmed::with_copy`): the overlay
+                // as it stood then, so a key the pool adds while the
+                // connect waits in the queue stays for the next one.
+                // Otherwise the overlay as it stands, which is what
+                // dcrd's connect drains.
+                let queued = self.mp_exists_addr.take_copy();
+                let copied = queued.unwrap_or_else(|| self.mp_exists_addr.keys());
+                let candidates = self.candidates(used_addrs, &copied);
+                (block.header.block_hash(), candidates, copied)
+            }
+        };
 
         let meta = db_tx.metadata();
         meta.bucket(EXISTS_ADDR_INDEX_KEY).ok_or_else(|| {
@@ -726,16 +832,17 @@ impl ExistsAddrIndex {
         db_put_indexer_tip(
             db_tx,
             EXISTS_ADDR_INDEX_KEY,
-            &block.header.block_hash(),
+            &hash,
             block_height(block) as i32,
         )?;
 
         let store = Arc::clone(&self.store);
         let overlay = Arc::clone(&self.mp_exists_addr);
         let hand_over = move || {
-            // The commit's own flush may have merged some candidates'
-            // partitions since they were filtered; the insert checks
-            // again.
+            // A flush, this commit's own or an earlier one, may have
+            // merged some candidates' partitions since they were
+            // filtered, and a connect outside the subscriber may have
+            // handed some of them over; the insert checks again.
             store.mem.insert_candidates(&candidates);
             let mut overlay = overlay.write().expect("unconfirmed overlay lock poisoned");
             for key in &copied {
@@ -812,13 +919,52 @@ impl Indexer for ExistsAddrIndex {
         db_tx: &Transaction,
         ntfn: &IndexNtfn,
     ) -> Result<(), IdxError> {
+        self.process_prepared_notification(db_tx, ntfn, None)
+    }
+
+    /// A connect that was queued with its copy of the unconfirmed overlay
+    /// (`ExistsAddrUnconfirmed::with_copy`, the daemon's index thread)
+    /// has both of its inputs already, the block and that copy, so
+    /// everything but the bucket check, the tip row and the hook is done
+    /// here, before the subscriber claims the database's writer.
+    ///
+    /// Any other connect copies the overlay as it stands, inside its
+    /// transaction as dcrd's connect drains the map inside its own
+    /// (`existsaddrindex.go:451-456`), and so prepares nothing: moving
+    /// that copy ahead of the wait for the writer would change which
+    /// block a key the pool adds during the wait goes with.  A disconnect
+    /// only moves the tip.
+    fn prepare_notification(&self, ntfn: &IndexNtfn) -> Option<PreparedNtfn> {
+        if ntfn.ntfn_type != CONNECT_NTFN {
+            return None;
+        }
+        let copied = self.mp_exists_addr.take_copy()?;
+        let prepared = self.prepare_connect(&ntfn.block, copied);
+        #[cfg(test)]
+        self.store.faults.prepares.fetch_add(1, Ordering::SeqCst);
+        Some(Box::new(prepared))
+    }
+
+    fn process_prepared_notification(
+        &mut self,
+        db_tx: &Transaction,
+        ntfn: &IndexNtfn,
+        prepared: Option<PreparedNtfn>,
+    ) -> Result<(), IdxError> {
         match ntfn.ntfn_type {
-            CONNECT_NTFN => self.connect_block(db_tx, &ntfn.block).map_err(|err| {
-                indexer_error(
-                    ErrorKind::ConnectBlock,
-                    format!("{}: unable to connect block: {err}", self.name()),
-                )
-            }),
+            CONNECT_NTFN => {
+                // Another index's, or nothing: the connect does it all.
+                let prepared = prepared
+                    .and_then(|prepared| prepared.downcast::<PreparedConnect>().ok())
+                    .map(|prepared| *prepared);
+                self.connect_block(db_tx, &ntfn.block, prepared)
+                    .map_err(|err| {
+                        indexer_error(
+                            ErrorKind::ConnectBlock,
+                            format!("{}: unable to connect block: {err}", self.name()),
+                        )
+                    })
+            }
             DISCONNECT_NTFN => self.disconnect_block(db_tx, &ntfn.block).map_err(|err| {
                 indexer_error(
                     ErrorKind::DisconnectBlock,

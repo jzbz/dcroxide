@@ -10,8 +10,8 @@
 //! The daemon shares one `ExistsAddrIndex` behind a mutex.  While
 //! `NodeRpcExistsAddresser::exists_addresses` held that mutex across its
 //! database reads, a single large request parked the index writer — and
-//! the index writer takes the database's *writer semaphore* before it
-//! waits on the index mutex (`dcroxide_indexers::subscriber`), which
+//! the index writer then took the database's *writer semaphore* before
+//! it waited on the index mutex (`dcroxide_indexers::subscriber`), which
 //! every database commit in the daemon queues behind.  One unprivileged
 //! authenticated call therefore stalled block connection for its whole
 //! duration.
@@ -28,11 +28,13 @@
 //!   its database work.  Revert `NodeRpcExistsAddresser::query` to lock
 //!   the index and call through the guard, and the timing assertion
 //!   below fails.
-//! - **Not pinned.** The companion change — the subscriber taking the
-//!   index guard *before* `Database::begin(true)` rather than after — is
-//!   a defensive ordering fix.  Reproducing its failure needs a live
-//!   subscriber mid-update, so no assertion here goes red if it is
-//!   reverted.  It is stated plainly rather than implied to be covered.
+//! - **Pinned elsewhere.** The companion change — the subscriber taking
+//!   the index guard *before* `Database::begin(true)` rather than after —
+//!   needs a live subscriber mid-update to show, so no assertion here
+//!   goes red if it is reverted.  The exists address index's own tests
+//!   hold it (`dcroxide-indexers/src/existsaddr/tests.rs`): an update
+//!   that waits for the writer behind another transaction must be
+//!   holding the index mutex.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};

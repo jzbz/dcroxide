@@ -30,6 +30,18 @@
 //! must hand over exactly what the same connect hands over when it is
 //! processed on the spot, and a copy no connect took must not linger.
 //!
+//! **The prepare step.**  A connect that brings that copy has the part of
+//! its work that needs no transaction done before the subscriber claims
+//! the database's writer.  It must leave the index, row for row, as the
+//! same connect does when it does that work inside its transaction; the
+//! result must serve its own connect only; and an update that fails after
+//! the prepare must leave the index as it was.  A connect that brings no
+//! copy must not be prepared: it takes the overlay as it stands once it
+//! has the writer.  The index's lock must be held from a prepare until
+//! its connect, and a flush that another thread's commit makes between
+//! the two must lose no key.  The power cuts, the lookup races and the
+//! hand-over control run both ways.
+//!
 //! **Keys an adversary grinds** to share a first hash160 byte must still
 //! spread over the partitions, keeping each flush near its page budget
 //! and the journal collectable.
@@ -57,9 +69,9 @@ use tempfile::TempDir;
 use super::policy::{CHUNK, PARTITIONS, Partitioner, Policy};
 use super::runs::{self, BASE, DELTA};
 use super::store::{AddrStore, LayoutCheck, check_layout};
-use crate::ChainQueryer;
 use crate::existsaddrindex::{EXISTS_ADDR_INDEX_KEY, ExistsAddrIndex};
 use crate::subscriber::{CONNECT_NTFN, IndexNtfn, IndexSubscriber, NO_PREREQS};
+use crate::{ChainQueryer, Indexer};
 
 impl_chain_queryer!(crate::ChainQueryer, chain::TestChain);
 
@@ -131,6 +143,17 @@ fn open_index(
     .expect("index")
 }
 
+/// The connect notification of a block paying `keys` on `parent`.
+fn connect_ntfn(parent: &Arc<MsgBlock>, salt: u32, keys: &[Key]) -> IndexNtfn {
+    let scripts: Vec<Vec<u8>> = keys.iter().map(|k| script_of(k, params())).collect();
+    IndexNtfn {
+        ntfn_type: CONNECT_NTFN,
+        block: block_on(parent, salt, vec![tx_paying(&scripts)]),
+        parent: Arc::clone(parent),
+        is_treasury_enabled: false,
+    }
+}
+
 /// Connect a block paying `keys` on the chain's tip through `subber`.
 fn connect(
     chain: &TestChain,
@@ -138,16 +161,38 @@ fn connect(
     salt: u32,
     keys: &[Key],
 ) -> Result<(), crate::IdxError> {
-    let scripts: Vec<Vec<u8>> = keys.iter().map(|k| script_of(k, params())).collect();
-    let parent = chain.at(chain.tip().0);
-    let block = block_on(&parent, salt, vec![tx_paying(&scripts)]);
-    chain.add(&block);
-    subber.notify(&IndexNtfn {
-        ntfn_type: CONNECT_NTFN,
-        block,
-        parent,
-        is_treasury_enabled: false,
-    })
+    let ntfn = connect_ntfn(&chain.at(chain.tip().0), salt, keys);
+    chain.add(&ntfn.block);
+    subber.notify(&ntfn)
+}
+
+/// How a test hands a connect to the subscriber.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Delivery {
+    /// On the spot: the connect copies the unconfirmed overlay itself and
+    /// does all of its work inside its transaction.
+    Inline,
+    /// As the daemon's index thread does: with the copy of the overlay
+    /// made when the connect was queued, which has the index prepare the
+    /// connect before its transaction begins.
+    Queued,
+}
+
+/// [`connect`], delivered as `delivery` says.
+fn deliver(
+    delivery: Delivery,
+    chain: &TestChain,
+    subber: &mut IndexSubscriber,
+    unconfirmed: &crate::ExistsAddrUnconfirmed,
+    salt: u32,
+    keys: &[Key],
+) -> Result<(), crate::IdxError> {
+    match delivery {
+        Delivery::Inline => connect(chain, subber, salt, keys),
+        Delivery::Queued => unconfirmed.with_copy(unconfirmed.copy_for_connect(), || {
+            connect(chain, subber, salt, keys)
+        }),
+    }
 }
 
 fn mempool_tx(keys: &[Key]) -> dcroxide_wire::MsgTx {
@@ -170,6 +215,8 @@ enum Step {
 struct Script {
     steps: Vec<Step>,
     cache_max_size: u64,
+    /// How the run hands each connect to the subscriber.
+    delivery: Delivery,
 }
 
 impl Script {
@@ -202,6 +249,16 @@ impl Script {
         Script {
             steps,
             cache_max_size: 2000 + rng.below(4000),
+            delivery: Delivery::Inline,
+        }
+    }
+
+    /// The same steps, each connect delivered as the daemon's index
+    /// thread delivers it.
+    fn queued(self) -> Script {
+        Script {
+            delivery: Delivery::Queued,
+            ..self
         }
     }
 }
@@ -223,6 +280,10 @@ struct Run {
     /// Summed over the run's flushes: keys journaled, merges, base
     /// rewrites, rows removed.
     work: [u64; 4],
+    /// The connects that committed, and those of them that used work
+    /// prepared before their transaction began.
+    connects: usize,
+    prepared: usize,
 }
 
 /// The index tip's height as the store holds it.
@@ -267,6 +328,7 @@ fn run(script: &Script, cut_after: Option<u64>, honest_sync: bool, brk: Break) -
     let idx = open_index(&mut subber, &db, &chain, fixed(Policy::tiny()));
     db.flush().expect("setup flush");
     let store = Arc::clone(idx.lock().expect("index").store());
+    let unconfirmed = idx.lock().expect("index").unconfirmed();
     if brk == Break::SkipJournal {
         store.faults.skip_journal.store(true, Ordering::SeqCst);
     }
@@ -285,7 +347,14 @@ fn run(script: &Script, cut_after: Option<u64>, honest_sync: bool, brk: Break) -
         let res = match step {
             Step::Connect(keys) => {
                 salt += 1;
-                let res = connect(&chain, &mut subber, salt, keys);
+                let res = deliver(
+                    script.delivery,
+                    &chain,
+                    &mut subber,
+                    &unconfirmed,
+                    salt,
+                    keys,
+                );
                 if res.is_ok() {
                     let mut handed: BTreeSet<Key> = keys.iter().copied().collect();
                     handed.append(&mut mempool);
@@ -336,6 +405,8 @@ fn run(script: &Script, cut_after: Option<u64>, honest_sync: bool, brk: Break) -
         drop(db.clear_flush_participant());
         let _ = db.close();
     }
+    let prepared = store.faults.prepared_connects.load(Ordering::SeqCst);
+    drop(unconfirmed);
     drop(idx);
     drop(subber);
     drop(db);
@@ -348,6 +419,8 @@ fn run(script: &Script, cut_after: Option<u64>, honest_sync: bool, brk: Break) -
         survived,
         ops,
         work,
+        connects: candidates.len() - 1,
+        prepared,
     }
 }
 
@@ -483,10 +556,29 @@ fn block_keys(block: &MsgBlock) -> Vec<Key> {
 #[test]
 fn a_power_cut_at_every_storage_operation_keeps_index_and_tip_together() {
     let mut rng = SplitMix64(0x7065_7263_7574_0001);
-    let script = Script::random(&mut rng, 22);
+    every_cut_keeps_index_and_tip_together(Script::random(&mut rng, 22));
+}
+
+/// The same run and the same cuts with every connect delivered as the
+/// daemon's index thread delivers it, so that each is prepared before its
+/// transaction begins.
+#[test]
+fn a_power_cut_at_every_storage_operation_of_prepared_connects_keeps_index_and_tip_together() {
+    let mut rng = SplitMix64(0x7065_7263_7574_0001);
+    every_cut_keeps_index_and_tip_together(Script::random(&mut rng, 22).queued());
+}
+
+fn every_cut_keeps_index_and_tip_together(script: Script) {
     let full = run(&script, None, true, Break::None);
     full.survived.expect("the uncut run");
     assert!(full.ops > 50, "the run made only {} operations", full.ops);
+    // Every connect took the path the script names.
+    let want = match script.delivery {
+        Delivery::Inline => 0,
+        Delivery::Queued => full.connects,
+    };
+    assert!(full.connects > 0);
+    assert_eq!(full.prepared, want, "of {} connects", full.connects);
     // The cuts land in flushes that journal, rewrite deltas and bases,
     // and remove rows (replaced chunks and collected journal rows).
     let [journaled, merges, bases, removed] = full.work;
@@ -506,9 +598,23 @@ fn a_power_cut_at_every_storage_operation_keeps_index_and_tip_together() {
 /// Random scripts cut at random points, and at their end.
 #[test]
 fn random_runs_cut_at_random_points_keep_index_and_tip_together() {
-    let mut rng = SplitMix64::from_entropy("random_runs_cut_at_random_points");
+    let rng = SplitMix64::from_entropy("random_runs_cut_at_random_points");
+    random_cuts_keep_index_and_tip_together(rng, Delivery::Inline);
+}
+
+/// The same with every connect prepared before its transaction begins.
+#[test]
+fn random_runs_of_prepared_connects_cut_at_random_points_keep_index_and_tip_together() {
+    let rng = SplitMix64::from_entropy("random_runs_of_prepared_connects");
+    random_cuts_keep_index_and_tip_together(rng, Delivery::Queued);
+}
+
+fn random_cuts_keep_index_and_tip_together(mut rng: SplitMix64, delivery: Delivery) {
     for round in 0..12 {
-        let script = Script::random(&mut rng, 30);
+        let script = Script {
+            delivery,
+            ..Script::random(&mut rng, 30)
+        };
         let cut = if round % 3 == 0 {
             None
         } else {
@@ -820,6 +926,96 @@ struct Race {
     lookups: usize,
 }
 
+/// What a race's readers share with its writer.
+#[derive(Clone)]
+struct Watched {
+    /// Keys that must answer true from the moment they are pushed.
+    always: Arc<RwLock<Vec<Key>>>,
+    /// Keys of each height, pushed before the block connects.
+    by_height: Arc<RwLock<Vec<Vec<Key>>>>,
+    stop: Arc<AtomicBool>,
+    falses: Arc<AtomicUsize>,
+    lookups: Arc<AtomicUsize>,
+}
+
+impl Watched {
+    fn new() -> Watched {
+        Watched {
+            always: Arc::new(RwLock::new(Vec::new())),
+            by_height: Arc::new(RwLock::new(vec![Vec::new()])),
+            stop: Arc::new(AtomicBool::new(false)),
+            falses: Arc::new(AtomicUsize::new(0)),
+            lookups: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    /// Start `n` readers, each looking up, until told to stop, keys that
+    /// must answer true: a key handed to the mempool, mostly one of the
+    /// newest, and the keys of the tip it read first or of a block below.
+    fn readers(&self, n: u64, query: &crate::ExistsAddrQuery) -> Vec<std::thread::JoinHandle<()>> {
+        (0..n)
+            .map(|t| {
+                let (query, watched) = (query.clone(), self.clone());
+                std::thread::spawn(move || watched.read(t, &query))
+            })
+            .collect()
+    }
+
+    /// Reader `t`'s lookups, until told to stop.
+    fn read(&self, t: u64, query: &crate::ExistsAddrQuery) {
+        let mut rng = SplitMix64(t);
+        while !self.stop.load(Ordering::SeqCst) {
+            // A mempool key, mostly one of the newest.
+            let pick = {
+                let always = self.always.read().expect("always");
+                (!always.is_empty()).then(|| {
+                    let from = always.len().saturating_sub(16);
+                    let i = if rng.below(4) == 0 {
+                        rng.below(always.len() as u64) as usize
+                    } else {
+                        from + rng.below((always.len() - from) as u64) as usize
+                    };
+                    always[i]
+                })
+            };
+            // The keys of the tip read first, or of a block below.
+            let tip = query.tip().expect("tip").0 as u64;
+            let height = if rng.below(2) == 0 {
+                tip
+            } else {
+                rng.below(tip + 1)
+            };
+            let mut keys: Vec<Key> = pick.into_iter().collect();
+            keys.extend(self.by_height.read().expect("heights")[height as usize].clone());
+            for key in &keys {
+                if !query
+                    .exists_address(&address_of(key, params()))
+                    .expect("lookup")
+                {
+                    self.falses.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+            let addrs: Vec<_> = keys.iter().map(|k| address_of(k, params())).collect();
+            let found = query.exists_addresses(&addrs).expect("lookups");
+            self.falses
+                .fetch_add(found.iter().filter(|&&b| !b).count(), Ordering::SeqCst);
+            self.lookups.fetch_add(keys.len() * 2, Ordering::SeqCst);
+        }
+    }
+
+    /// Stop the readers and report what they saw.
+    fn finish(&self, readers: Vec<std::thread::JoinHandle<()>>) -> Race {
+        self.stop.store(true, Ordering::SeqCst);
+        for reader in readers {
+            reader.join().expect("reader");
+        }
+        Race {
+            falses: self.falses.load(Ordering::SeqCst),
+            lookups: self.lookups.load(Ordering::SeqCst),
+        }
+    }
+}
+
 /// A fault a race runs under.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RaceFault {
@@ -839,6 +1035,7 @@ enum RaceFault {
 /// once a reader has seen a `false`.
 fn race(
     policy: Policy,
+    delivery: Delivery,
     flush_each: bool,
     fault: RaceFault,
     blocks: u32,
@@ -861,60 +1058,14 @@ fn race(
     let query = idx.lock().expect("index").query();
     let unconfirmed = idx.lock().expect("index").unconfirmed();
 
-    // Keys that must answer true from the moment they are pushed.
-    let always: Arc<RwLock<Vec<Key>>> = Arc::new(RwLock::new(Vec::new()));
-    // Keys of each height, pushed before the block connects.
-    let by_height: Arc<RwLock<Vec<Vec<Key>>>> = Arc::new(RwLock::new(vec![Vec::new()]));
-    let stop = Arc::new(AtomicBool::new(false));
-    let falses = Arc::new(AtomicUsize::new(0));
-    let lookups = Arc::new(AtomicUsize::new(0));
-    let readers: Vec<_> = (0..8u64)
-        .map(|t| {
-            let (query, always, by_height) =
-                (query.clone(), Arc::clone(&always), Arc::clone(&by_height));
-            let (stop, falses, lookups) =
-                (Arc::clone(&stop), Arc::clone(&falses), Arc::clone(&lookups));
-            std::thread::spawn(move || {
-                let mut rng = SplitMix64(t);
-                while !stop.load(Ordering::SeqCst) {
-                    // A mempool key, mostly one of the newest.
-                    let pick = {
-                        let always = always.read().expect("always");
-                        (!always.is_empty()).then(|| {
-                            let from = always.len().saturating_sub(16);
-                            let i = if rng.below(4) == 0 {
-                                rng.below(always.len() as u64) as usize
-                            } else {
-                                from + rng.below((always.len() - from) as u64) as usize
-                            };
-                            always[i]
-                        })
-                    };
-                    // The keys of the tip read first, or of a block below.
-                    let tip = query.tip().expect("tip").0 as u64;
-                    let height = if rng.below(2) == 0 {
-                        tip
-                    } else {
-                        rng.below(tip + 1)
-                    };
-                    let mut keys: Vec<Key> = pick.into_iter().collect();
-                    keys.extend(by_height.read().expect("heights")[height as usize].clone());
-                    for key in &keys {
-                        if !query
-                            .exists_address(&address_of(key, params()))
-                            .expect("lookup")
-                        {
-                            falses.fetch_add(1, Ordering::SeqCst);
-                        }
-                    }
-                    let addrs: Vec<_> = keys.iter().map(|k| address_of(k, params())).collect();
-                    let found = query.exists_addresses(&addrs).expect("lookups");
-                    falses.fetch_add(found.iter().filter(|&&b| !b).count(), Ordering::SeqCst);
-                    lookups.fetch_add(keys.len() * 2, Ordering::SeqCst);
-                }
-            })
-        })
-        .collect();
+    let watched = Watched::new();
+    let readers = watched.readers(8, &query);
+    let Watched {
+        always,
+        by_height,
+        falses,
+        ..
+    } = &watched;
 
     let started = Instant::now();
     let mut rng = SplitMix64(0x7261_6365);
@@ -930,7 +1081,7 @@ fn race(
             always.write().expect("always").extend(keys.iter().copied());
         }
         by_height.write().expect("heights").push(keys.clone());
-        connect(&chain, &mut subber, salt, &keys).expect("connect");
+        deliver(delivery, &chain, &mut subber, &unconfirmed, salt, &keys).expect("connect");
         if fault == RaceFault::HookAfterPublish {
             // Widen the window between the published tip and its keys.
             std::thread::sleep(Duration::from_micros(300));
@@ -940,29 +1091,29 @@ fn race(
             db.flush().expect("flush");
         }
     }
-    stop.store(true, Ordering::SeqCst);
-    for reader in readers {
-        reader.join().expect("reader");
-    }
-    Race {
-        falses: falses.load(Ordering::SeqCst),
-        lookups: lookups.load(Ordering::SeqCst),
-    }
+    watched.finish(readers)
 }
 
 /// No reader ever sees `false` for a key it must find while keys move
 /// from the overlay to the memtable.
 #[test]
 fn lookups_never_miss_a_key_handed_from_the_mempool() {
-    let race = race(
-        Policy::tiny(),
-        false,
-        RaceFault::None,
-        1500,
-        Duration::from_secs(60),
-    );
-    assert!(race.lookups > 1000, "{} lookups", race.lookups);
-    assert_eq!(race.falses, 0, "of {} lookups", race.lookups);
+    for delivery in [Delivery::Inline, Delivery::Queued] {
+        let race = race(
+            Policy::tiny(),
+            delivery,
+            false,
+            RaceFault::None,
+            1500,
+            Duration::from_secs(60),
+        );
+        assert!(
+            race.lookups > 1000,
+            "{delivery:?}: {} lookups",
+            race.lookups
+        );
+        assert_eq!(race.falses, 0, "{delivery:?}: of {} lookups", race.lookups);
+    }
 }
 
 /// The same with a merge of everything at every flush and a flush after
@@ -974,9 +1125,22 @@ fn lookups_never_miss_a_key_moving_into_the_runs() {
         k0_hard: 0,
         ..Policy::tiny()
     };
-    let race = race(policy, true, RaceFault::None, 800, Duration::from_secs(60));
-    assert!(race.lookups > 1000, "{} lookups", race.lookups);
-    assert_eq!(race.falses, 0, "of {} lookups", race.lookups);
+    for delivery in [Delivery::Inline, Delivery::Queued] {
+        let race = race(
+            policy,
+            delivery,
+            true,
+            RaceFault::None,
+            800,
+            Duration::from_secs(60),
+        );
+        assert!(
+            race.lookups > 1000,
+            "{delivery:?}: {} lookups",
+            race.lookups
+        );
+        assert_eq!(race.falses, 0, "{delivery:?}: of {} lookups", race.lookups);
+    }
 }
 
 /// Control: lookups that read the overlay last, as dcrd's do, miss a key
@@ -985,6 +1149,7 @@ fn lookups_never_miss_a_key_moving_into_the_runs() {
 fn control_reading_the_overlay_last_misses_keys_in_mid_move() {
     let race = race(
         Policy::tiny(),
+        Delivery::Inline,
         false,
         RaceFault::OverlayLast,
         u32::MAX,
@@ -994,17 +1159,25 @@ fn control_reading_the_overlay_last_misses_keys_in_mid_move() {
 }
 
 /// Control: a hand-over after the tip row is published leaves a window in
-/// which a reader sees the tip and misses one of its block's keys.
+/// which a reader sees the tip and misses one of its block's keys, whether
+/// the connect did its work inside its transaction or had it prepared.
 #[test]
 fn control_handing_keys_over_after_the_tip_is_published_misses_them() {
-    let race = race(
-        Policy::tiny(),
-        false,
-        RaceFault::HookAfterPublish,
-        u32::MAX,
-        Duration::from_secs(60),
-    );
-    assert!(race.falses > 0, "no false in {} lookups", race.lookups);
+    for delivery in [Delivery::Inline, Delivery::Queued] {
+        let race = race(
+            Policy::tiny(),
+            delivery,
+            false,
+            RaceFault::HookAfterPublish,
+            u32::MAX,
+            Duration::from_secs(60),
+        );
+        assert!(
+            race.falses > 0,
+            "{delivery:?}: no false in {} lookups",
+            race.lookups
+        );
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -1131,6 +1304,785 @@ fn a_copy_no_connect_took_is_withdrawn() {
         keys().contains(&c) && keys().contains(&d),
         "after a refusal"
     );
+}
+
+// ---------------------------------------------------------------------
+// The prepare step of a queued connect
+// ---------------------------------------------------------------------
+
+/// An index at genesis over its own database and chain, with the handles
+/// the prepare tests need.
+struct Fixture {
+    _dir: TempDir,
+    db: Arc<Database>,
+    chain: Arc<TestChain>,
+    subber: IndexSubscriber,
+    idx: Arc<Mutex<ExistsAddrIndex>>,
+    store: Arc<AddrStore>,
+    unconfirmed: crate::ExistsAddrUnconfirmed,
+    query: crate::ExistsAddrQuery,
+}
+
+/// What a [`Fixture`]'s index holds, for comparing two of them: the tip
+/// row, every key, the memtable's keys, and every row of the bucket.
+type IndexState = (Vec<u8>, Vec<Key>, Vec<Key>, Vec<(Vec<u8>, Vec<u8>)>);
+
+impl Fixture {
+    fn new(policy: Policy) -> Fixture {
+        let dir = TempDir::new().expect("tempdir");
+        let db =
+            Arc::new(Database::create(&Options::new(dir.path().join("db"), NET)).expect("create"));
+        let chain = TestChain::new(params());
+        let mut subber = new_subber();
+        let idx = open_index(&mut subber, &db, &chain, policy);
+        let (store, unconfirmed, query) = {
+            let idx = idx.lock().expect("index");
+            (Arc::clone(idx.store()), idx.unconfirmed(), idx.query())
+        };
+        Fixture {
+            _dir: dir,
+            db,
+            chain,
+            subber,
+            idx,
+            store,
+            unconfirmed,
+            query,
+        }
+    }
+
+    /// Connects prepared before their transaction, and connects that used
+    /// what was prepared for them.
+    fn prepared(&self) -> (usize, usize) {
+        (
+            self.store.faults.prepares.load(Ordering::SeqCst),
+            self.store.faults.prepared_connects.load(Ordering::SeqCst),
+        )
+    }
+
+    /// The connect notification of a block paying `keys` on the tip; the
+    /// block is not added to the chain.
+    fn next(&self, salt: u32, keys: &[Key]) -> IndexNtfn {
+        connect_ntfn(&self.chain.at(self.chain.tip().0), salt, keys)
+    }
+
+    fn deliver(&mut self, delivery: Delivery, salt: u32, keys: &[Key]) {
+        deliver(
+            delivery,
+            &self.chain,
+            &mut self.subber,
+            &self.unconfirmed,
+            salt,
+            keys,
+        )
+        .expect("connect");
+    }
+
+    /// What the index prepares for `ntfn` when it arrives as a queued
+    /// connect does, with the copy of the overlay as it stands.
+    fn prepare(&self, ntfn: &IndexNtfn) -> Option<crate::PreparedNtfn> {
+        self.unconfirmed
+            .with_copy(self.unconfirmed.copy_for_connect(), || {
+                self.idx.lock().expect("index").prepare_notification(ntfn)
+            })
+    }
+
+    /// Process `ntfn` with `prepared` in a transaction of the test's own,
+    /// outside the subscriber, and commit it.
+    fn apply(&self, ntfn: &IndexNtfn, prepared: Option<crate::PreparedNtfn>) {
+        let tx = self.db.begin(true).expect("begin");
+        self.idx
+            .lock()
+            .expect("index")
+            .process_prepared_notification(&tx, ntfn, prepared)
+            .expect("process");
+        tx.commit().expect("commit");
+    }
+
+    fn exists(&self, key: &Key) -> bool {
+        self.query
+            .exists_address(&address_of(key, params()))
+            .expect("lookup")
+    }
+
+    fn tip_row(&self) -> Vec<u8> {
+        let tx = self.db.begin(false).expect("begin");
+        let row = tx
+            .metadata()
+            .bucket(b"idxtips")
+            .and_then(|b| b.get(EXISTS_ADDR_INDEX_KEY))
+            .expect("tip row");
+        tx.rollback().expect("rollback");
+        row
+    }
+
+    /// The tip row a connect of `block` writes: its hash, then its height.
+    fn tip_row_of(block: &MsgBlock) -> Vec<u8> {
+        let mut row = block.header.block_hash().0.to_vec();
+        row.extend_from_slice(&block.header.height.to_le_bytes());
+        row
+    }
+
+    fn state(&self) -> IndexState {
+        let tx = self.db.begin(false).expect("begin");
+        let bucket = tx
+            .metadata()
+            .bucket(EXISTS_ADDR_INDEX_KEY)
+            .expect("bucket")
+            .raw_id();
+        let rows = tx.try_scan_after(&bucket, None, usize::MAX).expect("rows");
+        tx.rollback().expect("rollback");
+        let idx = self.idx.lock().expect("index");
+        (
+            self.tip_row(),
+            idx.logical_keys().expect("keys"),
+            idx.memtable_keys(),
+            rows,
+        )
+    }
+}
+
+fn sorted(mut keys: Vec<Key>) -> Vec<Key> {
+    keys.sort_unstable();
+    keys
+}
+
+/// A queued connect's index work is done while another transaction still
+/// holds the database's writer, and so before the subscriber has it: the
+/// prepare comes between taking the index's lock and the wait for the
+/// writer.  Nothing is handed over until the writer is free.
+///
+/// The same stall shows the lock order the subscriber keeps: the index's
+/// lock is held while the update waits for the writer.
+#[test]
+fn a_queued_connect_is_prepared_before_the_subscriber_claims_the_writer() {
+    let mut f = Fixture::new(Policy::tiny());
+    let mut rng = SplitMix64(0x7072_6570_0001);
+    let keys: Vec<Key> = (0..5).map(|_| random_key(&mut rng)).collect();
+    let pooled = random_key(&mut rng);
+    f.unconfirmed.add_unconfirmed_tx(&mempool_tx(&[pooled]));
+
+    let held = f.db.begin(true).expect("begin");
+    let (chain, subber, unconfirmed) = (&f.chain, &mut f.subber, &f.unconfirmed);
+    let (store, idx) = (&f.store, &f.idx);
+    let (prepares, index_locked, handed, connected) = std::thread::scope(|s| {
+        let updater = s.spawn(|| deliver(Delivery::Queued, chain, subber, unconfirmed, 1, &keys));
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while store.faults.prepares.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let prepares = store.faults.prepares.load(Ordering::SeqCst);
+        let index_locked = matches!(idx.try_lock(), Err(std::sync::TryLockError::WouldBlock));
+        let handed = store.mem.len();
+        // Released whatever was seen, so the updater always finishes.
+        held.rollback().expect("rollback");
+        (
+            prepares,
+            index_locked,
+            handed,
+            updater.join().expect("updater"),
+        )
+    });
+    assert_eq!(
+        prepares, 1,
+        "the connect was not prepared while another transaction held the writer"
+    );
+    assert!(
+        index_locked,
+        "the update waited for the writer without the index's lock"
+    );
+    assert_eq!(handed, 0, "keys were handed over outside a commit");
+    connected.expect("connect");
+    assert_eq!(f.prepared(), (1, 1));
+    let mut want = keys.clone();
+    want.push(pooled);
+    assert_eq!(f.store.mem.snapshot(), sorted(want));
+}
+
+/// A connect that brings no copy of the overlay is not prepared.  It
+/// copies the overlay as it stands once it has the writer, inside its
+/// transaction, as dcrd's connect drains the map inside its own
+/// (`existsaddrindex.go:451-456`): a key the pool adds while the update
+/// waits for the writer goes with this block.  Prepared ahead of that
+/// wait, the connect would have read the overlay without the key and
+/// left it for the next block.
+#[test]
+fn a_connect_with_no_copy_takes_the_overlay_once_it_has_the_writer() {
+    let mut f = Fixture::new(Policy::tiny());
+    let mut rng = SplitMix64(0x7072_6570_0006);
+    let keys: Vec<Key> = (0..3).map(|_| random_key(&mut rng)).collect();
+    let [pooled, late] = [0; 2].map(|_| random_key(&mut rng));
+    f.unconfirmed.add_unconfirmed_tx(&mempool_tx(&[pooled]));
+
+    let held = f.db.begin(true).expect("begin");
+    let (chain, subber, unconfirmed) = (&f.chain, &mut f.subber, &f.unconfirmed);
+    let idx = &f.idx;
+    let connected = std::thread::scope(|s| {
+        let updater = s.spawn(|| deliver(Delivery::Inline, chain, subber, unconfirmed, 1, &keys));
+        // The update takes the index's lock and then waits for the
+        // writer.  The pause is for a connect that reads the overlay
+        // ahead of that wait: it has done so before the pool's key
+        // arrives.  One that reads it inside its transaction cannot
+        // have, however long this takes.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !matches!(idx.try_lock(), Err(std::sync::TryLockError::WouldBlock))
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        std::thread::sleep(Duration::from_millis(300));
+        unconfirmed.add_unconfirmed_tx(&mempool_tx(&[late]));
+        held.rollback().expect("rollback");
+        updater.join().expect("updater")
+    });
+    connected.expect("connect");
+    assert_eq!(f.prepared(), (0, 0));
+    let mut want = keys.clone();
+    want.extend([pooled, late]);
+    assert_eq!(
+        f.store.mem.snapshot(),
+        sorted(want),
+        "the connect did not hand over the overlay as it stood when it had the writer"
+    );
+}
+
+/// The index's lock is held without a break from a connect's prepare
+/// until that connect has used the result, which is what the prepare's
+/// filter rests on: whenever another thread finds the lock free, every
+/// connect that was prepared has been made.
+///
+/// A race.  A subscriber that let the lock go between the two is caught
+/// when the watcher gets the lock in that gap, which over these connects
+/// it does many times; one that holds it cannot fail.
+#[test]
+fn the_index_lock_is_held_from_a_prepare_until_its_connect() {
+    let mut f = Fixture::new(Policy::tiny());
+    let mut rng = SplitMix64(0x7072_6570_0007);
+    let stop = AtomicBool::new(false);
+    let (chain, subber, unconfirmed) = (&f.chain, &mut f.subber, &f.unconfirmed);
+    let (store, idx) = (&f.store, &f.idx);
+    let (connected, held, between) = std::thread::scope(|s| {
+        let watcher = s.spawn(|| {
+            let (mut held, mut between) = (0u64, 0u64);
+            while !stop.load(Ordering::SeqCst) {
+                if let Ok(_guard) = idx.try_lock() {
+                    held += 1;
+                    let prepares = store.faults.prepares.load(Ordering::SeqCst);
+                    let used = store.faults.prepared_connects.load(Ordering::SeqCst);
+                    between += u64::from(prepares != used);
+                }
+                std::hint::spin_loop();
+            }
+            (held, between)
+        });
+        let connected = (1..=4000u32).try_for_each(|salt| {
+            let keys = [random_key(&mut rng)];
+            deliver(Delivery::Queued, chain, subber, unconfirmed, salt, &keys)
+        });
+        stop.store(true, Ordering::SeqCst);
+        let (held, between) = watcher.join().expect("watcher");
+        (connected, held, between)
+    });
+    connected.expect("connect");
+    assert_eq!(f.prepared(), (4000, 4000));
+    assert!(held > 1000, "the watcher held the lock only {held} times");
+    assert_eq!(
+        between, 0,
+        "the index's lock was free between a prepare and its connect, {between} times of {held}"
+    );
+}
+
+/// The same blocks, mempool transactions and flushes leave three indexes
+/// identical after every step, row for row: one whose connects are queued
+/// and so prepared before their transactions, one whose connects go
+/// through the subscriber on the spot, and one whose connects are
+/// processed in the test's own transactions, outside the subscriber.  A
+/// third of each block's keys were seen before, so the filter leaves keys
+/// out on every path.
+#[test]
+fn a_prepared_connect_leaves_the_index_as_a_connect_inside_its_transaction_does() {
+    let mut rng = SplitMix64(0x7072_6570_0002);
+    let mut queued = Fixture::new(fixed(Policy::tiny()));
+    let mut inline = Fixture::new(fixed(Policy::tiny()));
+    let direct = Fixture::new(fixed(Policy::tiny()));
+    let mut seen: Vec<Key> = Vec::new();
+    let mut connects = 0usize;
+    let mut flushed_rows = 0usize;
+    for step in 0..150u32 {
+        match rng.below(6) {
+            0 => {
+                let keys = [random_key(&mut rng), random_key(&mut rng)];
+                for f in [&queued, &inline, &direct] {
+                    f.unconfirmed.add_unconfirmed_tx(&mempool_tx(&keys));
+                }
+                seen.extend(keys);
+            }
+            1 => {
+                for f in [&queued, &inline, &direct] {
+                    f.db.flush().expect("flush");
+                }
+            }
+            _ => {
+                let keys: Vec<Key> = (0..1 + rng.below(10))
+                    .map(|_| {
+                        if !seen.is_empty() && rng.below(3) == 0 {
+                            seen[rng.below(seen.len() as u64) as usize]
+                        } else {
+                            random_key(&mut rng)
+                        }
+                    })
+                    .collect();
+                queued.deliver(Delivery::Queued, step, &keys);
+                inline.deliver(Delivery::Inline, step, &keys);
+                let ntfn = direct.next(step, &keys);
+                direct.chain.add(&ntfn.block);
+                direct.apply(&ntfn, None);
+                seen.extend(keys);
+                connects += 1;
+            }
+        }
+        let want = direct.state();
+        assert_eq!(queued.state(), want, "step {step}: queued against direct");
+        assert_eq!(inline.state(), want, "step {step}: inline against direct");
+        flushed_rows = flushed_rows.max(want.3.len());
+    }
+    assert!(connects > 50, "{connects} connects");
+    assert!(
+        flushed_rows > 10,
+        "the flushes wrote only {flushed_rows} rows"
+    );
+    // Each index took the path it stands for.
+    assert_eq!(queued.prepared(), (connects, connects));
+    assert_eq!(inline.prepared(), (0, 0));
+    assert_eq!(direct.prepared(), (0, 0));
+    for f in [&queued, &inline, &direct] {
+        f.db.flush().expect("flush");
+        check_layout(&f.db).expect("layout").expect("bucket");
+    }
+    assert_eq!(queued.state(), direct.state());
+    assert_eq!(inline.state(), direct.state());
+}
+
+/// What was prepared for one connect serves that connect only.  Handed
+/// to the connect of another block, to a disconnect of its own block, or
+/// to an index it is not from, it is dropped whole, the overlay copy in
+/// it included, and the work is done inside the transaction; the keys
+/// copied for it stay in the overlay.
+#[test]
+fn what_was_prepared_for_one_connect_is_not_used_for_another_notification() {
+    let mut f = Fixture::new(Policy::tiny());
+    let mut rng = SplitMix64(0x7072_6570_0003);
+    let [kx, ky, kz, pooled, added, later] = [0; 6].map(|_| random_key(&mut rng));
+
+    // Two blocks on the genesis block.  The index prepares the connect of
+    // one; the other's connect is handed the result.
+    f.unconfirmed.add_unconfirmed_tx(&mempool_tx(&[pooled]));
+    let x = f.next(1, &[kx]);
+    let y = f.next(2, &[ky]);
+    let for_x = f.prepare(&x);
+    assert!(for_x.is_some(), "a queued connect is prepared");
+    assert_eq!(f.prepared(), (1, 0));
+    // The pool adds a key after the copy in that result was made.
+    f.unconfirmed.add_unconfirmed_tx(&mempool_tx(&[added]));
+    f.chain.add(&y.block);
+    f.apply(&y, for_x);
+    assert_eq!(f.prepared(), (1, 0), "another block's result was used");
+    assert_eq!(f.tip_row(), Fixture::tip_row_of(&y.block));
+    // The connect of `y` did its own work: its key, and the overlay as it
+    // stands now, the later key with it, since the copy went with the
+    // result it did not use.
+    assert_eq!(f.store.mem.snapshot(), sorted(vec![ky, pooled, added]));
+    assert!(!f.exists(&kx), "the other block's key was handed over");
+
+    // A connect's result handed to the disconnect of that same block,
+    // whose notification holds the same allocation: the tip moves back
+    // and nothing else changes.
+    f.deliver(Delivery::Queued, 3, &[kz]);
+    assert_eq!(f.prepared(), (2, 1));
+    let z = IndexNtfn {
+        ntfn_type: CONNECT_NTFN,
+        block: f.chain.at(2),
+        parent: f.chain.at(1),
+        is_treasury_enabled: false,
+    };
+    f.unconfirmed.add_unconfirmed_tx(&mempool_tx(&[later]));
+    let for_z = f.prepare(&z);
+    assert_eq!(f.prepared(), (3, 1));
+    let before = f.store.mem.snapshot();
+    f.apply(
+        &IndexNtfn {
+            ntfn_type: crate::DISCONNECT_NTFN,
+            ..z.clone()
+        },
+        for_z,
+    );
+    assert_eq!(f.prepared(), (3, 1), "a disconnect used a connect's result");
+    assert_eq!(f.tip_row(), Fixture::tip_row_of(&y.block));
+    assert_eq!(f.store.mem.snapshot(), before, "a disconnect handed keys");
+    assert!(f.exists(&later), "the copied key left the overlay");
+
+    // A disconnect that arrives with a copy installed prepares nothing.
+    assert!(
+        f.prepare(&IndexNtfn {
+            ntfn_type: crate::DISCONNECT_NTFN,
+            ..z.clone()
+        })
+        .is_none()
+    );
+    assert_eq!(f.prepared(), (3, 1));
+
+    // Something that is not this index's is dropped, and the connect does
+    // its work inside the transaction: the key the pool added goes now.
+    f.apply(&z, Some(Box::new(7u32)));
+    assert_eq!(f.prepared(), (3, 1));
+    assert_eq!(f.tip_row(), Fixture::tip_row_of(&z.block));
+    assert_eq!(
+        f.store.mem.snapshot(),
+        sorted(vec![ky, kz, pooled, added, later])
+    );
+
+    // A connect that copies the overlay itself prepares nothing.
+    let w = f.next(4, &[kx]);
+    assert!(
+        f.idx
+            .lock()
+            .expect("index")
+            .prepare_notification(&w)
+            .is_none(),
+        "a connect with no copy installed was prepared"
+    );
+    assert_eq!(f.prepared(), (3, 1));
+}
+
+/// An update that fails after its connect was prepared leaves the index
+/// as it was: the memtable, the tip and the overlay, whose copied keys go
+/// with the next connect.  Three ways to fail: the transaction is rolled
+/// back, its commit fails, and the transaction never begins.
+#[test]
+fn an_update_that_fails_after_the_prepare_leaves_the_index_as_it_was() {
+    let mut f = Fixture::new(Policy::tiny());
+    let mut rng = SplitMix64(0x7072_6570_0004);
+    // More keys than `u_max`, so the next commit asks for a flush.
+    let first: Vec<Key> = (0..10).map(|_| random_key(&mut rng)).collect();
+    let [pooled, fresh] = [0; 2].map(|_| random_key(&mut rng));
+    f.deliver(Delivery::Queued, 1, &first);
+    f.unconfirmed.add_unconfirmed_tx(&mempool_tx(&[pooled]));
+    let memtable = f.store.mem.snapshot();
+    let tip = f.tip_row();
+    let unchanged = |f: &Fixture, what: &str| {
+        assert_eq!(f.store.mem.snapshot(), memtable, "{what}: the memtable");
+        assert_eq!(f.tip_row(), tip, "{what}: the tip");
+        assert!(f.exists(&pooled), "{what}: the copied key left the overlay");
+        assert!(!f.exists(&fresh), "{what}: the block's key is visible");
+    };
+
+    // Rolled back, after the connect used what was prepared.
+    let ntfn = f.next(2, &[fresh, first[0]]);
+    let prepared = f.prepare(&ntfn);
+    assert_eq!(f.prepared(), (2, 1));
+    {
+        let tx = f.db.begin(true).expect("begin");
+        f.idx
+            .lock()
+            .expect("index")
+            .process_prepared_notification(&tx, &ntfn, prepared)
+            .expect("connect");
+        tx.rollback().expect("rollback");
+    }
+    assert_eq!(f.prepared(), (2, 2));
+    unchanged(&f, "a rollback");
+
+    // A commit whose own flush fails: the hook never runs.
+    f.store.faults.fail_contribute.store(true, Ordering::SeqCst);
+    let failed = deliver(
+        Delivery::Queued,
+        &f.chain,
+        &mut f.subber,
+        &f.unconfirmed,
+        2,
+        &[fresh, first[0]],
+    );
+    let err = failed.expect_err("the commit's flush must fail");
+    assert!(
+        err.to_string().contains("injected contribute failure"),
+        "{err}"
+    );
+    assert_eq!(f.prepared(), (3, 3));
+    assert!(f.db.is_fatal(), "the store latched");
+    f.chain.remove_tip();
+    unchanged(&f, "a failed commit");
+
+    // The store is latched, so the next update is prepared and then
+    // refused its transaction; what was prepared is dropped.
+    let refused = deliver(
+        Delivery::Queued,
+        &f.chain,
+        &mut f.subber,
+        &f.unconfirmed,
+        2,
+        &[fresh, first[0]],
+    );
+    assert!(refused.is_err(), "a transaction began on a latched store");
+    assert_eq!(f.prepared(), (4, 3), "prepared, and never used");
+    f.chain.remove_tip();
+    unchanged(&f, "a refused transaction");
+}
+
+/// Nothing of a connect's prepared work outlives its update.  The same
+/// notification, the very block allocation the result was made for,
+/// delivered again after its first update rolled back and with nothing
+/// prepared, is done afresh inside its transaction: it reads the overlay
+/// as it stands by then.
+#[test]
+fn a_connect_delivered_again_after_its_update_rolled_back_starts_afresh() {
+    let f = Fixture::new(Policy::tiny());
+    let mut rng = SplitMix64(0x7072_6570_0008);
+    let [key, pooled, late] = [0; 3].map(|_| random_key(&mut rng));
+    f.unconfirmed.add_unconfirmed_tx(&mempool_tx(&[pooled]));
+    let ntfn = f.next(1, &[key]);
+    let prepared = f.prepare(&ntfn);
+    {
+        let tx = f.db.begin(true).expect("begin");
+        f.idx
+            .lock()
+            .expect("index")
+            .process_prepared_notification(&tx, &ntfn, prepared)
+            .expect("connect");
+        tx.rollback().expect("rollback");
+    }
+    assert_eq!(f.prepared(), (1, 1));
+    assert_eq!(f.store.mem.len(), 0, "a rolled-back connect handed keys");
+
+    // The pool adds a key, and the notification arrives again.
+    f.unconfirmed.add_unconfirmed_tx(&mempool_tx(&[late]));
+    f.chain.add(&ntfn.block);
+    f.apply(&ntfn, None);
+    assert_eq!(f.prepared(), (1, 1), "a result outlived its update");
+    assert_eq!(f.tip_row(), Fixture::tip_row_of(&ntfn.block));
+    assert_eq!(f.store.mem.snapshot(), sorted(vec![key, pooled, late]));
+}
+
+/// What was prepared stays good across a flush and across another
+/// connect.  A flush between the prepare and the transaction merges a
+/// partition whose key the filter left out: the key is in a run by then,
+/// and is not handed over again.  A connect outside the subscriber hands
+/// over one of the keys the filter kept: the hook finds it held and
+/// skips it.  The index holds every key once, and a restart loads the
+/// same.
+///
+/// The connect that filters inside its transaction, after the same flush,
+/// hands the merged key over again, as a duplicate of the run's.  That is
+/// the one difference between the two, and the keys the index holds are
+/// the same.
+#[test]
+fn what_was_prepared_stays_good_across_a_flush_and_another_connect() {
+    // Everything merges at every flush, and no commit asks for one.
+    let policy = fixed(Policy {
+        k0: 0,
+        k0_hard: 0,
+        u_max: 1000,
+        ..Policy::tiny()
+    });
+    let mut rng = SplitMix64(0x7072_6570_0005);
+    let [held, other, fresh, raced, pooled] = [0; 5].map(|_| random_key(&mut rng));
+    let run = |prepare_first: bool| {
+        let mut f = Fixture::new(policy);
+        f.deliver(Delivery::Inline, 1, &[held, other]);
+        f.unconfirmed.add_unconfirmed_tx(&mempool_tx(&[pooled]));
+        let ntfn = f.next(2, &[held, fresh, raced]);
+        let prepared = prepare_first.then(|| f.prepare(&ntfn).expect("prepared"));
+        // The flush moves `held` and `other` into their runs.
+        f.db.flush().expect("flush");
+        assert_eq!(f.store.mem.len(), 0, "the flush merged everything");
+        // A sibling connected outside the subscriber hands `raced` over.
+        let sibling = f.next(3, &[raced]);
+        f.apply(&sibling, None);
+        assert_eq!(f.store.mem.snapshot(), sorted(vec![raced, pooled]));
+
+        f.chain.add(&ntfn.block);
+        f.apply(&ntfn, prepared);
+        assert_eq!(
+            f.prepared(),
+            (usize::from(prepare_first), usize::from(prepare_first))
+        );
+        assert_eq!(f.tip_row(), Fixture::tip_row_of(&ntfn.block));
+        let memtable = f.store.mem.snapshot();
+        for key in [held, other, fresh, raced, pooled] {
+            assert!(f.exists(&key), "{} is missing", hex(&key));
+        }
+        let keys = f.idx.lock().expect("index").logical_keys().expect("keys");
+        assert_eq!(keys, sorted(vec![held, other, fresh, raced, pooled]));
+        // Durable, and the same after a restart.
+        f.db.flush().expect("flush");
+        check_layout(&f.db).expect("layout").expect("bucket");
+        let Fixture {
+            _dir: dir,
+            db,
+            chain,
+            subber,
+            idx,
+            store,
+            unconfirmed,
+            query,
+        } = f;
+        drop((subber, idx, store, unconfirmed, query));
+        db.close().expect("close");
+        drop(db);
+        let db =
+            Arc::new(Database::open(&Options::new(dir.path().join("db"), NET)).expect("reopen"));
+        let mut subber = new_subber();
+        let idx = open_index(&mut subber, &db, &chain, policy);
+        let reopened = idx.lock().expect("index").logical_keys().expect("keys");
+        assert_eq!(reopened, keys, "after a restart");
+        drop(idx);
+        drop(subber);
+        db.close().expect("close");
+        memtable
+    };
+    // Prepared before the flush: `held` was left out as held and is in
+    // its run; `raced` is held once.
+    assert_eq!(run(true), sorted(vec![fresh, raced, pooled]));
+    // Filtered inside the transaction, after the flush: `held` again.
+    assert_eq!(run(false), sorted(vec![held, fresh, raced, pooled]));
+}
+
+/// Another thread's commit flushes between a queued connect's prepare and
+/// its transaction, at every connect, while readers look keys up.
+///
+/// The test's own transaction holds the writer until the connect has
+/// been prepared, and its commit then runs the flush that the keys of the
+/// connect before ask for, which under `k0` = 0 merges every partition.
+/// So each key the prepare left out as held, half of every block's, is in
+/// a run and out of the memtable by the time the connect's hook runs.  No
+/// lookup misses a key, each connect hands over exactly the keys its
+/// prepare kept, and the index ends with every key once, in memory and on
+/// disk.
+#[test]
+fn a_flush_between_a_prepare_and_its_transaction_loses_no_key() {
+    const CONNECTS: usize = 300;
+    // Everything merges at every flush, and a commit asks for one as soon
+    // as a key is unjournaled.
+    let policy = fixed(Policy {
+        k0: 0,
+        k0_hard: 0,
+        u_max: 1,
+        ..Policy::tiny()
+    });
+    let mut f = Fixture::new(policy);
+    let mut rng = SplitMix64(0x7072_6570_0009);
+    let watched = Watched::new();
+    let readers = watched.readers(4, &f.query);
+    let mut all: BTreeSet<Key> = BTreeSet::new();
+
+    // A first block, for the memtable to hold keys at the first prepare.
+    let first: Vec<Key> = (0..6).map(|_| random_key(&mut rng)).collect();
+    watched
+        .by_height
+        .write()
+        .expect("heights")
+        .push(first.clone());
+    f.deliver(Delivery::Inline, 0, &first);
+    all.extend(first);
+
+    let mut left_out = 0usize;
+    for n in 1..=CONNECTS {
+        // Half of the block's keys are in the memtable, handed over by
+        // the connect before, and half are new; every third block finds
+        // two keys in the mempool as well.
+        let held = f.store.mem.snapshot();
+        assert!(!held.is_empty(), "connect {n}: nothing is held");
+        let keys: Vec<Key> = (0..6)
+            .map(|i| match i % 2 {
+                0 => held[rng.below(held.len() as u64) as usize],
+                _ => random_key(&mut rng),
+            })
+            .collect();
+        let mut pooled: Vec<Key> = Vec::new();
+        if n % 3 == 0 {
+            pooled.extend([random_key(&mut rng), random_key(&mut rng)]);
+            f.unconfirmed.add_unconfirmed_tx(&mempool_tx(&pooled));
+            watched.always.write().expect("always").extend(&pooled);
+        }
+        watched
+            .by_height
+            .write()
+            .expect("heights")
+            .push(keys.clone());
+
+        let writer = f.db.begin(true).expect("begin");
+        let (chain, subber, unconfirmed) = (&f.chain, &mut f.subber, &f.unconfirmed);
+        let store = &f.store;
+        let flushes = || store.faults.finished.lock().expect("log").len();
+        let (prepares, flushed, connected) = std::thread::scope(|s| {
+            let updater = s.spawn(|| {
+                deliver(
+                    Delivery::Queued,
+                    chain,
+                    subber,
+                    unconfirmed,
+                    n as u32,
+                    &keys,
+                )
+            });
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while store.faults.prepares.load(Ordering::SeqCst) < n && Instant::now() < deadline {
+                std::thread::yield_now();
+            }
+            let prepares = store.faults.prepares.load(Ordering::SeqCst);
+            let before = flushes();
+            // The connect is prepared and waits for the writer: this
+            // commit's flush falls between the two.
+            writer.commit().expect("commit");
+            let flushed = flushes() - before;
+            (prepares, flushed, updater.join().expect("updater"))
+        });
+        assert_eq!(
+            prepares, n,
+            "connect {n} was not prepared while another transaction held the writer"
+        );
+        connected.expect("connect");
+        assert_eq!(
+            flushed, 1,
+            "connect {n}: the commit before it did not flush"
+        );
+        assert_eq!(flushes(), n, "connect {n}: a flush besides that one");
+        // What the connect handed over is what its prepare kept: the keys
+        // the memtable did not hold then.  The others are in the runs.
+        let kept: BTreeSet<Key> = keys
+            .iter()
+            .chain(&pooled)
+            .copied()
+            .filter(|key| held.binary_search(key).is_err())
+            .collect();
+        left_out += keys.len() + pooled.len() - kept.len();
+        assert!(
+            f.store.mem.snapshot() == kept.into_iter().collect::<Vec<Key>>(),
+            "connect {n} did not hand over exactly the keys its prepare kept"
+        );
+        all.extend(keys);
+        all.extend(pooled);
+    }
+    let race = watched.finish(readers);
+    assert!(race.lookups > 1000, "{} lookups", race.lookups);
+    assert_eq!(race.falses, 0, "of {} lookups", race.lookups);
+    assert_eq!(f.prepared(), (CONNECTS, CONNECTS));
+    assert!(
+        left_out >= CONNECTS,
+        "the prepares left out {left_out} keys"
+    );
+
+    let want: Vec<Key> = all.into_iter().collect();
+    let keys = f.idx.lock().expect("index").logical_keys().expect("keys");
+    assert!(
+        keys == want,
+        "the index's keys are not the blocks' and the pool's"
+    );
+    f.db.flush().expect("flush");
+    check_layout(&f.db).expect("layout").expect("bucket");
+    let stored = super::store::stored_keys(&f.db)
+        .expect("stored")
+        .expect("index");
+    assert!(stored == want, "the stored keys are not the index's");
 }
 
 // ---------------------------------------------------------------------

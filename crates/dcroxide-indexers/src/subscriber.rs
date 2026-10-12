@@ -272,11 +272,28 @@ impl IndexSubscriber {
             // the transaction, so nothing waits on another lock while
             // holding it.
             //
-            // Pinned by `dcroxide-node/tests/b6_indexlock.rs`.
+            // Pinned by the exists address index's tests
+            // (`existsaddr/tests.rs`): an update that waits for the
+            // writer behind another transaction holds this mutex while it
+            // waits.
             let mut guard = idx.lock().expect("indexer lock poisoned");
             let db = guard.db();
+            // Between the two, whatever part of the update the index can
+            // do without a transaction (dcrd does all of it inside the
+            // `dbTx`): block connection opens several write transactions
+            // a block on another thread, and index work done with the
+            // writer held is time that thread may spend waiting for it.
+            // The guard is held from here until the index has used the
+            // result or the update has failed, and the result goes
+            // nowhere else: a `begin` that fails drops it.
+            //
+            // The same tests hold this place and that hold: a queued
+            // connect is prepared while another transaction still has the
+            // writer, and no other thread finds the index's lock free
+            // between a prepare and the connect it was made for.
+            let prepared = guard.prepare_notification(ntfn);
             let db_tx = db.begin(true)?;
-            match guard.process_notification(&db_tx, ntfn) {
+            match guard.process_prepared_notification(&db_tx, ntfn, prepared) {
                 Ok(()) => {
                     drop(guard);
                     db_tx.commit()?
