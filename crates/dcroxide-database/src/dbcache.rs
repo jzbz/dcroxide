@@ -45,9 +45,14 @@ use crate::blockfile::BlockStore;
 use crate::error::{Error, ErrorKind, db_error};
 use crate::participant::{FlushWriter, Registration};
 
-/// The default size for the database cache (dcrd `defaultCacheSize`,
-/// 100 MiB).
-pub(crate) const DEFAULT_CACHE_SIZE: u64 = 100 * 1024 * 1024;
+/// The default size for the database cache: 300 MiB, three times dcrd's
+/// `defaultCacheSize` of 100 MiB (`database/ffldb/dbcache.go:22`).  A
+/// UTXO cache flush that only its size limit tripped does not force a
+/// flush of this cache, so its rows wait here, and this ceiling is the
+/// most they wait for: with the factor in [`DbCache::needs_flush`], a
+/// commit flushes once more than 200 MiB is retained.  The flush
+/// interval, or a flush participant that asks for one, can come first.
+pub(crate) const DEFAULT_CACHE_SIZE: u64 = 300 * 1024 * 1024;
 
 /// The default number of seconds between flushes (dcrd
 /// `defaultFlushSecs`, five minutes).
@@ -1073,7 +1078,7 @@ mod tests {
         }
 
         // Fill the overlay with roughly 30 MiB of committed metadata,
-        // well under the 100 MiB flush threshold so nothing flushes
+        // well under the default flush threshold so nothing flushes
         // mid-measurement.
         const FILL_KEYS: usize = 30_000;
         const ROUNDS: usize = 300;

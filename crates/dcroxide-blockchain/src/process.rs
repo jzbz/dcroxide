@@ -286,11 +286,21 @@ pub struct Chain {
     /// `lastFlushHash`), compared against the backend's recorded utxo
     /// set state on startup.
     utxo_last_flush_hash: Hash,
-    /// The periodic clock reading of the last utxo cache flush (dcrd
-    /// `lastFlushTime`); see [`Chain::periodic_clock`].  `None` only
-    /// before a chain with no monotonic clock first observes the
+    /// The periodic clock reading of the last utxo cache flush that
+    /// ended in a durable database flush; see
+    /// [`Chain::periodic_clock`].  dcrd's `lastFlushTime` is stamped by
+    /// every flush (`utxocache.go:760`), and every dcrd flush follows a
+    /// durable flush of the block database (`utxocache.go:713`).  Here
+    /// a flush only the size limit tripped leaves its rows in the
+    /// database's write cache and does not move the stamp, so the
+    /// periodic interval counts from the last flush a crash cannot
+    /// lose.  A durable commit the write cache makes on its own does
+    /// not move the stamp either, since the chain is not told of one:
+    /// the periodic flush can then follow such a commit within the
+    /// interval, which adds a durable commit and loses nothing.  `None`
+    /// only before a chain with no monotonic clock first observes the
     /// adjusted time.
-    utxo_last_flush_nanos: Option<i64>,
+    utxo_last_durable_flush_nanos: Option<i64>,
     /// The block height of the last cache eviction (dcrd
     /// `lastEvictionHeight`).
     utxo_last_eviction_height: u32,
@@ -695,7 +705,7 @@ impl Chain {
             utxo_cache_hits: Cell::new(0),
             utxo_cache_misses: Cell::new(0),
             utxo_last_flush_hash: Hash::ZERO,
-            utxo_last_flush_nanos: crate::gotime::monotonic_nanos(),
+            utxo_last_durable_flush_nanos: crate::gotime::monotonic_nanos(),
             utxo_last_eviction_height: 0,
             utxo_clock_unix: 0,
             adjusted_time_observed: false,
@@ -1555,6 +1565,7 @@ impl Chain {
         if let Err(e) = self.db.as_ref().expect("checked above").flush() {
             return Err(crate::chaindb::ChainDbError::Db(e));
         }
+        self.utxo_stamp_durable_flush();
         Ok(())
     }
 
@@ -1864,7 +1875,10 @@ impl Chain {
     /// Whether a non-forced flush is due (dcrd
     /// `UtxoCache.shouldFlush`): not when already flushed through the
     /// best hash, and otherwise when the maximum size or the periodic
-    /// flush interval has been reached.
+    /// flush interval has been reached.  The interval counts from the
+    /// last durable flush, not from the last flush as dcrd's does, so
+    /// a periodic flush can follow a size-triggered one sooner than
+    /// dcrd's would.
     fn utxo_should_flush(&self, best_hash: &Hash) -> bool {
         if self.utxo_last_flush_hash == *best_hash {
             return false;
@@ -1872,7 +1886,15 @@ impl Chain {
         if self.utxo_cache_total_size() >= self.utxo_cache_max_bytes {
             return true;
         }
-        let (Some(now), Some(last)) = (self.periodic_now(), self.utxo_last_flush_nanos) else {
+        self.utxo_periodic_flush_due()
+    }
+
+    /// Whether the periodic flush interval has been reached: the time
+    /// test of dcrd `UtxoCache.shouldFlush` (`utxocache.go:669`),
+    /// counted from the last durable flush.
+    fn utxo_periodic_flush_due(&self) -> bool {
+        let (Some(now), Some(last)) = (self.periodic_now(), self.utxo_last_durable_flush_nanos)
+        else {
             return false;
         };
         now.saturating_sub(last) >= UTXO_PERIODIC_FLUSH_SECS.saturating_mul(NANOS_PER_SEC)
@@ -1880,14 +1902,46 @@ impl Chain {
 
     /// Conditionally flush the cache to the backend (dcrd
     /// `UtxoCache.MaybeFlush`).
+    ///
+    /// A forced flush, and one the periodic interval has come due for,
+    /// ends in a durable database flush, as every dcrd flush follows
+    /// one (`flushBlockDB`, `utxocache.go:713`).  A flush only the size
+    /// limit tripped commits its rows and the set state in one
+    /// transaction and returns with them in the database's write cache,
+    /// where the next durable commit picks them up: the write cache's
+    /// own (its size, its timer, an index's request), or the next
+    /// forced or periodic flush here.  Each of those is decided as a
+    /// block connects or a transaction commits, so while nothing does
+    /// either, the rows wait there for a clean shutdown: the wait is
+    /// bounded in work, not in time.
+    ///
+    /// dcrd flushes the block database first because its UTXO set is a
+    /// separate database that must never run ahead of the block index.
+    /// Here both are rows of one store, and every durable commit holds
+    /// whole transactions in the order they committed.  The rows and
+    /// the set state are written in one transaction, so on disk they
+    /// always describe the same block, and that block's connect is in
+    /// the same durable state.  The best state is at or past that
+    /// block, except across an interrupted disconnect, where the set
+    /// state names the disconnected block and its spend journal row is
+    /// still present, because the row is removed in a later
+    /// transaction.  An unclean stop loses what followed the last
+    /// durable commit, which [`Chain::initialize_utxo_state`] and the
+    /// block download make up.
     fn maybe_flush_utxo_cache(
         &mut self,
         best_hash: Hash,
         best_height: u32,
         force: bool,
     ) -> Result<(), crate::chaindb::ChainDbError> {
-        if force || self.utxo_should_flush(&best_hash) {
-            self.flush_utxo_cache(best_hash, best_height)?;
+        if force {
+            return self.flush_utxo_cache(best_hash, best_height);
+        }
+        if self.utxo_should_flush(&best_hash) {
+            // The clock never steps back, so a flush the interval
+            // granted is still due at this second reading.
+            let durable = self.utxo_periodic_flush_due();
+            self.flush_utxo_cache_with(best_hash, best_height, durable)?;
         }
         Ok(())
     }
@@ -1901,11 +1955,25 @@ impl Chain {
     /// cache.  The entry writes and the utxo set state land in ONE
     /// database transaction, exactly as dcrd's backend
     /// `PutUtxos(utxos, state)` couples them, so a crash can never
-    /// leave the flushed set and its recorded state out of step.
+    /// leave the flushed set and its recorded state out of step.  The
+    /// flush ends in a durable database flush.
     fn flush_utxo_cache(
         &mut self,
         last_flush_hash: Hash,
         last_flush_height: u32,
+    ) -> Result<(), crate::chaindb::ChainDbError> {
+        self.flush_utxo_cache_with(last_flush_hash, last_flush_height, true)
+    }
+
+    /// [`Chain::flush_utxo_cache`], ending in a durable database flush
+    /// only when `durable` is set; see
+    /// [`Chain::maybe_flush_utxo_cache`] for which flushes leave it
+    /// unset.
+    fn flush_utxo_cache_with(
+        &mut self,
+        last_flush_hash: Hash,
+        last_flush_height: u32,
+        durable: bool,
     ) -> Result<(), crate::chaindb::ChainDbError> {
         let eviction_height = self.utxo_calc_flush_eviction_height(last_flush_height);
         if let Some(db) = &self.db {
@@ -1935,14 +2003,18 @@ impl Chain {
         // overlay until that reaches disk, and a crash before then loses
         // the in-memory state along with it.
         self.utxo_flush_finish(eviction_height, last_flush_hash);
-        // Bound the crash-loss window to the UTXO flush cadence like
-        // dcrd, whose every UTXO cache flush makes the block database
-        // durable (`flushBlockDB`).
-        if let Some(db) = self.db.as_ref()
-            && let Err(e) = db.flush()
-        {
-            return Err(crate::chaindb::ChainDbError::Db(e));
+        // A forced or periodic flush is the chain's durability barrier,
+        // as dcrd's `flushBlockDB` is for every flush of its cache.  A
+        // size-triggered one returns here, and its rows ride in the
+        // next durable commit.  A chain without a database has no write
+        // cache, so each of its flushes counts.
+        if let Some(db) = self.db.as_ref() {
+            if !durable {
+                return Ok(());
+            }
+            db.flush().map_err(crate::chaindb::ChainDbError::Db)?;
         }
+        self.utxo_stamp_durable_flush();
         Ok(())
     }
 
@@ -2008,16 +2080,20 @@ impl Chain {
         });
         self.utxo_total_entry_size.set(total);
         self.utxo_last_flush_hash = last_flush_hash;
-        // dcrd `c.lastFlushTime = c.timeNow()` (`utxocache.go:760`).
-        // With no monotonic clock, a flush before the first processing
-        // call (a size-limit flush in the open's catch-up, or
-        // gettxoutsetinfo's) has no time to stamp, and leaves the stamp
-        // for that call's adjusted time to seed.
-        if let Some(now) = self.periodic_now() {
-            self.utxo_last_flush_nanos = Some(now);
-        }
         if eviction_height != 0 {
             self.utxo_last_eviction_height = eviction_height;
+        }
+    }
+
+    /// Stamp a flush that ended in a durable database flush (dcrd
+    /// `c.lastFlushTime = c.timeNow()`, `utxocache.go:760`, which every
+    /// dcrd flush reaches).  With no monotonic clock, a flush before
+    /// the first processing call (gettxoutsetinfo's) has no time to
+    /// stamp, and leaves the stamp for that call's adjusted time to
+    /// seed.
+    fn utxo_stamp_durable_flush(&mut self) {
+        if let Some(now) = self.periodic_now() {
+            self.utxo_last_durable_flush_nanos = Some(now);
         }
     }
 
@@ -3414,7 +3490,7 @@ impl Chain {
             .map_err(|e| persist_rule_error(crate::chaindb::ChainDbError::Db(e)))?;
         }
 
-        // The rows are durable now (or there is no database), so the
+        // The rows are committed now (or there is no database), so the
         // mirrors consensus reads can catch up.
         if let Some((block_hash, ts, tspend_updates)) = treasury_records {
             self.apply_treasury_records(block_hash, ts, &tspend_updates);
@@ -5550,15 +5626,15 @@ impl Chain {
 
     /// Record the adjusted time of the processing call in flight, which
     /// the is-current check reads.  With no monotonic clock it is also
-    /// the periodic clock, and its first observation seeds the flush
-    /// stamp, which nothing before it could set, so no periodic flush
-    /// fires within the interval of startup, as dcrd's `lastFlushTime:
-    /// time.Now()` at cache construction ensures.
+    /// the periodic clock, and its first observation seeds the durable
+    /// flush stamp, which nothing before it could set, so no periodic
+    /// flush fires within the interval of startup, as dcrd's
+    /// `lastFlushTime: time.Now()` at cache construction ensures.
     fn observe_adjusted_time(&mut self, adjusted_time_unix: i64) {
         self.utxo_clock_unix = adjusted_time_unix;
         self.adjusted_time_observed = true;
-        if self.utxo_last_flush_nanos.is_none() {
-            self.utxo_last_flush_nanos = self.periodic_now();
+        if self.utxo_last_durable_flush_nanos.is_none() {
+            self.utxo_last_durable_flush_nanos = self.periodic_now();
         }
     }
 
@@ -7998,7 +8074,7 @@ mod tests {
     fn use_test_clock(chain: &mut Chain) {
         chain.periodic_clock = test_clock;
         chain.last_prune_nanos = test_clock();
-        chain.utxo_last_flush_nanos = test_clock();
+        chain.utxo_last_durable_flush_nanos = test_clock();
         chain.cached_tips_last_pruned_nanos = test_clock();
     }
 
@@ -8428,7 +8504,7 @@ mod tests {
         let stamps = |chain: &Chain| {
             (
                 chain.last_prune_nanos,
-                chain.utxo_last_flush_nanos,
+                chain.utxo_last_durable_flush_nanos,
                 chain.cached_tips_last_pruned_nanos,
             )
         };
@@ -8453,15 +8529,16 @@ mod tests {
         assert_eq!(chain.utxo_last_flush_hash, chain.store.node(tip).hash);
     }
 
-    /// With no monotonic clock (a build without `std`), a flush made
-    /// before the first processing call hands in the adjusted time
+    /// With no monotonic clock (a build without `std`), a forced flush
+    /// made before the first processing call hands in the adjusted time
     /// leaves the flush stamp for that call to seed, so no periodic
     /// flush fires within the interval of startup, as dcrd's
     /// `lastFlushTime: time.Now()` at cache construction ensures.  The
     /// GAP07#1 fix stamped such a flush at adjusted time zero, which
-    /// blocked the seeding and made the first block after gettxoutsetinfo
-    /// (or after a size-limit flush in the open's catch-up) flush at
-    /// once.
+    /// blocked the seeding and made the first block after
+    /// gettxoutsetinfo flush at once.  A size-limit flush in the open's
+    /// catch-up did the same then; with no clock reading it is no
+    /// longer durable, and so never reaches the stamp.
     #[test]
     fn without_a_monotonic_clock_an_early_flush_leaves_the_stamp_to_seed() {
         fn no_clock() -> Option<i64> {
@@ -8476,7 +8553,7 @@ mod tests {
         // clock, and no stamp that could be read from one.
         chain.periodic_clock = no_clock;
         chain.last_prune_nanos = None;
-        chain.utxo_last_flush_nanos = None;
+        chain.utxo_last_durable_flush_nanos = None;
         chain.cached_tips_last_pruned_nanos = None;
         let genesis = chain.store.node(chain.best_chain.tip().expect("tip")).hash;
         let (blocks, now) = battery_main_chain();
@@ -8492,7 +8569,7 @@ mod tests {
         // gettxoutsetinfo before the first block: there is no time to
         // stamp the flush with.
         chain.flush_utxo_cache_for_stats().expect("stats flush");
-        assert_eq!(chain.utxo_last_flush_nanos, None);
+        assert_eq!(chain.utxo_last_durable_flush_nanos, None);
 
         // The first processing call seeds every stamp with its adjusted
         // time, and nothing is due within the interval.
@@ -8503,7 +8580,7 @@ mod tests {
         assert_eq!(
             (
                 chain.last_prune_nanos,
-                chain.utxo_last_flush_nanos,
+                chain.utxo_last_durable_flush_nanos,
                 chain.cached_tips_last_pruned_nanos
             ),
             (seeded, seeded, seeded)
@@ -8516,8 +8593,416 @@ mod tests {
         // One flush interval on, the periodic flush runs.
         let later = fast + UTXO_PERIODIC_FLUSH_SECS;
         connect(&mut chain, &blocks[20], later);
-        assert_eq!(chain.utxo_last_flush_nanos, Some(later * NANOS_PER_SEC));
+        assert_eq!(
+            chain.utxo_last_durable_flush_nanos,
+            Some(later * NANOS_PER_SEC)
+        );
         assert_eq!(chain.utxo_last_flush_hash, blocks[20].header.block_hash());
+    }
+
+    /// A database-backed regnet chain on the test clock whose UTXO cache
+    /// is at its size limit after every connect, with a count of the
+    /// durable flushes its database makes.  Everything the open wrote is
+    /// flushed first, so the count moves only for what a test does.
+    fn size_limited_chain(
+        opts: &mut dcroxide_database::Options,
+        params: &Params,
+    ) -> (Chain, Arc<core::sync::atomic::AtomicUsize>) {
+        let flushes = Arc::new(core::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&flushes);
+        opts.flush_observer = Some(Arc::new(move |_: &dcroxide_database::FlushObservation| {
+            counter.fetch_add(1, Ordering::SeqCst);
+        }));
+        let db = dcroxide_database::Database::create(opts).expect("create database");
+        let mut chain = Chain::open(db, params, Hash::ZERO, false, 0).expect("open chain");
+        set_test_clock(0);
+        use_test_clock(&mut chain);
+        chain.utxo_cache_max_bytes = 1;
+        let db = chain.db.as_ref().expect("db");
+        db.flush().expect("flush what the open wrote");
+        (chain, flushes)
+    }
+
+    /// The block the utxo set state names, read through the database's
+    /// write cache.
+    fn recorded_utxo_set_hash(db: &dcroxide_database::Database) -> Hash {
+        let mut recorded = None;
+        db.view(|tx| {
+            recorded = crate::chaindb::db_fetch_utxo_set_state(tx).expect("utxo set state");
+            Ok(())
+        })
+        .expect("read the utxo set state");
+        recorded.expect("a recorded utxo set state").last_flush_hash
+    }
+
+    /// A UTXO cache flush that only the size limit tripped writes its
+    /// rows and the set state and returns without a durable database
+    /// flush; the first flush 120 s or more after the last durable one
+    /// ends in one, however often the size limit tripped in between.
+    /// Every flush ended in a durable commit before, as each of dcrd's
+    /// follows `flushBlockDB` (`utxocache.go:713`).  The interval counts
+    /// from the last durable flush, not from the last flush as dcrd's
+    /// `lastFlushTime` does (`utxocache.go:760`): size-triggered flushes
+    /// would otherwise postpone the periodic one for as long as they
+    /// kept coming.
+    #[test]
+    fn a_size_triggered_utxo_flush_is_durable_only_once_the_interval_has_passed() {
+        let params = dcroxide_chaincfg::regnet_params();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut opts = dcroxide_database::Options::new(dir.path().join("chain"), params.net.0);
+        let (mut chain, flushes) = size_limited_chain(&mut opts, &params);
+        let (blocks, now) = battery_main_chain();
+        assert!(blocks.len() > 23, "the battery has a long main chain");
+        // Two days on, every block looks old, so the chain never
+        // latches to current and forces a flush of its own.
+        let fast = now + 48 * 60 * 60;
+        let connect = |chain: &mut Chain, block: &MsgBlock| {
+            let (_, errs) = chain.process_block(block, fast, &params);
+            assert!(errs.is_empty(), "{errs:?}");
+        };
+        let durable = || flushes.load(Ordering::SeqCst);
+        let base = durable();
+
+        // Within the interval of the last durable flush, every connect
+        // flushes the cache and none of the flushes is durable.
+        for block in &blocks[..10] {
+            connect(&mut chain, block);
+        }
+        set_test_clock(60);
+        for block in &blocks[10..20] {
+            connect(&mut chain, block);
+        }
+        set_test_clock(UTXO_PERIODIC_FLUSH_SECS - 1);
+        connect(&mut chain, &blocks[20]);
+        assert_eq!(durable(), base, "a size-triggered flush was durable");
+        let flushed = blocks[20].header.block_hash();
+        assert_eq!(chain.utxo_last_flush_hash, flushed);
+        assert_eq!(
+            recorded_utxo_set_hash(chain.db.as_ref().expect("db")),
+            flushed,
+            "the flush wrote the set state"
+        );
+        assert_eq!(chain.utxo_last_durable_flush_nanos, Some(0));
+
+        // One interval after the last durable flush, the flush is
+        // durable although the size limit tripped it too.
+        set_test_clock(UTXO_PERIODIC_FLUSH_SECS);
+        connect(&mut chain, &blocks[21]);
+        assert_eq!(durable(), base + 1, "the periodic flush was not durable");
+        assert_eq!(
+            chain.utxo_last_durable_flush_nanos,
+            Some(UTXO_PERIODIC_FLUSH_SECS * NANOS_PER_SEC)
+        );
+
+        // The next interval counts from that flush.
+        set_test_clock(2 * UTXO_PERIODIC_FLUSH_SECS - 1);
+        connect(&mut chain, &blocks[22]);
+        assert_eq!(durable(), base + 1, "durable within the interval");
+        set_test_clock(2 * UTXO_PERIODIC_FLUSH_SECS);
+        connect(&mut chain, &blocks[23]);
+        assert_eq!(durable(), base + 2);
+    }
+
+    /// The flushes a caller forces end in a durable database flush and
+    /// move the durable-flush stamp, with the cache at its size limit
+    /// and inside the periodic interval: gettxoutsetinfo's, a forced
+    /// `maybe_flush_utxo_cache`, and the shutdown flush.
+    #[test]
+    fn forced_utxo_flushes_end_in_a_durable_commit() {
+        let params = dcroxide_chaincfg::regnet_params();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut opts = dcroxide_database::Options::new(dir.path().join("chain"), params.net.0);
+        let (mut chain, flushes) = size_limited_chain(&mut opts, &params);
+        let (blocks, now) = battery_main_chain();
+        assert!(blocks.len() > 6, "the battery has a long main chain");
+        let fast = now + 48 * 60 * 60;
+        let connect = |chain: &mut Chain, block: &MsgBlock| {
+            let (_, errs) = chain.process_block(block, fast, &params);
+            assert!(errs.is_empty(), "{errs:?}");
+        };
+        let durable = || flushes.load(Ordering::SeqCst);
+        let base = durable();
+        let stamp = |secs: i64| Some(secs * NANOS_PER_SEC);
+
+        for block in &blocks[..5] {
+            connect(&mut chain, block);
+        }
+        assert_eq!(durable(), base, "a size-triggered flush was durable");
+        assert_eq!(chain.utxo_last_durable_flush_nanos, stamp(0));
+
+        // gettxoutsetinfo's flush.
+        set_test_clock(10);
+        chain.flush_utxo_cache_for_stats().expect("stats flush");
+        assert_eq!(durable(), base + 1, "the stats flush");
+        assert_eq!(chain.utxo_last_durable_flush_nanos, stamp(10));
+
+        // A forced flush, ten seconds after the last durable one.
+        connect(&mut chain, &blocks[5]);
+        assert_eq!(durable(), base + 1);
+        set_test_clock(20);
+        let (tip_hash, tip_height) = (blocks[5].header.block_hash(), blocks[5].header.height);
+        chain
+            .maybe_flush_utxo_cache(tip_hash, tip_height, true)
+            .expect("forced flush");
+        assert_eq!(durable(), base + 2, "the forced flush");
+        assert_eq!(chain.utxo_last_durable_flush_nanos, stamp(20));
+
+        // The shutdown flush.
+        connect(&mut chain, &blocks[6]);
+        assert_eq!(durable(), base + 2);
+        set_test_clock(30);
+        chain.flush(&params).expect("shutdown flush");
+        assert_eq!(durable(), base + 3, "the shutdown flush");
+        assert_eq!(chain.utxo_last_durable_flush_nanos, stamp(30));
+    }
+
+    /// Once the chain is current, every connect ends in a durable
+    /// database flush, with the cache at its size limit as it is after
+    /// an initial sync: the force a current chain asks for is tested
+    /// before the size rule, so nothing changes at the tip.
+    #[test]
+    fn a_connect_on_a_current_chain_is_durable_at_the_size_limit() {
+        let params = dcroxide_chaincfg::regnet_params();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut opts = dcroxide_database::Options::new(dir.path().join("chain"), params.net.0);
+        let (mut chain, flushes) = size_limited_chain(&mut opts, &params);
+        let (blocks, now) = battery_main_chain();
+        assert!(blocks.len() > 6, "the battery has a long main chain");
+        let durable = || flushes.load(Ordering::SeqCst);
+        let base = durable();
+
+        // The battery's own clock makes the first block recent, so the
+        // chain latches to current on it, and the latch forces a flush.
+        let (_, errs) = chain.process_block(&blocks[0], now, &params);
+        assert!(errs.is_empty(), "{errs:?}");
+        assert!(chain.is_current_at(now), "the chain latched to current");
+        assert_eq!(durable(), base + 1, "the latch flush");
+
+        // Every later connect is forced, well inside the interval.
+        for (connected, block) in blocks[1..6].iter().enumerate() {
+            set_test_clock(connected as i64 + 1);
+            let (_, errs) = chain.process_block(block, now, &params);
+            assert!(errs.is_empty(), "{errs:?}");
+            assert_eq!(chain.utxo_last_flush_hash, block.header.block_hash());
+            assert_eq!(
+                durable(),
+                base + 2 + connected,
+                "one durable flush for each connect"
+            );
+            assert_eq!(
+                chain.utxo_last_durable_flush_nanos,
+                Some((connected as i64 + 1) * NANOS_PER_SEC)
+            );
+        }
+    }
+
+    /// Every disconnect ends in a durable database flush, with the cache
+    /// at its size limit and inside the periodic interval: dcrd forces
+    /// the flush that follows a disconnect (`chain.go:898`), and the
+    /// spend journal row of the disconnected block is removed only
+    /// after it.  Each flush records the disconnected block's parent
+    /// and moves the durable-flush stamp.
+    #[test]
+    fn a_disconnect_ends_in_a_durable_commit() {
+        let params = dcroxide_chaincfg::regnet_params();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut opts = dcroxide_database::Options::new(dir.path().join("chain"), params.net.0);
+        let (mut chain, flushes) = size_limited_chain(&mut opts, &params);
+        let (blocks, now) = battery_main_chain();
+        assert!(blocks.len() > 5, "the battery has a long main chain");
+        // Two days on, every block looks old, so the chain never
+        // latches to current and forces a flush of its own.
+        let fast = now + 48 * 60 * 60;
+        let durable = || flushes.load(Ordering::SeqCst);
+        let base = durable();
+
+        for block in &blocks[..5] {
+            let (_, errs) = chain.process_block(block, fast, &params);
+            assert!(errs.is_empty(), "{errs:?}");
+        }
+        assert_eq!(durable(), base, "a size-triggered flush was durable");
+        assert_eq!(chain.utxo_last_durable_flush_nanos, Some(0));
+
+        // Invalidating the block below the tip disconnects two blocks,
+        // ten seconds after the last durable flush.
+        set_test_clock(10);
+        let errs = chain.invalidate_block(&blocks[3].header.block_hash(), fast, &params);
+        assert!(errs.is_empty(), "{errs:?}");
+        let new_tip = blocks[2].header.block_hash();
+        assert_eq!(chain.best_snapshot().hash, new_tip);
+        assert!(!chain.is_current_at(fast), "no latch flush was forced");
+        assert_eq!(durable(), base + 2, "one durable flush for each disconnect");
+        assert_eq!(
+            chain.utxo_last_durable_flush_nanos,
+            Some(10 * NANOS_PER_SEC)
+        );
+        assert_eq!(chain.utxo_last_flush_hash, new_tip);
+        assert_eq!(
+            recorded_utxo_set_hash(chain.db.as_ref().expect("db")),
+            new_tip
+        );
+    }
+
+    /// A chain with no database has no write cache for a flush's rows to
+    /// wait in, so each of its flushes moves the durable-flush stamp, a
+    /// size-triggered one inside the periodic interval included, and
+    /// its interval counts from the last flush as dcrd's does
+    /// (`utxocache.go:760`).
+    #[test]
+    fn a_chain_without_a_database_stamps_every_utxo_flush() {
+        let params = dcroxide_chaincfg::regnet_params();
+        let mut chain = Chain::new(&params, Hash::ZERO, false);
+        set_test_clock(0);
+        use_test_clock(&mut chain);
+        chain.utxo_cache_max_bytes = 1;
+        let (blocks, now) = battery_main_chain();
+        // Two days on, every block looks old, so the chain never
+        // latches to current and forces a flush of its own.
+        let fast = now + 48 * 60 * 60;
+
+        set_test_clock(60);
+        let (_, errs) = chain.process_block(&blocks[0], fast, &params);
+        assert!(errs.is_empty(), "{errs:?}");
+        assert!(!chain.is_current_at(fast), "the flush was not forced");
+        assert_eq!(chain.utxo_last_flush_hash, blocks[0].header.block_hash());
+        assert_eq!(
+            chain.utxo_last_durable_flush_nanos,
+            Some(60 * NANOS_PER_SEC),
+            "a flush with no write cache to wait in was not stamped"
+        );
+    }
+
+    /// A forced flush whose durable database flush fails returns the
+    /// error and leaves the durable-flush stamp where it was: the rows
+    /// did not reach the disk, so the periodic interval still counts
+    /// from the last flush that did.  The storage under the metadata
+    /// store refuses every write and sync from the flush on, as a
+    /// device that lost power would.
+    #[test]
+    fn a_utxo_flush_whose_durable_commit_fails_does_not_move_the_stamp() {
+        use dcroxide_testutil::powerloss::PowerLossBackend;
+
+        let params = dcroxide_chaincfg::regnet_params();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_dir = dir.path().join("chain");
+        std::fs::create_dir_all(&db_dir).expect("mkdir");
+        let backend = PowerLossBackend::create(&db_dir.join("metadata.redb"), true);
+        let mut opts = dcroxide_database::Options::new(&db_dir, params.net.0);
+        opts.backend = Some(Arc::clone(&backend) as dcroxide_database::SharedBackend);
+        let (mut chain, flushes) = size_limited_chain(&mut opts, &params);
+        let (blocks, now) = battery_main_chain();
+        assert!(blocks.len() > 3, "the battery has a long main chain");
+        // Two days on, every block looks old, so the chain never
+        // latches to current and forces a flush of its own.
+        let fast = now + 48 * 60 * 60;
+        let durable = || flushes.load(Ordering::SeqCst);
+        let base = durable();
+        for block in &blocks[..3] {
+            let (_, errs) = chain.process_block(block, fast, &params);
+            assert!(errs.is_empty(), "{errs:?}");
+        }
+        assert_eq!(durable(), base, "a size-triggered flush was durable");
+
+        // gettxoutsetinfo's flush, ten seconds on, with the power out:
+        // its transaction commits to the write cache and its durable
+        // flush fails.
+        set_test_clock(10);
+        backend.power_fails_after(0);
+        let err = chain
+            .flush_utxo_cache_for_stats()
+            .expect_err("the durable flush must fail");
+        assert!(backend.power_failed(), "the failure was the storage's");
+        assert!(
+            matches!(err, crate::chaindb::ChainDbError::Db(_)),
+            "{err:?}"
+        );
+        assert_eq!(
+            chain.utxo_last_durable_flush_nanos,
+            Some(0),
+            "a flush that did not reach the disk moved the stamp"
+        );
+    }
+
+    /// An unclean stop after a UTXO cache flush that was not durable
+    /// leaves the utxo set state one flush behind the best state, with
+    /// the rows that belong to it, and the next open replays the block
+    /// between them.
+    ///
+    /// The database's write cache is given no room here, so each commit
+    /// first makes every commit before it durable and the unclean stop
+    /// loses exactly the last transaction, which is the tip's UTXO
+    /// flush.  Every durable state is such a prefix of the commit
+    /// order; this is the shortest one a flush can be lost to.
+    #[test]
+    fn a_utxo_flush_lost_in_an_unclean_stop_is_replayed_on_reopen() {
+        let params = dcroxide_chaincfg::regnet_params();
+        let (blocks, now) = battery_main_chain();
+        assert!(blocks.len() >= 40, "the battery has a long main chain");
+        let blocks = &blocks[..40];
+        let (parent_hash, tip_hash) = (
+            blocks[38].header.block_hash(),
+            blocks[39].header.block_hash(),
+        );
+        // Two days on, every block looks old, so the chain never
+        // latches to current and forces a flush of its own.
+        let fast = now + 48 * 60 * 60;
+
+        // The reference: the same blocks, flushed at the tip by the
+        // stats.
+        let dir_a = tempfile::tempdir().expect("tempdir");
+        let opts_a = dcroxide_database::Options::new(dir_a.path().join("chain"), params.net.0);
+        let db_a = dcroxide_database::Database::create(&opts_a).expect("create database");
+        let mut reference = Chain::open(db_a, &params, Hash::ZERO, false, 0).expect("open chain");
+        for block in blocks {
+            let (_, errs) = reference.process_block(block, fast, &params);
+            assert!(errs.is_empty(), "{errs:?}");
+        }
+        let expected = reference.fetch_utxo_stats().expect("reference stats");
+        assert!(expected.utxos > 0, "the blocks leave a utxo set");
+
+        // The crash run: every connect flushes the UTXO cache, no flush
+        // is durable, and the chain and its database are dropped with
+        // neither a flush nor a close.
+        let dir_b = tempfile::tempdir().expect("tempdir");
+        let mut opts_b = dcroxide_database::Options::new(dir_b.path().join("chain"), params.net.0);
+        opts_b.cache_max_size = 0;
+        let (mut chain, _flushes) = size_limited_chain(&mut opts_b, &params);
+        for block in blocks {
+            let (_, errs) = chain.process_block(block, fast, &params);
+            assert!(errs.is_empty(), "{errs:?}");
+        }
+        assert_eq!(chain.utxo_last_durable_flush_nanos, Some(0));
+        assert_eq!(
+            recorded_utxo_set_hash(chain.db.as_ref().expect("db")),
+            tip_hash,
+            "the tip's flush was made"
+        );
+        drop(chain);
+
+        // What reached the disk: the tip's connect, and the utxo set as
+        // of its parent.
+        let db = dcroxide_database::Database::open(&opts_b).expect("reopen database");
+        let mut best = None;
+        db.view(|tx| {
+            best = Some(crate::chaindb::db_fetch_best_state(tx).expect("best state"));
+            Ok(())
+        })
+        .expect("read the best state");
+        assert_eq!(best.expect("best state").hash, tip_hash);
+        assert_eq!(
+            recorded_utxo_set_hash(&db),
+            parent_hash,
+            "the tip's flush was durable when it returned"
+        );
+
+        // The open replays the tip into the utxo set.
+        let mut chain = Chain::open(db, &params, Hash::ZERO, false, 0).expect("reopen chain");
+        assert_eq!(chain.best_snapshot().hash, tip_hash);
+        assert_eq!(
+            chain.fetch_utxo_stats().expect("caught-up stats"),
+            expected,
+            "the replayed utxo set is the reference's"
+        );
     }
 
     /// A block that extends the tip is attached, and announced, as the

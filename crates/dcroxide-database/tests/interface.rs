@@ -557,3 +557,15 @@ fn a_closed_transaction_releases_its_read_snapshot() {
     );
     drop(closed_but_held);
 }
+
+/// The metadata write cache's default ceiling is 300 MiB, three times
+/// dcrd's `defaultCacheSize` (`database/ffldb/dbcache.go:22`).  A UTXO
+/// cache flush that only its size limit tripped leaves its rows in the
+/// write cache, so the ceiling is the most a durable commit waits for;
+/// at dcrd's 100 MiB a commit flushes at a third of the retained bytes.
+#[test]
+fn the_default_write_cache_ceiling_is_300_mib() {
+    let dir = TempDir::new().expect("tempdir");
+    let opts = Options::new(dir.path().join("db"), NET);
+    assert_eq!(opts.cache_max_size, 300 * 1024 * 1024);
+}

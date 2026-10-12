@@ -71,7 +71,7 @@ Usage:
       synthetic inserts pinprobe applies.  --statsevery N takes the full
       decomposition on every Nth flush (default 25); it walks the whole
       tree, so sampling too often dominates the run it is measuring.
-      --metacache sets the overlay ceiling in MiB (default 100, the
+      --metacache sets the overlay ceiling in MiB (default 300, the
       production value) -- ADR-0004's flush-cadence lever.  --dbcache
       sets redb's page cache in MiB (default 1024, redb's own default)
       -- ADR-0004's read-cache lever.  The two interact, so a run that
@@ -92,10 +92,12 @@ Usage:
       --utxocache sets the UTXO cache ceiling in MiB (dcrd's
       --utxocachemaxsize, default 150).  It belongs with --metacache
       rather than beside it: connecting a block flushes the UTXO cache
-      when that ceiling is reached, and that flush forces a durable
-      metadata commit whatever the overlay ceiling says.  Raising
-      --metacache alone therefore does not decouple flush cadence from
-      block connection, which is what ADR-0004's lever (c) proposes.
+      when that ceiling is reached, and a flush that only that ceiling
+      tripped leaves its rows in the overlay instead of forcing a durable
+      metadata commit.  --metacache is therefore the most a durable
+      commit waits for during a catch-up; with --addrindex, the exists
+      address index asking for a flush at 1.5 million unjournaled keys
+      can come first.
 
       --txindex and --addrindex build the optional indexes the daemon
       builds when configured, which Chain::open does not.  Without them
@@ -474,7 +476,7 @@ fn cmd_replay(args: &Args) -> Result<(), String> {
     };
     let meta_cache_mib: u64 = match args.get("metacache") {
         Some(v) => v.parse().map_err(|e| format!("bad --metacache: {e}"))?,
-        None => 100,
+        None => 300,
     };
 
     // Observations go out over a channel to a writer thread, which appends
@@ -1542,7 +1544,7 @@ fn cmd_pinprobe(args: &Args) -> Result<(), String> {
     let db_path = data_dir.join("blocks_ffldb");
     let mut opts = Options::new(&db_path, params.net.0);
     // A small ceiling on purpose: the probe has to reach flushes, and at
-    // the 100 MiB production default a run short enough to iterate on
+    // the 300 MiB production default a run short enough to iterate on
     // would never trigger one.
     opts.cache_max_size = cache_mib.saturating_mul(1024 * 1024);
     eprintln!(

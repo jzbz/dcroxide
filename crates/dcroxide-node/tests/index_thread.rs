@@ -29,6 +29,11 @@
 //! - **Shutdown.**  Once the daemon's interrupt is set the thread drops
 //!   what is queued, as dcrd's handler returns on `ctx.Done()`, and the
 //!   next start's catch-up indexes those blocks.
+//! - **An unclean stop in a catch-up.**  With the UTXO cache at its size
+//!   limit and the chain not current, the durable commits are the ones
+//!   the exists address index asks for, from whichever thread commits
+//!   next.  What such a commit leaves on disk reopens to the right UTXO
+//!   set and the right index.
 //!
 //! The tests that stall the index thread hold the database's writer on
 //! the test thread: the thread then waits in its update with the index
@@ -38,21 +43,25 @@
 // Test-harness arithmetic over small counts and fixed deadlines.
 #![allow(clippy::arithmetic_side_effects)]
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
-use dcroxide_blockchain::process::Chain;
+use dcroxide_blockchain::chaindb::{db_fetch_best_state, db_fetch_utxo_set_state};
+use dcroxide_blockchain::process::{Chain, OpenConfig};
 use dcroxide_chaincfg::Params;
 use dcroxide_chainhash::Hash;
-use dcroxide_database::{Database, Options};
+use dcroxide_database::{Database, FlushObservation, Options};
 use dcroxide_indexers::{
-    ADDR_KEY_SIZE, CONNECT_NTFN, ChainQueryer, IndexNtfn, Interrupt, TxIndexEntry, addr_to_key,
+    ADDR_KEY_SIZE, CONNECT_NTFN, ChainQueryer, ExistsAddrIndex, ExistsAddrPolicy, IndexNtfn,
+    IndexSubscriber, Interrupt, NO_PREREQS, TxIndexEntry, addr_to_key,
 };
 use dcroxide_netsync::manager::SyncChain;
 use dcroxide_node::chainntfns::ChainNtfnHandler;
 use dcroxide_node::indexes::{
-    INDEX_NTFN_BUFFER_SIZE, IndexLogs, IndexNotifier, IndexThread, NodeIndexes, start_indexes,
+    INDEX_NTFN_BUFFER_SIZE, IndexLogs, IndexNotifier, IndexThread, NodeChainQueryer, NodeIndexes,
+    start_indexes, start_indexes_with_policy,
 };
 use dcroxide_node::sync::NodeSyncChain;
 use dcroxide_testutil::unhex;
@@ -598,9 +607,12 @@ fn the_index_thread_builds_the_same_indexes_as_inline_delivery() {
 /// The connect notification the chain handler builds for `block`, whose
 /// parent is `parent`.
 fn connect_of(node: &Node, block: &MsgBlock, parent: &MsgBlock) -> IndexNtfn {
-    let is_treasury_enabled = node
-        .indexes
-        .queryer
+    connect_ntfn(&node.indexes.queryer, block, parent)
+}
+
+/// [`connect_of`] for a chain behind `queryer`.
+fn connect_ntfn(queryer: &NodeChainQueryer, block: &MsgBlock, parent: &MsgBlock) -> IndexNtfn {
+    let is_treasury_enabled = queryer
         .is_treasury_agenda_active(&block.header.prev_block)
         .expect("agenda state");
     IndexNtfn {
@@ -683,6 +695,229 @@ fn a_shutdown_request_drops_the_queue_and_the_next_start_catches_up() {
         state_of(&chain, &restarted, &blocks),
         expected,
         "the catch-up against inline delivery"
+    );
+}
+
+// ---------------------------------------------------------------------
+// An unclean stop in a catch-up
+// ---------------------------------------------------------------------
+
+fn copy_dir(src: &Path, dst: &Path) {
+    std::fs::create_dir_all(dst).expect("create the copy's directory");
+    for entry in std::fs::read_dir(src).expect("read the directory") {
+        let entry = entry.expect("directory entry");
+        let to = dst.join(entry.file_name());
+        if entry.file_type().expect("file type").is_dir() {
+            copy_dir(&entry.path(), &to);
+        } else {
+            std::fs::copy(entry.path(), &to).expect("copy a file");
+        }
+    }
+}
+
+/// A durable commit the exists address index asked for carries the UTXO
+/// cache flushes before it that were not durable, with the connects and
+/// the index tip rows committed between them, and what it leaves on disk
+/// reopens to the right UTXO set and the right index.
+///
+/// This is the state an initial sync is in for most of its commits since
+/// a UTXO cache flush that only its size limit tripped stopped forcing a
+/// durable commit.  The chain is never current here and its cache is at
+/// its limit after every connect, so no UTXO flush is durable, and the
+/// index asks for a flush at its first unjournaled key, so the durable
+/// commits are its requests, granted on whichever of the two threads
+/// commits next.  Two mempool addresses give it a key to ask with part
+/// way through the blocks.
+///
+/// The directory is copied with both threads idle and nothing flushed or
+/// closed, which is what an unclean stop at that moment leaves.  In the
+/// copy the utxo set state and the index tip are at or behind the best
+/// state.  The chain then opens at the durable best state with the set
+/// an uninterrupted chain has there, and the index catches up to it
+/// holding the keys of those blocks and the mempool addresses of exactly
+/// the connects whose tip row was durable.
+#[test]
+fn an_unclean_stop_after_a_commit_the_index_asked_for_reopens_to_the_right_set_and_index() {
+    const BLOCKS: usize = 30;
+    // The connects that take a mempool address, by position in the
+    // blocks, and the byte each address is made of.
+    const MEMPOOL: [(usize, u8); 2] = [(10, 0x51), (20, 0x52)];
+
+    let (now, blocks) = accepted_prefix(BLOCKS);
+    let params = dcroxide_chaincfg::regnet_params();
+    // Two days on, every block looks old, so the chain never latches to
+    // current and no connect forces a durable flush.
+    let old = now + 48 * 60 * 60;
+    let policy = ExistsAddrPolicy {
+        u_max: 1,
+        ..ExistsAddrPolicy::tiny()
+    };
+    let open_config = || {
+        let mut config = OpenConfig::new(params.assume_valid, false, 0);
+        config.utxo_cache_max_bytes = 1;
+        config
+    };
+    let mempool_key = |seed: u8| {
+        let addr =
+            new_address_pub_key_hash_ecdsa_secp256k1_v0(&[seed; 20], &params).expect("address");
+        let key = addr_to_key(&addr).expect("key");
+        (addr, key)
+    };
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("blocks");
+    let durable = Arc::new(AtomicUsize::new(0));
+    let mut opts = Options::new(&path, params.net.0);
+    opts.flush_observer = Some({
+        let durable = Arc::clone(&durable);
+        Arc::new(move |_: &FlushObservation| {
+            durable.fetch_add(1, Ordering::SeqCst);
+        })
+    });
+    let db = Database::create(&opts).expect("create database");
+    let chain = Arc::new(Mutex::new(
+        Chain::open_with_config(db.clone(), &params, open_config()).expect("open chain"),
+    ));
+    let indexes = start_indexes_with_policy(
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(db.clone()),
+        Arc::clone(&chain),
+        params.clone(),
+        false,
+        true,
+        &IndexLogs::default(),
+        policy,
+    )
+    .expect("start indexes");
+    let thread = IndexThread::start(&indexes).expect("index thread");
+    let notifier = thread.notifier();
+    db.flush().expect("flush what the start wrote");
+    let started = durable.load(Ordering::SeqCst);
+
+    let unconfirmed = indexes
+        .exists_addr_index
+        .as_ref()
+        .expect("the index")
+        .lock()
+        .expect("index")
+        .unconfirmed();
+    for (at, block) in blocks.iter().enumerate() {
+        if let Some((_, seed)) = MEMPOOL.iter().find(|(connect, _)| *connect == at) {
+            unconfirmed.add_unconfirmed_tx(&paying(&mempool_key(*seed).0));
+        }
+        let (_, errs) = chain
+            .lock()
+            .expect("chain")
+            .process_block(block, old, &params);
+        assert!(errs.is_empty(), "block must accept: {errs:?}");
+        let parent = match at {
+            0 => &params.genesis_block,
+            _ => &blocks[at - 1],
+        };
+        notifier.notify(connect_ntfn(&indexes.queryer, block, parent));
+    }
+    assert!(notifier.wait_processed(), "the thread is running");
+    assert!(
+        !chain.lock().expect("chain").is_current_at(old),
+        "a current chain forces its flushes"
+    );
+    assert!(
+        durable.load(Ordering::SeqCst) > started,
+        "the index asked for no durable commit"
+    );
+
+    // What an unclean stop leaves.
+    let copy = dir.path().join("unclean");
+    copy_dir(&path, &copy);
+    let copy_db = Database::open(&Options::new(&copy, params.net.0)).expect("open the copy");
+    let mut recorded = None;
+    copy_db
+        .view(|tx| {
+            let best = db_fetch_best_state(tx).expect("best state").hash;
+            let set = db_fetch_utxo_set_state(tx)
+                .expect("utxo set state")
+                .expect("a recorded utxo set state");
+            recorded = Some((best, set.last_flush_hash));
+            Ok(())
+        })
+        .expect("read the states");
+    let (best, set_state) = recorded.expect("the states");
+    let main_chain: Vec<Hash> = std::iter::once(params.genesis_hash)
+        .chain(blocks.iter().map(|block| block.header.block_hash()))
+        .collect();
+    let height_of = |hash: &Hash| {
+        main_chain
+            .iter()
+            .position(|block| block == hash)
+            .expect("a block of the chain")
+    };
+    let best_height = height_of(&best);
+    assert!(
+        height_of(&set_state) > 0,
+        "no UTXO flush reached the disk in a commit the index asked for"
+    );
+    assert!(
+        height_of(&set_state) <= best_height,
+        "the utxo set state is past the best state"
+    );
+
+    // The next start: the chain replays its UTXO set to the best state,
+    // and the index, whose tip is not past it either, catches up.
+    let reopened = Arc::new(Mutex::new(
+        Chain::open_with_config(copy_db.clone(), &params, open_config()).expect("reopen chain"),
+    ));
+    assert_eq!(reopened.lock().expect("chain").best_snapshot().hash, best);
+    let queryer = Arc::new(NodeChainQueryer::new(Arc::clone(&reopened), params.clone()));
+    let mut subscriber = IndexSubscriber::new(Arc::new(AtomicBool::new(false)), None);
+    let index = ExistsAddrIndex::new_with_policy(
+        &mut subscriber,
+        Arc::new(copy_db.clone()),
+        Arc::clone(&queryer) as Arc<dyn ChainQueryer>,
+        NO_PREREQS,
+        policy,
+    )
+    .expect("reopen the index");
+    let tip_of = || {
+        let index = index.lock().expect("index");
+        index.query().tip().expect("index tip").1
+    };
+    let durable_index_height = height_of(&tip_of());
+    assert!(
+        durable_index_height <= best_height,
+        "the index tip is past the best state"
+    );
+    subscriber.catch_up(&*queryer).expect("catch up");
+    assert_eq!(tip_of(), best, "the index caught up to the best state");
+
+    // The reference: the same blocks on a current chain, every flush
+    // durable, indexed by a catch-up.
+    let reference = Node::new(Delivery::Inline, now, &blocks[..best_height]);
+    let mut expected = reference.state(&blocks[..best_height]).keys;
+    for (connect, seed) in MEMPOOL {
+        // The address went to the index with the connect of the block at
+        // this position, one below its height.
+        if connect < durable_index_height {
+            expected.push(mempool_key(seed).1);
+        }
+    }
+    expected.sort_unstable();
+    expected.dedup();
+    let mut keys = index.lock().expect("index").logical_keys().expect("keys");
+    keys.sort_unstable();
+    assert_eq!(keys, expected, "the index's keys after the catch-up");
+    assert_eq!(
+        reopened
+            .lock()
+            .expect("chain")
+            .fetch_utxo_stats()
+            .expect("stats"),
+        reference
+            .chain
+            .lock()
+            .expect("chain")
+            .fetch_utxo_stats()
+            .expect("reference stats"),
+        "the replayed utxo set"
     );
 }
 

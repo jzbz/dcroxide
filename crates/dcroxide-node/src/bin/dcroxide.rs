@@ -1901,8 +1901,9 @@ fn env_tuning_u64(var: &str, unit: &str) -> Option<u64> {
 /// These are the second of the two flush triggers, and until 2026-08 the
 /// unreachable one. Connecting a block flushes the UTXO cache when it
 /// fills, and `--utxocachemaxsize` governs that; the overlay has its own
-/// independent ceiling (100 MiB) and interval (300 s) that no flag or
-/// variable reached, so half the cadence lever was fixed at compile time.
+/// independent ceiling (300 MiB, dcrd's 100 MiB until 2026-10-11) and
+/// interval (300 s) that no flag or variable reached, so half the cadence
+/// lever was fixed at compile time.
 ///
 /// Cadence was the half that paid when these were added. On m1 in 2026-08
 /// (`docs/bench-ledger.md`), before the keys of ADR-0010 and the index
@@ -1910,17 +1911,31 @@ fn env_tuning_u64(var: &str, unit: &str) -> Option<u64> {
 /// over full-validation replays at 1200 MiB and 7% at 600 MiB, and a sync
 /// sampled on 2026-08-15 was *fully stalled*, with nothing runnable, for
 /// 34.6% of block-sync wall time (51.1% weighted by time), in a small
-/// number of very large durable commits. Both triggers force one, so an
-/// unreachable trigger capped cadence tuning; an 800 MiB overlay then
+/// number of very large durable commits. Both triggers forced one then, so
+/// an unreachable trigger capped cadence tuning; an 800 MiB overlay then
 /// gained 12.7% over four syncs on m1. On m3 on 2026-10-10, one sync each,
 /// the larger UTXO cache gained 3.7% and the same overlay setting nothing.
+///
+/// Since 2026-10-11 a UTXO cache flush that only its size limit tripped
+/// no longer forces a durable commit: its rows wait in the overlay, and
+/// this ceiling is the most the overlay holds before a commit flushes it.
+/// It sets the commit cadence of the header sync, of the early chain and
+/// of a node run with `--noexistsaddrindex` (36 of 41 commits in one sync
+/// on m3 on 2026-10-11). With the exists address index on, as by default,
+/// the index asks for a flush once 1.5 million of its keys are not yet
+/// journaled (`ExistsAddrPolicy::u_max`), and in three default syncs that
+/// day that request came before the ceiling for about seven commits in
+/// ten (11 of 54 began past the ceiling's trigger), so raising it buys
+/// few commits. While blocks connect, the UTXO cache's periodic flush
+/// forces a commit 120 s after the last one a UTXO flush forced, and
+/// `DCROXIDE_DB_OVERLAY=100` restores dcrd's ceiling.
 ///
 /// Environment variables rather than flags, for `DCROXIDE_DB_CACHE`'s
 /// reason: dcrd has no counterpart, and the generated `-h` output is
 /// pinned byte-for-byte against dcrd's.
 ///
-/// Unset leaves the compiled defaults exactly as they were, so an
-/// untouched node behaves identically. Raising either means more work
+/// Unset leaves the compiled defaults in force, so an untouched node
+/// runs at the ceiling and interval above. Raising either means more work
 /// redone after an unclean stop — the flush ordering holds and nothing
 /// is corrupted, but more of the recent window replays.
 fn apply_overlay_tuning(opts: &mut Options) {

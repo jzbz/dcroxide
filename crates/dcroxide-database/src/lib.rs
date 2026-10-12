@@ -539,6 +539,12 @@ pub struct Options {
     /// also half of that ADR's "decouple flush cadence from block
     /// connection" lever, which could not be evaluated without a way to
     /// set it.
+    ///
+    /// The default is 300 MiB (dcrd's is 100 MiB): a UTXO cache flush
+    /// that only its size limit tripped leaves its rows here instead of
+    /// forcing a flush, so this ceiling is the most a durable commit
+    /// waits for.  [`Self::cache_flush_interval_secs`], or a flush
+    /// participant that asks for a flush, can end the wait sooner.
     pub cache_max_size: u64,
     /// Seconds after which a commit flushes the overlay regardless of size.
     pub cache_flush_interval_secs: u64,
@@ -730,7 +736,7 @@ fn record_allocator_state(kv: &redb::Database) -> Result<(), Error> {
 
 impl Options {
     /// Options with dcrd's defaults for the given directory and
-    /// network.
+    /// network, except the overlay ceiling: see [`Self::cache_max_size`].
     pub fn new(path: impl Into<PathBuf>, network: u32) -> Options {
         Options {
             path: path.into(),

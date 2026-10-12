@@ -46,7 +46,10 @@ pub struct Policy {
     pub budget_pages: usize,
     /// Ask for a flush once this many keys are in memory and not yet
     /// journaled.  Drives the flushes of a catch-up, where the overlay
-    /// barely grows.
+    /// barely grows.  It also trips most durable commits of an initial
+    /// sync with the index on, now that a UTXO cache flush only its size
+    /// limit tripped forces none, and the memtable then holds up to
+    /// `k0_hard` plus this many keys as such a flush begins.
     pub u_max: usize,
     /// The key of the partition hash for an index created under this
     /// policy; `None`, the default, draws one from the operating system's
