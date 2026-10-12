@@ -979,3 +979,29 @@ earlier keys or index layout, and m1 was not measured again. In the three
 dcrd runs of that session the dcroxide server read its block files from the
 drive as it served them, which it had not before; whether that cost dcrd
 anything was not measured.
+
+## Addendum, 2026-10-11 — fewer, shared commits during catch-up
+
+The cost this ADR accepted with redb is its commit shape: a commit
+rewrites pages, and a sync made 133 of them. Since 2026-10-11 a sync
+makes fewer. A UTXO cache flush that only the cache's size limit tripped
+no longer forces a commit, the rows of several ride in one, and the
+overlay's default ceiling is 300 MiB
+([ADR-0004](0004-storage-backend.md), addendum of the same date;
+[bench-ledger.md](../bench-ledger.md), "Shared commits for UTXO-cache
+flushes, the filesystem's share and a delayed link"). On m3 three
+default syncs made 54 flushes each, taking 107.4–109.7 s or 15% of the
+sync, where the code before made 133 taking 177.8 s, 23%. redb's commits
+wrote 20.5–20.6 GB against 30.6 GB, and three to five commits a run were
+larger than the engine's 512 MiB write buffer, where none of the 133 in
+the one run of the code before were.
+
+None of the guardrails moves. Every commit that is made is still
+`Durability::Immediate`, the fatal latch and the policy test are as they
+were, and a durable state is still a prefix of the commit order, so the
+crash gate's argument is unchanged; what an unclean stop during catch-up
+loses grew to about 120 s of processing. The same session measured how
+much of the flush time is m3's filesystem and not the engine: on a data
+directory without copy-on-write, checksums or compression the code
+before the change took 736.8 s where it took 775.6 s on the directory as
+created, its 133 flushes 144.0 s against 177.8 s. One run each.

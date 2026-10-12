@@ -112,7 +112,7 @@ The agenda series:
   return `Result` (`agendas.rs:1340`, `:1363`) and lose their "no deployment
   selects V2" special case, and the header context check, the connect path
   and `load_chain_state` propagate the error, the last as the new
-  `ChainDbError::Rule` (`process.rs:1428-1429`). The new-tickets notification
+  `ChainDbError::Rule` (`process.rs:1438-1439`). The new-tickets notification
   already reused the connect path's value, as upstream now does. No shipped
   network can raise the error.
 - **Ported:** `e0f917df` makes `maxBlockSize` fallible and has it take
@@ -145,8 +145,8 @@ The agenda series:
   deployments and keeps `ErrUnknownDeploymentID`. Ported as
   `ConsensusAgenda`, `lookup_agenda` and `agenda_state` (`agendas.rs:652`,
   `:905`, `thresholdstate.rs:492`), with `Chain::next_threshold_state` and
-  `Chain::state_last_changed_height` in upstream's order (`process.rs:6080`,
-  `:6311`). Every unknown-agenda site in `validate.rs`, `process.rs` and
+  `Chain::state_last_changed_height` in upstream's order (`process.rs:6156`,
+  `:6387`). Every unknown-agenda site in `validate.rs`, `process.rs` and
   `sequencelock.rs` now carries dcrd's kind and text, where it had carried
   the port's own text under `ErrUnknownDeploymentID`; none is reachable with
   shipped parameters. `ErrUnknownAgendaID` is a context error, so it is not
@@ -196,10 +196,10 @@ The agenda series:
   internal byte order and pins them against `Hash::from_str` of dcrd's
   literals (`agendas.rs:105`, `:264`; `tests/agenda_tables.rs`
   `historical_agenda_tables_match_dcrd`), runs `make_agendas` with its full
-  validation when a chain is built (`process.rs:575-580`, `:867`), and adds
+  validation when a chain is built (`process.rs:585-590`, `:877`), and adds
   `is_agenda_active_positional`, `is_agenda_active_positional_by_id` and
   `Chain::is_agenda_active_positional_by_id` (`agendas.rs:949`, `:1017`,
-  `process.rs:6125`). On the real chains the answers equal the tally's. What
+  `process.rs:6201`). On the real chains the answers equal the tally's. What
   changes is that a mainnet or testnet3 query below an anchor no longer
   counts votes, so `tests/review_blake3_anchor.rs`, whose synthetic mainnet
   chain votes BLAKE3 in at 28287, drops blake3pow from its view's table, the
@@ -237,8 +237,8 @@ Block processing:
   block. `maybeAcceptBlockData` no longer marks a failed positional data
   check itself; `ProcessBlock` does, under the rule `ddd3b6d2` adds. Ported
   in `maybe_accept_block_header`, `check_block_data_sanity`,
-  `check_block_sanity` and `process_block` (`process.rs:3104`,
-  `validate.rs:615`, `:713`, `process.rs:4295`).
+  `check_block_sanity` and `process_block` (`process.rs:3180`,
+  `validate.rs:615`, `:713`, `process.rs:4371`).
 - **Ported:** `ddd3b6d2` checks a block's data against its header first.
   `checkMerkleRoots` now takes the merkle variant to check
   (`validate.go:1879-1952`). The new `checkBlockDataPreconditions`
@@ -266,15 +266,15 @@ Block processing:
   (upstream `process_test.go:745-759`). Ported as `MerkleRootVariant`,
   `check_merkle_roots`, `check_block_data_preconditions`,
   `check_merkle_roots_context` and `Chain::check_block_data_preconditions`
-  (`validate.rs:1965`, `:1985`, `:2091`, `:2158`, `process.rs:4050`), with
+  (`validate.rs:1965`, `:1985`, `:2091`, `:2158`, `process.rs:4126`), with
   the marking in `mark_block_failed_if_data_commit_proven` and
-  `mark_block_failed_on_context_violation` (`process.rs:4095`, `:5619`).
+  `mark_block_failed_on_context_violation` (`process.rs:4171`, `:5695`).
   Porting it surfaced a gap: dcrd's `PopulateTicketInfo` marks the node
   modified (`blockindex.go:955-960`, called at `process.go:297-298`), so a
   header's stored index row is rewritten with the block's votes even when a
   later data check rejects the block. `maybe_accept_block_data` populated
   without marking, which no test saw while every such rejection also marked
-  the block failed; it now marks (`process.rs:4155`), pinned by
+  the block failed; it now marks (`process.rs:4231`), pinned by
   `tests/review_process_reorder.rs`
   `rejected_block_data_still_rewrites_the_headers_votes`.
 - **Ported, not observable:** `b56e78f5` adds `recentMerkleChecks`, a
@@ -285,7 +285,7 @@ Block processing:
   both `ReconsiderBlock` loops delete the block (`validate.go:2032`,
   `:2134-2143`, `process.go:709`, `:837`, `:889`). It only spares hashing
   the trees again. The port generalizes its recent-context-checks set into
-  `LruHashSet`, which holds both caches (`process.rs:395`, `:413`), and
+  `LruHashSet`, which holds both caches (`process.rs:405`, `:423`), and
   `check_block_context` stays a pure function that takes the cache as a
   `&mut impl MerkleCheckCache`; the vector replays pass `NoMerkleCheckCache`
   (`validate.rs:2178-2199`).
@@ -455,7 +455,7 @@ text (`dcroxide-standalone` `tx.rs:32`, `dcroxide-stake` `MAX_AMOUNT_TEXT`,
 `treasury_tx_vectors.rs` `check_transaction_sanity_amount_range_texts` and
 the stake oracle differential `create_revocation_amount_range_text`. And
 `ErrInvalidTemplateParent` now names the tip's parent, with dcrd's second
-form for a tip without one (`validate.go:4665-4675`, `process.rs:4864-4879`;
+form for a tip without one (`validate.go:4665-4675`, `process.rs:4940-4955`;
 `review_error_texts.rs` `template_parent_texts_name_the_tips_parent`).
 
 **`036b7090..b9634e01` (3 commits).** `tools/pinbump` resolves the delta to
@@ -644,7 +644,10 @@ expensive step, dcroxide moves it before.
 | Reduction of a draw to a range | `ShuffleSlice`/`IntN` reduce through the bias-free `Uint64N` (`crypto/rand/uniform.go:102-148`): Lemire multiply-shift against a `-n % n` rejection threshold | `dcroxide_crypto::rand::Prng::uint64n` is that same reduction, line for line, and the peer environment's address shuffles go through it via `rand::shuffle_slice`. `dcroxide_connmgr::SystemCsprng::uint64n` and `dcroxide_addrmgr::SystemRng::int_n` reach the same distribution by rejection sampling instead, and `dcroxide-mempool/src/pool.rs` `limit_num_orphans` still reduces a full-width draw by plain modulo | Enumerated rather than counted, because three successive attempts to state this as a closed set were each wrong. Raw modulo over a random draw, in production code, is exactly two, both in the mempool: `dcroxide-mempool/src/pool.rs` `limit_num_orphans` (orphan eviction) and `shuffle_trial_order` (rival trial order). **Neither is a divergence, and neither is going to be converted.** dcrd draws nothing at either site — it ranges over a Go map — so there is no upstream reduction to converge on, and the *Orphan eviction source* row above records what that map walk actually distributes: off uniform by a factor of several, where this modulo is off by about one part in `2^57`. Adopting `Uint64N` here would buy distance from dcrd's real distribution while appearing to close a gap. It would also put a rejecting, redrawing loop behind `PoolChain::random_u64`, which this crate's test doubles answer with a constant: `2^64 mod n` is nonzero for every non-power-of-two bound, including the default `max_orphan_txs` of 100, so such a source would never clear the threshold and the pool would hang rather than fail. The modulo's totality is a property of this seam, not an oversight, and the trait's doc comment now says so. Converted where dcrd's own arithmetic was the target: the peer address shuffles, the mining-address pick, the rebroadcast timer's `rand.Duration` (`rebroadcast.rs` `rand_duration`, now `dcroxide_crypto::rand::duration` over `Prng::uint64n`, where it used to reject-and-retry over kernel draws), and the seeder's backdating, which was the largest of them — four days in nanoseconds (`~2^48`) is a bias near one part in `2^16`, roughly `2^41` times the mempool's. Bias-free but not Lemire, and so still divergent in arithmetic and draw count though not in distribution: `dcroxide_connmgr::SystemCsprng::uint64n` and `dcroxide_addrmgr::SystemRng::int_n`, which both reject-and-retry. What remains is those two rejection loops, which are bias-free but map stream bytes to outputs differently from Lemire and consume a different number of draws (unobservable: the input is an unpredictable keystream, so nothing outside the process can tell which arithmetic produced a value), and the two mempool modulo reductions above, whose bias is `2^64 mod n` in `2^64`: about one part in `2^57` for the default 100 orphans, a limit that also bounds the rival lists `shuffle_trial_order` permutes. |
 | Metadata store after a failed durable write | no latch: `dbCache.flush` returns the commit error without clearing the cached treaps (`database/ffldb/dbcache.go:501-509`), so the next flush retries the same dirty set and can return success | the failure latches the store fatal and every later write on that handle is refused with `ErrorKind::Fatal` (`ErrFatal`, the one error kind with no dcrd counterpart); reads keep answering from whatever redb can still read. After an I/O error redb fails every uncached page with `PreviousIo` until restart; the UTXO reads report that as an error, and the ffldb-layout reads answer absence, as ffldb does. The latch is set before a failing commit releases the writer semaphore, and it is checked again once `begin`, `Database::flush` or `Database::close` holds the semaphore, so a writer queued behind the failure cannot re-run the failed flush | A retry that succeeds after a failed commit is how a store loses data silently: the engine reports durability the log will not honour, and `Chain::flush` writes block index rows, UTXO entries and both state markers in one transaction precisely so a crash cannot leave them disagreeing. Not a runtime artifact either — the trade is availability for integrity, which is the right way round for a daemon that already runs under a supervisor because release builds abort on panic. Reads are deliberately not latched: bytes that reached disk are still valid, and refusing to serve them turns a write fault into a total outage for no gain. `Database::is_fatal` is threaded into the block-processing result (`storage_failed` in `NodeSyncChain::process_block`, `sync.rs`, handed to `combine_process_block_result`) so a storage fault is not reported as a consensus rule error against the peer that sent a perfectly good block, and a failed shutdown flush exits `FAILURE` rather than success. Pinned by the latch's own tests, the source-scanning durability test, and the ENOSPC fault injection. |
 | Shutdown UTXO flush failure | `ShutdownUtxoCache` discards `MaybeFlush`'s error (`internal/blockchain/utxocache.go:1062`), so `dcrdMain` exits 0 | logs `Unable to flush the block database: ...` and exits 1; `Server shutdown complete`, both shutdown events and the database close still follow | By then the store has latched fatal (row above), and exit status 0 would tell a supervisor the node's state reached disk. Nothing on disk is inconsistent: the store holds the last completed flush, and the next start replays forward from it (`initialize_utxo_state`). |
-| Commit that trips a cache flush | `commitTx` flushes and then writes the transaction's own rows straight to the persistent database with `commitTreaps` (`database/ffldb/dbcache.go:558-582`), so the triggering write is durable when the commit returns | the flush publishes first and the transaction's rows land in the overlay after it, so the commit that trips a flush returns before its own rows are durable | Nothing in the chain treats a returning commit as durable: the barrier is the explicit `db.flush()` at the end of the UTXO cache flush, and recovery already tolerates losing that whole window — a strictly larger loss. Writing through instead would let a reader that seeds between the flush's commit and its retirement observe the triggering transaction partially applied, and hold that snapshot for its lifetime; the RPC block-region path seeds outside the chain lock, which is what the split flush exists to allow. Real parity here is a reorder, not a write-through: publish the rows before starting the flush so they ride inside the captured layers. That is gated on the fatal-latch fix, because a failed flush would otherwise leave the rows cached while their block bytes rolled back. |
+| Commit that trips a cache flush | `commitTx` flushes and then writes the transaction's own rows straight to the persistent database with `commitTreaps` (`database/ffldb/dbcache.go:558-582`), so the triggering write is durable when the commit returns | the flush publishes first and the transaction's rows land in the overlay after it, so the commit that trips a flush returns before its own rows are durable | Nothing in the chain treats a returning commit as durable. The barriers are the explicit `Database::flush` that ends a forced UTXO cache flush (each connect once the chain is current, the latch to current, every disconnect, `gettxoutsetinfo`) or a periodic one, `Chain::flush` at shutdown and `Database::close`; since 2026-10-11 a UTXO cache flush that only the size limit tripped is itself a commit that returns before its rows are durable (the next row). Recovery tolerates losing any suffix of the commit order, because every durable commit is a prefix of it, and the triggering transaction is the first transaction of that suffix. Writing through instead would let a reader that seeds between the flush's commit and its retirement observe the triggering transaction partially applied, and hold that snapshot for its lifetime; the RPC block-region path seeds outside the chain lock, which is what the split flush exists to allow. Real parity here is a reorder, not a write-through: publish the rows before starting the flush so they ride inside the captured layers. That is gated on the fatal-latch fix, because a failed flush would otherwise leave the rows cached while their block bytes rolled back. |
+| UTXO cache flush and the durable commit | every UTXO cache flush first makes the block database durable (`flushBlockDB`, `utxocache.go:708-716`, wired to `db.Flush` at `server.go:4007`), whatever tripped it: the size limit, the two-minute interval (`shouldFlush`, `utxocache.go:656-670`) or a current chain (`chain.go:728`) | a forced flush and a periodic one end in `Database::flush`, as dcrd's do. A flush that only the size limit tripped, which is nearly every flush of an initial sync, writes its rows and the set state in one transaction and returns; they become durable with the next durable commit, whichever trigger makes it: the metadata write cache's size or time, the exists-address participant's, or the next forced or periodic flush (`maybe_flush_utxo_cache`, `flush_utxo_cache_with`) | dcrd flushes the block database first because its UTXO set is a separate database that must never run ahead of the block index. Here both are rows of one store and every durable commit is a prefix of the commit order. The rows and the set state are written in one transaction, so on disk they always describe the same block; that block's connect is in the same durable state; and the best state is at or past it, except across an interrupted disconnect, where the set state names the disconnected block and its spend journal row is still there. `initialize_utxo_state` replays or detaches whatever lies between, as it already did after a commit the write cache made on its own. What changes is what an unclean stop during initial sync loses and downloads again: about 120 s of processing while blocks connect, where it was one fill of the UTXO cache; every trigger is decided as a block connects or a transaction commits, so the bound is in work and not in time. On m3 on 2026-10-11 three default syncs with the change took a median of 728.7 s with 54 flushes, where the code before it took 775.6 s with 133 in one run that afternoon; peak resident memory rose from 2,635 MiB to 3,090–3,285 MiB with the exists-address index on, and was 2,138 MiB with it off (docs/bench-ledger.md, "Shared commits for UTXO-cache flushes, the filesystem's share and a delayed link"). |
+| Periodic UTXO cache flush interval | two minutes since the last flush of any kind (`lastFlushTime`, `utxocache.go:669`, `:760`) | two minutes since the last flush that ended in a durable commit (`utxo_last_durable_flush_nanos`), so a periodic flush can follow a size-triggered one sooner than dcrd's would | A flush that is not durable must not postpone the one that is: with dcrd's stamp, size-triggered flushes on a slow link could keep the periodic flush from ever firing, and the durable cadence would fall to the write cache's 300 s. |
+| Metadata write cache default | 100 MiB (`defaultCacheSize`, `database/ffldb/dbcache.go:22`) | 300 MiB (`DCROXIDE_DB_OVERLAY` sets it) | At 100 MiB the cache's own trigger, at 70 MB retained, would fire about as often as the UTXO cache flushes did, so the row above would gain little; that was reckoned from the flush logs and not run. One sync each of a prototype on m3 on 2026-10-11 took 724.6 s at 300 MiB and 736.9 s at 200 MiB with the same peak memory, against 775.6 s for the code before it. With the exists-address index on, the ceiling trips only the early commits of a sync, the index's participant most of the rest and the 120 s rule about one in ten (11, 38 and 5 of 54 in one run). The larger default should also mean fewer durable commits where no UTXO cache flush happens and the rows go through the write cache, as in the header sync, down to the cache's 300 s interval (not measured); `DCROXIDE_DB_OVERLAY=100` restores the old ceiling there. A catch-up of the exists-address index is paced by its participant and does not change. `addblock` has no such setting and takes the default. |
 | `invalidateblock` / `reconsiderblock` RPCs | live handlers; the chain's notifications drive mempool, index and websocket maintenance whoever reorganized | Live handlers since the 2026-09-23 review. `NodeRpcChain` calls `Chain::invalidate_block`/`reconsider_block`, then drains the daemon's `ChainNtfnHandler` with the chain mutex released, as the sync adapter does after a processed block. | An operator's `invalidateblock`/`reconsiderblock` therefore reaches the flush placement recorded under Open ("`invalidateblock` and `reconsiderblock` flush the block index before their final reorganization"), not only `force_head_reorganization`. Pinned by `review_rpc_seams::invalidate_and_reconsider_move_the_tip`. |
 | Tor SOCKS RESOLVE: two implementations, one live | one `TorLookupIP` (`addrmgr/tordns.go:44-137`), reached through `cfg.lookup`/`cfg.onionlookup` with `context.Background()` and no socket deadline, reading each reply head with a single unchecked `conn.Read`, and accepting any IPv6 answer longer than the six-byte minimum — `if replyLen <= 4+2 { ... }` then `addr = net.IP(reply[0:replyLen-2])`, so a nine-byte reply yields a seven-byte `net.IP` | two. `dcroxide-addrmgr`'s `tor_lookup_ip` reproduces all of the above exactly over a `TorTransport` seam, returning `Vec<Vec<u8>>` so an off-length answer is representable; it is reached only by its frozen vectors. The daemon calls `dcroxide-node`'s own (`src/socks.rs`), which reads the reply heads with `read_full`, carries one absolute deadline across the whole exchange, the proxy connect included (a proxy name with several addresses has the deadline split among them as Go's `partialDeadline` would split a context deadline, which dcrd's `context.Background()` lookup never has), and rejects an IPv6 answer whose address half is not exactly sixteen bytes — with dcrd's own "invalid IPV6 address" text | The daemon's lookup returns `std::net::IpAddr`, which cannot hold a seven-byte address, so the length check is forced by the type rather than chosen; dcrd's malformed `net.IP` fails to render or connect downstream anyway, so the observable difference is an error here against a useless address there. The deadline and the checked reads run in the port's favour and are deliberate: dcrd sets no deadline, so its Tor lookup can pin a caller indefinitely. The port's callers pass the bound: a minute for connect targets, seeder sources and `getaddednodeinfo`, 30 s for the server's other host lookups, `--externalip` names among them, and the dial timeout when marking a dial attempt. A lookup that runs it out fails with the dial timeout text or Go's `i/o timeout`, which dcrd never reports there. Both halves pinned — the daemon's by `the_daemon_resolver_refuses_an_ipv6_answer_dcrd_would_accept`, dcrd's by `seed_tor_vectors`. |
 | Mixpool key exchanges per identity | none: a key exchange needs only its sender's own pair request known and may reference arbitrary other hashes (`acceptKE`, `mixing/mixpool/mixpool.go:1668`), so one accepted pair request can mint unlimited sessions, each held until the pair request goes | `MAX_KES_PER_IDENTITY` = 32 key exchanges held per identity; the 33rd is refused with a non-bannable rule error, neither pooled nor relayed | Otherwise one UTXO buys remote memory growth at line rate. Honest headroom: a wallet forms one run per epoch tick for its pair request's life (about 6 mainnet and 20 testnet3 epochs) plus in-epoch reruns. Pinned by `key_exchange_flood_stops_at_the_per_identity_cap` (`crates/dcroxide-mixing/tests/mixpool_expiry.rs`). |
@@ -790,7 +793,15 @@ against upstream and the port is faithful.
   from the other"). With the exists-address index off in both, one run
   each, the port was 1.42x as fast, behind dcrd up to the assume-valid
   block and ahead after it (the same ledger, "The parity commit, the
-  index off, two levers and a full replay"). So the rest of this
+  index off, two levers and a full replay"). On 2026-10-11, after six
+  changes to block processing and to when the node commits, three
+  default syncs took a median of 12.1 minutes with 15% of the wall time
+  in flushes, and one with the index off 10.2 minutes; dcrd v2.1.6 took
+  48.1 minutes in one run that evening, 3.96x in one session, and 3.93x
+  and 2.04x against its figures above are across sessions (the same
+  ledger, "Five changes on the block-processing
+  thread" and "Shared commits for UTXO-cache flushes, the filesystem's
+  share and a delayed link"). So the rest of this
   passage explains the gap as it
   was measured on m1 in 2026-08. It has not been re-measured there, and
   on m3 the node is not flush-bound.) A task-state
@@ -1001,14 +1012,14 @@ against upstream and the port is faithful.
     commits no further blocks. `--dropexistsaddrindex` drops either
     layout.
   - **Two developer-only tuning values have no dcrd counterpart.** The
-    memtable and merge limits (`crates/dcroxide-indexers/src/existsaddr/policy.rs:60`)
+    memtable and merge limits (`crates/dcroxide-indexers/src/existsaddr/policy.rs:63`)
     change the pages a flush writes and the memory the index holds, up to
     about 4 million keys (84 MB) while syncing, never an answer; the
     `DCROXIDE_EXISTSADDR_MEMTABLE_KEYS` environment variable sets the
-    memtable target for measurements (`crates/dcroxide-node/src/bin/dcroxide.rs:1951`).
+    memtable target for measurements (`crates/dcroxide-node/src/bin/dcroxide.rs:1966`).
     The index's partitions are placed by SipHash-2-4 under a key each
     index draws when it is created, so nobody choosing addresses can crowd
-    one (`policy.rs:156`); dcrd has no partitions.
+    one (`policy.rs:159`); dcrd has no partitions.
 
   The answers are pinned by dcrd's own indexer session
   (`indexers_vectors.rs`, run at four merge settings), by a differential

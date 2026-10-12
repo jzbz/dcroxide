@@ -50,6 +50,12 @@ for dcroxide at 3.8 ms/block (265 blk/s), ~26 ms for dcrd at 2.9 ms/block
 (342 blk/s). No netem-delay arm (e.g. 50 and 100 ms added on the loopback
 path) has been measured yet, so this crossover is unconfirmed.
 
+> **Note (2026-10-11): measured, through a userspace relay and not
+> netem.** At round trips of 20, 50 and 150 ms dcroxide ran at 12.2, 13.0
+> and 13.6 blocks per round trip, and dcrd v2.1.6 at 12.6 at 50 ms, in
+> fixed-time runs over the early chain on m3. See "Shared commits for
+> UTXO-cache flushes, the filesystem's share and a delayed link" below.
+
 | date | machine | dcroxide commit | vs dcrd | corpus | result | source |
 |---|---|---|---|---|---|---|
 | 2026-07 | m1 | unrecorded (2.2.0-pre, at the ADR-0004 amendment) | 2.2.0-pre+452c1a6c3 (go1.26.5) | mainnet, ~1,100,400 blocks | syncer dcroxide: 2.47 h — 124 blk/s (from dcroxide), 2.51 h — 122 blk/s (from dcrd); syncer dcrd: 1.11 h — 276 blk/s, 1.02 h — 299 blk/s | ADR-0004 amendment |
@@ -58,6 +64,7 @@ path) has been measured yet, so this crossover is unconfirmed.
 | 2026-10-09 and 2026-10-10 | m3 | `c128a93` | release v2.1.6 (go1.25.4) | mainnet, genesis to 1,116,035 | Each daemon from a block server run by the other, four runs each on a quiet machine (three alternated, one from a later round), defaults apart from the flags that point the node at the server, exists-address index on in both; the syncing node's RPC is on for the harness's height polls, so not `--norpc`: dcroxide 1,058.6 s median (1,055.8–1,065.0) — **1,054.3 blk/s** at 1.71–1.72 mean cores; dcrd 2,863.9 s (2,848.8–2,894.8) — **389.7 blk/s** at 1.94–1.95. dcroxide **2.71x** as fast. One same-session run of each daemon from its own kind: 1,072.2 s and 2,872.8 s, so the source moved either by about 1% or less | this file, "Daemon against daemon, each from the other" |
 | 2026-10-10 | m3 | `c128a93` | master `6f6cf21b` (2.2.0-pre, go1.26.2, release image flags) | mainnet, genesis to 1,116,035 | The parity commit, in the harness of the row above: dcrd from a dcroxide block server, two runs, 2,909.8 s and 2,869.8 s — **383.5 and 388.9 blk/s** at 1.90–1.92 mean cores, against v2.1.6's 2,848.8–2,894.8 s. dcroxide's median of 1,058.6 s is **2.73x** as fast as their mean. With `--noexistsaddrindex` in both, one run each: dcroxide 880.8 s — **1,267.0 blk/s**; dcrd v2.1.6 1,247.8 s — **894.4 blk/s**; **1.42x** | this file, "The parity commit, the index off, two levers and a full replay" |
 | 2026-10-11 | m3 | `74168e8` and the five changes that follow it, added one at a time | not run in this session | mainnet, genesis to 1,116,035 | dcroxide from the dcrd v2.1.6 block server at the defaults, in the harness of the two rows above. `74168e8` itself: 1,058.3 s in one run, made after the first of the others, where the median two rows above is 1,058.6 s. One run per cumulative change: 1,015.3 s, 912.8 s, 893.7 s, 820.3 s and, with all five, 759.1 s and 756.2 s in two runs — **1,470.3 and 1,475.9 blk/s** at 1.93–1.94 mean cores. That is 28.3% and 28.5% under the same session's 1,058.3 s. Set against dcrd's 2,863.9 s of 2026-10-09 and 2026-10-10 it is 3.77x and 3.79x, across sessions | this file, "Five changes on the block-processing thread" |
+| 2026-10-11, afternoon | m3 | `b4a5d2d` (shared commits for UTXO-cache flushes, overlay default 300 MiB), and `7d31abb` before it | release v2.1.6 (go1.25.4), one run | mainnet, genesis to 1,116,035 | dcroxide from the dcrd v2.1.6 block server at the defaults, in the same harness. `7d31abb` itself: 775.6 s in one run that afternoon. With the change: 725.9 s, 728.7 s and 729.4 s, median 728.7 s — **1,531.6 blk/s** at 2.0 mean cores, 6.0% under the 775.6 s, with 54 flushes where there were 133. With `--noexistsaddrindex`, one run: 610.2 s — **1,829.1 blk/s**. dcrd from the same block server, one run that evening: 2,883.9 s — **387.0 blk/s**, so the change's median is **3.96x** as fast in one session. Set against dcrd's 2,863.9 s and 1,247.8 s of 2026-10-09 and 2026-10-10 it is 3.93x and 2.04x, across sessions | this file, "Shared commits for UTXO-cache flushes, the filesystem's share and a delayed link" |
 
 > **The headline 1.29x predates the fan-out fix, so it is conservative for
 > master.** That figure was measured on `b6d0c63`; `c091b46` (one validation
@@ -2630,3 +2637,226 @@ checked the binaries of pf-base, s-AG, s-AGBC and s-final and two builds
 that were not measured: an earlier one of the third step and an earlier
 one with all five changes. The binaries of s-A, s-AGB and s-AGBC-2 had
 no short run.
+
+## Shared commits for UTXO-cache flushes, the filesystem's share and a delayed link (2026-10-11, afternoon)
+
+"Five changes on the block-processing thread" above left the flushes
+alone, at 22% of a sync. In the runs on record about 120 of the 133 are not
+the overlay's own: each is the durable commit that ended a UTXO-cache
+flush the cache's size limit had tripped, as dcrd makes its block
+database durable before every UTXO-cache flush (`flushBlockDB`,
+`utxocache.go:708-716`). On the afternoon of 2026-10-11, in a second
+session on m3 in the same harness, a prototype that lets those flushes'
+rows wait for the next commit was measured, the change was then made
+properly and the code with it was measured. Two other things were
+measured in that session: the same sync on a data directory without
+copy-on-write, and syncs through a delayed link.
+
+**The deciding runs.** The prototype is `7d31abb` with one condition
+changed: a UTXO-cache flush forced a durable commit only when it was
+forced itself or when the cache was under its size limit, so that the
+120 s interval had tripped it. It was run with the overlay ceiling
+raised through `DCROXIDE_DB_OVERLAY`: at the default 100 MiB the
+overlay's own trigger, at 70 MB retained, would fire about as often as
+the UTXO-cache flushes had (9.16 GB went through the overlay in a sync),
+so little would be shared. That was not run. One default sync each, with
+the 300 s idle before each but the first of the two batches (f-head and
+f-proto-200):
+
+| run | started | code | overlay ceiling | data directory | wall | flushes | flush time | outside the flushes | node CPU time (user + sys) | passed to write calls | written at the volume | peak RSS | other userland |
+|---|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| f-head | 14:26 | `7d31abb` | 100 MiB (default) | as created | 775.6 s | 133 | 177.8 s | 597.8 s | 1,481.8 s (1,350.1 + 131.7) | 51.4 GB | 91.6 GB | 2,635 MiB | 0.14% |
+| f-proto | 14:46 | prototype | 300 MiB | as created | 724.6 s | 52 | 104.8 s | 619.8 s | 1,462.3 s (1,364.7 + 97.6) | 39.1 GB | 53.4 GB | 3,284 MiB | 0.07% |
+| f-proto-200 | 15:40 | prototype | 200 MiB | as created | 736.9 s | 63 | 115.3 s | 621.6 s | 1,466.7 s (1,368.2 + 98.5) | 40.7 GB | 59.4 GB | 3,271 MiB | 0.07% |
+| f-head-nocow | 15:23 | `7d31abb` | 100 MiB (default) | no copy-on-write | 736.8 s | 133 | 144.0 s | 592.8 s | 1,435.8 s (1,341.7 + 94.1) | 51.4 GB | 52.3 GB | 2,621 MiB | 0.07% |
+| f-proto-nocow | 15:05 | prototype | 300 MiB | no copy-on-write | 707.3 s | 52 | 86.7 s | 620.6 s | 1,450.5 s (1,365.5 + 85.0) | 39.2 GB | 40.4 GB | 3,098 MiB | 0.07% |
+
+Every run exited 0 on the server's tip and none was marked disturbed.
+
+- **On the data directory as created the prototype took 724.6 s where
+  `7d31abb` took 775.6 s, 51.0 s or 6.6% less.** The flushes fell from
+  133 to 52 and their time from 177.8 s to 104.8 s, 73.0 s. The time
+  outside the flushes rose by 22.0 s, of which 14.6 s is user CPU time;
+  what the node spends it on was not established.
+- **Without copy-on-write it took 707.3 s where `7d31abb` took 736.8 s,
+  29.5 s or 4.0% less.** The same 52 flushes took 86.7 s against 144.0 s,
+  and the time outside them rose by 27.8 s.
+- **It passed 39.1 GB to write calls where `7d31abb` passed 51.4 GB**,
+  24% less, and 53.4 GB reached the volume against 91.6 GB.
+- **Peak resident memory rose by 649 MiB, to 3,284 MiB**, and by 636 MiB
+  with a 200 MiB ceiling, so the ceiling is not what holds it. What does
+  was not established.
+- **A 200 MiB ceiling kept 76% of the gain**: 736.9 s, 38.7 s under
+  `7d31abb`, with 63 flushes, and the same peak memory as 300 MiB. So
+  the default was set at 300 MiB.
+
+Each of those is one run against one run. f-head is the code of the
+morning's s-final and s-final-2 (759.1 s and 756.2 s) in another build
+of the same sources, and took 775.6 s: 2.2% and 2.6% more, with 177.8 s
+of flush time against 167.9 s and 163.2 s. So the afternoon's runs are
+set against f-head and not against the morning's.
+
+**The filesystem's share.** m3's data volume is btrfs with zstd
+compression over an encrypted mapping. f-head-nocow and f-proto-nocow
+ran in a data directory created with the no-copy-on-write attribute
+(`chattr +C`), which turns off copy-on-write, checksums and compression
+for the files made in it. `7d31abb` took 736.8 s there against 775.6 s,
+38.8 s or 5.0% less: its 133 flushes took 144.0 s against 177.8 s, the
+node's system time fell from 131.7 s to 94.1 s, and the volume took 52.3
+GB against 91.6 GB for the same 51.4 GB passed to write calls. So about
+a fifth of the flush time on m3, 33.7 s of 177.8 s, is this volume's
+copy-on-write and compression, and the rest is not. That is one run
+against one run, and it measures this stack: what ext4 or xfs would do
+with the same writes was not measured.
+
+**The change as made (`b4a5d2d`).** A UTXO-cache flush now ends in a
+durable commit when it is forced (every connect once the chain is
+current, the latch to current, every disconnect, `gettxoutsetinfo`,
+shutdown) or when 120 s of processing have passed since the last one
+that did. A flush that only the cache's size limit tripped writes its
+rows and the set state in one transaction and returns, and they become
+durable with the next durable commit, whichever trigger makes it. The
+overlay's default ceiling is 300 MiB where it was dcrd's 100. It differs
+from the prototype in the 120 s rule, which the prototype did not have,
+and in tests. Three default syncs and one with `--noexistsaddrindex`,
+each after the 300 s idle but the first:
+
+| run | started | code | overlay ceiling | data directory | wall | flushes | flush time | outside the flushes | node CPU time (user + sys) | passed to write calls | written at the volume | peak RSS | other userland |
+|---|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| g-1 | 17:23 | final | 300 MiB (default) | as created | 725.9 s | 54 | 107.4 s | 618.5 s | 1,462.1 s (1,364.4 + 97.7) | 39.7 GB | 52.7 GB | 3,090 MiB | 0.07% |
+| g-2 | 17:42 | final | 300 MiB (default) | as created | 728.7 s | 54 | 108.9 s | 619.8 s | 1,461.7 s (1,364.5 + 97.2) | 39.7 GB | 53.1 GB | 3,285 MiB | 0.07% |
+| g-3 | 18:18 | final | 300 MiB (default) | as created | 729.4 s | 54 | 109.7 s | 619.7 s | 1,458.1 s (1,363.0 + 95.1) | 39.8 GB | 53.1 GB | 3,238 MiB | 0.07% |
+| g-off | 18:01 | final, `--noexistsaddrindex` | 300 MiB (default) | as created | 610.2 s | 41 | 63.6 s | 546.6 s | 1,273.2 s (1,196.7 + 76.5) | 32.7 GB | 38.1 GB | 2,138 MiB | 0.08% |
+
+Every run exited 0 on the server's tip and none was marked disturbed.
+
+- **At the defaults the final code took 725.9 s, 728.7 s and 729.4 s, a
+  median of 728.7 s, where `7d31abb` took 775.6 s in f-head: 46.9 s or
+  6.0% less.** That is three runs against one in one afternoon. The
+  three span 3.5 s.
+- **It made 54 flushes, two more than the prototype's 52**, taking
+  107.4–109.7 s, 15% of the sync where f-head's 133 took 23%. The median
+  flush is about 1.85 s against 1.44 s and the longest 3.2–3.4 s against
+  2.8 s.
+- **The overlay's ceiling trips few of them when the index is on.** In
+  g-1, 11 of the 54 flushes began with more than 200 MiB retained, the
+  overlay's own trigger at a 300 MiB ceiling, all of them within 141 s
+  of the first flush. Five more fall about 122 s apart, 113 s, 235 s,
+  357 s, 479 s and 601 s after the first, four of them clearly smaller
+  than their neighbours, and are presumably the 120 s rule's. The
+  exists-address index's participant asks for the other 38, which
+  journaled 1.1–1.25 million keys each with 100–190 MiB in the overlay.
+  With the index off (g-off) 36 of 41 flushes began over 200 MiB, and
+  the other five are about 122 s apart.
+- **Peak resident memory was 3,090, 3,285 and 3,238 MiB against f-head's
+  2,635 MiB**, and 2,138 MiB with the index off. `7d31abb` was not run
+  with the index off (`c128a93` peaked at 1,996 MiB without it on
+  2026-10-10), so what the change costs without the index was not
+  measured; nearly all of the 450–650 MiB appears to come with the
+  index. The index's memtable peaked at 4.50 million keys against 3.99
+  million in f-head, which does not account for it, and what holds it
+  was not established.
+- **The node passed 39.7–39.8 GB to write calls against 51.4 GB**, and
+  redb's commits wrote 20.5–20.6 GB against 30.6 GB. Three to five of
+  the 54 commits in each run wrote more than 512 MiB, the engine's
+  write buffer, where none of f-head's 133 did (two of s-final's 133
+  did that morning).
+- **With the index off the sync took 610.2 s**, 118.5 s less than the
+  median with it on: the index is 16% of a default sync, where it was
+  17% at `c128a93` (880.8 s on 2026-10-10 against the 1,058.6 s median
+  of 2026-10-09 and 2026-10-10).
+- **Against dcrd.** One run of dcrd v2.1.6 at the end of the session
+  (g-dcrd, started 18:49, from the same dcrd block server, exit 0 on its
+  tip, not disturbed) took 2,883.9 s, inside the 2,848.8–2,894.8 s of
+  its four runs of 2026-10-09 and 2026-10-10. Against it the final
+  code's median of 728.7 s is 3.96x, in one session: three runs against
+  one. Set against dcrd's 2,863.9 s median of the earlier runs it is
+  3.93x, across sessions, and with the index off 610.2 s against dcrd's
+  1,247.8 s of 2026-10-10 is 2.04x, across sessions. Up to the
+  assume-valid block the final code's
+  runs took 573.3–576.8 s and the blocks after it 152.6–152.7 s, about
+  586 blk/s.
+
+The binary of these four runs was built from the working tree after
+the last review change, which is the code as committed but for the
+wording of one comment.
+
+**A delayed link.** Every sync figure in this ledger is over loopback.
+Both daemons download through dcrd's window, 16 blocks in flight and a
+refill once fewer than 10 remain, and the model under "Sync throughput"
+has predicted since 2026-08 that a round trip longer than a few blocks'
+processing time makes that window set the pace, with no run to check
+it. On 2026-10-11 the syncing node was connected to a relay on the same
+machine that holds every chunk for a fixed time in each direction, and
+the relay to the dcrd block server: a pure delay, with no loss and no
+bandwidth limit. Each run was stopped after a fixed time and the height
+at each 10 s sample kept, so these are rates under a known round trip
+and not sync times. The dcroxide runs used `7d31abb`.
+
+| run | started | syncer | one-way delay | round trip | run length | height reached | first block after | rate once blocks flow | blocks per round trip | node CPU time |
+|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| dl-dcroxide-50 | 16:00 | dcroxide-head | 25 ms | 50 ms | 600 s | 144,821 | 51 s | 260 blk/s over blocks 4,851–143,004 | 13.0 | 84 s |
+| dl-dcrd-50 | 16:10 | dcrd | 25 ms | 50 ms | 600 s | 140,175 | 50 s | 252 blk/s over blocks 3,901–140,175 | 12.6 | 169 s |
+| dl-dcroxide-150 | 16:21 | dcroxide-head | 75 ms | 150 ms | 540 s | 40,172 | 100 s | 91 blk/s over blocks 1,078–39,347 | 13.6 | 30 s |
+| dl-dcroxide-20 | 16:30 | dcroxide-head | 10 ms | 20 ms | 420 s | 237,870 | 31 s | 609 blk/s over blocks 10,083–237,663 | 12.2 | 115 s |
+| dl-dcroxide-0 | 16:38 | dcroxide-head | 0 ms | 0 ms | 150 s | 378,239 | 20 s | 2,575 blk/s over blocks 70,501–370,444 | n/a | 159 s |
+
+- **At a 50 ms round trip dcroxide ran at 260 blk/s and dcrd v2.1.6 at
+  252 blk/s**, 13.0 and 12.6 blocks per round trip. Over loopback the
+  final code passed the same blocks at about 3,200 blk/s that afternoon
+  (g-1) and dcrd at about 1,500 on 2026-10-09 (r2), so over that stretch
+  a lead of about 2.1x, taken across sessions, becomes 1.03x.
+- **The rate follows the round trip.** At 150 ms dcroxide ran at
+  91 blk/s and at 20 ms at 609 blk/s: 13.6 and 12.2 blocks per round
+  trip. The model's figure was 9–16.
+- **The relay is not the limit.** With no delay dcroxide ran through it
+  at 2,575 blk/s over blocks 70,501–370,444, which the final code passes
+  over loopback at about 2,950 blk/s.
+- **The header sync is delay-bound too.** The first block arrived
+  between 40 and 51 s into the 50 ms runs and between 90 and 100 s into
+  the 150 ms run (the samples are 10 s apart), where it takes between 10
+  and 20 s over loopback: the headers come 2,000 to a round trip.
+- **What it implies, not measured.** At 13 blocks per round trip this
+  chain's 1,116,035 blocks need about 86,000 round trips: 72 minutes at
+  50 ms and 3.6 hours at 150 ms, for either daemon wherever it can
+  process faster than that. dcroxide can everywhere on this chain at
+  50 ms, since its slowest stretch, after the assume-valid block, runs
+  at about 586 blk/s. No delayed run went past block 237,870, and the
+  blocks there are small.
+
+These runs were not on a quiet machine: other work went on on it
+throughout, and a build was running at the end of the 20 ms and 0 ms
+runs, which is the one time the harness looks. It was held to other
+cores than the node's eight threads, the server's four and the relay's
+two. The node used 84 s of CPU time in
+the 600 s at 50 ms, so it was idle most of the time and the rates above
+are the link's.
+
+**What this does not establish.**
+
+- The ratio to dcrd in one session rests on one dcrd run, taken from a
+  dcrd block server where dcrd's published runs took their blocks from
+  a dcroxide one. With the index off dcrd was not run again.
+- Not what holds the extra memory, nor the 20 s or so more outside the
+  flushes (618.5–619.8 s against 597.8 s).
+- Not the final code on a data directory without copy-on-write, and
+  nothing on ext4, xfs or ZFS.
+- Not what an unclean stop now costs in time: the replay it leaves was
+  tested for correctness (a sweep of unclean stops at sampled commits
+  reopens to the right UTXO set) and not timed.
+- Not the final code at a 100 MiB or 200 MiB ceiling, and not the cost
+  of the forced commit every 120 s against a rule that counted the
+  overlay's own commits: the five flushes about 122 s apart, and two
+  more flushes in all than the prototype's, are the signs of it.
+- Nothing about a real link: the relay adds delay only, to one peer on
+  the same machine.
+- Not `--assumevalid=0`, the tuning levers, m1 or m2 on this code.
+
+Raw: the comparison's `runs.jsonl` rows labelled `f-head`, `f-proto`,
+`f-proto-200`, `f-proto-nocow`, `f-head-nocow`, `g-1`, `g-2`, `g-3`,
+`g-off` and `g-dcrd`, with per-run samples, flush logs and node logs as
+above;
+`delay.jsonl` for the delayed runs, with the relay's source and the
+script that drove them; the prototype's patch; and `smoke4.jsonl` and
+`delay-smoke.jsonl` for the short runs that checked the prototype, the
+no-copy-on-write option and the relay.

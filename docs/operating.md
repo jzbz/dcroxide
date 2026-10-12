@@ -75,6 +75,23 @@ size: N MiB)..." and "UTXO cache initialization completed", at the
 configured `--utxocachemaxsize`. A start that sits between those two lines
 is catching up, not hung.
 
+Since 2026-10-11 that replay is the usual outcome of an unclean stop
+during the initial sync, and there is more to do again. While the chain
+is catching up, a UTXO cache flush that the cache's size limit trips no
+longer forces the metadata store to disk. Its rows reach disk with the
+store's next commit, and the chain forces one of its own about every
+two minutes while blocks are connecting. If blocks stop arriving
+nothing commits, and what is waiting stays in memory until the next
+block or a clean shutdown: the loss is bounded in work, not in time. So
+a kill or a power cut in that phase loses about two minutes of
+processing at most, where it lost one fill of the UTXO cache, and the
+node downloads and connects those blocks again.
+Nothing is corrupted: what is on disk is always a state the chain was
+in. Once the chain is current every block is flushed to disk as it
+connects, as before, and a clean shutdown loses nothing in either phase.
+The storage section below has what the change bought and what it costs
+in memory.
+
 The enabled indexes then catch up to the chain tip, as in dcrd, between the
 INDX lines "Catching up from height X to Y" and "Caught up to height Y",
 with an "Indexed N blocks in the last ..." line every ten seconds, so a
@@ -150,7 +167,9 @@ difference is expected.
 
 Budget for it: on the one machine where a sync from genesis has been
 measured with the current layout, it took less time than dcrd v2.1.6
-did, and more disk. On machine m3 in
+did, and more disk. The current figure is a median of **12.1 minutes**
+over three runs on 2026-10-11; the comparison with dcrd was made on
+2026-10-09 and 2026-10-10, when dcroxide took 17.6, and it comes first. On machine m3 in
 [bench-ledger.md](bench-ledger.md), a 16-core desktop with one NVMe
 drive and the node held to eight of its cores, mainnet from genesis to
 block 1,116,035 took a median of **17.6 minutes**, against **47.7
@@ -175,8 +194,16 @@ sync. Two runs of the same sync with all five, at the defaults, took
 **12.6 and 12.7 minutes** (756.2 s and 759.1 s) and ended on the same
 block, where the code before them took 17.6 minutes (1,058.3 s) in one
 run the same day. Their peak resident memory was 2.56 GiB, where the
-runs above peaked at about 2.1. dcrd was not run again in that session,
-so no new ratio to dcrd was measured.
+runs above peaked at about 2.1. A sixth change that afternoon, to when
+the node commits during a sync (the paragraph on unclean stops above,
+and the storage section below), took the sync to a median of **12.1
+minutes** (728.7 s) over three runs, with a peak of 3.0–3.2 GiB, where
+the code before it took 12.9 minutes (775.6 s) in one run that
+afternoon and peaked at 2.6 GiB. With `--noexistsaddrindex` that code took 10.2 minutes (610.2 s)
+in one run and peaked at 2.1 GiB. dcrd v2.1.6 took 48.1 minutes
+(2,883.9 s) in one run that evening, 3.96x the 12.1 in one session;
+3.93x and 2.04x against its 47.7 and 20.8 minutes above are figures
+across sessions.
 The ledger's section "Five changes on the block-processing thread" has
 each step.
 
@@ -187,13 +214,13 @@ script checks included, up to the built-in assume-valid block,
 4.8 minutes, block 1,000,000 in 13.8 and the assume-valid block in 14.4.
 The 89,438 blocks after it took another 3.2 minutes, about 461 blocks/s
 on about five of the node's 16 threads, against 1,054 over the whole
-chain. (The two 2026-10-11 runs above reached the assume-valid block in
-about 10.1 minutes and took 2.6 for the blocks after it, about 580
-blocks/s.) New blocks are past that point too, so a chain longer than
-the one measured should add time at about 580 blocks/s on a machine
-like m3 (two runs on 2026-10-11; the four earlier runs, before that
-day's changes, gave a median of about 461), until a release moves the
-assume-valid block. With `--assumevalid=0`
+chain. (The three runs of 2026-10-11 with all six changes reached the
+assume-valid block in 9.6 minutes and took 2.5 for the blocks after it,
+about 586 blocks/s.) New blocks are past that point too, so a chain
+longer than the one measured should add time at about 586 blocks/s on a
+machine like m3 (three runs on 2026-10-11; the four earlier runs,
+before that day's changes, gave a median of about 461), until a release
+moves the assume-valid block. With `--assumevalid=0`
 every block is validated in full and none of these figures apply.
 
 On a smaller or slower machine, budget more. On m2, a ZFS mirror of QLC
@@ -214,10 +241,24 @@ All of these come from syncing over loopback from a local server, and
 none has been measured over the internet. There, both daemons request
 blocks the same way: through dcrd's window of at most 16 blocks in
 flight, refilled once fewer than 10 remain, from the sync peer only. By
-that window arithmetic (a prediction, not a measurement), once the
-round trip to the sync peer exceeds about nine blocks' processing time,
-the sync should wait on the network at about 9-16 blocks per round
-trip. On m3 a block took dcroxide 0.95 ms averaged over the chain and
+that window arithmetic, once the round trip to the sync peer exceeds
+about nine blocks' processing time, the sync should wait on the network
+at about 9-16 blocks per round trip. That was measured on 2026-10-11
+through a relay on the same machine that delays every chunk: over the
+early chain dcroxide synced at 12.2, 13.0 and 13.6 blocks per round
+trip at round trips of 20, 50 and 150 ms (609, 260 and 91 blocks/s),
+and dcrd v2.1.6 at 12.6 at 50 ms (252 blocks/s), where over loopback
+they pass those blocks at about 3,200 and 1,500 blocks/s. The header
+sync is paced the same way: the first blocks arrived between 41 and
+51 s into a run at 50 ms and between 91 and 101 s in at 150 ms (samples
+every 10 s). At 13 blocks per round trip the whole
+chain would take dcroxide about 72 minutes at 50 ms and either daemon
+3.6 hours at 150 ms; at 50 ms dcrd would take at least about 80
+minutes, since it runs the blocks after the assume-valid block at about
+104 blocks/s over loopback. These are worked out and were not run, and
+assume one peer, no loss and no bandwidth limit. The rest of this paragraph is the same
+arithmetic applied to the rates measured at `c128a93`, and is not a
+measurement. On m3 a block took dcroxide 0.95 ms averaged over the chain and
 2.2 ms after the assume-valid block, and dcrd 2.6 ms and 9.6 ms. So the
 network should pace dcroxide's average block once the round trip passes
 about 9 ms and dcrd's past about 23 ms, and the cheap early blocks
@@ -225,10 +266,12 @@ sooner. Only past about 87 ms would it also pace dcrd through the fully
 validated blocks after the assume-valid block, where about 20 ms
 already paces dcroxide, so the lead over dcrd should narrow toward 1x
 as latency grows toward that. Bandwidth binds too: the
-measured 17.6 minutes carried 19.2 GB of blocks, a mean of 145 Mbit/s.
+measured 17.6 minutes carried 19.2 GB of blocks, a mean of 145 Mbit/s,
+and the 12.1 minutes of 2026-10-11 a mean of 211 Mbit/s.
 Budget from your link's latency and bandwidth as well as from these
-figures; the missing WAN measurement is recorded in
-[bench-ledger.md](bench-ledger.md).
+figures; the delayed-link runs are in
+[bench-ledger.md](bench-ledger.md), and no sync over the internet has
+been measured.
 
 The disk difference is all in the metadata store. Block files make up
 17.88 GiB of each data directory at block 1,116,035, and the rest is
@@ -252,9 +295,11 @@ to dcroxide's 14.7, and was the first to the assume-valid block, in
 validated blocks after it, 2.9 minutes against 10.5. dcrd was not
 profiled, and dcroxide only on 2026-10-11, in one sync with the index on
 and before the five changes above (user-space time only; the ledger's
-"Five changes on the block-processing thread" has it), so why dcrd is
-ahead up to the assume-valid block with the index off, and dcroxide
-after it, has not been taken apart. What the runs of 2026-10-09 and
+"Five changes on the block-processing thread" has it), so why dcrd was
+ahead up to the assume-valid block with the index off at `c128a93`, and
+dcroxide after it, has not been taken apart; on 2026-10-11, in one run
+with the index off, dcroxide reached that block in 7.9 minutes, against
+dcrd's 10.3 of 2026-10-10. What the runs of 2026-10-09 and
 2026-10-10 record besides is that at the defaults
 the node process used a third of dcrd's CPU time (1,821 s
 against 5,567 s) and passed under a fifth of the bytes to write calls
@@ -262,7 +307,8 @@ against 5,567 s) and passed under a fifth of the bytes to write calls
 median of about 1.3 s and a longest of 3.0 s, took 15–16% of the wall
 time. In the two runs of 2026-10-11 with all five changes the same 133
 flushes took 167.9 s and 163.2 s, 22% of each: the flush time did not
-grow, the sync got shorter. This guide used to describe a node fully stalled on storage for
+grow, the sync got shorter. With the sixth change a sync made 54
+flushes taking 107–110 s, 15% of it. This guide used to describe a node fully stalled on storage for
 48% of block-sync wall time, with a median flush of 26.9 s, and a sync
 1.29x slower than dcrd's. Those were measured in 2026-08 on m1 in
 [bench-ledger.md](bench-ledger.md), another machine, against dcrd
@@ -292,7 +338,8 @@ the current layout it is much smaller (below): on the same tail, with
 those keys, the node ran at a median of 482 blocks/s with the index on
 and 501 with it off, and wrote 15.5 GB against 12.6 GB. From genesis on
 m3 it showed more: one sync with the index off took 14.7 minutes
-against 17.6 with it on, and left a data directory 2.0 GiB smaller.
+against 17.6 with it on, and left a data directory 2.0 GiB smaller
+(10.2 minutes against 12.1 on 2026-10-11, after that day's changes).
 With the index off, both RPCs fail with "exists address index
 disabled", as dcrd's do. With it on, the index is updated on a thread of
 its own and can trail the chain by a little more than 128 blocks while
@@ -339,7 +386,12 @@ Its peak resident memory was about 140 MiB higher (2,129–2,148 against
 1,996 MiB), and its data directory 2.01 GiB larger (27.90 against 25.88
 GiB). dcrd v2.1.6 on the same machine took 1,247.8 s in one run with its
 index off against a median of 2,863.9 s with it on, so the index is 56%
-of its sync, for 1.97 GiB on disk.
+of its sync, for 1.97 GiB on disk. On 2026-10-11, after that day's six
+changes, one sync with the index off took 610.2 s against a median of
+728.7 s over three with it on: 16% of a default sync, 15% more CPU time
+(1,462 against 1,273 s), 54 flushes taking 107–110 s against 41 taking
+63.6 s, 39.7 GB passed to write calls against 32.7 GB, and 2.00 GiB
+more on disk (27.89 against 25.88 GiB).
 
 - **Memory**: the index's in-memory set holds up to about 3 million
   addresses (about 63 MB) after each flush while syncing, and up to about
@@ -356,8 +408,11 @@ of its sync, for 1.97 GiB on disk.
   (above). That was on 2026-10-10, before the index thread. With the
   thread, two default syncs on 2026-10-11 peaked at 2,621 and 2,624
   MiB, where the seven that day without it peaked at 2,139–2,147 MiB.
-  The sync with the index off was not repeated on that code, so what
-  the index adds to peak memory now has not been measured.
+  Since the change to commits that afternoon, three default syncs
+  peaked at 3,090–3,285 MiB and one with the index off at 2,138 MiB, so
+  the index now adds about 0.9–1.1 GiB (952–1,147 MiB) to the peak of
+  an initial sync.
+  What in it holds that memory has not been found.
 - **Starting**: the node reads the journal back into memory before the
   index catches up, modelled at 1-3 s on mainnet, holding one copy of the
   addresses it reads back, and the journal's pages in the page cache.
@@ -424,6 +479,33 @@ Four settings change how the metadata store behaves. Three are measured and
 one is not; the numbers are in [bench-ledger.md](bench-ledger.md) and the
 reasoning in [ADR-0004](adr/0004-storage-backend.md).
 
+**Since 2026-10-11 a sync commits less often, and the overlay's default
+ceiling is 300 MiB.** Until then every UTXO cache flush forced a durable
+commit, about 120 of the 133 in a sync, and the overlay's own ceiling of
+100 MiB hardly mattered. Now a flush the size limit trips shares the
+next commit (the paragraph on unclean stops near the top has what that
+risks). That commit comes when the overlay holds two thirds of its
+ceiling or, with the exists-address index on, when the index has taken
+about 1.5 million new keys since its last flush, which is what trips
+most of them after the first few minutes of a sync; about one in ten is
+the two-minute rule's. On m3 that day the code before the change
+took 775.6 s with 133 flushes in one sync, a prototype of the change
+took 724.6 s with 52 flushes at 300 MiB and 736.9 s with 63 at 200 MiB,
+and the change as made took a median of 728.7 s over three syncs, with
+54 flushes. It costs memory: peak resident memory was 3.0–3.2 GiB in
+those three runs against 2.6 GiB before, and 2.1 GiB with the
+exists-address index off, where the index-off sync of `c128a93` peaked
+at 1.9 GiB. So nearly all of the extra appears to come with the index,
+though the code before the change was not run with the index off; what
+in it holds the memory has not been found. `DCROXIDE_DB_OVERLAY=100` should
+put the overlay's part of the cadence back to about one commit per UTXO
+cache flush, and restores the old ceiling in the header sync, where the
+larger one should also mean fewer commits; neither was run on the new
+code. A catch-up of the exists-address index is paced by the index
+itself and does not change. The paragraphs below
+describe measurements made before this change, and where they say a
+UTXO cache flush forces a commit, that was so then.
+
 The measurements quoted in the paragraphs below were taken on m1 in
 2026-08, before the height-first keys and the exists-address index's
 own layout. The two knobs that helped then, by about 12% each, were
@@ -449,23 +531,24 @@ On m2 the index's layout cut the flush time of a 200,000-block tail
 from 1,416 s over 58-59 flushes to 78 s over 31. On m3 on 2026-10-09
 and 2026-10-10 the median flush was about 1.3 s and flushes were 15–16%
 of a sync's wall time (22% in the two runs of 2026-10-11 with all five
-changes, where the flush time was the same and the sync shorter), where
+changes, where the flush time was the same and the sync shorter, and
+15% with the sixth, which makes 54 flushes), where
 on m1 on 2026-08-16 the median was 26.9 s and flush windows
 occupied 68% of it. m3 is another machine as well as another layout, so
 that pair is not a before and after.
 
 The two that helped on m1 are the two flush triggers, and they are worth
 understanding
-together: a durable metadata commit is forced when **either** the UTXO cache
-fills or the metadata overlay fills. Each ceiling governs one of them, raising
-either reduces how often the node commits, and each measured ~12% on its own
-there. `DCROXIDE_DB_CACHE`'s effect on sync time has not been measured
+together: a durable metadata commit was forced when **either** the UTXO cache
+filled or the metadata overlay filled. Each ceiling governed one of them,
+raising either reduced how often the node committed, and each measured ~12%
+on its own there. `DCROXIDE_DB_CACHE`'s effect on sync time has not been measured
 again since, and `DCROXIDE_DB_FLUSH_SECS` never has been.
 
 **`--utxocachemaxsize` (default 150 MiB) is one of the two.**
-Connecting a block flushes the UTXO cache when it fills, and that flush
-forces a durable metadata commit — so the ceiling governs how often the node
-commits. Raising it on its own measured **12% faster** over a full-chain
+Until 2026-10-11, connecting a block flushed the UTXO cache when it
+filled, and that flush forced a durable metadata commit — so the ceiling
+governed how often the node committed. Raising it on its own measured **12% faster** over a full-chain
 replay on m1 at
 1200 MiB, and 7% at 600 MiB, across three repetitions each with ranges that
 do not overlap the baseline's. dcrd has the same flag and the same 150 MiB
@@ -497,11 +580,11 @@ The default is the right value — the only thing that matters is not raising
 it, so leave the variable unset.
 
 **`DCROXIDE_DB_OVERLAY` and `DCROXIDE_DB_FLUSH_SECS` reach the other flush
-trigger.** Connecting a block forces a durable commit when *either* the UTXO
-cache fills or the metadata overlay does — and until now only the first was
-reachable. The overlay has its own ceiling, 100 MiB, and its own interval,
-300 seconds; both were fixed at compile time, so half the cadence lever could
-not be pulled. `DCROXIDE_DB_OVERLAY` sets the ceiling in MiB and
+trigger.** When they were added, connecting a block forced a durable commit
+when *either* the UTXO cache filled or the metadata overlay did, and only the
+first was reachable. The overlay has its own ceiling, 300 MiB since
+2026-10-11 and 100 MiB before, and its own interval, 300 seconds; both were
+fixed at compile time, so half the cadence lever could not be pulled. `DCROXIDE_DB_OVERLAY` sets the ceiling in MiB and
 `DCROXIDE_DB_FLUSH_SECS` the interval in seconds. The ceiling counts each
 overlay entry as dcrd does, at 72 bytes plus its key and value, so the
 configured MiB tracks the overlay's resident memory to within allocator
@@ -510,7 +593,7 @@ only, which let the overlay hold 2–4× the configured figure. The 12.7%
 measurement for `DCROXIDE_DB_OVERLAY=800` below was taken under that older
 accounting, so the same setting now flushes a smaller overlay. The one
 re-measurement since, on m3 (above), found no gain. Unset, both
-keep the compiled defaults, so an untouched node behaves exactly as before.
+keep the compiled defaults.
 
 **`DCROXIDE_DB_OVERLAY=800` measured 12.7% faster** on m1 in 2026-08,
 which made it the
@@ -573,7 +656,7 @@ configuration, every name changes.
 | data directory override | `--datadir` | `--datadir` |
 | extra TLS DNS names | `DCROXIDE_ALT_DNSNAMES` | `DCRD_ALT_DNSNAMES` |
 | metadata page cache | `DCROXIDE_DB_CACHE` (MiB, default 1024) | — |
-| metadata overlay flush size | `DCROXIDE_DB_OVERLAY` (MiB, default 100) | — |
+| metadata overlay flush size | `DCROXIDE_DB_OVERLAY` (MiB, default 300) | — |
 | metadata overlay flush interval | `DCROXIDE_DB_FLUSH_SECS` (s, default 300) | — |
 | metadata flush log (JSONL path) | `DCROXIDE_DB_FLUSHLOG` (unset = off) | — |
 | exists-address memtable target (developer-only) | `DCROXIDE_EXISTSADDR_MEMTABLE_KEYS` (keys, default 2,000,000) | — |

@@ -584,3 +584,45 @@ which was not examined. How long the block-processing thread and the index threa
 wait for each other at the writer was not measured, the fallback's
 flush-time test was not run again, and none of the plan's criteria is
 judged again.
+
+## Addendum, 2026-10-11 (second) — the participant now paces most commits of a sync
+
+Since the afternoon of 2026-10-11 a UTXO cache flush that only the
+cache's size limit tripped no longer forces a metadata commit
+([ADR-0004](0004-storage-backend.md), addendum of that date), and the
+overlay's default ceiling is 300 MiB. A default sync on m3 now makes 54
+flushes where it made 133 ([bench-ledger.md](../bench-ledger.md),
+"Shared commits for UTXO-cache flushes, the filesystem's share and a
+delayed link"). Nothing in the hooks or their contract changed, but what
+trips a flush did. In one of the three syncs measured, the overlay's own
+size tripped 11 of the 54, all within 141 s of the first flush; five
+more, about 122 s apart, are presumably the UTXO cache's periodic flush;
+and the other 38 journaled 1.1–1.25 million keys each with the overlay
+well under its trigger, which is the participant's `wants_flush`.
+`u_max` counts 1,500,000 keys new to the memtable, and about 1.2 million
+of them are journaled, because the keys of the partitions a flush merges
+go into their runs and not the journal. So the trigger this ADR added
+for the index's catch-up now paces most durable commits of an initial
+sync with the index on. With the index off, the overlay's size tripped
+36 of 41.
+
+In those three syncs the largest flush journaled 1,254,393 to 1,272,007
+keys, against 858,923 in a sync of the code before; the memtable peaked
+at 4.50 million keys against 3.99 million, which is `k0_hard` plus
+`u_max`; the participant's own time was 15.0–15.1 s over 53 flushes
+against 18.8 s over 129, and its merges about 2,520 against 3,387. Peak
+resident memory with the index on rose from 2,635 MiB to 3,090–3,285 MiB
+and was 2,138 MiB with it off, so the index now accounts for about
+0.9–1.1 GiB of the peak (952–1,147 MiB), where at `c128a93` it was about
+140 MiB. The code before this change was not run with the index off, so
+how much of that came with this change was not measured. What holds it
+was not established, and the memtable's extra half million keys do not
+account for it. The merge budget and `u_max` were tuned at the old
+cadence and were not re-tuned. A test now stops the node uncleanly after
+a commit the index asked for and checks the reopened UTXO set and index
+(`crates/dcroxide-node/tests/index_thread.rs`).
+
+The line numbers cited in the text above are those of the commit this
+ADR was accepted at. The change of 2026-10-11 moved the cited lines of
+`dcroxide-database`'s `lib.rs` and `dbcache.rs` down by four to six and
+those of `policy.rs` by three; the functions they name are unchanged.

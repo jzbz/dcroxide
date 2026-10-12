@@ -165,11 +165,32 @@ What Phase 15 has covered so far:
   machine for each cumulative step, and one of the code before them run
   later the same day (1,058.3 s): 1,015.3 s, 912.8 s, 893.7 s, 820.3 s
   and, in two runs, 759.1 s and 756.2 s (1,470 and 1,476 blk/s), every
-  one ending on the same block. dcrd was not run again that day. A profile of the code before them put 27% of
-  the user-space time up to the assume-valid block in BLAKE-256, 15% in
-  `memcmp` and 13.5% in the allocator. The callers of the last two were
-  not established, and the sync was not profiled again after the
-  changes.
+  one ending on the same block. dcrd was not run in that session. A
+  profile of the code before them put 27% of the user-space time up to
+  the assume-valid block in BLAKE-256, 15% in `memcmp` and 13.5% in the
+  allocator. The callers of the last two were not established, and the
+  sync was not profiled again after the changes.
+- **That afternoon a sixth change took it to a median of 728.7 s over
+  three runs** (1,532 blk/s), where the code before it took 775.6 s in
+  one run that afternoon. During the initial sync a UTXO cache flush
+  that only the cache's size limit tripped no longer forces a durable
+  commit, so a sync makes 54 commits where it made 133, and the metadata
+  overlay's default ceiling is 300 MiB where it was dcrd's 100. For that
+  6.0% it trades about 120 s of processing done again after an unclean
+  stop in that phase, and 450–650 MiB more peak memory with the
+  exists-address index on, which is not explained. With the index off,
+  one run: 610.2 s. dcrd v2.1.6 took 2,883.9 s in one run that evening,
+  3.96x the 728.7 s in one session; 3.93x and 2.04x against its figures
+  above are across sessions. On a data directory without
+  copy-on-write the code before the change took 5.0% less time, one run
+  each.
+- **A delayed link was measured for the first time on 2026-10-11.**
+  Through a relay that delays every chunk, at a 50 ms round trip
+  dcroxide synced the early chain at 260 blk/s and dcrd v2.1.6 at 252,
+  about 13 blocks per round trip each through dcrd's 16-block window,
+  where over loopback they pass those blocks at about 3,200 and
+  1,500 blk/s. Over those blocks the window sets the pace and the lead
+  over dcrd is gone; no delayed run went past block 237,870.
 - **Security-blocker campaign.** The release blockers, highs, and mediums from
   an audit of the ported surface: RPC authentication and admission, peer
   message-path bounds (stall deadlines, getdata, queue and write limits),

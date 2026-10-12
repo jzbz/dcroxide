@@ -1651,3 +1651,52 @@ profiled, so what the 367.0 s and the two regimes consist of is not known,
 and none of this sets redb against goleveldb. (The same ledger section
 records a full replay on m3, blocks 1 to 1,116,035 validated in full in
 1,909.41 s.)
+
+## Addendum, 2026-10-11 — a UTXO cache flush no longer forces a commit, so lever (c)'s ceiling can govern cadence
+
+Lever (c) found that the metadata overlay's ceiling "does not govern
+flush cadence", because every UTXO cache flush ended in a forced durable
+commit, and the 2026-10-10 addendum above measured the same on m3: 121
+flushes at an 800 MiB ceiling against 133. Since 2026-10-11 that is no
+longer so. A UTXO cache flush that only the cache's size limit tripped
+writes its rows and the set state in one transaction and returns; the
+rows become durable with the next durable commit. Forced flushes (every
+connect of a current chain, the latch to current, every disconnect,
+`gettxoutsetinfo`, shutdown) and one at least every 120 s of processing
+still end in `Database::flush`. The overlay's default ceiling went from
+dcrd's 100 MiB to 300 MiB with it, since at 100 MiB the overlay's own
+trigger, 66.7 MiB retained, is about what it held at each UTXO cache
+flush of the code before (a median of 67.7 MiB, 83 of 133 over the
+trigger), so few would share a commit; that is reckoned from the flush
+log and was not run. With the exists-address index off the ceiling now
+trips nearly every commit of a sync (36 of 41 in one run); with it on,
+the ceiling trips the early ones, the index's participant most of the
+rest, and the 120 s rule about five (11, 38 and 5 of 54 in one run;
+[ADR-0011](0011-exists-address-layout-3-and-the-flush-participant.md),
+second addendum of the same date).
+
+Measured on m3 that afternoon, one default sync each
+([bench-ledger.md](../bench-ledger.md), "Shared commits for UTXO-cache
+flushes, the filesystem's share and a delayed link"): the code before
+the change 775.6 s with 133 flushes taking 177.8 s; a prototype of it
+724.6 s with 52 flushes taking 104.8 s at 300 MiB, and 736.9 s with 63
+at 200 MiB. The change as made, which adds a durable flush at least
+every 120 s that the prototype did not have, took 725.9 s, 728.7 s and
+729.4 s in three syncs, with 54 flushes taking 107.4–109.7 s. redb's
+commits wrote 20.5–20.6 GB in those three against 30.6 GB, and three to
+five of the 54 in each wrote more than 512 MiB, where none of the 133
+did.
+
+What this ADR decided is untouched: the engine, `Durability::Immediate`
+on every commit that is made, and the single store. What moved is how
+often the chain asks for a commit while it is catching up, and with it
+what an unclean stop in that phase loses: about 120 s of processing,
+replayed or downloaded again, where it was one fill of the UTXO cache.
+Every durable state is still a prefix of the commit order
+([PARITY.md](../../PARITY.md), the row "UTXO cache flush and the durable
+commit"). The cost is memory: peak resident memory was 3,090–3,285 MiB
+in those three runs against 2,635 MiB, and 2,138 MiB with the
+exists-address index off, where the index-off sync of `c128a93` peaked
+at 1,996 MiB on 2026-10-10. So nearly all of it appears to come with the
+index, though the code before the change was not run with the index off.
+What in the index's path holds it was not established.
