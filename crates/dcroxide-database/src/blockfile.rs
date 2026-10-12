@@ -14,7 +14,6 @@
 
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -195,53 +194,46 @@ impl BlockStore {
         })
     }
 
-    /// Write the data at the write cursor and advance the cursor by the
-    /// bytes actually written -- also when the write fails part way
-    /// (dcrd `writeData`, `blockio.go:373-396`).  The field name is only
-    /// for the error.
+    /// Write a whole block record at the write cursor and advance the
+    /// cursor by the bytes actually written -- also when the write
+    /// fails part way (dcrd `writeData`, `blockio.go:373-396`, called
+    /// once per field of the record).
     ///
     /// Advancing on failure is what lets a rollback find a torn record.
     /// A cursor left on the rollback point makes the rollback a no-op,
     /// and the partial bytes stay in the file past it; one that moved
     /// sends the rollback to truncate them.
-    fn write_data(&mut self, data: &[u8], field_name: &str) -> Result<(), Error> {
-        let mut file: &File = self.write_file.as_deref().expect("write file open");
-        // `write` until done, counting what lands, as Go's `WriteAt`
-        // does; `write_all` would hide how much of a failed write did.
-        let mut written = 0usize;
-        let mut failure = None;
-        while written < data.len() {
-            match file.write(&data[written..]) {
-                Ok(0) => {
-                    failure = Some(std::io::Error::from(std::io::ErrorKind::WriteZero));
-                    break;
-                }
-                #[allow(
-                    clippy::arithmetic_side_effects,
-                    reason = "written + n <= data.len(): write returns at most the remaining buffer's length"
-                )]
-                Ok(n) => written += n,
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(e) => {
-                    failure = Some(e);
-                    break;
-                }
-            }
-        }
+    ///
+    /// The bytes the failing write itself landed count too.  dcrd's
+    /// cursor moves by what Go's `WriteAt` returns, which is nothing
+    /// for a call that failed, whatever it had written by then, so it
+    /// stops at the start of the field that failed; the cursor here
+    /// moves by every byte that landed, so any torn record moves it.
+    ///
+    /// The error is the one dcrd's call for the field the write stopped
+    /// in returns: it names that field and gives the offset the field
+    /// starts at, which is where that call began.
+    fn write_record(&mut self, record: &[u8], block_len: u32) -> Result<(), Error> {
+        let file: &File = self.write_file.as_deref().expect("write file open");
+        let record_offset = self.write_offset;
+        let (written, failure) = write_at(file, record, u64::from(record_offset));
         // At most one record, which `write_block` has checked fits the
         // u32 cursor.
         let written = written as u32;
-        self.write_offset = self.write_offset.wrapping_add(written);
+        self.write_offset = record_offset.wrapping_add(written);
         match failure {
             None => Ok(()),
-            Some(e) => Err(db_error(
-                ErrorKind::DriverSpecific,
-                format!(
-                    "failed to write {field_name} to file {} at offset {}: {e}",
-                    self.write_file_num,
-                    self.write_offset.wrapping_sub(written)
-                ),
-            )),
+            Some(e) => {
+                let (field_name, field_offset) = record_field_at(written, block_len);
+                Err(db_error(
+                    ErrorKind::DriverSpecific,
+                    format!(
+                        "failed to write {field_name} to file {} at offset {}: {e}",
+                        self.write_file_num,
+                        record_offset.wrapping_add(field_offset)
+                    ),
+                ))
+            }
         }
     }
 
@@ -273,23 +265,19 @@ impl BlockStore {
                 .map_err(|e| io_err(&e, "failed to open write file"))?;
             self.write_file = Some(Arc::new(file));
         }
-        let mut file: &File = self.write_file.as_deref().expect("write file open");
-        file.seek(SeekFrom::Start(u64::from(self.write_offset)))
-            .map_err(|e| io_err(&e, "failed to seek write file"))?;
 
-        // Record: network || length || block || checksum-of-preceding,
-        // each advancing the cursor by what it wrote, as dcrd's do.
+        // Record: network || length || block || checksum-of-preceding.
+        // dcrd writes the four fields with a `WriteAt` each
+        // (`blockio.go:466-489`); the same bytes go out here in one
+        // call, three of the four being four bytes long.
+        let mut record = Vec::with_capacity(full_len as usize);
+        record.extend_from_slice(&self.network.to_le_bytes());
+        record.extend_from_slice(&block_len.to_le_bytes());
+        record.extend_from_slice(raw_block);
+        let checksum = CASTAGNOLI.checksum(&record);
+        record.extend_from_slice(&checksum.to_be_bytes());
         let orig_offset = self.write_offset;
-        let mut digest = CASTAGNOLI.digest();
-        let net = self.network.to_le_bytes();
-        self.write_data(&net, "network")?;
-        digest.update(&net);
-        let len_bytes = block_len.to_le_bytes();
-        self.write_data(&len_bytes, "block length")?;
-        digest.update(&len_bytes);
-        self.write_data(raw_block, "block")?;
-        digest.update(raw_block);
-        self.write_data(&digest.finalize().to_be_bytes(), "checksum")?;
+        self.write_record(&record, block_len)?;
 
         let loc = BlockLocation {
             block_file_num: self.write_file_num,
@@ -486,14 +474,16 @@ impl BlockStore {
     }
 }
 
-/// A test's probe into block I/O, called with `"read"` or `"fsync"`.
+/// A test's probe into block I/O, called with `"read"`, `"write"` or
+/// `"fsync"`.
 #[cfg(test)]
 pub(crate) type IoHook = Box<dyn Fn(&'static str)>;
 
 #[cfg(test)]
 thread_local! {
-    /// Run on the calling thread just before each block read and each
-    /// fsync, so a test can see what is locked while the I/O runs.
+    /// Run on the calling thread just before each block read, each
+    /// write call for a block record and each fsync, so a test can see
+    /// what is locked while the I/O runs and how many calls it takes.
     pub(crate) static IO_HOOK: std::cell::RefCell<Option<IoHook>> =
         const { std::cell::RefCell::new(None) };
 }
@@ -506,6 +496,86 @@ fn io_hook(what: &'static str) {
             hook(what);
         }
     });
+}
+
+/// The field of a block record that holds the byte at `offset` into
+/// it, and the offset that field starts at.  A write that stopped
+/// `offset` bytes into the record stopped in that field, in the call
+/// dcrd's `writeBlock` makes for it (`blockio.go:466-489`); an empty
+/// block is no field at all, as dcrd's zero-length write of one cannot
+/// fail.
+fn record_field_at(offset: u32, block_len: u32) -> (&'static str, u32) {
+    match offset {
+        0..4 => ("network", 0),
+        4..8 => ("block length", 4),
+        _ if offset.wrapping_sub(8) < block_len => ("block", 8),
+        _ => ("checksum", block_len.wrapping_add(8)),
+    }
+}
+
+/// Write `buf` to the file at `offset` without using the handle's
+/// cursor, as the `WriteAt` dcrd's `writeData` calls does
+/// (`blockio.go:386`), returning how many bytes landed and the error
+/// that stopped it short, if one did ([`write_all_at`]).
+fn write_at(file: &File, buf: &[u8], offset: u64) -> (usize, Option<std::io::Error>) {
+    write_all_at(
+        |rest, at| {
+            #[cfg(test)]
+            io_hook("write");
+            #[cfg(unix)]
+            {
+                std::os::unix::fs::FileExt::write_at(file, rest, at)
+            }
+            #[cfg(windows)]
+            {
+                std::os::windows::fs::FileExt::seek_write(file, rest, at)
+            }
+        },
+        buf,
+        offset,
+    )
+}
+
+/// Hand `buf` to `write`, a positioned write that may take fewer bytes
+/// than it is given, until all of it is taken or a call fails.  Each
+/// call gets the bytes not yet taken and the offset they belong at.
+/// Returns how many bytes were taken and the error that stopped it
+/// short, if one did.
+///
+/// A short count is not a failure and an interrupted call is made
+/// again, as Go's `WriteAt` has it.  The count after a failure is not
+/// Go's: `WriteAt` reports none of the bytes of the call that failed,
+/// and this is every byte that landed, which is where the write
+/// cursor has to be for a rollback to find a torn record.
+fn write_all_at(
+    mut write: impl FnMut(&[u8], u64) -> std::io::Result<usize>,
+    buf: &[u8],
+    offset: u64,
+) -> (usize, Option<std::io::Error>) {
+    let mut written = 0usize;
+    while written < buf.len() {
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "offset is a u32 file offset and written < buf.len(), one record's length, so the sum is far below u64::MAX"
+        )]
+        let at = offset + written as u64;
+        match write(&buf[written..], at) {
+            Ok(0) => {
+                return (
+                    written,
+                    Some(std::io::Error::from(std::io::ErrorKind::WriteZero)),
+                );
+            }
+            #[allow(
+                clippy::arithmetic_side_effects,
+                reason = "written + n <= buf.len(): a write returns at most the remaining buffer's length"
+            )]
+            Ok(n) => written += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return (written, Some(e)),
+        }
+    }
+    (written, None)
 }
 
 /// Fill `buf` from the file at `offset` without moving the handle's
@@ -673,6 +743,10 @@ impl SyncPlan {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "test arithmetic over small fixed values"
+)]
 mod tests {
     use super::*;
 
@@ -929,6 +1003,570 @@ mod tests {
         );
         assert!(!block_file_path(dir.path(), 1).exists());
         store.sync().expect("sync must not fail on a removed file");
+    }
+
+    /// The bytes dcrd's `writeBlock` puts in a block file for one block
+    /// (`blockio.go:466-489`), field by field: the network, the block's
+    /// length, the block, and the Castagnoli checksum of those three,
+    /// taken with the one-table form and not the store's own.
+    fn record_of(network: u32, raw_block: &[u8]) -> Vec<u8> {
+        let mut record = Vec::new();
+        record.extend_from_slice(&network.to_le_bytes());
+        record.extend_from_slice(&(raw_block.len() as u32).to_le_bytes());
+        record.extend_from_slice(raw_block);
+        let checksum = crc::Crc::<u32>::new(&crc::CRC_32_ISCSI).checksum(&record);
+        record.extend_from_slice(&checksum.to_be_bytes());
+        record
+    }
+
+    /// What dcrd's `writeBlock` leaves in the block files for a
+    /// sequence of blocks: each record appended whole to the current
+    /// file, or to the next one from its start when it would pass the
+    /// size cap (`blockio.go:425-446`).
+    struct FileModel {
+        max_file_size: usize,
+        files: Vec<Vec<u8>>,
+    }
+
+    impl FileModel {
+        /// Append the block's record, returning where it went.
+        fn write(&mut self, network: u32, raw_block: &[u8]) -> BlockLocation {
+            let record = record_of(network, raw_block);
+            if self.files.last().expect("a file").len() + record.len() > self.max_file_size {
+                self.files.push(Vec::new());
+            }
+            let (block_file_num, _) = self.cursor();
+            let file = self.files.last_mut().expect("a file");
+            let loc = BlockLocation {
+                block_file_num,
+                file_offset: file.len() as u32,
+                block_len: record.len() as u32,
+            };
+            file.extend_from_slice(&record);
+            loc
+        }
+
+        /// The write cursor after the writes so far.
+        fn cursor(&self) -> (u32, u32) {
+            (
+                (self.files.len() - 1) as u32,
+                self.files.last().expect("a file").len() as u32,
+            )
+        }
+
+        /// Check the block files on disk hold exactly the model's bytes.
+        fn check(&self, dir: &Path, what: &str) {
+            for (num, want) in self.files.iter().enumerate() {
+                let path = block_file_path(dir, num as u32);
+                // A file whose first record was never written does not
+                // exist yet.
+                let got = fs::read(&path).unwrap_or_default();
+                assert_eq!(&got, want, "{what}: the bytes of file {num}");
+            }
+            assert!(
+                !block_file_path(dir, self.files.len() as u32).exists(),
+                "{what}: a file past the write cursor"
+            );
+        }
+    }
+
+    /// The store writes each record with one call where dcrd makes
+    /// four, and the files must come out the same: every block file
+    /// holds the records dcrd's `writeBlock` would have put there, each
+    /// at the offset the store reports and with the cursor moved past
+    /// it, across file rollovers, a reopen and a rollback.
+    #[test]
+    fn the_block_files_hold_the_records_dcrd_writes() {
+        const NET: u32 = 0x1234_5678;
+        const MAX: u32 = 4096;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut rng = dcroxide_testutil::SplitMix64::from_entropy("block records");
+        let mut model = FileModel {
+            max_file_size: MAX as usize,
+            files: vec![Vec::new()],
+        };
+        let mut store = BlockStore::open(dir.path(), NET, MAX, None).expect("open store");
+        let mut written: Vec<(BlockLocation, Vec<u8>)> = Vec::new();
+        for step in 0..400usize {
+            let room = MAX as usize - model.cursor().1 as usize;
+            let len = match step % 8 {
+                // An empty block, the shortest record there is.
+                0 => 0,
+                // A record that ends exactly on the size cap, and the
+                // one after it, which cannot fit.
+                1 if room >= BLOCK_RECORD_OVERHEAD as usize => {
+                    room - BLOCK_RECORD_OVERHEAD as usize
+                }
+                // A record one byte too long for the room left.
+                3 if room >= BLOCK_RECORD_OVERHEAD as usize => {
+                    room - BLOCK_RECORD_OVERHEAD as usize + 1
+                }
+                _ => rng.below(700) as usize,
+            };
+            let mut block = vec![0u8; len];
+            rng.fill(&mut block);
+
+            let want = model.write(NET, &block);
+            let got = store.write_block(&block).expect("write block");
+            assert_eq!(got, want, "step {step}: where the record went");
+            assert_eq!(
+                (store.write_file_num, store.write_offset),
+                model.cursor(),
+                "step {step}: the write cursor"
+            );
+            written.push((got, block));
+
+            match step % 50 {
+                // A restart: the cursor comes from the files and the
+                // write handle is a fresh one.
+                17 => {
+                    drop(store);
+                    store = BlockStore::open(dir.path(), NET, MAX, None).expect("reopen store");
+                    assert_eq!(
+                        (store.write_file_num, store.write_offset),
+                        model.cursor(),
+                        "step {step}: the cursor after a reopen"
+                    );
+                }
+                // A rollback of the last few records, as a failed commit
+                // makes, and the next record lands where they were.
+                33 => {
+                    let keep = written.len() - 1 - rng.below(4) as usize;
+                    let (first_gone, _) = written[keep];
+                    written.truncate(keep);
+                    model.files.truncate(first_gone.block_file_num as usize + 1);
+                    model
+                        .files
+                        .last_mut()
+                        .expect("a file")
+                        .truncate(first_gone.file_offset as usize);
+                    store
+                        .rollback_to(first_gone.block_file_num, first_gone.file_offset)
+                        .expect("rollback");
+                }
+                _ => {}
+            }
+        }
+        model.check(dir.path(), "at the end");
+        assert!(model.files.len() > 20, "the writes rolled over many times");
+
+        // And every record reads back as the block it was written from.
+        for (loc, block) in &written {
+            let reader = store.reader(loc.block_file_num).expect("reader");
+            assert_eq!(&reader.read_block(*loc).expect("read block"), block);
+        }
+    }
+
+    /// A record is never split between two files: one that ends exactly
+    /// on the size cap stays in the current file, and one a single byte
+    /// longer goes whole to the start of the next, leaving the current
+    /// file as it was (dcrd `writeBlock`, `blockio.go:425-446`, which
+    /// rolls over when `finalOffset > maxBlockFileSize`).
+    #[test]
+    fn a_record_that_does_not_fit_starts_the_next_file_whole() {
+        const NET: u32 = 0x1234_5678;
+        const MAX: u32 = 100;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut store = BlockStore::open(dir.path(), NET, MAX, None).expect("open store");
+        let file = |num| fs::read(block_file_path(dir.path(), num)).expect("read block file");
+
+        // 50 bytes, then 50 more: the second ends on the cap and stays.
+        let (a, b) = ([0xa1u8; 38], [0xb2u8; 38]);
+        store.write_block(&a).expect("first record");
+        let loc = store.write_block(&b).expect("a record ending on the cap");
+        assert_eq!(
+            (loc.block_file_num, loc.file_offset, loc.block_len),
+            (0, 50, 50)
+        );
+        assert_eq!((store.write_file_num, store.write_offset), (0, 100));
+        let full = [record_of(NET, &a), record_of(NET, &b)].concat();
+        assert_eq!(file(0), full);
+
+        // The file is full, so even an empty block starts the next one.
+        let loc = store.write_block(&[]).expect("an empty block");
+        assert_eq!(
+            (loc.block_file_num, loc.file_offset, loc.block_len),
+            (1, 0, 12)
+        );
+        assert_eq!(file(0), full, "the full file is left as it was");
+        assert_eq!(file(1), record_of(NET, &[]));
+
+        // 12 bytes are in file 1; a record of 89 would end one byte past
+        // the cap, so all of it goes to file 2 and none of it to file 1.
+        let c = [0xc3u8; 77];
+        let loc = store.write_block(&c).expect("a record one byte too long");
+        assert_eq!(
+            (loc.block_file_num, loc.file_offset, loc.block_len),
+            (2, 0, 89)
+        );
+        assert_eq!((store.write_file_num, store.write_offset), (2, 89));
+        assert_eq!(file(1), record_of(NET, &[]), "nothing of it in file 1");
+        assert_eq!(file(2), record_of(NET, &c));
+        assert_eq!(store.dirty_files, vec![0, 1, 2]);
+    }
+
+    /// Set in the child that runs under a file-size limit.
+    #[cfg(target_os = "linux")]
+    const TORN_RECORD_CHILD: &str = "DCROXIDE_TORN_RECORD_CHILD";
+
+    /// A record write that fails part way names the field it stopped
+    /// in, with that field's offset, as the one of dcrd's four
+    /// `writeData` calls that fails does (`blockio.go:384-392`): the
+    /// failing call is the one for the field holding the first byte
+    /// that did not land, and its error gives the offset that call
+    /// started at.  The write cursor moves by every byte that landed,
+    /// those of the field the write stopped in included, where Go's
+    /// `WriteAt` reports none of a failed call's and dcrd's cursor
+    /// stops at that field's start.  What landed stays in the file
+    /// past the old cursor until the rollback truncates it.
+    ///
+    /// The partial writes come from `RLIMIT_FSIZE`: the test re-runs
+    /// itself under `ulimit -f 1` with `SIGXFSZ` ignored, where a write
+    /// that crosses the limit stores what fits and the next one fails
+    /// with `EFBIG`.  The child starts each case from a block file that
+    /// ends a chosen number of bytes short of the limit.  Linux only:
+    /// storing the part that fits, to the byte, is what its kernel does
+    /// with such a write, and the cases are counted in those bytes.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_record_write_that_fails_part_way_names_the_field_it_stopped_in() {
+        if std::env::var_os(TORN_RECORD_CHILD).is_some() {
+            torn_record_child();
+            return;
+        }
+        let exe = std::env::current_exe().expect("test binary path");
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(
+                "ulimit -f 1 && trap '' XFSZ && exec \"$0\" --exact \
+                 blockfile::tests::a_record_write_that_fails_part_way_names_the_field_it_stopped_in \
+                 --nocapture",
+            )
+            .arg(&exe)
+            .env(TORN_RECORD_CHILD, "1")
+            .output()
+            .expect("run the limited child");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.status.success(),
+            "the child failed:\n{stdout}\n{stderr}"
+        );
+        assert!(
+            stdout.contains("torn-record child ran") || stderr.contains("torn-record child ran"),
+            "the child must have run the check, not skipped it:\n{stdout}\n{stderr}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    fn torn_record_child() {
+        use std::io::Write;
+
+        const NET: u32 = 0x1234_5678;
+
+        // The limit in bytes: one block of the shell's `ulimit -f`,
+        // 512 bytes in a POSIX sh and 1024 in bash.  A write across it
+        // stores what fits.
+        let probe_dir = tempfile::tempdir().expect("temp dir");
+        let mut probe = File::create(probe_dir.path().join("probe")).expect("create probe");
+        let limit = probe.write(&[0u8; 4096]).expect("a write across the limit");
+        assert!(
+            limit == 512 || limit == 1024,
+            "the file-size limit: {limit}"
+        );
+        let limit = limit as u32;
+
+        let block: Vec<u8> = (0..100u8).collect();
+        assert_eq!(record_of(NET, &block).len(), 112);
+        // The block, how many bytes of its record fit under the limit,
+        // the field the write then stops in, and that field's offset in
+        // the record.
+        let cases: [(&[u8], u32, &str, u32); 15] = [
+            (&block, 0, "network", 0),
+            (&block, 1, "network", 0),
+            (&block, 2, "network", 0),
+            (&block, 3, "network", 0),
+            (&block, 4, "block length", 4),
+            (&block, 7, "block length", 4),
+            (&block, 8, "block", 8),
+            (&block, 57, "block", 8),
+            (&block, 107, "block", 8),
+            (&block, 108, "checksum", 108),
+            (&block, 111, "checksum", 108),
+            // An empty block is never the field: dcrd's zero-length
+            // write of one cannot fail, so a write that stops after the
+            // length stopped in the checksum.
+            (&[], 3, "network", 0),
+            (&[], 7, "block length", 4),
+            (&[], 8, "checksum", 8),
+            (&[], 11, "checksum", 8),
+        ];
+        for (block, fits, field, field_offset) in cases {
+            let record = record_of(NET, block);
+            let what = format!(
+                "{fits} bytes of the record of a {}-byte block fit",
+                block.len()
+            );
+            let dir = tempfile::tempdir().expect("temp dir");
+            let path = block_file_path(dir.path(), 0);
+            // The file the store finds: records of earlier commits, up
+            // to `fits` bytes short of the limit.
+            let start = limit - fits;
+            let earlier = vec![0x5au8; start as usize];
+            fs::write(&path, &earlier).expect("write the earlier bytes");
+            let mut store = BlockStore::open(dir.path(), NET, DEFAULT_MAX_BLOCK_FILE_SIZE, None)
+                .expect("open store");
+            assert_eq!((store.write_file_num, store.write_offset), (0, start));
+
+            let err = store
+                .write_block(block)
+                .expect_err("the write must cross the file-size limit");
+            assert_eq!(err.kind, ErrorKind::DriverSpecific, "{what}");
+            let want = format!(
+                "failed to write {field} to file 0 at offset {}: ",
+                start + field_offset
+            );
+            assert!(
+                err.description.starts_with(&want) && err.description.len() > want.len(),
+                "{what}: want {want:?} and the cause, got {:?}",
+                err.description
+            );
+            assert_eq!(
+                (store.write_file_num, store.write_offset),
+                (0, start + fits),
+                "{what}: the cursor moves by what landed"
+            );
+            assert!(
+                store.dirty_files.is_empty(),
+                "{what}: a failed write owes no sync"
+            );
+            let left = fs::read(&path).expect("read block file");
+            assert_eq!(
+                left,
+                [earlier.as_slice(), &record[..fits as usize]].concat(),
+                "{what}: what the failed write left in the file"
+            );
+
+            // The commit's rollback then removes what landed.
+            store.rollback_to(0, start).expect("rollback");
+            assert_eq!((store.write_file_num, store.write_offset), (0, start));
+            assert_eq!(fs::read(&path).expect("read block file"), earlier);
+        }
+
+        // A record that ends exactly on the limit is written whole.
+        let record = record_of(NET, &block);
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = block_file_path(dir.path(), 0);
+        let earlier = vec![0x5au8; (limit - 112) as usize];
+        fs::write(&path, &earlier).expect("write the earlier bytes");
+        let mut store = BlockStore::open(dir.path(), NET, DEFAULT_MAX_BLOCK_FILE_SIZE, None)
+            .expect("open store");
+        store.write_block(&block).expect("the record fits");
+        assert_eq!((store.write_file_num, store.write_offset), (0, limit));
+        assert_eq!(
+            fs::read(&path).expect("read block file"),
+            [earlier.as_slice(), record.as_slice()].concat()
+        );
+        eprintln!("torn-record child ran");
+    }
+
+    /// The field a stopped write is blamed on, for every count of
+    /// bytes that can have landed: the one holding the next byte, with
+    /// its offset in the record.  An empty block is never that field,
+    /// so a write that stops once the length is down stopped in the
+    /// checksum, which then starts where the block would have.
+    #[test]
+    fn a_stopped_write_is_blamed_on_the_field_holding_the_next_byte() {
+        let expect = |block_len: u32, landed: std::ops::RangeInclusive<u32>, field, at: u32| {
+            for landed in landed {
+                assert_eq!(
+                    record_field_at(landed, block_len),
+                    (field, at),
+                    "{landed} bytes of the record of a {block_len}-byte block landed"
+                );
+            }
+        };
+        expect(100, 0..=3, "network", 0);
+        expect(100, 4..=7, "block length", 4);
+        expect(100, 8..=107, "block", 8);
+        expect(100, 108..=111, "checksum", 108);
+        expect(1, 4..=7, "block length", 4);
+        expect(1, 8..=8, "block", 8);
+        expect(1, 9..=12, "checksum", 9);
+        expect(0, 0..=3, "network", 0);
+        expect(0, 4..=7, "block length", 4);
+        expect(0, 8..=11, "checksum", 8);
+    }
+
+    /// What [`write_all_at`] returned, each call it made of the write
+    /// as the offset and the bytes it passed, and the file a write
+    /// that stores what it says it took leaves.
+    type Scripted = (
+        (usize, Option<std::io::Error>),
+        Vec<(u64, Vec<u8>)>,
+        Vec<u8>,
+    );
+
+    /// Run [`write_all_at`] over `buf` at `offset` against a write that
+    /// answers each call with the next step of `script`, taking the
+    /// leading bytes it is given when the step is a count.  The file
+    /// starts as zeroes and ends eight bytes past the write.
+    fn run_scripted(script: Vec<std::io::Result<usize>>, buf: &[u8], offset: u64) -> Scripted {
+        let mut calls = Vec::new();
+        let mut file = vec![0u8; offset as usize + buf.len() + 8];
+        let mut script = script.into_iter();
+        let result = write_all_at(
+            |rest, at| {
+                calls.push((at, rest.to_vec()));
+                let step = script.next().expect("a call past the script's end");
+                if let Ok(n) = step {
+                    file[at as usize..at as usize + n].copy_from_slice(&rest[..n]);
+                }
+                step
+            },
+            buf,
+            offset,
+        );
+        assert!(script.next().is_none(), "a step of the script was not used");
+        (result, calls, file)
+    }
+
+    /// A positioned write that takes less than it was given is made
+    /// again with the rest at the offset the rest belongs at, and one
+    /// that was interrupted is made again as it was, until the whole
+    /// buffer is down; each byte reaches the file once, at its place.
+    /// A write that takes everything is the only call made, which is
+    /// how a block record reaches its file.
+    #[test]
+    fn a_short_or_interrupted_write_is_continued_where_it_stopped() {
+        let buf: Vec<u8> = (1..=20u8).collect();
+        let interrupted = || std::io::Error::from(std::io::ErrorKind::Interrupted);
+        let in_place = |offset: usize, landed: &[u8]| {
+            let mut file = vec![0u8; offset + buf.len() + 8];
+            file[offset..offset + landed.len()].copy_from_slice(landed);
+            file
+        };
+
+        let ((written, failure), calls, file) = run_scripted(
+            vec![Ok(3), Err(interrupted()), Ok(5), Err(interrupted()), Ok(12)],
+            &buf,
+            1000,
+        );
+        assert_eq!((written, failure.map(|e| e.kind())), (20, None));
+        assert_eq!(
+            calls,
+            vec![
+                (1000, buf.clone()),
+                (1003, buf[3..].to_vec()),
+                (1003, buf[3..].to_vec()),
+                (1008, buf[8..].to_vec()),
+                (1008, buf[8..].to_vec()),
+            ]
+        );
+        assert_eq!(file, in_place(1000, &buf));
+
+        // Interrupted before anything landed.
+        let ((written, failure), calls, file) =
+            run_scripted(vec![Err(interrupted()), Ok(20)], &buf, 7);
+        assert_eq!((written, failure.map(|e| e.kind())), (20, None));
+        assert_eq!(calls, vec![(7, buf.clone()), (7, buf.clone())]);
+        assert_eq!(file, in_place(7, &buf));
+
+        // The whole buffer in one call.
+        let ((written, failure), calls, file) = run_scripted(vec![Ok(20)], &buf, 4096);
+        assert_eq!((written, failure.map(|e| e.kind())), (20, None));
+        assert_eq!(calls, vec![(4096, buf.clone())]);
+        assert_eq!(file, in_place(4096, &buf));
+
+        // Nothing to write is no call at all, as in Go's `WriteAt`.
+        let ((written, failure), calls, _) = run_scripted(Vec::new(), &[], 5);
+        assert_eq!((written, failure.map(|e| e.kind())), (0, None));
+        assert!(calls.is_empty());
+    }
+
+    /// A write that fails after part of the buffer landed reports the
+    /// bytes that landed, those of earlier short counts included, with
+    /// the error of the call that failed; a write that takes nothing
+    /// is such a failure and not the end of the buffer.
+    #[test]
+    fn a_failed_write_reports_what_landed_before_it() {
+        let buf: Vec<u8> = (1..=20u8).collect();
+
+        let ((written, failure), calls, file) = run_scripted(
+            vec![Ok(3), Ok(4), Err(std::io::Error::other("no room"))],
+            &buf,
+            100,
+        );
+        assert_eq!(written, 7);
+        let failure = failure.expect("the write failed");
+        assert_eq!(
+            (failure.kind(), failure.to_string()),
+            (std::io::ErrorKind::Other, "no room".to_string()),
+            "the error is the failing call's own"
+        );
+        assert_eq!(
+            calls,
+            vec![
+                (100, buf.clone()),
+                (103, buf[3..].to_vec()),
+                (107, buf[7..].to_vec()),
+            ]
+        );
+        assert_eq!(&file[100..107], &buf[..7]);
+        assert!(file[107..].iter().all(|&b| b == 0), "nothing past it");
+
+        // The first call fails: nothing landed.
+        let ((written, failure), calls, _) =
+            run_scripted(vec![Err(std::io::Error::other("no room"))], &buf, 100);
+        assert_eq!(written, 0);
+        assert_eq!(failure.expect("the write failed").to_string(), "no room");
+        assert_eq!(calls.len(), 1);
+
+        // A call that takes nothing.
+        let ((written, failure), calls, _) = run_scripted(vec![Ok(3), Ok(0)], &buf, 100);
+        assert_eq!(
+            (written, failure.map(|e| e.kind())),
+            (3, Some(std::io::ErrorKind::WriteZero))
+        );
+        assert_eq!(calls, vec![(100, buf.clone()), (103, buf[3..].to_vec())]);
+        let ((written, failure), ..) = run_scripted(vec![Ok(0)], &buf, 100);
+        assert_eq!(
+            (written, failure.map(|e| e.kind())),
+            (0, Some(std::io::ErrorKind::WriteZero))
+        );
+    }
+
+    /// Each block record reaches its file in one write call, where
+    /// dcrd makes one for each of its four fields
+    /// (`blockio.go:466-489`): counted through the store's I/O probe
+    /// over empty and full blocks, a rollover and a reopened store.
+    #[test]
+    fn a_block_record_is_written_with_one_call() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut store = BlockStore::open(dir.path(), 0x1234_5678, 100, None).expect("open store");
+        let writes = Rc::new(Cell::new(0usize));
+        let counter = Rc::clone(&writes);
+        IO_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |what| {
+                if what == "write" {
+                    counter.set(counter.get() + 1);
+                }
+            }));
+        });
+        let blocks: [&[u8]; 6] = [&[], &[7; 38], &[8; 38], &[9; 88], &[], &[1; 30]];
+        for (i, block) in blocks.into_iter().enumerate() {
+            if i == 3 {
+                drop(store);
+                store = BlockStore::open(dir.path(), 0x1234_5678, 100, None).expect("reopen");
+            }
+            store.write_block(block).expect("write block");
+            assert_eq!(writes.get(), i + 1, "write calls after record {i}");
+        }
+        IO_HOOK.with(|hook| *hook.borrow_mut() = None);
+        assert_eq!(store.write_file_num, 3, "the records rolled over");
     }
 
     /// The sixteen-table checksum is the one-table checksum: at every
