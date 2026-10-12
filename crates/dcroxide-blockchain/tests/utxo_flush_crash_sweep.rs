@@ -35,7 +35,12 @@
 //! disconnects a block, and every `stride`th of the rest.
 //! `DCROXIDE_CRASH_SWEEP_EVERY=1` takes every prefix, which is a few
 //! minutes in a debug build.
+//!
+//! The sweep copies the files of a store that is still open, which
+//! Windows refuses: redb holds a byte-range lock on its file while the
+//! database is open.  So it does not run there.
 
+#![cfg(not(windows))]
 // Test-harness arithmetic over small counts.
 #![allow(clippy::arithmetic_side_effects)]
 

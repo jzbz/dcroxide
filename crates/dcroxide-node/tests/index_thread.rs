@@ -43,25 +43,22 @@
 // Test-harness arithmetic over small counts and fixed deadlines.
 #![allow(clippy::arithmetic_side_effects)]
 
-use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
-use dcroxide_blockchain::chaindb::{db_fetch_best_state, db_fetch_utxo_set_state};
-use dcroxide_blockchain::process::{Chain, OpenConfig};
+use dcroxide_blockchain::process::Chain;
 use dcroxide_chaincfg::Params;
 use dcroxide_chainhash::Hash;
-use dcroxide_database::{Database, FlushObservation, Options};
+use dcroxide_database::{Database, Options};
 use dcroxide_indexers::{
-    ADDR_KEY_SIZE, CONNECT_NTFN, ChainQueryer, ExistsAddrIndex, ExistsAddrPolicy, IndexNtfn,
-    IndexSubscriber, Interrupt, NO_PREREQS, TxIndexEntry, addr_to_key,
+    ADDR_KEY_SIZE, CONNECT_NTFN, ChainQueryer, IndexNtfn, Interrupt, TxIndexEntry, addr_to_key,
 };
 use dcroxide_netsync::manager::SyncChain;
 use dcroxide_node::chainntfns::ChainNtfnHandler;
 use dcroxide_node::indexes::{
     INDEX_NTFN_BUFFER_SIZE, IndexLogs, IndexNotifier, IndexThread, NodeChainQueryer, NodeIndexes,
-    start_indexes, start_indexes_with_policy,
+    start_indexes,
 };
 use dcroxide_node::sync::NodeSyncChain;
 use dcroxide_testutil::unhex;
@@ -702,6 +699,26 @@ fn a_shutdown_request_drops_the_queue_and_the_next_start_catches_up() {
 // An unclean stop in a catch-up
 // ---------------------------------------------------------------------
 
+// What only the unclean-stop test below uses.  It copies the files of a
+// store that is still open, which Windows refuses: redb holds a
+// byte-range lock on its file while the database is open.
+#[cfg(not(windows))]
+use std::path::Path;
+#[cfg(not(windows))]
+use std::sync::atomic::AtomicUsize;
+
+#[cfg(not(windows))]
+use dcroxide_blockchain::chaindb::{db_fetch_best_state, db_fetch_utxo_set_state};
+#[cfg(not(windows))]
+use dcroxide_blockchain::process::OpenConfig;
+#[cfg(not(windows))]
+use dcroxide_database::FlushObservation;
+#[cfg(not(windows))]
+use dcroxide_indexers::{ExistsAddrIndex, ExistsAddrPolicy, IndexSubscriber, NO_PREREQS};
+#[cfg(not(windows))]
+use dcroxide_node::indexes::start_indexes_with_policy;
+
+#[cfg(not(windows))]
 fn copy_dir(src: &Path, dst: &Path) {
     std::fs::create_dir_all(dst).expect("create the copy's directory");
     for entry in std::fs::read_dir(src).expect("read the directory") {
@@ -736,6 +753,7 @@ fn copy_dir(src: &Path, dst: &Path) {
 /// an uninterrupted chain has there, and the index catches up to it
 /// holding the keys of those blocks and the mempool addresses of exactly
 /// the connects whose tip row was durable.
+#[cfg(not(windows))]
 #[test]
 fn an_unclean_stop_after_a_commit_the_index_asked_for_reopens_to_the_right_set_and_index() {
     const BLOCKS: usize = 30;
