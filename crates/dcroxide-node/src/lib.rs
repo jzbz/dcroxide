@@ -52,6 +52,7 @@ pub mod peerconn;
 pub mod peerloop;
 pub mod pipeserve;
 pub mod progresslog;
+pub mod readahead;
 pub mod rebroadcast;
 pub mod rpcrun;
 pub mod runtime;

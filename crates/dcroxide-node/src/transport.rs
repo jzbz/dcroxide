@@ -326,6 +326,11 @@ pub struct WireTransport<S> {
     /// re-arms it before every send anyway; an unbounded write clears
     /// it first, so it still runs with no timeout at all.
     write_timeout_armed: bool,
+    /// The time spent checking the checksum of and decoding the frames
+    /// read with [`BudgetStart::Waiter`], in nanoseconds, since it was
+    /// last taken ([`WireTransport::take_decode_nanos`]).  The reads the
+    /// input thread makes itself are not timed.
+    decode_nanos: u64,
 }
 
 impl<S> WireTransport<S> {
@@ -344,6 +349,7 @@ impl<S> WireTransport<S> {
             cancel: None,
             read_timeout_armed: None,
             write_timeout_armed: false,
+            decode_nanos: 0,
         }
     }
 
@@ -412,6 +418,69 @@ impl<S> WireTransport<S> {
     pub fn set_write_stall_policy(&mut self, policy: Option<WriteStallPolicy>) {
         self.write_stall = policy;
     }
+
+    /// The time spent checking the checksum of and decoding the frames
+    /// read with [`BudgetStart::Waiter`] since this was last called, in
+    /// nanoseconds.
+    pub(crate) fn take_decode_nanos(&mut self) -> u64 {
+        std::mem::take(&mut self.decode_nanos)
+    }
+}
+
+/// When the idle budget of one message read starts to run.
+///
+/// dcrd arms `SetReadDeadline(now + IdleTimeout)` as `inHandler` begins
+/// each read, which is the moment it has finished the message before
+/// (`readMessage`, `peer/peer.go:963-964`).  A read made on the input
+/// thread begins at that moment, so its budget starts with it.  A read
+/// made ahead of the input thread begins earlier, while that thread is
+/// still handling earlier messages, and must not spend the budget
+/// meanwhile: its budget starts when the input thread begins to wait
+/// for the message.
+#[derive(Clone, Copy)]
+pub(crate) enum BudgetStart<'a> {
+    /// The budget starts when the read does: one fixed deadline for the
+    /// whole message.
+    WithRead,
+    /// The budget starts at the instant the function returns, which is
+    /// when the thread the message is read for began waiting for it.
+    /// While it returns `None` that thread is not waiting for this
+    /// message, being busy or having an earlier one to take first, and
+    /// the read cannot time out.  The function is asked again before
+    /// every receive.
+    Waiter(&'a dyn Fn() -> Option<Instant>),
+}
+
+/// The bound on one message read, header and payload alike.
+#[derive(Clone, Copy)]
+enum ReadDeadline<'a> {
+    /// No budget is set: the stream's own settings govern each receive.
+    Unbounded,
+    /// One fixed instant.
+    At(Instant),
+    /// `budget` after the instant `since` returns, and not at all while
+    /// it returns `None` ([`BudgetStart::Waiter`]).
+    After {
+        /// When the budget began to run, if it has.
+        since: &'a dyn Fn() -> Option<Instant>,
+        /// The budget.
+        budget: Duration,
+    },
+}
+
+impl ReadDeadline<'_> {
+    /// How much of the budget is left.
+    fn remaining(self) -> Duration {
+        match self {
+            ReadDeadline::Unbounded => Duration::MAX,
+            ReadDeadline::At(deadline) => deadline.saturating_duration_since(Instant::now()),
+            ReadDeadline::After { since, budget } => match since() {
+                Some(began) => budget.saturating_sub(began.elapsed()),
+                // Nobody is waiting for the message yet.
+                None => budget,
+            },
+        }
+    }
 }
 
 /// Fill the buffer under an absolute deadline, in receives of at most
@@ -435,10 +504,16 @@ impl<S> WireTransport<S> {
 /// `WireTransport::read_timeout_armed`).  Each receive runs under
 /// `remaining.min(READ_POLL_INTERVAL)`; the timeout is set only when
 /// that differs from the one already armed.
+///
+/// What is left of the budget is worked out before every receive.  For
+/// a fixed deadline that is the time to it.  For a budget that starts
+/// when another thread begins to wait ([`BudgetStart::Waiter`]) it is
+/// the whole budget until then, so the read cannot time out, and from
+/// then on the budget less the time waited.
 fn read_exact_by_deadline<S: Read + SocketTimeout>(
     stream: &mut S,
     buf: &mut [u8],
-    deadline: Option<Instant>,
+    deadline: ReadDeadline<'_>,
     cancel: Option<&Cancel>,
     got: &mut usize,
     armed: &mut Option<Duration>,
@@ -456,7 +531,7 @@ fn read_exact_by_deadline<S: Read + SocketTimeout>(
         )
     };
     let mut filled = 0usize;
-    let Some(deadline) = deadline else {
+    if matches!(deadline, ReadDeadline::Unbounded) {
         // With no budget there is nothing to slice against, so the
         // flag can only be checked before parking in the read.  The
         // peer loop always sets a budget; this is the in-memory test
@@ -477,12 +552,12 @@ fn read_exact_by_deadline<S: Read + SocketTimeout>(
             }
         }
         return Ok(());
-    };
+    }
     while filled < buf.len() {
         if cancel.is_some_and(Cancel::is_cancelled) {
             return Err(cancelled());
         }
-        let remaining = deadline.saturating_duration_since(Instant::now());
+        let remaining = deadline.remaining();
         if remaining.is_zero() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
@@ -598,12 +673,23 @@ impl<S: Read + Write + SocketTimeout> WireTransport<S> {
     /// taken off the stream on the way, whether or not a message results
     /// (dcrd `wire.ReadMessageN` and the `totalBytes` it returns on every
     /// path).
-    fn read_framed(&mut self, got: &mut usize) -> Result<Message, dcroxide_peer::ReadError> {
+    fn read_framed(
+        &mut self,
+        got: &mut usize,
+        start: BudgetStart<'_>,
+    ) -> Result<Message, dcroxide_peer::ReadError> {
         // One absolute deadline covers the whole message — header and
         // payload (dcrd's single `SetReadDeadline` before
-        // `ReadMessageN`).
-        let now = Instant::now();
-        let deadline = self.read_budget.map(|b| now.checked_add(b).unwrap_or(now));
+        // `ReadMessageN`).  It is fixed here for a read whose budget
+        // starts with it, and follows the waiter otherwise.
+        let deadline = match (self.read_budget, start) {
+            (None, _) => ReadDeadline::Unbounded,
+            (Some(budget), BudgetStart::WithRead) => {
+                let now = Instant::now();
+                ReadDeadline::At(now.checked_add(budget).unwrap_or(now))
+            }
+            (Some(budget), BudgetStart::Waiter(since)) => ReadDeadline::After { since, budget },
+        };
         // Read the fixed-size header first so the payload length is
         // known before any payload allocation (dcrd `readMessageHeader`
         // then the payload read).
@@ -657,7 +743,16 @@ impl<S: Read + Write + SocketTimeout> WireTransport<S> {
         // errors.  Over-banning here would cost an honest peer 24 hours
         // over a decoder parity gap, and the handshake reads below are
         // unauthenticated.
-        let (msg, _) = wire_read_message(&buf, self.pver, self.net).map_err(|e| {
+        //
+        // A read made for a waiter is timed here, over the checksum and
+        // the decode: two clock reads a message, on that reader's thread.
+        let timed = matches!(start, BudgetStart::Waiter(_)).then(Instant::now);
+        let decoded = wire_read_message(&buf, self.pver, self.net);
+        if let Some(began) = timed {
+            let nanos = u64::try_from(began.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            self.decode_nanos = self.decode_nanos.saturating_add(nanos);
+        }
+        let (msg, _) = decoded.map_err(|e| {
             if e.kind_name().is_empty() {
                 dcroxide_peer::ReadError::io(e.to_string())
             } else {
@@ -665,6 +760,30 @@ impl<S: Read + Write + SocketTimeout> WireTransport<S> {
             }
         })?;
         Ok(msg)
+    }
+
+    /// Read the next message as [`MsgTransport::read_message`] does,
+    /// with the idle budget started as `start` says.  The bytes are
+    /// counted the same way whichever it is.
+    pub(crate) fn read_message_paced(
+        &mut self,
+        start: BudgetStart<'_>,
+    ) -> Result<Message, dcroxide_peer::ReadError> {
+        // Every byte taken off the wire counts, including those of a
+        // read that fails: a bad checksum, an unknown command, a payload
+        // cut short.  dcrd's `readMessage` adds `ReadMessageN`'s `n` to
+        // `bytesReceived`, and its `OnRead` adds it to the server's
+        // total, before either looks at the error (`peer/peer.go`,
+        // `server.go` `serverPeer.OnRead`).
+        let mut got = 0usize;
+        let result = self.read_framed(&mut got, start);
+        self.bytes_read = self.bytes_read.saturating_add(got as u64);
+        if let Some(totals) = &self.net_totals {
+            totals
+                .bytes_received
+                .fetch_add(got as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+        result
     }
 }
 
@@ -674,21 +793,10 @@ impl<S: Read + Write + SocketTimeout> MsgTransport for WireTransport<S> {
     }
 
     fn read_message(&mut self) -> Result<Message, dcroxide_peer::ReadError> {
-        // Every byte taken off the wire counts, including those of a
-        // read that fails: a bad checksum, an unknown command, a payload
-        // cut short.  dcrd's `readMessage` adds `ReadMessageN`'s `n` to
-        // `bytesReceived`, and its `OnRead` adds it to the server's
-        // total, before either looks at the error (`peer/peer.go`,
-        // `server.go` `serverPeer.OnRead`).
-        let mut got = 0usize;
-        let result = self.read_framed(&mut got);
-        self.bytes_read = self.bytes_read.saturating_add(got as u64);
-        if let Some(totals) = &self.net_totals {
-            totals
-                .bytes_received
-                .fetch_add(got as u64, std::sync::atomic::Ordering::Relaxed);
-        }
-        result
+        // The caller reads when it is ready for the message, so the
+        // budget starts with the read (dcrd's `SetReadDeadline(now +
+        // IdleTimeout)` before each `readMessage`).
+        self.read_message_paced(BudgetStart::WithRead)
     }
 
     fn write_message(&mut self, msg: &Message) -> Result<(), String> {
@@ -1488,5 +1596,294 @@ mod tests {
             "got {msg:?}"
         );
         sender.join().expect("sender");
+    }
+
+    /// A connected loopback pair: the end a transport reads, and the
+    /// remote's end.
+    fn socket_pair() -> (std::net::TcpStream, std::net::TcpStream) {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind");
+        let remote =
+            std::net::TcpStream::connect(listener.local_addr().expect("addr")).expect("connect");
+        let (local, _) = listener.accept().expect("accept");
+        (local, remote)
+    }
+
+    /// A transport reading `stream` under `budget`.
+    fn budgeted(
+        stream: std::net::TcpStream,
+        budget: Duration,
+    ) -> WireTransport<std::net::TcpStream> {
+        let mut transport = WireTransport::new(stream, 0, CurrencyNet::TEST_NET3);
+        transport.set_read_budget(Some(budget));
+        transport.set_cancel(Cancel::new());
+        transport
+    }
+
+    /// The text of a read that ran out of budget.
+    const TIMED_OUT: &str = "read timed out";
+
+    /// A read made ahead of the thread it is for spends none of the idle
+    /// budget while that thread is busy: the message may take several
+    /// budgets to arrive and is still read.
+    ///
+    /// dcrd arms the deadline when `inHandler` begins the read, which is
+    /// when it has finished the message before.  A read begun earlier
+    /// that ran its budget from its own start would drop an honest peer
+    /// because the local node was slow.
+    #[test]
+    fn a_read_started_while_the_waiter_is_busy_does_not_run_its_budget() {
+        const BUDGET: Duration = Duration::from_millis(150);
+        let (local, remote) = socket_pair();
+
+        // A remote that speaks only after five budgets of silence.
+        let sender = std::thread::spawn(move || {
+            let mut out = WireTransport::new(remote, 0, CurrencyNet::TEST_NET3);
+            std::thread::sleep(BUDGET * 5);
+            MsgTransport::write_message(&mut out, &Message::Ping(MsgPing { nonce: 5 }))
+                .expect("write ping");
+            std::thread::sleep(Duration::from_millis(200));
+        });
+
+        let mut transport = budgeted(local, BUDGET);
+        let started = Instant::now();
+        let msg = transport
+            .read_message_paced(BudgetStart::Waiter(&|| None))
+            .expect("a read nobody is waiting for yet must not time out");
+        assert!(
+            matches!(&msg, Message::Ping(p) if p.nonce == 5),
+            "got {msg:?}"
+        );
+        assert!(started.elapsed() >= BUDGET * 4, "{:?}", started.elapsed());
+        sender.join().expect("sender");
+    }
+
+    /// Once the thread a read is made for begins to wait, the budget
+    /// runs from that instant: the read fails one budget later, however
+    /// long before that it began.
+    #[test]
+    fn the_budget_runs_from_the_moment_the_waiter_began_waiting() {
+        const BUDGET: Duration = Duration::from_millis(300);
+        const BUSY: Duration = Duration::from_millis(700);
+        let (local, remote) = socket_pair();
+
+        // A silent remote that holds the connection open well past the
+        // end of the test, so that only the budget can end the read.
+        let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+        let mute = std::thread::spawn(move || {
+            let _ = stop_rx.recv_timeout(Duration::from_secs(5));
+            drop(remote);
+        });
+
+        // The waiter is busy for a while, then begins to wait.
+        let waiting = std::sync::Arc::new(std::sync::Mutex::new(None::<Instant>));
+        let waiter = {
+            let waiting = std::sync::Arc::clone(&waiting);
+            std::thread::spawn(move || {
+                std::thread::sleep(BUSY);
+                *waiting.lock().expect("waiting") = Some(Instant::now());
+            })
+        };
+
+        let mut transport = budgeted(local, BUDGET);
+        let since = || *waiting.lock().expect("waiting");
+        let err = transport
+            .read_message_paced(BudgetStart::Waiter(&since))
+            .expect_err("nothing arrives");
+        let ended = Instant::now();
+        waiter.join().expect("waiter");
+        let _ = stop_tx.send(());
+        mute.join().expect("mute");
+
+        assert_eq!(err.message, TIMED_OUT);
+        assert!(!err.wire_violation);
+        let began = since().expect("the waiter began waiting");
+        let waited = ended.saturating_duration_since(began);
+        assert!(
+            waited >= BUDGET,
+            "the read ended {waited:?} after the waiter began waiting, before its {BUDGET:?} budget"
+        );
+        assert!(
+            waited < BUDGET + READ_POLL_INTERVAL,
+            "the read ended {waited:?} after the waiter began waiting, long after its {BUDGET:?} \
+             budget"
+        );
+    }
+
+    /// Bytes arriving do not extend a budget that is running: a frame
+    /// dribbled in a byte at a time ends one budget after the waiter
+    /// began waiting, as an inline read ends one budget after it began.
+    #[test]
+    fn a_dribbled_read_still_ends_at_the_budget_once_the_waiter_waits() {
+        const BUDGET: Duration = Duration::from_millis(300);
+        let (local, mut remote) = socket_pair();
+
+        // A `ping` header, one byte every 40 ms: never whole inside the
+        // budget, and never silent for long.
+        let header = lone_header(b"ping", 8);
+        let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+        let dribbler = std::thread::spawn(move || {
+            let mut header = header;
+            header[0..4].copy_from_slice(&CurrencyNet::TEST_NET3.0.to_le_bytes());
+            for byte in header {
+                if remote.write_all(&[byte]).is_err() {
+                    return;
+                }
+                if stop_rx.recv_timeout(Duration::from_millis(40)).is_ok() {
+                    return;
+                }
+            }
+            let _ = stop_rx.recv_timeout(Duration::from_secs(5));
+        });
+
+        let mut transport = budgeted(local, BUDGET);
+        let began = Instant::now();
+        let since = || Some(began);
+        let err = transport
+            .read_message_paced(BudgetStart::Waiter(&since))
+            .expect_err("the frame never completes");
+        let waited = began.elapsed();
+        let _ = stop_tx.send(());
+        dribbler.join().expect("dribbler");
+
+        assert_eq!(err.message, TIMED_OUT);
+        assert!(waited >= BUDGET, "{waited:?}");
+        assert!(waited < BUDGET + READ_POLL_INTERVAL, "{waited:?}");
+        assert!(transport.bytes_read() > 0, "some of the header was read");
+    }
+
+    /// A read made on the thread that wants the message keeps its one
+    /// fixed deadline (dcrd's `SetReadDeadline(now + IdleTimeout)` before
+    /// `readMessage`): a silent peer is dropped one budget after the
+    /// read began, through the trait method and through
+    /// [`BudgetStart::WithRead`] alike.
+    #[test]
+    fn an_inline_read_keeps_its_fixed_deadline() {
+        const BUDGET: Duration = Duration::from_millis(200);
+        for through_trait in [true, false] {
+            let (local, remote) = socket_pair();
+            let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+            let mute = std::thread::spawn(move || {
+                let _ = stop_rx.recv_timeout(Duration::from_secs(5));
+                drop(remote);
+            });
+
+            let mut transport = budgeted(local, BUDGET);
+            let started = Instant::now();
+            let err = if through_trait {
+                MsgTransport::read_message(&mut transport)
+            } else {
+                transport.read_message_paced(BudgetStart::WithRead)
+            }
+            .expect_err("nothing arrives");
+            let waited = started.elapsed();
+            let _ = stop_tx.send(());
+            mute.join().expect("mute");
+
+            assert_eq!(err.message, TIMED_OUT, "trait: {through_trait}");
+            assert!(waited >= BUDGET, "trait: {through_trait}: {waited:?}");
+            assert!(
+                waited < BUDGET + READ_POLL_INTERVAL,
+                "trait: {through_trait}: {waited:?}"
+            );
+            assert_eq!(transport.take_decode_nanos(), 0);
+        }
+    }
+
+    /// A read made for a waiter counts its bytes exactly as an inline
+    /// read does, those of a failed read included, and gives the same
+    /// messages and the same failure.  Only reads made for a waiter are
+    /// timed.
+    #[test]
+    fn a_paced_read_counts_bytes_as_an_inline_one_does() {
+        let ping = |nonce| {
+            wire_write_message(&Message::Ping(MsgPing { nonce }), MAX_PROTOCOL_VERSION, NET)
+                .expect("frame")
+        };
+        // Two pings, then a whole message with a bad checksum.
+        let mut bad_checksum = ping(3);
+        bad_checksum[PAYLOAD_LEN_OFFSET + 4] ^= 0xff;
+        let input: Vec<u8> = [ping(1), ping(2), bad_checksum].concat();
+
+        let transport_over = |input: &[u8]| {
+            let totals = std::sync::Arc::new(NetByteTotals::new());
+            let mut transport =
+                WireTransport::new(Cursor::new(input.to_vec()), MAX_PROTOCOL_VERSION, NET);
+            transport.set_net_totals(std::sync::Arc::clone(&totals));
+            (transport, totals)
+        };
+        let (mut inline, inline_totals) = transport_over(&input);
+        let (mut paced, paced_totals) = transport_over(&input);
+
+        let received = |totals: &NetByteTotals| {
+            totals
+                .bytes_received
+                .load(std::sync::atomic::Ordering::Relaxed)
+        };
+        let mut failures = 0;
+        for read in 0..3 {
+            let want = MsgTransport::read_message(&mut inline);
+            let got = paced.read_message_paced(BudgetStart::Waiter(&|| None));
+            assert_eq!(got, want, "read {read}");
+            failures += usize::from(got.is_err());
+            assert_eq!(paced.bytes_read(), inline.bytes_read(), "read {read}");
+            assert_eq!(
+                received(&paced_totals),
+                received(&inline_totals),
+                "read {read}"
+            );
+        }
+        assert_eq!(failures, 1, "the bad checksum fails either way");
+        assert_eq!(paced.bytes_read(), input.len() as u64);
+        assert_eq!(received(&paced_totals), input.len() as u64);
+
+        assert!(paced.take_decode_nanos() > 0, "the paced decodes are timed");
+        assert_eq!(
+            paced.take_decode_nanos(),
+            0,
+            "and taking the time resets it"
+        );
+        assert_eq!(inline.take_decode_nanos(), 0, "inline reads are not timed");
+    }
+
+    /// A read made for a waiter gives up when the connection's flag goes
+    /// up, as an inline read does, although no budget is running that
+    /// could end it.
+    #[test]
+    fn a_paced_read_stops_at_the_flag() {
+        const BUDGET: Duration = Duration::from_secs(600);
+        let (local, remote) = socket_pair();
+        let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+        let mute = std::thread::spawn(move || {
+            let _ = stop_rx.recv_timeout(Duration::from_secs(10));
+            drop(remote);
+        });
+
+        let mut transport = budgeted(local, BUDGET);
+        let cancel = Cancel::new();
+        transport.set_cancel(cancel.clone());
+        let raiser = std::thread::spawn(move || {
+            std::thread::sleep(READ_POLL_INTERVAL / 4);
+            cancel.cancel();
+        });
+
+        let started = Instant::now();
+        let err = transport
+            .read_message_paced(BudgetStart::Waiter(&|| None))
+            .expect_err("a cancelled read must not return a message");
+        let waited = started.elapsed();
+        raiser.join().expect("raiser");
+        let _ = stop_tx.send(());
+        mute.join().expect("mute");
+
+        assert!(
+            waited < READ_POLL_INTERVAL * 4,
+            "the read waited {waited:?} for a cancellation it should have seen within \
+             {READ_POLL_INTERVAL:?}"
+        );
+        assert!(
+            err.message.contains("torn down locally"),
+            "the failure must name the local teardown, got: {}",
+            err.message
+        );
     }
 }

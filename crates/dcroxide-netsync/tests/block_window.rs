@@ -151,6 +151,8 @@ impl WindowChain {
 }
 
 impl SyncChain for WindowChain {
+    type Block = Arc<MsgBlock>;
+
     fn best_header(&mut self) -> (Hash, i64) {
         (
             self.best_branch

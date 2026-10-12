@@ -41,9 +41,11 @@ pub const MAX_IN_FLIGHT_BLOCKS: usize = 16;
 /// The stall detector gives every requested block one deadline from the
 /// moment its request is written and forgives the node's own processing
 /// for the latest check interval only (dcrd `peer/peer.go:1106-1123`,
-/// `:1260-1279`), and a block is read only after every block ahead of it
-/// has been processed, so each block ahead of a request is time against
-/// its deadline.  This count keeps that time small on a slow host.
+/// `:1260-1279`), and a block settles its deadline only once every block
+/// ahead of it has been processed, when the peer's input loop takes it,
+/// however early it was read off the socket.  So each block ahead of a
+/// request is time against its deadline.  This count keeps that time
+/// small on a slow host.
 pub const BUDGET_WINDOW_BLOCKS: usize = 128;
 
 /// The most blocks the budgeted download window may be set to keep
@@ -534,6 +536,14 @@ pub struct ProcessTxFailure {
 /// The chain operations the manager performs (the used surface of
 /// dcrd's `*blockchain.BlockChain` config field).
 pub trait SyncChain {
+    /// A block as the chain takes it: the block the peer's message was
+    /// decoded into, shared by reference count, with whatever the chain
+    /// wants carried beside it (dcrd passes one `*dcrutil.Block`, which
+    /// also holds the hashes computed from it).  The manager reads the
+    /// block through it and never looks at the rest.  A block from a
+    /// local source is wrapped with `From`.
+    type Block: core::ops::Deref<Target = MsgBlock> + From<Arc<MsgBlock>>;
+
     /// The hash and height of the current best known header (dcrd
     /// `BestHeader`).
     fn best_header(&mut self) -> (Hash, i64);
@@ -573,7 +583,7 @@ pub trait SyncChain {
     /// `ProcessBlock`).  The block is shared by reference count, as
     /// dcrd's is a `*dcrutil.Block`, so a chain that keeps it keeps the
     /// caller's allocation and copies nothing.
-    fn process_block(&mut self, block: &Arc<MsgBlock>) -> Result<i64, ProcessBlockFailure>;
+    fn process_block(&mut self, block: &Self::Block) -> Result<i64, ProcessBlockFailure>;
 }
 
 /// The transaction pool operations the manager performs (the used
@@ -2088,10 +2098,7 @@ impl<C: SyncChain, T: SyncTxPool, M: SyncMixPool> SyncManager<C, T, M> {
 
     /// Process the provided block using the internal chain instance
     /// (dcrd unexported `processBlock`).
-    fn process_block_internal(
-        &mut self,
-        block: &Arc<MsgBlock>,
-    ) -> Result<i64, ProcessBlockFailure> {
+    fn process_block_internal(&mut self, block: &C::Block) -> Result<i64, ProcessBlockFailure> {
         // Process the block to include validation, best chain
         // selection, etc.
         let fork_len = self.cfg.chain.process_block(block)?;
@@ -2111,9 +2118,10 @@ impl<C: SyncChain, T: SyncTxPool, M: SyncMixPool> SyncManager<C, T, M> {
     /// Process a block received from a remote peer (dcrd `OnBlock`).
     ///
     /// The block is the allocation the message was decoded into, shared
-    /// by reference count, and it is handed to the chain as it is: no
-    /// step between the peer and the chain copies it.
-    pub fn on_block(&mut self, peer_id: i32, block: &Arc<MsgBlock>) -> Vec<Action> {
+    /// by reference count, and it is handed to the chain as it is, with
+    /// whatever the chain's block type carries beside it: no step
+    /// between the peer and the chain copies it.
+    pub fn on_block(&mut self, peer_id: i32, block: &C::Block) -> Vec<Action> {
         let mut actions = Vec::new();
         if self.shutdown {
             return actions;
@@ -3404,7 +3412,7 @@ impl<C: SyncChain, T: SyncTxPool, M: SyncMixPool> SyncManager<C, T, M> {
             return Ok(());
         }
 
-        let fork_len = self.process_block_internal(&Arc::new(block.clone()))?;
+        let fork_len = self.process_block_internal(&C::Block::from(Arc::new(block.clone())))?;
 
         let on_main_chain = fork_len == 0;
         if on_main_chain {

@@ -56,7 +56,7 @@ use crate::server::{
     on_addr, on_get_addr, on_get_data, on_get_init_state, on_get_mining_state, on_inv_classify,
     serve_get_data_item,
 };
-use crate::sync::NodeSyncManager;
+use crate::sync::{ArrivedBlock, NodeSyncManager};
 
 /// The configured name resolver the server hands the external-address
 /// subsystem (dcrd's `dcrdLookup`, a package-level function there).
@@ -151,6 +151,11 @@ pub struct ServerContext {
     /// The mixing pool the getdata serve path reads, shared with the
     /// sync manager that accepts mix messages (dcrd `server.mixMsgPool`).
     pub mix_pool: Arc<Mutex<crate::mixnode::NodeMixPool>>,
+    /// Whether the sync peer's connection is read ahead of its block
+    /// handler during the initial chain sync ([`crate::readahead`]),
+    /// which dcrd does not do.  `false` leaves every connection to be
+    /// read by its input thread alone.
+    pub read_ahead: bool,
 }
 
 /// The maximum number of recently advertised transactions to track
@@ -1224,6 +1229,9 @@ pub struct ServerPeerHandler {
     /// counters, created on the first getdata (dcrd creates the
     /// channel in `newServerPeer` and starts the goroutine in `Run`).
     getdata_serve: Option<GetDataServe>,
+    /// Whether the connection should be read ahead of this handler, as
+    /// of the last block it handled ([`Self::read_ahead_wanted`]).
+    read_ahead_wanted: bool,
 }
 
 /// How often the serve worker re-reads the peer's send accounting
@@ -1962,6 +1970,7 @@ impl ServerPeerHandler {
             inbound,
             peer_handle: None,
             getdata_serve: None,
+            read_ahead_wanted: false,
         }
     }
 
@@ -2457,8 +2466,11 @@ impl ServerPeerHandler {
     ///
     /// The block is shared by reference count from here to the chain,
     /// which keeps this allocation: dcrd passes one `*dcrutil.Block`
-    /// the same way, and nothing on the way copies the block.
-    fn on_block(&mut self, block: Arc<MsgBlock>) -> ServeSignal {
+    /// the same way, and nothing on the way copies the block.  It comes
+    /// plain from a message this thread read itself, and with its hashes
+    /// from the connection's reader thread; everything decided about it
+    /// is decided here and below, the same way for both.
+    fn handle_block(&mut self, block: ArrivedBlock) -> ServeSignal {
         // The block the peer delivered is known to it, so the
         // announcement fan-out never echoes the inventory back (dcrd
         // `OnBlock`'s `AddKnownInventory` before the sync-manager
@@ -2468,12 +2480,50 @@ impl ServerPeerHandler {
                 id,
                 InvVect {
                     inv_type: dcroxide_wire::InvType::BLOCK,
-                    hash: block.header.block_hash(),
+                    hash: block.hash(),
                 },
             );
         }
-        self.drive_sync(|manager, id| manager.on_block(id, &block));
+        // Whether the messages behind this block should be read ahead is
+        // settled here, under the sync-manager lock the hand-off already
+        // holds and once the block has been processed: only for the
+        // current sync peer, and only until the initial chain sync is
+        // done.  A peer that is not registered never asks.
+        let read_ahead = self.ctx.read_ahead;
+        let mut wanted = false;
+        self.drive_sync(|manager, id| {
+            let actions = manager.on_block(id, &block);
+            wanted =
+                read_ahead && manager.sync_peer_id() == id && !manager.initial_chain_sync_done();
+            actions
+        });
+        self.read_ahead_wanted = wanted;
         ServeSignal::Continue
+    }
+
+    /// Handle a block the connection's reader thread read, ahead of the
+    /// input thread or in turn, and hashed
+    /// ([`crate::peerloop::ServeHooks::on_block`]): exactly what
+    /// a `block` message gets from [`Self::handle_message`], with the
+    /// hashes the block carries handed to the chain so it does not
+    /// compute them again.
+    pub fn on_block(&mut self, block: dcroxide_blockchain::HashedBlock) -> ServeSignal {
+        self.handle_block(ArrivedBlock::Hashed(block))
+    }
+
+    /// Whether the connection should be read ahead of this handler from
+    /// here on, as of the last block it handled
+    /// ([`crate::peerloop::ServeHooks::read_ahead_wanted`]): the setting
+    /// is on, this peer is the sync manager's sync peer and the initial
+    /// chain sync is not done.
+    ///
+    /// Only the sync peer's connection is worth another thread: its
+    /// input thread is the one connecting blocks.  A peer other than the
+    /// sync peer can deliver blocks too, ones it announced in its
+    /// initial state or ones moved to it when another peer left, and its
+    /// connection is read as dcrd reads every connection.
+    pub fn read_ahead_wanted(&self) -> bool {
+        self.read_ahead_wanted
     }
 
     /// Dispatch one incoming message to its server handler, queueing
@@ -2498,7 +2548,9 @@ impl ServerPeerHandler {
         // A block is taken out of the message by value, so that the
         // allocation it was decoded into is the one the chain keeps.
         let msg = match msg {
-            Message::Block(block) => return self.on_block(Arc::new(block)),
+            Message::Block(block) => {
+                return self.handle_block(ArrivedBlock::Plain(Arc::new(block)));
+            }
             msg => msg,
         };
         match &msg {
@@ -2608,7 +2660,7 @@ impl ServerPeerHandler {
                 // the relay fan-out never echoes it back — marked up front
                 // with the delivered hash regardless of the acceptance
                 // outcome (dcrd `OnTx`'s `AddKnownInventory` before the
-                // sync-manager hand-off), mirroring `on_block` above.
+                // sync-manager hand-off), mirroring `handle_block` above.
                 let tx_hash = tx.tx_hash();
                 if let Some(id) = self.sync_peer_id {
                     self.ctx.sync_peers.mark_known_inventory(

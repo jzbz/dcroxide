@@ -1634,6 +1634,11 @@ fn run_node(cfg: Config) -> ExitCode {
              storage fault before restarting."
         ));
     }
+    // What reading ahead of the block handler did, if it did anything
+    // (dcrd has no such line).
+    if let Some(line) = dcroxide_node::readahead::shutdown_line() {
+        dcroxide_node::logging::info("SRVR", &line);
+    }
     dcroxide_node::logging::info("SRVR", "Server shutdown complete");
     // dcrd defers this event once startup completes, so it fires as
     // `dcrdMain` returns from `svr.Run`: after the server's whole
@@ -1768,6 +1773,7 @@ fn build_server(
         ntfn,
         recently_advertised: dcroxide_node::dispatch::new_recently_advertised(),
         mix_pool,
+        read_ahead: read_ahead_setting(),
     });
     // Arm the header-sync stall watchdog around the manager (dcrd's
     // stallHandler timer).
@@ -1927,6 +1933,35 @@ fn with_block_window_setting(
         None => {}
     }
     manager
+}
+
+/// Whether the sync peer's connection is read ahead of its block
+/// handler, as `DCROXIDE_READ_AHEAD` says, logging what the variable
+/// did.
+///
+/// Unset, it is: during the initial chain sync a thread of its own reads
+/// the sync peer's connection, checks each frame's checksum, decodes it
+/// and hashes a block's transactions, up to four frames ahead of the
+/// thread that connects the blocks (`dcroxide_node::readahead`), which
+/// dcrd does not do (PARITY *Reading ahead of the block handler*).
+/// `off` or `0` leaves every connection to its input thread alone, as
+/// dcrd reads, from the same binary.
+///
+/// An environment variable for `DCROXIDE_DB_CACHE`'s reason: dcrd has no
+/// counterpart, and the generated `-h` output is pinned byte-for-byte
+/// against dcrd's.  Any other value is ignored with a warning, like the
+/// other tuning variables, and so is one that is not valid Unicode,
+/// which reads as a value nothing accepts rather than as unset.
+fn read_ahead_setting() -> bool {
+    let setting = std::env::var_os(dcroxide_node::readahead::READ_AHEAD_VAR)
+        .map(|value| value.to_string_lossy().into_owned());
+    let (read_ahead, notice) = dcroxide_node::readahead::read_ahead_setting(setting.as_deref());
+    match notice {
+        Some((dcroxide_netsync::LogLevel::Info, line)) => log_info(&line),
+        Some((_, line)) => log_warn(&line),
+        None => {}
+    }
+    read_ahead
 }
 
 /// A positive whole number from `var`, or `None` when it is unset,
@@ -2698,6 +2733,6 @@ mod tests {
             manager.process_block(&block).is_ok(),
             "a stopped manager drops the block unprocessed"
         );
-        assert!(manager.on_block(1, &Arc::new(block)).is_empty());
+        assert!(manager.on_block(1, &Arc::new(block).into()).is_empty());
     }
 }

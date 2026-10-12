@@ -16,7 +16,7 @@
 //!
 //! A value of either type can only be made by hashing a block, and it
 //! is only ever used with that same block instance.  Hashes meet a
-//! block in exactly three ways:
+//! block in exactly four ways:
 //!
 //! 1. Lexically, in the function that computed them from that
 //!    `&MsgBlock`: `Chain::process_block`, and the public functions
@@ -27,11 +27,17 @@
 //!    cannot be reused.  Never by block hash or height.
 //! 3. On the connected-block event, where `Chain::connect_block` sends
 //!    the block and its hashes together.
+//! 4. In a [`HashedBlock`], which owns the `Arc` of the block it hashed
+//!    and can be made in no other way.  A block may be hashed into one
+//!    before it reaches the chain, on another thread
+//!    (`Chain::process_hashed_block`); the chain then reads the block
+//!    and its hashes out of that one value, and the block it keeps in
+//!    the `blocks` mirror is that same `Arc`.
 //!
 //! Nothing is keyed by a block hash and nothing is stored.  The slot is
-//! empty outside `Chain::process_block`, and an event holds the hashes
-//! of its own block only.  So a block read back from the database is a
-//! new allocation and is hashed again, and so is every other block a
+//! empty outside a processing call, and an event holds the hashes of its
+//! own block only.  So a block read back from the database is a new
+//! allocation and is hashed again, and so is every other block a
 //! reorganization attaches, a side-chain block connected later, a block
 //! linked by a later block's data, the startup catch-up, an invalidate
 //! or reconsider, the template checks and every disconnect.  A mutated
@@ -62,6 +68,7 @@
 //! its own transaction had that prefix, rejecting the transaction's own
 //! and passing one made for the other transaction at the same input.
 
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use dcroxide_chainhash::{HASH_SIZE, Hash, hash_h};
@@ -97,6 +104,77 @@ pub(crate) struct BlockMerkleLeaves {
     stake: Vec<Hash>,
 }
 
+/// A block together with its block hash, the hashes of its transactions
+/// and its merkle leaves, all computed from that block: what dcrd holds
+/// in one `dcrutil.Block`, whose transactions carry their hashes
+/// (`dcrutil/block.go:162-224`) and whose block hash is computed as the
+/// block is wrapped (`NewBlock`, `dcrutil/block.go:288-293`).
+///
+/// The fields are private and [`HashedBlock::new`] is the only
+/// constructor, so the hashes are always those of the block the value
+/// owns.  `MsgBlock` has no interior mutability and the block is only
+/// ever lent out behind its `Arc`, so it cannot change after it was
+/// hashed.  The type is not `Clone`: a second value would have to hash
+/// again, and there is no reason for one.
+///
+/// It exists so that the hashing can be done before the block reaches
+/// the chain, away from the thread that connects blocks.  Making one
+/// reaches no verdict about the block: nothing is checked, no merkle
+/// root is compared, and the chain makes every check it makes of a block
+/// that arrives without hashes, in the same order
+/// (`Chain::process_hashed_block`).
+#[derive(Debug)]
+pub struct HashedBlock {
+    /// The block.
+    block: Arc<MsgBlock>,
+    /// The hash of the block's header.
+    hash: Hash,
+    /// The hash of each of the block's transactions.
+    tx_hashes: Arc<BlockTxHashes>,
+    /// The full hash of each of the block's transactions.
+    merkle_leaves: BlockMerkleLeaves,
+}
+
+impl HashedBlock {
+    /// Hash the block: its header, and each transaction once for both
+    /// the transaction hash and the merkle leaf.
+    pub fn new(block: Arc<MsgBlock>) -> HashedBlock {
+        let (tx_hashes, merkle_leaves) = BlockTxHashes::compute_with_merkle_leaves(&block);
+        let hash = block.header.block_hash();
+        HashedBlock {
+            block,
+            hash,
+            tx_hashes: Arc::new(tx_hashes),
+            merkle_leaves,
+        }
+    }
+
+    /// The block that was hashed.
+    pub fn block(&self) -> &Arc<MsgBlock> {
+        &self.block
+    }
+
+    /// The hash of the block's header (dcrd `Block.Hash`).
+    pub fn hash(&self) -> &Hash {
+        &self.hash
+    }
+
+    /// The hash of each of the block's transactions.
+    pub fn tx_hashes(&self) -> &Arc<BlockTxHashes> {
+        &self.tx_hashes
+    }
+
+    /// The leaves of the block's transaction merkle trees.
+    pub(crate) fn merkle_leaves(&self) -> &BlockMerkleLeaves {
+        &self.merkle_leaves
+    }
+
+    /// Give the block back, dropping the hashes.
+    pub fn into_block(self) -> Arc<MsgBlock> {
+        self.block
+    }
+}
+
 #[cfg(test)]
 std::thread_local! {
     /// How many times this thread hashed a block into a `BlockTxHashes`
@@ -104,6 +182,17 @@ std::thread_local! {
     /// It exists in this crate's unit-test builds only, where the tests
     /// read it to tell how often one processing call hashed its block.
     pub(crate) static BLOCKS_HASHED: core::cell::Cell<u64> =
+        const { core::cell::Cell::new(0) };
+
+    /// How many times this thread built a block's `BlockMerkleLeaves`
+    /// in a pass of their own (`BlockMerkleLeaves::compute`).  The
+    /// re-hash `assert_for` does under debug assertions is not counted,
+    /// and neither is the pass that builds the leaves together with the
+    /// transaction hashes, which `BLOCKS_HASHED` counts.  It exists in
+    /// this crate's unit-test builds only, where the tests read it to
+    /// tell that a processing call that was handed a block's leaves did
+    /// not build them again.
+    pub(crate) static LEAVES_HASHED: core::cell::Cell<u64> =
         const { core::cell::Cell::new(0) };
 }
 
@@ -208,6 +297,15 @@ impl BlockMerkleLeaves {
     /// The full hash of every transaction of the block, each computed
     /// by `MsgTx::tx_hash_full`.
     pub(crate) fn compute(block: &MsgBlock) -> BlockMerkleLeaves {
+        #[cfg(test)]
+        LEAVES_HASHED.set(LEAVES_HASHED.get().wrapping_add(1));
+        Self::hash_block(block)
+    }
+
+    /// What [`Self::compute`] computes, without the unit tests' count of
+    /// its calls: the comparison [`Self::assert_for`] makes under debug
+    /// assertions is not a pass any caller asked for.
+    fn hash_block(block: &MsgBlock) -> BlockMerkleLeaves {
         BlockMerkleLeaves {
             regular: block.transactions.iter().map(MsgTx::tx_hash_full).collect(),
             stake: block
@@ -239,7 +337,7 @@ impl BlockMerkleLeaves {
             "merkle leaves are not one per transaction of the block"
         );
         debug_assert!(
-            *self == Self::compute(block),
+            *self == Self::hash_block(block),
             "merkle leaves do not match the block's transactions"
         );
     }
@@ -428,6 +526,53 @@ mod tests {
             duplicates.contains(&"bmf14"),
             "bmf14 repeats a transaction: {duplicates:?}"
         );
+    }
+
+    /// A hashed block carries the hashes of the block it owns, for every
+    /// block of the battery: the transaction hashes and merkle leaves
+    /// the chain computes for itself, and the header's hash.  The block
+    /// it owns is the allocation it was given, untouched.
+    #[test]
+    fn a_hashed_block_carries_the_hashes_of_its_own_block() {
+        let blocks = fixture_blocks();
+        assert_eq!(blocks.len(), 561, "the battery's blocks");
+        for (name, block) in blocks {
+            let shared = Arc::new(block.clone());
+            let hashed = HashedBlock::new(Arc::clone(&shared));
+
+            assert!(Arc::ptr_eq(hashed.block(), &shared), "{name}");
+            assert_eq!(**hashed.block(), block, "{name}");
+            assert_eq!(*hashed.hash(), block.header.block_hash(), "{name}");
+            assert_eq!(
+                **hashed.tx_hashes(),
+                BlockTxHashes::compute(&block),
+                "{name}"
+            );
+            assert_eq!(
+                *hashed.merkle_leaves(),
+                BlockMerkleLeaves::compute(&block),
+                "{name}"
+            );
+            // The checks every consumer makes of a pair pass.
+            hashed.tx_hashes().assert_for(hashed.block());
+            hashed.merkle_leaves().assert_for(hashed.block());
+
+            // Giving the block back gives that same allocation.
+            assert!(Arc::ptr_eq(&hashed.into_block(), &shared), "{name}");
+        }
+    }
+
+    /// Hashing a block into a [`HashedBlock`] is one pass over its
+    /// transactions, counted like the chain's own.
+    #[test]
+    fn hashing_a_block_ahead_is_one_pass() {
+        let block = Arc::new(one_transaction_block());
+        let before = BLOCKS_HASHED.get();
+        let hashed = HashedBlock::new(block);
+        assert_eq!(BLOCKS_HASHED.get().wrapping_sub(before), 1);
+        // Reading it back hashes nothing.
+        let _ = (hashed.hash(), hashed.tx_hashes(), hashed.merkle_leaves());
+        assert_eq!(BLOCKS_HASHED.get().wrapping_sub(before), 1);
     }
 
     /// The regression network's genesis block: one regular transaction

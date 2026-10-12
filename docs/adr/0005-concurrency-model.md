@@ -6,7 +6,8 @@
   2026-08-07 (ratified), 2026-08-13 (addendum: the storage levers closed),
   2026-10-10 (addendum: a later sync comparison; second addendum: the
   parity commit and the index off), 2026-10-11 (addendum: one more
-  thread, for the indexes)
+  thread, for the indexes), 2026-10-12 (addendum: a thread dcrd does not
+  have, reading ahead on the sync peer's connection)
 
 ## Context
 
@@ -294,3 +295,121 @@ one of the commit before it took 820.3 s, with node CPU time unchanged
 block-processing thread"). Up to the assume-valid block an average of
 1.15 and 1.17 of the node's 16 threads were busy where 1.06 were
 before, so that stretch is still close to one thread. D2 is unchanged.
+
+## Addendum, 2026-10-12 — a thread dcrd does not have: reading ahead on the sync peer's connection
+
+The daemon gained a thread on 2026-10-12 that has no counterpart in
+dcrd. During the initial chain sync, once the sync peer's connection has
+had a block handled, a thread named "peer-reader" takes over that
+connection's reads. It reads each frame, checks its checksum, decodes it
+and, for a block, hashes its transactions, up to four frames ahead of
+the connection's input thread, which goes on handling every message in
+the order it arrived, with the code that handled it before (`PARITY.md`,
+*Reading ahead of the block handler*, has the rule, what it leaves
+unchanged and what can be observed of it). dcrd's `inHandler` reads a
+message only when its listener has returned from the one before
+(`peer/peer.go:1535-1598`), and the comment on its `OnBlock` says the
+further receives are held back on purpose, so that a peer cannot queue
+up bad blocks (`server.go:1365-1369`).
+
+That is a departure from the ground the addenda above stand on, and it
+is recorded as one. The 2026-08-07 addendum keeps OS threads over
+channels because they mirror dcrd's goroutine-per-concern layout thread
+for goroutine, which is what keeps the line-by-line parity audit
+tractable. The 2026-10-11 addendum admitted the index thread as the
+shape dcrd has. This thread mirrors nothing: dcrd has no goroutine ahead
+of `inHandler`. What stands in for the mirror is tests. One runs 300
+seeded streams over a real connection with and without the thread and
+requires the same calls with the same contents in the same order and
+the same end of the connection
+(`the_handler_sees_the_same_calls_with_and_without_read_ahead`), and
+others hold the queue to four frames, the stall detector and the peer's
+counters to the moment a message is handled, the idle timer to the
+moment the input thread began waiting, and the teardown to handling
+nothing that is still queued. PARITY's row names them and lists what
+they do not cover.
+
+It is confined to one kind of connection because only there is the
+reading in the way. During the initial chain sync the sync peer's input
+thread is the thread that connects blocks, so the socket reads, the
+checksums, the decoding and the hashing were done by the thread the sync
+waits for. Every other connection, and every connection under
+`DCROXIDE_READ_AHEAD=off`, is read by its input thread alone, as dcrd
+reads. Once the sync is done the server answers no after every block,
+so no connection is given the thread and one that has it stops being
+read ahead. The thread is started behind the first block the connection
+is kept for while it is the sync peer, and it stays until the
+connection ends: once reading ahead is no longer wanted it reads each
+frame only in turn, and it still hashes every block it reads. It is an
+OS thread over std primitives: no runtime, no pool, and no thread per
+block.
+
+The queue between the two threads is a `std::sync::Mutex` with two
+`Condvar`s over a `VecDeque` of at most four items, not the
+`std::sync::mpsc` channel the other threads use. The reader may start a
+frame early only behind a block. In every other case it has to wait
+until the input thread is waiting with nothing queued, which is when
+`inHandler` begins its read, and that same moment starts the idle
+budget of the frame being read. A channel does not tell its sender that
+the receiver is waiting on an empty queue. A lock that both sides take
+does.
+
+The two clauses the 2026-07-26 addendum calls load-bearing hold. No
+consensus crate is async, and this change starts no thread and takes no
+lock in one: `HashedBlock::new` in `dcroxide-blockchain` is plain
+computation that the reader thread calls, and
+`Chain::process_hashed_block` makes the checks of
+`Chain::process_block` in the same order, reading the hashes where that
+computes them. Chain state keeps its single writer: the reader thread
+touches the socket, its queue and its counters and nothing else, and
+every block of the connection is still processed by its input thread
+under the chain's mutex.
+
+On m3 on 2026-10-12, on a quiet machine with the node held to eight of
+the machine's cores (16 threads), one binary synced mainnet to block
+1,116,035 from a dcrd v2.1.6 server over loopback four times at the
+defaults, in the order off, on, off, on with other runs between the
+pairs: 597.6 s and 599.0 s with `DCROXIDE_READ_AHEAD=off`, and 494.6 s
+and 490.8 s with the thread, 17.2% and 18.1% less. In the two runs with
+it the reader thread spent 45.829 s and 45.886 s on checksums and
+decoding and 47.209 s and 47.246 s on hashing, was parked with its
+queue full for 382.350 s and 378.719 s, and the input thread waited
+0.271 s and 0.273 s for a block: in those runs the thread that connects
+blocks, not the reading, was the slower side. The queue never held more
+than four frames. Peak resident memory was 2,967 and 2,921 MiB with the
+thread against 3,273 and 3,256 MiB without, which is not explained.
+Those four runs are of the build made before the review of 2026-10-12
+and its fixes, which changed one condition of the idle budget and one
+internal call of the hashing; the code as committed has not been run in
+a sync. The binary also holds the commit before this one, which hands a
+peer's block to the chain without copying it; the commit before that
+took 612.4 s in one run that day. No sync was run of the hand-off
+alone, and the 14.8 s and 13.4 s between that run and the two with the
+setting off are not attributed.
+
+Not measured: a sync over a delayed or a real link, where the round
+trip and not the thread that connects blocks may set the pace and the
+thread may gain nothing; fewer cores than those eight; the
+exists-address index off; `--assumevalid=0`; the memory the queue can
+hold, which is bounded at four frames and estimated, not measured, in
+bytes; and macOS and Windows, where nothing of this change has been
+run, neither a sync nor any of its tests, two of which
+(`tests/read_ahead_join.rs`, `tests/read_ahead_sync.rs`) are
+Linux-only.
+
+What would undo it. At run time, `DCROXIDE_READ_AHEAD=off`: no reader
+thread is started, and the same binary reads every connection as it did
+before. In the code, a connection gets the thread only where an
+implementation of `ServeHooks::read_ahead_wanted` answers yes, and the
+trait's default is no (`hooks_that_do_not_ask_are_never_read_ahead`).
+The daemon's one yes is in `ServerPeerHandler::handle_block`. Without
+it no thread is ever started, and the reader, the setting and the
+shutdown line can be taken out, leaving the input loop on its own
+reads.
+
+D2 as ratified does not cover a thread that dcrd has no goroutine for,
+and this addendum does not claim that it does: it records what was
+added and on what grounds. Whether those grounds, tests and four
+loopback syncs on one machine in place of dcrd's shape, are enough to
+keep the thread is the project owner's decision. Declining it is the
+paragraph above, and nothing else in this ADR depends on the thread.

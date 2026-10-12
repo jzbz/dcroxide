@@ -308,7 +308,9 @@ not its figures.
 
 The wider window can cost a node its sync peer where dcrd's would not,
 in two cases. Neither has been measured; both are read from the code. A
-requested block has to be read within 30 to 45 s of being asked for, so
+requested block has to reach the thread that processes blocks within
+30 to 45 s of being asked for (one read off the socket ahead of that
+thread, as below, does not count until its turn comes), so
 a path that carries less than about 70 to 105 kB/s, which is 0.56 to
 0.84 Mbit/s (the sync peer's uplink counts as much as your own link),
 or a host that processes fewer than three or four blocks a second, has
@@ -348,6 +350,88 @@ stalled peer. With that setting the node requests blocks by dcrd's rule
 exactly, never narrows or widens the window, and logs `Block download
 window set to dcrd's 16 blocks in flight by DCROXIDE_BLOCK_WINDOW` at
 startup.
+
+During the initial sync dcroxide also reads its sync peer's connection
+ahead of the thread that processes the blocks, which dcrd does not do
+([PARITY.md](../PARITY.md), *Reading ahead of the block handler*). Once
+that peer has delivered a first block, a thread of its own reads the
+connection, checks each message's checksum, decodes it and hashes a
+block's transactions, and keeps at most four messages ahead of the
+thread that processes blocks, which still handles every message in the
+order it arrived. It changes nothing about which blocks or messages are
+accepted, which peers are dropped or banned, or what is logged about
+them, beyond lines of its own (below, and two more at the debug level
+in PARITY.md): it moves work and decides nothing, and PARITY.md names
+the tests that hold it to that and what they leave uncovered. One pair
+of counters shows it: `getnettotals` counts a message's bytes when it
+is read and `getpeerinfo`'s `bytesrecv` for that peer when it is
+handled, so the total can lead the peer's count by up to four messages.
+It costs one more thread and one more descriptor on that one
+connection, kept until the connection ends, and the memory of up to
+four decoded messages. By an estimate from the sizes of the structures,
+not a measurement, those four are about 150 kB for main network blocks
+of mean size, well under 1 MiB; at worst, from a hostile sync peer
+sending the largest blocks made of the smallest transactions, the
+connection holds about 57 MB with the block being handled and the read
+buffer counted, against about 12.5 MB for one such block without the
+read-ahead. It was measured on m3 on 2026-10-12, on a quiet machine
+with the node held to eight of the machine's cores, with one binary:
+two default syncs to block 1,116,035 over loopback took 494.6 s and
+490.8 s with it, and two with `DCROXIDE_READ_AHEAD=off` took 597.6 s
+and 599.0 s, so 17.2% and 18.1% less, with peak resident memory of
+2,967 and 2,921 MiB against 3,273 and 3,256 MiB, which is not
+explained. Those four runs are of the build made before a review's
+fixes to it; the code as committed has not been run in a sync, so none
+of these is a figure to budget from, and all are of later code than the
+12.1 minutes above. No sync has been run with it over a delayed or a
+real link, where the round trip and not the thread that processes
+blocks may set the pace and it may gain nothing, nor on fewer cores,
+with `--noexistsaddrindex` or with `--assumevalid=0`, nor on macOS or
+Windows, where none of its tests has been run either.
+
+Whether reading ahead ever costs anything has not been measured: the
+loopback runs above are all there is. Set `DCROXIDE_READ_AHEAD=off` (or
+`0`) and restart the node to have every connection read one message at
+a time by its own thread alone, as dcrd reads: to rule the read-ahead
+out when a sync peer's connection misbehaves, to hold the sync peer's
+connection to one decoded message at a time when that peer is not
+trusted, or to compare the two. The node then logs `Read-ahead of
+blocks disabled by DCROXIDE_READ_AHEAD` at startup. With it on, the one
+line of its own that a node logs at the default level between its
+startup and its shutdown is a warning under `PEER`, `Unable to start a
+read-ahead thread for peer P: E -- reading on the input thread`, when
+the operating system refuses the thread: that connection goes on being
+read by its own thread, as it was until then. A node that read ahead
+also logs one line under `SRVR` as it shuts down, just before `Server
+shutdown complete`:
+
+```text
+Read-ahead: N blocks (B bytes) on C connections; checksum and decode X s and hashing Y s done off the block thread; the reader waited G s for the block thread; the block thread waited W s for the reader; at most Q items queued; index queue full for I s
+```
+
+N blocks of B bytes were read by the reading threads of C connections;
+the first block of a connection is not among them, since the thread
+that processes blocks read that one itself. X and Y are the time the
+reading threads spent on checksums and decoding and on hashing, which
+the thread that processes blocks no longer spends; the socket reads
+moved too and are not timed. G is how long the reading threads stood
+still with four messages waiting: when it is most of the sync, the
+thread that processes blocks set the pace and the reading kept up. W is
+how long the thread that processes blocks waited for a block with none
+ready. By the counter's definition, and not seen in a run, a large W
+means the peer, the link or the reading itself was the slower side, and
+reading ahead had less to give. Q is the most messages that waited at
+once, and is never more than four. I is how long handing blocks to the
+index thread waited for room in its queue, which is time the indexes
+set the pace; it is counted whether or not anything is read ahead, and
+printed in this line only. In the two runs above with it on the line
+reported 1,116,034 blocks and 19,215,875,473 bytes on one connection
+(printed as `1116034 blocks (19215875473 bytes) on 1 connections`),
+with X at 45.829 s and 45.886 s, Y at 47.209 s and 47.246 s, G at
+382.350 s and 378.719 s, W at 0.271 s and 0.273 s, Q at 4 and I at
+3.191 s and 3.265 s. X and Y together are 93.0 s and 93.1 s, less than
+the 103.0 s and 108.2 s the syncs gained, and what the rest is was not
+established.
 
 The disk difference is all in the metadata store. Block files make up
 17.88 GiB of each data directory at block 1,116,035, and the rest is
@@ -737,18 +821,21 @@ configuration, every name changes.
 | metadata flush log (JSONL path) | `DCROXIDE_DB_FLUSHLOG` (unset = off) | — |
 | exists-address memtable target (developer-only) | `DCROXIDE_EXISTSADDR_MEMTABLE_KEYS` (keys, default 2,000,000) | — |
 | block download window | `DCROXIDE_BLOCK_WINDOW` (`dcrd`, or a whole number of blocks from 16 to 505; default this port's own window, at most 128 blocks and 3,145,728 bytes) | — |
+| block read-ahead | `DCROXIDE_READ_AHEAD` (unset = on; `off` or `0` = off; anything else warns and stays on) | — |
 
 The chain itself lives under the home directory, not at it: `--datadir`
 defaults to `<home>/data` with the network appended, so on Linux the
 blocks are in `~/.dcroxide/data/mainnet` while `dcroxide.conf`,
 `rpc.cert` and `rpc.key` sit in `~/.dcroxide` itself.
 
-Those eight are the only `DCROXIDE_*` variables read; only the first
+Those nine are the only `DCROXIDE_*` variables read; only the first
 two have dcrd counterparts, since the page cache, the overlay and the
 flush log are properties of redb, which dcrd does not use, the
-memtable is a property of this port's exists-address layout, and the
+memtable is a property of this port's exists-address layout, the
 download window is this port's own rule for requesting blocks
-([PARITY.md](../PARITY.md), *Block download window*). Of the four
+([PARITY.md](../PARITY.md), *Block download window*), and the
+read-ahead is a thread dcrd does not have (*Reading ahead of the block
+handler*). Of the four
 storage variables, `DCROXIDE_DB_CACHE` is the one to leave unset, the
 next two are untuned instruments — see the storage tuning above — and
 `DCROXIDE_DB_FLUSHLOG` is diagnostic: it appends one JSON object per
@@ -780,9 +867,18 @@ DCROXIDE_BLOCK_WINDOW`, where N is the full width and never a narrowed
 one, and any other value as the warning `DCROXIDE_BLOCK_WINDOW=V is
 neither dcrd nor a whole number of blocks from 16 to 505; using the
 default`. Unset, the default applies and nothing is logged.
+`DCROXIDE_READ_AHEAD` is read once at startup too, and turns off the
+read-ahead of blocks during the initial sync; the sync budget above
+says what that is and when to turn it off. `off`, in any letter case,
+or `0` turns it off and is logged at startup as `Read-ahead of blocks
+disabled by DCROXIDE_READ_AHEAD`. Any other value, `on` and `1`
+included, is the warning `DCROXIDE_READ_AHEAD=V is neither off nor 0;
+using the default`, and the read-ahead stays on. Unset, it is on and
+nothing is logged.
 A malformed or zero value in any of the tuning variables warns and
 falls back to the default rather than refusing to start, since they are
-hints. Everything else is a command-line flag or a `dcroxide.conf` entry,
+hints; `DCROXIDE_READ_AHEAD` alone takes `0`, which turns it off.
+Everything else is a command-line flag or a `dcroxide.conf` entry,
 and the flag set is a verbatim port of dcrd's — same names, same semantics,
 and the same help text apart from the two environment annotations, which
 name `DCROXIDE_APPDATA` and `DCROXIDE_ALT_DNSNAMES` where dcrd's name

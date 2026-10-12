@@ -33,19 +33,33 @@
 //! deadline is applied through the transport's absolute per-message
 //! read budget (dcrd's `SetReadDeadline` before each read); a read
 //! timeout ends the loop exactly like dcrd's idle disconnect.
+//!
+//! The input loop takes its messages from a source (`MsgSource` in
+//! [`crate::readahead`]), one at a time and in the order they arrived,
+//! asking for the next only when it has handled the one before.  The
+//! source is normally the read itself, made on the input thread as
+//! dcrd's `inHandler` makes it.  On the sync peer's connection during
+//! the initial chain sync a `peer-reader` thread does the reading, the
+//! checksum, the decoding and the hashing of blocks up to four messages
+//! ahead, which dcrd does not do; the loop, and everything it decides,
+//! is the same either way.
 
 use std::io::{Read, Write};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
+use dcroxide_blockchain::HashedBlock;
 use dcroxide_peer::{
     ArmOutcome, MAX_PROTOCOL_VERSION, MsgTransport, NEGOTIATE_TIMEOUT, NegotiateError,
     NegotiateErrorKind, Peer, PeerEnv, PeerGlobals, ReadError, STALL_RESPONSE_TIMEOUT,
-    STALL_TICK_INTERVAL, StallDetector, StallReason,
+    STALL_TICK_INTERVAL, Settles, StallDetector, StallReason,
 };
-use dcroxide_wire::{CurrencyNet, MESSAGE_HEADER_SIZE, Message, MsgPing, MsgVersion};
+use dcroxide_wire::{
+    CurrencyNet, InvType, InvVect, MESSAGE_HEADER_SIZE, Message, MsgPing, MsgVersion,
+};
 
 use crate::peerconn::NodePeerEnv;
+use crate::readahead::{MsgSource, ReadAheadSource, Received};
 use crate::socktimeout::SocketTimeout;
 use crate::transport::{WireTransport, WriteStallPolicy};
 
@@ -227,6 +241,36 @@ pub trait ServeHooks {
         mix_hash: Option<dcroxide_chainhash::Hash>,
         outbound: &OutboundQueue,
     ) -> ServeSignal;
+    /// A block arrived that the connection's reader thread read, ahead
+    /// of this loop or in turn, and hashed ([`crate::readahead`]): the
+    /// block with its block hash and the hashes of its transactions, all
+    /// computed from it.  The loop gives it exactly the handling a
+    /// `block` message gets, with the hash it carries in place of one
+    /// computed here.
+    ///
+    /// The default hands the block on as the message it arrived as, so
+    /// an implementation that has no use for the hashes sees every block
+    /// through [`on_message`](ServeHooks::on_message), whichever thread
+    /// read it.
+    fn on_block(
+        &mut self,
+        peer: &Mutex<Peer>,
+        block: HashedBlock,
+        outbound: &OutboundQueue,
+    ) -> ServeSignal {
+        let block = Arc::unwrap_or_clone(block.into_block());
+        self.on_message(peer, Message::Block(block), None, outbound)
+    }
+    /// Whether the connection should read ahead of its handler from here
+    /// on.  The input loop asks after every block the handler kept the
+    /// connection for, and tells the connection's message source the
+    /// answer.  The default is never, which is what every implementation
+    /// that does not override it gets: each message is then read only
+    /// once the one before it has been handled, as dcrd's `inHandler`
+    /// reads.
+    fn read_ahead_wanted(&mut self) -> bool {
+        false
+    }
     /// The connection is winding down (dcrd `DonePeer`).  The peer
     /// arrives unlocked, as at [`on_connected`](ServeHooks::on_connected):
     /// it stays registered until the sync manager has let it go.  The
@@ -288,9 +332,13 @@ where
 /// bracketed by the detector's handler-active window (dcrd's
 /// `sccReceiveMessage`, `sccHandlerStart` and `sccHandlerDone`).  The
 /// bracket is what keeps a slow local callback from looking like a
-/// remote stall: the next message is not read until this one finishes
-/// processing, so the time spent here is credited back to every pending
-/// deadline.  The messages a legacy peer delayed past the handshake are
+/// remote stall: the next message is not taken, and so not reported,
+/// until this one finishes processing, so the time spent here is
+/// credited back to every pending deadline.  That holds whether the
+/// next message is still in the socket or was read ahead and is waiting
+/// in the connection's queue ([`crate::readahead`]): the detector hears
+/// of a message when the loop takes it, never when it was read.  The
+/// messages a legacy peer delayed past the handshake are
 /// replayed without stall signalling, exactly as dcrd's `inHandler`
 /// drains `delayedHandshakeMsgs` before its stall handler is involved.
 pub fn run_peer_input_with_stall<T, E, H>(
@@ -304,6 +352,35 @@ pub fn run_peer_input_with_stall<T, E, H>(
 ) -> DisconnectReason
 where
     T: MsgTransport,
+    E: PeerEnv,
+    H: ServeHooks,
+{
+    // Each message is read on this thread when the loop asks for it.
+    // The source snapshots the transport's cumulative read counter so
+    // each message contributes its delta to the peer's receive
+    // accounting (dcrd's `readMessage` adding its byte count to
+    // `bytesReceived`); the handshake's bytes were folded in by the
+    // connection assembly.
+    let mut source = crate::readahead::InlineSource::new(transport);
+    run_input_loop(peer, &mut source, env, outbound, hooks, delayed, stall)
+}
+
+/// The body of [`run_peer_input_with_stall`] over any source of the
+/// connection's messages ([`MsgSource`]).  Whatever the source, each
+/// message goes through this one body on the calling thread, in the
+/// order the messages arrived, and the next one is asked for only when
+/// this one has been handled.
+pub(crate) fn run_input_loop<S, E, H>(
+    peer: &Mutex<Peer>,
+    source: &mut S,
+    env: &mut E,
+    outbound: &OutboundQueue,
+    hooks: &mut H,
+    delayed: Vec<Message>,
+    stall: Option<&Mutex<StallDetector>>,
+) -> DisconnectReason
+where
+    S: MsgSource,
     E: PeerEnv,
     H: ServeHooks,
 {
@@ -339,16 +416,14 @@ where
         }
     }
 
-    // Snapshot the transport's cumulative read counter so each message
-    // contributes its delta to the peer's receive accounting (dcrd's
-    // `readMessage` adding its byte count to `bytesReceived`); the
-    // handshake's bytes were folded in by the connection assembly.
-    let mut read_total = transport.total_bytes_read();
     loop {
-        // Read without the peer lock held so the ping timer and the
-        // server keep making progress while this thread blocks.
-        let msg = match transport.read_message() {
-            Ok(msg) => msg,
+        // Take the next message without the peer lock held so the ping
+        // timer and the server keep making progress while this thread
+        // blocks.
+        let item = source.next();
+        let read_delta = item.read_delta;
+        let received = match item.result {
+            Ok(received) => received,
             Err(e) => {
                 // Ban peers sending messages that do not conform to
                 // the wire protocol (dcrd `OnRead` on a
@@ -366,14 +441,12 @@ where
                 return DisconnectReason::ReadError(e.message);
             }
         };
-        let read_delta = transport.total_bytes_read().wrapping_sub(read_total);
-        read_total = transport.total_bytes_read();
-
-        // Hash a mixing message once, before taking any lock: dcrd does
-        // this in `readMessage` and caches the hash on the message, and
-        // the stall detector and the server handler both read this one.
-        let mix_hash = mix_message_hash(&msg);
-
+        // A mixing message arrives with its hash, computed once as it
+        // was read, before any lock was taken: dcrd does this in
+        // `readMessage` and caches the hash on the message, and the
+        // stall detector and the server handler both read this one.  A
+        // block the reader thread read ahead arrives with its hashes.
+        //
         // Settle any deadline this message answers and open the
         // handler-active window before taking any lock, so every
         // moment between finishing the read and finishing the handling
@@ -383,7 +456,15 @@ where
         // a `notfound`'s list in place), and this peer's output loop
         // takes the same lock to arm every request it sends.
         if let Some(stall) = stall {
-            let settled = dcroxide_peer::settles(&msg, mix_hash);
+            let settled = match &received {
+                Received::Message { msg, mix_hash } => dcroxide_peer::settles(msg, *mix_hash),
+                // What `settles` answers for a block message, with the
+                // block hash already computed.
+                Received::Block(block) => Settles::Inventory(InvVect {
+                    inv_type: InvType::BLOCK,
+                    hash: *block.hash(),
+                }),
+            };
             let mut stall = stall.lock().expect("stall mutex poisoned");
             stall.received_settles(&settled);
             stall.handler_start();
@@ -406,8 +487,14 @@ where
             if read_delta > 0 {
                 peer.record_recv(read_delta, env.now_nanos());
             }
-            classify_incoming(&mut peer, &msg, env)
+            match &received {
+                Received::Message { msg, .. } => classify_incoming(&mut peer, msg, env),
+                // A block gets no protocol-level handling: this is what
+                // `classify_incoming` answers for one.
+                Received::Block(_) => IncomingAction::Process { reply: None },
+            }
         };
+        let is_block = received.is_block();
         match action {
             IncomingAction::Disconnect(reason) => return DisconnectReason::Protocol(reason.into()),
             IncomingAction::Process { reply } => {
@@ -430,12 +517,24 @@ where
                         Err(QueueError::Closed) => return DisconnectReason::LocalShutdown,
                     }
                 }
-                if let ServeSignal::Disconnect(reason) =
-                    hooks.on_message(peer, msg, mix_hash, outbound)
-                {
+                let signal = match received {
+                    Received::Message { msg, mix_hash } => {
+                        hooks.on_message(peer, msg, mix_hash, outbound)
+                    }
+                    Received::Block(block) => hooks.on_block(peer, block, outbound),
+                };
+                if let ServeSignal::Disconnect(reason) = signal {
                     return DisconnectReason::Protocol(reason);
                 }
             }
+        }
+
+        // A block was handled and the connection is kept: tell the
+        // source whether the server wants the messages behind it read
+        // ahead.  This is inside the handler-active window, so starting
+        // to read ahead is never charged to the peer.
+        if is_block {
+            source.block_handled(hooks.read_ahead_wanted());
         }
 
         // The message is handled.  The peer lock was released above, so
@@ -463,7 +562,7 @@ where
 /// ([`Message::mix_hash`]), which the stall detector's settlement reads
 /// too ([`Message::is_mix`]), so every mixing message it expects a hash
 /// for is hashed here.
-fn mix_message_hash(msg: &Message) -> Option<dcroxide_chainhash::Hash> {
+pub(crate) fn mix_message_hash(msg: &Message) -> Option<dcroxide_chainhash::Hash> {
     msg.mix_hash().and_then(Result::ok)
 }
 
@@ -1275,7 +1374,7 @@ const READ_EOF_TEXT: &str = "failed to fill whole buffer";
 /// The error text of a read the connection's own teardown cut short
 /// (`read_exact_by_deadline` in `transport.rs`): dcrd's read of a conn
 /// closed under it.
-const READ_TORN_DOWN_TEXT: &str = "the connection was torn down locally";
+pub(crate) const READ_TORN_DOWN_TEXT: &str = "the connection was torn down locally";
 
 /// The wire codec's text for Go's `io.EOF`: a payload that ends on a
 /// field boundary (`WireError::Eof`).
@@ -1387,6 +1486,13 @@ fn refuse_connection(
 /// `serverPeer.Run` starts `Peer.Run` before `AddPeer`, so a thread the
 /// OS refuses drops the connection with nothing to unwind
 /// ([`DisconnectReason::ThreadRefused`]).
+///
+/// A connection the server wants read ahead of its block handler
+/// ([`ServeHooks::read_ahead_wanted`]) gets one more thread, the reader
+/// of [`crate::readahead`], behind the first block it is kept for.
+/// dcrd has no such thread.  The OS refusing it changes nothing for the
+/// connection, which goes on reading on this thread, and it is joined
+/// with the others before this returns.
 #[allow(clippy::too_many_arguments)] // Mirrors dcrd's connection surface.
 pub fn run_peer_connection_with_stall<H>(
     conn: crate::transport::Teardown,
@@ -1602,6 +1708,12 @@ where
         }
     };
 
+    // Where the input loop gets its messages from: this thread's own
+    // reads of the transport, until the server first wants the messages
+    // behind a block read ahead ([`ServeHooks::read_ahead_wanted`]).
+    // The source owns the transport from here on.
+    let mut source = ReadAheadSource::new(read_transport, cancel.clone(), label.clone());
+
     // Request all block announcements via full headers instead of the
     // inv message (dcrd `serverPeer.Run` queueing `NewMsgSendHeaders`
     // before `AddPeer`).  The queue is empty here, so this cannot fail
@@ -1616,9 +1728,9 @@ where
         hooks.on_connected(&peer, &outbound, remote_version.disable_relay_tx);
 
         // Drive the input loop on this thread until the peer disconnects.
-        let reason = run_peer_input_with_stall(
+        let reason = run_input_loop(
             &peer,
-            &mut read_transport,
+            &mut source,
             &mut env,
             &outbound,
             &mut hooks,
@@ -1647,8 +1759,10 @@ where
     // without this peer seeing any of it: before, the socket stayed open
     // for that wait, relay traffic and pings kept being written to a
     // peer already dropped, and a deadline expiring meanwhile logged a
-    // stall for a peer that was already gone.
-    read_transport.get_ref().disconnect();
+    // stall for a peer that was already gone.  A reader thread, if the
+    // connection has one, is released here too: nothing it has queued
+    // is handled once the input loop has ended.
+    source.disconnect();
     let _ = timer_shutdown.send(());
     if connected {
         // The connection is winding down (dcrd `DonePeer`).
@@ -1660,9 +1774,13 @@ where
     // registry and getdata worker) are released by `on_disconnected`.
     drop(outbound);
     let _ = output.join();
+    let stalled = timers.join();
+    // The reader thread, if there is one, is joined last: it touches
+    // only the socket and its queue, both already shut.
+    source.finish();
     // A stall is the real reason the connection ended; the input loop
     // only saw the socket the detector shut down under it.
-    match timers.join() {
+    match stalled {
         Ok(Some(command)) => DisconnectReason::Protocol(
             format!("peer appears to be stalled or misbehaving, {command} timeout").into(),
         ),
@@ -2851,5 +2969,646 @@ mod tests {
         ] {
             assert_eq!(mix_message_hash(&msg), None, "{}", msg.command());
         }
+    }
+
+    /// A source that plays a script and records what the input loop
+    /// tells it after each block.
+    struct ToldSource {
+        items: std::collections::VecDeque<Message>,
+        told: Vec<bool>,
+    }
+
+    impl ToldSource {
+        fn over(items: Vec<Message>) -> ToldSource {
+            ToldSource {
+                items: items.into(),
+                told: Vec::new(),
+            }
+        }
+    }
+
+    impl MsgSource for ToldSource {
+        fn next(&mut self) -> crate::readahead::ReadItem {
+            let result = match self.items.pop_front() {
+                Some(msg) => Ok(Received::Message {
+                    mix_hash: mix_message_hash(&msg),
+                    msg,
+                }),
+                None => Err(ReadError::io("end of script")),
+            };
+            crate::readahead::ReadItem {
+                result,
+                read_delta: 0,
+            }
+        }
+
+        fn block_handled(&mut self, wanted: bool) {
+            self.told.push(wanted);
+        }
+    }
+
+    /// Hooks that answer the read-ahead question as told, count how
+    /// often they are asked, and refuse the block with one nonce.
+    struct WantingHooks {
+        wanted: bool,
+        refused_nonce: Option<u32>,
+        asked: usize,
+    }
+
+    impl ServeHooks for WantingHooks {
+        fn on_message(
+            &mut self,
+            _peer: &Mutex<Peer>,
+            msg: Message,
+            _mix_hash: Option<dcroxide_chainhash::Hash>,
+            _outbound: &OutboundQueue,
+        ) -> ServeSignal {
+            match msg {
+                Message::Block(block) if Some(block.header.nonce) == self.refused_nonce => {
+                    ServeSignal::Disconnect("unrequested block".into())
+                }
+                _ => ServeSignal::Continue,
+            }
+        }
+
+        fn read_ahead_wanted(&mut self) -> bool {
+            self.asked = self.asked.saturating_add(1);
+            self.wanted
+        }
+    }
+
+    /// A block told apart by its header's nonce.
+    fn block_msg(nonce: u32) -> Message {
+        let (mut header, _) =
+            dcroxide_wire::BlockHeader::from_bytes(&[0u8; 180]).expect("zero header");
+        header.nonce = nonce;
+        Message::Block(dcroxide_wire::MsgBlock {
+            header,
+            transactions: Vec::new(),
+            stransactions: Vec::new(),
+        })
+    }
+
+    /// Run the input loop over a scripted source, returning what the
+    /// source was told after each block, how often the hooks were asked,
+    /// and how the loop ended.
+    fn told_after_blocks(
+        items: Vec<Message>,
+        wanted: bool,
+        refused_nonce: Option<u32>,
+    ) -> (Vec<bool>, usize, DisconnectReason) {
+        let mut source = ToldSource::over(items);
+        let mut hooks = WantingHooks {
+            wanted,
+            refused_nonce,
+            asked: 0,
+        };
+        let (queue, _receiver) = OutboundQueue::channel();
+        let reason = run_input_loop(
+            &Mutex::new(test_peer()),
+            &mut source,
+            &mut NodePeerEnv::new(),
+            &queue,
+            &mut hooks,
+            Vec::new(),
+            None,
+        );
+        (source.told, hooks.asked, reason)
+    }
+
+    /// Hooks that keep every hashed block they are handed and every
+    /// block message, and ask for read-ahead.
+    #[derive(Default)]
+    struct BlockKeepingHooks {
+        hashed: Vec<HashedBlock>,
+        messages: Vec<Message>,
+        /// Whether `on_block` is left to the trait's default.
+        default_on_block: bool,
+    }
+
+    impl ServeHooks for BlockKeepingHooks {
+        fn on_message(
+            &mut self,
+            _peer: &Mutex<Peer>,
+            msg: Message,
+            _mix_hash: Option<dcroxide_chainhash::Hash>,
+            _outbound: &OutboundQueue,
+        ) -> ServeSignal {
+            self.messages.push(msg);
+            ServeSignal::Continue
+        }
+
+        fn on_block(
+            &mut self,
+            peer: &Mutex<Peer>,
+            block: HashedBlock,
+            outbound: &OutboundQueue,
+        ) -> ServeSignal {
+            if self.default_on_block {
+                // What the trait's default does.
+                let block = Arc::unwrap_or_clone(block.into_block());
+                return self.on_message(peer, Message::Block(block), None, outbound);
+            }
+            self.hashed.push(block);
+            ServeSignal::Continue
+        }
+
+        fn read_ahead_wanted(&mut self) -> bool {
+            true
+        }
+    }
+
+    /// A source that hands over one block, hashed as the reader thread
+    /// hashes it, having read `read_delta` bytes for it.
+    struct HashedSource {
+        block: Option<Arc<dcroxide_wire::MsgBlock>>,
+        read_delta: u64,
+        told: Vec<bool>,
+    }
+
+    impl MsgSource for HashedSource {
+        fn next(&mut self) -> crate::readahead::ReadItem {
+            match self.block.take() {
+                Some(block) => crate::readahead::ReadItem {
+                    result: Ok(Received::Block(HashedBlock::new(block))),
+                    read_delta: self.read_delta,
+                },
+                None => crate::readahead::ReadItem {
+                    result: Err(ReadError::io("end of script")),
+                    read_delta: 0,
+                },
+            }
+        }
+
+        fn block_handled(&mut self, wanted: bool) {
+            self.told.push(wanted);
+        }
+    }
+
+    /// A block that arrives hashed from the reader thread gets exactly
+    /// what a `block` message gets from the input loop: it settles the
+    /// deadline of its own inventory, its bytes are added to the peer's
+    /// receive counter as it is handled, the server is handed that very
+    /// block with its hashes, and the source is told the block was
+    /// handled.  A server that takes no hashed blocks is handed the
+    /// block as its message.
+    #[test]
+    fn a_hashed_block_is_handled_as_its_message_is() {
+        let Message::Block(block) = block_msg(5) else {
+            unreachable!("a block message");
+        };
+        let block = Arc::new(block);
+        let wanted = dcroxide_wire::InvVect {
+            inv_type: dcroxide_wire::InvType::BLOCK,
+            hash: block.header.block_hash(),
+        };
+        let other = dcroxide_wire::InvVect {
+            inv_type: dcroxide_wire::InvType::BLOCK,
+            hash: dcroxide_chainhash::Hash([9; 32]),
+        };
+
+        for default_on_block in [false, true] {
+            // Two blocks have been asked for, and this is one of them.
+            let stall = Mutex::new(StallDetector::with_response_timeout(
+                Duration::from_secs(60).as_nanos() as i64,
+            ));
+            let request = Message::GetData(dcroxide_wire::MsgGetData {
+                inv_list: vec![wanted, other],
+            });
+            assert_eq!(
+                stall.lock().expect("stall").sent_message(&request),
+                ArmOutcome::Armed
+            );
+
+            let peer = Mutex::new(test_peer());
+            let mut source = HashedSource {
+                block: Some(Arc::clone(&block)),
+                read_delta: 4242,
+                told: Vec::new(),
+            };
+            let mut hooks = BlockKeepingHooks {
+                default_on_block,
+                ..BlockKeepingHooks::default()
+            };
+            let (queue, _receiver) = OutboundQueue::channel();
+            let reason = run_input_loop(
+                &peer,
+                &mut source,
+                &mut NodePeerEnv::new(),
+                &queue,
+                &mut hooks,
+                Vec::new(),
+                Some(&stall),
+            );
+            assert!(
+                matches!(reason, DisconnectReason::ReadError(_)),
+                "{reason:?}"
+            );
+
+            // Its own deadline is settled, and only its own.
+            assert_eq!(stall.lock().expect("stall").pending_inv_count(), 1);
+            assert_eq!(peer.lock().expect("peer").stats_snapshot().bytes_recv, 4242);
+            assert_eq!(source.told, vec![true]);
+            if default_on_block {
+                assert_eq!(hooks.messages, vec![Message::Block((*block).clone())]);
+            } else {
+                assert!(hooks.messages.is_empty());
+                assert_eq!(hooks.hashed.len(), 1);
+                assert!(Arc::ptr_eq(hooks.hashed[0].block(), &block));
+                assert_eq!(*hooks.hashed[0].hash(), block.header.block_hash());
+            }
+        }
+    }
+
+    /// A read transport over the accepted end of a loopback pair, as the
+    /// connection assembly builds it, with its teardown flag.
+    fn read_transport(
+        conn: crate::transport::Teardown,
+    ) -> (
+        WireTransport<crate::transport::Teardown>,
+        crate::transport::Cancel,
+    ) {
+        let cancel = conn.cancel();
+        let mut transport = WireTransport::new(conn, MAX_PROTOCOL_VERSION, NET);
+        transport.set_cancel(cancel.clone());
+        transport.set_read_budget(Some(Duration::from_secs(5)));
+        (transport, cancel)
+    }
+
+    /// The input loop asks whether reading ahead is wanted once after
+    /// every block the connection is kept for and at no other time, and
+    /// a reader thread is started only on a yes while the connection's
+    /// flag is down: not before a block, not when the server says no,
+    /// not for a block that is answered with a disconnect, and not for
+    /// one whose handling tore the connection down.
+    #[test]
+    fn read_ahead_starts_only_after_a_kept_block_while_wanted() {
+        let ping = |nonce| Message::Ping(MsgPing { nonce });
+
+        // No block yet: nothing is asked.
+        let (told, asked, _) = told_after_blocks(vec![ping(1), Message::SendHeaders], true, None);
+        assert_eq!((told, asked), (Vec::new(), 0));
+
+        // The server says no, and the source is told so.
+        let (told, asked, _) = told_after_blocks(vec![block_msg(1)], false, None);
+        assert_eq!((told, asked), (vec![false], 1));
+
+        // Once per kept block, and never for another message.
+        let (told, asked, _) =
+            told_after_blocks(vec![block_msg(1), ping(2), block_msg(3)], true, None);
+        assert_eq!((told, asked), (vec![true, true], 2));
+
+        // A block answered with a disconnect is not a kept block.
+        let (told, asked, reason) = told_after_blocks(
+            vec![block_msg(1), block_msg(9), block_msg(3)],
+            true,
+            Some(9),
+        );
+        assert_eq!((told, asked), (vec![true], 1));
+        assert!(
+            matches!(&reason, DisconnectReason::Protocol(r) if r == "unrequested block"),
+            "{reason:?}"
+        );
+
+        // The source itself: told no, it keeps reading inline; told yes
+        // with the connection torn down, as a block that got its peer
+        // disconnected by a sync-manager action leaves it, it still does.
+        let (conn, _remote, _client) = loopback_pair();
+        let (transport, cancel) = read_transport(conn);
+        let mut source = ReadAheadSource::new(transport, cancel.clone(), "test".to_string());
+        assert!(!source.is_ahead(), "no block yet");
+        source.block_handled(false);
+        assert!(!source.is_ahead(), "not wanted");
+        cancel.cancel();
+        source.block_handled(true);
+        assert!(!source.is_ahead(), "the connection is being torn down");
+        source.finish();
+
+        // Told yes with the connection up, it starts a reader, which
+        // stays when reading ahead is no longer wanted.
+        let (conn, _remote, _client) = loopback_pair();
+        let (transport, cancel) = read_transport(conn);
+        let mut source = ReadAheadSource::new(transport, cancel, "test".to_string());
+        source.block_handled(true);
+        assert!(source.is_ahead());
+        source.block_handled(false);
+        assert!(source.is_ahead());
+        source.finish();
+    }
+
+    /// Hooks that ask for read-ahead after every block and make the OS
+    /// refuse the next thread while they handle one, until a `feefilter`
+    /// arrives.
+    struct RefusingHooks;
+
+    impl ServeHooks for RefusingHooks {
+        fn on_message(
+            &mut self,
+            _peer: &Mutex<Peer>,
+            msg: Message,
+            _mix_hash: Option<dcroxide_chainhash::Hash>,
+            _outbound: &OutboundQueue,
+        ) -> ServeSignal {
+            match msg {
+                Message::Block(_) => {
+                    crate::runtime::REFUSE_CONN_THREADS.with(|refuse| refuse.set(true));
+                }
+                Message::FeeFilter(_) => {
+                    crate::runtime::REFUSE_CONN_THREADS.with(|refuse| refuse.set(false));
+                }
+                _ => {}
+            }
+            ServeSignal::Continue
+        }
+
+        fn read_ahead_wanted(&mut self) -> bool {
+            true
+        }
+    }
+
+    /// A reader thread the OS refuses is not fatal: the connection keeps
+    /// reading on its input thread and is served as before, and the
+    /// thread is not asked for again.  The transport is not lost with the
+    /// refused thread.
+    #[test]
+    fn a_refused_reader_thread_leaves_the_connection_reading_inline() {
+        let (conn, remote, client) = loopback_pair();
+        let server = std::thread::spawn(move || {
+            run_peer_connection(
+                conn,
+                inbound_peer(remote),
+                0,
+                NET,
+                NEVER,
+                NEVER,
+                None,
+                RefusingHooks,
+            )
+        });
+        let mut transport = client_handshake(client);
+        let expect_pong = |transport: &mut WireTransport<std::net::TcpStream>, nonce| {
+            transport
+                .write_message(&Message::Ping(MsgPing { nonce }))
+                .expect("send ping");
+            loop {
+                match transport.read_message().expect("the connection is served") {
+                    Message::Pong(pong) => break assert_eq!(pong.nonce, nonce),
+                    _ => continue,
+                }
+            }
+        };
+
+        // The block's reader thread is refused; the connection answers.
+        transport.write_message(&block_msg(1)).expect("send block");
+        expect_pong(&mut transport, 5);
+        // Threads can be had again, and another block is handled.
+        transport
+            .write_message(&Message::FeeFilter(dcroxide_wire::MsgFeeFilter {
+                min_fee: 1,
+            }))
+            .expect("send feefilter");
+        transport.write_message(&block_msg(2)).expect("send block");
+        expect_pong(&mut transport, 6);
+
+        drop(transport);
+        let reason = server.join().expect("the server must not panic");
+        assert!(
+            matches!(reason, DisconnectReason::ReadError(_)),
+            "the client closing ends the connection: {reason:?}"
+        );
+
+        // The source itself: a refusal leaves it reading inline with its
+        // transport, and it does not try again when threads are back.
+        let (conn, _remote, client) = loopback_pair();
+        let (transport, cancel) = read_transport(conn);
+        let mut source = ReadAheadSource::new(transport, cancel, "test".to_string());
+        crate::runtime::REFUSE_CONN_THREADS.with(|refuse| refuse.set(true));
+        source.block_handled(true);
+        crate::runtime::REFUSE_CONN_THREADS.with(|refuse| refuse.set(false));
+        assert!(!source.is_ahead(), "the thread was refused");
+        source.block_handled(true);
+        assert!(!source.is_ahead(), "a refusal is not retried");
+
+        let mut peer = WireTransport::new(client, MAX_PROTOCOL_VERSION, NET);
+        peer.write_message(&Message::Ping(MsgPing { nonce: 77 }))
+            .expect("send ping");
+        match source.next().result {
+            Ok(Received::Message { msg, .. }) => {
+                assert_eq!(msg, Message::Ping(MsgPing { nonce: 77 }));
+            }
+            Ok(Received::Block(_)) => panic!("an inline read does not hash a block"),
+            Err(e) => panic!("the transport was lost with the refused thread: {e}"),
+        }
+        source.finish();
+    }
+
+    /// Hooks that say nothing about reading ahead are never read ahead:
+    /// the source is told no after every block, so each message is read
+    /// only once the one before it has been handled.
+    #[test]
+    fn hooks_that_do_not_ask_are_never_read_ahead() {
+        struct SilentHooks;
+
+        impl ServeHooks for SilentHooks {
+            fn on_message(
+                &mut self,
+                _peer: &Mutex<Peer>,
+                _msg: Message,
+                _mix_hash: Option<dcroxide_chainhash::Hash>,
+                _outbound: &OutboundQueue,
+            ) -> ServeSignal {
+                ServeSignal::Continue
+            }
+        }
+
+        let mut source = ToldSource::over(vec![block_msg(1), block_msg(2)]);
+        let (queue, _receiver) = OutboundQueue::channel();
+        let _ = run_input_loop(
+            &Mutex::new(test_peer()),
+            &mut source,
+            &mut NodePeerEnv::new(),
+            &queue,
+            &mut SilentHooks,
+            Vec::new(),
+            None,
+        );
+        assert_eq!(source.told, vec![false, false]);
+    }
+
+    /// A reader thread that is told reading ahead is no longer wanted
+    /// reads nothing until the handler waits for it, although frames are
+    /// there to be read, and from then on one frame each time it is asked.
+    #[test]
+    fn a_reader_no_longer_wanted_ahead_reads_only_when_the_handler_waits() {
+        let (conn, _remote, client) = loopback_pair();
+        let (transport, cancel) = read_transport(conn);
+        let mut source = ReadAheadSource::new(transport, cancel, "test".to_string());
+        source.block_handled(true);
+        assert!(source.is_ahead());
+        source.block_handled(false);
+
+        let mut peer = WireTransport::new(client, MAX_PROTOCOL_VERSION, NET);
+        for nonce in 1..=4 {
+            peer.write_message(&block_msg(nonce)).expect("send block");
+        }
+        std::thread::sleep(Duration::from_millis(300));
+        // At most the one frame whose read began while reading ahead was
+        // still wanted.
+        let queued = source.max_queued().expect("a reader thread");
+        assert!(queued <= 1, "{queued} frames were read with nobody waiting");
+
+        for nonce in 1..=4 {
+            match source.next().result {
+                Ok(Received::Block(block)) => assert_eq!(block.block().header.nonce, nonce),
+                Ok(Received::Message { msg, .. }) => panic!("block {nonce} arrived as {msg:?}"),
+                Err(e) => panic!("block {nonce}: {e}"),
+            }
+            source.block_handled(false);
+            std::thread::sleep(Duration::from_millis(50));
+            let queued = source.max_queued().expect("a reader thread");
+            assert!(queued <= 1, "{queued} frames queued behind block {nonce}");
+        }
+        source.finish();
+    }
+
+    /// Disconnecting a connection that is read ahead releases its reader
+    /// thread there and then, before the server's disconnection hook and
+    /// the joins that follow it, whatever the thread is doing.  Here it
+    /// is parked on a full queue nobody will take from again, which
+    /// shutting the socket down does not reach.
+    #[test]
+    fn disconnecting_releases_a_reader_parked_on_a_full_queue() {
+        let (conn, _remote, client) = loopback_pair();
+        let (transport, cancel) = read_transport(conn);
+        let mut source = ReadAheadSource::new(transport, cancel, "test".to_string());
+        source.block_handled(true);
+        assert!(source.is_ahead());
+
+        // More blocks than the queue holds: the reader fills it and
+        // parks with two still unread.
+        let full = crate::readahead::READ_AHEAD_MAX_ITEMS;
+        let mut peer = WireTransport::new(client, MAX_PROTOCOL_VERSION, NET);
+        for nonce in 1..=6 {
+            peer.write_message(&block_msg(nonce)).expect("send block");
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while source.max_queued() != Some(full) {
+            assert!(
+                Instant::now() < deadline,
+                "the reader never filled its queue"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(source.reader_exited(), Some(false), "the reader is parked");
+
+        source.disconnect();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while source.reader_exited() != Some(true) {
+            assert!(
+                Instant::now() < deadline,
+                "the reader thread was not released by the disconnect"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        source.finish();
+    }
+
+    /// [`DropThenBlockHooks`] on a connection that is read ahead.
+    struct DropThenBlockAheadHooks(DropThenBlockHooks);
+
+    impl ServeHooks for DropThenBlockAheadHooks {
+        fn on_connected(
+            &mut self,
+            peer: &Arc<Mutex<Peer>>,
+            outbound: &OutboundQueue,
+            remote_disable_relay_tx: bool,
+        ) {
+            self.0.on_connected(peer, outbound, remote_disable_relay_tx);
+        }
+
+        fn on_message(
+            &mut self,
+            peer: &Mutex<Peer>,
+            msg: Message,
+            mix_hash: Option<dcroxide_chainhash::Hash>,
+            outbound: &OutboundQueue,
+        ) -> ServeSignal {
+            self.0.on_message(peer, msg, mix_hash, outbound)
+        }
+
+        fn read_ahead_wanted(&mut self) -> bool {
+            true
+        }
+
+        fn on_disconnected(&mut self, peer: &Mutex<Peer>) {
+            self.0.on_disconnected(peer);
+        }
+    }
+
+    /// A dropped peer whose connection was being read ahead is
+    /// disconnected before the server lets it go, exactly as one read by
+    /// its input thread is: the remote reads the end of the stream while
+    /// the disconnection hook is still waiting.
+    #[test]
+    fn a_dropped_peer_read_ahead_is_disconnected_before_the_server_lets_it_go() {
+        use std::io::Read as _;
+
+        let (conn, remote, client) = loopback_pair();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let hooks = DropThenBlockAheadHooks(DropThenBlockHooks {
+            queue: None,
+            entered: entered_tx,
+            release: release_rx,
+        });
+        let server = std::thread::spawn(move || {
+            run_peer_connection(
+                conn,
+                inbound_peer(remote),
+                0,
+                NET,
+                NEVER,
+                NEVER,
+                None,
+                hooks,
+            )
+        });
+
+        let mut transport = client_handshake(client);
+        // A block the connection is kept for puts a reader thread on it.
+        transport.write_message(&block_msg(1)).expect("send block");
+        transport
+            .write_message(&Message::Ping(MsgPing { nonce: 1 }))
+            .expect("send ping");
+        loop {
+            match transport.read_message().expect("the connection is served") {
+                Message::Pong(pong) => break assert_eq!(pong.nonce, 1),
+                _ => continue,
+            }
+        }
+        transport
+            .write_message(&Message::Ping(MsgPing { nonce: 2 }))
+            .expect("send ping");
+        entered_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the disconnection hook runs");
+
+        // The hook is still blocked.  The client's five-second read
+        // timeout is what ends this read if the socket is still open.
+        let mut stream = transport.into_inner();
+        let mut bytes = Vec::new();
+        let end = stream.read_to_end(&mut bytes);
+        assert!(
+            end.is_ok(),
+            "the remote must see the end of the stream before the server lets the peer go: {end:?}"
+        );
+
+        release_tx.send(()).expect("release the hook");
+        let reason = server.join().expect("server thread");
+        assert!(
+            matches!(&reason, DisconnectReason::Protocol(r) if r == "dropped by the handler"),
+            "the handler's drop is the reason: {reason:?}"
+        );
     }
 }

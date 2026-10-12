@@ -56,6 +56,7 @@ fn genesis_server() -> (tempfile::TempDir, Arc<ServerContext>) {
         false,
     );
     let server = Arc::new(ServerContext {
+        read_ahead: false,
         external_addr_candidates: Mutex::new(Default::default()),
         external_addr_facts: dcroxide_node::server::ExternalAddrFacts {
             listeners: Vec::new(),

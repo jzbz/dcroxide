@@ -61,6 +61,7 @@ fn serve_genesis_chain() -> GenesisChainRig {
         false,
     );
     let server = Arc::new(ServerContext {
+        read_ahead: false,
         external_addr_candidates: std::sync::Mutex::new(Default::default()),
         external_addr_facts: dcroxide_node::server::ExternalAddrFacts {
             listeners: Vec::new(),
@@ -734,6 +735,7 @@ fn initiates_header_sync_with_a_data_serving_peer() {
         false,
     );
     let server = Arc::new(ServerContext {
+        read_ahead: false,
         external_addr_candidates: std::sync::Mutex::new(Default::default()),
         external_addr_facts: dcroxide_node::server::ExternalAddrFacts {
             listeners: Vec::new(),
@@ -880,6 +882,7 @@ fn disconnects_a_stalled_header_sync_peer() {
         Duration::from_millis(300),
     );
     let server = Arc::new(ServerContext {
+        read_ahead: false,
         external_addr_candidates: std::sync::Mutex::new(Default::default()),
         external_addr_facts: dcroxide_node::server::ExternalAddrFacts {
             listeners: Vec::new(),
@@ -1077,6 +1080,7 @@ fn announces_connected_blocks_to_served_peers() {
     );
     let sync_peers = dcroxide_node::dispatch::SyncPeers::new();
     let server = Arc::new(ServerContext {
+        read_ahead: false,
         external_addr_candidates: std::sync::Mutex::new(Default::default()),
         external_addr_facts: dcroxide_node::server::ExternalAddrFacts {
             listeners: Vec::new(),
@@ -1206,7 +1210,7 @@ fn announces_connected_blocks_to_served_peers() {
     // The first connected block announces as an inventory.
     let fork_len = dcroxide_netsync::manager::SyncChain::process_block(
         &mut sync_chain,
-        &Arc::new(blocks[0].clone()),
+        &Arc::new(blocks[0].clone()).into(),
     )
     .expect("first block accepts");
     assert_eq!(fork_len, 0);
@@ -1234,7 +1238,7 @@ fn announces_connected_blocks_to_served_peers() {
     );
     dcroxide_netsync::manager::SyncChain::process_block(
         &mut sync_chain,
-        &Arc::new(blocks[1].clone()),
+        &Arc::new(blocks[1].clone()).into(),
     )
     .expect("second block accepts");
     match transport.read_message().expect("read headers announcement") {
@@ -1332,7 +1336,7 @@ fn battery_prefix(limit: usize) -> Vec<dcroxide_wire::MsgBlock> {
 /// [`ServerPeerHandler`] directly: the sync manager is the daemon's, so
 /// a handler's peer becomes the sync peer and has blocks requested from
 /// it as a served connection's does.
-fn regnet_server() -> (tempfile::TempDir, Arc<ServerContext>) {
+fn regnet_server(read_ahead: bool) -> (tempfile::TempDir, Arc<ServerContext>) {
     let params = dcroxide_chaincfg::regnet_params();
     let dir = tempfile::tempdir().expect("temp dir");
     let opts = Options::new(dir.path().join("blocks"), params.net.0);
@@ -1351,6 +1355,7 @@ fn regnet_server() -> (tempfile::TempDir, Arc<ServerContext>) {
         false,
     );
     let server = Arc::new(ServerContext {
+        read_ahead,
         external_addr_candidates: std::sync::Mutex::new(Default::default()),
         external_addr_facts: dcroxide_node::server::ExternalAddrFacts {
             listeners: Vec::new(),
@@ -1432,6 +1437,12 @@ impl HandledPeer {
             .handle_message(&self.peer, msg, None, &self.queue)
     }
 
+    /// Hand the handler a block from the peer that the connection's
+    /// reader thread read ahead and hashed.
+    fn deliver_hashed(&mut self, block: dcroxide_blockchain::HashedBlock) -> ServeSignal {
+        self.handler.on_block(block)
+    }
+
     /// Everything queued for the peer since the last call.
     fn take_sent(&self) -> Vec<Message> {
         std::iter::from_fn(|| self.sent.try_recv().ok()).collect()
@@ -1455,8 +1466,14 @@ impl HandledPeer {
 
 /// Connect an inbound full node at `addr` whose version message claims
 /// a chain of `last_block` blocks, as far as the server's connection
-/// hook.
-fn handled_peer(ctx: &Arc<ServerContext>, addr: &str, last_block: i32) -> HandledPeer {
+/// hook.  `globals` hands out the peer's id, so the peers of one server
+/// share it.
+fn handled_peer(
+    ctx: &Arc<ServerContext>,
+    globals: &PeerGlobals,
+    addr: &str,
+    last_block: i32,
+) -> HandledPeer {
     let net = ctx.params.net;
     let mut peer = Peer::new_inbound(Config {
         net,
@@ -1502,7 +1519,7 @@ fn handled_peer(ctx: &Arc<ServerContext>, addr: &str, last_block: i32) -> Handle
         ScriptedHandshake(vec![Message::Version(version.clone()), Message::VerAck].into_iter());
     let mut handler =
         ServerPeerHandler::new(Arc::clone(ctx), false, None, false, None, addr.to_string());
-    peer.negotiate_inbound_protocol(&mut handshake, &mut env, &PeerGlobals::new(), None)
+    peer.negotiate_inbound_protocol(&mut handshake, &mut env, globals, None)
         .expect("a current full node is accepted");
     handler
         .on_version(&peer, &version)
@@ -1525,12 +1542,15 @@ fn handled_peer(ctx: &Arc<ServerContext>, addr: &str, last_block: i32) -> Handle
 /// message was decoded into: no step from the dispatch through the sync
 /// manager to the chain's mirror of recent blocks copies it (dcrd hands
 /// one `*dcrutil.Block` from `OnBlock` to `ProcessBlock`, which caches
-/// that pointer, `process.go:571`).
+/// that pointer, `process.go:571`).  That holds for a block that arrives
+/// as a message and for one that arrives hashed from the connection's
+/// reader thread, whose hashes go to the chain with it.
 #[test]
 fn a_delivered_block_reaches_the_chain_without_a_copy() {
     let blocks = battery_prefix(3);
-    let (_dir, ctx) = regnet_server();
-    let mut sync_peer = handled_peer(&ctx, "127.0.0.1:18655", blocks.len() as i32);
+    let (_dir, ctx) = regnet_server(false);
+    let globals = PeerGlobals::new();
+    let mut sync_peer = handled_peer(&ctx, &globals, "127.0.0.1:18655", blocks.len() as i32);
     assert_eq!(
         ctx.sync_manager.lock().expect("manager").sync_peer_id(),
         sync_peer.id
@@ -1548,20 +1568,34 @@ fn a_delivered_block_reaches_the_chain_without_a_copy() {
     let wanted: Vec<Hash> = blocks.iter().map(|b| b.header.block_hash()).collect();
     assert_eq!(sync_peer.take_requested_blocks(), wanted);
 
-    for block in &blocks {
+    for (i, block) in blocks.iter().enumerate() {
         // The message owns the block; where its transaction lists live
         // is all that is kept of it here.
         let delivered = block.clone();
         let regular_at = delivered.transactions.as_ptr();
         let stake_at = delivered.stransactions.as_ptr();
-        assert_eq!(
-            sync_peer.deliver(Message::Block(delivered)),
-            ServeSignal::Continue
-        );
+        let hashed_by_chain = ctx.chain.lock().expect("chain").arrivals_hashed;
+        // The second block arrives as the connection's reader thread
+        // hands one over, with its hashes, and the others as messages.
+        let arrives_hashed = i == 1;
+        let signal = if arrives_hashed {
+            sync_peer.deliver_hashed(dcroxide_blockchain::HashedBlock::new(Arc::new(delivered)))
+        } else {
+            sync_peer.deliver(Message::Block(delivered))
+        };
+        assert_eq!(signal, ServeSignal::Continue);
 
         let chain = ctx.chain.lock().expect("chain");
         let hash = block.header.block_hash();
         assert_eq!(chain.best_snapshot().hash, hash, "the block connected");
+        // A block that arrived with its hashes is not hashed again by
+        // the chain; one that arrived as a message is hashed there, once.
+        assert_eq!(
+            chain.arrivals_hashed.wrapping_sub(hashed_by_chain),
+            u64::from(!arrives_hashed),
+            "block {i}"
+        );
+        assert_eq!(chain.tx_hash_recomputes, 0, "block {i}");
         let mirrored = chain
             .blocks
             .get(&hash.0)
@@ -1578,4 +1612,452 @@ fn a_delivered_block_reaches_the_chain_without_a_copy() {
             "the chain keeps a copy of the block's stake transactions"
         );
     }
+}
+
+/// A block a peer delivers is known to that peer from then on, whether
+/// it arrived as a message or hashed, as a connection's reader thread
+/// hands one over (dcrd `OnBlock`'s `AddKnownInventory`): the node's
+/// answer to that peer's getblocks leaves the block out.  The peer here
+/// announced its blocks in its initial state, which marks nothing, so
+/// the delivery is the only thing that can have marked them.
+#[test]
+fn a_delivered_block_is_known_to_the_peer_that_delivered_it() {
+    let blocks = battery_prefix(4);
+    let hashes: Vec<Hash> = blocks.iter().map(|b| b.header.block_hash()).collect();
+    let (_dir, ctx) = regnet_server(false);
+    let globals = PeerGlobals::new();
+    let mut sync_peer = handled_peer(&ctx, &globals, "127.0.0.1:18655", blocks.len() as i32);
+    let mut other = handled_peer(&ctx, &globals, "127.0.0.1:18656", blocks.len() as i32);
+
+    // The other peer announces the first two blocks in its initial
+    // state and is asked for them; the sync peer is asked for the rest.
+    let init_state = dcroxide_wire::MsgInitState {
+        block_hashes: hashes[..2].to_vec(),
+        vote_hashes: Vec::new(),
+        tspend_hashes: Vec::new(),
+    };
+    assert_eq!(
+        other.deliver(Message::InitState(init_state)),
+        ServeSignal::Continue
+    );
+    assert_eq!(other.take_requested_blocks(), hashes[..2].to_vec());
+    let headers = dcroxide_wire::MsgHeaders {
+        headers: blocks.iter().map(|block| block.header).collect(),
+    };
+    assert_eq!(
+        sync_peer.deliver(Message::Headers(headers)),
+        ServeSignal::Continue
+    );
+    assert_eq!(sync_peer.take_requested_blocks(), hashes[2..].to_vec());
+
+    // The other peer delivers one as a message and one hashed; the sync
+    // peer delivers the rest.
+    assert_eq!(
+        other.deliver(Message::Block(blocks[0].clone())),
+        ServeSignal::Continue
+    );
+    assert_eq!(
+        other.deliver_hashed(dcroxide_blockchain::HashedBlock::new(Arc::new(
+            blocks[1].clone()
+        ))),
+        ServeSignal::Continue
+    );
+    for block in &blocks[2..] {
+        assert_eq!(
+            sync_peer.deliver(Message::Block(block.clone())),
+            ServeSignal::Continue
+        );
+    }
+    assert_eq!(
+        ctx.chain.lock().expect("chain").best_snapshot().hash,
+        hashes[3],
+        "the blocks connected"
+    );
+    let _ = other.take_sent();
+
+    // Asked for the blocks after the genesis block, the node tells the
+    // other peer of the two it did not deliver, and of no other.
+    let request = dcroxide_wire::MsgGetBlocks(locator(ctx.params.genesis_hash));
+    assert_eq!(
+        other.deliver(Message::GetBlocks(request)),
+        ServeSignal::Continue
+    );
+    let told: Vec<Hash> = other
+        .take_sent()
+        .into_iter()
+        .filter_map(|msg| match msg {
+            Message::Inv(inv) => Some(inv.inv_list),
+            _ => None,
+        })
+        .flatten()
+        .map(|inv| inv.hash)
+        .collect();
+    assert_eq!(told, hashes[2..].to_vec());
+}
+
+/// Blocks a served connection reads ahead reach the chain with the
+/// hashes its reader thread computed, and the chain hashes none of them
+/// again: the listener runtime, the server handler, the sync manager and
+/// the chain together.  The first block is read by the input thread and
+/// hashed inside the chain; behind it the connection is read ahead, so
+/// every later block arrives hashed.  With the setting off every block
+/// is read by the input thread and hashed inside the chain, as before.
+#[test]
+fn blocks_read_ahead_over_a_served_connection_are_hashed_once() {
+    let blocks = battery_prefix(12);
+    let tip = blocks.last().expect("blocks").header.block_hash();
+    for read_ahead in [true, false] {
+        let (_dir, ctx) = regnet_server(read_ahead);
+        let net = ctx.params.net;
+        let template = PeerTemplate {
+            net,
+            protocol_version: 0,
+            services: ServiceFlag::NODE_NETWORK,
+            user_agent_name: "dcroxide".to_string(),
+            user_agent_version: "0.1.0".to_string(),
+            idle_timeout: Duration::from_secs(3600),
+            ping_interval: Duration::from_secs(3600),
+            disable_relay_tx: false,
+            proxy: String::new(),
+            newest_block: None,
+        };
+        let runtime = ListenerRuntime::start(
+            &[("tcp4", ":0".to_string())],
+            inbound_peer_handler(
+                template,
+                ConnectedPeers::new(),
+                Some(Arc::clone(&ctx)),
+                None,
+            ),
+        )
+        .expect("start serving runtime");
+        let port = runtime.bound_addrs()[0].port();
+
+        // A full node that has the whole chain connects.
+        let stream = TcpStream::connect(("127.0.0.1", port)).expect("connect to the server");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(20)))
+            .expect("set read timeout");
+        let mut transport = WireTransport::new(stream, MAX_PROTOCOL_VERSION, net);
+        let height = blocks.len() as i64;
+        let config = Config {
+            net,
+            services: ServiceFlag::NODE_NETWORK,
+            protocol_version: 0,
+            newest_block: Some(Box::new(move || Ok((tip, height)))),
+            ..Config::default()
+        };
+        let mut peer = Peer::new_outbound(config, &format!("127.0.0.1:{port}")).expect("outbound");
+        peer.negotiate_outbound_protocol(
+            &mut transport,
+            &mut NodePeerEnv::new(),
+            &PeerGlobals::new(),
+            None,
+        )
+        .expect("negotiate");
+        let read_until = |transport: &mut WireTransport<TcpStream>, command: &str| loop {
+            let msg = transport
+                .read_message()
+                .unwrap_or_else(|e| panic!("waiting for {command}: {e}"));
+            if msg.command() == command {
+                break msg;
+            }
+        };
+
+        // It answers the node's header request, is asked for every
+        // block, and sends them all at once.
+        read_until(&mut transport, "getheaders");
+        transport
+            .write_message(&Message::Headers(dcroxide_wire::MsgHeaders {
+                headers: blocks.iter().map(|block| block.header).collect(),
+            }))
+            .expect("send headers");
+        let mut requested = 0;
+        while requested < blocks.len() {
+            if let Message::GetData(get_data) = read_until(&mut transport, "getdata") {
+                requested += get_data.inv_list.len();
+            }
+        }
+        for block in &blocks {
+            transport
+                .write_message(&Message::Block(block.clone()))
+                .expect("send block");
+        }
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while ctx.chain.lock().expect("chain").best_snapshot().hash != tip {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "read-ahead {read_ahead}: the chain never reached the tip"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        {
+            let chain = ctx.chain.lock().expect("chain");
+            let expected = if read_ahead { 1 } else { blocks.len() as u64 };
+            assert_eq!(
+                chain.arrivals_hashed, expected,
+                "read-ahead {read_ahead}: blocks the chain hashed itself"
+            );
+            assert_eq!(chain.tx_hash_recomputes, 0, "read-ahead {read_ahead}");
+        }
+        drop(transport);
+        runtime.shutdown();
+    }
+}
+
+/// A regnet chain whose tip is fresh: the first two blocks of dcrd's
+/// full block battery and `mined` blocks mined on top of them now, in
+/// height order.  A node that syncs it believes itself current at the
+/// last block, which the battery's own blocks, mined long ago, never
+/// bring about.
+fn fresh_regnet_chain(mined: u32) -> Vec<dcroxide_wire::MsgBlock> {
+    use dcroxide_node::dispatch::{SyncPeers, new_recently_advertised};
+    use dcroxide_rpc::server::RpcCpuMiner;
+
+    let params = dcroxide_chaincfg::regnet_params();
+    let dir = tempfile::tempdir().expect("temp dir");
+    let opts = Options::new(dir.path().join("blocks"), params.net.0);
+    let db = Database::create(&opts).expect("create database");
+    let chain = Arc::new(Mutex::new(
+        Chain::open(db, &params, params.assume_valid, false, 0).expect("open chain"),
+    ));
+    let history = battery_prefix(2);
+    for block in &history {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let (_, errs) = chain
+            .lock()
+            .expect("chain")
+            .process_block(block, now, &params);
+        assert!(errs.is_empty(), "history block must accept: {errs:?}");
+    }
+
+    let tx_pool = dcroxide_node::txmempool::new_shared_tx_pool(
+        Arc::clone(&chain),
+        &params,
+        false,
+        100,
+        10000,
+        false,
+        false,
+    );
+    let sync_manager = Arc::new(Mutex::new(dcroxide_node::sync::new_sync_manager(
+        Arc::clone(&chain),
+        &params,
+        false,
+        8,
+        1000,
+        Arc::clone(&tx_pool),
+        dcroxide_node::mixnode::shared_mix_pool(Arc::clone(&chain), params.clone(), &tx_pool),
+    )));
+    let policy = || dcroxide_mining::MiningPolicy {
+        block_max_size: params.maximum_block_sizes[0] as u32,
+        tx_min_free_fee: 10000,
+        aggressive_mining: true,
+    };
+    let mining_address =
+        dcroxide_txscript::stdaddr::decode_address("RsKrWb7Vny1jnzL1sDLgKTAteh9RZcRr5g6", &params)
+            .expect("mining address");
+    let generator = dcroxide_node::bgtemplate::start_generator(
+        Arc::clone(&chain),
+        Arc::clone(&tx_pool),
+        params.clone(),
+        vec![mining_address],
+        policy(),
+        0,
+        true,
+        dcroxide_node::sync::SyncGate::always_current(),
+        None,
+        None,
+    );
+    let mut handler = dcroxide_node::chainntfns::ChainNtfnHandler::new(
+        None,
+        params.clone(),
+        true,
+        dcroxide_node::sync::SyncGate::always_current(),
+        None,
+        Arc::clone(&tx_pool),
+        SyncPeers::new(),
+        new_recently_advertised(),
+    );
+    handler.set_generator(generator.sink());
+    {
+        let callback = handler.clone();
+        chain
+            .lock()
+            .expect("chain")
+            .set_notification_callback(Box::new(move |n| callback.handle(n)));
+    }
+    sync_manager
+        .lock()
+        .expect("sync manager")
+        .chain_mut()
+        .set_chain_ntfn_handler(handler);
+    let miner = dcroxide_node::cpuminer::NodeCpuMiner::new(
+        generator.current_handle(),
+        generator.subscribers_handle(),
+        generator.sink(),
+        Arc::clone(&chain),
+        Arc::clone(&sync_manager),
+        Arc::clone(&tx_pool),
+        params.clone(),
+        policy(),
+        0,
+        SyncPeers::new(),
+        true,
+    );
+    let hashes = miner.generate_n_blocks(mined).expect("mine the blocks");
+    assert_eq!(hashes.len(), mined as usize);
+    generator.shutdown();
+
+    let chain = chain.lock().expect("chain");
+    let height = chain.best_snapshot().height;
+    assert_eq!(height, i64::from(mined).saturating_add(2));
+    (1..=height)
+        .map(|h| chain.block_by_height(h).expect("a main chain block"))
+        .collect()
+}
+
+/// What the handlers of a sync answered about reading ahead: before any
+/// block, and after each block, by height, with the peer that delivered
+/// it.
+#[derive(Debug, PartialEq)]
+struct ReadAheadAnswers {
+    before_any_block: bool,
+    /// The answer of the peer that is not the sync peer, after the block
+    /// it delivered.
+    other_peer: bool,
+    /// The sync peer's answers after each of its blocks.
+    sync_peer: Vec<bool>,
+    /// Whether the initial chain sync was done after each of the sync
+    /// peer's blocks.
+    sync_done: Vec<bool>,
+}
+
+/// Sync `blocks` into a fresh node from two peers: one announces the
+/// first block in its initial state and delivers it, without being the
+/// sync peer, and the sync peer delivers the rest.
+fn sync_from_two_peers(read_ahead: bool, blocks: &[dcroxide_wire::MsgBlock]) -> ReadAheadAnswers {
+    let (_dir, ctx) = regnet_server(read_ahead);
+    let globals = PeerGlobals::new();
+    let mut sync_peer = handled_peer(&ctx, &globals, "127.0.0.1:18655", blocks.len() as i32);
+    let mut other = handled_peer(&ctx, &globals, "127.0.0.1:18656", blocks.len() as i32);
+    let sync_peer_id = || ctx.sync_manager.lock().expect("manager").sync_peer_id();
+    assert_eq!(sync_peer_id(), sync_peer.id);
+    assert_ne!(other.id, sync_peer.id);
+
+    // The other peer announces the first block in its initial state, so
+    // that block is requested from it and not from the sync peer.
+    let first = blocks[0].header.block_hash();
+    let init_state = dcroxide_wire::MsgInitState {
+        block_hashes: vec![first],
+        vote_hashes: Vec::new(),
+        tspend_hashes: Vec::new(),
+    };
+    assert_eq!(
+        other.deliver(Message::InitState(init_state)),
+        ServeSignal::Continue
+    );
+    assert_eq!(other.take_requested_blocks(), vec![first]);
+
+    // The sync peer's headers complete the header sync, and the node
+    // asks it for every other block.
+    let headers = dcroxide_wire::MsgHeaders {
+        headers: blocks.iter().map(|block| block.header).collect(),
+    };
+    assert_eq!(
+        sync_peer.deliver(Message::Headers(headers)),
+        ServeSignal::Continue
+    );
+    let rest: Vec<Hash> = blocks[1..].iter().map(|b| b.header.block_hash()).collect();
+    assert_eq!(sync_peer.take_requested_blocks(), rest);
+
+    let before_any_block =
+        sync_peer.handler.read_ahead_wanted() || other.handler.read_ahead_wanted();
+
+    assert_eq!(
+        other.deliver(Message::Block(blocks[0].clone())),
+        ServeSignal::Continue
+    );
+    assert_eq!(
+        sync_peer_id(),
+        sync_peer.id,
+        "the sync peer has not changed"
+    );
+    let other_peer = other.handler.read_ahead_wanted();
+
+    let (mut answers, mut sync_done) = (Vec::new(), Vec::new());
+    for (i, block) in blocks[1..].iter().enumerate() {
+        // Every other block arrives hashed, as the reader thread hands
+        // them over once it runs: the answer is worked out the same way.
+        let signal = if i % 2 == 1 {
+            sync_peer.deliver_hashed(dcroxide_blockchain::HashedBlock::new(Arc::new(
+                block.clone(),
+            )))
+        } else {
+            sync_peer.deliver(Message::Block(block.clone()))
+        };
+        assert_eq!(signal, ServeSignal::Continue);
+        assert_eq!(
+            ctx.chain.lock().expect("chain").best_snapshot().hash,
+            block.header.block_hash(),
+            "the block connected"
+        );
+        answers.push(sync_peer.handler.read_ahead_wanted());
+        sync_done.push(
+            ctx.sync_manager
+                .lock()
+                .expect("manager")
+                .initial_chain_sync_done(),
+        );
+    }
+    // Delivering a block never changes the other peer's answer.
+    assert_eq!(other.handler.read_ahead_wanted(), other_peer);
+    ReadAheadAnswers {
+        before_any_block,
+        other_peer,
+        sync_peer: answers,
+        sync_done,
+    }
+}
+
+/// The server wants a connection read ahead of its handler only when the
+/// setting is on, the connection is the sync manager's sync peer and the
+/// initial chain sync is not done: not before the connection has
+/// delivered a block, not from a peer that delivers a block it announced
+/// in its initial state without being the sync peer, and not from the
+/// block that completes the sync on.
+#[test]
+fn read_ahead_is_wanted_only_from_the_sync_peer_during_the_initial_chain_sync() {
+    let blocks = fresh_regnet_chain(4);
+    assert_eq!(blocks.len(), 6);
+
+    let on = sync_from_two_peers(true, &blocks);
+    assert_eq!(
+        on,
+        ReadAheadAnswers {
+            before_any_block: false,
+            other_peer: false,
+            // Wanted behind every block but the last, which is the one
+            // that completes the initial chain sync.
+            sync_peer: vec![true, true, true, true, false],
+            sync_done: vec![false, false, false, false, true],
+        }
+    );
+
+    // With the setting off nothing is ever wanted, and the sync goes the
+    // same way.
+    let off = sync_from_two_peers(false, &blocks);
+    assert_eq!(
+        off,
+        ReadAheadAnswers {
+            before_any_block: false,
+            other_peer: false,
+            sync_peer: vec![false; 5],
+            sync_done: vec![false, false, false, false, true],
+        }
+    );
 }

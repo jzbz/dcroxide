@@ -21,14 +21,44 @@ use dcroxide_wire::{
     PROTOCOL_VERSION, ServiceFlag, TxOut,
 };
 
+/// A chain's own block type: the shared block, and a note of how it
+/// came to be.
+struct Carried {
+    block: Arc<MsgBlock>,
+    /// Whether the manager wrapped the block itself, with `From`.
+    wrapped_by_the_manager: bool,
+}
+
+impl std::ops::Deref for Carried {
+    type Target = MsgBlock;
+
+    fn deref(&self) -> &MsgBlock {
+        &self.block
+    }
+}
+
+impl From<Arc<MsgBlock>> for Carried {
+    fn from(block: Arc<MsgBlock>) -> Carried {
+        Carried {
+            block,
+            wrapped_by_the_manager: true,
+        }
+    }
+}
+
 /// A chain that knows only the zero hash and keeps every block it is
-/// handed, as the allocation it was handed.
+/// handed, as the allocation it was handed, with where the value it
+/// arrived in lives and how that value came to be.
 struct KeepingChain {
     next_blocks: Vec<Hash>,
     kept: Vec<Arc<MsgBlock>>,
+    carried_at: Vec<*const Carried>,
+    wrapped_by_the_manager: Vec<bool>,
 }
 
 impl SyncChain for KeepingChain {
+    type Block = Carried;
+
     fn best_header(&mut self) -> (Hash, i64) {
         (Hash([0x39; 32]), 3)
     }
@@ -67,8 +97,11 @@ impl SyncChain for KeepingChain {
     fn process_block_header(&mut self, _header: &BlockHeader) -> Result<(), ProcessBlockFailure> {
         Ok(())
     }
-    fn process_block(&mut self, block: &Arc<MsgBlock>) -> Result<i64, ProcessBlockFailure> {
-        self.kept.push(Arc::clone(block));
+    fn process_block(&mut self, block: &Carried) -> Result<i64, ProcessBlockFailure> {
+        self.kept.push(Arc::clone(&block.block));
+        self.carried_at.push(std::ptr::from_ref(block));
+        self.wrapped_by_the_manager
+            .push(block.wrapped_by_the_manager);
         Ok(0)
     }
 }
@@ -121,6 +154,8 @@ fn manager(next_blocks: Vec<Hash>) -> Manager {
         chain: KeepingChain {
             next_blocks,
             kept: Vec::new(),
+            carried_at: Vec::new(),
+            wrapped_by_the_manager: Vec::new(),
         },
         tx_mem_pool: EmptyTxPool,
         mix_pool: EmptyMixPool,
@@ -184,8 +219,10 @@ fn request_from_sync_peer(m: &mut Manager, block: &MsgBlock) {
     assert!(requested, "{actions:?}");
 }
 
-/// The chain is handed the allocation the peer's block arrived in, not
-/// a copy of it, and the caller's `Arc` stays usable beside the chain's.
+/// The chain is handed the very value the peer's block arrived in, with
+/// whatever the chain's block type carries, and so the allocation of the
+/// block itself, not a copy of it.  The caller's `Arc` stays usable
+/// beside the chain's.
 #[test]
 fn a_peers_block_reaches_the_chain_as_the_same_allocation() {
     let block = Arc::new(block());
@@ -194,7 +231,11 @@ fn a_peers_block_reaches_the_chain_as_the_same_allocation() {
 
     let regular_at = block.transactions.as_ptr();
     let stake_at = block.stransactions.as_ptr();
-    let actions = m.on_block(7, &block);
+    let carried = Carried {
+        block: Arc::clone(&block),
+        wrapped_by_the_manager: false,
+    };
+    let actions = m.on_block(7, &carried);
     assert!(
         !actions
             .iter()
@@ -202,20 +243,28 @@ fn a_peers_block_reaches_the_chain_as_the_same_allocation() {
         "{actions:?}"
     );
 
-    let kept = &m.chain_mut().kept;
-    assert_eq!(kept.len(), 1, "the chain was handed the block once");
+    let chain = m.chain_mut();
+    assert_eq!(chain.kept.len(), 1, "the chain was handed the block once");
+    assert_eq!(
+        chain.carried_at,
+        vec![std::ptr::from_ref(&carried)],
+        "the chain was handed another value than the one that arrived"
+    );
+    assert_eq!(chain.wrapped_by_the_manager, vec![false]);
     assert!(
-        Arc::ptr_eq(&kept[0], &block),
+        Arc::ptr_eq(&chain.kept[0], &block),
         "the chain was handed a copy of the block"
     );
-    assert_eq!(kept[0].transactions.as_ptr(), regular_at);
-    assert_eq!(kept[0].stransactions.as_ptr(), stake_at);
-    // The caller's and the chain's: the manager kept none.
-    assert_eq!(Arc::strong_count(&block), 2);
+    assert_eq!(chain.kept[0].transactions.as_ptr(), regular_at);
+    assert_eq!(chain.kept[0].stransactions.as_ptr(), stake_at);
+    // The caller's, the one in the value it arrived in and the chain's:
+    // the manager kept none.
+    assert_eq!(Arc::strong_count(&block), 3);
 }
 
-/// A block from a local source is borrowed: the chain is handed a copy
-/// with the same contents, and the caller's block is left alone.
+/// A block from a local source is borrowed: the manager wraps a copy of
+/// it in the chain's block type, with the same contents, and the
+/// caller's block is left alone.
 #[test]
 fn a_local_block_is_wrapped_for_the_chain() {
     let block = block();
@@ -223,6 +272,7 @@ fn a_local_block_is_wrapped_for_the_chain() {
 
     m.process_block(&block).expect("the chain accepts it");
 
+    assert_eq!(m.chain_mut().wrapped_by_the_manager, vec![true]);
     let kept = &m.chain_mut().kept;
     assert_eq!(kept.len(), 1, "the chain was handed the block once");
     assert_eq!(*kept[0], block);

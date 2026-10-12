@@ -35,7 +35,7 @@
 //! thread instead, with no queue: that is for callers that run no index
 //! thread, which today are in-process tests.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -320,6 +320,36 @@ pub struct IndexNotifier {
     unconfirmed: Option<ExistsAddrUnconfirmed>,
 }
 
+/// How long [`IndexNotifier::notify`] has spent waiting for room in a
+/// full queue, in nanoseconds, over the life of the process.
+static NOTIFY_BLOCKED_NANOS: AtomicU64 = AtomicU64::new(0);
+
+/// How long the threads that hand blocks to the index thread, in effect
+/// the block thread, have been held up by its queue being full, in
+/// nanoseconds, over the life of the process.  A figure for the
+/// shutdown line that says how the read-ahead of blocks went
+/// ([`crate::readahead::shutdown_line`]): time spent here is time the
+/// index thread, not the block thread, set the pace.
+pub fn notify_blocked_nanos() -> u64 {
+    NOTIFY_BLOCKED_NANOS.load(Ordering::Relaxed)
+}
+
+/// Send to the index thread's queue as a plain blocking send does,
+/// returning how long the send waited when the queue was full.  The
+/// queue is tried first so that only a wait for room is timed: the usual
+/// send finds room and reads no clock.  A queue whose thread has stopped
+/// drops the message, with or without a wait.
+fn send_timing_a_wait(queue: &SyncSender<IndexMsg>, msg: IndexMsg) -> Option<Duration> {
+    match queue.try_send(msg) {
+        Ok(()) | Err(mpsc::TrySendError::Disconnected(_)) => None,
+        Err(mpsc::TrySendError::Full(msg)) => {
+            let began = Instant::now();
+            let _ = queue.send(msg);
+            Some(began.elapsed())
+        }
+    }
+}
+
 impl IndexNotifier {
     /// Queue a notification for the index thread (dcrd `Notify`).  Blocks
     /// while the queue is full, as dcrd's send does, and drops the
@@ -336,7 +366,10 @@ impl IndexNotifier {
             }
             _ => None,
         };
-        let _ = self.queue.send(IndexMsg::Ntfn(ntfn, copy));
+        if let Some(waited) = send_timing_a_wait(&self.queue, IndexMsg::Ntfn(ntfn, copy)) {
+            let nanos = u64::try_from(waited.as_nanos()).unwrap_or(u64::MAX);
+            NOTIFY_BLOCKED_NANOS.fetch_add(nanos, Ordering::Relaxed);
+        }
     }
 
     /// Wait until the index thread has processed everything queued before
@@ -999,6 +1032,73 @@ mod tests {
         // A send after the stop is dropped without a wait.
         notifier.notify(connect_at(2));
         assert_eq!(query.tip().expect("tip").0, tip);
+    }
+
+    /// A send to the index queue is timed only when it has to wait for
+    /// room, and then for as long as it waits; the wait is what the
+    /// process-wide counter sums.  A queue whose thread has gone is not
+    /// waited for.
+    #[test]
+    fn only_a_wait_for_room_in_the_index_queue_is_timed() {
+        const HELD: Duration = Duration::from_millis(200);
+        let params = dcroxide_chaincfg::simnet_params();
+        let ntfn = || {
+            IndexMsg::Ntfn(
+                IndexNtfn {
+                    ntfn_type: CONNECT_NTFN,
+                    block: Arc::new(params.genesis_block.clone()),
+                    parent: Arc::new(params.genesis_block.clone()),
+                    is_treasury_enabled: false,
+                },
+                None,
+            )
+        };
+
+        // Room: no wait, and nothing timed.
+        let (queue, entries) = mpsc::sync_channel(1);
+        assert_eq!(send_timing_a_wait(&queue, ntfn()), None);
+
+        // Full until the receiver takes an entry a while later.
+        let taker = std::thread::spawn(move || {
+            std::thread::sleep(HELD);
+            let first = entries.recv().is_ok();
+            let second = entries.recv().is_ok();
+            (first, second, entries)
+        });
+        let waited = send_timing_a_wait(&queue, ntfn()).expect("the queue was full");
+        assert!(waited >= HELD / 2, "{waited:?}");
+        let (first, second, entries) = taker.join().expect("taker");
+        assert!(first && second, "both entries arrived");
+
+        // The notifier adds its waits to the process-wide counter.
+        let notifier = IndexNotifier {
+            queue: queue.clone(),
+            unconfirmed: None,
+        };
+        let IndexMsg::Ntfn(fill, _) = ntfn() else {
+            unreachable!("built above");
+        };
+        let IndexMsg::Ntfn(blocked, _) = ntfn() else {
+            unreachable!("built above");
+        };
+        let before = notify_blocked_nanos();
+        notifier.notify(fill);
+        let taker = std::thread::spawn(move || {
+            std::thread::sleep(HELD);
+            let _ = entries.recv();
+            entries
+        });
+        notifier.notify(blocked);
+        let added = notify_blocked_nanos().saturating_sub(before);
+        assert!(
+            added >= u64::try_from((HELD / 2).as_nanos()).expect("fits"),
+            "{added} ns"
+        );
+
+        // A queue whose thread has gone takes nothing and is not waited
+        // for.
+        drop(taker.join().expect("taker"));
+        assert_eq!(send_timing_a_wait(&queue, ntfn()), None);
     }
 
     /// [`IndexThread::shutdown`] joins the thread (see

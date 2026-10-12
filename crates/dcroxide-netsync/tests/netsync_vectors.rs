@@ -109,6 +109,8 @@ impl ChainAdapter {
 }
 
 impl SyncChain for ChainAdapter {
+    type Block = Arc<MsgBlock>;
+
     fn best_header(&mut self) -> (Hash, i64) {
         let Some(best) = self.chain.index.best_header() else {
             return (Hash([0u8; 32]), 0);
@@ -275,6 +277,8 @@ impl SyncMixPool for ScriptedMixPool {
 struct StubChain;
 
 impl SyncChain for StubChain {
+    type Block = Arc<MsgBlock>;
+
     fn best_header(&mut self) -> (Hash, i64) {
         (Hash([0u8; 32]), 0)
     }
@@ -910,6 +914,8 @@ struct ScriptedHeaderChain {
 }
 
 impl SyncChain for ScriptedHeaderChain {
+    type Block = Arc<MsgBlock>;
+
     fn best_header(&mut self) -> (Hash, i64) {
         self.best
     }

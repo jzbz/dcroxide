@@ -779,6 +779,25 @@ impl ServeHooks for InboundHooks {
         }
     }
 
+    fn on_block(
+        &mut self,
+        _peer: &Mutex<Peer>,
+        block: dcroxide_blockchain::HashedBlock,
+        _outbound: &OutboundQueue,
+    ) -> ServeSignal {
+        match self {
+            InboundHooks::Server(handler) => handler.on_block(block),
+            InboundHooks::NoOp => ServeSignal::Continue,
+        }
+    }
+
+    fn read_ahead_wanted(&mut self) -> bool {
+        match self {
+            InboundHooks::Server(handler) => handler.read_ahead_wanted(),
+            InboundHooks::NoOp => false,
+        }
+    }
+
     fn on_disconnected(&mut self, peer: &Mutex<Peer>) {
         if let InboundHooks::Server(handler) = self {
             handler.on_disconnected(peer);

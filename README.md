@@ -315,7 +315,9 @@ work). Currently implemented:
   IPC lifecycle, and the tool binaries (gencerts, addblock,
   promptsecret) — the P2P and RPC decision cores replayed against
   dcrd's real handlers, the runtime pinned by end-to-end socket
-  tests
+  tests; one of its threads has no goroutine in dcrd, the one that
+  reads the sync peer's connection ahead of the block handler during
+  the initial sync (PARITY.md, *Reading ahead of the block handler*)
 - `dcroxide-peer` — the peer-to-peer protocol decision core from
   dcrd's `peer` package: version negotiation with self-connection
   detection and dcrd's exact acceptance rules, local version

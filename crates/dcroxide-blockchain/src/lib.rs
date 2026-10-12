@@ -54,7 +54,7 @@ mod utxoio;
 pub mod utxoview;
 pub mod validate;
 
-pub use blockhashes::BlockTxHashes;
+pub use blockhashes::{BlockTxHashes, HashedBlock};
 pub use compress::CURRENT_COMPRESSION_VERSION;
 pub use error::Error;
 pub use ruleerror::{RuleError, RuleErrorKind, render_multi_error};

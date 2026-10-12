@@ -155,8 +155,10 @@ pub struct ChainNtfnHandler {
 /// mempool maintenance, websocket notify, index notify — clones
 /// pointers to the one block the chain connected, like dcrd passing
 /// the same `*dcrutil.Block` to every observer.  A connected block
-/// comes with the hashes of its transactions as the chain computed
-/// them, which dcrd's observers read from that block's hash cache.
+/// comes with the hashes of its transactions as the chain sent them,
+/// computed from that very block by the chain or, for a block that
+/// arrived with its hashes, before it reached the chain; dcrd's
+/// observers read them from that block's hash cache.
 enum PendingBlockEvent {
     /// A block connected to the main chain.
     Connected {
@@ -999,10 +1001,11 @@ impl ChainNtfnHandler {
         check_tx_flags: AgendaFlags,
         mined_later: &dyn Fn(&Hash) -> bool,
     ) {
-        // The chain hashed every transaction of the block and sent the
-        // hashes with the event: the fee-estimator feed and the
-        // per-transaction pool maintenance below both key on them, and
-        // nothing is hashed again here (dcrd reads them from the
+        // Every transaction of the block was hashed before the event
+        // was sent, by the chain or before the block reached it, and
+        // the hashes came with the event: the fee-estimator feed and
+        // the per-transaction pool maintenance below both key on them,
+        // and nothing is hashed again here (dcrd reads them from the
         // `dcrutil.Block` hash cache).
         tx_hashes.assert_for(block);
         let regular_hashes = tx_hashes.regular();

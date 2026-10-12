@@ -21,7 +21,7 @@
 use std::sync::{Arc, Mutex};
 
 use dcroxide_blockchain::process::{Chain, is_persisted_db_corruption};
-use dcroxide_blockchain::{RuleError, RuleErrorKind, render_multi_error};
+use dcroxide_blockchain::{HashedBlock, RuleError, RuleErrorKind, render_multi_error};
 use dcroxide_chaincfg::Params;
 use dcroxide_chainhash::Hash;
 use dcroxide_netsync::manager::{
@@ -45,6 +45,53 @@ const MAX_RECENTLY_CONFIRMED_TXNS: u32 = 23000;
 /// The false positive rate for the recently-confirmed filter (dcrd
 /// `recentlyConfirmedTxnsFPRate`).
 const RECENTLY_CONFIRMED_TXNS_FP_RATE: f64 = 0.000001;
+
+/// A block a peer delivered, on its way through the sync manager to the
+/// chain (dcrd's `*dcrutil.Block`, handed from `OnBlock` to
+/// `ProcessBlock`).
+///
+/// The block is shared by reference count either way, and the chain
+/// keeps that allocation.  What differs is whether its transactions have
+/// been hashed yet: a block the connection's reader thread read ahead
+/// arrives with its hashes ([`crate::readahead`]), and every other block
+/// arrives without and is hashed inside the chain, where dcrd's
+/// `ProcessBlock` first asks for them.
+pub enum ArrivedBlock {
+    /// The block as it was decoded.
+    Plain(Arc<MsgBlock>),
+    /// The block with the hashes computed from it.
+    Hashed(HashedBlock),
+}
+
+impl ArrivedBlock {
+    /// The block's hash: the one already computed for a hashed block,
+    /// and the header hashed here otherwise.
+    pub fn hash(&self) -> Hash {
+        match self {
+            ArrivedBlock::Plain(block) => block.header.block_hash(),
+            ArrivedBlock::Hashed(hashed) => *hashed.hash(),
+        }
+    }
+}
+
+impl std::ops::Deref for ArrivedBlock {
+    type Target = MsgBlock;
+
+    fn deref(&self) -> &MsgBlock {
+        match self {
+            ArrivedBlock::Plain(block) => block,
+            ArrivedBlock::Hashed(hashed) => hashed.block(),
+        }
+    }
+}
+
+/// A block from a local source, the RPC server or the CPU miner, arrives
+/// without hashes.
+impl From<Arc<MsgBlock>> for ArrivedBlock {
+    fn from(block: Arc<MsgBlock>) -> ArrivedBlock {
+        ArrivedBlock::Plain(block)
+    }
+}
 
 /// The chain adapter handing the manager the shared chain instance
 /// (dcrd passes `s.chain` directly; the mutex stands in for Go's
@@ -86,6 +133,8 @@ fn adjusted_time_unix() -> i64 {
 }
 
 impl SyncChain for NodeSyncChain {
+    type Block = ArrivedBlock;
+
     fn best_header(&mut self) -> (Hash, i64) {
         self.locked().best_header()
     }
@@ -159,14 +208,24 @@ impl SyncChain for NodeSyncChain {
         })
     }
 
-    fn process_block(&mut self, block: &Arc<MsgBlock>) -> Result<i64, ProcessBlockFailure> {
+    fn process_block(&mut self, block: &ArrivedBlock) -> Result<i64, ProcessBlockFailure> {
         // The chain keeps this very allocation in its mirror of recent
         // blocks (dcrd's `ProcessBlock` caching the `*dcrutil.Block` it
         // is handed), so a block is not copied between the peer that
-        // sent it and the chain.
-        let (fork_len, errs) =
-            self.locked()
-                .process_shared_block(block, adjusted_time_unix(), &self.params);
+        // sent it and the chain.  A block that arrived without hashes
+        // goes in without: the chain hashes it at the point it always
+        // has, after its duplicate and header checks.
+        let (fork_len, errs) = {
+            let mut chain = self.locked();
+            match block {
+                ArrivedBlock::Plain(block) => {
+                    chain.process_shared_block(block, adjusted_time_unix(), &self.params)
+                }
+                ArrivedBlock::Hashed(hashed) => {
+                    chain.process_hashed_block(hashed, adjusted_time_unix(), &self.params)
+                }
+            }
+        };
 
         // Run the deferred mempool maintenance and winning-tickets
         // lookups the callback queued, now that the chain mutex is
@@ -774,6 +833,106 @@ mod tests {
                 ),
                 "{bad:?}"
             );
+        }
+    }
+
+    /// A sync chain over a new in-memory regnet chain, the chain it
+    /// wraps, and the first three blocks of dcrd's full block battery
+    /// that extend its tip one after another.
+    fn regnet_sync_chain() -> (NodeSyncChain, Arc<Mutex<Chain>>, Vec<Arc<MsgBlock>>) {
+        let params = dcroxide_chaincfg::regnet_params();
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../dcroxide-blockchain/tests/data/fullblock_vectors.txt"
+        );
+        let data = std::fs::read_to_string(path).expect("fullblock vectors");
+        let mut tip = params.genesis_hash;
+        let mut blocks = Vec::new();
+        for line in data.lines() {
+            let f: Vec<&str> = line.split(' ').collect();
+            // accept <name> <mainchain> <orphan> <blockhex>
+            if f[0] != "accept" || f[2] != "true" {
+                continue;
+            }
+            let (block, _) = MsgBlock::from_bytes(&dcroxide_testutil::unhex(f[4])).expect("block");
+            if block.header.prev_block != tip {
+                continue;
+            }
+            tip = block.header.block_hash();
+            blocks.push(Arc::new(block));
+            if blocks.len() == 3 {
+                break;
+            }
+        }
+        assert_eq!(blocks.len(), 3, "the battery provides the prefix");
+        let chain = Arc::new(Mutex::new(Chain::new(&params, Hash::ZERO, false)));
+        let sync_chain = NodeSyncChain::new(Arc::clone(&chain), params);
+        (sync_chain, chain, blocks)
+    }
+
+    /// A block that arrives without hashes is handed to the chain
+    /// without: the chain hashes it itself, at the point it always has,
+    /// and keeps the allocation that arrived.
+    #[test]
+    fn a_plain_block_is_hashed_inside_the_chain() {
+        let (mut sync_chain, chain, blocks) = regnet_sync_chain();
+        for (i, block) in blocks.iter().enumerate() {
+            let arrived = ArrivedBlock::from(Arc::clone(block));
+            assert!(matches!(arrived, ArrivedBlock::Plain(_)));
+            assert_eq!(arrived.hash(), block.header.block_hash());
+            assert_eq!(*arrived, **block);
+
+            let before = chain.lock().expect("chain").arrivals_hashed;
+            assert_eq!(sync_chain.process_block(&arrived).expect("accepted"), 0);
+            let chain = chain.lock().expect("chain");
+            assert_eq!(
+                chain.arrivals_hashed.wrapping_sub(before),
+                1,
+                "block {i}: the chain did not hash the block itself"
+            );
+            assert_eq!(chain.best_snapshot().hash, block.header.block_hash());
+            assert!(Arc::ptr_eq(
+                &chain.blocks[&block.header.block_hash().0],
+                block
+            ));
+        }
+    }
+
+    /// A block that arrives with its hashes reaches the chain with them:
+    /// the chain hashes nothing, connects the block, and keeps the
+    /// allocation the hashed block owns.
+    #[test]
+    fn a_hashed_block_reaches_the_chain_with_its_hashes() {
+        let (mut sync_chain, chain, blocks) = regnet_sync_chain();
+        for (i, block) in blocks.iter().enumerate() {
+            let arrived = ArrivedBlock::Hashed(HashedBlock::new(Arc::clone(block)));
+            assert_eq!(arrived.hash(), block.header.block_hash());
+            assert_eq!(*arrived, **block);
+
+            let before = chain.lock().expect("chain").arrivals_hashed;
+            assert_eq!(sync_chain.process_block(&arrived).expect("accepted"), 0);
+            let chain = chain.lock().expect("chain");
+            assert_eq!(
+                chain.arrivals_hashed, before,
+                "block {i}: the chain hashed a block that arrived hashed"
+            );
+            assert_eq!(chain.tx_hash_recomputes, 0, "block {i}");
+            assert_eq!(chain.best_snapshot().hash, block.header.block_hash());
+            assert!(Arc::ptr_eq(
+                &chain.blocks[&block.header.block_hash().0],
+                block
+            ));
+        }
+
+        // A duplicate is refused the same way either way.
+        for arrived in [
+            ArrivedBlock::Plain(Arc::clone(&blocks[0])),
+            ArrivedBlock::Hashed(HashedBlock::new(Arc::clone(&blocks[0]))),
+        ] {
+            let failure = sync_chain
+                .process_block(&arrived)
+                .expect_err("the chain has the block");
+            assert!(failure.is_duplicate_block, "{}", failure.message);
         }
     }
 

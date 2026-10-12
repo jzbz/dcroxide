@@ -35,6 +35,8 @@ struct StubChain {
 }
 
 impl SyncChain for StubChain {
+    type Block = Arc<MsgBlock>;
+
     fn best_header(&mut self) -> (Hash, i64) {
         self.best
     }

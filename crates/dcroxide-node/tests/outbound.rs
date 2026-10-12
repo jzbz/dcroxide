@@ -35,6 +35,7 @@ fn genesis_server(dir: &std::path::Path, name: &str) -> (Arc<ServerContext>, Con
         false,
     );
     let server = Arc::new(ServerContext {
+        read_ahead: false,
         external_addr_candidates: std::sync::Mutex::new(Default::default()),
         external_addr_facts: dcroxide_node::server::ExternalAddrFacts {
             listeners: Vec::new(),

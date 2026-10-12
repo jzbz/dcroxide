@@ -137,6 +137,7 @@ fn genesis_server(facts: ExternalAddrFacts) -> (tempfile::TempDir, Arc<ServerCon
         false,
     );
     let server = Arc::new(ServerContext {
+        read_ahead: false,
         external_addr_candidates: Mutex::new(Default::default()),
         external_addr_facts: facts,
         // Unreachable on this path: every candidate address is an IP

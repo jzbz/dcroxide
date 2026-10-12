@@ -27,7 +27,7 @@ use dcroxide_uint256::Uint256;
 use dcroxide_wire::{MsgBlock, MsgTx, OutPoint};
 
 use crate::RuleError;
-use crate::blockhashes::{BlockMerkleLeaves, BlockTxHashes};
+use crate::blockhashes::{BlockMerkleLeaves, BlockTxHashes, HashedBlock};
 use crate::blockindex::{BlockIndex, BlockStatus, NodeId, NodeStore};
 use crate::chainio::SpentTxOut;
 use crate::chainview_nodes::{NodeBranchView, NodeChainView};
@@ -389,20 +389,26 @@ pub struct Chain {
     /// The blocks whose header has recently been definitively proven to
     /// commit to their data (dcrd `recentMerkleChecks`).
     recent_merkle_checks: LruHashSet,
-    /// The transaction hashes of the block `process_block` is
-    /// processing, beside the `blocks` mirror's own `Arc` of that block,
-    /// from the moment its data is accepted until the call returns.  The
-    /// connect that follows in the same call takes them from here -- for
-    /// that very allocation only (`tx_hashes_for` compares the
-    /// pointers), never by block hash.  `process_block` empties it on
-    /// entry and again on every return, so it is empty outside that
-    /// call.
+    /// The transaction hashes of the block a processing call
+    /// (`process_block` or its shared or hashed form) is processing,
+    /// beside the `blocks` mirror's own `Arc` of that block, from the
+    /// moment its data is accepted until the call returns: the hashes
+    /// the call computed from the block, or the ones the block arrived
+    /// with.  The connect that follows in the same call takes them from
+    /// here -- for that very allocation only (`tx_hashes_for` compares
+    /// the pointers), never by block hash.  The processing call empties
+    /// it on entry and again on every return, so it is empty outside
+    /// that call.
     accepted_tx_hashes: Option<(Arc<MsgBlock>, Arc<BlockTxHashes>)>,
     /// How many connects hashed their block's transactions again
     /// because the block was not the one being processed: the other
     /// blocks a reorganization attaches, a block linked by a later
     /// block's data, an invalidate or reconsider.
     pub tx_hash_recomputes: u64,
+    /// How many arriving blocks the chain hashed itself as it processed
+    /// them: every block that passed the header checks and did not
+    /// arrive with its hashes in a [`HashedBlock`].
+    pub arrivals_hashed: u64,
     /// The shutdown interrupt (dcrd `BlockChain.interrupt`, its
     /// context's `Done` channel), set at open from
     /// [`OpenConfig::interrupt`].  The startup UTXO catch-up checks it,
@@ -430,19 +436,22 @@ pub struct Chain {
 }
 
 /// A block on its way into the chain, as the caller of
-/// [`Chain::process_block`] or [`Chain::process_shared_block`] holds it.
+/// [`Chain::process_block`], [`Chain::process_shared_block`] or
+/// [`Chain::process_hashed_block`] holds it.
 ///
 /// dcrd's `ProcessBlock` takes a `*dcrutil.Block` and caches that very
 /// pointer (`process.go:571`).  A caller here either lends the block and
 /// keeps its own, in which case the `blocks` mirror gets a copy, or
 /// shares the allocation, in which case the mirror holds the same one and
-/// nothing is copied.
+/// nothing is copied.  A shared block may arrive with its hashes.
 #[derive(Clone, Copy)]
 enum ArrivingBlock<'a> {
     /// The caller keeps the block.
     Borrowed(&'a MsgBlock),
     /// The caller shares the block by reference count.
     Shared(&'a Arc<MsgBlock>),
+    /// The caller shares the block and has hashed it.
+    Hashed(&'a HashedBlock),
 }
 
 impl<'a> ArrivingBlock<'a> {
@@ -451,6 +460,7 @@ impl<'a> ArrivingBlock<'a> {
         match self {
             ArrivingBlock::Borrowed(block) => block,
             ArrivingBlock::Shared(block) => block,
+            ArrivingBlock::Hashed(hashed) => hashed.block(),
         }
     }
 
@@ -460,6 +470,17 @@ impl<'a> ArrivingBlock<'a> {
         match self {
             ArrivingBlock::Borrowed(block) => Arc::new(block.clone()),
             ArrivingBlock::Shared(block) => Arc::clone(block),
+            ArrivingBlock::Hashed(hashed) => Arc::clone(hashed.block()),
+        }
+    }
+
+    /// The hashes the block arrived with, if it arrived with any.  They
+    /// are read out of the value that owns the block, so they cannot be
+    /// another block's.
+    fn hashed(self) -> Option<&'a HashedBlock> {
+        match self {
+            ArrivingBlock::Borrowed(_) | ArrivingBlock::Shared(_) => None,
+            ArrivingBlock::Hashed(hashed) => Some(hashed),
         }
     }
 }
@@ -812,6 +833,7 @@ impl Chain {
             recent_merkle_checks: LruHashSet::new(MERKLE_CHECK_CACHE_SIZE),
             accepted_tx_hashes: None,
             tx_hash_recomputes: 0,
+            arrivals_hashed: 0,
             interrupt: None,
             cached_tips_last_pruned_nanos: crate::gotime::monotonic_nanos(),
             periodic_clock: crate::gotime::monotonic_nanos,
@@ -3930,9 +3952,9 @@ impl Chain {
                 return Err(interrupt_rule_error());
             }
             let block = self.stored_block_arc(node)?;
-            // This block's transaction hashes: the ones `process_block`
-            // computed when it is the block being processed, fresh ones
-            // for any other.
+            // This block's transaction hashes: the ones the processing
+            // call computed, or the block arrived with, when it is the
+            // block being processed, fresh ones for any other.
             let tx_hashes = self.tx_hashes_for(&block);
             let parent_id = self.store.node(node).parent.expect("attach parent");
             let parent = match prev_block_attached.take().or_else(|| fork_block.take()) {
@@ -4295,9 +4317,10 @@ impl Chain {
         )
     }
 
-    /// [`Self::maybe_accept_block_data`] for [`Self::process_block`] and
-    /// [`Self::process_shared_block`], which hand in the hashes they
-    /// computed from the block.  They are filed beside the `blocks`
+    /// [`Self::maybe_accept_block_data`] for the processing calls
+    /// ([`Self::process_block`] and its shared and hashed forms), which
+    /// hand in the block's hashes: the ones they computed from it, or
+    /// the ones it arrived with.  They are filed beside the `blocks`
     /// mirror's `Arc` of the block, where the connect that follows in
     /// the same call finds them (`tx_hashes_for`).  Without hashes
     /// nothing is filed, and that connect hashes the block itself.
@@ -4495,6 +4518,25 @@ impl Chain {
         self.process_arriving_block(ArrivingBlock::Shared(block), adjusted_time_unix, params)
     }
 
+    /// [`Self::process_shared_block`] for a block that arrives with its
+    /// hashes, made before it reached the chain ([`HashedBlock`]): the
+    /// same checks in the same order and the same results, with the
+    /// block's transactions not hashed again here.
+    ///
+    /// The hashes are consulted exactly where [`Self::process_block`]
+    /// computes them, which is after the duplicate, known-invalid and
+    /// header checks; a block refused by one of those was hashed for
+    /// nothing, and is refused as it would have been.  The block kept in
+    /// the `blocks` mirror is the `Arc` the [`HashedBlock`] owns.
+    pub fn process_hashed_block(
+        &mut self,
+        block: &HashedBlock,
+        adjusted_time_unix: i64,
+        params: &Params,
+    ) -> (i64, Vec<RuleError>) {
+        self.process_arriving_block(ArrivingBlock::Hashed(block), adjusted_time_unix, params)
+    }
+
     /// [`Self::process_block_inner`], wrapped so that the transaction
     /// hashes filed for the block while it is processed are dropped on
     /// every return.
@@ -4512,8 +4554,8 @@ impl Chain {
         result
     }
 
-    /// The body of [`Self::process_block`] and
-    /// [`Self::process_shared_block`].
+    /// The body of [`Self::process_block`], [`Self::process_shared_block`]
+    /// and [`Self::process_hashed_block`].
     fn process_block_inner(
         &mut self,
         arriving: ArrivingBlock<'_>,
@@ -4572,12 +4614,23 @@ impl Chain {
         // connected-block event carries them to the daemon (dcrd hashes
         // each transaction once in `dcrutil.NewTx` and again in
         // `TxHashFull`).  They belong to this block instance: computed
-        // from `block` and only ever used with it.
-        let (tx_hashes, merkle_leaves) = BlockTxHashes::compute_with_merkle_leaves(block);
-        let tx_hashes = Arc::new(tx_hashes);
+        // from `block` and only ever used with it.  A block that arrived
+        // with its hashes brings them in the value that owns it, and
+        // this is the first point at which they are read: the checks
+        // above did not depend on them.
+        let computed_leaves;
+        let (tx_hashes, merkle_leaves) = match arriving.hashed() {
+            Some(hashed) => (Arc::clone(hashed.tx_hashes()), hashed.merkle_leaves()),
+            None => {
+                let (tx_hashes, leaves) = BlockTxHashes::compute_with_merkle_leaves(block);
+                self.arrivals_hashed = self.arrivals_hashed.wrapping_add(1);
+                computed_leaves = leaves;
+                (Arc::new(tx_hashes), &computed_leaves)
+            }
+        };
         let data_commit_proven = match self.check_block_data_preconditions_with_leaves(
             block,
-            &merkle_leaves,
+            merkle_leaves,
             parent,
             params,
         ) {
@@ -5495,7 +5548,8 @@ impl Chain {
     }
 
     /// The transaction hashes of a block about to be connected: the
-    /// ones `process_block` computed when `block` is the very allocation
+    /// ones the processing call filed, which it computed from the block
+    /// or the block arrived with, when `block` is the very allocation
     /// they were filed with (the pointers are compared, never the block
     /// hashes), and freshly computed ones for any other block, counted
     /// in [`Chain::tx_hash_recomputes`].
@@ -9642,6 +9696,166 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The battery's blocks that extend the tip one after another, with
+    /// the current time the battery is replayed at.
+    fn tip_extensions(limit: usize) -> (i64, Vec<MsgBlock>) {
+        let params = dcroxide_chaincfg::regnet_params();
+        let (mut now, mut tip, mut blocks) = (0, params.genesis_hash, Vec::new());
+        for line in include_str!("../tests/data/fullblock_vectors.txt").lines() {
+            let f: Vec<&str> = line.split(' ').collect();
+            match f[0] {
+                "now" => now = f[1].parse().expect("now"),
+                "accept" if f[2] == "true" => {
+                    let (block, _) =
+                        MsgBlock::from_bytes(&dcroxide_testutil::unhex(f[4])).expect("block");
+                    if block.header.prev_block != tip {
+                        break;
+                    }
+                    tip = block.header.block_hash();
+                    blocks.push(block);
+                    if blocks.len() == limit {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(
+            blocks.len(),
+            limit,
+            "the battery extends the tip often enough"
+        );
+        (now, blocks)
+    }
+
+    /// A block that arrives with its hashes is not hashed again by the
+    /// processing call, with and without full validation: the chain
+    /// reads the hashes and the merkle leaves it was handed, keeps the
+    /// block they came with, and the connect that follows takes the
+    /// hashes from the slot.  A block that arrives without is hashed
+    /// once, by the chain.
+    #[test]
+    fn a_hashed_block_is_processed_without_hashing_it_again() {
+        let params = dcroxide_chaincfg::regnet_params();
+        let (now, blocks) = tip_extensions(30);
+        for bulk_import in [false, true] {
+            let mut chain = Chain::new(&params, Hash::ZERO, false);
+            chain.bulk_import_mode = bulk_import;
+            // A twin that is handed every block without hashes, for how
+            // often a processing call builds merkle leaves in a pass of
+            // their own.  The contextual merkle check does when the
+            // positional one could not prove the commitment, whatever
+            // the block arrived with.
+            let mut twin = Chain::new(&params, Hash::ZERO, false);
+            twin.bulk_import_mode = bulk_import;
+            for (i, block) in blocks.iter().enumerate() {
+                let leaves_before = crate::blockhashes::LEAVES_HASHED.get();
+                let (_, errs) = twin.process_block(block, now, &params);
+                assert!(errs.is_empty(), "block {i} on the twin: {errs:?}");
+                let leaves_of_a_plain_block = crate::blockhashes::LEAVES_HASHED
+                    .get()
+                    .wrapping_sub(leaves_before);
+
+                let shared = Arc::new(block.clone());
+                // Every other block arrives hashed.
+                let hashed = (i % 2 == 0).then(|| HashedBlock::new(Arc::clone(&shared)));
+
+                let hashed_before = crate::blockhashes::BLOCKS_HASHED.get();
+                let leaves_before = crate::blockhashes::LEAVES_HASHED.get();
+                let arrivals_before = chain.arrivals_hashed;
+                let recomputes_before = chain.tx_hash_recomputes;
+                let (fork_len, errs) = match &hashed {
+                    Some(hashed) => chain.process_hashed_block(hashed, now, &params),
+                    None => chain.process_shared_block(&shared, now, &params),
+                };
+                assert!(errs.is_empty(), "block {i}: {errs:?}");
+                assert_eq!(fork_len, 0, "block {i}");
+                let tip = chain.best_chain.tip().expect("tip");
+                assert_eq!(chain.store.node(tip).hash, block.header.block_hash());
+
+                let hashed_here = crate::blockhashes::BLOCKS_HASHED
+                    .get()
+                    .wrapping_sub(hashed_before);
+                let arrivals = chain.arrivals_hashed.wrapping_sub(arrivals_before);
+                let expected = u64::from(hashed.is_none());
+                assert_eq!(
+                    (hashed_here, arrivals),
+                    (expected, expected),
+                    "block {i} (bulk import: {bulk_import})"
+                );
+                assert_eq!(chain.tx_hash_recomputes, recomputes_before, "block {i}");
+                // The leaves a block arrived with are the ones the
+                // processing call uses: it builds leaves in a pass of
+                // their own no more often than for a block it hashed
+                // itself.
+                assert_eq!(
+                    crate::blockhashes::LEAVES_HASHED
+                        .get()
+                        .wrapping_sub(leaves_before),
+                    leaves_of_a_plain_block,
+                    "block {i} (bulk import: {bulk_import}): the merkle leaves were built again"
+                );
+                // The mirror holds the allocation that arrived.
+                assert!(
+                    Arc::ptr_eq(&chain.blocks[&block.header.block_hash().0], &shared),
+                    "block {i}"
+                );
+                assert!(chain.accepted_tx_hashes.is_none(), "block {i}");
+            }
+        }
+    }
+
+    /// A block the chain already has is refused as a duplicate before
+    /// the hashes it arrived with are looked at.  The block here has an
+    /// accepted block's header, hence its hash, over other transactions:
+    /// were the hashes read first, the merkle check would refuse it for
+    /// its merkle root instead.  It is refused the same way through
+    /// every entry.
+    #[test]
+    fn a_duplicate_block_is_refused_before_its_hashes_are_read() {
+        let params = dcroxide_chaincfg::regnet_params();
+        let (now, blocks) = tip_extensions(3);
+        let mut chain = Chain::new(&params, Hash::ZERO, false);
+        for block in &blocks {
+            let (_, errs) = chain.process_block(block, now, &params);
+            assert!(errs.is_empty(), "{errs:?}");
+        }
+
+        let mut altered = blocks[1].clone();
+        altered.transactions[0].lock_time ^= 1;
+        assert_eq!(altered.header.block_hash(), blocks[1].header.block_hash());
+        let hash = altered.header.block_hash();
+        let shared = Arc::new(altered.clone());
+        let hashed = HashedBlock::new(Arc::clone(&shared));
+        // Its merkle root is wrong, so the checks that read the hashes
+        // would refuse it for that.
+        let wrong_root = crate::validate::check_merkle_roots_with_leaves(
+            &altered,
+            hashed.merkle_leaves(),
+            crate::validate::MerkleRootVariant::Original,
+        )
+        .expect_err("the altered block does not match its header");
+        assert_eq!(wrong_root.kind, RuleErrorKind::BadMerkleRoot);
+
+        let arrivals_before = chain.arrivals_hashed;
+        let results = [
+            chain.process_block(&altered, now, &params),
+            chain.process_shared_block(&shared, now, &params),
+            chain.process_hashed_block(&hashed, now, &params),
+        ];
+        for (fork_len, errs) in results {
+            assert_eq!(fork_len, 0);
+            assert_eq!(errs.len(), 1, "{errs:?}");
+            assert_eq!(errs[0].kind, RuleErrorKind::DuplicateBlock);
+            assert_eq!(errs[0].description, format!("already have block {hash}"));
+        }
+        // Nothing was hashed for it, and the chain kept the block it
+        // had, not this one.
+        assert_eq!(chain.arrivals_hashed, arrivals_before);
+        assert!(!Arc::ptr_eq(&chain.blocks[&hash.0], &shared));
+        assert_eq!(*chain.blocks[&hash.0], blocks[1]);
     }
 
     /// The hashes filed while a block is processed do not outlive the

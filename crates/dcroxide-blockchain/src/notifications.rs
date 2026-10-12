@@ -45,9 +45,11 @@ pub struct BlockAcceptedNtfnsData<'a> {
 /// `*dcrutil.Block`'s hash cache.  They are private to the crate, so
 /// outside it an event is only built by
 /// [`BlockConnectedNtfnsData::new`], which hashes the block it is
-/// given, and the chain sends the ones it computed from the very block
-/// it connected.  `block` stays a public field: replacing it on an
-/// event already built would leave these behind, and nothing does.
+/// given, and the chain sends the ones computed from the very block it
+/// connected: by its own processing call, or before the block reached
+/// it when the block arrived with its hashes.  `block` stays a public
+/// field: replacing it on an event already built would leave these
+/// behind, and nothing does.
 pub struct BlockConnectedNtfnsData {
     /// The connected block.
     pub block: Arc<MsgBlock>,

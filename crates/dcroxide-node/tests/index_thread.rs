@@ -451,7 +451,7 @@ impl Node {
     /// then the handler's drain.
     fn connect(&mut self, block: &MsgBlock) {
         self.sync_chain
-            .process_block(&Arc::new(block.clone()))
+            .process_block(&Arc::new(block.clone()).into())
             .expect("live block");
     }
 
