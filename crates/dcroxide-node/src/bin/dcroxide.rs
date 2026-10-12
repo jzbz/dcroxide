@@ -1701,17 +1701,20 @@ fn build_server(
         dcroxide_node::mixnode::shared_mix_pool(Arc::clone(&chain), params.clone(), &tx_pool);
     // The sync manager shares the chain with the message handlers
     // (dcrd `newServer` building its `netsync.Config`).
-    let sync_manager = Arc::new(Mutex::new(dcroxide_node::sync::new_sync_manager(
-        Arc::clone(&chain),
+    let sync_manager = Arc::new(Mutex::new(with_block_window_setting(
+        dcroxide_node::sync::new_sync_manager(
+            Arc::clone(&chain),
+            params,
+            cfg.no_mining_state_sync,
+            // dcrd's OTHER outbound target -- signed comparison, widened
+            // afterwards (`server.go:4132-4142`).  Deliberately not the same
+            // computation as the server's; see QK-0014.
+            dcroxide_node::netsync_max_outbound_peers(cfg.max_peers),
+            cfg.max_orphan_txs as usize,
+            Arc::clone(&tx_pool),
+            Arc::clone(&mix_pool),
+        ),
         params,
-        cfg.no_mining_state_sync,
-        // dcrd's OTHER outbound target -- signed comparison, widened
-        // afterwards (`server.go:4132-4142`).  Deliberately not the same
-        // computation as the server's; see QK-0014.
-        dcroxide_node::netsync_max_outbound_peers(cfg.max_peers),
-        cfg.max_orphan_txs as usize,
-        Arc::clone(&tx_pool),
-        Arc::clone(&mix_pool),
     )));
     // The daemon-wide state the served peers' message handlers consult
     // (dcrd `newServer` deriving `minKnownWork` from the params).
@@ -1872,6 +1875,58 @@ fn db_cache_bytes() -> usize {
             dcroxide_database::DEFAULT_DB_CACHE_BYTES
         }
     }
+}
+
+/// The sync manager with the block download window `DCROXIDE_BLOCK_WINDOW`
+/// names, logging what the variable did.
+///
+/// Unset, the manager keeps the window it was built with: the budgeted
+/// one, which requests blocks from the sync peer by the bytes their
+/// headers promise instead of dcrd's fixed 16 (PARITY *Block download
+/// window*).  `dcrd` puts dcrd's window back, exactly.  A whole number
+/// from 16 to 505 keeps the budget and changes the most blocks it
+/// requests, for measurement.
+///
+/// The budgeted window loses its sync peer where dcrd's would not in two
+/// cases, and halves itself each time, down to dcrd's 16 blocks, saying
+/// so in a `SYNC` line (`Block download window narrowed to ...`).  One
+/// is a link, a sync peer or a host too slow to take a whole window
+/// inside the 30-second stall deadline: the peer is dropped as stalled
+/// while it is still delivering blocks.  The other is a pause of 20
+/// seconds or more in reading the sync peer's socket, a long cache flush
+/// for one, while more is requested than the socket buffers hold: a peer
+/// that bounds its writes (dcrd since `62fd529a`, and this port) hangs
+/// up, and neither end logs a stall.  The sync manager is not told why a
+/// peer left, so a sync peer that leaves for any other reason with more
+/// than 16 blocks requested from it halves the window as well.  A
+/// narrowed window is widened again after enough blocks from one sync
+/// peer, so a node in either case keeps losing a sync peer now and then;
+/// `dcrd` is the setting that stops that.  The width in force is held in
+/// memory: the line logged here names the full width, only the `SYNC`
+/// lines report a change, and a restart begins at the full width.
+///
+/// An environment variable for `DCROXIDE_DB_CACHE`'s reason: dcrd has no
+/// counterpart, and the generated `-h` output is pinned byte-for-byte
+/// against dcrd's.  A value that is neither is ignored with a warning,
+/// like the other tuning variables, and so is one that is not valid
+/// Unicode, which reads as a value nothing accepts rather than as unset.
+///
+/// The line comes from `apply_block_window_setting`, which builds it
+/// from the window the manager reports after the change.
+fn with_block_window_setting(
+    manager: dcroxide_node::sync::NodeSyncManager,
+    params: &dcroxide_chaincfg::Params,
+) -> dcroxide_node::sync::NodeSyncManager {
+    let setting = std::env::var_os(dcroxide_node::sync::BLOCK_WINDOW_VAR)
+        .map(|value| value.to_string_lossy().into_owned());
+    let (manager, notice) =
+        dcroxide_node::sync::apply_block_window_setting(manager, setting.as_deref(), params);
+    match notice {
+        Some((dcroxide_netsync::LogLevel::Info, line)) => log_info(&line),
+        Some((_, line)) => log_warn(&line),
+        None => {}
+    }
+    manager
 }
 
 /// A positive whole number from `var`, or `None` when it is unset,

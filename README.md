@@ -295,7 +295,10 @@ work). Currently implemented:
   header-first sync, block download scheduling, announcement
   tracking, and the rejected/recently-confirmed filters, pinned by a
   scripted 87-step session against a real dcrd sync manager, chain,
-  peers, and pools, replayed over the real Rust chain engine
+  peers, and pools, replayed over the real Rust chain engine; beside
+  dcrd's block download window it holds the wider one the daemon uses
+  by default, which dcrd does not have (PARITY.md, *Block download
+  window*)
 - `dcroxide-node` — the daemon itself from dcrd's package main, as OS
   threads over channels rather than goroutines: the full configuration
   layer (every option with dcrd's defaults, the go-flags command line,
@@ -521,9 +524,11 @@ What these figures do not say:
   profiled, and dcroxide only on 2026-10-11, in one sync of the code
   before the six changes above (user-space time only). What dcrd's time
   goes on has not been taken apart.
-- **It is loopback, and a delayed link takes most of the lead away.**
-  Both daemons request blocks through dcrd's window of 16 in flight,
-  refilled once fewer than 10 remain. Through a relay that delays every
+- **It is loopback, and what a delayed link costs depends on the
+  download window.** dcrd requests blocks through a window of 16 in
+  flight, refilled once fewer than 10 remain. So did dcroxide through
+  the runs of 2026-10-11, and so it does when started with
+  `DCROXIDE_BLOCK_WINDOW=dcrd`. Through a relay that delays every
   chunk, at a 50 ms round trip dcroxide synced the early chain at
   260 blk/s and dcrd at 252, about 13 blocks per round trip each, where
   over loopback they pass those blocks at about 3,200 and 1,500 blk/s.
@@ -533,9 +538,41 @@ What these figures do not say:
   faster than that throughout, as dcroxide does over loopback; dcrd runs
   the blocks after the assume-valid block at about 104 blk/s, so by the
   same arithmetic it would take at least about 80. Both are worked out
-  and were not run. A real link adds loss and a bandwidth limit that the
-  relay does not; [docs/operating.md](docs/operating.md) has the
-  budget.
+  for dcrd's window and were not run.
+  By default dcroxide now uses a window of its own, measured only in
+  short runs. It keeps up to 128 blocks requested from its sync peer,
+  and beyond the first 16 no more than 3,145,728 bytes of them by the
+  sizes in their headers, and it halves both limits, down to dcrd's 16
+  blocks, each time a sync peer leaves with more than 16 requested
+  ([PARITY.md](PARITY.md), *Block download window*). On 2026-10-12, on
+  m3, one binary was run through the same relay for 300 s per arm,
+  header sync included, on a quiet machine with the node on four cores,
+  once with `DCROXIDE_BLOCK_WINDOW=dcrd` and once at the default: at a
+  50 ms round trip it reached block 68,031 under dcrd's rule and block
+  532,079 under the default, and at 150 ms blocks 18,445 and 158,440.
+  No arm logged a narrowed or widened window or a stalled peer. The
+  relay delays and does not limit bandwidth. The same day five
+  outbound-only starts of 300 s were made against the public main
+  network, on a machine that was not quiet and with the peers and links
+  the network offered: under dcrd's rule the node reached block 24,455
+  180.7 s after its first block arrived and block 41,191 after 220.3 s,
+  and under the default block 188,469 after 215.7 s and block 93,095
+  after 161.8 s. A third start under the default fetched no block, its
+  header sync being about 68% done when the 300 s ended. None logged a
+  narrowing, a stalled peer or a ban. Over loopback, on a quiet
+  machine, one sync to block 1,116,035 took 612.4 s with the window and
+  607.7 s with the code before it (`3a367e5`), one run each that day:
+  0.8% more, and one run each does not settle whether the window costs
+  anything over loopback. Both are of code later than
+  the tables above. Not measured: a whole sync over a delayed or a real
+  link, and the two cases in which the wider window can cost sync
+  peers. No sync was run over a link held to a set rate or with a
+  reader made to stop for 20 s or more: the public-network starts ran
+  over whatever links their peers had, at rates that were not recorded,
+  and the longest flush of the loopback sync took 3.5 s. A real link
+  adds loss and a bandwidth limit that the relay does not;
+  [docs/operating.md](docs/operating.md) has the budget and the setting
+  that puts dcrd's window back.
 - **It is one machine with fast storage.** On m2 in the ledger, a
   container on a ZFS
   mirror of QLC drives with the node on four cores, dcroxide with the
@@ -559,8 +596,9 @@ and that payload comparison has not been repeated.
 layout.
 
 Earlier measurements are kept in the
-[bench ledger](docs/bench-ledger.md), which records every figure per
-machine, commit and corpus, with the storage analysis behind them in
+[bench ledger](docs/bench-ledger.md), which records every figure
+through 2026-10-11 per machine, commit and corpus, with the storage
+analysis behind them in
 [ADR-0004](docs/adr/0004-storage-backend.md) and
 [ADR-0009](docs/adr/0009-storage-shape.md). The 2026-07 and 2026-08
 figures there were taken against dcrd 2.2.0-pre on m1, before the
@@ -568,7 +606,8 @@ height-first block keys
 ([ADR-0010](docs/adr/0010-height-first-block-keys.md)) and the
 exists-address layout, so they are not earlier points on the same curve
 as the headline figures above. The 2026-10 rows on m2 measure those two
-changes, on slower storage and four cores.
+changes, on slower storage and four cores. The runs of 2026-10-12 cited
+above are recorded in [PARITY.md](PARITY.md), *Block download window*.
 
 ## Layout
 

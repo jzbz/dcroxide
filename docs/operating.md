@@ -238,11 +238,14 @@ by 1.5% and dcrd by 2.6%. That is one run each, but if your host is
 busy with other work, expect the sync to stretch.
 
 All of these come from syncing over loopback from a local server, and
-none has been measured over the internet. There, both daemons request
-blocks the same way: through dcrd's window of at most 16 blocks in
-flight, refilled once fewer than 10 remain, from the sync peer only. By
-that window arithmetic, once the round trip to the sync peer exceeds
-about nine blocks' processing time, the sync should wait on the network
+no whole sync has been measured over the internet. There, dcrd requests
+blocks through a window of at most 16 blocks in flight, refilled once
+fewer than 10 remain, from the sync peer only. dcroxide did the same
+through the runs of 2026-10-11 and does when started with
+`DCROXIDE_BLOCK_WINDOW=dcrd`; its default is now a wider window of its
+own, in the next paragraph. By the arithmetic of dcrd's window, once
+the round trip to the sync peer exceeds about nine blocks' processing
+time, the sync should wait on the network
 at about 9-16 blocks per round trip. That was measured on 2026-10-11
 through a relay on the same machine that delays every chunk: over the
 early chain dcroxide synced at 12.2, 13.0 and 13.6 blocks per round
@@ -255,23 +258,96 @@ every 10 s). At 13 blocks per round trip the whole
 chain would take dcroxide about 72 minutes at 50 ms and either daemon
 3.6 hours at 150 ms; at 50 ms dcrd would take at least about 80
 minutes, since it runs the blocks after the assume-valid block at about
-104 blocks/s over loopback. These are worked out and were not run, and
+104 blocks/s over loopback. These are worked out for dcrd's window and
+were not run, and
 assume one peer, no loss and no bandwidth limit. The rest of this paragraph is the same
 arithmetic applied to the rates measured at `c128a93`, and is not a
 measurement. On m3 a block took dcroxide 0.95 ms averaged over the chain and
-2.2 ms after the assume-valid block, and dcrd 2.6 ms and 9.6 ms. So the
+2.2 ms after the assume-valid block, and dcrd 2.6 ms and 9.6 ms. So
+under dcrd's window the
 network should pace dcroxide's average block once the round trip passes
 about 9 ms and dcrd's past about 23 ms, and the cheap early blocks
 sooner. Only past about 87 ms would it also pace dcrd through the fully
 validated blocks after the assume-valid block, where about 20 ms
-already paces dcroxide, so the lead over dcrd should narrow toward 1x
+already paces dcroxide, so with both daemons on that window the lead
+over dcrd should narrow toward 1x
 as latency grows toward that. Bandwidth binds too: the
 measured 17.6 minutes carried 19.2 GB of blocks, a mean of 145 Mbit/s,
 and the 12.1 minutes of 2026-10-11 a mean of 211 Mbit/s.
 Budget from your link's latency and bandwidth as well as from these
-figures; the delayed-link runs are in
-[bench-ledger.md](bench-ledger.md), and no sync over the internet has
-been measured.
+figures; the delayed-link runs of 2026-10-11 are in
+[bench-ledger.md](bench-ledger.md), and no whole sync over the internet
+has been measured.
+
+By default dcroxide now requests blocks through a window of its own
+([PARITY.md](../PARITY.md), *Block download window*): up to 128 blocks
+requested from the sync peer and, beyond the first 16, no more than
+3,145,728 bytes of them by the sizes in their headers. It was measured
+on m3 on 2026-10-12 in short runs only, one binary and one run per arm.
+Through the same relay for 300 s from the start of the process, on a
+quiet machine with the node on four cores, the node reached block
+68,031 with `DCROXIDE_BLOCK_WINDOW=dcrd` and block 532,079 at the
+default at a 50 ms round trip, and blocks 18,445 and 158,440 at 150 ms.
+No arm logged a narrowed or widened window or a stalled peer. The relay
+delays and does not limit bandwidth. In five outbound-only starts of
+300 s against the public main network, on a machine that was not quiet
+and with the peers and links the network offered, the node under dcrd's
+rule reached block 24,455 180.7 s after its first block arrived and
+block 41,191 after 220.3 s, and under the default block 188,469 after
+215.7 s and block 93,095 after 161.8 s; a third start under the default
+fetched no block, its header sync being about 68% done when the 300 s
+ended. None logged a narrowing, a stalled peer or a ban. Over loopback,
+on a quiet machine, one sync to block 1,116,035 took 612.4 s with the
+window and 607.7 s with the code before it (`3a367e5`), one run each,
+0.8% more, and one run each does not settle whether the window costs
+anything over loopback; both are of later code than the 12.1 minutes
+above. No whole sync has been run through
+the default window over a delayed or a real link, so there is no sync
+time to budget from for it, and the 72 minutes and 3.6 hours above are
+not its figures.
+
+The wider window can cost a node its sync peer where dcrd's would not,
+in two cases. Neither has been measured; both are read from the code. A
+requested block has to be read within 30 to 45 s of being asked for, so
+a path that carries less than about 70 to 105 kB/s, which is 0.56 to
+0.84 Mbit/s (the sync peer's uplink counts as much as your own link),
+or a host that processes fewer than three or four blocks a second, has
+its sync peer dropped as stalled while the peer is still delivering.
+And a peer that bounds its writes (dcrd since its commit `62fd529a`,
+and this port) hangs up on a node that does not read its socket for
+more than about 20 s, through a long flush for one, while more of the
+window is unsent than the socket buffers hold; neither end logs a stall
+then. The node is not told why a peer left. Each time its sync peer
+leaves with more than 16 blocks requested from it, for whatever reason,
+it halves the window, 128 to 64 to 32 to dcrd's 16, and logs the first
+of these lines under `SYNC`. Once one sync peer has since delivered
+enough blocks (2,048 after the first narrowing, 4,096 once two are
+counted, and so on) it undoes one halving and logs the second. dcrd
+logs neither.
+
+```text
+Block download window narrowed to at most N blocks in flight: the sync peer left with M requested
+Block download window widened to at most N blocks in flight after K blocks from the sync peer
+```
+
+The width in force is kept in memory only. A narrowed window is widened
+only by blocks its sync peer delivers, and once the node has caught up
+those are only the new blocks that peer is the first to announce. On
+the main network, at 288 blocks a day, the 2,048 that undo the first
+halving of the default window are at least 7.1 days of them, so a node
+that has caught up keeps the width its sync ended with for a week or
+more. A restart puts it back at the full width.
+
+Set `DCROXIDE_BLOCK_WINDOW=dcrd` and restart the node if its log shows
+any of these during a sync: the narrowed line again and again; `Peer P
+appears to be stalled or misbehaving` lines for sync peers that were
+still delivering blocks; or the sync peer leaving around a long pause
+in the node's own progress, a long flush for one, with no stalled line
+before the narrowed one. The runs above logged no narrowed line and no
+stalled peer. With that setting the node requests blocks by dcrd's rule
+exactly, never narrows or widens the window, and logs `Block download
+window set to dcrd's 16 blocks in flight by DCROXIDE_BLOCK_WINDOW` at
+startup.
 
 The disk difference is all in the metadata store. Block files make up
 17.88 GiB of each data directory at block 1,116,035, and the rest is
@@ -660,16 +736,19 @@ configuration, every name changes.
 | metadata overlay flush interval | `DCROXIDE_DB_FLUSH_SECS` (s, default 300) | — |
 | metadata flush log (JSONL path) | `DCROXIDE_DB_FLUSHLOG` (unset = off) | — |
 | exists-address memtable target (developer-only) | `DCROXIDE_EXISTSADDR_MEMTABLE_KEYS` (keys, default 2,000,000) | — |
+| block download window | `DCROXIDE_BLOCK_WINDOW` (`dcrd`, or a whole number of blocks from 16 to 505; default this port's own window, at most 128 blocks and 3,145,728 bytes) | — |
 
 The chain itself lives under the home directory, not at it: `--datadir`
 defaults to `<home>/data` with the network appended, so on Linux the
 blocks are in `~/.dcroxide/data/mainnet` while `dcroxide.conf`,
 `rpc.cert` and `rpc.key` sit in `~/.dcroxide` itself.
 
-Those seven are the only `DCROXIDE_*` variables read; only the first
+Those eight are the only `DCROXIDE_*` variables read; only the first
 two have dcrd counterparts, since the page cache, the overlay and the
-flush log are properties of redb, which dcrd does not use, and the
-memtable is a property of this port's exists-address layout. Of the four
+flush log are properties of redb, which dcrd does not use, the
+memtable is a property of this port's exists-address layout, and the
+download window is this port's own rule for requesting blocks
+([PARITY.md](../PARITY.md), *Block download window*). Of the four
 storage variables, `DCROXIDE_DB_CACHE` is the one to leave unset, the
 next two are untuned instruments — see the storage tuning above — and
 `DCROXIDE_DB_FLUSHLOG` is diagnostic: it appends one JSON object per
@@ -689,7 +768,19 @@ for measurements only: it sets how many keys the exists-address index
 holds in memory before its flushes merge them into its sorted runs (the
 hard bound is one and a half times it), trading the index's memory, 21
 bytes a key, against the pages its flushes write. It never changes an
-answer; leave it unset. A malformed or zero value in any of the tuning variables warns and
+answer; leave it unset. `DCROXIDE_BLOCK_WINDOW` is read once at startup
+and is the way back to dcrd's download window; the sync budget above
+says when to use it. `dcrd`, in any letter case, selects dcrd's window
+exactly. A whole number from 16 to 505 keeps the default's byte budget
+and sets the most blocks it requests, for measurement; 16 is not dcrd's
+rule. A set value is logged at startup, as `Block download window set
+to dcrd's 16 blocks in flight by DCROXIDE_BLOCK_WINDOW` or `Block
+download window set to at most N blocks in flight by
+DCROXIDE_BLOCK_WINDOW`, where N is the full width and never a narrowed
+one, and any other value as the warning `DCROXIDE_BLOCK_WINDOW=V is
+neither dcrd nor a whole number of blocks from 16 to 505; using the
+default`. Unset, the default applies and nothing is logged.
+A malformed or zero value in any of the tuning variables warns and
 falls back to the default rather than refusing to start, since they are
 hints. Everything else is a command-line flag or a `dcroxide.conf` entry,
 and the flag set is a verbatim port of dcrd's — same names, same semantics,

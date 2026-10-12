@@ -216,9 +216,16 @@ Entry format:
   bearing in the honest direction: at 99 points per full inventory
   message the rate is 0.00198 points per item, and against the 60 s
   half-life and the threshold of 100 the equilibrium sits at ~583
-  items per second sustained. Both daemons request blocks in batches
-  of `maxInFlightBlocks` (16), which truncates to zero, so dcrd
-  charges an honestly syncing peer nothing at all. An earlier revision
+  items per second sustained. A syncing dcrd requests blocks in batches
+  of at most `maxInFlightBlocks` (16). This port's batches are at most
+  its download window: 128 blocks by default and never more than 505,
+  which is 50,000 / 99 in integer division, or dcrd's 16 when it is
+  started with `DCROXIDE_BLOCK_WINDOW=dcrd` (PARITY, *Block download
+  window*). All of those truncate to zero, so dcrd charges an honestly
+  syncing peer nothing at all. The requests of a departing peer that
+  move to another peer known to hold the data go out in one message
+  that is not held to that count, in dcrd
+  (`internal/netsync/manager.go:916-938`) and here. An earlier revision
   of this port carried the truncated remainder into the next request
   so that repeated 505-item batches were no longer free; that change
   charges an ordinary peer the full per-item rate, and at ~1 KiB
@@ -232,7 +239,11 @@ Entry format:
   dcrd's expression the way Go does across the domain, pins the 505/506
   boundary at 0 and 1, and drives ten thousand consecutive 16-item
   `getdata` requests through `on_get_data` without the peer ever
-  reaching the ban threshold)
+  reaching the ban threshold), and
+  `the_largest_block_window_costs_no_ban_score` in the same file (505
+  items, the most this port's download window may be set to request,
+  score 0 and 506 score 1, and ten thousand consecutive 505-item
+  requests never ban the peer)
 
 ## QK-0010 — a `mixdcnet` message can decode but not re-encode
 

@@ -21,11 +21,296 @@ use dcroxide_wire::{
 
 /// The minimum number of blocks that should be in the request queue
 /// before requesting more (dcrd `minInFlightBlocks`).
+///
+/// Under [`BlockWindow::Budget`] more are requested above it as well,
+/// once a refill's worth fits; below it, whatever fits is requested.
 pub const MIN_IN_FLIGHT_BLOCKS: usize = 10;
 
 /// The maximum number of blocks to allow in the sync peer request
 /// queue (dcrd `maxInFlightBlocks`).
+///
+/// Under [`BlockWindow::Budget`] it is not the maximum but the floor:
+/// the number of blocks requested whatever their sizes come to, and the
+/// count that window is never narrowed below.
 pub const MAX_IN_FLIGHT_BLOCKS: usize = 16;
+
+/// The most blocks the budgeted download window
+/// ([`BlockWindow::Budget`]) keeps requested from the sync peer unless
+/// told otherwise.
+///
+/// The stall detector gives every requested block one deadline from the
+/// moment its request is written and forgives the node's own processing
+/// for the latest check interval only (dcrd `peer/peer.go:1106-1123`,
+/// `:1260-1279`), and a block is read only after every block ahead of it
+/// has been processed, so each block ahead of a request is time against
+/// its deadline.  This count keeps that time small on a slow host.
+pub const BUDGET_WINDOW_BLOCKS: usize = 128;
+
+/// The most blocks the budgeted download window may be set to keep
+/// requested: the largest getdata that costs its sender no ban score.
+///
+/// dcrd charges `numNewReqs*99/wire.MaxInvPerMsg` per getdata in integer
+/// division (`server.go:1433-1436`), which is zero up to this many items,
+/// and the port's server charges the same.  The window never asks for
+/// more than its count in one message.  The requests of a departing
+/// peer that move to another peer known to hold the data go out in one
+/// message, blocks, transactions and mixing messages together, as in
+/// dcrd (`internal/netsync/manager.go:916-938`), and that message is not
+/// held to the count.
+pub const MAX_BUDGET_WINDOW_BLOCKS: usize = (MAX_INV_PER_MSG / 99) as usize;
+
+/// The most bytes the budgeted download window keeps requested from the
+/// sync peer once the floor of [`MAX_IN_FLIGHT_BLOCKS`] blocks is met,
+/// whatever the network: eight maximum-size main network blocks
+/// (8 x 393,216 bytes).
+///
+/// dcrd's window already asks a link for sixteen consecutive blocks
+/// inside one stall deadline, and on the main network the heaviest
+/// sixteen come to 5,876,343 bytes (heights 1,025,094 to 1,025,109).
+/// The budget stays under that, so a window of small blocks never asks
+/// a link for more inside one deadline than the chain's heaviest blocks
+/// already do.  It asks for that much far more often: taking, at every
+/// height of the main network up to 1,116,035, the window that starts
+/// there by the sizes in the headers, the budgeted window at its
+/// defaults has more than 2 MiB requested at 52.6% of heights, and
+/// dcrd's at 0.09% ([`BlockWindow::Budget`] says what that costs).  The
+/// main network is the only one the budget was checked against, so the
+/// others do not get a larger one from their larger blocks.
+pub const MAX_BUDGET_WINDOW_BYTES: u64 = 3 * 1024 * 1024;
+
+/// The number of maximum-size blocks the byte budget of the budgeted
+/// download window comes to: half of dcrd's window.
+const BUDGET_WINDOW_FULL_BLOCKS: usize = MAX_IN_FLIGHT_BLOCKS / 2;
+
+/// The fewest blocks the budgeted download window asks for while at
+/// least [`MIN_IN_FLIGHT_BLOCKS`] are requested: the batch dcrd's own
+/// rule sends when it tops nine requested blocks back up to
+/// [`MAX_IN_FLIGHT_BLOCKS`].
+const REFILL_BATCH_BLOCKS: usize = MAX_IN_FLIGHT_BLOCKS - MIN_IN_FLIGHT_BLOCKS + 1;
+
+/// How many times the most blocks a budgeted download window may keep
+/// requested one sync peer has to have accepted, for each time the
+/// window has been narrowed so far, before a narrowed window is widened
+/// by one step again: 2,048 blocks at [`BUDGET_WINDOW_BLOCKS`] after the
+/// first narrowing, 4,096 after the second, and so on.
+///
+/// A widened window that the path cannot carry costs a sync peer.  This
+/// many blocks are at least sixteen windows of the width being tried,
+/// counted in blocks, whichever of its two limits binds.  While the
+/// blocks that follow are no lighter than those of the window that was
+/// lost, a path too slow to deliver that window inside the 30-second
+/// stall deadline takes more than eight minutes to deliver them, and
+/// each attempt that fails puts the next further off.  Where they are
+/// light enough for the next attempt to come sooner than that, a window
+/// of them is lighter than the one that was lost, for as long as the
+/// blocks stay as light.  A sync peer lost to the node not reading its
+/// socket has no such bound in time, only this one in blocks.
+///
+/// Arithmetic over the header sizes of the main network's blocks up to
+/// height 1,116,035, for a link of a constant rate with processing
+/// taking no time, puts the sync peers lost to the 30-second deadline
+/// over the whole chain at 220 under dcrd's window and 234 under this
+/// rule at 50 kB/s, and at 122 and 134 at 70 kB/s.  With the same
+/// 2,048 blocks after every narrowing it puts them at 595 and 486, and
+/// with no narrowing at all at 11,293 and 6,967.  No sync has been run
+/// at such a rate.
+pub const WINDOW_RECOVERY_WINDOWS: usize = 16;
+
+/// How many blocks the sync manager keeps requested from the sync peer
+/// during the initial chain sync, and when it asks for more.
+///
+/// A new manager uses [`BlockWindow::Dcrd`];
+/// [`SyncManager::with_block_window`] selects the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlockWindow {
+    /// dcrd's window: at most [`MAX_IN_FLIGHT_BLOCKS`] blocks requested
+    /// from the sync peer, topped back up once fewer than
+    /// [`MIN_IN_FLIGHT_BLOCKS`] are requested in all, from a list of
+    /// [`NEXT_BLOCKS_BUF_SIZE`] needed blocks that is rebuilt when one to
+    /// nine remain (`internal/netsync/manager.go:434-448`, `:490-546`,
+    /// `:1359-1371`).
+    Dcrd,
+    /// A window budgeted in bytes, which dcrd does not have.
+    ///
+    /// Under dcrd's window a sync over a link with a round trip of tens
+    /// of milliseconds is paced by the round trip: 12.2 to 13.6 blocks
+    /// each at 20 to 150 ms, measured through a delaying relay on
+    /// 2026-10-11.  This window keeps blocks requested from the sync
+    /// peer while the sizes their headers carry, summed over the blocks
+    /// requested from it, stay within `max_bytes` and their number
+    /// within `max_blocks`.  Below [`MAX_IN_FLIGHT_BLOCKS`] requested
+    /// blocks the bytes are not consulted, so a run of large blocks is
+    /// requested exactly as dcrd requests it.
+    ///
+    /// A getdata goes out when fewer than [`MIN_IN_FLIGHT_BLOCKS`] blocks
+    /// are requested from the sync peer or when at least dcrd's refill of
+    /// seven more fit, after every block the sync peer delivers rather
+    /// than only once fewer than ten are requested, so the requests
+    /// follow the deliveries instead of waiting for the window to drain.
+    /// The list of needed blocks is [`NEXT_BLOCKS_BUF_SIZE`] plus twice
+    /// `max_blocks` long, is rebuilt once fewer than `max_blocks` remain
+    /// (none included) unless it already ran to the best known header,
+    /// and is rebuilt whenever a block request is forgotten (its peer
+    /// left, reported the block not found, or was never sent the
+    /// request), so the forgotten blocks are the next ones asked for.
+    ///
+    /// What it costs is two deadlines that a wide window runs into far
+    /// more often than dcrd's does.  Both are read from the code; neither
+    /// has been measured.
+    ///
+    /// The node's own: a requested block is given 30 seconds from the
+    /// moment its request is written, checked every 15 with the node's
+    /// own handling credited for the latest check only, and a block is
+    /// read only after every block ahead of it has been processed (dcrd
+    /// `peer/peer.go:1106-1123`, `:1260-1279`).  The last block of a
+    /// window therefore has to be delivered and reached 30 to 45 seconds
+    /// after it was asked for.  A path that carries less than `max_bytes`
+    /// in that time (70 to 105 kB/s at [`MAX_BUDGET_WINDOW_BYTES`], the
+    /// sync peer's uplink counting as much as the node's own link), or a
+    /// host that processes fewer than `max_blocks` blocks in it (3 to 4
+    /// a second at [`BUDGET_WINDOW_BLOCKS`]), has its sync peer dropped
+    /// as stalled while the peer is still delivering.
+    ///
+    /// The serving peer's: dcrd since its commit `62fd529a`, and this
+    /// port, give every message they write 20 seconds plus one for each
+    /// 256 KiB and disconnect when that passes (`peer/peer.go:86-96`,
+    /// `:1032-1040`).  A node that does not read its sync peer's socket
+    /// for that long, through a long cache flush for one, while more of
+    /// the window is unsent than the socket buffers of the two ends hold,
+    /// is disconnected by such a peer, and neither end logs a stall.
+    /// By the count [`MAX_BUDGET_WINDOW_BYTES`] describes, over the main
+    /// network's heights up to 1,116,035, more than 512 KiB is requested
+    /// at 98.0% of heights under this window at its defaults and at 5.3%
+    /// under dcrd's; 512 KiB stands in here for what the socket buffers
+    /// hold, which the host decides.
+    ///
+    /// Either way the node loses its sync peer with most of a window
+    /// requested, and nothing else the manager is told says the window
+    /// was too wide, so that is what narrows it.  When the sync peer
+    /// leaves with more than [`MAX_IN_FLIGHT_BLOCKS`] blocks requested
+    /// from it, whichever path requested them, both limits are halved,
+    /// the count never below [`MAX_IN_FLIGHT_BLOCKS`], at which the bytes
+    /// are no longer consulted and as many blocks are requested as under
+    /// dcrd's window (three halvings from [`BUDGET_WINDOW_BLOCKS`]).  A
+    /// window narrowed that far is still not dcrd's rule: its refill
+    /// counts the sync peer's requests alone, and its list of needed
+    /// blocks keeps its own length and is rebuilt as before.
+    ///
+    /// A halving is undone once one sync peer has had
+    /// [`WINDOW_RECOVERY_WINDOWS`] times `max_blocks` blocks accepted
+    /// since the window last changed, times the number of times the
+    /// window has been narrowed so far, so each window lost puts the next
+    /// wider one further off.  Both are counts of what the manager is
+    /// told, not times, so the manager stays free of clocks.  A node that
+    /// cannot carry the window loses one sync peer for each halving it
+    /// needs and one more each time a wider window is tried again;
+    /// [`BlockWindow::Dcrd`] is the window that never tries.
+    ///
+    /// The width in force and the number of narrowings belong to the
+    /// manager, and only selecting a window again puts them back
+    /// ([`SyncManager::with_block_window`]).  The blocks that undo a
+    /// halving are those the sync peer delivers, and while the chain is
+    /// current a block is asked of whichever peer announces it, so only
+    /// the blocks the sync peer is the first to announce count then.  At
+    /// the main network's target of 288 blocks a day the 2,048 that undo
+    /// the first halving of the default window are at least a week of
+    /// them, so a window still narrowed when a sync ends is not widened
+    /// for at least that long, short of another sync.
+    Budget {
+        /// The most bytes of blocks to keep requested from the sync peer
+        /// once [`MAX_IN_FLIGHT_BLOCKS`] blocks are.
+        max_bytes: u64,
+        /// The most blocks to keep requested from the sync peer, from
+        /// [`MAX_IN_FLIGHT_BLOCKS`] to [`MAX_BUDGET_WINDOW_BLOCKS`].
+        max_blocks: usize,
+    },
+}
+
+impl BlockWindow {
+    /// The budgeted window for a network whose blocks are at most
+    /// `max_block_size` bytes, keeping at most `max_blocks` blocks
+    /// requested.
+    ///
+    /// The byte budget is eight maximum-size blocks and never more than
+    /// [`MAX_BUDGET_WINDOW_BYTES`].  The count is brought into
+    /// [`MAX_IN_FLIGHT_BLOCKS`] to [`MAX_BUDGET_WINDOW_BLOCKS`].
+    pub fn budget(max_block_size: usize, max_blocks: usize) -> BlockWindow {
+        let max_bytes = (BUDGET_WINDOW_FULL_BLOCKS as u64)
+            .saturating_mul(max_block_size as u64)
+            .min(MAX_BUDGET_WINDOW_BYTES);
+        BlockWindow::Budget {
+            max_bytes,
+            max_blocks: clamp_window_blocks(max_blocks),
+        }
+    }
+
+    /// The window with both limits of a budgeted one halved `halvings`
+    /// times, the count never below [`MAX_IN_FLIGHT_BLOCKS`].  dcrd's
+    /// window has nothing to halve.
+    fn narrowed(self, halvings: u32) -> BlockWindow {
+        match self {
+            BlockWindow::Dcrd => BlockWindow::Dcrd,
+            BlockWindow::Budget {
+                max_bytes,
+                max_blocks,
+            } => BlockWindow::Budget {
+                max_bytes: max_bytes.checked_shr(halvings).unwrap_or(0),
+                max_blocks: max_blocks
+                    .checked_shr(halvings)
+                    .unwrap_or(0)
+                    .max(MAX_IN_FLIGHT_BLOCKS),
+            },
+        }
+    }
+
+    /// Whether the window halved `halvings` times still keeps more
+    /// blocks requested than dcrd's does, so that halving it once more
+    /// changes something.
+    fn can_narrow(self, halvings: u32) -> bool {
+        match self {
+            BlockWindow::Dcrd => false,
+            BlockWindow::Budget { max_blocks, .. } => {
+                max_blocks.checked_shr(halvings).unwrap_or(0) > MAX_IN_FLIGHT_BLOCKS
+            }
+        }
+    }
+}
+
+/// The count of a budgeted window brought into its bounds: never fewer
+/// blocks than dcrd's window, and never a getdata that costs ban score.
+fn clamp_window_blocks(max_blocks: usize) -> usize {
+    max_blocks.clamp(MAX_IN_FLIGHT_BLOCKS, MAX_BUDGET_WINDOW_BLOCKS)
+}
+
+/// Whether the list of the next needed blocks is to be rebuilt from the
+/// chain before blocks are taken from it, given whether the best known
+/// header changed since the list was built, how many entries remain, and
+/// whether the list ends at the best known header.
+///
+/// dcrd rebuilds a list that is "not empty, is getting short, and does
+/// not already end at the best known header"
+/// (`internal/netsync/manager.go:441-443`).  A list drained to exactly
+/// nothing is therefore never rebuilt until the best header moves.  Its
+/// batches of sixteen and then seven leave six of 512, so dcrd reaches
+/// that only after an interruption; a window whose batches vary can take
+/// the whole list, so the budgeted window rebuilds an empty list too, and
+/// earlier: as soon as fewer blocks remain than its widest window holds.
+fn next_blocks_need_update(
+    window: BlockWindow,
+    best_header_changed: bool,
+    num_needed: usize,
+    ends_at_best_header: bool,
+) -> bool {
+    if best_header_changed {
+        return true;
+    }
+    match window {
+        BlockWindow::Dcrd => {
+            num_needed > 0 && num_needed < MIN_IN_FLIGHT_BLOCKS && !ends_at_best_header
+        }
+        BlockWindow::Budget { max_blocks, .. } => num_needed < max_blocks && !ends_at_best_header,
+    }
+}
 
 /// The maximum number of recently rejected transactions to track
 /// (dcrd `maxRejectedTxns`).
@@ -73,6 +358,9 @@ pub const HEADER_SYNC_STALL_TIMEOUT_SECS: u64 = (3 + MAX_BLOCK_HEADERS_PER_MSG /
 
 /// The size of the lookahead buffer for the next needed blocks (the
 /// length of dcrd's `nextBlocksBuf` backing array).
+///
+/// Under [`BlockWindow::Budget`] the list is longer by twice the most
+/// blocks that window requests.
 pub const NEXT_BLOCKS_BUF_SIZE: usize = 512;
 
 /// The number of blocks from the sync height within which the final
@@ -118,7 +406,10 @@ pub enum Action {
     Log {
         /// The level dcrd logs the line at.
         level: LogLevel,
-        /// The formatted line, byte-for-byte dcrd's.
+        /// The formatted line, byte-for-byte dcrd's.  The two lines about
+        /// the budgeted download window being narrowed and widened are
+        /// the exception: dcrd has neither the window nor the lines
+        /// ([`BlockWindow::Budget`]).
         message: String,
     },
     /// Accumulate a processed block into the periodic sync progress
@@ -650,8 +941,30 @@ pub struct SyncManager<C, T, M: SyncMixPool> {
     sync_height: Arc<AtomicI64>,
     is_current: Arc<AtomicBool>,
 
+    /// The block download window selected ([`Self::with_block_window`]).
+    block_window: BlockWindow,
+    /// How many times the limits of a budgeted window are halved at
+    /// present ([`Self::narrow_block_window`]); always zero under dcrd's.
+    window_halvings: u32,
+    /// How many times the window has been narrowed since it was
+    /// selected, which is what the blocks needed to widen it grow with.
+    window_narrowings: usize,
+    /// The sync peer whose accepted blocks are being counted toward
+    /// widening a narrowed window, with the count so far
+    /// ([`Self::maybe_widen_block_window`]).
+    window_proving: Option<(i32, usize)>,
+
     next_blocks_header: Hash,
-    next_needed_blocks: VecDeque<Hash>,
+    /// Whether the list of needed blocks, as the chain last returned it
+    /// to the budgeted window, ran to the best known header: it came back
+    /// shorter than asked for or its last hash was that header's.  Asking
+    /// again then adds nothing until the header changes or a request is
+    /// forgotten.  dcrd reads the same from the last entry of its list,
+    /// which an emptied list no longer has.
+    next_blocks_reach_best_header: bool,
+    /// The next blocks to request, in order, each with the size its
+    /// header carries (zero, and unread, under dcrd's window).
+    next_needed_blocks: VecDeque<(Hash, u32)>,
 
     shutdown: bool,
 }
@@ -677,9 +990,144 @@ impl<C: SyncChain, T: SyncTxPool, M: SyncMixPool> SyncManager<C, T, M> {
             is_initial_chain_sync_done: false,
             sync_height,
             is_current,
+            block_window: BlockWindow::Dcrd,
+            window_halvings: 0,
+            window_narrowings: 0,
+            window_proving: None,
             next_blocks_header: Hash([0u8; 32]),
+            next_blocks_reach_best_header: false,
             next_needed_blocks: VecDeque::new(),
             shutdown: false,
+        }
+    }
+
+    /// The manager with the given block download window in place of
+    /// dcrd's, which [`Self::new`] selects.
+    ///
+    /// The count of a budgeted window is brought into its bounds, as
+    /// [`BlockWindow::budget`] brings it, so a window built by hand
+    /// cannot send a getdata that costs ban score.  The list of needed
+    /// blocks is emptied so the next fetch builds it under the new
+    /// window's rule, with the sizes the budgeted window reads, and the
+    /// window starts at its full width.
+    pub fn with_block_window(mut self, window: BlockWindow) -> SyncManager<C, T, M> {
+        self.block_window = match window {
+            BlockWindow::Dcrd => BlockWindow::Dcrd,
+            BlockWindow::Budget {
+                max_bytes,
+                max_blocks,
+            } => BlockWindow::Budget {
+                max_bytes,
+                max_blocks: clamp_window_blocks(max_blocks),
+            },
+        };
+        self.window_halvings = 0;
+        self.window_narrowings = 0;
+        self.window_proving = None;
+        self.next_blocks_header = Hash([0u8; 32]);
+        self.next_blocks_reach_best_header = false;
+        self.next_needed_blocks.clear();
+        self
+    }
+
+    /// The block download window selected, at its full width.
+    pub fn block_window(&self) -> BlockWindow {
+        self.block_window
+    }
+
+    /// The block download window as it is applied at present: the one
+    /// selected, with the limits of a budgeted window halved once for
+    /// each time it was narrowed and has not been widened again
+    /// ([`BlockWindow::Budget`]).
+    pub fn block_window_in_force(&self) -> BlockWindow {
+        self.block_window.narrowed(self.window_halvings)
+    }
+
+    /// Halve the budgeted window after the sync peer left with
+    /// `num_requested` blocks requested from it, when that is more than
+    /// [`MAX_IN_FLIGHT_BLOCKS`], the most dcrd's window itself asks of a
+    /// sync peer.
+    ///
+    /// Every block requested from the peer counts, whichever path asked
+    /// for it: the window, the requests of a departed peer that moved to
+    /// it, the blocks it announced once the chain was current, and
+    /// [`Self::request_from_peer`].  The last three are dcrd's
+    /// (`internal/netsync/manager.go:875-893`, `:1751-1776`,
+    /// `:2086-2120`) and can leave its sync peer with more than sixteen
+    /// requested as well, so a sync peer the window asked for sixteen
+    /// blocks or fewer can narrow the window by leaving.
+    ///
+    /// The manager is not told why a peer left.  A sync peer dropped as
+    /// stalled with a window it could not deliver in time, and one that
+    /// hung up on a node that was not reading its socket, both arrive
+    /// here; so does a peer that left for a reason of its own, and so
+    /// does each of several sync peers lost one after another with
+    /// nothing delivered in between, as when the node's own link goes
+    /// down.  Every one of them narrows the window, and each narrowing
+    /// is undone like any other ([`Self::maybe_widen_block_window`]).
+    fn narrow_block_window(&mut self, num_requested: usize, actions: &mut Vec<Action>) {
+        if num_requested <= MAX_IN_FLIGHT_BLOCKS
+            || !self.block_window.can_narrow(self.window_halvings)
+        {
+            return;
+        }
+        self.window_halvings += 1;
+        self.window_narrowings = self.window_narrowings.saturating_add(1);
+        self.window_proving = None;
+        if let BlockWindow::Budget { max_blocks, .. } = self.block_window_in_force() {
+            actions.push(Action::Log {
+                level: LogLevel::Info,
+                message: format!(
+                    "Block download window narrowed to at most {max_blocks} blocks in flight: \
+                     the sync peer left with {num_requested} requested"
+                ),
+            });
+        }
+    }
+
+    /// Count a block accepted from the sync peer toward widening a
+    /// narrowed budgeted window, and undo one halving once that peer has
+    /// had [`WINDOW_RECOVERY_WINDOWS`] times the window's full count
+    /// accepted since the window last changed, for each time the window
+    /// has been narrowed so far.
+    ///
+    /// The count belongs to one sync peer and starts again with another:
+    /// what is being shown is that the path to this peer carries the
+    /// window as it is.  It grows with every narrowing because a wider
+    /// window that fails costs a sync peer each time it is tried, and a
+    /// path that failed it before is the likeliest to fail it again.
+    fn maybe_widen_block_window(&mut self, peer_id: i32, actions: &mut Vec<Action>) {
+        let BlockWindow::Budget {
+            max_blocks: full_blocks,
+            ..
+        } = self.block_window
+        else {
+            return;
+        };
+        if self.window_halvings == 0 {
+            return;
+        }
+        let num_accepted = match self.window_proving {
+            Some((from, count)) if from == peer_id => count + 1,
+            _ => 1,
+        };
+        let num_needed = WINDOW_RECOVERY_WINDOWS
+            .saturating_mul(full_blocks)
+            .saturating_mul(self.window_narrowings);
+        if num_accepted < num_needed {
+            self.window_proving = Some((peer_id, num_accepted));
+            return;
+        }
+        self.window_halvings -= 1;
+        self.window_proving = None;
+        if let BlockWindow::Budget { max_blocks, .. } = self.block_window_in_force() {
+            actions.push(Action::Log {
+                level: LogLevel::Info,
+                message: format!(
+                    "Block download window widened to at most {max_blocks} blocks in flight \
+                     after {num_needed} blocks from the sync peer"
+                ),
+            });
         }
     }
 
@@ -814,26 +1262,94 @@ impl<C: SyncChain, T: SyncTxPool, M: SyncMixPool> SyncManager<C, T, M> {
         // Update the list if the best known header changed since the
         // last time it was updated or it is not empty, is getting
         // short, and does not already end at the best known header.
+        //
+        // The budgeted window keeps a longer list, rebuilds it once a
+        // full window can no longer be taken from what remains, an
+        // emptied list included, and reads whether the list ran to the
+        // best known header from what the chain returned
+        // (`next_blocks_need_update`).  Both go by the window's full
+        // count, whether or not it is narrowed at present.
         let (best_header, _) = self.cfg.chain.best_header();
-        let num_needed = self.next_needed_blocks.len();
-        let needs_update = self.next_blocks_header != best_header
-            || (num_needed > 0
-                && num_needed < MIN_IN_FLIGHT_BLOCKS
-                && self.next_needed_blocks[num_needed - 1] != best_header);
-        if needs_update {
-            self.next_needed_blocks = self
-                .cfg
-                .chain
-                .put_next_needed_blocks(NEXT_BLOCKS_BUF_SIZE)
-                .into();
-            self.next_blocks_header = best_header;
+        let ends_at_best_header = match self.block_window {
+            BlockWindow::Dcrd => self
+                .next_needed_blocks
+                .back()
+                .is_some_and(|(last, _)| *last == best_header),
+            BlockWindow::Budget { .. } => self.next_blocks_reach_best_header,
+        };
+        let needs_update = next_blocks_need_update(
+            self.block_window,
+            self.next_blocks_header != best_header,
+            self.next_needed_blocks.len(),
+            ends_at_best_header,
+        );
+        if !needs_update {
+            return;
         }
+        match self.block_window {
+            BlockWindow::Dcrd => {
+                self.next_needed_blocks = self
+                    .cfg
+                    .chain
+                    .put_next_needed_blocks(NEXT_BLOCKS_BUF_SIZE)
+                    .into_iter()
+                    .map(|hash| (hash, 0))
+                    .collect();
+            }
+            BlockWindow::Budget { max_blocks, .. } => {
+                // Twice the window beyond dcrd's list: up to one window
+                // of what the chain returns is already requested from the
+                // sync peer and dropped below, and the list is rebuilt
+                // with up to one window left, so more than dcrd's 512
+                // blocks are requested before the list next runs short,
+                // whatever the window is set to.
+                let max_results = NEXT_BLOCKS_BUF_SIZE + 2 * max_blocks;
+                let hashes = self.cfg.chain.put_next_needed_blocks(max_results);
+                self.next_blocks_reach_best_header =
+                    hashes.len() < max_results || hashes.last() == Some(&best_header);
+
+                // Blocks that are still requested are dropped here, so
+                // every entry is one to ask for, and each entry carries
+                // the size its header gives the block.  Consensus
+                // requires that field to equal the serialized size (dcrd
+                // `validate.go:910-914`), so a header that misstates it
+                // is for a block that is rejected.  A size the chain
+                // cannot supply counts as the largest, so such a block is
+                // only ever requested under the floor of the window.
+                let mut needed = VecDeque::with_capacity(hashes.len());
+                for hash in hashes {
+                    if self.requested_blocks.contains_key(&hash) {
+                        continue;
+                    }
+                    let size = self
+                        .cfg
+                        .chain
+                        .header_by_hash(&hash)
+                        .map_or(u32::MAX, |header| header.size);
+                    needed.push_back((hash, size));
+                }
+                self.next_needed_blocks = needed;
+            }
+        }
+        self.next_blocks_header = best_header;
     }
 
     /// Create and record a request to the provided peer for the next
     /// blocks to be downloaded based on the current headers (dcrd
     /// `fetchNextBlocks`).
     fn fetch_next_blocks(&mut self, peer_id: i32, actions: &mut Vec<Action>) {
+        // The budgeted window decides what to request by its own rule,
+        // within its limits as they are narrowed at present; the rest of
+        // this function is dcrd's.
+        if let BlockWindow::Budget {
+            max_bytes,
+            max_blocks,
+        } = self.block_window_in_force()
+        {
+            self.fetch_next_blocks_budgeted(peer_id, max_bytes, max_blocks, actions);
+            return;
+        }
+
         // Nothing to do if the target maximum number of blocks to
         // request from the peer at the same time are already in flight.
         let num_in_flight = self
@@ -865,7 +1381,7 @@ impl<C: SyncChain, T: SyncTxPool, M: SyncMixPool> SyncManager<C, T, M> {
             // already been requested or it will be requested, but in
             // either case, the block is no longer needed for future
             // iterations.
-            let Some(hash) = self.next_needed_blocks.pop_front() else {
+            let Some((hash, _)) = self.next_needed_blocks.pop_front() else {
                 break;
             };
 
@@ -888,6 +1404,94 @@ impl<C: SyncChain, T: SyncTxPool, M: SyncMixPool> SyncManager<C, T, M> {
                 message: Message::GetData(MsgGetData { inv_list }),
             });
         }
+    }
+
+    /// [`Self::fetch_next_blocks`] under [`BlockWindow::Budget`], which
+    /// dcrd does not have: request the next needed blocks from the peer
+    /// while the blocks requested from it stay within `max_blocks` and,
+    /// past [`MAX_IN_FLIGHT_BLOCKS`] of them, their header sizes within
+    /// `max_bytes`.
+    ///
+    /// Both totals are counted from the request map on every call, so no
+    /// path that removes a request can leave a stale total behind.  A
+    /// block requested outside the window (one announced once the chain
+    /// is current, or one asked for through
+    /// [`Self::request_from_peer`]) counts as one block of no bytes.
+    fn fetch_next_blocks_budgeted(
+        &mut self,
+        peer_id: i32,
+        max_bytes: u64,
+        max_blocks: usize,
+        actions: &mut Vec<Action>,
+    ) {
+        // Nothing to do when the most blocks the window allows are
+        // already requested from the peer.
+        let (num_in_flight, bytes_in_flight) = self.requested_blocks.outstanding_from(peer_id);
+        if num_in_flight >= max_blocks {
+            return;
+        }
+
+        // Potentially update the list of the next blocks to download in
+        // the branch leading up to the best known header.
+        self.maybe_update_next_needed_blocks();
+
+        // Take blocks from the front of the list, in order, until one
+        // does not fit.  Below dcrd's window the bytes are not consulted:
+        // the stall deadline of a request has to cover the blocks ahead
+        // of it, and up to fifteen blocks of any size are ahead of a
+        // request under dcrd's rule already.
+        let mut num_walked = 0;
+        let mut num_requested = num_in_flight;
+        let mut bytes_requested = bytes_in_flight;
+        let mut batch = Vec::new();
+        for &(hash, size) in &self.next_needed_blocks {
+            // A block requested since the list was built is passed over
+            // without being counted: it is already counted under the
+            // peer it was requested from.
+            if self.requested_blocks.contains_key(&hash) {
+                num_walked += 1;
+                continue;
+            }
+            if num_requested >= max_blocks {
+                break;
+            }
+            let bytes_with_block = bytes_requested.saturating_add(u64::from(size));
+            if num_requested >= MAX_IN_FLIGHT_BLOCKS && bytes_with_block > max_bytes {
+                break;
+            }
+            batch.push((hash, size));
+            num_walked += 1;
+            num_requested += 1;
+            bytes_requested = bytes_with_block;
+        }
+
+        // Ask now when the peer is running short of requests, as dcrd
+        // does below its minimum, or when at least the batch dcrd's own
+        // refill sends fits.  Anything less waits, with the list left as
+        // it is, for a later block to make room: at least the minimum
+        // are still requested from the peer, and every one of them that
+        // is accepted comes back here.  That keeps the number of getdata
+        // messages at about one for every seven blocks, as under dcrd's
+        // window, instead of one for every block.
+        if batch.is_empty()
+            || (num_in_flight >= MIN_IN_FLIGHT_BLOCKS && batch.len() < REFILL_BATCH_BLOCKS)
+        {
+            return;
+        }
+
+        self.next_needed_blocks.drain(..num_walked);
+        let mut inv_list = Vec::with_capacity(batch.len());
+        for (hash, size) in batch {
+            self.requested_blocks.insert_sized(hash, peer_id, size);
+            inv_list.push(InvVect {
+                inv_type: InvType::BLOCK,
+                hash,
+            });
+        }
+        actions.push(Action::QueueMessage {
+            peer: peer_id,
+            message: Message::GetData(MsgGetData { inv_list }),
+        });
     }
 
     /// Request headers from the provided peer starting from the parent
@@ -1132,6 +1736,11 @@ impl<C: SyncChain, T: SyncTxPool, M: SyncMixPool> SyncManager<C, T, M> {
 
         // The initial headers sync process is done at this point.
 
+        // How many blocks the peer leaves with requested from it, before
+        // they are moved or forgotten.  For the sync peer this is what
+        // narrows the budgeted window below.
+        let num_requested_from_peer = self.requested_blocks.outstanding_from(peer_id).0;
+
         // Re-request in-flight blocks and transactions that were not
         // received by the disconnected peer if the data was announced
         // by another peer.  Remove the data from the request maps if no
@@ -1166,8 +1775,23 @@ impl<C: SyncChain, T: SyncTxPool, M: SyncMixPool> SyncManager<C, T, M> {
                 }
             };
         requeue(&mut self.requested_txns, &mut self.peers, InvType::TX);
+        let num_requested_blocks = self.requested_blocks.len();
         requeue(&mut self.requested_blocks, &mut self.peers, InvType::BLOCK);
+        let forgot_block = self.requested_blocks.len() < num_requested_blocks;
         requeue(&mut self.requested_mix_msgs, &mut self.peers, InvType::MIX);
+
+        // A forgotten block was taken from the needed-blocks list when
+        // it was requested.  dcrd leaves the list as it is, so the next
+        // sync peer is first asked for the blocks after the forgotten
+        // ones, which the chain stores without being able to connect
+        // them, and for the forgotten ones when the list is next
+        // rebuilt (`internal/netsync/manager.go:875-893`, `:940-945`).
+        // The budgeted window forgets up to a whole window here, so it
+        // rebuilds the list on the next fetch and asks for the lowest
+        // missing block first.
+        if forgot_block && matches!(self.block_window, BlockWindow::Budget { .. }) {
+            self.next_blocks_header = Hash([0u8; 32]);
+        }
         for (pp, request_queue) in request_queues {
             let mut inv_list = Vec::new();
             for inv in request_queue {
@@ -1190,8 +1814,12 @@ impl<C: SyncChain, T: SyncTxPool, M: SyncMixPool> SyncManager<C, T, M> {
         }
 
         // Attempt to find a new peer to sync the chain from when the
-        // quitting peer is the sync peer.
+        // quitting peer is the sync peer.  If it left with more blocks
+        // requested from it than dcrd's window asks of a sync peer, a
+        // budgeted window is halved first, so the next sync peer is
+        // asked for half as much.
         if self.sync_peer == Some(peer_id) {
+            self.narrow_block_window(num_requested_from_peer, &mut actions);
             self.start_chain_sync(&mut actions);
         }
 
@@ -1667,9 +2295,21 @@ impl<C: SyncChain, T: SyncTxPool, M: SyncMixPool> SyncManager<C, T, M> {
         }
 
         // Request more blocks using the headers when the request queue
-        // is getting short.
-        if self.sync_peer == Some(peer_id) && self.requested_blocks.len() < MIN_IN_FLIGHT_BLOCKS {
-            self.fetch_next_blocks(peer_id, &mut actions);
+        // is getting short.  The budgeted window asks after every block
+        // from the sync peer and decides there whether enough fits to be
+        // worth a request (`fetch_next_blocks_budgeted`); the block also
+        // counts toward widening the window if it is narrowed.
+        if self.sync_peer == Some(peer_id) {
+            let request_more = match self.block_window {
+                BlockWindow::Dcrd => self.requested_blocks.len() < MIN_IN_FLIGHT_BLOCKS,
+                BlockWindow::Budget { .. } => {
+                    self.maybe_widen_block_window(peer_id, &mut actions);
+                    true
+                }
+            };
+            if request_more {
+                self.fetch_next_blocks(peer_id, &mut actions);
+            }
         }
 
         actions
@@ -2176,6 +2816,16 @@ impl<C: SyncChain, T: SyncTxPool, M: SyncMixPool> SyncManager<C, T, M> {
                 InvType::BLOCK => {
                     if self.requested_blocks.get(&inv.hash) == Some(&peer_id) {
                         self.requested_blocks.remove(&inv.hash);
+
+                        // The block left the needed-blocks list when it
+                        // was requested, and dcrd asks for it again only
+                        // when the list is next rebuilt.  The budgeted
+                        // window rebuilds it on the next fetch, so the
+                        // block is asked for again before the ones that
+                        // build on it.
+                        if matches!(self.block_window, BlockWindow::Budget { .. }) {
+                            self.next_blocks_header = Hash([0u8; 32]);
+                        }
                     }
                 }
                 InvType::TX => {
@@ -2771,10 +3421,15 @@ impl<C: SyncChain, T: SyncTxPool, M: SyncMixPool> SyncManager<C, T, M> {
 /// The entries live densely in a vector indexed by hash, so a removal
 /// swaps the last entry into the hole.  Iteration follows the vector,
 /// an order no caller depends on (dcrd's is random).
+///
+/// Each entry also carries the size of the requested item in bytes, for
+/// the budgeted block download window ([`BlockWindow::Budget`]): the
+/// size its header gives a block the window requested, and zero for
+/// everything else.
 #[derive(Default)]
 struct RequestMap {
     index: HashMap<Hash, usize>,
-    entries: Vec<(Hash, i32)>,
+    entries: Vec<(Hash, i32, u32)>,
     /// The number of eviction victims drawn so far, the counter each
     /// draw hashes.
     draws: u64,
@@ -2787,7 +3442,7 @@ impl RequestMap {
 
     fn get(&self, hash: &Hash) -> Option<&i32> {
         let idx = *self.index.get(hash)?;
-        self.entries.get(idx).map(|(_, peer)| peer)
+        self.entries.get(idx).map(|(_, peer, _)| peer)
     }
 
     fn contains_key(&self, hash: &Hash) -> bool {
@@ -2795,7 +3450,9 @@ impl RequestMap {
     }
 
     /// Map the hash to the peer, replacing (in place) any existing
-    /// mapping and returning the peer it held.
+    /// mapping and returning the peer it held.  A new entry has no size;
+    /// a replaced one keeps its size, which belongs to the item and not
+    /// to the peer asked for it.
     fn insert(&mut self, hash: Hash, peer: i32) -> Option<i32> {
         if let Some(&idx) = self.index.get(&hash) {
             return self
@@ -2804,26 +3461,51 @@ impl RequestMap {
                 .map(|entry| std::mem::replace(&mut entry.1, peer));
         }
         self.index.insert(hash, self.entries.len());
-        self.entries.push((hash, peer));
+        self.entries.push((hash, peer, 0));
         None
+    }
+
+    /// [`Self::insert`] for an item of a known size in bytes, which
+    /// replaces the size of an existing mapping as well.
+    fn insert_sized(&mut self, hash: Hash, peer: i32, size: u32) -> Option<i32> {
+        let previous = self.insert(hash, peer);
+        if let Some(entry) = self
+            .index
+            .get(&hash)
+            .and_then(|&idx| self.entries.get_mut(idx))
+        {
+            entry.2 = size;
+        }
+        previous
+    }
+
+    /// How many items are requested from the peer and the sum of their
+    /// sizes in bytes, in one pass over the entries.
+    fn outstanding_from(&self, peer: i32) -> (usize, u64) {
+        self.entries
+            .iter()
+            .filter(|(_, from, _)| *from == peer)
+            .fold((0, 0), |(count, bytes), (_, _, size)| {
+                (count + 1, bytes + u64::from(*size))
+            })
     }
 
     /// Remove the hash, returning the peer it mapped to.
     fn remove(&mut self, hash: &Hash) -> Option<i32> {
         let idx = self.index.remove(hash)?;
-        let (_, peer) = self.entries.swap_remove(idx);
-        if let Some((moved, _)) = self.entries.get(idx) {
+        let (_, peer, _) = self.entries.swap_remove(idx);
+        if let Some((moved, _, _)) = self.entries.get(idx) {
             self.index.insert(*moved, idx);
         }
         Some(peer)
     }
 
     fn iter(&self) -> impl Iterator<Item = (&Hash, &i32)> {
-        self.entries.iter().map(|(hash, peer)| (hash, peer))
+        self.entries.iter().map(|(hash, peer, _)| (hash, peer))
     }
 
     fn values(&self) -> impl Iterator<Item = &i32> {
-        self.entries.iter().map(|(_, peer)| peer)
+        self.entries.iter().map(|(_, peer, _)| peer)
     }
 
     /// A uniformly random entry's hash, `None` when empty.
@@ -2843,7 +3525,7 @@ impl RequestMap {
         // The modulo bias over a 64-bit draw is negligible at these
         // sizes (at most `MAX_INV_PER_MSG` entries).
         let idx = (draw % self.entries.len() as u64) as usize;
-        self.entries.get(idx).map(|(hash, _)| *hash)
+        self.entries.get(idx).map(|(hash, _, _)| *hash)
     }
 }
 
@@ -2878,7 +3560,11 @@ fn limit_add(m: &mut RequestMap, hash: Hash, peer: i32, limit: usize) {
 
 #[cfg(test)]
 mod tests {
-    use super::{Hash, RequestMap, go_interval_string, limit_add};
+    use super::{
+        BUDGET_WINDOW_BLOCKS, BlockWindow, Hash, MAX_BUDGET_WINDOW_BLOCKS, MAX_BUDGET_WINDOW_BYTES,
+        MAX_IN_FLIGHT_BLOCKS, MIN_IN_FLIGHT_BLOCKS, REFILL_BATCH_BLOCKS, RequestMap,
+        WINDOW_RECOVERY_WINDOWS, go_interval_string, limit_add, next_blocks_need_update,
+    };
 
     /// A distinct hash per counter value.
     fn key(n: u64) -> Hash {
@@ -2947,6 +3633,215 @@ mod tests {
             assert_eq!(m.get(hash), Some(peer));
         }
         assert_eq!(m.values().count(), 5);
+    }
+
+    /// The size of a request stays with its hash: through the peer being
+    /// replaced, as the disconnect and refusal sweeps replace it, and
+    /// through a removal moving the last entry into the hole.  The
+    /// budgeted window counts what is requested from one peer only.
+    #[test]
+    fn request_map_sizes_follow_their_entries() {
+        let mut m = RequestMap::default();
+        assert_eq!(m.insert_sized(key(1), 7, 100), None);
+        assert_eq!(m.insert_sized(key(2), 7, 20), None);
+        assert_eq!(m.insert_sized(key(3), 8, 3_000), None);
+        assert_eq!(m.insert(key(4), 7), None, "no size of its own");
+        assert_eq!(m.insert_sized(key(5), 7, 5), None);
+        assert_eq!(m.outstanding_from(7), (4, 125));
+        assert_eq!(m.outstanding_from(8), (1, 3_000));
+        assert_eq!(m.outstanding_from(9), (0, 0));
+
+        // Moving a request to another peer moves its size with it.
+        assert_eq!(m.insert(key(1), 8), Some(7));
+        assert_eq!(m.outstanding_from(7), (3, 25));
+        assert_eq!(m.outstanding_from(8), (2, 3_100));
+
+        // Removing the first entry swaps the last one into its place;
+        // every remaining size is still its own hash's.
+        assert_eq!(m.remove(&key(1)), Some(8));
+        assert_eq!(m.outstanding_from(8), (1, 3_000));
+        assert_eq!(m.outstanding_from(7), (3, 25));
+        assert_eq!(m.remove(&key(5)), Some(7));
+        assert_eq!(m.outstanding_from(7), (2, 20));
+        assert_eq!(m.remove(&key(2)), Some(7));
+        assert_eq!(m.outstanding_from(7), (1, 0));
+
+        // A sized insert over an existing entry replaces peer and size.
+        assert_eq!(m.insert_sized(key(3), 7, 40), Some(8));
+        assert_eq!(m.outstanding_from(7), (2, 40));
+        assert_eq!(m.outstanding_from(8), (0, 0));
+        assert_eq!(m.len(), 2);
+    }
+
+    /// The byte budget is half of dcrd's sixteen blocks at the network's
+    /// maximum size and never more than eight main network blocks, and
+    /// the count stays between dcrd's window and the largest getdata
+    /// that costs no ban score.
+    #[test]
+    fn budget_is_half_of_sixteen_maximum_blocks_and_the_count_is_clamped() {
+        assert_eq!(MAX_BUDGET_WINDOW_BLOCKS, 505);
+        assert_eq!(MAX_BUDGET_WINDOW_BYTES, 8 * 393_216);
+        assert_eq!(REFILL_BATCH_BLOCKS, 7);
+        assert_eq!(
+            BlockWindow::budget(393_216, BUDGET_WINDOW_BLOCKS),
+            BlockWindow::Budget {
+                max_bytes: 3_145_728,
+                max_blocks: 128,
+            }
+        );
+        // A network of smaller blocks gets eight of its own.
+        assert_eq!(
+            BlockWindow::budget(100_000, 128),
+            BlockWindow::Budget {
+                max_bytes: 800_000,
+                max_blocks: 128,
+            }
+        );
+        // A network of larger blocks gets no more than the main network.
+        for max_block_size in [393_217, 1_000_000, 1_310_720, usize::MAX] {
+            assert_eq!(
+                BlockWindow::budget(max_block_size, 128),
+                BlockWindow::Budget {
+                    max_bytes: MAX_BUDGET_WINDOW_BYTES,
+                    max_blocks: 128,
+                },
+                "{max_block_size}"
+            );
+        }
+
+        let count = |max_blocks| match BlockWindow::budget(393_216, max_blocks) {
+            BlockWindow::Budget { max_blocks, .. } => max_blocks,
+            BlockWindow::Dcrd => unreachable!("a budget was asked for"),
+        };
+        for (asked, want) in [
+            (0, 16),
+            (15, 16),
+            (16, 16),
+            (17, 17),
+            (504, 504),
+            (505, 505),
+            (506, 505),
+            (usize::MAX, 505),
+        ] {
+            assert_eq!(count(asked), want, "{asked}");
+        }
+    }
+
+    /// Halving a budgeted window halves its bytes and its count, the
+    /// count never below dcrd's 16, where there is nothing more to
+    /// narrow: three halvings from the default and five from the widest
+    /// setting.  dcrd's window is never narrowed.
+    #[test]
+    fn a_budgeted_window_is_halved_down_to_dcrds_count() {
+        assert_eq!(WINDOW_RECOVERY_WINDOWS, 16);
+        let window = |max_bytes, max_blocks| BlockWindow::Budget {
+            max_bytes,
+            max_blocks,
+        };
+
+        let default = BlockWindow::budget(393_216, BUDGET_WINDOW_BLOCKS);
+        // (halvings, bytes, blocks, whether a further halving narrows it)
+        let steps = [
+            (0, 3_145_728, 128, true),
+            (1, 1_572_864, 64, true),
+            (2, 786_432, 32, true),
+            (3, 393_216, 16, false),
+            (4, 196_608, 16, false),
+        ];
+        for (halvings, max_bytes, max_blocks, further) in steps {
+            assert_eq!(
+                default.narrowed(halvings),
+                window(max_bytes, max_blocks),
+                "{halvings}"
+            );
+            assert_eq!(default.can_narrow(halvings), further, "{halvings}");
+        }
+
+        let widest = BlockWindow::budget(393_216, MAX_BUDGET_WINDOW_BLOCKS);
+        for (halvings, max_blocks, further) in [
+            (0, 505, true),
+            (1, 252, true),
+            (2, 126, true),
+            (3, 63, true),
+            (4, 31, true),
+            (5, 16, false),
+        ] {
+            assert_eq!(
+                widest.narrowed(halvings),
+                window(3_145_728 >> halvings, max_blocks),
+                "{halvings}"
+            );
+            assert_eq!(widest.can_narrow(halvings), further, "{halvings}");
+        }
+
+        // A count of 16 has nothing to narrow, and 17 has one step.
+        let narrowest = BlockWindow::budget(393_216, 16);
+        assert!(!narrowest.can_narrow(0));
+        let seventeen = BlockWindow::budget(393_216, 17);
+        assert!(seventeen.can_narrow(0));
+        assert!(!seventeen.can_narrow(1));
+        assert_eq!(seventeen.narrowed(1), window(1_572_864, 16));
+
+        // More halvings than the limits have bits leave the floor.
+        for halvings in [63, 64, 65, u32::MAX] {
+            assert_eq!(default.narrowed(halvings), window(0, 16), "{halvings}");
+            assert!(!default.can_narrow(halvings), "{halvings}");
+        }
+
+        assert_eq!(BlockWindow::Dcrd.narrowed(3), BlockWindow::Dcrd);
+        assert!(!BlockWindow::Dcrd.can_narrow(0));
+    }
+
+    /// When the list of needed blocks is rebuilt.  dcrd's rule leaves a
+    /// list drained to nothing alone until the best header moves
+    /// (`manager.go:441-443`); the budgeted window rebuilds it, and any
+    /// list a full window can no longer be taken from, unless the list
+    /// already ran to the best known header.
+    #[test]
+    fn the_needed_blocks_list_is_rebuilt_before_a_window_can_run_dry() {
+        let dcrd = BlockWindow::Dcrd;
+        let budget = BlockWindow::budget(393_216, BUDGET_WINDOW_BLOCKS);
+        assert_eq!(MIN_IN_FLIGHT_BLOCKS, 10);
+        assert_eq!(MAX_IN_FLIGHT_BLOCKS, 16);
+
+        // (window, best header changed, entries left, ends at the best
+        // header) and whether the list is rebuilt.
+        let cases = [
+            // A changed best header always rebuilds.
+            (dcrd, true, 0, false, true),
+            (dcrd, true, 300, true, true),
+            (budget, true, 0, true, true),
+            (budget, true, 700, false, true),
+            // dcrd: only a list of one to nine entries that stops short
+            // of the best header.
+            (dcrd, false, 0, false, false),
+            (dcrd, false, 1, false, true),
+            (dcrd, false, 9, false, true),
+            (dcrd, false, 10, false, false),
+            (dcrd, false, 9, true, false),
+            (dcrd, false, 1, true, false),
+            // Budget: fewer entries than the window holds, none included.
+            (budget, false, 0, false, true),
+            (budget, false, 1, false, true),
+            (budget, false, 127, false, true),
+            (budget, false, 128, false, false),
+            (budget, false, 640, false, false),
+            // Nothing more to learn from the chain.
+            (budget, false, 0, true, false),
+            (budget, false, 127, true, false),
+        ];
+        for (window, changed, left, at_best, want) in cases {
+            assert_eq!(
+                next_blocks_need_update(window, changed, left, at_best),
+                want,
+                "{window:?}, changed {changed}, {left} left, at best {at_best}"
+            );
+        }
+
+        // The threshold follows the window's count.
+        let wide = BlockWindow::budget(393_216, MAX_BUDGET_WINDOW_BLOCKS);
+        assert!(next_blocks_need_update(wide, false, 504, false));
+        assert!(!next_blocks_need_update(wide, false, 505, false));
     }
 
     /// Whole-second intervals render exactly like Go's

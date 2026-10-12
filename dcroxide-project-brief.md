@@ -186,11 +186,42 @@ What Phase 15 has covered so far:
   each.
 - **A delayed link was measured for the first time on 2026-10-11.**
   Through a relay that delays every chunk, at a 50 ms round trip
-  dcroxide synced the early chain at 260 blk/s and dcrd v2.1.6 at 252,
-  about 13 blocks per round trip each through dcrd's 16-block window,
-  where over loopback they pass those blocks at about 3,200 and
-  1,500 blk/s. Over those blocks the window sets the pace and the lead
-  over dcrd is gone; no delayed run went past block 237,870.
+  dcroxide `7d31abb` synced the early chain at 260 blk/s and dcrd
+  v2.1.6 at 252, about 13 blocks per round trip each through dcrd's
+  16-block window, which dcroxide then used, where over loopback they
+  pass those blocks at about 3,200 and 1,500 blk/s. Over those blocks
+  that window set the pace and the lead over dcrd was gone; no delayed
+  run of that day went past block 237,870.
+- **The daemon's default download window is now its own, not dcrd's,
+  and was measured on 2026-10-12 in short runs only** (PARITY.md,
+  *Block download window*). It keeps up to 128 blocks requested from
+  the sync peer and, beyond the first 16, no more than 3,145,728 bytes
+  of them, and halves both limits, down to dcrd's 16 blocks, each time
+  a sync peer leaves with more than 16 requested;
+  `DCROXIDE_BLOCK_WINDOW=dcrd` puts dcrd's window back. The runs were
+  on the same machine, with one binary and one run per arm. Through the
+  same relay for 300 s, on a quiet machine with the node on four cores:
+  at a 50 ms round trip the node reached block 68,031 under dcrd's rule
+  and block 532,079 under the default, and at 150 ms blocks 18,445 and
+  158,440, with no narrowing, widening or stalled peer logged. In five
+  outbound-only starts of 300 s against the public main network, on a
+  machine that was not quiet and with the peers and links the network
+  offered: under dcrd's rule the node reached block 24,455 180.7 s
+  after its first block arrived and block 41,191 after 220.3 s; under
+  the default it reached block 188,469 after 215.7 s and block 93,095
+  after 161.8 s, and in a third start it fetched no block, its header
+  sync being about 68% done when the 300 s ended. None logged a
+  narrowing, a stalled peer or a ban. Over loopback, on a quiet
+  machine, one sync each to block 1,116,035: 612.4 s with the window
+  against 607.7 s for the code before it (`3a367e5`), 0.8% more, which
+  one run each does not settle as a cost or as nothing. Not measured: a
+  whole sync over a delayed or a real link, a sync over a link held to
+  a set rate, or one with a reader made to stop for 20 s or more. The
+  last two are where the wider window can cost sync peers, which is
+  read from the code and from a model over header sizes, not from a
+  run: the public-network starts ran over whatever links their peers
+  had, at rates that were not recorded, and the longest flush of the
+  loopback sync took 3.5 s.
 - **Security-blocker campaign.** The release blockers, highs, and mediums from
   an audit of the ported surface: RPC authentication and admission, peer
   message-path bounds (stall deadlines, getdata, queue and write limits),

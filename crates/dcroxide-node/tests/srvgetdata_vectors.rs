@@ -199,10 +199,13 @@ const SCORE_NOW_UNIX: i64 = 1_700_000_000;
 ///
 /// At 99 points per full inventory message the rate is 0.00198 points
 /// per item, and against dcrd's 60-second half-life and threshold of 100
-/// the equilibrium is reached at ~583 items/second sustained. Both dcrd
-/// and this port request blocks in batches of `maxInFlightBlocks` (16),
-/// which truncates to zero — so dcrd charges an honestly syncing peer
-/// nothing at all, where a carry would charge it the full per-item rate.
+/// the equilibrium is reached at ~583 items/second sustained. dcrd
+/// requests blocks in batches of at most `maxInFlightBlocks` (16), which
+/// truncates to zero — so dcrd charges an honestly syncing peer nothing
+/// at all, where a carry would charge it the full per-item rate. This
+/// port's batches are larger, and
+/// `the_largest_block_window_costs_no_ban_score` pins that they are free
+/// too.
 /// Early-chain blocks are ~1 KiB, so 583 blocks/s is ~0.6 MB/s of
 /// upload: a peer bootstrapping from us over an ordinary link would be
 /// banned partway through the small-block window.
@@ -231,9 +234,9 @@ fn the_getdata_ban_score_matches_dcrds_truncating_rate() {
     assert_eq!(getdata_ban_score_increase(MAX_INV_PER_MSG), 99);
     assert!(getdata_ban_score_increase(MAX_INV_PER_MSG) < BAN_THRESHOLD);
 
-    // The property the truncation protects: the batch size both dcrd's
-    // netsync and this port's actually use for block requests costs an
-    // honestly syncing peer nothing, however many batches it sends.
+    // The property the truncation protects: the largest batch dcrd's
+    // netsync uses for block requests costs an honestly syncing peer
+    // nothing, however many batches it sends.
     const MAX_IN_FLIGHT_BLOCKS: u32 = 16;
     assert_eq!(getdata_ban_score_increase(MAX_IN_FLIGHT_BLOCKS), 0);
     let mut state = ServerPeerAddrState::new(false);
@@ -252,6 +255,44 @@ fn the_getdata_ban_score_matches_dcrds_truncating_rate() {
             OnGetDataOutcome::BanScore,
             "an honest peer requesting {MAX_IN_FLIGHT_BLOCKS} blocks per getdata \
              must never be banned for it, as in dcrd"
+        );
+    }
+}
+
+/// The most blocks this port's download window may be set to request is
+/// the largest getdata that is free under dcrd's rate, so no request the
+/// window makes can have a dcrd peer, or a peer running this port, score
+/// the node for syncing from it, even the whole window in one getdata,
+/// as when it is first filled.  The requests of a departing peer that
+/// move to another peer known to hold the data are not the window's:
+/// they go out in one message whatever their number, as in dcrd.
+///
+/// One block more costs a point for each getdata of that size.
+#[test]
+fn the_largest_block_window_costs_no_ban_score() {
+    let largest = u32::try_from(dcroxide_netsync::manager::MAX_BUDGET_WINDOW_BLOCKS)
+        .expect("the window's limit fits in a getdata count");
+    assert_eq!(getdata_ban_score_increase(largest), 0);
+    assert_eq!(getdata_ban_score_increase(largest + 1), 1);
+
+    // The window the daemon uses unless told otherwise is inside it.
+    assert!(dcroxide_netsync::manager::BUDGET_WINDOW_BLOCKS <= largest as usize);
+
+    let mut state = ServerPeerAddrState::new(false);
+    for _ in 0..10_000 {
+        let out = on_get_data(
+            &mut state,
+            largest,
+            0,
+            0,
+            false,
+            BAN_THRESHOLD,
+            SCORE_NOW_UNIX,
+        );
+        assert_ne!(
+            out,
+            OnGetDataOutcome::BanScore,
+            "a peer requesting {largest} blocks per getdata must never be banned for it"
         );
     }
 }

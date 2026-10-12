@@ -10,7 +10,10 @@
 //! over it, the shared mempool ([`crate::txmempool::NodeSyncTxPool`]),
 //! and the shared mixing pool ([`crate::mixnode::NodeSyncMixPool`]);
 //! the daemon drives that manager from the peer dispatch path
-//! ([`crate::dispatch`]).  [`SyncGate`] exposes the manager's is-current
+//! ([`crate::dispatch`]).  [`default_block_window`] is the block
+//! download window that manager syncs with, and
+//! [`apply_block_window_setting`] the operator's way to choose another,
+//! dcrd's included.  [`SyncGate`] exposes the manager's is-current
 //! state (dcrd `SyncManager.IsCurrent`) to the gates that cannot take
 //! the manager lock.  [`NullTxPool`] and [`NullMixPool`] are empty-pool
 //! test doubles for exercising the chain adapter on its own.
@@ -22,7 +25,8 @@ use dcroxide_blockchain::{RuleError, RuleErrorKind, render_multi_error};
 use dcroxide_chaincfg::Params;
 use dcroxide_chainhash::Hash;
 use dcroxide_netsync::manager::{
-    BestSnapshot, Config, ProcessBlockFailure, ProcessTxFailure, SyncChain, SyncManager,
+    BUDGET_WINDOW_BLOCKS, BestSnapshot, BlockWindow, Config, LogLevel, MAX_BUDGET_WINDOW_BLOCKS,
+    MAX_IN_FLIGHT_BLOCKS, ProcessBlockFailure, ProcessTxFailure, SyncChain, SyncManager,
     SyncMixPool, SyncTxPool,
 };
 use dcroxide_uint256::Uint256;
@@ -408,8 +412,117 @@ impl SyncGate {
     }
 }
 
+/// The environment variable that selects the block download window
+/// ([`apply_block_window_setting`]).
+pub const BLOCK_WINDOW_VAR: &str = "DCROXIDE_BLOCK_WINDOW";
+
+/// The block download window the daemon syncs with unless
+/// [`BLOCK_WINDOW_VAR`] says otherwise: the budgeted window, which dcrd
+/// does not have (PARITY *Block download window*), at
+/// [`BUDGET_WINDOW_BLOCKS`] blocks at most.
+///
+/// Its byte budget is worked out from the smallest of the network's
+/// maximum block sizes and is capped at eight main network blocks
+/// (`dcroxide_netsync::manager::MAX_BUDGET_WINDOW_BYTES`), which is what
+/// it comes to on all four networks.
+pub fn default_block_window(params: &Params) -> BlockWindow {
+    let max_block_size = params
+        .maximum_block_sizes
+        .iter()
+        .copied()
+        .min()
+        .unwrap_or(dcroxide_wire::MAX_BLOCK_PAYLOAD as usize);
+    BlockWindow::budget(max_block_size, BUDGET_WINDOW_BLOCKS)
+}
+
+/// The block download window a [`BLOCK_WINDOW_VAR`] value names, or
+/// `None` for a value that names none.
+///
+/// `dcrd`, in any case, is dcrd's own window of 16 blocks refilled below
+/// 10.  A whole number from 16 to 505 is the budgeted window with that
+/// many blocks at most in place of [`BUDGET_WINDOW_BLOCKS`], a setting
+/// for measurement: 16 is the most dcrd's window keeps requested and the
+/// fewest this one may be set to, and 505 is the largest getdata that
+/// costs no ban score ([`MAX_BUDGET_WINDOW_BLOCKS`]).  Surrounding
+/// whitespace is ignored.
+pub fn parse_block_window(raw: &str, params: &Params) -> Option<BlockWindow> {
+    let value = raw.trim();
+    if value.eq_ignore_ascii_case("dcrd") {
+        return Some(BlockWindow::Dcrd);
+    }
+    // Digits only: `parse` alone would also take a leading plus sign.
+    if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let max_blocks = value.parse::<usize>().ok()?;
+    if !(MAX_IN_FLIGHT_BLOCKS..=MAX_BUDGET_WINDOW_BLOCKS).contains(&max_blocks) {
+        return None;
+    }
+    let BlockWindow::Budget { max_bytes, .. } = default_block_window(params) else {
+        return None;
+    };
+    Some(BlockWindow::Budget {
+        max_bytes,
+        max_blocks,
+    })
+}
+
+/// Give the manager the block download window the [`BLOCK_WINDOW_VAR`]
+/// setting names, returning it with the line to log about the setting,
+/// if any, and the level to log it at.
+///
+/// Unset leaves the manager as [`new_sync_manager`] built it and says
+/// nothing.  A value [`parse_block_window`] accepts is applied, and the
+/// line reports the window read back from the manager afterwards, so it
+/// cannot name a window the manager does not have.  Any other value is
+/// ignored with a warning rather than being fatal, like the daemon's
+/// other tuning variables.
+///
+/// The window named is the widest the manager uses.  A budgeted window
+/// halves itself when it loses its sync peer with more than 16 blocks
+/// requested from it and says so in a `SYNC` line of its own
+/// (`dcroxide_netsync::BlockWindow::Budget`).
+///
+/// The manager is taken and returned by value, so a caller cannot log
+/// the setting and leave the manager it uses untouched.
+pub fn apply_block_window_setting<C, T, M>(
+    manager: SyncManager<C, T, M>,
+    setting: Option<&str>,
+    params: &Params,
+) -> (SyncManager<C, T, M>, Option<(LogLevel, String)>)
+where
+    C: SyncChain,
+    T: SyncTxPool,
+    M: SyncMixPool,
+{
+    let Some(raw) = setting else {
+        return (manager, None);
+    };
+    let Some(window) = parse_block_window(raw, params) else {
+        let line = format!(
+            "{BLOCK_WINDOW_VAR}={} is neither dcrd nor a whole number of blocks from \
+             {MAX_IN_FLIGHT_BLOCKS} to {MAX_BUDGET_WINDOW_BLOCKS}; using the default",
+            raw.trim()
+        );
+        return (manager, Some((LogLevel::Warn, line)));
+    };
+    let manager = manager.with_block_window(window);
+    let line = match manager.block_window() {
+        BlockWindow::Dcrd => format!(
+            "Block download window set to dcrd's {MAX_IN_FLIGHT_BLOCKS} blocks in flight by \
+             {BLOCK_WINDOW_VAR}"
+        ),
+        BlockWindow::Budget { max_blocks, .. } => format!(
+            "Block download window set to at most {max_blocks} blocks in flight by \
+             {BLOCK_WINDOW_VAR}"
+        ),
+    };
+    (manager, Some((LogLevel::Info, line)))
+}
+
 /// Construct the daemon's sync manager over the shared chain (dcrd
-/// `newServer` building its `netsync.Config`).
+/// `newServer` building its `netsync.Config`), with the daemon's block
+/// download window in place of dcrd's ([`default_block_window`]).
 pub fn new_sync_manager(
     chain: Arc<Mutex<Chain>>,
     params: &Params,
@@ -434,6 +547,7 @@ pub fn new_sync_manager(
             RECENTLY_CONFIRMED_TXNS_FP_RATE,
         ))),
     })
+    .with_block_window(default_block_window(params))
 }
 
 #[cfg(test)]
@@ -444,6 +558,218 @@ mod tests {
         RuleError {
             kind,
             description: description.to_string(),
+        }
+    }
+
+    /// The four networks, by name.
+    fn networks() -> [(&'static str, Params); 4] {
+        [
+            ("mainnet", dcroxide_chaincfg::mainnet_params()),
+            ("testnet3", dcroxide_chaincfg::testnet3_params()),
+            ("simnet", dcroxide_chaincfg::simnet_params()),
+            ("regnet", dcroxide_chaincfg::regnet_params()),
+        ]
+    }
+
+    /// The daemon's sync manager over a new chain for the network, built
+    /// as the daemon builds it, with the directory its database is in.
+    fn daemon_sync_manager(params: &Params) -> (tempfile::TempDir, NodeSyncManager) {
+        let dir = tempfile::tempdir().expect("database directory");
+        let opts = dcroxide_database::Options::new(dir.path().join("blocks_ffldb"), params.net.0);
+        dcroxide_database::create_dir_all_owner_only(&opts.path).expect("create the directory");
+        let db = dcroxide_database::Database::create(&opts).expect("create the database");
+        let chain = Arc::new(Mutex::new(
+            Chain::open(db, params, params.assume_valid, false, 0).expect("open the chain"),
+        ));
+        let tx_pool = crate::txmempool::new_shared_tx_pool(
+            Arc::clone(&chain),
+            params,
+            false,
+            100,
+            10_000,
+            false,
+            false,
+        );
+        let mix_pool =
+            crate::mixnode::shared_mix_pool(Arc::clone(&chain), params.clone(), &tx_pool);
+        let manager = new_sync_manager(chain, params, false, 8, 100, tx_pool, mix_pool);
+        (dir, manager)
+    }
+
+    /// The window the daemon syncs with by default is the budgeted one,
+    /// at 128 blocks and eight of the main network's maximum-size blocks
+    /// on every network: the others allow larger blocks, and the budget
+    /// does not follow them up.
+    #[test]
+    fn the_default_block_window_is_budgeted_on_every_network() {
+        let main_net = dcroxide_chaincfg::mainnet_params();
+        assert_eq!(main_net.maximum_block_sizes, vec![393_216]);
+        assert_eq!(
+            dcroxide_netsync::manager::MAX_BUDGET_WINDOW_BYTES,
+            8 * 393_216,
+            "eight maximum-size main network blocks"
+        );
+        for (name, params) in networks() {
+            assert!(
+                params
+                    .maximum_block_sizes
+                    .iter()
+                    .all(|size| *size >= 393_216),
+                "{name}"
+            );
+            assert_eq!(
+                default_block_window(&params),
+                BlockWindow::Budget {
+                    max_bytes: 3_145_728,
+                    max_blocks: 128,
+                },
+                "{name}"
+            );
+        }
+
+        // A network of smaller blocks is budgeted from the smallest of
+        // its maximum sizes.
+        let mut small = dcroxide_chaincfg::simnet_params();
+        small.maximum_block_sizes = vec![200_000, 100_000, 300_000];
+        assert_eq!(
+            default_block_window(&small),
+            BlockWindow::Budget {
+                max_bytes: 800_000,
+                max_blocks: 128,
+            }
+        );
+    }
+
+    /// `DCROXIDE_BLOCK_WINDOW` names dcrd's window or a count for the
+    /// budgeted one, from dcrd's 16 to the largest getdata that costs no
+    /// ban score.  Nothing else is a window.
+    #[test]
+    fn block_window_settings_parse() {
+        let params = dcroxide_chaincfg::mainnet_params();
+        for raw in ["dcrd", "DCRD", "Dcrd", " dcrd ", "\tdcrd\n"] {
+            assert_eq!(
+                parse_block_window(raw, &params),
+                Some(BlockWindow::Dcrd),
+                "{raw:?}"
+            );
+        }
+        for (raw, max_blocks) in [
+            ("16", 16),
+            ("17", 17),
+            ("128", 128),
+            (" 256 ", 256),
+            ("0064", 64),
+            ("504", 504),
+            ("505", 505),
+        ] {
+            assert_eq!(
+                parse_block_window(raw, &params),
+                Some(BlockWindow::Budget {
+                    max_bytes: 3_145_728,
+                    max_blocks,
+                }),
+                "{raw:?}"
+            );
+        }
+        for raw in [
+            "",
+            " ",
+            "0",
+            "1",
+            "15",
+            "506",
+            "50000",
+            "99999999999999999999999999",
+            "-1",
+            "-128",
+            "+128",
+            "128 blocks",
+            "12 8",
+            "1e2",
+            "0x80",
+            "128.0",
+            "abc",
+            "dcrd16",
+            "default",
+            "budget",
+        ] {
+            assert_eq!(parse_block_window(raw, &params), None, "{raw:?}");
+        }
+    }
+
+    /// The manager the daemon builds syncs with the daemon's default
+    /// window, not with the window the core starts with, on every
+    /// network.
+    #[test]
+    fn the_daemons_sync_manager_has_the_default_block_window() {
+        for (name, params) in networks() {
+            let (_dir, manager) = daemon_sync_manager(&params);
+            assert_eq!(
+                manager.block_window(),
+                default_block_window(&params),
+                "{name}"
+            );
+            assert_ne!(manager.block_window(), BlockWindow::Dcrd, "{name}");
+        }
+    }
+
+    /// The setting reaches the manager: what comes back syncs with the
+    /// window the setting names, and the line to log says which.  An
+    /// unset variable changes nothing and says nothing; a value that
+    /// names no window changes nothing and warns.
+    #[test]
+    fn a_block_window_setting_is_applied_to_the_manager() {
+        let params = dcroxide_chaincfg::simnet_params();
+        let default = default_block_window(&params);
+        let apply = |setting: Option<&str>| {
+            let (_dir, manager) = daemon_sync_manager(&params);
+            let (manager, notice) = apply_block_window_setting(manager, setting, &params);
+            (manager.block_window(), notice)
+        };
+
+        assert_eq!(apply(None), (default, None));
+        assert_eq!(
+            apply(Some("dcrd")),
+            (
+                BlockWindow::Dcrd,
+                Some((
+                    LogLevel::Info,
+                    "Block download window set to dcrd's 16 blocks in flight by \
+                     DCROXIDE_BLOCK_WINDOW"
+                        .to_string()
+                ))
+            )
+        );
+        assert_eq!(
+            apply(Some(" 256 ")),
+            (
+                BlockWindow::Budget {
+                    max_bytes: 3_145_728,
+                    max_blocks: 256,
+                },
+                Some((
+                    LogLevel::Info,
+                    "Block download window set to at most 256 blocks in flight by \
+                     DCROXIDE_BLOCK_WINDOW"
+                        .to_string()
+                ))
+            )
+        );
+        for bad in ["15", "506", "", "fast"] {
+            assert_eq!(
+                apply(Some(bad)),
+                (
+                    default,
+                    Some((
+                        LogLevel::Warn,
+                        format!(
+                            "DCROXIDE_BLOCK_WINDOW={bad} is neither dcrd nor a whole number of \
+                             blocks from 16 to 505; using the default"
+                        )
+                    ))
+                ),
+                "{bad:?}"
+            );
         }
     }
 

@@ -2061,13 +2061,15 @@ pub const GETDATA_SCORE_PER_FULL_INV: u32 = 99;
 /// not an improvement: at 99 points per full inventory message the rate
 /// is 0.00198 points per item, and against dcrd's 60-second ban-score
 /// half-life and threshold of 100 the equilibrium is reached at ~583
-/// items per second sustained.  Both dcrd and this port request blocks
-/// in batches of `maxInFlightBlocks` (16), which truncates to zero, so
-/// dcrd charges an honestly syncing peer nothing — while a carry would
-/// charge it at the full per-item rate.  Early-chain blocks are ~1 KiB,
-/// so 583 blocks/s is only ~0.6 MB/s of upload: an ordinary peer
-/// bootstrapping from us over a fast link would be banned partway
-/// through the small-block window.
+/// items per second sustained.  dcrd requests blocks in batches of at
+/// most `maxInFlightBlocks` (16), and this port in batches of at most
+/// its download window: 128 blocks unless set otherwise, and never more
+/// than `dcroxide_netsync::manager::MAX_BUDGET_WINDOW_BLOCKS` (505).
+/// Both truncate to zero, so dcrd charges an honestly syncing peer
+/// nothing — while a carry would charge it at the full per-item rate.
+/// Early-chain blocks are ~1 KiB, so 583 blocks/s is only ~0.6 MB/s of
+/// upload: an ordinary peer bootstrapping from us over a fast link would
+/// be banned partway through the small-block window.
 ///
 /// What actually bounds the getdata path is the machinery
 /// [`MAX_CONCURRENT_GETDATA_REQS`], [`MAX_PENDING_GETDATA_ITEM_REQS`]
