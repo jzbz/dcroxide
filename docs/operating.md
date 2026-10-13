@@ -1106,6 +1106,26 @@ Start it against simnet or testnet rather than mainnet while evaluating:
 right default if you only want a syncing node — it removes the entire
 authenticated surface from the process.
 
+**Three error lines when the peer is on a private address are dcrd's,
+not a fault.** Syncing from a node on the same machine or LAN, with
+`--connect` or `--addpeer` naming a loopback, RFC 1918, `100.64.0.0/10`
+or other non-routable address, logs these at each connection:
+
+```text
+[ERR] SRVR: Marking address as attempted failed: address 127.0.0.1:19108 not found
+[ERR] SRVR: Setting services for address failed: address 127.0.0.1:19108 not found
+[ERR] SRVR: Marking address as good failed: address 127.0.0.1:19108 not found
+```
+
+dcrd logs the same three for the same peer, because its address manager
+keeps only routable addresses, so the three updates it makes for an
+outbound peer find nothing to update. The connection and the sync are
+unaffected. The first line comes at every dial, retries included; the
+second when the peer's version message arrives; the third once the
+handshake completes. None is logged on simnet or regnet, for an inbound
+peer, or for a peer with a public address. See QK-0028 in
+[QUIRKS.md](../QUIRKS.md).
+
 ## Status of what you are running
 
 Per-package parity status is in [PARITY.md](../PARITY.md), which also

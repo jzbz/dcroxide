@@ -2130,6 +2130,21 @@ impl ServerPeerHandler {
                 msg.disable_relay_tx,
             )
         };
+        // dcrd logs the address manager's refusal of the advertised
+        // services and carries on, ahead of every rejection
+        // (`server.go:987-990`).  The manager takes no address that is
+        // not routable (`addrmgr/addrmanager.go:300-304`), so it does
+        // not hold an outbound peer on a loopback or private address,
+        // the usual --connect or --addpeer target on the same host or
+        // LAN, and such a peer logs this at every handshake, between
+        // the dial's `Marking address as attempted failed` and the
+        // admission's `Marking address as good failed`.
+        if let Some(err) = &outcome.set_services_error {
+            crate::logging::error(
+                "SRVR",
+                &format!("Setting services for address failed: {err}"),
+            );
+        }
         if let Some(rejection) = outcome.rejected {
             return Err(crate::server::version_rejection_text(
                 &facts, msg, rejection,

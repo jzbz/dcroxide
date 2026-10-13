@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: ISC
 //! The server version handler against dcrd master 452c1a6c's
 //! `serverPeer.OnVersion` (the callback dcrd 2.2 fires from inside
-//! the handshake): the services update that precedes every rejection,
-//! the old-protocol rejection, the mix-capable outbound preference
+//! the handshake): the services update that precedes every rejection
+//! and the address manager's refusal of it that dcrd logs, the
+//! old-protocol rejection, the mix-capable outbound preference
 //! that now rejects (pre-2.2 it disconnected and deliberately
 //! continued), the missing-services rejection, the accept paths, and
 //! dcrd's exact rejection texts.  The address advertisement, getaddr
@@ -10,7 +11,7 @@
 //! post-handshake add-peer admission and are exercised by the served
 //! peer integration tests.
 
-use dcroxide_addrmgr::{AddrManager, NetAddressType};
+use dcroxide_addrmgr::{AddrError, AddrManager, ErrorKind, NetAddressType};
 use dcroxide_node::server::{
     OnVersionFacts, VersionRejection, natf_supported, on_ver_ack, on_version,
     version_rejection_text, wire_to_addrmgr_net_address,
@@ -195,6 +196,72 @@ fn accepted_outbound_and_inbound_peers_gate_the_services_update() {
     );
     assert!(!out.set_services);
     assert_eq!(out.rejected, None);
+}
+
+#[test]
+fn a_refused_services_update_is_reported_where_dcrd_logs_it() {
+    let dir = tempfile::tempdir().unwrap();
+    // The manager does not hold the peer's address.  That is the
+    // standing case for an address that is not routable, which
+    // `AddAddresses` never takes (`addrmgr/addrmanager.go:300-304`).
+    let mut mgr = amgr(dir.path(), false);
+    let not_found = Some(AddrError {
+        kind: ErrorKind::AddressNotFound,
+        description: "address 52.91.77.2:34567 not found".to_string(),
+    });
+
+    // Outbound: `SetServices` fails and dcrd logs `Setting services for
+    // address failed: %v` (`server.go:987-990`); the error comes back
+    // for the caller to log, and the peer is admitted all the same.
+    let out = on_version(
+        &mut mgr,
+        &facts(false, false, 8),
+        PROTOCOL_VERSION as i32,
+        ServiceFlag::NODE_NETWORK,
+        false,
+    );
+    assert!(out.set_services);
+    assert_eq!(out.set_services_error, not_found);
+    assert_eq!(out.rejected, None);
+
+    // The update, and so its failure, comes before the rejection of a
+    // peer that is too old (the NOTE at `server.go:981-983`).
+    let out = on_version(
+        &mut mgr,
+        &facts(false, false, 8),
+        REMOVE_REJECT_VERSION as i32 - 1,
+        ServiceFlag::NODE_NETWORK,
+        false,
+    );
+    assert_eq!(out.set_services_error, not_found);
+    assert_eq!(out.rejected, Some(VersionRejection::OldProtocol));
+
+    // Inbound, and on the simulation and regression test networks, the
+    // update is not made, so nothing fails, though the manager still
+    // does not hold the address.
+    for skipped in [facts(true, false, 8), facts(false, true, 8)] {
+        let out = on_version(
+            &mut mgr,
+            &skipped,
+            PROTOCOL_VERSION as i32,
+            ServiceFlag::NODE_NETWORK,
+            false,
+        );
+        assert!(!out.set_services);
+        assert_eq!(out.set_services_error, None);
+    }
+
+    // An address the manager holds takes the update.
+    let mut mgr = amgr(dir.path(), true);
+    let out = on_version(
+        &mut mgr,
+        &facts(false, false, 8),
+        PROTOCOL_VERSION as i32,
+        ServiceFlag::NODE_NETWORK,
+        false,
+    );
+    assert!(out.set_services);
+    assert_eq!(out.set_services_error, None);
 }
 
 #[test]

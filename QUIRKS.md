@@ -772,3 +772,42 @@ Entry format:
   target's round-trip assertion allows exactly this case.
 - **How found:** the `address_decode` fuzz target, within seconds of its
   mode that builds well-formed base58check strings being added.
+
+## QK-0028 — a healthy outbound peer on a private address logs three errors
+
+- **Where:** dcrd `server.go` `attemptDcrdDial` (`:1930-1937`),
+  `serverPeer.OnVersion` (`:986-990`) and `handleAddPeer` (`:2661-2665`),
+  over `addrmgr` `addOrUpdateAddress` (`addrmgr/addrmanager.go:300-304`) /
+  dcroxide-node `outbound.rs` `mark_dial_attempt`, `dispatch.rs`
+  `ServerPeerHandler::on_version` (from the outcome of `server.rs`
+  `on_version`) and `on_connected`
+- **What:** the dial wrapper's comment says it makes sure the dialed address
+  exists in the address manager, but `AddAddresses` drops an address that is
+  not routable without reporting it: loopback, RFC 1918, 100.64.0.0/10,
+  link-local and the other ranges `IsRoutable` rejects
+  (`addrmgr/network.go:285-290`). The three updates dcrd then makes for the
+  peer (`Attempt` at the dial, `SetServices` when its version message
+  arrives, `Good` once the handshake completes) each fail with `address
+  <ip:port> not found`, and each failure is logged at error level under
+  SRVR: `Marking address as attempted failed`, `Setting services for address
+  failed`, `Marking address as good failed`. A `--connect` or `--addpeer`
+  peer on the same host or LAN therefore produces three error lines per
+  connection, the first again at every retry, while it connects and syncs
+  normally. Nothing is logged on simnet or regnet, for an inbound peer, or
+  for a peer with a public address.
+- **Why reproduced:** operator-visible log parity. The lines read like a
+  fault and are not one; lowering their level or exempting persistent peers
+  would make the port's log differ from dcrd's for the same start.
+- **Pinned by:** `an_outbound_loopback_peer_logs_dcrds_three_address_errors`
+  and its five neighbours in
+  `crates/dcroxide-node/tests/review_peer_addr_logs.rs` (the order and the
+  exact text, the same three again at a redial, the second line ahead of the
+  old-protocol rejection, and the absence for a routable, an inbound, a
+  simnet and a regnet peer);
+  `a_refused_services_update_is_reported_where_dcrd_logs_it` in
+  `tests/srvversion_vectors.rs`; the first line at a refused dial by
+  `a_refused_connect_peer_logs_dcrds_dial_lines` in
+  `tests/review_dial_logs.rs`.
+- **How found:** a sync from a node on a private address logged the first
+  and third lines and not the second, which a dcrd v2.1.6 node syncing over
+  loopback logs between them.

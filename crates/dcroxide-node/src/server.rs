@@ -28,8 +28,8 @@ use std::collections::BTreeMap;
 use std::ops::ControlFlow;
 
 use dcroxide_addrmgr::{
-    AddrManager, AddressPriority, NetAddress, NetAddressReach, NetAddressType, encode_host,
-    is_routable, new_net_address_from_ip_port, new_net_address_from_params,
+    AddrError, AddrManager, AddressPriority, NetAddress, NetAddressReach, NetAddressType,
+    encode_host, is_routable, new_net_address_from_ip_port, new_net_address_from_params,
 };
 use dcroxide_wire::ServiceFlag;
 
@@ -1398,6 +1398,13 @@ pub struct OnVersionOutcome {
     /// Whether the advertised services were forwarded to the
     /// address manager.
     pub set_services: bool,
+    /// The address manager's refusal of those services, which it
+    /// gives when it does not hold the peer's address.  The dial
+    /// hands the manager its target first, but the manager takes no
+    /// address that is not routable.  dcrd logs the refusal at error
+    /// level and goes on to the rejections (`server.go:987-990`); the
+    /// caller logs it, whatever `rejected` says.
+    pub set_services_error: Option<AddrError>,
     /// An early rejection; the peer disconnects and nothing below
     /// applies.
     pub rejected: Option<VersionRejection>,
@@ -1418,6 +1425,7 @@ pub fn on_version(
 ) -> OnVersionOutcome {
     let mut outcome = OnVersionOutcome {
         set_services: false,
+        set_services_error: None,
         rejected: None,
         disable_relay_tx: false,
     };
@@ -1427,8 +1435,11 @@ pub fn on_version(
     // the simulation and regression test networks.  This happens
     // before rejecting peers that are too old.
     if !facts.sim_or_reg_net && !facts.inbound {
-        // A lookup failure is logged and ignored.
-        let _ = addr_mgr.set_services(&facts.remote_na, msg_services);
+        // The manager refuses an address it does not hold.  dcrd logs
+        // the refusal and goes on to the checks below
+        // (`server.go:987-990`); it is returned for the caller to log
+        // once the manager is unlocked.
+        outcome.set_services_error = addr_mgr.set_services(&facts.remote_na, msg_services).err();
         outcome.set_services = true;
     }
 
@@ -1843,7 +1854,10 @@ pub fn done_peer(
     // discovered peers.
     if !facts.sim_or_reg_net {
         let remote_addr = wire_to_addrmgr_net_address(&facts.na);
-        // A failure is logged and ignored.
+        // dcrd logs a failure at error level under SRVR, as `Marking
+        // address as connected failed: %v`, and carries on
+        // (`server.go:2733-2736`).  This model logs nothing; the
+        // outcome says whether the manager took the update.
         outcome.marked_connected = addr_mgr.connected(&remote_addr).is_ok();
     }
 
