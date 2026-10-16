@@ -1918,6 +1918,48 @@ impl<B: MixBlockChain> Pool<B> {
             return Ok(false);
         }
 
+        // Check the KE does not conflict with an already accepted KE
+        // message by the same identity for the same session (dcrd
+        // `ffb42adf`, `mixing/mixpool/mixpool.go:1703-1722`).  A hash the
+        // session records but the pool no longer holds, which only
+        // `remove_message` leaves, is a plain error.  dcrd walks the
+        // session's hashes in Go's map order and returns at the first of
+        // either; here the hash smallest in internal byte order decides
+        // (the bytes as held, the reverse of the displayed hex), so the
+        // answer is fixed when both are present.
+        if let Some(ses) = self.sessions.get(&ke.session_id) {
+            let mut first: Option<(&[u8; 32], bool)> = None;
+            for prev in &ses.hashes {
+                let missing = match self.pool.get(prev) {
+                    None => true,
+                    Some(e) => match &e.msg {
+                        PoolMessage::KE(ses_ke) if ses_ke.identity == ke.identity => false,
+                        _ => continue,
+                    },
+                };
+                if first.is_none_or(|(h, _)| prev < h) {
+                    first = Some((prev, missing));
+                }
+            }
+            if let Some((prev, missing)) = first {
+                let prev = Hash(*prev);
+                if missing {
+                    return Err(PoolError::Other(format!(
+                        "unknown message {prev} recorded by session {}",
+                        hex(&ke.session_id)
+                    )));
+                }
+                return Err(rule_other(format!(
+                    "message {} by identity {} in session {} conflicts with \
+                     already accepted message {}",
+                    hash,
+                    hex(id),
+                    hex(&ke.session_id),
+                    prev
+                )));
+            }
+        }
+
         // While KEs are allowed to reference unknown PRs, they must
         // at least reference the PR submitted by their own identity.
         // If not, the KE is saved as an orphan and may be processed
