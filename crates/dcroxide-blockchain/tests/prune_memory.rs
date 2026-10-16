@@ -143,12 +143,16 @@ fn replay_battery(chain: &mut Chain, params: &dcroxide_chaincfg::Params, clock_o
 }
 
 /// The bytes in the store's flat block files.
+///
+/// Each file's size is read from the file itself: on Windows a
+/// directory entry's metadata is what the directory recorded, which can
+/// lag behind a file the store still holds open.
 fn block_file_bytes(store: &std::path::Path) -> u64 {
     std::fs::read_dir(store)
         .expect("store directory")
-        .map(|entry| entry.expect("directory entry"))
-        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "fdb"))
-        .map(|entry| entry.metadata().expect("block file metadata").len())
+        .map(|entry| entry.expect("directory entry").path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "fdb"))
+        .map(|path| std::fs::metadata(&path).expect("block file metadata").len())
         .sum()
 }
 

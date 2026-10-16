@@ -1109,7 +1109,7 @@ mod tests {
                     os.asked.fetch_add(1, Ordering::SeqCst);
                     let granted =
                         os.grants
-                            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                            .try_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
                                 left.checked_sub(1)
                             });
                     if granted.is_err() {
