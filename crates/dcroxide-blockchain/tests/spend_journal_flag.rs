@@ -266,6 +266,7 @@ fn a_missing_spend_journal_row_still_panics() {
 /// its parent, exactly like dcrd.
 #[test]
 fn connect_block_fetches_parent_journal_only_on_disapprove() {
+    let params = simnet_params();
     let none_resolver = |_: &OutPoint| -> Option<UtxoEntry> { None };
 
     // A coinbase-only parent: nothing to disconnect, so the lazily
@@ -283,6 +284,7 @@ fn connect_block_fetches_parent_journal_only_on_disapprove() {
         let mut view = UtxoView::new();
         view.set_best_hash(parent_hash);
         view.connect_block(
+            &params,
             &child,
             &parent,
             || {
@@ -309,6 +311,7 @@ fn connect_block_fetches_parent_journal_only_on_disapprove() {
         let mut view = UtxoView::new();
         view.set_best_hash(parent_hash);
         view.connect_block(
+            &params,
             &child,
             &parent,
             || {

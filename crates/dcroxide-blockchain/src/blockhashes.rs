@@ -1407,6 +1407,7 @@ mod tests {
     fn the_view_connect_refuses_hashes_of_another_shape() {
         let hashes = BlockTxHashes::compute(&one_transaction_block());
         let _ = crate::utxoview::UtxoView::new().connect_block_with_hashes(
+            &dcroxide_chaincfg::regnet_params(),
             &a_block_of_another_shape(),
             &hashes,
             &one_transaction_block(),

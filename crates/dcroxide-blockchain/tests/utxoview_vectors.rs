@@ -157,6 +157,9 @@ fn utxoview_vectors() {
     let data = include_str!("data/utxoview_vectors.txt");
     let mut lines = data.lines();
 
+    // The disconnect looks the grandfathered same-block stake spends up
+    // by network and height, and no network has one at these heights.
+    let params = dcroxide_chaincfg::regnet_params();
     let mut view = UtxoView::new();
     let none_resolver = |_: &OutPoint| -> Option<UtxoEntry> { None };
     let mut parent: Option<MsgBlock> = None;
@@ -257,7 +260,7 @@ fn utxoview_vectors() {
         if f[0] == "afterconnect" {
             let blk = block.as_ref().expect("block");
             let parent = parent.as_ref().expect("parent");
-            view.disconnect_block(blk, parent, &stxos, &none_resolver, TREASURY)
+            view.disconnect_block(&params, blk, parent, &stxos, &none_resolver, TREASURY)
                 .expect("disconnect block");
         }
     }

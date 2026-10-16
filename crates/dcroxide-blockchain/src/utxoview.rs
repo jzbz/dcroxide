@@ -14,6 +14,7 @@ use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use core::cmp::Ordering;
 
+use dcroxide_chaincfg::Params;
 use dcroxide_chainhash::Hash;
 use dcroxide_stake::TxType;
 use dcroxide_wire::{MsgBlock, MsgTx, OutPoint};
@@ -933,9 +934,95 @@ impl UtxoView {
         )
     }
 
+    /// Add the output that older consensus rules let a stake
+    /// transaction spend in the block that created it, when the block
+    /// is at a height that has one (dcrd `addSBSSViolations`,
+    /// `utxoviewpoint.go:613-631`): output 0 of the regular
+    /// transaction [`crate::validate::sbss_violation_hash`] names for
+    /// the network and height.  Without it the block, which is part of
+    /// the network's history, would be rejected.  Callers add it after
+    /// any undo of a disapproved parent and before the block's inputs
+    /// are fetched, so it is already in the view when the fetch runs.
+    pub(crate) fn add_sbss_violations(
+        &mut self,
+        params: &Params,
+        block: &MsgBlock,
+        regular_tx_hashes: &[Hash],
+        is_treasury_enabled: bool,
+    ) {
+        self.add_sbss_violations_with(
+            &sbss_violation_lookup(params),
+            block,
+            regular_tx_hashes,
+            is_treasury_enabled,
+        );
+    }
+
+    /// [`Self::add_sbss_violations`] over the given lookup of the
+    /// violating transaction's hash by height.
+    fn add_sbss_violations_with(
+        &mut self,
+        sbss_violation: &impl Fn(i64) -> Option<Hash>,
+        block: &MsgBlock,
+        regular_tx_hashes: &[Hash],
+        is_treasury_enabled: bool,
+    ) {
+        // Nothing to do for blocks that do not have a violation.
+        let height = i64::from(block.header.height);
+        let Some(violation_hash) = sbss_violation(height) else {
+            return;
+        };
+        for (idx, (tx, tx_hash)) in block.transactions.iter().zip(regular_tx_hashes).enumerate() {
+            if *tx_hash == violation_hash {
+                self.add_tx_out_with_hash(tx, tx_hash, 0, height, idx as u32, is_treasury_enabled);
+                return;
+            }
+        }
+    }
+
+    /// Mark spent the output [`Self::add_sbss_violations`] adds, once
+    /// the block that holds it has been disconnected, so the disconnect
+    /// does not leave it in the set (dcrd `removeSBSSViolations`,
+    /// `utxoviewpoint.go:974-1004`): the disconnect of the stake tree
+    /// restores it as an input of the stake transaction that spent it.
+    ///
+    /// # Panics
+    ///
+    /// When the output is missing from the view, with dcrd's text.
+    fn remove_sbss_violations_with(
+        &mut self,
+        sbss_violation: &impl Fn(i64) -> Option<Hash>,
+        block: &MsgBlock,
+        regular_tx_hashes: &[Hash],
+    ) {
+        // Nothing to do for blocks that do not have a violation.
+        let height = i64::from(block.header.height);
+        let Some(violation_hash) = sbss_violation(height) else {
+            return;
+        };
+        if !regular_tx_hashes.contains(&violation_hash) {
+            return;
+        }
+        let out = OutPoint {
+            hash: violation_hash,
+            index: 0,
+            tree: 0,
+        };
+        let Some(entry) = self.entries.get_mut(&key(&out)) else {
+            panic!(
+                "SBS spend violation output {out} for block {} (height {height}) is missing \
+                 from the view after disconnecting it",
+                block.header.block_hash()
+            );
+        };
+        entry.spend();
+    }
+
     /// Update the view to represent connecting the passed block,
     /// undoing the parent's regular transactions first when the block
-    /// disapproves it (dcrd `connectBlock`).
+    /// disapproves it, and adding the output a grandfathered same-block
+    /// stake spend needs before the inputs are fetched (dcrd
+    /// `connectBlock`).
     ///
     /// The parent's spend journal is only needed to undo a disapproved
     /// parent, so it is supplied lazily and decoded solely on that
@@ -945,8 +1032,10 @@ impl UtxoView {
     /// the wrong treasury flag on the common approve path (the child's
     /// flag differs from the parent's exactly at the treasury agenda
     /// activation boundary).
+    #[allow(clippy::too_many_arguments)]
     pub fn connect_block(
         &mut self,
+        params: &Params,
         block: &MsgBlock,
         parent: &MsgBlock,
         parent_stxos: impl FnOnce() -> Result<Vec<SpentTxOut>, RuleError>,
@@ -956,6 +1045,7 @@ impl UtxoView {
     ) -> Result<(), RuleError> {
         let tx_hashes = crate::blockhashes::BlockTxHashes::compute(block);
         self.connect_block_with_hashes(
+            params,
             block,
             &tx_hashes,
             parent,
@@ -973,6 +1063,33 @@ impl UtxoView {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn connect_block_with_hashes(
         &mut self,
+        params: &Params,
+        block: &MsgBlock,
+        tx_hashes: &crate::blockhashes::BlockTxHashes,
+        parent: &MsgBlock,
+        parent_stxos: impl FnOnce() -> Result<Vec<SpentTxOut>, RuleError>,
+        resolver: &impl UtxoResolver,
+        stxos: Option<&mut Vec<SpentTxOut>>,
+        is_treasury_enabled: bool,
+    ) -> Result<(), RuleError> {
+        self.connect_block_with_lookup(
+            &sbss_violation_lookup(params),
+            block,
+            tx_hashes,
+            parent,
+            parent_stxos,
+            resolver,
+            stxos,
+            is_treasury_enabled,
+        )
+    }
+
+    /// [`Self::connect_block_with_hashes`] over the given lookup of
+    /// the grandfathered same-block stake spends.
+    #[allow(clippy::too_many_arguments)]
+    fn connect_block_with_lookup(
+        &mut self,
+        sbss_violation: &impl Fn(i64) -> Option<Hash>,
         block: &MsgBlock,
         tx_hashes: &crate::blockhashes::BlockTxHashes,
         parent: &MsgBlock,
@@ -991,6 +1108,12 @@ impl UtxoView {
                 is_treasury_enabled,
             )?;
         }
+        self.add_sbss_violations_with(
+            sbss_violation,
+            block,
+            tx_hashes.regular(),
+            is_treasury_enabled,
+        );
         self.fetch_input_utxos(block, tx_hashes.regular(), resolver, is_treasury_enabled);
         self.connect_stake_transactions(
             block,
@@ -1004,10 +1127,34 @@ impl UtxoView {
     }
 
     /// Update the view to represent disconnecting the passed block,
-    /// reconnecting the parent's regular transactions when the block
-    /// disapproved them (dcrd `disconnectBlock`).
+    /// marking spent again the output a grandfathered same-block stake
+    /// spend restored, and reconnecting the parent's regular
+    /// transactions when the block disapproved them (dcrd
+    /// `disconnectBlock`).
     pub fn disconnect_block(
         &mut self,
+        params: &Params,
+        block: &MsgBlock,
+        parent: &MsgBlock,
+        stxos: &[SpentTxOut],
+        resolver: &impl UtxoResolver,
+        is_treasury_enabled: bool,
+    ) -> Result<(), RuleError> {
+        self.disconnect_block_with_lookup(
+            &sbss_violation_lookup(params),
+            block,
+            parent,
+            stxos,
+            resolver,
+            is_treasury_enabled,
+        )
+    }
+
+    /// [`Self::disconnect_block`] over the given lookup of the
+    /// grandfathered same-block stake spends.
+    fn disconnect_block_with_lookup(
+        &mut self,
+        sbss_violation: &impl Fn(i64) -> Option<Hash>,
         block: &MsgBlock,
         parent: &MsgBlock,
         stxos: &[SpentTxOut],
@@ -1024,6 +1171,7 @@ impl UtxoView {
         self.fetch_input_utxos(block, &regular_tx_hashes, resolver, is_treasury_enabled);
         self.disconnect_transactions(block, &regular_tx_hashes, stxos, false, is_treasury_enabled)?;
         self.disconnect_transactions(block, &stake_tx_hashes, stxos, true, is_treasury_enabled)?;
+        self.remove_sbss_violations_with(sbss_violation, block, &regular_tx_hashes);
         if !crate::validate::header_approves_parent(&block.header) {
             let parent_regular_tx_hashes = collect_tx_hashes(&parent.transactions);
             self.fetch_regular_input_utxos(
@@ -1042,6 +1190,12 @@ impl UtxoView {
         self.set_best_hash(block.header.prev_block);
         Ok(())
     }
+}
+
+/// The lookup of the grandfathered same-block stake spends on the
+/// given network, by height.
+fn sbss_violation_lookup(params: &Params) -> impl Fn(i64) -> Option<Hash> + '_ {
+    |height| crate::validate::sbss_violation_hash(params, height).copied()
 }
 
 #[cfg(test)]
@@ -1484,5 +1638,349 @@ mod tests {
                 assert_eq!(stxo.transaction_type(), tx_type);
             }
         }
+    }
+
+    /// The height the grandfathered same-block stake spend of the
+    /// tests below sits at.  No network has one there; the tests hand
+    /// the view their own lookup of the violating transaction by
+    /// height, as the network tables are looked up in production.
+    const SBSS_HEIGHT: u32 = 4_242;
+
+    /// An output paying `value` to an anyone-can-spend script.
+    fn op_true_out(value: i64) -> TxOut {
+        TxOut {
+            value,
+            version: 0,
+            pk_script: alloc::vec![0x51],
+        }
+    }
+
+    /// An input spending `outpoint`, with fraud proof data for an
+    /// output of `value` created at `height` by the transaction at
+    /// `index` of its block.
+    fn input_spending(outpoint: OutPoint, value: i64, height: u32, index: u32) -> TxIn {
+        TxIn {
+            previous_out_point: outpoint,
+            sequence: u32::MAX,
+            value_in: value,
+            block_height: height,
+            block_index: index,
+            signature_script: Vec::new(),
+        }
+    }
+
+    /// A ticket purchase spending `outpoint`, worth `value`: the
+    /// stake-tagged payment, its commitment and its change.
+    fn ticket_spending(outpoint: OutPoint, value: i64, height: u32, index: u32) -> MsgTx {
+        let p2pkh = |opcode: u8| {
+            let mut script = alloc::vec![opcode, 0x76, 0xa9, 0x14];
+            script.extend_from_slice(&[0x11; 20]);
+            script.extend_from_slice(&[0x88, 0xac]);
+            script
+        };
+        let mut commitment = alloc::vec![0x6a, 0x1e];
+        commitment.extend_from_slice(&[0x22; 20]);
+        commitment.extend_from_slice(&value.to_le_bytes());
+        commitment.extend_from_slice(&[0x00, 0x58]);
+        MsgTx {
+            tx_in: alloc::vec![input_spending(outpoint, value, height, index)],
+            tx_out: alloc::vec![
+                TxOut {
+                    value,
+                    version: 0,
+                    pk_script: p2pkh(0xba),
+                },
+                TxOut {
+                    value: 0,
+                    version: 0,
+                    pk_script: commitment,
+                },
+                TxOut {
+                    value: 0,
+                    version: 0,
+                    pk_script: p2pkh(0xbd),
+                },
+            ],
+            ..MsgTx::default()
+        }
+    }
+
+    /// The output the block's regular transaction spends, confirmed
+    /// long before, and its entry.
+    fn sbss_external() -> (OutPoint, UtxoEntry) {
+        let outpoint = OutPoint {
+            hash: Hash([0xee; 32]),
+            index: 0,
+            tree: 0,
+        };
+        let entry = UtxoEntry::new(
+            5_000,
+            alloc::vec![0x51],
+            100,
+            1,
+            0,
+            false,
+            false,
+            TxType::Regular,
+            None,
+        );
+        (outpoint, entry)
+    }
+
+    /// A block at [`SBSS_HEIGHT`] that approves its parent, with the
+    /// regular tree `[coinbase, origin]` and a ticket in the stake tree
+    /// that spends output 0 of `origin`, as the grandfathered blocks
+    /// do.  Returns the block and the hash of `origin`.
+    fn sbss_block() -> (MsgBlock, Hash) {
+        let (external, _) = sbss_external();
+        let coinbase = MsgTx {
+            tx_in: alloc::vec![TxIn {
+                previous_out_point: null_outpoint(),
+                sequence: u32::MAX,
+                value_in: 0,
+                block_height: 0,
+                block_index: u32::MAX,
+                signature_script: alloc::vec![0x01, 0x02],
+            }],
+            tx_out: alloc::vec![op_true_out(0)],
+            ..MsgTx::default()
+        };
+        let origin = MsgTx {
+            tx_in: alloc::vec![input_spending(external, 5_000, 100, 1)],
+            tx_out: alloc::vec![op_true_out(3_000), op_true_out(2_000)],
+            ..MsgTx::default()
+        };
+        let origin_hash = origin.tx_hash();
+        let origin_out = OutPoint {
+            hash: origin_hash,
+            index: 0,
+            tree: 0,
+        };
+        let ticket = ticket_spending(origin_out, 3_000, SBSS_HEIGHT, 1);
+        assert_eq!(dcroxide_stake::determine_tx_type(&ticket), TxType::SStx);
+        let (mut header, _) = BlockHeader::from_bytes(&[0u8; 180]).expect("zero header");
+        header.height = SBSS_HEIGHT;
+        header.vote_bits = 1;
+        let block = MsgBlock {
+            header,
+            transactions: alloc::vec![coinbase, origin],
+            stransactions: alloc::vec![ticket],
+        };
+        (block, origin_hash)
+    }
+
+    /// The lookup naming `hash` at `height` and nothing anywhere else.
+    fn violation_at(height: u32, hash: Hash) -> impl Fn(i64) -> Option<Hash> {
+        move |h| (h == i64::from(height)).then_some(hash)
+    }
+
+    fn no_violation(_: i64) -> Option<Hash> {
+        None
+    }
+
+    fn origin_out(origin_hash: Hash, index: u32) -> OutPoint {
+        OutPoint {
+            hash: origin_hash,
+            index,
+            tree: 0,
+        }
+    }
+
+    /// dcrd `addSBSSViolations` (`utxoviewpoint.go:613-631`): for a
+    /// block at a height with a violation, output 0 of the regular
+    /// transaction it names is added, at the block's height and the
+    /// transaction's index; nothing else, and nothing for any other
+    /// height or a block without that transaction.
+    #[test]
+    fn the_grandfathered_output_is_added_for_its_height_alone() {
+        let (block, origin_hash) = sbss_block();
+        let hashes = collect_tx_hashes(&block.transactions);
+
+        let mut view = UtxoView::new();
+        view.add_sbss_violations_with(
+            &violation_at(SBSS_HEIGHT, origin_hash),
+            &block,
+            &hashes,
+            false,
+        );
+        let added: Vec<_> = view.entries().map(|(key, _)| *key).collect();
+        assert_eq!(added, alloc::vec![(origin_hash.0, 0, 0)]);
+        let entry = view
+            .lookup_entry(&origin_out(origin_hash, 0))
+            .expect("added");
+        assert_eq!(entry.amount(), 3_000);
+        assert_eq!(entry.block_height(), i64::from(SBSS_HEIGHT));
+        assert_eq!(entry.block_index(), 1);
+        assert_eq!(entry.state_bits(), UTXO_STATE_MODIFIED);
+
+        for lookup in [
+            violation_at(SBSS_HEIGHT + 1, origin_hash),
+            violation_at(SBSS_HEIGHT, Hash([0x33; 32])),
+        ] {
+            let mut view = UtxoView::new();
+            view.add_sbss_violations_with(&lookup, &block, &hashes, false);
+            assert_eq!(view.entries().count(), 0);
+        }
+        let mut view = UtxoView::new();
+        view.add_sbss_violations_with(&no_violation, &block, &hashes, false);
+        assert_eq!(view.entries().count(), 0);
+    }
+
+    /// Write a committed view to a backend map, as a flush would.
+    fn commit_to(backend: &mut BTreeMap<OutPointKey, UtxoEntry>, view: &mut UtxoView) {
+        for (key, entry) in view.commit() {
+            if entry.is_spent() {
+                backend.remove(&key);
+            } else {
+                let mut entry = entry;
+                entry.set_state_bits(0);
+                backend.insert(key, entry);
+            }
+        }
+    }
+
+    /// dcrd `connectBlock` adds the grandfathered output before the
+    /// fetch (`utxoviewpoint.go:947-957`), so the ticket finds the
+    /// output it spends.  The regular tree, connected after the stake
+    /// tree, then adds the output back unspent, which is what the
+    /// historical chain holds.  Without the lookup the ticket's input
+    /// is missing from the view.
+    #[test]
+    fn a_block_with_a_grandfathered_spend_connects_through_the_lookup() {
+        let (block, origin_hash) = sbss_block();
+        let tx_hashes = crate::blockhashes::BlockTxHashes::compute(&block);
+        let parent = stake_block(Vec::new());
+        let (external, external_entry) = sbss_external();
+        let backend = move |op: &OutPoint| (*op == external).then(|| external_entry.clone());
+
+        let mut view = UtxoView::new();
+        let err = view
+            .connect_block_with_lookup(
+                &no_violation,
+                &block,
+                &tx_hashes,
+                &parent,
+                || Ok(Vec::new()),
+                &backend,
+                None,
+                false,
+            )
+            .expect_err("the ticket's input is missing without the lookup");
+        assert_eq!(err.kind, RuleErrorKind::UtxoBackendCorruption);
+
+        let mut view = UtxoView::new();
+        let mut stxos = Vec::new();
+        view.connect_block_with_lookup(
+            &violation_at(SBSS_HEIGHT, origin_hash),
+            &block,
+            &tx_hashes,
+            &parent,
+            || Ok(Vec::new()),
+            &backend,
+            Some(&mut stxos),
+            false,
+        )
+        .expect("connect");
+        let entry = view
+            .lookup_entry(&origin_out(origin_hash, 0))
+            .expect("in the view");
+        assert!(!entry.is_spent(), "the regular tree adds it back unspent");
+        // The ticket's spend is journaled first, with the output's own
+        // height and index, then the regular transaction's.
+        assert_eq!(stxos.len(), 2);
+        assert_eq!(
+            (stxos[0].amount, stxos[0].block_height, stxos[0].block_index),
+            (3_000, SBSS_HEIGHT, 1)
+        );
+        assert_eq!(stxos[1].amount, 5_000);
+    }
+
+    /// dcrd `disconnectBlock` marks the grandfathered output spent once
+    /// both trees are disconnected (`removeSBSSViolations`,
+    /// `utxoviewpoint.go:1051`): the stake tree's disconnect restores it
+    /// as the ticket's input, and without the lookup it is left unspent
+    /// in a view of the parent, where it never existed.
+    #[test]
+    fn disconnecting_the_block_spends_the_grandfathered_output_again() {
+        let (block, origin_hash) = sbss_block();
+        let tx_hashes = crate::blockhashes::BlockTxHashes::compute(&block);
+        let parent = stake_block(Vec::new());
+        let (external, external_entry) = sbss_external();
+        let lookup = violation_at(SBSS_HEIGHT, origin_hash);
+
+        let mut backend = BTreeMap::new();
+        backend.insert((external.hash.0, 0, 0), external_entry);
+        let mut view = UtxoView::new();
+        let mut stxos = Vec::new();
+        {
+            let resolve = |op: &OutPoint| backend.get(&(op.hash.0, op.index, op.tree)).cloned();
+            view.connect_block_with_lookup(
+                &lookup,
+                &block,
+                &tx_hashes,
+                &parent,
+                || Ok(Vec::new()),
+                &resolve,
+                Some(&mut stxos),
+                false,
+            )
+            .expect("connect");
+        }
+        commit_to(&mut backend, &mut view);
+        assert!(backend.contains_key(&(origin_hash.0, 0, 0)));
+
+        for (lookup, want_spent) in [
+            (&lookup as &dyn Fn(i64) -> Option<Hash>, true),
+            (&no_violation, false),
+        ] {
+            let resolve = |op: &OutPoint| backend.get(&(op.hash.0, op.index, op.tree)).cloned();
+            let mut view = UtxoView::new();
+            view.disconnect_block_with_lookup(&lookup, &block, &parent, &stxos, &resolve, false)
+                .expect("disconnect");
+            let entry = view
+                .lookup_entry(&origin_out(origin_hash, 0))
+                .expect("in the view");
+            assert_eq!(entry.is_spent(), want_spent, "the grandfathered output");
+            assert!(entry.is_modified());
+            assert!(
+                view.lookup_entry(&origin_out(origin_hash, 1))
+                    .expect("in the view")
+                    .is_spent()
+            );
+            assert!(!view.lookup_entry(&external).expect("restored").is_spent());
+        }
+    }
+
+    /// dcrd panics when the grandfathered output is missing from the
+    /// view after the disconnect (`utxoviewpoint.go:994-999`), with
+    /// this text.
+    #[test]
+    fn a_grandfathered_output_missing_after_a_disconnect_panics() {
+        let (block, origin_hash) = sbss_block();
+        let hashes = collect_tx_hashes(&block.transactions);
+        let lookup = violation_at(SBSS_HEIGHT, origin_hash);
+        let want = alloc::format!(
+            "SBS spend violation output {origin_hash}:0 for block {} (height {SBSS_HEIGHT}) \
+             is missing from the view after disconnecting it",
+            block.header.block_hash()
+        );
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            UtxoView::new().remove_sbss_violations_with(&lookup, &block, &hashes);
+        }))
+        .expect_err("a missing output panics");
+        assert_eq!(panic.downcast_ref::<String>(), Some(&want));
+
+        // Another height or a block without the transaction is left
+        // alone.
+        UtxoView::new().remove_sbss_violations_with(
+            &violation_at(SBSS_HEIGHT + 1, origin_hash),
+            &block,
+            &hashes,
+        );
+        UtxoView::new().remove_sbss_violations_with(
+            &violation_at(SBSS_HEIGHT, Hash([0x33; 32])),
+            &block,
+            &hashes,
+        );
     }
 }

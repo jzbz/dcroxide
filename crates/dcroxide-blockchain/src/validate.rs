@@ -962,22 +962,34 @@ pub fn sbss_violation_constants() -> (SbssExceptions, SbssExceptions) {
 /// Whether the given network, height and utxo hash name one of the
 /// grandfathered same-block stake spends, exposed for the same reason as
 /// [`sbss_violation_constants`].
-pub fn is_sbss_violation_for(params: &Params, tx_height: i64, utxo_hash: &Hash) -> bool {
-    is_sbss_spend_violation(params, tx_height, utxo_hash)
+pub fn is_sbss_violation_for(params: &Params, height: i64, utxo_hash: &Hash) -> bool {
+    is_sbss_violation(params, height, utxo_hash)
+}
+
+/// The hash of the regular transaction at the given height whose output
+/// 0 a stake transaction of the same block was allowed to spend under
+/// old consensus rules, or `None` when the height has none (dcrd
+/// `sbssViolationHash`, `validate.go:3365-3376`).  A lookup by height:
+/// a block at any other height costs the callers that run once per
+/// block this one lookup and nothing more.
+pub(crate) fn sbss_violation_hash(params: &Params, height: i64) -> Option<&'static Hash> {
+    let table = match params.net {
+        dcroxide_wire::CurrencyNet::MAIN_NET => SBSS_VIOLATIONS,
+        dcroxide_wire::CurrencyNet::TEST_NET3 => SBSS_VIOLATIONS_TESTNET3,
+        _ => return None,
+    };
+    table
+        .iter()
+        .find(|(violation_height, _)| *violation_height == height)
+        .map(|(_, hash)| hash)
 }
 
 /// Whether the utxo at the given height is one that was valid under old
 /// consensus rules but is no longer valid, and so would be incorrectly
-/// rejected during an initial sync (dcrd `isSBSSpendViolation`).
-fn is_sbss_spend_violation(params: &Params, tx_height: i64, utxo_hash: &Hash) -> bool {
-    let table = match params.net {
-        dcroxide_wire::CurrencyNet::MAIN_NET => SBSS_VIOLATIONS,
-        dcroxide_wire::CurrencyNet::TEST_NET3 => SBSS_VIOLATIONS_TESTNET3,
-        _ => return false,
-    };
-    table
-        .iter()
-        .any(|(height, hash)| *height == tx_height && hash == utxo_hash)
+/// rejected during an initial sync (dcrd `isSBSSViolation`,
+/// `validate.go:3378-3384`).
+fn is_sbss_violation(params: &Params, height: i64, utxo_hash: &Hash) -> bool {
+    sbss_violation_hash(params, height).is_some_and(|hash| hash == utxo_hash)
 }
 
 /// The DCP0005 hash constants in dump order, exposed so the parity
@@ -3599,7 +3611,7 @@ pub fn check_transaction_inputs<'a, SP: dcroxide_standalone::SubsidyParams>(
         // from the regular or stake tree of the same block.
         if is_stake_tx
             && utxo_entry.block_height() == tx_height
-            && !is_sbss_spend_violation(params, tx_height, tx_in_hash)
+            && !is_sbss_violation(params, tx_height, tx_in_hash)
         {
             let tx_hash = tx.tx_hash();
             return Err(rule_error(
@@ -6292,19 +6304,15 @@ pub(crate) fn check_connect_block_with_hashes<SP: dcroxide_standalone::SubsidyPa
     // Duplicate transaction checking is a no-op at this version.
     check_dup_txs(&block.stransactions, |op| view.lookup_entry(op), 1)?;
 
+    // Add utxo entries that were valid under old consensus rules but
+    // are no longer valid and would therefore cause the block to be
+    // incorrectly rejected, ahead of the fetch as dcrd does since
+    // `96a55a74` (`validate.go:4433-4436`).
+    view.add_sbss_violations(params, block, regular_tx_hashes, is_treasury_enabled);
+
     // Load all of the utxos referenced by the block that are not
     // already in the view.
     view.fetch_input_utxos(block, regular_tx_hashes, resolver, is_treasury_enabled);
-
-    // Add utxo entries that were valid under old consensus rules but
-    // are no longer valid and would therefore cause the block to be
-    // incorrectly rejected during an initial sync (dcrd `a38c0195`).
-    for (idx, tx) in block.transactions.iter().enumerate() {
-        let tx_hash = &regular_tx_hashes[idx];
-        if is_sbss_spend_violation(params, node_height, tx_hash) {
-            view.add_tx_out_with_hash(tx, tx_hash, 0, node_height, idx as u32, is_treasury_enabled);
-        }
-    }
 
     // Determine the subsidy split.
     let split =

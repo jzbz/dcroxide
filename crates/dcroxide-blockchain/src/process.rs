@@ -2420,6 +2420,7 @@ impl Chain {
                 .fetch_spend_journal(&block, is_treasury_enabled)
                 .map_err(|e| crate::chaindb::ChainDbError::Corrupt(e.description.clone()))?;
             view.disconnect_block(
+                params,
                 &block,
                 &parent,
                 &stxos,
@@ -2482,6 +2483,7 @@ impl Chain {
                     .map_err(crate::chaindb::ChainDbError::Rule)?
             };
             view.connect_block(
+                params,
                 &block,
                 &parent,
                 || self.fetch_spend_journal(&parent, is_treasury_enabled),
@@ -4015,6 +4017,7 @@ impl Chain {
             // journal and update the view to unspend them.
             let stxos = self.fetch_spend_journal(&block, is_treasury_enabled)?;
             view.disconnect_block(
+                params,
                 &block,
                 &parent,
                 &stxos,
@@ -4087,6 +4090,7 @@ impl Chain {
             let filter;
             if self.index.node_status(&self.store, node).has_validated() {
                 view.connect_block_with_hashes(
+                    params,
                     &block,
                     &tx_hashes,
                     &parent,
@@ -5515,6 +5519,7 @@ impl Chain {
         let parent = self.stored_block_arc(prev_node)?;
         let stxos = self.fetch_spend_journal(&tip_block, is_treasury_enabled)?;
         view.disconnect_block(
+            params,
             &tip_block,
             &parent,
             &stxos,
@@ -5598,6 +5603,7 @@ impl Chain {
             .fetch_spend_journal(&tip_block, is_treasury_enabled)
             .map_err(|e| e.description.clone())?;
         view.disconnect_block(
+            params,
             &tip_block,
             &parent,
             &stxos,
@@ -5617,6 +5623,7 @@ impl Chain {
         // stxos to collect here; the parent journal is decoded lazily,
         // only on that disapproval path, as dcrd does).
         view.connect_block(
+            params,
             block,
             &parent,
             || self.fetch_spend_journal(&parent, is_treasury_enabled),
