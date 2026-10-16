@@ -4,8 +4,8 @@
 //! chain handler feed every non-coinbase transaction into the shared
 //! recently-confirmed filter — the sync manager's duplicate-request
 //! gate and the RPC duplicate classification consult it — while the
-//! coinbase is skipped, and the rebroadcast thread receives the
-//! removal and prune commands without stalling the drain.
+//! coinbase is skipped, and the removals and the prune go to the
+//! rebroadcast sink without stalling the drain.
 
 use std::sync::{Arc, Mutex};
 
@@ -77,8 +77,9 @@ fn confirmed_transactions_feed_the_shared_filter() {
     );
 
     // The daemon wiring: the confirmed filter is shared with the sync
-    // manager, and the rebroadcast thread receives the removals and
-    // prunes (idle here — its first fire is dcrd's five minutes out).
+    // manager, and the removals and prunes go to the rebroadcast sink
+    // (which sends its thread none of them, as it tracks nothing here;
+    // the thread's first fire is dcrd's five minutes out).
     let filter = Arc::new(Mutex::new(dcroxide_containers::apbf::new_filter(
         23000, 0.000001,
     )));

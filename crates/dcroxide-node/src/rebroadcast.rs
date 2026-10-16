@@ -18,8 +18,14 @@
 //! reference release checks strict live-treap membership here, so a
 //! normally-missed ticket's pending revocation is pruned on the first
 //! pass — kept bug for bug).
+//!
+//! dcrd sends the remove and the prune whatever the handler holds.
+//! Here neither is sent while the thread holds nothing and no add is
+//! on its way, which is when the handler would do nothing with them;
+//! see [`RebroadcastSink`].
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -55,6 +61,10 @@ enum RebroadcastCommand {
     Prune,
     /// Wind the thread down.
     Stop,
+    /// Report the inventory tracked once every earlier command has been
+    /// applied.
+    #[cfg(test)]
+    Tracked(mpsc::Sender<Vec<InvVect>>),
 }
 
 /// The pending rebroadcast inventory owned by the thread (dcrd's
@@ -66,12 +76,14 @@ struct PendingInvs {
 
 impl PendingInvs {
     /// Apply an add or remove (the corresponding dcrd message cases).
-    fn add(&mut self, iv: InvVect, tx: MsgTx) {
-        self.invs.insert(iv, tx);
+    /// An add says whether it replaced an entry and a remove whether
+    /// it found one, for the count the sink reads.
+    fn add(&mut self, iv: InvVect, tx: MsgTx) -> bool {
+        self.invs.insert(iv, tx).is_some()
     }
 
-    fn del(&mut self, iv: &InvVect) {
-        self.invs.remove(iv);
+    fn del(&mut self, iv: &InvVect) -> bool {
+        self.invs.remove(iv).is_some()
     }
 
     /// Drop entries a block change invalidated (dcrd's
@@ -79,11 +91,12 @@ impl PendingInvs {
     /// no longer matches the next stake difficulty, an expired
     /// ticket, and a revocation whose referenced ticket is not in the
     /// live set.  Regular transactions are never pruned — only
-    /// confirmation removes them.
-    fn prune(&mut self, chain: &Arc<Mutex<Chain>>) {
+    /// confirmation removes them.  Returns how many entries went.
+    fn prune(&mut self, chain: &Arc<Mutex<Chain>>) -> usize {
         let chain = chain.lock().expect("chain mutex poisoned");
         let best = chain.best_snapshot();
         let (next_stake_diff, best_height) = (best.next_stake_diff, best.height);
+        let before = self.invs.len();
         self.invs.retain(|_, tx| {
             match determine_tx_type(tx) {
                 TxType::SStx => {
@@ -114,6 +127,7 @@ impl PendingInvs {
                 _ => true,
             }
         });
+        before.saturating_sub(self.invs.len())
     }
 
     /// Re-relay every pending entry (dcrd's timer case: each
@@ -171,6 +185,9 @@ fn rand_duration(max: Duration) -> Duration {
 #[derive(Clone)]
 pub struct RebroadcastSink {
     sender: mpsc::Sender<RebroadcastCommand>,
+    /// The entries the thread holds plus the adds on their way to it;
+    /// see [`Self::tracks_nothing`].
+    tracked: Arc<AtomicUsize>,
 }
 
 impl RebroadcastSink {
@@ -181,12 +198,18 @@ impl RebroadcastSink {
             inv_type: InvType::TX,
             hash: *tx_hash,
         };
+        // Counted before it is sent, which is what lets a remove or a
+        // prune trust a count of zero.
+        self.tracked.fetch_add(1, Ordering::SeqCst);
         let _ = self.sender.send(RebroadcastCommand::Add(iv, tx.clone()));
     }
 
     /// Stop tracking the transaction (dcrd
     /// `RemoveRebroadcastInventory`).
     pub fn remove_rebroadcast_inventory(&self, tx_hash: &Hash) {
+        if self.tracks_nothing() {
+            return;
+        }
         let iv = InvVect {
             inv_type: InvType::TX,
             hash: *tx_hash,
@@ -197,7 +220,34 @@ impl RebroadcastSink {
     /// Run the prune rules over the pending inventory (dcrd
     /// `PruneRebroadcastInventory`).
     pub fn prune_rebroadcast_inventory(&self) {
+        if self.tracks_nothing() {
+            return;
+        }
         let _ = self.sender.send(RebroadcastCommand::Prune);
+    }
+
+    /// Whether a remove or a prune sent at this instant would find the
+    /// pending inventory empty, so that not sending it changes nothing.
+    ///
+    /// dcrd sends both for every connected block and its handler finds
+    /// nothing to do with them unless a transaction came in over RPC
+    /// (`server.go:3287-3288`, `:3290-3331`).  The count is every add
+    /// sent so far less every entry the thread has since removed or
+    /// replaced, and an add is counted before it is sent, so a count of
+    /// zero says that every add sent before this instant has reached
+    /// the thread and its entry is gone again.  The thread takes its
+    /// commands in the order they were sent, so a remove or a prune
+    /// sent now would come after all of those and find nothing.
+    ///
+    /// An add that another thread sends while this one is between the
+    /// reading and the send it skips is counted after the reading, so
+    /// it is sent after this instant: skipping is the same as having
+    /// sent the command before that add, which is one of the two orders
+    /// dcrd's handler can take the two in, and the one in which the
+    /// command does nothing.  A remove or a prune that follows an add
+    /// on any thread reads a count the add has already raised.
+    fn tracks_nothing(&self) -> bool {
+        self.tracked.load(Ordering::SeqCst) == 0
     }
 }
 
@@ -258,6 +308,8 @@ fn start_with_delays(
     max_interval: Duration,
 ) -> Rebroadcaster {
     let (sender, receiver) = mpsc::channel();
+    let tracked = Arc::new(AtomicUsize::new(0));
+    let sink_tracked = Arc::clone(&tracked);
     let thread = std::thread::spawn(move || {
         let mut pending = PendingInvs::default();
         let mut deadline = Instant::now()
@@ -265,11 +317,19 @@ fn start_with_delays(
             .expect("rebroadcast deadline");
         loop {
             let wait = deadline.saturating_duration_since(Instant::now());
-            match receiver.recv_timeout(wait) {
-                Ok(RebroadcastCommand::Add(iv, tx)) => pending.add(iv, tx),
-                Ok(RebroadcastCommand::Del(iv)) => pending.del(&iv),
+            // The count the sink reads comes down only once an entry is
+            // gone, so it is never zero while one is held: an add that
+            // replaces an entry leaves one entry for two adds counted.
+            let gone = match receiver.recv_timeout(wait) {
+                Ok(RebroadcastCommand::Add(iv, tx)) => usize::from(pending.add(iv, tx)),
+                Ok(RebroadcastCommand::Del(iv)) => usize::from(pending.del(&iv)),
                 Ok(RebroadcastCommand::Prune) => pending.prune(&chain),
                 Ok(RebroadcastCommand::Stop) | Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                #[cfg(test)]
+                Ok(RebroadcastCommand::Tracked(reply)) => {
+                    let _ = reply.send(pending.invs.keys().copied().collect());
+                    0
+                }
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     // Any inventory we have has not made it into a
                     // block yet; resubmit it, then fire again at a
@@ -279,12 +339,19 @@ fn start_with_delays(
                     deadline = Instant::now()
                         .checked_add(rand_duration(max_interval))
                         .expect("rebroadcast deadline");
+                    0
                 }
+            };
+            if gone > 0 {
+                tracked.fetch_sub(gone, Ordering::SeqCst);
             }
         }
     });
     Rebroadcaster {
-        sink: RebroadcastSink { sender },
+        sink: RebroadcastSink {
+            sender,
+            tracked: sink_tracked,
+        },
         thread: Some(thread),
     }
 }
@@ -528,6 +595,261 @@ mod tests {
             let d = rand_duration(MAX_INTERVAL);
             assert!(d < MAX_INTERVAL);
         }
+    }
+
+    /// A sink over a channel the test reads, with nothing tracked.
+    fn sink_and_receiver() -> (RebroadcastSink, mpsc::Receiver<RebroadcastCommand>) {
+        let (sender, receiver) = mpsc::channel();
+        let sink = RebroadcastSink {
+            sender,
+            tracked: Arc::default(),
+        };
+        (sink, receiver)
+    }
+
+    /// A rebroadcast thread that never fires, over the given chain.
+    fn quiet_rebroadcaster(chain: Arc<Mutex<Chain>>) -> Rebroadcaster {
+        let never = Duration::from_secs(24 * 60 * 60);
+        start_with_delays(
+            chain,
+            SyncPeers::new(),
+            crate::dispatch::new_recently_advertised(),
+            never,
+            never,
+        )
+    }
+
+    /// The inventory the thread tracks once it has applied every command
+    /// sent before this call, and the count the sink reads then.
+    fn tracked(sink: &RebroadcastSink) -> (Vec<InvVect>, usize) {
+        let (reply, answer) = mpsc::channel();
+        sink.sender
+            .send(RebroadcastCommand::Tracked(reply))
+            .expect("the thread is running");
+        let mut invs = answer
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the thread answers");
+        invs.sort_by_key(|iv| iv.hash.0);
+        // The thread brings the count down before it takes its next
+        // command, and this one came after the ones being asked about.
+        (invs, sink.tracked.load(Ordering::SeqCst))
+    }
+
+    fn sorted(mut invs: Vec<InvVect>) -> Vec<InvVect> {
+        invs.sort_by_key(|iv| iv.hash.0);
+        invs
+    }
+
+    /// While nothing is tracked, a confirmed transaction and a block
+    /// send the thread nothing.  Once an add has been sent, both are
+    /// sent again, in the order they are called.
+    #[test]
+    fn nothing_is_sent_while_nothing_is_tracked() {
+        let (sink, receiver) = sink_and_receiver();
+        let (confirmed, submitted) = (regular_tx(1), regular_tx(2));
+
+        sink.remove_rebroadcast_inventory(&confirmed.tx_hash());
+        sink.prune_rebroadcast_inventory();
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+
+        sink.add_rebroadcast_inventory(&submitted.tx_hash(), &submitted);
+        sink.remove_rebroadcast_inventory(&confirmed.tx_hash());
+        sink.prune_rebroadcast_inventory();
+        match receiver.try_recv() {
+            Ok(RebroadcastCommand::Add(got, tx)) => {
+                assert_eq!((got, tx), (iv(&submitted), submitted.clone()));
+            }
+            _ => panic!("the add is sent first"),
+        }
+        match receiver.try_recv() {
+            Ok(RebroadcastCommand::Del(got)) => assert_eq!(got, iv(&confirmed)),
+            _ => panic!("the remove is sent second"),
+        }
+        assert!(matches!(receiver.try_recv(), Ok(RebroadcastCommand::Prune)));
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+    }
+
+    /// With entries tracked, a block's prune and a confirmed
+    /// transaction's remove reach the thread and do what they did
+    /// before the count: the prune takes the off-price ticket and
+    /// leaves the regular transaction, the remove takes the transaction
+    /// it names.  The count is the number of entries throughout: after
+    /// an add of a tracked transaction, after a prune that takes
+    /// nothing, and after one that takes two entries at once.  It is
+    /// back at zero, with nothing sent, once the last entry is gone.
+    #[test]
+    fn a_tracked_entry_is_pruned_and_removed_as_before() {
+        let (_dir, chain) = battery_chain(2);
+        let next_stake_diff = chain.lock().expect("chain").best_snapshot().next_stake_diff;
+        let (off_price, _) = stake_txs();
+        assert_ne!(off_price.tx_out[0].value, next_stake_diff);
+        let (regular, other) = (regular_tx(9), regular_tx(10));
+        let rebroadcaster = quiet_rebroadcaster(chain);
+        let sink = rebroadcaster.sink();
+        assert_eq!(tracked(&sink), (Vec::new(), 0));
+
+        sink.add_rebroadcast_inventory(&regular.tx_hash(), &regular);
+        sink.add_rebroadcast_inventory(&off_price.tx_hash(), &off_price);
+        sink.add_rebroadcast_inventory(&regular.tx_hash(), &regular);
+        assert_eq!(
+            tracked(&sink),
+            (sorted(vec![iv(&regular), iv(&off_price)]), 2)
+        );
+
+        // A transaction that is not tracked: sent, and nothing goes.
+        sink.remove_rebroadcast_inventory(&other.tx_hash());
+        assert_eq!(
+            tracked(&sink),
+            (sorted(vec![iv(&regular), iv(&off_price)]), 2)
+        );
+
+        // A block: the off-price ticket goes.
+        sink.prune_rebroadcast_inventory();
+        assert_eq!(tracked(&sink), (vec![iv(&regular)], 1));
+
+        // Another block, which takes nothing: the entry is still
+        // counted.
+        sink.prune_rebroadcast_inventory();
+        assert_eq!(tracked(&sink), (vec![iv(&regular)], 1));
+
+        // The transaction is confirmed.
+        sink.remove_rebroadcast_inventory(&regular.tx_hash());
+        assert_eq!(tracked(&sink), (Vec::new(), 0));
+
+        // And tracked again from nothing.
+        sink.add_rebroadcast_inventory(&other.tx_hash(), &other);
+        assert_eq!(tracked(&sink), (vec![iv(&other)], 1));
+        sink.remove_rebroadcast_inventory(&other.tx_hash());
+        assert_eq!(tracked(&sink), (Vec::new(), 0));
+
+        // A block that takes two entries takes both from the count.
+        let mut second_off_price = off_price.clone();
+        second_off_price.lock_time = 1;
+        assert_eq!(determine_tx_type(&second_off_price), TxType::SStx);
+        sink.add_rebroadcast_inventory(&off_price.tx_hash(), &off_price);
+        sink.add_rebroadcast_inventory(&second_off_price.tx_hash(), &second_off_price);
+        assert_eq!(
+            tracked(&sink),
+            (sorted(vec![iv(&off_price), iv(&second_off_price)]), 2)
+        );
+        sink.prune_rebroadcast_inventory();
+        assert_eq!(tracked(&sink), (Vec::new(), 0));
+        rebroadcaster.shutdown();
+    }
+
+    /// A transaction submitted while a block that confirms it is being
+    /// handled on another thread: whichever way the two fall, the thread
+    /// ends with that one entry or with none, and the count is the
+    /// number of entries it holds.  Both orders occur.  A remove that
+    /// follows the add always empties the inventory and the count.
+    ///
+    /// That the add is counted before it is sent is not held here: an
+    /// add counted late ends a round with the entry kept and counted,
+    /// as an add that came second does;
+    /// `an_add_is_counted_before_it_is_sent` holds it.
+    #[test]
+    fn an_add_racing_a_block_leaves_the_count_and_the_inventory_agreeing() {
+        let (_dir, chain) = battery_chain(2);
+        let rebroadcaster = quiet_rebroadcaster(chain);
+        let sink = rebroadcaster.sink();
+        let (mut kept, mut removed) = (0, 0);
+        for round in 0..1000u32 {
+            let mut tx = regular_tx(11);
+            tx.lock_time = round;
+            let hash = tx.tx_hash();
+            // The side that reaches the barrier last runs on while the
+            // other is woken, so the two take turns at that, and the
+            // one that runs on is then held back by a different amount
+            // each round: they meet in both orders and at many
+            // distances.
+            let late = (round / 2).wrapping_mul(7) % 3000;
+            let start = std::sync::Barrier::new(2);
+            let held_back = |late: u32| {
+                start.wait();
+                for _ in 0..late {
+                    std::hint::spin_loop();
+                }
+            };
+            let add = |late: u32| {
+                held_back(late);
+                sink.add_rebroadcast_inventory(&hash, &tx);
+            };
+            let block = |late: u32| {
+                held_back(late);
+                sink.remove_rebroadcast_inventory(&hash);
+                sink.prune_rebroadcast_inventory();
+            };
+            std::thread::scope(|scope| {
+                if round % 2 == 0 {
+                    scope.spawn(|| add(0));
+                    block(late);
+                } else {
+                    scope.spawn(|| block(0));
+                    add(late);
+                }
+            });
+            let (invs, count) = tracked(&sink);
+            assert_eq!(invs.len(), count, "round {round}");
+            if invs.is_empty() {
+                removed += 1;
+            } else {
+                assert_eq!(invs, vec![iv(&tx)], "round {round}");
+                kept += 1;
+            }
+
+            // The block that confirms it, after the add.
+            sink.remove_rebroadcast_inventory(&hash);
+            sink.prune_rebroadcast_inventory();
+            assert_eq!(tracked(&sink), (Vec::new(), 0), "round {round}");
+        }
+        assert!(
+            kept > 50 && removed > 50,
+            "the add came second in {kept} rounds and first in {removed}"
+        );
+        rebroadcaster.shutdown();
+    }
+
+    /// An add is counted before it is sent: whenever one arrives, the
+    /// count already holds it.  A count raised after the send would let
+    /// a remove that follows the add on another thread read zero and be
+    /// skipped with the add already on its way.
+    #[test]
+    fn an_add_is_counted_before_it_is_sent() {
+        const ADDS: usize = 200_000;
+        let (sink, receiver) = sink_and_receiver();
+        let tx = regular_tx(12);
+        let hash = tx.tx_hash();
+        std::thread::scope(|scope| {
+            let counted = &sink.tracked;
+            scope.spawn(move || {
+                let mut arrived = 0;
+                while arrived < ADDS {
+                    match receiver.try_recv() {
+                        Ok(RebroadcastCommand::Add(..)) => {
+                            arrived += 1;
+                            let counted = counted.load(Ordering::SeqCst);
+                            assert!(
+                                counted >= arrived,
+                                "add {arrived} arrived with {counted} counted"
+                            );
+                        }
+                        Ok(_) => panic!("only adds are sent"),
+                        Err(mpsc::TryRecvError::Empty) => std::hint::spin_loop(),
+                        Err(mpsc::TryRecvError::Disconnected) => panic!("the sink is gone"),
+                    }
+                }
+            });
+            for _ in 0..ADDS {
+                sink.add_rebroadcast_inventory(&hash, &tx);
+            }
+        });
+        assert_eq!(sink.tracked.load(Ordering::SeqCst), ADDS);
     }
 
     /// The thread accepts commands over the sink, fires on the timer,
