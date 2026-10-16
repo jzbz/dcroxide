@@ -51,8 +51,11 @@ const MAX_VOTE_DOUBLE_SPENDS: usize = 5;
 /// are pruned (dcrd `heightDiffToPruneTicket`).
 const HEIGHT_DIFF_TO_PRUNE_TICKET: i64 = 288;
 
-/// The number of blocks to pass in terms of height before votes on a
-/// block are pruned (dcrd `heightDiffToPruneVotes`).
+/// The number of blocks to pass in terms of height before votes are
+/// pruned (dcrd `heightDiffToPruneVotes`): a vote transaction counts from
+/// the height it was accepted at, and the metadata of a block's votes
+/// from the height the first of them claims
+/// ([`VoteTracker::prune_old_votes`]).
 const HEIGHT_DIFF_TO_PRUNE_VOTES: i64 = 10;
 
 /// The maximum amount of time an orphan is allowed to stay in the
@@ -386,6 +389,85 @@ fn shuffle_trial_order<T>(items: &mut [T], mut draw: impl FnMut() -> u64) {
     }
 }
 
+/// The metadata of the recently accepted votes on one block (dcrd
+/// `trackedVotes`, `mempool.go:258-265`).
+#[derive(Clone, Debug)]
+struct TrackedVotes {
+    /// The height the first vote tracked for the block claims (dcrd
+    /// `blockHeight`).
+    block_height: i64,
+    /// The metadata of the votes, one per ticket, in acceptance order.
+    votes: Vec<VoteDesc>,
+}
+
+/// The metadata of votes that may or may not also be in the pool, keyed
+/// by the block they vote on (dcrd `voteTracker`, `mempool.go:267-396`).
+///
+/// It is not kept in sync with pool membership, as in dcrd: code outside
+/// the pool looks recent votes up by block hash whatever their current
+/// membership, and [`TxPool::check_vote_double_spend`] checks membership
+/// itself.  An entry lives until the stake pruning runs at a height more
+/// than [`HEIGHT_DIFF_TO_PRUNE_VOTES`] past the one its first vote
+/// claims.  dcrd guards the tracker with its own lock; here it sits under
+/// the pool's.
+#[derive(Clone, Debug, Default)]
+struct VoteTracker {
+    votes: BTreeMap<[u8; 32], TrackedVotes>,
+}
+
+impl VoteTracker {
+    /// Track the vote for the block it votes on, unless a vote by the
+    /// same ticket is already tracked for that block (dcrd `AddVote`).
+    fn add_vote(&mut self, vote: &MsgTx, vote_hash: &Hash) {
+        let (voted_hash, voted_height) = dcroxide_stake::ssgen_block_voted_on(vote);
+        let ticket_hash = vote.tx_in[1].previous_out_point.hash;
+
+        // Nothing to do if a vote for the ticket is already known.
+        if self
+            .votes
+            .get(&voted_hash.0)
+            .is_some_and(|tracked| tracked.votes.iter().any(|vt| vt.ticket_hash == ticket_hash))
+        {
+            return;
+        }
+
+        // The first vote tracked for a block records its height.
+        let tracked = self
+            .votes
+            .entry(voted_hash.0)
+            .or_insert_with(|| TrackedVotes {
+                block_height: i64::from(voted_height),
+                votes: Vec::new(),
+            });
+        let vote_bits = dcroxide_stake::ssgen_vote_bits(vote);
+        let approves_parent = vote_bits & 0x0001 != 0;
+        tracked.votes.push(VoteDesc {
+            vote_hash: *vote_hash,
+            ticket_hash,
+            approves_parent,
+        });
+    }
+
+    /// The metadata tracked for the block, empty when none is.
+    fn votes_on(&self, block_hash: &Hash) -> &[VoteDesc] {
+        self.votes
+            .get(&block_hash.0)
+            .map_or(&[], |tracked| tracked.votes.as_slice())
+    }
+
+    /// Drop the metadata of every block whose first vote claims a height
+    /// more than [`HEIGHT_DIFF_TO_PRUNE_VOTES`] below the given height
+    /// (dcrd `PruneOldVotes`).
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "block_height is a u32 claimed height widened to i64, so adding 10 cannot overflow"
+    )]
+    fn prune_old_votes(&mut self, height: i64) {
+        self.votes
+            .retain(|_, tracked| tracked.block_height + HEIGHT_DIFF_TO_PRUNE_VOTES >= height);
+    }
+}
+
 /// The transaction memory pool (dcrd `TxPool`).
 pub struct TxPool<C: PoolChain> {
     /// The chain backend.
@@ -409,7 +491,7 @@ pub struct TxPool<C: PoolChain> {
     staged_outpoints: BTreeMap<OutKey, Arc<TxDesc>>,
     transient: BTreeMap<[u8; 32], MsgTx>,
     mining_view: TxMiningView,
-    votes: BTreeMap<[u8; 32], Vec<VoteDesc>>,
+    vote_track: VoteTracker,
     tspends: BTreeSet<[u8; 32]>,
     /// The monotonic reading after which the next orphan expiry scan may
     /// run ([`PoolChain::now_mono_nanos`]).
@@ -450,7 +532,7 @@ impl<C: PoolChain> TxPool<C> {
             staged_outpoints: BTreeMap::new(),
             transient: BTreeMap::new(),
             mining_view,
-            votes: BTreeMap::new(),
+            vote_track: VoteTracker::default(),
             tspends: BTreeSet::new(),
             next_expire_scan_mono,
             exists_addr_index: None,
@@ -566,44 +648,26 @@ impl<C: PoolChain> TxPool<C> {
         self.mixpool_probe = Some(probe);
     }
 
-    /// Insert a vote into the map of block votes (dcrd `insertVote`).
-    fn insert_vote(&mut self, ssgen: &MsgTx, vote_hash: &Hash) {
-        // Get the block it is voting on; here we're agnostic of
-        // height.
-        let (block_hash, _block_height) = dcroxide_stake::ssgen_block_voted_on(ssgen);
-
-        let votes = self.votes.entry(block_hash.0).or_default();
-
-        // Nothing to do if a vote for the ticket is already known.
-        let ticket_hash = ssgen.tx_in[1].previous_out_point.hash;
-        if votes.iter().any(|vt| vt.ticket_hash == ticket_hash) {
-            return;
-        }
-
-        let vote_bits = dcroxide_stake::ssgen_vote_bits(ssgen);
-        let approves_parent = vote_bits & 0x0001 != 0;
-        votes.push(VoteDesc {
-            vote_hash: *vote_hash,
-            ticket_hash,
-            approves_parent,
-        });
-    }
-
-    /// The hashes for all votes on the provided block hash currently
-    /// in the mempool (dcrd `VoteHashesForBlock`).
+    /// The hashes for all recently accepted votes on the provided block
+    /// hash (dcrd `VoteHashesForBlock`).
+    ///
+    /// A vote stays listed after it leaves the pool, until the stake
+    /// pruning passes ten blocks beyond the height the first vote on its
+    /// block claims.
     pub fn vote_hashes_for_block(&self, block_hash: &Hash) -> Vec<Hash> {
-        match self.votes.get(&block_hash.0) {
-            None => Vec::new(),
-            Some(votes) => votes.iter().map(|vt| vt.vote_hash).collect(),
-        }
+        self.vote_track
+            .votes_on(block_hash)
+            .iter()
+            .map(|vt| vt.vote_hash)
+            .collect()
     }
 
-    /// The vote metadata for all votes on the provided block hashes
-    /// (dcrd `VotesForBlocks`).
+    /// The recently accepted vote metadata for all votes on the provided
+    /// block hashes (dcrd `VotesForBlocks`).
     pub fn votes_for_blocks(&self, hashes: &[Hash]) -> Vec<Vec<VoteDesc>> {
         hashes
             .iter()
-            .map(|hash| self.votes.get(&hash.0).cloned().unwrap_or_default())
+            .map(|hash| self.vote_track.votes_on(hash).to_vec())
             .collect()
     }
 
@@ -1242,10 +1306,10 @@ impl<C: PoolChain> TxPool<C> {
     fn check_vote_double_spend(&self, vote: &MsgTx, vote_hash: &Hash) -> Result<(), RuleError> {
         let ticket_spent = vote.tx_in[1].previous_out_point.hash;
         let (hash_voted_on, height_voted_on) = dcroxide_stake::ssgen_block_voted_on(vote);
-        for existing in self.votes.get(&hash_voted_on.0).into_iter().flatten() {
+        for existing in self.vote_track.votes_on(&hash_voted_on) {
             if existing.ticket_hash == ticket_spent {
                 // Ensure the vote is still actually in the mempool
-                // since the votes map is not kept in sync with the
+                // since the tracked votes are not kept in sync with the
                 // contents of the pool.
                 if !self.pool.contains_key(&existing.vote_hash.0) {
                     continue;
@@ -1265,8 +1329,7 @@ impl<C: PoolChain> TxPool<C> {
     /// known to be disapproved by the pool's votes (dcrd
     /// `IsRegTxTreeKnownDisapproved`).
     pub fn is_reg_tx_tree_known_disapproved(&self, hash: &Hash) -> bool {
-        let empty = Vec::new();
-        let vts = self.votes.get(&hash.0).unwrap_or(&empty);
+        let vts = self.vote_track.votes_on(hash);
 
         // There are not possibly enough votes to tell if the regular
         // transaction tree is approved or not, so assume it's valid.
@@ -1970,7 +2033,7 @@ impl<C: PoolChain> TxPool<C> {
 
         // Keep track of votes separately.
         if is_vote {
-            self.insert_vote(tx, &tx_hash);
+            self.vote_track.add_vote(tx, &tx_hash);
         }
 
         // Keep track of tspends separately.
@@ -2466,10 +2529,29 @@ impl<C: PoolChain> TxPool<C> {
                 continue;
             }
         }
+
+        // Prune old votes from the map of per-block votes (dcrd
+        // `mempool.go:2269-2270`).  The vote transactions above go by the
+        // height they were accepted at and the metadata by the height the
+        // first vote on the block claims, so a vote accepted late can
+        // outlive its metadata, and while it does, a second vote by its
+        // ticket on the same block passes `check_vote_double_spend`, up to
+        // the five-vote cap, as in dcrd.
+        self.vote_track.prune_old_votes(height);
     }
 
-    /// The public stake pruning entry point, called on every new block
-    /// (dcrd `PruneStakeTx`).
+    /// Prune stake transactions that are no longer deemed relevant for
+    /// the given parameters, which are expected to be relative to the
+    /// best chain tip: it is meant to run each time a block is added to
+    /// the main chain (dcrd `PruneStakeTx`).
+    ///
+    /// It prunes ticket purchases accepted more than 288 blocks before the
+    /// height or below the given required stake difficulty, votes and
+    /// revocations accepted more than ten blocks before it (every
+    /// revocation while the automatic revocations agenda is active), and
+    /// the vote metadata of blocks whose first vote claims a height more
+    /// than ten blocks below it.  Nothing
+    /// is pruned when the agenda cannot be read.
     pub fn prune_stake_tx(&mut self, required_stake_difficulty: i64, height: i64) {
         let Ok(is_auto_revocations_enabled) = self.chain.is_auto_revocations_agenda_active() else {
             return;
@@ -3773,5 +3855,312 @@ mod fetch_input_utxos_tests {
                 "{rehashed}: the parent must not be re-hashed"
             );
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "test arithmetic over small fixed heights"
+)]
+mod vote_tracker_tests {
+    use super::*;
+
+    use dcroxide_wire::{TX_TREE_REGULAR, TX_TREE_STAKE, TxIn, TxOut};
+
+    /// The height of the block every vote here votes on, dcrd's in
+    /// `TestVoteTrackerPruneOldVotesBoundary`.
+    const BLOCK_HEIGHT: u32 = 12345;
+
+    /// A chain backend answering only the clock and draw questions that
+    /// adding, removing and pruning transactions ask, and the automatic
+    /// revocations agenda query, which fails while the agenda is set
+    /// unreadable.
+    struct ClockChain {
+        agenda_unreadable: bool,
+    }
+
+    impl PoolChain for ClockChain {
+        fn next_stake_difficulty(&self) -> Result<i64, String> {
+            unimplemented!()
+        }
+        fn fetch_utxo_view(
+            &self,
+            _tx: &MsgTx,
+            _tx_hash: &Hash,
+            _tree: i8,
+            _tree_valid: bool,
+        ) -> Result<UtxoView, String> {
+            unimplemented!()
+        }
+        fn best_hash(&self) -> Hash {
+            unimplemented!()
+        }
+        fn best_height(&self) -> i64 {
+            unimplemented!()
+        }
+        fn header_by_hash(&self, _hash: &Hash) -> Result<BlockHeader, String> {
+            unimplemented!()
+        }
+        fn past_median_time(&self) -> i64 {
+            unimplemented!()
+        }
+        fn calc_sequence_lock(
+            &self,
+            _tx: &MsgTx,
+            _tx_hash: &Hash,
+            _view: &UtxoView,
+        ) -> Result<SequenceLock, PoolError> {
+            unimplemented!()
+        }
+        fn is_treasury_agenda_active(&self) -> Result<bool, String> {
+            unimplemented!()
+        }
+        fn is_auto_revocations_agenda_active(&self) -> Result<bool, String> {
+            if self.agenda_unreadable {
+                return Err("the agenda state cannot be read".into());
+            }
+            Ok(false)
+        }
+        fn is_subsidy_split_agenda_active(&self) -> Result<bool, String> {
+            unimplemented!()
+        }
+        fn is_subsidy_split_r2_agenda_active(&self) -> Result<bool, String> {
+            unimplemented!()
+        }
+        fn tspend_mined_on_ancestor(&self, _tspend: &Hash) -> Result<(), String> {
+            unimplemented!()
+        }
+        fn standard_verify_flags(&self) -> Result<ScriptFlags, String> {
+            unimplemented!()
+        }
+        fn now_unix(&self) -> i64 {
+            1751800000
+        }
+        fn now_mono_nanos(&self) -> i64 {
+            0
+        }
+        fn random_u64(&self) -> u64 {
+            0
+        }
+    }
+
+    fn new_pool() -> TxPool<ClockChain> {
+        let params = dcroxide_chaincfg::mainnet_params();
+        let policy = Policy {
+            accept_non_std: false,
+            max_orphan_txs: 100,
+            max_orphan_tx_size: 5000,
+            max_sig_ops_per_tx: 1000,
+            min_relay_tx_fee: 10000,
+            allow_old_votes: false,
+            max_vote_age: params.coinbase_maturity,
+            enable_ancestor_tracking: true,
+        };
+        let chain = ClockChain {
+            agenda_unreadable: false,
+        };
+        TxPool::new(chain, policy, &params)
+    }
+
+    /// A vote by the ticket with the given hash on the block with the
+    /// given hash and claimed height.  Only its shape is real: nothing
+    /// here checks its scripts or amounts.
+    fn vote(block: [u8; 32], height: u32, ticket: [u8; 32], bits: u16) -> MsgTx {
+        let mut block_ref = vec![0x6a, 0x24];
+        block_ref.extend_from_slice(&block);
+        block_ref.extend_from_slice(&height.to_le_bytes());
+        let mut vote_bits = vec![0x6a, 0x02];
+        vote_bits.extend_from_slice(&bits.to_le_bytes());
+        let mut reward = vec![dcroxide_txscript::OP_SSGEN, 0x76, 0xa9, 0x14];
+        reward.extend_from_slice(&[0x11; 20]);
+        reward.extend_from_slice(&[0x88, 0xac]);
+        let tx = MsgTx {
+            tx_in: vec![
+                TxIn {
+                    previous_out_point: OutPoint {
+                        hash: Hash([0; 32]),
+                        index: u32::MAX,
+                        tree: TX_TREE_REGULAR,
+                    },
+                    sequence: u32::MAX,
+                    value_in: 1,
+                    block_height: 0,
+                    block_index: NULL_BLOCK_INDEX,
+                    signature_script: vec![0x00, 0x00],
+                },
+                TxIn {
+                    previous_out_point: OutPoint {
+                        hash: Hash(ticket),
+                        index: 0,
+                        tree: TX_TREE_STAKE,
+                    },
+                    sequence: u32::MAX,
+                    value_in: 1,
+                    block_height: 1,
+                    block_index: 0,
+                    signature_script: vec![0x51],
+                },
+            ],
+            tx_out: vec![
+                TxOut {
+                    value: 0,
+                    version: 0,
+                    pk_script: block_ref,
+                },
+                TxOut {
+                    value: 0,
+                    version: 0,
+                    pk_script: vote_bits,
+                },
+                TxOut {
+                    value: 2,
+                    version: 0,
+                    pk_script: reward,
+                },
+            ],
+            ..MsgTx::default()
+        };
+        assert_eq!(dcroxide_stake::determine_tx_type(&tx), TxType::SSGen);
+        tx
+    }
+
+    /// Put the vote in the pool as accepted at the given height, and in
+    /// the tracker, as acceptance does.
+    fn accept(pool: &mut TxPool<ClockChain>, vote: &MsgTx, accepted_at: i64) -> Hash {
+        let tx_hash = vote.tx_hash();
+        pool.add_transaction(Arc::new(TxDesc {
+            tx: vote.clone(),
+            tx_hash,
+            tree: TX_TREE_STAKE,
+            tx_type: TxType::SSGen,
+            added_unix: 1751800000,
+            height: accepted_at,
+            fee: 0,
+            total_sig_ops: 0,
+            tx_size: vote.serialize_size() as i64,
+        }));
+        pool.vote_track.add_vote(vote, &tx_hash);
+        tx_hash
+    }
+
+    /// dcrd `TestVoteTrackerPruneOldVotesBoundary`
+    /// (`internal/mempool/mempool_test.go:2566-2615`): a block's metadata
+    /// is kept by a prune at its height plus nine and plus ten, and
+    /// dropped at plus eleven.
+    #[test]
+    fn metadata_is_kept_through_ten_blocks_past_the_block() {
+        let block = Hash([0x01; 32]);
+        let height = i64::from(BLOCK_HEIGHT);
+        for (prune_height, want_pruned) in [
+            (height + HEIGHT_DIFF_TO_PRUNE_VOTES - 1, false),
+            (height + HEIGHT_DIFF_TO_PRUNE_VOTES, false),
+            (height + HEIGHT_DIFF_TO_PRUNE_VOTES + 1, true),
+        ] {
+            let mut tracker = VoteTracker::default();
+            let tracked = vote(block.0, BLOCK_HEIGHT, [0x71; 32], 0x0001);
+            tracker.add_vote(&tracked, &tracked.tx_hash());
+            tracker.prune_old_votes(prune_height);
+            assert_eq!(
+                tracker.votes_on(&block).is_empty(),
+                want_pruned,
+                "prune at {prune_height}"
+            );
+        }
+    }
+
+    /// The first vote tracked for a block sets the height its metadata
+    /// is pruned by (dcrd `AddVote` sets `blockHeight` only for a new
+    /// entry), and a second vote by the same ticket on the block is not
+    /// tracked.
+    #[test]
+    fn the_first_vote_on_a_block_sets_its_height_and_a_ticket_counts_once() {
+        let block = Hash([0x02; 32]);
+        let mut tracker = VoteTracker::default();
+        let first = vote(block.0, BLOCK_HEIGHT, [0x71; 32], 0x0001);
+        let again = vote(block.0, BLOCK_HEIGHT, [0x71; 32], 0x0000);
+        let later = vote(block.0, BLOCK_HEIGHT + 100, [0x72; 32], 0x0001);
+        tracker.add_vote(&first, &first.tx_hash());
+        tracker.add_vote(&again, &again.tx_hash());
+        tracker.add_vote(&later, &later.tx_hash());
+        let hashes: Vec<Hash> = tracker
+            .votes_on(&block)
+            .iter()
+            .map(|v| v.vote_hash)
+            .collect();
+        assert_eq!(hashes, vec![first.tx_hash(), later.tx_hash()]);
+
+        tracker.prune_old_votes(i64::from(BLOCK_HEIGHT) + HEIGHT_DIFF_TO_PRUNE_VOTES + 1);
+        assert!(tracker.votes_on(&block).is_empty());
+    }
+
+    /// The two clocks of dcrd's stake pruning (`d54099ad`): a vote
+    /// accepted three blocks after the block it votes on stays in the pool
+    /// until ten blocks past its acceptance, but its metadata goes ten
+    /// blocks past the block.  In between, nothing records that its
+    /// ticket already votes on that block, so a second vote by the
+    /// ticket on the block passes the double-vote check.
+    #[test]
+    fn a_late_vote_outlives_its_metadata_and_its_ticket_may_vote_again() {
+        let block = [0x03; 32];
+        let ticket = [0x71; 32];
+        let height = i64::from(BLOCK_HEIGHT);
+        let mut pool = new_pool();
+        let first = vote(block, BLOCK_HEIGHT, ticket, 0x0001);
+        let first_hash = accept(&mut pool, &first, height + 3);
+        let second = vote(block, BLOCK_HEIGHT, ticket, 0x0000);
+        let second_hash = second.tx_hash();
+        let already_voted = |pool: &TxPool<ClockChain>| {
+            pool.check_vote_double_spend(&second, &second_hash)
+                .map_err(|e| e.err)
+        };
+        assert_eq!(
+            already_voted(&pool),
+            Err(crate::RuleErrorSource::Mempool(ErrorKind::AlreadyVoted))
+        );
+
+        // Ten blocks past the block: both kept.
+        pool.prune_stake_tx(0, height + 10);
+        assert!(pool.is_transaction_in_pool(&first_hash));
+        assert_eq!(pool.vote_hashes_for_block(&Hash(block)), vec![first_hash]);
+        assert!(already_voted(&pool).is_err());
+
+        // Eleven past: the metadata goes and the vote stays.
+        pool.prune_stake_tx(0, height + 11);
+        assert!(pool.is_transaction_in_pool(&first_hash));
+        assert!(pool.vote_hashes_for_block(&Hash(block)).is_empty());
+        assert_eq!(already_voted(&pool), Ok(()));
+
+        // The vote goes once the pruning is more than ten blocks past
+        // its acceptance.
+        pool.prune_stake_tx(0, height + 13);
+        assert!(pool.is_transaction_in_pool(&first_hash));
+        pool.prune_stake_tx(0, height + 14);
+        assert!(!pool.is_transaction_in_pool(&first_hash));
+    }
+
+    /// dcrd's `PruneStakeTx` returns before pruning anything when the
+    /// automatic revocations agenda cannot be read (`mempool.go:2281-2285`),
+    /// and `PruneOldVotes` runs at the end of `pruneStakeTx`
+    /// (`:2269-2270`), so the vote metadata is kept as well.
+    #[test]
+    fn nothing_is_pruned_while_the_agenda_cannot_be_read() {
+        let block = [0x04; 32];
+        let height = i64::from(BLOCK_HEIGHT);
+        let mut pool = new_pool();
+        let tracked = vote(block, BLOCK_HEIGHT, [0x71; 32], 0x0001);
+        let tracked_hash = accept(&mut pool, &tracked, height);
+        let past_both = height + HEIGHT_DIFF_TO_PRUNE_VOTES + 1;
+
+        pool.chain.agenda_unreadable = true;
+        pool.prune_stake_tx(0, past_both);
+        assert!(pool.is_transaction_in_pool(&tracked_hash));
+        assert_eq!(pool.vote_hashes_for_block(&Hash(block)), vec![tracked_hash]);
+
+        // Once the agenda can be read, the same pruning takes both.
+        pool.chain.agenda_unreadable = false;
+        pool.prune_stake_tx(0, past_both);
+        assert!(!pool.is_transaction_in_pool(&tracked_hash));
+        assert!(pool.vote_hashes_for_block(&Hash(block)).is_empty());
     }
 }

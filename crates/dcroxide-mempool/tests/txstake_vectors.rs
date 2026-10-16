@@ -4,12 +4,23 @@
 //! vote orphan flow, duplicate-vote and max-vote-double-spend
 //! rejection across blocks, old vote policy, the stake validation
 //! height gates, revocation acceptance with the one-revocation rule,
-//! disapproval tallies over no-votes, the votes-map retention quirk
-//! after pruning, and the treasury battery — concurrent tspend
+//! disapproval tallies over no-votes, the pruning of vote metadata
+//! with the votes, and the treasury battery — concurrent tspend
 //! limits, mined-on-ancestor, the expiry policy in all directions,
 //! the chain-level Pi key and signature rejections, treasury adds
 //! under the fee policy, and standalone treasurybase rejection — over
 //! a mirrored fake chain with a replaced Pi key set.
+//!
+//! One row was re-expected by hand: the `vhb` that follows
+//! `prune 0 4107` at the end of the votes section.  The harness at the
+//! old parity pin kept vote metadata for good, so the row listed the
+//! three no-votes on block `d1..` after the prune had removed them from
+//! the pool.  dcrd master `d54099ad` prunes a block's metadata once the
+//! stake pruning runs more than ten blocks past the height its first
+//! tracked vote claims (`mempool.go:385-396`, called at `:2270`).  The
+//! three votes claim 4096 and 4096 + 10 < 4107, so the block's metadata
+//! goes with them and the row now reads `-`.  Nothing else in the file
+//! reads metadata after a prune.
 
 // Test-harness arithmetic over bounded lengths.
 #![allow(clippy::arithmetic_side_effects)]

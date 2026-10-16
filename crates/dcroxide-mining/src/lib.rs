@@ -1,13 +1,14 @@
 // SPDX-License-Identifier: ISC
 //! Block template mining support, ported from dcrd's
-//! `internal/mining` package at the parity pin, master `6f6cf21b` (the
-//! package is unchanged since the 2.2 campaign target `452c1a6c`): the
-//! transaction descriptor types, the dependency graph and mining view
-//! with ancestor statistics tracking, the transaction priority queue
-//! with Go's exact heap semantics, the priority calculation, the block
-//! template generation (`NewBlockTemplate`), the background template
-//! generator's regeneration state machine, and the CPU miner's
-//! proof-of-work solve core (`internal/mining/cpuminer`'s
+//! `internal/mining` package at the parity pin, master `6f6cf21b` (since
+//! then master has changed only the wording of two `TxSource` doc
+//! comments there, in `6444f057`, which `TemplateTxSource`'s docs need
+//! not follow): the transaction descriptor types, the dependency graph
+//! and mining view with ancestor statistics tracking, the transaction
+//! priority queue with Go's exact heap semantics, the priority
+//! calculation, the block template generation (`NewBlockTemplate`), the
+//! background template generator's regeneration state machine, and the
+//! CPU miner's proof-of-work solve core (`internal/mining/cpuminer`'s
 //! `solveBlock`).
 
 #![cfg_attr(not(test), no_std)]
