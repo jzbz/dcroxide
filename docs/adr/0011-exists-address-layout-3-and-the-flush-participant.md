@@ -801,3 +801,143 @@ lines of `lib.rs` before `:320`, of `transaction.rs`, `participant.rs`
 and `dcroxide.rs`, and of `policy.rs` since 2026-10-11, did not move.
 The functions named are unchanged but for the connect, divided as
 above.
+
+## Addendum, 2026-10-16 — the commit hook trusts a partition that has not changed since the filter
+
+The addendum of 2026-10-12 calls the filter made before the transaction
+advisory: nothing enters the memtable before the commit hook, and the
+hook checks each key again under its partition's write lock, which is
+what keeps a partition's vectors disjoint. Since `64359e7` the hook
+makes that second search only where something may have changed. Each
+partition counts the changes to its vectors, its version. The only two
+places that write the vectors, `Part::add_run` for an insert that adds a
+run and `Part::replace` for a flush's fold, a flush's clear of a
+partition it merged and a load, both under the partition's write lock,
+move it, and nothing sets it back. `Memtable::filter`
+(`existsaddr/memtable.rs:230`) reads a partition's version under the
+same read lock as its search, before the search, and each key it keeps
+carries that version. `Memtable::insert_candidates` (`:268`) takes a
+partition's keys as one run, without a search, a sort or a pass for
+repeats, when every one of them carries the partition's current version
+and they strictly ascend. Any other group is searched key by key and
+sorted, as before, and a debug build still searches on the first path,
+as an assertion. An unmoved version means nothing entered or left the
+partition since each key was found missing, so the search would have
+removed nothing, and ascending keys are what the sort would have left.
+Disjointness now rests on the version where it stands and on the search
+where it has moved, and the filter is no longer advisory: where its
+partition has not moved, it is what the hook inserts.
+
+The argument of the addendum of 2026-10-12 for why the filter is still
+good at the hook stands. Its last sentence reads the same with the
+version in it: a caller outside the subscriber that commits a connect of
+its own between a prepare and its hook moves the versions of the
+partitions it inserts into, so the hook searches those and skips what
+that connect added. On the daemon's index thread nothing comes between
+the filter and the hook but a flush, which moves the versions of the
+partitions it changes.
+
+A version says something only of the memtable it was read from. So what
+a connect prepared now names the store it was filtered against, and
+`connect_block` uses it only on that store and for that very block
+(`existsaddrindex.rs:820-821`). Handed to another instance of the index,
+it is dropped whole and the work is done inside the transaction, as the
+documentation of `Indexer::process_prepared_notification` already asked.
+The daemon runs one instance, so only a direct call can meet this.
+
+The run that goes in is the run the search would have made, so the
+merges, the journal, the flush log's counters, the rows on disk and
+every answer are unchanged. No on-disk format, policy constant or lock
+order changes, and the two database hooks and their contract are
+untouched. Two other commits of the same day touch the hooks'
+surroundings without changing that contract. `85a5dc8` has a commit and
+`Database::flush` free the overlay layers a flush retired once the
+writer semaphore is released, on the thread that flushed, where they
+were freed while it was held; `finished` is still called under the
+writer. And `6376eeb` keeps a copy of the bucket index in memory,
+updated as each commit publishes its rows; a participant's rows never
+pass through a commit, so the refusal of a participant prefix inside the
+bucket index, which registration already made, is now a condition of
+that copy being right.
+
+Measured only with `85a5dc8` and not one at a time, on m3 on 2026-10-13
+([bench-ledger.md](../bench-ledger.md), "Seven cumulative builds, the
+validation pool, a background commit and dcrd"), in a series of builds
+on `4700cf1` that each added one change or group of changes to the build
+before. Every build of it also held a developer variable for this
+index's flush request that is not in the tree, so the code as committed
+has not been run in a sync. The build that added the two took 466.7 s
+against 481.7 s for the build before it, one run each. Those 15.0 s are
+not the gain: the earlier run's flushes spent about 8 s longer in their
+commit phase, for reasons the records do not give. With the commit
+seconds taken out the step is 7.0 s, and by the node's clock less its
+flush time 6.5 s, each good to 3.5 to 6 s either way, so one run's best
+estimate and not an established figure. What holds beyond one run is the
+wait the two act on. The flush log's total of the waits for the writer
+by the threads other than the index thread, which bounds the wait of the
+thread that connects blocks from above, less the flushes the index
+thread ran, was 8.1 to 9.5 s in the eleven runs of earlier code that
+session that committed on the flushing thread and changed no other
+setting, and 1.6 to 1.7 s in all five runs of builds with the two. The
+same session has the one run with the index off since the addendum of
+2026-10-12: `4700cf1`, without this change, took 423.6 s with
+`--noexistsaddrindex` against 504.2 to 513.5 s in three runs at the
+defaults, two of which had slow commit phases, and peaked at 2,149 MiB
+against 2,832 to 3,128 MiB, read before the closing flush. So the
+index's share of a sync and of its peak is known for `4700cf1` from one
+run, and not for the code as it stands. The fallback's flush-time test
+was not run again, and none of the plan's criteria is judged again.
+
+The tests are in `crates/dcroxide-indexers/src/existsaddr/memtable.rs`
+(the first four) and `existsaddr/tests.rs`: a partition's version moves
+with every change to its vectors and to no other partition's, and never
+back
+(`a_version_moves_with_every_change_to_its_partition_and_never_back`);
+an insert searches only the partitions changed since its filter
+(`an_insert_searches_only_the_partitions_changed_since_its_filter`);
+threads that filter without the writer and insert with it held, with
+flushes among them, leave no key twice
+(`filters_that_race_inserts_leave_no_key_twice`); a memtable that trusts
+its versions and one that searches for every key hold the same vectors
+through random filters, inserts, flushes and loads
+(`random_interleavings_leave_what_a_search_for_every_key_leaves`); two
+indexes, one of each kind, hold the same tip row, keys, memtable and
+rows through a script with another connect, a flush or a disconnect
+between a prepare and its connect
+(`a_hook_that_trusts_its_versions_leaves_what_one_that_searches_leaves`);
+a scripted run ends at a digest pinned from `4700cf1`
+(`a_scripted_run_writes_the_rows_it_wrote_when_the_hook_searched_for_every_key`);
+a block's journal row holds the bytes it held
+(`a_blocks_journal_row_holds_the_bytes_it_always_held`); on the
+subscriber's path with no flush the hook searches for nothing
+(`a_connect_through_the_subscriber_searches_the_memtable_once`); and
+what one index prepared is not used by another
+(`what_one_index_prepared_is_not_used_by_another`). They have run on
+Linux only.
+
+The changes of 2026-10-16 moved more of the lines cited above, whose
+numbers stay as they were written. In `existsaddrindex.rs` the version
+constant is now at `:48`, the version refusal at `:497`, the lookup's
+two at `:237` and `:275`, the load and registration at `:523` and
+`:547`, the drops at `:1031` and `:1075`, the journal load at `:482`,
+the address extraction at `:638`, the candidates at `:705`,
+`prepare_connect` at `:767`, `connect_block` at `:810`, and the hook at
+`:870`, registered at `:892`; `Memtable::insert_candidates` is at
+`existsaddr/memtable.rs:268`. In `dcroxide-database`'s `lib.rs`,
+`begin_durable_write` is at `:158`, the latch's `:187` and `:212` at
+`:199` and `:224`, the participant's field at `:404`, `flush_locked` at
+`:875` with `wants_flush` asked at `:890` and `finished` called at
+`:923`, `close` at `:1919-1944`, `set_flush_participant` at `:1983` and
+`clear_flush_participant` at `:2051`. In `dbcache.rs`, `has_work` is
+asked at `:916`, the prefix guard is at `:951`, `contribute` is called
+at `:987`, the commit at `:1012` and the participant-only flush's count
+at `:1073`. In `transaction.rs`, `raw_id` is at `:1817`, the prefix
+check at `:1228` and its call in the commit at `:1293`, `on_commit` at
+`:1212`, the commit's own flush at `:1371`, its hooks taken at `:1396`
+and its rows published at `:1420`, the hooks dropped by a rollback at
+`:1180`, and `try_first_after` and `try_scan_after` at `:696` and
+`:712`. `participant.rs`'s key check is at `:325`. The cited lines of
+`existsaddr/store.rs`, `policy.rs` and `mod.rs`, of `subscriber.rs`,
+`common.rs`, `indexes.rs`, `participant.rs:64` and `dcroxide.rs` did not
+move. The functions named are unchanged but for the hook's insert and
+`connect_block`, as above.

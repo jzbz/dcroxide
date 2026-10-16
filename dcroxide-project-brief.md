@@ -42,7 +42,7 @@ assembles them end to end: config and CLI, the chain engine with full
 consensus validation, mempool and fee estimation, mining and the CPU miner, the
 P2P server with sync, relay, and StakeShuffle mixing message relay, the
 JSON-RPC/websocket server, the tool commands, the pipe IPC lifecycle, and the
-Windows service wrapper. The gate runs 2,124 tests across 423 suites on Linux,
+Windows service wrapper. The gate runs 2,291 tests across 430 suites on Linux,
 most of them differential against dcrd or replaying sessions generated inside dcrd's own
 packages. The parity target moved five times during the port, from
 `release-v2.1.5` to upstream master `452c1a6c` and then through `29f17894`,
@@ -217,15 +217,31 @@ What Phase 15 has covered so far:
   measured in one binary run four times: 597.6 s and 599.0 s with
   `DCROXIDE_READ_AHEAD=off`, and 494.6 s and 490.8 s with the read-ahead
   on, 17.2% and 18.1% less. Those four runs are of the build made before
-  the review of the read-ahead and its fixes, so `b4ceb1c` as committed
-  has not been run in a sync, and the hand-off was not measured alone.
-  dcrd's last run is the 2,883.9 s of the evening before: against it,
-  across sessions, 612.4 s is 4.71x and the two read-ahead runs 5.83x
-  and 5.88x. Not measured for any of the eleven: the index off, another
-  machine or filesystem, a whole sync over a delayed or a real link, the
-  changes within the two batches one at a time, and a replay with full
-  validation. The [bench ledger](docs/bench-ledger.md) has every run,
-  and what else was measured that day and is not in the repository.
+  the review of the read-ahead and its fixes; `b4ceb1c` as committed was
+  run in syncs on 2026-10-13, inside `4700cf1` and only with the
+  read-ahead on, and the hand-off was not measured alone. dcrd's last
+  run before that day is the 2,883.9 s of the evening before: against
+  it, across sessions, 612.4 s is 4.71x and the two read-ahead runs
+  5.83x and 5.88x. Not measured for any of the eleven that day: the
+  index off (`4700cf1`, which holds them, was run so once on
+  2026-10-13), another machine or filesystem, a whole sync over a
+  delayed or a real link, the changes within the two batches one at a
+  time, and a replay with full validation. The [bench
+  ledger](docs/bench-ledger.md) has every run, and what else was
+  measured that day and is not in the repository.
+- **Eighteen more commits to the node's code followed, and the code as
+  it stands has not been run in a sync.** `4700cf1` adds a log line dcrd
+  writes; the seventeen of 2026-10-16 after it change how the node does
+  its work, among them the reading thread's work for each block and
+  threads kept for the scripts of a connected block (ADR-0005, addendum
+  of that date), and one more commit of that day adds tests only. On
+  2026-10-13 `4700cf1` was run three times at the defaults and once with
+  the exists-address index off, and dcrd once, in one session, beside a
+  series of builds holding sixteen of the seventeen and a build of
+  `4700cf1` with the seventeenth alone; no build run held all of them,
+  and every build of the series also held a developer variable that is
+  not in the tree. The [bench ledger](docs/bench-ledger.md) has that
+  session. The README sets out no figure from it.
 - **The daemon's default download window is now its own, not dcrd's,
   and was measured on 2026-10-12 in short runs only** (PARITY.md,
   *Block download window*). It keeps up to 128 blocks requested from

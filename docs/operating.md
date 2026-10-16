@@ -164,21 +164,26 @@ directory of its own. Every start that opens the chain logs its version
 under CHAN, "Blockchain database version info: chain: 15, ...", where
 dcrd prints "chain: 14": the one place the number shows, and the
 difference is expected. The eleven commits of 2026-10-12 (`7f99184` to
-`b4ceb1c`) change no on-disk format and no database version. That is
+`b4ceb1c`) change no on-disk format and no database version, and nor do
+the eighteen commits to the node's code after them (below). That is
 read from the code: no run on record opened a directory written before
 them with a build made after them.
 
 Budget for it: on the one machine where a sync from genesis has been
 measured with the current layout, it took less time than dcrd v2.1.6
-did, and more disk. Each figure below is of the code named with it. For
-the code as it stands, `b4ceb1c`, there are two runs at the defaults,
-on 2026-10-12, of a build made before the last fixes to it: **8.2
-minutes** each. That commit itself has not been run in a sync. The last
-commit that has, `540b203`, took 10.2 minutes in one run that day, and
-a median of **12.1 minutes** over three runs on 2026-10-11 is the last
-figure with more than two runs behind it (the paragraph on 2026-10-12
-below has the steps). The comparison with dcrd was made on 2026-10-09
-and 2026-10-10, when dcroxide took 17.6, and it comes first. On machine
+did, and more disk. Each figure below is of the code named with it. The
+code as it stands has not been run in a sync; the paragraph on
+2026-10-13 below says what was. The last commit that has been run as
+committed, `4700cf1`, took 504.2 s, 513.4 s and 513.5 s at the
+defaults on 2026-10-13, **8.4 to 8.6 minutes**, in a session not to be
+set beside the earlier ones without its label (that paragraph says
+why). On 2026-10-12 two runs of a build of `b4ceb1c` made before the
+last fixes to it took **8.2 minutes** each, and `540b203` took 10.2
+minutes in one run; a median of **12.1 minutes** over three runs on
+2026-10-11 is the figure before those with more than two runs behind it
+(the paragraph on 2026-10-12 below has the steps). The comparison with
+dcrd was made on 2026-10-09 and 2026-10-10, when dcroxide took 17.6,
+and it comes first. On machine
 m3 in [bench-ledger.md](bench-ledger.md), a 16-core desktop with one NVMe
 drive and the node held to eight of its cores, mainnet from genesis to
 block 1,116,035 took a median of **17.6 minutes**, against **47.7
@@ -228,29 +233,65 @@ index's work for each block and one to the ticket database's, it took
 628.0 s. With a block's `SigHashAll` signature hashes built on the
 transaction hashes its connect has already computed (`3a367e5`) it took
 607.7 s, and with the block download window below (`540b203`) 612.4 s,
-**10.2 minutes**, which is the last figure there is for a commit as
-committed. The two commits after it hand a peer's block to the chain
-without copying it (`5cf9e04`) and read the sync peer's connection ahead
+**10.2 minutes**, which was the last figure for a commit as committed
+until those of `4700cf1` on 2026-10-13 (below). The two commits after
+it hand a peer's block to the chain without copying it (`5cf9e04`) and
+read the sync peer's connection ahead
 (`b4ceb1c`, below). They were measured only together, and only in a
 build made before a review's fixes to the second: two syncs took
 **8.2 minutes** each (494.6 s and 490.8 s) with the read-ahead, and two
 took 597.6 s and 599.0 s with `DCROXIDE_READ_AHEAD=off`, which still had
 the hand-off. So for the code of `b4ceb1c` those runs of an earlier
-build are all there is: the committed code has not been run in a sync,
-and the hand-off was not measured alone. Peak resident memory was
-3.1–3.2 GiB (3,204–3,299 MiB) in the seven runs without the read-ahead
-and 2.9 GiB (2,967 and 2,921 MiB) in the two with it, which is not
-explained. The node's CPU time, user and system, went from 1,458 s to
-1,119 s and 1,118 s, most of the fall coming with the signature hash
-(1,394 s in the run before it, 1,152 s with it). dcrd was not run that
-day. Set against the 48.1 minutes of its one run on the evening of
-2026-10-11 the two 8.2-minute runs are 5.83x and 5.88x as fast, and
-against its 47.7-minute median above 5.79x and 5.84x: ratios across
-sessions, and of a build that is not the committed code. None of the
-eleven changes has been run on another machine or filesystem, with
-`--noexistsaddrindex`, or in a whole sync over a delayed or a real link.
+build were all there was that day: the committed code was run in syncs
+on 2026-10-13, inside `4700cf1` and only with the read-ahead on
+(below), and the hand-off was not measured alone. Peak resident memory
+was 3.1–3.2 GiB (3,204–3,299 MiB) in the seven runs without the
+read-ahead and 2.9 GiB (2,967 and 2,921 MiB) in the two with it, which
+is not explained. The node's CPU time, user and system, went from
+1,458 s to 1,119 s and 1,118 s, most of the fall coming with the
+signature hash (1,394 s in the run before it, 1,152 s with it). dcrd was
+not run that day. Set against the 48.1 minutes of its one run on the
+evening of 2026-10-11 the two 8.2-minute runs are 5.83x and 5.88x as
+fast, and against its 47.7-minute median above 5.79x and 5.84x: ratios
+across sessions, and of a build that is not the committed code. None of
+the eleven changes has been run on another machine or filesystem, or in
+a whole sync over a delayed or a real link, and with
+`--noexistsaddrindex` only once, inside `4700cf1` on 2026-10-13 (below).
 The ledger's section "Eleven changes, a background commit not kept and a
 pool gate" has each step.
+
+Eighteen more commits to the node's code followed, and one that adds
+tests only. `4700cf1` adds an error line dcrd logs (the end of this
+guide). The seventeen after it, all of 2026-10-16, change how the node
+does its work: on the path of an arriving block, in the flush log, in
+the exists-address index's commit hook, in the database's flushes and
+its lookups of nested buckets, in the ticket treap, in the rebroadcast
+thread, on the reading thread (below), and in where a connected block's
+scripts are checked (below). On 2026-10-13, on m3, in the same harness,
+with no run marked as disturbed, `4700cf1` took 504.2 s, 513.4 s and
+513.5 s at the defaults. Two of those three runs spent about 10 s longer
+in their flushes' commit phase than the third, 80.6 s and 80.0 s against
+70.5 s, and the records do not say why; with those seconds taken out the
+three agree to within a second. In that session the block server read
+15.7 to 18.0 GB from its drive in every run, where it had read none in
+the runs of 2026-10-11 and at most 1.5 GB in those of 2026-10-12, so its
+times are not a later point on the same curve as theirs. The seventeen
+were not run as committed. Sixteen of them were run as a series of
+builds on `4700cf1`, each adding one change or group of changes to the
+build before, and every build of it also held a developer variable that
+is not in the tree. The first build, `4700cf1` with the flush log's
+processor times and that variable, ran at the speed of `4700cf1`
+(505.6 s and 502.8 s); the last, with the other fifteen, took 441.9 s
+and 442.2 s: 62 to 64 s, 12.3%, off a sync of about 504 s, with two runs
+at each end, where the steps between are single runs. The seventeenth,
+the script checks below, was run on `4700cf1` alone, twice: 491.3 s and
+493.4 s, about 12 to 16 s less than the code it was added to, depending
+on the measure, all of it after the assume-valid block. No build holding
+both was run, so the two are not to be added, and the code as it stands
+has not been run. dcrd was run once in that session. The ledger's
+section "Seven cumulative builds, the validation pool, a background
+commit and dcrd" has every run, what each step is good to, and what was
+not measured.
 
 The rate falls as the chain grows, and falls again where full
 validation begins: by default both daemons skip connect validation,
@@ -407,10 +448,14 @@ During the initial sync dcroxide also reads its sync peer's connection
 ahead of the thread that processes the blocks, which dcrd does not do
 ([PARITY.md](../PARITY.md), *Reading ahead of the block handler*). Once
 that peer has delivered a first block, a thread of its own reads the
-connection, checks each message's checksum, decodes it and hashes a
-block's transactions, and keeps at most four messages ahead of the
-thread that processes blocks, which still handles every message in the
-order it arrived. It changes nothing about which blocks or messages are
+connection, checks each message's checksum and decodes it, and for a
+block hashes its transactions, builds its two merkle trees and lays
+the bytes it arrived in out as its block-file record, after comparing
+them with the block's own serialization. It keeps at most four
+messages ahead of the thread that processes blocks, which still
+handles every message in the order it arrived, and stores a block
+that comes with its record as that record, without serializing it
+again. It changes nothing about which blocks or messages are
 accepted, which peers are dropped or banned, or what is logged about
 them, beyond lines of its own (below, and two more at the debug level
 in PARITY.md): it moves work and decides nothing, and PARITY.md names
@@ -420,12 +465,15 @@ is read and `getpeerinfo`'s `bytesrecv` for that peer when it is
 handled, so the total can lead the peer's count by up to four messages.
 It costs one more thread and one more descriptor on that one
 connection, kept until the connection ends, and the memory of up to
-four decoded messages. By an estimate from the sizes of the structures,
-not a measurement, those four are about 150 kB for main network blocks
-of mean size, well under 1 MiB; at worst, from a hostile sync peer
-sending the largest blocks made of the smallest transactions, the
-connection holds about 57 MB with the block being handled and the read
-buffer counted, against about 12.5 MB for one such block without the
+four decoded messages, each kept with the frame it was read in. By an
+estimate from the sizes of the structures, not a measurement, those
+four are about 220 kB for main network blocks of mean size, well under
+1 MiB; at worst, from a hostile sync peer sending the largest blocks
+made of the smallest transactions, the connection holds about 62 MB
+with the block being handled and every frame counted, with about
+1.3 MB more for a moment while one frame is compared with its block's
+serialization, or up to about 1.4 MB while one block's merkle trees are
+built, against about 12.5 MB for one such block without the
 read-ahead. It was measured on m3 on 2026-10-12, on a quiet machine
 with the node held to eight of the machine's cores, with one binary:
 two default syncs to block 1,116,035 over loopback took 494.6 s and
@@ -433,13 +481,21 @@ two default syncs to block 1,116,035 over loopback took 494.6 s and
 and 599.0 s, so 17.2% and 18.1% less, with peak resident memory of
 2,967 and 2,921 MiB against 3,273 and 3,256 MiB, which is not
 explained. Those four runs are of the build made before a review's
-fixes to it; the code as committed has not been run in a sync, so none
-of these is a figure to budget from, and all are of later code than the
-12.1 minutes above. No sync has been run with it over a delayed or a
-real link, where the round trip and not the thread that processes
-blocks may set the pace and it may gain nothing, nor on fewer cores,
-with `--noexistsaddrindex` or with `--assumevalid=0`, nor on macOS or
-Windows, where none of its tests has been run either.
+fixes to it, so none of these is a figure to budget from, and all are
+of later code than the 12.1 minutes above. The read-ahead as `b4ceb1c`
+committed it was run on 2026-10-13, inside `4700cf1` and only on
+(above), so what it gains as committed has not been measured; the
+reading thread's added work, the record and the merkle trees, has been
+run only in builds that are not the code as it stands, where it moved
+about 7 s and 5 s of processor time from the thread that processes
+blocks to the reading thread rather than removing it, which paid there
+because the reading thread, fed by a server on the same machine, waited
+over 320 s for the other. No sync has been run with it over a delayed or
+a real link, where the round trip and not the thread that processes
+blocks may set the pace and it may gain nothing, nor on fewer cores or
+with `--assumevalid=0`, nor on macOS or Windows, where none of its tests
+has been run either; with `--noexistsaddrindex` it was run once, in
+`4700cf1` on 2026-10-13, and never against a run with it off.
 
 Whether reading ahead ever costs anything has not been measured: the
 loopback runs above are all there is. Set `DCROXIDE_READ_AHEAD=off` (or
@@ -458,7 +514,7 @@ also logs one line under `SRVR` as it shuts down, just before `Server
 shutdown complete`:
 
 ```text
-Read-ahead: N blocks (B bytes) on C connections; checksum and decode X s and hashing Y s done off the block thread; the reader waited G s for the block thread; the block thread waited W s for the reader; at most Q items queued; index queue full for I s
+Read-ahead: N blocks (B bytes) on C connections; checksum and decode X s and hashing Y s done off the block thread; the reader waited G s for the block thread; the block thread waited W s for the reader; at most Q items queued; index queue full for I s; block-file records laid out for R blocks in Z s, K written as laid out
 ```
 
 N blocks of B bytes were read by the reading threads of C connections;
@@ -466,8 +522,10 @@ the first block of a connection is not among them, since the thread
 that processes blocks read that one itself. X and Y are the time the
 reading threads spent on checksums and decoding and on hashing, which
 the thread that processes blocks no longer spends; the socket reads
-moved too and are not timed. G is how long the reading threads stood
-still with four messages waiting: when it is most of the sync, the
+moved too and are not timed. Since `44cf801` Y also covers building
+each block's two merkle trees, so it is not to be compared with a Y
+from earlier code. G is how long the reading threads stood still with
+four messages waiting: when it is most of the sync, the
 thread that processes blocks set the pace and the reading kept up. W is
 how long the thread that processes blocks waited for a block with none
 ready. By the counter's definition, and not seen in a run, a large W
@@ -476,14 +534,55 @@ reading ahead had less to give. Q is the most messages that waited at
 once, and is never more than four. I is how long handing blocks to the
 index thread waited for room in its queue, which is time the indexes
 set the pace; it is counted whether or not anything is read ahead, and
-printed in this line only. In the two runs above with it on the line
-reported 1,116,034 blocks and 19,215,875,473 bytes on one connection
+printed in this line only. R is the blocks the reading threads handed
+over laid out as their block-file records, and Z the time they spent
+laying them out: serializing each block, comparing the bytes it arrived
+in with that serialization, taking the record's checksum and hashing
+the header once more, the serialization and the checksum being work
+the thread that processes blocks does for every block that comes
+without a record. R below N means bytes that were dropped for not
+matching the serialization, which is not expected. K is the records
+the block database wrote as they were handed to it, counted over the
+life of the database: below R by the blocks the chain did not store,
+and 0 beside an R above 0 when the database laid every record out
+again, as it does for a record laid out for another network. The line
+ended with I before `a589c4a`. In the two runs above with it on, of
+the build of 2026-10-12, the line reported 1,116,034 blocks and
+19,215,875,473 bytes on one connection
 (printed as `1116034 blocks (19215875473 bytes) on 1 connections`),
 with X at 45.829 s and 45.886 s, Y at 47.209 s and 47.246 s, G at
 382.350 s and 378.719 s, W at 0.271 s and 0.273 s, Q at 4 and I at
 3.191 s and 3.265 s. X and Y together are 93.0 s and 93.1 s, less than
 the 103.0 s and 108.2 s the syncs gained, and what the rest is was not
-established.
+established. In the three runs of 2026-10-13 whose builds held the
+record, none of them the code as it stands, R and K were both
+1,116,034, every block read ahead, and Z was 7.078 s, 7.128 s and
+7.165 s; Y was 47.369 s in the first, whose build had no merkle trees
+on the reading thread, and 52.536 s and 52.562 s in the two whose
+build had them.
+
+After the assume-valid block the node also keeps threads for checking
+scripts. dcrd starts goroutines for each batch of a block's inputs.
+dcroxide, since `f60ae3a`, checks each transaction tree with 4 script
+items or more of a block it connects on helper threads that live as long
+as the process, the thread that processes blocks checking with them
+([PARITY.md](../PARITY.md), *Script checks of a connected block*). They
+are named `scriptval-N`, are created as batches want them, as many as
+the widest batch so far less one and never more than one fewer than the
+logical CPUs the process may run on, and are parked, using no processor
+time, while there is nothing to check. Before the assume-valid block no
+script is checked, so a sync from genesis starts none until then, and a
+node that has checked scripts keeps the ones it made until it exits.
+Count them against a task limit (`TasksMax` under systemd, a cgroup's
+`pids.max`, `RLIMIT_NPROC`). A helper the operating system refuses costs
+speed only: the thread that processes blocks and the helpers there are
+do its share, nothing is logged, and no creation is tried again before
+the 1,024th batch after that one. No `DCROXIDE_` variable sets their
+number. In the two syncs of 2026-10-13 of `4700cf1` with these threads
+added (above), on a node held to eight cores, 16 hardware threads, 15 of
+them were there at the end, and peak resident memory, read before the
+closing flush, was 2,998 and 2,908 MiB, inside the 2,832 to 3,128 MiB of
+the three runs of `4700cf1` without them.
 
 The disk difference is all in the metadata store. Block files make up
 17.88 GiB of each data directory at block 1,116,035, and the rest is
@@ -530,8 +629,12 @@ Those nine passed 39.6–40.3 GB to write calls, as the three of
 records, are not comparable across `7c6ec9a`, the third of that day's
 changes: it writes each block record with one positioned write where
 there were a seek and four writes, so three fewer write calls and one
-fewer seek for every block record, with the same bytes. This guide used
-to describe a node fully stalled on storage for
+fewer seek for every block record, with the same bytes. Since
+`a589c4a` the record of a block the reading thread read (above) is
+built and checksummed on that thread, from the bytes the block arrived
+in, and not at the commit, which still writes it with that one
+positioned write. This guide used to describe a node fully stalled on
+storage for
 48% of block-sync wall time, with a median flush of 26.9 s, and a sync
 1.29x slower than dcrd's. Those were measured in 2026-08 on m1 in
 [bench-ledger.md](bench-ledger.md), another machine, against dcrd
@@ -563,9 +666,11 @@ and 501 with it off, and wrote 15.5 GB against 12.6 GB. From genesis on
 m3 it showed more: one sync with the index off took 14.7 minutes
 against 17.6 with it on, and left a data directory 2.0 GiB smaller
 (10.2 minutes against 12.1 on 2026-10-11, after that day's changes).
-No sync has been run with the index off since. Two of the changes of
-2026-10-12 are to the index's own work for each block, so what turning
-it off saves on the code as it stands has not been measured.
+On 2026-10-13 one sync of `4700cf1` with the index off took 423.6 s,
+against 504.2 s to 513.5 s in three with it on (the sync budget above
+has that session's label). The index's commit hook has changed since
+(`64359e7`), so what turning it off saves on the code as it stands has
+not been measured.
 With the index off, both RPCs fail with "exists address index
 disabled", as dcrd's do. With it on, the index is updated on a thread of
 its own and can trail the chain by a little more than 128 blocks while
@@ -624,8 +729,12 @@ its key comparisons were made inline
 addendum of that date). With those two and a change to the ticket
 database that was measured with them, one sync with the index on took
 628.0 s where the run before them took 673.8 s. No sync ran with the
-index off that day, so the 16% is the index's share on `b4a5d2d`, and
-its share on the code as it stands is not known.
+index off that day, so the 16% is the index's share on `b4a5d2d`. On
+2026-10-13 `4700cf1`, which holds those changes, took 423.6 s with the
+index off in one run, 80.6 s to 89.9 s less than each of its three
+runs with it on, two of which had slow commit phases (the sync budget
+above); its share on the code as it stands, whose index hook has
+changed since, is not known.
 
 - **Memory**: the index's in-memory set holds up to about 3 million
   addresses (about 63 MB) after each flush while syncing, and up to about
@@ -633,11 +742,12 @@ its share on the code as it stands is not known.
   4.5 million (95 MB). Those figures are from before the change to
   commits of 2026-10-11. Since it, with the index pacing most commits
   of a sync, the set has held 4.5 million at the start of its fullest
-  flush in every sync measured with the index on, those of 2026-10-12
-  included. It also takes in, at each block, every address the
-  mempool has seen since the last block, so a very large mempool adds to
-  that. The index's pages also fill the metadata page cache
-  (`DCROXIDE_DB_CACHE`, below) up to its configured size. On m2's tail,
+  flush in every sync measured with the index on at the defaults, those
+  of 2026-10-12 and 2026-10-13 included. It also takes in, at each
+  block, every address the mempool has seen since the last block, so a
+  very large mempool adds to that. The index's pages also fill the
+  metadata page cache (`DCROXIDE_DB_CACHE`, below) up to its configured
+  size. On m2's tail,
   at the default 1 GiB cache, the node's peak resident memory was about
   350 MiB above the index-off run's (2,773 against 2,424 MiB). On a
   development desktop it was about 380 MB above at that cache over a
@@ -655,8 +765,10 @@ its share on the code as it stands is not known.
   as created, of that code and of five steps after it, peaked at
   3,204–3,299 MiB without the read-ahead, and the two with it (the
   build before its review's fixes) at 2,967 and 2,921 MiB. None ran
-  with the index off, so what the index adds to the peak on the code as
-  it stands has not been measured.
+  with the index off. On 2026-10-13 `4700cf1` peaked at 2,149 MiB in
+  one run with the index off against 2,832 to 3,128 MiB in three with
+  it on, each read before the closing flush; what the index adds to the
+  peak on the code as it stands has not been measured.
 - **Starting**: the node reads the journal back into memory before the
   index catches up, modelled at 1-3 s on mainnet, holding one copy of the
   addresses it reads back, and the journal's pages in the page cache.
@@ -836,9 +948,11 @@ configured MiB tracks the overlay's resident memory to within allocator
 overhead. Before 2026-09-23 entries were counted at key and value bytes
 only, which let the overlay hold 2–4× the configured figure. The 12.7%
 measurement for `DCROXIDE_DB_OVERLAY=800` below was taken under that older
-accounting, so the same setting now flushes a smaller overlay. The one
-re-measurement since, on m3 (above), found no gain. Unset, both
-keep the compiled defaults.
+accounting, so the same setting now flushes a smaller overlay. The
+re-measurements since, on m3, found no gain: the one above, and one run
+on 2026-10-13 at 450 MiB together with a developer setting that is not
+in the tree (the ledger has it). Unset, both keep the compiled
+defaults.
 
 **`DCROXIDE_DB_OVERLAY=800` measured 12.7% faster** on m1 in 2026-08,
 which made it the
@@ -958,14 +1072,29 @@ and, on Linux, the bytes the flushing thread read from storage and the bytes
 it dirtied in that phase. `write_bytes` counts pages when they are dirtied,
 not when they are written back, so writeback time shows in a phase's `ms`
 and not in its `write_bytes`, and the block-file sync always reads about 0
-there. Each line's `participant` is what the exists-address index wrote
+there. Since 2026-10-16 each phase ends with the flushing thread's
+processor time in it, four fields after those three. `utime_ms` and
+`stime_ms` are the milliseconds it ran in user mode and in the kernel,
+from `/proc/thread-self/stat`, which counts in clock ticks of 10 ms;
+`on_cpu_ns` and `runq_wait_ns` are the nanoseconds it was on a
+processor and the nanoseconds it was runnable but waiting for one, from
+`/proc/thread-self/schedstat`. What a phase's `ms` holds beyond those
+last two the thread spent asleep, waiting for storage or for a lock.
+All four are `null` off Linux, and the last two on a kernel without
+that file. The kernel brings those counters up to date at a scheduler
+tick or a context switch, so a figure can be off by a tick at either
+end of a phase, and a phase of a millisecond or two can show more
+processor time than its `ms`: sums over a sync mean something, single
+short phases do not. No field the lines had changed its name, place or
+format. Each line's `participant` is what the exists-address index wrote
 inside that flush -- its rows, reads, journaled keys, merges, base
-rewrites and memtable size, with its own time and I/O as a fourth phase --
-or `null` when it had nothing to write. Since 2026-10-12 each line ends
-with two more fields. `thread` is the name of the thread that ran the
-flush, which held the database's writer for the flush's `elapsed_ms`,
-or `null` for a thread without a name. In a sync from an outbound
-peer, as in the syncs measured that day, the lines read
+rewrites and memtable size, with its own time, I/O and processor time
+as a fourth phase -- or `null` when it had nothing to write. Since
+2026-10-12 each line ends with two more fields. `thread` is the name of
+the thread that ran the flush, which held the database's writer for
+the flush's `elapsed_ms`, or `null` for a thread without a name. In a
+sync from an outbound peer, as in the syncs measured that day, the
+lines read
 `peer-outbound`, the thread that connects the sync peer's blocks
 (`peer-inbound` when that peer connected to the node, by the code; not
 seen in a run), `index`, the index thread, and `main` for the flush at
@@ -988,9 +1117,16 @@ their `elapsed_ms` is the most the thread that connects blocks can have
 waited behind those flushes, and the rest of `other` was waited behind
 the index thread's transactions for each block, or behind another
 thread that is not the index thread. `dcroxide-bench`'s own
-`--flushlog` writes lines of another shape, which carry neither field.
-Leave `DCROXIDE_DB_FLUSHLOG` unset in normal operation; it writes a
-line inside each flush. `DCROXIDE_EXISTSADDR_MEMTABLE_KEYS` is
+`--flushlog` writes lines of another shape, which carry neither field,
+though their three phases carry the four processor-time fields. Leave
+`DCROXIDE_DB_FLUSHLOG` unset in normal operation; it writes a line
+inside each flush, and on a Linux kernel with all three counter files
+(`io`, `stat` and `schedstat` under `/proc/thread-self`) it has each
+flush read `/proc` 18 times where it read it 6 times before
+2026-10-16, or 24 where 8 when the index writes in the flush,
+outside each phase's `ms` and inside the line's `elapsed_ms`; what
+those reads cost was not measured apart. Without it a flush reads
+nothing from `/proc`. `DCROXIDE_EXISTSADDR_MEMTABLE_KEYS` is
 for measurements only: it sets how many keys the exists-address index
 holds in memory before its flushes merge them into its sorted runs (the
 hard bound is one and a half times it), trading the index's memory, 21

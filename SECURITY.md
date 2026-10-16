@@ -175,18 +175,32 @@ evaluating this code.
   peer's blocks. dcrd holds further receives back until a block is
   known good or bad, so that a malicious peer cannot queue up bad
   blocks and waste memory (`server.go:1365-1369`). Here up to four
-  frames from the sync peer are checksummed, decoded and, for blocks,
-  hashed before the frame ahead of them has been judged, and they are
-  held decoded until their turn. None is acted on early: each is
-  handled in the order it arrived by the code that handled it before,
-  and nothing queued is handled once the connection is being torn
-  down. So what a hostile sync peer gains is the work and the memory:
-  at worst about 57 MB held on that connection against about 12.5 MB
-  without the read-ahead, an estimate from struct layouts and not a
-  measurement. It also costs one more thread and one more descriptor
-  on that connection. `DCROXIDE_READ_AHEAD=off` removes it: every
-  connection is then read as dcrd reads. Details are in PARITY.md,
-  *Reading ahead of the block handler*.
+  frames from the sync peer are checksummed and decoded before the
+  frame ahead of them has been judged, and a block among them is also
+  hashed, has its two transaction merkle trees built, is serialized
+  once and compared with the payload it arrived in, and has that
+  payload laid out as its block-file record, with a CRC-32C and a
+  second hash of its header. They are held, decoded and each with its
+  frame, until their turn. None is acted on early: each is handled in
+  the order it arrived by the code that handled it before, and nothing
+  queued is handled once the connection is being torn down. So what a
+  hostile sync peer gains is the work and the memory. The merkle trees
+  add less work than a block's transactions already cost: a tree of n
+  transactions has at most n - 1 + ceil(log2 n) inner nodes, each one
+  hash of 64 bytes, two BLAKE-256 compressions, where each transaction
+  takes at least four compressions; the decoder allows 43,691
+  transactions in each tree and accepts one of five bytes, so the block
+  whose trees cost the most has a payload of 437,096 bytes and 87,396
+  inner nodes, 174,792 compressions beside at least 349,528 for its
+  transactions. The memory is at worst about 62 MB held on that
+  connection, with about 1.3 MB more for a moment while one frame is
+  compared with its block's serialization, or up to about 1.4 MB while
+  one block's trees are built, against about 12.5 MB without the
+  read-ahead: estimates from struct layouts, not measurements. It also
+  costs one more thread and one more descriptor on that connection.
+  `DCROXIDE_READ_AHEAD=off` removes it: every connection is then read as
+  dcrd reads, and no frame is kept. Details are in PARITY.md, *Reading
+  ahead of the block handler*.
 - **Fuzzing reaches the stateless parsers, not the state machines.**
   Seventeen `cargo-fuzz` targets run for 60 seconds apiece on every push
   to `master` and every pull request, and for ten minutes apiece
@@ -266,8 +280,13 @@ evaluating this code.
   that aborted the process, and #1332, a cyclic branch pointer reached
   from ordinary reads, are now reported as corruption — as an error on a
   point read of a UTXO row and on the UTXO stats walk; as absence on
-  other point reads, as ffldb's `Get` discards a store error; and on
-  other bucket walks by ending the store's side of the walk, as ffldb's
+  other point reads of a row, as ffldb's `Get` discards a store error;
+  as a refusal to open where the damage is in the bucket index, which
+  since 2026-10-16 the database reads whole when it opens and answers
+  every nested bucket lookup from without a read, so that damage there
+  after the open is met by no lookup, where ffldb's lookup reads the
+  row each time and, on a store error, finds no bucket; and on other
+  bucket walks by ending the store's side of the walk, as ffldb's
   cursor treats an iterator error (before 2026-09-23 such a walk skipped
   the error and spun forever on redb's repeated `PreviousIo`) — and
   #1333, a repair-path panic that left a file permanently unopenable, now

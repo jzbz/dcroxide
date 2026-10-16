@@ -80,6 +80,9 @@ path) has been measured yet, so this crossover is unconfirmed.
 | 2026-10-11, afternoon | m3 | `b4a5d2d` (shared commits for UTXO-cache flushes, overlay default 300 MiB), and `7d31abb` before it | release v2.1.6 (go1.25.4), one run | mainnet, genesis to 1,116,035 | dcroxide from the dcrd v2.1.6 block server at the defaults, in the same harness. `7d31abb` itself: 775.6 s in one run that afternoon. With the change: 725.9 s, 728.7 s and 729.4 s, median 728.7 s — **1,531.6 blk/s** at 2.0 mean cores, 6.0% under the 775.6 s, with 54 flushes where there were 133. With `--noexistsaddrindex`, one run: 610.2 s — **1,829.1 blk/s**. dcrd from the same block server, one run that evening: 2,883.9 s — **387.0 blk/s**, so the change's median is **3.96x** as fast in one session. Set against dcrd's 2,863.9 s and 1,247.8 s of 2026-10-09 and 2026-10-10 it is 3.93x and 2.04x, across sessions | this file, "Shared commits for UTXO-cache flushes, the filesystem's share and a delayed link" |
 | 2026-10-12 | m3 | `a83f9a1`, `6271436`, `3a367e5` and `540b203`, one run each | not run in this session | mainnet, genesis to 1,116,035 | dcroxide from the dcrd v2.1.6 block server at the defaults, in the same harness. The binary of the row above again: 728.5 s in one run, where its three runs above have a median of 728.7 s. Then one run per state, each holding the changes before it: `a83f9a1` (the missed-ticket handle, the UTXO maps' key comparison, one write per block record, the writer-wait timer) 673.8 s — 1,656.2 blk/s; `6271436` (three changes to the exists-address index and the ticket buckets) 628.0 s — 1,777.2 blk/s; `3a367e5` (the SigHashAll prefix hash) 607.7 s — **1,836.6 blk/s** at 1.9 mean cores; `540b203` (the block download window) 612.4 s — **1,822.3 blk/s** at 1.9 mean cores. The last two are 16.6% and 15.9% under the same session's 728.5 s. Set against dcrd's 2,883.9 s of the evening of 2026-10-11 and its 2,863.9 s of 2026-10-09 and 2026-10-10, the 612.4 s is 4.71x and 4.68x, across sessions | this file, "Eleven changes, a background commit not kept and a pool gate" |
 | 2026-10-12 | m3 | the read-ahead build before its review's fixes, which became `b4ceb1c` and also holds `5cf9e04`; neither commit was run as committed | not run in this session | mainnet, genesis to 1,116,035 | One binary in the same harness, two runs under each setting, alternated. With `DCROXIDE_READ_AHEAD=off`: 597.6 s and 599.0 s. At the defaults: 494.6 s and 490.8 s — **2,256.3 and 2,273.9 blk/s** at 2.26–2.28 mean cores, 103.0 s and 108.2 s less than with read-ahead off and 32.1% and 32.6% under the same session's 728.5 s for `b4a5d2d`. `b4ceb1c` differs from the binary's code in one condition of the reader's idle budget and one private function, and has not been run in a sync. Set against dcrd's 2,883.9 s and 2,863.9 s as in the row above, the 494.6 s and 490.8 s are 5.83x and 5.88x, and 5.79x and 5.84x, across sessions | this file, "Eleven changes, a background commit not kept and a pool gate" |
+| 2026-10-13 | m3 | `4700cf1` (the code of `b4ceb1c` and one log line more) | release v2.1.6 (go1.25.4), one run | mainnet, genesis to 1,116,035 | dcroxide from the dcrd v2.1.6 block server at the defaults, in the same harness, in a session in which that server read 15.7–18.0 GB from the drive during every run, where it read none in the runs of 2026-10-11 and at most 1.5 GB in those of 2026-10-12, none in the read-ahead runs of the row above. Three runs: 513.4 s, 513.5 s and 504.2 s — **2,173.8, 2,173.3 and 2,213.3 blk/s** at 2.19–2.23 mean cores. The first two spent about 10 s longer in their flushes' commit phase, for a reason the records do not give; with the commit seconds taken out the three are 432.8–433.7 s. With `--noexistsaddrindex`, one run: 423.6 s — 2,634.6 blk/s. dcrd from the same block server, one run: 2,920.3 s — **382.2 blk/s** at 1.94 mean cores, so dcroxide is **5.69x to 5.79x** as fast over the three pairings with that one run. The 494.6 s and 490.8 s of the row above are another session and another build | this file, "Seven cumulative builds, the validation pool, a background commit and dcrd" |
+| 2026-10-13 | m3 | seven builds on `4700cf1` that add, one group at a time, the changes of the seventeen commits from `d76e8ec` to `6376eeb`, in another order than the commits and each with a developer variable the tree does not have, left unset; none is the tree of a commit | release v2.1.6, the one run of the row above | mainnet, genesis to 1,116,035 | The same session and harness. The first build (`4700cf1` with the flush log's processor times and the variable): 505.6 s and 502.8 s, the speed of `4700cf1` within its spread. The last: 441.9 s and 442.2 s — **2,525.5 and 2,524.1 blk/s** at 2.39–2.40 mean cores, 62.2 s or 12.3% under the first by wall, 62.6 s with the commit seconds taken out and 63.6 s by the node's clock less its flush time, with two runs at each end. The five builds between ran once each. The tree these commits leave with `f60ae3a` has not been run in a sync | this file, "Seven cumulative builds, the validation pool, a background commit and dcrd" |
+| 2026-10-13 | m3 | `4700cf1` with the persistent validation pool that `f60ae3a` carries on top of the other seventeen commits; the tree of `f60ae3a` has not been run | release v2.1.6, the one run of the first 2026-10-13 row | mainnet, genesis to 1,116,035 | The same session and harness. Two runs: 491.3 s and 493.4 s — **2,271.8 and 2,262.1 blk/s** at 2.19 mean cores. About 12 to 16 s, 2.4–3.2%, under the code without the pool, by the measure: 11.9 s by wall against its runs with an ordinary commit phase and those of the first cumulative build, 15.8 s with the commit seconds taken out. All of it falls after the assume-valid block | this file, "Seven cumulative builds, the validation pool, a background commit and dcrd" |
 
 > **The headline 1.29x predates the fan-out fix, so it is conservative for
 > master.** That figure was measured on `b6d0c63`; `c091b46` (one validation
@@ -576,6 +579,25 @@ the same note.
 > workers on every call
 > (`crates/dcroxide-blockchain/src/validate.rs:5280`). See "Eleven
 > changes, a background commit not kept and a pool gate" below.
+>
+> **Note (2026-10-16): in the repository since `f60ae3a`, and measured
+> in a sync on 2026-10-13.** A connected block's script trees of four
+> items or more (`MIN_POOLED_ITEMS`,
+> `crates/dcroxide-blockchain/src/scriptpool.rs:129`) are checked on
+> helper threads that live as long as the process, at most one fewer
+> than the logical CPUs it may run on, with the calling thread checking
+> too. `validate_items`
+> (`crates/dcroxide-blockchain/src/validate.rs:5505`) still creates its
+> workers on every call for a batch of 16 items or more, where it is
+> still used: a connected block's tree whose previous scripts exceed
+> 1 MiB, the template check, the public `check_block_scripts` and a
+> single transaction's inputs after its first. On m3 a build of
+> `4700cf1` with the pool synced in 491.3 s and 493.4 s, about 12 to
+> 16 s under the same code without it, depending on the measure, and all
+> of it after the assume-valid block. The tree of `f60ae3a`, with the
+> pool and the seventeen other commits of 2026-10-16, has not been run
+> in a sync. See "Seven cumulative builds, the validation pool, a
+> background commit and dcrd" below.
 
 ## IBD profiling attempt (2026-08-14) — and why replay cannot proxy for it
 
@@ -1260,6 +1282,15 @@ implementation.**
 > 2026-08, and "cannot work" and "closed by measurement" below are
 > statements about it. See "Eleven changes, a background commit not
 > kept and a pool gate" below.
+>
+> **Note (2026-10-13): built a third time, on `231997b`, and it gained
+> again.** With the engine's commit on its second thread holding a read
+> snapshot of the store while it runs, a default sync on m3 took
+> 465.7 s and 460.5 s against its control arm's 501.1 s and 500.5 s,
+> 35.4 s and 40.0 s less, in two pairs of one binary, with no memory
+> cost detected at a resolution of about 300 MiB. That form is not in
+> the repository either. See "Seven cumulative builds, the validation
+> pool, a background commit and dcrd" below.
 
 The design: a committer thread per flush, holding an `Arc<DbInner>` so the
 database cannot be destroyed mid-commit; the previous commit joined before the
@@ -3181,6 +3212,17 @@ above and does not single it out. A wait that has not ended when a
 line is written is not in that line, and nothing a thread does while
 it holds the writer is in any of them.
 
+> **Note (2026-10-16):** on the code of `4700cf1`, which holds all
+> eleven, one run with `--noexistsaddrindex` took 423.6 s on
+> 2026-10-13, 80.6 to 89.9 s under each of three default runs of it
+> that session. Less the flushes the index thread ran, the other
+> threads' wait for the writer was 8.1 to 9.5 s in the eleven runs of
+> that session whose code lacked `64359e7` and `85a5dc8` and that
+> committed on the flushing thread with no other setting changed, and
+> 1.6 to 1.7 s in the five runs of builds with them. See "Seven
+> cumulative builds, the validation pool, a background commit and dcrd"
+> below.
+
 **The index batch.** 628.0 s against 673.8 s, 45.8 s or 6.8% less:
 487.7 s against 524.6 s up to the assume-valid block and 140.3 s
 against 149.2 s after it. The node's CPU time is 7.1 s lower and the
@@ -3295,6 +3337,24 @@ read-ahead on:
   on**, by 22.9 s and 21.1 s and by 306 and 335 MiB. Neither was
   explained.
 
+> **Note (2026-10-16): the reader thread does more since, and its
+> line says more.** From `a589c4a` the reader thread also lays out each
+> block's block-file record in the bytes it received, and from
+> `44cf801` it builds the block's two merkle trees, whose time is in
+> the hashing figure; from `54e8cad` the header hash it took is handed
+> down the processing call. The line gains a tail with the records
+> laid out and those written as laid out (`shutdown_line`,
+> `crates/dcroxide-node/src/readahead.rs:979`). In the syncs of
+> 2026-10-13, another session, the three runs of `4700cf1` had 47.2 to
+> 47.5 s of hashing, the reader waiting 391.9 to 401.7 s for the block
+> thread and the block thread 0.26 to 0.28 s for the reader. The two
+> runs of a build with the record and the trees had 52.536 s and
+> 52.562 s of hashing, 1,116,034 records laid out in 7.128 s and
+> 7.165 s and all of them written as laid out, the reader waiting
+> 321.9 s and 321.8 s and the block thread 1.04 s and 1.01 s. See
+> "Seven cumulative builds, the validation pool, a background commit
+> and dcrd" below.
+
 These four runs are of the build before the review's fixes, which is
 not the code of any commit. Rebuilt from the patch saved with the
 binary, its tree differs from `b4ceb1c` in production code in two
@@ -3306,6 +3366,18 @@ for that block and could time out early. The other is a private
 which the merkle-leaf pass now goes through so that unit-test builds
 can count its calls. The rest is tests, comments and documents.
 `b4ceb1c` itself has not been run in a sync.
+
+> **Note (2026-10-13): run since, as `4700cf1`.** `4700cf1` is the
+> code of `b4ceb1c` with one log line more. Three default syncs of it
+> on 2026-10-13 took 513.4 s, 513.5 s and 504.2 s, the first two with
+> about 10 s more in their flushes' commit phase, and 432.8 s, 433.5 s
+> and 433.7 s with the commit seconds taken out. In that session the
+> block server read 15.7 to 18.0 GB from the drive during every run,
+> where it read none in the runs above; no effect of that on
+> dcroxide's times is shown, but the two sessions' times are of two
+> sessions and two builds, and the difference between them is not a
+> measure of the review's fixes. See "Seven cumulative builds, the
+> validation pool, a background commit and dcrd" below.
 
 **A background commit, measured and not kept.** "Background commit
 (2026-08-16)" above built one on m1, measured it 9.5% slower and
@@ -3365,6 +3437,23 @@ default, and how ADR-0009's rule for a durable write that fails would
 read when the failure reaches the next write, flush or close and not
 the commit that tripped the flush.
 
+> **Note (2026-10-13): built a third time, on `231997b`, and measured
+> in two pairs and one more run.** In that build the engine's commit on
+> `dbcommit` holds a read snapshot of the store while it runs, and
+> `DCROXIDE_DB_BARE_COMMIT=1` runs it without one, as the form above
+> did. With the snapshot a default sync took 465.7 s and 460.5 s
+> against its control arm's 501.1 s and 500.5 s, 35.4 s and 40.0 s
+> less, 31 to 34 s of it before the assume-valid block; in both pairs
+> the arm with the snapshot ran first. No memory cost was detected, at
+> a resolution of about 300 MiB: its peak was 119 MiB above its
+> control in one pair and 288 MiB below it in the other. Without the
+> snapshot, in one run, it took 471.1 s and peaked at 3,321 MiB,
+> against 2,996 and 3,341 MiB for the two control runs, and wrote
+> 3,269 to 3,340 MiB more than either control before its commits. That
+> form is not in the repository either, and it was not built on
+> `4700cf1`. See "Seven cumulative builds, the validation pool, a
+> background commit and dcrd" below.
+
 **A persistent validation pool: the gate.** "Script validation fan-out
 (2026-08-14)" above has asked for this arm to be measured. On
 2026-10-12 it was put through a replay benchmark that is not in the
@@ -3415,6 +3504,23 @@ tree outside the repository. It is not in the repository, and no sync
 of it has been run, so no part of the saving above has been seen in a
 sync.
 
+> **Note (2026-10-16): in the repository since `f60ae3a`, and run in
+> two syncs on 2026-10-13.** The pool takes a connected block's trees
+> of four items or more, as gated. It differs from the build this
+> paragraph describes in two rules: a batch it runs names its failing
+> input of lowest index, and in an unwinding build a check's panic on a
+> helper is raised again on the calling thread with its message. Arm
+> A's threshold of 16 (`MIN_PARALLEL_ITEMS`, now
+> `crates/dcroxide-blockchain/src/validate.rs:5510`) still decides
+> whether scoped workers are made for every batch the pool does not
+> take. Two syncs of a build of `4700cf1` with the pool took 491.3 s
+> and 493.4 s, about 12 to 16 s under the same code without it, all of
+> it after the assume-valid block: 13 to 15 s by the node's clock
+> there, and 17 to 18 s with the flush time taken out, where the replay
+> above estimated 19.8 to 20.2 s. The tree of `f60ae3a` has not been
+> run in a sync. See "Seven cumulative builds, the validation pool, a
+> background commit and dcrd" below.
+
 **Coalescing the storage engine's page writes: designed, not built.**
 A storage backend that holds a commit's page writes and issues
 adjacent ones as one write before the sync was designed and reviewed
@@ -3454,6 +3560,17 @@ paid for was not identified. That is an estimate from those records.
 - The validation pool in a sync, and the background commit in more
   than the two pairs above.
 
+> **Note (2026-10-13): five of these were run on 2026-10-13**, in
+> another session: dcrd v2.1.6 once, 2,920.3 s; the code of `b4ceb1c`,
+> as `4700cf1`, three times; the eleven with `--noexistsaddrindex`, as
+> `4700cf1`, once, 423.6 s; the validation pool in two syncs of a build
+> of `4700cf1`; and a background commit in another form, on `231997b`,
+> in two pairs and one more run. The overlay's ceiling was raised in
+> one run, together with a developer variable the tree does not have,
+> in a build that is not a commit's. No profile was taken. See "Seven
+> cumulative builds, the validation pool, a background commit and dcrd"
+> below.
+
 Raw: the comparison's `runs.jsonl` rows labelled `h-nocow`, `h-base`,
 `h-small`, `h-index`, `h-sighash`, `h-window`, `h-ra-off-1`,
 `h-ra-on-1`, `h-bg-sync-1`, `h-bg-on-1`, `h-ra-off-2`, `h-ra-on-2`,
@@ -3464,3 +3581,481 @@ and node logs as above; `delay.jsonl` rows `dl2-dcrdrule-50`,
 with the replay benchmark's source; the patches of the measured trees
 and of the two experiments; and the designs of the pool, the
 background commit and the coalesced writes.
+
+## Seven cumulative builds, the validation pool, a background commit and dcrd (2026-10-13)
+
+"Eleven changes, a background commit not kept and a pool gate" above
+left a default sync at 494.6 s and 490.8 s for a build that is not the
+code of any commit, dcrd unrun that day, the index's cost on that code
+unmeasured and the persistent validation pool measured only in a
+replay. On 2026-10-13, between 05:20 and 13:03, 27 syncs were run on
+m3:
+
+- three of `4700cf1`, the commit then pushed, which is the code of
+  `b4ceb1c` with one log line more;
+- nine of seven builds on `4700cf1` that add, one group at a time, the
+  changes the seventeen commits from `d76e8ec` to `6376eeb` later
+  carried;
+- two of a build of `4700cf1` with the persistent validation pool,
+  which `f60ae3a` later carried;
+- five of a background commit built on `231997b`, which is not in the
+  repository;
+- five of settings that are not the tree's, and one with a deeper
+  allocator thread cache;
+- one of `4700cf1` with the exists-address index off;
+- one of dcrd v2.1.6.
+
+The commits were made on 2026-10-16, after the runs. The tree they
+leave, `f60ae3a`, has not been run in a sync.
+
+The syncs are in the harness of the sections above: mainnet from
+genesis to 1,116,035 over loopback from the dcrd v2.1.6 block server,
+at the defaults but for the setting a row names, with the same pinning,
+clock and quiet gate, the flush log on in every dcroxide run, and a
+`sync` and a 300 s idle before every run but n-head-1 and n-pool-1.
+Those two were the first of the two batches the queue was started
+with, at 05:19 and 08:00: n-head-1 began 87 s after three smoke syncs
+of 150,000 blocks, and n-pool-1 about three minutes after n-head-2
+ended. Every run exited 0 on the server's tip, `8752fdc9…`, none failed
+and none was marked disturbed; other userland was 0.03% to 0.15% of
+the machine.
+
+The runs are read on three measures, because wall time moved by up to
+10 s between runs of one binary this session (below):
+
+- **Wall** is the harness's clock, from starting the node to the first
+  once-a-second `getblockcount` poll that sees 1,116,035. That poll
+  comes 0.02 to 1.00 s after the node logs the block, so a difference
+  under a second is not measured.
+- **Less commit** is wall less the commit phases of the flushes made
+  inside the clock. Every dcroxide flush log ends with one flush the
+  close makes at shutdown. It starts 0.07 to 0.27 s after the node logs
+  that its server is shutting down, which the harness causes only after
+  it has stopped the clock, and no flush inside the clock ends after
+  the node logs the tip. Its commit, 1.16 to 3.33 s, is in no figure
+  here.
+- **Flush-free** is the node's own clock, from its first log line to
+  the line that shows 1,116,035, less the time of the flushes inside
+  it.
+
+The time to block 1,026,597, the assume-valid block, is interpolated
+from the node log's lines for blocks processed, with the flushes'
+stalls taken out and the block rate either side weighed in. It is good
+to about 1 s, and uncertain by a flush's length where the block falls
+beside one, which it does once: in n-head-1 a flush ran from 394.7 s to
+397.5 s, and if the block came after it the time after it is 115.3 s.
+"After it" is the node's clock less that time, so the two columns add
+to the node's clock and not to wall. Peak RSS is `VmHWM` read after the
+clock stops and before the harness signals the node, so before the
+closing flush, which raised the mark by 120 to 545 MiB in the five runs
+whose flush log records it. Node CPU time is the process's. The start
+times are taken from each run's id; the `started` field of
+`runs.jsonl` is 9 to 11 s late in all 27 records.
+
+| run | started | build | setting | wall | commit, inside the clock | less commit | flush-free | to block 1,026,597 | after it | node CPU time (user + sys) | peak RSS |
+|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| n-head-1 | 05:20 | `4700cf1` | defaults | 513.4 s | 80.6 s | 432.8 s | 388.9 s | 395.2 s | 117.7 s | 1,126.4 s (1,030.1 + 96.3) | 3,021 MiB |
+| n-L0-1 | 05:36 | L0 | defaults | 505.6 s | 73.0 s | 432.7 s | 388.9 s | 392.8 s | 112.1 s | 1,125.0 s (1,029.0 + 96.0) | 2,895 MiB |
+| n-L1-A | 05:51 | L1 | defaults | 481.4 s | 72.4 s | 409.1 s | 365.5 s | 372.1 s | 109.2 s | 1,095.4 s (1,002.7 + 92.7) | 2,721 MiB |
+| n-L2-R3 | 06:06 | L2 | defaults | 481.7 s | 81.0 s | 400.7 s | 356.4 s | 370.2 s | 111.0 s | 1,084.9 s (992.1 + 92.8) | 2,760 MiB |
+| n-L3-R4 | 06:21 | L3 | defaults | 466.7 s | 72.9 s | 393.8 s | 349.9 s | 356.9 s | 109.0 s | 1,075.2 s (978.5 + 96.7) | 3,047 MiB |
+| n-L4-R5 | 06:36 | L4 | defaults | 458.1 s | 71.2 s | 386.9 s | 342.4 s | 349.9 s | 107.5 s | 1,064.5 s (970.0 + 94.5) | 3,303 MiB |
+| n-L5-R6 | 06:51 | L5 | defaults | 446.5 s | 70.4 s | 376.1 s | 333.1 s | 340.6 s | 105.9 s | 1,058.7 s (965.6 + 93.1) | 3,166 MiB |
+| n-L6-B-1 | 07:05 | L6 | defaults | 441.9 s | 73.2 s | 368.7 s | 324.6 s | 335.2 s | 105.8 s | 1,057.4 s (963.4 + 94.0) | 3,188 MiB |
+| n-L6-B-2 | 07:20 | L6 | defaults | 442.2 s | 72.9 s | 369.3 s | 325.0 s | 334.0 s | 107.2 s | 1,059.4 s (965.3 + 94.1) | 3,089 MiB |
+| n-L0-2 | 07:34 | L0 | defaults | 502.8 s | 72.2 s | 430.6 s | 387.9 s | 390.0 s | 112.7 s | 1,123.8 s (1,028.2 + 95.6) | 3,021 MiB |
+| n-head-2 | 07:49 | `4700cf1` | defaults | 513.5 s | 80.0 s | 433.5 s | 390.6 s | 398.4 s | 115.1 s | 1,123.9 s (1,029.5 + 94.4) | 3,128 MiB |
+| n-pool-1 | 08:02 | the pool on `4700cf1` | defaults | 491.3 s | 74.1 s | 417.2 s | 373.5 s | 391.2 s | 99.4 s | 1,074.4 s (1,008.1 + 66.3) | 2,998 MiB |
+| n-pool-2 | 08:17 | the pool on `4700cf1` | defaults | 493.4 s | 75.4 s | 418.0 s | 374.1 s | 392.8 s | 99.9 s | 1,079.4 s (1,011.0 + 68.4) | 2,908 MiB |
+| n-K-umax3M-1 | 08:32 | L0 | `DCROXIDE_EXISTSADDR_U_MAX=3000000` | 502.4 s | 69.3 s | 433.1 s | 390.9 s | 385.8 s | 116.4 s | 1,122.3 s (1,031.8 + 90.5) | 3,061 MiB |
+| n-K-umax3M-2 | 08:47 | L0 | `DCROXIDE_EXISTSADDR_U_MAX=3000000` | 508.3 s | 69.9 s | 438.4 s | 396.4 s | 392.5 s | 115.4 s | 1,129.5 s (1,038.5 + 91.0) | 3,281 MiB |
+| n-M1-tcache | 09:03 | `4700cf1` | a deeper glibc thread cache (`GLIBC_TUNABLES`, below) | 2,005.2 s | 80.5 s | 1,924.7 s | 1,326.9 s | 1,706.4 s | 298.3 s | 3,021.8 s (2,917.8 + 104.0) | 4,794 MiB |
+| n-bg-test-1 | 09:43 | background commit on `231997b` | defaults (commits in the background, with the snapshot) | 465.7 s | 75.6 s | 390.1 s | 346.6 s | 357.4 s | 107.5 s | 1,150.1 s (1,049.2 + 100.9) | 3,115 MiB |
+| n-bg-control-1 | 09:58 | background commit on `231997b` | `DCROXIDE_DB_SYNC_COMMIT=1` | 501.1 s | 71.2 s | 430.0 s | 387.0 s | 388.3 s | 112.2 s | 1,121.8 s (1,026.7 + 95.1) | 2,996 MiB |
+| n-bg-bare | 10:14 | background commit on `231997b` | `DCROXIDE_DB_BARE_COMMIT=1` | 471.1 s | 76.1 s | 395.0 s | 349.3 s | 359.9 s | 110.2 s | 1,152.2 s (1,052.7 + 99.5) | 3,321 MiB |
+| n-M2-memtable4M | 10:28 | L0 | `DCROXIDE_EXISTSADDR_MEMTABLE_KEYS=4000000` | 502.7 s | 66.4 s | 436.3 s | 395.2 s | 388.4 s | 113.8 s | 1,135.7 s (1,042.7 + 93.0) | 3,264 MiB |
+| n-M2-memtable4M-umax3M | 10:44 | L0 | `DCROXIDE_EXISTSADDR_MEMTABLE_KEYS=4000000` and `DCROXIDE_EXISTSADDR_U_MAX=3000000` | 495.8 s | 59.4 s | 436.4 s | 398.0 s | 384.3 s | 111.1 s | 1,134.3 s (1,045.5 + 88.8) | 3,581 MiB |
+| n-M5-overlay450-umax4.5M | 10:59 | L0 | `DCROXIDE_DB_OVERLAY=450` and `DCROXIDE_EXISTSADDR_U_MAX=4500000` | 503.2 s | 57.6 s | 445.6 s | 403.1 s | 389.8 s | 112.8 s | 1,140.8 s (1,049.3 + 91.5) | 3,411 MiB |
+| n-head-noindex | 11:15 | `4700cf1` | `--noexistsaddrindex` | 423.6 s | 38.2 s | 385.4 s | 358.4 s | 321.9 s | 101.2 s | 947.3 s (872.6 + 74.7) | 2,149 MiB |
+| n-head-3 | 11:28 | `4700cf1` | defaults | 504.2 s | 70.5 s | 433.7 s | 390.6 s | 392.4 s | 111.2 s | 1,124.5 s (1,030.5 + 94.0) | 2,832 MiB |
+| n-dcrd | 11:44 | dcrd v2.1.6 | defaults | 2,920.3 s | — | — | — | — | — | 5,679.8 s (4,542.1 + 1,137.7) | 1,852 MiB |
+| n-bg-test-2 | 12:39 | background commit on `231997b` | defaults (commits in the background, with the snapshot) | 460.5 s | 69.9 s | 390.6 s | 348.0 s | 355.8 s | 104.7 s | 1,151.3 s (1,050.9 + 100.4) | 3,053 MiB |
+| n-bg-control-2 | 12:54 | background commit on `231997b` | `DCROXIDE_DB_SYNC_COMMIT=1` | 500.5 s | 68.1 s | 432.4 s | 389.8 s | 389.5 s | 110.7 s | 1,123.9 s (1,029.6 + 94.3) | 3,341 MiB |
+
+The builds L0 to L6 are described below, and they ran in the
+table's order. Of the 27, only the five runs of `4700cf1` and dcrd's
+are of the code of a commit.
+
+**The block files are the same in all 27, dcrd's included.** After
+shutdown the harness takes one SHA-256 over the block files' names and
+bytes and records its first 64 bits. They were `33b7ac837a45c74f` in
+every run, over 36 files and 19,202,596,910 B: in the runs of builds
+that lay a block's record out on the reader thread (L5 and L6), in
+those that do not and in dcrd's. That is the equality of a 64-bit
+prefix of one hash, not a byte-for-byte comparison, and the metadata
+store is not compared: only the tip and the data directory's size are
+recorded.
+
+**This session is not those of 2026-10-11 and 2026-10-12.** The block
+server read 15.7 to 18.0 GB from the drive during every run, where it
+read none in the runs of 2026-10-11 and none in those of 2026-10-12 but
+the first two, h-nocow and h-base, which read 1,489 MB and 269 MB. The
+block thread waited at most 1.04 s in all for the reader in any dcroxide
+run, so no effect on dcroxide's times is shown. Still, this session's
+times are not to be set beside those of the sections above without that
+label. In particular `4700cf1` ran 504.2 to 513.5 s here, and the
+494.6 s and 490.8 s of 2026-10-12 are another session and another build,
+the read-ahead build before its review's fixes. One percent of a default
+sync is 5.0 to 5.1 s in this session.
+
+**The pushed commit, and why wall is not enough.** `4700cf1` took
+513.4 s, 513.5 s and 504.2 s. The first two spent 80.6 s and 80.0 s in
+the commit phases of their flushes inside the clock and the third
+70.5 s. With those seconds taken out the three are 432.8 s, 433.5 s and
+433.7 s, and flush-free 388.9 s, 390.6 s and 390.6 s.
+
+- **Four runs had a commit phase near 80 s**: those two, n-L2-R3 and
+  n-M1-tcache. The other default-setting runs that commit on the
+  flushing thread took 68.1 to 75.4 s.
+- **The extra was waiting.** `4700cf1`'s binary logs no processor time
+  per phase. In n-L2-R3, of a build that does, the commit phases spent
+  44.7 s on a processor, inside the 44.5 to 47.1 s of the other eight
+  runs of the cumulative builds, and 36.1 s asleep against their 25.3
+  to 27.7 s.
+- **What it goes with.** Over the 16 default-setting runs that commit
+  on the flushing thread, the commit seconds follow the bytes written
+  at the drive (r = 0.88: 60.2 to 60.9 GB in the three slow runs, 55.3
+  to 60.1 GB in the rest) and the mean I/O pressure in the samples
+  (r = 0.86), and not the node's own `write_bytes` (r = 0.24). The
+  records do not say what wrote the extra bytes, nor which way the
+  relation runs. Two slow runs of three for `4700cf1`, against one of
+  thirteen for the other default-setting builds, neither shows nor
+  rules out something of that binary's own.
+
+So each change below is read on wall and on the two commit-free
+measures. On those two, runs of one binary at one setting differ by
+0.4 to 2.8 s, and by 5.3 s and 5.5 s in the one pair at a raised flush
+request.
+
+**How sure a step is.** Pooling the spread of the runs repeated with
+one binary at the defaults, two or three runs each, on the assumption
+that they share one variance: at 95%, a difference between two single
+runs is good to about ±3.5 s less commit and ±3.7 s flush-free, or
+±5.7 s and ±5.9 s with the pair at the raised flush request counted
+in, and to about ±11 s by wall. With two runs on one side the interval
+is 0.87 times that; with two on each side it is ±2.5 to ±4.2 s on the
+commit-free measures and ±7.9 s by wall.
+
+**L0 runs at the speed of `4700cf1`.** L0 is `4700cf1` with the
+processor time per flush phase in the flush log (`d76e8ec`) and the
+developer variable described below, unset: 505.6 s and 502.8 s, 7.8 to
+10.7 s under the two slow-commit runs of `4700cf1` by wall and within
+1.4 s of the third. Less commit it took 432.7 s and 430.6 s and
+flush-free 388.9 s and 387.9 s, 1.6 to 1.8 s under `4700cf1` on those
+two, which repeats do not resolve.
+
+**dcrd, one run.** dcrd v2.1.6, the binary of the sections above, from
+the same block server: 2,920.3 s, with 5,679.8 s of CPU time
+(4,542.1 + 1,137.7) and a peak of 1,852 MiB. Against the three runs of
+`4700cf1` in this session that is 5.69x (against 513.4 s and 513.5 s)
+to 5.79x (against 504.2 s), and 5.72x against their mean. It is one
+dcrd run, so that is a range over three pairings with it and not a
+spread of the ratio. Seven runs of this binary between 2026-10-09 and
+2026-10-11, some from a dcroxide block server, took 2,848.8 to
+2,947.3 s; 2,920.3 s is the second slowest of the eight. Neither figure
+holds dcroxide's closing flush, which comes after the clock: shutdown
+took 2.3 s, 2.4 s and 4.0 s in the three runs of `4700cf1` and 0.2 s
+for dcrd.
+
+**The index off.** One run of `4700cf1` with `--noexistsaddrindex`:
+423.6 s, 80.6 to 89.9 s under each of its three default runs, with
+385.4 s less commit and 358.4 s flush-free. It made 40 flushes inside
+the clock against 54 to 56, and peaked at 2,149 MiB against 2,832 to
+3,128 MiB. dcrd was not run with the index off in this session.
+
+**Seven cumulative builds.** Each adds one change or group of changes
+to the build before it, in the order below, which is not the order of
+the commits that carry them: the bucket index, second here, is the
+last code commit of the series but the pool's. Every build also holds
+`DCROXIDE_EXISTSADDR_U_MAX`, a developer variable for the number of
+keys not yet journaled at which the exists-address index asks for a
+flush. It was unset in all nine runs, so the index asked at 1,500,000
+keys, the figure the tree fixes. The tree does not have the variable:
+it was left out of the series. So none of the builds is the tree of a
+commit, and the last holds the changes of the seventeen commits from
+`d76e8ec` to `6376eeb` and the variable. L0 and L6 ran twice, L0 before
+and after the others, and L1 to L5 once each.
+
+| build | adds | carried by | runs |
+|---|---|---|---:|
+| L0 | to `4700cf1`, the flushing thread's processor time per phase in the flush log, and the variable | `d76e8ec`; the variable by none | 2 |
+| L1 | seven changes to header acceptance and the block thread: the rejected-transaction filter reset without a pass over data already zero, the node remembered beside each agenda's activation anchor, the early exit of the majority-version walk, one hash per accepted header, the treasury predicates refusing without building an error, with the spent outputs counted once, the copies, second store lookup and input set taken off an arriving block's path, and nothing sent to the rebroadcast thread while it tracks nothing | `8bec107`, `e6bc950`, `be14253`, `b2cacc3`, `0985600` and `674782a`, `3bd5e64`, `d82d86c` | 1 |
+| L2 | nested bucket lookups answered from a copy of the bucket index in memory | `6376eeb` | 1 |
+| L3 | the exists-address index's insert without a second search of unchanged partitions, and the overlay layers a flush retired freed after the writer is released | `64359e7`, `85a5dc8` | 1 |
+| L4 | the ticket treap's path borrowed, its keys compared inline and one descent | `9330b4b` | 1 |
+| L5 | the block-file record laid out on the reader thread from the bytes received | `a589c4a` | 1 |
+| L6 | a block's two merkle trees built on the reader thread, and its header hash taken once and handed down the processing call | `44cf801`, `54e8cad`, and the count test `4878589` | 2 |
+
+What each step gained, on each measure, with how far the commit-free
+figures are good (95%):
+
+| step | runs | by wall | less commit | flush-free | block thread's CPU time outside its flushes | share of L0's 504.2 s, commit-free | good to, commit-free |
+|---|---|---:|---:|---:|---:|---:|---:|
+| L0 to L1 | two against one | 22.8 s | 22.6 s | 22.9 s | 23.3 s | 4.5% | ±3.0 to ±5.1 s |
+| L1 to L2 | one against one | not resolved: 481.4 s and 481.7 s | 8.3 s | 9.1 s | 8.4 s | 1.6–1.8% | ±3.5 to ±5.9 s |
+| L2 to L3 | one against one | 15.0 s, L2's slow commit phase in it | 7.0 s | 6.5 s | 1.4 s | 1.3–1.4% | ±3.5 to ±5.9 s |
+| L3 to L4 | one against one | 8.6 s | 6.9 s | 7.5 s | 7.7 s | 1.4–1.5% | ±3.5 to ±5.9 s |
+| L4 to L5 | one against one | 11.6 s | 10.8 s | 9.3 s | 9.2 s | 1.8–2.1% | ±3.5 to ±5.9 s |
+| L5 to L6 | one against two | 4.5 s | 7.1 s | 8.3 s | 8.3 s | 1.4–1.6% | ±3.0 to ±5.1 s |
+| L0 to L6 | two against two | 62.2 s | 62.6 s | 63.6 s | | 12.3% by wall | ±2.5 to ±4.2 s |
+
+The CPU column is user and system time. By wall a step between two
+single runs is good to about ±11 s, ±9.7 s with two runs on one side.
+
+- **As one batch the seven builds gained 62 to 64 s on every
+  measure, 12.3% of L0 by wall**, with two runs at each end: good to
+  ±8 s by wall and ±2.5 to ±4.2 s on the commit-free measures, so
+  beyond doubt. By the node's clock 56.8 s of it falls before the
+  assume-valid block and 5.9 s after it.
+- **Step by step each is a single run's best estimate.** By that
+  estimate every step is above 1% of a sync on both commit-free
+  measures (1.3% to 4.5%). Beyond the uncertainty of single runs only
+  the first is, and the block-file record on the tighter interval.
+- **Like for like against `4700cf1`**, L6 is 62.2 s or 12.3% under
+  n-head-3 by wall, and 64.4 s under the mean of `4700cf1`'s three runs
+  with the commit seconds taken out. Against `4700cf1`'s median run,
+  513.4 s, it is 71.4 s, but that run is one of the two with a slow
+  commit phase and both runs of L6 had ordinary ones.
+
+What the records show beyond the times, step by step:
+
+- **L1.** The initial headers sync took 12.5 s and 12.7 s in L0's two
+  runs, the second of them after all the others, and 7.2 to 7.5 s in all
+  seven runs of L1 to L6: about 5 s of the gain, before any block is
+  connected. The rest was not divided among the seven changes.
+- **L2.** By wall the two runs are the same, a difference under the
+  harness's resolution, because L2's commit phases took 8.6 s longer,
+  8.4 s of it asleep: 36.1 s asleep against 27.7 s, with 44.7 s on a
+  processor against 44.5 s. Outside the flushes the block thread's CPU
+  time fell 8.4 s and the index thread's 2.8 s.
+- **L3.** The 15.0 s by wall holds L2's slow commit phase. What holds
+  beyond one run is the wait the two changes act on. The flush log's
+  total of the waits for the writer by the threads other than the index
+  thread, which bounds the block thread's from above (see "Eleven
+  changes, a background commit not kept and a pool gate"), less the
+  flushes the index thread ran, was 8.1 to 9.5 s in the eleven runs of
+  code without them that committed on the flushing thread with no other
+  setting changed (`4700cf1`'s three, L0's two, L1, L2, the pool's two
+  and the background commit's two control runs) and 1.6 to 1.7 s in all
+  five runs with them, about 6.4 s less. The time the index's queue was
+  full rose from 3.1–3.2 s to 4.0–4.1 s. The block thread's user time
+  fell 8.2 s, but mostly because seven flushes ran on the index thread
+  instead (43 on the block thread, where L2 ran 50); outside its flushes
+  its CPU time fell 1.0 to 1.4 s. The index thread's CPU time outside
+  its flushes fell from 119.0 s to 107.9 s, and was 106.6 to 107.1 s in
+  the four later runs. How much is each of the two changes was not
+  measured.
+- **L4.** Neither run had a slow commit phase. The block thread's CPU
+  time outside its flushes fell 7.7 to 8.2 s.
+- **L5.** The node's line at shutdown reported records laid out for
+  1,116,034 blocks in 7.078 s and 1,116,034 written as laid out, and
+  the same counts in 7.128 s and 7.165 s in the two runs of L6. The
+  reader thread's user time rose 7.0 s, from 94.4 s to 101.5 s, as the
+  block thread's CPU time outside its flushes fell 9.2 s, and the block
+  thread waited 0.82 s in all for the reader where it had waited
+  0.54 s.
+- **L6.** The node's hashing figure rose from 47.369 s to 52.536 s and
+  52.562 s, the reader's user time from 101.5 s to 106.6 s, and the
+  block thread's wait for the reader to 1.04 s and 1.01 s; the block
+  thread's CPU time outside its flushes fell 8.3 s. By wall the step
+  is 4.5 s against the one run of L5, whose 54 flushes inside the clock
+  took 113.4 s against 55 in 116.2 s and 116.4 s in L6's: the step
+  nearest the bar by wall, and above it on the commit-free measures.
+
+**The last two steps move CPU time rather than remove it.** The
+block-file record and the merkle trees put about 7 s and 5 s of CPU
+time on the reader thread. That pays while the reader has time to
+spare, and here it waited 321.8 s and 321.9 s for the block thread in
+L6's runs, fed by a server on the same machine.
+
+**Memory and CPU.** Peak RSS before the closing flush was 2,895 and
+3,021 MiB for L0, 2,721 for L1, 2,760 for L2, 3,047 for L3, 3,303 for
+L4, 3,166 for L5, and 3,188 and 3,089 MiB for L6. Runs of one binary
+differed by up to 345 MiB this session. L1 and L2 are the two lowest
+default-setting runs of the session, and from L3 on the runs lie
+inside the 2,832 to 3,341 MiB of `4700cf1`'s runs and the background
+commit's control runs; which step, if any, moves memory is not decided
+by one run each. The process's user time fell from 1,029.0 s and
+1,028.2 s at L0 to 963.4 s and 965.3 s at L6.
+
+**The validation pool, on `4700cf1` alone.** One build: `4700cf1` with
+a persistent pool for a connected block's script trees of four items
+or more, the change `f60ae3a` later carried on top of the seventeen
+commits above. Two runs, 491.3 s and 493.4 s. It was not run with any
+change of the cumulative builds.
+
+- **About 12 to 16 s, 2.4% to 3.2% of a sync of 504 s, by the
+  measure.** By wall 11.9 s against the mean of the runs of that code
+  with an ordinary commit phase, n-head-3 and the two of L0 (504.2 s).
+  Less commit 15.8 s, 417.2 s and 418.0 s against 432.8 to 433.7 s,
+  and 14.9 to 16.6 s over the pairings. Flush-free 16.3 s. Against
+  n-head-1 and n-head-2 alone it is 20 to 22 s by wall, and 18.0 s
+  against the mean of `4700cf1`'s three runs, which holds the slow
+  commit phases of those two and is not the pool's doing.
+- **All of it falls after the assume-valid block**, before which no
+  script is checked and the pool does not exist. From that block to
+  the tip the two runs took 99.4 s and 99.9 s by the node's clock,
+  against 110.7 to 117.7 s in seven runs of code without the pool
+  (`4700cf1`'s three, L0's two and the background commit's two control
+  runs): 13 to 15 s less, and 17 to 18 s with the flush time taken out.
+  The replay gate of 2026-10-12 had estimated 19.8 to 20.2 s over the
+  validated part of a sync for a pool at this threshold. Before the
+  block the pool's runs were about 2 s slower outside the flushes than
+  the mean of those seven, at or just past their top, which two runs
+  do not resolve.
+- **CPU.** The process's system time was 66.3 s and 68.4 s, against
+  94.0 to 96.3 s for `4700cf1`, and its user time 1,008.1 s and
+  1,011.0 s against 1,029.5 to 1,030.5 s. Both runs ended with 15
+  threads named `scriptval-N`, one fewer than the 16 logical CPUs the
+  node was pinned to, each with 27.2 to 27.4 s of user time.
+  Per-thread figures do not compare between the pool and the rest
+  without care: in `4700cf1`'s runs the script checks' scoped threads
+  had exited before the harness's last read, so 442 to 444 s of user
+  time and 22 to 23 s of system time are listed under no thread
+  there.
+- **Memory.** Peak RSS 2,998 and 2,908 MiB, inside the 2,832 to
+  3,128 MiB of `4700cf1`'s three runs.
+
+**A background commit, in a third form, not kept.** Built on
+`231997b`, one commit behind `4700cf1` and so the code of `b4ceb1c`
+without its log line, in a scratch tree outside the repository. For a
+flush that a commit's own check trips, the storage engine's commit runs
+on a second thread, `dbcommit`, as in the form of 2026-10-12 above, and
+here it holds a read snapshot of the store while it runs. One binary,
+three arms: nothing set, with the snapshot; `DCROXIDE_DB_SYNC_COMMIT=1`,
+every commit on the committing thread, the control arm; and
+`DCROXIDE_DB_BARE_COMMIT=1`, in the background without the snapshot, as
+in the form of 2026-10-12. Both variables are the experiment's, and no
+build of the repository reads them. Two pairs, each with the snapshot
+arm before its control (09:43 and 09:58, 12:39 and 12:54), not
+alternated, and one run without the snapshot.
+
+- **With the snapshot it took 465.7 s and 460.5 s, against its control
+  arm's 501.1 s and 500.5 s**: 35.4 s and 40.0 s less, 7.1% and 8.0% of
+  its own control. That is against its control, on `231997b`, and not
+  against `4700cf1`. The control's commit phases were at the fast end
+  (71.2 s and 68.1 s): by wall it ran 3 to 13 s under `4700cf1`'s runs,
+  and less commit 430.0 s and 432.4 s against 432.8 to 433.7 s.
+- **31 to 34 s of the gain came before the assume-valid block** (30.9 s
+  and 33.8 s) and 4.7 s and 6.1 s after it, by the node's clock. The
+  threads that trip flushes spent 46.7 s and 47.0 s in them inside the
+  clock against the control's 113.5 s and 110.5 s. Of those 64 to
+  67 s, 35 to 40 s reached the wall: the time outside the flushes rose
+  by 25.7 s and 21.1 s before the block and 5.6 s and 3.5 s after it.
+- **Without the snapshot, one run: 471.1 s**, 30.0 s and 29.4 s under
+  the two controls and 5.4 to 10.6 s over the runs with it. What marks
+  that arm is the writing before the commits: 3,587 MiB, against 247
+  and 318 MiB in the controls and 133 and 89 MiB with the snapshot, and
+  1.26 million read calls against 1.02 to 1.06 million.
+- **Process CPU time was about 28 s higher with the snapshot**, about
+  22 s of it user and 5 to 6 s system. Each background commit runs on a
+  new `dbcommit` thread that exits, so its CPU is in no per-thread
+  figure.
+- **No memory cost was detected, at a resolution of about 300 MiB.**
+  Peak RSS before the closing flush was 119 MiB above the control in
+  the first pair and 288 MiB below it in the second, and −226 and
+  +57 MiB paired the other way. The run without the snapshot peaked
+  325 MiB above the first control and 20 MiB below the second. Runs of
+  one binary differed by 62 to 345 MiB this session, so a difference of
+  two single runs is good to about ±440 MiB, and of two pairs' means to
+  about ±310 MiB. The last reading each flush log has, after the
+  closing commit and not the mark at exit, is 3,266 and 3,299 MiB with
+  the snapshot, 3,536 and 3,461 MiB for the controls and 3,886 MiB
+  without the snapshot.
+
+On 2026-10-12 the form without the snapshot had peaked 981 and 748 MiB
+above its control runs, one pair each on other code. This form is not
+in the repository either. It was not built on `4700cf1`, and it was
+not run with the cumulative builds' changes or the pool.
+
+**Settings, on L0.** Five runs of the L0 binary, against its two
+default runs (mean 504.2 s). The flush request is the developer
+variable above, which the tree does not have. The memtable target
+(`DCROXIDE_EXISTSADDR_MEMTABLE_KEYS`, 2,000,000 keys by default) and the
+overlay's ceiling (`DCROXIDE_DB_OVERLAY`, 300 MiB by default) are the
+tree's variables, here at values that are not its defaults.
+
+| runs | setting | wall | flushes inside the clock | their time | flush-free | block thread's CPU time outside its flushes | peak RSS |
+|---|---|---:|---:|---:|---:|---:|---:|
+| n-L0-1, n-L0-2 | defaults | 505.6 s, 502.8 s | 54, 54 | 116.1 s, 114.8 s | 388.9 s, 387.9 s | 345.0 s, 344.2 s | 2,895, 3,021 MiB |
+| n-K-umax3M-1, n-K-umax3M-2 | `DCROXIDE_EXISTSADDR_U_MAX=3000000` | 502.4 s, 508.3 s | 42, 41 | 111.3 s, 111.6 s | 390.9 s, 396.4 s | 345.2 s, 351.2 s | 3,061, 3,281 MiB |
+| n-M2-memtable4M | `DCROXIDE_EXISTSADDR_MEMTABLE_KEYS=4000000` | 502.7 s | 55 | 107.0 s | 395.2 s | 350.9 s | 3,264 MiB |
+| n-M2-memtable4M-umax3M | both of those | 495.8 s | 41 | 97.3 s | 398.0 s | 350.4 s | 3,581 MiB |
+| n-M5-overlay450-umax4.5M | `DCROXIDE_DB_OVERLAY=450` and `DCROXIDE_EXISTSADDR_U_MAX=4500000` | 503.2 s | 28 | 99.5 s | 403.1 s | 356.9 s | 3,411 MiB |
+
+- **Three settings show no gain**: the larger flush request, the larger
+  memtable target, and the larger overlay together with a flush
+  request of 4,500,000. In every setting the flushes took less time,
+  by 4.0, 8.4, 18.1 and 15.9 s in the order of the table, and the time
+  outside them rose, by 2.5 to 8.0, 6.8, 9.6 and 14.7 s.
+- **The two index settings together took 495.8 s in one run**, 7.0 s
+  and 9.8 s (1.4% to 1.9%) under the two runs of L0, with 560 to
+  690 MiB more at peak than L0 and 240 MiB above the highest peak of
+  any default-setting run of the session, 3,341 MiB. One run against a
+  pair is good to about ±10 s by wall, so a gain is neither shown nor
+  excluded.
+- They draw on the same commit seconds as the background commit, and
+  were run on L0 alone.
+
+**A deeper allocator thread cache.** One run of `4700cf1` with glibc's
+per-thread cache raised two ways at once through `GLIBC_TUNABLES`,
+`glibc.malloc.tcache_count=4096` and `glibc.malloc.tcache_max=131072`:
+2,005.2 s, 3.91 to 3.98 times `4700cf1`'s default runs, with 2,917.8 s
+of user and 104.0 s of system time and a peak of 4,794 MiB. The block
+thread used 1,775.1 s of user time, the 63 flushes inside the clock
+took 677.8 s, and the assume-valid block came at 1,706 s. Both tunables
+were changed in the one run, so the records cannot say which did it,
+and no run with the count alone was made. The tree sets no allocator
+tunable.
+
+**What was not measured.**
+
+- The tree as committed, `f60ae3a`, in any sync, and any build that
+  holds two or more of the cumulative builds' changes, the pool and the
+  background commit. The three gains rest on three baselines, L0,
+  `4700cf1` and the background commit's own control, and the
+  cumulative builds and the background commit both gain before the
+  assume-valid block, so their sum is not a prediction. With the later
+  changes the pool fans out trees of 4 to 15 items beside a reader
+  thread that `a589c4a` and `44cf801` gave more work, and its threshold
+  has not been tried with them.
+- Second runs of L1 to L5. The queue held n-L1-A-2 and n-L2-R3-2, the
+  repeats of L1 and L2, and n-M6-utxo600, a run with a UTXO cache
+  setting of 600; all three were skipped for the session's deadline.
+  One more run of each of L1 to L5 would make each step good to about
+  ±2.5 to ±4 s on the commit-free measures.
+- The background commit on `4700cf1` or later code, and its memory to
+  better than about 300 MiB.
+- The settings on anything but L0, and a second run of the two index
+  settings together.
+- Either thread-cache tunable alone.
+- A second dcrd run, and dcrd with the index off, in this session.
+- The metadata store's end state in any run, and the memory high-water
+  mark at exit.
+- A sync from peers over a real link. Every run took its blocks from a
+  server on the same machine, and the block-file record and the merkle
+  trees moved work onto a reader thread that had time to spare here.
+- A profile of any of this code, or a run on m1, m2, another filesystem
+  or fewer cores.
+
+Raw: the comparison's `runs.jsonl` rows labelled `n-head-1`,
+`n-L0-1`, `n-L1-A`, `n-L2-R3`, `n-L3-R4`, `n-L4-R5`, `n-L5-R6`,
+`n-L6-B-1`, `n-L6-B-2`, `n-L0-2`, `n-head-2`, `n-pool-1`, `n-pool-2`,
+`n-K-umax3M-1`, `n-K-umax3M-2`, `n-M1-tcache`, `n-bg-test-1`,
+`n-bg-control-1`, `n-bg-bare`, `n-M2-memtable4M`,
+`n-M2-memtable4M-umax3M`, `n-M5-overlay450-umax4.5M`,
+`n-head-noindex`, `n-head-3`, `n-dcrd`, `n-bg-test-2` and
+`n-bg-control-2`, with per-run samples, flush logs and node logs as
+above; the queue's log; the scripts that reconciled the figures from
+those records, with the tables they wrote; and the patches of the
+measured trees and of the background-commit experiment.

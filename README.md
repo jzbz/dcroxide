@@ -17,7 +17,7 @@ JSON-RPC/websocket server, the tool commands, the pipe IPC lifecycle,
 and the Windows service wrapper. The deliberate non-ports are small
 and documented in PARITY.md (Go GC tuning, the pprof servers, UPnP,
 the Windows event log, and the wallet-side mixclient). The test suite
-runs 2,124 tests across 423 suites on Linux, most differential against
+runs 2,291 tests across 430 suites on Linux, most differential against
 dcrd itself or replaying sessions generated inside dcrd's own packages.
 
 Since the surface completed, four rounds of work have landed on it. A
@@ -57,14 +57,18 @@ only, each of which validated in full only the blocks after the
 assume-valid block. One of the eleven changes how a `SigHashAll`
 signature hash is computed while a block is connected, and the syncs
 made with it put that to the 89,438 blocks after the assume-valid block
-and to none before it. That the rules reject what dcrd's reject rests
-on the test batteries described below, not on a sync, and none of it
-says the node is safe to operate. **Do not expose it to the internet
-and do not use it with funds** — see [SECURITY.md](SECURITY.md) for
-what is known to be missing and how to report a vulnerability, and
-[docs/operating.md](docs/operating.md) for what running it deliberately
-requires (a supervisor is mandatory, and a dcrd data directory will not
-work). Currently implemented:
+and to none before it. The eighteen commits to the node's code after the
+eleven, several of which change code that applies the consensus rules,
+among them where a connected block's scripts are checked, have been put
+to blocks only in syncs, and only in builds that are not the code as it
+stands, which has been run in none (Performance). That the rules reject
+what dcrd's reject rests on the test batteries described below, not on a
+sync, and none of it says the node is safe to operate. **Do not expose
+it to the internet and do not use it with funds** — see
+[SECURITY.md](SECURITY.md) for what is known to be missing and how to
+report a vulnerability, and [docs/operating.md](docs/operating.md) for
+what running it deliberately requires (a supervisor is mandatory, and a
+dcrd data directory will not work). Currently implemented:
 
 - `dcroxide-crypto` — BLAKE-256 (vendored from
   [dcr-rs](https://github.com/jzbz/dcr-rs), KAT-pinned, differential-tested
@@ -412,18 +416,24 @@ work). Currently implemented:
 
 ## Performance
 
-The figures here are of two kinds. The last complete comparison, with
-three runs of dcroxide, a run with the exists-address index off and
-dcrd in the same session, is of dcroxide `b4a5d2d` on 2026-10-11: a
-median of 12.1 minutes against dcrd's 48.1, 3.96x. Eleven commits that
-change the node's code have followed it. Their steps were measured on
-2026-10-12 in one or two syncs each, dcrd was not run that day, and the
-last step was measured in a build that is not the code as committed. So
-what is known of the code as it stands comes first. From *The last
-complete comparison* on, every table, and every measurement of dcroxide
-not dated 2026-10-12, is of `b4a5d2d` or of the code before it. Every
-sync time on this page is from one machine, over loopback, into a fresh
-data directory.
+The figures here are of two kinds. The last complete comparison set out
+on this page, with three runs of dcroxide, a run with the exists-address
+index off and dcrd in the same session, is of dcroxide `b4a5d2d` on
+2026-10-11: a median of 12.1 minutes against dcrd's 48.1, 3.96x. Eleven
+commits that change the node's code followed it. Their steps were
+measured on 2026-10-12 in one or two syncs each, dcrd was not run that
+day, and the last step was measured in a build that is not the code as
+committed. They come first. Eighteen more commits that change the
+node's code have followed those eleven, and the code as it stands has
+not been run in a sync. A session of the same kind was run on
+2026-10-13 with `4700cf1`, the first of the eighteen, beside builds
+that held the changes of the other seventeen in parts, none of the
+builds run holding them all. The [bench ledger](docs/bench-ledger.md)
+has that session, and this page sets out no figure from it. From *The
+last complete comparison* on, every table, and every measurement of
+dcroxide not dated 2026-10-12, is of `b4a5d2d` or of the code before
+it. Every sync time on this page is from one machine, over loopback,
+into a fresh data directory.
 
 **Eleven commits to the node's code since `b4a5d2d`, measured a step at
 a time on 2026-10-12.** Each run was a sync of mainnet from genesis to
@@ -456,10 +466,13 @@ With `DCROXIDE_READ_AHEAD=off`, which leaves the block hand-off of
 and 599.0 s. With the read-ahead of `b4ceb1c` on, which is the default,
 it took 494.6 s and 490.8 s, 8.2 minutes: 103.0 s and 108.2 s less,
 17.2% and 18.1%. **That binary is the build made before the review of
-the read-ahead and its fixes. Those four runs are of no commit, and
-`b4ceb1c` as committed has not been run in a sync.** The hand-off was
-not measured alone: the 14.8 s and 13.4 s between the window's run and
-the two with the read-ahead off are not attributed.
+the read-ahead and its fixes. Those four runs are of no commit.**
+`b4ceb1c` as committed was run in syncs on 2026-10-13, inside `4700cf1`
+and only with the read-ahead on (the [bench
+ledger](docs/bench-ledger.md) has those runs), so its gain as committed
+has not been measured. The hand-off was not measured alone: the 14.8 s
+and 13.4 s between the window's run and the two with the read-ahead off
+are not attributed.
 
 What the eleven are, in the order they were made:
 
@@ -518,33 +531,41 @@ What the eleven are, in the order they were made:
   messages ahead of the thread that connects blocks, checks each
   checksum, decodes and, for a block, hashes its transactions. dcrd has
   no such thread and holds further reads back on purpose
-  (`server.go:1365-1369`). [PARITY.md](PARITY.md), *Reading ahead of
-  the block handler*, has the rule and what a peer can see of it, and
+  (`server.go:1365-1369`). Two of the eighteen later commits to the
+  node's code give that thread more to do for each block: since
+  `a589c4a` it lays the block out as its block-file record from the
+  bytes it arrived in, and since `44cf801` it builds the block's two
+  merkle trees. [PARITY.md](PARITY.md), *Reading ahead of the block
+  handler*, has the rule and what a peer can see of it, and
   [SECURITY.md](SECURITY.md) what it gives a hostile sync peer.
 
-**dcrd was not run on 2026-10-12, so there is no ratio for this code
-from one session.** dcrd's last run, on the evening of 2026-10-11 on
-the same machine and in the same harness, took 2,883.9 s. Set against
-it across sessions, the 612.4 s of `540b203`, the last commit whose
-code was run, is 4.71x, and the two runs with the read-ahead on are
-5.83x and 5.88x, of a build that is not the committed code. Neither is
-a figure of the kind the 3.96x below is.
+**dcrd was not run on 2026-10-12, so there is no ratio for the code run
+that day from one session.** dcrd's last run before it, on the evening
+of 2026-10-11 on the same machine and in the same harness, took
+2,883.9 s. Set against it across sessions, the 612.4 s of `540b203`,
+the last commit whose code was run that day, is 4.71x, and the two runs
+with the read-ahead on are 5.83x and 5.88x, of a build that is not the
+committed code. Neither is a figure of the kind the 3.96x below is.
+dcrd was run once more on 2026-10-13, in the session of `4700cf1`
+above, and that run is in the ledger.
 
-Not measured for any of the eleven: a sync with the exists-address
-index off, so what the index costs this code, and how much of the lead
-it is, is not known; a second run of any step but the last; the four
-changes of the first batch and the three of the second one at a time;
-any other machine or filesystem; and a whole sync over a delayed or a
-real link, where the round trip and not the thread that connects
-blocks may set the pace. The tables of the index's cost and of the
-time to each height below are of `b4a5d2d` and were not redone. The
+Not measured on 2026-10-12, for any of the eleven: a sync with the
+exists-address index off, so what the index cost that code, and how
+much of the lead it was, was not known that day (`4700cf1` was run once
+with the index off on 2026-10-13, and dcrd was not); a second run of
+any step but the last; the four changes of the first batch and the
+three of the second one at a time; any other machine or filesystem;
+and a whole sync over a delayed or a real link, where the round trip
+and not the thread that connects blocks may set the pace. The tables of
+the index's cost and of the time to each height below are of `b4a5d2d`
+and were not redone. The
 [bench ledger](docs/bench-ledger.md) has every run of the day, with
 what else was measured then and is not in the repository.
 
-**The last complete comparison is of `b4a5d2d`, on 2026-10-11.** It
-synced mainnet from genesis to block 1,116,035 in a median of 12.1
-minutes over three runs that day. dcrd release v2.1.6 (go1.25.4) took
-48.1 minutes in one run that evening, so
+**The last complete comparison set out here is of `b4a5d2d`, on
+2026-10-11.** It synced mainnet from genesis to block 1,116,035 in a
+median of 12.1 minutes over three runs that day. dcrd release v2.1.6
+(go1.25.4) took 48.1 minutes in one run that evening, so
 dcroxide was **3.96x as fast** in one session. dcrd's median over four
 runs on 2026-10-09 and 2026-10-10, on the same machine and in the same
 harness, is 47.7 minutes, and the tables below use it: against it the
@@ -718,7 +739,7 @@ What these figures do not say:
   adds loss and a bandwidth limit that the relay does not;
   [docs/operating.md](docs/operating.md) has the budget and the setting
   that puts dcrd's window back.
-- **The read-ahead was measured over loopback only, and not as
+- **The read-ahead's gain was measured over loopback only, and not as
   committed.** dcrd reads one message from a connection, handles it
   and only then reads the next (`inHandler`,
   `peer/peer.go:1535-1598`). During the initial sync dcroxide now
@@ -739,16 +760,23 @@ What these figures do not say:
   loopback the next block was nearly always there, which a link with a
   round trip need not give. Peak resident memory was 2,967 and
   2,921 MiB with it on against 3,273 and 3,256 MiB with it off, which
-  is not explained. Not measured: the code as committed; a sync with
-  it over a delayed or a real link, where the round trip and not the
-  thread that connects blocks may set the pace and reading ahead may
-  gain nothing; a node on fewer than eight cores; and a sync with
-  `--noexistsaddrindex`. It costs one more thread and one more
+  is not explained. Not measured: the gain of the code as committed,
+  which was run on 2026-10-13 only inside `4700cf1` and only with the
+  read-ahead on, nor of the reader's added work since (`a589c4a`,
+  `44cf801`), which has been run only in builds that are not the code
+  as it stands; a sync with it over a delayed or a real link, where the
+  round trip and not the thread that connects blocks may set the pace
+  and reading ahead may gain nothing; a node on fewer than eight cores;
+  and its gain with `--noexistsaddrindex`, under which it was run once,
+  in `4700cf1` on 2026-10-13. It costs one more thread and one more
   descriptor on that connection and the memory of up to four decoded
-  messages held there, which was not measured. By estimates from the
-  sizes of the structures those are about 150 kB for four main network
-  blocks of mean size, and at worst, from a hostile sync peer, the
-  connection holds about 57 MB against about 12.5 MB without the
+  messages held there, each with the frame it was read in, which was
+  not measured. By estimates from the sizes of the structures, since
+  `a589c4a` those are about 220 kB for four main network blocks of mean
+  size, and at worst, from a hostile sync peer, the connection holds
+  about 62 MB, with about 1.3 MB more for a moment while one frame is
+  compared with its block's serialization, or up to about 1.4 MB while
+  one block's merkle trees are built, against about 12.5 MB without the
   read-ahead ([SECURITY.md](SECURITY.md), *Known gaps*).
   [docs/operating.md](docs/operating.md) has the setting and how to
   read the shutdown line.

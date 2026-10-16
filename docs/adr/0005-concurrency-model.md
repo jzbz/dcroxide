@@ -7,7 +7,9 @@
   2026-10-10 (addendum: a later sync comparison; second addendum: the
   parity commit and the index off), 2026-10-11 (addendum: one more
   thread, for the indexes), 2026-10-12 (addendum: a thread dcrd does not
-  have, reading ahead on the sync peer's connection)
+  have, reading ahead on the sync peer's connection), 2026-10-16
+  (addendum: more work on the reading thread, and threads kept for the
+  scripts of a connected block)
 
 ## Context
 
@@ -413,3 +415,116 @@ added and on what grounds. Whether those grounds, tests and four
 loopback syncs on one machine in place of dcrd's shape, are enough to
 keep the thread is the project owner's decision. Declining it is the
 paragraph above, and nothing else in this ADR depends on the thread.
+
+## Addendum, 2026-10-16 — more work on the reading thread, and threads kept for the scripts of a connected block
+
+Commits of 2026-10-16 bear on this ADR in two places. None adds a
+runtime, a dependency or an `async fn`, and chain state keeps its single
+writer.
+
+**The reading thread does more for each block.** The 2026-10-12 addendum
+has the `peer-reader` thread read each frame, check its checksum, decode
+it and, for a block, hash its transactions. Since `a589c4a` it also
+serializes a block once, compares the serialization with the payload the
+block arrived in, and lays that payload out in its own buffer as the
+block's block-file record, with the record's CRC-32C and one more hash
+of the header (`HashedBlock::keep_wire_bytes`,
+`crates/dcroxide-blockchain/src/blockhashes.rs:310`). The input thread's
+chain stores such a block as that record
+(`Transaction::store_block_record`), so the thread that connects blocks
+neither serializes nor checksums it. Since `44cf801` the reading thread
+also builds the block's two transaction merkle trees from the hashes it
+has taken and keeps their roots (`HashedBlock::new`, `:252`). The block
+hash it takes is, since `54e8cad`, the one the sync manager and the
+whole processing call use. The recorded choice stands, and in these
+words: making a `HashedBlock` reaches no verdict, no merkle root is
+compared with a header and no rule is applied off the input thread, and
+a payload that does not compare equal to the serialization is dropped
+without a verdict and its block stored as any other. Where the
+2026-10-12 addendum says the thread "still hashes every block it reads",
+it now hashes, builds the trees of and lays out every block it reads. It
+is still one thread on one connection with at most four frames ahead;
+each queued block now keeps the frame it was read in, which PARITY.md's
+row *Reading ahead of the block handler* and SECURITY.md put in bytes,
+as estimates. The work moved and was not removed: in the syncs of
+2026-10-13, one or two runs a build, the build that added the record
+took about 9 s of processor time off the thread that connects blocks,
+outside its flushes, and added about 7 s to the reading thread, and the
+one that added the trees, with the carried header hash, about 8 s and 5
+s, while the reading thread, fed by a server on the same machine, still
+waited over 320 s for the other. Over a link that leaves the reading
+thread no time to spare, the move may gain nothing; that was not
+measured.
+
+**Threads kept for the scripts of a connected block.** The 2026-07-26
+addendum records the validation pool as `std::thread::scope` in
+`validate_items`, and the first addendum of 2026-10-10 records it as
+`validate_items` at one worker per core. Both stand as the record of
+those commits. Since `f60ae3a` the scripts of a block the chain connects
+go, a transaction tree at a time, to helper threads that live as long as
+the process (`crates/dcroxide-blockchain/src/scriptpool.rs`,
+`Pool::global` at `:476`): the hand-rolled pool the proposal of
+2026-07-03 named, still without rayon. It holds at most as many helpers
+as the logical CPUs the process may run on, less one, so that with the
+calling thread, which always checks too, a batch has at most one worker
+per CPU, the width of 2026-08-14. Helpers are named `scriptval-N`, are
+created as batches want them, park while there is nothing to check and
+are never joined, the pool being a process-wide static. One mutex guards
+the queue of open batches and a last-in-first-out stack of parked
+helpers, and is never held across a check, a thread creation, an unpark
+or a park; a helper leaves a batch through an atomic count that unparks
+the calling thread when it reaches zero. A helper the OS refuses leaves
+the pool narrower, the calling thread covers the work, and no creation
+is tried again before the 1,024th batch after that one, so a refusal
+still costs speed and not the node. The crate forbids unsafe code, so a
+helper that outlives the call cannot borrow from the caller: a batch
+owns what its checks read, holding the block, its transaction hashes and
+the signature cache by reference count and a single copy of the previous
+scripts it spends.
+
+The scoped path keeps the rest (`validate_items`,
+`crates/dcroxide-blockchain/src/validate.rs:5505`): a connected block's
+tree of fewer than 4 script items, a tree whose previous scripts come to
+more than 1 MiB, every tree where the process may run on one logical CPU
+or in a build without `std`, the template check, the public
+`check_block_scripts`, and a single transaction's check. A tree of 16
+items or more is offered no fewer workers than before, so the lesson of
+2026-08-14 holds; a tree of 4 to 15 items, which the calling thread
+checked alone, now has a worker for each item up to one per CPU.
+
+Three things are new to this ADR. A node that has checked scripts keeps
+its helpers until it exits, parked and using no CPU when idle, and a
+task limit counts them ([operating.md](../operating.md)). In an
+unwinding build a helper catches the panic of a check, stops the batch
+and keeps serving, and the calling thread raises the panic again; that
+is the crate's first `catch_unwind` outside its tests, and like the
+others the release profile's `panic = "abort"` makes it inert. And a
+batch the pool runs names its failing input of lowest index on every
+run, which dcrd's `txValidator` and the scoped workers do not promise;
+PARITY.md's row *Script checks of a connected block* has the rule and
+its exceptions. That no wake-up is lost and no interleaving deadlocks
+rests on reading and on the tests, not on a model checker in the
+repository. A verdict does not rest on it: `Ok` is returned only when an
+always-on count shows that every item passed and the batch was not
+stopped, and an error is always one a check of that batch returned, so a
+fault in the pool can stall or stop the node and cannot accept a block.
+
+This keeps dcrd's shape in what it does and departs from it in how long
+the threads live. dcrd's `validateHandler` goroutines do the same work
+and are started for each batch
+(`internal/blockchain/scriptval.go:117-166`); the helpers here are the
+same work kept alive between batches, which is the departure, and not a
+thread without a dcrd counterpart in the sense of the 2026-10-12
+addendum.
+
+On m3 on 2026-10-13 two default syncs of `4700cf1` with the pool alone
+took 491.3 s and 493.4 s, about 12 to 16 s less than that code,
+depending on the measure, all of it after the assume-valid block; both
+had 15 `scriptval-N` threads at the end, on a node held to 16 hardware
+threads, and their peak resident memory, read before the closing flush,
+was inside the range of `4700cf1`'s own runs
+([bench-ledger.md](../bench-ledger.md), "Seven cumulative builds, the
+validation pool, a background commit and dcrd"). The pool has not been
+run with the other commits of 2026-10-16, so the code as it stands has
+not been run in a sync, and its threshold of 4 items has not been tried
+beside the reading thread's added work. D2 is unchanged.
