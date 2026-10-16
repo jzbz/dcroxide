@@ -289,6 +289,27 @@ type ThresholdStateCacheMap = alloc::collections::BTreeMap<
     alloc::collections::BTreeMap<(u32, [u8; 32]), crate::thresholdstate::ThresholdStateTuple>,
 >;
 
+/// An agenda's cached activation anchor (dcrd's per-agenda
+/// `activeAnchor`, `agendas.go:429`).
+pub(crate) struct ActiveAnchor {
+    /// The anchor: the parent of the block at which the agenda
+    /// activated.
+    pub(crate) anchor: NodeId,
+    /// The winning choice ID.
+    pub(crate) choice_id: &'static str,
+    /// The node most recently shown to descend from the anchor (or to be
+    /// it).  It is not a dcrd field: dcrd walks from the queried node to
+    /// the anchor's height on every load (`IsAncestorOf`,
+    /// `blockindex.go:372-374`, called at `thresholdstate.go:454` and
+    /// `agendas.go:652`), and a query for this node or for a child of it
+    /// has the same answer without the walk, since the ancestors of a
+    /// node are its parent's ancestors and the parent.  It is replaced
+    /// together with the anchor and only ever moves to a node the anchor
+    /// was shown to be an ancestor of, and node links never change once
+    /// a node exists, so it stays a descendant of the anchor for good.
+    pub(crate) descendant: core::cell::Cell<NodeId>,
+}
+
 /// The arena owning every block node, providing the node-level
 /// operations dcrd implements as `blockNode` methods.
 ///
@@ -335,9 +356,8 @@ pub struct NodeStore {
     /// resolved historical activation or the first LockedIn to Active
     /// boundary a tally computes, and like the BLAKE3 anchors above it
     /// only counts for queries it is an ancestor of.
-    pub(crate) agenda_active_anchors: core::cell::RefCell<
-        alloc::collections::BTreeMap<alloc::string::String, (NodeId, &'static str)>,
-    >,
+    pub(crate) agenda_active_anchors:
+        core::cell::RefCell<alloc::collections::BTreeMap<alloc::string::String, ActiveAnchor>>,
     /// The node a branch view last served, with that branch's tip.  It
     /// is not a dcrd cache: dcrd's walks step `node.parent`, and a
     /// height-indexed view that resumes from this node does the same
