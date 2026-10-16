@@ -35,7 +35,15 @@
 //!   frame.  A block it hands over with the hashes of its transactions
 //!   (`dcroxide_blockchain::HashedBlock`), which the chain reads where
 //!   it would have computed them and not before; no merkle root is
-//!   compared and no rule applied on the reader's thread.  Every ban,
+//!   compared and no rule applied on the reader's thread.  The block
+//!   also carries the payload it was decoded from, laid out as its
+//!   record for the block files, which the chain writes where it would
+//!   have serialized the block and taken the record's checksum (dcrd
+//!   stores the payload too, `server.go:1359`, `dcrutil/block.go:54-58`).
+//!   The payload is kept only once it has been compared with the
+//!   block's serialization and found to be it
+//!   (`HashedBlock::keep_wire_bytes`), so the block files hold the same
+//!   bytes whichever thread read the block.  Every ban,
 //!   disconnect, reject, log line, pong and stall-detector event comes
 //!   from the input thread, from the same code, at the same position in
 //!   the stream.  A failed read is the last item in the queue and is
@@ -72,7 +80,9 @@ use dcroxide_peer::{MsgTransport, ReadError};
 use dcroxide_wire::Message;
 
 use crate::peerloop::{READ_TORN_DOWN_TEXT, mix_message_hash};
-use crate::transport::{BudgetStart, Cancel, READ_POLL_INTERVAL, Teardown, WireTransport};
+use crate::transport::{
+    BlockFrame, BudgetStart, Cancel, READ_POLL_INTERVAL, Teardown, WireTransport,
+};
 
 /// What one read produced, and the bytes it took off the wire.
 pub(crate) struct ReadItem {
@@ -115,7 +125,8 @@ pub(crate) enum Received {
     /// A block the reader thread read, ahead of the handler or in turn,
     /// with its block hash and the hashes of its transactions computed on
     /// that thread (what dcrd's `dcrutil.Block` holds, made lazily while
-    /// the chain processes the block).  A block the input thread read for
+    /// the chain processes the block), and with the payload it arrived in
+    /// laid out as its block-file record.  A block the input thread read for
     /// itself, on a connection that has no reader thread, arrives as a
     /// [`Received::Message`] and is hashed inside the chain.
     Block(HashedBlock),
@@ -208,6 +219,14 @@ impl<T: MsgTransport> MsgSource for InlineSource<'_, T> {
 /// times faster than the connect, so a deeper queue would only hold more
 /// decoded blocks, and a hostile sync peer could fill it with blocks of
 /// the largest size.
+///
+/// A block the reader read holds the frame it arrived in as well, as its
+/// block-file record, from the read until the handler has finished with
+/// the block: the payload and twenty-eight bytes for each of these
+/// items and for the block being handled.  No frame is held anywhere
+/// else, so this bound is the bound on them too.  While the reader
+/// checks a frame it also holds that one block's serialization, which
+/// it lets go of before the block is queued.
 pub(crate) const READ_AHEAD_MAX_ITEMS: usize = 4;
 
 /// What the reader and the handler of one connection share.
@@ -382,8 +401,9 @@ impl Shared {
     /// deadline (`readMessage`, `peer/peer.go:963-964`).  Answering with
     /// the recorded instant there would charge the frame behind a block
     /// with the handler's wait for the block, and a block whose last byte
-    /// arrived inside its budget but whose checksum, decoding and hashing
-    /// ended after it would cost the peer its connection.
+    /// arrived inside its budget but whose checksum, decoding, hashing
+    /// and laying out as a block-file record ended after it would cost
+    /// the peer its connection.
     fn waiting_since(&self) -> Option<Instant> {
         let state = self.lock();
         if state.queue.is_empty() {
@@ -485,6 +505,11 @@ pub(crate) trait FrameReader {
     /// The time spent checking and decoding frames since the last call,
     /// in nanoseconds.
     fn take_decode_nanos(&mut self) -> u64;
+
+    /// The frame the last read decoded its block from, as it came off
+    /// the wire, if that read gave a block and the reader keeps frames.
+    /// It is handed out once.
+    fn take_block_frame(&mut self) -> Option<BlockFrame>;
 }
 
 impl FrameReader for WireTransport<Teardown> {
@@ -498,6 +523,10 @@ impl FrameReader for WireTransport<Teardown> {
 
     fn take_decode_nanos(&mut self) -> u64 {
         WireTransport::take_decode_nanos(self)
+    }
+
+    fn take_block_frame(&mut self) -> Option<BlockFrame> {
+        WireTransport::take_block_frame(self)
     }
 }
 
@@ -515,10 +544,11 @@ impl Drop for ReaderExit<'_> {
 /// the blocks among them, and queue each frame for the handler, until a
 /// read fails or the handler leaves.
 ///
-/// It is handed the transport and the queue and nothing else.  It
-/// reaches no verdict on what it reads, and after its first failed read
-/// it reads nothing more.
-fn reader_loop<R: FrameReader>(mut reader: R, shared: &Shared) {
+/// It is handed the transport, the queue and the counters its own work
+/// is added to, which are the process's ([`STATS`]) for every reader
+/// thread of a node, and nothing else.  It reaches no verdict on what it
+/// reads, and after its first failed read it reads nothing more.
+fn reader_loop<R: FrameReader>(mut reader: R, shared: &Shared, stats: &Stats) {
     let _exit = ReaderExit(shared);
     let mut read_total = reader.total_bytes_read();
     // The reader starts right behind a block the handler has handled.
@@ -528,8 +558,8 @@ fn reader_loop<R: FrameReader>(mut reader: R, shared: &Shared) {
         let total = reader.total_bytes_read();
         let read_delta = total.wrapping_sub(read_total);
         read_total = total;
-        STATS.frames.fetch_add(1, Ordering::Relaxed);
-        STATS
+        stats.frames.fetch_add(1, Ordering::Relaxed);
+        stats
             .decode_nanos
             .fetch_add(reader.take_decode_nanos(), Ordering::Relaxed);
         match result {
@@ -547,11 +577,31 @@ fn reader_loop<R: FrameReader>(mut reader: R, shared: &Shared) {
                     // were computed from, and nothing about the block is
                     // decided by computing them.
                     Message::Block(block) => {
+                        let frame = reader.take_block_frame();
                         let began = Instant::now();
-                        let hashed = HashedBlock::new(Arc::new(block));
-                        add_nanos(&STATS.hash_nanos, began.elapsed());
-                        STATS.blocks.fetch_add(1, Ordering::Relaxed);
-                        STATS.block_bytes.fetch_add(read_delta, Ordering::Relaxed);
+                        let mut hashed = HashedBlock::new(Arc::new(block));
+                        add_nanos(&stats.hash_nanos, began.elapsed());
+                        stats.blocks.fetch_add(1, Ordering::Relaxed);
+                        stats.block_bytes.fetch_add(read_delta, Ordering::Relaxed);
+                        // The payload the block was decoded from goes
+                        // with it, laid out here as its record for the
+                        // block files, so that the thread that stores
+                        // the block neither serializes it nor takes the
+                        // record's checksum (dcrd's `OnBlock` keeps the
+                        // payload the same way, `server.go:1359`).  The
+                        // payload is compared with the block's
+                        // serialization first, here, and one that
+                        // differs is dropped: the block is then stored
+                        // as one that arrived without.
+                        if let Some(frame) = frame {
+                            let began = Instant::now();
+                            let kept =
+                                hashed.keep_wire_bytes(frame.buf, frame.payload_at, frame.net.0);
+                            add_nanos(&stats.record_nanos, began.elapsed());
+                            if kept {
+                                stats.records.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
                         Received::Block(hashed)
                     }
                     // A mixing message is hashed once as it is read, as
@@ -656,7 +706,7 @@ impl ReadAheadSource {
         let reader_shared = Arc::clone(&shared);
         let spawned = crate::runtime::spawn_conn_thread("peer-reader", move || {
             if let Ok(transport) = handed.recv() {
-                reader_loop(transport, &reader_shared);
+                reader_loop(transport, &reader_shared, &STATS);
             }
         });
         let reader = match spawned {
@@ -840,6 +890,13 @@ struct Stats {
     decode_nanos: AtomicU64,
     /// Time the reader threads spent hashing blocks.
     hash_nanos: AtomicU64,
+    /// Blocks the reader threads handed over with the payload they were
+    /// decoded from laid out as a block-file record.
+    records: AtomicU64,
+    /// Time the reader threads spent comparing those payloads with the
+    /// blocks' serializations and laying the records out, the ones that
+    /// were then dropped included.
+    record_nanos: AtomicU64,
     /// Time the reader threads were parked with read-ahead allowed, that
     /// is with the queue full.
     reader_waited_nanos: AtomicU64,
@@ -850,17 +907,29 @@ struct Stats {
     max_queued: AtomicU64,
 }
 
-static STATS: Stats = Stats {
-    connections: AtomicU64::new(0),
-    frames: AtomicU64::new(0),
-    blocks: AtomicU64::new(0),
-    block_bytes: AtomicU64::new(0),
-    decode_nanos: AtomicU64::new(0),
-    hash_nanos: AtomicU64::new(0),
-    reader_waited_nanos: AtomicU64::new(0),
-    handler_waited_nanos: AtomicU64::new(0),
-    max_queued: AtomicU64::new(0),
-};
+impl Stats {
+    /// Counters that have counted nothing.
+    const fn new() -> Stats {
+        Stats {
+            connections: AtomicU64::new(0),
+            frames: AtomicU64::new(0),
+            blocks: AtomicU64::new(0),
+            block_bytes: AtomicU64::new(0),
+            decode_nanos: AtomicU64::new(0),
+            hash_nanos: AtomicU64::new(0),
+            records: AtomicU64::new(0),
+            record_nanos: AtomicU64::new(0),
+            reader_waited_nanos: AtomicU64::new(0),
+            handler_waited_nanos: AtomicU64::new(0),
+            max_queued: AtomicU64::new(0),
+        }
+    }
+}
+
+/// The counters of this process.  A reader thread is handed them as it
+/// starts ([`reader_loop`]); the queue adds its waits and its high-water
+/// mark to them directly.
+static STATS: Stats = Stats::new();
 
 /// Add a duration to a nanosecond counter.
 fn add_nanos(counter: &AtomicU64, elapsed: Duration) {
@@ -878,18 +947,33 @@ fn seconds(nanos: u64) -> String {
 
 /// What the reader threads did over the life of the process, as one
 /// line, or `None` when no reader thread read anything.
+/// `records_written` is how many block-file records the block database
+/// wrote as they were handed to it
+/// (`dcroxide_database::Database::records_written_as_laid_out`), which
+/// the caller reads from the node's database.
 ///
 /// The times are sums over all reader threads.  The checksum and decode
-/// time and the hashing time together are the work that left the block
-/// thread, the ceiling of what reading ahead can gain; the socket reads
-/// themselves are not timed.  The two waits say which side was short: the
-/// reader waits for the block thread when the queue is full, and the
-/// block thread waits for the reader when the queue is empty.  The most
-/// items queued is the check on the queue's bound of four.  The last
-/// figure is the index queue's
-/// ([`crate::indexes::notify_blocked_nanos`]): how long the block thread
-/// was held up handing blocks to the index thread.
-pub fn shutdown_line() -> Option<String> {
+/// time and the hashing time together are timed work that left the block
+/// thread; the socket reads themselves are not timed.  The two waits say
+/// which side was short: the reader waits for the block thread when the
+/// queue is full, and the block thread waits for the reader when the
+/// queue is empty.  The most items queued is the check on the queue's
+/// bound of four.  The index queue's figure
+/// ([`crate::indexes::notify_blocked_nanos`]) is how long the block
+/// thread was held up handing blocks to the index thread.
+///
+/// The last three are about the block-file records.  The first is how
+/// many of the blocks were handed over with their payload laid out as
+/// one; a count below the blocks read means payloads that were not kept.
+/// The second is the time the reader threads spent serializing those
+/// blocks, comparing the payloads with the serializations and taking the
+/// records' checksums: the serialization and the checksum are work the
+/// block thread does for every other block as it stores it, and the
+/// comparison is the reader's alone.  The third is how many records the
+/// database then wrote as they stood.  It is below the first by the
+/// blocks the chain did not store, and a database that wrote none of the
+/// records laid out for it laid every one of them out again.
+pub fn shutdown_line(records_written: u64) -> Option<String> {
     let load = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
     if load(&STATS.frames) == 0 {
         return None;
@@ -898,7 +982,8 @@ pub fn shutdown_line() -> Option<String> {
         "Read-ahead: {} blocks ({} bytes) on {} connections; checksum and decode {} s and \
          hashing {} s done off the block thread; the reader waited {} s for the block thread; \
          the block thread waited {} s for the reader; at most {} items queued; index queue \
-         full for {} s",
+         full for {} s; block-file records laid out for {} blocks in {} s, {} written as laid \
+         out",
         load(&STATS.blocks),
         load(&STATS.block_bytes),
         load(&STATS.connections),
@@ -908,6 +993,9 @@ pub fn shutdown_line() -> Option<String> {
         seconds(load(&STATS.handler_waited_nanos)),
         load(&STATS.max_queued),
         seconds(crate::indexes::notify_blocked_nanos()),
+        load(&STATS.records),
+        seconds(load(&STATS.record_nanos)),
+        records_written,
     ))
 }
 
@@ -917,7 +1005,12 @@ pub fn shutdown_line() -> Option<String> {
 mod tests {
     use super::*;
 
-    use dcroxide_wire::{BlockHeader, MsgBlock, MsgPing};
+    use dcroxide_wire::{
+        BlockHeader, CurrencyNet, MESSAGE_HEADER_SIZE, MsgBlock, MsgPing, MsgTx, TxOut,
+    };
+
+    /// The network the scripted frames are for.
+    const NET: CurrencyNet = CurrencyNet::REG_NET;
 
     /// How long a test waits for something that must happen.
     const PATIENCE: Duration = Duration::from_secs(10);
@@ -929,6 +1022,10 @@ mod tests {
     enum Step {
         /// The frame arrives at once, having taken this many bytes.
         Frame(Message, u64),
+        /// The message arrives at once with the bytes it is said to have
+        /// been decoded from, a message header and then the payload, as
+        /// the transport keeps them for a block.
+        Kept(Message, Vec<u8>),
         /// The frame arrives once the test opens the gate.
         Gated(Message, u64),
         /// The read fails at once, having taken this many bytes.
@@ -959,6 +1056,8 @@ mod tests {
         gate: mpsc::Receiver<()>,
         /// What `since` answered when a gated read was let through.
         since_at_gate: mpsc::Sender<Option<Instant>>,
+        /// The frame of the last read, if the script gave it one.
+        frame: Option<BlockFrame>,
     }
 
     impl FrameReader for Scripted {
@@ -968,9 +1067,19 @@ mod tests {
                 since_at_start: since(),
             });
             self.index += 1;
+            self.frame = None;
             match self.steps.pop_front() {
                 Some(Step::Frame(msg, bytes)) => {
                     self.total += bytes;
+                    Ok(msg)
+                }
+                Some(Step::Kept(msg, buf)) => {
+                    self.total += buf.len() as u64;
+                    self.frame = Some(BlockFrame {
+                        buf,
+                        payload_at: MESSAGE_HEADER_SIZE,
+                        net: NET,
+                    });
                     Ok(msg)
                 }
                 Some(Step::Gated(msg, bytes)) => {
@@ -1003,6 +1112,10 @@ mod tests {
         fn take_decode_nanos(&mut self) -> u64 {
             0
         }
+
+        fn take_block_frame(&mut self) -> Option<BlockFrame> {
+            self.frame.take()
+        }
     }
 
     /// A reader thread over a script, and the handler's side of its
@@ -1020,6 +1133,14 @@ mod tests {
         /// Start a reader thread over the script, as a connection does
         /// behind a block it wants read ahead of.
         fn start(steps: Vec<Step>) -> Rig {
+            Rig::start_counting(steps, None)
+        }
+
+        /// [`Rig::start`] with the reader's own work counted in the
+        /// given counters, where it is otherwise counted in the
+        /// process's, which every reader thread of this test binary
+        /// moves.
+        fn start_counting(steps: Vec<Step>, stats: Option<Arc<Stats>>) -> Rig {
             let cancel = Cancel::new();
             let shared = Arc::new(Shared::new(cancel.clone()));
             let (started_tx, started) = mpsc::channel();
@@ -1033,9 +1154,12 @@ mod tests {
                 started: started_tx,
                 gate: gate_rx,
                 since_at_gate: since_tx,
+                frame: None,
             };
             let reader_shared = Arc::clone(&shared);
-            let reader = std::thread::spawn(move || reader_loop(scripted, &reader_shared));
+            let reader = std::thread::spawn(move || {
+                reader_loop(scripted, &reader_shared, stats.as_deref().unwrap_or(&STATS));
+            });
             Rig {
                 shared,
                 cancel,
@@ -1126,6 +1250,28 @@ mod tests {
     /// A ping with the nonce.
     fn ping(nonce: u64) -> Message {
         Message::Ping(MsgPing { nonce })
+    }
+
+    /// A block with one transaction, told apart by its header's nonce,
+    /// and the frame a peer sends it in.
+    fn block_and_frame(nonce: u32) -> (MsgBlock, Vec<u8>) {
+        let Message::Block(mut block) = block(nonce) else {
+            unreachable!("a block");
+        };
+        let mut tx = MsgTx::default();
+        tx.tx_out.push(TxOut {
+            value: i64::from(nonce),
+            version: 0,
+            pk_script: vec![0x51; 40],
+        });
+        block.transactions.push(tx);
+        let frame = dcroxide_wire::write_message(
+            &Message::Block(block.clone()),
+            dcroxide_wire::PROTOCOL_VERSION,
+            NET,
+        )
+        .expect("frame the block");
+        (block, frame)
     }
 
     /// A frame of the script.
@@ -1629,11 +1775,15 @@ mod tests {
             fn take_decode_nanos(&mut self) -> u64 {
                 0
             }
+
+            fn take_block_frame(&mut self) -> Option<BlockFrame> {
+                None
+            }
         }
 
         let shared = Arc::new(Shared::new(Cancel::new()));
         let reader_shared = Arc::clone(&shared);
-        let reader = std::thread::spawn(move || reader_loop(Panicking, &reader_shared));
+        let reader = std::thread::spawn(move || reader_loop(Panicking, &reader_shared, &STATS));
         assert!(reader.join().is_err(), "the reader thread panicked");
 
         let (answered_tx, answered) = mpsc::channel();
@@ -1683,6 +1833,95 @@ mod tests {
         }
     }
 
+    /// A block the reader is handed with the frame it was decoded from
+    /// goes to the handler with that frame's payload laid out as its
+    /// block-file record, for the frame's network and in the frame's own
+    /// buffer: the payload is not copied on the way.  A block read
+    /// without a frame goes without a record, and so does one whose
+    /// frame holds anything but its serialization: a byte more, or
+    /// another block of the same length.  The block and its hashes
+    /// arrive either way, and only the records that were kept are
+    /// counted.
+    #[test]
+    fn a_block_is_handed_over_with_its_frame_laid_out_as_its_record() {
+        use dcroxide_database::BlockRecord;
+
+        let (kept, mut kept_frame) = block_and_frame(1);
+        let (bare, bare_frame) = block_and_frame(2);
+        let (longer, mut longer_frame) = block_and_frame(3);
+        longer_frame.push(0);
+        let (paired, paired_frame) = block_and_frame(4);
+        let (_, another_frame) = block_and_frame(5);
+        assert_eq!(another_frame.len(), paired_frame.len());
+
+        // Room behind the payload for the record's checksum, as the
+        // transport reserves it, and where the payload lies: the record
+        // must be laid out around it there.
+        kept_frame.reserve_exact(BlockRecord::SUFFIX_LEN);
+        let payload_at = kept_frame[MESSAGE_HEADER_SIZE..].as_ptr();
+        let kept_wire = kept_frame.clone();
+
+        // The reader's work is counted in counters of this test's own:
+        // the process's are moved by every reader thread of this binary.
+        let stats = Arc::new(Stats::new());
+        let rig = Rig::start_counting(
+            vec![
+                Step::Kept(Message::Block(kept.clone()), kept_frame),
+                Step::Frame(Message::Block(bare.clone()), bare_frame.len() as u64),
+                Step::Kept(Message::Block(longer.clone()), longer_frame),
+                Step::Kept(Message::Block(paired.clone()), another_frame),
+            ],
+            Some(Arc::clone(&stats)),
+        );
+        let take = || match rig.shared.next().result {
+            Ok(Received::Block(hashed)) => hashed,
+            Ok(Received::Message { msg, .. }) => panic!("not hashed: {msg:?}"),
+            Err(e) => panic!("the stream ended early: {e}"),
+        };
+
+        let hashed = take();
+        assert_eq!(**hashed.block(), kept);
+        let record = hashed.record().expect("the frame's payload was kept");
+        assert_eq!(record.block(), kept.serialize());
+        assert_eq!(record.block(), &kept_wire[MESSAGE_HEADER_SIZE..]);
+        assert_eq!(
+            record.block().as_ptr(),
+            payload_at,
+            "the payload was copied on its way to the record"
+        );
+        assert_eq!(record.hash(), hashed.hash());
+        assert_eq!(record.network(), NET.0);
+        // The record's leading fields, laid over the end of the frame's
+        // header: the network and the block's length.
+        let prefix = [
+            NET.0.to_le_bytes(),
+            (kept.serialize_size() as u32).to_le_bytes(),
+        ]
+        .concat();
+        assert_eq!(record.as_bytes()[..8], prefix);
+        assert_eq!(
+            record.as_bytes().len(),
+            kept_wire.len() - MESSAGE_HEADER_SIZE + 12
+        );
+
+        for (block, what) in [
+            (bare, "no frame"),
+            (longer, "a byte behind the block"),
+            (paired, "another block's frame"),
+        ] {
+            let hashed = take();
+            assert_eq!(**hashed.block(), block, "{what}");
+            assert_eq!(*hashed.hash(), block.header.block_hash(), "{what}");
+            hashed.tx_hashes().assert_for(hashed.block());
+            assert!(hashed.record().is_none(), "{what}");
+        }
+        rig.finish();
+        // Four blocks read, one record: the shutdown line counts the
+        // records that were kept, not the frames that were offered.
+        assert_eq!(stats.blocks.load(Ordering::Relaxed), 4, "blocks read");
+        assert_eq!(stats.records.load(Ordering::Relaxed), 1, "records laid out");
+    }
+
     /// The shutdown line reports times in seconds to the millisecond,
     /// and exists once a reader thread has read something.
     #[test]
@@ -1695,7 +1934,7 @@ mod tests {
         let rig = Rig::start(vec![Step::Frame(block(0), 180)]);
         assert_eq!(rig.take(), block(0));
         rig.finish();
-        let line = shutdown_line().expect("a reader thread read a block");
+        let line = shutdown_line(7).expect("a reader thread read a block");
         assert!(line.starts_with("Read-ahead: "), "{line}");
         for part in [
             " blocks (",
@@ -1706,9 +1945,12 @@ mod tests {
             " s for the block thread; the block thread waited ",
             " s for the reader; at most ",
             " items queued; index queue full for ",
+            " s; block-file records laid out for ",
+            " blocks in ",
         ] {
             assert!(line.contains(part), "{part:?} is missing from: {line}");
         }
-        assert!(line.ends_with(" s"), "{line}");
+        // The line ends with the count it was handed, the database's.
+        assert!(line.ends_with(" s, 7 written as laid out"), "{line}");
     }
 }

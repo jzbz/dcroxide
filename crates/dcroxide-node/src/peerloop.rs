@@ -244,14 +244,15 @@ pub trait ServeHooks {
     /// A block arrived that the connection's reader thread read, ahead
     /// of this loop or in turn, and hashed ([`crate::readahead`]): the
     /// block with its block hash and the hashes of its transactions, all
-    /// computed from it.  The loop gives it exactly the handling a
+    /// computed from it, and with the payload it was read in laid out as
+    /// its block-file record.  The loop gives it exactly the handling a
     /// `block` message gets, with the hash it carries in place of one
     /// computed here.
     ///
-    /// The default hands the block on as the message it arrived as, so
-    /// an implementation that has no use for the hashes sees every block
-    /// through [`on_message`](ServeHooks::on_message), whichever thread
-    /// read it.
+    /// The default hands the block on as the message it arrived as,
+    /// without the hashes and the record, so an implementation that has
+    /// no use for them sees every block through
+    /// [`on_message`](ServeHooks::on_message), whichever thread read it.
     fn on_block(
         &mut self,
         peer: &Mutex<Peer>,

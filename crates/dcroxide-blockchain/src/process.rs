@@ -444,7 +444,9 @@ pub struct Chain {
 /// pointer (`process.go:571`).  A caller here either lends the block and
 /// keeps its own, in which case the `blocks` mirror gets a copy, or
 /// shares the allocation, in which case the mirror holds the same one and
-/// nothing is copied.  A shared block may arrive with its hashes.
+/// nothing is copied.  A shared block may arrive with its hashes, and
+/// then also with the bytes it was decoded from, as its record for the
+/// block files ([`HashedBlock::record`]).
 #[derive(Clone, Copy)]
 enum ArrivingBlock<'a> {
     /// The caller keeps the block.
@@ -4449,9 +4451,24 @@ impl Chain {
             params,
         );
         if let Some(db) = &self.db {
-            let stored = db.update(|tx| match tx.store_block(block) {
-                Err(err) if err.kind == dcroxide_database::ErrorKind::BlockExists => Ok(()),
-                stored => stored,
+            // A block that arrived with the bytes it was decoded from
+            // laid out as its record is stored as that record, as dcrd's
+            // `StoreBlock` writes the bytes its block was made from
+            // (`ffldb/db.go:1175`, `dcrutil/block.go:54-58`; made in
+            // `OnBlock`, `server.go:1359`).  They were compared with the
+            // bytes `store_block` serializes before the record was kept
+            // (`HashedBlock::keep_wire_bytes`), so what is stored does
+            // not depend on how the block arrived.
+            let record = arriving.hashed().and_then(HashedBlock::record);
+            let stored = db.update(|tx| {
+                let stored = match record {
+                    Some(record) => tx.store_block_record(&block_hash, record),
+                    None => tx.store_block(block),
+                };
+                match stored {
+                    Err(err) if err.kind == dcroxide_database::ErrorKind::BlockExists => Ok(()),
+                    stored => stored,
+                }
             });
             if let Err(err) = stored {
                 return Err(persist_rule_error(crate::chaindb::ChainDbError::Db(err)));
@@ -4578,7 +4595,10 @@ impl Chain {
     /// [`Self::process_shared_block`] for a block that arrives with its
     /// hashes, made before it reached the chain ([`HashedBlock`]): the
     /// same checks in the same order and the same results, with the
-    /// block's transactions not hashed again here.
+    /// block's transactions not hashed again here.  A block that also
+    /// carries its record for the block files ([`HashedBlock::record`])
+    /// is stored as that record where another block is serialized, which
+    /// leaves the same bytes in the block files.
     ///
     /// The hashes are consulted exactly where [`Self::process_block`]
     /// computes them, which is after the duplicate, known-invalid and

@@ -67,7 +67,7 @@ use std::fs::OpenOptions;
 use std::io::Write;
 
 use dcroxide_chainhash::Hash;
-use dcroxide_database::{Database, ErrorKind, Options};
+use dcroxide_database::{BlockRecord, Database, Error, ErrorKind, Options, Transaction};
 use dcroxide_testutil::SplitMix64;
 use dcroxide_wire::{BlockHeader, MsgBlock, MsgTx, OutPoint, TxIn, TxOut, TxSerializeType};
 use tempfile::TempDir;
@@ -107,6 +107,20 @@ fn make_block(rng: &mut SplitMix64) -> MsgBlock {
         }],
         stransactions: Vec::new(),
     }
+}
+
+/// Store the block laid out as its block-file record ahead of the
+/// transaction, as a block that arrives with the bytes it was read in is
+/// stored (`Transaction::store_block_record`): the commit writes the
+/// record as it stands where `store_block` has it serialize the block
+/// and lay the record out.
+fn store_as_record(tx: &Transaction, block: &MsgBlock) -> Result<(), Error> {
+    // A message header's worth of other bytes ahead of the block, as in
+    // the frame a block is read in.
+    let mut frame = vec![0u8; 24];
+    frame.extend_from_slice(&block.serialize());
+    let record = BlockRecord::lay_out(frame, 24, NET).expect("a record");
+    tx.store_block_record(&block.header.block_hash(), &Arc::new(record))
 }
 
 /// Torn write: block bytes hit the flat file but the metadata commit
@@ -505,6 +519,10 @@ fn paired_commits_never_desync_under_repeated_tears() {
 /// must never happen is a block that recovery keeps while the metadata
 /// naming it is gone, or metadata naming a block whose bytes were rolled
 /// back.
+///
+/// Each transaction stores two blocks, one handed in as itself and one
+/// laid out as its record ahead of the commit, so the rollback is shown
+/// for both ways a block reaches the files.
 #[test]
 fn block_data_and_its_metadata_roll_back_together() {
     let dir = TempDir::new().expect("tempdir");
@@ -512,50 +530,57 @@ fn block_data_and_its_metadata_roll_back_together() {
     let mut rng = SplitMix64::from_entropy("db-crash-domains");
 
     let db = Database::create(&opts).expect("create");
+    // Two blocks and the metadata rows naming them, one transaction.
+    let store_pair = |pair: &[MsgBlock; 2], value: &[u8]| {
+        db.update(|tx| {
+            tx.store_block(&pair[0])?;
+            store_as_record(tx, &pair[1])?;
+            let b = tx.metadata().create_bucket_if_not_exists(IDX_BUCKET)?;
+            for block in pair {
+                b.put(&block.header.block_hash().0, value)?;
+            }
+            Ok(())
+        })
+    };
 
-    // Durable: a block plus the metadata row naming it, one transaction.
-    let kept = make_block(&mut rng);
-    let kept_hash = kept.header.block_hash();
-    db.update(|tx| {
-        tx.store_block(&kept)?;
-        let b = tx.metadata().create_bucket_if_not_exists(IDX_BUCKET)?;
-        b.put(&kept_hash.0, b"kept")?;
-        Ok(())
-    })
-    .expect("store kept");
+    // Durable.
+    let kept = [make_block(&mut rng), make_block(&mut rng)];
+    store_pair(&kept, b"kept").expect("store kept");
     db.flush().expect("flush");
 
     // Not durable: the same pairing, lost to the crash.
-    let lost = make_block(&mut rng);
-    let lost_hash = lost.header.block_hash();
-    db.update(|tx| {
-        tx.store_block(&lost)?;
-        let b = tx.metadata().create_bucket_if_not_exists(IDX_BUCKET)?;
-        b.put(&lost_hash.0, b"lost")?;
-        Ok(())
-    })
-    .expect("store lost");
+    let lost = [make_block(&mut rng), make_block(&mut rng)];
+    store_pair(&lost, b"lost").expect("store lost");
+    // One block of each pair went to the files as the record it was
+    // handed in as.
+    assert_eq!(db.records_written_as_laid_out(), 2);
     drop(db);
 
     let db = Database::open(&opts).expect("reopen");
     db.view(|tx| {
         let b = tx.metadata().bucket(IDX_BUCKET).expect("index bucket");
 
-        // The durable pair survived intact, both halves.
-        assert_eq!(
-            tx.fetch_block(&kept_hash, kept.header.height)?,
-            kept.serialize()
-        );
-        assert_eq!(b.get(&kept_hash.0).as_deref(), Some(b"kept".as_slice()));
+        // The durable pairs survived intact, both halves.
+        for block in &kept {
+            let hash = block.header.block_hash();
+            assert_eq!(
+                tx.fetch_block(&hash, block.header.height)?,
+                block.serialize()
+            );
+            assert_eq!(b.get(&hash.0).as_deref(), Some(b"kept".as_slice()));
+        }
 
-        // The torn pair is gone, both halves. Either half surviving alone
-        // is the desync this test exists to catch.
-        let has_block = tx.has_block(&lost_hash, lost.header.height)?;
-        let has_meta = b.get(&lost_hash.0).is_some();
-        assert!(
-            !has_block && !has_meta,
-            "torn commit half-survived: block={has_block} metadata={has_meta}"
-        );
+        // The torn pairs are gone, both halves. Either half surviving
+        // alone is the desync this test exists to catch.
+        for block in &lost {
+            let hash = block.header.block_hash();
+            let has_block = tx.has_block(&hash, block.header.height)?;
+            let has_meta = b.get(&hash.0).is_some();
+            assert!(
+                !has_block && !has_meta,
+                "torn commit half-survived: block={has_block} metadata={has_meta}"
+            );
+        }
         Ok(())
     })
     .expect("view");
@@ -795,7 +820,9 @@ fn power_loss_before_a_flush_stays_internally_consistent() {
 /// writes its row in the internal block index, keyed by its height and
 /// then its hash (ADR-0010), so this stores blocks at heights whose
 /// bytes cross the boundaries a byte-order mistake would show at, some
-/// flushed and some not, and cuts the power.
+/// flushed and some not, and cuts the power.  Every other block is
+/// handed in laid out as its record ahead of the commit, so both ways a
+/// block reaches the files meet the power cut on both sides of the flush.
 #[test]
 fn power_loss_keeps_flushed_blocks_under_their_heights() {
     let dir = TempDir::new().expect("tempdir");
@@ -817,13 +844,25 @@ fn power_loss_keeps_flushed_blocks_under_their_heights() {
         .collect();
 
     let db = Database::create(&opts).expect("create");
-    db.update(|tx| durable.iter().try_for_each(|block| tx.store_block(block)))
+    let store_all = |tx: &Transaction, blocks: &[MsgBlock]| {
+        blocks.iter().enumerate().try_for_each(|(i, block)| {
+            if i % 2 == 1 {
+                store_as_record(tx, block)
+            } else {
+                tx.store_block(block)
+            }
+        })
+    };
+    db.update(|tx| store_all(tx, &durable))
         .expect("store the durable blocks");
     db.flush().expect("flush");
     // Committed to the cache but never flushed: the window a power cut
     // eats.
-    db.update(|tx| lost.iter().try_for_each(|block| tx.store_block(block)))
+    db.update(|tx| store_all(tx, &lost))
         .expect("store the lost blocks");
+    // Two blocks on each side of the flush went to the files as the
+    // records they were handed in as.
+    assert_eq!(db.records_written_as_laid_out(), 4);
     drop(db);
     backend.cut_power();
 

@@ -55,7 +55,10 @@ const RECENTLY_CONFIRMED_TXNS_FP_RATE: f64 = 0.000001;
 /// been hashed yet: a block the connection's reader thread read ahead
 /// arrives with its hashes ([`crate::readahead`]), and every other block
 /// arrives without and is hashed inside the chain, where dcrd's
-/// `ProcessBlock` first asks for them.
+/// `ProcessBlock` first asks for them.  A block that arrives hashed also
+/// carries the payload it was read in, as its record for the block
+/// files, which the chain writes where it serializes every other block
+/// (`HashedBlock::record`).
 pub enum ArrivedBlock {
     /// The block as it was decoded.
     Plain(Arc<MsgBlock>),

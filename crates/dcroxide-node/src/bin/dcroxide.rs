@@ -1635,8 +1635,15 @@ fn run_node(cfg: Config) -> ExitCode {
         ));
     }
     // What reading ahead of the block handler did, if it did anything
-    // (dcrd has no such line).
-    if let Some(line) = dcroxide_node::readahead::shutdown_line() {
+    // (dcrd has no such line), with how many of the block-file records
+    // the reader threads laid out the database wrote as they stood.
+    let records_written = chain
+        .lock()
+        .expect("chain mutex poisoned")
+        .db
+        .as_ref()
+        .map_or(0, dcroxide_database::Database::records_written_as_laid_out);
+    if let Some(line) = dcroxide_node::readahead::shutdown_line(records_written) {
         dcroxide_node::logging::info("SRVR", &line);
     }
     dcroxide_node::logging::info("SRVR", "Server shutdown complete");

@@ -204,7 +204,7 @@ fn expect_handled(handled: &mpsc::Receiver<Handled>, block: Option<u32>) -> Hand
 #[test]
 fn the_shutdown_line_reports_the_figures_of_a_known_stream() {
     assert_eq!(
-        dcroxide_node::readahead::shutdown_line(),
+        dcroxide_node::readahead::shutdown_line(0),
         None,
         "nothing has been read ahead in this process yet"
     );
@@ -294,7 +294,9 @@ fn the_shutdown_line_reports_the_figures_of_a_known_stream() {
         "{reason:?}"
     );
 
-    let line = dcroxide_node::readahead::shutdown_line().expect("a reader thread read blocks");
+    // No database runs here: the count of records one wrote as they
+    // were handed to it is the caller's to give, and the line repeats it.
+    let line = dcroxide_node::readahead::shutdown_line(3).expect("a reader thread read blocks");
     // Every block but the first was read by the reader thread, on the
     // one connection there was.
     assert_eq!(count(&line, "Read-ahead: ", " blocks ("), 8, "{line}");
@@ -347,5 +349,26 @@ fn the_shutdown_line_reports_the_figures_of_a_known_stream() {
     );
 
     // No index thread runs here.
-    assert!(line.ends_with("; index queue full for 0.000 s"), "{line}");
+    assert_eq!(
+        time(
+            &line,
+            "; index queue full for ",
+            " s; block-file records laid out for "
+        ),
+        Duration::ZERO,
+        "{line}"
+    );
+
+    // Every block the reader thread read went to the handler with its
+    // payload laid out as its block-file record, which took the reader
+    // time: the large block's comparison and checksum alone are over
+    // hundreds of kilobytes.
+    assert_eq!(
+        count(&line, "; block-file records laid out for ", " blocks in "),
+        8,
+        "{line}"
+    );
+    let laid_out = time(&line, " blocks in ", " s, 3 written as laid out");
+    assert!(laid_out < PATIENCE, "{line}");
+    assert!(line.ends_with(" s, 3 written as laid out"), "{line}");
 }

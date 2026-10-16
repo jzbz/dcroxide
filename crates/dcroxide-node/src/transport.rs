@@ -33,6 +33,7 @@ use std::time::{Duration, Instant};
 
 use crate::socktimeout::SocketTimeout;
 
+use dcroxide_database::BlockRecord;
 use dcroxide_peer::MsgTransport;
 use dcroxide_wire::{
     CurrencyNet, MESSAGE_HEADER_SIZE, Message, read_message as wire_read_message,
@@ -331,7 +332,33 @@ pub struct WireTransport<S> {
     /// last taken ([`WireTransport::take_decode_nanos`]).  The reads the
     /// input thread makes itself are not timed.
     decode_nanos: u64,
+    /// The frame the last read with [`BudgetStart::Waiter`] decoded its
+    /// block from, until it is taken
+    /// ([`WireTransport::take_block_frame`]).  `None` after every other
+    /// read: one that failed, one that gave another message, and every
+    /// read the input thread makes itself.
+    block_frame: Option<BlockFrame>,
 }
+
+/// A `block` message as it came off the wire, kept by the read that
+/// decoded it so that the block's bytes can go to the block files as
+/// they are (`dcroxide_blockchain::HashedBlock::keep_wire_bytes`): what
+/// dcrd's `OnBlock` is handed beside the message, `buf`
+/// (`server.go:1356-1359`).
+pub(crate) struct BlockFrame {
+    /// The frame: the message header and then the payload, with room
+    /// reserved behind it for the checksum a block-file record ends with.
+    pub(crate) buf: Vec<u8>,
+    /// Where the payload starts in `buf`.  The header ahead of it is
+    /// more than the room a block-file record needs ahead of its block.
+    pub(crate) payload_at: usize,
+    /// The network the frame was read for.
+    pub(crate) net: CurrencyNet,
+}
+
+// A block-file record is laid out around the payload in the frame's own
+// buffer, with its leading fields over the end of the message header.
+const _: () = assert!(MESSAGE_HEADER_SIZE >= BlockRecord::PREFIX_LEN);
 
 impl<S> WireTransport<S> {
     /// Wrap a stream, framing messages for the given protocol version
@@ -350,6 +377,7 @@ impl<S> WireTransport<S> {
             read_timeout_armed: None,
             write_timeout_armed: false,
             decode_nanos: 0,
+            block_frame: None,
         }
     }
 
@@ -424,6 +452,22 @@ impl<S> WireTransport<S> {
     /// nanoseconds.
     pub(crate) fn take_decode_nanos(&mut self) -> u64 {
         std::mem::take(&mut self.decode_nanos)
+    }
+
+    /// The frame the last read decoded its block from, when that read
+    /// was made with [`BudgetStart::Waiter`] and gave a block.  It is
+    /// handed out once, and a frame that is not taken is dropped as the
+    /// next read begins, so a frame is only ever paired with the block
+    /// that was decoded from it.
+    ///
+    /// What is stored does not rest on that pairing.  The frame's
+    /// payload is compared with its block's serialization before it is
+    /// kept as the block's record
+    /// (`dcroxide_blockchain::HashedBlock::keep_wire_bytes`), so a frame
+    /// that met another read's block would be dropped there, and the
+    /// block stored as one that came without a frame.
+    pub(crate) fn take_block_frame(&mut self) -> Option<BlockFrame> {
+        self.block_frame.take()
     }
 }
 
@@ -716,7 +760,15 @@ impl<S: Read + Write + SocketTimeout> WireTransport<S> {
         let header = wire_read_message_header(&buf, self.pver, self.net)
             .map_err(|e| dcroxide_peer::ReadError::wire(e.to_string()))?;
         let payload_len = header.payload_len as usize;
+        let for_waiter = matches!(start, BudgetStart::Waiter(_));
         if payload_len > 0 {
+            // A read made for a waiter may hand its buffer on as a
+            // block-file record ([`BlockFrame`]), which ends with a
+            // checksum behind the payload: room for it is reserved with
+            // the payload, so that appending it does not move the block.
+            if for_waiter {
+                buf.reserve_exact(payload_len.saturating_add(BlockRecord::SUFFIX_LEN));
+            }
             buf.resize(MESSAGE_HEADER_SIZE.saturating_add(payload_len), 0);
             read_exact_by_deadline(
                 &mut self.stream,
@@ -746,7 +798,7 @@ impl<S: Read + Write + SocketTimeout> WireTransport<S> {
         //
         // A read made for a waiter is timed here, over the checksum and
         // the decode: two clock reads a message, on that reader's thread.
-        let timed = matches!(start, BudgetStart::Waiter(_)).then(Instant::now);
+        let timed = for_waiter.then(Instant::now);
         let decoded = wire_read_message(&buf, self.pver, self.net);
         if let Some(began) = timed {
             let nanos = u64::try_from(began.elapsed().as_nanos()).unwrap_or(u64::MAX);
@@ -759,6 +811,18 @@ impl<S: Read + Write + SocketTimeout> WireTransport<S> {
                 dcroxide_peer::ReadError::wire(e.to_string())
             }
         })?;
+        // A block read for a waiter keeps the frame it was decoded from.
+        // The decode consumed the whole payload and nothing else
+        // (`dcroxide_wire::read_message` refuses trailing bytes, as
+        // dcrd's `ReadMessageN` does), so the payload is the bytes of
+        // this block and of nothing more.
+        if for_waiter && matches!(msg, Message::Block(_)) {
+            self.block_frame = Some(BlockFrame {
+                buf,
+                payload_at: MESSAGE_HEADER_SIZE,
+                net: self.net,
+            });
+        }
         Ok(msg)
     }
 
@@ -776,6 +840,9 @@ impl<S: Read + Write + SocketTimeout> WireTransport<S> {
         // total, before either looks at the error (`peer/peer.go`,
         // `server.go` `serverPeer.OnRead`).
         let mut got = 0usize;
+        // A frame the read before this one kept and nobody took belongs
+        // to that read's block, not to whatever this one gives.
+        self.block_frame = None;
         let result = self.read_framed(&mut got, start);
         self.bytes_read = self.bytes_read.saturating_add(got as u64);
         if let Some(totals) = &self.net_totals {
@@ -1885,5 +1952,184 @@ mod tests {
             "the failure must name the local teardown, got: {}",
             err.message
         );
+    }
+
+    /// A block read for a waiter keeps the frame it was decoded from,
+    /// whole and with room behind it for a block-file record's checksum,
+    /// and hands it out once.  The frame goes with that read's block
+    /// only: one that was not taken is gone when the next read begins,
+    /// whatever that read gives.  A read the input thread makes itself
+    /// keeps nothing.
+    #[test]
+    fn a_block_read_for_a_waiter_keeps_the_frame_it_was_decoded_from() {
+        use dcroxide_wire::{BlockHeader, MsgBlock, MsgTx, TxOut};
+
+        // A network other than the main one, so that the network a kept
+        // frame names is seen to be this transport's own.
+        const NET: CurrencyNet = CurrencyNet::SIM_NET;
+
+        let block = |nonce: u32| {
+            let (mut header, _) = BlockHeader::from_bytes(&[0u8; 180]).expect("zero header");
+            header.nonce = nonce;
+            let mut tx = MsgTx::default();
+            tx.tx_out.push(TxOut {
+                value: i64::from(nonce),
+                version: 0,
+                pk_script: vec![0x51; 300],
+            });
+            Message::Block(MsgBlock {
+                header,
+                transactions: vec![tx],
+                stransactions: Vec::new(),
+            })
+        };
+        let frame =
+            |msg: &Message| wire_write_message(msg, MAX_PROTOCOL_VERSION, NET).expect("frame");
+        let frames = [
+            frame(&block(1)),
+            frame(&block(2)),
+            frame(&Message::Ping(MsgPing { nonce: 9 })),
+            frame(&block(4)),
+            {
+                // A whole block frame with a bad checksum.
+                let mut bad = frame(&block(5));
+                bad[PAYLOAD_LEN_OFFSET + 4] ^= 0xff;
+                bad
+            },
+        ];
+        let input = frames.concat();
+        let since = || None;
+
+        let mut paced = WireTransport::new(Cursor::new(input.clone()), MAX_PROTOCOL_VERSION, NET);
+        assert!(paced.take_block_frame().is_none(), "nothing was read yet");
+        let msg = paced
+            .read_message_paced(BudgetStart::Waiter(&since))
+            .expect("the first block");
+        assert_eq!(msg, block(1));
+        let kept = paced.take_block_frame().expect("the block's frame");
+        assert_eq!(kept.buf, frames[0], "the frame as it came off the wire");
+        assert_eq!(kept.payload_at, MESSAGE_HEADER_SIZE);
+        assert_eq!(kept.net, NET);
+        assert!(
+            kept.buf.capacity() >= kept.buf.len() + BlockRecord::SUFFIX_LEN,
+            "room for the checksum: {} of {}",
+            kept.buf.len(),
+            kept.buf.capacity()
+        );
+        let Message::Block(decoded) = &msg else {
+            panic!("a block");
+        };
+        assert_eq!(kept.buf[kept.payload_at..], decoded.serialize());
+        assert!(paced.take_block_frame().is_none(), "handed out once");
+
+        // The second block's frame is not taken, and is not handed out
+        // with the ping read behind it.
+        paced
+            .read_message_paced(BudgetStart::Waiter(&since))
+            .expect("the second block");
+        let msg = paced
+            .read_message_paced(BudgetStart::Waiter(&since))
+            .expect("the ping");
+        assert!(matches!(msg, Message::Ping(_)));
+        assert!(paced.take_block_frame().is_none(), "a ping keeps no frame");
+
+        // Nor is the fourth block's with the failed read behind it.
+        paced
+            .read_message_paced(BudgetStart::Waiter(&since))
+            .expect("the fourth block");
+        paced
+            .read_message_paced(BudgetStart::Waiter(&since))
+            .expect_err("a bad checksum");
+        assert!(
+            paced.take_block_frame().is_none(),
+            "a failed read keeps no frame"
+        );
+
+        // The input thread's own reads keep nothing.
+        let mut inline = WireTransport::new(Cursor::new(input), MAX_PROTOCOL_VERSION, NET);
+        assert_eq!(MsgTransport::read_message(&mut inline), Ok(block(1)));
+        assert!(inline.take_block_frame().is_none());
+        assert_eq!(
+            inline.read_message_paced(BudgetStart::WithRead),
+            Ok(block(2))
+        );
+        assert!(inline.take_block_frame().is_none());
+    }
+
+    /// A block of the largest payload a `block` message may carry is read
+    /// for a waiter into a buffer with the room its block-file record
+    /// needs, and the record is laid out around the payload where it was
+    /// read: the frame is the one allocation the block's bytes ever lie
+    /// in, from the socket to the block files.
+    #[test]
+    fn the_largest_block_is_laid_out_as_its_record_where_it_was_read() {
+        use std::sync::Arc;
+
+        use dcroxide_blockchain::HashedBlock;
+        use dcroxide_wire::{BlockHeader, MAX_BLOCK_PAYLOAD, MsgBlock, MsgTx, TxOut};
+
+        const NET: CurrencyNet = CurrencyNet::SIM_NET;
+        let (header, _) = BlockHeader::from_bytes(&[0u8; 180]).expect("zero header");
+        let mut block = MsgBlock {
+            header,
+            transactions: vec![MsgTx::default()],
+            stransactions: Vec::new(),
+        };
+        // One output whose script pads the block out to the limit.  Its
+        // length takes five bytes to write at any size tried here, so
+        // the block grows by exactly what the script grows by.
+        let script_len = |pad: usize| MAX_BLOCK_PAYLOAD as usize - pad;
+        block.transactions[0].tx_out.push(TxOut {
+            value: 1,
+            version: 0,
+            pk_script: vec![0x6a; script_len(1024)],
+        });
+        let over = block.serialize_size() - script_len(1024);
+        block.transactions[0].tx_out[0].pk_script = vec![0x6a; script_len(over)];
+        assert_eq!(block.serialize_size(), MAX_BLOCK_PAYLOAD as usize);
+
+        let msg = Message::Block(block.clone());
+        let frame = wire_write_message(&msg, MAX_PROTOCOL_VERSION, NET).expect("frame");
+        assert_eq!(
+            frame.len(),
+            MESSAGE_HEADER_SIZE + MAX_BLOCK_PAYLOAD as usize
+        );
+        // One byte more is not a block message.
+        let mut longer = block.clone();
+        longer.transactions[0].tx_out[0].pk_script.push(0x6a);
+        assert!(
+            wire_write_message(&Message::Block(longer), MAX_PROTOCOL_VERSION, NET).is_err(),
+            "the limit is the limit"
+        );
+
+        let since = || None;
+        let mut paced = WireTransport::new(Cursor::new(frame.clone()), MAX_PROTOCOL_VERSION, NET);
+        let read = paced
+            .read_message_paced(BudgetStart::Waiter(&since))
+            .expect("the block");
+        assert_eq!(read, msg);
+        let kept = paced.take_block_frame().expect("the block's frame");
+        assert_eq!(kept.buf, frame);
+        // The header's twenty-four bytes ahead of the payload and the
+        // checksum's four behind it: twenty-eight more than the payload.
+        assert_eq!(
+            kept.buf.capacity(),
+            MAX_BLOCK_PAYLOAD as usize + MESSAGE_HEADER_SIZE + BlockRecord::SUFFIX_LEN
+        );
+        let payload_at = kept.buf[kept.payload_at..].as_ptr();
+
+        let Message::Block(decoded) = read else {
+            panic!("a block");
+        };
+        let mut hashed = HashedBlock::new(Arc::new(decoded));
+        assert!(hashed.keep_wire_bytes(kept.buf, kept.payload_at, kept.net.0));
+        let record = hashed.record().expect("kept");
+        assert_eq!(record.block().as_ptr(), payload_at, "the payload moved");
+        assert_eq!(record.block(), &frame[MESSAGE_HEADER_SIZE..]);
+        assert_eq!(
+            record.as_bytes().len(),
+            MAX_BLOCK_PAYLOAD as usize + BlockRecord::PREFIX_LEN + BlockRecord::SUFFIX_LEN
+        );
+        assert_eq!(record.network(), NET.0);
     }
 }

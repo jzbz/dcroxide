@@ -35,6 +35,13 @@
 //! overlay's, and [`Transaction::on_commit`], which runs a closure once a
 //! commit's own flush has succeeded and before its rows are published.
 //!
+//! [`Transaction::store_block_record`] has none either.  It stores a
+//! block that was laid out as its block-file record ahead of the commit
+//! ([`BlockRecord`]), on whichever thread held its bytes, and leaves the
+//! file bytes and the index row that `store_block` leaves for the same
+//! block.  [`Database::records_written_as_laid_out`] counts the records
+//! that were written as they were handed in.
+//!
 //! [ADR-0004]: ../../../docs/adr/0004-storage-backend.md
 //! [ADR-0010]: ../../../docs/adr/0010-height-first-block-keys.md
 //! [ADR-0011]: ../../../docs/adr/0011-exists-address-layout-3-and-the-flush-participant.md
@@ -53,6 +60,7 @@ use std::sync::Condvar;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+pub use blockfile::BlockRecord;
 use blockfile::{BlockStore, deserialize_write_row, serialize_write_row};
 pub use bootstrap::ImportStats;
 pub use error::{Error, ErrorKind};
@@ -1703,6 +1711,26 @@ impl Database {
     /// a perfectly good block.
     pub fn is_fatal(&self) -> bool {
         self.inner.fatal.load(Ordering::SeqCst)
+    }
+
+    /// How many blocks this handle has written to the block files as the
+    /// record they were handed in as
+    /// ([`Transaction::store_block_record`]), where the record of every
+    /// other block is laid out by the commit that writes it.  A record
+    /// laid out for another network than the database's is not among
+    /// them, since the store lays out its own; one whose commit failed
+    /// after the write, and was rolled back, is.
+    ///
+    /// dcrd has no such figure.  It is for a person and for tests to
+    /// read, to tell that the work of laying records out was done before
+    /// the commit and not repeated in it: nothing in the store depends
+    /// on it, and it starts at zero with every open.
+    pub fn records_written_as_laid_out(&self) -> u64 {
+        self.inner
+            .block_store
+            .lock()
+            .expect("store lock")
+            .laid_out_written
     }
 
     /// Acquire everything a new transaction needs, in the safe order:

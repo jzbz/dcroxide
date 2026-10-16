@@ -6,8 +6,10 @@
 //! persistence across reopen, flat-file rollover, and the exact ffldb
 //! record byte format.
 
+use std::sync::Arc;
+
 use dcroxide_chainhash::Hash;
-use dcroxide_database::{BlockRegion, Database, Error, ErrorKind, Options};
+use dcroxide_database::{BlockRecord, BlockRegion, Database, Error, ErrorKind, Options};
 use dcroxide_testutil::SplitMix64;
 use dcroxide_wire::{BlockHeader, MsgBlock, MsgTx, OutPoint, TxIn, TxOut, TxSerializeType};
 use tempfile::TempDir;
@@ -393,4 +395,265 @@ fn block_index_rows(db: &Database) -> Vec<(Vec<u8>, Vec<u8>)> {
     })
     .expect("walk the block index");
     rows
+}
+
+/// The block laid out as its block-file record for the network, in a
+/// buffer that holds a message header's worth of other bytes ahead of
+/// it, as the frame a block is read in does.
+fn record_of(block: &MsgBlock, network: u32) -> Arc<BlockRecord> {
+    let mut buf = vec![0xa5u8; 24];
+    buf.extend_from_slice(&block.serialize());
+    Arc::new(BlockRecord::lay_out(buf, 24, network).expect("a record"))
+}
+
+/// Every block file of the database, by name.
+fn block_files(db_dir: &std::path::Path) -> Vec<(String, Vec<u8>)> {
+    let mut files: Vec<(String, Vec<u8>)> = std::fs::read_dir(db_dir)
+        .expect("read the database directory")
+        .map(|entry| entry.expect("entry").path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "fdb"))
+        .map(|path| {
+            let name = path
+                .file_name()
+                .expect("name")
+                .to_string_lossy()
+                .into_owned();
+            (name, std::fs::read(&path).expect("read block file"))
+        })
+        .collect();
+    files.sort();
+    files
+}
+
+/// Every row of the internal block index, whole: key, location and
+/// header.
+fn whole_block_index_rows(db: &Database) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let mut rows = Vec::new();
+    db.view(|tx| {
+        let bucket = tx
+            .metadata()
+            .bucket(b"ffldb-blockidx")
+            .expect("block index bucket");
+        bucket.for_each(|key, row| {
+            rows.push((key.to_vec(), row.to_vec()));
+            Ok(())
+        })
+    })
+    .expect("walk the block index");
+    rows
+}
+
+/// A block stored as a record laid out ahead is stored as `store_block`
+/// stores it: the same block files byte for byte across a rollover, the
+/// same index rows, the same answers inside the transaction that holds
+/// it pending and after its commit, and after a reopen.  That holds for
+/// a record laid out for another network too, which the store does not
+/// write.
+#[test]
+fn a_block_stored_as_a_laid_out_record_is_stored_as_store_block_stores_it() {
+    const OTHER_NET: u32 = 0x0102_0304;
+    let dir = TempDir::new().expect("tempdir");
+    let open = |name: &str| {
+        let mut opts = Options::new(dir.path().join(name), NET);
+        // Small enough to roll over several times.
+        opts.max_block_file_size = 2048;
+        (Database::create(&opts).expect("create"), opts)
+    };
+    let (serialized_db, serialized_opts) = open("serialized");
+    let (laid_db, laid_opts) = open("laid");
+    let mut rng = SplitMix64::from_entropy("db-block-record");
+
+    let blocks: Vec<MsgBlock> = (0..14).map(|_| make_block(&mut rng)).collect();
+    let hashes = keys_of(&blocks);
+    let serialized: Vec<Vec<u8>> = blocks.iter().map(MsgBlock::serialize).collect();
+
+    for (i, block) in blocks.iter().enumerate() {
+        let (hash, height) = hashes[i];
+        serialized_db
+            .update(|tx| tx.store_block(block))
+            .expect("store");
+
+        // Every third record is for another network.
+        let network = if i % 3 == 2 { OTHER_NET } else { NET };
+        let record = record_of(block, network);
+        assert_eq!(record.block(), serialized[i]);
+        assert_eq!(*record.hash(), hash);
+        laid_db
+            .update(|tx| {
+                assert!(!tx.has_block(&hash, height)?);
+                tx.store_block_record(&hash, &record)?;
+                // The transaction shares the record; it does not copy it.
+                assert_eq!(Arc::strong_count(&record), 2);
+
+                // Pending, it reads as a pending block does.
+                assert!(tx.has_block(&hash, height)?);
+                assert_eq!(tx.fetch_block(&hash, height)?, serialized[i]);
+                assert_eq!(tx.fetch_block_header(&hash, height)?, serialized[i][..180]);
+                let region = BlockRegion {
+                    hash,
+                    offset: 8,
+                    len: 12,
+                };
+                assert_eq!(
+                    tx.fetch_block_region(&region, height)?,
+                    serialized[i][8..20]
+                );
+                assert_eq!(
+                    tx.store_block_record(&hash, &record).err().map(kind_of),
+                    Some(ErrorKind::BlockExists)
+                );
+                assert_eq!(
+                    tx.store_block(block).err().map(kind_of),
+                    Some(ErrorKind::BlockExists)
+                );
+                Ok(())
+            })
+            .expect("store record");
+        // The transaction let go of the record when it ended.
+        assert_eq!(Arc::strong_count(&record), 1);
+    }
+
+    let compare = |serialized_db: &Database, laid_db: &Database, when: &str| {
+        let want = block_files(&serialized_opts.path);
+        assert!(want.len() > 2, "{when}: the blocks rolled over");
+        assert_eq!(block_files(&laid_opts.path), want, "{when}: block files");
+        assert_eq!(
+            whole_block_index_rows(laid_db),
+            whole_block_index_rows(serialized_db),
+            "{when}: index rows"
+        );
+        laid_db
+            .view(|tx| {
+                assert_eq!(tx.fetch_blocks(&hashes)?, serialized, "{when}");
+                Ok(())
+            })
+            .expect("view");
+    };
+    compare(&serialized_db, &laid_db, "committed");
+    // The records for this database's network were written as they were
+    // handed in; the four for another network were laid out again.
+    assert_eq!(laid_db.records_written_as_laid_out(), 10);
+    assert_eq!(serialized_db.records_written_as_laid_out(), 0);
+
+    // A stored block is refused again, as a record and as a block.
+    let again = record_of(&blocks[0], NET);
+    assert_eq!(
+        laid_db
+            .update(|tx| tx.store_block_record(&hashes[0].0, &again))
+            .err()
+            .map(kind_of),
+        Some(ErrorKind::BlockExists)
+    );
+    assert_eq!(Arc::strong_count(&again), 1);
+
+    for db in [&serialized_db, &laid_db] {
+        db.close().expect("close");
+    }
+    drop((serialized_db, laid_db));
+    let serialized_db = Database::open(&serialized_opts).expect("reopen");
+    let laid_db = Database::open(&laid_opts).expect("reopen");
+    compare(&serialized_db, &laid_db, "reopened");
+}
+
+/// A record is stored under the hash of the header its block begins
+/// with and under no other, in a writable transaction only, and a
+/// transaction that is rolled back leaves nothing of it.  The refusals
+/// are `store_block_raw`'s, text included.
+#[test]
+fn a_laid_out_record_is_refused_as_mismatched_bytes_are() {
+    let dir = TempDir::new().expect("tempdir");
+    let opts = Options::new(dir.path().join("db"), NET);
+    let db = Database::create(&opts).expect("create");
+    let mut rng = SplitMix64::from_entropy("db-block-record-refusals");
+    let block = make_block(&mut rng);
+    let (hash, height) = (block.header.block_hash(), block.header.height);
+    let record = record_of(&block, NET);
+
+    let wrong = Hash([9u8; 32]);
+    let err = db
+        .update(|tx| tx.store_block_record(&wrong, &record))
+        .expect_err("another hash");
+    let raw_err = db
+        .update(|tx| tx.store_block_raw(&wrong, block.serialize()))
+        .expect_err("another hash");
+    assert_eq!(err.kind, ErrorKind::DriverSpecific);
+    assert_eq!(
+        err.to_string(),
+        format!("block {wrong} was given bytes whose header hashes to {hash}")
+    );
+    assert_eq!(err.to_string(), raw_err.to_string());
+
+    let err = db
+        .view(|tx| tx.store_block_record(&hash, &record))
+        .expect_err("a read-only transaction");
+    assert_eq!(err.kind, ErrorKind::TxNotWritable);
+    // The hash is the last thing looked at, as `store_block_raw` looks
+    // at it last: a read-only transaction refuses a record under another
+    // hash as something it cannot write, not as a mismatch.
+    let err = db
+        .view(|tx| tx.store_block_record(&wrong, &record))
+        .expect_err("a read-only transaction and another hash");
+    let raw_err = db
+        .view(|tx| tx.store_block_raw(&wrong, block.serialize()))
+        .expect_err("a read-only transaction and another hash");
+    assert_eq!(err.kind, ErrorKind::TxNotWritable);
+    assert_eq!(
+        (err.kind, err.to_string()),
+        (raw_err.kind, raw_err.to_string())
+    );
+
+    // Rolled back: nothing reaches the files, and the record is let go.
+    let rolled_back = db.update(|tx| {
+        tx.store_block_record(&hash, &record)?;
+        Err(Error {
+            kind: ErrorKind::DriverSpecific,
+            description: "give up".to_string(),
+        })
+    });
+    assert!(rolled_back.is_err());
+    assert_eq!(Arc::strong_count(&record), 1);
+    assert!(
+        block_files(&opts.path)
+            .iter()
+            .all(|(_, bytes)| bytes.is_empty())
+    );
+    db.view(|tx| {
+        assert!(!tx.has_block(&hash, height)?);
+        Ok(())
+    })
+    .expect("view");
+
+    // And it is stored after all of that, the one record this database
+    // has written as it was handed in.
+    assert_eq!(db.records_written_as_laid_out(), 0);
+    db.update(|tx| tx.store_block_record(&hash, &record))
+        .expect("store");
+    assert_eq!(db.records_written_as_laid_out(), 1);
+    db.view(|tx| {
+        assert_eq!(tx.fetch_block(&hash, height)?, block.serialize());
+        Ok(())
+    })
+    .expect("view");
+
+    // With the block stored, the record of another block of its height
+    // handed in under its hash is a block that exists already: the
+    // existence check comes before the hash is compared with the
+    // record's own, as it does for those bytes in `store_block_raw`.
+    let mut other = make_block(&mut rng);
+    other.header.height = height;
+    let other_record = record_of(&other, NET);
+    assert_ne!(*other_record.hash(), hash);
+    let err = db
+        .update(|tx| tx.store_block_record(&hash, &other_record))
+        .expect_err("a stored block's hash");
+    let raw_err = db
+        .update(|tx| tx.store_block_raw(&hash, other.serialize()))
+        .expect_err("a stored block's hash");
+    assert_eq!(err.kind, ErrorKind::BlockExists);
+    assert_eq!(
+        (err.kind, err.to_string()),
+        (raw_err.kind, raw_err.to_string())
+    );
+    assert_eq!(Arc::strong_count(&other_record), 1);
+    assert_eq!(db.records_written_as_laid_out(), 1);
 }

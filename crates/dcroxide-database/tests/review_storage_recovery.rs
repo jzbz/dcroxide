@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use dcroxide_chainhash::{Hash, hash_h};
-use dcroxide_database::{Database, ErrorKind, LogLevel, LogSink, Options};
+use dcroxide_database::{BlockRecord, Database, ErrorKind, LogLevel, LogSink, Options};
 use tempfile::TempDir;
 
 const NET: u32 = 0x12141c16; // simnet magic
@@ -492,6 +492,10 @@ const TORN_WRITE_CHILD: &str = "DCROXIDE_TORN_WRITE_CHILD";
 /// The partial write comes from `RLIMIT_FSIZE`: the test re-runs itself
 /// under `ulimit -f` with `SIGXFSZ` ignored, so a write that crosses the
 /// limit stores what fits and the next one fails with `EFBIG`.
+///
+/// A block that reaches the commit laid out as its record
+/// (`Transaction::store_block_record`) goes through that same write, and
+/// the child tears one too.
 #[cfg(unix)]
 #[test]
 fn a_torn_block_write_is_truncated_by_the_rollback() {
@@ -546,6 +550,30 @@ fn torn_write_child() {
         before,
         "the rollback must truncate the torn record"
     );
+    db.view(|tx| {
+        assert_eq!(tx.fetch_block(&small, height(&raw_small))?, raw_small);
+        assert!(!tx.has_block(&big, height(&raw_big))?);
+        Ok(())
+    })
+    .expect("view");
+
+    // The same block handed in laid out as its record is the same write:
+    // it tears at the same byte, fails with the same error and is rolled
+    // back the same way.
+    let mut framed = vec![0u8; 24];
+    framed.extend_from_slice(&raw_big);
+    let record = Arc::new(BlockRecord::lay_out(framed, 24, NET).expect("a record"));
+    let record_err = db
+        .update(|tx| tx.store_block_record(&big, &record))
+        .expect_err("the record's write must cross the file-size limit");
+    assert_eq!(record_err.kind, err.kind);
+    assert_eq!(record_err.description, err.description);
+    assert_eq!(
+        file_len(&block_file(&path, 0)),
+        before,
+        "the rollback must truncate the torn record"
+    );
+    assert_eq!(Arc::strong_count(&record), 1, "the commit let go of it");
     db.view(|tx| {
         assert_eq!(tx.fetch_block(&small, height(&raw_small))?, raw_small);
         assert!(!tx.has_block(&big, height(&raw_big))?);

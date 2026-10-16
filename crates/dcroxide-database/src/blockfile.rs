@@ -17,7 +17,10 @@ use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use dcroxide_chainhash::Hash;
+
 use crate::error::{Error, ErrorKind, db_error};
+use crate::transaction::BLOCK_HDR_SIZE;
 use crate::{LogLevel, LogSink, log_line};
 
 /// CRC-32 with the Castagnoli polynomial (dcrd's `castagnoli` table).
@@ -116,6 +119,124 @@ fn block_file_path(db_path: &Path, file_num: u32) -> PathBuf {
     db_path.join(format!("{file_num:09}.fdb"))
 }
 
+/// A serialized block laid out as its block-file record before it
+/// reaches the store: the record the store builds from a block's bytes
+/// as it writes them (`BlockStore::write_block`), with its checksum,
+/// built ahead of the commit that writes it and on whichever thread
+/// holds the bytes.
+///
+/// dcrd has no counterpart.  Its `writeBlock` is handed the block's
+/// bytes and checksums the record as it writes it
+/// (`blockio.go:466-489`), on the goroutine that commits.  Here the
+/// thread that read a block off the wire can do that work, so the commit
+/// is left with the write.
+///
+/// The fields are private and [`BlockRecord::lay_out`] is the only
+/// constructor, so a value is always a whole record of the block it
+/// holds, for the network it names, with the checksum of exactly the
+/// bytes before it.  What it cannot know is whether the bytes it was
+/// handed are the serialization of any block: that is its maker's to
+/// establish, as it is the caller's of [`Transaction::store_block_raw`].
+///
+/// [`Transaction::store_block_raw`]: crate::Transaction::store_block_raw
+#[derive(Debug)]
+pub struct BlockRecord {
+    /// The record is this buffer from `start` on.  What lies before
+    /// `start` is whatever the buffer held ahead of the record's
+    /// headroom, and is never read.
+    buf: Vec<u8>,
+    /// Where the record starts in `buf`: [`Self::PREFIX_LEN`] bytes
+    /// before the block.
+    start: usize,
+    /// The network the record names, which its checksum covers.
+    network: u32,
+    /// The hash of the block's header, taken from the record's own
+    /// bytes, so that a store can check the hash it is asked to file the
+    /// block under without hashing the header again.
+    hash: Hash,
+}
+
+impl BlockRecord {
+    /// The bytes a record holds ahead of its block: the network and the
+    /// block's length.
+    pub const PREFIX_LEN: usize = 8;
+
+    /// The bytes a record holds behind its block: the checksum.
+    pub const SUFFIX_LEN: usize = 4;
+
+    /// Lay out the record of the serialized block at `buf[block_at..]`,
+    /// in that buffer: the network and the block's length go into the
+    /// [`Self::PREFIX_LEN`] bytes ahead of the block, overwriting what
+    /// was there, and the checksum is appended.  A buffer with room for
+    /// [`Self::SUFFIX_LEN`] more bytes is not reallocated, so the block
+    /// is not copied.
+    ///
+    /// `None`, with the buffer dropped, when there is no such record to
+    /// lay out: fewer than [`Self::PREFIX_LEN`] bytes ahead of the block
+    /// or no block at `block_at`, a block shorter than a header, which
+    /// no store accepts ([`Transaction::store_block_raw`]), or one whose
+    /// record's length does not fit the 32 bits a block location holds.
+    ///
+    /// [`Transaction::store_block_raw`]: crate::Transaction::store_block_raw
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "start + 4 <= start + PREFIX_LEN = block_at <= buf.len(), by the checked \
+                  subtraction and the slice taken at block_at"
+    )]
+    pub fn lay_out(mut buf: Vec<u8>, block_at: usize, network: u32) -> Option<BlockRecord> {
+        let start = block_at.checked_sub(Self::PREFIX_LEN)?;
+        let block = buf.get(block_at..)?;
+        let header = block.get(..BLOCK_HDR_SIZE)?;
+        let hash = dcroxide_chainhash::hash_h(header);
+        let block_len = u32::try_from(block.len()).ok()?;
+        block_len.checked_add(BLOCK_RECORD_OVERHEAD)?;
+
+        // The bytes `write_block` puts in a record, in its order.
+        buf[start..start + 4].copy_from_slice(&network.to_le_bytes());
+        buf[start + 4..block_at].copy_from_slice(&block_len.to_le_bytes());
+        let checksum = CASTAGNOLI.checksum(&buf[start..]);
+        buf.extend_from_slice(&checksum.to_be_bytes());
+        Some(BlockRecord {
+            buf,
+            start,
+            network,
+            hash,
+        })
+    }
+
+    /// The whole record: network, length, block and checksum.
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.buf[self.start..]
+    }
+
+    /// The serialized block the record holds.
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "the record is PREFIX_LEN bytes, the block and SUFFIX_LEN bytes, by construction"
+    )]
+    pub fn block(&self) -> &[u8] {
+        &self.buf[self.start + Self::PREFIX_LEN..self.buf.len() - Self::SUFFIX_LEN]
+    }
+
+    /// The hash of the header the block's bytes begin with.
+    pub fn hash(&self) -> &Hash {
+        &self.hash
+    }
+
+    /// The network the record was laid out for.
+    pub fn network(&self) -> u32 {
+        self.network
+    }
+
+    /// The record, when it was laid out for `network`.  The network is
+    /// part of a record and of what its checksum covers, so a record
+    /// laid out for another network is not that store's record of the
+    /// block, and the store builds its own.
+    fn for_network(&self, network: u32) -> Option<&[u8]> {
+        (self.network == network).then(|| self.as_bytes())
+    }
+}
+
 /// Flat-file block store (dcrd `blockStore`), sans the LRU open-file
 /// cache: read handles are simply kept open per file (block file counts
 /// stay small at Decred's chain size; revisit if profiling ever says
@@ -146,6 +267,12 @@ pub(crate) struct BlockStore {
     /// The driver's log sink (see [`crate::LogSink`]), for the
     /// `ROLLBACK:` lines dcrd's `handleRollback` logs.
     log: Option<LogSink>,
+    /// How many records were written as they were handed in
+    /// ([`Self::write_block_record`]), where every other record was laid
+    /// out by the write that wrote it.  A count for
+    /// [`crate::Database::records_written_as_laid_out`]: nothing here
+    /// reads it.
+    pub(crate) laid_out_written: u64,
 }
 
 fn io_err(err: &std::io::Error, what: &str) -> Error {
@@ -191,6 +318,7 @@ impl BlockStore {
             write_file: None,
             dirty_files: Vec::new(),
             log,
+            laid_out_written: 0,
         })
     }
 
@@ -243,6 +371,36 @@ impl BlockStore {
     /// runs it ([`SyncPlan::run`]) and discharges it with
     /// [`Self::finish_sync`].
     pub(crate) fn write_block(&mut self, raw_block: &[u8]) -> Result<BlockLocation, Error> {
+        self.write_block_as(raw_block, None)
+    }
+
+    /// [`Self::write_block`] for a block that was laid out as its record
+    /// before the commit ([`BlockRecord`]): the same bytes at the same
+    /// place by the same rules, with the record written as it stands
+    /// where `write_block` builds one, and counted
+    /// (`laid_out_written`).  A record laid out for another network than
+    /// this store's is not written; the store builds its own from the
+    /// block the record holds.
+    pub(crate) fn write_block_record(
+        &mut self,
+        record: &BlockRecord,
+    ) -> Result<BlockLocation, Error> {
+        let laid_out = record.for_network(self.network);
+        let loc = self.write_block_as(record.block(), laid_out)?;
+        if laid_out.is_some() {
+            self.laid_out_written = self.laid_out_written.wrapping_add(1);
+        }
+        Ok(loc)
+    }
+
+    /// The body of [`Self::write_block`] and [`Self::write_block_record`]:
+    /// `laid_out`, when there is one, is the whole record of `raw_block`
+    /// for this store's network.
+    fn write_block_as(
+        &mut self,
+        raw_block: &[u8],
+        laid_out: Option<&[u8]>,
+    ) -> Result<BlockLocation, Error> {
         let block_len = raw_block.len() as u32;
         let full_len = block_len.wrapping_add(BLOCK_RECORD_OVERHEAD);
 
@@ -269,15 +427,29 @@ impl BlockStore {
         // Record: network || length || block || checksum-of-preceding.
         // dcrd writes the four fields with a `WriteAt` each
         // (`blockio.go:466-489`); the same bytes go out here in one
-        // call, three of the four being four bytes long.
-        let mut record = Vec::with_capacity(full_len as usize);
-        record.extend_from_slice(&self.network.to_le_bytes());
-        record.extend_from_slice(&block_len.to_le_bytes());
-        record.extend_from_slice(raw_block);
-        let checksum = CASTAGNOLI.checksum(&record);
-        record.extend_from_slice(&checksum.to_be_bytes());
+        // call, three of the four being four bytes long.  A record laid
+        // out ahead holds those bytes already.
+        let built;
+        let record: &[u8] = match laid_out {
+            Some(record) => {
+                debug_assert_eq!(record.len(), full_len as usize);
+                record
+            }
+            None => {
+                #[cfg(test)]
+                io_hook("record");
+                let mut record = Vec::with_capacity(full_len as usize);
+                record.extend_from_slice(&self.network.to_le_bytes());
+                record.extend_from_slice(&block_len.to_le_bytes());
+                record.extend_from_slice(raw_block);
+                let checksum = CASTAGNOLI.checksum(&record);
+                record.extend_from_slice(&checksum.to_be_bytes());
+                built = record;
+                &built
+            }
+        };
         let orig_offset = self.write_offset;
-        self.write_record(&record, block_len)?;
+        self.write_record(record, block_len)?;
 
         let loc = BlockLocation {
             block_file_num: self.write_file_num,
@@ -474,16 +646,18 @@ impl BlockStore {
     }
 }
 
-/// A test's probe into block I/O, called with `"read"`, `"write"` or
-/// `"fsync"`.
+/// A test's probe into block I/O, called with `"read"`, `"write"`,
+/// `"fsync"` or `"record"`.
 #[cfg(test)]
 pub(crate) type IoHook = Box<dyn Fn(&'static str)>;
 
 #[cfg(test)]
 thread_local! {
     /// Run on the calling thread just before each block read, each
-    /// write call for a block record and each fsync, so a test can see
-    /// what is locked while the I/O runs and how many calls it takes.
+    /// write call for a block record, each fsync and each record the
+    /// store lays out itself, so a test can see what is locked while the
+    /// I/O runs, how many calls it takes and which records were built
+    /// at the commit.
     pub(crate) static IO_HOOK: std::cell::RefCell<Option<IoHook>> =
         const { std::cell::RefCell::new(None) };
 }
@@ -1087,6 +1261,7 @@ mod tests {
         };
         let mut store = BlockStore::open(dir.path(), NET, MAX, None).expect("open store");
         let mut written: Vec<(BlockLocation, Vec<u8>)> = Vec::new();
+        let mut laid_out = 0usize;
         for step in 0..400usize {
             let room = MAX as usize - model.cursor().1 as usize;
             let len = match step % 8 {
@@ -1107,7 +1282,17 @@ mod tests {
             rng.fill(&mut block);
 
             let want = model.write(NET, &block);
-            let got = store.write_block(&block).expect("write block");
+            // Every other block that holds a header goes in laid out as
+            // its record ahead of the store, among them the ones that
+            // end on the size cap and one byte past it.
+            let got = if step % 2 == 1 && block.len() >= BLOCK_HDR_SIZE {
+                let record =
+                    BlockRecord::lay_out(framed(24, &block, 4), 24, NET).expect("a record");
+                laid_out += 1;
+                store.write_block_record(&record).expect("write record")
+            } else {
+                store.write_block(&block).expect("write block")
+            };
             assert_eq!(got, want, "step {step}: where the record went");
             assert_eq!(
                 (store.write_file_num, store.write_offset),
@@ -1149,6 +1334,7 @@ mod tests {
         }
         model.check(dir.path(), "at the end");
         assert!(model.files.len() > 20, "the writes rolled over many times");
+        assert!(laid_out > 100, "{laid_out} records were laid out ahead");
 
         // And every record reads back as the block it was written from.
         for (loc, block) in &written {
@@ -1567,6 +1753,267 @@ mod tests {
         }
         IO_HOOK.with(|hook| *hook.borrow_mut() = None);
         assert_eq!(store.write_file_num, 3, "the records rolled over");
+    }
+
+    /// Bytes standing for a serialized block of the length, told apart
+    /// by the seed.
+    fn block_bytes(len: usize, seed: u32) -> Vec<u8> {
+        (0..len as u32)
+            .map(|i| (i.wrapping_add(seed).wrapping_mul(2_654_435_761) >> 24) as u8)
+            .collect()
+    }
+
+    /// A buffer holding `headroom` bytes of something else and then the
+    /// block, as a frame holds a message header and then a payload.
+    fn framed(headroom: usize, block: &[u8], spare: usize) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(headroom + block.len() + spare);
+        buf.resize(headroom, 0xee);
+        buf.extend_from_slice(block);
+        buf
+    }
+
+    /// Count the store's I/O probe calls of one kind while `run` runs.
+    fn count_hook<T>(what: &'static str, run: impl FnOnce() -> T) -> (usize, T) {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        let calls = Rc::new(Cell::new(0usize));
+        let counter = Rc::clone(&calls);
+        IO_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |called| {
+                if called == what {
+                    counter.set(counter.get() + 1);
+                }
+            }));
+        });
+        let result = run();
+        IO_HOOK.with(|hook| *hook.borrow_mut() = None);
+        (calls.get(), result)
+    }
+
+    /// A record laid out ahead is the record the store builds from the
+    /// same block: dcrd's bytes, field for field, at every block length
+    /// around the checksum's sixteen-byte step and with any room ahead
+    /// of the block.  Written through `write_block_record` it leaves the
+    /// file `write_block` leaves, at the same locations.
+    #[test]
+    fn a_record_laid_out_ahead_is_the_record_the_store_builds() {
+        const NET: u32 = 0x1234_5678;
+        let built_dir = tempfile::tempdir().expect("temp dir");
+        let laid_dir = tempfile::tempdir().expect("temp dir");
+        // Files small enough that the records roll over several times.
+        let mut built = BlockStore::open(built_dir.path(), NET, 100_000, None).expect("open");
+        let mut laid = BlockStore::open(laid_dir.path(), NET, 100_000, None).expect("open");
+
+        let lens = [
+            180, 181, 187, 188, 189, 195, 196, 197, 203, 204, 205, 300, 4096, 70_001,
+        ];
+        let mut seed = 0;
+        for len in lens {
+            for headroom in [8, 9, 24, 100] {
+                seed += 1;
+                let block = block_bytes(len, seed);
+                let record = BlockRecord::lay_out(framed(headroom, &block, 4), headroom, NET)
+                    .expect("a record");
+                let what = format!("{len} bytes behind {headroom}");
+                assert_eq!(record.as_bytes(), record_of(NET, &block), "{what}");
+                assert_eq!(record.block(), block, "{what}");
+                assert_eq!(
+                    *record.hash(),
+                    dcroxide_chainhash::hash_h(&block[..BLOCK_HDR_SIZE]),
+                    "{what}"
+                );
+                assert_eq!(record.network(), NET, "{what}");
+
+                let want = built.write_block(&block).expect("write block");
+                let got = laid.write_block_record(&record).expect("write record");
+                assert_eq!(got, want, "{what}");
+            }
+        }
+        assert!(built.write_file_num > 2, "the records rolled over");
+        assert_eq!(
+            (laid.write_file_num, laid.write_offset),
+            (built.write_file_num, built.write_offset)
+        );
+        assert_eq!(laid.dirty_files, built.dirty_files);
+        for num in 0..=built.write_file_num {
+            assert_eq!(
+                fs::read(block_file_path(laid_dir.path(), num)).expect("read"),
+                fs::read(block_file_path(built_dir.path(), num)).expect("read"),
+                "block file {num}"
+            );
+        }
+    }
+
+    /// The store writes a record laid out for its network as it stands,
+    /// in one call and without building one; a record laid out for
+    /// another network is not written, and the store builds its own
+    /// from the block, as it does for a block's bytes.
+    #[test]
+    fn a_laid_out_record_is_written_as_it_stands_for_its_own_network_only() {
+        const NET: u32 = 0x1234_5678;
+        const OTHER: u32 = 0x8765_4321;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut store = BlockStore::open(dir.path(), NET, 1 << 20, None).expect("open");
+        let block = block_bytes(500, 7);
+        let ours = BlockRecord::lay_out(framed(24, &block, 4), 24, NET).expect("a record");
+        let theirs = BlockRecord::lay_out(framed(24, &block, 4), 24, OTHER).expect("a record");
+        assert_ne!(ours.as_bytes(), theirs.as_bytes());
+        assert_eq!(theirs.as_bytes(), record_of(OTHER, &block));
+
+        let (built, _) = count_hook("record", || store.write_block(&block).expect("write"));
+        assert_eq!(built, 1, "a block's bytes are laid out at the write");
+        assert_eq!(store.laid_out_written, 0, "and not counted as handed in");
+        let (built, _) = count_hook("record", || store.write_block_record(&ours).expect("write"));
+        assert_eq!(built, 0, "a record for this network is written as it is");
+        assert_eq!(store.laid_out_written, 1, "which is counted");
+        let (writes, _) = count_hook("write", || store.write_block_record(&ours).expect("write"));
+        assert_eq!(writes, 1, "in one call");
+        assert_eq!(store.laid_out_written, 2);
+        let (built, _) = count_hook("record", || {
+            store.write_block_record(&theirs).expect("write")
+        });
+        assert_eq!(built, 1, "a record for another network is built again");
+        assert_eq!(store.laid_out_written, 2, "and is not counted");
+
+        // Four records of the block, every one this store's.
+        let want = record_of(NET, &block);
+        assert_eq!(
+            fs::read(block_file_path(dir.path(), 0)).expect("read"),
+            [want.as_slice(); 4].concat()
+        );
+    }
+
+    /// A transaction that was handed a laid-out record writes that
+    /// record at its commit, in one call and without building one,
+    /// where a block handed in as itself or as its bytes has its record
+    /// built at the commit.  A transaction holding blocks of all three
+    /// kinds writes them in the order they were stored, and the database
+    /// counts the records it wrote as they were handed in.
+    #[test]
+    fn a_commit_writes_the_record_it_was_handed() {
+        const NET: u32 = 0x1234_5678;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db = crate::Database::create(&crate::Options::new(dir.path().join("db"), NET))
+            .expect("create");
+        let mut blocks: Vec<Vec<u8>> = (0..6).map(|seed| block_bytes(300, 40 + seed)).collect();
+        // One block the transaction is handed as itself, which it
+        // serializes: a header and two empty transaction trees.
+        let whole = {
+            let (header, _) = dcroxide_wire::BlockHeader::from_bytes(&block_bytes(180, 60))
+                .expect("any 180 bytes are a header");
+            dcroxide_wire::MsgBlock {
+                header,
+                transactions: Vec::new(),
+                stransactions: Vec::new(),
+            }
+        };
+        blocks.insert(5, whole.serialize());
+        let hashes: Vec<Hash> = blocks
+            .iter()
+            .map(|block| dcroxide_chainhash::hash_h(&block[..BLOCK_HDR_SIZE]))
+            .collect();
+        let record = |i: usize| {
+            Arc::new(BlockRecord::lay_out(framed(24, &blocks[i], 4), 24, NET).expect("a record"))
+        };
+
+        let commit = |store: &dyn Fn(&crate::Transaction) -> Result<(), Error>| {
+            let tx = db.begin(true).expect("begin");
+            store(&tx).expect("store");
+            let (built, ()) = count_hook("record", || tx.commit().expect("commit"));
+            built
+        };
+        assert_eq!(db.records_written_as_laid_out(), 0);
+        let first = record(0);
+        assert_eq!(commit(&|tx| tx.store_block_record(&hashes[0], &first)), 0);
+        assert_eq!(db.records_written_as_laid_out(), 1);
+        assert_eq!(
+            commit(&|tx| tx.store_block_raw(&hashes[1], blocks[1].clone())),
+            1
+        );
+        assert_eq!(db.records_written_as_laid_out(), 1);
+        // The write of a handed record is one call, as any record's is.
+        let second = record(2);
+        let tx = db.begin(true).expect("begin");
+        tx.store_block_record(&hashes[2], &second).expect("store");
+        let (writes, ()) = count_hook("write", || tx.commit().expect("commit"));
+        assert_eq!(writes, 1);
+        assert_eq!(db.records_written_as_laid_out(), 2);
+
+        // One transaction holding a block's bytes, a record, a block and
+        // another record, in that order: two records are built at the
+        // commit, two are written as they stand, and all four go into
+        // the file in the order they were stored.
+        let (third, fourth) = (record(4), record(6));
+        let built = commit(&|tx| {
+            tx.store_block_raw(&hashes[3], blocks[3].clone())?;
+            tx.store_block_record(&hashes[4], &third)?;
+            tx.store_block(&whole)?;
+            tx.store_block_record(&hashes[6], &fourth)
+        });
+        assert_eq!(built, 2);
+        assert_eq!(db.records_written_as_laid_out(), 4);
+        for record in [&first, &second, &third, &fourth] {
+            assert_eq!(Arc::strong_count(record), 1, "the commit let go of it");
+        }
+
+        let want: Vec<u8> = blocks
+            .iter()
+            .flat_map(|block| record_of(NET, block))
+            .collect();
+        assert_eq!(
+            fs::read(block_file_path(&dir.path().join("db"), 0)).expect("read"),
+            want
+        );
+        // And each row of the block index names its own record.
+        db.view(|tx| {
+            for (hash, block) in hashes.iter().zip(&blocks) {
+                let height = crate::transaction::serialized_block_height(block).expect("a height");
+                assert_eq!(&tx.fetch_block(hash, height)?, block);
+            }
+            Ok(())
+        })
+        .expect("view");
+    }
+
+    /// A record is laid out in the buffer it was handed: with room
+    /// behind the block for the checksum, the block is not moved.
+    #[test]
+    fn a_record_is_laid_out_in_the_buffer_it_was_handed() {
+        let block = block_bytes(1000, 3);
+        let buf = framed(24, &block, BlockRecord::SUFFIX_LEN);
+        let (at, capacity) = (buf[24..].as_ptr(), buf.capacity());
+        let record = BlockRecord::lay_out(buf, 24, 9).expect("a record");
+        assert_eq!(record.block().as_ptr(), at);
+        assert_eq!(record.buf.capacity(), capacity);
+        // The bytes ahead of the record's headroom are left alone.
+        assert_eq!(record.buf[..16], [0xee; 16]);
+        assert_eq!(
+            record.as_bytes().len(),
+            1000 + BLOCK_RECORD_OVERHEAD as usize
+        );
+        assert_eq!(
+            BlockRecord::PREFIX_LEN + BlockRecord::SUFFIX_LEN,
+            BLOCK_RECORD_OVERHEAD as usize
+        );
+    }
+
+    /// No record is laid out without room ahead of the block for the
+    /// network and the length, without a block at the offset, or around
+    /// a block shorter than a header.
+    #[test]
+    fn a_record_is_not_laid_out_without_headroom_or_a_whole_header() {
+        let block = block_bytes(200, 1);
+        assert!(BlockRecord::lay_out(framed(8, &block, 4), 8, 1).is_some());
+        assert!(BlockRecord::lay_out(framed(7, &block, 4), 7, 1).is_none());
+        assert!(BlockRecord::lay_out(block.clone(), 0, 1).is_none());
+        // An offset past the buffer, and at its very end.
+        assert!(BlockRecord::lay_out(framed(8, &block, 4), 209, 1).is_none());
+        assert!(BlockRecord::lay_out(framed(8, &block, 4), 208, 1).is_none());
+        assert!(BlockRecord::lay_out(framed(8, &block, 4), usize::MAX, 1).is_none());
+        // One byte short of a header, and exactly one.
+        assert!(BlockRecord::lay_out(framed(8, &block[..179], 4), 8, 1).is_none());
+        assert!(BlockRecord::lay_out(framed(8, &block[..180], 4), 8, 1).is_some());
     }
 
     /// The sixteen-table checksum is the one-table checksum: at every

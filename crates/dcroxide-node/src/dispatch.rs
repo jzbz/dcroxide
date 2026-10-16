@@ -2483,8 +2483,9 @@ impl ServerPeerHandler {
     /// which keeps this allocation: dcrd passes one `*dcrutil.Block`
     /// the same way, and nothing on the way copies the block.  It comes
     /// plain from a message this thread read itself, and with its hashes
-    /// from the connection's reader thread; everything decided about it
-    /// is decided here and below, the same way for both.
+    /// and its block-file record from the connection's reader thread;
+    /// everything decided about it is decided here and below, the same
+    /// way for both.
     fn handle_block(&mut self, block: ArrivedBlock) -> ServeSignal {
         // The block the peer delivered is known to it, so the
         // announcement fan-out never echoes the inventory back (dcrd
@@ -2521,7 +2522,9 @@ impl ServerPeerHandler {
     /// ([`crate::peerloop::ServeHooks::on_block`]): exactly what
     /// a `block` message gets from [`Self::handle_message`], with the
     /// hashes the block carries handed to the chain so it does not
-    /// compute them again.
+    /// compute them again, and with them the payload the block was read
+    /// in, laid out as its block-file record, so the chain does not
+    /// serialize the block to store it.
     pub fn on_block(&mut self, block: dcroxide_blockchain::HashedBlock) -> ServeSignal {
         self.handle_block(ArrivedBlock::Hashed(block))
     }

@@ -44,6 +44,15 @@
 //! block that shares a header hash with a good one can never pick up
 //! the good one's hashes.
 //!
+//! That rule is about the hashes.  A [`HashedBlock`] may carry one thing
+//! more, and that one is stored: the block's record for the block files,
+//! made from the bytes the block was decoded from
+//! ([`HashedBlock::keep_wire_bytes`]).  It is kept only once those bytes
+//! have been compared with the block's serialization, in every build, so
+//! it holds the bytes the chain writes for that block when it has no
+//! record, and it reaches the chain in the one value that owns the
+//! block.  A record is never looked up by a block hash either.
+//!
 //! Every function that reads the hashes first checks them against its
 //! block with `assert_for`: one hash per transaction of each tree in
 //! every build, and a full re-hash and comparison under debug
@@ -72,6 +81,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use dcroxide_chainhash::{HASH_SIZE, Hash, hash_h};
+use dcroxide_database::BlockRecord;
 use dcroxide_wire::{MsgBlock, MsgTx};
 
 /// The hash of every transaction of one block
@@ -123,6 +133,14 @@ pub(crate) struct BlockMerkleLeaves {
 /// root is compared, and the chain makes every check it makes of a block
 /// that arrives without hashes, in the same order
 /// (`Chain::process_hashed_block`).
+///
+/// A block that was decoded from bytes may also carry those bytes, laid
+/// out as its record for the block files ([`HashedBlock::keep_wire_bytes`]):
+/// what dcrd holds as the `serializedBlock` of a `dcrutil.Block` made by
+/// `NewBlockFromBlockAndBytes` (`dcrutil/block.go:54-58`, `:386-392`),
+/// which is what its `StoreBlock` writes.  The record is kept only when
+/// the bytes compare equal to the block's serialization, so a chain that
+/// stores it stores the bytes it would have serialized.
 #[derive(Debug)]
 pub struct HashedBlock {
     /// The block.
@@ -133,6 +151,10 @@ pub struct HashedBlock {
     tx_hashes: Arc<BlockTxHashes>,
     /// The full hash of each of the block's transactions.
     merkle_leaves: BlockMerkleLeaves,
+    /// The bytes the block was decoded from, laid out as its block-file
+    /// record, when they were handed in and are the block's
+    /// serialization ([`HashedBlock::keep_wire_bytes`]).
+    record: Option<Arc<BlockRecord>>,
 }
 
 impl HashedBlock {
@@ -146,7 +168,75 @@ impl HashedBlock {
             hash,
             tx_hashes: Arc::new(tx_hashes),
             merkle_leaves,
+            record: None,
         }
+    }
+
+    /// Keep the bytes the block was decoded from, `buf[block_at..]`, as
+    /// its record for the block files, laid out in that buffer for
+    /// `network` ([`BlockRecord::lay_out`], which needs
+    /// [`BlockRecord::PREFIX_LEN`] bytes ahead of the block and takes the
+    /// record's checksum).  Says whether the record was kept; when it was
+    /// not, the buffer is dropped and the value is as it was, so the
+    /// chain serializes the block when it stores it, as it does for a
+    /// block that arrives without one.
+    ///
+    /// The record is kept only when the bytes are the block's
+    /// serialization, which is found by comparing them with it
+    /// (`MsgBlock::serialize`, the bytes `Transaction::store_block`
+    /// stores) in every build.  So the bytes a chain stores for a block
+    /// are the same whether or not the block arrived with a record,
+    /// whatever was handed in here: another block's bytes, a longer
+    /// encoding of this one, or its bytes with more behind them, are
+    /// dropped.  The comparison serializes the block once, on the calling
+    /// thread, and lets go of that copy before the record is laid out.
+    /// That is the price of the stored bytes resting on a comparison and
+    /// not on an argument about the decoder, and it is paid away from the
+    /// thread that stores the block.
+    ///
+    /// For the bytes a block was decoded from, with none left over, the
+    /// comparison is expected to hold every time.  The decoder reads
+    /// every fixed-width field of a block bit for bit into the field
+    /// `MsgBlock::serialize` writes it back from, a transaction's
+    /// serialization type included, and copies every script.  That
+    /// leaves the counts and lengths, the only fields with more than one
+    /// encoding, and the decoder refuses a variable length integer
+    /// written longer than it need be (`dcroxide_wire::read_var_int`,
+    /// dcrd `ReadVarInt`).  Bytes that are dropped therefore mean a
+    /// caller that paired a block with bytes it was not decoded from, or
+    /// a decoder that no longer reads a field back as it is written;
+    /// neither is a reason to store anything but the serialization.
+    ///
+    /// Bytes that are kept begin with the block's own header, so the
+    /// hash the record took of its header ([`BlockRecord::hash`]) is the
+    /// hash of the block's, which is the one hash a store files the
+    /// record under (`Transaction::store_block_record`).  The hash this
+    /// value carries is not consulted.
+    ///
+    /// Nothing is decided about the block by this: bytes that are not
+    /// kept are not a fault of the block's, and the chain treats a block
+    /// with a record exactly as one without.
+    pub fn keep_wire_bytes(&mut self, buf: Vec<u8>, block_at: usize, network: u32) -> bool {
+        let is_serialization = {
+            let serialized = self.block.serialize();
+            buf.get(block_at..) == Some(serialized.as_slice())
+        };
+        if !is_serialization {
+            return false;
+        }
+        let Some(record) = BlockRecord::lay_out(buf, block_at, network) else {
+            return false;
+        };
+        self.record = Some(Arc::new(record));
+        true
+    }
+
+    /// The block's record for the block files, when the bytes it was
+    /// decoded from were kept ([`Self::keep_wire_bytes`]): the block's
+    /// serialization with the record's network, length and checksum
+    /// around it.
+    pub fn record(&self) -> Option<&Arc<BlockRecord>> {
+        self.record.as_ref()
     }
 
     /// The block that was hashed.
@@ -169,7 +259,7 @@ impl HashedBlock {
         &self.merkle_leaves
     }
 
-    /// Give the block back, dropping the hashes.
+    /// Give the block back, dropping the hashes and the record.
     pub fn into_block(self) -> Arc<MsgBlock> {
         self.block
     }

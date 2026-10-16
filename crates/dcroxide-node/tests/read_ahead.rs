@@ -349,6 +349,10 @@ enum Call {
     Disconnected,
     /// A block arrived with hashes that are not its own.
     WrongHashes(Hash),
+    /// A block the reader thread read arrived without the payload it
+    /// was read in laid out as its block-file record, or with a record
+    /// of other bytes than its serialization.
+    WrongRecord(Hash),
 }
 
 /// Hooks that record every call and behave as told.
@@ -441,6 +445,13 @@ impl ServeHooks for Recorder {
             || **block.tx_hashes() != BlockTxHashes::compute(block.block())
         {
             self.record(Call::WrongHashes(*block.hash()));
+        }
+        // And so is the record: the payload the block arrived in, which
+        // is its serialization, under its own header's hash.
+        if block.record().is_none_or(|record| {
+            record.block() != block.block().serialize() || record.hash() != block.hash()
+        }) {
+            self.record(Call::WrongRecord(*block.hash()));
         }
         let block = Arc::unwrap_or_clone(block.into_block());
         self.handle(peer, Message::Block(block), None)
@@ -542,7 +553,7 @@ fn exchange(stream: &[u8], behaviour: Behaviour, await_replies: Option<usize>) -
 /// How many connections have started a reader thread in this process,
 /// from the line the daemon logs at shutdown.
 fn reader_threads_started() -> u64 {
-    let Some(line) = dcroxide_node::readahead::shutdown_line() else {
+    let Some(line) = dcroxide_node::readahead::shutdown_line(0) else {
         return 0;
     };
     let rest = line.split_once(" bytes) on ").expect("the line's shape").1;

@@ -29,7 +29,7 @@ use std::sync::Arc;
 
 use dcroxide_chainhash::Hash;
 
-use crate::blockfile::{BLOCK_LOC_SIZE, BlockLocation, serialize_write_row};
+use crate::blockfile::{BLOCK_LOC_SIZE, BlockLocation, BlockRecord, serialize_write_row};
 use crate::error::{Error, ErrorKind, db_error};
 use crate::{DbInner, METADATA_TABLE};
 
@@ -58,7 +58,7 @@ pub(crate) const BLOCK_IDX_BUCKET_NAME: &[u8] = b"ffldb-blockidx";
 
 /// The size of a block header, which is how many bytes of a stored
 /// block the header occupies (dcrd `blockHdrSize`).
-const BLOCK_HDR_SIZE: usize = 180;
+pub(crate) const BLOCK_HDR_SIZE: usize = 180;
 
 /// Where a serialized block header keeps its little-endian height: after
 /// the version (4 bytes), the previous block, merkle and stake roots (32
@@ -201,6 +201,26 @@ enum KvTx {
     Write(redb::ReadTransaction),
 }
 
+/// A block a transaction holds until its commit writes it.
+enum PendingBlock {
+    /// The serialized block.  The commit lays its record out.
+    Bytes(Vec<u8>),
+    /// The block already laid out as its record
+    /// ([`Transaction::store_block_record`]), shared with whoever handed
+    /// it in.  The commit writes it as it stands.
+    Record(Arc<BlockRecord>),
+}
+
+impl PendingBlock {
+    /// The serialized block.
+    fn bytes(&self) -> &[u8] {
+        match self {
+            PendingBlock::Bytes(raw) => raw,
+            PendingBlock::Record(record) => record.block(),
+        }
+    }
+}
+
 /// The mutable state of a transaction, kept behind a `RefCell` so
 /// bucket and cursor handles can share the transaction immutably (like
 /// dcrd's interface, a transaction and its derived handles are intended
@@ -230,8 +250,9 @@ struct TxState {
     table: Option<redb::ReadOnlyTable<&'static [u8], &'static [u8]>>,
     /// Blocks buffered by `store_block` to be written on commit, each
     /// with the height that keys its index row, plus an index over them
-    /// by hash (dcrd `pendingBlocks` / `pendingBlockData`).
-    pending_blocks: Vec<(Hash, u32, Vec<u8>)>,
+    /// by hash (dcrd `pendingBlocks` / `pendingBlockData`).  A block is
+    /// held as its bytes or as the record it arrived laid out as.
+    pending_blocks: Vec<(Hash, u32, PendingBlock)>,
     pending_index: HashMap<[u8; 32], usize>,
     /// Metadata puts buffered until commit (dcrd `pendingKeys`).
     pending_keys: std::collections::BTreeMap<Vec<u8>, Vec<u8>>,
@@ -726,7 +747,7 @@ impl Transaction {
         self.store_block_with(
             &block.header.block_hash(),
             Some(block.header.height),
-            || Ok(block.serialize()),
+            || Ok(PendingBlock::Bytes(block.serialize())),
         )
     }
 
@@ -764,23 +785,56 @@ impl Transaction {
                     format!("block {hash} was given bytes whose header hashes to {header_hash}"),
                 ));
             }
-            Ok(raw)
+            Ok(PendingBlock::Bytes(raw))
         })
     }
 
-    /// The body of [`Self::store_block`] and [`Self::store_block_raw`],
-    /// in dcrd `StoreBlock`'s order: the transaction checks and the
-    /// existence check, and only then the block's bytes (dcrd
-    /// `block.Bytes()`, whose failure is `ErrDriverSpecific`).  `height`
-    /// is the one the block's header records, for the existence check;
-    /// it is `None` only for bytes that `bytes` refuses as too short to
-    /// hold a header.  The row is filed under the height the stored
-    /// bytes record.
+    /// Store a block that was laid out as its block-file record before
+    /// it came here ([`BlockRecord`]), given its hash: what
+    /// [`Self::store_block_raw`] does with the block the record holds,
+    /// except that the commit writes the record as it stands and does
+    /// not copy the block into one and checksum it.  The file bytes, the
+    /// index row and everything read back are those of
+    /// `store_block_raw`.
+    ///
+    /// dcrd's `StoreBlock` is handed a block that carries the bytes it
+    /// was decoded from (`dcrutil.NewBlockFromBlockAndBytes`,
+    /// `dcrutil/block.go:54-58`) and stores those; this is the entry
+    /// for a caller that kept them.
+    ///
+    /// The hash must be that of the header the record's block begins
+    /// with, which the record took from its own bytes as it was laid
+    /// out; another hash fails with [`ErrorKind::DriverSpecific`], as it
+    /// does in `store_block_raw`.  A record always holds a whole header.
+    /// The record is shared, not copied: the transaction lets go of it
+    /// when it ends.
+    pub fn store_block_record(&self, hash: &Hash, record: &Arc<BlockRecord>) -> Result<(), Error> {
+        let height = serialized_block_height(record.block());
+        self.store_block_with(hash, height, || {
+            let header_hash = record.hash();
+            if header_hash != hash {
+                return Err(db_error(
+                    ErrorKind::DriverSpecific,
+                    format!("block {hash} was given bytes whose header hashes to {header_hash}"),
+                ));
+            }
+            Ok(PendingBlock::Record(Arc::clone(record)))
+        })
+    }
+
+    /// The body of [`Self::store_block`], [`Self::store_block_raw`] and
+    /// [`Self::store_block_record`], in dcrd `StoreBlock`'s order: the
+    /// transaction checks and the existence check, and only then the
+    /// block's bytes (dcrd `block.Bytes()`, whose failure is
+    /// `ErrDriverSpecific`).  `height` is the one the block's header
+    /// records, for the existence check; it is `None` only for bytes
+    /// that `bytes` refuses as too short to hold a header.  The row is
+    /// filed under the height the stored bytes record.
     fn store_block_with(
         &self,
         hash: &Hash,
         height: Option<u32>,
-        bytes: impl FnOnce() -> Result<Vec<u8>, Error>,
+        bytes: impl FnOnce() -> Result<PendingBlock, Error>,
     ) -> Result<(), Error> {
         self.check_closed()?;
         if !self.writable {
@@ -802,7 +856,7 @@ impl Transaction {
         let raw = bytes()?;
         // `bytes` refuses anything shorter than a header, and a header
         // records its height, so this error is never reached.
-        let height = serialized_block_height(&raw).ok_or_else(|| {
+        let height = serialized_block_height(raw.bytes()).ok_or_else(|| {
             db_error(
                 ErrorKind::DriverSpecific,
                 format!("block {hash} is too short to record its height"),
@@ -853,7 +907,7 @@ impl Transaction {
 
     fn pending_block_bytes(&self, hash: &Hash, height: u32) -> Option<Vec<u8>> {
         let idx = self.pending_block_index(hash, height)?;
-        Some(self.state.borrow().pending_blocks[idx].2.clone())
+        Some(self.state.borrow().pending_blocks[idx].2.bytes().to_vec())
     }
 
     /// The raw serialized bytes of the block header for the given hash
@@ -1141,7 +1195,7 @@ impl Transaction {
         // then commit it.  A crash between the file writes and the
         // metadata commit leaves orphaned file bytes which are
         // reconciled away on the next open, matching dcrd's ordering.
-        let pending: Vec<(Hash, u32, Vec<u8>)> =
+        let pending: Vec<(Hash, u32, PendingBlock)> =
             std::mem::take(&mut self.state.borrow_mut().pending_blocks);
         let rollback_pos = {
             let store = self.db.block_store.lock().expect("store lock");
@@ -1152,9 +1206,12 @@ impl Transaction {
             let mut locations = Vec::with_capacity(pending.len());
             {
                 let mut store = self.db.block_store.lock().expect("store lock");
-                for (hash, height, bytes) in &pending {
-                    let loc = store.write_block(bytes)?;
-                    locations.push((*hash, *height, loc, bytes));
+                for (hash, height, block) in &pending {
+                    let loc = match block {
+                        PendingBlock::Bytes(raw) => store.write_block(raw)?,
+                        PendingBlock::Record(record) => store.write_block_record(record)?,
+                    };
+                    locations.push((*hash, *height, loc, block.bytes()));
                 }
                 // The metadata cache flush syncs the files; per-
                 // commit syncing is gone with it (dcrd ffldb).
