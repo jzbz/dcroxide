@@ -846,8 +846,12 @@ mod tests {
     }
 
     /// A sync chain over a new in-memory regnet chain, the chain it
-    /// wraps, and the first three blocks of dcrd's full block battery
-    /// that extend its tip one after another.
+    /// wraps, and the first twenty blocks of dcrd's full block battery
+    /// that extend its tip one after another.  The last three buy
+    /// tickets, which gives each a stake tree of five script items: a
+    /// tree the chain runs on its script pool (on a machine with more
+    /// than one CPU), where the blocks before them have no script to
+    /// check.
     fn regnet_sync_chain() -> (NodeSyncChain, Arc<Mutex<Chain>>, Vec<Arc<MsgBlock>>) {
         let params = dcroxide_chaincfg::regnet_params();
         let path = concat!(
@@ -869,11 +873,26 @@ mod tests {
             }
             tip = block.header.block_hash();
             blocks.push(Arc::new(block));
-            if blocks.len() == 3 {
+            if blocks.len() == 20 {
                 break;
             }
         }
-        assert_eq!(blocks.len(), 3, "the battery provides the prefix");
+        assert_eq!(blocks.len(), 20, "the battery provides the prefix");
+        // A stake tree's script items: its inputs that are not
+        // coinbase-style.
+        let stake_items: Vec<usize> = blocks
+            .iter()
+            .map(|block| {
+                block
+                    .stransactions
+                    .iter()
+                    .flat_map(|tx| &tx.tx_in)
+                    .filter(|tx_in| tx_in.previous_out_point.index != u32::MAX)
+                    .count()
+            })
+            .collect();
+        assert_eq!(stake_items[..17], [0; 17], "the blocks without a script");
+        assert_eq!(stake_items[17..], [5; 3], "the blocks that buy tickets");
         let chain = Arc::new(Mutex::new(Chain::new(&params, Hash::ZERO, false)));
         let sync_chain = NodeSyncChain::new(Arc::clone(&chain), params);
         (sync_chain, chain, blocks)

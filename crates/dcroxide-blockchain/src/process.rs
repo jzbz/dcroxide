@@ -496,6 +496,19 @@ impl<'a> ArrivingBlock<'a> {
     }
 }
 
+#[cfg(test)]
+std::thread_local! {
+    /// The hashes the last block data accepted on this thread was filed
+    /// with (`Chain::accepted_tx_hashes`), by address; null when it was
+    /// filed with none.  It exists in this crate's unit-test builds
+    /// only, where a test compares the address with that of the hashes
+    /// a batch of the script pool held, to tell that the pool was handed
+    /// the filed hashes themselves and not an equal copy.  Nothing is
+    /// ever read through it.
+    static FILED_TX_HASHES: core::cell::Cell<*const BlockTxHashes> =
+        const { core::cell::Cell::new(core::ptr::null()) };
+}
+
 /// Nanoseconds per second, for the periodic intervals.
 const NANOS_PER_SEC: i64 = 1_000_000_000;
 
@@ -4142,7 +4155,22 @@ impl Chain {
                         &ChainUtxoResolver { chain: self },
                         Some(&mut stxos),
                         run_scripts,
-                        self.sig_cache.as_deref(),
+                        // The scripts of the blocks the chain connects
+                        // run on the persistent script pool.  The three
+                        // handles are the ones this loop already holds,
+                        // and the block and the hashes are the ones
+                        // passed above.  For a block in the `blocks`
+                        // mirror that is the mirror's allocation, which
+                        // is the caller's own when the block arrived
+                        // shared or hashed, and for the block being
+                        // processed the hashes are the ones filed with
+                        // it.  The pool is lent reference counts of
+                        // them and copies neither.
+                        crate::validate::ScriptRunner::Pooled {
+                            block: &block,
+                            tx_hashes: &tx_hashes,
+                            sig_cache: self.sig_cache.as_ref(),
+                        },
                         &|blk: &MsgBlock| self.tspend_checks(parent_id, blk, params),
                         params,
                     )
@@ -4523,6 +4551,8 @@ impl Chain {
             tx_hashes.assert_for(&mirrored);
             (Arc::clone(&mirrored), Arc::clone(tx_hashes), block_hash)
         });
+        #[cfg(test)]
+        FILED_TX_HASHES.set(tx_hashes.map_or(core::ptr::null(), Arc::as_ptr));
         self.blocks.insert(block_hash.0, mirrored);
         self.remember_ticket_purchases(
             block_hash.0,
@@ -10217,7 +10247,7 @@ mod tests {
             &|_: &OutPoint| -> Option<UtxoEntry> { None },
             None,
             false,
-            None,
+            crate::validate::ScriptRunner::Scoped(None),
             &|_: &MsgBlock| Ok(()),
             &params,
         );
@@ -10734,6 +10764,771 @@ mod tests {
         assert_eq!(chain.arrivals_hashed, arrivals_before);
         assert!(!Arc::ptr_eq(&chain.blocks[&hash.0], &shared));
         assert_eq!(*chain.blocks[&hash.0], blocks[1]);
+    }
+
+    /// The connect checks on the genesis block, no script run, with a
+    /// pooled runner that holds an equal copy of the block, or of its
+    /// hashes, in place of the one being checked.
+    fn connect_check_with_a_copy_in_the_runner(copy_the_block: bool) {
+        let params = dcroxide_chaincfg::regnet_params();
+        let chain = Chain::new(&params, Hash::ZERO, false);
+        let genesis = Arc::new(params.genesis_block.clone());
+        let tx_hashes = Arc::new(BlockTxHashes::compute(&genesis));
+        let block_copy = Arc::new(MsgBlock::clone(&genesis));
+        let hashes_copy = Arc::new(BlockTxHashes::clone(&tx_hashes));
+        let (shared_block, shared_hashes) = if copy_the_block {
+            (&block_copy, &tx_hashes)
+        } else {
+            (&genesis, &hashes_copy)
+        };
+        let tip = chain.best_chain.tip().expect("tip");
+        let mut view = UtxoView::new();
+        let mut subsidy_cache = dcroxide_standalone::SubsidyCache::new(&params);
+        let _ = crate::validate::check_connect_block_with_hashes(
+            &NodeBranchView {
+                store: &chain.store,
+                tip,
+            },
+            &mut subsidy_cache,
+            1,
+            genesis.header.block_hash(),
+            0,
+            0,
+            &genesis,
+            &tx_hashes,
+            &genesis,
+            || Ok(Vec::new()),
+            &mut view,
+            &|_: &OutPoint| -> Option<UtxoEntry> { None },
+            None,
+            false,
+            crate::validate::ScriptRunner::Pooled {
+                block: shared_block,
+                tx_hashes: shared_hashes,
+                sig_cache: None,
+            },
+            &|_: &MsgBlock| Ok(()),
+            &params,
+        );
+    }
+
+    /// The connect checks refuse a pooled runner whose block is not the
+    /// very block being connected, in every build and whether or not a
+    /// script runs: the script pool's helpers would read the
+    /// transactions of the one while the items were collected from the
+    /// other.
+    #[test]
+    #[should_panic(
+        expected = "the script pool was handed another block or other hashes than the ones \
+                    being checked"
+    )]
+    fn the_shared_block_must_be_the_block_being_connected() {
+        connect_check_with_a_copy_in_the_runner(true);
+    }
+
+    /// And one whose hashes are not the very hashes being checked.
+    #[test]
+    #[should_panic(
+        expected = "the script pool was handed another block or other hashes than the ones \
+                    being checked"
+    )]
+    fn the_shared_hashes_must_be_the_hashes_being_checked() {
+        connect_check_with_a_copy_in_the_runner(false);
+    }
+
+    /// The scripts of every block the chain connects are offered to the
+    /// script pool: both trees of a tip extension arrive at the script
+    /// check with a pooled runner, and a tree goes to the pool exactly
+    /// when it holds four script items or more (on a machine with more
+    /// than one CPU).  A bulk import checks no script.  Afterwards the
+    /// chain's copy of the block has the owners it has after a bulk
+    /// import: no batch outlives the call that made it.
+    #[test]
+    fn a_connected_blocks_scripts_are_offered_to_the_script_pool() {
+        let params = dcroxide_chaincfg::regnet_params();
+        let pool_width = crate::scriptpool::Pool::global().width();
+        // The script items of a tree that holds no revocation: its
+        // inputs that are not coinbase-style.
+        let items = |txs: &[dcroxide_wire::MsgTx]| -> Option<usize> {
+            if txs.iter().any(dcroxide_stake::is_ssrtx) {
+                return None;
+            }
+            let spends = txs
+                .iter()
+                .flat_map(|tx| &tx.tx_in)
+                .filter(|tx_in| tx_in.previous_out_point.index != u32::MAX)
+                .count();
+            Some(spends)
+        };
+        let mut owners: Vec<BTreeMap<Hash, usize>> = Vec::new();
+        for bulk_import in [false, true] {
+            let mut chain = Chain::new(&params, Hash::ZERO, false);
+            chain.bulk_import_mode = bulk_import;
+            let (mut now, mut extensions, mut pooled_trees, mut inline_trees) =
+                (0, 0u64, 0u64, 0u64);
+            let mut owners_now = BTreeMap::new();
+            for line in include_str!("../tests/data/fullblock_vectors.txt").lines() {
+                let f: Vec<&str> = line.split(' ').collect();
+                let hex = match f[0] {
+                    "now" => {
+                        now = f[1].parse().expect("now");
+                        continue;
+                    }
+                    "accept" => f[4],
+                    "reject" => f[3],
+                    _ => continue,
+                };
+                let (block, _) =
+                    MsgBlock::from_bytes(&dcroxide_testutil::unhex(hex)).expect("block");
+                let tip_before = chain.best_chain.tip();
+                let before = crate::validate::BLOCK_SCRIPT_ROUTES.get();
+                let runs_before = crate::scriptpool::BATCHES_RUN.get();
+                let (_, errs) = chain.process_block(&block, now, &params);
+                let after = crate::validate::BLOCK_SCRIPT_ROUTES.get();
+                let pooled_runner = after.0.wrapping_sub(before.0);
+                let to_pool = after.1.wrapping_sub(before.1);
+                // Counted inside the pool: every tree counted on its way
+                // there was run by it, and nothing else was.
+                assert_eq!(
+                    crate::scriptpool::BATCHES_RUN
+                        .get()
+                        .wrapping_sub(runs_before),
+                    to_pool,
+                    "{}: the trees for the pool are the batches it ran",
+                    f[1]
+                );
+                if bulk_import {
+                    assert_eq!((pooled_runner, to_pool), (0, 0), "{}", f[1]);
+                }
+
+                // Only a block that was accepted and alone extended the
+                // tip is counted: its two trees were checked by this
+                // call and nothing else was.
+                let block_hash = block.header.block_hash();
+                let tip = chain.best_chain.tip().expect("tip");
+                let tip_node = chain.store.node(tip);
+                if !errs.is_empty() || tip_node.hash != block_hash || tip_node.parent != tip_before
+                {
+                    continue;
+                }
+                extensions = extensions.wrapping_add(1);
+                let mirrored = chain.blocks.get(&block_hash.0).expect("mirrored");
+                owners_now.insert(block_hash, Arc::strong_count(mirrored));
+                if bulk_import {
+                    continue;
+                }
+                assert_eq!(pooled_runner, 2, "{}: both trees, pooled runner", f[1]);
+                let trees = [items(&block.stransactions), items(&block.transactions)];
+                if let [Some(stake), Some(regular)] = trees {
+                    let large = [stake, regular].iter().filter(|n| **n >= 4).count() as u64;
+                    let small = [stake, regular]
+                        .iter()
+                        .filter(|n| (1..4).contains(*n))
+                        .count();
+                    let expected = if pool_width > 0 { large } else { 0 };
+                    assert_eq!(to_pool, expected, "{}: {stake} and {regular} items", f[1]);
+                    pooled_trees = pooled_trees.wrapping_add(large);
+                    inline_trees = inline_trees.wrapping_add(small as u64);
+                } else {
+                    assert!(to_pool <= 2, "{}", f[1]);
+                }
+            }
+            assert!(extensions > 100, "{extensions} tip extensions");
+            if !bulk_import {
+                assert!(
+                    pooled_trees > 0 && inline_trees > 0,
+                    "{pooled_trees} trees for the pool, {inline_trees} below its threshold"
+                );
+            }
+            owners.push(owners_now);
+        }
+        // The two replays do not extend their tips with the same
+        // blocks throughout (a bulk import accepts what only a script
+        // refuses), so the blocks both extended with are compared.
+        let mut compared = 0;
+        for (block_hash, validated_owners) in &owners[0] {
+            if let Some(imported_owners) = owners[1].get(block_hash) {
+                assert_eq!(validated_owners, imported_owners, "{block_hash}");
+                compared += 1;
+            }
+        }
+        assert!(compared > 100, "{compared} blocks compared");
+    }
+
+    /// Every block a processing call validates has both its trees
+    /// checked with a pooled runner, whichever block of the call it is:
+    /// the block the call was handed, and every other block a
+    /// reorganization attaches that had only been stored until then.  A
+    /// block the call refuses was checked up to its failure: neither
+    /// tree, one or both.
+    ///
+    /// dcrd's full block battery is replayed with every block fully
+    /// validated.  Which blocks a call validated and which it refused is
+    /// read from the block index, before and after the call.
+    #[test]
+    fn every_block_a_call_validates_is_checked_with_a_pooled_runner() {
+        let params = dcroxide_chaincfg::regnet_params();
+        let mut chain = Chain::new(&params, Hash::ZERO, false);
+        // The node of every block the replay has given the index.
+        let mut nodes: Vec<NodeId> = Vec::new();
+        // The calls that validated one block and refused none, and those
+        // that validated several and refused none.
+        let (mut now, mut one, mut several) = (0, 0u64, 0u64);
+        for line in include_str!("../tests/data/fullblock_vectors.txt").lines() {
+            let f: Vec<&str> = line.split(' ').collect();
+            let hex = match f[0] {
+                "now" => {
+                    now = f[1].parse().expect("now");
+                    continue;
+                }
+                "accept" => f[4],
+                "reject" => f[3],
+                _ => continue,
+            };
+            let (block, _) = MsgBlock::from_bytes(&dcroxide_testutil::unhex(hex)).expect("block");
+            let mut statuses: Vec<BlockStatus> = nodes
+                .iter()
+                .map(|&node| chain.index.node_status(&chain.store, node))
+                .collect();
+            let routes = crate::validate::BLOCK_SCRIPT_ROUTES.get();
+            let _ = chain.process_block(&block, now, &params);
+            let pooled_runner = crate::validate::BLOCK_SCRIPT_ROUTES
+                .get()
+                .0
+                .wrapping_sub(routes.0);
+
+            // A block the index first held in this call had no status
+            // before it.
+            if let Some(node) = chain.index.lookup_node(&block.header.block_hash())
+                && !nodes.contains(&node)
+            {
+                nodes.push(node);
+                statuses.push(BlockStatus::NONE);
+            }
+            let (mut validated, mut refused) = (0u64, 0u64);
+            for (&node, was) in nodes.iter().zip(&statuses) {
+                let is = chain.index.node_status(&chain.store, node);
+                validated += u64::from(is.has_validated() && !was.has_validated());
+                refused += u64::from(is.known_validate_failed() && !was.known_validate_failed());
+            }
+            assert!(
+                (2 * validated..=2 * (validated + refused)).contains(&pooled_runner),
+                "{}: {pooled_runner} trees checked with a pooled runner for {validated} blocks \
+                 validated and {refused} refused",
+                f[1]
+            );
+            if refused == 0 {
+                one += u64::from(validated == 1);
+                several += u64::from(validated > 1);
+            }
+        }
+        assert!(
+            one > 100 && several >= 5,
+            "{one} calls validated one block, {several} validated several"
+        );
+    }
+
+    /// A template check offers the script pool nothing: the public
+    /// `check_connect_block` keeps the scoped workers.  Every block of
+    /// the battery that builds on the tip is first checked as a template
+    /// and then processed, so the checks run on the chain states the
+    /// blocks were made for, and many of them reach their scripts.
+    #[test]
+    fn a_template_check_offers_the_script_pool_nothing() {
+        let params = dcroxide_chaincfg::regnet_params();
+        let mut chain = Chain::new(&params, Hash::ZERO, false);
+        let (mut now, mut templates, mut with_scripts, mut passed) = (0, 0u64, 0u64, 0u64);
+        for line in include_str!("../tests/data/fullblock_vectors.txt").lines() {
+            let f: Vec<&str> = line.split(' ').collect();
+            let hex = match f[0] {
+                "now" => {
+                    now = f[1].parse().expect("now");
+                    continue;
+                }
+                "accept" => f[4],
+                "reject" => f[3],
+                _ => continue,
+            };
+            let (block, _) = MsgBlock::from_bytes(&dcroxide_testutil::unhex(hex)).expect("block");
+            let tip = chain.best_chain.tip().expect("tip");
+            if block.header.prev_block == chain.store.node(tip).hash {
+                let routes = crate::validate::BLOCK_SCRIPT_ROUTES.get();
+                let runs = crate::scriptpool::BATCHES_RUN.get();
+                let items = crate::validate::BLOCK_SCRIPT_ITEMS.get();
+                let verdict = chain.check_connect_block_template(&block, now, &params);
+                assert_eq!(
+                    crate::validate::BLOCK_SCRIPT_ROUTES.get(),
+                    routes,
+                    "{}: a template check offers the pool nothing",
+                    f[1]
+                );
+                assert_eq!(
+                    crate::scriptpool::BATCHES_RUN.get(),
+                    runs,
+                    "{}: a template check runs nothing on the pool",
+                    f[1]
+                );
+                templates = templates.wrapping_add(1);
+                if crate::validate::BLOCK_SCRIPT_ITEMS.get() != items {
+                    with_scripts = with_scripts.wrapping_add(1);
+                }
+                passed = passed.wrapping_add(u64::from(verdict.is_ok()));
+            }
+            let _ = chain.process_block(&block, now, &params);
+        }
+        assert!(
+            with_scripts > 100 && passed > 100,
+            "{templates} template checks, {with_scripts} that collected script items, {passed} \
+             that passed"
+        );
+    }
+
+    /// A script that fails in a tree the script pool runs refuses the
+    /// block as one that fails on the scoped workers does: the error is
+    /// the failing input's own, the block is marked as having failed
+    /// validation, the tip stays, and a valid block is accepted on it
+    /// afterwards.
+    ///
+    /// The refused block is a twin of a block of the battery that
+    /// extends the tip with enough stake script items for the pool: one
+    /// signature script in the middle of the stake tree is changed, the
+    /// merkle root in the header that covers it is computed again, and
+    /// the proof of work is found again.  The valid block is the
+    /// battery's own.  One twin is made for each size of stake tree the
+    /// battery's first run of tip extensions has.
+    #[test]
+    fn a_script_that_fails_on_the_script_pool_refuses_the_block() {
+        let params = dcroxide_chaincfg::regnet_params();
+        let pow_limit = dcroxide_standalone::BigInt::from_bytes_be(
+            dcroxide_standalone::Sign::Plus,
+            &params.pow_limit.to_be_bytes(),
+        );
+        let to_pool = u64::from(crate::scriptpool::Pool::global().width() > 0);
+        let mut chain = Chain::new(&params, Hash::ZERO, false);
+        let mut now = 0;
+        // The sizes of the stake trees a twin was refused for.
+        let mut refused: Vec<usize> = Vec::new();
+        for line in include_str!("../tests/data/fullblock_vectors.txt").lines() {
+            let f: Vec<&str> = line.split(' ').collect();
+            match f[0] {
+                "now" => {
+                    now = f[1].parse().expect("now");
+                    continue;
+                }
+                "accept" if f[2] == "true" => {}
+                "accept" => break,
+                _ => continue,
+            }
+            let name = f[1];
+            let (block, _) = MsgBlock::from_bytes(&dcroxide_testutil::unhex(f[4])).expect("block");
+            let tip = chain.best_chain.tip().expect("tip");
+            assert_eq!(
+                block.header.prev_block,
+                chain.store.node(tip).hash,
+                "{name}"
+            );
+
+            // The stake tree's script items, there being no revocation
+            // to skip: its inputs that are not coinbase-style.
+            let spends: Vec<(usize, usize)> = block
+                .stransactions
+                .iter()
+                .enumerate()
+                .flat_map(|(tx_idx, tx)| {
+                    tx.tx_in
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, tx_in)| tx_in.previous_out_point.index != u32::MAX)
+                        .map(move |(tx_in_idx, _)| (tx_idx, tx_in_idx))
+                })
+                .collect();
+            assert!(!block.stransactions.iter().any(dcroxide_stake::is_ssrtx));
+            if spends.len() >= 4 && !refused.contains(&spends.len()) {
+                let (tx_idx, tx_in_idx) = spends[(spends.len() - 1) / 2];
+                let mut twin = block.clone();
+                let script = &mut twin.stransactions[tx_idx].tx_in[tx_in_idx].signature_script;
+                *script.last_mut().expect("a signature script") ^= 0x01;
+                // The header commits to the signature scripts through
+                // the combined root of both trees, or through the stake
+                // tree's own root before that agenda.
+                let combined = |block: &MsgBlock| {
+                    dcroxide_standalone::calc_combined_tx_tree_merkle_root(
+                        &block.transactions,
+                        &block.stransactions,
+                    )
+                };
+                let stake_root = |block: &MsgBlock| {
+                    dcroxide_standalone::calc_tx_tree_merkle_root(&block.stransactions)
+                };
+                if block.header.merkle_root == combined(&block) {
+                    twin.header.merkle_root = combined(&twin);
+                } else {
+                    assert_eq!(block.header.stake_root, stake_root(&block), "{name}");
+                    twin.header.stake_root = stake_root(&twin);
+                }
+                twin.header.nonce = 0;
+                while crate::validate::check_proof_of_work_sanity(&twin.header, &pow_limit, false)
+                    .is_err()
+                {
+                    twin.header.nonce = twin.header.nonce.wrapping_add(1);
+                }
+                let twin_hash = twin.header.block_hash();
+                assert_ne!(twin_hash, block.header.block_hash(), "{name}");
+
+                let routes = crate::validate::BLOCK_SCRIPT_ROUTES.get();
+                let runs = crate::scriptpool::BATCHES_RUN.get();
+                let (_, errs) = chain.process_block(&twin, now, &params);
+                assert_eq!(errs.len(), 1, "{name}: {errs:?}");
+                let err = &errs[0];
+                assert_eq!(
+                    err.kind,
+                    RuleErrorKind::ScriptValidation,
+                    "{name}: {}",
+                    err.description
+                );
+                let names_the_input = format!(
+                    "failed to validate input {}:{tx_in_idx} ",
+                    twin.stransactions[tx_idx].tx_hash()
+                );
+                assert!(
+                    err.description.starts_with(&names_the_input),
+                    "{name}: {}",
+                    err.description
+                );
+                // The stake tree is checked first, so it is the one tree
+                // this call checked: with a pooled runner, and by the
+                // pool wherever the machine gives the pool a helper.
+                let routes_after = crate::validate::BLOCK_SCRIPT_ROUTES.get();
+                assert_eq!(routes_after.0.wrapping_sub(routes.0), 1, "{name}");
+                assert_eq!(
+                    routes_after.1.wrapping_sub(routes.1),
+                    to_pool,
+                    "{name}: {} stake script items",
+                    spends.len()
+                );
+                assert_eq!(
+                    crate::scriptpool::BATCHES_RUN.get().wrapping_sub(runs),
+                    to_pool,
+                    "{name}"
+                );
+
+                assert_eq!(chain.best_chain.tip(), Some(tip), "{name}: the tip stays");
+                let twin_node = chain
+                    .index
+                    .lookup_node(&twin_hash)
+                    .expect("the twin's node");
+                assert!(
+                    chain
+                        .index
+                        .node_status(&chain.store, twin_node)
+                        .known_validate_failed(),
+                    "{name}: the refused block is marked"
+                );
+                refused.push(spends.len());
+            }
+
+            let (_, errs) = chain.process_block(&block, now, &params);
+            assert!(errs.is_empty(), "{name}: {errs:?}");
+            let tip = chain.best_chain.tip().expect("tip");
+            assert_eq!(
+                chain.store.node(tip).hash,
+                block.header.block_hash(),
+                "{name}"
+            );
+        }
+        assert!(
+            refused.len() >= 2,
+            "stake trees of {refused:?} items were refused on the pool"
+        );
+    }
+
+    /// The script pool is handed a block in the allocations it arrived
+    /// in.  Whichever way a block reaches the chain, the batch the pool
+    /// runs holds by reference count the block the `blocks` mirror
+    /// holds, which is the caller's own allocation when the block came
+    /// shared or hashed and the chain's one copy of it when it was lent;
+    /// the hashes the processing call filed with the block, which are
+    /// the caller's own allocation when the block came with them; and
+    /// the chain's signature cache.  Nothing is copied for the pool, and
+    /// when the call returns the batch is gone: the block, its hashes
+    /// and the cache have the owners they had before, and the mirror.
+    #[test]
+    fn the_script_pool_holds_a_block_as_it_arrived() {
+        let params = dcroxide_chaincfg::regnet_params();
+        let (now, blocks) = tip_extensions(150);
+        let mut chain = Chain::new(&params, Hash::ZERO, false);
+        let cache = Arc::clone(chain.sig_cache.as_ref().expect("the default cache"));
+        let no_batch: crate::validate::PooledBatchOwners =
+            (core::ptr::null(), core::ptr::null(), core::ptr::null());
+        // The blocks with a tree the pool ran, by the way they arrived:
+        // lent, shared, hashed.
+        let mut pooled = [0usize; 3];
+        for (i, block) in blocks.iter().enumerate() {
+            let form = i % 3;
+            let shared = Arc::new(block.clone());
+            let hashed = (form == 2).then(|| HashedBlock::new(Arc::clone(&shared)));
+            let block_owners = Arc::strong_count(&shared);
+
+            crate::validate::POOLED_BATCH_OWNERS.set(no_batch);
+            FILED_TX_HASHES.set(core::ptr::null());
+            let routes = crate::validate::BLOCK_SCRIPT_ROUTES.get();
+            let (_, errs) = match (form, &hashed) {
+                (0, _) => chain.process_block(block, now, &params),
+                (_, None) => chain.process_shared_block(&shared, now, &params),
+                (_, Some(hashed)) => chain.process_hashed_block(hashed, now, &params),
+            };
+            assert!(errs.is_empty(), "block {i}: {errs:?}");
+            let to_pool = crate::validate::BLOCK_SCRIPT_ROUTES
+                .get()
+                .1
+                .wrapping_sub(routes.1);
+            let (batch_block, batch_hashes, batch_cache) =
+                crate::validate::POOLED_BATCH_OWNERS.get();
+            let mirror = &chain.blocks[&block.header.block_hash().0];
+
+            // Whether or not a tree went to the pool, nothing of the
+            // call is left holding what it was handed.
+            assert_eq!(Arc::strong_count(&cache), 2, "block {i}");
+            if form == 0 {
+                assert_eq!(Arc::strong_count(mirror), 1, "block {i}");
+            } else {
+                assert!(Arc::ptr_eq(mirror, &shared), "block {i}");
+                assert_eq!(Arc::strong_count(&shared), block_owners + 1, "block {i}");
+            }
+            if let Some(hashed) = &hashed {
+                assert_eq!(Arc::strong_count(hashed.tx_hashes()), 1, "block {i}");
+            }
+
+            if to_pool == 0 {
+                assert_eq!(
+                    (batch_block, batch_hashes, batch_cache),
+                    no_batch,
+                    "block {i}"
+                );
+                continue;
+            }
+            pooled[form] += 1;
+            assert!(
+                core::ptr::eq(batch_block, Arc::as_ptr(mirror)),
+                "block {i}: the batch held the mirror's block"
+            );
+            assert!(
+                core::ptr::eq(batch_cache, Arc::as_ptr(&cache)),
+                "block {i}: the batch held the chain's signature cache"
+            );
+            // The hashes are the ones the call filed with the block,
+            // whoever computed them; for a lent or a shared block they
+            // are gone by now, and only their address is compared.
+            assert!(
+                !batch_hashes.is_null() && core::ptr::eq(batch_hashes, FILED_TX_HASHES.get()),
+                "block {i}: the batch held the hashes filed with the block"
+            );
+            match &hashed {
+                // The lent block is not the one the pool read: the
+                // chain's copy is.
+                None if form == 0 => assert!(!core::ptr::eq(batch_block, block), "block {i}"),
+                None => assert!(
+                    core::ptr::eq(batch_block, Arc::as_ptr(&shared)),
+                    "block {i}: the batch held the caller's block"
+                ),
+                Some(hashed) => {
+                    assert!(
+                        core::ptr::eq(batch_block, Arc::as_ptr(hashed.block())),
+                        "block {i}: the batch held the caller's block"
+                    );
+                    assert!(
+                        core::ptr::eq(batch_hashes, Arc::as_ptr(hashed.tx_hashes())),
+                        "block {i}: the batch held the hashes the block arrived with"
+                    );
+                }
+            }
+        }
+        if crate::scriptpool::Pool::global().width() > 0 {
+            assert!(
+                pooled.iter().all(|blocks| *blocks >= 10),
+                "{pooled:?} blocks with a pooled tree arrived lent, shared and hashed"
+            );
+        } else {
+            assert_eq!(pooled, [0; 3]);
+        }
+    }
+
+    /// A block in the form the daemon's reader thread hands over during
+    /// the initial chain sync, on a chain over a database that already
+    /// has the block's header: hashed before it arrived, with the bytes
+    /// it was decoded from kept as its record for the block files
+    /// ([`HashedBlock::keep_wire_bytes`]).  One processing call uses all
+    /// of what such a block arrives with, and makes or copies none of it
+    /// again:
+    ///
+    /// - The call hashes no transaction and builds no merkle leaf or
+    ///   tree.  It hashes one header for a block that is fully
+    ///   validated, the parent's, and one more for a block added without
+    ///   full validation, the block's own in the view that connects it.
+    /// - The `blocks` mirror holds the caller's allocation.
+    /// - The block is stored as the record it arrived with, which the
+    ///   database writes as it stands and lets go of with its
+    ///   transaction.
+    /// - Both trees of a fully validated block reach the script check
+    ///   with a pooled runner.  A tree with enough script items for the
+    ///   script pool is run by it (on a machine with more than one CPU),
+    ///   in a batch that holds by reference count the caller's block, the
+    ///   hashes the block arrived with and the chain's signature cache.
+    ///   A block added without full validation has no script checked.
+    /// - When the call returns the mirror is the block's one new owner,
+    ///   and the hashes, the record and the signature cache have the
+    ///   owners they had before it.
+    ///
+    /// The header commitments agenda is forced, as it is decided for
+    /// every block of the main and test networks: the merkle commitment
+    /// is then proven where the roots the block arrived with are compared
+    /// with the header, and no later check builds a tree.
+    #[test]
+    fn a_block_with_its_hashes_and_its_record_is_processed_as_it_arrived_over_a_database() {
+        use crate::blockhashes::{BLOCKS_HASHED, LEAVES_HASHED, TREES_BUILT};
+        use crate::scriptpool::{BATCHES_RUN, MIN_POOLED_ITEMS, Pool};
+        use crate::validate::{BLOCK_SCRIPT_ROUTES, POOLED_BATCH_OWNERS, PooledBatchOwners};
+        use dcroxide_database::BlockRecord;
+        use dcroxide_wire::header_hashes_on_this_thread;
+
+        let mut params = dcroxide_chaincfg::regnet_params();
+        force_deployment_result(
+            &mut params,
+            crate::agendas::VOTE_ID_HEADER_COMMITMENTS,
+            "no",
+        );
+        let (now, blocks) = tip_extensions(150);
+        let pool_width = Pool::global().width();
+        let no_batch: PooledBatchOwners = (core::ptr::null(), core::ptr::null(), core::ptr::null());
+        // The script items of a tree that holds no revocation: its
+        // inputs that are not coinbase-style.
+        let script_items = |txs: &[MsgTx]| -> usize {
+            txs.iter()
+                .flat_map(|tx| &tx.tx_in)
+                .filter(|tx_in| tx_in.previous_out_point.index != u32::MAX)
+                .count()
+        };
+        for bulk_import in [false, true] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let opts = dcroxide_database::Options::new(dir.path().join("chain"), params.net.0);
+            let db = dcroxide_database::Database::create(&opts).expect("create database");
+            let mut chain = Chain::open(db, &params, Hash::ZERO, false, 0).expect("open chain");
+            chain.bulk_import_mode = bulk_import;
+            for block in &blocks {
+                chain
+                    .process_block_header(&block.header, now, &params)
+                    .expect("header");
+            }
+            let cache = Arc::clone(chain.sig_cache.as_ref().expect("the default cache"));
+            // The blocks with a tree the pool ran.
+            let mut pooled = 0usize;
+            for (i, block) in blocks.iter().enumerate() {
+                let what = format!("block {i} (bulk import: {bulk_import})");
+                assert!(
+                    !block.stransactions.iter().any(dcroxide_stake::is_ssrtx),
+                    "{what}"
+                );
+                let shared = Arc::new(block.clone());
+                let mut hashed = HashedBlock::new(Arc::clone(&shared));
+                // The block's serialization, which is the bytes a reader
+                // decoded it from, behind the room the head of a record
+                // takes.
+                let mut buf = alloc::vec![0u8; BlockRecord::PREFIX_LEN];
+                buf.extend_from_slice(&block.serialize());
+                assert!(
+                    hashed.keep_wire_bytes(buf, BlockRecord::PREFIX_LEN, params.net.0),
+                    "{what}"
+                );
+                let hash = *hashed.hash();
+                let block_owners = Arc::strong_count(&shared);
+
+                POOLED_BATCH_OWNERS.set(no_batch);
+                let routes = BLOCK_SCRIPT_ROUTES.get();
+                let runs = BATCHES_RUN.get();
+                let hashing = (BLOCKS_HASHED.get(), LEAVES_HASHED.get(), TREES_BUILT.get());
+                let chain_hashing = (chain.arrivals_hashed, chain.tx_hash_recomputes);
+                let headers = header_hashes_on_this_thread();
+                let (fork_len, errs) = chain.process_hashed_block(&hashed, now, &params);
+                let headers = header_hashes_on_this_thread().wrapping_sub(headers);
+                assert!(errs.is_empty(), "{what}: {errs:?}");
+                assert_eq!(fork_len, 0, "{what}");
+                let tip = chain.best_chain.tip().expect("tip");
+                assert_eq!(chain.store.node(tip).hash, hash, "{what}");
+
+                // Nothing the block arrived with was made again.
+                assert_eq!(
+                    (BLOCKS_HASHED.get(), LEAVES_HASHED.get(), TREES_BUILT.get()),
+                    hashing,
+                    "{what}: transactions hashed, leaves built, trees built"
+                );
+                assert_eq!(
+                    (chain.arrivals_hashed, chain.tx_hash_recomputes),
+                    chain_hashing,
+                    "{what}"
+                );
+                assert_eq!(headers, if bulk_import { 2 } else { 1 }, "{what}");
+
+                // The mirror holds the caller's block, the database wrote
+                // the record the block arrived with, and neither the call
+                // nor the database kept anything else.
+                assert!(Arc::ptr_eq(&chain.blocks[&hash.0], &shared), "{what}");
+                assert_eq!(Arc::strong_count(&shared), block_owners + 1, "{what}");
+                assert_eq!(Arc::strong_count(hashed.tx_hashes()), 1, "{what}");
+                assert_eq!(
+                    Arc::strong_count(hashed.record().expect("kept")),
+                    1,
+                    "{what}"
+                );
+                assert_eq!(Arc::strong_count(&cache), 2, "{what}");
+                let db = chain.db.as_ref().expect("a chain over a database");
+                assert_eq!(db.records_written_as_laid_out(), i as u64 + 1, "{what}");
+
+                // Where the scripts ran.
+                let routes_after = BLOCK_SCRIPT_ROUTES.get();
+                let pooled_runner = routes_after.0.wrapping_sub(routes.0);
+                let to_pool = routes_after.1.wrapping_sub(routes.1);
+                assert_eq!(BATCHES_RUN.get().wrapping_sub(runs), to_pool, "{what}");
+                let batch = POOLED_BATCH_OWNERS.get();
+                if bulk_import {
+                    assert_eq!((pooled_runner, to_pool), (0, 0), "{what}");
+                    assert_eq!(batch, no_batch, "{what}");
+                    continue;
+                }
+                assert_eq!(pooled_runner, 2, "{what}: both trees, pooled runner");
+                let for_the_pool = [&block.stransactions, &block.transactions]
+                    .iter()
+                    .filter(|txs| script_items(txs) >= MIN_POOLED_ITEMS)
+                    .count() as u64;
+                assert_eq!(
+                    to_pool,
+                    if pool_width > 0 { for_the_pool } else { 0 },
+                    "{what}"
+                );
+                if to_pool == 0 {
+                    assert_eq!(batch, no_batch, "{what}");
+                    continue;
+                }
+                pooled += 1;
+                let (batch_block, batch_hashes, batch_cache) = batch;
+                assert!(
+                    core::ptr::eq(batch_block, Arc::as_ptr(hashed.block())),
+                    "{what}: the batch held the caller's block"
+                );
+                assert!(
+                    core::ptr::eq(batch_hashes, Arc::as_ptr(hashed.tx_hashes())),
+                    "{what}: the batch held the hashes the block arrived with"
+                );
+                assert!(
+                    core::ptr::eq(batch_cache, Arc::as_ptr(&cache)),
+                    "{what}: the batch held the chain's signature cache"
+                );
+            }
+            if bulk_import || pool_width == 0 {
+                assert_eq!(pooled, 0, "bulk import: {bulk_import}");
+            } else {
+                assert!(pooled >= 50, "{pooled} blocks with a pooled tree");
+            }
+        }
     }
 
     /// The hashes filed while a block is processed do not outlive the

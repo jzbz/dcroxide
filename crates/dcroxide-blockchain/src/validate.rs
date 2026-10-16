@@ -7,6 +7,7 @@
 
 use alloc::format;
 use alloc::string::String;
+use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -5370,6 +5371,18 @@ struct ValidateItem<'a> {
     /// then takes the prefix hash of a `SigHashAll` signature hash from
     /// it.  `None` has the engine hash the prefix for every signature.
     tx_hash: Option<&'a Hash>,
+    /// The position of `tx` in its tree of the block: where a batch
+    /// handed to the script pool finds the transaction and its hash
+    /// again.  Zero, and never read, for a transaction that is not
+    /// checked as part of a block.
+    #[cfg_attr(
+        not(any(test, feature = "std")),
+        expect(
+            dead_code,
+            reason = "read only by the script pool's batch, which needs threads"
+        )
+    )]
+    tx_idx: usize,
     tx_in_idx: usize,
     pk_script: &'a [u8],
     script_version: u16,
@@ -5468,17 +5481,20 @@ fn validate_item(
 /// sufficient — workers pull from a shared index rather than owning a
 /// fixed slice, so an uneven batch still balances without oversubscribing.
 ///
-/// **Open arm: a persistent pool.** Every call at or above the parallel
-/// threshold still creates and joins its workers through
-/// `std::thread::scope`, so the adopted arm above creates 17-19
-/// thousand threads per ten seconds. All three measured arms were scope
-/// threads; a long-lived pool of `cores` workers (what ADR-0005
-/// proposed) would keep the full width without the per-call spawns, and
-/// has not been measured.  The spawns also land on the relay path
+/// **Block connects have a persistent pool.** Every call here at or
+/// above the parallel threshold creates and joins its workers through
+/// `std::thread::scope`, and all three arms measured above were scope
+/// threads.  The trees of the blocks the chain connects no longer come
+/// here once they hold `MIN_POOLED_ITEMS` items: they run on the
+/// long-lived helpers of the crate's script pool (what ADR-0005
+/// proposed), which keep the full width without the per-call spawns
+/// (see [`ScriptRunner`]).  This function still creates its workers per
+/// call, for the relay and template paths, the public block checks and
+/// the trees the pool does not take.  On the relay path the spawns land
 /// through [`validate_transaction_scripts`], which checks a
 /// transaction's first input inline before calling here, so a garbage
 /// first signature is rejected without them; a transaction whose first
-/// input is valid still pays them until the pool lands.
+/// input is valid still pays them.
 ///
 /// Small batches still run inline. Which failure surfaces when several
 /// items are invalid remains scheduling-dependent, exactly like dcrd's
@@ -5600,6 +5616,263 @@ fn validate_items(
     Ok(())
 }
 
+/// Where the script checks of a block being connected run.
+///
+/// dcrd has one `txValidator` for every caller, and it starts its
+/// goroutines anew for each batch (scriptval.go:120-132).  The scoped
+/// workers of [`validate_items`] do the same with OS threads.  The
+/// chain, which connects block after block, lends its batches the
+/// long-lived helpers of the crate's script pool instead.  The verdict
+/// and the error for a failing input are the same either way: both run
+/// [`validate_item`] on the same transaction, input, previous script
+/// bytes and transaction hash.
+///
+/// The two differ in which input they name when several fail.  The
+/// pool always names the one of lowest index.  The scoped workers do so
+/// for a tree they check on the calling thread, and for a tree they fan
+/// out name whichever failure is recorded first, as dcrd does for every
+/// batch (scriptval.go:141-163).
+#[derive(Clone, Copy)]
+pub(crate) enum ScriptRunner<'a> {
+    /// On the calling thread and the scoped workers of
+    /// [`validate_items`], with the optional signature cache.
+    Scoped(Option<&'a dcroxide_txscript::SigCache>),
+    /// On the script pool, for a tree of at least `MIN_POOLED_ITEMS`
+    /// items whose previous scripts are small enough to copy; on the
+    /// scoped workers for every other tree, and for all of them where
+    /// the crate is built without threads.
+    ///
+    /// A helper of the pool outlives the call, so it cannot be lent
+    /// what the caller borrows.  The block, its transaction hashes and
+    /// the signature cache are handed over by reference count, and
+    /// `block` and `tx_hashes` must be the very allocations of the
+    /// block and the hashes being checked:
+    /// [`ScriptRunner::assert_for`] and every item of a pooled batch
+    /// compare them by address.
+    Pooled {
+        /// The block being connected.
+        block: &'a Arc<MsgBlock>,
+        /// The hashes of its transactions.
+        tx_hashes: &'a Arc<crate::blockhashes::BlockTxHashes>,
+        /// The optional signature cache.
+        sig_cache: Option<&'a Arc<dcroxide_txscript::SigCache>>,
+    },
+}
+
+impl<'a> ScriptRunner<'a> {
+    /// The signature cache the engines share, wherever they run.
+    fn sig_cache(self) -> Option<&'a dcroxide_txscript::SigCache> {
+        match self {
+            ScriptRunner::Scoped(sig_cache) => sig_cache,
+            ScriptRunner::Pooled { sig_cache, .. } => sig_cache.map(|cache| &**cache),
+        }
+    }
+
+    /// A pooled runner must hold the block and the hashes being
+    /// checked themselves, not equal copies: the pool's helpers read
+    /// the transactions and the hashes through the runner's references
+    /// while the items were collected from `block` and `tx_hashes`.
+    /// Checked in every build.
+    fn assert_for(self, block: &MsgBlock, tx_hashes: &crate::blockhashes::BlockTxHashes) {
+        if let ScriptRunner::Pooled {
+            block: shared_block,
+            tx_hashes: shared_hashes,
+            ..
+        } = self
+        {
+            assert!(
+                core::ptr::eq(Arc::as_ptr(shared_block), block)
+                    && core::ptr::eq(Arc::as_ptr(shared_hashes), tx_hashes),
+                "the script pool was handed another block or other hashes than the ones \
+                 being checked"
+            );
+        }
+    }
+}
+
+/// The transactions of one tree of a block, and the hashes of that same
+/// tree when the block's transaction hashes are given.
+///
+/// This is the one place a tree is chosen.  The collection of a tree's
+/// script items and the batch the script pool is handed both read the
+/// transactions and the hashes through it, so neither can pair a
+/// transaction with a hash of the other tree.
+fn block_tree<'a>(
+    block: &'a MsgBlock,
+    tx_hashes: Option<&'a crate::blockhashes::BlockTxHashes>,
+    tx_tree_regular: bool,
+) -> (&'a [MsgTx], Option<&'a [Hash]>) {
+    if tx_tree_regular {
+        (
+            &block.transactions,
+            tx_hashes.map(crate::blockhashes::BlockTxHashes::regular),
+        )
+    } else {
+        (
+            &block.stransactions,
+            tx_hashes.map(crate::blockhashes::BlockTxHashes::stake),
+        )
+    }
+}
+
+/// [`block_tree`] with the hashes in hand.
+#[cfg(any(test, feature = "std"))]
+fn tree<'a>(
+    block: &'a MsgBlock,
+    tx_hashes: &'a crate::blockhashes::BlockTxHashes,
+    tx_tree_regular: bool,
+) -> (&'a [MsgTx], &'a [Hash]) {
+    let (txs, hashes) = block_tree(block, Some(tx_hashes), tx_tree_regular);
+    (txs, hashes.expect("hashes given are hashes returned"))
+}
+
+/// The most bytes of previous scripts a batch copies for the script
+/// pool.  The pool's helpers cannot borrow the view, so a pooled batch
+/// copies the scripts its items spend into one buffer.  A tree that
+/// spends more than this keeps them where the view has them and runs on
+/// the scoped workers, which borrow.  The scripts a block spends are far
+/// smaller as a rule; the bound is for the block that spends many large
+/// stored scripts, which would otherwise be held twice.
+#[cfg(any(test, feature = "std"))]
+const MAX_POOLED_SCRIPT_BYTES: usize = 1 << 20;
+
+/// One item of an [`OwnedBatch`]: the positions that find its
+/// transaction, its hash and its input in the block again, and where
+/// its previous script lies in the batch's buffer.
+#[cfg(any(test, feature = "std"))]
+struct OwnedItem {
+    tx_idx: u32,
+    tx_in_idx: u32,
+    script_start: u32,
+    script_len: u32,
+    script_version: u16,
+}
+
+/// The script items of one tree of a block in the form the script pool
+/// runs: the batch owns everything its checks read.  The block, its
+/// transaction hashes and the signature cache are held by reference
+/// count, and the previous scripts are copied once into one buffer.
+#[cfg(any(test, feature = "std"))]
+struct OwnedBatch {
+    block: Arc<MsgBlock>,
+    tx_hashes: Arc<crate::blockhashes::BlockTxHashes>,
+    tx_tree_regular: bool,
+    items: Vec<OwnedItem>,
+    /// The items' previous scripts, end to end.
+    scripts: Vec<u8>,
+    script_flags: dcroxide_txscript::ScriptFlags,
+    sig_cache: Option<Arc<dcroxide_txscript::SigCache>>,
+}
+
+#[cfg(any(test, feature = "std"))]
+impl OwnedBatch {
+    /// Copy the collected items of one tree of `shared_block`.  `None`
+    /// when their previous scripts come to more than
+    /// [`MAX_POOLED_SCRIPT_BYTES`].
+    ///
+    /// Each item's transaction and hash are compared by address with
+    /// the ones the tree holds at the item's `tx_idx`, in every build.
+    /// A helper rebuilds the item from that index alone, and
+    /// `dcroxide_txscript::Engine::set_tx_hash` compares the hash with
+    /// its transaction only under debug assertions: without this check
+    /// an index or a tree that went wrong on the way here would have a
+    /// release build verify signatures against another transaction's
+    /// hash, which can reject a valid block and can also accept a
+    /// signature made for that other transaction.
+    fn new(
+        shared_block: &Arc<MsgBlock>,
+        shared_hashes: &Arc<crate::blockhashes::BlockTxHashes>,
+        tx_tree_regular: bool,
+        items: &[ValidateItem<'_>],
+        script_flags: dcroxide_txscript::ScriptFlags,
+        sig_cache: Option<&Arc<dcroxide_txscript::SigCache>>,
+    ) -> Option<OwnedBatch> {
+        let total = items.iter().fold(0usize, |total, item| {
+            total.saturating_add(item.pk_script.len())
+        });
+        if total > MAX_POOLED_SCRIPT_BYTES {
+            return None;
+        }
+        let (txs, hashes) = tree(shared_block, shared_hashes, tx_tree_regular);
+        let mut scripts = Vec::with_capacity(total);
+        let mut owned = Vec::with_capacity(items.len());
+        for item in items {
+            assert!(
+                txs.get(item.tx_idx)
+                    .is_some_and(|tx| core::ptr::eq(tx, item.tx)),
+                "a script item's transaction is not the block's at its position"
+            );
+            assert!(
+                matches!(
+                    (item.tx_hash, hashes.get(item.tx_idx)),
+                    (Some(given), Some(held)) if core::ptr::eq(given, held)
+                ),
+                "a script item's hash is not the block's for its transaction"
+            );
+            assert!(
+                item.tx_in_idx < item.tx.tx_in.len(),
+                "a script item's input is not one of its transaction's"
+            );
+            let script_start = u32::try_from(scripts.len()).expect("at most the cap");
+            scripts.extend_from_slice(item.pk_script);
+            owned.push(OwnedItem {
+                tx_idx: u32::try_from(item.tx_idx).expect("a position in a block's tree"),
+                tx_in_idx: u32::try_from(item.tx_in_idx).expect("a position in a transaction"),
+                script_start,
+                script_len: u32::try_from(item.pk_script.len()).expect("at most the cap"),
+                script_version: item.script_version,
+            });
+        }
+        Some(OwnedBatch {
+            block: Arc::clone(shared_block),
+            tx_hashes: Arc::clone(shared_hashes),
+            tx_tree_regular,
+            items: owned,
+            scripts,
+            script_flags,
+            sig_cache: sig_cache.cloned(),
+        })
+    }
+
+    /// The item at `index` as the scoped path would hold it: the same
+    /// transaction object and hash, found through [`tree`] as they were
+    /// when the item was collected, and the copy of its previous script.
+    fn item(&self, index: usize) -> ValidateItem<'_> {
+        let item = &self.items[index];
+        let (txs, hashes) = tree(&self.block, &self.tx_hashes, self.tx_tree_regular);
+        let tx_idx = item.tx_idx as usize;
+        let script_start = item.script_start as usize;
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "the end of a script copied into the buffer, at most the buffer's length"
+        )]
+        let script_end = script_start + item.script_len as usize;
+        ValidateItem {
+            tx: &txs[tx_idx],
+            tx_hash: Some(&hashes[tx_idx]),
+            tx_idx,
+            tx_in_idx: item.tx_in_idx as usize,
+            pk_script: &self.scripts[script_start..script_end],
+            script_version: item.script_version,
+        }
+    }
+}
+
+#[cfg(any(test, feature = "std"))]
+impl crate::scriptpool::Batch for OwnedBatch {
+    fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    fn check(&self, index: usize) -> Result<(), RuleError> {
+        validate_item(
+            &self.item(index),
+            self.script_flags,
+            self.sig_cache.as_deref(),
+        )
+    }
+}
+
 /// Validate every script in one of the block's transaction trees
 /// against the utxo view (dcrd `checkBlockScripts`: the items collect
 /// up front and validate across the worker pool, each engine sharing
@@ -5623,7 +5896,7 @@ pub fn check_block_scripts(
         view,
         tx_tree_regular,
         script_flags,
-        sig_cache,
+        ScriptRunner::Scoped(sig_cache),
         is_auto_revocations_enabled,
     )
 }
@@ -5642,13 +5915,18 @@ pub fn check_block_scripts(
 /// engine.  A release build checks only that there is one hash per
 /// transaction, so the signature hashes rest on the pairing rule of
 /// [`crate::blockhashes`], as the keys of the block's new outputs do.
+///
+/// `runner` says where the checks run.  A pooled one must hold this
+/// very block and these very hashes; a tree that goes to the script pool
+/// has each of its items checked against them by address, in every
+/// build.
 pub(crate) fn check_block_scripts_with_hashes(
     block: &MsgBlock,
     tx_hashes: &crate::blockhashes::BlockTxHashes,
     view: &crate::utxoview::UtxoView,
     tx_tree_regular: bool,
     script_flags: dcroxide_txscript::ScriptFlags,
-    sig_cache: Option<&dcroxide_txscript::SigCache>,
+    runner: ScriptRunner<'_>,
     is_auto_revocations_enabled: bool,
 ) -> Result<(), RuleError> {
     tx_hashes.assert_for(block);
@@ -5658,7 +5936,7 @@ pub(crate) fn check_block_scripts_with_hashes(
         view,
         tx_tree_regular,
         script_flags,
-        sig_cache,
+        runner,
         is_auto_revocations_enabled,
     )
 }
@@ -5672,34 +5950,50 @@ std::thread_local! {
     /// processing call ran.
     pub(crate) static BLOCK_SCRIPT_ITEMS: core::cell::Cell<(u64, u64)> =
         const { core::cell::Cell::new((0, 0)) };
+
+    /// The block script checks this thread ran with a pooled runner,
+    /// and how many of them handed their batch to the script pool.  Like
+    /// [`BLOCK_SCRIPT_ITEMS`] it exists in this crate's unit-test builds
+    /// only, where the tests read it to tell which way a tree went.
+    pub(crate) static BLOCK_SCRIPT_ROUTES: core::cell::Cell<(u64, u64)> =
+        const { core::cell::Cell::new((0, 0)) };
+
+    /// The block, the transaction hashes and the signature cache that
+    /// the last batch this thread handed to the script pool held, by
+    /// address; the cache's is null for a batch without one.  Like
+    /// [`BLOCK_SCRIPT_ITEMS`] it exists in this crate's unit-test builds
+    /// only.  The tests compare the addresses with those of allocations
+    /// they keep alive across the check, to tell whose allocations a
+    /// pooled batch held; nothing is ever read through them.
+    pub(crate) static POOLED_BATCH_OWNERS: core::cell::Cell<PooledBatchOwners> = const {
+        core::cell::Cell::new((core::ptr::null(), core::ptr::null(), core::ptr::null()))
+    };
 }
 
-/// The body of [`check_block_scripts`] and
-/// [`check_block_scripts_with_hashes`].
-fn check_block_scripts_inner(
-    block: &MsgBlock,
-    tx_hashes: Option<&crate::blockhashes::BlockTxHashes>,
-    view: &crate::utxoview::UtxoView,
+/// What [`POOLED_BATCH_OWNERS`] holds.
+#[cfg(test)]
+pub(crate) type PooledBatchOwners = (
+    *const MsgBlock,
+    *const crate::blockhashes::BlockTxHashes,
+    *const dcroxide_txscript::SigCache,
+);
+
+/// The script items of one tree of a block, in block order: one for
+/// every input that is not coinbase-style, of every transaction but the
+/// revocations the automatic revocations agenda exempts.  Given the
+/// block's transaction hashes, each item carries its transaction's.
+fn block_script_items<'a>(
+    block: &'a MsgBlock,
+    tx_hashes: Option<&'a crate::blockhashes::BlockTxHashes>,
+    view: &'a crate::utxoview::UtxoView,
     tx_tree_regular: bool,
-    script_flags: dcroxide_txscript::ScriptFlags,
-    sig_cache: Option<&dcroxide_txscript::SigCache>,
     is_auto_revocations_enabled: bool,
-) -> Result<(), RuleError> {
+) -> Result<Vec<ValidateItem<'a>>, RuleError> {
     // The tree's transactions and their hashes are chosen together, and
     // a hash is read by its transaction's own position in the tree
     // (never by walking the two lists side by side, which would stop at
     // the shorter one and leave transactions unchecked).
-    let (txs, hashes) = if tx_tree_regular {
-        (
-            &block.transactions,
-            tx_hashes.map(crate::blockhashes::BlockTxHashes::regular),
-        )
-    } else {
-        (
-            &block.stransactions,
-            tx_hashes.map(crate::blockhashes::BlockTxHashes::stake),
-        )
-    };
+    let (txs, hashes) = block_tree(block, tx_hashes, tx_tree_regular);
     let mut items = Vec::new();
     for (tx_idx, tx) in txs.iter().enumerate() {
         let tx_hash = hashes.map(|hashes| &hashes[tx_idx]);
@@ -5731,12 +6025,35 @@ fn check_block_scripts_inner(
             items.push(ValidateItem {
                 tx,
                 tx_hash,
+                tx_idx,
                 tx_in_idx,
                 pk_script: entry.pk_script(),
                 script_version: entry.script_version(),
             });
         }
     }
+    Ok(items)
+}
+
+/// The body of [`check_block_scripts`] and
+/// [`check_block_scripts_with_hashes`]: collect the tree's items and
+/// run them where `runner` says.
+fn check_block_scripts_inner(
+    block: &MsgBlock,
+    tx_hashes: Option<&crate::blockhashes::BlockTxHashes>,
+    view: &crate::utxoview::UtxoView,
+    tx_tree_regular: bool,
+    script_flags: dcroxide_txscript::ScriptFlags,
+    runner: ScriptRunner<'_>,
+    is_auto_revocations_enabled: bool,
+) -> Result<(), RuleError> {
+    let items = block_script_items(
+        block,
+        tx_hashes,
+        view,
+        tx_tree_regular,
+        is_auto_revocations_enabled,
+    )?;
     #[cfg(test)]
     {
         // Counted from what each item holds, not from whether hashes
@@ -5748,8 +6065,58 @@ fn check_block_scripts_inner(
             with_hash.wrapping_add(carrying),
             without.wrapping_add(collected.wrapping_sub(carrying)),
         ));
+        if let ScriptRunner::Pooled { .. } = runner {
+            let (pooled_runner, to_pool) = BLOCK_SCRIPT_ROUTES.get();
+            BLOCK_SCRIPT_ROUTES.set((pooled_runner.wrapping_add(1), to_pool));
+        }
     }
-    validate_items(&items, script_flags, sig_cache)
+
+    // The script pool takes the tree when the runner offers it, the
+    // tree has enough items for helpers to pay, the machine has more
+    // than one CPU, and the previous scripts are small enough to copy.
+    // Every other tree, and every tree of a build without threads, goes
+    // to `validate_items`, with the same verdict and the same error for
+    // a failing input.  With more than one failing input a tree the
+    // pool runs names the one of lowest index, on every run.  So does
+    // `validate_items` for a tree below its own parallel threshold; for
+    // a larger one it names whichever failure is recorded first, as
+    // dcrd's validator does for every batch (scriptval.go:141-163).
+    #[cfg(any(test, feature = "std"))]
+    if let ScriptRunner::Pooled {
+        block: shared_block,
+        tx_hashes: shared_hashes,
+        sig_cache,
+    } = runner
+        && items.len() >= crate::scriptpool::MIN_POOLED_ITEMS
+    {
+        let pool = crate::scriptpool::Pool::global();
+        if pool.width() > 0
+            && let Some(batch) = OwnedBatch::new(
+                shared_block,
+                shared_hashes,
+                tx_tree_regular,
+                &items,
+                script_flags,
+                sig_cache,
+            )
+        {
+            #[cfg(test)]
+            {
+                let (pooled_runner, to_pool) = BLOCK_SCRIPT_ROUTES.get();
+                BLOCK_SCRIPT_ROUTES.set((pooled_runner, to_pool.wrapping_add(1)));
+                POOLED_BATCH_OWNERS.set((
+                    Arc::as_ptr(&batch.block),
+                    Arc::as_ptr(&batch.tx_hashes),
+                    batch
+                        .sig_cache
+                        .as_ref()
+                        .map_or(core::ptr::null(), Arc::as_ptr),
+                ));
+            }
+            return pool.run(batch);
+        }
+    }
+    validate_items(&items, script_flags, runner.sig_cache())
 }
 
 /// A UTXO view as the previous-script source a version 2 filter build
@@ -5828,7 +6195,7 @@ pub fn check_connect_block<SP: dcroxide_standalone::SubsidyParams>(
         resolver,
         stxos,
         run_scripts,
-        sig_cache,
+        ScriptRunner::Scoped(sig_cache),
         full_tspend_checks,
         params,
     )
@@ -5836,7 +6203,9 @@ pub fn check_connect_block<SP: dcroxide_standalone::SubsidyParams>(
 
 /// [`check_connect_block`] given the hashes of the block's transactions
 /// (dcrd `checkConnectBlock` reading them from its `dcrutil.Block`),
-/// which must have been computed from this very block.
+/// which must have been computed from this very block, and told through
+/// `script_runner` where the script checks run.  A pooled runner must
+/// hold this very block and these very hashes.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn check_connect_block_with_hashes<SP: dcroxide_standalone::SubsidyParams>(
     view_chain: &impl FullChainView,
@@ -5853,7 +6222,7 @@ pub(crate) fn check_connect_block_with_hashes<SP: dcroxide_standalone::SubsidyPa
     resolver: &impl crate::utxoview::UtxoResolver,
     mut stxos: Option<&mut Vec<crate::chainio::SpentTxOut>>,
     run_scripts: bool,
-    sig_cache: Option<&dcroxide_txscript::SigCache>,
+    script_runner: ScriptRunner<'_>,
     full_tspend_checks: FullTspendChecks<'_>,
     params: &Params,
 ) -> Result<dcroxide_gcs::FilterV2, RuleError> {
@@ -5874,6 +6243,7 @@ pub(crate) fn check_connect_block_with_hashes<SP: dcroxide_standalone::SubsidyPa
     // below (dcrd's `dcrutil.Tx` wrapper memoizes the hash;
     // `MsgTx::tx_hash` re-serializes per call).
     tx_hashes.assert_for(block);
+    script_runner.assert_for(block, tx_hashes);
     let regular_tx_hashes: &[Hash] = tx_hashes.regular();
     let stake_tx_hashes: &[Hash] = tx_hashes.stake();
 
@@ -6015,7 +6385,7 @@ pub(crate) fn check_connect_block_with_hashes<SP: dcroxide_standalone::SubsidyPa
             view,
             false,
             script_flags,
-            sig_cache,
+            script_runner,
             is_auto_revocations_enabled,
         )?;
     }
@@ -6101,7 +6471,7 @@ pub(crate) fn check_connect_block_with_hashes<SP: dcroxide_standalone::SubsidyPa
             view,
             true,
             script_flags,
-            sig_cache,
+            script_runner,
             is_auto_revocations_enabled,
         )?;
     }
@@ -6119,11 +6489,17 @@ pub(crate) fn check_connect_block_with_hashes<SP: dcroxide_standalone::SubsidyPa
 /// referenced output scripts (dcrd `ValidateTransactionScripts`).
 ///
 /// The inputs collect into the same items the block path builds and
-/// run through the same worker pool and engine setup
-/// (`validate_items`), with the signature cache threaded through
+/// run through the same engine setup, on the scoped workers of
+/// `validate_items`, with the signature cache threaded through
 /// `sig_cache` exactly as dcrd wires its `sigCache` -- dcrd hands both
-/// entry points one `txValidator`, so the port shares one too.  An
-/// entry is missing only when the lookup returns none: dcrd's
+/// entry points one `txValidator`, and the port shares those workers
+/// with the public block checks ([`check_block_scripts`] and
+/// [`check_connect_block`]).  The blocks the chain connects are the
+/// exception: a tree of theirs with `MIN_POOLED_ITEMS` items or more
+/// runs on the crate's script pool (`ScriptRunner`), through the same
+/// per-item check.
+///
+/// An entry is missing only when the lookup returns none: dcrd's
 /// `UtxoViewpoint.PrevScript` checks `entry == nil` and nothing else
 /// (utxoviewpoint.go:211-220), so a spent entry still supplies its
 /// script, as it does in [`check_block_scripts`].
@@ -6172,6 +6548,7 @@ pub fn validate_transaction_scripts<'a>(
         items.push(ValidateItem {
             tx,
             tx_hash: None,
+            tx_idx: 0,
             tx_in_idx,
             pk_script: entry.pk_script(),
             script_version: entry.script_version(),
@@ -6179,9 +6556,9 @@ pub fn validate_transaction_scripts<'a>(
     }
 
     // Validate all of the inputs.  The first runs on the calling thread
-    // before any worker is spawned: `validate_items` still creates its
-    // workers per call (the persistent pool is the open arm in its
-    // doc), and on the relay path that would let a transaction whose
+    // before any worker is spawned: `validate_items` creates its
+    // workers per call (the persistent pool serves block connects
+    // only), and on the relay path that would let a transaction whose
     // first signature is garbage buy up to one thread per core before
     // it is rejected.  The verdict is unchanged: dcrd's `txValidator`
     // returns whichever failing input comes off its result channel
@@ -6287,6 +6664,7 @@ mod tests {
             let items = [ValidateItem {
                 tx: &tx,
                 tx_hash: None,
+                tx_idx: 0,
                 tx_in_idx: 0,
                 pk_script: entry.pk_script(),
                 script_version: 0,
@@ -6371,6 +6749,7 @@ mod tests {
                 .map(|i| ValidateItem {
                     tx: &tx,
                     tx_hash: None,
+                    tx_idx: 0,
                     tx_in_idx: i,
                     pk_script: if Some(i) == bad_idx {
                         bad.pk_script()
@@ -6759,7 +7138,9 @@ mod tests {
     /// dcrd validates a transaction's inputs with the same parallel
     /// `txValidator` as a block's (scriptval.go:216-221); the port's
     /// single-transaction path used to run every input serially on the
-    /// calling thread instead of through `validate_items`.
+    /// calling thread instead of through `validate_items`.  The workers
+    /// are that function's scoped ones: the persistent script pool
+    /// serves block connects only.
     #[test]
     fn transaction_scripts_fan_out_across_the_block_worker_pool() {
         let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
@@ -7394,8 +7775,15 @@ mod tests {
         let flags = ScriptFlags(0);
         let plain = check_block_scripts(block, view, regular, flags, None, true);
         let tx_hashes = BlockTxHashes::compute(block);
-        let with_hashes =
-            check_block_scripts_with_hashes(block, &tx_hashes, view, regular, flags, None, true);
+        let with_hashes = check_block_scripts_with_hashes(
+            block,
+            &tx_hashes,
+            view,
+            regular,
+            flags,
+            ScriptRunner::Scoped(None),
+            true,
+        );
         assert_eq!(with_hashes, plain, "regular tree: {regular}");
         plain
     }
@@ -7440,7 +7828,7 @@ mod tests {
                     &view,
                     regular,
                     flags,
-                    Some(&cache),
+                    ScriptRunner::Scoped(Some(&cache)),
                     true
                 ),
                 Ok(())
@@ -7515,7 +7903,7 @@ mod tests {
                 &view,
                 regular,
                 flags,
-                None,
+                ScriptRunner::Scoped(None),
                 true,
             )
             .expect_err("signed for another lock time");
@@ -7567,7 +7955,7 @@ mod tests {
                     &view,
                     regular,
                     ScriptFlags(0),
-                    None,
+                    ScriptRunner::Scoped(None),
                     true,
                 )
             });
@@ -7601,6 +7989,7 @@ mod tests {
             ValidateItem {
                 tx,
                 tx_hash,
+                tx_idx: 0,
                 tx_in_idx,
                 pk_script: entry.pk_script(),
                 script_version: entry.script_version(),
@@ -7775,5 +8164,635 @@ mod tests {
         } else {
             assert_eq!(outcome.expect("no check to panic"), WRONG);
         }
+    }
+
+    // The block script check on the persistent script pool, held
+    // against the scoped workers on the same blocks.
+
+    use crate::scriptpool::{BATCHES_RUN, Batch, Pool};
+    use dcroxide_txscript::SigCache;
+
+    /// Whether a tree of this many script items goes to the script pool
+    /// when the runner offers it.  The threshold is written out here:
+    /// these tests are what pins `MIN_POOLED_ITEMS`.
+    fn goes_to_pool(items: usize) -> bool {
+        items >= 4 && Pool::global().width() > 0
+    }
+
+    /// No script flag: what the checks below run under unless a test is
+    /// about the flags.
+    const NO_FLAGS: ScriptFlags = ScriptFlags(0);
+
+    fn tree_mut(block: &mut MsgBlock, regular: bool) -> &mut Vec<MsgTx> {
+        if regular {
+            &mut block.transactions
+        } else {
+            &mut block.stransactions
+        }
+    }
+
+    /// The block script check of one tree three ways: dcrd's form, the
+    /// form given the block's hashes on the scoped workers, and that
+    /// form with a pooled runner.  The three must agree, down to the
+    /// error text.  Returns the shared verdict and whether the pooled
+    /// run handed its batch to the script pool, which must then have
+    /// run it: [`BATCHES_RUN`] is counted inside the pool, where
+    /// [`BLOCK_SCRIPT_ROUTES`] is counted on the way to it.
+    fn check_three_ways(
+        block: &Arc<MsgBlock>,
+        view: &UtxoView,
+        regular: bool,
+        cache: Option<&Arc<SigCache>>,
+        flags: ScriptFlags,
+    ) -> (Result<(), RuleError>, bool) {
+        let borrowed = cache.map(|cache| &**cache);
+        let start = BLOCK_SCRIPT_ROUTES.get();
+        let runs_at_start = BATCHES_RUN.get();
+        let plain = check_block_scripts(block, view, regular, flags, borrowed, true);
+        let tx_hashes = Arc::new(BlockTxHashes::compute(block));
+        let scoped = check_block_scripts_with_hashes(
+            block,
+            &tx_hashes,
+            view,
+            regular,
+            flags,
+            ScriptRunner::Scoped(borrowed),
+            true,
+        );
+        let before = BLOCK_SCRIPT_ROUTES.get();
+        assert_eq!(before, start, "a scoped runner offers the pool nothing");
+        assert_eq!(
+            BATCHES_RUN.get(),
+            runs_at_start,
+            "a scoped runner runs nothing on the pool"
+        );
+        let pooled = check_block_scripts_with_hashes(
+            block,
+            &tx_hashes,
+            view,
+            regular,
+            flags,
+            ScriptRunner::Pooled {
+                block,
+                tx_hashes: &tx_hashes,
+                sig_cache: cache,
+            },
+            true,
+        );
+        let after = BLOCK_SCRIPT_ROUTES.get();
+        assert_eq!(scoped, plain, "scoped, regular tree: {regular}");
+        assert_eq!(pooled, plain, "pooled, regular tree: {regular}");
+        assert_eq!(after.0.wrapping_sub(before.0), 1, "one pooled runner");
+        let to_pool = after.1.wrapping_sub(before.1);
+        assert!(to_pool <= 1, "one tree, at most one batch");
+        assert_eq!(
+            BATCHES_RUN.get().wrapping_sub(runs_at_start),
+            to_pool,
+            "a tree counted for the pool is run by the pool, and no other is"
+        );
+        // Nothing of a pooled batch outlives the call.
+        assert_eq!(Arc::strong_count(block), 1);
+        assert_eq!(Arc::strong_count(&tx_hashes), 1);
+        (plain, to_pool == 1)
+    }
+
+    /// The verdict of [`check_three_ways`] on a block with one bad
+    /// input must be that input's failure, of the given kind.
+    fn assert_names(
+        verdict: Result<(), RuleError>,
+        kind: RuleErrorKind,
+        verb: &str,
+        tx: &MsgTx,
+        tx_in_idx: usize,
+    ) {
+        let err = verdict.expect_err("one input is bad");
+        assert_eq!(err.kind, kind, "{}", err.description);
+        let start = format!("failed to {verb} input {}:{tx_in_idx} ", tx.tx_hash());
+        assert!(err.description.starts_with(&start), "{}", err.description);
+    }
+
+    /// I1.  A tree checked through a pooled runner gets the verdict of
+    /// the scoped workers and of dcrd's form: the same `Ok`, and for
+    /// exactly one bad input the same kind and the identical
+    /// description, wherever the input sits, in both trees and for
+    /// trees on both sides of the pool's threshold and of the scoped
+    /// workers' own.  The tree goes to the pool exactly when it has four
+    /// items or more.
+    #[test]
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "test arithmetic over small fixed values"
+    )]
+    fn pooled_and_scoped_block_scripts_agree() {
+        // 30 items in the regular tree and 6 in the stake tree, whose
+        // second signed transaction follows the skipped revocation.
+        // The places are the first, a middle and the last item.
+        let (block, view) = signed_block();
+        let trees = [
+            (true, 30, [(MANY_INPUTS, 0), (EVERY_OPCODE, 3), (3, 1)]),
+            (
+                false,
+                6,
+                [(STAKE_FIRST, 0), (STAKE_LAST, 0), (STAKE_LAST, 2)],
+            ),
+        ];
+        for (regular, items, places) in trees {
+            let (verdict, pooled) =
+                check_three_ways(&Arc::new(block.clone()), &view, regular, None, NO_FLAGS);
+            assert_eq!(verdict, Ok(()), "regular tree: {regular}");
+            assert_eq!(pooled, goes_to_pool(items), "regular tree: {regular}");
+
+            for (tx_idx, tx_in_idx) in places {
+                // A signature that does not verify.
+                let mut tampered = block.clone();
+                tree_mut(&mut tampered, regular)[tx_idx].tx_in[tx_in_idx].signature_script[10] ^=
+                    0x01;
+                let tampered = Arc::new(tampered);
+                let (verdict, pooled) = check_three_ways(&tampered, &view, regular, None, NO_FLAGS);
+                let tx = &block_tree(&tampered, None, regular).0[tx_idx];
+                assert_names(
+                    verdict,
+                    RuleErrorKind::ScriptValidation,
+                    "validate",
+                    tx,
+                    tx_in_idx,
+                );
+                assert_eq!(pooled, goes_to_pool(items));
+
+                // Scripts the engine refuses to run at all: both empty.
+                let mut unparsed = block.clone();
+                let tx_in = &mut tree_mut(&mut unparsed, regular)[tx_idx].tx_in[tx_in_idx];
+                tx_in.signature_script.clear();
+                let mut emptied = view.clone();
+                emptied.insert_entry(
+                    &tx_in.previous_out_point,
+                    entry(Vec::new(), TxType::Regular, None),
+                );
+                let unparsed = Arc::new(unparsed);
+                let (verdict, _) = check_three_ways(&unparsed, &emptied, regular, None, NO_FLAGS);
+                let tx = &block_tree(&unparsed, None, regular).0[tx_idx];
+                assert_names(
+                    verdict,
+                    RuleErrorKind::ScriptMalformed,
+                    "parse",
+                    tx,
+                    tx_in_idx,
+                );
+            }
+
+            // With a signature cache, filled by the pool's helpers and
+            // read by the scoped workers and back.
+            let cache = Arc::new(SigCache::new(100));
+            let shared = Arc::new(block.clone());
+            for _ in 0..2 {
+                let (verdict, pooled) =
+                    check_three_ways(&shared, &view, regular, Some(&cache), NO_FLAGS);
+                assert_eq!(verdict, Ok(()));
+                assert_eq!(pooled, goes_to_pool(items));
+            }
+            assert_eq!(Arc::strong_count(&cache), 1);
+        }
+
+        // One transaction of `n` signed inputs in each tree.
+        for n in [3usize, 4, 5, 15, 16, 17] {
+            let mut view = UtxoView::new();
+            let locks: Vec<(Lock, u8)> = (0..n as u8)
+                .map(|i| (Lock::PubKeyHash(0x40 + i, None), 0x01))
+                .collect();
+            let block = MsgBlock {
+                header: zero_header(),
+                transactions: vec![unchecked_tx(1), signed_tx(0x51, 0, &locks, &mut view)],
+                stransactions: vec![unchecked_tx(2), signed_tx(0x52, 0, &locks, &mut view)],
+            };
+            for regular in [true, false] {
+                let (verdict, pooled) =
+                    check_three_ways(&Arc::new(block.clone()), &view, regular, None, NO_FLAGS);
+                assert_eq!(verdict, Ok(()), "{n} items, regular tree: {regular}");
+                assert_eq!(pooled, goes_to_pool(n), "{n} items");
+                for bad in [0, n / 2, n - 1] {
+                    let mut tampered = block.clone();
+                    tree_mut(&mut tampered, regular)[1].tx_in[bad].signature_script[10] ^= 0x01;
+                    let tampered = Arc::new(tampered);
+                    let (verdict, pooled) =
+                        check_three_ways(&tampered, &view, regular, None, NO_FLAGS);
+                    let tx = &block_tree(&tampered, None, regular).0[1];
+                    assert_names(
+                        verdict,
+                        RuleErrorKind::ScriptValidation,
+                        "validate",
+                        tx,
+                        bad,
+                    );
+                    assert_eq!(pooled, goes_to_pool(n), "{n} items, input {bad} bad");
+                }
+            }
+        }
+    }
+
+    /// I2.  The items a pooled batch hands its checks are the collected
+    /// items again, field by field: the same transaction object and the
+    /// same hash by address, the same indices, equal script bytes and
+    /// the same script version.  Both trees, the stake tree's with a
+    /// skipped revocation ahead of a checked transaction.
+    #[test]
+    fn owned_items_reproduce_the_collected_items() {
+        let (block, mut view) = signed_block();
+        // A script version other than zero on one entry of each tree.
+        for tx_in in [
+            &block.transactions[EVERY_OPCODE].tx_in[5],
+            &block.stransactions[STAKE_LAST].tx_in[1],
+        ] {
+            let pk_script = view
+                .lookup_entry(&tx_in.previous_out_point)
+                .expect("entry")
+                .pk_script()
+                .to_vec();
+            let versioned =
+                UtxoEntry::new(1, pk_script, 100, 0, 7, false, false, TxType::Regular, None);
+            view.insert_entry(&tx_in.previous_out_point, versioned);
+        }
+        let block = Arc::new(block);
+        let tx_hashes = Arc::new(BlockTxHashes::compute(&block));
+        let cache = Arc::new(SigCache::new(10));
+
+        for (regular, count) in [(true, 30), (false, 6)] {
+            let items =
+                block_script_items(&block, Some(&tx_hashes), &view, regular, true).expect("items");
+            let flags = ScriptFlags(ScriptFlags::VERIFY_SHA256.0);
+            let batch = OwnedBatch::new(&block, &tx_hashes, regular, &items, flags, Some(&cache))
+                .expect("small scripts");
+            assert_eq!(items.len(), count);
+            assert_eq!(Batch::len(&batch), count);
+            // The batch holds the block, the hashes and the cache it was
+            // given, and the flags.
+            assert!(Arc::ptr_eq(&batch.block, &block));
+            assert!(Arc::ptr_eq(&batch.tx_hashes, &tx_hashes));
+            assert!(
+                batch
+                    .sig_cache
+                    .as_ref()
+                    .is_some_and(|held| Arc::ptr_eq(held, &cache))
+            );
+            assert_eq!(batch.script_flags.0, flags.0);
+            assert_eq!(batch.tx_tree_regular, regular);
+
+            // What the tree holds, walked here without the collection.
+            let (txs, hashes) = if regular {
+                (&block.transactions, tx_hashes.regular())
+            } else {
+                (&block.stransactions, tx_hashes.stake())
+            };
+            let mut expected = Vec::new();
+            for (tx_idx, tx) in txs.iter().enumerate() {
+                if dcroxide_stake::is_ssrtx(tx) {
+                    continue;
+                }
+                for (tx_in_idx, tx_in) in tx.tx_in.iter().enumerate() {
+                    if tx_in.previous_out_point.index != u32::MAX {
+                        expected.push((tx_idx, tx_in_idx));
+                    }
+                }
+            }
+            assert_eq!(expected.len(), count);
+            if !regular {
+                // The checked transaction after the skipped revocation.
+                assert!(dcroxide_stake::is_ssrtx(&txs[STAKE_LAST - 1]));
+                assert!(expected.contains(&(STAKE_LAST, 0)));
+            }
+
+            let mut versions = Vec::new();
+            for (index, (tx_idx, tx_in_idx)) in expected.into_iter().enumerate() {
+                let entry = view
+                    .lookup_entry(&txs[tx_idx].tx_in[tx_in_idx].previous_out_point)
+                    .expect("entry");
+                for (which, item) in [("collected", &items[index]), ("owned", &batch.item(index))] {
+                    let place = format!("{which} item {index}, regular tree: {regular}");
+                    assert!(core::ptr::eq(item.tx, &txs[tx_idx]), "{place}");
+                    assert!(
+                        item.tx_hash
+                            .is_some_and(|hash| core::ptr::eq(hash, &hashes[tx_idx])),
+                        "{place}"
+                    );
+                    assert_eq!(item.tx_idx, tx_idx, "{place}");
+                    assert_eq!(item.tx_in_idx, tx_in_idx, "{place}");
+                    assert_eq!(item.pk_script, entry.pk_script(), "{place}");
+                    assert_eq!(item.script_version, entry.script_version(), "{place}");
+                }
+                versions.push(batch.item(index).script_version);
+            }
+            assert!(versions.contains(&7) && versions.contains(&0));
+        }
+        // The batches are gone, and what they held with them.
+        assert_eq!(Arc::strong_count(&block), 1);
+        assert_eq!(Arc::strong_count(&tx_hashes), 1);
+        assert_eq!(Arc::strong_count(&cache), 1);
+    }
+
+    /// A script of the given data pushes, each dropped again, and then
+    /// `last_op`: with `OP_TRUE` it passes, and its length is the pushed
+    /// bytes plus four for each push and one.
+    fn pushes_then(pushes: &[usize], last_op: u8) -> Vec<u8> {
+        let mut script = Vec::new();
+        for &len in pushes {
+            script.push(dcroxide_txscript::OP_PUSHDATA2);
+            script.extend_from_slice(&(len as u16).to_le_bytes());
+            script.extend(core::iter::repeat_n(0x5a, len));
+            script.push(dcroxide_txscript::OP_DROP);
+        }
+        script.push(last_op);
+        script
+    }
+
+    /// I3.  A tree whose previous scripts come to more than 1 MiB is not
+    /// copied for the pool: it runs on the scoped workers, with the
+    /// verdict and the error it would have had.  One byte less and it is
+    /// pooled.
+    #[test]
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "test arithmetic over small fixed values"
+    )]
+    fn oversized_previous_scripts_use_the_scoped_workers() {
+        const INPUTS: usize = 128;
+        let block = Arc::new(MsgBlock {
+            header: zero_header(),
+            transactions: vec![unchecked_tx(1), spender(INPUTS)],
+            stransactions: Vec::new(),
+        });
+        let tx = &block.transactions[1];
+        // 127 scripts of 8,209 bytes and one that brings the total to
+        // exactly 1 MiB, or to one byte more.
+        for (last_push, over) in [(1924usize, false), (1925, true)] {
+            for last_op in [dcroxide_txscript::OP_TRUE, dcroxide_txscript::OP_0] {
+                let mut view = UtxoView::new();
+                let mut total = 0;
+                for (i, tx_in) in tx.tx_in.iter().enumerate() {
+                    let script = if i == INPUTS - 1 {
+                        pushes_then(&[2048, 2048, last_push], last_op)
+                    } else {
+                        pushes_then(&[2048; 4], dcroxide_txscript::OP_TRUE)
+                    };
+                    total += script.len();
+                    view.insert_entry(
+                        &tx_in.previous_out_point,
+                        entry(script, TxType::Regular, None),
+                    );
+                }
+                assert_eq!(total, (1 << 20) + usize::from(over));
+
+                let (verdict, pooled) = check_three_ways(&block, &view, true, None, NO_FLAGS);
+                if last_op == dcroxide_txscript::OP_TRUE {
+                    assert_eq!(verdict, Ok(()), "over: {over}");
+                } else {
+                    assert_names(
+                        verdict,
+                        RuleErrorKind::ScriptValidation,
+                        "validate",
+                        tx,
+                        INPUTS - 1,
+                    );
+                }
+                assert_eq!(
+                    pooled,
+                    !over && Pool::global().width() > 0,
+                    "{total} bytes of previous scripts"
+                );
+            }
+        }
+    }
+
+    /// A tree is checked under the script flags it was given, on the
+    /// script pool as on the scoped workers.  One previous script of
+    /// the tree leaves two items on the stack, which only the clean
+    /// stack flag refuses: without the flag every way of checking
+    /// passes the tree, with it every way names that input.  A tree
+    /// below the scoped workers' own threshold, which they check on the
+    /// calling thread, and one above it.
+    #[test]
+    fn a_tree_is_checked_under_its_script_flags() {
+        const UNCLEAN: usize = 5;
+        for inputs in [8usize, 20] {
+            let block = Arc::new(MsgBlock {
+                header: zero_header(),
+                transactions: vec![unchecked_tx(1), spender(inputs)],
+                stransactions: Vec::new(),
+            });
+            let tx = &block.transactions[1];
+            let mut view = UtxoView::new();
+            for (i, tx_in) in tx.tx_in.iter().enumerate() {
+                let script = if i == UNCLEAN {
+                    vec![dcroxide_txscript::OP_TRUE, dcroxide_txscript::OP_TRUE]
+                } else {
+                    vec![dcroxide_txscript::OP_TRUE]
+                };
+                view.insert_entry(
+                    &tx_in.previous_out_point,
+                    entry(script, TxType::Regular, None),
+                );
+            }
+
+            let (verdict, pooled) = check_three_ways(&block, &view, true, None, NO_FLAGS);
+            assert_eq!(verdict, Ok(()), "{inputs} inputs");
+            assert_eq!(pooled, goes_to_pool(inputs), "{inputs} inputs");
+
+            let clean_stack = ScriptFlags::VERIFY_CLEAN_STACK;
+            let (verdict, pooled) = check_three_ways(&block, &view, true, None, clean_stack);
+            assert_names(
+                verdict,
+                RuleErrorKind::ScriptValidation,
+                "validate",
+                tx,
+                UNCLEAN,
+            );
+            assert_eq!(pooled, goes_to_pool(inputs), "{inputs} inputs");
+        }
+    }
+
+    /// A previous script that works for a while and then fails: one
+    /// pushed element of the largest size hashed over and over, each
+    /// hash dropped, and a false value left on the stack.
+    fn slow_failure() -> Vec<u8> {
+        let mut script = vec![dcroxide_txscript::OP_PUSHDATA2];
+        script.extend_from_slice(&2048u16.to_le_bytes());
+        script.extend(core::iter::repeat_n(0x5a, 2048));
+        for _ in 0..80 {
+            script.extend_from_slice(&[
+                dcroxide_txscript::OP_DUP,
+                dcroxide_txscript::OP_HASH256,
+                dcroxide_txscript::OP_DROP,
+            ]);
+        }
+        script.extend_from_slice(&[dcroxide_txscript::OP_DROP, dcroxide_txscript::OP_0]);
+        script
+    }
+
+    /// A tree the script pool runs names its failing input of lowest
+    /// index when two inputs fail, on every run and whichever of them
+    /// fails first: the lower one fails at the end of a long script and
+    /// the higher one at once, and then the other way round.  The two
+    /// fail for different reasons, so the kind of the error is settled
+    /// with the input.  Trees on both sides of the scoped workers' own
+    /// threshold: below it their verdict, reached in index order on the
+    /// calling thread, is the same; above it theirs is whichever
+    /// failure they record first, and only the pool's is held to the
+    /// rule.
+    #[test]
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "test arithmetic over small fixed values"
+    )]
+    fn a_pooled_tree_names_its_lowest_failing_input() {
+        for inputs in [4usize, 9, 16, 40] {
+            let block = Arc::new(MsgBlock {
+                header: zero_header(),
+                transactions: vec![unchecked_tx(1), spender(inputs)],
+                stransactions: Vec::new(),
+            });
+            let tx_hashes = Arc::new(BlockTxHashes::compute(&block));
+            let tx = &block.transactions[1];
+            for (lower, higher) in [(0, inputs - 1), (1, 2), (inputs / 2, inputs - 1)] {
+                for lower_is_slow in [true, false] {
+                    // The slow script fails validation; an empty previous
+                    // script under an empty signature script is refused
+                    // before anything runs.
+                    let slow = (slow_failure(), RuleErrorKind::ScriptValidation, "validate");
+                    let fast = (Vec::new(), RuleErrorKind::ScriptMalformed, "parse");
+                    let ((lower_script, kind, verb), (higher_script, ..)) = if lower_is_slow {
+                        (slow, fast)
+                    } else {
+                        (fast, slow)
+                    };
+                    let mut view = UtxoView::new();
+                    for (i, tx_in) in tx.tx_in.iter().enumerate() {
+                        let script = if i == lower {
+                            lower_script.clone()
+                        } else if i == higher {
+                            higher_script.clone()
+                        } else {
+                            vec![dcroxide_txscript::OP_TRUE]
+                        };
+                        view.insert_entry(
+                            &tx_in.previous_out_point,
+                            entry(script, TxType::Regular, None),
+                        );
+                    }
+
+                    for _ in 0..3 {
+                        let before = BLOCK_SCRIPT_ROUTES.get();
+                        let pooled = check_block_scripts_with_hashes(
+                            &block,
+                            &tx_hashes,
+                            &view,
+                            true,
+                            NO_FLAGS,
+                            ScriptRunner::Pooled {
+                                block: &block,
+                                tx_hashes: &tx_hashes,
+                                sig_cache: None,
+                            },
+                            true,
+                        );
+                        let after = BLOCK_SCRIPT_ROUTES.get();
+                        assert_eq!(
+                            after.1.wrapping_sub(before.1),
+                            u64::from(goes_to_pool(inputs)),
+                            "{inputs} inputs"
+                        );
+                        assert_names(pooled, kind, verb, tx, lower);
+                    }
+                    if inputs < 16 {
+                        let scoped = check_block_scripts(&block, &view, true, NO_FLAGS, None, true);
+                        assert_names(scoped, kind, verb, tx, lower);
+                    }
+                }
+            }
+        }
+    }
+
+    /// I4b.  An item whose index is not its transaction's position in
+    /// the tree is refused before any helper could pair the transaction
+    /// at that position with it: here the position the transaction after
+    /// the skipped revocation would have were only checked transactions
+    /// counted.
+    #[test]
+    #[should_panic(expected = "a script item's transaction is not the block's at its position")]
+    fn a_wrong_transaction_index_is_refused() {
+        let (block, view) = signed_block();
+        let block = Arc::new(block);
+        let tx_hashes = Arc::new(BlockTxHashes::compute(&block));
+        let mut items =
+            block_script_items(&block, Some(&tx_hashes), &view, false, true).expect("items");
+        let item = items.last_mut().expect("items");
+        assert_eq!(item.tx_idx, STAKE_LAST);
+        item.tx_idx = STAKE_LAST.wrapping_sub(1);
+        let _ = OwnedBatch::new(&block, &tx_hashes, false, &items, ScriptFlags(0), None);
+    }
+
+    /// I4c.  An item that carries the hash the other tree holds at its
+    /// transaction's position is refused.
+    #[test]
+    #[should_panic(expected = "a script item's hash is not the block's for its transaction")]
+    fn a_hash_from_the_other_tree_is_refused() {
+        let (block, view) = signed_block();
+        let block = Arc::new(block);
+        let tx_hashes = Arc::new(BlockTxHashes::compute(&block));
+        let mut items =
+            block_script_items(&block, Some(&tx_hashes), &view, true, true).expect("items");
+        let item = items.first_mut().expect("items");
+        item.tx_hash = Some(&tx_hashes.stake()[item.tx_idx]);
+        let _ = OwnedBatch::new(&block, &tx_hashes, true, &items, ScriptFlags(0), None);
+    }
+
+    /// An item without its transaction's hash is refused like one with
+    /// another hash: a pooled batch always hands its engines one.
+    #[test]
+    #[should_panic(expected = "a script item's hash is not the block's for its transaction")]
+    fn an_item_without_its_hash_is_refused() {
+        let (block, view) = signed_block();
+        let block = Arc::new(block);
+        let tx_hashes = Arc::new(BlockTxHashes::compute(&block));
+        let items = block_script_items(&block, None, &view, true, true).expect("items");
+        let _ = OwnedBatch::new(&block, &tx_hashes, true, &items, ScriptFlags(0), None);
+    }
+
+    /// So is one whose hash has the right value but is not the shared
+    /// hashes' own: the check is of identity, as for the transaction.
+    #[test]
+    #[should_panic(expected = "a script item's hash is not the block's for its transaction")]
+    fn a_hash_from_a_copy_of_the_hashes_is_refused() {
+        let (block, view) = signed_block();
+        let block = Arc::new(block);
+        let tx_hashes = Arc::new(BlockTxHashes::compute(&block));
+        let copy = BlockTxHashes::clone(&tx_hashes);
+        let items = block_script_items(&block, Some(&copy), &view, true, true).expect("items");
+        let _ = OwnedBatch::new(&block, &tx_hashes, true, &items, ScriptFlags(0), None);
+    }
+
+    /// An item of an equal copy of the block is refused: the batch
+    /// reads the transactions of the block it holds, so the items must
+    /// be that block's by address.
+    #[test]
+    #[should_panic(expected = "a script item's transaction is not the block's at its position")]
+    fn an_item_of_a_copy_of_the_block_is_refused() {
+        let (block, view) = signed_block();
+        let copy = Arc::new(block.clone());
+        let tx_hashes = Arc::new(BlockTxHashes::compute(&block));
+        let items = block_script_items(&block, Some(&tx_hashes), &view, true, true).expect("items");
+        let _ = OwnedBatch::new(&copy, &tx_hashes, true, &items, ScriptFlags(0), None);
+    }
+
+    /// An item whose input index is past its transaction's inputs is
+    /// refused.
+    #[test]
+    #[should_panic(expected = "a script item's input is not one of its transaction's")]
+    fn an_input_index_out_of_range_is_refused() {
+        let (block, view) = signed_block();
+        let block = Arc::new(block);
+        let tx_hashes = Arc::new(BlockTxHashes::compute(&block));
+        let mut items =
+            block_script_items(&block, Some(&tx_hashes), &view, true, true).expect("items");
+        let item = items.last_mut().expect("items");
+        item.tx_in_idx = item.tx.tx_in.len();
+        let _ = OwnedBatch::new(&block, &tx_hashes, true, &items, ScriptFlags(0), None);
     }
 }

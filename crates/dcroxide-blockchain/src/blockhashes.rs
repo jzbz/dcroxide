@@ -108,6 +108,10 @@
 //! transaction's hash would check its `SigHashAll` signatures as though
 //! its own transaction had that prefix, rejecting the transaction's own
 //! and passing one made for the other transaction at the same input.
+//! A tree that the chain hands to its script pool is held to more: in
+//! every build each of its items has its transaction and its hash
+//! compared by address with the block's and the hashes' own at the
+//! item's position (`validate::ScriptRunner`).
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -1425,7 +1429,7 @@ mod tests {
             &crate::utxoview::UtxoView::new(),
             true,
             dcroxide_txscript::ScriptFlags(0),
-            None,
+            crate::validate::ScriptRunner::Scoped(None),
             true,
         );
     }

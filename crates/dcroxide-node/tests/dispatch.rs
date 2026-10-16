@@ -1702,9 +1702,32 @@ fn a_delivered_block_is_known_to_the_peer_that_delivered_it() {
 /// hashed inside the chain; behind it the connection is read ahead, so
 /// every later block arrives hashed.  With the setting off every block
 /// is read by the input thread and hashed inside the chain, as before.
+///
+/// A block read ahead also arrives with its payload laid out as its
+/// record for the block files, and the chain's database writes that
+/// record as it stands; a block the input thread read is laid out by the
+/// database.  The last three of the twenty blocks buy tickets, which
+/// gives each a stake tree of five script items: a tree the chain runs
+/// on its script pool (on a machine with more than one CPU).  So blocks
+/// in the form the reader thread makes them reach that pool here, on a
+/// chain over a database.
 #[test]
 fn blocks_read_ahead_over_a_served_connection_are_hashed_once() {
-    let blocks = battery_prefix(12);
+    let blocks = battery_prefix(20);
+    // A stake tree's script items: its inputs that are not
+    // coinbase-style.
+    let stake_items: Vec<usize> = blocks
+        .iter()
+        .map(|block| {
+            block
+                .stransactions
+                .iter()
+                .flat_map(|tx| &tx.tx_in)
+                .filter(|tx_in| tx_in.previous_out_point.index != u32::MAX)
+                .count()
+        })
+        .collect();
+    assert_eq!(stake_items[17..], [5; 3], "the blocks that buy tickets");
     let tip = blocks.last().expect("blocks").header.block_hash();
     for read_ahead in [true, false] {
         let (_dir, ctx) = regnet_server(read_ahead);
@@ -1800,6 +1823,18 @@ fn blocks_read_ahead_over_a_served_connection_are_hashed_once() {
                 "read-ahead {read_ahead}: blocks the chain hashed itself"
             );
             assert_eq!(chain.tx_hash_recomputes, 0, "read-ahead {read_ahead}");
+            // Every block but the first was read ahead.
+            let laid_out_ahead = if read_ahead {
+                blocks[1..].len() as u64
+            } else {
+                0
+            };
+            let db = chain.db.as_ref().expect("a chain over a database");
+            assert_eq!(
+                db.records_written_as_laid_out(),
+                laid_out_ahead,
+                "read-ahead {read_ahead}: blocks stored as the record they arrived with"
+            );
         }
         drop(transport);
         runtime.shutdown();

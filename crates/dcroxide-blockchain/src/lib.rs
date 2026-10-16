@@ -45,6 +45,8 @@ pub mod gotime;
 pub mod notifications;
 pub mod process;
 mod ruleerror;
+#[cfg(any(test, feature = "std"))]
+mod scriptpool;
 pub mod sequencelock;
 pub mod stakever;
 pub mod thresholdstate;
