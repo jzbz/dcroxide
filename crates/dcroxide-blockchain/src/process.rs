@@ -3426,14 +3426,30 @@ impl Chain {
         params: &Params,
     ) -> Result<(), RuleError> {
         let tx_hashes = Arc::new(BlockTxHashes::compute(block));
-        self.connect_block_with_hashes(node, block, parent, tx_hashes, view, stxos, filter, params)
+        let num_spent_outputs = count_spent_outputs(block);
+        self.connect_block_with_hashes(
+            node,
+            block,
+            parent,
+            tx_hashes,
+            view,
+            stxos,
+            num_spent_outputs,
+            filter,
+            params,
+        )
     }
 
     /// [`Self::connect_block`] given the hashes of the block's
     /// transactions, which must have been computed from this very
-    /// block.  They are sent with the block on the connected event, for
-    /// the daemon's observers (dcrd's read them from the
-    /// `*dcrutil.Block` the event carries).
+    /// block, and the number of outputs the block spends, which must be
+    /// [`count_spent_outputs`] of this very block.  The hashes are sent
+    /// with the block on the connected event, for the daemon's
+    /// observers (dcrd's read them from the `*dcrutil.Block` the event
+    /// carries).  The count is a function of the block alone, and the
+    /// caller that sized the spend journal with it
+    /// (`chain.go:1184-1185`) passes it on, where dcrd classifies the
+    /// block's stake transactions a second time (`chain.go:605`).
     #[allow(clippy::too_many_arguments)]
     fn connect_block_with_hashes(
         &mut self,
@@ -3443,6 +3459,7 @@ impl Chain {
         tx_hashes: Arc<BlockTxHashes>,
         view: &mut UtxoView,
         stxos: Vec<SpentTxOut>,
+        num_spent_outputs: usize,
         filter: FilterV2,
         params: &Params,
     ) -> Result<(), RuleError> {
@@ -3470,10 +3487,16 @@ impl Chain {
             crate::validate::determine_check_tx_flags(&parent_view, prev_height, params)?
         };
 
-        // Sanity check the correct number of stxos are provided.
+        // Sanity check the correct number of stxos are provided.  The
+        // count is the caller's; a debug build holds it to the block.
+        debug_assert_eq!(
+            num_spent_outputs,
+            count_spent_outputs(block),
+            "the count passed is not the number of outputs the block spends"
+        );
         assert_eq!(
             stxos.len(),
-            count_spent_outputs(block),
+            num_spent_outputs,
             "provided stxos do not match the outputs the block spends"
         );
 
@@ -3991,7 +4014,8 @@ impl Chain {
             // Skip validation when the block has already been
             // validated; the view, stxos, and header commitment data
             // are still needed.
-            let mut stxos: Vec<SpentTxOut> = Vec::with_capacity(count_spent_outputs(&block));
+            let num_spent_outputs = count_spent_outputs(&block);
+            let mut stxos: Vec<SpentTxOut> = Vec::with_capacity(num_spent_outputs);
             let filter;
             if self.index.node_status(&self.store, node).has_validated() {
                 view.connect_block_with_hashes(
@@ -4084,7 +4108,15 @@ impl Chain {
             // Update the chain state and drop any best chain
             // candidates that now have less work than the new tip.
             self.connect_block_with_hashes(
-                node, &block, &parent, tx_hashes, &mut view, stxos, filter, params,
+                node,
+                &block,
+                &parent,
+                tx_hashes,
+                &mut view,
+                stxos,
+                num_spent_outputs,
+                filter,
+                params,
             )?;
             self.index.remove_less_work_candidates(&self.store, node);
         }
@@ -9553,8 +9585,162 @@ mod tests {
             Arc::new(wrong),
             &mut view,
             Vec::new(),
+            0,
             filter,
             &params,
+        );
+    }
+
+    /// A chain whose tip is the parent of the battery's first block that
+    /// spends outputs, with what a connect of that block takes: the
+    /// tip's node, the block, its parent, a view, a filter, and the
+    /// number of outputs the block spends.  The node is the tip's, which
+    /// has a parent as the block's own would; the connect reads no more
+    /// of it before it checks the spend journal, and the view and the
+    /// filter are not read before that either.
+    #[allow(clippy::type_complexity)]
+    fn before_the_first_spending_block() -> (
+        Params,
+        Chain,
+        NodeId,
+        Arc<MsgBlock>,
+        Arc<MsgBlock>,
+        UtxoView,
+        FilterV2,
+        usize,
+    ) {
+        let params = dcroxide_chaincfg::regnet_params();
+        let mut chain = Chain::new(&params, Hash::ZERO, false);
+        let (now, blocks) = tip_extensions(40);
+        let at = blocks
+            .iter()
+            .position(|block| count_spent_outputs(block) > 0)
+            .expect("the battery spends outputs early");
+        for block in &blocks[..at] {
+            let (_, errs) = chain.process_block(block, now, &params);
+            assert!(errs.is_empty(), "{errs:?}");
+        }
+        let tip = chain.best_chain.tip().expect("tip");
+        let view = UtxoView::new();
+        let filter = dcroxide_gcs::blockcf2::regular(
+            &params.genesis_block,
+            &crate::validate::ViewScripts(&view),
+        )
+        .expect("filter");
+        let block = Arc::new(blocks[at].clone());
+        let parent = Arc::new(blocks[at - 1].clone());
+        let count = count_spent_outputs(&block);
+        (params, chain, tip, block, parent, view, filter, count)
+    }
+
+    /// The chain's connect refuses a spend journal that does not hold
+    /// one entry for each output the block spends (dcrd's panic,
+    /// `chain.go:604-609`), when it counts them itself.
+    #[test]
+    #[should_panic(expected = "provided stxos do not match the outputs the block spends")]
+    fn the_chain_connect_refuses_a_spend_journal_of_another_length() {
+        let (params, mut chain, tip, block, parent, mut view, filter, _) =
+            before_the_first_spending_block();
+        let _ = chain.connect_block(tip, &block, &parent, &mut view, Vec::new(), filter, &params);
+    }
+
+    /// The same refusal when the connect is handed the block's count.
+    #[test]
+    #[should_panic(expected = "provided stxos do not match the outputs the block spends")]
+    fn the_chain_connect_holds_the_spend_journal_to_the_count_it_is_handed() {
+        let (params, mut chain, tip, block, parent, mut view, filter, count) =
+            before_the_first_spending_block();
+        let _ = chain.connect_block_with_hashes(
+            tip,
+            &block,
+            &parent,
+            Arc::new(BlockTxHashes::compute(&block)),
+            &mut view,
+            Vec::new(),
+            count,
+            filter,
+            &params,
+        );
+    }
+
+    /// The count the connect is handed must be its block's.  Recounting
+    /// is what handing it over saves, so only a debug build compares
+    /// the two, here with a journal that fits the count handed over.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "the count passed is not the number of outputs the block spends")]
+    fn the_chain_connect_refuses_a_count_that_is_not_its_blocks() {
+        let (params, mut chain, tip, block, parent, mut view, filter, count) =
+            before_the_first_spending_block();
+        let _ = chain.connect_block_with_hashes(
+            tip,
+            &block,
+            &parent,
+            Arc::new(BlockTxHashes::compute(&block)),
+            &mut view,
+            vec![SpentTxOut::default(); count + 1],
+            count + 1,
+            filter,
+            &params,
+        );
+    }
+
+    /// Every connect of dcrd's full block battery, those of its
+    /// reorganizations included, is handed the count of its own block:
+    /// a debug build's connect compares the two, and the battery
+    /// connects blocks whose stake transactions spend outputs and
+    /// blocks that spend another number of outputs than their parent,
+    /// so neither a constant nor a neighbouring block's count would do.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn the_battery_connects_every_block_with_its_own_spent_output_count() {
+        use crate::utxoview::count_spent_stake_outputs;
+
+        let params = dcroxide_chaincfg::regnet_params();
+        let mut chain = Chain::new(&params, Hash::ZERO, false);
+        // (stake outputs spent, outputs spent, outputs the parent spends)
+        let connected: Arc<std::sync::Mutex<Vec<(usize, usize, usize)>>> = Arc::default();
+        let sink = Arc::clone(&connected);
+        chain.set_notification_callback(Box::new(move |ntfn| {
+            if let Notification::BlockConnected(data) = ntfn {
+                sink.lock().expect("sink").push((
+                    count_spent_stake_outputs(&data.block),
+                    count_spent_outputs(&data.block),
+                    count_spent_outputs(&data.parent_block),
+                ));
+            }
+        }));
+
+        let mut now = 0;
+        for line in include_str!("../tests/data/fullblock_vectors.txt").lines() {
+            let f: Vec<&str> = line.split(' ').collect();
+            let block_hex = match f[0] {
+                "now" => {
+                    now = f[1].parse().expect("now");
+                    continue;
+                }
+                "accept" => f[4],
+                "reject" => f[3],
+                "orphanorreject" => f[2],
+                _ => continue,
+            };
+            let (block, _) =
+                MsgBlock::from_bytes(&dcroxide_testutil::unhex(block_hex)).expect("block");
+            // The verdicts are `fullblock_vectors.rs`'s to check.
+            let _ = chain.process_block(&block, now, &params);
+        }
+
+        let connected = connected.lock().expect("connected");
+        let with_stake_spends = connected.iter().filter(|c| c.0 > 0).count();
+        let unlike_the_parent = connected.iter().filter(|c| c.1 != c.2).count();
+        assert!(connected.len() >= 200, "{} connects", connected.len());
+        assert!(
+            with_stake_spends >= 100,
+            "{with_stake_spends} with stake spends"
+        );
+        assert!(
+            unlike_the_parent >= 10,
+            "{unlike_the_parent} unlike the parent"
         );
     }
 
