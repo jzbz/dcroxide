@@ -445,12 +445,29 @@ pub fn check_proof_of_work_sanity(
     pow_limit: &BigInt,
     skip_pow_check: bool,
 ) -> Result<(), RuleError> {
+    check_proof_of_work_sanity_hashed(header, None, pow_limit, skip_pow_check)
+}
+
+/// [`check_proof_of_work_sanity`], taking the header's block hash from
+/// a caller that has it.  The version 1 proof of work hash is the block
+/// hash (dcrd `PowHashV1`, `wire/blockheader.go:109-111`), which dcrd
+/// computes again here (`validate.go:753`); without one it is computed
+/// at the same point, after the skip flag is tested.
+fn check_proof_of_work_sanity_hashed(
+    header: &dcroxide_wire::BlockHeader,
+    block_hash: Option<&Hash>,
+    pow_limit: &BigInt,
+    skip_pow_check: bool,
+) -> Result<(), RuleError> {
     if skip_pow_check {
         return dcroxide_standalone::check_proof_of_work_range(header.bits, pow_limit)
             .map_err(standalone_to_chain_rule_error);
     }
 
-    let pow_hash_v1 = header.pow_hash_v1();
+    let pow_hash_v1 = match block_hash {
+        Some(hash) => *hash,
+        None => header.pow_hash_v1(),
+    };
     let mut result = dcroxide_standalone::check_proof_of_work(&pow_hash_v1, header.bits, pow_limit);
     if result.is_err() {
         let pow_hash_v2 = header.pow_hash_v2();
@@ -481,6 +498,48 @@ pub fn check_block_header_sanity(
     skip_pow_check: bool,
     params: &Params,
 ) -> Result<(), RuleError> {
+    check_block_header_sanity_hashed(header, None, adjusted_time_unix, skip_pow_check, params)
+}
+
+/// [`check_block_header_sanity`] for a header whose block hash the
+/// caller has already computed: the same checks in the same order with
+/// the same results, the proof of work check reading that hash where it
+/// otherwise hashes the header.  The hash must be the header's own:
+/// under debug assertions the header is hashed again and compared, and
+/// a release build takes the hash as it is handed.  The comparison
+/// hashes the serialized header directly and not through
+/// `BlockHeader::block_hash`, so that it is not among the hashes the
+/// tests count: it is not one a caller asked for.
+pub(crate) fn check_block_header_sanity_with_hash(
+    header: &dcroxide_wire::BlockHeader,
+    block_hash: &Hash,
+    adjusted_time_unix: i64,
+    skip_pow_check: bool,
+    params: &Params,
+) -> Result<(), RuleError> {
+    debug_assert_eq!(
+        *block_hash,
+        dcroxide_chainhash::hash_h(&header.serialize()),
+        "the hash handed to the header sanity checks is not the header's"
+    );
+    check_block_header_sanity_hashed(
+        header,
+        Some(block_hash),
+        adjusted_time_unix,
+        skip_pow_check,
+        params,
+    )
+}
+
+/// The body of [`check_block_header_sanity`] and
+/// [`check_block_header_sanity_with_hash`].
+fn check_block_header_sanity_hashed(
+    header: &dcroxide_wire::BlockHeader,
+    block_hash: Option<&Hash>,
+    adjusted_time_unix: i64,
+    skip_pow_check: bool,
+    params: &Params,
+) -> Result<(), RuleError> {
     let stake_validation_height = params.stake_validation_height as u32;
     let stake_enabled_height = params.stake_enabled_height as u32;
     assert!(
@@ -496,7 +555,7 @@ pub fn check_block_header_sanity(
         dcroxide_standalone::Sign::Plus,
         &params.pow_limit.to_be_bytes(),
     );
-    check_proof_of_work_sanity(header, &pow_limit, skip_pow_check)?;
+    check_proof_of_work_sanity_hashed(header, block_hash, &pow_limit, skip_pow_check)?;
 
     // Ensure the block time is not too far in the future.
     #[allow(
@@ -1228,6 +1287,61 @@ pub fn check_block_header_positional(
     fork_rejection: Option<&ForkRejection>,
     params: &Params,
 ) -> Result<(), RuleError> {
+    check_block_header_positional_hashed(
+        view,
+        header,
+        None,
+        prev_height,
+        fast_add,
+        fork_rejection,
+        params,
+    )
+}
+
+/// [`check_block_header_positional`] for a header whose block hash the
+/// caller has already computed: the same checks in the same order with
+/// the same results, the checkpoint and old block version checks
+/// reading that hash where dcrd hashes the header again
+/// (`validate.go:1303`).  The hash must be the header's own: under
+/// debug assertions the header is hashed again and compared, as in
+/// [`check_block_header_sanity_with_hash`], and a release build takes
+/// the hash as it is handed.
+pub(crate) fn check_block_header_positional_with_hash(
+    view: &impl FullChainView,
+    header: &dcroxide_wire::BlockHeader,
+    block_hash: &Hash,
+    prev_height: Option<i64>,
+    fast_add: bool,
+    fork_rejection: Option<&ForkRejection>,
+    params: &Params,
+) -> Result<(), RuleError> {
+    debug_assert_eq!(
+        *block_hash,
+        dcroxide_chainhash::hash_h(&header.serialize()),
+        "the hash handed to the positional header checks is not the header's"
+    );
+    check_block_header_positional_hashed(
+        view,
+        header,
+        Some(block_hash),
+        prev_height,
+        fast_add,
+        fork_rejection,
+        params,
+    )
+}
+
+/// The body of [`check_block_header_positional`] and
+/// [`check_block_header_positional_with_hash`].
+fn check_block_header_positional_hashed(
+    view: &impl FullChainView,
+    header: &dcroxide_wire::BlockHeader,
+    block_hash: Option<&Hash>,
+    prev_height: Option<i64>,
+    fast_add: bool,
+    fork_rejection: Option<&ForkRejection>,
+    params: &Params,
+) -> Result<(), RuleError> {
     // The genesis block is valid by definition.
     let Some(prev_height) = prev_height else {
         return Ok(());
@@ -1336,7 +1450,10 @@ pub fn check_block_header_positional(
 
     // Reject version 3 test network chains that are not specifically
     // the chain used to activate maximum difficulty semantics.
-    let block_hash = header.block_hash();
+    let block_hash = match block_hash {
+        Some(hash) => *hash,
+        None => header.block_hash(),
+    };
     if crate::difficulty::is_testnet3(params)
         && block_height == crate::difficulty::TESTNET3_MAX_DIFF_ACTIVATION_HEIGHT
         && block_hash != BLOCK_962928_HASH
@@ -7372,6 +7489,146 @@ mod tests {
             } else {
                 assert_eq!(outcome.expect("no check to panic"), Ok(()));
             }
+        }
+    }
+
+    // Header acceptance hands the header's hash to the context-free
+    // header checks, the positional header checks and the new block
+    // index node.  Under debug assertions each hashes the header again
+    // and refuses a hash that is not the header's, with its own message.
+    // A release build has no such check and reads the hash it is handed:
+    // the arms below that run only without debug assertions hand each a
+    // hash chosen to change what it does.
+
+    /// The proof of work check compares the hash it is handed with the
+    /// target.  The zero hash meets every target and is not this
+    /// header's, whose own hashes miss the main network's easiest one.
+    #[test]
+    fn the_header_sanity_checks_hold_a_handed_hash_to_its_header() {
+        let params = mainnet_params();
+        let mut header = zero_header();
+        header.bits = params.pow_limit_bits;
+        header.vote_bits = EARLY_VOTE_BITS_VALUE;
+        header.height = 1;
+
+        // Handed the header's own hash, the checks say what they say
+        // without one, with the proof of work looked at and without.
+        let own = header.block_hash();
+        let err = check_block_header_sanity(&header, 0, false, &params).expect_err("high hash");
+        assert_eq!(err.kind, RuleErrorKind::HighHash);
+        assert_eq!(
+            check_block_header_sanity_with_hash(&header, &own, 0, false, &params),
+            Err(err)
+        );
+        assert_eq!(check_block_header_sanity(&header, 0, true, &params), Ok(()));
+        assert_eq!(
+            check_block_header_sanity_with_hash(&header, &own, 0, true, &params),
+            Ok(())
+        );
+
+        let outcome = outcome_or_panic_message(|| {
+            check_block_header_sanity_with_hash(&header, &Hash::ZERO, 0, false, &params)
+        });
+        if cfg!(debug_assertions) {
+            let message = outcome.expect_err("refused under debug assertions");
+            assert!(
+                message.contains("the hash handed to the header sanity checks is not the header's"),
+                "{message}"
+            );
+        } else {
+            assert_eq!(outcome.expect("no check to panic"), Ok(()));
+        }
+    }
+
+    /// The positional checks compare the hash they are handed with the
+    /// version 3 test network's checkpoint at the height where its
+    /// maximum difficulty rules begin.  This header is at that height
+    /// and is not that block, and the checkpoint's hash is not its own.
+    #[test]
+    fn the_positional_header_checks_hold_a_handed_hash_to_its_header() {
+        let params = dcroxide_chaincfg::testnet3_params();
+        let height = u32::try_from(crate::difficulty::TESTNET3_MAX_DIFF_ACTIVATION_HEIGHT)
+            .expect("a block height");
+        let mut parent = zero_header();
+        parent.height = height.wrapping_sub(1);
+        let mut store = crate::blockindex::NodeStore::new();
+        let tip = store.new_node(&parent, None);
+        let view = crate::chainview_nodes::NodeBranchView { store: &store, tip };
+        let prev_height = Some(store.node(tip).height);
+        let mut header = zero_header();
+        header.prev_block = parent.block_hash();
+        header.height = height;
+
+        // Handed the header's own hash, the checks say what they say
+        // without one.
+        let own = header.block_hash();
+        let err = check_block_header_positional(&view, &header, prev_height, true, None, &params)
+            .expect_err("not the checkpoint block");
+        assert_eq!(err.kind, RuleErrorKind::BadMaxDiffCheckpoint);
+        assert_eq!(
+            check_block_header_positional_with_hash(
+                &view,
+                &header,
+                &own,
+                prev_height,
+                true,
+                None,
+                &params
+            ),
+            Err(err)
+        );
+
+        let outcome = outcome_or_panic_message(|| {
+            check_block_header_positional_with_hash(
+                &view,
+                &header,
+                &BLOCK_962928_HASH,
+                prev_height,
+                true,
+                None,
+                &params,
+            )
+        });
+        if cfg!(debug_assertions) {
+            let message = outcome.expect_err("refused under debug assertions");
+            assert!(
+                message.contains(
+                    "the hash handed to the positional header checks is not the header's"
+                ),
+                "{message}"
+            );
+        } else {
+            assert_eq!(outcome.expect("no check to panic"), Ok(()));
+        }
+    }
+
+    /// A new block index node carries the hash it is handed, which is
+    /// the key the index finds it by.
+    #[test]
+    fn a_new_block_node_holds_a_handed_hash_to_its_header() {
+        let header = zero_header();
+        let own = header.block_hash();
+        let mut store = crate::blockindex::NodeStore::new();
+        let plain = store.new_node(&header, None);
+        let handed = store.new_node_with_hash(&header, own, None);
+        assert_eq!(store.node(plain).hash, own);
+        assert_eq!(store.node(handed).hash, own);
+        assert_eq!(store.header(handed), store.header(plain));
+
+        static WRONG: Hash = Hash([0x5a; 32]);
+        let outcome = outcome_or_panic_message(|| {
+            let mut store = crate::blockindex::NodeStore::new();
+            let node = store.new_node_with_hash(&header, WRONG, None);
+            store.node(node).hash
+        });
+        if cfg!(debug_assertions) {
+            let message = outcome.expect_err("refused under debug assertions");
+            assert!(
+                message.contains("the hash handed to a new block node is not its header's"),
+                "{message}"
+            );
+        } else {
+            assert_eq!(outcome.expect("no check to panic"), WRONG);
         }
     }
 }

@@ -11,6 +11,25 @@ use crate::error::WireError;
 /// size.
 pub const MAX_BLOCK_HEADER_PAYLOAD: usize = 84 + HASH_SIZE * 3;
 
+#[cfg(any(test, feature = "count-header-hashes"))]
+std::thread_local! {
+    /// How many times this thread called [`BlockHeader::block_hash`].
+    /// It exists in this crate's unit-test builds and under the
+    /// `count-header-hashes` feature, which only tests enable.
+    static HEADER_HASHES: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
+}
+
+/// How many block headers the calling thread has hashed so far, through
+/// [`BlockHeader::block_hash`] and everything that calls it
+/// ([`BlockHeader::pow_hash_v1`], `MsgBlock::block_hash`).  A test reads
+/// it before and after a call to tell how many headers the call hashed
+/// on that thread.  A hash made of a header's bytes without the header,
+/// by `hash_h` over a serialized block's first bytes, is not counted.
+#[cfg(any(test, feature = "count-header-hashes"))]
+pub fn header_hashes_on_this_thread() -> u64 {
+    HEADER_HASHES.get()
+}
+
 /// A Decred block header, byte-compatible with dcrd's `BlockHeader`.
 ///
 /// The timestamp is a `u32` of unix seconds: that is the wire format (dcrd
@@ -129,6 +148,8 @@ impl BlockHeader {
 
     /// The BLAKE-256 block identifier hash (dcrd `BlockHash`).
     pub fn block_hash(&self) -> Hash {
+        #[cfg(any(test, feature = "count-header-hashes"))]
+        HEADER_HASHES.set(HEADER_HASHES.get().wrapping_add(1));
         hash_h(&self.serialize())
     }
 
@@ -303,6 +324,35 @@ mod tests {
         assert_eq!(header.serialize().as_slice(), encoded.as_slice());
         assert_eq!(header.block_hash().as_bytes().as_slice(), want.as_slice());
         assert_eq!(header.pow_hash_v1(), header.block_hash());
+    }
+
+    /// The counter the tests of other crates read goes up by one for
+    /// each header a thread hashes, by either name the hash goes by, and
+    /// belongs to that thread alone.  The version 2 proof of work hash
+    /// is another function and is not counted.
+    #[test]
+    fn hashed_headers_are_counted_per_thread() {
+        let header = sample_header();
+        let before = header_hashes_on_this_thread();
+        let _ = header.block_hash();
+        assert_eq!(header_hashes_on_this_thread() - before, 1);
+        let _ = header.pow_hash_v1();
+        assert_eq!(header_hashes_on_this_thread() - before, 2);
+        let _ = header.pow_hash_v2();
+        let _ = header.serialize();
+        assert_eq!(header_hashes_on_this_thread() - before, 2);
+
+        let elsewhere = std::thread::spawn(move || {
+            let before = header_hashes_on_this_thread();
+            for _ in 0..3 {
+                let _ = header.block_hash();
+            }
+            header_hashes_on_this_thread() - before
+        })
+        .join()
+        .expect("thread");
+        assert_eq!(elsewhere, 3);
+        assert_eq!(header_hashes_on_this_thread() - before, 2);
     }
 
     #[test]

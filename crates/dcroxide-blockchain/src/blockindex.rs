@@ -387,10 +387,38 @@ impl NodeStore {
     /// `newBlockNode`/`initBlockNode`).  The work sum accumulates from
     /// the parent when one is provided.
     pub fn new_node(&mut self, header: &BlockHeader, parent: Option<NodeId>) -> NodeId {
+        self.init_node(header, header.block_hash(), parent)
+    }
+
+    /// [`Self::new_node`] for a header whose block hash the caller has
+    /// already computed, where dcrd's `initBlockNode` hashes the header
+    /// again (`blockindex.go:235`).  The hash must be the header's own:
+    /// it is the key the node is indexed and stored under.  Under debug
+    /// assertions the header is hashed again and compared, from its
+    /// serialization and not through `BlockHeader::block_hash`, so that
+    /// the comparison is not among the hashes the tests count; a release
+    /// build takes the hash as it is handed.
+    pub(crate) fn new_node_with_hash(
+        &mut self,
+        header: &BlockHeader,
+        hash: Hash,
+        parent: Option<NodeId>,
+    ) -> NodeId {
+        debug_assert_eq!(
+            hash,
+            dcroxide_chainhash::hash_h(&header.serialize()),
+            "the hash handed to a new block node is not its header's"
+        );
+        self.init_node(header, hash, parent)
+    }
+
+    /// The body of [`Self::new_node`] and [`Self::new_node_with_hash`]:
+    /// the node for the header, under the given hash.
+    fn init_node(&mut self, header: &BlockHeader, hash: Hash, parent: Option<NodeId>) -> NodeId {
         let mut node = BlockNode {
             parent: None,
             skip_to_ancestor: None,
-            hash: header.block_hash(),
+            hash,
             work_sum: calc_work_uint256(header.bits),
             height: i64::from(header.height),
             block_version: header.version,

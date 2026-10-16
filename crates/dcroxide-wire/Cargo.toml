@@ -8,6 +8,17 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+# For tests only: counts the block headers each thread hashes
+# (`header_hashes_on_this_thread`), so that a test in another crate can
+# pin how often a path hashes a header.  It needs `std` for the
+# thread-local counter, so the crate is not no_std with it.  Only
+# dev-dependencies name it, so it is off in every build made without
+# them (`cargo build`, a release build) and on, in every crate of the
+# build, in one made with them (`cargo test`, `--all-targets`), the
+# daemon binary that integration tests start included.
+count-header-hashes = []
+
 [dependencies]
 dcroxide-chainhash = { path = "../dcroxide-chainhash" }
 dcroxide-crypto = { path = "../dcroxide-crypto" }

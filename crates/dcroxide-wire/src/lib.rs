@@ -47,6 +47,9 @@
 #![deny(clippy::iter_over_hash_type)]
 
 extern crate alloc;
+// The counter of hashed headers is a thread-local.
+#[cfg(feature = "count-header-hashes")]
+extern crate std;
 
 mod blockheader;
 mod cursor;
@@ -62,6 +65,8 @@ mod netaddress;
 mod protocol;
 mod varint;
 
+#[cfg(any(test, feature = "count-header-hashes"))]
+pub use blockheader::header_hashes_on_this_thread;
 pub use blockheader::{BlockHeader, MAX_BLOCK_HEADER_PAYLOAD};
 pub use cursor::Cursor;
 pub use error::{MessageText, WireError};

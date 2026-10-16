@@ -30,6 +30,9 @@ num-bigint = { version = "0.5.1", default-features = false }
 [dev-dependencies]
 tempfile = "3"
 dcroxide-testutil = { path = "../dcroxide-testutil" }
+# The same crate as above, with its counter of hashed headers for the
+# tests that pin how often a block's header is hashed.
+dcroxide-wire = { path = "../dcroxide-wire", features = ["count-header-hashes"] }
 
 [lints]
 workspace = true

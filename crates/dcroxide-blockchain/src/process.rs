@@ -41,7 +41,9 @@ use crate::stakever::calc_want_height;
 use crate::thresholdstate::{ThresholdStateTuple, VoteCounts, agenda_state, state_last_changed};
 use crate::utxoentry::UtxoEntry;
 use crate::utxoview::{OutPointKey, UtxoKey, UtxoView, count_spent_outputs};
-use crate::validate::{ForkRejection, check_block_header_positional, check_block_header_sanity};
+use crate::validate::{
+    ForkRejection, check_block_header_positional_with_hash, check_block_header_sanity_with_hash,
+};
 
 /// Statistics on the current UTXO set (dcrd `UtxoStats`).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -3301,8 +3303,16 @@ impl Chain {
             return Ok(node);
         }
 
-        // Perform context-free sanity checks on the block header.
-        check_block_header_sanity(header, adjusted_time_unix, false, params)?;
+        // Perform context-free sanity checks on the block header.  They,
+        // the positional checks and the new block node below each read
+        // the header's hash, which dcrd computes afresh in each
+        // (`validate.go:753`, `:1303`, `blockindex.go:235`): the one
+        // computed above is that hash, of this same header, so it is
+        // handed to them.  Each compares it with the header's hash only
+        // under debug assertions, so in a release build all three rely
+        // on `hash` being the hash of `header` here, and the node is
+        // indexed under it.
+        check_block_header_sanity_with_hash(header, &hash, adjusted_time_unix, false, params)?;
 
         // Orphan headers are not allowed and this function should
         // never be called with the genesis block.
@@ -3342,9 +3352,10 @@ impl Chain {
             store: &self.store,
             tip: prev_node,
         };
-        check_block_header_positional(
+        check_block_header_positional_with_hash(
             &view,
             header,
+            &hash,
             Some(prev_height),
             false,
             fork_rejection.as_ref(),
@@ -3353,7 +3364,7 @@ impl Chain {
 
         // Create a new block node for the block and add it to the
         // block index.
-        let new_node = self.store.new_node(header, Some(prev_node));
+        let new_node = self.store.new_node_with_hash(header, hash, Some(prev_node));
         self.store.node_mut(new_node).status = BlockStatus::NONE;
         self.index.add_node(&self.store, new_node);
 
@@ -10066,5 +10077,93 @@ mod tests {
         );
 
         assert_eq!(chain.calculate_treasury_balance(prev, &params), 107);
+    }
+
+    /// Accepting a new header hashes it once.  Composed from their
+    /// public forms, the same steps hash it four times, as dcrd's do:
+    /// for the index lookup (`process.go:165`), in the proof of work
+    /// check (`validate.go:753`), in the positional checks (`:1303`) and
+    /// for the new block index node (`blockindex.go:235`).  Header
+    /// acceptance hands the lookup's hash to the other three.
+    ///
+    /// The count is of `BlockHeader::block_hash` calls on this thread,
+    /// so a hash made anywhere under the call is seen.  It is taken
+    /// around `process_block_header`, the call the sync manager makes
+    /// for each header of a headers message, which flushes the new
+    /// index row as well.  A header the index already has is hashed for
+    /// the lookup and no more.
+    ///
+    /// Not counted: under debug assertions each of the three hashes the
+    /// serialized header once more to hold the handed hash to it.  In a
+    /// release build nothing but `maybe_accept_block_header` itself
+    /// holds the two together.
+    #[test]
+    fn accepting_a_header_hashes_it_once() {
+        use crate::validate::{check_block_header_positional, check_block_header_sanity};
+        use dcroxide_wire::header_hashes_on_this_thread;
+
+        let hashed_since = |before: u64| header_hashes_on_this_thread().wrapping_sub(before);
+
+        let params = dcroxide_chaincfg::regnet_params();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let opts = dcroxide_database::Options::new(dir.path().join("chain"), params.net.0);
+        let db = dcroxide_database::Database::create(&opts).expect("create database");
+        let mut chain = Chain::open(db, &params, Hash::ZERO, false, 0).expect("open chain");
+        let (now, blocks) = tip_extensions(30);
+        let mut prev = chain.best_chain.genesis().expect("genesis");
+        for (i, block) in blocks.iter().enumerate() {
+            let header = &block.header;
+            let hash = header.block_hash();
+            // The proof of work check reads the block hash as the
+            // version 1 proof of work hash, which is what it is.
+            assert_eq!(header.pow_hash_v1(), hash, "header {i}");
+
+            // What the steps cost a caller that has only the header: a
+            // hash each, and none for the context-free checks when the
+            // proof of work is not looked at.
+            let before = header_hashes_on_this_thread();
+            check_block_header_sanity(header, now, true, &params).expect("sane");
+            assert_eq!(hashed_since(before), 0, "header {i}");
+            check_block_header_sanity(header, now, false, &params).expect("sane");
+            assert_eq!(hashed_since(before), 1, "header {i}");
+            let view = NodeBranchView {
+                store: &chain.store,
+                tip: prev,
+            };
+            let prev_height = Some(chain.store.node(prev).height);
+            check_block_header_positional(&view, header, prev_height, false, None, &params)
+                .expect("positional");
+            assert_eq!(hashed_since(before), 2, "header {i}");
+            let _ = NodeStore::new().new_node(header, None);
+            assert_eq!(hashed_since(before), 3, "header {i}");
+
+            // Accepting the header runs the same checks and makes the
+            // same node on the one hash of the lookup.
+            let before = header_hashes_on_this_thread();
+            chain
+                .process_block_header(header, now, &params)
+                .unwrap_or_else(|err| panic!("header {i}: {err:?}"));
+            assert_eq!(hashed_since(before), 1, "header {i}");
+            let node = chain.index.lookup_node(&hash).expect("indexed by its hash");
+            assert_eq!(chain.index.best_header(), Some(node), "header {i}");
+            assert_eq!(chain.store.node(node).hash, hash, "header {i}");
+            assert_eq!(chain.store.node(node).parent, Some(prev), "header {i}");
+            assert_eq!(chain.store.header(node), *header, "header {i}");
+
+            // A header the index already holds is looked up by its hash
+            // and neither checked nor given another node.
+            let before = header_hashes_on_this_thread();
+            chain
+                .process_block_header(header, now, &params)
+                .unwrap_or_else(|err| panic!("known header {i}: {err:?}"));
+            assert_eq!(hashed_since(before), 1, "known header {i}");
+            assert_eq!(
+                chain.maybe_accept_block_header(header, now, &params).ok(),
+                Some(node),
+                "header {i}"
+            );
+            assert_eq!(chain.index.best_header(), Some(node), "header {i}");
+            prev = node;
+        }
     }
 }
