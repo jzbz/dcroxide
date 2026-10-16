@@ -227,10 +227,10 @@ fn in_view<T>(
 ///
 /// The run that failed the last read, the page holding the rows, must
 /// be a store error.  That is the run an erased error answers with
-/// absence, and it also shows the rows were read from the store at all:
-/// were they still in the cache overlay, a keyed read's last store read
-/// would be its bucket lookup, whose failure ffldb reads as a missing
-/// bucket (`ChainDbError::Corrupt`), and the state row would need none.
+/// absence.  That a keyed read has faulted runs at all shows its rows
+/// were read from the store: were they still in the cache overlay it
+/// would read nothing there, its bucket being found in the bucket index
+/// the database holds in memory, and no run would be refused a read.
 fn check_sweep<T: std::fmt::Debug>(
     what: &str,
     results: &[Result<T, ChainDbError>],

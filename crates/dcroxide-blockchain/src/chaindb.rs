@@ -541,8 +541,7 @@ pub fn db_put_utxo(
 /// the row and an entry writes its serialization, which ignores the
 /// entry's cache state bits.  The bucket resolves once for the whole
 /// batch, as [`db_fetch_utxo_entries`] does on the read side, instead
-/// of once per row -- a lookup that walks the transaction's growing
-/// pending writes every time.  (dcrd's cache flush writes each row
+/// of once per row.  (dcrd's cache flush writes each row
 /// straight into a leveldb batch, which has no bucket to resolve.)
 pub fn db_put_utxos<'a>(
     tx: &Transaction,

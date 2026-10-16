@@ -21,7 +21,10 @@
 //! `fetch_block_region` and their plural forms) take the block's height
 //! beside its hash ([ADR-0010]).  The others stay within the interface
 //! contract: the metadata write cache is a layered overlay rather than
-//! goleveldb's treap pair (see `dbcache`), no LRU block-file handle
+//! goleveldb's treap pair (see `dbcache`), a nested bucket is found in a
+//! copy of the bucket index held in memory, which `create` and `open`
+//! read from the store, rather than by reading its index row on every
+//! lookup (see `bucketindex`), no LRU block-file handle
 //! cache, cursors materialize their view at creation (the interface
 //! contract already declares cursors invalidated by any bucket
 //! modification other than `Cursor::delete`), and `Cursor::delete` on
@@ -50,6 +53,7 @@
 
 mod blockfile;
 pub mod bootstrap;
+mod bucketindex;
 pub(crate) mod dbcache;
 mod error;
 mod participant;
@@ -243,12 +247,17 @@ impl DbInner {
     /// with the overlay configured from the options -- one constructor
     /// for `create` and `open`, so an option wired into one cannot be
     /// forgotten in the other.
-    fn new(kv: redb::Database, block_store: BlockStore, opts: &Options) -> DbInner {
+    ///
+    /// It reads the store's bucket index, which every transaction's
+    /// bucket lookups are then answered from, and fails when that read
+    /// does ([`bucketindex::BucketIndex::load`]).
+    fn new(kv: redb::Database, block_store: BlockStore, opts: &Options) -> Result<DbInner, Error> {
         let mut cache = crate::dbcache::DbCache::new();
         cache.set_observer(opts.flush_observer.clone(), opts.flush_stats_every);
         cache.set_write_log(opts.write_log.clone());
         cache.set_limits(opts.cache_max_size, opts.cache_flush_interval_secs);
-        DbInner {
+        cache.set_bucket_index(bucketindex::BucketIndex::load(&kv)?);
+        Ok(DbInner {
             kv,
             block_store: Mutex::new(block_store),
             closed: AtomicBool::new(false),
@@ -260,7 +269,7 @@ impl DbInner {
             writer_waits_index: WaitTotal::default(),
             writer_waits_other: WaitTotal::default(),
             participant: Mutex::new(None),
-        }
+        })
     }
 
     /// Take the writer semaphore, waiting out whoever holds it.
@@ -1413,6 +1422,15 @@ impl Database {
     }
 }
 
+/// What [`Database::begin_seed`] acquires for a new transaction: the store
+/// snapshot, the overlay snapshot, and the bucket index of the commits
+/// that overlay snapshot holds.
+type TxSeed = (
+    KvTxSeed,
+    Arc<crate::dbcache::CacheMap>,
+    Arc<bucketindex::BucketIndex>,
+);
+
 impl Database {
     /// Create a new database at the directory in the options; errors
     /// with `ErrDbExists` when one is already there (dcrd
@@ -1425,6 +1443,10 @@ impl Database {
     /// every file after the first deleted and the first truncated --
     /// before anything is written, rather than adopted with the durable
     /// cursor and the live one disagreeing until the first flush.
+    ///
+    /// After the reconciliation the store's bucket index is read, as
+    /// [`Self::open`] reads it, and a store read error there fails the
+    /// call.
     pub fn create(opts: &Options) -> Result<Database, Error> {
         let meta_path = opts.path.join(METADATA_FILE);
         // The guard protects against clobbering a store that lives at
@@ -1510,7 +1532,7 @@ impl Database {
         )?;
         reconcile_db(&kv, &mut block_store, opts.log.as_ref())?;
         Ok(Database {
-            inner: Arc::new(DbInner::new(kv, block_store, opts)),
+            inner: Arc::new(DbInner::new(kv, block_store, opts)?),
         })
     }
 
@@ -1521,6 +1543,13 @@ impl Database {
     /// the file writes and the metadata commit), and erroring with
     /// `ErrCorruption` when the metadata claims more data than the
     /// files actually hold (dcrd `reconcileDB`).
+    ///
+    /// After the reconciliation the store's bucket index is read once,
+    /// for every later bucket lookup to be answered from (see the
+    /// `bucketindex` module), and a store read error there fails the open
+    /// with the store's error.  dcrd's open reads only the write cursor
+    /// (`ffldb/reconcile.go:53-118`) and meets such an error at the first
+    /// lookup of the bucket, as a missing bucket.
     pub fn open(opts: &Options) -> Result<Database, Error> {
         let meta_path = opts.path.join(METADATA_FILE);
         if !meta_path.exists() {
@@ -1543,7 +1572,7 @@ impl Database {
         )?;
         reconcile_db(&kv, &mut block_store, opts.log.as_ref())?;
         Ok(Database {
-            inner: Arc::new(DbInner::new(kv, block_store, opts)),
+            inner: Arc::new(DbInner::new(kv, block_store, opts)?),
         })
     }
 
@@ -1738,10 +1767,12 @@ impl Database {
     /// cache overlay snapshot, and only then the redb read snapshot.
     /// A flush between the two snapshots is then seen twice (the
     /// overlay wins with identical values) instead of not at all.
-    fn begin_seed(
-        &self,
-        writable: bool,
-    ) -> Result<(KvTxSeed, std::sync::Arc<crate::dbcache::CacheMap>), Error> {
+    ///
+    /// The bucket index is taken with the overlay snapshot, under the
+    /// same hold of the cache lock: a commit changes both under one hold
+    /// of it, so the map is the bucket index of exactly the commits the
+    /// overlay snapshot holds.
+    fn begin_seed(&self, writable: bool) -> Result<TxSeed, Error> {
         let release = |inner: &DbInner| {
             let mut busy = inner.writer_busy.lock().expect("writer flag poisoned");
             *busy = false;
@@ -1793,6 +1824,7 @@ impl Database {
         // deadlock against each other.
         let cache = self.inner.cache.lock().expect("cache lock poisoned");
         let cache_snap = std::sync::Arc::clone(&cache.cached);
+        let buckets = std::sync::Arc::clone(&cache.buckets);
         let kv = match self.inner.kv.begin_read() {
             Ok(t) => t,
             Err(e) => {
@@ -1809,7 +1841,7 @@ impl Database {
         } else {
             KvTxSeed::Read(kv)
         };
-        Ok((seed, cache_snap))
+        Ok((seed, cache_snap, buckets))
     }
 
     /// Hold the writer semaphore for the guard's lifetime, waiting out
@@ -1838,8 +1870,8 @@ impl Database {
         if writable {
             self.inner.check_writable()?;
         }
-        let (seed, cache_snap) = self.begin_seed(writable)?;
-        Transaction::new(Arc::clone(&self.inner), seed, cache_snap, false)
+        let (seed, cache_snap, buckets) = self.begin_seed(writable)?;
+        Transaction::new(Arc::clone(&self.inner), seed, cache_snap, buckets, false)
     }
 
     fn begin_managed(&self, writable: bool) -> Result<Transaction, Error> {
@@ -1847,8 +1879,8 @@ impl Database {
         if writable {
             self.inner.check_writable()?;
         }
-        let (seed, cache_snap) = self.begin_seed(writable)?;
-        Transaction::new(Arc::clone(&self.inner), seed, cache_snap, true)
+        let (seed, cache_snap, buckets) = self.begin_seed(writable)?;
+        Transaction::new(Arc::clone(&self.inner), seed, cache_snap, buckets, true)
     }
 
     /// Invoke the function in a managed read-only transaction (dcrd
@@ -1954,6 +1986,10 @@ impl Database {
         participant: Arc<dyn FlushParticipant>,
     ) -> Result<(), Error> {
         self.check_open()?;
+        // The bucket index is reserved for a second reason: a flush
+        // writes a participant's rows to the store without their passing
+        // through a commit, and the bucket index held in memory
+        // (`bucketindex`) follows commits alone.
         let reserved = [
             METADATA_BUCKET_ID.as_slice(),
             BLOCK_IDX_BUCKET_ID.as_slice(),

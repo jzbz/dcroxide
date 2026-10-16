@@ -42,8 +42,10 @@ use std::time::{Duration, Instant};
 
 use crate::METADATA_TABLE;
 use crate::blockfile::BlockStore;
+use crate::bucketindex::BucketIndex;
 use crate::error::{Error, ErrorKind, db_error};
 use crate::participant::{FlushWriter, Registration};
+use crate::transaction::BUCKET_INDEX_PREFIX;
 
 /// The default size for the database cache: 300 MiB, three times dcrd's
 /// `defaultCacheSize` of 100 MiB (`database/ffldb/dbcache.go:22`).  A
@@ -566,6 +568,17 @@ pub(crate) struct DbCache {
     /// transactions snapshot it by cloning the `Arc`, which is O(1) and
     /// never copies a layer.
     pub(crate) cached: Arc<CacheSnapshot>,
+    /// The bucket index of the committed state `cached` publishes: the
+    /// store's bucket index rows with those of every transaction
+    /// committed since applied (see [`BucketIndex`]).  It changes only in
+    /// [`Self::commit_pending`], with `cached`, so the two are always of
+    /// one commit, and a transaction clones both handles under one hold
+    /// of the cache lock.  A flush leaves it alone.  The rows it moves
+    /// from the overlay to the store it does not change, and the rows a
+    /// flush participant writes with it lie under the participant's
+    /// prefix, which `Database::set_flush_participant` refuses inside the
+    /// bucket index: the map is the rows only for as long as it does.
+    pub(crate) buckets: Arc<BucketIndex>,
     /// The approximate byte size of the entries the overlay RETAINS,
     /// each counted as dcrd's treap counts a node: [`NODE_FIELDS_SIZE`]
     /// plus its key and value bytes, for a pending deletion as for a
@@ -637,6 +650,7 @@ impl DbCache {
     pub(crate) fn new() -> DbCache {
         DbCache {
             cached: Arc::new(CacheSnapshot::default()),
+            buckets: Arc::new(BucketIndex::default()),
             total_size: 0,
             last_flush: Instant::now(),
             max_size: DEFAULT_CACHE_SIZE,
@@ -671,6 +685,13 @@ impl DbCache {
         self.write_log = sink;
     }
 
+    /// Start from the bucket index the store holds.  For the open, while
+    /// the overlay is still empty: from then on only
+    /// [`Self::commit_pending`] changes it.
+    pub(crate) fn set_bucket_index(&mut self, index: BucketIndex) {
+        self.buckets = Arc::new(index);
+    }
+
     /// Apply a committed transaction's pending sets to the overlay
     /// with dcrd's size accounting (dcrd `commitTx` onto the cached
     /// treaps).
@@ -681,6 +702,12 @@ impl DbCache {
     /// holds a snapshot naming the layer, the layer stays frozen and
     /// this commit seals a fresh layer above it instead, so no
     /// transaction ever copies the overlay to make progress.
+    ///
+    /// The transaction's bucket index rows are applied to
+    /// [`Self::buckets`] as well, here and nowhere else, so the map and
+    /// the overlay change under one hold of the cache lock.  The map is
+    /// copied first when a transaction still holds it, which leaves that
+    /// transaction the bucket index it began with.
     pub(crate) fn commit_pending(
         &mut self,
         puts: BTreeMap<Vec<u8>, Vec<u8>>,
@@ -727,6 +754,9 @@ impl DbCache {
         // `Put` onto an existing node does
         // (`database/internal/treap/immutable.go:164`).
         for key in removes {
+            if key.starts_with(BUCKET_INDEX_PREFIX) {
+                Arc::make_mut(&mut self.buckets).remove_row(&key);
+            }
             let key_len = key.len();
             match top.insert(key, None) {
                 // Replaced an entry in the mutable layer: the key stays,
@@ -744,6 +774,9 @@ impl DbCache {
             }
         }
         for (key, value) in puts {
+            if key.starts_with(BUCKET_INDEX_PREFIX) {
+                Arc::make_mut(&mut self.buckets).put_row(&key, &value);
+            }
             let key_len = key.len();
             let added = value.len() as u64;
             match top.insert(key, Some(value)) {

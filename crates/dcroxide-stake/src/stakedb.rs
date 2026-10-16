@@ -271,8 +271,8 @@ fn put_ticket(
 /// each looked up by name when a ticket first needs it and not again.
 ///
 /// dcrd's `DbPutTicket` and `DbDeleteTicket` look their bucket up on
-/// every call (`internal/ticketdb/chainio.go:609`, `:625`), which here is
-/// a keyed read of the bucket index for every ticket a block moves.  No
+/// every call (`internal/ticketdb/chainio.go:609`, `:625`), which here
+/// would be a lookup for every ticket a block moves.  No
 /// step of a best-node write creates or removes a bucket, so within one
 /// the first answer is every later one's.  A bucket is still looked up
 /// only once a ticket needs it, so a missing one is reported where it

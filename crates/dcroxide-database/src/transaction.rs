@@ -30,6 +30,7 @@ use std::sync::Arc;
 use dcroxide_chainhash::Hash;
 
 use crate::blockfile::{BLOCK_LOC_SIZE, BlockLocation, BlockRecord, serialize_write_row};
+use crate::bucketindex::BucketIndex;
 use crate::error::{Error, ErrorKind, db_error};
 use crate::{DbInner, METADATA_TABLE};
 
@@ -265,6 +266,19 @@ struct TxState {
     /// commit, before the cache applies this transaction, so the
     /// cache's newest layer is unshared and takes the write in place.
     cache_snap: Arc<crate::dbcache::CacheSnapshot>,
+    /// The bucket index beneath this transaction's pending changes: the
+    /// one the cache published when `cache_snap` was taken, under the
+    /// same hold of the cache lock, so it holds what a read of the bucket
+    /// index rows through `cache_snap` and the store returns
+    /// ([`BucketIndex`]).  `None` once the transaction is closed, and
+    /// from the point a commit publishes its rows, so the cache's map is
+    /// unshared when it takes them.
+    buckets: Option<Arc<BucketIndex>>,
+    /// Whether this transaction has staged a put or a delete of a key
+    /// under the bucket index prefix.  Until it has, neither pending set
+    /// can hold a bucket's index row, and a bucket lookup is answered by
+    /// `buckets` alone ([`Transaction::child_bucket_id`]).
+    staged_bucket_index: bool,
     /// Closures to run once a commit's own flush has succeeded and before
     /// its rows are published, in registration order (see
     /// [`Transaction::on_commit`]).  Dropped unrun by `close`, so a
@@ -298,6 +312,7 @@ impl Transaction {
         db: Arc<DbInner>,
         kv: KvTxSeed,
         cache_snap: Arc<crate::dbcache::CacheSnapshot>,
+        buckets: Arc<BucketIndex>,
         managed: bool,
     ) -> Result<Transaction, Error> {
         let (kv, writable) = match kv {
@@ -319,6 +334,8 @@ impl Transaction {
                 pending_keys: std::collections::BTreeMap::new(),
                 pending_removes: std::collections::BTreeSet::new(),
                 cache_snap,
+                buckets: Some(buckets),
+                staged_bucket_index: false,
                 on_commit: Vec::new(),
             }),
             writable,
@@ -362,7 +379,8 @@ impl Transaction {
     /// `dbCacheSnapshot.Get` does with a leveldb error
     /// (`ffldb/dbcache.go`), so every ffldb-layout read keeps dcrd's
     /// answer.  Reads that port a backend which does keep the two apart
-    /// use [`Self::try_fetch_raw`].
+    /// use [`Self::try_fetch_raw`].  The lookup of a nested bucket is
+    /// not one of these reads: it makes none ([`Bucket::bucket`]).
     pub(crate) fn fetch_raw(&self, key: &[u8]) -> Option<Vec<u8>> {
         self.try_fetch_raw(key).unwrap_or(None)
     }
@@ -419,6 +437,9 @@ impl Transaction {
         if state.kv.is_none() || !self.writable {
             return Err(db_error(ErrorKind::TxNotWritable, "tx not writable"));
         }
+        if key.starts_with(BUCKET_INDEX_PREFIX) {
+            state.staged_bucket_index = true;
+        }
         state.pending_removes.remove(&key);
         state.pending_keys.insert(key, value);
         Ok(())
@@ -429,6 +450,9 @@ impl Transaction {
         let mut state = self.state.borrow_mut();
         if state.kv.is_none() || !self.writable {
             return Err(db_error(ErrorKind::TxNotWritable, "tx not writable"));
+        }
+        if key.starts_with(BUCKET_INDEX_PREFIX) {
+            state.staged_bucket_index = true;
         }
         state.pending_keys.remove(&key);
         state.pending_removes.insert(key);
@@ -446,6 +470,9 @@ impl Transaction {
         let mut state = self.state.borrow_mut();
         if state.kv.is_none() || !self.writable {
             return Err(db_error(ErrorKind::TxNotWritable, "tx not writable"));
+        }
+        if key.starts_with(BUCKET_INDEX_PREFIX) {
+            state.staged_bucket_index = true;
         }
         // `put_raw` and `delete_raw` keep the two pending sets disjoint.
         let prior = match state.pending_keys.remove(key) {
@@ -694,6 +721,51 @@ impl Transaction {
             Some(e) => Err(e),
             None => Ok(window.rows),
         }
+    }
+
+    /// The ID of the bucket `name` nested in the bucket `parent`, or
+    /// `None` when there is none: [`Self::fetch_raw`] of the bucket's
+    /// index row, read as an ID, without the read.
+    ///
+    /// Beneath this transaction's pending changes the row is the entry of
+    /// the bucket index taken with its snapshots ([`BucketIndex`]).  The
+    /// pending changes can hold the row only once this transaction has
+    /// staged a write under the bucket index prefix, which creating or
+    /// deleting a bucket does; until then they are not consulted, and the
+    /// lookup builds no key.
+    fn child_bucket_id(&self, parent: [u8; 4], name: &[u8]) -> Option<[u8; 4]> {
+        let state = self.state.borrow();
+        if state.staged_bucket_index {
+            let key = bucket_index_key(parent, name);
+            if state.pending_removes.contains(&key) {
+                return None;
+            }
+            if let Some(value) = state.pending_keys.get(&key) {
+                return value.as_slice().try_into().ok();
+            }
+        }
+        state.buckets.as_ref()?.get(parent, name)
+    }
+
+    /// The bucket index as a scan of its rows through this transaction's
+    /// layered view builds it, pending changes included: what a read-only
+    /// transaction's own map must equal.
+    #[cfg(test)]
+    pub(crate) fn bucket_index_from_rows(&self) -> BucketIndex {
+        let mut index = BucketIndex::default();
+        let rows = self
+            .scan_prefix_window(BUCKET_INDEX_PREFIX, None, None, true, true)
+            .rows;
+        for (key, value) in rows {
+            index.put_row(&key, &value);
+        }
+        index
+    }
+
+    /// The bucket index this transaction took with its snapshots.
+    #[cfg(test)]
+    pub(crate) fn held_bucket_index(&self) -> Option<Arc<BucketIndex>> {
+        self.state.borrow().buckets.clone()
     }
 
     /// Allocate the next bucket ID (dcrd `nextBucketID`).
@@ -1100,6 +1172,7 @@ impl Transaction {
         state.pending_keys.clear();
         state.pending_removes.clear();
         state.cache_snap = Arc::new(crate::dbcache::CacheSnapshot::default());
+        state.buckets = None;
         // Unrun: whatever closed the transaction short of a successful
         // commit -- a rollback, a drop, a failed commit -- must not run
         // them.  Dropped after the state is released, in case dropping
@@ -1332,6 +1405,9 @@ impl Transaction {
             // can take them in place (a snapshot naming that layer
             // forces the commit to seal a fresh layer instead).
             state.cache_snap = Arc::new(crate::dbcache::CacheSnapshot::default());
+            // And its bucket index, so the cache changes its own map in
+            // place when this transaction created or deleted a bucket.
+            state.buckets = None;
             (
                 std::mem::take(&mut state.pending_keys),
                 std::mem::take(&mut state.pending_removes),
@@ -1403,7 +1479,27 @@ pub struct Bucket<'tx> {
 impl<'tx> Bucket<'tx> {
     /// Retrieve the nested bucket with the given key, or `None` if it
     /// does not exist (dcrd `Bucket`).
+    ///
+    /// dcrd reads the bucket's index row for this on every call
+    /// (`ffldb/db.go:598-614`).  The answer here is that row's, taken
+    /// from the bucket index the transaction holds and from its own
+    /// pending changes once it has created or deleted a bucket, without
+    /// the read.  The one difference is a store read error: the read
+    /// turns it into `None`, and no read is made here to meet it (see
+    /// the `bucketindex` module docs).
     pub fn bucket(&self, key: &[u8]) -> Option<Bucket<'tx>> {
+        if self.tx.check_closed().is_err() {
+            return None;
+        }
+        let id = self.tx.child_bucket_id(self.id, key)?;
+        Some(Bucket { tx: self.tx, id })
+    }
+
+    /// [`Self::bucket`] as dcrd makes it, by reading the bucket's index
+    /// row through the transaction's layered view: the answer the bucket
+    /// index has to give.
+    #[cfg(test)]
+    pub(crate) fn bucket_from_rows(&self, key: &[u8]) -> Option<Bucket<'tx>> {
         if self.tx.check_closed().is_err() {
             return None;
         }
