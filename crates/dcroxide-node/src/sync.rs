@@ -314,8 +314,8 @@ fn combine_process_block_result(
 
 /// Whether the chain error is one dcrd's sync manager singles out with
 /// its `Critical failure` line: `database.ErrCorruption` or
-/// `blockchain.ErrUtxoBackendCorruption` (`manager.go:1265-1269`,
-/// `:1646-1648`).
+/// `blockchain.ErrUtxoBackendCorruption` (`manager.go:1266-1270`,
+/// `:1647-1649`).
 ///
 /// The port hands both over as a `RuleError`, so the split is
 /// reconstructed from what each carries:
@@ -329,9 +329,13 @@ fn combine_process_block_result(
 ///   block, a closed store) carries `ErrUtxoBackend` instead, as dcrd's
 ///   plain database error matches neither check
 ///   (`process::db_read_rule_error`).  The corruption kind also stands
-///   in for dcrd's missing-input `AssertError`
-///   (`UtxoView::assert_missing`), which dcrd's check does not match;
-///   it renders with `AssertError`'s `assertion failed: ` prefix.
+///   in for the `AssertError` dcrd's `checkTreasurybaseUniqueHeight`
+///   returns for a block without stake transactions
+///   (`validate::check_treasurybase_unique_height`, dcrd
+///   `validate.go:1668-1672`), which dcrd's check does not match; it
+///   renders with `AssertError`'s `assertion failed: ` prefix.  The
+///   view's missing input, the other such assertion, panics in dcrd
+///   since `e60cedc5`, and so it does here.
 /// - A database corruption the store reports travels through
 ///   `persist_rule_error`, which keeps the database error's
 ///   `ErrorKind::Corruption` (dcrd `database.ErrCorruption`) only in
@@ -1119,11 +1123,11 @@ mod tests {
 
     /// An internal inconsistency is not the peer's fault either.
     ///
-    /// dcrd's `connectTransaction` raises `AssertError("view missing
-    /// input ...")` when the view lost an input
-    /// (`utxoviewpoint.go:290-294`).  `AssertError` is not a
+    /// dcrd's `checkTreasurybaseUniqueHeight` returns an `AssertError`
+    /// when it is handed a block without stake transactions
+    /// (`validate.go:1668-1672`).  `AssertError` is not a
     /// `blockchain.RuleError`, so dcrd's sync manager takes the
-    /// `Failed to process block` branch (`manager.go:1263`) rather than
+    /// `Failed to process block` branch (`manager.go:1264`) rather than
     /// `Rejected block %v from %s`.
     ///
     /// The port has no separate assertion type -- it carries dcrd's
@@ -1133,23 +1137,15 @@ mod tests {
     /// fatal flag, which is exactly why the latch alone was not enough.
     #[test]
     fn an_internal_inconsistency_is_not_blamed_on_the_peer() {
-        let failure = combine_process_block_result(
-            0,
-            vec![rule_err(
-                RuleErrorKind::UtxoBackendCorruption,
-                "assertion failed: view missing input \
-                 0000000000000000000000000000000000000000000000000000000000000000:0",
-            )],
-            false,
-        )
-        .unwrap_err();
+        let failure = combine_process_block_result(0, vec![treasurybase_height_assertion()], false)
+            .unwrap_err();
         assert!(
             !failure.is_rule_error,
             "a local view/backend inconsistency must not be reported as a consensus violation"
         );
     }
 
-    /// The split is kind-level, not a one-off for the view assertion.
+    /// The split is kind-level, not a one-off for the assertion.
     ///
     /// `ErrUnknownAgendaID` is what an agenda query inside block
     /// validation raises (`agendas.go:719-722`), and it and
@@ -1185,37 +1181,35 @@ mod tests {
         )
     }
 
-    /// The rule error the chain's view raises for an input it lost
-    /// (`UtxoView::assert_missing`, dcrd's `AssertError`): a regular
-    /// transaction spending an output an empty view does not hold.
-    fn missing_input_assertion() -> RuleError {
-        let tx = dcroxide_wire::MsgTx {
-            tx_in: vec![dcroxide_wire::TxIn {
-                previous_out_point: dcroxide_wire::OutPoint {
-                    hash: Hash([1; 32]),
-                    index: 0,
-                    tree: 0,
-                },
-                ..Default::default()
-            }],
-            ..Default::default()
+    /// The rule error the chain raises for dcrd's `AssertError` from
+    /// `checkTreasurybaseUniqueHeight`: a block without stake
+    /// transactions handed to the treasurybase height check.  Since
+    /// `e60cedc5` it is the chain's only `AssertError` stand-in on the
+    /// block paths; the view's missing input panics.
+    fn treasurybase_height_assertion() -> RuleError {
+        let block = dcroxide_wire::MsgBlock {
+            header: dcroxide_wire::BlockHeader::from_bytes(&[0u8; 180])
+                .expect("zero header")
+                .0,
+            transactions: Vec::new(),
+            stransactions: Vec::new(),
         };
-        let err = dcroxide_blockchain::utxoview::UtxoView::new()
-            .connect_regular_transaction(&tx, &tx.tx_hash(), 1, 1, None, false)
-            .unwrap_err();
+        let err =
+            dcroxide_blockchain::validate::check_treasurybase_unique_height(2, &block).unwrap_err();
         assert_eq!(err.kind, RuleErrorKind::UtxoBackendCorruption);
+        assert!(err.description.starts_with("assertion failed: "));
         err
     }
 
     /// dcrd's sync manager adds a `Critical failure` error line for
     /// `database.ErrCorruption` and `blockchain.ErrUtxoBackendCorruption`
-    /// (`manager.go:1265-1269`).  The port hands both over as rule
+    /// (`manager.go:1266-1270`).  The port hands both over as rule
     /// errors, so the adapter has to recognise them: a corrupt spend
     /// journal or UTXO backend by its kind, a database corruption by the
     /// kind `persist_rule_error` records in its text.  Neither the
-    /// missing-input assertion that shares the UTXO kind nor any other
-    /// database failure counts.  Both texts come from the chain's own
-    /// producers, so a change to either breaks this test.
+    /// treasurybase height assertion that shares the UTXO kind nor any
+    /// other database failure counts.  Both texts come from the chain's
+    /// own producers, so a change to either breaks this test.
     #[test]
     fn corruption_is_classified_for_the_critical_failure_line() {
         let classify = |errs: Vec<RuleError>, storage_failed: bool| {
@@ -1236,7 +1230,7 @@ mod tests {
             true,
         ));
 
-        assert!(!classify(vec![missing_input_assertion()], false));
+        assert!(!classify(vec![treasurybase_height_assertion()], false));
         assert!(!classify(
             vec![persisted_db_error(dcroxide_database::ErrorKind::Fatal)],
             true,

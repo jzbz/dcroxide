@@ -19,12 +19,12 @@ use dcroxide_chainhash::Hash;
 use dcroxide_stake::TxType;
 use dcroxide_wire::{MsgBlock, MsgTx, OutPoint};
 
+use crate::RuleError;
 use crate::chainio::SpentTxOut;
 use crate::utxoentry::{
     UTXO_STATE_MODIFIED, UTXO_STATE_SPENT, UTXO_STATE_SPENT_BY_ZERO_CONF, UtxoEntry,
     encode_utxo_flags, is_ticket_submission_output,
 };
-use crate::{RuleError, RuleErrorKind};
 
 /// The key identifying an outpoint within the view.
 pub type OutPointKey = ([u8; 32], u32, i8);
@@ -266,10 +266,21 @@ impl UtxoView {
                 continue;
             }
             if entry.is_spent_by_zero_conf() {
-                assert!(
-                    entry.is_spent(),
-                    "zero confirmation spend not also marked spent"
-                );
+                // dcrd panics here since `e60cedc5`
+                // (`utxocache.go:594-601`).
+                if !entry.is_spent() {
+                    let (hash, index, tree) = key.0;
+                    let outpoint = OutPoint {
+                        hash: Hash(hash),
+                        index,
+                        tree,
+                    };
+                    panic!(
+                        "output {outpoint} (tree {tree}) from view@{} is simultaneously marked \
+                         spent by a transaction later in the same block and not spent",
+                        self.best_hash
+                    );
+                }
                 continue;
             }
             updates.push((key.0, entry));
@@ -448,28 +459,17 @@ impl UtxoView {
         );
     }
 
-    /// The internal-consistency assertion dcrd raises when the view
-    /// lost an input it was asked to spend (`utxoviewpoint.go:290-294`,
-    /// `connectTransaction`).
-    ///
-    /// dcrd renders this through `AssertError`, whose `Error()`
-    /// prefixes `assertion failed: ` (`error.go:17-25`), and formats
-    /// the outpoint as `hash:index` via `wire.OutPoint.String`.  The
-    /// port has no separate assertion type -- it carries dcrd's
-    /// `ErrUtxoBackendCorruption` kind, which `is_rule_violation`
-    /// classifies out of the peer-blaming branch -- but the text can
-    /// match, so it does.
-    fn assert_missing(outpoint: &OutPoint) -> RuleError {
-        crate::ruleerror::rule_error(
-            RuleErrorKind::UtxoBackendCorruption,
-            alloc::format!("assertion failed: view missing input {outpoint}"),
-        )
-    }
-
     /// Connect a stake tree transaction, spending its inputs and
     /// adding its outputs (dcrd `connectStakeTransaction`).  The
     /// caller supplies the transaction's hash, computed once per
     /// block.
+    ///
+    /// # Panics
+    ///
+    /// When the view does not hold an input the transaction spends,
+    /// with dcrd's text (`utxoviewpoint.go:274-280`, since `e60cedc5`):
+    /// a view missing an input is an invariant violation there is no
+    /// recovering from.
     pub fn connect_stake_transaction(
         &mut self,
         tx: &MsgTx,
@@ -478,15 +478,15 @@ impl UtxoView {
         block_index: u32,
         mut stxos: Option<&mut Vec<SpentTxOut>>,
         is_treasury_enabled: bool,
-    ) -> Result<(), RuleError> {
+    ) {
         // Treasurybases have no inputs to spend.
         if is_treasury_enabled && block_index == 0 {
-            return Ok(());
+            return;
         }
         // Treasury spends source from the treasury account.
         if is_treasury_enabled && dcroxide_stake::is_tspend(tx) {
             self.add_tx_outs_with_hash(tx, tx_hash, block_height, block_index, is_treasury_enabled);
-            return Ok(());
+            return;
         }
         let is_vote = dcroxide_stake::is_ssgen(tx);
         for (tx_in_idx, tx_in) in tx.tx_in.iter().enumerate() {
@@ -496,7 +496,7 @@ impl UtxoView {
             }
             let prev_out = &tx_in.previous_out_point;
             let Some(entry) = self.entries.get_mut(&key(prev_out)) else {
-                return Err(Self::assert_missing(prev_out));
+                panic!("view missing input {prev_out} (tree {})", prev_out.tree);
             };
             if let Some(stxos) = stxos.as_deref_mut() {
                 stxos.push(entry_to_spent_tx_out(entry));
@@ -504,19 +504,23 @@ impl UtxoView {
             entry.spend();
         }
         self.add_tx_outs_with_hash(tx, tx_hash, block_height, block_index, is_treasury_enabled);
-        Ok(())
     }
 
     /// Connect every stake tree transaction of the block (dcrd
     /// `connectStakeTransactions`).  `stake_tx_hashes` carries the
     /// hash of each stake transaction, computed once per block.
+    ///
+    /// # Panics
+    ///
+    /// When the view does not hold an input a transaction spends, as
+    /// [`Self::connect_stake_transaction`] does.
     pub fn connect_stake_transactions(
         &mut self,
         block: &MsgBlock,
         stake_tx_hashes: &[Hash],
         mut stxos: Option<&mut Vec<SpentTxOut>>,
         is_treasury_enabled: bool,
-    ) -> Result<(), RuleError> {
+    ) {
         debug_assert_eq!(
             block.stransactions.len(),
             stake_tx_hashes.len(),
@@ -531,9 +535,8 @@ impl UtxoView {
                 i as u32,
                 stxos.as_deref_mut(),
                 is_treasury_enabled,
-            )?;
+            );
         }
-        Ok(())
     }
 
     /// Connect a regular tree transaction, spending its inputs and
@@ -542,6 +545,11 @@ impl UtxoView {
     /// fetch of the block's inputs fills, is marked as a
     /// zero-confirmation spend.  The caller supplies the transaction's
     /// hash, computed once per block.
+    ///
+    /// # Panics
+    ///
+    /// When the view does not hold an input the transaction spends,
+    /// with dcrd's text (`utxoviewpoint.go:342-348`, since `e60cedc5`).
     pub fn connect_regular_transaction(
         &mut self,
         tx: &MsgTx,
@@ -550,16 +558,16 @@ impl UtxoView {
         block_index: u32,
         mut stxos: Option<&mut Vec<SpentTxOut>>,
         is_treasury_enabled: bool,
-    ) -> Result<(), RuleError> {
+    ) {
         if dcroxide_standalone::is_coin_base_tx(tx, is_treasury_enabled) {
             self.add_tx_outs_with_hash(tx, tx_hash, block_height, block_index, is_treasury_enabled);
-            return Ok(());
+            return;
         }
         for tx_in in &tx.tx_in {
             let prev_out = &tx_in.previous_out_point;
             let prev_key = key(prev_out);
             let Some(entry) = self.entries.get_mut(&prev_key) else {
-                return Err(Self::assert_missing(prev_out));
+                panic!("view missing input {prev_out} (tree {})", prev_out.tree);
             };
             if let Some(stxos) = stxos.as_deref_mut() {
                 stxos.push(entry_to_spent_tx_out(entry));
@@ -573,7 +581,6 @@ impl UtxoView {
             }
         }
         self.add_tx_outs_with_hash(tx, tx_hash, block_height, block_index, is_treasury_enabled);
-        Ok(())
     }
 
     /// Connect every regular tree transaction of the block, marking the
@@ -582,13 +589,18 @@ impl UtxoView {
     /// zero-confirmation set (dcrd `connectRegularTransactions`).
     /// `regular_tx_hashes` carries the hash of each regular
     /// transaction, computed once per block.
+    ///
+    /// # Panics
+    ///
+    /// When the view does not hold an input a transaction spends, as
+    /// [`Self::connect_regular_transaction`] does.
     pub fn connect_regular_transactions(
         &mut self,
         block: &MsgBlock,
         regular_tx_hashes: &[Hash],
         mut stxos: Option<&mut Vec<SpentTxOut>>,
         is_treasury_enabled: bool,
-    ) -> Result<(), RuleError> {
+    ) {
         debug_assert_eq!(
             block.transactions.len(),
             regular_tx_hashes.len(),
@@ -596,20 +608,16 @@ impl UtxoView {
         );
         let height = i64::from(block.header.height);
         for (i, (tx, tx_hash)) in block.transactions.iter().zip(regular_tx_hashes).enumerate() {
-            if let Err(err) = self.connect_regular_transaction(
+            self.connect_regular_transaction(
                 tx,
                 tx_hash,
                 height,
                 i as u32,
                 stxos.as_deref_mut(),
                 is_treasury_enabled,
-            ) {
-                self.clear_zero_conf_outs();
-                return Err(err);
-            }
+            );
         }
         self.clear_zero_conf_outs();
-        Ok(())
     }
 
     /// Drop the view's zero-confirmation set once the regular tree it
@@ -1209,8 +1217,8 @@ impl UtxoView {
             tx_hashes.stake(),
             stxos.as_deref_mut(),
             is_treasury_enabled,
-        )?;
-        self.connect_regular_transactions(block, tx_hashes.regular(), stxos, is_treasury_enabled)?;
+        );
+        self.connect_regular_transactions(block, tx_hashes.regular(), stxos, is_treasury_enabled);
         self.set_best_hash(block.header.block_hash());
         Ok(())
     }
@@ -1274,7 +1282,7 @@ impl UtxoView {
                 &parent_regular_tx_hashes,
                 None,
                 is_treasury_enabled,
-            )?;
+            );
         }
         self.set_best_hash(block.header.prev_block);
         Ok(())
@@ -1676,11 +1684,10 @@ mod tests {
         assert!(tally.iter().all(|&entries| entries >= 300), "{tally:?}");
     }
 
-    /// dcrd fails the commit on a zero-confirmation spend that is not
-    /// marked spent (`utxocache.go:590-597`), which the port asserts;
-    /// the commit still checks every such entry.
+    /// dcrd panics at the commit of a zero-confirmation spend that is
+    /// not marked spent, with this text (`utxocache.go:594-601`, since
+    /// `e60cedc5`); the commit still checks every such entry.
     #[test]
-    #[should_panic(expected = "zero confirmation spend not also marked spent")]
     fn commit_refuses_a_zero_conf_spend_that_is_not_spent() {
         let mut rng = SplitMix64(3);
         let mut view = commit_test_view(20, &mut rng, |_| UTXO_STATE_MODIFIED);
@@ -1689,7 +1696,29 @@ mod tests {
             .get_mut(&last)
             .expect("the entry")
             .set_state_bits(UTXO_STATE_MODIFIED | UTXO_STATE_SPENT_BY_ZERO_CONF);
-        view.commit();
+        let (hash, index, tree) = last.0;
+        let outpoint = OutPoint {
+            hash: Hash(hash),
+            index,
+            tree,
+        };
+        let want = alloc::format!(
+            "output {outpoint} (tree {tree}) from view@{} is simultaneously marked spent by a \
+             transaction later in the same block and not spent",
+            Hash([0x77; 32])
+        );
+        assert_eq!(panic_text(|| drop(view.commit())), want);
+    }
+
+    /// The text of the panic `f` raises.
+    fn panic_text(f: impl FnOnce()) -> String {
+        let payload =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).expect_err("the call panics");
+        payload
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_string()))
+            .expect("a text payload")
     }
 
     /// dcrd `utxoEntryToSpentTxOut` encodes `encodeFlags(IsCoinBase(),
@@ -1931,9 +1960,8 @@ mod tests {
         let (external, external_entry) = sbss_external();
         let backend = move |op: &OutPoint| (*op == external).then(|| external_entry.clone());
 
-        let mut view = UtxoView::new();
-        let err = view
-            .connect_block_with_lookup(
+        let text = panic_text(|| {
+            let _ = UtxoView::new().connect_block_with_lookup(
                 &no_violation,
                 &block,
                 &tx_hashes,
@@ -1942,9 +1970,13 @@ mod tests {
                 &backend,
                 None,
                 false,
-            )
-            .expect_err("the ticket's input is missing without the lookup");
-        assert_eq!(err.kind, RuleErrorKind::UtxoBackendCorruption);
+            );
+        });
+        assert_eq!(
+            text,
+            alloc::format!("view missing input {origin_hash}:0 (tree 0)"),
+            "the ticket's input is missing without the lookup"
+        );
 
         let mut view = UtxoView::new();
         let mut stxos = Vec::new();
@@ -2161,8 +2193,7 @@ mod tests {
 
         let mut view = UtxoView::new();
         view.fetch_input_utxos(&block, &hashes, &resolve, false);
-        view.connect_regular_transactions(&block, &hashes, None, false)
-            .expect("connect");
+        view.connect_regular_transactions(&block, &hashes, None, false);
         for index in 0..2 {
             assert_eq!(
                 state_of(&view, &origin_out(a_hash, index)),
@@ -2220,8 +2251,7 @@ mod tests {
                 view.insert_entry(&origin_out(a_hash, 1), a1);
             }
             view.fetch_input_utxos(&block, &hashes, &resolve, false);
-            view.connect_regular_transactions(&block, &hashes, None, false)
-                .expect("connect");
+            view.connect_regular_transactions(&block, &hashes, None, false);
             assert!(
                 view.lookup_entry(&origin_out(a_hash, 0)).is_none(),
                 "no view holds A:0"
@@ -2299,12 +2329,10 @@ mod tests {
         view.fetch_input_utxos(&block, &hashes, &resolve, false);
         assert!(view.zero_conf_outs.iter().eq([&a0]));
         assert!(view.clone().zero_conf_outs.is_empty(), "a copy has none");
-        view.connect_stake_transactions(&block, &[], None, false)
-            .expect("connect stake");
+        view.connect_stake_transactions(&block, &[], None, false);
         assert!(!view.zero_conf_outs.is_empty(), "the stake tree leaves it");
         let mut stxos = Vec::new();
-        view.connect_regular_transactions(&block, &hashes, Some(&mut stxos), false)
-            .expect("connect regular");
+        view.connect_regular_transactions(&block, &hashes, Some(&mut stxos), false);
         assert!(view.zero_conf_outs.is_empty(), "the connect clears it");
 
         let mut view = UtxoView::new();
@@ -2399,5 +2427,44 @@ mod tests {
         )
         .expect("connect");
         assert_eq!(state_of(&view, &origin_out(origin_hash, 1)), SPENT);
+    }
+
+    /// dcrd panics when the view lacks an input a transaction spends,
+    /// in either tree, with this text (`utxoviewpoint.go:274-280`,
+    /// `:342-348`, since `e60cedc5`), where it returned an
+    /// `AssertError`.
+    #[test]
+    fn a_missing_input_panics_in_both_trees() {
+        let (block, origin_hash) = zero_conf_block(&[]);
+        let a = &block.transactions[1];
+        let (external, _) = sbss_external();
+        let text = panic_text(|| {
+            UtxoView::new().connect_regular_transaction(a, &origin_hash, 120, 1, None, false);
+        });
+        assert_eq!(
+            text,
+            alloc::format!("view missing input {external} (tree 0)")
+        );
+
+        let ticket_input = OutPoint {
+            hash: Hash([0x44; 32]),
+            index: 3,
+            tree: 1,
+        };
+        let ticket = ticket_spending(ticket_input, 3_000, 100, 2);
+        let text = panic_text(|| {
+            UtxoView::new().connect_stake_transaction(
+                &ticket,
+                &ticket.tx_hash(),
+                120,
+                1,
+                None,
+                false,
+            );
+        });
+        assert_eq!(
+            text,
+            alloc::format!("view missing input {ticket_input} (tree 1)")
+        );
     }
 }

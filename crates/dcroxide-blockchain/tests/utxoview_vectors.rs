@@ -247,8 +247,7 @@ fn utxoview_vectors() {
                     &regular_hashes,
                     Some(&mut parent_stxos),
                     TREASURY,
-                )
-                .expect("connect parent");
+                );
                 parent = Some(blk);
             }
             "pstxos" => check_stxos(&parent_stxos, &f, &mut lines, "pstxos"),
@@ -265,15 +264,13 @@ fn utxoview_vectors() {
                 let stake_hashes =
                     dcroxide_blockchain::utxoview::collect_tx_hashes(&blk.stransactions);
                 view.fetch_input_utxos(&blk, &regular_hashes, &none_resolver, TREASURY);
-                view.connect_stake_transactions(&blk, &stake_hashes, Some(&mut stxos), TREASURY)
-                    .expect("connect stake");
+                view.connect_stake_transactions(&blk, &stake_hashes, Some(&mut stxos), TREASURY);
                 view.connect_regular_transactions(
                     &blk,
                     &regular_hashes,
                     Some(&mut stxos),
                     TREASURY,
-                )
-                .expect("connect regular");
+                );
                 view.set_best_hash(blk.header.block_hash());
                 block = Some(blk);
             }

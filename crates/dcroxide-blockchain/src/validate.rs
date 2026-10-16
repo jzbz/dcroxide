@@ -2047,10 +2047,10 @@ pub fn check_treasurybase_unique_height(
     // dcrd returns an `AssertError` here rather than panicking, and the
     // block is peer input, so a caller that skipped the guard must get
     // an error back, not a process abort under `panic = "abort"`.  The
-    // port has no separate assertion type: like
-    // `UtxoView::assert_missing` it carries `ErrUtxoBackendCorruption`,
-    // which `is_rule_violation` keeps out of the peer-blaming branch,
-    // with `AssertError`'s `assertion failed: ` text (error.go:17-25).
+    // port has no separate assertion type: it carries
+    // `ErrUtxoBackendCorruption`, which `is_rule_violation` keeps out of
+    // the peer-blaming branch, with `AssertError`'s `assertion failed: `
+    // text (error.go:17-25).
     if block.stransactions.is_empty() {
         return Err(rule_error(
             RuleErrorKind::UtxoBackendCorruption,
@@ -4856,7 +4856,7 @@ pub fn check_transactions_and_connect<SP: dcroxide_standalone::SubsidyParams>(
                 idx as u32,
                 stxos.as_deref_mut(),
                 is_treasury_enabled,
-            )?;
+            );
         } else {
             view.connect_stake_transaction(
                 tx,
@@ -4865,7 +4865,7 @@ pub fn check_transactions_and_connect<SP: dcroxide_standalone::SubsidyParams>(
                 idx as u32,
                 stxos.as_deref_mut(),
                 is_treasury_enabled,
-            )?;
+            );
         }
     }
 

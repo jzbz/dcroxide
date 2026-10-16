@@ -14,6 +14,11 @@
 //! not yet flushed to the backend, undone by a disapproval and spent
 //! again in the block that disapproves it.
 //!
+//! dcrd `e60cedc5` turned the commit's remaining check, a
+//! zero-confirmation spend that is not also marked spent, from an
+//! `AssertError` into a panic (`utxocache.go:594-601`), and `TestCommit`
+//! now expects the panic.
+//!
 //! The entries are dcrd's fixtures, in the states its
 //! `makeEntryStates` builds.  The cache is seeded with entries in
 //! exactly the given states, as dcrd's `createTestUtxoCache` does.
@@ -90,6 +95,9 @@ fn entry1200(state: u8) -> UtxoEntry {
 }
 
 const MODIFIED_SPENT: u8 = UTXO_STATE_MODIFIED | UTXO_STATE_SPENT;
+/// The spent-by-zero-confirmation state bit (dcrd
+/// `utxoStateSpentByZeroConf`), which the crate does not export.
+const UTXO_STATE_SPENT_BY_ZERO_CONF: u8 = 1 << 2;
 
 /// A chain without a database whose cache holds exactly `cached`
 /// and whose backend holds exactly `backend`.
@@ -237,4 +245,27 @@ fn a_second_spend_before_a_flush_leaves_the_tombstone_for_the_flush() {
         None,
         "the output is spent through the cache and the backend"
     );
+}
+
+/// `TestCommit` "modified spent by zero conf view entry w/o spent
+/// panics": a view entry marked as a zero-confirmation spend but not
+/// spent stops the commit with dcrd's text.
+#[test]
+fn a_zero_conf_view_entry_that_is_not_spent_panics() {
+    let outpoint = outpoint1200();
+    let mut chain = chain_with(&[], &[]);
+    let mut view = view_with(&[(
+        outpoint,
+        entry1200(UTXO_STATE_MODIFIED | UTXO_STATE_SPENT_BY_ZERO_CONF),
+    )]);
+    let want = format!(
+        "output {outpoint} (tree 0) from view@{} is simultaneously marked spent by a \
+         transaction later in the same block and not spent",
+        Hash::ZERO
+    );
+    let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        chain.commit_view(&mut view);
+    }))
+    .expect_err("the commit panics");
+    assert_eq!(payload.downcast_ref::<String>(), Some(&want));
 }

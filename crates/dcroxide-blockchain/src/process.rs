@@ -2669,12 +2669,12 @@ impl Chain {
     /// `lastFlushHash` on disk that is one block behind a backend which
     /// already contains the newer block; the catch-up replay then
     /// reconnects an already-applied block, and both implementations
-    /// reject that rather than absorbing it — dcrd with
-    /// `AssertError("view missing input …")`
-    /// (`utxoviewpoint.go:292`, reached from the replay at
-    /// `utxocache.go:1015`), the port with the same guard in
-    /// `utxoview.rs` surfacing as `ChainDbError::Corrupt` out of
-    /// [`Self::initialize_utxo_state`].  Holding the chain lock across
+    /// stop rather than absorb it: the view lacks the inputs the block
+    /// already spent, and both panic with "view missing input …"
+    /// (dcrd `utxoviewpoint.go:274-280` and `:342-348` since
+    /// `e60cedc5`, reached from the replay at `utxocache.go:1024`; the
+    /// port's `UtxoView` connect functions, reached from
+    /// [`Self::initialize_utxo_state`]).  Holding the chain lock across
     /// the flush closes that window, so the port does not inherit the
     /// race.  Only the walk below is safe to run unlocked.
     pub fn flush_utxo_cache_for_stats(&mut self) -> Result<(), crate::chaindb::ChainDbError> {
@@ -2928,11 +2928,10 @@ impl Chain {
             );
         }
         crate::chainio::deserialize_spend_journal_entry(&serialized, &block_txns).map_err(|e| {
-            // Carried as `ErrUtxoBackendCorruption` for the reason
-            // `UtxoView::assert_missing` carries it: dcrd expresses this
-            // through a type the port has no counterpart for, and the
-            // kind is what keeps `is_rule_violation` from blaming the
-            // peer for local corruption.
+            // Carried as `ErrUtxoBackendCorruption`: dcrd expresses
+            // this through a type the port has no counterpart for, and
+            // the kind is what keeps `is_rule_violation` from blaming
+            // the peer for local corruption.
             // The inner error prints as dcrd's bare `errDeserialize`
             // text (`chainio.go:790-792`).
             rule_error(
@@ -10861,6 +10860,16 @@ mod tests {
     /// than one CPU).  A bulk import checks no script.  Afterwards the
     /// chain's copy of the block has the owners it has after a bulk
     /// import: no batch outlives the call that made it.
+    ///
+    /// A bulk import marks a block validated before it is connected
+    /// (dcrd `process.go:521-524`), so neither its inputs nor its
+    /// scripts are checked, and since `e60cedc5` a view lacking an
+    /// input panics (`utxoviewpoint.go:342-348`): a bulk import of a
+    /// block the battery refuses for its inputs stops the process, in
+    /// dcrd as here.  The bulk replay therefore takes the blocks the
+    /// battery accepts and those it refuses only because a script fails
+    /// (`ErrScriptValidation`), whose inputs exist, and a bulk import
+    /// accepts the latter.
     #[test]
     fn a_connected_blocks_scripts_are_offered_to_the_script_pool() {
         let params = dcroxide_chaincfg::regnet_params();
@@ -10893,7 +10902,7 @@ mod tests {
                         continue;
                     }
                     "accept" => f[4],
-                    "reject" => f[3],
+                    "reject" if !bulk_import || f[2] == "ErrScriptValidation" => f[3],
                     _ => continue,
                 };
                 let (block, _) =
@@ -10917,6 +10926,9 @@ mod tests {
                 );
                 if bulk_import {
                     assert_eq!((pooled_runner, to_pool), (0, 0), "{}", f[1]);
+                    if f[0] == "reject" {
+                        assert!(errs.is_empty(), "{}: {errs:?}", f[1]);
+                    }
                 }
 
                 // Only a block that was accepted and alone extended the
@@ -10960,9 +10972,8 @@ mod tests {
             }
             owners.push(owners_now);
         }
-        // The two replays do not extend their tips with the same
-        // blocks throughout (a bulk import accepts what only a script
-        // refuses), so the blocks both extended with are compared.
+        // The blocks both replays extended their tips with are
+        // compared.
         let mut compared = 0;
         for (block_hash, validated_owners) in &owners[0] {
             if let Some(imported_owners) = owners[1].get(block_hash) {
