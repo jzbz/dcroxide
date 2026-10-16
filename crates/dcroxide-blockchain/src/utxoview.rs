@@ -266,38 +266,17 @@ impl UtxoView {
         self.entries.iter().map(|(key, entry)| (&key.0, entry))
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn add_tx_out_raw(
-        &mut self,
-        outpoint: OutPoint,
-        value: i64,
-        version: u16,
-        pk_script: &[u8],
-        packed_flags: u8,
-        block_height: i64,
-        block_index: u32,
-        ticket_min_outs: Option<Vec<u8>>,
-    ) {
-        // Unspendable outputs never make it into the view.
-        if dcroxide_txscript::is_unspendable(value, pk_script) {
-            return;
-        }
-        let entry = self.entries.entry(key(&outpoint)).or_insert_with(|| {
-            UtxoEntry::new(0, Vec::new(), 0, 0, 0, false, false, TxType::Regular, None)
-        });
-        entry.amount = value;
-        entry.block_height = block_height as u32;
-        entry.block_index = block_index;
-        entry.script_version = version;
-        entry.packed_flags = packed_flags;
-        entry.ticket_min_outs = ticket_min_outs;
-        entry.state &= !(UTXO_STATE_SPENT | UTXO_STATE_SPENT_BY_ZERO_CONF);
-        entry.state |= UTXO_STATE_MODIFIED;
-        if entry.pk_script != pk_script {
-            entry.pk_script = pk_script.to_vec();
-        }
-    }
-
+    /// Add the outputs `start..end` of the transaction that are not
+    /// provably unspendable to the view (dcrd `addTxOuts`,
+    /// `utxoviewpoint.go:92-162`, the common body of `AddTxOut` and
+    /// `AddTxOuts`).  An output the view already holds is marked
+    /// unspent and has every field rewritten, since a reorganization
+    /// can replace it with a different transaction of the same hash.
+    /// The caller must have checked that the range exists.
+    ///
+    /// The unspendable test comes before the ticket minimal outputs
+    /// are built, so an unspendable output costs no serialization, as
+    /// in dcrd since `248a9d40`.
     #[allow(clippy::too_many_arguments)]
     fn add_tx_outs_internal(
         &mut self,
@@ -319,9 +298,27 @@ impl UtxoView {
             if is_treasury_add_output(tx_type, tx_out_idx) {
                 continue;
             }
+            // Unspendable outputs never make it into the view.
+            let tx_out = &tx.tx_out[tx_out_idx as usize];
+            if dcroxide_txscript::is_unspendable(tx_out.value, &tx_out.pk_script) {
+                continue;
+            }
+            let outpoint = OutPoint {
+                hash: *tx_hash,
+                index: tx_out_idx,
+                tree,
+            };
+            let entry = self.entries.entry(key(&outpoint)).or_insert_with(|| {
+                UtxoEntry::new(0, Vec::new(), 0, 0, 0, false, false, TxType::Regular, None)
+            });
+            entry.amount = tx_out.value;
+            entry.block_height = block_height as u32;
+            entry.block_index = block_index;
+            entry.script_version = tx_out.version;
+            entry.packed_flags = flags;
             // Ticket submission outputs carry the serialized minimal
             // outputs so votes and revocations can be validated.
-            let ticket_min_outs = if is_ticket_submission_output(tx_type as u8, tx_out_idx) {
+            entry.ticket_min_outs = if is_ticket_submission_output(tx_type as u8, tx_out_idx) {
                 let mut data =
                     alloc::vec![0u8; crate::chainio::serialize_size_for_minimal_outputs(tx)];
                 crate::chainio::put_tx_to_minimal_outputs(&mut data, tx);
@@ -329,22 +326,12 @@ impl UtxoView {
             } else {
                 None
             };
-            let tx_out = &tx.tx_out[tx_out_idx as usize];
-            let outpoint = OutPoint {
-                hash: *tx_hash,
-                index: tx_out_idx,
-                tree,
-            };
-            self.add_tx_out_raw(
-                outpoint,
-                tx_out.value,
-                tx_out.version,
-                &tx_out.pk_script,
-                flags,
-                block_height,
-                block_index,
-                ticket_min_outs,
-            );
+            // The output is always unspent and modified once added.
+            entry.state &= !(UTXO_STATE_SPENT | UTXO_STATE_SPENT_BY_ZERO_CONF);
+            entry.state |= UTXO_STATE_MODIFIED;
+            if entry.pk_script != tx_out.pk_script {
+                entry.pk_script = tx_out.pk_script.clone();
+            }
         }
     }
 
