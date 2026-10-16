@@ -132,6 +132,22 @@ pub struct Filter {
     /// The actual filter data implemented as a packed ring buffer
     /// where the individual filter slices perform logical shifts.
     data: Vec<u8>,
+
+    /// Whether a bit has been set in the data since it was last all
+    /// zero.  It is not a dcrd field: the data starts all zero, only
+    /// [`Filter::set_bit`] ever sets a bit, and aging only clears bits,
+    /// so while this is false every byte of the data is zero and
+    /// [`Filter::reset`] has nothing to clear.
+    maybe_set: bool,
+}
+
+#[cfg(test)]
+std::thread_local! {
+    /// How many times a [`Filter::reset`] on this thread passed over
+    /// its filter's data to zero it.  It exists in this crate's
+    /// unit-test builds only, where a test reads it to tell which
+    /// resets made the pass and which found nothing to clear.
+    static CLEARING_PASSES: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
 }
 
 impl Filter {
@@ -227,6 +243,7 @@ impl Filter {
     /// the underlying filter data (dcrd `setBit`).
     fn set_bit(&mut self, bit: u64) {
         self.data[(bit >> 3) as usize] |= 1 << (bit & 7);
+        self.maybe_set = true;
     }
 
     /// Insert the provided data into the filter (dcrd `Add`).
@@ -369,8 +386,21 @@ impl Filter {
         self.key1 = key1;
         self.base_index = 0;
         self.items_in_cur_generation = 0;
-        for b in self.data.iter_mut() {
-            *b = 0;
+
+        // dcrd zeroes the data unconditionally (`filter.go:499-501`).
+        // Data in which no bit was set since it was last all zero is
+        // all zero already, so writing zeros over it changes nothing: a
+        // filter that is reset far more often than it is added to (the
+        // rejected transactions, once per connected block) skips the
+        // pass over its whole data.  The key and the generation state
+        // above change on every reset regardless.
+        if self.maybe_set {
+            #[cfg(test)]
+            CLEARING_PASSES.set(CLEARING_PASSES.get().wrapping_add(1));
+            for b in self.data.iter_mut() {
+                *b = 0;
+            }
+            self.maybe_set = false;
         }
     }
 
@@ -399,6 +429,14 @@ impl Filter {
     #[doc(hidden)]
     pub fn internal_params(&self) -> (u32, u64) {
         (self.items_per_generation, self.bits_per_slice)
+    }
+
+    /// Whether a bit has been set in the data since it was last all
+    /// zero, which is what makes [`Filter::reset`] clear it; exposed so
+    /// tests can hold it against the data.
+    #[doc(hidden)]
+    pub fn maybe_set(&self) -> bool {
+        self.maybe_set
     }
 }
 
@@ -484,6 +522,7 @@ pub fn new_filter_kl(min_capacity: u32, k: u8, l: u8) -> Filter {
         items_in_cur_generation: 0,
         base_index: 0,
         data: vec![0u8; filter_bytes as usize],
+        maybe_set: false,
     }
 }
 
@@ -526,4 +565,76 @@ pub fn new_filter(min_capacity: u32, fp_rate: f64) -> Filter {
     let k = near_optimal_k(fp_rate);
     let l = near_optimal_l(k, fp_rate);
     new_filter_kl(min_capacity, k, l)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CLEARING_PASSES, Filter, new_filter, new_filter_kl};
+
+    /// Reset the filter and return how many passes over its data that
+    /// took.
+    fn passes_of_a_reset(filter: &mut Filter) -> u64 {
+        let before = CLEARING_PASSES.get();
+        filter.reset();
+        CLEARING_PASSES.get().wrapping_sub(before)
+    }
+
+    /// A reset passes over the data only when a bit was set since the
+    /// data was last all zero: not for a filter nothing was added to,
+    /// once after any number of additions, and not again until the next
+    /// addition.  What each of those resets leaves behind is held
+    /// against a filter that always clears in `tests/apbf_reset.rs`;
+    /// this is the test that the pass itself is skipped.
+    #[test]
+    fn a_reset_passes_over_the_data_only_after_an_addition() {
+        // The parameters of the sync manager's filter of rejected
+        // transactions (dcrd `maxRejectedTxns` and `rejectedTxnsFPRate`,
+        // `internal/netsync/manager.go`), which is reset once per
+        // connected block.
+        let mut filter = new_filter(62500, 0.000_000_1);
+        assert_eq!((filter.k, filter.l), (24, 19));
+        assert_eq!(filter.data.len(), 581_592, "what a pass walks");
+        for _ in 0..3 {
+            assert_eq!(passes_of_a_reset(&mut filter), 0, "nothing added yet");
+        }
+
+        filter.add(b"a rejected transaction");
+        assert_eq!(passes_of_a_reset(&mut filter), 1, "one addition");
+        assert!(filter.data.iter().all(|&b| b == 0));
+        assert_eq!(
+            passes_of_a_reset(&mut filter),
+            0,
+            "cleared by the reset before"
+        );
+
+        for i in 0u32..100 {
+            filter.add(&i.to_be_bytes());
+        }
+        assert_eq!(passes_of_a_reset(&mut filter), 1, "a hundred additions");
+        assert!(filter.data.iter().all(|&b| b == 0));
+        for _ in 0..3 {
+            assert_eq!(passes_of_a_reset(&mut filter), 0, "nothing added since");
+        }
+
+        // Additions that outlast the filter leave bits behind as well:
+        // aging clears slices, not the whole data.
+        let mut small = new_filter_kl(8, 4, 3);
+        for i in 0u32..200 {
+            small.add(&i.to_be_bytes());
+        }
+        assert_eq!(passes_of_a_reset(&mut small), 1, "aged many times over");
+        assert_eq!(
+            passes_of_a_reset(&mut small),
+            0,
+            "cleared by the reset before"
+        );
+
+        // A filter with no slice to set a bit in never has anything to
+        // clear, however much is added to it.
+        let mut bitless = new_filter_kl(8, 0, 3);
+        for i in 0u32..20 {
+            bitless.add(&i.to_be_bytes());
+        }
+        assert_eq!(passes_of_a_reset(&mut bitless), 0, "no bit to set");
+    }
 }
