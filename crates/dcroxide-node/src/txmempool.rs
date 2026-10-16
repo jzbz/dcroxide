@@ -276,10 +276,24 @@ impl PoolChain for NodePoolChain {
         self.locked().best_snapshot().height
     }
 
-    fn header_by_hash(&self, hash: &Hash) -> Result<BlockHeader, String> {
+    /// The winners of the block's ticket lottery, including for side
+    /// chain blocks (dcrd's `WinningTicketsByHash` closure over
+    /// `LotteryDataForBlock`, `server.go:4082-4088`).  Every failure is a
+    /// plain error to the pool, as dcrd's are, among them a block known
+    /// only by its header, whose stake node cannot be built until its data
+    /// arrives.  A block whose stake node is no longer held in memory is
+    /// rebuilt from the database, as in dcrd.
+    fn winning_tickets_by_hash(&self, hash: &Hash) -> Result<Vec<Hash>, String> {
         self.locked()
-            .header_by_hash(hash)
-            .ok_or_else(|| format!("unable to find block {hash}"))
+            .lottery_data_for_block(hash, &self.params)
+            .map(|(winners, _, _)| winners)
+            .map_err(|e| e.description)
+    }
+
+    /// The header from the block index, side chain and header-only
+    /// blocks included (dcrd `BlockChain.HeaderByHash`).
+    fn header_by_hash(&self, hash: &Hash) -> Option<BlockHeader> {
+        self.locked().header_by_hash(hash)
     }
 
     fn past_median_time(&self) -> i64 {

@@ -26,7 +26,7 @@
 
 mod common;
 
-use common::{FakeChain, chain_from_init, error_kind, harness_policy, parse_tx};
+use common::{FakeChain, apply_block_row, chain_from_init, error_kind, harness_policy, parse_tx};
 use dcroxide_chaincfg::mainnet_params;
 use dcroxide_mempool::{MixpoolProbe, TxPool};
 use dcroxide_stake::{TxType, determine_tx_type};
@@ -124,10 +124,10 @@ fn the_same_spend_is_accepted_when_neither_step_refuses_it() {
 
 /// The stake vectors' first section up to its first transaction: the
 /// chain its init row builds with the rows ahead of that transaction
-/// applied, and the section's first vote and first ticket purchase.  At
-/// that height both clear every check ahead of the mixpool steps and
-/// then miss an input, the vote its ticket and the ticket its funding
-/// transaction.
+/// applied, and the section's first vote and first ticket purchase.  With
+/// that height and the block the vote votes on known, both clear every
+/// check ahead of the mixpool steps and then miss an input, the vote its
+/// ticket and the ticket its funding transaction.
 fn stake_battery() -> (FakeChain, MsgTx, MsgTx) {
     let data = include_str!("data/txstake_vectors.txt");
     let mut rows = data
@@ -143,6 +143,9 @@ fn stake_battery() -> (FakeChain, MsgTx, MsgTx) {
         match f[0] {
             "pt" => txs.push(parse_tx(f[1])),
             "sethgt" if txs.is_empty() => chain.best_height = f[1].parse().expect("height"),
+            _ if txs.is_empty() => {
+                apply_block_row(&mut chain, &f);
+            }
             _ => {}
         }
     }

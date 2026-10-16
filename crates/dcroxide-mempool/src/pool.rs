@@ -43,6 +43,16 @@ pub use dcroxide_mining::{TxDesc, UNMINED_HEIGHT, VoteDesc};
 /// transaction fee (dcrd `maxRelayFeeMultiplier`).
 const MAX_RELAY_FEE_MULTIPLIER: i64 = 10000;
 
+/// The maximum number of blocks ahead of the current best chain tip that
+/// a vote is allowed to reference (dcrd `maxFutureVoteAge`,
+/// `mempool.go:34-43`).
+///
+/// A legitimate vote on a block beyond the tip should normally be only one
+/// block ahead, when it arrives before the block's announcement has been
+/// seen or fully processed; the larger limit leaves room for latency, poor
+/// connectivity and slow processing.
+const MAX_FUTURE_VOTE_AGE: i64 = 5;
+
 /// The maximum number of vote double spends allowed in the pool (dcrd
 /// `maxVoteDoubleSpends`).
 const MAX_VOTE_DOUBLE_SPENDS: usize = 5;
@@ -101,9 +111,20 @@ pub trait PoolChain {
     fn best_hash(&self) -> Hash;
     /// The current best block height (dcrd `Config.BestHeight`).
     fn best_height(&self) -> i64;
-    /// The header for the given block hash (dcrd
+    /// The winning tickets for the given block hash: the tickets the
+    /// lottery selected to vote on it (dcrd
+    /// `Config.WinningTicketsByHash`, which `newServer` answers from
+    /// `LotteryDataForBlock`, `server.go:4082-4088`).  An error is a plain
+    /// failure, never a rule violation.
+    fn winning_tickets_by_hash(&self, hash: &Hash) -> Result<Vec<Hash>, String>;
+    /// The header for the given block hash, from the main chain or any
+    /// side chain, or `None` when the chain does not know the block (dcrd
     /// `Config.HeaderByHash`).
-    fn header_by_hash(&self, hash: &Hash) -> Result<BlockHeader, String>;
+    ///
+    /// dcrd's real lookup answers from the block index and fails only
+    /// with `ErrUnknownBlock` (`internal/blockchain/chain.go:1666-1673`),
+    /// so `None` is that failure; the pool has no other one to tell apart.
+    fn header_by_hash(&self, hash: &Hash) -> Option<BlockHeader>;
     /// The median time of the current chain tip as unix seconds (dcrd
     /// `Config.PastMedianTime`).
     fn past_median_time(&self) -> i64;
@@ -393,8 +414,9 @@ fn shuffle_trial_order<T>(items: &mut [T], mut draw: impl FnMut() -> u64) {
 /// `trackedVotes`, `mempool.go:258-265`).
 #[derive(Clone, Debug)]
 struct TrackedVotes {
-    /// The height the first vote tracked for the block claims (dcrd
-    /// `blockHeight`).
+    /// The known good height of the block: the height the first vote
+    /// tracked for it claims, which `check_vote_block` has compared with
+    /// the block's header by then (dcrd `blockHeight`).
     block_height: i64,
     /// The metadata of the votes, one per ticket, in acceptance order.
     votes: Vec<VoteDesc>,
@@ -1325,6 +1347,117 @@ impl<C: PoolChain> TxPool<C> {
         Ok(())
     }
 
+    /// Reject a vote whose voted block height is too old or too far in
+    /// the future for the tip at the given height (dcrd
+    /// `checkVoteHeightPolicy`, `mempool.go:1104-1134`).
+    ///
+    /// The vote must already be known to be a vote.
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "best_height is the chain tip's height, a u32 header field widened to i64, and max_vote_age is a u16, so neither the sums nor the difference can overflow"
+    )]
+    fn check_vote_height_policy(
+        &self,
+        vote: &MsgTx,
+        vote_hash: &Hash,
+        best_height: i64,
+    ) -> Result<(), RuleError> {
+        // Reject votes on blocks that are too old.
+        let next_block_height = best_height + 1;
+        let (_, voted_height) = dcroxide_stake::ssgen_block_voted_on(vote);
+        let min_voted_height = next_block_height - i64::from(self.policy.max_vote_age);
+        if i64::from(voted_height) < min_voted_height && !self.policy.allow_old_votes {
+            let str = format!(
+                "vote {vote_hash} references old block height {voted_height} which is \
+                 before the current cutoff height of {min_voted_height}"
+            );
+            return Err(tx_rule_error(ErrorKind::OldVote, str));
+        }
+
+        // Reject votes on blocks that are too far in the future.
+        let max_voted_height = best_height + MAX_FUTURE_VOTE_AGE;
+        if i64::from(voted_height) > max_voted_height {
+            let str = format!(
+                "vote {vote_hash} references block height {voted_height} which is \
+                 after the maximum permitted future height {max_voted_height}"
+            );
+            return Err(tx_rule_error(ErrorKind::FutureVote, str));
+        }
+
+        Ok(())
+    }
+
+    /// Reject a vote on a block the chain does not know, or one that
+    /// claims a height other than the block's (dcrd `checkVoteBlock`,
+    /// `mempool.go:1136-1164`).
+    ///
+    /// dcrd passes any failure of the lookup other than an unknown block
+    /// through as a plain error; the chain seam has none, so the port
+    /// has no such branch.  A block known only by its header passes, as
+    /// in dcrd, whose lookup answers from the block index.
+    fn check_vote_block(&self, vote: &MsgTx, vote_hash: &Hash) -> Result<(), RuleError> {
+        let (voted_hash, voted_height) = dcroxide_stake::ssgen_block_voted_on(vote);
+        let Some(header) = self.chain.header_by_hash(&voted_hash) else {
+            let str = format!("vote {vote_hash} votes on unknown block {voted_hash}");
+            return Err(tx_rule_error(ErrorKind::VoteBlockUnknown, str));
+        };
+        if voted_height != header.height {
+            let str = format!(
+                "vote {vote_hash} votes on block {voted_hash} (height {}) with \
+                 incorrect height {voted_height}",
+                header.height
+            );
+            return Err(tx_rule_error(ErrorKind::VoteBlockHeight, str));
+        }
+        Ok(())
+    }
+
+    /// Reject a recent enough vote whose ticket is not one of the winning
+    /// tickets of the block it votes on (dcrd `checkVoteTicket`,
+    /// `mempool.go:1166-1203`).
+    ///
+    /// Only votes at or above the maximum vote age policy's cutoff are
+    /// checked, since finding the winners can be expensive for older
+    /// blocks; older votes reach here only when old votes are allowed,
+    /// and then consensus refuses an ineligible ticket when a block holds
+    /// it.  A failed lookup is a plain error, as dcrd's
+    /// `wrapChainRuleError` passes every failure of
+    /// `LotteryDataForBlock` through: among them that of a block known
+    /// only by its header, whose ticket data has not arrived.
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "best_height is the chain tip's height, a u32 header field widened to i64, and max_vote_age is a u16, so neither the sum nor the difference can overflow"
+    )]
+    fn check_vote_ticket(
+        &self,
+        vote: &MsgTx,
+        vote_hash: &Hash,
+        best_height: i64,
+    ) -> Result<(), PoolError> {
+        let next_block_height = best_height + 1;
+        let (voted_hash, voted_height) = dcroxide_stake::ssgen_block_voted_on(vote);
+        let min_voted_height = next_block_height - i64::from(self.policy.max_vote_age);
+        if i64::from(voted_height) < min_voted_height {
+            return Ok(());
+        }
+
+        // Reject votes that do not vote on a winning ticket for the block
+        // that is being voted on.
+        let winning_tickets = self
+            .chain
+            .winning_tickets_by_hash(&voted_hash)
+            .map_err(PoolError::Other)?;
+        let ticket_spent = vote.tx_in[1].previous_out_point.hash;
+        if !winning_tickets.contains(&ticket_spent) {
+            let str = format!(
+                "vote {vote_hash} votes on block {voted_hash} (height {voted_height}) \
+                 with ineligible ticket {ticket_spent}"
+            );
+            return Err(tx_rule_error(ErrorKind::IneligibleTicketVote, str).into());
+        }
+        Ok(())
+    }
+
     /// Whether the regular tree of the block with the provided hash is
     /// known to be disapproved by the pool's votes (dcrd
     /// `IsRegTxTreeKnownDisapproved`).
@@ -1624,6 +1757,18 @@ impl<C: PoolChain> TxPool<C> {
             return Err(tx_rule_error(ErrorKind::Invalid, str).into());
         }
 
+        // Reject votes on blocks that are too old or too far in the future,
+        // votes on unknown blocks, and votes that claim an incorrect block
+        // height (dcrd `mempool.go:1492-1502`).  These run right after the
+        // stake validation height gate, ahead of the revocation gate and
+        // every later check, so a vote that fails one of them is reported
+        // for it even when it is also, say, non-standard or over the
+        // five-vote limit.
+        if is_vote {
+            self.check_vote_height_policy(tx, &tx_hash, best_height)?;
+            self.check_vote_block(tx, &tx_hash)?;
+        }
+
         // Reject revocations before they can possibly be valid.
         let is_revocation = tx_type == TxType::SSRtx;
         #[allow(
@@ -1743,25 +1888,6 @@ impl<C: PoolChain> TxPool<C> {
             }
         }
 
-        // Votes that are on too old of blocks are rejected.
-        if is_vote {
-            let (_, vote_height) = dcroxide_stake::ssgen_block_voted_on(tx);
-            #[allow(
-                clippy::arithmetic_side_effects,
-                reason = "next_block_height is a chain height within u32 range plus one and max_vote_age is a u16, so the difference cannot overflow i64"
-            )]
-            if i64::from(vote_height) < next_block_height - i64::from(self.policy.max_vote_age)
-                && !self.policy.allow_old_votes
-            {
-                let str = format!(
-                    "transaction {tx_hash} votes on old block height of {vote_height} \
-                     which is before the current cutoff height of {}",
-                    next_block_height - i64::from(self.policy.max_vote_age)
-                );
-                return Err(tx_rule_error(ErrorKind::OldVote, str).into());
-            }
-        }
-
         // Fetch all of the unspent transaction outputs referenced by
         // the inputs to this transaction along with the transaction
         // itself for duplicate detection.
@@ -1865,7 +1991,7 @@ impl<C: PoolChain> TxPool<C> {
         let best_header = self
             .chain
             .header_by_hash(&best_hash)
-            .map_err(PoolError::Other)?;
+            .ok_or_else(|| PoolError::Other(format!("block {best_hash} is not known")))?;
         let tx_fee = check_transaction_inputs(
             &mut self.subsidy_cache,
             &tx,
@@ -1983,6 +2109,15 @@ impl<C: PoolChain> TxPool<C> {
             is_auto_revocations_enabled,
         )
         .map_err(|e| PoolError::Rule(chain_rule_error(e)))?;
+
+        // Reject recent votes that do not vote on a winning ticket for the
+        // block that is being voted on (dcrd `mempool.go:1849-1861`).  This
+        // runs after the signatures are checked, so an unsigned vote cannot
+        // make the pool look winners up, which can be expensive for older
+        // blocks.
+        if is_vote {
+            self.check_vote_ticket(&tx, &tx_hash, best_height)?;
+        }
 
         // Only allow treasury spends that have a valid expiry.
         if is_treasury_enabled && is_tspend {
@@ -2731,7 +2866,10 @@ mod send_tests {
             fn best_height(&self) -> i64 {
                 unimplemented!()
             }
-            fn header_by_hash(&self, _hash: &Hash) -> Result<BlockHeader, String> {
+            fn winning_tickets_by_hash(&self, _hash: &Hash) -> Result<Vec<Hash>, String> {
+                unimplemented!()
+            }
+            fn header_by_hash(&self, _hash: &Hash) -> Option<BlockHeader> {
                 unimplemented!()
             }
             fn past_median_time(&self) -> i64 {
@@ -2828,7 +2966,10 @@ mod removal_cascade_tests {
         fn best_height(&self) -> i64 {
             unimplemented!()
         }
-        fn header_by_hash(&self, _hash: &Hash) -> Result<BlockHeader, String> {
+        fn winning_tickets_by_hash(&self, _hash: &Hash) -> Result<Vec<Hash>, String> {
+            unimplemented!()
+        }
+        fn header_by_hash(&self, _hash: &Hash) -> Option<BlockHeader> {
             unimplemented!()
         }
         fn past_median_time(&self) -> i64 {
@@ -3324,7 +3465,10 @@ mod orphan_eviction_tests {
         fn best_height(&self) -> i64 {
             unimplemented!()
         }
-        fn header_by_hash(&self, _hash: &Hash) -> Result<BlockHeader, String> {
+        fn winning_tickets_by_hash(&self, _hash: &Hash) -> Result<Vec<Hash>, String> {
+            unimplemented!()
+        }
+        fn header_by_hash(&self, _hash: &Hash) -> Option<BlockHeader> {
             unimplemented!()
         }
         fn past_median_time(&self) -> i64 {
@@ -3678,7 +3822,10 @@ mod fetch_input_utxos_tests {
         fn best_height(&self) -> i64 {
             unimplemented!()
         }
-        fn header_by_hash(&self, _hash: &Hash) -> Result<BlockHeader, String> {
+        fn winning_tickets_by_hash(&self, _hash: &Hash) -> Result<Vec<Hash>, String> {
+            unimplemented!()
+        }
+        fn header_by_hash(&self, _hash: &Hash) -> Option<BlockHeader> {
             unimplemented!()
         }
         fn past_median_time(&self) -> i64 {
@@ -3857,6 +4004,70 @@ mod fetch_input_utxos_tests {
         }
     }
 }
+/// A vote by the ticket with the given hash on the block with the given
+/// hash and claimed height, for the unit tests: only its shape is real,
+/// and nothing checks its scripts or amounts.
+#[cfg(test)]
+fn test_vote(block: [u8; 32], height: u32, ticket: [u8; 32], bits: u16) -> MsgTx {
+    use dcroxide_wire::{TX_TREE_REGULAR, TX_TREE_STAKE, TxIn, TxOut};
+
+    let mut block_ref = vec![0x6a, 0x24];
+    block_ref.extend_from_slice(&block);
+    block_ref.extend_from_slice(&height.to_le_bytes());
+    let mut vote_bits = vec![0x6a, 0x02];
+    vote_bits.extend_from_slice(&bits.to_le_bytes());
+    let mut reward = vec![dcroxide_txscript::OP_SSGEN, 0x76, 0xa9, 0x14];
+    reward.extend_from_slice(&[0x11; 20]);
+    reward.extend_from_slice(&[0x88, 0xac]);
+    let tx = MsgTx {
+        tx_in: vec![
+            TxIn {
+                previous_out_point: OutPoint {
+                    hash: Hash([0; 32]),
+                    index: u32::MAX,
+                    tree: TX_TREE_REGULAR,
+                },
+                sequence: u32::MAX,
+                value_in: 1,
+                block_height: 0,
+                block_index: NULL_BLOCK_INDEX,
+                signature_script: vec![0x00, 0x00],
+            },
+            TxIn {
+                previous_out_point: OutPoint {
+                    hash: Hash(ticket),
+                    index: 0,
+                    tree: TX_TREE_STAKE,
+                },
+                sequence: u32::MAX,
+                value_in: 1,
+                block_height: 1,
+                block_index: 0,
+                signature_script: vec![0x51],
+            },
+        ],
+        tx_out: vec![
+            TxOut {
+                value: 0,
+                version: 0,
+                pk_script: block_ref,
+            },
+            TxOut {
+                value: 0,
+                version: 0,
+                pk_script: vote_bits,
+            },
+            TxOut {
+                value: 2,
+                version: 0,
+                pk_script: reward,
+            },
+        ],
+        ..MsgTx::default()
+    };
+    assert_eq!(dcroxide_stake::determine_tx_type(&tx), TxType::SSGen);
+    tx
+}
 
 #[cfg(test)]
 #[allow(
@@ -3866,7 +4077,7 @@ mod fetch_input_utxos_tests {
 mod vote_tracker_tests {
     use super::*;
 
-    use dcroxide_wire::{TX_TREE_REGULAR, TX_TREE_STAKE, TxIn, TxOut};
+    use dcroxide_wire::TX_TREE_STAKE;
 
     /// The height of the block every vote here votes on, dcrd's in
     /// `TestVoteTrackerPruneOldVotesBoundary`.
@@ -3899,7 +4110,10 @@ mod vote_tracker_tests {
         fn best_height(&self) -> i64 {
             unimplemented!()
         }
-        fn header_by_hash(&self, _hash: &Hash) -> Result<BlockHeader, String> {
+        fn winning_tickets_by_hash(&self, _hash: &Hash) -> Result<Vec<Hash>, String> {
+            unimplemented!()
+        }
+        fn header_by_hash(&self, _hash: &Hash) -> Option<BlockHeader> {
             unimplemented!()
         }
         fn past_median_time(&self) -> i64 {
@@ -3963,68 +4177,6 @@ mod vote_tracker_tests {
         TxPool::new(chain, policy, &params)
     }
 
-    /// A vote by the ticket with the given hash on the block with the
-    /// given hash and claimed height.  Only its shape is real: nothing
-    /// here checks its scripts or amounts.
-    fn vote(block: [u8; 32], height: u32, ticket: [u8; 32], bits: u16) -> MsgTx {
-        let mut block_ref = vec![0x6a, 0x24];
-        block_ref.extend_from_slice(&block);
-        block_ref.extend_from_slice(&height.to_le_bytes());
-        let mut vote_bits = vec![0x6a, 0x02];
-        vote_bits.extend_from_slice(&bits.to_le_bytes());
-        let mut reward = vec![dcroxide_txscript::OP_SSGEN, 0x76, 0xa9, 0x14];
-        reward.extend_from_slice(&[0x11; 20]);
-        reward.extend_from_slice(&[0x88, 0xac]);
-        let tx = MsgTx {
-            tx_in: vec![
-                TxIn {
-                    previous_out_point: OutPoint {
-                        hash: Hash([0; 32]),
-                        index: u32::MAX,
-                        tree: TX_TREE_REGULAR,
-                    },
-                    sequence: u32::MAX,
-                    value_in: 1,
-                    block_height: 0,
-                    block_index: NULL_BLOCK_INDEX,
-                    signature_script: vec![0x00, 0x00],
-                },
-                TxIn {
-                    previous_out_point: OutPoint {
-                        hash: Hash(ticket),
-                        index: 0,
-                        tree: TX_TREE_STAKE,
-                    },
-                    sequence: u32::MAX,
-                    value_in: 1,
-                    block_height: 1,
-                    block_index: 0,
-                    signature_script: vec![0x51],
-                },
-            ],
-            tx_out: vec![
-                TxOut {
-                    value: 0,
-                    version: 0,
-                    pk_script: block_ref,
-                },
-                TxOut {
-                    value: 0,
-                    version: 0,
-                    pk_script: vote_bits,
-                },
-                TxOut {
-                    value: 2,
-                    version: 0,
-                    pk_script: reward,
-                },
-            ],
-            ..MsgTx::default()
-        };
-        assert_eq!(dcroxide_stake::determine_tx_type(&tx), TxType::SSGen);
-        tx
-    }
-
     /// Put the vote in the pool as accepted at the given height, and in
     /// the tracker, as acceptance does.
     fn accept(pool: &mut TxPool<ClockChain>, vote: &MsgTx, accepted_at: i64) -> Hash {
@@ -4058,7 +4210,7 @@ mod vote_tracker_tests {
             (height + HEIGHT_DIFF_TO_PRUNE_VOTES + 1, true),
         ] {
             let mut tracker = VoteTracker::default();
-            let tracked = vote(block.0, BLOCK_HEIGHT, [0x71; 32], 0x0001);
+            let tracked = test_vote(block.0, BLOCK_HEIGHT, [0x71; 32], 0x0001);
             tracker.add_vote(&tracked, &tracked.tx_hash());
             tracker.prune_old_votes(prune_height);
             assert_eq!(
@@ -4077,9 +4229,9 @@ mod vote_tracker_tests {
     fn the_first_vote_on_a_block_sets_its_height_and_a_ticket_counts_once() {
         let block = Hash([0x02; 32]);
         let mut tracker = VoteTracker::default();
-        let first = vote(block.0, BLOCK_HEIGHT, [0x71; 32], 0x0001);
-        let again = vote(block.0, BLOCK_HEIGHT, [0x71; 32], 0x0000);
-        let later = vote(block.0, BLOCK_HEIGHT + 100, [0x72; 32], 0x0001);
+        let first = test_vote(block.0, BLOCK_HEIGHT, [0x71; 32], 0x0001);
+        let again = test_vote(block.0, BLOCK_HEIGHT, [0x71; 32], 0x0000);
+        let later = test_vote(block.0, BLOCK_HEIGHT + 100, [0x72; 32], 0x0001);
         tracker.add_vote(&first, &first.tx_hash());
         tracker.add_vote(&again, &again.tx_hash());
         tracker.add_vote(&later, &later.tx_hash());
@@ -4106,9 +4258,9 @@ mod vote_tracker_tests {
         let ticket = [0x71; 32];
         let height = i64::from(BLOCK_HEIGHT);
         let mut pool = new_pool();
-        let first = vote(block, BLOCK_HEIGHT, ticket, 0x0001);
+        let first = test_vote(block, BLOCK_HEIGHT, ticket, 0x0001);
         let first_hash = accept(&mut pool, &first, height + 3);
-        let second = vote(block, BLOCK_HEIGHT, ticket, 0x0000);
+        let second = test_vote(block, BLOCK_HEIGHT, ticket, 0x0000);
         let second_hash = second.tx_hash();
         let already_voted = |pool: &TxPool<ClockChain>| {
             pool.check_vote_double_spend(&second, &second_hash)
@@ -4148,7 +4300,7 @@ mod vote_tracker_tests {
         let block = [0x04; 32];
         let height = i64::from(BLOCK_HEIGHT);
         let mut pool = new_pool();
-        let tracked = vote(block, BLOCK_HEIGHT, [0x71; 32], 0x0001);
+        let tracked = test_vote(block, BLOCK_HEIGHT, [0x71; 32], 0x0001);
         let tracked_hash = accept(&mut pool, &tracked, height);
         let past_both = height + HEIGHT_DIFF_TO_PRUNE_VOTES + 1;
 
@@ -4162,5 +4314,219 @@ mod vote_tracker_tests {
         pool.prune_stake_tx(0, past_both);
         assert!(!pool.is_transaction_in_pool(&tracked_hash));
         assert!(pool.vote_hashes_for_block(&Hash(block)).is_empty());
+    }
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "test arithmetic over small fixed heights"
+)]
+mod vote_check_tests {
+    use super::*;
+
+    /// The tip's height in these tests, stake validation height on
+    /// mainnet.
+    const TIP: i64 = 4096;
+
+    /// A chain backend that knows the headers it is given and answers the
+    /// winners lookup with a fixed result, or panics when it is asked
+    /// for winners it was not given.
+    struct LookupChain {
+        headers: BTreeMap<[u8; 32], BlockHeader>,
+        winners: Option<Result<Vec<Hash>, String>>,
+    }
+
+    impl PoolChain for LookupChain {
+        fn next_stake_difficulty(&self) -> Result<i64, String> {
+            unimplemented!()
+        }
+        fn fetch_utxo_view(
+            &self,
+            _tx: &MsgTx,
+            _tx_hash: &Hash,
+            _tree: i8,
+            _tree_valid: bool,
+        ) -> Result<UtxoView, String> {
+            unimplemented!()
+        }
+        fn best_hash(&self) -> Hash {
+            unimplemented!()
+        }
+        fn best_height(&self) -> i64 {
+            TIP
+        }
+        fn winning_tickets_by_hash(&self, _hash: &Hash) -> Result<Vec<Hash>, String> {
+            self.winners
+                .clone()
+                .expect("the winners are not to be read")
+        }
+        fn header_by_hash(&self, hash: &Hash) -> Option<BlockHeader> {
+            self.headers.get(&hash.0).cloned()
+        }
+        fn past_median_time(&self) -> i64 {
+            unimplemented!()
+        }
+        fn calc_sequence_lock(
+            &self,
+            _tx: &MsgTx,
+            _tx_hash: &Hash,
+            _view: &UtxoView,
+        ) -> Result<SequenceLock, PoolError> {
+            unimplemented!()
+        }
+        fn is_treasury_agenda_active(&self) -> Result<bool, String> {
+            unimplemented!()
+        }
+        fn is_auto_revocations_agenda_active(&self) -> Result<bool, String> {
+            unimplemented!()
+        }
+        fn is_subsidy_split_agenda_active(&self) -> Result<bool, String> {
+            unimplemented!()
+        }
+        fn is_subsidy_split_r2_agenda_active(&self) -> Result<bool, String> {
+            unimplemented!()
+        }
+        fn tspend_mined_on_ancestor(&self, _tspend: &Hash) -> Result<(), String> {
+            unimplemented!()
+        }
+        fn standard_verify_flags(&self) -> Result<ScriptFlags, String> {
+            unimplemented!()
+        }
+        fn now_unix(&self) -> i64 {
+            1751800000
+        }
+        fn now_mono_nanos(&self) -> i64 {
+            0
+        }
+        fn random_u64(&self) -> u64 {
+            0
+        }
+    }
+
+    const BLOCK: [u8; 32] = [0xb1; 32];
+    const TICKET: [u8; 32] = [0x71; 32];
+
+    /// A pool whose chain knows `BLOCK` at the given height and answers
+    /// the winners lookup as given.
+    fn pool(
+        block_height: u32,
+        winners: Option<Result<Vec<Hash>, String>>,
+        allow_old_votes: bool,
+    ) -> TxPool<LookupChain> {
+        let params = dcroxide_chaincfg::mainnet_params();
+        let (mut header, _) = BlockHeader::from_bytes(&[0; 180]).expect("a zero header");
+        header.height = block_height;
+        let chain = LookupChain {
+            headers: BTreeMap::from([(BLOCK, header)]),
+            winners,
+        };
+        let policy = Policy {
+            accept_non_std: false,
+            max_orphan_txs: 100,
+            max_orphan_tx_size: 5000,
+            max_sig_ops_per_tx: 1000,
+            min_relay_tx_fee: 10000,
+            allow_old_votes,
+            max_vote_age: params.coinbase_maturity,
+            enable_ancestor_tracking: true,
+        };
+        TxPool::new(chain, policy, &params)
+    }
+
+    fn kind(err: RuleError) -> ErrorKind {
+        match err.err {
+            crate::RuleErrorSource::Mempool(kind) => kind,
+            crate::RuleErrorSource::Chain(err) => panic!("chain error {err:?}"),
+        }
+    }
+
+    /// dcrd `checkVoteHeightPolicy`: the cutoff is the next block's
+    /// height less the maximum vote age (256 on mainnet), and the
+    /// future limit the tip's height plus five; allowing old votes lifts
+    /// the first and not the second.
+    #[test]
+    fn the_height_policy_bounds_are_dcrds() {
+        let cutoff = (TIP + 1 - 256) as u32;
+        let future = (TIP + 5) as u32;
+        for (height, allow_old, want) in [
+            (cutoff - 1, false, Some(ErrorKind::OldVote)),
+            (cutoff, false, None),
+            (cutoff - 1, true, None),
+            (future, false, None),
+            (future + 1, false, Some(ErrorKind::FutureVote)),
+            (future + 1, true, Some(ErrorKind::FutureVote)),
+        ] {
+            let pool = pool(height, None, allow_old);
+            let vote = test_vote(BLOCK, height, TICKET, 1);
+            let got = pool
+                .check_vote_height_policy(&vote, &vote.tx_hash(), TIP)
+                .err()
+                .map(kind);
+            assert_eq!(got, want, "height {height}, old votes allowed {allow_old}");
+        }
+    }
+
+    /// dcrd `checkVoteBlock`: a block the chain does not know, and a
+    /// height other than the block's header's, are refused; a header the
+    /// chain knows at the claimed height passes.
+    #[test]
+    fn the_voted_block_must_be_known_at_the_claimed_height() {
+        let pool = pool(4090, None, false);
+        let on = |block: [u8; 32], height: u32| {
+            let vote = test_vote(block, height, TICKET, 1);
+            pool.check_vote_block(&vote, &vote.tx_hash())
+                .err()
+                .map(kind)
+        };
+        assert_eq!(on(BLOCK, 4090), None);
+        assert_eq!(on(BLOCK, 4091), Some(ErrorKind::VoteBlockHeight));
+        assert_eq!(on([0xb2; 32], 4090), Some(ErrorKind::VoteBlockUnknown));
+    }
+
+    /// dcrd `checkVoteTicket`: the ticket must be one of the block's
+    /// winners; a failed lookup is a plain error, as dcrd passes it
+    /// through (a block known only by its header fails it so); and a
+    /// vote below the cutoff, which only allowed old votes reach, is not
+    /// looked up at all.
+    #[test]
+    fn the_ticket_must_be_a_winner_of_a_recent_block() {
+        let check = |winners: Option<Result<Vec<Hash>, String>>, block_height: u32| {
+            let vote = test_vote(BLOCK, block_height, TICKET, 1);
+            pool(block_height, winners, true).check_vote_ticket(&vote, &vote.tx_hash(), TIP)
+        };
+        assert_eq!(
+            check(Some(Ok(vec![Hash([1; 32]), Hash(TICKET)])), 4090),
+            Ok(())
+        );
+        let ineligible = check(Some(Ok(vec![Hash([1; 32])])), 4090);
+        assert!(
+            matches!(
+                ineligible,
+                Err(PoolError::Rule(RuleError {
+                    err: crate::RuleErrorSource::Mempool(ErrorKind::IneligibleTicketVote),
+                    ..
+                }))
+            ),
+            "{ineligible:?}"
+        );
+        assert_eq!(
+            check(Some(Err("no block data".into())), 4090),
+            Err(PoolError::Other("no block data".into()))
+        );
+        // At the cutoff, 4097 less 256, the winners are read, so a ticket
+        // that is not among them is refused; below it they are not read.
+        let at_cutoff = check(Some(Ok(vec![Hash([1; 32])])), 3841);
+        assert!(
+            matches!(
+                at_cutoff,
+                Err(PoolError::Rule(RuleError {
+                    err: crate::RuleErrorSource::Mempool(ErrorKind::IneligibleTicketVote),
+                    ..
+                }))
+            ),
+            "{at_cutoff:?}"
+        );
+        assert_eq!(check(None, 3840), Ok(()));
     }
 }

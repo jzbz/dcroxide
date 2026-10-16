@@ -47,6 +47,15 @@ pub enum ErrorKind {
     /// A ticket votes on a block height lower than the minimum allowed
     /// by the mempool.
     OldVote,
+    /// A ticket votes on a block height higher than the maximum allowed
+    /// by the mempool.
+    FutureVote,
+    /// A vote on an unknown block.
+    VoteBlockUnknown,
+    /// A vote claims an incorrect block height.
+    VoteBlockHeight,
+    /// A vote for a block with an ineligible ticket.
+    IneligibleTicketVote,
     /// A transaction already exists on the main chain and is not fully
     /// spent.
     AlreadyExists,
@@ -89,6 +98,10 @@ impl ErrorKind {
             ErrorKind::TooManyVotes => "ErrTooManyVotes",
             ErrorKind::DuplicateRevocation => "ErrDuplicateRevocation",
             ErrorKind::OldVote => "ErrOldVote",
+            ErrorKind::FutureVote => "ErrFutureVote",
+            ErrorKind::VoteBlockUnknown => "ErrVoteBlockUnknown",
+            ErrorKind::VoteBlockHeight => "ErrVoteBlockHeight",
+            ErrorKind::IneligibleTicketVote => "ErrIneligibleTicketVote",
             ErrorKind::AlreadyExists => "ErrAlreadyExists",
             ErrorKind::SeqLockUnmet => "ErrSeqLockUnmet",
             ErrorKind::FeeTooHigh => "ErrFeeTooHigh",
@@ -200,9 +213,9 @@ impl From<RuleError> for PoolError {
 mod tests {
     use super::ErrorKind;
 
-    /// dcrd's `TestErrorKindStringer` table as `3c8a1734` leaves it, in
-    /// its order (`internal/mempool/error_test.go:14-53` at that commit).
-    const KIND_NAMES: [(ErrorKind, &str); 23] = [
+    /// dcrd's `TestErrorKindStringer` table, in its order
+    /// (`internal/mempool/error_test.go:14-57`).
+    const KIND_NAMES: [(ErrorKind, &str); 27] = [
         (ErrorKind::Invalid, "ErrInvalid"),
         (ErrorKind::OrphanPolicyViolation, "ErrOrphanPolicyViolation"),
         (ErrorKind::MempoolDoubleSpend, "ErrMempoolDoubleSpend"),
@@ -219,6 +232,10 @@ mod tests {
         (ErrorKind::TooManyVotes, "ErrTooManyVotes"),
         (ErrorKind::DuplicateRevocation, "ErrDuplicateRevocation"),
         (ErrorKind::OldVote, "ErrOldVote"),
+        (ErrorKind::FutureVote, "ErrFutureVote"),
+        (ErrorKind::VoteBlockUnknown, "ErrVoteBlockUnknown"),
+        (ErrorKind::VoteBlockHeight, "ErrVoteBlockHeight"),
+        (ErrorKind::IneligibleTicketVote, "ErrIneligibleTicketVote"),
         (ErrorKind::AlreadyExists, "ErrAlreadyExists"),
         (ErrorKind::SeqLockUnmet, "ErrSeqLockUnmet"),
         (ErrorKind::FeeTooHigh, "ErrFeeTooHigh"),
@@ -249,13 +266,17 @@ mod tests {
             ErrorKind::TooManyVotes => 13,
             ErrorKind::DuplicateRevocation => 14,
             ErrorKind::OldVote => 15,
-            ErrorKind::AlreadyExists => 16,
-            ErrorKind::SeqLockUnmet => 17,
-            ErrorKind::FeeTooHigh => 18,
-            ErrorKind::Orphan => 19,
-            ErrorKind::TooManyTSpends => 20,
-            ErrorKind::TSpendMinedOnAncestor => 21,
-            ErrorKind::TSpendInvalidExpiry => 22,
+            ErrorKind::FutureVote => 16,
+            ErrorKind::VoteBlockUnknown => 17,
+            ErrorKind::VoteBlockHeight => 18,
+            ErrorKind::IneligibleTicketVote => 19,
+            ErrorKind::AlreadyExists => 20,
+            ErrorKind::SeqLockUnmet => 21,
+            ErrorKind::FeeTooHigh => 22,
+            ErrorKind::Orphan => 23,
+            ErrorKind::TooManyTSpends => 24,
+            ErrorKind::TSpendMinedOnAncestor => 25,
+            ErrorKind::TSpendInvalidExpiry => 26,
         }
     }
 

@@ -17,7 +17,7 @@ JSON-RPC/websocket server, the tool commands, the pipe IPC lifecycle,
 and the Windows service wrapper. The deliberate non-ports are small
 and documented in PARITY.md (Go GC tuning, the pprof servers, UPnP,
 the Windows event log, and the wallet-side mixclient). The test suite
-runs 2,324 tests across 431 suites on Linux, most differential against
+runs 2,330 tests across 432 suites on Linux, most differential against
 dcrd itself or replaying sessions generated inside dcrd's own packages.
 
 Since the surface completed, four rounds of work have landed on it. A
@@ -417,6 +417,8 @@ dcrd data directory will not work). Currently implemented:
   test inside a dcrd checkout's `mixing/mixpool` package through
   `go test -overlay` with the pool's clock frozen, writing nothing into
   the checkout (Go + sh)
+- `tools/mempoolvectors` — the exporter of the mempool vector files, an
+  overlay run inside dcrd's `internal/mempool` (Go, not a module)
 
 ## Performance
 
@@ -834,6 +836,8 @@ changes, on slower storage and four cores.
   engine-independent crash-consistency testing (C + Python)
 - `tools/mixpoolgen/` — the mixpool vector generator, an overlay test for
   dcrd's `mixing/mixpool` (Go + sh)
+- `tools/mempoolvectors/` — the mempool vector exporter, an overlay for
+  dcrd's `internal/mempool` (Go)
 - `fuzz/` — `cargo-fuzz` targets (nightly toolchain)
 - `docs/adr/` — architecture decision records
 

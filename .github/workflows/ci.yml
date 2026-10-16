@@ -176,6 +176,8 @@ jobs:
     # only when someone ran it by hand, and a stale tool surfaced only
     # at the next manual regeneration. fullblockgen is left out: its
     # go.mod asks for a newer Go than the oracle's toolchain here.
+    # mempoolvectors is not a module but an overlay that compiles only
+    # inside a dcrd checkout's internal/mempool, so it is left out too.
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7

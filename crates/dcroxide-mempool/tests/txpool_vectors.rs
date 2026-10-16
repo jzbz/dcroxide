@@ -10,7 +10,9 @@
 //! parent confirmation, stake difficulty gates and pruning, batch
 //! acceptance through the transient pool, and double spend removal —
 //! comparing every verdict, accepted-transaction list, and the full
-//! pool/orphan/stage/tspend state after every operation.
+//! pool/orphan/stage/tspend state after every operation.  The file is
+//! written by `tools/mempoolvectors`, run inside dcrd's
+//! `internal/mempool`.
 
 // Test-harness arithmetic over bounded lengths.
 #![allow(clippy::arithmetic_side_effects)]

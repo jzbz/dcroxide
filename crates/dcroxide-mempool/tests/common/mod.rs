@@ -58,13 +58,19 @@ pub fn error_kind(err: &PoolError) -> String {
 }
 
 /// A mirror of dcrd's mempool test `fakeChain`: generated utxos, a
-/// faked chain height and best block, and the simplified sequence
-/// lock calculation over caller-set utxo median times.
+/// faked chain height and best block, the headers of the blocks it
+/// knows and their winning tickets, and the simplified sequence lock
+/// calculation over caller-set utxo median times.
 pub struct FakeChain {
     pub next_stake_diff: i64,
     pub utxos: UtxoView,
     pub utxo_times: HashMap<([u8; 32], u32, i8), i64>,
+    /// The headers of the blocks the chain knows (dcrd's `blocks`, which
+    /// `AddMockBlock` fills).
     pub headers: HashMap<[u8; 32], BlockHeader>,
+    /// The winning tickets of each block, in the order they were added
+    /// (dcrd's `winningTickets`, which `AddWinningTicket` fills).
+    pub winners: HashMap<[u8; 32], Vec<Hash>>,
     pub best_hash: Hash,
     pub best_height: i64,
     pub median_time: i64,
@@ -121,11 +127,16 @@ impl PoolChain for FakeChain {
         self.best_height
     }
 
-    fn header_by_hash(&self, hash: &Hash) -> Result<BlockHeader, String> {
-        self.headers
-            .get(&hash.0)
-            .cloned()
-            .ok_or_else(|| format!("unable to find block {hash} in fake chain"))
+    /// dcrd's fake answers a block it was never given with
+    /// `blockchain.ErrUnknownBlock`, as the real chain does.
+    fn header_by_hash(&self, hash: &Hash) -> Option<BlockHeader> {
+        self.headers.get(&hash.0).cloned()
+    }
+
+    /// dcrd's fake answers a block it has no winners for with none, and
+    /// no error.
+    fn winning_tickets_by_hash(&self, hash: &Hash) -> Result<Vec<Hash>, String> {
+        Ok(self.winners.get(&hash.0).cloned().unwrap_or_default())
     }
 
     fn past_median_time(&self) -> i64 {
@@ -277,6 +288,7 @@ pub fn chain_from_init(f: &[&str]) -> FakeChain {
         utxos: UtxoView::new(),
         utxo_times: HashMap::new(),
         headers: HashMap::new(),
+        winners: HashMap::new(),
         best_hash: parse_hash(f[3]),
         best_height: f[2].parse().expect("height"),
         median_time: f[1].parse().expect("median time"),
@@ -294,4 +306,28 @@ pub fn chain_from_init(f: &[&str]) -> FakeChain {
         .utxos
         .add_tx_outs(&seed_coinbase, 1, 0xffffffff, false);
     chain
+}
+
+/// Apply a row that changes what the fake chain knows about blocks:
+/// `block <hash> <header>` (dcrd's `AddMockBlock`), `besthash <hash>`
+/// (`SetBestHash`, which adds no block) and `winner <block> <ticket>`
+/// (`AddWinningTicket`, which lists a ticket once).  Returns whether the
+/// row was one of them.
+pub fn apply_block_row(chain: &mut FakeChain, f: &[&str]) -> bool {
+    match f[0] {
+        "block" => {
+            let (header, _) = BlockHeader::from_bytes(&unhex(f[2])).expect("header");
+            chain.headers.insert(parse_hash(f[1]).0, header);
+        }
+        "besthash" => chain.best_hash = parse_hash(f[1]),
+        "winner" => {
+            let winners = chain.winners.entry(parse_hash(f[1]).0).or_default();
+            let ticket = parse_hash(f[2]);
+            if !winners.contains(&ticket) {
+                winners.push(ticket);
+            }
+        }
+        _ => return false,
+    }
+    true
 }
