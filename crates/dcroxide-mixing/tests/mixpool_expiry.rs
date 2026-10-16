@@ -347,3 +347,17 @@ fn key_exchange_flood_stops_at_the_per_identity_cap() {
     let id_b = fill(&mut pool, 2, 110, 5);
     assert_eq!(pool.identity_key_exchange_count(&id_b), 5);
 }
+
+/// The cap leaves an honest wallet room for its runs.  On testnet3 a
+/// pair request lives about 20 three-minute epochs, each with room for
+/// about three runs since dcrd's client shortened its stages there to
+/// 10 seconds (`55892be8`), and every run's key exchange is held until
+/// the pair request goes: about 60, which the earlier cap of 32 refused
+/// from the 33rd on.
+#[test]
+fn sixty_runs_of_one_pair_request_fit_under_the_cap() {
+    let mut pool = new_pool();
+    let id = fill(&mut pool, 3, 110, 60);
+    assert_eq!(pool.identity_key_exchange_count(&id), 60);
+    assert_eq!(MAX_KES_PER_IDENTITY, 64);
+}

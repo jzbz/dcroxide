@@ -6,6 +6,8 @@
 //!   wire's 512, no longer by `MAX_PEERS`.
 //! - `ffb42adf`: one key exchange per identity and session, and a plain
 //!   error for a session that records a message the pool dropped.
+//! - `38811b0b`: at most `MAX_MESSAGES_PER_IDENTITY` messages per
+//!   identity over its pair request's life, on all three paths.
 
 // Test-harness arithmetic over bounded values.
 #![allow(clippy::arithmetic_side_effects)]
@@ -17,12 +19,12 @@ use dcroxide_chaincfg::{Params, simnet_params};
 use dcroxide_chainhash::Hash;
 use dcroxide_dcrec::secp256k1::PrivateKey;
 use dcroxide_mixing::{
-    MAX_PEERS, MixBlockChain, Pool, PoolError, PoolMessage, RuleKind, SCRIPT_CLASS_P2PKH_V0,
-    no_mempool_spent, sign_message, sort_prs_for_session,
+    MAX_MESSAGES_PER_IDENTITY, MAX_PEERS, MixBlockChain, Pool, PoolError, PoolMessage, RuleKind,
+    SCRIPT_CLASS_P2PKH_V0, no_mempool_spent, sign_message, sort_prs_for_session,
 };
 use dcroxide_wire::{
     MAX_MIX_PEERS, MIX_VERSION, Message, MixPairReqUTXO, MsgMixCiphertexts, MsgMixKeyExchange,
-    MsgMixPairReq, OutPoint, ServiceFlag, WireError, decode_message_payload,
+    MsgMixPairReq, MsgMixSlotReserve, OutPoint, ServiceFlag, WireError, decode_message_payload,
 };
 
 /// The tip the pool validates pair request expiries against.
@@ -207,6 +209,20 @@ fn ciphertexts(priv_key: &PrivateKey, id: [u8; 33], sid: [u8; 32]) -> MsgMixCiph
     };
     sign_message(&mut ct, priv_key).expect("sign ciphertexts");
     ct
+}
+
+/// A signed slot reservation in `sid`, distinct per `n`.
+fn slot_reserve(priv_key: &PrivateKey, id: [u8; 33], sid: [u8; 32], n: u8) -> MsgMixSlotReserve {
+    let mut sr = MsgMixSlotReserve {
+        signature: [0u8; 64],
+        identity: id,
+        session_id: sid,
+        run: 0,
+        dc_mix: vec![vec![vec![n]]],
+        seen_ciphertexts: Vec::new(),
+    };
+    sign_message(&mut sr, priv_key).expect("sign slot reservation");
+    sr
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -504,4 +520,268 @@ fn a_session_holding_both_failures_answers_for_the_smaller_hash() {
         }
     }
     assert!(seen_missing && seen_conflict, "both orders were exercised");
+}
+
+/// The hashes in the message index of a pool's only identity.
+fn index_len(pool: &Pool<StubChain>) -> usize {
+    assert_eq!(pool.state_sizes().4, 1, "one identity");
+    pool.state_sizes().5
+}
+
+/// Accept key exchanges in fresh sessions, each removed again at once,
+/// until the identity's message index holds `len` hashes: each adds a
+/// hash the removal leaves, and frees its key exchange slot.  Unknown
+/// pair requests are numbered from `*next`.
+fn fill_index(
+    pool: &mut Pool<StubChain>,
+    key: &PrivateKey,
+    id: [u8; 33],
+    pr: &MsgMixPairReq,
+    next: &mut u32,
+    len: usize,
+) {
+    while index_len(pool) < len {
+        let ke = key_exchange(key, id, &with_unknown(pr, *next, 1), pr, NOW_SECS as u64);
+        *next += 1;
+        accept_ke(pool, &ke).expect("key exchange under the limit");
+        pool.remove_message(&PoolMessage::KE(Box::new(ke)))
+            .expect("remove key exchange");
+    }
+    assert_eq!(index_len(pool), len);
+    assert_eq!(pool.identity_key_exchange_count(&id), 0);
+}
+
+fn limit_error(id: &[u8; 33]) -> PoolError {
+    PoolError::Rule(RuleKind::Other(format!(
+        "identity {} has exceeded maximum message limit",
+        hex(id)
+    )))
+}
+
+/// `38811b0b`: 7 messages a session, 2 epochs, `MAX_PEERS` peers.
+#[test]
+fn the_identity_message_limit_is_dcrds() {
+    assert_eq!(MAX_MESSAGES_PER_IDENTITY, 896);
+    assert_eq!(MAX_MESSAGES_PER_IDENTITY, 7 * 2 * MAX_PEERS as usize);
+}
+
+/// `38811b0b`: the limit counts the identity's index over its pair
+/// request's life, removed messages included.  At the limit a message
+/// on the direct path, a key exchange in a new session and a key
+/// exchange that would be orphaned for a missing own pair request are
+/// all refused with dcrd's text, not bannable; a message whose session
+/// has no key exchange of the identity's is still orphaned, as the
+/// orphan branch comes first in dcrd.
+#[test]
+fn an_identity_at_its_message_limit_gets_nothing_more_accepted() {
+    let (mut pool, _, _) = new_pool();
+    let (key, id) = identity(7);
+    let pr = pair_request(&key, id, 7);
+    accept(&mut pool, PoolMessage::PR(pr.clone())).expect("pair request");
+    let mut next = 0;
+    fill_index(
+        &mut pool,
+        &key,
+        id,
+        &pr,
+        &mut next,
+        MAX_MESSAGES_PER_IDENTITY - 1,
+    );
+
+    // The last message the limit allows: a live key exchange.
+    let session = with_unknown(&pr, 100_000, 1);
+    let ke = key_exchange(&key, id, &session, &pr, NOW_SECS as u64);
+    accept_ke(&mut pool, &ke).expect("the index's last hash");
+    assert_eq!(index_len(&pool), MAX_MESSAGES_PER_IDENTITY);
+
+    // Direct path, into a session the identity holds a key exchange in.
+    let ct = ciphertexts(&key, id, ke.session_id);
+    let err = accept(&mut pool, PoolMessage::CT(ct.clone()))
+        .err()
+        .expect("refused");
+    assert_eq!(err, limit_error(&id));
+    assert!(!err.is_bannable(ServiceFlag(u64::MAX)));
+    assert!(!pool.have_message(&ct.mix_hash().expect("hash")));
+
+    // A key exchange in a new session.
+    let fresh = key_exchange(&key, id, &with_unknown(&pr, next, 1), &pr, NOW_SECS as u64);
+    assert_eq!(
+        accept_ke(&mut pool, &fresh).err().expect("refused"),
+        limit_error(&id)
+    );
+
+    // A key exchange claiming a position whose pair request the pool
+    // does not know, which below the limit is orphaned.
+    let unknown = unknown_pair_request(200_000);
+    let orphan = key_exchange(
+        &key,
+        id,
+        &with_unknown(&pr, 200_000, 1),
+        &unknown,
+        NOW_SECS as u64,
+    );
+    assert_eq!(
+        accept_ke(&mut pool, &orphan).err().expect("refused"),
+        limit_error(&id)
+    );
+    assert_eq!(orphan_count(&pool), 0, "not orphaned either");
+
+    // A slot reservation for a session without the identity's key
+    // exchange is orphaned, as the orphan branch comes first.
+    let parked = slot_reserve(&key, id, [0x77; 32], 1);
+    assert!(
+        accept(&mut pool, PoolMessage::SR(parked))
+            .expect("orphaned")
+            .is_empty()
+    );
+    assert_eq!(orphan_count(&pool), 1);
+    assert_eq!(index_len(&pool), MAX_MESSAGES_PER_IDENTITY);
+}
+
+/// `38811b0b`: when a key exchange takes its identity to the limit, the
+/// orphans it would un-orphan stay orphans, as dcrd's `continue` leaves
+/// them.  dcrd's limit is checked before the port's one-per-type drop,
+/// so a second orphan of a type is kept too rather than dropped.
+#[test]
+fn orphans_stay_orphans_once_the_limit_is_reached() {
+    let (mut pool, _, mono) = new_pool();
+    let (key, id) = identity(8);
+    let pr = pair_request(&key, id, 8);
+    accept(&mut pool, PoolMessage::PR(pr.clone())).expect("pair request");
+    let session = with_unknown(&pr, 100_000, 1);
+    let ke = key_exchange(&key, id, &session, &pr, NOW_SECS as u64);
+    let sid = ke.session_id;
+
+    let parked = [
+        PoolMessage::SR(slot_reserve(&key, id, sid, 1)),
+        PoolMessage::SR(slot_reserve(&key, id, sid, 2)),
+        PoolMessage::CT(ciphertexts(&key, id, sid)),
+    ];
+    for msg in &parked {
+        mono.fetch_add(1, Ordering::SeqCst);
+        assert!(accept(&mut pool, msg.clone()).expect("orphaned").is_empty());
+    }
+    assert_eq!(orphan_count(&pool), 3);
+
+    let mut next = 0;
+    fill_index(
+        &mut pool,
+        &key,
+        id,
+        &pr,
+        &mut next,
+        MAX_MESSAGES_PER_IDENTITY - 1,
+    );
+    let accepted = accept_ke(&mut pool, &ke).expect("key exchange");
+    assert_eq!(accepted.len(), 1, "the key exchange alone");
+    assert_eq!(index_len(&pool), MAX_MESSAGES_PER_IDENTITY);
+    assert_eq!(orphan_count(&pool), 3, "every orphan stays");
+    for msg in &parked {
+        assert!(!pool.have_message(&msg.mix_hash().expect("hash")));
+    }
+}
+
+/// `38811b0b`: the limit is checked before each orphan is accepted, so
+/// a key exchange one short of it un-orphans the earliest-received
+/// orphan and leaves the next.
+#[test]
+fn the_limit_is_checked_before_each_un_orphaned_message() {
+    let (mut pool, _, mono) = new_pool();
+    let (key, id) = identity(9);
+    let pr = pair_request(&key, id, 9);
+    accept(&mut pool, PoolMessage::PR(pr.clone())).expect("pair request");
+    let session = with_unknown(&pr, 100_000, 1);
+    let ke = key_exchange(&key, id, &session, &pr, NOW_SECS as u64);
+    let sid = ke.session_id;
+
+    let first = PoolMessage::SR(slot_reserve(&key, id, sid, 1));
+    let second = PoolMessage::CT(ciphertexts(&key, id, sid));
+    for msg in [&first, &second] {
+        mono.fetch_add(1, Ordering::SeqCst);
+        assert!(accept(&mut pool, msg.clone()).expect("orphaned").is_empty());
+    }
+
+    let mut next = 0;
+    fill_index(
+        &mut pool,
+        &key,
+        id,
+        &pr,
+        &mut next,
+        MAX_MESSAGES_PER_IDENTITY - 2,
+    );
+    let accepted = accept_ke(&mut pool, &ke).expect("key exchange");
+    let mut got: Vec<Hash> = accepted
+        .iter()
+        .map(|m| m.mix_hash().expect("hash"))
+        .collect();
+    got.sort_by_key(|h| h.0);
+    let mut want = vec![hash_of(&ke), first.mix_hash().expect("hash")];
+    want.sort_by_key(|h| h.0);
+    assert_eq!(got, want);
+    assert_eq!(index_len(&pool), MAX_MESSAGES_PER_IDENTITY);
+    assert_eq!(orphan_count(&pool), 1);
+    assert!(!pool.have_message(&second.mix_hash().expect("hash")));
+}
+
+/// `38811b0b` after `ffb42adf`: `acceptKE` checks the identity's limit
+/// after the same-session conflict and before the pair requests the key
+/// exchange names (`mixing/mixpool/mixpool.go:1703-1726`).  At the limit
+/// a second key exchange in the identity's session is refused as a
+/// conflict, and one claiming another identity's position, an identity
+/// mismatch below the limit, as over the limit.
+#[test]
+fn the_limit_is_checked_between_the_conflict_and_the_pair_requests() {
+    let (key, id) = identity(12);
+    let (other_key, other_id) = identity(13);
+    let pr = pair_request(&key, id, 12);
+    let other = pair_request(&other_key, other_id, 13);
+    let misplaced = key_exchange(
+        &key,
+        id,
+        &[pr.clone(), other.clone()],
+        &other,
+        NOW_SECS as u64,
+    );
+
+    let (mut below, _, _) = new_pool();
+    for p in [&pr, &other] {
+        accept(&mut below, PoolMessage::PR(p.clone())).expect("pair request");
+    }
+    assert_eq!(
+        accept_ke(&mut below, &misplaced).err().expect("refused"),
+        PoolError::Rule(RuleKind::Other(
+            "KE identity does not match own PR at unmixed position".into()
+        ))
+    );
+
+    let (mut pool, _, _) = new_pool();
+    accept(&mut pool, PoolMessage::PR(pr.clone())).expect("pair request");
+    let mut next = 0;
+    fill_index(
+        &mut pool,
+        &key,
+        id,
+        &pr,
+        &mut next,
+        MAX_MESSAGES_PER_IDENTITY - 1,
+    );
+    let session = with_unknown(&pr, 100_000, 1);
+    let ke = key_exchange(&key, id, &session, &pr, NOW_SECS as u64);
+    accept_ke(&mut pool, &ke).expect("the index's last hash");
+    assert_eq!(index_len(&pool), MAX_MESSAGES_PER_IDENTITY);
+
+    let second = key_exchange_committing(&key, id, &session, &pr, NOW_SECS as u64, 7);
+    assert_eq!(second.session_id, ke.session_id);
+    assert_eq!(
+        accept_ke(&mut pool, &second).err().expect("refused"),
+        conflict(&second, hash_of(&ke))
+    );
+
+    accept(&mut pool, PoolMessage::PR(other.clone())).expect("the other pair request");
+    assert_eq!(
+        accept_ke(&mut pool, &misplaced).err().expect("refused"),
+        limit_error(&id)
+    );
+    assert!(!pool.have_message(&hash_of(&misplaced)));
 }

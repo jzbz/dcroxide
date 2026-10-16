@@ -107,44 +107,72 @@ fn go_since_unix(now: i64, secs: i64) -> i64 {
     i64::try_from(d).unwrap_or(if d < 0 { i64::MIN } else { i64::MAX })
 }
 
+/// The maximum number of messages the pool accepts from a single mixing
+/// identity over its pair request's life (dcrd `maxMessagesPerIdentity`,
+/// `mixing/mixpool/mixpool.go:46-51`): seven messages a session (KE, CT,
+/// SR, DC, FP, CM, RS), two ten-minute epochs in twenty minutes, and
+/// [`MAX_PEERS`].
+///
+/// What is counted is the identity's message index, as dcrd counts
+/// `messagesByIdentity`: its pair request seeds it, every message
+/// accepted for the identity grows it, and only the pair request's
+/// removal clears it, so a message removed from the pool still counts.
+/// An identity at the limit gets nothing further accepted, on the
+/// direct path, as a key exchange (not even as an orphan) or when its
+/// orphans are reconsidered, until its pair request goes; a message
+/// whose session holds no key exchange of the identity's is still
+/// orphaned first, as in dcrd, and then stays an orphan.  The refusal
+/// is a rule error that is not bannable.
+pub const MAX_MESSAGES_PER_IDENTITY: usize = 7 * 2 * MAX_PEERS as usize;
+
 /// The maximum number of key exchange messages the pool holds at one
 /// time for a single mixing identity.
 ///
-/// This is a deliberate divergence from dcrd, which has no equivalent
-/// limit.  A key exchange creates a session keyed by a session ID the
-/// sender derives from the pair request hashes it claims to have seen,
-/// and only the sender's own pair request has to be known to the pool
-/// -- every other referenced hash may be arbitrary.  A peer holding a
-/// single accepted pair request can therefore mint an unlimited number
-/// of distinct sessions, each one adding a pool entry (over a kilobyte
-/// of key exchange), a session, and an entry in the by-identity index,
-/// none of which is reclaimed until the pair request expires.  That is
-/// remote unbounded memory growth at line rate, so acceptance is
-/// capped per identity here.
+/// This is a deliberate divergence from dcrd, which bounds an identity
+/// more loosely.  A key exchange creates a session keyed by a session ID
+/// the sender derives from the pair request hashes it claims to have
+/// seen, and only the sender's own pair request has to be known to the
+/// pool -- every other referenced hash may be arbitrary -- so one
+/// accepted pair request can mint sessions, each holding messages of the
+/// identity's until the pair request expires.  dcrd allows one key
+/// exchange per identity and session (`ffb42adf`) and
+/// [`MAX_MESSAGES_PER_IDENTITY`] messages over the pair request's life
+/// (`38811b0b`), both enforced here too, which leave room for 128
+/// sessions' worth.  With the one-message-per-type rule below a session
+/// holds at most about 1 MiB of one identity's messages (a slot
+/// reservation alone may be 512 KiB), so this cap holds an identity to
+/// about 65 MiB, where dcrd's limit admits about 447 MiB, mostly slot
+/// reservations un-orphaned into a session in bulk.  Both figures are
+/// arithmetic from the message limits, not measurements.
 ///
-/// The bound counts session *runs*, not epochs, and the headroom it
-/// leaves honest use is narrower than that distinction makes it sound.
-/// A wallet broadcasts one key exchange per run; dcrd's client forms a
-/// run on every epoch tick for as long as the pair request lives, and
-/// does so deliberately even when it already knows too few peers to
-/// mix, because "a run is still formed so that KEs can be broadcast"
-/// (`mixing/mixclient/client.go:942-945`); and it reruns inside the
-/// epoch, under a freshly derived session ID, on blame or when the
-/// agreed pair requests exceed the coinjoin limits.  A pair request may
-/// not outlive roughly an hour of blocks (`max_expiry`), which is about
-/// 6 mainnet epochs and about 20 testnet3 epochs, so that many runs are
-/// honest before a single rerun.
+/// The bound counts session *runs*, not epochs, and is set for the
+/// headroom honest use needs.  A wallet broadcasts one key exchange per
+/// run; dcrd's client forms a run on every epoch tick for as long as the
+/// pair request lives, and does so deliberately even when it already
+/// knows too few peers to mix, because "a run is still formed so that
+/// KEs can be broadcast" (`mixing/mixclient/client.go:965-968`); and it
+/// reruns inside the epoch, under a freshly derived session ID, on blame
+/// or when the agreed pair requests exceed the coinjoin limits.  A pair
+/// request may not outlive roughly an hour of blocks (`max_expiry`):
+/// 13 mainnet blocks, about six and a half epochs of ten minutes, each
+/// with room for about four runs of five 30-second stages, and 31
+/// testnet3 blocks, about 20 epochs of three minutes, each with room
+/// for about three runs since the client's testnet3 stages became 10
+/// seconds (`55892be8`).  That is up to about 26 and 60 runs, again by
+/// arithmetic rather than observation; the cap was 32 before that
+/// client change.
 ///
 /// Nothing reclaims an abandoned run before the pair request itself
 /// goes away.  `removeSession`'s callers are `RemoveSession`,
 /// `RemoveConfirmedMixes`, `RemoveSpentPRs` and `removePR`
-/// (`mixing/mixpool/mixpool.go:621`, `:723`, `:738`, `:1354`); of those
+/// (`mixing/mixpool/mixpool.go:629`, `:731`, `:746`, `:1374`); of those
 /// a daemon runs `RemoveSpentPRs` over every connected block
-/// (`internal/netsync/manager.go:1354-1355`, mirrored here) and
+/// (`internal/netsync/manager.go:1355-1356`, mirrored here) and
 /// `removePR` on height expiry, both of which retire the pair request
 /// and all its sessions together rather than reclaiming one abandoned
-/// run.  Capacity is a live-state limit, not a lifetime counter, but in
-/// practice it is released only when the pair request goes.
+/// run.  Capacity is a live-state limit, not a lifetime count like
+/// dcrd's, but in practice it is released only when the pair request
+/// goes.
 ///
 /// Refusal is not a ban: `rule_other` is not bannable, so the message
 /// is dropped and not relayed rather than costing the sender its
@@ -155,14 +183,16 @@ fn go_since_unix(now: i64, secs: i64) -> i64 {
 /// most one of each type per identity and session.  dcrd enforces that
 /// second rule on the direct path alone: when a key exchange un-orphans
 /// the identity's waiting messages it accepts every one of them for the
-/// session (`reconsiderOrphans`, `mixing/mixpool/mixpool.go:1585-1629`),
-/// so a sender could park an orphan pool's worth of one message type
-/// before its key exchange and have them all pooled and relayed at once.
-/// The port applies the same-type conflict check there too, keeping the
+/// session until the identity reaches its message limit
+/// (`reconsiderOrphans`, `mixing/mixpool/mixpool.go:1605-1654`), so a
+/// sender can park an orphan pool's worth of one message type before its
+/// key exchange and have them all pooled and relayed at once.  The port
+/// applies the same-type conflict check there too, after dcrd's limit so
+/// that the two agree wherever the limit decides, keeping the
 /// earliest-received message and dropping the rest -- also a divergence,
 /// and one honest senders never reach, since they send one message of
 /// each type per session.
-pub const MAX_KES_PER_IDENTITY: usize = 32;
+pub const MAX_KES_PER_IDENTITY: usize = 64;
 
 type IdPubKey = [u8; 33];
 type OutPointKey = ([u8; 32], u32, i8);
@@ -1460,6 +1490,9 @@ impl<B: MixBlockChain> Pool<B> {
             return Ok(Vec::new());
         }
 
+        // dcrd `38811b0b` (`mixing/mixpool/mixpool.go:1333-1335`).
+        self.check_identity_message_limit(&id)?;
+
         if !self.sessions.contains_key(&sid) {
             return Err(rule_other(format!(
                 "{msgtype} {hash} belongs to unknown session {}",
@@ -1723,9 +1756,10 @@ impl<B: MixBlockChain> Pool<B> {
     /// orphans) or missing the identity's KE in a matching session
     /// (for all other messages) (dcrd `reconsiderOrphans`).
     ///
-    /// Un-orphaned messages other than key exchanges are held to the
-    /// direct path's one-message-per-type rule, which dcrd does not do
-    /// here; see [`MAX_KES_PER_IDENTITY`].
+    /// Un-orphaned messages other than key exchanges are held to
+    /// dcrd's [`MAX_MESSAGES_PER_IDENTITY`] first, as there, and then to
+    /// the direct path's one-message-per-type rule, which dcrd does not
+    /// apply here; see [`MAX_KES_PER_IDENTITY`].
     fn reconsider_orphans(
         &mut self,
         accepted: PoolMessage,
@@ -1826,6 +1860,15 @@ impl<B: MixBlockChain> Pool<B> {
                     Some(msgtype) => msgtype,
                 };
 
+                // An identity at its message limit leaves the orphan where
+                // it is (dcrd `38811b0b`,
+                // `mixing/mixpool/mixpool.go:1641-1644`).  Checked before
+                // the port's own drop below, so the two agree whenever the
+                // limit decides.
+                if self.identity_at_message_limit(id) {
+                    continue;
+                }
+
                 // A second message of a type the identity already holds
                 // in this session is what the direct path refuses as a
                 // conflict; drop it rather than pool it.
@@ -1881,6 +1924,25 @@ impl<B: MixBlockChain> Pool<B> {
             return Err(rule_other("KE received too early for stated epoch"));
         }
 
+        Ok(())
+    }
+
+    /// Whether an identity's message index has reached
+    /// [`MAX_MESSAGES_PER_IDENTITY`] (dcrd's
+    /// `len(p.messagesByIdentity[*id]) >= maxMessagesPerIdentity`).
+    fn identity_at_message_limit(&self, id: &IdPubKey) -> bool {
+        self.messages_by_identity.get(id).map_or(0, Vec::len) >= MAX_MESSAGES_PER_IDENTITY
+    }
+
+    /// dcrd's refusal of a message from an identity at its message
+    /// limit.
+    fn check_identity_message_limit(&self, id: &IdPubKey) -> Result<(), PoolError> {
+        if self.identity_at_message_limit(id) {
+            return Err(rule_other(format!(
+                "identity {} has exceeded maximum message limit",
+                hex(id)
+            )));
+        }
         Ok(())
     }
 
@@ -1960,6 +2022,11 @@ impl<B: MixBlockChain> Pool<B> {
             }
         }
 
+        // dcrd `38811b0b` (`mixing/mixpool/mixpool.go:1724-1726`), before
+        // the own pair request lookup: an identity at its message limit
+        // cannot leave orphan key exchanges either.
+        self.check_identity_message_limit(id)?;
+
         // While KEs are allowed to reference unknown PRs, they must
         // at least reference the PR submitted by their own identity.
         // If not, the KE is saved as an orphan and may be processed
@@ -2005,11 +2072,12 @@ impl<B: MixBlockChain> Pool<B> {
         }
 
         // Bound the sessions and pool entries a single identity can
-        // create (see MAX_KES_PER_IDENTITY; a divergence from dcrd,
-        // which is unbounded here).  This is not a bannable rule
-        // violation: the peer that relayed the message is not
-        // necessarily the identity that authored it, and the capacity
-        // is released again by the expiry pass.
+        // hold at once (see MAX_KES_PER_IDENTITY; a divergence from
+        // dcrd, which bounds them only through the identity's lifetime
+        // message limit above).  This is not a bannable rule violation:
+        // the peer that relayed the message is not necessarily the
+        // identity that authored it, and the capacity is released again
+        // by the expiry pass.
         if self.identity_ke_count(id) >= MAX_KES_PER_IDENTITY {
             return Err(rule_other(format!(
                 "identity {} already has the maximum of {} accepted key exchanges",
