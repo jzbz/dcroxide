@@ -10,7 +10,7 @@
 //! exist), and the disapproved-parent disconnect takes the parent's
 //! spend journal directly rather than fetching it.
 
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
 use core::cmp::Ordering;
 
@@ -183,10 +183,31 @@ pub fn collect_tx_hashes(txs: &[MsgTx]) -> Vec<Hash> {
 
 /// A view into the set of unspent transaction outputs from a specific
 /// point of view in the chain (dcrd `UtxoViewpoint`).
-#[derive(Default, Clone)]
+#[derive(Default)]
 pub struct UtxoView {
     entries: BTreeMap<UtxoKey, UtxoEntry>,
     best_hash: Hash,
+    /// The regular tree outputs that later transactions in the same
+    /// block spend and that may bypass cache updates (dcrd
+    /// `zeroConfOuts`, `utxoviewpoint.go:34-39`).  They are found when
+    /// the inputs are fetched, before outputs of earlier transactions
+    /// in the block are added to the view, and the connect or
+    /// disconnect of that block's regular tree consumes them.  An
+    /// empty set holds no allocation.
+    zero_conf_outs: BTreeSet<UtxoKey>,
+}
+
+impl Clone for UtxoView {
+    /// A copy of the view's entries and best hash (dcrd `clone`,
+    /// `utxoviewpoint.go:1287-1300`), without the zero-confirmation
+    /// set, which dcrd's copy does not carry either.
+    fn clone(&self) -> UtxoView {
+        UtxoView {
+            entries: self.entries.clone(),
+            best_hash: self.best_hash,
+            zero_conf_outs: BTreeSet::new(),
+        }
+    }
 }
 
 impl UtxoView {
@@ -515,55 +536,52 @@ impl UtxoView {
         Ok(())
     }
 
-    /// Connect a regular tree transaction, tracking in-flight spends
-    /// of outputs created earlier in the same block (dcrd
-    /// `connectRegularTransaction`).  The caller supplies the
-    /// transaction's hash, computed once per block.  Spends of
-    /// in-flight outputs are marked as zero-confirmation spends only
-    /// when `mark_zero_conf` is set, which callers derive from whether
-    /// the block approves its parent.
-    #[allow(clippy::too_many_arguments)]
+    /// Connect a regular tree transaction, spending its inputs and
+    /// adding its outputs (dcrd `connectRegularTransaction`).  A spend
+    /// of an output in the view's zero-confirmation set, which the
+    /// fetch of the block's inputs fills, is marked as a
+    /// zero-confirmation spend.  The caller supplies the transaction's
+    /// hash, computed once per block.
     pub fn connect_regular_transaction(
         &mut self,
         tx: &MsgTx,
         tx_hash: &Hash,
         block_height: i64,
         block_index: u32,
-        in_flight_tx: &mut BTreeMap<[u8; 32], u32>,
-        mark_zero_conf: bool,
         mut stxos: Option<&mut Vec<SpentTxOut>>,
         is_treasury_enabled: bool,
     ) -> Result<(), RuleError> {
         if dcroxide_standalone::is_coin_base_tx(tx, is_treasury_enabled) {
             self.add_tx_outs_with_hash(tx, tx_hash, block_height, block_index, is_treasury_enabled);
-            in_flight_tx.insert(tx_hash.0, block_index);
             return Ok(());
         }
         for tx_in in &tx.tx_in {
             let prev_out = &tx_in.previous_out_point;
-            let Some(entry) = self.entries.get_mut(&key(prev_out)) else {
+            let prev_key = key(prev_out);
+            let Some(entry) = self.entries.get_mut(&prev_key) else {
                 return Err(Self::assert_missing(prev_out));
             };
             if let Some(stxos) = stxos.as_deref_mut() {
                 stxos.push(entry_to_spent_tx_out(entry));
             }
             entry.spend();
-            // Mark spends of outputs created earlier in this block.
-            if mark_zero_conf
-                && let Some(&in_flight_idx) = in_flight_tx.get(&prev_out.hash.0)
-                && block_index > in_flight_idx
-            {
+            // Mark eligible outputs spent by later transactions in the
+            // regular tree of the same block as zero-confirmation
+            // spends (`utxoviewpoint.go:365-369`).
+            if self.zero_conf_outs.contains(&prev_key) {
                 entry.state |= UTXO_STATE_SPENT_BY_ZERO_CONF;
             }
         }
         self.add_tx_outs_with_hash(tx, tx_hash, block_height, block_index, is_treasury_enabled);
-        in_flight_tx.insert(tx_hash.0, block_index);
         Ok(())
     }
 
-    /// Connect every regular tree transaction of the block (dcrd
-    /// `connectRegularTransactions`).  `regular_tx_hashes` carries
-    /// the hash of each regular transaction, computed once per block.
+    /// Connect every regular tree transaction of the block, marking the
+    /// eligible outputs that later transactions in the tree spend as
+    /// zero-confirmation spends, and clear the view's
+    /// zero-confirmation set (dcrd `connectRegularTransactions`).
+    /// `regular_tx_hashes` carries the hash of each regular
+    /// transaction, computed once per block.
     pub fn connect_regular_transactions(
         &mut self,
         block: &MsgBlock,
@@ -577,29 +595,39 @@ impl UtxoView {
             "one hash per regular transaction"
         );
         let height = i64::from(block.header.height);
-        let mark_zero_conf = crate::validate::header_approves_parent(&block.header);
-        let mut in_flight_tx: BTreeMap<[u8; 32], u32> = BTreeMap::new();
         for (i, (tx, tx_hash)) in block.transactions.iter().zip(regular_tx_hashes).enumerate() {
-            self.connect_regular_transaction(
+            if let Err(err) = self.connect_regular_transaction(
                 tx,
                 tx_hash,
                 height,
                 i as u32,
-                &mut in_flight_tx,
-                mark_zero_conf,
                 stxos.as_deref_mut(),
                 is_treasury_enabled,
-            )?;
+            ) {
+                self.clear_zero_conf_outs();
+                return Err(err);
+            }
         }
+        self.clear_zero_conf_outs();
         Ok(())
+    }
+
+    /// Drop the view's zero-confirmation set once the regular tree it
+    /// was found for has been connected or disconnected (dcrd sets
+    /// `zeroConfOuts` to nil).
+    pub(crate) fn clear_zero_conf_outs(&mut self) {
+        self.zero_conf_outs = BTreeSet::new();
     }
 
     /// Disconnect one of the block's transaction trees, restoring the
     /// spent outputs from the spend journal (dcrd
     /// `disconnectTransactions`).  The create-if-missing map shape
-    /// mirrors dcrd's.  `tx_hashes` carries the hash of each
-    /// transaction in the tree being disconnected, computed once per
-    /// block.
+    /// mirrors dcrd's.  An output of the block in the view's
+    /// zero-confirmation set is marked as a zero-confirmation spend,
+    /// and disconnecting the regular tree clears the set (dcrd
+    /// `disconnectRegularTransactions`).  `tx_hashes` carries the hash
+    /// of each transaction in the tree being disconnected, computed
+    /// once per block.
     #[allow(clippy::map_entry)]
     pub fn disconnect_transactions(
         &mut self,
@@ -623,7 +651,6 @@ impl UtxoView {
             (stxos.len() as i64 - 1, &block.transactions)
         };
 
-        let mut spends_in_flight: BTreeMap<UtxoKey, usize> = BTreeMap::new();
         for tx_idx in (0..transactions.len()).rev() {
             let tx = &transactions[tx_idx];
             let tx_hash = tx_hashes[tx_idx];
@@ -682,9 +709,10 @@ impl UtxoView {
                 }
                 let entry = self.entries.get_mut(&k).expect("just inserted");
                 entry.spend();
-                if let Some(&in_flight_idx) = spends_in_flight.get(&k)
-                    && tx_idx < in_flight_idx
-                {
+                // Mark eligible outputs spent by later transactions in
+                // the same block as zero-confirmation spends
+                // (`utxoviewpoint.go:498-502`).
+                if self.zero_conf_outs.contains(&k) {
                     entry.state |= UTXO_STATE_SPENT_BY_ZERO_CONF;
                 }
             }
@@ -728,10 +756,10 @@ impl UtxoView {
                 let entry = self.entries.get_mut(&k).expect("just inserted");
                 entry.state &= !(UTXO_STATE_SPENT | UTXO_STATE_SPENT_BY_ZERO_CONF);
                 entry.state |= UTXO_STATE_MODIFIED;
-                if !stake_tree {
-                    spends_in_flight.insert(k, tx_idx);
-                }
             }
+        }
+        if !stake_tree {
+            self.clear_zero_conf_outs();
         }
         Ok(())
     }
@@ -784,10 +812,27 @@ impl UtxoView {
         }
     }
 
+    /// Whether the view holds any output of the transaction in the
+    /// regular tree (dcrd `hasAnyRegularTxOut`,
+    /// `utxoviewpoint.go:1106-1118`).  dcrd tests for a non-nil entry;
+    /// the view stores no entry where dcrd stores a nil one, so
+    /// presence is the same test.
+    fn has_any_regular_tx_out(&self, tx: &MsgTx, tx_hash: &Hash) -> bool {
+        (0..tx.tx_out.len() as u32).any(|index| {
+            self.entries.contains_key(&key(&OutPoint {
+                hash: *tx_hash,
+                index,
+                tree: 0,
+            }))
+        })
+    }
+
     /// Queue the missing utxos for the regular transactions' inputs,
     /// adding outputs created earlier in the same block to the view
-    /// directly (the set-construction half of dcrd
-    /// `fetchRegularInputUtxos`).  `regular_tx_hashes` carries the
+    /// directly and replacing the view's zero-confirmation set with the
+    /// ones eligible to bypass cache updates (the set-construction
+    /// half of dcrd `fetchRegularInputUtxos`, `addRegularInputUtxos`,
+    /// `utxoviewpoint.go:1128-1198`).  `regular_tx_hashes` carries the
     /// hash of each regular transaction, computed once per block.
     fn queue_regular_input_utxos(
         &mut self,
@@ -801,16 +846,42 @@ impl UtxoView {
         for (i, tx_hash) in regular_tx_hashes.iter().enumerate() {
             tx_in_flight.insert(tx_hash.0, i);
         }
+        let mut zero_conf_eligible: BTreeMap<[u8; 32], bool> = BTreeMap::new();
+        let mut zero_conf_outs: BTreeSet<UtxoKey> = BTreeSet::new();
         for (i, tx) in block.transactions.iter().enumerate().skip(1) {
             for tx_in in &tx.tx_in {
-                let origin_hash = &tx_in.previous_out_point.hash;
-                if let Some(&in_flight_index) = tx_in_flight.get(&origin_hash.0) {
+                let prev_out = &tx_in.previous_out_point;
+                if let Some(&in_flight_index) = tx_in_flight.get(&prev_out.hash.0) {
                     // Only a transaction earlier in the block may be
                     // referenced.  dcrd compares the index of the
-                    // coinbase-skipping slice (`i >= inFlightIndex`),
+                    // coinbase-skipping slice (`i >= inFlightIdx`),
                     // which is one less than the block position used
                     // here, so the two comparisons are the same rule.
                     if i > in_flight_index {
+                        // A spend may bypass the cache only when the
+                        // output exists in the view alone, which is
+                        // guaranteed only for outputs the transaction
+                        // newly creates: the creating transaction is
+                        // eligible when the view holds none of its
+                        // outputs before any of them is added here
+                        // (`utxoviewpoint.go:1161-1183`).  The answer
+                        // is kept per transaction, since later
+                        // transactions can spend several of its
+                        // outputs.
+                        let origin_tx = &block.transactions[in_flight_index];
+                        let origin_hash = &regular_tx_hashes[in_flight_index];
+                        let eligible = match zero_conf_eligible.get(&prev_out.hash.0) {
+                            Some(&eligible) => eligible,
+                            None => {
+                                let eligible = !self.has_any_regular_tx_out(origin_tx, origin_hash);
+                                zero_conf_eligible.insert(prev_out.hash.0, eligible);
+                                eligible
+                            }
+                        };
+                        if eligible {
+                            zero_conf_outs.insert(key(prev_out));
+                        }
+
                         // Add only the referenced output (dcrd
                         // `AddTxOut(originTx, originIdx)`, since
                         // 01208035).  Adding every output would also
@@ -818,11 +889,10 @@ impl UtxoView {
                         // parent's disconnect left spent in the view,
                         // and it would keep such siblings out of the
                         // fetch set, where dcrd resolves them to nil.
-                        let origin_tx = &block.transactions[in_flight_index];
                         self.add_tx_out_with_hash(
                             origin_tx,
-                            &regular_tx_hashes[in_flight_index],
-                            tx_in.previous_out_point.index,
+                            origin_hash,
+                            prev_out.index,
                             height,
                             in_flight_index as u32,
                             is_treasury_enabled,
@@ -830,9 +900,10 @@ impl UtxoView {
                         continue;
                     }
                 }
-                self.queue_missing(needed, &tx_in.previous_out_point);
+                self.queue_missing(needed, prev_out);
             }
         }
+        self.zero_conf_outs = zero_conf_outs;
     }
 
     /// Queue the missing utxos for the stake transactions' inputs
@@ -865,11 +936,22 @@ impl UtxoView {
     }
 
     /// Load the utxos for the regular transactions' inputs into the
-    /// view, adding outputs created earlier in the same block directly
-    /// (dcrd `fetchRegularInputUtxos` over the resolver: the missing
-    /// outpoints collect into one set and resolve in one batch).
-    /// `regular_tx_hashes` carries the hash of each regular
-    /// transaction, computed once per block.
+    /// view (dcrd `fetchRegularInputUtxos`, `utxoviewpoint.go:1200-1222`,
+    /// over the resolver: the missing outpoints collect into one set
+    /// and resolve in one batch).  `regular_tx_hashes` carries the hash
+    /// of each regular transaction, computed once per block.
+    ///
+    /// Outputs a transaction of the regular tree creates and a later
+    /// one spends are added from the creating transaction and replace
+    /// any entries the view holds for them; every other entry already
+    /// in the view is left as it is.
+    ///
+    /// The view's zero-confirmation set is replaced with the outputs
+    /// eligible to bypass cache updates when spent.  Eligibility
+    /// depends on what the view holds when this runs, so any entries
+    /// that already exist must be added first, and the set must be
+    /// consumed by connecting or disconnecting the regular tree of the
+    /// same block before any further fetch.
     pub fn fetch_regular_input_utxos(
         &mut self,
         block: &MsgBlock,
@@ -883,12 +965,19 @@ impl UtxoView {
     }
 
     /// Load the utxos for all of the block's inputs into the view
-    /// (dcrd `fetchInputUtxos` over the resolver: every missing
-    /// outpoint across both trees resolves in one batch, so a
-    /// database-backed resolver reads them all in one transaction).
-    /// `regular_tx_hashes` carries the hash of each regular
-    /// transaction, computed once per block; the stake tree only
-    /// resolves inputs and needs no hashes.
+    /// (dcrd `fetchInputUtxos`, `utxoviewpoint.go:1224-1285`, over the
+    /// resolver: every missing outpoint across both trees resolves in
+    /// one batch, so a database-backed resolver reads them all in one
+    /// transaction).  `regular_tx_hashes` carries the hash of each
+    /// regular transaction, computed once per block; the stake tree
+    /// only resolves inputs and needs no hashes.
+    ///
+    /// The regular tree is fetched as [`Self::fetch_regular_input_utxos`]
+    /// fetches it, with the same requirements on callers.  The stake
+    /// tree may not spend outputs created in the same block, so all of
+    /// its inputs are resolved, except the historical grandfathered
+    /// outputs, which callers add first (`add_sbss_violations`) so they
+    /// exist when eligibility is decided.
     pub fn fetch_input_utxos(
         &mut self,
         block: &MsgBlock,
@@ -1733,18 +1822,7 @@ mod tests {
     /// do.  Returns the block and the hash of `origin`.
     fn sbss_block() -> (MsgBlock, Hash) {
         let (external, _) = sbss_external();
-        let coinbase = MsgTx {
-            tx_in: alloc::vec![TxIn {
-                previous_out_point: null_outpoint(),
-                sequence: u32::MAX,
-                value_in: 0,
-                block_height: 0,
-                block_index: u32::MAX,
-                signature_script: alloc::vec![0x01, 0x02],
-            }],
-            tx_out: alloc::vec![op_true_out(0)],
-            ..MsgTx::default()
-        };
+        let coinbase = test_coinbase(0);
         let origin = MsgTx {
             tx_in: alloc::vec![input_spending(external, 5_000, 100, 1)],
             tx_out: alloc::vec![op_true_out(3_000), op_true_out(2_000)],
@@ -1982,5 +2060,344 @@ mod tests {
             &block,
             &hashes,
         );
+    }
+
+    /// A coinbase whose input commits to `subsidy` and which pays
+    /// nothing spendable.
+    fn test_coinbase(subsidy: i64) -> MsgTx {
+        MsgTx {
+            tx_in: alloc::vec![TxIn {
+                previous_out_point: null_outpoint(),
+                sequence: u32::MAX,
+                value_in: subsidy,
+                block_height: 0,
+                block_index: u32::MAX,
+                signature_script: alloc::vec![0x01, 0x02],
+            }],
+            tx_out: alloc::vec![op_true_out(0)],
+            ..MsgTx::default()
+        }
+    }
+
+    /// The height of the blocks the zero-confirmation tests below
+    /// build, on the simulation network.
+    const ZERO_CONF_HEIGHT: u32 = 120;
+
+    const SPENT: u8 = UTXO_STATE_MODIFIED | UTXO_STATE_SPENT;
+    const SPENT_BY_ZERO_CONF: u8 =
+        UTXO_STATE_MODIFIED | UTXO_STATE_SPENT | UTXO_STATE_SPENT_BY_ZERO_CONF;
+
+    /// A block at [`ZERO_CONF_HEIGHT`] approving its parent, with the
+    /// regular tree `[coinbase, A, spends...]`: A spends the external
+    /// output into two outputs, and each later transaction spends the
+    /// output of A at the given index.  Returns the block and A's hash.
+    fn zero_conf_block(spends: &[u32]) -> (MsgBlock, Hash) {
+        let params = dcroxide_chaincfg::simnet_params();
+        let mut subsidy_cache = dcroxide_standalone::SubsidyCache::new(&params);
+        let height = i64::from(ZERO_CONF_HEIGHT);
+        let subsidy = subsidy_cache.calc_work_subsidy_v3(
+            height,
+            0,
+            dcroxide_standalone::SubsidySplitVariant::Original,
+        ) + subsidy_cache.calc_treasury_subsidy(height, 0, false);
+        let (external, _) = sbss_external();
+        let a = MsgTx {
+            tx_in: alloc::vec![input_spending(external, 5_000, 100, 1)],
+            tx_out: alloc::vec![op_true_out(3_000), op_true_out(2_000)],
+            ..MsgTx::default()
+        };
+        let a_hash = a.tx_hash();
+        let mut transactions = alloc::vec![test_coinbase(subsidy), a];
+        for &index in spends {
+            let value = [3_000, 2_000][index as usize];
+            transactions.push(MsgTx {
+                tx_in: alloc::vec![input_spending(
+                    origin_out(a_hash, index),
+                    value,
+                    ZERO_CONF_HEIGHT,
+                    1,
+                )],
+                tx_out: alloc::vec![op_true_out(value)],
+                ..MsgTx::default()
+            });
+        }
+        let (mut header, _) = BlockHeader::from_bytes(&[0u8; 180]).expect("zero header");
+        header.height = ZERO_CONF_HEIGHT;
+        header.vote_bits = 1;
+        let block = MsgBlock {
+            header,
+            transactions,
+            stransactions: Vec::new(),
+        };
+        (block, a_hash)
+    }
+
+    /// The backend holding the external output alone.
+    fn external_backend() -> BTreeMap<OutPointKey, UtxoEntry> {
+        let (external, entry) = sbss_external();
+        let mut backend = BTreeMap::new();
+        backend.insert((external.hash.0, external.index, external.tree), entry);
+        backend
+    }
+
+    fn state_of(view: &UtxoView, outpoint: &OutPoint) -> u8 {
+        view.lookup_entry(outpoint)
+            .expect("in the view")
+            .state_bits()
+    }
+
+    /// dcrd decides eligibility once per creating transaction, before
+    /// any of its outputs is added to the view, and keeps the answer
+    /// for later spends of its other outputs
+    /// (`utxoviewpoint.go:1166-1177`): spends of A:0 and A:1 by two
+    /// later transactions are both zero-confirmation spends, although
+    /// the first adds A:0 to the view before the second is looked at.
+    #[test]
+    fn eligibility_is_decided_once_per_creating_transaction() {
+        let (block, a_hash) = zero_conf_block(&[0, 1]);
+        let hashes = collect_tx_hashes(&block.transactions);
+        let backend = external_backend();
+        let resolve = |op: &OutPoint| backend.get(&(op.hash.0, op.index, op.tree)).cloned();
+
+        let mut view = UtxoView::new();
+        view.fetch_input_utxos(&block, &hashes, &resolve, false);
+        view.connect_regular_transactions(&block, &hashes, None, false)
+            .expect("connect");
+        for index in 0..2 {
+            assert_eq!(
+                state_of(&view, &origin_out(a_hash, index)),
+                SPENT_BY_ZERO_CONF,
+                "A:{index}"
+            );
+        }
+    }
+
+    /// dcrd's `hasAnyRegularTxOut` looks at every output of the
+    /// creating transaction (`utxoviewpoint.go:1106-1118`).  A's output
+    /// 0 is provably unspendable, so no view holds it; a view that holds
+    /// A:1 before the fetch, as the undo of a disapproved parent that
+    /// confirmed A leaves it, makes the spend of A:1 later in the block
+    /// an ordinary spend, and a view that holds neither makes it a
+    /// zero-confirmation spend.
+    #[test]
+    fn eligibility_looks_at_every_output_of_the_creating_transaction() {
+        let (mut block, _) = zero_conf_block(&[]);
+        block.transactions[1].tx_out[0] = TxOut {
+            value: 0,
+            version: 0,
+            pk_script: alloc::vec![0x6a],
+        };
+        let a_hash = block.transactions[1].tx_hash();
+        block.transactions.push(MsgTx {
+            tx_in: alloc::vec![input_spending(
+                origin_out(a_hash, 1),
+                2_000,
+                ZERO_CONF_HEIGHT,
+                1
+            )],
+            tx_out: alloc::vec![op_true_out(2_000)],
+            ..MsgTx::default()
+        });
+        let hashes = collect_tx_hashes(&block.transactions);
+        let backend = external_backend();
+        let resolve = |op: &OutPoint| backend.get(&(op.hash.0, op.index, op.tree)).cloned();
+
+        for (holds_a1, want) in [(true, SPENT), (false, SPENT_BY_ZERO_CONF)] {
+            let mut view = UtxoView::new();
+            if holds_a1 {
+                let mut a1 = UtxoEntry::new(
+                    2_000,
+                    alloc::vec![0x51],
+                    ZERO_CONF_HEIGHT - 1,
+                    1,
+                    0,
+                    false,
+                    false,
+                    TxType::Regular,
+                    None,
+                );
+                a1.spend();
+                view.insert_entry(&origin_out(a_hash, 1), a1);
+            }
+            view.fetch_input_utxos(&block, &hashes, &resolve, false);
+            view.connect_regular_transactions(&block, &hashes, None, false)
+                .expect("connect");
+            assert!(
+                view.lookup_entry(&origin_out(a_hash, 0)).is_none(),
+                "no view holds A:0"
+            );
+            assert_eq!(
+                state_of(&view, &origin_out(a_hash, 1)),
+                want,
+                "the view held A:1 before the fetch: {holds_a1}"
+            );
+        }
+    }
+
+    /// The disconnect marks a spend inside the block when its creating
+    /// transaction is eligible against the view the disconnect fetched
+    /// into (`utxoviewpoint.go:498-502`): a view holding none of A's
+    /// outputs marks A:0, re-created spent, and the view the block was
+    /// connected in, which still holds them, does not.
+    #[test]
+    fn the_disconnect_marks_the_in_block_spends_that_are_eligible() {
+        let (block, a_hash) = zero_conf_block(&[0]);
+        let tx_hashes = crate::blockhashes::BlockTxHashes::compute(&block);
+        let parent = stake_block(Vec::new());
+        let mut backend = external_backend();
+
+        let mut view = UtxoView::new();
+        let mut stxos = Vec::new();
+        {
+            let resolve = |op: &OutPoint| backend.get(&(op.hash.0, op.index, op.tree)).cloned();
+            view.connect_block_with_lookup(
+                &no_violation,
+                &block,
+                &tx_hashes,
+                &parent,
+                || Ok(Vec::new()),
+                &resolve,
+                Some(&mut stxos),
+                false,
+            )
+            .expect("connect");
+        }
+        assert_eq!(state_of(&view, &origin_out(a_hash, 0)), SPENT_BY_ZERO_CONF);
+        let mut connected = view.clone();
+        commit_to(&mut backend, &mut view);
+        let resolve = |op: &OutPoint| backend.get(&(op.hash.0, op.index, op.tree)).cloned();
+
+        let mut fresh = UtxoView::new();
+        fresh
+            .disconnect_block_with_lookup(&no_violation, &block, &parent, &stxos, &resolve, false)
+            .expect("disconnect");
+        assert_eq!(state_of(&fresh, &origin_out(a_hash, 0)), SPENT_BY_ZERO_CONF);
+        assert_eq!(state_of(&fresh, &origin_out(a_hash, 1)), SPENT);
+
+        connected
+            .disconnect_block_with_lookup(&no_violation, &block, &parent, &stxos, &resolve, false)
+            .expect("disconnect");
+        assert_eq!(state_of(&connected, &origin_out(a_hash, 0)), SPENT);
+    }
+
+    /// The zero-confirmation set lives from the fetch of a block's
+    /// inputs until its regular tree is connected or disconnected:
+    /// `connectRegularTransactions`, `disconnectRegularTransactions` and
+    /// the regular tree of `checkTransactionsAndConnect` clear it
+    /// (`utxoviewpoint.go:396`, `:562`, `validate.go:4092-4094`), the
+    /// stake tree's leave it, and a copy of the view does not carry it
+    /// (`utxoviewpoint.go:1287-1300`).
+    #[test]
+    fn the_zero_conf_set_lasts_from_the_fetch_to_its_regular_tree() {
+        let (block, a_hash) = zero_conf_block(&[0]);
+        let hashes = collect_tx_hashes(&block.transactions);
+        let backend = external_backend();
+        let resolve = |op: &OutPoint| backend.get(&(op.hash.0, op.index, op.tree)).cloned();
+        let a0 = key(&origin_out(a_hash, 0));
+
+        let mut view = UtxoView::new();
+        view.fetch_input_utxos(&block, &hashes, &resolve, false);
+        assert!(view.zero_conf_outs.iter().eq([&a0]));
+        assert!(view.clone().zero_conf_outs.is_empty(), "a copy has none");
+        view.connect_stake_transactions(&block, &[], None, false)
+            .expect("connect stake");
+        assert!(!view.zero_conf_outs.is_empty(), "the stake tree leaves it");
+        let mut stxos = Vec::new();
+        view.connect_regular_transactions(&block, &hashes, Some(&mut stxos), false)
+            .expect("connect regular");
+        assert!(view.zero_conf_outs.is_empty(), "the connect clears it");
+
+        let mut view = UtxoView::new();
+        view.fetch_input_utxos(&block, &hashes, &resolve, false);
+        view.disconnect_transactions(&block, &[], &stxos, true, false)
+            .expect("disconnect stake");
+        assert!(!view.zero_conf_outs.is_empty(), "the stake tree leaves it");
+        view.disconnect_transactions(&block, &hashes, &stxos, false, false)
+            .expect("disconnect regular");
+        assert!(view.zero_conf_outs.is_empty(), "the disconnect clears it");
+
+        let params = dcroxide_chaincfg::simnet_params();
+        let mut subsidy_cache = dcroxide_standalone::SubsidyCache::new(&params);
+        let (mut prev_header, _) = BlockHeader::from_bytes(&[0u8; 180]).expect("zero header");
+        prev_header.height = ZERO_CONF_HEIGHT - 1;
+        let mut view = UtxoView::new();
+        view.fetch_input_utxos(&block, &hashes, &resolve, false);
+        crate::validate::check_transactions_and_connect(
+            &mut subsidy_cache,
+            0,
+            i64::from(ZERO_CONF_HEIGHT),
+            Hash::default(),
+            0,
+            &prev_header,
+            &block.stransactions,
+            &[],
+            &mut view,
+            None,
+            true,
+            false,
+            false,
+            dcroxide_standalone::SubsidySplitVariant::Original,
+            &params,
+        )
+        .expect("the stake tree checks");
+        assert!(!view.zero_conf_outs.is_empty(), "the stake tree leaves it");
+        crate::validate::check_transactions_and_connect(
+            &mut subsidy_cache,
+            0,
+            i64::from(ZERO_CONF_HEIGHT),
+            Hash::default(),
+            0,
+            &prev_header,
+            &block.transactions,
+            &hashes,
+            &mut view,
+            None,
+            false,
+            false,
+            false,
+            dcroxide_standalone::SubsidySplitVariant::Original,
+            &params,
+        )
+        .expect("the regular tree checks");
+        assert_eq!(state_of(&view, &origin_out(a_hash, 0)), SPENT_BY_ZERO_CONF);
+        assert!(view.zero_conf_outs.is_empty(), "the check clears it");
+    }
+
+    /// dcrd adds the grandfathered output before the fetch, so it is in
+    /// the view when eligibility is decided (`utxoviewpoint.go:1235-1239`,
+    /// `:947-957`): a later regular transaction's spend of another
+    /// output of the listed transaction is then not a zero-confirmation
+    /// spend.
+    #[test]
+    fn the_grandfathered_output_is_in_the_view_when_eligibility_is_decided() {
+        let (mut block, origin_hash) = sbss_block();
+        block.transactions.push(MsgTx {
+            tx_in: alloc::vec![input_spending(
+                origin_out(origin_hash, 1),
+                2_000,
+                SBSS_HEIGHT,
+                1
+            )],
+            tx_out: alloc::vec![op_true_out(2_000)],
+            ..MsgTx::default()
+        });
+        let tx_hashes = crate::blockhashes::BlockTxHashes::compute(&block);
+        let parent = stake_block(Vec::new());
+        let (external, external_entry) = sbss_external();
+        let backend = move |op: &OutPoint| (*op == external).then(|| external_entry.clone());
+
+        let mut view = UtxoView::new();
+        view.connect_block_with_lookup(
+            &violation_at(SBSS_HEIGHT, origin_hash),
+            &block,
+            &tx_hashes,
+            &parent,
+            || Ok(Vec::new()),
+            &backend,
+            None,
+            false,
+        )
+        .expect("connect");
+        assert_eq!(state_of(&view, &origin_out(origin_hash, 1)), SPENT);
     }
 }

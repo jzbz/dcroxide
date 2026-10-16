@@ -4761,7 +4761,6 @@ pub fn check_transactions_and_connect<SP: dcroxide_standalone::SubsidyParams>(
     node_height: i64,
     node_hash: Hash,
     node_voters: u16,
-    node_vote_bits: u16,
     prev_header: &dcroxide_wire::BlockHeader,
     txs: &[MsgTx],
     tx_hashes: &[Hash],
@@ -4779,8 +4778,6 @@ pub fn check_transactions_and_connect<SP: dcroxide_standalone::SubsidyParams>(
     // caller can carry the stake tree fees into the regular tree
     // (dcrd 2.2 folded getStakeTreeFees into this return).
     debug_assert_eq!(txs.len(), tx_hashes.len(), "one hash per transaction");
-    let mut in_flight_regular_tx: alloc::collections::BTreeMap<[u8; 32], u32> =
-        alloc::collections::BTreeMap::new();
     let mut total_fees: i64 = input_fees; // Stake tx tree carry forward
     let mut cumulative_sig_ops: u32 = 0;
     for (idx, (tx, tx_hash)) in txs.iter().zip(tx_hashes).enumerate() {
@@ -4847,15 +4844,16 @@ pub fn check_transactions_and_connect<SP: dcroxide_standalone::SubsidyParams>(
         }
 
         // Connect the transaction to the view so the remaining
-        // transactions can spend its outputs.
+        // transactions can spend its outputs.  A regular transaction
+        // marks its spends of the outputs in the view's
+        // zero-confirmation set, which the caller's fetch of the
+        // block's inputs filled.
         if !stake_tree {
             view.connect_regular_transaction(
                 tx,
                 tx_hash,
                 node_height,
                 idx as u32,
-                &mut in_flight_regular_tx,
-                vote_bits_approve_parent(node_vote_bits),
                 stxos.as_deref_mut(),
                 is_treasury_enabled,
             )?;
@@ -4872,6 +4870,10 @@ pub fn check_transactions_and_connect<SP: dcroxide_standalone::SubsidyParams>(
     }
 
     if !stake_tree {
+        // The regular tree has consumed the view's zero-confirmation
+        // set (`validate.go:4092-4094`).
+        view.clear_zero_conf_outs();
+
         // Apply the penalty for the regular tree fees based on the
         // number of votes once stake validation begins.
         #[allow(
@@ -6337,7 +6339,6 @@ pub(crate) fn check_connect_block_with_hashes<SP: dcroxide_standalone::SubsidyPa
         node_height,
         node_hash,
         node_voters,
-        block.header.vote_bits,
         prev_header,
         &block.stransactions,
         stake_tx_hashes,
@@ -6408,7 +6409,6 @@ pub(crate) fn check_connect_block_with_hashes<SP: dcroxide_standalone::SubsidyPa
         node_height,
         node_hash,
         node_voters,
-        block.header.vote_bits,
         prev_header,
         &block.transactions,
         regular_tx_hashes,

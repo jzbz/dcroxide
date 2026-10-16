@@ -5,7 +5,46 @@
 //! child block that disapproves the parent connected with both trees
 //! (undoing the parent's regular transactions from its journal), and
 //! the full disconnect back — comparing every entry field, the spend
-//! journals, and the best hashes at each step.
+//! journals, and the best hashes at each step.  One view is kept across
+//! the three steps and never committed.
+//!
+//! `tools/utxoviewgen` writes the file: it reads the base view and the
+//! two blocks from it and computes every other row again with dcrd's
+//! code.  A copy adapted to the older signatures of three of its calls
+//! writes the previous file byte for byte at `6f6cf21b`.  Run at
+//! `382ff4dd`, it changed three rows from state 7 (modified, spent,
+//! spent by a zero-confirmation spend) to 3 (modified, spent), as the
+//! rule below determines.  dcrd `2115b56b` decides which spends inside
+//! a block are zero-confirmation spends when the block's inputs are
+//! fetched: an output a later transaction of the regular tree spends
+//! is one only when the view holds none of its creating transaction's
+//! regular outputs at that moment (`addRegularInputUtxos`,
+//! `internal/blockchain/utxoviewpoint.go:1161-1183` at `382ff4dd`), and
+//! the connect and disconnect mark exactly those (`:365-369`,
+//! `:498-502`).
+//!
+//! The blocks: the parent P, at height 1000, has the regular tree
+//! `[coinbase, A, B]` (A is `8ef55d11...` in the rows' byte order) and B
+//! spends A:1; the child N, at 1001, disapproves P and has `[coinbase,
+//! C, D]` (C is `8cb2b49b...`) and D spends C:0.
+//!
+//! 1. `parent`: the fetch finds no output of A in the view, so A:1 is
+//!    eligible and B's spend marks it: `afterparent` keeps A:1 at 7.
+//!    The step fetches before it connects, as dcrd's `connectBlock`
+//!    does; without the fetch nothing is eligible.
+//! 2. `block`: the undo of P fetches P's inputs first
+//!    (`disconnectDisapprovedBlock`, `:598`), and the view still holds
+//!    A:0 and A:1 from step 1, so A is not eligible and the undo leaves
+//!    A:1 spent without the mark: `afterconnect` A:1 goes from 7 to 3.
+//!    N's own fetch finds no output of C, so C:0 is eligible and D's
+//!    spend marks it: `afterconnect` C:0 stays at 7.
+//! 3. The disconnect of N fetches N's inputs (`disconnectBlock`,
+//!    `:1035`) while the view holds C:0, so C is not eligible:
+//!    `afterdisconnect` C:0 goes from 7 to 3.  The redo of P fetches
+//!    P's inputs (`:1059`) while the view holds A's outputs again, so
+//!    B's spend is not marked: `afterdisconnect` A:1 goes from 7 to 3.
+//!
+//! Every other row, the journals and the best hashes are unchanged.
 
 // Test-harness arithmetic over bounded lengths.
 #![allow(clippy::arithmetic_side_effects)]
@@ -29,19 +68,13 @@ fn opt_hex(s: &str) -> Vec<u8> {
     if s == "-" { Vec::new() } else { unhex(s) }
 }
 
-/// The spent-by-zero-confirmation state bit (`UTXO_STATE_SPENT_BY_ZERO_CONF`).
-const STATE_SPENT_BY_ZERO_CONF: u8 = 1 << 2;
-
 /// Compare the view's entries and best hash against an emitted
-/// snapshot, consuming its rows from the iterator.  When
-/// `unmarked_height` is set, entries created at that height are not
-/// compared on the spent-by-zero-confirmation bit.
+/// snapshot, consuming its rows from the iterator.
 fn check_snapshot<'a>(
     view: &UtxoView,
     header: &[&str],
     lines: &mut impl Iterator<Item = &'a str>,
     tag: &str,
-    unmarked_height: Option<u32>,
 ) {
     let count: usize = header[1].parse().expect("count");
     let best = parse_hash(header[2]);
@@ -79,11 +112,11 @@ fn check_snapshot<'a>(
             f[7].parse::<u16>().expect("sv"),
             "{tag}: sver"
         );
-        let mut want_state = f[8].parse::<u8>().expect("st");
-        if unmarked_height == Some(entry.block_height() as u32) {
-            want_state &= !STATE_SPENT_BY_ZERO_CONF;
-        }
-        assert_eq!(entry.state_bits(), want_state, "{tag}: state {line}");
+        assert_eq!(
+            entry.state_bits(),
+            f[8].parse::<u8>().expect("st"),
+            "{tag}: state {line}"
+        );
         assert_eq!(
             entry.packed_flags_bits(),
             f[9].parse::<u8>().expect("fl"),
@@ -206,6 +239,9 @@ fn utxoview_vectors() {
                 let (blk, _) = MsgBlock::from_bytes(&unhex(f[1])).expect("parent");
                 let regular_hashes =
                     dcroxide_blockchain::utxoview::collect_tx_hashes(&blk.transactions);
+                // Mirror connectBlock: the fetch decides which in-block
+                // spends are zero-confirmation spends.
+                view.fetch_regular_input_utxos(&blk, &regular_hashes, &none_resolver, TREASURY);
                 view.connect_regular_transactions(
                     &blk,
                     &regular_hashes,
@@ -216,7 +252,7 @@ fn utxoview_vectors() {
                 parent = Some(blk);
             }
             "pstxos" => check_stxos(&parent_stxos, &f, &mut lines, "pstxos"),
-            "afterparent" => check_snapshot(&view, &f, &mut lines, "afterparent", None),
+            "afterparent" => check_snapshot(&view, &f, &mut lines, "afterparent"),
             "block" => {
                 let (blk, _) = MsgBlock::from_bytes(&unhex(f[1])).expect("block");
                 let parent = parent.as_ref().expect("parent first");
@@ -242,18 +278,8 @@ fn utxoview_vectors() {
                 block = Some(blk);
             }
             "stxos" => check_stxos(&stxos, &f, &mut lines, "stxos"),
-            // The child disapproves its parent, and a block that
-            // disapproves its parent does not mark zero-confirmation
-            // spends of its own outputs
-            // (`UtxoView::connect_regular_transaction`).
-            "afterconnect" => check_snapshot(
-                &view,
-                &f,
-                &mut lines,
-                "afterconnect",
-                block.as_ref().map(|b| b.header.height),
-            ),
-            "afterdisconnect" => check_snapshot(&view, &f, &mut lines, "afterdisconnect", None),
+            "afterconnect" => check_snapshot(&view, &f, &mut lines, "afterconnect"),
+            "afterdisconnect" => check_snapshot(&view, &f, &mut lines, "afterdisconnect"),
             other => panic!("unknown row tag {other}"),
         }
         // Disconnect after verifying the connect snapshot.

@@ -1201,16 +1201,7 @@ mod tests {
             ..Default::default()
         };
         let err = dcroxide_blockchain::utxoview::UtxoView::new()
-            .connect_regular_transaction(
-                &tx,
-                &tx.tx_hash(),
-                1,
-                1,
-                &mut std::collections::BTreeMap::new(),
-                true,
-                None,
-                false,
-            )
+            .connect_regular_transaction(&tx, &tx.tx_hash(), 1, 1, None, false)
             .unwrap_err();
         assert_eq!(err.kind, RuleErrorKind::UtxoBackendCorruption);
         err
