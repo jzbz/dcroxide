@@ -51,7 +51,10 @@ pub const MIN_PEERS: u32 = 4;
 
 /// The maximum number of peers allowed together in a single mix
 /// session (dcrd mixing `MaxPeers`; a practical limit below the wire
-/// protocol's).
+/// protocol's).  It bounds the slot reservation and XOR DC-net
+/// matrices and the previous messages a mix message other than a key
+/// exchange may reference; a key exchange's seen pair requests are
+/// bounded only by the wire's 512 (`mixing/limits.go:22-26`).
 pub const MAX_PEERS: u32 = 64;
 
 /// The maximum number of mixed messages that any single peer can

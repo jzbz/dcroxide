@@ -1855,7 +1855,12 @@ impl<B: MixBlockChain> Pool<B> {
     }
 
     fn check_accept_ke(&self, ke: &MsgMixKeyExchange) -> Result<(), PoolError> {
-        check_ke_limits(ke)?;
+        // Unlike the other message types, a key exchange has no limits
+        // check: dcrd dropped its `MAX_PEERS` bound on the seen pair
+        // requests in `6b65e0d1`, leaving the wire's 512
+        // (`mixing/mixpool/mixpool.go:1669-1673`).  A wallet narrows a
+        // larger pairing to `MAX_PEERS` only after the key exchanges
+        // have agreed on it, so the bound had stalled those mixes.
 
         // Validate PR order and session ID.  These wrap the mixing
         // package's plain errors, which are not bannable, unlike the
@@ -2669,18 +2674,6 @@ fn check_pr_limits(pr: &MsgMixPairReq) -> Result<(), PoolError> {
         return Err(rule_other(format!(
             "message count {} exceeds max {}",
             pr.message_count, MAX_MCOUNT
-        )));
-    }
-
-    Ok(())
-}
-
-fn check_ke_limits(ke: &MsgMixKeyExchange) -> Result<(), PoolError> {
-    if ke.seen_prs.len() as u32 > MAX_PEERS {
-        return Err(rule_other(format!(
-            "{} referenced PRs exceeds max peers {}",
-            ke.seen_prs.len(),
-            MAX_PEERS
         )));
     }
 
