@@ -102,7 +102,7 @@ pub(crate) struct FlushBatch {
     write_log: Option<crate::WriteLogSink>,
     take_stats: bool,
     /// Whether an observer will see this flush, which is what the I/O
-    /// counters of [`crate::FlushPhase`] are read for.
+    /// and processor time counters of [`crate::FlushPhase`] are read for.
     observed: bool,
     started: Instant,
     /// The waits for the writer semaphore as of this flush, for the
@@ -149,7 +149,7 @@ impl FlushOutcome {
 fn thread_io() -> Option<(u64, u64)> {
     #[cfg(target_os = "linux")]
     {
-        let io = std::fs::read_to_string("/proc/thread-self/io").ok()?;
+        let io = String::from_utf8(read_proc("/proc/thread-self/io")?).ok()?;
         let (mut read, mut write) = (None, None);
         for line in io.lines() {
             if let Some(v) = line.strip_prefix("read_bytes:") {
@@ -166,30 +166,150 @@ fn thread_io() -> Option<(u64, u64)> {
     }
 }
 
-/// Times one phase of a flush, reading the thread's I/O counters at
-/// either end when an observer will see the result.
+/// The calling thread's processor time so far, `(utime, stime)` from
+/// Linux's `/proc/thread-self/stat`, in clock ticks: the time it has run
+/// in user mode and in the kernel.  `None` elsewhere.
+///
+/// Per thread for [`thread_io`]'s reason.
+fn thread_times() -> Option<(u64, u64)> {
+    #[cfg(target_os = "linux")]
+    {
+        parse_stat_times(&read_proc("/proc/thread-self/stat")?)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+/// The calling thread's time on a processor and its time runnable but
+/// waiting for one so far, both in nanoseconds, from Linux's
+/// `/proc/thread-self/schedstat`; `None` elsewhere, and where the kernel
+/// has no such file.  A kernel that has the file but keeps no scheduler
+/// accounting writes zeros in it.
+///
+/// The two do not add up to the wall time between two readings: the
+/// rest of it the thread spent asleep, which in a flush is waiting for
+/// storage or for a lock.  The kernel brings a running thread's time on
+/// a processor up to date at a scheduler tick or a context switch, not
+/// when the file is read, so a reading can trail the thread by up to a
+/// tick; so can those of [`thread_times`] where, as on x86 and ARM, the
+/// kernel reports them as a division of the same figure.
+fn thread_sched() -> Option<(u64, u64)> {
+    #[cfg(target_os = "linux")]
+    {
+        parse_schedstat(&read_proc("/proc/thread-self/schedstat")?)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+/// The contents of the `/proc` file at `path`; `None` when it cannot be
+/// read.  The counters above all read through here.
+#[cfg(target_os = "linux")]
+fn read_proc(path: &str) -> Option<Vec<u8>> {
+    #[cfg(test)]
+    PROC_READS.with(|reads| reads.set(reads.get().saturating_add(1)));
+    std::fs::read(path).ok()
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many `/proc` files the calling thread has asked for through
+    /// `read_proc`, for the tests that an unobserved flush reads none.
+    static PROC_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// `utime` and `stime`, in clock ticks, from the contents of a
+/// `/proc/<pid>/stat` file (`proc_pid_stat(5)`).
+///
+/// The second field is the thread's name in parentheses, and a name may
+/// itself hold spaces, parentheses and bytes that are not UTF-8 (the
+/// kernel cuts a name at 15 bytes, wherever that falls), so the fields
+/// are counted from the last `)` of the file: everything after the name
+/// is a state letter and numbers.  From there `utime` and `stime` are the
+/// twelfth and thirteenth fields, the file's fourteenth and fifteenth.
+#[cfg(any(target_os = "linux", test))]
+fn parse_stat_times(stat: &[u8]) -> Option<(u64, u64)> {
+    let name_end = stat.iter().rposition(|&byte| byte == b')')?;
+    let rest = std::str::from_utf8(stat.get(name_end.checked_add(1)?..)?).ok()?;
+    let mut fields = rest.split_ascii_whitespace();
+    let utime = fields.nth(11)?.parse().ok()?;
+    let stime = fields.next()?.parse().ok()?;
+    Some((utime, stime))
+}
+
+/// The first two fields of a `/proc/<pid>/schedstat` file: nanoseconds
+/// on a processor, and nanoseconds runnable but waiting for one.
+#[cfg(any(target_os = "linux", test))]
+fn parse_schedstat(schedstat: &[u8]) -> Option<(u64, u64)> {
+    let mut fields = std::str::from_utf8(schedstat)
+        .ok()?
+        .split_ascii_whitespace();
+    let on_cpu = fields.next()?.parse().ok()?;
+    let waiting = fields.next()?.parse().ok()?;
+    Some((on_cpu, waiting))
+}
+
+/// Milliseconds in one clock tick of `/proc/<pid>/stat`.  The kernel
+/// writes process times there in units of its `USER_HZ`, which its
+/// generic definition, the one x86, ARM and RISC-V take, sets to 100 a
+/// second (alpha's is 1024).
+const MS_PER_CLOCK_TICK: u64 = 10;
+
+/// What each of a pair of counters grew by since `before`, read again by
+/// `read`; `None`, with nothing read, when `before` is.
+fn grown(
+    before: Option<(u64, u64)>,
+    read: impl FnOnce() -> Option<(u64, u64)>,
+) -> Option<(u64, u64)> {
+    let (first, second) = before?;
+    let (first_now, second_now) = read()?;
+    Some((
+        first_now.saturating_sub(first),
+        second_now.saturating_sub(second),
+    ))
+}
+
+/// Times one phase of a flush, reading the thread's I/O and processor
+/// time counters at either end when an observer will see the result.
+///
+/// The processor time counters are read nearest the phase at both ends,
+/// so the reads of the I/O counters are outside what they measure; the
+/// wall time is taken inside all of them.
 struct PhaseTimer {
     started: Instant,
     io: Option<(u64, u64)>,
+    times: Option<(u64, u64)>,
+    sched: Option<(u64, u64)>,
 }
 
 impl PhaseTimer {
     fn start(observed: bool) -> PhaseTimer {
         PhaseTimer {
             io: if observed { thread_io() } else { None },
+            times: if observed { thread_times() } else { None },
+            sched: if observed { thread_sched() } else { None },
             started: Instant::now(),
         }
     }
 
     fn finish(self) -> crate::FlushPhase {
         let elapsed = self.started.elapsed();
-        let delta = self.io.and_then(|(read, write)| {
-            thread_io().map(|(r, w)| (r.saturating_sub(read), w.saturating_sub(write)))
-        });
+        let sched = grown(self.sched, thread_sched);
+        let times = grown(self.times, thread_times);
+        let io = grown(self.io, thread_io);
+        let ms = |ticks: u64| ticks.saturating_mul(MS_PER_CLOCK_TICK);
         crate::FlushPhase {
             elapsed,
-            read_bytes: delta.map(|(read, _)| read),
-            write_bytes: delta.map(|(_, write)| write),
+            read_bytes: io.map(|(read, _)| read),
+            write_bytes: io.map(|(_, write)| write),
+            utime_ms: times.map(|(utime, _)| ms(utime)),
+            stime_ms: times.map(|(_, stime)| ms(stime)),
+            on_cpu_ns: sched.map(|(on_cpu, _)| on_cpu),
+            runq_wait_ns: sched.map(|(_, waiting)| waiting),
         }
     }
 }
@@ -1513,9 +1633,9 @@ mod tests {
 
     /// The observer is told how a flush's time divides between its three
     /// phases -- the block-file fsync, the insert loop and the commit --
-    /// and, on Linux, the storage I/O the flushing thread did in each.
-    /// A single `elapsed` over all three cannot say which phase a stall
-    /// inside a flush window was in.
+    /// and, on Linux, the storage I/O the flushing thread did in each and
+    /// the processor time it used.  A single `elapsed` over all three
+    /// cannot say which phase a stall inside a flush window was in.
     #[test]
     fn a_flush_observation_splits_the_flush_into_its_phases() {
         let dir = TempDir::new().expect("tempdir");
@@ -1554,7 +1674,461 @@ mod tests {
                 );
             }
         }
+        // The processor time of each phase, where the kernel has the
+        // file it is read from; nothing anywhere else.
+        for phase in [obs.block_sync, obs.insert, obs.commit] {
+            let has = thread_self_has;
+            assert_eq!(
+                (phase.utime_ms.is_some(), phase.stime_ms.is_some()),
+                (has("stat"), has("stat")),
+                "{phase:?}"
+            );
+            assert_eq!(
+                (phase.on_cpu_ns.is_some(), phase.runq_wait_ns.is_some()),
+                (has("schedstat"), has("schedstat")),
+                "{phase:?}"
+            );
+            // A phase is inside the flush, so the thread was on a
+            // processor in it for no longer than the flush took, give or
+            // take the tick the kernel's figure can trail by at each end.
+            let flush = obs.elapsed + Duration::from_millis(20);
+            assert!(
+                phase.on_cpu_ns.unwrap_or(0) <= flush.as_nanos() as u64,
+                "{phase:?} in a flush of {:?}",
+                obs.elapsed
+            );
+            assert_eq!(phase.utime_ms.unwrap_or(0) % 10, 0, "whole ticks");
+            assert_eq!(phase.stime_ms.unwrap_or(0) % 10, 0, "whole ticks");
+        }
         assert!(obs.commit.to_json().starts_with("{\"ms\":"));
+    }
+
+    /// A phase renders as one JSON object: the three fields it always
+    /// had, as they were, then the four processor time fields, `null`
+    /// for each counter that was not read.
+    #[test]
+    fn a_flush_phase_renders_its_counters_after_the_fields_it_had() {
+        let phase = crate::FlushPhase {
+            elapsed: Duration::from_micros(1_500),
+            read_bytes: Some(8192),
+            write_bytes: Some(4096),
+            utime_ms: Some(30),
+            stime_ms: Some(10),
+            on_cpu_ns: Some(41_234_567),
+            runq_wait_ns: Some(89),
+        };
+        assert_eq!(
+            phase.to_json(),
+            concat!(
+                r#"{"ms":1.500,"read_bytes":8192,"write_bytes":4096,"#,
+                r#""utime_ms":30,"stime_ms":10,"on_cpu_ns":41234567,"runq_wait_ns":89}"#,
+            )
+        );
+        assert_eq!(
+            crate::FlushPhase::default().to_json(),
+            concat!(
+                r#"{"ms":0.000,"read_bytes":null,"write_bytes":null,"#,
+                r#""utime_ms":null,"stime_ms":null,"on_cpu_ns":null,"runq_wait_ns":null}"#,
+            )
+        );
+        // Each field is rendered from its own counter.
+        let only = |set: fn(&mut crate::FlushPhase)| {
+            let mut phase = crate::FlushPhase::default();
+            set(&mut phase);
+            phase.to_json()
+        };
+        assert!(only(|p| p.utime_ms = Some(7)).contains(r#""utime_ms":7,"stime_ms":null,"#));
+        assert!(only(|p| p.stime_ms = Some(7)).contains(r#""stime_ms":7,"on_cpu_ns":null,"#));
+        assert!(only(|p| p.on_cpu_ns = Some(7)).contains(r#""on_cpu_ns":7,"runq_wait_ns":null}"#));
+        assert!(
+            only(|p| p.runq_wait_ns = Some(7)).ends_with(r#""on_cpu_ns":null,"runq_wait_ns":7}"#)
+        );
+    }
+
+    /// `utime` and `stime` are found by counting fields from the last
+    /// `)` of a stat file, because the thread's name, between the first
+    /// `(` and that `)`, can hold anything: spaces, parentheses, text
+    /// shaped like the fields that follow it, and bytes that are not
+    /// UTF-8.
+    #[test]
+    fn the_stat_parser_counts_fields_from_the_end_of_the_thread_name() {
+        use super::parse_stat_times;
+
+        // The fields after the name, `utime` 111 and `stime` 222 among
+        // them, then `cutime` and the rest.
+        let rest = " S 1 2 3 4 5 6 7 8 9 10 111 222 13 14 20 0 1 0 99 1000 1 1844\n";
+        let stat = |name: &[u8]| [b"4242 (", name, b")", rest.as_bytes()].concat();
+        for name in [
+            &b"index"[..],
+            b"peer outbound",
+            b"a (b) c",
+            b"))) (((",
+            b") R 9 9 9 9 9 9 9 9 9 9 77 88 9",
+            b"",
+            // Cut at its fifteenth byte, inside a two-byte character.
+            b"peer-outbound-\xc3",
+            b"\xff\xfe",
+        ] {
+            assert_eq!(
+                parse_stat_times(&stat(name)),
+                Some((111, 222)),
+                "{:?}",
+                String::from_utf8_lossy(name)
+            );
+        }
+        // A real one, of a thread whose name is plain.
+        assert_eq!(
+            parse_stat_times(
+                b"1395644 (cat) R 1395643 1395644 1395643 0 -1 4194304 99 0 0 0 3 5 0 0 12 -8 1 \
+                  0 3148778 6635520 575 18446744073709551615 1 1 0 0 0 0 0 0 0 0 0 0 17 15 0 0 0 \
+                  0 0 0 0 0 0 0 0 0 0\n"
+            ),
+            Some((3, 5))
+        );
+
+        // Not a stat file: no name, too few fields after it, or a field
+        // that is not a count.
+        for bad in [
+            &b""[..],
+            b"4242 index S 1 2 3 4 5 6 7 8 9 10 111 222 13",
+            b"4242 (index) S 1 2 3 4 5 6 7 8 9 10 111",
+            b"4242 (index) S 1 2 3 4 5 6 7 8 9 10",
+            b"4242 (index) S 1 2 3 4 5 6 7 8 9 10 -1 222",
+            b"4242 (index) S 1 2 3 4 5 6 7 8 9 10 111 x",
+            b"4242 (index)",
+            b"4242 (index) S 1 2 3 4 5 6 7 8 9 10 111 222 \xff",
+        ] {
+            assert_eq!(
+                parse_stat_times(bad),
+                None,
+                "{:?}",
+                String::from_utf8_lossy(bad)
+            );
+        }
+    }
+
+    /// The schedstat file's first two fields are the time on a processor
+    /// and the time waiting for one; the third, a count of time slices,
+    /// is not read.
+    #[test]
+    fn the_schedstat_parser_takes_the_two_times() {
+        use super::parse_schedstat;
+
+        assert_eq!(parse_schedstat(b"381472 2380 2\n"), Some((381_472, 2_380)));
+        assert_eq!(parse_schedstat(b"0 0 0\n"), Some((0, 0)));
+        assert_eq!(
+            parse_schedstat(b"18446744073709551615 7"),
+            Some((u64::MAX, 7))
+        );
+        for bad in [
+            &b""[..],
+            b"\n",
+            b"381472\n",
+            b"381472 x 2\n",
+            b"-1 2 3\n",
+            b"1 \xff 3\n",
+        ] {
+            assert_eq!(
+                parse_schedstat(bad),
+                None,
+                "{:?}",
+                String::from_utf8_lossy(bad)
+            );
+        }
+    }
+
+    /// How many `/proc` files this thread has asked for so far.
+    fn proc_reads() -> u64 {
+        super::PROC_READS.with(|reads| reads.get())
+    }
+
+    /// Whether this thread's `/proc` entry has `file`: false off Linux.
+    fn thread_self_has(file: &str) -> bool {
+        cfg!(target_os = "linux")
+            && std::path::Path::new("/proc/thread-self")
+                .join(file)
+                .exists()
+    }
+
+    /// The `/proc` reads one observed phase makes: each counter file
+    /// that exists once at either end, and one that does not once, at the
+    /// start, since a counter that could not be read is not read again.
+    /// None off Linux.
+    fn reads_of_an_observed_phase() -> u64 {
+        if !cfg!(target_os = "linux") {
+            return 0;
+        }
+        ["io", "stat", "schedstat"]
+            .into_iter()
+            .map(|file| if thread_self_has(file) { 2 } else { 1 })
+            .sum()
+    }
+
+    /// With no observer nothing is read from `/proc`, by a phase's timer
+    /// or by a whole flush, and a phase has its wall time and no counter;
+    /// with one, each counter file is read once at either end of a phase.
+    /// A flush runs on the thread that calls it, which is this one.
+    #[test]
+    fn the_counters_are_read_only_for_an_observer() {
+        use super::PhaseTimer;
+
+        let before = proc_reads();
+        let phase = PhaseTimer::start(false).finish();
+        assert_eq!(proc_reads(), before, "an unobserved phase read /proc");
+        assert_eq!(
+            phase,
+            crate::FlushPhase {
+                elapsed: phase.elapsed,
+                ..crate::FlushPhase::default()
+            }
+        );
+
+        let (_dir, db) = new_db();
+        {
+            let tx = db.begin(true).expect("begin write");
+            tx.metadata().create_bucket(b"cache").expect("create");
+            tx.commit().expect("commit");
+        }
+        commit_one(&db, b"key", b"value");
+        db.flush().expect("flush");
+        assert_eq!(proc_reads(), before, "an unobserved flush read /proc");
+        drop(db);
+
+        // Observed: one phase, then a flush of three.
+        let phase = PhaseTimer::start(true).finish();
+        let per_phase = reads_of_an_observed_phase();
+        assert_eq!(proc_reads() - before, per_phase);
+        assert_eq!(
+            (phase.read_bytes.is_some(), phase.write_bytes.is_some()),
+            (thread_self_has("io"), thread_self_has("io"))
+        );
+        assert_eq!(
+            (phase.utime_ms.is_some(), phase.stime_ms.is_some()),
+            (thread_self_has("stat"), thread_self_has("stat"))
+        );
+        assert_eq!(
+            (phase.on_cpu_ns.is_some(), phase.runq_wait_ns.is_some()),
+            (thread_self_has("schedstat"), thread_self_has("schedstat"))
+        );
+
+        let dir = TempDir::new().expect("tempdir");
+        let mut opts = Options::new(dir.path().join("db"), NET);
+        let flushes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = Arc::clone(&flushes);
+        opts.flush_observer = Some(Arc::new(move |_: &crate::FlushObservation| {
+            seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }));
+        let db = Database::create(&opts).expect("create");
+        {
+            let tx = db.begin(true).expect("begin write");
+            tx.metadata().create_bucket(b"cache").expect("create");
+            tx.commit().expect("commit");
+        }
+        let before = proc_reads();
+        let flushed = flushes.load(std::sync::atomic::Ordering::SeqCst);
+        db.flush().expect("flush");
+        assert_eq!(
+            flushes.load(std::sync::atomic::Ordering::SeqCst),
+            flushed + 1,
+            "the flush was observed"
+        );
+        assert_eq!(
+            proc_reads() - before,
+            3 * per_phase,
+            "the block sync, the insert loop and the commit"
+        );
+    }
+
+    /// A flush participant that writes one row under its prefix in every
+    /// flush and counts the flushes it wrote in.
+    struct OneRow {
+        prefix: Vec<u8>,
+        contributed: std::sync::atomic::AtomicUsize,
+    }
+
+    impl crate::FlushParticipant for OneRow {
+        fn wants_flush(&self) -> bool {
+            false
+        }
+
+        fn has_work(&self) -> bool {
+            true
+        }
+
+        fn contribute(
+            &self,
+            w: &mut crate::FlushWriter<'_, '_>,
+        ) -> Result<crate::ParticipantStats, crate::Error> {
+            let mut key = self.prefix.clone();
+            key.push(b'r');
+            w.insert(&key, b"row")?;
+            self.contributed
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(crate::ParticipantStats::default())
+        }
+
+        fn finished(&self, _: bool) {}
+    }
+
+    /// Register a [`OneRow`] in `db`, under a bucket made for it and
+    /// flushed first.
+    fn register_one_row(db: &Database) -> Arc<OneRow> {
+        let tx = db.begin(true).expect("begin write");
+        let prefix = tx
+            .metadata()
+            .create_bucket(b"journal")
+            .expect("create")
+            .raw_id()
+            .to_vec();
+        tx.commit().expect("commit");
+        db.flush().expect("flush the bucket");
+        let journal = Arc::new(OneRow {
+            prefix: prefix.clone(),
+            contributed: std::sync::atomic::AtomicUsize::new(0),
+        });
+        db.set_flush_participant(
+            &prefix,
+            Arc::clone(&journal) as Arc<dyn crate::FlushParticipant>,
+        )
+        .expect("register");
+        journal
+    }
+
+    /// The participant's part of a flush is a fourth phase, counted as
+    /// the other three are.  With no observer a flush the participant
+    /// writes in reads nothing from `/proc`; with one, that phase has the
+    /// counters of a phase and the flush makes four phases' reads.
+    #[test]
+    fn the_participants_phase_is_counted_only_for_an_observer() {
+        let contributed = |journal: &OneRow| {
+            journal
+                .contributed
+                .load(std::sync::atomic::Ordering::SeqCst)
+        };
+
+        let (_dir, db) = new_db();
+        let journal = register_one_row(&db);
+        let before = proc_reads();
+        db.flush().expect("flush");
+        assert_eq!(contributed(&journal), 1, "the participant wrote");
+        assert_eq!(
+            proc_reads(),
+            before,
+            "an unobserved flush with a participant read /proc"
+        );
+        drop(db);
+
+        let dir = TempDir::new().expect("tempdir");
+        let mut opts = Options::new(dir.path().join("db"), NET);
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        opts.flush_observer = Some(Arc::new(move |obs: &crate::FlushObservation| {
+            sink.lock().expect("observations").push(*obs);
+        }));
+        let db = Database::create(&opts).expect("create");
+        let journal = register_one_row(&db);
+        let before = proc_reads();
+        let observed = seen.lock().expect("observations").len();
+        db.flush().expect("flush");
+        assert_eq!(contributed(&journal), 1, "the participant wrote");
+        assert_eq!(
+            proc_reads() - before,
+            4 * reads_of_an_observed_phase(),
+            "the block sync, the insert loop, the participant and the commit"
+        );
+        let obs = {
+            let seen = seen.lock().expect("observations");
+            assert_eq!(seen.len(), observed + 1, "the flush was observed");
+            *seen.last().expect("the flush was observed")
+        };
+        let phase = obs.participant.expect("the participant's part").contribute;
+        let has = thread_self_has;
+        assert_eq!(
+            (phase.read_bytes.is_some(), phase.write_bytes.is_some()),
+            (has("io"), has("io")),
+            "{phase:?}"
+        );
+        assert_eq!(
+            (phase.utime_ms.is_some(), phase.stime_ms.is_some()),
+            (has("stat"), has("stat")),
+            "{phase:?}"
+        );
+        assert_eq!(
+            (phase.on_cpu_ns.is_some(), phase.runq_wait_ns.is_some()),
+            (has("schedstat"), has("schedstat")),
+            "{phase:?}"
+        );
+        assert!(
+            phase.elapsed <= obs.elapsed,
+            "{phase:?} in {:?}",
+            obs.elapsed
+        );
+    }
+
+    /// A phase's processor time is the flushing thread's own over that
+    /// phase and no more.  A phase spent computing shows about as much
+    /// time on a processor as it took, nearly all of it in user mode, and
+    /// the two files the figures come from agree.  A phase spent asleep
+    /// straight after it shows next to none, though the thread's totals
+    /// by then hold all of the first and another thread of the process
+    /// computes throughout.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_phase_reports_the_processor_time_of_that_phase() {
+        use super::PhaseTimer;
+
+        /// Compute for `wall`, never sleeping: the calling thread is on
+        /// a processor or waiting for one throughout.
+        fn compute_for(wall: Duration) -> u64 {
+            let began = Instant::now();
+            let mut x = 1u64;
+            while began.elapsed() < wall {
+                for i in 0..10_000u64 {
+                    x = x.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(i);
+                    x = std::hint::black_box(x);
+                }
+            }
+            x
+        }
+
+        if !thread_self_has("stat") || !thread_self_has("schedstat") {
+            return;
+        }
+        let ms = |nanos: u64| nanos / 1_000_000;
+
+        let timer = PhaseTimer::start(true);
+        compute_for(Duration::from_millis(400));
+        let busy = timer.finish();
+        let elapsed = busy.elapsed.as_millis() as u64;
+        let (utime, stime) = (busy.utime_ms.expect("utime"), busy.stime_ms.expect("stime"));
+        let on_cpu = ms(busy.on_cpu_ns.expect("on_cpu"));
+        let waited = ms(busy.runq_wait_ns.expect("runq_wait"));
+        if super::thread_sched() == Some((0, 0)) {
+            // A kernel that keeps no scheduler accounting.
+            return;
+        }
+        assert!(on_cpu <= elapsed + 20, "{busy:?}");
+        assert!(on_cpu + waited + 20 >= elapsed / 2, "{busy:?}");
+        assert!((utime + stime).abs_diff(on_cpu) <= 50, "{busy:?}");
+        assert!(utime >= stime, "a loop in user mode: {busy:?}");
+
+        // Asleep, beside a thread that computes from before the phase
+        // until after it.  The short sleep ahead of the phase has the
+        // kernel bring this thread's times up to date as it is switched
+        // out, so the tick they can trail by after the computing above
+        // is not counted into the phase, however long the kernel's tick.
+        let other = std::thread::spawn(|| compute_for(Duration::from_millis(250)));
+        std::thread::sleep(Duration::from_millis(1));
+        let timer = PhaseTimer::start(true);
+        std::thread::sleep(Duration::from_millis(100));
+        let idle = timer.finish();
+        other.join().expect("the computing thread");
+        assert!(idle.elapsed >= Duration::from_millis(100), "{idle:?}");
+        assert!(ms(idle.on_cpu_ns.expect("on_cpu")) <= 25, "{idle:?}");
+        assert!(
+            idle.utime_ms.expect("utime") + idle.stime_ms.expect("stime") <= 30,
+            "{idle:?}"
+        );
     }
 
     /// The flush writes from the merged view, so it has to be exercised

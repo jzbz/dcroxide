@@ -514,7 +514,11 @@ pub struct FlushObservation {
 /// same kernel function.  The per-phase time and `read_bytes` can: a
 /// slow phase with large `read_bytes` was waiting on reads.  Writeback
 /// shows only as a phase's time, because `write_bytes` cannot see it
-/// (see its note).
+/// (see its note).  The processor times say how much of a phase the
+/// thread was working rather than waiting at all: `on_cpu_ns` is its
+/// time on a processor, which `utime_ms` and `stime_ms` divide between
+/// its own code and the kernel's, and what `elapsed` holds beyond that
+/// and `runq_wait_ns` it spent asleep.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct FlushPhase {
     /// Wall time the phase took.
@@ -534,6 +538,33 @@ pub struct FlushPhase {
     /// the blocks were written, before the flush began.  The commit's
     /// figure is what redb's page writes dirtied, not what reached disk.
     pub write_bytes: Option<u64>,
+    /// Milliseconds the flushing thread ran in user mode in the phase:
+    /// `utime` in Linux's `/proc/thread-self/stat`, which counts in clock
+    /// ticks of 10 ms, so this is a multiple of 10 and a short phase
+    /// often reads 0.  `None` off Linux and when no observer is attached.
+    pub utime_ms: Option<u64>,
+    /// Likewise `stime`: milliseconds the thread ran in the kernel, in
+    /// its system calls and page faults.
+    pub stime_ms: Option<u64>,
+    /// Nanoseconds the flushing thread spent on a processor in the phase,
+    /// in either mode: the first field of Linux's
+    /// `/proc/thread-self/schedstat`.  On most architectures, x86 and ARM
+    /// among them, the kernel reports `utime` and `stime` as a division
+    /// of this figure, so their sum follows it to within their ticks.
+    /// `None` off Linux, on a kernel without the file, and when no
+    /// observer is attached; 0 on a kernel that has the file but keeps no
+    /// scheduler accounting.
+    ///
+    /// The kernel brings the figure up to date at a scheduler tick or a
+    /// context switch and not when it is read, so it can be off by a tick
+    /// at either end of the phase, and a short phase can read more than
+    /// its `elapsed`.
+    pub on_cpu_ns: Option<u64>,
+    /// Likewise the second field: nanoseconds the thread was runnable
+    /// but waiting for a processor.  What is left of `elapsed` after this
+    /// and `on_cpu_ns` the thread spent asleep: waiting for storage (a
+    /// read, an fsync, writeback) or for a lock.
+    pub runq_wait_ns: Option<u64>,
 }
 
 impl FlushPhase {
@@ -541,10 +572,17 @@ impl FlushPhase {
     pub fn to_json(&self) -> String {
         let count = |v: Option<u64>| v.map_or_else(|| "null".to_string(), |v| v.to_string());
         format!(
-            "{{\"ms\":{:.3},\"read_bytes\":{},\"write_bytes\":{}}}",
+            concat!(
+                "{{\"ms\":{:.3},\"read_bytes\":{},\"write_bytes\":{},",
+                "\"utime_ms\":{},\"stime_ms\":{},\"on_cpu_ns\":{},\"runq_wait_ns\":{}}}"
+            ),
             self.elapsed.as_secs_f64() * 1000.0,
             count(self.read_bytes),
             count(self.write_bytes),
+            count(self.utime_ms),
+            count(self.stime_ms),
+            count(self.on_cpu_ns),
+            count(self.runq_wait_ns),
         )
     }
 }

@@ -134,8 +134,9 @@ pub struct ParticipantStats {
     /// Keys the participant held in memory when the flush began.
     pub memtable_keys: u64,
     /// The call to [`FlushParticipant::contribute`]: its wall time and the
-    /// flushing thread's storage I/O during it, a fourth phase beside
-    /// [`crate::FlushObservation`]'s three.  Filled by the database.
+    /// flushing thread's storage I/O and processor time during it, a
+    /// fourth phase beside [`crate::FlushObservation`]'s three.  Filled by
+    /// the database.
     pub contribute: FlushPhase,
 }
 

@@ -2092,10 +2092,18 @@ fn exists_addr_policy(enabled: bool) -> dcroxide_indexers::ExistsAddrPolicy {
 /// waiting on reads: `write_bytes` counts pages when they are dirtied,
 /// not when they are written back, so writeback time shows in a phase's
 /// `ms` and not in its `write_bytes`, and the block-file sync reads
-/// about 0 there however much it flushes.  `participant` is what the
-/// exists address index wrote inside the flush (its rows, reads, journal
-/// keys, merges and memtable size, and a fourth phase for its time and
-/// I/O), or `null` when it had nothing to write.
+/// about 0 there however much it flushes.  Each phase also has the
+/// flushing thread's processor time in it, on Linux: `utime_ms` and
+/// `stime_ms`, the milliseconds it ran in user mode and in the kernel,
+/// counted in ticks of 10 ms, and `on_cpu_ns` and `runq_wait_ns`, the
+/// nanoseconds it was on a processor and the nanoseconds it was runnable
+/// but waiting for one.  What a phase's `ms` holds beyond those last two
+/// the thread spent asleep, waiting for storage or for a lock, which is
+/// what divides a commit between work and waiting.  `participant` is
+/// what the exists address index wrote inside the flush (its rows, reads,
+/// journal keys, merges and memtable size, and a fourth phase for its
+/// time, I/O and processor time), or `null` when it had nothing to
+/// write.
 ///
 /// `thread` is the name of the thread that ran the flush, which held
 /// the database's writer for the flush's `elapsed_ms`.  `writer_wait`
@@ -2511,10 +2519,18 @@ mod tests {
         use dcroxide_database::{FlushObservation, FlushPhase, WriterWait, WriterWaits};
         use std::time::Duration;
 
-        let phase = |ms, read_bytes, write_bytes| FlushPhase {
+        // The I/O counters, the processor times and the scheduler's two
+        // times each come from a file of their own, so each pair is
+        // there or not together.
+        type Pair = Option<(u64, u64)>;
+        let phase = |ms, io: Pair, times: Pair, sched: Pair| FlushPhase {
             elapsed: Duration::from_millis(ms),
-            read_bytes,
-            write_bytes,
+            read_bytes: io.map(|(read, _)| read),
+            write_bytes: io.map(|(_, write)| write),
+            utime_ms: times.map(|(utime, _)| utime),
+            stime_ms: times.map(|(_, stime)| stime),
+            on_cpu_ns: sched.map(|(on_cpu, _)| on_cpu),
+            runq_wait_ns: sched.map(|(_, waited)| waited),
         };
         FlushObservation {
             sequence: 7,
@@ -2522,9 +2538,14 @@ mod tests {
             dirty_bytes: 345_678,
             elapsed: Duration::from_micros(1_234_500),
             stats_elapsed: Duration::ZERO,
-            block_sync: phase(3, Some(0), Some(0)),
-            insert: phase(400, Some(8192), Some(4096)),
-            commit: phase(800, None, None),
+            block_sync: phase(3, Some((0, 0)), Some((0, 0)), Some((61_000, 2_000))),
+            insert: phase(
+                400,
+                Some((8192, 4096)),
+                Some((310, 20)),
+                Some((333_000_000, 1_200_000)),
+            ),
+            commit: phase(800, None, None, None),
             stats: None,
             participant: None,
             writer_waits: WriterWaits {
@@ -2542,12 +2563,33 @@ mod tests {
 
     /// A line of the metadata flush log is what it was, with the name of
     /// the thread that ran the flush and the waits for the database's
-    /// writer after it.
+    /// writer after it, and with the flushing thread's processor time in
+    /// each phase as that phase's last four fields.
     #[test]
     fn a_flush_log_line_names_the_flushing_thread_and_the_writer_waits() {
         let obs = a_flush_observation();
+        let line = flush_log_line(&obs, 1_790_000_000.25, Some("index"));
         assert_eq!(
-            flush_log_line(&obs, 1_790_000_000.25, Some("index")),
+            line,
+            concat!(
+                r#"{"seq":7,"end":1790000000.250,"elapsed_ms":1234.500,"entries":1200,"bytes":345678,"#,
+                r#""sync":{"ms":3.000,"read_bytes":0,"write_bytes":0,"#,
+                r#""utime_ms":0,"stime_ms":0,"on_cpu_ns":61000,"runq_wait_ns":2000},"#,
+                r#""insert":{"ms":400.000,"read_bytes":8192,"write_bytes":4096,"#,
+                r#""utime_ms":310,"stime_ms":20,"on_cpu_ns":333000000,"runq_wait_ns":1200000},"#,
+                r#""commit":{"ms":800.000,"read_bytes":null,"write_bytes":null,"#,
+                r#""utime_ms":null,"stime_ms":null,"on_cpu_ns":null,"runq_wait_ns":null},"#,
+                r#""participant":null,"thread":"index","#,
+                r#""writer_wait":{"index":{"count":3,"ns":1500000},"other":{"count":41,"ns":73000000000}}}"#,
+            )
+        );
+        dcroxide_dcrjson::gojson::validate(&line).expect("a line is one JSON value");
+        // With the processor times taken out again the line is, byte for
+        // byte, the one written before they were added: they are four
+        // more fields at the end of a phase, and every other field is
+        // where and what it was.
+        assert_eq!(
+            without_processor_times(&line),
             concat!(
                 r#"{"seq":7,"end":1790000000.250,"elapsed_ms":1234.500,"entries":1200,"bytes":345678,"#,
                 r#""sync":{"ms":3.000,"read_bytes":0,"write_bytes":0},"#,
@@ -2561,6 +2603,70 @@ mod tests {
         assert!(
             flush_log_line(&obs, 0.0, None)
                 .contains(r#""participant":null,"thread":null,"writer_wait":{"#)
+        );
+    }
+
+    /// `line` with the four processor time fields cut from the end of
+    /// each phase.
+    fn without_processor_times(line: &str) -> String {
+        let mut out = String::new();
+        let mut rest = line;
+        while let Some(at) = rest.find(r#","utime_ms":"#) {
+            let (before, phase_end) = rest.split_at(at);
+            let (cut, after) = phase_end
+                .split_once('}')
+                .expect("a phase is an object, which ends");
+            assert!(
+                cut.contains(r#","stime_ms":"#)
+                    && cut.contains(r#","on_cpu_ns":"#)
+                    && cut.contains(r#","runq_wait_ns":"#),
+                "{cut}"
+            );
+            out.push_str(before);
+            out.push('}');
+            rest = after;
+        }
+        out.push_str(rest);
+        out
+    }
+
+    /// The participant's part of a flush is a fourth phase, with the
+    /// same counters as the other three, and the line it is in is still
+    /// one JSON value.
+    #[test]
+    fn a_flush_log_line_has_the_participants_phase_with_its_processor_time() {
+        let mut obs = a_flush_observation();
+        let mut stats = dcroxide_database::ParticipantStats::default();
+        stats.rows_put = 5;
+        stats.memtable_keys = 4_500_000;
+        stats.contribute = dcroxide_database::FlushPhase {
+            utime_ms: Some(120),
+            stime_ms: Some(30),
+            on_cpu_ns: Some(151_000_000),
+            runq_wait_ns: Some(7),
+            ..obs.insert
+        };
+        obs.participant = Some(stats);
+        let line = flush_log_line(&obs, 1_790_000_000.25, Some("peer-outbound"));
+        dcroxide_dcrjson::gojson::validate(&line).expect("a line is one JSON value");
+        assert!(
+            line.contains(concat!(
+                r#","memtable_keys":4500000,"#,
+                r#""contribute":{"ms":400.000,"read_bytes":8192,"write_bytes":4096,"#,
+                r#""utime_ms":120,"stime_ms":30,"on_cpu_ns":151000000,"runq_wait_ns":7}},"#,
+                r#""thread":"peer-outbound","#,
+            )),
+            "{line}"
+        );
+        // And without them, the participant's object as it was.
+        assert!(
+            without_processor_times(&line).contains(concat!(
+                r#""participant":{"rows_put":5,"rows_removed":0,"bytes_put":0,"rows_read":0,"#,
+                r#""keys_journaled":0,"merges":0,"base_rewrites":0,"memtable_keys":4500000,"#,
+                r#""contribute":{"ms":400.000,"read_bytes":8192,"write_bytes":4096}},"#,
+                r#""thread":"peer-outbound","#,
+            )),
+            "{line}"
         );
     }
 

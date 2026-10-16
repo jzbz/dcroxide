@@ -954,6 +954,28 @@ fn the_flush_log_counts_a_flush_only_the_participant_wrote() {
     assert_eq!(stats.keys_journaled, 3, "the participant's own figure kept");
     assert!(stats.bytes_put > 0);
     assert!(stats.contribute.elapsed <= obs.elapsed);
+    // Its phase has what every phase of an observed flush has: the
+    // flushing thread's counters, each where the kernel has the file it
+    // is read from and nowhere else.
+    let has = |file: &str| {
+        cfg!(target_os = "linux") && Path::new("/proc/thread-self").join(file).exists()
+    };
+    let phase = stats.contribute;
+    assert_eq!(
+        (phase.read_bytes.is_some(), phase.write_bytes.is_some()),
+        (has("io"), has("io")),
+        "{phase:?}"
+    );
+    assert_eq!(
+        (phase.utime_ms.is_some(), phase.stime_ms.is_some()),
+        (has("stat"), has("stat")),
+        "{phase:?}"
+    );
+    assert_eq!(
+        (phase.on_cpu_ns.is_some(), phase.runq_wait_ns.is_some()),
+        (has("schedstat"), has("schedstat")),
+        "{phase:?}"
+    );
     assert!(stats.to_json().starts_with("{\"rows_put\":4,"));
 
     // The commit path: `wants_flush` makes the first commit after a flush
