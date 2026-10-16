@@ -1856,11 +1856,13 @@ impl Chain {
             .set(total.saturating_add(entry_size));
     }
 
-    /// Spend an output in the cache (dcrd `UtxoCache.spendEntry`):
-    /// fresh entries are replaced with an explicit spent marker since
-    /// the backend never knew about them, other cached entries become
-    /// spent tombstones, and cache misses pull the backend entry in
-    /// as a tombstone so the next flush removes it.
+    /// Spend an output in the cache (dcrd `UtxoCache.spendEntry`,
+    /// `utxocache.go:323-420`): an explicit spent marker and an entry
+    /// already marked spent are left as they are, fresh entries are
+    /// replaced with an explicit spent marker since the backend never
+    /// knew about them, other cached entries become spent tombstones,
+    /// and cache misses pull the backend entry in as a tombstone so the
+    /// next flush removes it.
     fn cache_spend_entry(&mut self, key: OutPointKey) {
         // What the cache probe decided; the mutating follow-ups run
         // with the probe's borrow released.
@@ -1872,8 +1874,18 @@ impl Chain {
         let action = match self.utxo_cache.get_mut().0.get_mut(&UtxoKey(key)) {
             Some(slot) => match slot {
                 None => SpendAction::Done,
+                // Nothing to update when the cache already holds the
+                // output spent, and it is not a double spend: the view
+                // holds a single spend of the output, and double spends
+                // are refused when the transactions are validated
+                // against the view (dcrd `utxocache.go:340-355`).  dcrd
+                // names the path that reaches it even when every block
+                // is flushed: the spend of an output not yet flushed to
+                // the backend, undone by a disapproval and spent again
+                // in the block that disapproves it.  The test comes
+                // before the fresh test, as in dcrd.
+                Some(entry) if entry.is_spent() => SpendAction::Done,
                 Some(entry) => {
-                    assert!(!entry.is_spent(), "attempt to double spend in view commit");
                     if entry.is_fresh() {
                         // A fresh entry was never flushed: replace it
                         // in place with an explicit spent marker so
@@ -9362,7 +9374,6 @@ mod tests {
                 (5, false) => Some(None),
                 _ => None,
             };
-            let cache_spent = matches!(&cached, Some(Some(e)) if e.is_spent());
             if let Some(cached) = cached {
                 cached_size += cached.as_ref().map_or(0, utxo_entry_size);
                 chain.utxo_cache.get_mut().insert(key, cached);
@@ -9375,8 +9386,8 @@ mod tests {
                 3 => UTXO_STATE_MODIFIED,
                 4 => UTXO_STATE_MODIFIED | UTXO_STATE_FRESH,
                 5 => UTXO_STATE_MODIFIED | UTXO_STATE_SPENT | UTXO_STATE_SPENT_BY_ZERO_CONF,
-                // The cache refuses to spend an output twice.
-                _ if cache_spent => UTXO_STATE_MODIFIED,
+                // Over a spent tombstone too, which the cache leaves
+                // as it is.
                 _ => UTXO_STATE_MODIFIED | UTXO_STATE_SPENT,
             };
             view.insert_entry(&outpoint, entry(n + 2000, view_state));
