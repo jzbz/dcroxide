@@ -307,7 +307,7 @@ pub fn db_put_best_state(
     };
     Ok(tx
         .metadata()
-        .put(CHAIN_STATE_KEY_NAME, &serialize_best_chain_state(&state))?)
+        .put_owned(CHAIN_STATE_KEY_NAME, serialize_best_chain_state(&state))?)
 }
 
 /// Fetch the best chain state row (dcrd `dbFetchBestState`).
@@ -330,9 +330,9 @@ pub fn db_put_block_index_entry(
     let bucket = meta
         .bucket(BLOCK_INDEX_BUCKET_NAME)
         .ok_or_else(|| ChainDbError::Corrupt("missing block index bucket".into()))?;
-    Ok(bucket.put(
+    Ok(bucket.put_owned(
         &block_index_key(block_hash, block_height),
-        &serialize_block_index_entry(entry),
+        serialize_block_index_entry(entry),
     )?)
 }
 
@@ -503,9 +503,9 @@ pub fn db_put_header_commitments(
     let bucket = meta
         .bucket(HEADER_CMTS_BUCKET_NAME)
         .ok_or_else(|| ChainDbError::Corrupt("missing header commitments bucket".into()))?;
-    Ok(bucket.put(
+    Ok(bucket.put_owned(
         &block_row_key(block_hash, block_height),
-        &serialize_header_commitments(commitments),
+        serialize_header_commitments(commitments),
     )?)
 }
 
@@ -562,7 +562,7 @@ pub fn db_put_utxos<'a>(
                 let serialized = serialize_utxo_entry(entry).ok_or_else(|| {
                     ChainDbError::Corrupt("serializing a spent utxo entry".into())
                 })?;
-                bucket.put(&key, &serialized)?;
+                bucket.put_owned(&key, serialized)?;
             }
         }
     }
@@ -633,7 +633,7 @@ pub fn db_fetch_utxo_entries(
 pub fn db_put_utxo_set_state(tx: &Transaction, state: &UtxoSetState) -> Result<(), ChainDbError> {
     Ok(tx
         .metadata()
-        .put(UTXO_SET_STATE_KEY_NAME, &serialize_utxo_set_state(state))?)
+        .put_owned(UTXO_SET_STATE_KEY_NAME, serialize_utxo_set_state(state))?)
 }
 
 /// Fetch the UTXO set state row when present.

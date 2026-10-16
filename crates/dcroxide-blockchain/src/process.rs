@@ -7,7 +7,6 @@
 //! rejection checkpoint tracking, and the full block processing path
 //! (`ProcessBlock` and the reorganization machinery it drives).
 
-use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::format;
 use alloc::string::String;
@@ -729,7 +728,7 @@ impl Chain {
             BlockStatus(BlockStatus::DATA_STORED.0 | BlockStatus::VALIDATED.0);
         store.node_mut(genesis).is_fully_linked = true;
         store.node_mut(genesis).stake_node =
-            Some(Box::new(StakeNode::genesis(stake_node_params(params))));
+            Some(Arc::new(StakeNode::genesis(stake_node_params(params))));
         index.add_node(&store, genesis);
         let best_chain = NodeChainView::new(&store, Some(genesis));
 
@@ -1437,7 +1436,7 @@ impl Chain {
         {
             let n = self.store.node_mut(tip);
             n.new_tickets = Some(stake_node.new_tickets().to_vec());
-            n.stake_node = Some(Box::new(stake_node.clone()));
+            n.stake_node = Some(Arc::new(stake_node));
         }
 
         // Warm the recent-window mirrors (blocks, spend journals,
@@ -3063,15 +3062,19 @@ impl Chain {
     /// to the fork point (regenerating pruned nodes from the ticket
     /// undo rows) and replaying any side chain blocks up to the
     /// requested node (dcrd `fetchStakeNode`).
+    ///
+    /// The node returned is the one the block index holds, shared: dcrd
+    /// returns its `node.stakeNode` pointer the same way
+    /// (`stakenode.go:99-118`).
     pub fn fetch_stake_node(
         &mut self,
         node: NodeId,
         params: &Params,
-    ) -> Result<StakeNode, dcroxide_stake::RuleError> {
+    ) -> Result<Arc<StakeNode>, dcroxide_stake::RuleError> {
         // Return the cached immutable stake node when it is already
         // loaded.
         if let Some(stake_node) = &self.store.node(node).stake_node {
-            return Ok(StakeNode::clone(stake_node));
+            return Ok(Arc::clone(stake_node));
         }
 
         // Create the requested stake node from the parent stake node
@@ -3081,13 +3084,16 @@ impl Chain {
         {
             self.maybe_fetch_ticket_info(node, params)?;
             let n = self.store.node(node);
-            let voted = n.tickets_voted.clone();
-            let revoked = n.tickets_revoked.clone();
-            let new_tickets = n.new_tickets.clone().expect("new tickets loaded");
+            let new_tickets = n.new_tickets.as_deref().expect("new tickets loaded");
             let iv = self.store.lottery_iv(node);
             let parent_stake_node = self.store.node(parent).stake_node.as_ref().expect("loaded");
-            let stake_node = parent_stake_node.connect(iv, &voted, &revoked, &new_tickets)?;
-            self.store.node_mut(node).stake_node = Some(Box::new(stake_node.clone()));
+            let stake_node = Arc::new(parent_stake_node.connect(
+                iv,
+                &n.tickets_voted,
+                &n.tickets_revoked,
+                new_tickets,
+            )?);
+            self.store.node_mut(node).stake_node = Some(Arc::clone(&stake_node));
             return Ok(stake_node);
         }
 
@@ -3122,7 +3128,7 @@ impl Chain {
                     .as_ref()
                     .expect("stake node along the walk is loaded")
                     .disconnect(prev_iv, &utds, &tickets)?;
-                self.store.node_mut(prev_id).stake_node = Some(Box::new(stake_node));
+                self.store.node_mut(prev_id).stake_node = Some(Arc::new(stake_node));
             }
             cur = prev;
         }
@@ -3134,8 +3140,7 @@ impl Chain {
                 .store
                 .node(node)
                 .stake_node
-                .as_deref()
-                .cloned()
+                .clone()
                 .expect("fork stake node loaded"));
         }
 
@@ -3168,15 +3173,14 @@ impl Chain {
                 .as_ref()
                 .expect("parent stake node loaded along the attach path");
             let stake_node = parent_stake_node.connect(iv, &voted, &revoked, &new_tickets)?;
-            self.store.node_mut(id).stake_node = Some(Box::new(stake_node));
+            self.store.node_mut(id).stake_node = Some(Arc::new(stake_node));
         }
 
         Ok(self
             .store
             .node(node)
             .stake_node
-            .as_deref()
-            .cloned()
+            .clone()
             .expect("requested stake node loaded"))
     }
 
@@ -3566,15 +3570,17 @@ impl Chain {
         let tickets_new = stake_node.new_tickets().to_vec();
 
         // The database writes: the spend journal record, the ticket
-        // database rows, the filter, and the commitment leaves.
+        // database rows, the filter, and the commitment leaves.  The
+        // mirrors take the journal, the filter and the leaves
+        // themselves, and the connect transaction below writes each row
+        // from the mirror's entry.
         let serialized_journal =
             crate::chainio::serialize_spend_journal_entry(&stxos).unwrap_or_default();
-        self.spend_journal
-            .insert(node_hash.0, serialized_journal.clone());
+        self.spend_journal.insert(node_hash.0, serialized_journal);
         self.write_stake_db_rows(node);
-        self.filters.insert(node_hash.0, filter.clone());
+        self.filters.insert(node_hash.0, filter);
         self.header_commitments
-            .insert(node_hash.0, hdr_commitment_leaves.clone());
+            .insert(node_hash.0, hdr_commitment_leaves);
         // The treasury account and spend rows when the agenda is active
         // (dcrd `connectBlock` taking the flag once at `chain.go:602`).
         // Computed before the transaction opens and published after it
@@ -3592,6 +3598,12 @@ impl Chain {
             let work_sum = self.store.node(node).work_sum;
             let (total_txns, total_subsidy) = (state.total_txns, state.total_subsidy);
             let db = self.db.as_ref().expect("checked above");
+            // Nothing between the inserts above and here removes a
+            // mirror entry: entries are evicted where a connect ends
+            // and by the timed prune.
+            let serialized_journal = &self.spend_journal[&node_hash.0];
+            let filter = &self.filters[&node_hash.0];
+            let hdr_commitment_leaves = &self.header_commitments[&node_hash.0];
             db.update(|tx| {
                 crate::chaindb::db_put_best_state(
                     tx,
@@ -3606,7 +3618,7 @@ impl Chain {
                     tx,
                     &node_hash,
                     node_height as u32,
-                    &serialized_journal,
+                    serialized_journal,
                 )
                 .map_err(chain_db_to_db_error)?;
                 dcroxide_stake::stakedb::write_connected_best_node(tx, &stake_node, &node_hash)
@@ -3620,13 +3632,13 @@ impl Chain {
                         tspend_updates,
                     )?;
                 }
-                crate::chaindb::db_put_gcs_filter(tx, &node_hash, node_height as u32, &filter)
+                crate::chaindb::db_put_gcs_filter(tx, &node_hash, node_height as u32, filter)
                     .map_err(chain_db_to_db_error)?;
                 crate::chaindb::db_put_header_commitments(
                     tx,
                     &node_hash,
                     node_height as u32,
-                    &hdr_commitment_leaves,
+                    hdr_commitment_leaves,
                 )
                 .map_err(chain_db_to_db_error)?;
                 Ok(())
@@ -4408,7 +4420,11 @@ impl Chain {
         // store and the index status flush leaves the bytes present
         // without the stored bit, and the redelivered block must heal
         // that window rather than be rejected on the database's
-        // block-exists error.
+        // block-exists error.  dcrd asks `HasBlock` and then
+        // `StoreBlock`, which asks again before it stores
+        // (`chainio.go:461-472`, `ffldb/db.go:1168-1173`); here the
+        // store is asked once, and its refusal of a block it has is
+        // read as the answer.
         //
         // A block that arrived shared goes into the mirror as the
         // caller's own allocation, as dcrd's `ProcessBlock` caches the
@@ -4433,11 +4449,9 @@ impl Chain {
             params,
         );
         if let Some(db) = &self.db {
-            let stored = db.update(|tx| {
-                if tx.has_block(&block_hash, block.header.height)? {
-                    return Ok(());
-                }
-                tx.store_block(block)
+            let stored = db.update(|tx| match tx.store_block(block) {
+                Err(err) if err.kind == dcroxide_database::ErrorKind::BlockExists => Ok(()),
+                stored => stored,
             });
             if let Err(err) = stored {
                 return Err(persist_rule_error(crate::chaindb::ChainDbError::Db(err)));
@@ -9741,6 +9755,262 @@ mod tests {
         assert!(
             unlike_the_parent >= 10,
             "{unlike_the_parent} unlike the parent"
+        );
+    }
+
+    /// A connect moves the block's spend journal, filter and commitment
+    /// leaves into the mirrors and writes the database rows from the
+    /// mirrors' entries.  Over the battery's main chain, each connected
+    /// block's mirror entries and database rows are the same, and they
+    /// are that block's: the journal holds an entry for each output the
+    /// block spends, and the filter is the one its leaves commit to and
+    /// not its parent's.
+    #[test]
+    fn a_connect_writes_the_rows_its_mirrors_hold() {
+        let params = dcroxide_chaincfg::regnet_params();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let opts = dcroxide_database::Options::new(dir.path().join("chain"), params.net.0);
+        let db = dcroxide_database::Database::create(&opts).expect("create");
+        let mut chain = Chain::open(db, &params, Hash::ZERO, false, 0).expect("open");
+        let (blocks, now) = battery_main_chain();
+
+        let (mut with_journal, mut with_leaves) = (0, 0);
+        let mut parent_filter: Option<Vec<u8>> = None;
+        for block in &blocks {
+            let (_, errs) = chain.process_block(block, now, &params);
+            assert!(errs.is_empty(), "{errs:?}");
+            let (hash, height) = (block.header.block_hash(), block.header.height);
+            assert_eq!(
+                chain.best_chain.tip().map(|tip| chain.store.node(tip).hash),
+                Some(hash)
+            );
+
+            let journal = chain.spend_journal[&hash.0].clone();
+            let filter = chain.filters[&hash.0].clone();
+            let leaves = chain.header_commitments[&hash.0].clone();
+
+            // The mirrors hold this block's rows.
+            let is_treasury_enabled = chain
+                .is_treasury_agenda_active(&block.header.prev_block, &params)
+                .expect("agenda");
+            let stxos = chain
+                .fetch_spend_journal(block, is_treasury_enabled)
+                .expect("journal");
+            assert_eq!(stxos.len(), count_spent_outputs(block));
+            assert_eq!(journal.is_empty(), stxos.is_empty());
+            assert!(filter.n() > 0, "block {height}: an empty filter");
+            assert!(
+                leaves.is_empty() || leaves == [filter.hash()],
+                "block {height}: leaves of another filter"
+            );
+            if let Some(parent_filter) = &parent_filter {
+                assert_ne!(filter.bytes(), &parent_filter[..]);
+            }
+
+            // The database holds what the mirrors hold.
+            let db = chain.db.as_ref().expect("database");
+            db.view(|tx| {
+                assert_eq!(
+                    crate::chaindb::db_fetch_spend_journal_entry(tx, &hash, height),
+                    Some(journal.clone()),
+                    "block {height}: journal row"
+                );
+                assert_eq!(
+                    crate::chaindb::db_fetch_raw_gcs_filter(tx, &hash, height)
+                        .expect("filter row")
+                        .as_deref(),
+                    Some(filter.bytes()),
+                    "block {height}: filter row"
+                );
+                assert_eq!(
+                    crate::chaindb::db_fetch_header_commitments(tx, &hash, height)
+                        .expect("leaves row"),
+                    leaves,
+                    "block {height}: leaves row"
+                );
+                Ok(())
+            })
+            .expect("view");
+
+            with_journal += usize::from(!journal.is_empty());
+            with_leaves += usize::from(!leaves.is_empty());
+            parent_filter = Some(filter.bytes().to_vec());
+        }
+        assert!(with_journal > 50, "{with_journal} blocks with a journal");
+        // The battery never activates the header commitments agenda, so
+        // every list of leaves it connects is empty;
+        // `a_connect_writes_the_commitment_leaves_its_mirror_holds`
+        // connects its blocks with the agenda active.
+        assert_eq!(with_leaves, 0, "the battery commits to a filter");
+    }
+
+    /// With the header commitments agenda active, the leaves a connect
+    /// files are the hash of the block's filter (dcrd `connectBlock`,
+    /// `chain.go:636-643`), and the row written is the mirror's entry,
+    /// as for the journal and the filter.  The battery never activates
+    /// the agenda, so each block of its main chain is connected as the
+    /// battery has it, detached, and attached again under parameters
+    /// that force the agenda active: the attach of a block that is
+    /// already validated runs none of the checks that would hold its
+    /// header to the commitment, and it files the leaves, the journal
+    /// and the filter anew.
+    #[test]
+    fn a_connect_writes_the_commitment_leaves_its_mirror_holds() {
+        let params = dcroxide_chaincfg::regnet_params();
+        let mut active = dcroxide_chaincfg::regnet_params();
+        force_deployment_result(
+            &mut active,
+            crate::agendas::VOTE_ID_HEADER_COMMITMENTS,
+            "yes",
+        );
+        let dir = tempfile::tempdir().expect("tempdir");
+        let opts = dcroxide_database::Options::new(dir.path().join("chain"), params.net.0);
+        let db = dcroxide_database::Database::create(&opts).expect("create");
+        let mut chain = Chain::open(db, &params, Hash::ZERO, false, 0).expect("open");
+        let (blocks, now) = battery_main_chain();
+        assert!(blocks.len() > 100, "{} blocks", blocks.len());
+
+        let mut with_journal = 0;
+        let mut parent_leaves: Option<Vec<Hash>> = None;
+        for block in &blocks {
+            let (_, errs) = chain.process_block(block, now, &params);
+            assert!(errs.is_empty(), "{errs:?}");
+            let (hash, height) = (block.header.block_hash(), block.header.height);
+            let tip = chain.best_chain.tip().expect("tip");
+            assert_eq!(chain.store.node(tip).hash, hash);
+            let parent = chain.store.node(tip).parent.expect("parent");
+
+            // As the battery has it: no leaves.
+            let journal = chain.spend_journal[&hash.0].clone();
+            let filter = chain.filters[&hash.0].clone();
+            assert!(chain.header_commitments[&hash.0].is_empty());
+
+            // Detached, and attached with the agenda active.
+            chain
+                .reorganize_chain_internal(parent, &params)
+                .expect("detach");
+            assert_eq!(chain.best_chain.tip(), Some(parent));
+            assert!(!chain.spend_journal.contains_key(&hash.0));
+            chain
+                .reorganize_chain_internal(tip, &active)
+                .expect("attach");
+            assert_eq!(chain.best_chain.tip(), Some(tip));
+
+            // The mirrors hold this block's leaves, journal and filter.
+            let leaves = alloc::vec![filter.hash()];
+            assert_eq!(
+                chain.header_commitments[&hash.0], leaves,
+                "block {height}: leaves mirror"
+            );
+            assert_ne!(Some(&leaves), parent_leaves.as_ref(), "block {height}");
+            assert_eq!(
+                chain.spend_journal[&hash.0], journal,
+                "block {height}: journal mirror"
+            );
+            assert_eq!(
+                chain.filters[&hash.0].bytes(),
+                filter.bytes(),
+                "block {height}: filter mirror"
+            );
+
+            // The database holds what the mirrors hold.
+            let db = chain.db.as_ref().expect("database");
+            db.view(|tx| {
+                assert_eq!(
+                    crate::chaindb::db_fetch_header_commitments(tx, &hash, height)
+                        .expect("leaves row"),
+                    leaves,
+                    "block {height}: leaves row"
+                );
+                assert_eq!(
+                    crate::chaindb::db_fetch_spend_journal_entry(tx, &hash, height),
+                    Some(journal.clone()),
+                    "block {height}: journal row"
+                );
+                assert_eq!(
+                    crate::chaindb::db_fetch_raw_gcs_filter(tx, &hash, height)
+                        .expect("filter row")
+                        .as_deref(),
+                    Some(filter.bytes()),
+                    "block {height}: filter row"
+                );
+                Ok(())
+            })
+            .expect("view");
+
+            with_journal += usize::from(!journal.is_empty());
+            parent_leaves = Some(leaves);
+        }
+        assert!(with_journal > 50, "{with_journal} blocks with a journal");
+    }
+
+    /// The stake node `fetch_stake_node` hands out is the one the block
+    /// index holds, shared and not copied, as dcrd returns its
+    /// `node.stakeNode` pointer (`stakenode.go:99-118`): for a node that
+    /// is loaded, and for one connected from its loaded parent, which is
+    /// then the node the index keeps.  The node connected from the
+    /// parent is the one the block's own connect made.
+    #[test]
+    fn the_stake_node_handed_out_is_the_one_the_index_holds() {
+        let params = dcroxide_chaincfg::regnet_params();
+        let mut chain = Chain::new(&params, Hash::ZERO, false);
+        let (blocks, now) = battery_main_chain();
+
+        let (mut with_votes, mut with_new_tickets) = (0, 0);
+        for block in &blocks {
+            let (_, errs) = chain.process_block(block, now, &params);
+            assert!(errs.is_empty(), "{errs:?}");
+            let tip = chain.best_chain.tip().expect("tip");
+
+            // Loaded: the index's own node.
+            let held = chain.store.node(tip).stake_node.clone().expect("loaded");
+            let fetched = chain.fetch_stake_node(tip, &params).expect("fetch");
+            assert!(Arc::ptr_eq(&fetched, &held));
+
+            // Dropped and connected again from the parent's.
+            chain.store.node_mut(tip).stake_node = None;
+            let connected = chain.fetch_stake_node(tip, &params).expect("connect");
+            let kept = chain.store.node(tip).stake_node.as_ref().expect("kept");
+            assert!(Arc::ptr_eq(&connected, kept));
+            assert!(!Arc::ptr_eq(&connected, &held));
+
+            // Both are the parent's node connected with this block's
+            // votes, revocations and new tickets, in that order.
+            let node = chain.store.node(tip);
+            let parent = node.parent.expect("parent");
+            let want = chain
+                .store
+                .node(parent)
+                .stake_node
+                .as_ref()
+                .expect("parent stake node")
+                .connect(
+                    chain.store.lottery_iv(tip),
+                    &node.tickets_voted,
+                    &node.tickets_revoked,
+                    node.new_tickets.as_deref().expect("new tickets"),
+                )
+                .expect("connect");
+            for got in [&connected, &held] {
+                assert_eq!(got.height(), want.height());
+                assert_eq!(got.winners(), want.winners());
+                assert_eq!(got.final_state(), want.final_state());
+                assert_eq!(got.pool_size(), want.pool_size());
+                assert_eq!(got.new_tickets(), want.new_tickets());
+                assert_eq!(got.undo_data(), want.undo_data());
+                assert_eq!(got.live_tickets(), want.live_tickets());
+                assert_eq!(got.missed_tickets(), want.missed_tickets());
+                assert_eq!(got.revoked_tickets(), want.revoked_tickets());
+            }
+
+            with_votes += usize::from(!node.tickets_voted.is_empty());
+            with_new_tickets +=
+                usize::from(node.new_tickets.as_ref().is_some_and(|t| !t.is_empty()));
+        }
+        assert!(with_votes > 10, "{with_votes} blocks with votes");
+        assert!(
+            with_new_tickets > 40,
+            "{with_new_tickets} blocks with new tickets"
         );
     }
 

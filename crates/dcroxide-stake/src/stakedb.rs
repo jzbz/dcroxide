@@ -122,7 +122,7 @@ pub fn db_fetch_best_state(tx: &Transaction) -> Result<BestChainState, StakeDbEr
 pub fn db_put_best_state(tx: &Transaction, bcs: &BestChainState) -> Result<(), StakeDbError> {
     Ok(tx
         .metadata()
-        .put(STAKE_CHAIN_STATE_KEY_NAME, &serialize_best_chain_state(bcs))?)
+        .put_owned(STAKE_CHAIN_STATE_KEY_NAME, serialize_best_chain_state(bcs))?)
 }
 
 /// Fetch the block undo data for a height (dcrd
@@ -155,7 +155,7 @@ pub fn db_put_block_undo_data(
     let bucket = meta
         .bucket(STAKE_BLOCK_UNDO_DATA_BUCKET_NAME)
         .ok_or_else(|| missing_bucket(STAKE_BLOCK_UNDO_DATA_BUCKET_NAME))?;
-    Ok(bucket.put(&height_key(height), &serialize_block_undo_data(utds))?)
+    Ok(bucket.put_owned(&height_key(height), serialize_block_undo_data(utds))?)
 }
 
 /// Remove the block undo data for a height (dcrd
@@ -188,7 +188,7 @@ pub fn db_put_new_tickets(tx: &Transaction, height: u32, ths: &[Hash]) -> Result
     let bucket = meta
         .bucket(TICKETS_IN_BLOCK_BUCKET_NAME)
         .ok_or_else(|| missing_bucket(TICKETS_IN_BLOCK_BUCKET_NAME))?;
-    Ok(bucket.put(&height_key(height), &serialize_ticket_hashes(ths))?)
+    Ok(bucket.put_owned(&height_key(height), serialize_ticket_hashes(ths))?)
 }
 
 /// Remove the maturing ticket hashes for a height (dcrd

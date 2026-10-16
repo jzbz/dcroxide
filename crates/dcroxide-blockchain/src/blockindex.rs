@@ -169,10 +169,13 @@ pub struct BlockNode {
 
     /// The immutable ticket pool state as of this block, when loaded
     /// (dcrd `stakeNode`; pruned nodes drop it and it is regenerated
-    /// on demand).  Boxed like dcrd's pointer: only the few hundred
+    /// on demand).  Behind a pointer like dcrd's: only the few hundred
     /// most recent nodes hold one, so the rest pay for a pointer
-    /// rather than the inline node.
-    pub stake_node: Option<alloc::boxed::Box<dcroxide_stake::ticketnode::Node>>,
+    /// rather than the inline node.  The pointer is shared, as dcrd's
+    /// is with every caller of `fetchStakeNode`
+    /// (`stakenode.go:99-118`), so handing the node out copies none of
+    /// its lists.
+    pub stake_node: Option<alloc::sync::Arc<dcroxide_stake::ticketnode::Node>>,
     /// The tickets maturing in this block, when loaded (dcrd
     /// `newTickets`; `None` means never looked up while an empty list
     /// means no tickets mature here).
@@ -1151,7 +1154,7 @@ mod tests {
     fn block_node_layout_stays_compact() {
         assert_eq!(core::mem::size_of::<Option<NodeId>>(), 4);
         assert_eq!(
-            core::mem::size_of::<Option<alloc::boxed::Box<dcroxide_stake::ticketnode::Node>>>(),
+            core::mem::size_of::<Option<alloc::sync::Arc<dcroxide_stake::ticketnode::Node>>>(),
             core::mem::size_of::<usize>()
         );
         assert!(

@@ -245,7 +245,7 @@ pub fn db_put_treasury_balance(
     let bucket = meta
         .bucket(TREASURY_BUCKET_NAME)
         .ok_or_else(|| ChainDbError::Corrupt("missing treasury bucket".into()))?;
-    Ok(bucket.put(&block_row_key(hash, height), &serialized)?)
+    Ok(bucket.put_owned(&block_row_key(hash, height), serialized)?)
 }
 
 /// Fetch a block's treasury state row when present (dcrd
@@ -278,7 +278,7 @@ pub fn db_put_tspend(
     let bucket = meta
         .bucket(TREASURY_TSPEND_BUCKET_NAME)
         .ok_or_else(|| ChainDbError::Corrupt("missing tspend bucket".into()))?;
-    Ok(bucket.put(&tx_hash.0, &serialize_tspend(blocks))?)
+    Ok(bucket.put_owned(&tx_hash.0, serialize_tspend(blocks))?)
 }
 
 /// Fetch a treasury spend blocks row when present (dcrd

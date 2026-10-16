@@ -218,20 +218,42 @@ pub fn check_transaction_sanity(tx: &MsgTx, max_tx_size: u64) -> Result<(), Rule
     }
 
     // Check for duplicate transaction inputs.
-    let mut existing_tx_out: BTreeSet<([u8; 32], u32, i8)> = BTreeSet::new();
-    for tx_in in &tx.tx_in {
-        let key = (
-            tx_in.previous_out_point.hash.0,
-            tx_in.previous_out_point.index,
-            tx_in.previous_out_point.tree,
-        );
-        if !existing_tx_out.insert(key) {
-            return Err(rule_error(
-                ErrorKind::DuplicateTxInputs,
-                "transaction contains duplicate inputs",
-            ));
-        }
+    if has_duplicate_inputs(tx) {
+        return Err(rule_error(
+            ErrorKind::DuplicateTxInputs,
+            "transaction contains duplicate inputs",
+        ));
     }
 
     Ok(())
+}
+
+/// The most inputs [`has_duplicate_inputs`] compares pair by pair.
+const MAX_PAIRWISE_INPUTS: usize = 16;
+
+/// Whether two of the transaction's inputs spend the same previous
+/// output: the same hash, index and tree, which is the key of the map
+/// dcrd fills (`tx.go:218-226`).
+///
+/// The answer does not depend on how the search is made, and neither
+/// does the error it leads to, which names no input.  Up to
+/// [`MAX_PAIRWISE_INPUTS`] inputs are compared with one another, which
+/// allocates nothing; more are filed in an ordered set.
+fn has_duplicate_inputs(tx: &MsgTx) -> bool {
+    if tx.tx_in.len() > MAX_PAIRWISE_INPUTS {
+        let mut existing_tx_out: BTreeSet<([u8; 32], u32, i8)> = BTreeSet::new();
+        return tx.tx_in.iter().any(|tx_in| {
+            let prev_out = &tx_in.previous_out_point;
+            !existing_tx_out.insert((prev_out.hash.0, prev_out.index, prev_out.tree))
+        });
+    }
+    tx.tx_in.iter().enumerate().any(|(idx, tx_in)| {
+        let prev_out = &tx_in.previous_out_point;
+        tx.tx_in[..idx].iter().any(|earlier| {
+            let earlier = &earlier.previous_out_point;
+            earlier.index == prev_out.index
+                && earlier.tree == prev_out.tree
+                && earlier.hash == prev_out.hash
+        })
+    })
 }

@@ -142,6 +142,16 @@ fn replay_battery(chain: &mut Chain, params: &dcroxide_chaincfg::Params, clock_o
     }
 }
 
+/// The bytes in the store's flat block files.
+fn block_file_bytes(store: &std::path::Path) -> u64 {
+    std::fs::read_dir(store)
+        .expect("store directory")
+        .map(|entry| entry.expect("directory entry"))
+        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "fdb"))
+        .map(|entry| entry.metadata().expect("block file metadata").len())
+        .sum()
+}
+
 #[test]
 fn a_prestored_block_still_connects() {
     // A crash can land between storing a block's bytes and flushing
@@ -152,10 +162,14 @@ fn a_prestored_block_still_connects() {
     // present — rather than rejected on the database's block-exists
     // error, which would stall the chain on that height forever.
     // Pre-storing every block's bytes replays the entire battery
-    // through that crash window.
+    // through that crash window.  The chain hands the block to the
+    // store without asking for it first and reads the store's refusal
+    // as the answer, so the store must not have taken the block a
+    // second time: the flat files hold what they held before.
     let params = regnet_params();
     let dir = TempDir::new().expect("tempdir");
-    let opts = Options::new(dir.path().join("chain"), params.net.0);
+    let store = dir.path().join("chain");
+    let opts = Options::new(store.clone(), params.net.0);
     let db = Database::create(&opts).expect("create database");
     let mut chain = Chain::open(db, &params, Hash::ZERO, false, 0).expect("open chain");
 
@@ -178,9 +192,17 @@ fn a_prestored_block_still_connects() {
                         tx.store_block(&block)
                     })
                     .expect("pre-store the block bytes");
+                let stored = block_file_bytes(&store);
+                assert!(stored > 0, "no block file under {}", store.display());
                 let (_, errs) = chain.process_block(&block, now, &params);
                 let is_orphan = errs.len() == 1 && errs[0].kind == RuleErrorKind::MissingParent;
                 assert!(errs.is_empty() || is_orphan, "accept {}: {errs:?}", f[1]);
+                assert_eq!(
+                    block_file_bytes(&store),
+                    stored,
+                    "accept {}: the block was stored again",
+                    f[1]
+                );
             }
             _ => {}
         }

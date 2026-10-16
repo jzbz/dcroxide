@@ -390,15 +390,16 @@ impl Transaction {
     }
 
     /// Stage a put.  The key is taken owned, as every caller has just
-    /// built it, so it reaches the pending set -- and from there the
-    /// cache overlay -- without another copy.
-    pub(crate) fn put_raw(&self, key: Vec<u8>, value: &[u8]) -> Result<(), Error> {
+    /// built it, and so is the value: both reach the pending set -- and
+    /// from there the cache overlay -- without another copy.  A caller
+    /// that holds a borrowed value copies it once, on the way in.
+    pub(crate) fn put_raw(&self, key: Vec<u8>, value: Vec<u8>) -> Result<(), Error> {
         let mut state = self.state.borrow_mut();
         if state.kv.is_none() || !self.writable {
             return Err(db_error(ErrorKind::TxNotWritable, "tx not writable"));
         }
         state.pending_removes.remove(&key);
-        state.pending_keys.insert(key, value.to_vec());
+        state.pending_keys.insert(key, value);
         Ok(())
     }
 
@@ -688,7 +689,7 @@ impl Transaction {
             .checked_add(1)
             .ok_or_else(|| db_error(ErrorKind::DriverSpecific, "bucket IDs exhausted"))?;
         let next_bytes = next.to_be_bytes();
-        self.put_raw(CUR_BUCKET_ID_KEY.to_vec(), &next_bytes)?;
+        self.put_raw(CUR_BUCKET_ID_KEY.to_vec(), next_bytes.to_vec())?;
         Ok(next_bytes)
     }
 
@@ -1162,12 +1163,15 @@ impl Transaction {
                     let mut row = Vec::with_capacity(BLOCK_LOC_SIZE + BLOCK_HDR_SIZE);
                     row.extend_from_slice(&loc.serialize());
                     row.extend_from_slice(&bytes[..BLOCK_HDR_SIZE]);
-                    self.put_raw(block_idx_key(hash, *height), &row)?;
+                    self.put_raw(block_idx_key(hash, *height), row)?;
                 }
 
                 // Stage the new write cursor position.
                 let row = serialize_write_row(store.write_file_num, store.write_offset);
-                self.put_raw(bucketized_key(METADATA_BUCKET_ID, WRITE_LOC_KEY), &row)?;
+                self.put_raw(
+                    bucketized_key(METADATA_BUCKET_ID, WRITE_LOC_KEY),
+                    row.to_vec(),
+                )?;
             }
 
             Ok(())
@@ -1339,7 +1343,7 @@ impl<'tx> Bucket<'tx> {
         };
 
         // Add the new bucket to the bucket index.
-        self.tx.put_raw(bidx_key, &child_id)?;
+        self.tx.put_raw(bidx_key, child_id.to_vec())?;
         Ok(Bucket {
             tx: self.tx,
             id: child_id,
@@ -1619,6 +1623,27 @@ impl<'tx> Bucket<'tx> {
 
     /// Save the specified key/value pair to the bucket (dcrd `Put`).
     pub fn put(&self, key: &[u8], value: &[u8]) -> Result<(), Error> {
+        self.check_put(key)?;
+        self.tx
+            .put_raw(bucketized_key(self.id, key), value.to_vec())
+    }
+
+    /// [`Self::put`] of a value the caller built for the row and has no
+    /// more use for.  The buffer itself is staged, where `put` stages a
+    /// copy of the borrowed bytes; dcrd's `Put` hands the caller's slice
+    /// to `putKey`, which keeps it too (`ffldb/db.go:1058-1065`).  The
+    /// checks, their order and their errors are `put`'s, and so is what
+    /// the row holds.  Capacity past the value's length is given back
+    /// first, so the pending set and the cache overlay retain what they
+    /// would for the copy.
+    pub fn put_owned(&self, key: &[u8], mut value: Vec<u8>) -> Result<(), Error> {
+        self.check_put(key)?;
+        value.shrink_to_fit();
+        self.tx.put_raw(bucketized_key(self.id, key), value)
+    }
+
+    /// The checks of dcrd's `Put`, in its order (`ffldb/db.go:877-893`).
+    fn check_put(&self, key: &[u8]) -> Result<(), Error> {
         self.tx.check_closed()?;
         if !self.tx.writable {
             return Err(db_error(
@@ -1629,7 +1654,7 @@ impl<'tx> Bucket<'tx> {
         if key.is_empty() {
             return Err(db_error(ErrorKind::KeyRequired, "put requires a key"));
         }
-        self.tx.put_raw(bucketized_key(self.id, key), value)
+        Ok(())
     }
 
     /// The value for the given key, or `None` if it does not exist;
@@ -2072,5 +2097,190 @@ mod block_idx_key_tests {
         }
         assert_eq!(serialized_block_height(&[0u8; 131]), None);
         assert_eq!(serialized_block_height(&[]), None);
+    }
+}
+
+#[cfg(test)]
+mod put_owned_tests {
+    //! [`Bucket::put_owned`] against [`Bucket::put`]: the same checks in
+    //! the same order with the same errors, and the same row in the
+    //! pending set, in the cache overlay and in the durable store.
+
+    use std::sync::{Arc, Mutex};
+
+    use tempfile::TempDir;
+
+    use crate::{Database, ErrorKind, Options};
+
+    /// simnet magic, matching the interface battery.
+    const NET: u32 = 0x1214_1c16;
+
+    /// Every key and value a flush handed the engine, in order.
+    type Written = Arc<Mutex<Vec<(Vec<u8>, Option<Vec<u8>>)>>>;
+
+    /// What one flush reported: its entries and the bytes it counted.
+    type Flushed = Arc<Mutex<Vec<(usize, u64)>>>;
+
+    /// A new store that records what its flushes write and report.
+    fn recording_db() -> (TempDir, Database, Written, Flushed) {
+        let dir = TempDir::new().expect("tempdir");
+        let written: Written = Arc::default();
+        let flushed: Flushed = Arc::default();
+        let mut opts = Options::new(dir.path().join("db"), NET);
+        let sink = Arc::clone(&written);
+        opts.write_log = Some(Arc::new(move |key: &[u8], value: Option<&[u8]>| {
+            sink.lock()
+                .expect("write log")
+                .push((key.to_vec(), value.map(<[u8]>::to_vec)));
+        }));
+        let sink = Arc::clone(&flushed);
+        opts.flush_observer = Some(Arc::new(move |obs: &crate::FlushObservation| {
+            sink.lock()
+                .expect("observations")
+                .push((obs.dirty_entries, obs.dirty_bytes));
+        }));
+        let db = Database::create(&opts).expect("create");
+        (dir, db, written, flushed)
+    }
+
+    /// The rows the two stores are given: empty, short and long values,
+    /// a key written twice, and a key deleted and written again.
+    fn rows() -> Vec<(&'static [u8], Vec<u8>)> {
+        vec![
+            (b"empty", Vec::new()),
+            (b"short", vec![0x01]),
+            (b"long", (0..=255u8).cycle().take(5000).collect()),
+            (b"twice", vec![0x02; 40]),
+            (b"twice", vec![0x03; 7]),
+            (b"deleted", vec![0x04; 9]),
+        ]
+    }
+
+    /// The value in a buffer with room to spare, as a serializer that
+    /// reserved more than it wrote would hand it over.
+    fn roomy(value: &[u8]) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(value.len().saturating_add(64));
+        buf.extend_from_slice(value);
+        buf
+    }
+
+    /// Write [`rows`] in one transaction, owned or borrowed, and return
+    /// what the transaction read back before it committed.
+    fn write_rows(db: &Database, owned: bool) -> Vec<Option<Vec<u8>>> {
+        let tx = db.begin(true).expect("begin");
+        let bucket = tx.metadata().create_bucket(b"rows").expect("bucket");
+        bucket.put(b"deleted", b"before").expect("put");
+        bucket.delete(b"deleted").expect("delete");
+        for (key, value) in rows() {
+            if owned {
+                bucket.put_owned(key, roomy(&value)).expect("put_owned");
+            } else {
+                bucket.put(key, &value).expect("put");
+            }
+        }
+        // No pending value holds more than its bytes, whichever way it
+        // came in.
+        for (key, value) in &tx.state.borrow().pending_keys {
+            assert_eq!(value.capacity(), value.len(), "key {key:02x?}");
+        }
+        let read = rows().iter().map(|(key, _)| bucket.get(key)).collect();
+        tx.commit().expect("commit");
+        read
+    }
+
+    /// What the store reads for every key of [`rows`].
+    fn read_rows(db: &Database) -> Vec<Option<Vec<u8>>> {
+        let mut read = Vec::new();
+        db.view(|tx| {
+            let bucket = tx.metadata().bucket(b"rows").expect("bucket");
+            read = rows().iter().map(|(key, _)| bucket.get(key)).collect();
+            Ok(())
+        })
+        .expect("view");
+        read
+    }
+
+    #[test]
+    fn an_owned_put_leaves_what_a_borrowed_put_leaves() {
+        let (_borrowed_dir, borrowed, borrowed_written, borrowed_flushed) = recording_db();
+        let (_owned_dir, owned, owned_written, owned_flushed) = recording_db();
+
+        // In the pending set.
+        let want: Vec<Option<Vec<u8>>> = vec![
+            Some(Vec::new()),
+            Some(vec![0x01]),
+            Some((0..=255u8).cycle().take(5000).collect()),
+            Some(vec![0x03; 7]),
+            Some(vec![0x03; 7]),
+            Some(vec![0x04; 9]),
+        ];
+        assert_eq!(write_rows(&borrowed, false), want);
+        assert_eq!(write_rows(&owned, true), want);
+
+        // In the cache overlay.
+        assert_eq!(read_rows(&borrowed), want);
+        assert_eq!(read_rows(&owned), want);
+
+        // In what the flush hands the engine and counts.
+        borrowed.flush().expect("flush");
+        owned.flush().expect("flush");
+        let borrowed_written = borrowed_written.lock().expect("write log").clone();
+        assert!(borrowed_written.len() >= 5, "{}", borrowed_written.len());
+        assert_eq!(*owned_written.lock().expect("write log"), borrowed_written);
+        let borrowed_flushed = borrowed_flushed.lock().expect("observations").clone();
+        assert_eq!(borrowed_flushed.len(), 1);
+        assert_eq!(
+            *owned_flushed.lock().expect("observations"),
+            borrowed_flushed
+        );
+
+        // And in the durable store.
+        assert_eq!(read_rows(&borrowed), want);
+        assert_eq!(read_rows(&owned), want);
+    }
+
+    #[test]
+    fn an_owned_put_is_refused_as_a_borrowed_put_is() {
+        let (_dir, db, _, _) = recording_db();
+        db.update(|tx| tx.metadata().create_bucket(b"rows").map(|_| ()))
+            .expect("bucket");
+
+        // No key.
+        let tx = db.begin(true).expect("begin");
+        let bucket = tx.metadata().bucket(b"rows").expect("bucket");
+        let borrowed = bucket.put(b"", b"value").expect_err("put");
+        let owned = bucket.put_owned(b"", b"value".to_vec()).expect_err("owned");
+        assert_eq!(borrowed.kind, ErrorKind::KeyRequired);
+        assert_eq!(
+            (owned.kind, &owned.description),
+            (borrowed.kind, &borrowed.description)
+        );
+        tx.rollback().expect("rollback");
+
+        // A read-only transaction, which is refused before the key is
+        // looked at.
+        let tx = db.begin(false).expect("begin");
+        let bucket = tx.metadata().bucket(b"rows").expect("bucket");
+        for key in [&b""[..], &b"key"[..]] {
+            let borrowed = bucket.put(key, b"value").expect_err("put");
+            let owned = bucket.put_owned(key, b"value".to_vec()).expect_err("owned");
+            assert_eq!(borrowed.kind, ErrorKind::TxNotWritable);
+            assert_eq!(
+                (owned.kind, &owned.description),
+                (borrowed.kind, &borrowed.description)
+            );
+        }
+
+        // A closed transaction, which is refused before anything else.
+        tx.rollback().expect("rollback");
+        for key in [&b""[..], &b"key"[..]] {
+            let borrowed = bucket.put(key, b"value").expect_err("put");
+            let owned = bucket.put_owned(key, b"value".to_vec()).expect_err("owned");
+            assert_eq!(borrowed.kind, ErrorKind::TxClosed);
+            assert_eq!(
+                (owned.kind, &owned.description),
+                (borrowed.kind, &borrowed.description)
+            );
+        }
     }
 }
