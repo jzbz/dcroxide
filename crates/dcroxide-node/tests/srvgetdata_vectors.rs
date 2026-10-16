@@ -181,7 +181,7 @@ use dcroxide_node::server::{
 };
 use dcroxide_node::transport::WireTransport;
 use dcroxide_peer::{Config, MAX_PROTOCOL_VERSION, MsgTransport, Peer, PeerGlobals};
-use dcroxide_wire::{CurrencyNet, Message, MsgGetData, ServiceFlag};
+use dcroxide_wire::{CurrencyNet, Message, MsgGetData, MsgPing, MsgPong, ServiceFlag};
 
 const SERVE_NET: CurrencyNet = CurrencyNet::TEST_NET3;
 const BAN_THRESHOLD: u32 = 100;
@@ -573,6 +573,21 @@ fn serve_genesis_chain() -> (
     assert_eq!(
         transport.read_message().expect("read sendheaders"),
         Message::SendHeaders
+    );
+    // The server queues `sendheaders` before it hands the peer to its
+    // connect hook (dcrd `serverPeer.Run` queueing it before `AddPeer`),
+    // and the hook reads the chain while it registers the peer with the
+    // sync manager.  A test that takes the chain lock as soon as
+    // `sendheaders` arrives can catch the peer's thread in that hook,
+    // before its input loop reads anything.  The input loop answers a
+    // ping only once the hook has returned, so the pong marks the end of
+    // the connect.
+    transport
+        .write_message(&Message::Ping(MsgPing { nonce: 0xdcd0 }))
+        .expect("send a ping");
+    assert_eq!(
+        transport.read_message().expect("read the pong"),
+        Message::Pong(MsgPong { nonce: 0xdcd0 })
     );
 
     (dir, runtime, connected, transport, chain)
