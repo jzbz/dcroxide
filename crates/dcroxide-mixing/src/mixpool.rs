@@ -2038,34 +2038,42 @@ impl<B: MixBlockChain> Pool<B> {
 
     /// All key exchange messages that were received for a particular
     /// epoch from peers who formed sessions (as indicated by a
-    /// received CT), and their pair requests (dcrd `activeInEpoch`).
+    /// received CT), and their pair requests (dcrd `activeInEpoch`,
+    /// `mixing/mixpool/mixpool.go:810-868`).
+    ///
+    /// One pass over the pool gathers the epoch's key exchanges and the
+    /// identity and session of every ciphertexts message, and a key
+    /// exchange is kept when its own identity and session are among
+    /// them (`70485d9e`).  A ciphertexts message is pooled under an
+    /// identity exactly when its hash is in that identity's index, so
+    /// this keeps what the earlier walk of each key exchange's index
+    /// kept, without a pass over an identity's messages per key
+    /// exchange.
     fn active_in_epoch(&self, epoch: u64) -> ActivePeers {
         let mut epoch_kes: Vec<&MsgMixKeyExchange> = Vec::new();
+        let mut id_pairs: HashSet<(IdPubKey, [u8; 32])> = HashSet::new();
         for e in self.pool.values() {
-            if let PoolMessage::KE(ke) = &e.msg
-                && ke.epoch == epoch
-            {
-                epoch_kes.push(ke);
-            }
-        }
-        let mut kes: Vec<&MsgMixKeyExchange> = Vec::new();
-        'next_ke: for ke in epoch_kes {
-            if let Some(hashes) = self.messages_by_identity.get(&ke.identity) {
-                for msg_hash in hashes {
-                    if let Some(e) = self.pool.get(&msg_hash.0)
-                        && e.msgtype == MsgType::CT
-                        && e.sid == ke.session_id
+            match e.msgtype {
+                MsgType::KE => {
+                    if let PoolMessage::KE(ke) = &e.msg
+                        && ke.epoch == epoch
                     {
-                        kes.push(ke);
-                        continue 'next_ke;
+                        epoch_kes.push(ke);
                     }
                 }
+                MsgType::CT => {
+                    id_pairs.insert((e.msg.identity(), e.sid));
+                }
+                _ => {}
             }
         }
 
+        // Select only the key exchanges of peers that formed a session.
         let mut active_kes: HashMap<IdPubKey, Vec<MsgMixKeyExchange>> = HashMap::new();
-        for ke in kes {
-            active_kes.entry(ke.identity).or_default().push(ke.clone());
+        for ke in epoch_kes {
+            if id_pairs.contains(&(ke.identity, ke.session_id)) {
+                active_kes.entry(ke.identity).or_default().push(ke.clone());
+            }
         }
         let mut active = HashMap::new();
         for pr in self.prs.values() {
@@ -2817,4 +2825,228 @@ fn check_rs_limits(rs: &MsgMixSecrets) -> Result<(), PoolError> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    // Test-harness arithmetic over bounded values.
+    #![allow(clippy::arithmetic_side_effects)]
+
+    use super::*;
+    use crate::{sign_message, sort_prs_for_session};
+    use dcroxide_dcrec::secp256k1::PrivateKey;
+
+    /// A whole minute, so key exchanges stating it are in dcrd's window.
+    const NOW_SECS: u64 = 1_699_999_980;
+
+    struct Tip(Params);
+
+    impl MixBlockChain for Tip {
+        fn chain_params(&self) -> &Params {
+            &self.0
+        }
+        fn current_tip(&self) -> (Hash, i64) {
+            (Hash([0; 32]), 100)
+        }
+    }
+
+    fn pool() -> Pool<Tip> {
+        Pool::new_with_clock(
+            Tip(dcroxide_chaincfg::simnet_params()),
+            None,
+            Arc::new(|| NOW_SECS as i64 * NANOS_PER_SEC),
+        )
+    }
+
+    fn key(seed: u8) -> (PrivateKey, IdPubKey) {
+        let mut bytes = [0x31; 32];
+        bytes[31] = seed;
+        let k = PrivateKey::from_bytes(&bytes).expect("private key");
+        let id = k.public_key().serialize_compressed();
+        (k, id)
+    }
+
+    fn pair_request(k: &PrivateKey, id: IdPubKey, seed: u8) -> MsgMixPairReq {
+        let mut pr = MsgMixPairReq {
+            signature: [0; 64],
+            identity: id,
+            expiry: 110,
+            mix_amount: 10_000_000,
+            script_class: crate::SCRIPT_CLASS_P2PKH_V0.to_string(),
+            tx_version: 1,
+            lock_time: 0,
+            message_count: 1,
+            input_value: 10_100_000,
+            utxos: vec![dcroxide_wire::MixPairReqUTXO {
+                out_point: OutPoint {
+                    hash: Hash([seed; 32]),
+                    index: 0,
+                    tree: 0,
+                },
+                script: Vec::new(),
+                pub_key: Vec::new(),
+                signature: Vec::new(),
+                opcode: 0,
+            }],
+            change: None,
+            flags: 0,
+            pairing_flags: 0,
+        };
+        sign_message(&mut pr, k).expect("sign");
+        pr
+    }
+
+    fn key_exchange(
+        k: &PrivateKey,
+        id: IdPubKey,
+        prs: &[&MsgMixPairReq],
+        own: &MsgMixPairReq,
+        epoch: u64,
+    ) -> MsgMixKeyExchange {
+        let mut sorted: Vec<MsgMixPairReq> = prs.iter().map(|pr| (*pr).clone()).collect();
+        let session_id = sort_prs_for_session(&mut sorted, epoch);
+        let seen_prs: Vec<Hash> = sorted
+            .iter()
+            .map(|pr| pr.mix_hash().expect("hash"))
+            .collect();
+        let own = own.mix_hash().expect("hash");
+        let pos = seen_prs.iter().position(|h| *h == own).expect("own") as u32;
+        let mut ke = MsgMixKeyExchange {
+            signature: [0; 64],
+            identity: id,
+            session_id,
+            epoch,
+            run: 0,
+            pos,
+            ecdh: [0; 33],
+            pqpk: [0; 1218],
+            commitment: [0; 32],
+            seen_prs,
+        };
+        sign_message(&mut ke, k).expect("sign");
+        ke
+    }
+
+    fn ciphertexts(k: &PrivateKey, id: IdPubKey, ke: &MsgMixKeyExchange) -> MsgMixCiphertexts {
+        let mut ct = MsgMixCiphertexts {
+            signature: [0; 64],
+            identity: id,
+            session_id: ke.session_id,
+            run: 0,
+            ciphertexts: vec![[0; 1047]],
+            seen_key_exchanges: vec![ke.mix_hash().expect("hash")],
+        };
+        sign_message(&mut ct, k).expect("sign");
+        ct
+    }
+
+    fn slot_reserve(k: &PrivateKey, id: IdPubKey, ke: &MsgMixKeyExchange) -> MsgMixSlotReserve {
+        let mut sr = MsgMixSlotReserve {
+            signature: [0; 64],
+            identity: id,
+            session_id: ke.session_id,
+            run: 0,
+            dc_mix: vec![vec![vec![1]]],
+            seen_ciphertexts: Vec::new(),
+        };
+        sign_message(&mut sr, k).expect("sign");
+        sr
+    }
+
+    fn factored_poly(k: &PrivateKey, id: IdPubKey, ke: &MsgMixKeyExchange) -> MsgMixFactoredPoly {
+        let mut fp = MsgMixFactoredPoly {
+            signature: [0; 64],
+            identity: id,
+            session_id: ke.session_id,
+            run: 0,
+            roots: vec![vec![1]],
+            seen_slot_reserves: Vec::new(),
+        };
+        sign_message(&mut fp, k).expect("sign");
+        fp
+    }
+
+    fn accept(pool: &mut Pool<Tip>, msg: PoolMessage) {
+        let accepted = pool
+            .accept_message(&msg, 1, &no_mempool_spent)
+            .unwrap_or_else(|err| panic!("accepted: {err}"));
+        assert_eq!(accepted.len(), 1);
+    }
+
+    /// `70485d9e`: a key exchange counts as active in its epoch when its
+    /// own identity sent a ciphertexts message in its own session -- not
+    /// one in another session, not another identity's in its session,
+    /// and not a message of another type, which dcrd's switch passes over
+    /// (`mixing/mixpool/mixpool.go:830-843`).  The first two are what a
+    /// lookup keyed on only one of identity and session would get wrong.
+    #[test]
+    fn active_peers_pair_a_key_exchange_with_its_own_ciphertexts() {
+        let mut pool = pool();
+        let epoch = NOW_SECS;
+        let other_epoch = NOW_SECS - 60;
+        let [a, b, c, d, e, f] = [1, 2, 3, 4, 5, 6].map(key);
+        let prs: Vec<MsgMixPairReq> = [&a, &b, &c, &d, &e, &f]
+            .iter()
+            .zip(1u8..)
+            .map(|((k, id), seed)| pair_request(k, *id, seed))
+            .collect();
+        for pr in &prs {
+            accept(&mut pool, PoolMessage::PR(pr.clone()));
+        }
+        let [pa, pb, pc, pd, pe, pf] = [&prs[0], &prs[1], &prs[2], &prs[3], &prs[4], &prs[5]];
+
+        // A: one session in the epoch, with its ciphertexts.
+        let ke = key_exchange(&a.0, a.1, &[pa], pa, epoch);
+        accept(&mut pool, PoolMessage::KE(Box::new(ke.clone())));
+        accept(&mut pool, PoolMessage::CT(ciphertexts(&a.0, a.1, &ke)));
+
+        // B: a key exchange in the epoch without ciphertexts, and
+        // ciphertexts in its session of another epoch.
+        let ke = key_exchange(&b.0, b.1, &[pb], pb, epoch);
+        accept(&mut pool, PoolMessage::KE(Box::new(ke)));
+        let ke = key_exchange(&b.0, b.1, &[pb], pb, other_epoch);
+        accept(&mut pool, PoolMessage::KE(Box::new(ke.clone())));
+        accept(&mut pool, PoolMessage::CT(ciphertexts(&b.0, b.1, &ke)));
+
+        // C and D share a session; only D sends ciphertexts.
+        let ke_c = key_exchange(&c.0, c.1, &[pc, pd], pc, epoch);
+        let ke_d = key_exchange(&d.0, d.1, &[pc, pd], pd, epoch);
+        assert_eq!(ke_c.session_id, ke_d.session_id);
+        accept(&mut pool, PoolMessage::KE(Box::new(ke_c)));
+        accept(&mut pool, PoolMessage::KE(Box::new(ke_d.clone())));
+        accept(&mut pool, PoolMessage::CT(ciphertexts(&d.0, d.1, &ke_d)));
+
+        // E: two sessions in the epoch, each with its ciphertexts.
+        for other in [pa, pb] {
+            let ke = key_exchange(&e.0, e.1, &[pe, other], pe, epoch);
+            accept(&mut pool, PoolMessage::KE(Box::new(ke.clone())));
+            accept(&mut pool, PoolMessage::CT(ciphertexts(&e.0, e.1, &ke)));
+        }
+
+        // F: a slot reservation and a factored polynomial in its session
+        // of the epoch, but no ciphertexts.
+        let ke = key_exchange(&f.0, f.1, &[pf], pf, epoch);
+        accept(&mut pool, PoolMessage::KE(Box::new(ke.clone())));
+        accept(&mut pool, PoolMessage::SR(slot_reserve(&f.0, f.1, &ke)));
+        accept(&mut pool, PoolMessage::FP(factored_poly(&f.0, f.1, &ke)));
+
+        let active = pool.active_in_epoch(epoch);
+        let mut got: Vec<(IdPubKey, usize)> = active
+            .iter()
+            .map(|(id, (pr, kes))| {
+                assert_eq!(pr.identity, *id);
+                assert!(kes.iter().all(|ke| ke.identity == *id && ke.epoch == epoch));
+                (*id, kes.len())
+            })
+            .collect();
+        got.sort();
+        let mut want = vec![(a.1, 1), (d.1, 1), (e.1, 2)];
+        want.sort();
+        assert_eq!(got, want);
+
+        // The other epoch has B's one session.
+        let active = pool.active_in_epoch(other_epoch);
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[&b.1].1.len(), 1);
+    }
 }
