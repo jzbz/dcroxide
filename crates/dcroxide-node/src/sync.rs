@@ -138,6 +138,12 @@ fn adjusted_time_unix() -> i64 {
 impl SyncChain for NodeSyncChain {
     type Block = ArrivedBlock;
 
+    // The hash a block arrived with is the one its reader computed from
+    // it, so the manager does not hash the header again.
+    fn block_hash(block: &ArrivedBlock) -> Hash {
+        block.hash()
+    }
+
     fn best_header(&mut self) -> (Hash, i64) {
         self.locked().best_header()
     }
@@ -936,6 +942,57 @@ mod tests {
                 .process_block(&arrived)
                 .expect_err("the chain has the block");
             assert!(failure.is_duplicate_block, "{}", failure.message);
+        }
+    }
+
+    /// The hash a block arrived with travels with it from its reader to
+    /// the chain: the sync manager is answered with it, and the chain
+    /// processes the block with it.  With the headers already in the
+    /// index and every block fully validated, as here, the one header
+    /// the chain still hashes for a block that arrived hashed is its
+    /// parent's, where the reorganization checks the parent it was
+    /// handed.  A block that arrived without hashes has its header
+    /// hashed once for the sync manager and once by the chain.  (A block
+    /// added without full validation, as the ancestors of the assumed
+    /// valid block are, has its header hashed once more either way, by
+    /// the view that connects it; the chain's own tests count that.)
+    #[test]
+    fn a_blocks_hash_travels_with_it_from_its_reader_to_the_chain() {
+        use dcroxide_wire::header_hashes_on_this_thread;
+
+        for arrives_hashed in [true, false] {
+            let (mut sync_chain, chain, blocks) = regnet_sync_chain();
+            for block in &blocks {
+                sync_chain
+                    .process_block_header(&block.header)
+                    .expect("header");
+            }
+            for (i, block) in blocks.iter().enumerate() {
+                let hash = block.header.block_hash();
+                let arrived = if arrives_hashed {
+                    ArrivedBlock::Hashed(HashedBlock::new(Arc::clone(block)))
+                } else {
+                    ArrivedBlock::Plain(Arc::clone(block))
+                };
+                let own = u64::from(!arrives_hashed);
+
+                let before = header_hashes_on_this_thread();
+                assert_eq!(NodeSyncChain::block_hash(&arrived), hash, "block {i}");
+                assert_eq!(
+                    header_hashes_on_this_thread() - before,
+                    own,
+                    "block {i} (hashed: {arrives_hashed}): the sync manager's hash"
+                );
+
+                let before = header_hashes_on_this_thread();
+                assert_eq!(sync_chain.process_block(&arrived).expect("accepted"), 0);
+                assert_eq!(
+                    header_hashes_on_this_thread() - before,
+                    own + 1,
+                    "block {i} (hashed: {arrives_hashed}): the chain's hashes"
+                );
+                assert_eq!(chain.lock().expect("chain").best_snapshot().hash, hash);
+            }
         }
     }
 

@@ -751,6 +751,35 @@ impl Transaction {
         )
     }
 
+    /// [`Self::store_block`] for a caller that holds the hash of the
+    /// block's header, which is then not hashed again here: the same
+    /// checks in the same order, the same row and the same bytes (dcrd
+    /// `StoreBlock` reads `block.Hash()`, the hash its `dcrutil.Block`
+    /// computed as the block was wrapped, `ffldb/db.go:1169`,
+    /// `dcrutil/block.go:92-94`, `:288-293`).
+    ///
+    /// The hash must be that of `block.header`: it keys the block index
+    /// row and the pending set, and nothing here can tell another hash
+    /// from the right one short of hashing the header, which is what
+    /// this entry exists to spare.  [`Self::store_block_raw`] makes that
+    /// comparison because its bytes come from outside; a caller of this
+    /// one hands in the hash it computed from the very block it lends.
+    /// Under debug assertions the pair is checked.
+    pub fn store_block_hashed(
+        &self,
+        hash: &Hash,
+        block: &dcroxide_wire::MsgBlock,
+    ) -> Result<(), Error> {
+        debug_assert_eq!(
+            *hash,
+            dcroxide_chainhash::hash_h(&block.header.serialize()),
+            "the hash handed in with a block is not its header's"
+        );
+        self.store_block_with(hash, Some(block.header.height), || {
+            Ok(PendingBlock::Bytes(block.serialize()))
+        })
+    }
+
     /// Store a block given its hash and raw serialized bytes; the raw
     /// entry point used by bulk import.
     ///
@@ -822,14 +851,18 @@ impl Transaction {
         })
     }
 
-    /// The body of [`Self::store_block`], [`Self::store_block_raw`] and
-    /// [`Self::store_block_record`], in dcrd `StoreBlock`'s order: the
-    /// transaction checks and the existence check, and only then the
-    /// block's bytes (dcrd `block.Bytes()`, whose failure is
-    /// `ErrDriverSpecific`).  `height` is the one the block's header
-    /// records, for the existence check; it is `None` only for bytes
-    /// that `bytes` refuses as too short to hold a header.  The row is
-    /// filed under the height the stored bytes record.
+    /// The body of [`Self::store_block`], [`Self::store_block_hashed`],
+    /// [`Self::store_block_raw`] and [`Self::store_block_record`], in dcrd
+    /// `StoreBlock`'s order: the transaction checks and the existence
+    /// check, and only then the block's bytes (dcrd `block.Bytes()`,
+    /// whose failure is `ErrDriverSpecific`).  `hash` is taken as given:
+    /// `store_block` computes it from the block, `store_block_raw` and
+    /// `store_block_record` refuse bytes whose header does not hash to
+    /// it, and `store_block_hashed` relies on its caller.  `height` is
+    /// the one the block's header records, for the existence check; it
+    /// is `None` only for bytes that `bytes` refuses as too short to
+    /// hold a header.  The row is filed under the height the stored
+    /// bytes record.
     fn store_block_with(
         &self,
         hash: &Hash,

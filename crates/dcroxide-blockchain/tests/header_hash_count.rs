@@ -8,47 +8,40 @@
 //! recent blocks and the stored block, the key of the contextual merkle
 //! check and the filter lookup all read that one hash (`process.go:452`,
 //! `validate.go:2031`, `:2111`, `ffldb/db.go:1169`, `chain.go:989`).
-//! `dcroxide_wire::MsgBlock` caches nothing, and each of those steps
-//! hashes the header of the block it is handed, as does the contextual
-//! proof of work check while the version 1 proof of work applies, but
-//! for the store when the block arrives with its record for the block
-//! files (below).
+//! `dcroxide_wire::MsgBlock` caches nothing.  A processing call
+//! therefore takes the block's hash once, from the `HashedBlock` the
+//! block arrived in or by hashing the header where it starts, and hands
+//! it to each of those steps and to the contextual proof of work check,
+//! which compares that hash with the target while the version 1 proof
+//! of work applies.
 //!
 //! These tests count the calls of `BlockHeader::block_hash` on the
 //! processing thread for blocks that extend the tip of a chain over a
 //! database, with the header already in the index, as during the
-//! initial chain sync, and that arrive without such a record.  What a
-//! call hashes depends on how the block is validated:
+//! initial chain sync.  What a call still hashes depends on how the
+//! block is validated:
 //!
-//! - A block that is fully validated has its header hashed where the
-//!   call starts, as its data is accepted, in the store, by the
-//!   contextual proof of work check and for the key of the contextual
-//!   merkle check, and once more for the record of a merkle commitment
-//!   that the agenda's state proves before the data is accepted.  The
+//! - A block that is fully validated costs one header hash: the
 //!   reorganization's check that the block it was handed as the parent
-//!   is the parent hashes the parent's header.
+//!   is the parent, which hashes the parent's header.
 //! - A block added without full validation, as in a bulk import and as
-//!   the ancestors of the assumed valid block are, has its header hashed
-//!   twice more: for the filter lookup and by the view that connects
-//!   it, for the best hash it records.
+//!   the ancestors of the assumed valid block are, costs that and one
+//!   more: the view that connects it hashes the block's header for the
+//!   best hash it records.
 //!
-//! The counts are the same for each way these tests hand a block over:
-//! lent to `Chain::process_block`, shared with
-//! `Chain::process_shared_block`, or in a `HashedBlock` without a
-//! record to `Chain::process_hashed_block`.  The hash a `HashedBlock`
-//! carries is not one the chain reads.  A `HashedBlock` that also
-//! carries the block's record for the block files
-//! (`HashedBlock::record`), as one made by a connection's `peer-reader`
-//! thread does, is stored through `Transaction::store_block_record`,
-//! which compares the hash it is handed with the one the record took of
-//! its header as it was laid out and hashes no header itself.  Such a
-//! block costs one header hash fewer than the counts here, the store's,
-//! and these tests do not make one.
+//! A block that arrives without hashes costs its own hash on top, once.
+//! The counts do not depend on whether the header commitments agenda is
+//! decided for the block.
+//!
+//! The hash a `HashedBlock` is made with is hashed where it is made,
+//! here before the count starts and in the daemon on the thread that
+//! read the block.
 //!
 //! The counter sees calls of `BlockHeader::block_hash` only.  A header
-//! hashed from serialized bytes is not counted:
-//! `Transaction::store_block_raw` does that to check the hash it is
-//! given, which no step of these calls goes through.
+//! hashed from serialized bytes is not counted: the debug assertions
+//! that check a hash handed in beside its header do that on purpose, and
+//! `Transaction::store_block_raw` does it to check the hash it is given,
+//! which no step of these calls goes through.
 
 // Test-harness arithmetic over small counts.
 #![allow(clippy::arithmetic_side_effects)]
@@ -93,22 +86,23 @@ enum Validation {
 /// by how the block is validated, whether the header commitments agenda
 /// is decided for it, and how it arrived.
 const HEADER_HASHES_PER_BLOCK: [(Validation, bool, Arrival, u64); 12] = [
-    (Validation::Full, true, Arrival::Hashed, 7),
-    (Validation::Full, true, Arrival::Shared, 7),
-    (Validation::Full, true, Arrival::Borrowed, 7),
-    (Validation::Full, false, Arrival::Hashed, 6),
-    (Validation::Full, false, Arrival::Shared, 6),
-    (Validation::Full, false, Arrival::Borrowed, 6),
-    (Validation::FastAdd, true, Arrival::Hashed, 9),
-    (Validation::FastAdd, true, Arrival::Shared, 9),
-    (Validation::FastAdd, true, Arrival::Borrowed, 9),
-    (Validation::FastAdd, false, Arrival::Hashed, 8),
-    (Validation::FastAdd, false, Arrival::Shared, 8),
-    (Validation::FastAdd, false, Arrival::Borrowed, 8),
+    (Validation::Full, true, Arrival::Hashed, 1),
+    (Validation::Full, true, Arrival::Shared, 2),
+    (Validation::Full, true, Arrival::Borrowed, 2),
+    (Validation::Full, false, Arrival::Hashed, 1),
+    (Validation::Full, false, Arrival::Shared, 2),
+    (Validation::Full, false, Arrival::Borrowed, 2),
+    (Validation::FastAdd, true, Arrival::Hashed, 2),
+    (Validation::FastAdd, true, Arrival::Shared, 3),
+    (Validation::FastAdd, true, Arrival::Borrowed, 3),
+    (Validation::FastAdd, false, Arrival::Hashed, 2),
+    (Validation::FastAdd, false, Arrival::Shared, 3),
+    (Validation::FastAdd, false, Arrival::Borrowed, 3),
 ];
 
-/// The header hashes of one `Chain::maybe_accept_block_data` call.
-const HEADER_HASHES_OF_DATA_ACCEPTANCE: u64 = 2;
+/// The header hashes of one `Chain::maybe_accept_block_data` call, which
+/// is handed no hash.
+const HEADER_HASHES_OF_DATA_ACCEPTANCE: u64 = 1;
 
 /// Regnet, with the header commitments agenda forced to "no" when
 /// `decided` is set (dcrd's `forceDeploymentResult`), which is the state
@@ -193,7 +187,7 @@ fn header_hashes_per_block(
     for (i, block) in blocks.iter().enumerate() {
         let what = format!("block {i} ({validation:?}, {arrival:?})");
         let shared = Arc::new(block.clone());
-        // Hashed where the block was read, before the count starts.
+        // Hashed where the block was read, not by the processing call.
         let hashed = HashedBlock::new(Arc::clone(&shared));
         let before = header_hashes_on_this_thread();
         let (fork_len, errs) = match arrival {
@@ -215,10 +209,12 @@ fn header_hashes_per_block(
 }
 
 /// With its header already in the index, each block is connected with
-/// the header hashes the table gives for it, the same for every block
-/// and however it arrives: one more where the merkle commitment is
-/// proven and recorded before the data is accepted, and two more for a
-/// block added without full validation.
+/// the header hashes the table gives for it, the same for every block:
+/// the parent's for a block that is fully validated, the parent's and
+/// the one the connecting view makes for a block added without full
+/// validation, and its own on top, once, when it arrives without
+/// hashes.  That holds whether or not the merkle commitment is proven
+/// and recorded before the data is accepted.
 #[test]
 fn a_connected_block_costs_the_processing_thread_the_header_hashes_of_the_table() {
     let (now, blocks) = tip_extensions(40);
@@ -240,7 +236,8 @@ fn a_connected_block_costs_the_processing_thread_the_header_hashes_of_the_table(
 
 /// A block whose header is not in the index yet has it accepted first,
 /// which hashes the header for itself.  What that adds is the same
-/// however the block arrives.
+/// however the block arrives: the hash a block arrives with spares the
+/// processing call exactly one header hash there too.
 #[test]
 fn accepting_the_header_adds_the_same_hashes_however_the_block_arrives() {
     let (now, blocks) = tip_extensions(20);
@@ -265,10 +262,10 @@ fn accepting_the_header_adds_the_same_hashes_however_the_block_arrives() {
     }
 }
 
-/// `Chain::maybe_accept_block_data` hashes the header of the block it
-/// is lent and files the block under that hash: in the mirror of recent
-/// blocks and, over a database, in the store, which hashes the header
-/// again, as the bytes the block serializes to.
+/// `Chain::maybe_accept_block_data` is handed no hash, so it hashes the
+/// header of the block it is lent, once, and files the block under that
+/// hash: in the mirror of recent blocks and, over a database, in the
+/// store, as the bytes the block serializes to.
 #[test]
 fn accepted_data_is_filed_under_the_hash_of_its_header() {
     let (now, blocks) = tip_extensions(3);

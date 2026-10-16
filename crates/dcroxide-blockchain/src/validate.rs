@@ -1578,6 +1578,44 @@ pub fn check_proof_of_work_context(
     no_pow_check: bool,
     params: &Params,
 ) -> Result<(), RuleError> {
+    check_proof_of_work_context_with_hash(view, header, None, prev_height, no_pow_check, params)
+}
+
+/// Panic, under debug assertions, unless `block_hash` is the hash of the
+/// header.  Every check that is handed a header's hash beside the
+/// header calls this first.  The comparison hashes the serialized header
+/// directly and not through `BlockHeader::block_hash`, so that it is
+/// not among the calls the tests count: it is no hash a caller asked
+/// for.
+#[track_caller]
+pub(crate) fn debug_assert_block_hash(header: &dcroxide_wire::BlockHeader, block_hash: &Hash) {
+    debug_assert_eq!(
+        *block_hash,
+        dcroxide_chainhash::hash_h(&header.serialize()),
+        "the hash handed in with a block header is not that header's"
+    );
+}
+
+/// [`check_proof_of_work_context`] given the header's block hash when
+/// the caller holds it, which must be the hash of this very header.
+/// The version 1 proof of work hash is the block hash
+/// (`dcroxide_wire::BlockHeader::pow_hash_v1`; dcrd `PowHashV1`,
+/// `wire/blockheader.go:109-111`, returns `BlockHash`), so a hash in
+/// hand is compared with the target as it is and the header is not
+/// hashed again.  The version 2 hash is another function of the header
+/// and is always computed here.
+pub(crate) fn check_proof_of_work_context_with_hash(
+    view: &impl FullChainView,
+    header: &dcroxide_wire::BlockHeader,
+    block_hash: Option<&Hash>,
+    prev_height: i64,
+    no_pow_check: bool,
+    params: &Params,
+) -> Result<(), RuleError> {
+    if let Some(block_hash) = block_hash {
+        debug_assert_block_hash(header, block_hash);
+    }
+
     // Nothing to do when the flag to avoid proof of work checks is
     // set.
     if no_pow_check {
@@ -1591,7 +1629,10 @@ pub fn check_proof_of_work_context(
     let pow_hash = if is_blake3_active {
         header.pow_hash_v2()
     } else {
-        header.pow_hash_v1()
+        match block_hash {
+            Some(block_hash) => *block_hash,
+            None => header.pow_hash_v1(),
+        }
     };
     dcroxide_standalone::check_proof_of_work_hash(&pow_hash, header.bits)
         .map_err(standalone_to_chain_rule_error)
@@ -1617,6 +1658,34 @@ pub fn check_block_header_context(
     parent_final_state: [u8; 6],
     params: &Params,
 ) -> Result<(), RuleError> {
+    check_block_header_context_with_hash(
+        view,
+        header,
+        None,
+        prev_height,
+        fast_add,
+        no_pow_check,
+        parent_pool_size,
+        parent_final_state,
+        params,
+    )
+}
+
+/// [`check_block_header_context`] given the header's block hash when
+/// the caller holds it, which must be the hash of this very header
+/// ([`check_proof_of_work_context_with_hash`]).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn check_block_header_context_with_hash(
+    view: &impl FullChainView,
+    header: &dcroxide_wire::BlockHeader,
+    block_hash: Option<&Hash>,
+    prev_height: Option<i64>,
+    fast_add: bool,
+    no_pow_check: bool,
+    parent_pool_size: u32,
+    parent_final_state: [u8; 6],
+    params: &Params,
+) -> Result<(), RuleError> {
     // The genesis block is valid by definition.
     let Some(prev_height) = prev_height else {
         return Ok(());
@@ -1625,7 +1694,14 @@ pub fn check_block_header_context(
     // Ensure the proof of work hash is less than the target value
     // described by the bits using the correct hash algorithm; the bits
     // have already been validated to be in range by the sanity checks.
-    check_proof_of_work_context(view, header, prev_height, no_pow_check, params)?;
+    check_proof_of_work_context_with_hash(
+        view,
+        header,
+        block_hash,
+        prev_height,
+        no_pow_check,
+        params,
+    )?;
 
     if !fast_add {
         let prev_node = crate::difficulty::ChainView::node(view, prev_height).expect("prev node");
@@ -4152,18 +4228,58 @@ pub fn check_block_context(
     merkle_checks: &mut impl MerkleCheckCache,
     params: &Params,
 ) -> Result<(), RuleError> {
+    check_block_context_with_hash(
+        view,
+        block,
+        None,
+        prev_height,
+        fast_add,
+        no_pow_check,
+        parent_pool_size,
+        parent_final_state,
+        parent_stake_node,
+        merkle_checks,
+        params,
+    )
+}
+
+/// [`check_block_context`] given the block's hash when the caller holds
+/// it, which must be the hash of this very block's header (dcrd
+/// `checkBlockContext` reads `block.Hash()`, `validate.go:2111`, the
+/// hash its `dcrutil.Block` computed as the block was wrapped).  The
+/// hash in hand is the key of the recent merkle checks and, where the
+/// version 1 proof of work applies, the hash compared with the target;
+/// without one the header is hashed for each.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn check_block_context_with_hash(
+    view: &impl FullChainView,
+    block: &MsgBlock,
+    block_hash: Option<&Hash>,
+    prev_height: Option<i64>,
+    fast_add: bool,
+    no_pow_check: bool,
+    parent_pool_size: u32,
+    parent_final_state: [u8; 6],
+    parent_stake_node: Option<&dcroxide_stake::ticketnode::Node>,
+    merkle_checks: &mut impl MerkleCheckCache,
+    params: &Params,
+) -> Result<(), RuleError> {
     // The genesis block is valid by definition.
     let Some(prev_height) = prev_height else {
         return Ok(());
     };
 
     let header = &block.header;
+    if let Some(block_hash) = block_hash {
+        debug_assert_block_hash(header, block_hash);
+    }
 
     // Perform all block header related validation checks that depend
     // on having the full block data for all of its ancestors.
-    check_block_header_context(
+    check_block_header_context_with_hash(
         view,
         header,
+        block_hash,
         Some(prev_height),
         fast_add,
         no_pow_check,
@@ -4179,7 +4295,10 @@ pub fn check_block_context(
     // no need to check them again once they have been proven valid; a
     // pass is recorded even if a later check fails, as in dcrd
     // (`validate.go:2125-2143`).
-    let block_hash = header.block_hash();
+    let block_hash = match block_hash {
+        Some(block_hash) => *block_hash,
+        None => header.block_hash(),
+    };
     if !merkle_checks.contains(&block_hash) {
         check_merkle_roots_context(view, block, prev_height, params)?;
         merkle_checks.put(block_hash);

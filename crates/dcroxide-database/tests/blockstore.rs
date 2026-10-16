@@ -378,6 +378,114 @@ fn block_index_rows_are_keyed_by_height_then_hash() {
     assert_eq!(block_index_rows(&db), want, "the store");
 }
 
+/// A block stored under a hash the caller holds is the block
+/// `store_block` stores: the same record in the block file, the same
+/// index row and the same answers, with the same errors for a block the
+/// database has and for a transaction that cannot write.  The one
+/// difference is that the header is not hashed by the store.
+#[test]
+fn a_block_stored_under_its_hash_in_hand_is_stored_as_store_block_stores_it() {
+    let dir = TempDir::new().expect("tempdir");
+    let mut rng = SplitMix64::from_entropy("db-block-hash-in-hand");
+    let blocks: Vec<MsgBlock> = (0..10).map(|_| make_block(&mut rng)).collect();
+    let hashes = keys_of(&blocks);
+    let serialized: Vec<Vec<u8>> = blocks.iter().map(MsgBlock::serialize).collect();
+
+    let hashing = Database::create(&Options::new(dir.path().join("hashing"), NET)).expect("create");
+    let handed = Database::create(&Options::new(dir.path().join("handed"), NET)).expect("create");
+
+    // Half the blocks in one transaction and the rest one a transaction.
+    let store = |db: &Database, in_hand: bool, range: std::ops::Range<usize>| {
+        db.update(|tx| {
+            for i in range.clone() {
+                let before = dcroxide_wire::header_hashes_on_this_thread();
+                if in_hand {
+                    tx.store_block_hashed(&hashes[i].0, &blocks[i])?;
+                } else {
+                    tx.store_block(&blocks[i])?;
+                }
+                assert_eq!(
+                    dcroxide_wire::header_hashes_on_this_thread() - before,
+                    u64::from(!in_hand),
+                    "block {i}"
+                );
+                // The block is pending under its hash and height either
+                // way, and a second store of it is refused.
+                assert!(tx.has_block(&hashes[i].0, hashes[i].1)?);
+                assert_eq!(tx.fetch_block(&hashes[i].0, hashes[i].1)?, serialized[i]);
+                let again = if in_hand {
+                    tx.store_block_hashed(&hashes[i].0, &blocks[i])
+                } else {
+                    tx.store_block(&blocks[i])
+                };
+                let err = again.expect_err("the block is pending");
+                assert_eq!(err.kind, ErrorKind::BlockExists);
+                assert_eq!(
+                    err.description,
+                    format!("block {} already exists", hashes[i].0)
+                );
+            }
+            Ok(())
+        })
+        .expect("store");
+    };
+    for (db, in_hand) in [(&hashing, false), (&handed, true)] {
+        store(db, in_hand, 0..5);
+        for i in 5..10 {
+            store(db, in_hand, i..i + 1);
+        }
+    }
+
+    // The same rows and the same blocks.
+    assert_eq!(block_index_rows(&handed), block_index_rows(&hashing));
+    for db in [&hashing, &handed] {
+        db.view(|tx| {
+            assert_eq!(tx.has_blocks(&hashes)?, vec![true; hashes.len()]);
+            assert_eq!(tx.fetch_blocks(&hashes)?, serialized);
+            Ok(())
+        })
+        .expect("view");
+    }
+
+    // A committed block is refused again, and a read-only transaction
+    // cannot store, with the texts `store_block` gives.
+    let refusals = |db: &Database, in_hand: bool| -> Vec<(ErrorKind, String)> {
+        let attempt = |tx: &dcroxide_database::Transaction| {
+            if in_hand {
+                tx.store_block_hashed(&hashes[0].0, &blocks[0])
+            } else {
+                tx.store_block(&blocks[0])
+            }
+        };
+        let mut errors = Vec::new();
+        let exists = db.update(|tx| attempt(tx)).expect_err("the block exists");
+        errors.push((exists.kind, exists.description));
+        db.view(|tx| {
+            let read_only = attempt(tx).expect_err("the transaction cannot write");
+            errors.push((read_only.kind, read_only.description));
+            Ok(())
+        })
+        .expect("view");
+        errors
+    };
+    let refused = refusals(&handed, true);
+    assert_eq!(refused, refusals(&hashing, false));
+    assert_eq!(
+        refused.iter().map(|(kind, _)| *kind).collect::<Vec<_>>(),
+        vec![ErrorKind::BlockExists, ErrorKind::TxNotWritable]
+    );
+
+    // The same bytes in the block files, once both are closed.
+    hashing.close().expect("close");
+    handed.close().expect("close");
+    let block_file = |name: &str| {
+        std::fs::read(dir.path().join(name).join("000000000.fdb")).expect("read block file")
+    };
+    let records = block_file("handed");
+    assert!(records.len() > serialized.iter().map(Vec::len).sum::<usize>());
+    assert_eq!(records, block_file("hashing"));
+}
+
 /// Every row of the internal block index in walk order: the key, and
 /// the header that follows the block's 12-byte location.
 fn block_index_rows(db: &Database) -> Vec<(Vec<u8>, Vec<u8>)> {

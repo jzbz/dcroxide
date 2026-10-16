@@ -66,6 +66,32 @@
 //! assertions they are compared with roots built from those leaves
 //! again.
 //!
+//! # The block hash
+//!
+//! The hash of a block's header follows the same rule on a shorter
+//! path.  dcrd's `dcrutil.Block` computes it as the block is wrapped
+//! and hands it out from then on (`dcrutil/block.go:92-94`,
+//! `:288-293`); `dcroxide_wire::MsgBlock` caches nothing.  A processing
+//! call takes the hash once, out of the [`HashedBlock`] the block
+//! arrived in or by hashing the header where the call starts, and hands
+//! it down lexically to the steps that are lent that same block: the
+//! record of a proven merkle commitment, the acceptance of the data and
+//! the store.  It is filed in the slot beside the transaction hashes,
+//! and two later steps read it from there by allocation identity, as the
+//! connect reads the transaction hashes: the contextual checks made as
+//! the block being processed is accepted, and the filter lookup made as
+//! it is attached when it needs no full validation.  No block's hash is
+//! taken from the key it is held under in the `blocks` mirror, which is
+//! a public map that promises nothing about its keys, or from an index
+//! entry.  So every other block is hashed where its hash is needed, the
+//! parent that the reorganization's attach loop is handed among them:
+//! that loop hashes its header to check that it is the parent, once for
+//! each block it attaches.  The view that connects a block attached
+//! without full validation is handed no hash either, and hashes the
+//! block's header for the best hash it records.  Under debug assertions
+//! every function that is handed a header's hash hashes the header again
+//! and compares.
+//!
 //! # The script check reads them too
 //!
 //! The block script check of the connect checks

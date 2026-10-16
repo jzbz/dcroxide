@@ -540,9 +540,22 @@ pub trait SyncChain {
     /// decoded into, shared by reference count, with whatever the chain
     /// wants carried beside it (dcrd passes one `*dcrutil.Block`, which
     /// also holds the hashes computed from it).  The manager reads the
-    /// block through it and never looks at the rest.  A block from a
-    /// local source is wrapped with `From`.
+    /// block through it, asks [`Self::block_hash`] for its hash and
+    /// never looks at the rest.  A block from a local source is wrapped
+    /// with `From`.
     type Block: core::ops::Deref<Target = MsgBlock> + From<Arc<MsgBlock>>;
+
+    /// The hash of the block's header, which `on_block` asks for once
+    /// (dcrd `block.Hash()` in `OnBlock`,
+    /// `internal/netsync/manager.go:1221`: a `dcrutil.Block` computes
+    /// its hash as it is made and hands that out from then on,
+    /// `dcrutil/block.go:92-94`, `:288-293`).  The default hashes the
+    /// header.  A chain whose block type carries the hash computed from
+    /// that very block returns that one, and it must be the hash the
+    /// default would give.
+    fn block_hash(block: &Self::Block) -> Hash {
+        block.header.block_hash()
+    }
 
     /// The hash and height of the current best known header (dcrd
     /// `BestHeader`).
@@ -2129,7 +2142,7 @@ impl<C: SyncChain, T: SyncTxPool, M: SyncMixPool> SyncManager<C, T, M> {
 
         // The remote peer is misbehaving when the block was not
         // requested.
-        let block_hash = block.header.block_hash();
+        let block_hash = C::block_hash(block);
         self.mark_peer_holds(peer_id, InvType::BLOCK, block_hash);
         let requested = self.requested_blocks.get(&block_hash) == Some(&peer_id);
         if !requested {

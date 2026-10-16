@@ -19,6 +19,9 @@ dcroxide-wire = { path = "../dcroxide-wire" }
 [dev-dependencies]
 dcroxide-blockchain = { path = "../dcroxide-blockchain" }
 dcroxide-testutil = { path = "../dcroxide-testutil" }
+# The same crate as above, with its counter of hashed headers for the
+# test that the manager takes a block's hash from the chain's block type.
+dcroxide-wire = { path = "../dcroxide-wire", features = ["count-header-hashes"] }
 
 [lints]
 workspace = true

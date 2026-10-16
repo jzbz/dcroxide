@@ -17,6 +17,9 @@ redb = "4"
 [dev-dependencies]
 crc = "3.4"
 dcroxide-testutil = { path = "../dcroxide-testutil" }
+# The same crate as above, with its counter of hashed headers for the
+# test that a block stored under a hash in hand is not hashed again.
+dcroxide-wire = { path = "../dcroxide-wire", features = ["count-header-hashes"] }
 tempfile = "3"
 
 [lints]

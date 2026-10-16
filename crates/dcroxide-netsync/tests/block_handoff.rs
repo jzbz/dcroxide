@@ -7,6 +7,12 @@
 //! allocation, so nothing between the peer and the chain copies the
 //! block.  A block from a local source (the RPC server, the CPU miner)
 //! is borrowed, and the chain is handed a copy of it.
+//!
+//! dcrd's `OnBlock` also reads the block's hash from that
+//! `dcrutil.Block` (`internal/netsync/manager.go:1221`).  The manager
+//! asks the chain for the hash of a block of its type, so a type that
+//! carries the hash computed from the block saves hashing the header
+//! again.
 
 use std::sync::Arc;
 
@@ -21,12 +27,15 @@ use dcroxide_wire::{
     PROTOCOL_VERSION, ServiceFlag, TxOut,
 };
 
-/// A chain's own block type: the shared block, and a note of how it
-/// came to be.
+/// A chain's own block type: the shared block, a note of how it came to
+/// be, and the hash it carries, if it carries one.
 struct Carried {
     block: Arc<MsgBlock>,
     /// Whether the manager wrapped the block itself, with `From`.
     wrapped_by_the_manager: bool,
+    /// The hash the chain answers for this block, in place of hashing
+    /// its header.
+    hash: Option<Hash>,
 }
 
 impl std::ops::Deref for Carried {
@@ -42,6 +51,7 @@ impl From<Arc<MsgBlock>> for Carried {
         Carried {
             block,
             wrapped_by_the_manager: true,
+            hash: None,
         }
     }
 }
@@ -58,6 +68,13 @@ struct KeepingChain {
 
 impl SyncChain for KeepingChain {
     type Block = Carried;
+
+    fn block_hash(block: &Carried) -> Hash {
+        match block.hash {
+            Some(hash) => hash,
+            None => block.header.block_hash(),
+        }
+    }
 
     fn best_header(&mut self) -> (Hash, i64) {
         (Hash([0x39; 32]), 3)
@@ -234,6 +251,7 @@ fn a_peers_block_reaches_the_chain_as_the_same_allocation() {
     let carried = Carried {
         block: Arc::clone(&block),
         wrapped_by_the_manager: false,
+        hash: None,
     };
     let actions = m.on_block(7, &carried);
     assert!(
@@ -260,6 +278,79 @@ fn a_peers_block_reaches_the_chain_as_the_same_allocation() {
     // The caller's, the one in the value it arrived in and the chain's:
     // the manager kept none.
     assert_eq!(Arc::strong_count(&block), 3);
+}
+
+/// The manager takes a delivered block's hash from the chain's block
+/// type and hashes no header itself: a block that carries its hash goes
+/// through `on_block` without a header being hashed, and one that does
+/// not has its header hashed once, by the chain's answer.  Either way
+/// the block is the one that was requested and reaches the chain.
+#[test]
+fn a_delivered_blocks_hash_is_the_one_its_type_carries() {
+    for carries_its_hash in [true, false] {
+        let block = Arc::new(block());
+        let hash = block.header.block_hash();
+        let mut m = manager(vec![hash]);
+        request_from_sync_peer(&mut m, &block);
+
+        let carried = Carried {
+            block: Arc::clone(&block),
+            wrapped_by_the_manager: false,
+            hash: carries_its_hash.then_some(hash),
+        };
+        let before = dcroxide_wire::header_hashes_on_this_thread();
+        let actions = m.on_block(7, &carried);
+        assert_eq!(
+            dcroxide_wire::header_hashes_on_this_thread() - before,
+            u64::from(!carries_its_hash),
+            "carries its hash: {carries_its_hash}"
+        );
+        assert!(
+            !actions
+                .iter()
+                .any(|action| matches!(action, Action::Disconnect { .. })),
+            "{actions:?}"
+        );
+        assert_eq!(
+            m.chain_mut().kept.len(),
+            1,
+            "the chain was handed the block"
+        );
+    }
+}
+
+/// The hash the chain's block type answers is the block's identity to
+/// the manager, for every use it makes of it: a block whose type
+/// answers another hash than the one requested is an unrequested block,
+/// named by that hash, and is not handed to the chain.
+#[test]
+fn the_manager_knows_a_delivered_block_by_the_hash_its_type_answers() {
+    let block = Arc::new(block());
+    let mut m = manager(vec![block.header.block_hash()]);
+    request_from_sync_peer(&mut m, &block);
+
+    let other = Hash([0x5a; 32]);
+    let carried = Carried {
+        block: Arc::clone(&block),
+        wrapped_by_the_manager: false,
+        hash: Some(other),
+    };
+    let actions = m.on_block(7, &carried);
+    assert!(
+        actions.iter().any(|action| matches!(
+            action,
+            Action::Log { message, .. }
+                if message.starts_with(&format!("Got unrequested block {other} from "))
+        )),
+        "{actions:?}"
+    );
+    assert!(
+        actions
+            .iter()
+            .any(|action| matches!(action, Action::Disconnect { peer: 7 })),
+        "{actions:?}"
+    );
+    assert!(m.chain_mut().kept.is_empty());
 }
 
 /// A block from a local source is borrowed: the manager wraps a copy of

@@ -111,6 +111,9 @@ rustix = { version = "1.1.4", default-features = false, features = ["std", "even
 [dev-dependencies]
 dcroxide-dcrec = { path = "../dcroxide-dcrec" }
 dcroxide-testutil = { path = "../dcroxide-testutil" }
+# The same crate as above, with its counter of hashed headers for the
+# test that a block's hash travels with it from its reader to the chain.
+dcroxide-wire = { path = "../dcroxide-wire", features = ["count-header-hashes"] }
 tempfile = "3"
 
 [lints]

@@ -400,7 +400,15 @@ pub struct Chain {
     /// the pointers), never by block hash.  The processing call empties
     /// it on entry and again on every return, so it is empty outside
     /// that call.
-    accepted_tx_hashes: Option<(Arc<MsgBlock>, Arc<BlockTxHashes>)>,
+    ///
+    /// The third member is the hash of that block's header: the one the
+    /// processing call computed from it or the block arrived with.  Two
+    /// steps that follow in the same call read it for that very
+    /// allocation (`accepted_block_hash`), where they would otherwise
+    /// hash the header again: the contextual checks made as the block is
+    /// accepted, and the filter lookup made as a block that needs no
+    /// full validation is attached.
+    accepted_tx_hashes: Option<(Arc<MsgBlock>, Arc<BlockTxHashes>, Hash)>,
     /// How many connects hashed their block's transactions again
     /// because the block was not the one being processed: the other
     /// blocks a reorganization attaches, a block linked by a later
@@ -3896,7 +3904,28 @@ impl Chain {
         block: &MsgBlock,
         view: &UtxoView,
     ) -> Result<FilterV2, RuleError> {
-        if let Some(filter) = self.filters.get(&block.header.block_hash().0) {
+        self.load_or_create_filter_with_hash(block, None, view)
+    }
+
+    /// [`Self::load_or_create_filter`] given the block's hash when the
+    /// caller holds it, which must be the hash of this very block's
+    /// header: the key a stored filter is looked up under (dcrd reads
+    /// `block.Hash()`, `chain.go:989`).  Without it the header is hashed
+    /// here.
+    fn load_or_create_filter_with_hash(
+        &self,
+        block: &MsgBlock,
+        block_hash: Option<&Hash>,
+        view: &UtxoView,
+    ) -> Result<FilterV2, RuleError> {
+        let block_hash = match block_hash {
+            Some(block_hash) => {
+                crate::validate::debug_assert_block_hash(&block.header, block_hash);
+                *block_hash
+            }
+            None => block.header.block_hash(),
+        };
+        if let Some(filter) = self.filters.get(&block_hash.0) {
             return Ok(filter.clone());
         }
         // dcrd `ruleError(ErrMissingTxOut, err.Error())`.
@@ -4041,7 +4070,14 @@ impl Chain {
                     Some(&mut stxos),
                     is_treasury_enabled,
                 )?;
-                filter = self.load_or_create_filter(&block, &view)?;
+                // A block added without full validation is attached
+                // here, so this lookup is made for every such block.
+                // When it is the block being processed the call already
+                // holds its hash; any other block's header is hashed by
+                // the lookup.
+                let block_hash = self.accepted_block_hash(&block);
+                filter =
+                    self.load_or_create_filter_with_hash(&block, block_hash.as_ref(), &view)?;
             } else {
                 // The block must pass all of the validation rules
                 // which depend on having the full block data for all
@@ -4054,10 +4090,17 @@ impl Chain {
                     let parent_stake_node = self
                         .fetch_stake_node(parent_id, params)
                         .map_err(stake_rule_error)?;
+                    // No hash is handed in.  The block being processed
+                    // reaches this check only when the one made as it
+                    // was accepted failed without marking it, or when
+                    // enough blocks were linked with it to push it out
+                    // of the recent checks; like any other block checked
+                    // here, it then has its header hashed by the check.
                     let context_result = check_block_context_for(
                         &self.store,
                         parent_id,
                         &block,
+                        None,
                         &parent_stake_node,
                         false,
                         &mut self.recent_merkle_checks,
@@ -4297,7 +4340,9 @@ impl Chain {
         params: &Params,
     ) -> Result<bool, RuleError> {
         let leaves = BlockMerkleLeaves::compute(block);
-        self.check_block_data_preconditions_with_leaves(block, &leaves, None, prev_node, params)
+        self.check_block_data_preconditions_with_leaves(
+            block, &leaves, None, None, prev_node, params,
+        )
     }
 
     /// [`Self::check_block_data_preconditions`] given the block's merkle
@@ -4305,14 +4350,23 @@ impl Chain {
     /// the roots of the two trees over them when the block arrived with
     /// those too.  The roots spare this call the building of the trees
     /// and change nothing else of it.
+    ///
+    /// `block_hash` is the hash of the block's header when the caller
+    /// holds it, the key a proven commitment is recorded under (dcrd
+    /// `block.Hash()`, `validate.go:2031`).  Without it the header is
+    /// hashed here once the commitment is proven.
     fn check_block_data_preconditions_with_leaves(
         &mut self,
         block: &MsgBlock,
         leaves: &BlockMerkleLeaves,
         roots: Option<&BlockMerkleRoots>,
+        block_hash: Option<&Hash>,
         prev_node: Option<NodeId>,
         params: &Params,
     ) -> Result<bool, RuleError> {
+        if let Some(block_hash) = block_hash {
+            crate::validate::debug_assert_block_hash(&block.header, block_hash);
+        }
         let proven = crate::validate::check_block_data_preconditions_with_leaves(
             block,
             leaves,
@@ -4332,7 +4386,10 @@ impl Chain {
         // agenda state is definitively known.  An eviction from the
         // bounded cache only means checking them again later.
         if proven {
-            self.recent_merkle_checks.put(block.header.block_hash());
+            self.recent_merkle_checks.put(match block_hash {
+                Some(block_hash) => *block_hash,
+                None => block.header.block_hash(),
+            });
         }
         Ok(proven)
     }
@@ -4389,15 +4446,23 @@ impl Chain {
     /// mirror's `Arc` of the block, where the connect that follows in
     /// the same call finds them (`tx_hashes_for`).  Without hashes
     /// nothing is filed, and that connect hashes the block itself.
+    ///
+    /// The hashes come with the hash of the block's header, which then
+    /// is not computed again here: it keys the mirror, the ticket
+    /// purchases and the stored block (dcrd reads `block.Hash()`
+    /// throughout `maybeAcceptBlockData`, `process.go:267-338`), and it
+    /// is filed with the hashes for the steps that follow in the same
+    /// call (`accepted_block_hash`).
     fn maybe_accept_block_data_with_hashes(
         &mut self,
         node: NodeId,
         arriving: ArrivingBlock<'_>,
-        tx_hashes: Option<&Arc<BlockTxHashes>>,
+        hashes: Option<(&Hash, &Arc<BlockTxHashes>)>,
         fast_add: bool,
         params: &Params,
     ) -> Result<Vec<NodeId>, RuleError> {
         let block = arriving.block();
+        let tx_hashes = hashes.map(|(_, tx_hashes)| tx_hashes);
         if self.index.node_status(&self.store, node).have_data() {
             return Ok(Vec::new());
         }
@@ -4441,15 +4506,22 @@ impl Chain {
         // caller's pointer (`process.go:571`).  A borrowed one is copied
         // here, the one copy of it the chain makes, because its caller
         // keeps its own.  Every later step shares the mirror's `Arc`.
-        let block_hash = block.header.block_hash();
+        let block_hash = match hashes {
+            Some((block_hash, _)) => {
+                crate::validate::debug_assert_block_hash(&block.header, block_hash);
+                *block_hash
+            }
+            None => block.header.block_hash(),
+        };
         let mirrored = arriving.shared();
         // The hashes go with the allocation the mirror holds, which is
         // the one the connect that follows in this call is handed.  It
         // is the block they were computed from or a field for field copy
-        // of it, so they are its hashes either way.
+        // of it, so they are its hashes either way, and the block hash
+        // is its header's.
         self.accepted_tx_hashes = tx_hashes.map(|tx_hashes| {
             tx_hashes.assert_for(&mirrored);
-            (Arc::clone(&mirrored), Arc::clone(tx_hashes))
+            (Arc::clone(&mirrored), Arc::clone(tx_hashes), block_hash)
         });
         self.blocks.insert(block_hash.0, mirrored);
         self.remember_ticket_purchases(
@@ -4471,7 +4543,10 @@ impl Chain {
             let stored = db.update(|tx| {
                 let stored = match record {
                     Some(record) => tx.store_block_record(&block_hash, record),
-                    None => tx.store_block(block),
+                    // The hash is this block's header's, computed from it
+                    // above or handed in with it, so the store does not
+                    // hash the header a second time.
+                    None => tx.store_block_hashed(&block_hash, block),
                 };
                 match stored {
                     Err(err) if err.kind == dcroxide_database::ErrorKind::BlockExists => Ok(()),
@@ -4528,11 +4603,16 @@ impl Chain {
                     Err(err) => return (nodes[..i].to_vec(), Some(stake_rule_error(err))),
                 }
             };
+            // The block being processed is checked with the hash the
+            // call already holds for it; any other linked block's header
+            // is hashed by the check.
+            let block_hash = self.accepted_block_hash(&block);
             if let Some(parent_stake_node) = &parent_stake_node
                 && let Err(err) = check_block_context_for(
                     &self.store,
                     parent_id,
                     &block,
+                    block_hash.as_ref(),
                     parent_stake_node,
                     fast_add,
                     &mut self.recent_merkle_checks,
@@ -4603,21 +4683,22 @@ impl Chain {
     /// [`Self::process_shared_block`] for a block that arrives with its
     /// hashes, made before it reached the chain ([`HashedBlock`]): the
     /// same checks in the same order and the same results, with the
-    /// block's transactions not hashed again here and its two merkle
-    /// trees not built here.  A block that also carries its record for
-    /// the block files ([`HashedBlock::record`]) is stored as that record
-    /// where another block is serialized, which leaves the same bytes in
-    /// the block files.
+    /// block's header and transactions not hashed again here and its two
+    /// merkle trees not built here.  A block that also carries its
+    /// record for the block files ([`HashedBlock::record`]) is stored as
+    /// that record where another block is serialized, which leaves the
+    /// same bytes in the block files.
     ///
-    /// The hashes are consulted exactly where [`Self::process_block`]
-    /// computes them, which is after the duplicate, known-invalid and
-    /// header checks; a block refused by one of those was hashed for
-    /// nothing, and is refused as it would have been.  The roots of the
-    /// trees are compared with the header where [`Self::process_block`]
-    /// builds and compares them, by the same code, which selects the
-    /// commitment by the agenda and combines the two under DCP0005.  The
-    /// block kept in the `blocks` mirror is the `Arc` the
-    /// [`HashedBlock`] owns.
+    /// Each hash is consulted exactly where [`Self::process_block`]
+    /// computes it.  The block hash is read at the start, where that
+    /// hashes the header, for the duplicate and known-invalid checks.
+    /// The transaction hashes are read after those and the header
+    /// checks; a block refused by one of them was hashed for nothing,
+    /// and is refused as it would have been.  The roots of the trees are
+    /// compared with the header where [`Self::process_block`] builds and
+    /// compares them, by the same code, which selects the commitment by
+    /// the agenda and combines the two under DCP0005.  The block kept in
+    /// the `blocks` mirror is the `Arc` the [`HashedBlock`] owns.
     pub fn process_hashed_block(
         &mut self,
         block: &HashedBlock,
@@ -4655,9 +4736,27 @@ impl Chain {
         let block = arriving.block();
         self.observe_adjusted_time(adjusted_time_unix);
 
+        // The block's hash, for the whole call: the one a block that was
+        // hashed before it reached the chain arrived with, computed from
+        // the header of the very block that value owns, and otherwise
+        // the header hashed here, once (dcrd `block.Hash()`,
+        // `process.go:452`, which a `dcrutil.Block` computes as it is
+        // made).  The checks below, the acceptance of the data with the
+        // store, the contextual checks and the filter lookup of a block
+        // attached without full validation are handed this one.  The
+        // view that connects such a block still hashes its header for
+        // the best hash it records (`UtxoView::connect_block_with_hashes`),
+        // and the block attached after this one hashes it as its parent.
+        let hash = match arriving.hashed() {
+            Some(hashed) => {
+                crate::validate::debug_assert_block_hash(&block.header, hashed.hash());
+                *hashed.hash()
+            }
+            None => block.header.block_hash(),
+        };
+
         // The block must not already exist in the main chain or side
         // chains.
-        let hash = block.header.block_hash();
         if self.index.have_block(&self.store, &hash) {
             return (
                 0,
@@ -4729,6 +4828,7 @@ impl Chain {
             block,
             merkle_leaves,
             merkle_roots,
+            Some(&hash),
             parent,
             params,
         ) {
@@ -4767,7 +4867,7 @@ impl Chain {
         let linked = match self.maybe_accept_block_data_with_hashes(
             node,
             arriving,
-            Some(&tx_hashes),
+            Some((&hash, &tx_hashes)),
             fast_add,
             params,
         ) {
@@ -5652,13 +5752,26 @@ impl Chain {
     /// hashes), and freshly computed ones for any other block, counted
     /// in [`Chain::tx_hash_recomputes`].
     fn tx_hashes_for(&mut self, block: &Arc<MsgBlock>) -> Arc<BlockTxHashes> {
-        if let Some((accepted, tx_hashes)) = &self.accepted_tx_hashes
+        if let Some((accepted, tx_hashes, _)) = &self.accepted_tx_hashes
             && Arc::ptr_eq(accepted, block)
         {
             return Arc::clone(tx_hashes);
         }
         self.tx_hash_recomputes = self.tx_hash_recomputes.wrapping_add(1);
         Arc::new(BlockTxHashes::compute(block))
+    }
+
+    /// The hash of the block's header when `block` is the very
+    /// allocation the processing call filed its hashes with (the
+    /// pointers are compared, as in [`Self::tx_hashes_for`]): the hash
+    /// that call computed from this block's header, or the block arrived
+    /// with.  `None` for any other block, whose header is hashed where
+    /// its hash is needed.
+    fn accepted_block_hash(&self, block: &Arc<MsgBlock>) -> Option<Hash> {
+        match &self.accepted_tx_hashes {
+            Some((accepted, _, block_hash)) if Arc::ptr_eq(accepted, block) => Some(*block_hash),
+            _ => None,
+        }
     }
 
     /// The block data for a node as an owned block, for the public
@@ -8268,11 +8381,14 @@ fn agenda_without_deployment_error(agenda_id: &str) -> RuleError {
 /// Run the contextual block checks for a linked block or an attach
 /// candidate over its parent branch (the dcrd `checkBlockContext` calls
 /// in `maybeAcceptBlocks` and the reorg attach loop), consulting and
-/// updating the chain's recent merkle checks.
+/// updating the chain's recent merkle checks.  `block_hash` is the hash
+/// of the block's header when the caller holds it.
+#[allow(clippy::too_many_arguments)]
 fn check_block_context_for(
     store: &NodeStore,
     parent_id: NodeId,
     block: &MsgBlock,
+    block_hash: Option<&Hash>,
     parent_stake_node: &StakeNode,
     fast_add: bool,
     merkle_checks: &mut LruHashSet,
@@ -8283,9 +8399,10 @@ fn check_block_context_for(
         tip: parent_id,
     };
     let prev_height = Some(store.node(parent_id).height);
-    crate::validate::check_block_context(
+    crate::validate::check_block_context_with_hash(
         &parent_view,
         block,
+        block_hash,
         prev_height,
         fast_add,
         false,
@@ -9536,7 +9653,8 @@ mod tests {
     /// allocation they were filed with and for nothing else: not for an
     /// equal block in another allocation, not for a block with the same
     /// header -- so the same block hash -- and other transactions, and
-    /// not for another block.  Nothing is keyed by block hash.
+    /// not for another block.  Nothing is keyed by block hash.  The
+    /// block hash filed with them is handed out by the same rule.
     #[test]
     fn hashes_are_only_reused_for_the_very_block_they_were_filed_with() {
         let params = dcroxide_chaincfg::regnet_params();
@@ -9559,19 +9677,27 @@ mod tests {
 
         let filed = Arc::new(BlockTxHashes::compute(&a));
         let arc_a = Arc::new(a.clone());
-        chain.accepted_tx_hashes = Some((Arc::clone(&arc_a), Arc::clone(&filed)));
+        let hash_a = a.header.block_hash();
+        chain.accepted_tx_hashes = Some((Arc::clone(&arc_a), Arc::clone(&filed), hash_a));
 
         // The very allocation: the filed hashes, and nothing is hashed.
         let got = chain.tx_hashes_for(&arc_a);
         assert!(Arc::ptr_eq(&got, &filed));
         assert_eq!(chain.tx_hash_recomputes, 0);
+        let headers_hashed = dcroxide_wire::header_hashes_on_this_thread();
+        assert_eq!(chain.accepted_block_hash(&arc_a), Some(hash_a));
+        assert_eq!(
+            dcroxide_wire::header_hashes_on_this_thread(),
+            headers_hashed
+        );
 
         // An equal block in another allocation: equal hashes, computed
-        // again.
+        // again, and no block hash is handed out for it.
         let got = chain.tx_hashes_for(&Arc::new(a.clone()));
         assert!(!Arc::ptr_eq(&got, &filed));
         assert_eq!(*got, *filed);
         assert_eq!(chain.tx_hash_recomputes, 1);
+        assert_eq!(chain.accepted_block_hash(&Arc::new(a.clone())), None);
 
         // The same header, hence the same block hash, over one stake
         // transaction fewer.
@@ -9593,15 +9719,18 @@ mod tests {
         assert_eq!(*got, BlockTxHashes::compute(&altered));
         assert_ne!(*got, *filed);
         assert_eq!(chain.tx_hash_recomputes, 3);
+        assert_eq!(chain.accepted_block_hash(&Arc::new(altered)), None);
 
         // Another block.
         let got = chain.tx_hashes_for(&Arc::new(b.clone()));
         assert_eq!(*got, BlockTxHashes::compute(&b));
         assert_eq!(chain.tx_hash_recomputes, 4);
+        assert_eq!(chain.accepted_block_hash(&Arc::new(b.clone())), None);
 
         // None of that disturbed the slot.
         assert!(Arc::ptr_eq(&chain.tx_hashes_for(&arc_a), &filed));
         assert_eq!(chain.tx_hash_recomputes, 4);
+        assert_eq!(chain.accepted_block_hash(&arc_a), Some(hash_a));
 
         // With nothing filed, every block is hashed.
         chain.accepted_tx_hashes = None;
@@ -9609,6 +9738,7 @@ mod tests {
         assert!(!Arc::ptr_eq(&got, &filed));
         assert_eq!(*got, *filed);
         assert_eq!(chain.tx_hash_recomputes, 5);
+        assert_eq!(chain.accepted_block_hash(&arc_a), None);
     }
 
     /// The network's genesis block, and the hashes of a block with one
@@ -10381,6 +10511,177 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The contextual proof of work check reaches the same verdict, with
+    /// the same text, when it is handed the header's block hash as when
+    /// it hashes the header itself, for a header that meets its target
+    /// and for one that does not.  While the version 1 proof of work
+    /// applies the hash in hand is the one compared and the header is
+    /// not hashed; under the version 2 proof of work the hash in hand is
+    /// not the proof of work hash and plays no part.
+    #[test]
+    fn the_contextual_proof_of_work_check_takes_the_block_hash_it_is_handed() {
+        use crate::validate::{check_proof_of_work_context, check_proof_of_work_context_with_hash};
+        use dcroxide_wire::header_hashes_on_this_thread;
+
+        let (_, blocks) = tip_extensions(1);
+        let pow_limit = dcroxide_standalone::BigInt::from_bytes_be(
+            dcroxide_standalone::Sign::Plus,
+            &dcroxide_chaincfg::regnet_params().pow_limit.to_be_bytes(),
+        );
+        let meets_v1 = |header: &BlockHeader| {
+            dcroxide_standalone::check_proof_of_work(&header.pow_hash_v1(), header.bits, &pow_limit)
+                .is_ok()
+        };
+        let meets_v2 = |header: &BlockHeader| {
+            dcroxide_standalone::check_proof_of_work(&header.pow_hash_v2(), header.bits, &pow_limit)
+                .is_ok()
+        };
+        // Four headers of the battery's first block, by nonce: one for
+        // each combination of meeting the target under the two proof of
+        // work hashes.
+        let with_nonce = |v1: bool, v2: bool| {
+            let mut header = blocks[0].header;
+            header.nonce = 0;
+            while (meets_v1(&header), meets_v2(&header)) != (v1, v2) {
+                header.nonce += 1;
+            }
+            header
+        };
+        let headers = [
+            with_nonce(true, true),
+            with_nonce(true, false),
+            with_nonce(false, true),
+            with_nonce(false, false),
+        ];
+
+        for blake3 in [false, true] {
+            let mut params = dcroxide_chaincfg::regnet_params();
+            force_deployment_result(
+                &mut params,
+                crate::agendas::VOTE_ID_BLAKE3_POW,
+                if blake3 { "yes" } else { "no" },
+            );
+            let chain = Chain::new(&params, Hash::ZERO, false);
+            let view = NodeBranchView {
+                store: &chain.store,
+                tip: chain.best_chain.tip().expect("tip"),
+            };
+            for header in &headers {
+                let what = format!("blake3: {blake3}, nonce {}", header.nonce);
+                let hash = header.block_hash();
+                let meets = if blake3 {
+                    meets_v2(header)
+                } else {
+                    meets_v1(header)
+                };
+
+                let before = header_hashes_on_this_thread();
+                let handed = check_proof_of_work_context_with_hash(
+                    &view,
+                    header,
+                    Some(&hash),
+                    0,
+                    false,
+                    &params,
+                );
+                assert_eq!(
+                    header_hashes_on_this_thread(),
+                    before,
+                    "{what}: the header was hashed beside the hash in hand"
+                );
+                let hashing = check_proof_of_work_context(&view, header, 0, false, &params);
+                assert_eq!(
+                    header_hashes_on_this_thread() - before,
+                    u64::from(!blake3),
+                    "{what}"
+                );
+
+                assert_eq!(handed, hashing, "{what}");
+                assert_eq!(handed.is_ok(), meets, "{what}: {handed:?}");
+                if let Err(err) = &handed {
+                    assert_eq!(err.kind, RuleErrorKind::HighHash, "{what}");
+                }
+                // The flag that skips the check skips it either way.
+                assert_eq!(
+                    check_proof_of_work_context_with_hash(
+                        &view,
+                        header,
+                        Some(&hash),
+                        0,
+                        true,
+                        &params
+                    ),
+                    Ok(()),
+                    "{what}"
+                );
+            }
+        }
+    }
+
+    /// The contextual block checks reach the same verdict, with the same
+    /// text, and leave the same record in the recent merkle checks when
+    /// they are handed the block's hash as when they hash the header
+    /// themselves: for the battery's blocks that extend the tip, each
+    /// checked over its parent, and for the same blocks with another
+    /// transaction than the header commits to.  Handed the hash, they
+    /// hash no header.
+    #[test]
+    fn the_contextual_checks_take_the_block_hash_they_are_handed() {
+        use dcroxide_wire::header_hashes_on_this_thread;
+
+        let params = dcroxide_chaincfg::regnet_params();
+        let (now, blocks) = tip_extensions(30);
+        let mut chain = Chain::new(&params, Hash::ZERO, false);
+        let (mut passed, mut failed) = (0usize, 0usize);
+        for (i, block) in blocks.iter().enumerate() {
+            let parent_id = chain.best_chain.tip().expect("tip");
+            let parent_stake_node = chain
+                .fetch_stake_node(parent_id, &params)
+                .expect("stake node");
+            let mut altered = block.clone();
+            altered.transactions[0].lock_time ^= 1;
+            for case in [block, &altered] {
+                let hash = case.header.block_hash();
+                let check = |block_hash: Option<&Hash>| {
+                    let mut merkle_checks = LruHashSet::new(4);
+                    let before = header_hashes_on_this_thread();
+                    let result = check_block_context_for(
+                        &chain.store,
+                        parent_id,
+                        case,
+                        block_hash,
+                        &parent_stake_node,
+                        false,
+                        &mut merkle_checks,
+                        &params,
+                    );
+                    let hashed = header_hashes_on_this_thread() - before;
+                    (result, merkle_checks.hashes, hashed)
+                };
+                let (handed, handed_record, handed_hashes) = check(Some(&hash));
+                let (hashing, hashing_record, hashing_hashes) = check(None);
+                assert_eq!(handed, hashing, "block {i}");
+                assert_eq!(handed_record, hashing_record, "block {i}");
+                assert_eq!(handed_hashes, 0, "block {i}: a header was hashed");
+                assert_eq!(hashing_hashes, 2, "block {i}");
+                match &handed {
+                    Ok(()) => {
+                        assert!(handed_record.contains(&hash.0), "block {i}");
+                        passed += 1;
+                    }
+                    Err(err) => {
+                        assert_eq!(err.kind, RuleErrorKind::BadMerkleRoot, "block {i}");
+                        assert!(handed_record.is_empty(), "block {i}");
+                        failed += 1;
+                    }
+                }
+            }
+            let (_, errs) = chain.process_block(block, now, &params);
+            assert!(errs.is_empty(), "block {i}: {errs:?}");
+        }
+        assert_eq!((passed, failed), (30, 30));
     }
 
     /// A block the chain already has is refused as a duplicate before
