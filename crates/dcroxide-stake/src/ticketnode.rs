@@ -60,8 +60,17 @@ fn hash_in_slice(h: &Hash, list: &[Hash]) -> bool {
     list.contains(h)
 }
 
-fn safe_get(t: &Immutable, k: &Key) -> Result<Value, RuleError> {
-    t.value(k).ok_or_else(|| {
+/// Take the ticket out of the treap: the value it held and the treap
+/// without it (dcrd `safeGet` and then `safeDelete`, tickets.go:464-482
+/// and :503-511).
+///
+/// dcrd looks the ticket up, and `safeDelete` asks whether it is there
+/// before deleting it: three descents to one node, where this makes
+/// one.  A ticket that is missing is refused with the lookup's error,
+/// the first of the two dcrd reaches; the removal's own cannot follow a
+/// lookup that found the ticket in the same treap.
+fn safe_get_and_delete(t: &Immutable, k: &Key) -> Result<(Value, Immutable), RuleError> {
+    t.take(k).ok_or_else(|| {
         stake_rule_error(
             ErrorKind::MissingTicket,
             format!(
@@ -72,27 +81,32 @@ fn safe_get(t: &Immutable, k: &Key) -> Result<Value, RuleError> {
     })
 }
 
+/// Put a ticket the treap must not hold yet (dcrd `safePut`,
+/// tickets.go:487-498), in the one descent that finds both whether the
+/// ticket is there and where it goes.
 fn safe_put(t: &Immutable, k: Key, v: Value) -> Result<Immutable, RuleError> {
-    if t.has(&k) {
-        return Err(stake_rule_error(
+    t.put_new(k, v).ok_or_else(|| {
+        stake_rule_error(
             ErrorKind::DuplicateTicket,
             format!("attempted to insert duplicate key {} into treap", Hash(k)),
-        ));
-    }
-    Ok(t.put(k, v))
+        )
+    })
 }
 
+/// Delete a ticket the treap must hold (dcrd `safeDelete`,
+/// tickets.go:503-511), in the one descent that finds both whether the
+/// ticket is there and the path its removal rebuilds.
 fn safe_delete(t: &Immutable, k: &Key) -> Result<Immutable, RuleError> {
-    if !t.has(k) {
-        return Err(stake_rule_error(
+    match t.take(k) {
+        Some((_, treap)) => Ok(treap),
+        None => Err(stake_rule_error(
             ErrorKind::MissingTicket,
             format!(
                 "attempted to delete non-existing key {} from treap",
                 Hash(*k)
             ),
-        ));
+        )),
     }
-    Ok(t.delete(k))
 }
 
 /// The winning ticket keys for the given indexes (dcrd lottery.go
@@ -459,15 +473,16 @@ impl Node {
 
             for ticket in &self.next_winners {
                 let k = ticket.0;
-                let mut v = safe_get(&connected.live_tickets, &k)?;
+                // A winner leaves the live set whether it voted or
+                // not, so the lookup and the removal are one step.
+                let (mut v, live_tickets) = safe_get_and_delete(&connected.live_tickets, &k)?;
+                connected.live_tickets = live_tickets;
                 if hash_in_slice(ticket, tickets_voted) {
                     v.spent = true;
                     v.missed = false;
-                    connected.live_tickets = safe_delete(&connected.live_tickets, &k)?;
                 } else {
                     v.spent = false;
                     v.missed = true;
-                    connected.live_tickets = safe_delete(&connected.live_tickets, &k)?;
                     connected.missed_tickets = safe_put(&connected.missed_tickets, k, v)?;
                 }
                 connected.database_undo_update.push(UndoTicketData {
@@ -515,9 +530,9 @@ impl Node {
             // Process the revocations.
             for revoked in revoked_tickets {
                 let k = revoked.0;
-                let mut v = safe_get(&connected.missed_tickets, &k)?;
+                let (mut v, missed_tickets) = safe_get_and_delete(&connected.missed_tickets, &k)?;
                 v.revoked = true;
-                connected.missed_tickets = safe_delete(&connected.missed_tickets, &k)?;
+                connected.missed_tickets = missed_tickets;
                 connected.revoked_tickets = safe_put(&connected.revoked_tickets, k, v)?;
                 connected.database_undo_update.push(UndoTicketData {
                     ticket_hash: *revoked,
@@ -682,5 +697,492 @@ impl Node {
         }
 
         Ok(restored)
+    }
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "test arithmetic over small bounded values"
+)]
+mod tests {
+    use super::*;
+
+    use alloc::collections::BTreeSet;
+    use alloc::string::String;
+    use dcroxide_testutil::SplitMix64;
+
+    use crate::tickettreap::NodeShape;
+
+    /// Stake enabled from the first block and the lottery never
+    /// reached, so a connect runs every ticket transition and nothing
+    /// after them.
+    const PARAMS: StakeNodeParams = StakeNodeParams {
+        votes_per_block: 5,
+        stake_validation_begin_height: 1_000_000,
+        stake_enable_height: 0,
+        ticket_expiry_blocks: 40,
+    };
+
+    /// The height of the node the tests connect to and disconnect.
+    const HEIGHT: u32 = 100;
+
+    /// The height of a ticket that expires in the block after
+    /// [`HEIGHT`].
+    const EXPIRING: u32 = HEIGHT + 1 - PARAMS.ticket_expiry_blocks;
+
+    fn ticket(n: u8) -> Hash {
+        Hash([n; 32])
+    }
+
+    fn treap_of(tickets: &[(Hash, Value)]) -> Immutable {
+        tickets
+            .iter()
+            .fold(Immutable::new(), |treap, (hash, value)| {
+                treap.put(hash.0, *value)
+            })
+    }
+
+    /// A node at [`HEIGHT`] holding the tickets given, whether or not
+    /// a chain could have led to them.
+    fn node_of(
+        live: &[(Hash, Value)],
+        missed: &[(Hash, Value)],
+        revoked: &[(Hash, Value)],
+        winners: &[Hash],
+        undo: &[UndoTicketData],
+    ) -> Node {
+        Node {
+            height: HEIGHT,
+            live_tickets: treap_of(live),
+            missed_tickets: treap_of(missed),
+            revoked_tickets: treap_of(revoked),
+            database_undo_update: undo.to_vec(),
+            database_block_tickets: Vec::new(),
+            next_winners: winners.to_vec(),
+            final_state: [0u8; 6],
+            params: PARAMS,
+        }
+    }
+
+    /// dcrd `safeGet`'s error (tickets.go:470-472).
+    fn not_found(ticket: Hash) -> (ErrorKind, String) {
+        (
+            ErrorKind::MissingTicket,
+            format!(
+                "ticket {ticket} was supposed to be in the passed treap, but could not be found"
+            ),
+        )
+    }
+
+    /// dcrd `safePut`'s error (tickets.go:492-494).
+    fn duplicate(ticket: Hash) -> (ErrorKind, String) {
+        (
+            ErrorKind::DuplicateTicket,
+            format!("attempted to insert duplicate key {ticket} into treap"),
+        )
+    }
+
+    /// dcrd `safeDelete`'s error (tickets.go:505-507).
+    fn not_deleted(ticket: Hash) -> (ErrorKind, String) {
+        (
+            ErrorKind::MissingTicket,
+            format!("attempted to delete non-existing key {ticket} from treap"),
+        )
+    }
+
+    fn error_of(result: Result<Node, RuleError>) -> (ErrorKind, String) {
+        let err = result.expect_err("the transition is refused");
+        (err.kind, err.description)
+    }
+
+    const IV: Hash = Hash([0xee; 32]);
+
+    /// Each ticket transition of a connect that the treaps cannot make
+    /// is refused with the error of the dcrd helper that finds it: the
+    /// lookup's for a winner or a revocation that is not where it must
+    /// be, the insert's for a ticket already where it is going.
+    #[test]
+    fn a_connect_the_treaps_cannot_make_is_refused_as_dcrd_refuses_it() {
+        let value = Value::new(HEIGHT - 10);
+        let (a, b) = (ticket(1), ticket(2));
+
+        // A winner that is not live, voted or not: `safeGet`
+        // (tickets.go:552).
+        let node = node_of(&[], &[], &[], &[a], &[]);
+        assert_eq!(error_of(node.connect(IV, &[a], &[], &[])), not_found(a));
+        assert_eq!(error_of(node.connect(IV, &[], &[], &[])), not_found(a));
+
+        // A winner that did not vote and is in the missed set already:
+        // `safePut` (tickets.go:581).
+        let node = node_of(&[(a, value)], &[(a, value)], &[], &[a], &[]);
+        assert_eq!(error_of(node.connect(IV, &[], &[], &[])), duplicate(a));
+        // Voting, it only leaves the live set.
+        let connected = node.connect(IV, &[a], &[], &[]).expect("the vote connects");
+        assert!(connected.live_tickets().is_empty());
+        assert_eq!(connected.missed_tickets(), [a]);
+
+        // A ticket that expires and is in the missed set already:
+        // `safePut` (tickets.go:618).
+        let expiring = Value::new(EXPIRING);
+        let node = node_of(&[(a, expiring)], &[(a, expiring)], &[], &[], &[]);
+        assert_eq!(error_of(node.connect(IV, &[], &[], &[])), duplicate(a));
+
+        // A revocation of a ticket that is not missed: `safeGet`
+        // (tickets.go:644).
+        let node = node_of(&[(a, value)], &[(b, value)], &[(a, value)], &[], &[]);
+        assert_eq!(error_of(node.connect(IV, &[], &[a], &[])), not_found(a));
+
+        // A revocation of a ticket that is in the revoked set already:
+        // `safePut` (tickets.go:657).
+        let node = node_of(&[], &[(a, value)], &[(a, value)], &[], &[]);
+        assert_eq!(error_of(node.connect(IV, &[], &[a], &[])), duplicate(a));
+
+        // A new ticket that is live already: `safePut`
+        // (tickets.go:686).
+        let node = node_of(&[(a, value)], &[], &[], &[], &[]);
+        assert_eq!(error_of(node.connect(IV, &[], &[], &[a])), duplicate(a));
+    }
+
+    /// A connect with several transitions the treaps cannot make
+    /// reports the first in dcrd's order: the winners in the parent's
+    /// order, then the expiring tickets, the revocations and the new
+    /// tickets.
+    #[test]
+    fn a_connect_reports_the_first_transition_it_cannot_make() {
+        let value = Value::new(HEIGHT - 10);
+        let expiring = Value::new(EXPIRING);
+        let (a, b, c, d, e) = (ticket(1), ticket(2), ticket(3), ticket(4), ticket(5));
+        // Winner a did not vote and is missed already, winner b is not
+        // live, c expires and is missed already, d is revoked without
+        // being missed, e is bought while live.
+        let live = [(a, value), (c, expiring), (e, value)];
+        let missed = [(a, value), (c, expiring)];
+
+        let node = node_of(&live, &missed, &[], &[a, b], &[]);
+        assert_eq!(error_of(node.connect(IV, &[], &[d], &[e])), duplicate(a));
+        let node = node_of(&live, &missed, &[], &[b, a], &[]);
+        assert_eq!(error_of(node.connect(IV, &[], &[d], &[e])), not_found(b));
+        let node = node_of(&live, &missed, &[], &[], &[]);
+        assert_eq!(error_of(node.connect(IV, &[], &[d], &[e])), duplicate(c));
+        let node = node_of(&live[..1], &[], &[], &[], &[]);
+        assert_eq!(error_of(node.connect(IV, &[], &[d], &[a])), not_found(d));
+        assert_eq!(error_of(node.connect(IV, &[], &[], &[a])), duplicate(a));
+    }
+
+    /// The tickets of a treap with the values it holds for them, in
+    /// key order.
+    fn held(treap: &Immutable) -> Vec<(Hash, Value)> {
+        let mut tickets = Vec::new();
+        treap.for_each(|k, v| {
+            tickets.push((Hash(*k), *v));
+            true
+        });
+        tickets
+    }
+
+    /// A connect moves each ticket between the sets with the flags
+    /// dcrd gives it there (tickets.go:548-700), and records each move
+    /// in the undo data in the order it was made; the disconnect that
+    /// undoes it leaves each ticket where it was, as it was.
+    #[test]
+    fn a_connect_moves_each_ticket_as_dcrd_does_and_a_disconnect_moves_it_back() {
+        let value = Value::new(HEIGHT - 10);
+        let was_missed = Value {
+            missed: true,
+            ..Value::new(HEIGHT - 20)
+        };
+        let was_revoked = Value {
+            missed: true,
+            revoked: true,
+            ..Value::new(HEIGHT - 30)
+        };
+        // Two winners, of which the first votes; a ticket that
+        // expires; a missed ticket that is revoked; a ticket bought;
+        // and one ticket in each set that nothing happens to.
+        let (voter, absentee, expiring, revokee, bought) =
+            (ticket(1), ticket(2), ticket(3), ticket(4), ticket(5));
+        let (stays_live, stays_missed, stays_revoked) = (ticket(6), ticket(7), ticket(8));
+        let live = [
+            (voter, value),
+            (absentee, value),
+            (expiring, Value::new(EXPIRING)),
+            (stays_live, value),
+        ];
+        let missed = [(revokee, was_missed), (stays_missed, was_missed)];
+        let revoked = [(stays_revoked, was_revoked)];
+        let parent = node_of(&live, &missed, &revoked, &[voter, absentee], &[]);
+
+        let connected = parent
+            .connect(IV, &[voter], &[revokee], &[bought])
+            .expect("the block connects");
+        assert_eq!(connected.height(), HEIGHT + 1);
+        assert_eq!(
+            held(&connected.live_tickets),
+            [(bought, Value::new(HEIGHT + 1)), (stays_live, value)]
+        );
+        assert_eq!(
+            held(&connected.missed_tickets),
+            [
+                (
+                    absentee,
+                    Value {
+                        missed: true,
+                        ..value
+                    }
+                ),
+                (
+                    expiring,
+                    Value {
+                        missed: true,
+                        expired: true,
+                        ..Value::new(EXPIRING)
+                    }
+                ),
+                (stays_missed, was_missed),
+            ]
+        );
+        assert_eq!(
+            held(&connected.revoked_tickets),
+            [
+                (
+                    revokee,
+                    Value {
+                        revoked: true,
+                        ..was_missed
+                    }
+                ),
+                (stays_revoked, was_revoked),
+            ]
+        );
+        let undo = |ticket_hash, v: Value, missed, revoked, spent, expired| UndoTicketData {
+            ticket_hash,
+            ticket_height: v.height,
+            missed,
+            revoked,
+            spent,
+            expired,
+        };
+        assert_eq!(
+            connected.undo_data(),
+            [
+                undo(voter, value, false, false, true, false),
+                undo(absentee, value, true, false, false, false),
+                undo(expiring, Value::new(EXPIRING), true, false, false, true),
+                undo(revokee, was_missed, true, true, false, false),
+                undo(bought, Value::new(HEIGHT + 1), false, false, false, false),
+            ]
+        );
+        assert_eq!(connected.new_tickets(), [bought]);
+        // The parent is as it was.
+        assert_eq!(held(&parent.live_tickets), {
+            let mut live = live.to_vec();
+            live.sort_by_key(|(hash, _)| hash.0);
+            live
+        });
+        assert_eq!(held(&parent.missed_tickets), missed);
+        assert_eq!(held(&parent.revoked_tickets), revoked);
+
+        let restored = connected
+            .disconnect(IV, parent.undo_data(), parent.new_tickets())
+            .expect("the block disconnects");
+        assert_eq!(restored.height(), HEIGHT);
+        assert_eq!(held(&restored.live_tickets), held(&parent.live_tickets));
+        assert_eq!(held(&restored.missed_tickets), held(&parent.missed_tickets));
+        assert_eq!(
+            held(&restored.revoked_tickets),
+            held(&parent.revoked_tickets)
+        );
+        assert_eq!(restored.winners(), [voter, absentee]);
+    }
+
+    fn undo_of(ticket: Hash, missed: bool, revoked: bool, spent: bool) -> UndoTicketData {
+        UndoTicketData {
+            ticket_hash: ticket,
+            ticket_height: HEIGHT - 10,
+            missed,
+            revoked,
+            spent,
+            expired: false,
+        }
+    }
+
+    /// Each transition a disconnect cannot undo is refused with the
+    /// error of the dcrd helper that finds it: the removal's for a
+    /// ticket that is not where the undo data says it went, the
+    /// insert's for one already where it came from.
+    #[test]
+    fn a_disconnect_the_treaps_cannot_make_is_refused_as_dcrd_refuses_it() {
+        let value = Value::new(HEIGHT - 10);
+        let a = ticket(1);
+        let disconnect = |node: Node| error_of(node.disconnect(IV, &[], &[]));
+
+        // A ticket bought in the block that is not live: `safeDelete`
+        // (tickets.go:820).
+        let bought = [undo_of(a, false, false, false)];
+        assert_eq!(
+            disconnect(node_of(&[], &[], &[], &[], &bought)),
+            not_deleted(a)
+        );
+
+        // A ticket revoked in the block that is not in the revoked
+        // set: `safeDelete` (tickets.go:831); and one that is, and is
+        // missed already: `safePut` (tickets.go:836).
+        let revoked = [undo_of(a, true, true, false)];
+        assert_eq!(
+            disconnect(node_of(&[], &[(a, value)], &[], &[], &revoked)),
+            not_deleted(a)
+        );
+        assert_eq!(
+            disconnect(node_of(&[], &[(a, value)], &[(a, value)], &[], &revoked)),
+            duplicate(a)
+        );
+
+        // A ticket missed in the block that is not in the missed set:
+        // `safeDelete` (tickets.go:854); and one that is, and is live
+        // already: `safePut` (tickets.go:859).
+        let missed = [undo_of(a, true, false, false)];
+        assert_eq!(
+            disconnect(node_of(&[(a, value)], &[], &[], &[], &missed)),
+            not_deleted(a)
+        );
+        assert_eq!(
+            disconnect(node_of(&[(a, value)], &[(a, value)], &[], &[], &missed)),
+            duplicate(a)
+        );
+
+        // A ticket that voted in the block and is live already:
+        // `safePut` (tickets.go:871).
+        let voted = [undo_of(a, false, false, true)];
+        assert_eq!(
+            disconnect(node_of(&[(a, value)], &[], &[], &[], &voted)),
+            duplicate(a)
+        );
+    }
+
+    /// `safeGet` as dcrd has it (tickets.go:464-482): a lookup.
+    fn get_as_dcrd_does(t: &Immutable, k: &Key) -> Result<Value, RuleError> {
+        t.value(k).ok_or_else(|| {
+            stake_rule_error(
+                ErrorKind::MissingTicket,
+                format!(
+                    "ticket {} was supposed to be in the passed treap, but could not be found",
+                    Hash(*k)
+                ),
+            )
+        })
+    }
+
+    /// `safePut` as dcrd has it (tickets.go:487-498): `Has`, then
+    /// `Put`.
+    fn put_as_dcrd_does(t: &Immutable, k: Key, v: Value) -> Result<Immutable, RuleError> {
+        if t.has(&k) {
+            return Err(stake_rule_error(
+                ErrorKind::DuplicateTicket,
+                format!("attempted to insert duplicate key {} into treap", Hash(k)),
+            ));
+        }
+        Ok(t.put(k, v))
+    }
+
+    /// `safeDelete` as dcrd has it (tickets.go:503-511): `Has`, then
+    /// `Delete`.
+    fn delete_as_dcrd_does(t: &Immutable, k: &Key) -> Result<Immutable, RuleError> {
+        if !t.has(k) {
+            return Err(stake_rule_error(
+                ErrorKind::MissingTicket,
+                format!(
+                    "attempted to delete non-existing key {} from treap",
+                    Hash(*k)
+                ),
+            ));
+        }
+        Ok(t.delete(k))
+    }
+
+    /// What a helper made of a treap: the nodes of the treap it
+    /// returned, each node it shares with the treap it was given under
+    /// that node's address and each node it built under none, with the
+    /// treap's length and size.
+    fn made_of(from: &Immutable, made: &Immutable) -> (Vec<NodeShape>, usize, u64) {
+        let given: BTreeSet<*const ()> = from.shape().iter().map(|n| n.address).collect();
+        let mut shape = made.shape();
+        for node in &mut shape {
+            if !given.contains(&node.address) {
+                node.address = core::ptr::null();
+            }
+        }
+        (shape, made.len(), made.size())
+    }
+
+    /// Each helper that descends once returns what dcrd's helpers,
+    /// which look the ticket up and then descend again, return: the
+    /// same treap built of the same new nodes over the same shared
+    /// ones, the same value, or the same error.
+    #[test]
+    fn the_helpers_return_what_the_lookup_and_the_operation_return() {
+        let mut rng = SplitMix64::from_entropy("stake node treap helpers");
+        let random_key = |rng: &mut SplitMix64| {
+            let mut key = [0u8; 32];
+            rng.fill(&mut key);
+            key
+        };
+        // Results that were a treap, and results that were an error.
+        let mut tally = [[0usize; 2]; 3];
+        for round in 0..60 {
+            // Few heights, so priorities tie and a removal cascades
+            // through the ties.
+            let mut keys: Vec<Key> = Vec::new();
+            let mut treap = Immutable::new();
+            for _ in 0..rng.below(120) {
+                let key = random_key(&mut rng);
+                let value = Value {
+                    missed: rng.below(2) == 0,
+                    expired: rng.below(2) == 0,
+                    ..Value::new(rng.below(6) as u32)
+                };
+                keys.push(key);
+                treap = treap.put(key, value);
+            }
+            for _ in 0..40 {
+                let key = if !keys.is_empty() && rng.below(2) == 0 {
+                    keys[rng.below(keys.len() as u64) as usize]
+                } else {
+                    random_key(&mut rng)
+                };
+                let value = Value {
+                    revoked: true,
+                    ..Value::new(rng.below(6) as u32)
+                };
+
+                let put = safe_put(&treap, key, value);
+                tally[0][usize::from(put.is_err())] += 1;
+                assert_eq!(
+                    put.map(|made| made_of(&treap, &made)),
+                    put_as_dcrd_does(&treap, key, value).map(|made| made_of(&treap, &made)),
+                    "round {round}: put"
+                );
+
+                let deleted = safe_delete(&treap, &key);
+                tally[1][usize::from(deleted.is_err())] += 1;
+                assert_eq!(
+                    deleted.map(|made| made_of(&treap, &made)),
+                    delete_as_dcrd_does(&treap, &key).map(|made| made_of(&treap, &made)),
+                    "round {round}: delete"
+                );
+
+                let taken = safe_get_and_delete(&treap, &key);
+                tally[2][usize::from(taken.is_err())] += 1;
+                assert_eq!(
+                    taken.map(|(held, made)| (held, made_of(&treap, &made))),
+                    get_as_dcrd_does(&treap, &key).and_then(|held| {
+                        delete_as_dcrd_does(&treap, &key).map(|made| (held, made_of(&treap, &made)))
+                    }),
+                    "round {round}: get and delete"
+                );
+            }
+        }
+        // Each helper returned a treap and an error many times.
+        assert!(tally.iter().flatten().all(|&n| n >= 500), "{tally:?}");
     }
 }
