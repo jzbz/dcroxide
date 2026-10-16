@@ -3398,7 +3398,9 @@ pub fn check_transaction_inputs<'a, SP: dcroxide_standalone::SubsidyParams>(
     // Perform additional checks on treasury spend transactions such as
     // ensuring they have a valid signature from a sanctioned key.
     let mut is_treasury_spend = false;
-    if is_treasury_enabled && let Ok((signature, pub_key)) = dcroxide_stake::check_tspend(tx) {
+    if is_treasury_enabled
+        && let Some((signature, pub_key)) = dcroxide_stake::tspend_signature_and_pub_key(tx)
+    {
         is_treasury_spend = true;
 
         // The public key used to sign the treasury spend must be

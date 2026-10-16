@@ -47,6 +47,11 @@ fn classify(tx: &MsgTx) {
     assert_eq!(stake::is_tadd(tx), tadd, "is_tadd vs check_tadd");
     assert_eq!(stake::is_tspend(tx), tspend, "is_tspend vs check_tspend");
     assert_eq!(
+        stake::tspend_signature_and_pub_key(tx),
+        stake::check_tspend(tx).ok(),
+        "tspend_signature_and_pub_key vs check_tspend"
+    );
+    assert_eq!(
         stake::is_treasury_base(tx),
         tbase,
         "is_treasury_base vs check_treasury_base"

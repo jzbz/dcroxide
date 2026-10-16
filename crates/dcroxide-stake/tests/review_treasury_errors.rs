@@ -22,7 +22,7 @@ use dcroxide_chaincfg::{Params, regnet_params};
 use dcroxide_chainhash::Hash;
 use dcroxide_stake::{
     ErrorKind, RuleError, check_tadd, check_treasury_base, check_tspend, is_stake_base, is_tadd,
-    is_treasury_base, is_tspend,
+    is_treasury_base, is_tspend, tspend_signature_and_pub_key,
 };
 use dcroxide_testutil::unhex;
 use dcroxide_txscript::stdaddr;
@@ -178,6 +178,26 @@ fn kind<T>(result: Result<T, RuleError>) -> Option<ErrorKind> {
     result.err().map(|e| e.kind)
 }
 
+/// Every predicate answers as its check does, whichever table the
+/// transaction comes from: dcrd's `IsTAdd`, `IsTSpend` and
+/// `IsTreasuryBase` are the checks with the error dropped
+/// (`treasury.go:120-122`, `:227-230`, `:316-318`), and the port's test
+/// the version and the counts before they run theirs.
+fn assert_predicates_match_checks(name: &str, tx: &MsgTx) {
+    assert_eq!(is_tadd(tx), check_tadd(tx).is_ok(), "{name}: is_tadd");
+    assert_eq!(is_tspend(tx), check_tspend(tx).is_ok(), "{name}: is_tspend");
+    assert_eq!(
+        is_treasury_base(tx),
+        check_treasury_base(tx).is_ok(),
+        "{name}: is_treasury_base"
+    );
+    assert_eq!(
+        tspend_signature_and_pub_key(tx),
+        check_tspend(tx).ok(),
+        "{name}: tspend_signature_and_pub_key"
+    );
+}
+
 #[test]
 fn treasury_is_functions() {
     let params = regnet_params();
@@ -283,6 +303,7 @@ fn treasury_is_functions() {
         assert_eq!(is_tadd(tx), *tadd, "{name}: treasury add");
         assert_eq!(is_treasury_base(tx), *tbase, "{name}: treasurybase");
         assert_eq!(is_tspend(tx), *tspend, "{name}: treasury spend");
+        assert_predicates_match_checks(name, tx);
     }
 }
 
@@ -428,6 +449,7 @@ fn treasury_spend_errors() {
             !is_tspend(tx),
             "{name}: IsTSpend claimed an invalid treasury spend is valid"
         );
+        assert_predicates_match_checks(name, tx);
     }
 }
 
@@ -511,6 +533,7 @@ fn treasury_add_errors() {
             !is_tadd(tx),
             "{name}: IsTAdd claimed an invalid tadd is valid"
         );
+        assert_predicates_match_checks(name, tx);
     }
 }
 
@@ -624,5 +647,6 @@ fn treasury_base_errors() {
             !is_treasury_base(tx),
             "{name}: IsTreasuryBase claimed an invalid treasury base is valid"
         );
+        assert_predicates_match_checks(name, tx);
     }
 }

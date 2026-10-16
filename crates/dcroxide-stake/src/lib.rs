@@ -61,7 +61,7 @@ pub use error::{ErrorKind, RuleError};
 pub use lottery::{Hash256Prng, calc_hash256_prng_iv, find_ticket_idxs};
 pub use treasury::{
     TSPEND_SCRIPT_LEN, TX_VERSION_TREASURY, check_tadd, check_treasury_base, check_tspend, is_tadd,
-    is_treasury_base, is_tspend,
+    is_treasury_base, is_tspend, tspend_signature_and_pub_key,
 };
 
 use error::stake_rule_error;
