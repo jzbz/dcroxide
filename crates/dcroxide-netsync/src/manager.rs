@@ -1626,9 +1626,23 @@ impl<C: SyncChain, T: SyncTxPool, M: SyncMixPool> SyncManager<C, T, M> {
         // header for the local chain from the sync peer.
         self.fetch_next_headers(sync_peer, actions);
 
-        // Update the sync height when it is higher than the currently
-        // best known value.
-        self.maybe_update_sync_height(sync_height);
+        // Update the sync height to the height claimed by the new sync
+        // peer, but no lower than the best known header.
+        //
+        // dcrd `17dd9f45` made this a store where it was a raise
+        // (`internal/netsync/manager.go:679-682` at `382ff4dd`), so the
+        // sync height can fall here.  A sync peer that claimed a height
+        // the chain has not reached, up to `math.MaxInt32`, used to
+        // leave that height behind when the stall timeout dropped it,
+        // and the initial header sync then waited for a header within
+        // `SYNC_HEIGHT_FETCH_OFFSET` of it.  A candidate claims at least
+        // the best header height when it is selected, so the floor binds
+        // only when the best header moves after that read, as a call on
+        // another thread that takes only the chain's lock, such as
+        // `reconsiderblock`, can make it.
+        let (_, best_header_height) = self.cfg.chain.best_header();
+        self.sync_height
+            .store(sync_height.max(best_header_height), Ordering::SeqCst);
 
         // Start the header sync progress stall timeout.
         actions.push(Action::ResetHeaderSyncStallTimeout);

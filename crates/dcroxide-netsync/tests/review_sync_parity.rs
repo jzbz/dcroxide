@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: ISC
-//! Sync manager behaviour the review found missing against dcrd's
-//! `internal/netsync/manager.go`:
+//! Sync manager behaviour pinned natively against dcrd's
+//! `internal/netsync/manager.go`.  The review found these missing:
 //!
 //! - the peer height rises that dcrd's embedded `*peer.Peer` shares
 //!   with `getpeerinfo` (`maybeUpdateBestAnnouncedBlock` and the
@@ -13,7 +13,17 @@
 //! - the transaction and mix intake split around the pool call, so a
 //!   caller can release the manager's lock across the validation the
 //!   way dcrd's `OnTx` and `OnMixMsg` hold only `requestMtx`.
+//!
+//! The tests with `sync_height` in their names pin a change dcrd made
+//! after `6f6cf21b`, and its bounds.  Since `17dd9f45` each new header
+//! sync peer sets the sync height to its claim, but no lower than the
+//! best known header, where it used to only raise it
+//! (`manager.go:679-682` at `382ff4dd`).  With no candidate left
+//! nothing is stored (`:659-662`), and the next candidate to connect
+//! sets the sync height (`:767-773`).  A new sync peer for the chain
+//! sync leaves it alone (`startChainSync`, `:693-709`).
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 use dcroxide_chainhash::Hash;
@@ -29,9 +39,12 @@ use dcroxide_wire::{
 
 /// A chain that knows only the zero hash, credits every header with
 /// some work, and fails header and block processing as scripted.
+/// Reads of its best header take their answers from
+/// `best_header_reads` in order while it holds any, and `best` after.
 struct StubChain {
     current: bool,
     best: (Hash, i64),
+    best_header_reads: VecDeque<(Hash, i64)>,
     next_blocks: Vec<Hash>,
     header_failure: Option<ProcessBlockFailure>,
     block_failure: Option<ProcessBlockFailure>,
@@ -42,6 +55,7 @@ impl StubChain {
         StubChain {
             current: true,
             best: (Hash::ZERO, 0),
+            best_header_reads: VecDeque::new(),
             next_blocks: Vec::new(),
             header_failure: None,
             block_failure: None,
@@ -53,7 +67,7 @@ impl SyncChain for StubChain {
     type Block = Arc<MsgBlock>;
 
     fn best_header(&mut self) -> (Hash, i64) {
-        self.best
+        self.best_header_reads.pop_front().unwrap_or(self.best)
     }
     fn header_by_hash(&mut self, _hash: &Hash) -> Option<BlockHeader> {
         None
@@ -532,4 +546,178 @@ fn the_split_mix_intake_keeps_on_mix_msgs_bookkeeping() {
     assert_eq!(m.begin_mix_msg(7, &fresh), Some(fresh));
     assert_eq!(m.finish_mix_msg(&fresh, Ok(vec![fresh])), Ok(vec![fresh]));
     assert!(!m.rejected_mix_msgs_contains(&fresh));
+}
+
+/// A sync peer that claimed a height the chain has not reached, here
+/// `math.MaxInt32`, no longer holds the initial header sync once the
+/// stall timeout drops it: the next sync peer's claim becomes the sync
+/// height, and that peer's headers complete the sync (dcrd `17dd9f45`,
+/// `manager.go:679-682` at `382ff4dd`).  A new sync peer used to only
+/// raise the sync height, so it stayed at 2,147,483,647 and no header
+/// came within `syncHeightFetchOffset` (6) of it.
+#[test]
+fn a_new_header_sync_peer_sets_the_sync_height_to_its_claim() {
+    let mut m = manager(StubChain::new());
+    connect(&mut m, 1, i64::from(i32::MAX));
+    connect(&mut m, 2, 50);
+    assert_eq!(m.sync_peer_id(), 1);
+    assert_eq!(m.sync_height(), i64::from(i32::MAX));
+
+    // The stall timeout disconnects the sync peer, and the daemon
+    // reports the disconnect back.
+    let actions = m.on_header_sync_stall_timeout();
+    assert!(disconnected(&actions, 1), "{actions:?}");
+    let actions = m.on_peer_disconnected(1);
+    assert_eq!(m.sync_peer_id(), 2);
+    assert_eq!(m.sync_height(), 50, "{actions:?}");
+    let info_lines: Vec<&str> = actions
+        .iter()
+        .filter_map(|action| match action {
+            Action::Log {
+                level: LogLevel::Info,
+                message,
+            } => Some(message.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        info_lines,
+        vec!["Syncing headers to block height 50 from peer 10.0.0.2:9108 (outbound)"]
+    );
+    assert!(
+        actions.iter().any(|action| matches!(
+            action,
+            Action::QueueMessage {
+                peer: 2,
+                message: Message::GetHeaders(_)
+            }
+        )),
+        "{actions:?}"
+    );
+    assert!(
+        actions
+            .iter()
+            .any(|action| matches!(action, Action::ResetHeaderSyncStallTimeout)),
+        "{actions:?}"
+    );
+
+    // A final header at 44 plus the offset of 6 does not exceed the
+    // sync height of 50; one at 45 does, and completes the initial
+    // header sync.
+    let actions = m.on_headers(
+        2,
+        &MsgHeaders {
+            headers: vec![connecting_header(44)],
+        },
+    );
+    assert!(!m.initial_header_sync_done(), "{actions:?}");
+    let actions = m.on_headers(
+        2,
+        &MsgHeaders {
+            headers: vec![connecting_header(45)],
+        },
+    );
+    assert!(m.initial_header_sync_done(), "{actions:?}");
+    assert_eq!(m.sync_height(), 50);
+}
+
+/// The new sync peer's claim takes the sync height no lower than the
+/// best known header, read after the `getheaders` request as dcrd reads
+/// it (`manager.go:677-682` at `382ff4dd`).  A candidate claims at
+/// least the best header height when it is selected, so this binds
+/// only when the best header moves past the claim after that check, as
+/// a call on another thread that takes only the chain's lock can make
+/// it.  The claim is 20; the stub answers the candidate check and the
+/// request's locator with a best header at 0, and moves it to 30 after
+/// the request.
+#[test]
+fn a_new_header_sync_peer_floors_the_sync_height_at_the_best_header() {
+    let mut m = manager(StubChain::new());
+    connect(&mut m, 1, 100);
+    connect(&mut m, 2, 20);
+    assert_eq!(m.sync_peer_id(), 1);
+    assert_eq!(m.sync_height(), 100);
+
+    let chain = m.chain_mut();
+    chain.best_header_reads.push_back((Hash::ZERO, 0));
+    chain.best_header_reads.push_back((Hash::ZERO, 0));
+    chain.best = (Hash::ZERO, 30);
+
+    let actions = m.on_header_sync_stall_timeout();
+    assert!(disconnected(&actions, 1), "{actions:?}");
+    let actions = m.on_peer_disconnected(1);
+    assert_eq!(
+        m.sync_peer_id(),
+        2,
+        "the candidate check saw the best header at 0: {actions:?}"
+    );
+    assert!(m.chain_mut().best_header_reads.is_empty());
+    assert_eq!(m.sync_height(), 30);
+}
+
+/// With no candidate left when the stall timeout drops the sync peer,
+/// the sync height stays at that peer's claim, since dcrd returns
+/// before the store (`manager.go:659-662` at `382ff4dd`).  The next
+/// peer to connect becomes the sync peer and sets the sync height to
+/// its own claim (`:767-773`), and its headers complete the sync with
+/// no restart, the recovery dcrd `17dd9f45` describes from a peer that
+/// claimed `math.MaxInt32`.
+#[test]
+fn a_header_sync_peer_that_connects_after_none_was_left_sets_the_sync_height() {
+    let mut m = manager(StubChain::new());
+    connect(&mut m, 1, i64::from(i32::MAX));
+    assert_eq!(m.sync_peer_id(), 1);
+    assert_eq!(m.sync_height(), i64::from(i32::MAX));
+
+    let actions = m.on_header_sync_stall_timeout();
+    assert!(disconnected(&actions, 1), "{actions:?}");
+    let actions = m.on_peer_disconnected(1);
+    assert_eq!(m.sync_peer_id(), 0, "{actions:?}");
+    assert_eq!(m.sync_height(), i64::from(i32::MAX));
+    assert!(
+        actions.iter().any(|action| matches!(
+            action,
+            Action::Log {
+                level: LogLevel::Warn,
+                message,
+            } if message == "No sync peer candidates available"
+        )),
+        "{actions:?}"
+    );
+
+    let actions = connect(&mut m, 2, 50);
+    assert_eq!(m.sync_peer_id(), 2, "{actions:?}");
+    assert_eq!(m.sync_height(), 50);
+    let actions = m.on_headers(
+        2,
+        &MsgHeaders {
+            headers: vec![connecting_header(45)],
+        },
+    );
+    assert!(m.initial_header_sync_done(), "{actions:?}");
+}
+
+/// Once the headers are synced, a new sync peer for the chain sync
+/// leaves the sync height alone, whatever it claims: dcrd `17dd9f45`
+/// changes only the initial header sync, and `startChainSync`
+/// (`manager.go:693-709` at `382ff4dd`) does not write the sync height.
+#[test]
+fn a_new_chain_sync_peer_leaves_the_sync_height_alone() {
+    let mut m = manager(StubChain::new());
+    connect(&mut m, 1, 10);
+    assert_eq!(m.sync_height(), 10);
+    let actions = m.on_headers(
+        1,
+        &MsgHeaders {
+            headers: vec![connecting_header(5)],
+        },
+    );
+    assert!(m.initial_header_sync_done(), "{actions:?}");
+    assert_eq!(m.sync_height(), 10);
+
+    connect(&mut m, 2, 1000);
+    assert_eq!(m.sync_peer_id(), 1);
+    let actions = m.on_peer_disconnected(1);
+    assert_eq!(m.sync_peer_id(), 2, "{actions:?}");
+    assert_eq!(m.sync_height(), 10);
 }

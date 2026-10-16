@@ -49,6 +49,17 @@
 //!    values last read from the manager, at block 42, where the old rows
 //!    had p1 already disconnected at step 85.
 //!
+//! dcrd `17dd9f45`, after `6f6cf21b`, changes `internal/netsync`, and
+//! the manager replayed here has it: a new header sync peer sets the
+//! sync height to its claim, but no lower than the best known header,
+//! where it used to only raise it (`manager.go:679-682` at
+//! `382ff4dd`).  No row moves.  The session selects a header sync peer
+//! once, at step 1, where p1 claims 36 with the best header at genesis
+//! and the sync height at its initial 0, so the store and the raise
+//! both give 36.  Step 2 connects p2 while p1 is the sync peer, and
+//! every later connect and disconnect comes after the headers are
+//! synced at step 3.
+//!
 //! The dump read each peer's state off its own peer object, which
 //! outlives the manager's hold on it, so a removed peer's rows repeat
 //! the values last read through the manager -- except, possibly, its
