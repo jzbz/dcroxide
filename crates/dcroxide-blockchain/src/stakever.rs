@@ -396,7 +396,18 @@ pub fn calc_voter_version(
 }
 
 /// Whether a majority of the last few block header versions meet the
-/// given minimum (dcrd `isMajorityVersion`).
+/// given minimum (dcrd `isMajorityVersion`, `chain.go:558-572`).
+///
+/// dcrd walks until it has counted the required number, has looked at
+/// the number of blocks to check or has run out of ancestors, and
+/// answers whether the count reached the required number.  This walk
+/// also stops once the count can no longer reach it: every block still
+/// to be looked at adds at most one, so when the count and the blocks
+/// left to look at together fall short of the required number, the
+/// count dcrd ends with falls short of it too, and both answer false.
+/// Until then the two walks are the same, so the answer is dcrd's for
+/// every input.  A walk that would have run out of ancestors first only
+/// has fewer blocks left to count than the bound assumes.
 pub fn is_majority_version(
     view: &impl VersionChainView,
     min_ver: i32,
@@ -407,21 +418,33 @@ pub fn is_majority_version(
     let num_to_check = params.block_upgrade_num_to_check;
     let mut num_found: u64 = 0;
     let mut i: u64 = 0;
+
+    // Whether another block is looked at: dcrd's loop condition, and
+    // that the required number is still within reach.
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "evaluated left to right, so i < num_to_check at the subtraction, and \
+                  num_found <= i, so the sum is at most num_to_check"
+    )]
+    let more = |i: u64, num_found: u64| {
+        i < num_to_check
+            && num_found < num_required
+            && num_found + (num_to_check - i) >= num_required
+    };
     #[allow(
         clippy::arithmetic_side_effects,
         reason = "each visit follows a check that i < num_to_check, so i + 1 fits in u64, and \
                   num_found <= i"
     )]
     if let Some(start_height) = start_height
-        && i < num_to_check
-        && num_found < num_required
+        && more(i, num_found)
     {
         view.walk_back(start_height, &mut |node| {
             if node.block_version >= min_ver {
                 num_found += 1;
             }
             i += 1;
-            i < num_to_check && num_found < num_required
+            more(i, num_found)
         });
     }
     num_found >= num_required
