@@ -2101,7 +2101,7 @@ pub enum MerkleRootVariant {
 /// the merkle roots of the two transaction trees.
 pub fn check_merkle_roots(block: &MsgBlock, variant: MerkleRootVariant) -> Result<(), RuleError> {
     let leaves = crate::blockhashes::BlockMerkleLeaves::compute(block);
-    check_merkle_roots_with_leaves(block, &leaves, variant)
+    check_merkle_roots_with_leaves(block, &leaves, None, variant)
 }
 
 /// [`check_merkle_roots`] given the full hash of each of the block's
@@ -2110,19 +2110,40 @@ pub fn check_merkle_roots(block: &MsgBlock, variant: MerkleRootVariant) -> Resul
 /// `CalcTxTreeMerkleRoot` and `CalcCombinedTxTreeMerkleRoot` hash the
 /// transactions).  The leaves must have been computed from this very
 /// block.
+///
+/// `roots` are the roots of the two trees over those leaves, when the
+/// block arrived with them (`crate::blockhashes::HashedBlock`): each is
+/// then read where it would otherwise be built here, and nothing else
+/// differs.  Without them a tree is built at the point dcrd builds it,
+/// so the stake tree of a block whose regular root fails the original
+/// variant is never built.  The comparisons with the header, their
+/// order, the combination under DCP0005 and every text are the same
+/// either way.
 pub(crate) fn check_merkle_roots_with_leaves(
     block: &MsgBlock,
     leaves: &crate::blockhashes::BlockMerkleLeaves,
+    roots: Option<&crate::blockhashes::BlockMerkleRoots>,
     variant: MerkleRootVariant,
 ) -> Result<(), RuleError> {
     leaves.assert_for(block);
+    if let Some(roots) = roots {
+        roots.assert_for(leaves);
+    }
+    let regular_tree_root = || match roots {
+        Some(roots) => roots.regular(),
+        None => leaves.regular_root(),
+    };
+    let stake_tree_root = || match roots {
+        Some(roots) => roots.stake(),
+        None => leaves.stake_root(),
+    };
     let header = &block.header;
 
     match variant {
         MerkleRootVariant::Original => {
             // Build the merkle tree and ensure the calculated merkle
             // root matches the entry in the block header.
-            let want_merkle_root = dcroxide_standalone::calc_merkle_root(leaves.regular());
+            let want_merkle_root = regular_tree_root();
             if header.merkle_root != want_merkle_root {
                 return Err(rule_error(
                     RuleErrorKind::BadMerkleRoot,
@@ -2135,7 +2156,7 @@ pub(crate) fn check_merkle_roots_with_leaves(
             }
 
             // Build the stake tx tree merkle root too and check it.
-            let want_stake_root = dcroxide_standalone::calc_merkle_root(leaves.stake());
+            let want_stake_root = stake_tree_root();
             if header.stake_root != want_stake_root {
                 return Err(rule_error(
                     RuleErrorKind::BadMerkleRoot,
@@ -2156,8 +2177,8 @@ pub(crate) fn check_merkle_roots_with_leaves(
             // header.  dcrd `CalcCombinedTxTreeMerkleRoot` hashes the
             // concatenation of the two roots, which is the root of a
             // tree of those two leaves.
-            let regular_root = dcroxide_standalone::calc_merkle_root(leaves.regular());
-            let stake_root = dcroxide_standalone::calc_merkle_root(leaves.stake());
+            let regular_root = regular_tree_root();
+            let stake_root = stake_tree_root();
             let want_merkle_root =
                 dcroxide_standalone::calc_merkle_root(&[regular_root, stake_root]);
             if header.merkle_root != want_merkle_root {
@@ -2210,16 +2231,19 @@ pub fn check_block_data_preconditions(
     hdr_cmts_positional: impl FnOnce() -> Result<crate::agendas::AgendaActiveInfo, RuleError>,
 ) -> Result<bool, RuleError> {
     let leaves = crate::blockhashes::BlockMerkleLeaves::compute(block);
-    check_block_data_preconditions_with_leaves(block, &leaves, hdr_cmts_positional)
+    check_block_data_preconditions_with_leaves(block, &leaves, None, hdr_cmts_positional)
 }
 
 /// [`check_block_data_preconditions`] given the block's merkle leaves
 /// (dcrd `checkBlockDataPreconditions`, `validate.go:1954-2049`, whose
 /// `checkMerkleRoots` calls hash the transactions).  The leaves must
-/// have been computed from this very block.
+/// have been computed from this very block, and `roots`, when the block
+/// arrived with them, from those leaves
+/// ([`check_merkle_roots_with_leaves`]).
 pub(crate) fn check_block_data_preconditions_with_leaves(
     block: &MsgBlock,
     leaves: &crate::blockhashes::BlockMerkleLeaves,
+    roots: Option<&crate::blockhashes::BlockMerkleRoots>,
     hdr_cmts_positional: impl FnOnce() -> Result<crate::agendas::AgendaActiveInfo, RuleError>,
 ) -> Result<bool, RuleError> {
     // A block must not exceed the maximum allowed block payload when
@@ -2245,7 +2269,7 @@ pub(crate) fn check_block_data_preconditions_with_leaves(
         } else {
             MerkleRootVariant::Original
         };
-        check_merkle_roots_with_leaves(block, leaves, variant)?;
+        check_merkle_roots_with_leaves(block, leaves, roots, variant)?;
         return Ok(true);
     }
 
@@ -2256,8 +2280,8 @@ pub(crate) fn check_block_data_preconditions_with_leaves(
     // return reports the data commitment as not definitively known to
     // be valid: it is only provisionally valid.  When both variants
     // fail, the error is the DCP0005 variant's, as dcrd returns it.
-    if check_merkle_roots_with_leaves(block, leaves, MerkleRootVariant::Original).is_err() {
-        check_merkle_roots_with_leaves(block, leaves, MerkleRootVariant::Dcp0005)?;
+    if check_merkle_roots_with_leaves(block, leaves, roots, MerkleRootVariant::Original).is_err() {
+        check_merkle_roots_with_leaves(block, leaves, roots, MerkleRootVariant::Dcp0005)?;
     }
     Ok(false)
 }

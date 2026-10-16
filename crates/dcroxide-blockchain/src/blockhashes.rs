@@ -10,13 +10,15 @@
 //! all read one hash per transaction.  `dcroxide_wire::MsgTx` caches
 //! nothing, so [`BlockTxHashes`] is the side structure that stands in
 //! for that cache, and `BlockMerkleLeaves` holds the full hashes the
-//! merkle roots are built from.
+//! merkle roots are built from.  `BlockMerkleRoots` holds the roots of
+//! the two trees once they have been built from those leaves, for a
+//! block that was hashed before it reached the chain.
 //!
 //! # The rule
 //!
-//! A value of either type can only be made by hashing a block, and it
-//! is only ever used with that same block instance.  Hashes meet a
-//! block in exactly four ways:
+//! A value of any of these types can only be made by hashing a block,
+//! and it is only ever used with that same block instance.  Hashes meet
+//! a block in exactly four ways:
 //!
 //! 1. Lexically, in the function that computed them from that
 //!    `&MsgBlock`: `Chain::process_block`, and the public functions
@@ -58,7 +60,11 @@
 //! every build, and a full re-hash and comparison under debug
 //! assertions.  The length check is not optional: the connect helpers
 //! walk the transactions and the hashes together, and a short list
-//! would skip transactions silently.
+//! would skip transactions silently.  The two roots have no length to
+//! check.  They are only ever read beside the leaves they were built
+//! from, out of the one [`HashedBlock`] that owns both, and under debug
+//! assertions they are compared with roots built from those leaves
+//! again.
 //!
 //! # The script check reads them too
 //!
@@ -82,6 +88,7 @@ use alloc::vec::Vec;
 
 use dcroxide_chainhash::{HASH_SIZE, Hash, hash_h};
 use dcroxide_database::BlockRecord;
+use dcroxide_standalone::calc_merkle_root;
 use dcroxide_wire::{MsgBlock, MsgTx};
 
 /// The hash of every transaction of one block
@@ -114,11 +121,39 @@ pub(crate) struct BlockMerkleLeaves {
     stake: Vec<Hash>,
 }
 
-/// A block together with its block hash, the hashes of its transactions
-/// and its merkle leaves, all computed from that block: what dcrd holds
-/// in one `dcrutil.Block`, whose transactions carry their hashes
-/// (`dcrutil/block.go:162-224`) and whose block hash is computed as the
-/// block is wrapped (`NewBlock`, `dcrutil/block.go:288-293`).
+/// The roots of one block's two transaction merkle trees, each built
+/// from the block's [`BlockMerkleLeaves`]: what dcrd's
+/// `CalcTxTreeMerkleRoot` returns for the regular and for the stake
+/// transactions (`blockchain/standalone/merkle.go:112-127`).
+///
+/// They are the two roots `checkMerkleRoots` builds
+/// (`validate.go:1909-1952`).  For the original commitment it builds the
+/// stake tree only once the regular root has matched the header, and
+/// for DCP0005 it builds both before it compares anything; a
+/// [`HashedBlock`] holds both whichever commitment applies.  Holding
+/// them decides nothing: which header field a root must equal, and
+/// whether the two are first combined into one as DCP0005 specifies,
+/// depends on the header commitments agenda, which the chain alone
+/// answers.
+///
+/// The fields are private and [`BlockMerkleRoots::compute`] is the only
+/// constructor, so a value is always the pair of roots of some block's
+/// leaves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BlockMerkleRoots {
+    /// The root of the tree over the regular transactions' full hashes.
+    regular: Hash,
+    /// The root of the tree over the stake transactions' full hashes.
+    stake: Hash,
+}
+
+/// A block together with its block hash, the hashes of its transactions,
+/// its merkle leaves and the roots of its two transaction merkle trees,
+/// all computed from that block: what dcrd holds in one `dcrutil.Block`,
+/// whose transactions carry their hashes (`dcrutil/block.go:162-224`)
+/// and whose block hash is computed as the block is wrapped (`NewBlock`,
+/// `dcrutil/block.go:288-293`).  dcrd caches no merkle root: it builds
+/// both trees inside `checkMerkleRoots`.
 ///
 /// The fields are private and [`HashedBlock::new`] is the only
 /// constructor, so the hashes are always those of the block the value
@@ -130,8 +165,8 @@ pub(crate) struct BlockMerkleLeaves {
 /// It exists so that the hashing can be done before the block reaches
 /// the chain, away from the thread that connects blocks.  Making one
 /// reaches no verdict about the block: nothing is checked, no merkle
-/// root is compared, and the chain makes every check it makes of a block
-/// that arrives without hashes, in the same order
+/// root is compared with the header, and the chain makes every check it
+/// makes of a block that arrives without hashes, in the same order
 /// (`Chain::process_hashed_block`).
 ///
 /// A block that was decoded from bytes may also carry those bytes, laid
@@ -151,6 +186,8 @@ pub struct HashedBlock {
     tx_hashes: Arc<BlockTxHashes>,
     /// The full hash of each of the block's transactions.
     merkle_leaves: BlockMerkleLeaves,
+    /// The roots of the two trees over `merkle_leaves`.
+    merkle_roots: BlockMerkleRoots,
     /// The bytes the block was decoded from, laid out as its block-file
     /// record, when they were handed in and are the block's
     /// serialization ([`HashedBlock::keep_wire_bytes`]).
@@ -158,16 +195,40 @@ pub struct HashedBlock {
 }
 
 impl HashedBlock {
-    /// Hash the block: its header, and each transaction once for both
-    /// the transaction hash and the merkle leaf.
+    /// Hash the block: its header, each transaction once for both the
+    /// transaction hash and the merkle leaf, and the inner nodes of the
+    /// two transaction merkle trees.
+    ///
+    /// The trees are the smaller part of that work, whatever the block
+    /// holds.  A tree of `n` leaves has at most
+    /// `n - 1 + ceil(log2(n))` inner nodes
+    /// (`dcroxide_standalone::calc_merkle_root`: each level hashes half
+    /// the nodes of the one below, rounded up), and each is one hash of
+    /// 64 bytes, two BLAKE-256 compressions.  A leaf is one such hash
+    /// too, made after a hash of the transaction's prefix and one of its
+    /// witness data, so the leaves of a tree take at least `4 * n`
+    /// compressions, and two serializations of each transaction, where
+    /// its inner nodes take at most `2 * (n - 1 + ceil(log2(n)))`
+    /// compressions: fewer for every `n`, and about half as many for a
+    /// tree of the smallest transactions a block can be filled with.  So
+    /// the trees can never double what this function spends on a block,
+    /// and what it spends stays linear in the size of the block as it
+    /// was received.  The number of leaves is bounded where the block
+    /// was decoded: a block off the wire holds at most
+    /// `dcroxide_wire::max_tx_per_tx_tree` transactions in each tree
+    /// (dcrd `MsgBlock.BtcDecode`, `wire/msgblock.go:101-131`), whatever
+    /// its size.  Each tree is built in a copy of its leaves that is
+    /// freed before this returns.
     pub fn new(block: Arc<MsgBlock>) -> HashedBlock {
         let (tx_hashes, merkle_leaves) = BlockTxHashes::compute_with_merkle_leaves(&block);
+        let merkle_roots = BlockMerkleRoots::compute(&merkle_leaves);
         let hash = block.header.block_hash();
         HashedBlock {
             block,
             hash,
             tx_hashes: Arc::new(tx_hashes),
             merkle_leaves,
+            merkle_roots,
             record: None,
         }
     }
@@ -259,6 +320,12 @@ impl HashedBlock {
         &self.merkle_leaves
     }
 
+    /// The roots of the block's transaction merkle trees, built from
+    /// [`Self::merkle_leaves`].
+    pub(crate) fn merkle_roots(&self) -> &BlockMerkleRoots {
+        &self.merkle_roots
+    }
+
     /// Give the block back, dropping the hashes and the record.
     pub fn into_block(self) -> Arc<MsgBlock> {
         self.block
@@ -283,6 +350,17 @@ std::thread_local! {
     /// tell that a processing call that was handed a block's leaves did
     /// not build them again.
     pub(crate) static LEAVES_HASHED: core::cell::Cell<u64> =
+        const { core::cell::Cell::new(0) };
+
+    /// How many transaction merkle trees this thread built from a
+    /// block's leaves ([`BlockMerkleLeaves::regular_root`] and
+    /// [`BlockMerkleLeaves::stake_root`]).  The trees
+    /// `BlockMerkleRoots::assert_for` builds again under debug
+    /// assertions are not counted, and neither is the tree of two leaves
+    /// that combines the roots under DCP0005.  It exists in this crate's
+    /// unit-test builds only, where the tests read it to tell that a
+    /// processing call that was handed a block's roots built no tree.
+    pub(crate) static TREES_BUILT: core::cell::Cell<u64> =
         const { core::cell::Cell::new(0) };
 }
 
@@ -416,6 +494,22 @@ impl BlockMerkleLeaves {
         &self.stake
     }
 
+    /// The root of the regular transaction tree, built here (dcrd
+    /// `CalcTxTreeMerkleRoot` over `block.Transactions`).
+    pub(crate) fn regular_root(&self) -> Hash {
+        #[cfg(test)]
+        TREES_BUILT.set(TREES_BUILT.get().wrapping_add(1));
+        calc_merkle_root(&self.regular)
+    }
+
+    /// The root of the stake transaction tree, built here (dcrd
+    /// `CalcTxTreeMerkleRoot` over `block.STransactions`).
+    pub(crate) fn stake_root(&self) -> Hash {
+        #[cfg(test)]
+        TREES_BUILT.set(TREES_BUILT.get().wrapping_add(1));
+        calc_merkle_root(&self.stake)
+    }
+
     /// Panic unless these leaves belong to the block: one per
     /// transaction of each tree in every build, and equal to freshly
     /// computed ones under debug assertions.
@@ -433,6 +527,39 @@ impl BlockMerkleLeaves {
     }
 }
 
+impl BlockMerkleRoots {
+    /// Build both trees from the block's leaves.
+    pub(crate) fn compute(leaves: &BlockMerkleLeaves) -> BlockMerkleRoots {
+        BlockMerkleRoots {
+            regular: leaves.regular_root(),
+            stake: leaves.stake_root(),
+        }
+    }
+
+    /// The root of the regular transaction tree.
+    pub(crate) fn regular(&self) -> Hash {
+        self.regular
+    }
+
+    /// The root of the stake transaction tree.
+    pub(crate) fn stake(&self) -> Hash {
+        self.stake
+    }
+
+    /// Panic, under debug assertions, unless these are the roots of the
+    /// trees over the given leaves.  A release build has nothing to
+    /// check here: the pairing rests on both having been read out of the
+    /// one [`HashedBlock`] that built these from those.
+    #[track_caller]
+    pub(crate) fn assert_for(&self, leaves: &BlockMerkleLeaves) {
+        debug_assert!(
+            self.regular == calc_merkle_root(leaves.regular())
+                && self.stake == calc_merkle_root(leaves.stake()),
+            "merkle roots do not match the block's merkle leaves"
+        );
+    }
+}
+
 #[cfg(test)]
 #[allow(
     clippy::arithmetic_side_effects,
@@ -446,10 +573,12 @@ mod tests {
     };
 
     use super::*;
-    use crate::RuleErrorKind;
+    use crate::agendas::AgendaActiveInfo;
     use crate::validate::{
-        MerkleRootVariant, check_block_data_sanity_with_hashes, check_merkle_roots_with_leaves,
+        MerkleRootVariant, check_block_data_preconditions_with_leaves,
+        check_block_data_sanity_with_hashes, check_merkle_roots_with_leaves,
     };
+    use crate::{RuleError, RuleErrorKind};
 
     /// Every block of dcrd's full block battery, valid or not, by row
     /// name (the one row that does not decode is not a block).
@@ -576,7 +705,7 @@ mod tests {
             // The merkle check on the leaves: the same verdict and the
             // same text as the check that hashed the transactions.
             for variant in [MerkleRootVariant::Original, MerkleRootVariant::Dcp0005] {
-                let got = check_merkle_roots_with_leaves(block, &leaves, variant);
+                let got = check_merkle_roots_with_leaves(block, &leaves, None, variant);
                 match reference_merkle_failure(block, variant) {
                     None => {
                         assert!(got.is_ok(), "{name} {variant:?}: {got:?}");
@@ -653,16 +782,516 @@ mod tests {
     }
 
     /// Hashing a block into a [`HashedBlock`] is one pass over its
-    /// transactions, counted like the chain's own.
+    /// transactions, counted like the chain's own, and builds each of
+    /// its two merkle trees once.
     #[test]
     fn hashing_a_block_ahead_is_one_pass() {
         let block = Arc::new(one_transaction_block());
         let before = BLOCKS_HASHED.get();
+        let trees_before = TREES_BUILT.get();
         let hashed = HashedBlock::new(block);
         assert_eq!(BLOCKS_HASHED.get().wrapping_sub(before), 1);
+        assert_eq!(TREES_BUILT.get().wrapping_sub(trees_before), 2);
         // Reading it back hashes nothing.
-        let _ = (hashed.hash(), hashed.tx_hashes(), hashed.merkle_leaves());
+        let _ = (
+            hashed.hash(),
+            hashed.tx_hashes(),
+            hashed.merkle_leaves(),
+            hashed.merkle_roots(),
+        );
         assert_eq!(BLOCKS_HASHED.get().wrapping_sub(before), 1);
+        assert_eq!(TREES_BUILT.get().wrapping_sub(trees_before), 2);
+    }
+
+    /// The root of the tree over the leaves by a walk of its own, one
+    /// level at a time with the last node of an odd level paired with
+    /// itself (dcrd `CalcMerkleRootInPlace`,
+    /// `blockchain/standalone/merkle.go:55-70`), and how many nodes it
+    /// hashed on the way.
+    fn root_and_inner_nodes(leaves: &[Hash]) -> (Hash, usize) {
+        let mut level = leaves.to_vec();
+        let mut inner_nodes = 0;
+        while level.len() > 1 {
+            level = level
+                .chunks(2)
+                .map(|pair| {
+                    let mut both = [0u8; 2 * HASH_SIZE];
+                    both[..HASH_SIZE].copy_from_slice(&pair[0].0);
+                    both[HASH_SIZE..].copy_from_slice(&pair[pair.len() - 1].0);
+                    hash_h(&both)
+                })
+                .collect();
+            inner_nodes += level.len();
+        }
+        (level.first().copied().unwrap_or(Hash::ZERO), inner_nodes)
+    }
+
+    /// How many nodes a tree of that many leaves has above them: each
+    /// level has half the nodes of the one below, rounded up.
+    fn inner_nodes_of(leaves: usize) -> usize {
+        let (mut nodes, mut inner_nodes) = (leaves, 0);
+        while nodes > 1 {
+            nodes = nodes.div_ceil(2);
+            inner_nodes += nodes;
+        }
+        inner_nodes
+    }
+
+    /// The least number of levels that halve `leaves` nodes to one,
+    /// `ceil(log2(leaves))`.
+    fn ceil_log2(leaves: usize) -> usize {
+        leaves.next_power_of_two().trailing_zeros() as usize
+    }
+
+    /// The block whose trees cost the most is hashed within the bound
+    /// [`HashedBlock::new`] states.  The block decoder allows each tree
+    /// `max_tx_per_tx_tree` transactions and accepts a transaction of
+    /// five bytes, one that carries only witness data and has no inputs,
+    /// so both trees are full in a block a third the size of the largest
+    /// payload, and the rest of that size can add no leaf.  Each tree of
+    /// that block has no more inner nodes than `n - 1 + ceil(log2(n))`,
+    /// each two compressions where a leaf takes four or more, and
+    /// [`HashedBlock::new`] builds each tree once.
+    #[test]
+    fn the_trees_of_the_fullest_block_stay_within_the_stated_bound() {
+        use dcroxide_wire::{
+            MAX_BLOCK_PAYLOAD, Message, PROTOCOL_VERSION, TxSerializeType, decode_message_payload,
+            max_tx_per_tx_tree,
+        };
+
+        let smallest = MsgTx {
+            ser_type: TxSerializeType::OnlyWitness,
+            ..MsgTx::default()
+        };
+        assert_eq!(smallest.serialize().len(), 5);
+        let cap = usize::try_from(max_tx_per_tx_tree(PROTOCOL_VERSION)).expect("cap");
+        assert_eq!(cap, 43_691);
+        let mut block = one_transaction_block();
+        block.transactions = vec![smallest.clone(); cap];
+        block.stransactions = vec![smallest.clone(); cap];
+
+        // The decoder takes the block as a peer would send it, and
+        // refuses one transaction more in either tree.
+        let decode = |block: &MsgBlock| {
+            decode_message_payload("block", &block.serialize(), PROTOCOL_VERSION)
+        };
+        let payload_len = block.serialize().len();
+        assert_eq!(payload_len, 437_096);
+        assert!(payload_len * 2 < MAX_BLOCK_PAYLOAD as usize);
+        let Ok(Message::Block(decoded)) = decode(&block) else {
+            panic!("a block of two full trees decodes");
+        };
+        assert_eq!(decoded, block);
+        for regular in [true, false] {
+            let mut over = block.clone();
+            if regular {
+                over.transactions.push(smallest.clone());
+            } else {
+                over.stransactions.push(smallest.clone());
+            }
+            assert!(decode(&over).is_err(), "regular: {regular}");
+        }
+
+        let trees_before = TREES_BUILT.get();
+        let hashed = HashedBlock::new(Arc::new(decoded));
+        assert_eq!(TREES_BUILT.get().wrapping_sub(trees_before), 2);
+        assert_eq!(
+            *hashed.merkle_roots(),
+            BlockMerkleRoots {
+                regular: calc_tx_tree_merkle_root(&block.transactions),
+                stake: calc_tx_tree_merkle_root(&block.stransactions),
+            }
+        );
+
+        for (leaves, root) in [
+            (
+                hashed.merkle_leaves().regular(),
+                hashed.merkle_roots().regular(),
+            ),
+            (
+                hashed.merkle_leaves().stake(),
+                hashed.merkle_roots().stake(),
+            ),
+        ] {
+            let n = leaves.len();
+            assert_eq!(n, cap);
+            // The root is that of the tree the walk hashes node by node.
+            let (walked_root, inner_nodes) = root_and_inner_nodes(leaves);
+            assert_eq!(root, walked_root);
+            assert_eq!(inner_nodes, 43_698);
+            assert!(inner_nodes <= n - 1 + ceil_log2(n));
+            // Two compressions a node against four or more a leaf.
+            assert!(2 * inner_nodes < 4 * n);
+        }
+    }
+
+    /// The bound on a tree's inner nodes holds for every number of
+    /// leaves up to the decoder's limit and past it, and the count it
+    /// bounds is the number of nodes a walk of the tree hashes.
+    #[test]
+    fn a_tree_has_no_more_inner_nodes_than_the_stated_bound() {
+        assert_eq!((inner_nodes_of(0), inner_nodes_of(1)), (0, 0));
+        for n in 1usize..=100_000 {
+            let inner_nodes = inner_nodes_of(n);
+            assert!(inner_nodes <= n - 1 + ceil_log2(n), "{n}: {inner_nodes}");
+            assert!(inner_nodes < 2 * n, "{n}: {inner_nodes}");
+        }
+        for n in 0u8..=64 {
+            let leaves: Vec<Hash> = (0..n).map(|i| Hash([i; HASH_SIZE])).collect();
+            let (root, inner_nodes) = root_and_inner_nodes(&leaves);
+            assert_eq!(root, calc_merkle_root(&leaves), "{n} leaves");
+            assert_eq!(inner_nodes, inner_nodes_of(leaves.len()), "{n} leaves");
+        }
+    }
+
+    /// The tree with its last nodes repeated at the first level that has
+    /// an odd number of them, which has the root of the tree without the
+    /// repeats: a level of odd length is hashed with its last node
+    /// paired with itself.  `None` for a tree with no such level, one of
+    /// a power of two leaves or of none.
+    fn with_repeated_tail(txs: &[MsgTx]) -> Option<Vec<MsgTx>> {
+        let (mut nodes, mut width) = (txs.len(), 1);
+        while nodes > 0 && nodes % 2 == 0 {
+            nodes /= 2;
+            width *= 2;
+        }
+        (nodes >= 3).then(|| {
+            let mut repeated = txs.to_vec();
+            repeated.extend_from_slice(&txs[txs.len() - width..]);
+            repeated
+        })
+    }
+
+    /// Blocks made from one block that fail, or may fail, the checks
+    /// that read its hashes, by shape: a tree that no longer has the
+    /// root the header names, a tree padded with repeats that still has
+    /// it, in a block of the size its header names, and trees with
+    /// nothing in them.  The header is the block's own unless the shape
+    /// says otherwise.
+    fn bad_shapes(block: &MsgBlock) -> Vec<(&'static str, MsgBlock)> {
+        let mut shapes = Vec::new();
+        let mut add = |shape: &'static str, make: &dyn Fn(&mut MsgBlock) -> bool| {
+            let mut altered = block.clone();
+            if make(&mut altered) {
+                shapes.push((shape, altered));
+            }
+        };
+        let alter_last = |txs: &mut Vec<MsgTx>| match txs.last_mut() {
+            Some(tx) => {
+                tx.lock_time ^= 1;
+                true
+            }
+            None => false,
+        };
+        let size_of = |block: &MsgBlock| block.serialize_size() as u32;
+
+        add("another regular tree", &|b| alter_last(&mut b.transactions));
+        add("another stake tree", &|b| alter_last(&mut b.stransactions));
+        add("a stake tree where there was none", &|b| {
+            let had_none = b.stransactions.is_empty();
+            b.stransactions.extend(b.transactions.first().cloned());
+            had_none && !b.stransactions.is_empty()
+        });
+        add("both trees are others", &|b| {
+            alter_last(&mut b.transactions) && alter_last(&mut b.stransactions)
+        });
+        // A tree with repeats keeps its root, so the header still names
+        // it; the header names the size of the block with the repeats.
+        add(
+            "a regular tree with repeats",
+            &|b| match with_repeated_tail(&b.transactions) {
+                Some(repeated) => {
+                    b.transactions = repeated;
+                    b.header.size = size_of(b);
+                    true
+                }
+                None => false,
+            },
+        );
+        add(
+            "a stake tree with repeats",
+            &|b| match with_repeated_tail(&b.stransactions) {
+                Some(repeated) => {
+                    b.stransactions = repeated;
+                    b.header.size = size_of(b);
+                    true
+                }
+                None => false,
+            },
+        );
+        add("no transactions", &|b| {
+            b.transactions.clear();
+            b.stransactions.clear();
+            true
+        });
+        add("no regular transactions", &|b| {
+            b.transactions.clear();
+            true
+        });
+        // A header that commits to two empty trees, each way a header
+        // can.
+        add("no transactions, as the header says", &|b| {
+            b.transactions.clear();
+            b.stransactions.clear();
+            b.header.merkle_root = Hash::ZERO;
+            b.header.stake_root = Hash::ZERO;
+            b.header.fresh_stake = 0;
+            b.header.size = size_of(b);
+            true
+        });
+        add("no transactions, as the combined root says", &|b| {
+            b.transactions.clear();
+            b.stransactions.clear();
+            b.header.merkle_root = calc_merkle_root(&[Hash::ZERO, Hash::ZERO]);
+            b.header.fresh_stake = 0;
+            b.header.size = size_of(b);
+            true
+        });
+        shapes
+    }
+
+    /// What the checks that read a block's merkle data and transaction
+    /// hashes report, made in the order `Chain::process_block` makes
+    /// them: the preconditions with the answer the agenda query gave,
+    /// then the sanity checks.  `Ok` carries whether the data commitment
+    /// was proven.
+    fn first_failure(
+        block: &MsgBlock,
+        tx_hashes: &BlockTxHashes,
+        leaves: &BlockMerkleLeaves,
+        roots: Option<&BlockMerkleRoots>,
+        agenda: &Result<AgendaActiveInfo, RuleError>,
+        params: &dcroxide_chaincfg::Params,
+    ) -> Result<bool, (RuleErrorKind, String)> {
+        let failure = |err: RuleError| (err.kind, err.description);
+        let proven =
+            check_block_data_preconditions_with_leaves(block, leaves, roots, || agenda.clone())
+                .map_err(failure)?;
+        check_block_data_sanity_with_hashes(block, tx_hashes, params).map_err(failure)?;
+        Ok(proven)
+    }
+
+    /// What decides how many trees the checks build for a block they
+    /// are not handed the roots of, worked out on the standalone
+    /// functions that hash the transactions themselves.
+    struct TreesBuilt {
+        /// Whether the block is within the wire protocol's size limit.
+        size_passes: bool,
+        /// Whether the regular tree has the root in the header's merkle
+        /// root field.
+        regular_matches: bool,
+        /// Whether the block fails the original commitment.
+        original_fails: bool,
+    }
+
+    impl TreesBuilt {
+        fn of(block: &MsgBlock) -> TreesBuilt {
+            let size = i64::try_from(block.serialize_size()).expect("size");
+            TreesBuilt {
+                size_passes: crate::validate::check_block_size_sanity(size).is_ok(),
+                regular_matches: calc_tx_tree_merkle_root(&block.transactions)
+                    == block.header.merkle_root,
+                original_fails: reference_merkle_failure(block, MerkleRootVariant::Original)
+                    .is_some(),
+            }
+        }
+
+        /// How many of the block's two transaction trees the merkle
+        /// check builds, which is how many dcrd's `checkMerkleRoots`
+        /// builds (`validate.go:1909-1952`): for the original commitment
+        /// the stake tree only once the regular root has matched the
+        /// header, for DCP0005 both.
+        fn by_the_merkle_check(&self, variant: MerkleRootVariant) -> u64 {
+            match variant {
+                MerkleRootVariant::Original if !self.regular_matches => 1,
+                MerkleRootVariant::Original | MerkleRootVariant::Dcp0005 => 2,
+            }
+        }
+
+        /// The same count for the preconditions, by the answer the
+        /// agenda query gave (dcrd `checkBlockDataPreconditions`,
+        /// `validate.go:1954-2049`): no tree when the size check or the
+        /// query fails first, the trees of the selected commitment when
+        /// the agenda is decided, and otherwise those of the original
+        /// commitment and, when that one fails, both trees again for
+        /// DCP0005.
+        fn by_the_preconditions(&self, agenda: &Result<AgendaActiveInfo, RuleError>) -> u64 {
+            match agenda {
+                _ if !self.size_passes => 0,
+                Err(_) => 0,
+                Ok(info) if info.is_valid => self.by_the_merkle_check(if info.is_active {
+                    MerkleRootVariant::Dcp0005
+                } else {
+                    MerkleRootVariant::Original
+                }),
+                Ok(_) => {
+                    let original = self.by_the_merkle_check(MerkleRootVariant::Original);
+                    if self.original_fails {
+                        original + 2
+                    } else {
+                        original
+                    }
+                }
+            }
+        }
+    }
+
+    /// A block that arrives with the roots of its merkle trees gets the
+    /// verdict of the same block without them, with the same text, from
+    /// the same check: for every block of the battery and for every bad
+    /// shape made from it, under each answer the header commitments
+    /// agenda query can give.  The side without roots builds each tree
+    /// where dcrd builds it and no other, so a block whose regular root
+    /// fails the original commitment has no stake tree built; the side
+    /// with roots builds none.
+    #[test]
+    fn carried_merkle_roots_give_the_verdicts_of_roots_built_by_the_check() {
+        let params = dcroxide_chaincfg::regnet_params();
+        let agendas = [
+            Ok(AgendaActiveInfo {
+                is_valid: true,
+                is_active: false,
+            }),
+            Ok(AgendaActiveInfo {
+                is_valid: true,
+                is_active: true,
+            }),
+            Ok(AgendaActiveInfo::default()),
+            Err(crate::ruleerror::rule_error(
+                RuleErrorKind::UnknownAgendaID,
+                "no such agenda",
+            )),
+        ];
+
+        let mut seen: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+        let mut repeats_keep_the_root = 0usize;
+        for (name, block) in fixture_blocks() {
+            let mut cases = vec![("the block", block.clone())];
+            cases.extend(bad_shapes(&block));
+            for (shape, case) in cases {
+                let hashed = HashedBlock::new(Arc::new(case.clone()));
+                let (tx_hashes, leaves) = BlockTxHashes::compute_with_merkle_leaves(&case);
+                assert_eq!(
+                    *hashed.merkle_roots(),
+                    BlockMerkleRoots {
+                        regular: calc_tx_tree_merkle_root(&case.transactions),
+                        stake: calc_tx_tree_merkle_root(&case.stransactions),
+                    },
+                    "{name}, {shape}"
+                );
+                hashed.merkle_roots().assert_for(hashed.merkle_leaves());
+                let trees_built = TreesBuilt::of(&case);
+                if shape.contains("with repeats") {
+                    // The shape is what it says: other transactions,
+                    // the same two roots.
+                    assert_ne!(case.serialize_size(), block.serialize_size());
+                    assert_eq!(
+                        *hashed.merkle_roots(),
+                        BlockMerkleRoots::compute(&BlockMerkleLeaves::compute(&block)),
+                        "{name}, {shape}"
+                    );
+                    repeats_keep_the_root += 1;
+                }
+
+                // The merkle check alone, against the check that hashes
+                // the transactions for itself.
+                for variant in [MerkleRootVariant::Original, MerkleRootVariant::Dcp0005] {
+                    let before = TREES_BUILT.get();
+                    let with_roots = check_merkle_roots_with_leaves(
+                        hashed.block(),
+                        hashed.merkle_leaves(),
+                        Some(hashed.merkle_roots()),
+                        variant,
+                    );
+                    assert_eq!(
+                        TREES_BUILT.get(),
+                        before,
+                        "{name}, {shape}, {variant:?}: a tree was built beside the roots"
+                    );
+                    let without = check_merkle_roots_with_leaves(&case, &leaves, None, variant);
+                    assert_eq!(
+                        TREES_BUILT.get().wrapping_sub(before),
+                        trees_built.by_the_merkle_check(variant),
+                        "{name}, {shape}, {variant:?}: the trees built without roots"
+                    );
+                    assert_eq!(with_roots, without, "{name}, {shape}, {variant:?}");
+                    assert_eq!(
+                        with_roots.err().map(|err| (err.kind, err.description)),
+                        reference_merkle_failure(&case, variant)
+                            .map(|text| (RuleErrorKind::BadMerkleRoot, text)),
+                        "{name}, {shape}, {variant:?}"
+                    );
+                }
+
+                // The checks in the order the chain makes them.
+                for agenda in &agendas {
+                    let before = TREES_BUILT.get();
+                    let with_roots = first_failure(
+                        hashed.block(),
+                        hashed.tx_hashes(),
+                        hashed.merkle_leaves(),
+                        Some(hashed.merkle_roots()),
+                        agenda,
+                        &params,
+                    );
+                    assert_eq!(
+                        TREES_BUILT.get(),
+                        before,
+                        "{name}, {shape}, {agenda:?}: a tree was built beside the roots"
+                    );
+                    let without = first_failure(&case, &tx_hashes, &leaves, None, agenda, &params);
+                    assert_eq!(
+                        TREES_BUILT.get().wrapping_sub(before),
+                        trees_built.by_the_preconditions(agenda),
+                        "{name}, {shape}, {agenda:?}: the trees built without roots"
+                    );
+                    assert_eq!(with_roots, without, "{name}, {shape}, {agenda:?}");
+
+                    let verdict = match &with_roots {
+                        Ok(proven) => format!("ok, proven: {proven}"),
+                        Err((RuleErrorKind::BadMerkleRoot, text)) => {
+                            let which = text.split(" is invalid").next().expect("text");
+                            format!("ErrBadMerkleRoot, {which}")
+                        }
+                        Err((kind, _)) => kind.kind_name().to_string(),
+                    };
+                    *seen.entry(format!("{shape}: {verdict}")).or_default() += 1;
+                }
+            }
+        }
+
+        assert!(
+            repeats_keep_the_root >= 100,
+            "{repeats_keep_the_root} trees with repeats"
+        );
+        // Every shape reached the check it was made for, on both sides.
+        for verdict in [
+            "the block: ok, proven: true",
+            "the block: ok, proven: false",
+            "the block: ErrUnknownAgendaID",
+            "another regular tree: ErrBadMerkleRoot, block merkle root",
+            "another stake tree: ErrBadMerkleRoot, block stake merkle root",
+            "another stake tree: ErrBadMerkleRoot, block merkle root",
+            "a stake tree where there was none: ErrBadMerkleRoot, block stake merkle root",
+            "both trees are others: ErrBadMerkleRoot, block merkle root",
+            "a regular tree with repeats: ErrDuplicateTx",
+            "a stake tree with repeats: ErrDuplicateTx",
+            "no transactions: ErrBadMerkleRoot, block merkle root",
+            "no regular transactions: ErrBadMerkleRoot, block merkle root",
+            "no transactions, as the header says: ErrNoTransactions",
+            "no transactions, as the combined root says: ErrNoTransactions",
+        ] {
+            assert!(
+                seen.get(verdict).is_some_and(|&count| count > 0),
+                "nothing gave {verdict:?}: {seen:#?}"
+            );
+        }
+        // With both trees wrong, the original variant names the regular
+        // root, which it compares first, and never the stake root.
+        assert!(
+            !seen.contains_key("both trees are others: ErrBadMerkleRoot, block stake merkle root"),
+            "{seen:#?}"
+        );
     }
 
     /// The regression network's genesis block: one regular transaction
@@ -738,6 +1367,7 @@ mod tests {
         let _ = check_merkle_roots_with_leaves(
             &a_block_of_another_shape(),
             &leaves,
+            None,
             MerkleRootVariant::Original,
         );
     }

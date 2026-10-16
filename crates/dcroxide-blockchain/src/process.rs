@@ -26,7 +26,7 @@ use dcroxide_uint256::Uint256;
 use dcroxide_wire::{MsgBlock, MsgTx, OutPoint};
 
 use crate::RuleError;
-use crate::blockhashes::{BlockMerkleLeaves, BlockTxHashes, HashedBlock};
+use crate::blockhashes::{BlockMerkleLeaves, BlockMerkleRoots, BlockTxHashes, HashedBlock};
 use crate::blockindex::{BlockIndex, BlockStatus, NodeId, NodeStore};
 use crate::chainio::SpentTxOut;
 use crate::chainview_nodes::{NodeBranchView, NodeChainView};
@@ -4297,26 +4297,34 @@ impl Chain {
         params: &Params,
     ) -> Result<bool, RuleError> {
         let leaves = BlockMerkleLeaves::compute(block);
-        self.check_block_data_preconditions_with_leaves(block, &leaves, prev_node, params)
+        self.check_block_data_preconditions_with_leaves(block, &leaves, None, prev_node, params)
     }
 
     /// [`Self::check_block_data_preconditions`] given the block's merkle
-    /// leaves, which must have been computed from this very block.
+    /// leaves, which must have been computed from this very block, and
+    /// the roots of the two trees over them when the block arrived with
+    /// those too.  The roots spare this call the building of the trees
+    /// and change nothing else of it.
     fn check_block_data_preconditions_with_leaves(
         &mut self,
         block: &MsgBlock,
         leaves: &BlockMerkleLeaves,
+        roots: Option<&BlockMerkleRoots>,
         prev_node: Option<NodeId>,
         params: &Params,
     ) -> Result<bool, RuleError> {
-        let proven =
-            crate::validate::check_block_data_preconditions_with_leaves(block, leaves, || {
+        let proven = crate::validate::check_block_data_preconditions_with_leaves(
+            block,
+            leaves,
+            roots,
+            || {
                 self.is_agenda_active_positional_by_id(
                     prev_node,
                     crate::agendas::VOTE_ID_HEADER_COMMITMENTS,
                     params,
                 )
-            })?;
+            },
+        )?;
 
         // Mark the header as having definitively been proven to commit
         // to the data, to avoid computing and checking the merkle roots
@@ -4595,16 +4603,21 @@ impl Chain {
     /// [`Self::process_shared_block`] for a block that arrives with its
     /// hashes, made before it reached the chain ([`HashedBlock`]): the
     /// same checks in the same order and the same results, with the
-    /// block's transactions not hashed again here.  A block that also
-    /// carries its record for the block files ([`HashedBlock::record`])
-    /// is stored as that record where another block is serialized, which
-    /// leaves the same bytes in the block files.
+    /// block's transactions not hashed again here and its two merkle
+    /// trees not built here.  A block that also carries its record for
+    /// the block files ([`HashedBlock::record`]) is stored as that record
+    /// where another block is serialized, which leaves the same bytes in
+    /// the block files.
     ///
     /// The hashes are consulted exactly where [`Self::process_block`]
     /// computes them, which is after the duplicate, known-invalid and
     /// header checks; a block refused by one of those was hashed for
-    /// nothing, and is refused as it would have been.  The block kept in
-    /// the `blocks` mirror is the `Arc` the [`HashedBlock`] owns.
+    /// nothing, and is refused as it would have been.  The roots of the
+    /// trees are compared with the header where [`Self::process_block`]
+    /// builds and compares them, by the same code, which selects the
+    /// commitment by the agenda and combines the two under DCP0005.  The
+    /// block kept in the `blocks` mirror is the `Arc` the
+    /// [`HashedBlock`] owns.
     pub fn process_hashed_block(
         &mut self,
         block: &HashedBlock,
@@ -4694,20 +4707,28 @@ impl Chain {
         // from `block` and only ever used with it.  A block that arrived
         // with its hashes brings them in the value that owns it, and
         // this is the first point at which they are read: the checks
-        // above did not depend on them.
+        // above did not depend on them.  Such a block also brings the
+        // roots of its two transaction trees, which the merkle check
+        // below then compares with the header in place of building the
+        // trees; for any other block it builds them, as it compares.
         let computed_leaves;
-        let (tx_hashes, merkle_leaves) = match arriving.hashed() {
-            Some(hashed) => (Arc::clone(hashed.tx_hashes()), hashed.merkle_leaves()),
+        let (tx_hashes, merkle_leaves, merkle_roots) = match arriving.hashed() {
+            Some(hashed) => (
+                Arc::clone(hashed.tx_hashes()),
+                hashed.merkle_leaves(),
+                Some(hashed.merkle_roots()),
+            ),
             None => {
                 let (tx_hashes, leaves) = BlockTxHashes::compute_with_merkle_leaves(block);
                 self.arrivals_hashed = self.arrivals_hashed.wrapping_add(1);
                 computed_leaves = leaves;
-                (Arc::new(tx_hashes), &computed_leaves)
+                (Arc::new(tx_hashes), &computed_leaves, None)
             }
         };
         let data_commit_proven = match self.check_block_data_preconditions_with_leaves(
             block,
             merkle_leaves,
+            merkle_roots,
             parent,
             params,
         ) {
@@ -10294,6 +10315,74 @@ mod tests {
         }
     }
 
+    /// A block that arrives with its hashes brings the roots of its two
+    /// merkle trees, and the processing call builds neither tree for the
+    /// check that compares them with the header: two trees fewer than
+    /// for the same block arriving without, whether the agenda that
+    /// selects the commitment is decided for the block or not.  Where it
+    /// is decided the commitment is proven by that check, nothing checks
+    /// it again, and the call builds no tree at all.  Where it is not,
+    /// the contextual check builds both trees from the block again,
+    /// whatever the block arrived with.
+    #[test]
+    fn a_hashed_block_is_processed_without_building_its_merkle_trees() {
+        let (now, blocks) = tip_extensions(30);
+        for decided in [false, true] {
+            let mut params = dcroxide_chaincfg::regnet_params();
+            if decided {
+                force_deployment_result(
+                    &mut params,
+                    crate::agendas::VOTE_ID_HEADER_COMMITMENTS,
+                    "no",
+                );
+            }
+            let mut chain = Chain::new(&params, Hash::ZERO, false);
+            // A twin that is handed every block without hashes.
+            let mut twin = Chain::new(&params, Hash::ZERO, false);
+            for (i, block) in blocks.iter().enumerate() {
+                let before = crate::blockhashes::TREES_BUILT.get();
+                let (_, errs) = twin.process_block(block, now, &params);
+                assert!(errs.is_empty(), "block {i} on the twin: {errs:?}");
+                let trees_of_a_plain_block =
+                    crate::blockhashes::TREES_BUILT.get().wrapping_sub(before);
+                assert_eq!(
+                    trees_of_a_plain_block,
+                    if decided { 2 } else { 4 },
+                    "block {i} (decided: {decided})"
+                );
+
+                let shared = Arc::new(block.clone());
+                // Every other block arrives hashed.  The trees built
+                // where it is hashed are not the processing call's.
+                let hashed = (i % 2 == 0).then(|| HashedBlock::new(Arc::clone(&shared)));
+                let before = crate::blockhashes::TREES_BUILT.get();
+                let (_, errs) = match &hashed {
+                    Some(hashed) => chain.process_hashed_block(hashed, now, &params),
+                    None => chain.process_shared_block(&shared, now, &params),
+                };
+                assert!(errs.is_empty(), "block {i}: {errs:?}");
+                let tip = chain.best_chain.tip().expect("tip");
+                assert_eq!(chain.store.node(tip).hash, block.header.block_hash());
+                let spared = if hashed.is_some() { 2 } else { 0 };
+                assert_eq!(
+                    crate::blockhashes::TREES_BUILT.get().wrapping_sub(before),
+                    trees_of_a_plain_block - spared,
+                    "block {i} (decided: {decided}, hashed: {})",
+                    hashed.is_some()
+                );
+                // The commitment that was checked is recorded under the
+                // block's hash however the block arrived.
+                assert!(
+                    chain
+                        .recent_merkle_checks
+                        .hashes
+                        .contains(&block.header.block_hash().0),
+                    "block {i} (decided: {decided})"
+                );
+            }
+        }
+    }
+
     /// A block the chain already has is refused as a duplicate before
     /// the hashes it arrived with are looked at.  The block here has an
     /// accepted block's header, hence its hash, over other transactions:
@@ -10321,6 +10410,7 @@ mod tests {
         let wrong_root = crate::validate::check_merkle_roots_with_leaves(
             &altered,
             hashed.merkle_leaves(),
+            Some(hashed.merkle_roots()),
             crate::validate::MerkleRootVariant::Original,
         )
         .expect_err("the altered block does not match its header");

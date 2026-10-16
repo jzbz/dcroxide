@@ -33,21 +33,22 @@
 //!   so the handler sees the frames in the order they ended on the wire.
 //! - **Values, never verdicts.**  The reader checks nothing but the
 //!   frame.  A block it hands over with the hashes of its transactions
+//!   and the roots of its two transaction merkle trees
 //!   (`dcroxide_blockchain::HashedBlock`), which the chain reads where
 //!   it would have computed them and not before; no merkle root is
-//!   compared and no rule applied on the reader's thread.  The block
-//!   also carries the payload it was decoded from, laid out as its
-//!   record for the block files, which the chain writes where it would
-//!   have serialized the block and taken the record's checksum (dcrd
-//!   stores the payload too, `server.go:1359`, `dcrutil/block.go:54-58`).
-//!   The payload is kept only once it has been compared with the
-//!   block's serialization and found to be it
+//!   compared with a header and no rule applied on the reader's thread.
+//!   The block also carries the payload it was decoded from, laid out as
+//!   its record for the block files, which the chain writes where it
+//!   would have serialized the block and taken the record's checksum
+//!   (dcrd stores the payload too, `server.go:1359`,
+//!   `dcrutil/block.go:54-58`).  The payload is kept only once it has
+//!   been compared with the block's serialization and found to be it
 //!   (`HashedBlock::keep_wire_bytes`), so the block files hold the same
-//!   bytes whichever thread read the block.  Every ban,
-//!   disconnect, reject, log line, pong and stall-detector event comes
-//!   from the input thread, from the same code, at the same position in
-//!   the stream.  A failed read is the last item in the queue and is
-//!   acted on only after every frame before it.
+//!   bytes whichever thread read the block.  Every ban, disconnect,
+//!   reject, log line, pong and stall-detector event comes from the
+//!   input thread, from the same code, at the same position in the
+//!   stream.  A failed read is the last item in the queue and is acted
+//!   on only after every frame before it.
 //! - **Early reads only behind a block.**  The reader starts a frame
 //!   before the handler is waiting for it only when the frame it read
 //!   last was a block and the handler's latest answer was that reading
@@ -125,9 +126,11 @@ pub(crate) enum Received {
     /// A block the reader thread read, ahead of the handler or in turn,
     /// with its block hash and the hashes of its transactions computed on
     /// that thread (what dcrd's `dcrutil.Block` holds, made lazily while
-    /// the chain processes the block), and with the payload it arrived in
-    /// laid out as its block-file record.  A block the input thread read for
-    /// itself, on a connection that has no reader thread, arrives as a
+    /// the chain processes the block), with the roots of its two
+    /// transaction merkle trees, which dcrd builds inside its merkle
+    /// check, and with the payload it arrived in laid out as its
+    /// block-file record.  A block the input thread read for itself, on a
+    /// connection that has no reader thread, arrives as a
     /// [`Received::Message`] and is hashed inside the chain.
     Block(HashedBlock),
 }
