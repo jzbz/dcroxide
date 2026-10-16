@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: ISC
 //! The daemon's mixpool probe is wired into the transaction pool.
 //!
-//! The gauntlet step this feeds (dcrd's `NonMixSpendsPairRequest`, in
-//! `crates/dcroxide-mempool/tests/mixpool_gate.rs`) is optional by
-//! construction: a pool with no probe skips it and accepts the spend,
-//! which is exactly dcrd's nil-closure behavior and exactly how a correct
-//! gauntlet ends up doing nothing in a running node.  So the fix is only
-//! real if the daemon's own pool carries a probe.
+//! The gauntlet steps this feeds (dcrd's `NonMixSpendsPairRequest` and
+//! `MisbehavingMixSpend`, in `crates/dcroxide-mempool/tests/mixpool_gate.rs`)
+//! are optional by construction: a pool with no probe skips both and
+//! accepts the spend, which is exactly dcrd's nil-closure behavior and
+//! exactly how a correct gauntlet ends up doing nothing in a running node.
+//! So the fix is only real if the daemon's own pool carries a probe.
 //!
 //! [`shared_mix_pool`] installs it, which is why it takes the tx pool at
 //! all — every construction site, the daemon's included, gets the wiring

@@ -1707,8 +1707,9 @@ fn build_server(
     );
     // The mixing pool the getdata serve path and the sync manager share
     // (dcrd `newServer` building one `mixpool.Pool`).
-    // Building it installs the tx pool's pair-request probe, so the
-    // acceptance gauntlet runs dcrd's `NonMixSpendsPairRequest` step.
+    // Building it installs the tx pool's mixpool probe, so the
+    // acceptance gauntlet runs dcrd's `NonMixSpendsPairRequest` and
+    // `MisbehavingMixSpend` steps.
     let mix_pool =
         dcroxide_node::mixnode::shared_mix_pool(Arc::clone(&chain), params.clone(), &tx_pool);
     // The sync manager shares the chain with the message handlers

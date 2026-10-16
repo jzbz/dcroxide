@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: ISC
 //! The descriptions of the mempool rule errors that name an outpoint
-//! or a serialization type.  They reach clients verbatim, as the text
-//! of `sendrawtransaction`'s "rejected transaction" error, and dcrd
-//! formats them with `%v`: a `wire.OutPoint` through its `String`
-//! method (`hash:index`), and a `wire.TxSerializeType`, a bare
-//! `uint16`, as its number.  The vector replays compare kinds only, so
-//! the text is pinned here.
+//! or a serialization type, and of the mixing misbehavior rejection.
+//! They reach clients verbatim, as the text of `sendrawtransaction`'s
+//! "rejected transaction" error, and dcrd formats them with `%v`: a
+//! `wire.OutPoint` through its `String` method (`hash:index`), and a
+//! `wire.TxSerializeType`, a bare `uint16`, as its number.  The vector
+//! replays compare kinds only, and no vector installs a mixpool probe,
+//! so the text is pinned here.
 
 // Test-harness arithmetic over bounded lengths.
 #![allow(clippy::arithmetic_side_effects)]
@@ -14,7 +15,7 @@ mod common;
 
 use common::{chain_from_init, error_kind, harness_policy, parse_hash, parse_tx};
 use dcroxide_chaincfg::mainnet_params;
-use dcroxide_mempool::{PoolError, TxPool, check_transaction_standard};
+use dcroxide_mempool::{MixpoolProbe, PoolError, TxPool, check_transaction_standard};
 use dcroxide_stake::TxType;
 use dcroxide_testutil::unhex;
 use dcroxide_wire::{BlockHeader, MsgTx, TxSerializeType};
@@ -163,4 +164,53 @@ fn the_serialize_type_description_is_the_wire_number() {
             format!("transaction is not serialized with all required data -- type {number}")
         );
     }
+}
+
+/// A probe whose observer has struck every output, and which reserves
+/// none for a pair request.
+struct EveryOutputStruck;
+
+impl MixpoolProbe for EveryOutputStruck {
+    fn non_mix_spends_pair_request(&self, _tx: &MsgTx) -> bool {
+        false
+    }
+
+    fn misbehaving_mix_spend(&self, _tx: &MsgTx) -> bool {
+        true
+    }
+}
+
+/// A non-mix spend of an output a misbehaving mixing peer controls is
+/// rejected with dcrd's text, which names the transaction by its hash
+/// (`mempool.go:1557-1560`).
+#[test]
+fn the_mixing_misbehavior_description_names_the_transaction() {
+    let data = include_str!("data/txpool_vectors.txt");
+    let mut lines = data.lines();
+    let init: Vec<&str> = lines.next().expect("init row").split(' ').collect();
+    let tx = lines
+        .find_map(|l| {
+            l.strip_prefix("pt ")
+                .map(|r| parse_tx(r.split(' ').next().expect("txhex")))
+        })
+        .expect("a pt row");
+
+    let params = mainnet_params();
+    let mut pool = TxPool::new(
+        chain_from_init(&init),
+        harness_policy(params.coinbase_maturity),
+        &params,
+    );
+    pool.set_mixpool_probe(Box::new(EveryOutputStruck));
+    let err = pool
+        .maybe_accept_transaction_pub(&tx, true)
+        .expect_err("the probe flags the spend");
+    assert_eq!(error_kind(&err), "ErrMixingMisbehavior");
+    assert_eq!(
+        description(&err),
+        format!(
+            "non-mix transaction {} spends outputs controlled by a misbehaving mixing peer",
+            tx.tx_hash()
+        )
+    );
 }

@@ -20,6 +20,9 @@ pub enum ErrorKind {
     /// A non-mix transaction attempts to double spend current pair
     /// request UTXOs in the mixpool.
     MixpoolDoubleSpend,
+    /// A non-mix transaction attempts to spend outputs controlled by a
+    /// misbehaving mixing peer.
+    MixingMisbehavior,
     /// A ticket already voted.
     AlreadyVoted,
     /// A transaction already exists in the mempool.
@@ -74,6 +77,7 @@ impl ErrorKind {
             ErrorKind::OrphanPolicyViolation => "ErrOrphanPolicyViolation",
             ErrorKind::MempoolDoubleSpend => "ErrMempoolDoubleSpend",
             ErrorKind::MixpoolDoubleSpend => "ErrMixpoolDoubleSpend",
+            ErrorKind::MixingMisbehavior => "ErrMixingMisbehavior",
             ErrorKind::AlreadyVoted => "ErrorAlreadyVoted",
             ErrorKind::Duplicate => "ErrDuplicate",
             ErrorKind::Coinbase => "ErrCoinbase",
@@ -189,5 +193,77 @@ impl PoolError {
 impl From<RuleError> for PoolError {
     fn from(err: RuleError) -> PoolError {
         PoolError::Rule(err)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ErrorKind;
+
+    /// dcrd's `TestErrorKindStringer` table as `3c8a1734` leaves it, in
+    /// its order (`internal/mempool/error_test.go:14-53` at that commit).
+    const KIND_NAMES: [(ErrorKind, &str); 23] = [
+        (ErrorKind::Invalid, "ErrInvalid"),
+        (ErrorKind::OrphanPolicyViolation, "ErrOrphanPolicyViolation"),
+        (ErrorKind::MempoolDoubleSpend, "ErrMempoolDoubleSpend"),
+        (ErrorKind::MixpoolDoubleSpend, "ErrMixpoolDoubleSpend"),
+        (ErrorKind::MixingMisbehavior, "ErrMixingMisbehavior"),
+        (ErrorKind::AlreadyVoted, "ErrorAlreadyVoted"),
+        (ErrorKind::Duplicate, "ErrDuplicate"),
+        (ErrorKind::Coinbase, "ErrCoinbase"),
+        (ErrorKind::Treasurybase, "ErrTreasurybase"),
+        (ErrorKind::Expired, "ErrExpired"),
+        (ErrorKind::NonStandard, "ErrNonStandard"),
+        (ErrorKind::DustOutput, "ErrDustOutput"),
+        (ErrorKind::InsufficientFee, "ErrInsufficientFee"),
+        (ErrorKind::TooManyVotes, "ErrTooManyVotes"),
+        (ErrorKind::DuplicateRevocation, "ErrDuplicateRevocation"),
+        (ErrorKind::OldVote, "ErrOldVote"),
+        (ErrorKind::AlreadyExists, "ErrAlreadyExists"),
+        (ErrorKind::SeqLockUnmet, "ErrSeqLockUnmet"),
+        (ErrorKind::FeeTooHigh, "ErrFeeTooHigh"),
+        (ErrorKind::Orphan, "ErrOrphan"),
+        (ErrorKind::TooManyTSpends, "ErrTooManyTSpends"),
+        (ErrorKind::TSpendMinedOnAncestor, "ErrTSpendMinedOnAncestor"),
+        (ErrorKind::TSpendInvalidExpiry, "ErrTSpendInvalidExpiry"),
+    ];
+
+    /// The row of [`KIND_NAMES`] that holds the kind.  The match has no
+    /// wildcard arm, so a kind added without a row here fails to
+    /// compile rather than going unchecked.
+    fn row(kind: ErrorKind) -> usize {
+        match kind {
+            ErrorKind::Invalid => 0,
+            ErrorKind::OrphanPolicyViolation => 1,
+            ErrorKind::MempoolDoubleSpend => 2,
+            ErrorKind::MixpoolDoubleSpend => 3,
+            ErrorKind::MixingMisbehavior => 4,
+            ErrorKind::AlreadyVoted => 5,
+            ErrorKind::Duplicate => 6,
+            ErrorKind::Coinbase => 7,
+            ErrorKind::Treasurybase => 8,
+            ErrorKind::Expired => 9,
+            ErrorKind::NonStandard => 10,
+            ErrorKind::DustOutput => 11,
+            ErrorKind::InsufficientFee => 12,
+            ErrorKind::TooManyVotes => 13,
+            ErrorKind::DuplicateRevocation => 14,
+            ErrorKind::OldVote => 15,
+            ErrorKind::AlreadyExists => 16,
+            ErrorKind::SeqLockUnmet => 17,
+            ErrorKind::FeeTooHigh => 18,
+            ErrorKind::Orphan => 19,
+            ErrorKind::TooManyTSpends => 20,
+            ErrorKind::TSpendMinedOnAncestor => 21,
+            ErrorKind::TSpendInvalidExpiry => 22,
+        }
+    }
+
+    #[test]
+    fn every_kind_has_dcrds_name() {
+        for (i, (kind, want)) in KIND_NAMES.iter().enumerate() {
+            assert_eq!(kind.kind_name(), *want, "#{i}");
+            assert_eq!(row(*kind), i, "{want} is listed once, in dcrd's order");
+        }
     }
 }

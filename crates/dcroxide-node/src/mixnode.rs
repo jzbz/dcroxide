@@ -133,9 +133,10 @@ impl MixUtxoEntry for NodeMixUtxo {
 /// `newServer` building `mixpool.NewPool`).
 ///
 /// Takes the transaction pool so it can install [`NodeMixpoolProbe`] on
-/// the way out: dcrd's mempool config carries
-/// `mixpool.NonMixSpendsPairRequest`, and a pool built without it silently
-/// skips that step of the acceptance gauntlet.  Threading it through the
+/// the way out: dcrd's mempool config carries the mixpool's
+/// `NonMixSpendsPairRequest` and the observer's `MisbehavingTx`
+/// (`server.go:4129-4134`), and a pool built without them silently skips
+/// those steps of the acceptance gauntlet.  Threading it through the
 /// constructor rather than leaving it to a separate call at the one daemon
 /// site makes the wiring impossible to omit.
 pub fn shared_mix_pool(
@@ -156,12 +157,17 @@ pub fn shared_mix_pool(
 }
 
 /// The mixpool as the transaction memory pool consults it, for dcrd's
-/// `NonMixSpendsPairRequest` step of the acceptance gauntlet.
+/// `NonMixSpendsPairRequest` and `MisbehavingMixSpend` steps of the
+/// acceptance gauntlet.
 ///
 /// Lock order: **tx pool then mixpool then chain**.  The tx pool holds its
-/// own guard across this call, and `Pool::non_mix_spends_pr` is a pure
-/// in-memory lookup that never reaches back into the chain, so the edge
-/// composes with the mixpool-then-chain order pinned by `b5_lockorder`.
+/// own guard across these calls, and `Pool::non_mix_spends_pr` and
+/// `Pool::misbehaving_tx` are pure in-memory lookups that never reach back
+/// into the chain, so the edge composes with the mixpool-then-chain order
+/// pinned by `b5_lockorder`.  dcrd's `MisbehavingTx` takes the mixpool
+/// lock and then the observer's (`mixing/mixpool/observer.go:462-469`);
+/// here the strike sets sit in the pool under its guard, each behind its
+/// own mutex taken last.
 /// Nothing takes the tx-pool mutex while holding either of the other two:
 /// [`crate::chainntfns::ChainNtfnHandler::handle`] only queues inside the
 /// chain's critical section, and every tx-pool acquisition happens in a
@@ -173,7 +179,7 @@ pub struct NodeMixpoolProbe {
 }
 
 impl NodeMixpoolProbe {
-    /// Adapt the shared mixpool as the tx pool's pair-request probe.
+    /// Adapt the shared mixpool as the tx pool's mixpool probe.
     pub fn new(pool: Arc<Mutex<NodeMixPool>>) -> NodeMixpoolProbe {
         NodeMixpoolProbe { pool }
     }
@@ -185,6 +191,13 @@ impl dcroxide_mempool::MixpoolProbe for NodeMixpoolProbe {
             .lock()
             .expect("mixpool mutex poisoned")
             .non_mix_spends_pr(tx)
+    }
+
+    fn misbehaving_mix_spend(&self, tx: &MsgTx) -> bool {
+        self.pool
+            .lock()
+            .expect("mixpool mutex poisoned")
+            .misbehaving_tx(tx)
     }
 }
 
@@ -427,7 +440,8 @@ fn run_epoch_ticker(
 ///   `s.mixObserver.Run(ctx)`): after each epoch completes, the
 ///   previous epoch's sessions are checked for timeout misbehavior,
 ///   feeding the strike set behind [`Pool::misbehaving_block`] and
-///   [`Pool::misbehaving_tx`]; and
+///   [`Pool::misbehaving_tx`], which the transaction pool's acceptance
+///   consults through [`NodeMixpoolProbe`]; and
 /// * the scheduled expiry (dcrd `Pool.ExpireMessagesInBackground`
 ///   spawning `p.expireMessages`, which sleeps to the epoch boundary
 ///   and then runs the pass): the height latched by every block

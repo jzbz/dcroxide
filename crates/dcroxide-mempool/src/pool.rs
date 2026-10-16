@@ -312,10 +312,14 @@ pub trait UnconfirmedAddrIndexer: Send {
 }
 
 /// The mixpool's view of which outpoints are reserved by a current pair
-/// request (dcrd's mempool config carrying `mixpool.NonMixSpendsPairRequest`).
+/// request and which are controlled by a misbehaving mixing peer (dcrd's
+/// mempool config carrying `NonMixSpendsPairRequest` and
+/// `MisbehavingMixSpend`, `mempool.go:181-188`).
 ///
-/// `None` on the pool means "no", matching dcrd's nil-closure guard at
-/// `mempool.go:1353`.
+/// `None` on the pool means "no" to both, matching dcrd's nil-closure
+/// guards at `mempool.go:1549` and `:1557`.  dcrd's two closures can be
+/// nil independently, but `newServer` always sets both
+/// (`server.go:4129-4134`), so one probe answers both questions.
 ///
 /// **Lock order.** The implementation takes the mixpool lock, and the pool
 /// calls it while holding its own, creating a tx-pool -> mixpool edge. The
@@ -329,6 +333,11 @@ pub trait MixpoolProbe: Send {
     /// Whether a NON-mix transaction spends an outpoint a current pair
     /// request depends on (dcrd `NonMixSpendsPairRequest`).
     fn non_mix_spends_pair_request(&self, tx: &MsgTx) -> bool;
+
+    /// Whether a transaction that is not a known mix transaction spends
+    /// an outpoint flagged for mixing misbehavior (dcrd
+    /// `MisbehavingMixSpend`, wired to the observer's `MisbehavingTx`).
+    fn misbehaving_mix_spend(&self, tx: &MsgTx) -> bool;
 }
 
 /// The optional tspend-received hook (dcrd mempool `Config`'s
@@ -537,10 +546,10 @@ impl<C: PoolChain> TxPool<C> {
 
     /// Whether a mixpool probe is installed, and so whether the
     /// acceptance gauntlet actually runs its `NonMixSpendsPairRequest`
-    /// step.
+    /// and `MisbehavingMixSpend` steps.
     ///
-    /// A pool without one skips the step silently, which is the way this
-    /// fix fails: correct in the gauntlet, never reached in the daemon.
+    /// A pool without one skips both steps silently, which is the way
+    /// they fail: correct in the gauntlet, never reached in the daemon.
     /// Exposed so the node side can assert its wiring rather than trust
     /// it.
     pub fn has_mixpool_probe(&self) -> bool {
@@ -548,11 +557,11 @@ impl<C: PoolChain> TxPool<C> {
     }
 
     /// Install the mixpool probe the acceptance gauntlet consults for
-    /// dcrd's `NonMixSpendsPairRequest` step.
+    /// dcrd's `NonMixSpendsPairRequest` and `MisbehavingMixSpend` steps.
     ///
     /// Installed after construction because the mixpool is built later in
-    /// daemon startup than the tx pool; without this call the step is
-    /// inert and the gauntlet silently keeps its pre-fix behaviour.
+    /// daemon startup than the tx pool; without this call both steps are
+    /// inert and the gauntlet silently admits what they would refuse.
     pub fn set_mixpool_probe(&mut self, probe: Box<dyn MixpoolProbe>) {
         self.mixpool_probe = Some(probe);
     }
@@ -1602,7 +1611,7 @@ impl<C: PoolChain> TxPool<C> {
         }
 
         // A non-mix transaction may not spend an output a current mixpool
-        // pair request depends on (dcrd `mempool.go:1351-1357`). Applies to
+        // pair request depends on (dcrd `mempool.go:1547-1553`). Applies to
         // every transaction type, so it sits ahead of the vote/revocation
         // branch rather than inside it.
         if let Some(mix) = &self.mixpool_probe
@@ -1611,6 +1620,19 @@ impl<C: PoolChain> TxPool<C> {
             let str =
                 format!("non-mix transaction {tx_hash} spends current mixpool pair request UTXOs");
             return Err(tx_rule_error(ErrorKind::MixpoolDoubleSpend, str).into());
+        }
+
+        // Nor may it spend an output controlled by a misbehaving mixing
+        // peer (dcrd `mempool.go:1555-1561`), for every transaction type
+        // too.
+        if let Some(mix) = &self.mixpool_probe
+            && mix.misbehaving_mix_spend(tx)
+        {
+            let str = format!(
+                "non-mix transaction {tx_hash} spends outputs controlled by a \
+                 misbehaving mixing peer"
+            );
+            return Err(tx_rule_error(ErrorKind::MixingMisbehavior, str).into());
         }
 
         // Aside from a few exceptions for votes and revocations, the
