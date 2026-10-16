@@ -42,6 +42,17 @@
 //! the two must lose no key.  The power cuts, the lookup races and the
 //! hand-over control run both ways.
 //!
+//! **The hook's search.**  A connect's hook searches the memtable again
+//! only for the keys of a partition that has changed since the connect's
+//! filter.  It must leave the index, row for row, as a hook that searches
+//! for every key leaves it, whatever came between the filter and the
+//! hook: another connect's keys, a flush, a disconnect.  A scripted run is
+//! also held to a digest of the states it left when the hook searched for
+//! every key, and one block's journal row to its bytes.  On the
+//! subscriber's path, with no flush, the hook must search for nothing.
+//! And since a filter's answer is good only for the memtable it was made
+//! against, what one index prepared must not be used by another.
+//!
 //! **The key order.**  Keys are compared by an inline comparison of three
 //! words, not by the array type's own; the two must be one order, in the
 //! comparison itself and in every row a flush writes.
@@ -1758,6 +1769,77 @@ fn what_was_prepared_for_one_connect_is_not_used_for_another_notification() {
     assert_eq!(f.prepared(), (3, 1));
 }
 
+/// What one index prepared is not used by another index of the same
+/// kind, even for the very block it was made for: the second does its own
+/// work inside its transaction, against its own memtable and with its own
+/// overlay.
+///
+/// The keys in a prepared connect carry the versions of the first index's
+/// memtable.  Here the key's partition has the same version in both
+/// indexes, and the second holds the key where the first does not.  A
+/// hook that took the first index's word for it would put the key into
+/// the partition a second time, and the next flush would journal a row
+/// holding the key twice, which the layout check refuses as corrupt.
+#[test]
+fn what_one_index_prepared_is_not_used_by_another() {
+    // Nothing merges and no commit asks for a flush.
+    let policy = fixed(Policy {
+        k0: usize::MAX,
+        k0_hard: usize::MAX,
+        u_max: usize::MAX,
+        ..Policy::tiny()
+    });
+    let mut a = Fixture::new(policy);
+    let mut b = Fixture::new(policy);
+    let mut rng = SplitMix64(0x7072_6570_000a);
+    let k = random_key(&mut rng);
+    let p = part().of(&k);
+    let j = random_key_in(&mut rng, p);
+    let [pooled_a, pooled_b] = [0; 2].map(|_| random_key(&mut rng));
+    assert!(BTreeSet::from([k, j, pooled_a, pooled_b]).len() == 4);
+
+    // One connect each, of a key of the one partition: `b` holds `k` and
+    // `a` does not, and the partition has changed as often in both.
+    b.deliver(Delivery::Inline, 1, &[k]);
+    a.deliver(Delivery::Inline, 1, &[j]);
+    let versions = [&a, &b].map(|f| f.store.mem.version(usize::from(p)));
+    assert_eq!(versions[0], versions[1]);
+    assert!(a.store.partitioner().of(&k) == p && b.store.partitioner().of(&k) == p);
+
+    // `a` prepares the connect of a block paying `k`, with a key in its
+    // own overlay, and the result is handed to `b` for that block.
+    a.unconfirmed.add_unconfirmed_tx(&mempool_tx(&[pooled_a]));
+    b.unconfirmed.add_unconfirmed_tx(&mempool_tx(&[pooled_b]));
+    let ntfn = b.next(2, &[k]);
+    let prepared = a.prepare(&ntfn);
+    assert!(prepared.is_some(), "a queued connect is prepared");
+    assert_eq!((a.prepared(), b.prepared()), ((1, 0), (0, 0)));
+    b.chain.add(&ntfn.block);
+    b.apply(&ntfn, prepared);
+    assert_eq!(b.prepared(), (0, 0), "another index's result was used");
+    assert_eq!(b.tip_row(), Fixture::tip_row_of(&ntfn.block));
+
+    // `b` did its own work: `k` once, as before, and its own overlay's
+    // key.  Nothing of `a`'s overlay came with the result, and `a` is as
+    // it was, its copied key still in its overlay.
+    assert_eq!(b.store.mem.snapshot(), sorted(vec![k, pooled_b]));
+    assert_eq!(b.store.mem.len(), 2);
+    assert!(
+        !b.exists(&pooled_a),
+        "the other index's overlay was handed over"
+    );
+    assert_eq!(a.store.mem.snapshot(), vec![j]);
+    assert!(a.exists(&pooled_a));
+
+    // The row the flush journals holds each key once, in order.
+    b.db.flush().expect("flush");
+    check_layout(&b.db).expect("layout").expect("bucket");
+    assert_eq!(
+        b.idx.lock().expect("index").logical_keys().expect("keys"),
+        sorted(vec![k, pooled_b])
+    );
+}
+
 /// An update that fails after its connect was prepared leaves the index
 /// as it was: the memtable, the tip and the overlay, whose copied keys go
 /// with the next connect.  Three ways to fail: the transaction is rolled
@@ -2090,6 +2172,336 @@ fn a_flush_between_a_prepare_and_its_transaction_loses_no_key() {
 }
 
 // ---------------------------------------------------------------------
+// The hook's second search, and the versions that spare it
+// ---------------------------------------------------------------------
+
+/// How many steps of each kind a [`hook_script`] ran.
+#[derive(Debug, Default)]
+struct HookSteps {
+    /// Connects delivered through the subscriber.
+    delivered: usize,
+    /// Connects prepared and then processed in the test's own
+    /// transaction, with something in between.
+    prepared: usize,
+    /// Of those, the ones with another connect's hand-over in between,
+    /// with a flush, and with a disconnect.
+    inserts: usize,
+    flushes: usize,
+    disconnects: usize,
+}
+
+/// Drive every fixture through the same random steps, calling `after`
+/// once all of them have taken a step.
+///
+/// The steps: a mempool transaction; a flush; a connect delivered through
+/// the subscriber, queued or on the spot; and a connect prepared as a
+/// queued one is and then processed in the test's own transaction, after
+/// any of three things that can come between a filter and its hook
+/// outside the subscriber.  Those are another connect, which hands over
+/// half of the prepared block's keys, one key more and the overlay; a
+/// flush; and a disconnect of the tip.  A third of each block's keys were
+/// seen before, and under [`Policy::tiny`] every few commits flush on
+/// their own, between the commit's filter and its hook.
+fn hook_script(
+    seed: u64,
+    steps: u32,
+    fixtures: &mut [Fixture],
+    mut after: impl FnMut(u32, &[Fixture]),
+) -> HookSteps {
+    let mut rng = SplitMix64(seed);
+    let mut seen: Vec<Key> = Vec::new();
+    let mut ran = HookSteps::default();
+    for step in 0..steps {
+        let kind = rng.below(12);
+        match kind {
+            0 => {
+                let keys = [random_key(&mut rng), random_key(&mut rng)];
+                for f in fixtures.iter() {
+                    f.unconfirmed.add_unconfirmed_tx(&mempool_tx(&keys));
+                }
+                seen.extend(keys);
+            }
+            1 => {
+                for f in fixtures.iter() {
+                    f.db.flush().expect("flush");
+                }
+            }
+            _ => {
+                let keys: Vec<Key> = (0..1 + rng.below(10))
+                    .map(|_| {
+                        if !seen.is_empty() && rng.below(3) == 0 {
+                            seen[rng.below(seen.len() as u64) as usize]
+                        } else {
+                            random_key(&mut rng)
+                        }
+                    })
+                    .collect();
+                if kind < 8 {
+                    // What comes between the prepare and the connect.
+                    let between = 1 + rng.below(7);
+                    let tip = fixtures[0].chain.tip().0;
+                    let (insert, flush, disconnect) = (
+                        between & 1 != 0,
+                        between & 2 != 0,
+                        between & 4 != 0 && tip > 0,
+                    );
+                    let mut theirs: Vec<Key> = keys.iter().copied().step_by(2).collect();
+                    theirs.push(random_key(&mut rng));
+                    for f in fixtures.iter() {
+                        let ntfn = f.next(step, &keys);
+                        let prepared = f.prepare(&ntfn);
+                        assert!(prepared.is_some(), "step {step}: not prepared");
+                        if insert {
+                            f.apply(&f.next(step + 1_000_000, &theirs), None);
+                        }
+                        if flush {
+                            f.db.flush().expect("flush");
+                        }
+                        if disconnect {
+                            let undone = IndexNtfn {
+                                ntfn_type: crate::DISCONNECT_NTFN,
+                                block: f.chain.at(tip),
+                                parent: f.chain.at(tip - 1),
+                                is_treasury_enabled: false,
+                            };
+                            f.apply(&undone, None);
+                        }
+                        f.chain.add(&ntfn.block);
+                        f.apply(&ntfn, prepared);
+                    }
+                    ran.prepared += 1;
+                    ran.inserts += usize::from(insert);
+                    ran.flushes += usize::from(flush);
+                    ran.disconnects += usize::from(disconnect);
+                    if insert {
+                        seen.extend(&theirs);
+                    }
+                } else {
+                    let delivery = match kind {
+                        8 => Delivery::Inline,
+                        _ => Delivery::Queued,
+                    };
+                    for f in fixtures.iter_mut() {
+                        f.deliver(delivery, step, &keys);
+                    }
+                    ran.delivered += 1;
+                }
+                seen.extend(keys);
+            }
+        }
+        after(step, fixtures);
+    }
+    ran
+}
+
+/// BLAKE-256 of `digest` and then everything in `state`, each part with
+/// its length.
+fn chain_state(digest: [u8; 32], state: &IndexState) -> [u8; 32] {
+    let (tip, keys, memtable, rows) = state;
+    let mut buf = digest.to_vec();
+    let mut put = |part: &[u8]| {
+        buf.extend_from_slice(&(part.len() as u64).to_be_bytes());
+        buf.extend_from_slice(part);
+    };
+    put(tip);
+    put(&keys.concat());
+    put(&memtable.concat());
+    for (key, value) in rows {
+        put(key);
+        put(value);
+    }
+    dcroxide_chainhash::hash_b(&buf)
+}
+
+/// A scripted run leaves the rows, the memtable and the tip, after every
+/// one of its steps, that it left when the hook searched the memtable
+/// again for every key it was handed: the digest below is of that code's
+/// states, chained step by step.
+///
+/// The run is made twice.  The second time the memtable searches for
+/// every key whatever the versions say, which is the insert the digest
+/// was taken from.  So a change that is meant to move the digest, to a
+/// row's layout, to [`Policy::tiny`] or to the blocks the script builds,
+/// moves it for both runs alike, and the value to pin is the one the
+/// second run then reports.
+#[test]
+fn a_scripted_run_writes_the_rows_it_wrote_when_the_hook_searched_for_every_key() {
+    for search_always in [false, true] {
+        let mut fixtures = [Fixture::new(fixed(Policy::tiny()))];
+        fixtures[0]
+            .store
+            .mem
+            .search_always
+            .store(search_always, Ordering::SeqCst);
+        let mut digest = [0u8; 32];
+        let mut most_rows = 0usize;
+        let ran = hook_script(0x686f_6f6b_0001, 400, &mut fixtures, |_, fixtures| {
+            let state = fixtures[0].state();
+            most_rows = most_rows.max(state.3.len());
+            digest = chain_state(digest, &state);
+        });
+        assert!(
+            ran.delivered > 80 && ran.inserts > 60 && ran.flushes > 60 && ran.disconnects > 60,
+            "{ran:?}"
+        );
+        assert!(most_rows > 20, "the flushes wrote only {most_rows} rows");
+        check_layout(&fixtures[0].db)
+            .expect("layout")
+            .expect("bucket");
+        assert_eq!(
+            hex(&digest),
+            "48e3468c0d495602d2b7a923d51f7f8c491966ec62cb8362189e864a5050e169",
+            "a hook that searches for every key: {search_always}"
+        );
+        let unsearched = fixtures[0].store.mem.unsearched();
+        assert_eq!(unsearched == 0, search_always, "{unsearched} unsearched");
+    }
+}
+
+/// Two indexes taken through the same script hold the same tip row, keys,
+/// memtable and rows after every step: one whose hook trusts the versions
+/// its candidates carry, and one whose hook searches the memtable for
+/// every key, as the hook did when a partition had no version.  So what
+/// each flush journals and merges is the same, byte for byte, whatever
+/// came between a connect's filter and its hook.
+#[test]
+fn a_hook_that_trusts_its_versions_leaves_what_one_that_searches_leaves() {
+    let mut fixtures = [
+        Fixture::new(fixed(Policy::tiny())),
+        Fixture::new(fixed(Policy::tiny())),
+    ];
+    fixtures[1]
+        .store
+        .mem
+        .search_always
+        .store(true, Ordering::SeqCst);
+    let mut most_rows = 0usize;
+    let ran = hook_script(0x686f_6f6b_0002, 600, &mut fixtures, |step, fixtures| {
+        let want = fixtures[1].state();
+        assert_eq!(fixtures[0].state(), want, "step {step}");
+        most_rows = most_rows.max(want.3.len());
+    });
+    assert!(
+        ran.delivered > 100 && ran.inserts > 100 && ran.flushes > 100 && ran.disconnects > 100,
+        "{ran:?}"
+    );
+    assert!(most_rows > 20, "the flushes wrote only {most_rows} rows");
+    for f in &fixtures {
+        f.db.flush().expect("flush");
+        check_layout(&f.db).expect("layout").expect("bucket");
+    }
+    assert_eq!(fixtures[0].state(), fixtures[1].state());
+    // The one index searched for every key it was handed, and the other
+    // for some: those whose partition another connect, or a flush, had
+    // changed since their filter.
+    let [trusting, searching] = fixtures.map(|f| f.store.mem.unsearched());
+    assert_eq!(searching, 0);
+    assert!(trusting > 500, "{trusting} keys went in unsearched");
+}
+
+/// On the subscriber's path nothing comes between a connect's filter and
+/// its hook but a flush, so while no flush runs the hook searches for
+/// nothing: every key the memtable holds went in unsearched, whether the
+/// connect was prepared before its transaction or filtered inside it.  A
+/// third of each block's keys were seen before, and the filter left them
+/// out.
+#[test]
+fn a_connect_through_the_subscriber_searches_the_memtable_once() {
+    // No commit asks for a flush.
+    let policy = fixed(Policy {
+        u_max: usize::MAX,
+        ..Policy::tiny()
+    });
+    for delivery in [Delivery::Queued, Delivery::Inline] {
+        let mut f = Fixture::new(policy);
+        let mut rng = SplitMix64(0x686f_6f6b_0003);
+        let mut seen: BTreeSet<Key> = BTreeSet::new();
+        for salt in 0..200u32 {
+            let keys: Vec<Key> = (0..1 + rng.below(10))
+                .map(|_| match seen.iter().nth(rng.below(30) as usize) {
+                    Some(&key) if rng.below(3) == 0 => key,
+                    _ => random_key(&mut rng),
+                })
+                .collect();
+            if salt % 5 == 0 {
+                let pooled = random_key(&mut rng);
+                f.unconfirmed.add_unconfirmed_tx(&mempool_tx(&[pooled]));
+                seen.insert(pooled);
+            }
+            f.deliver(delivery, salt, &keys);
+            seen.extend(keys);
+        }
+        let prepared = match delivery {
+            Delivery::Queued => (200, 200),
+            Delivery::Inline => (0, 0),
+        };
+        assert_eq!(f.prepared(), prepared);
+        assert!(seen.len() > 600, "{} keys", seen.len());
+        assert_eq!(
+            f.store.mem.snapshot(),
+            seen.iter().copied().collect::<Vec<Key>>()
+        );
+        assert_eq!(
+            f.store.mem.unsearched(),
+            seen.len(),
+            "{delivery:?}: the hook searched for keys its filter had kept"
+        );
+    }
+}
+
+/// The journal row a flush writes for one block is the block's new keys
+/// and the pool's, in byte order: these bytes, which are the ones the row
+/// held when the hook searched for every key again.
+#[test]
+fn a_blocks_journal_row_holds_the_bytes_it_always_held() {
+    // Nothing merges and no commit asks for a flush.
+    let mut f = Fixture::new(fixed(Policy {
+        k0: usize::MAX,
+        k0_hard: usize::MAX,
+        u_max: usize::MAX,
+        ..Policy::tiny()
+    }));
+    let key = |t: u8, fill: u8| {
+        let mut key = [fill; 21];
+        key[0] = t;
+        key
+    };
+    let [held, a, b, c, d, pooled] = [
+        key(1, 0x40),
+        key(3, 0x11),
+        key(0, 0xfe),
+        key(2, 0x7f),
+        key(0, 0x01),
+        key(1, 0x80),
+    ];
+    f.deliver(Delivery::Queued, 1, &[held]);
+    f.db.flush().expect("flush");
+    f.unconfirmed.add_unconfirmed_tx(&mempool_tx(&[pooled]));
+    f.deliver(Delivery::Queued, 2, &[a, held, b, c, d]);
+    assert_eq!(f.prepared(), (2, 2));
+    f.db.flush().expect("flush");
+    let rows = f.state().3;
+    let journal: Vec<&(Vec<u8>, Vec<u8>)> = rows
+        .iter()
+        .filter(|(row, _)| row[4] == super::journal::JOURNAL_TAG)
+        .collect();
+    assert_eq!(journal.len(), 2, "one row a flush");
+    let (row, value) = journal[1];
+    assert_eq!(*value, sorted(vec![a, b, c, d, pooled]).concat());
+    assert_eq!(hex(row), "000000034a0000000200000000");
+    assert_eq!(
+        hex(value),
+        concat!(
+            "000101010101010101010101010101010101010101",
+            "00fefefefefefefefefefefefefefefefefefefefe",
+            "018080808080808080808080808080808080808080",
+            "027f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f",
+            "031111111111111111111111111111111111111111",
+        )
+    );
+}
+
+// ---------------------------------------------------------------------
 // Merges, probes and the leaf size, over a store driven directly
 // ---------------------------------------------------------------------
 
@@ -2146,9 +2558,8 @@ impl StoreRig {
 
     fn insert(&self, keys: Vec<Key>) {
         let part = self.store.partitioner();
-        let mut cands: Vec<(u8, Key)> = keys.into_iter().map(|k| (part.of(&k), k)).collect();
-        cands.sort_unstable();
-        self.store.mem.insert_candidates(&cands);
+        let mem = &self.store.mem;
+        mem.insert_candidates(&mem.filter(keys.into_iter().map(|k| (part.of(&k), k))));
     }
 
     fn flush(&self) {

@@ -27,6 +27,7 @@ use crate::common::{
     db_put_indexer_tip, drop_flat_index, notify_sync_subscribers, tip,
 };
 use crate::error::{ErrorKind, IdxError, indexer_error};
+use crate::existsaddr::memtable::Candidate;
 use crate::existsaddr::policy::Policy;
 use crate::existsaddr::runs::{self, BASE, DELTA};
 use crate::existsaddr::store::{self, AddrStore};
@@ -141,15 +142,22 @@ const NO_BUCKET: u64 = u64::MAX;
 /// The part of one connect that needs no transaction, done before the
 /// connect's transaction began (`ExistsAddrIndex::prepare_connect`).
 struct PreparedConnect {
+    /// The store of the index that made this.  A connect uses it on this
+    /// very store and no other: the partitions the candidates name are
+    /// this store's, and the versions they carry are its memtable's and
+    /// say nothing of another's.  Held, like the block, so the allocation
+    /// cannot be reused for another store while this lives.
+    store: Arc<AddrStore>,
     /// The block this was made for.  A connect uses it for this very
     /// allocation and no other, and holding the block here keeps the
     /// allocation from being reused for another while this lives.
     block: Arc<MsgBlock>,
     /// The block's hash, for the tip row.
     hash: Hash,
-    /// The keys to hand to the memtable, each with its partition, sorted,
-    /// less those the memtable held when they were filtered.
-    candidates: Vec<(u8, [u8; ADDR_KEY_SIZE])>,
+    /// The keys to hand to the memtable, each with its partition and the
+    /// version the partition had when the key was filtered, sorted, less
+    /// those the memtable held then.
+    candidates: Vec<Candidate>,
     /// The copy of the unconfirmed overlay the connect was queued with:
     /// what its hook removes from the overlay.
     copied: Vec<[u8; ADDR_KEY_SIZE]>,
@@ -692,24 +700,21 @@ impl ExistsAddrIndex {
     }
 
     /// The keys a connect hands to the memtable: the block's and the
-    /// copied overlay's, each with its partition, less those the memtable
-    /// holds now, sorted.
+    /// copied overlay's, each with its partition and that partition's
+    /// version, less those the memtable holds now, sorted.
     fn candidates(
         &self,
         mut used_addrs: HashSet<[u8; ADDR_KEY_SIZE]>,
         copied: &[[u8; ADDR_KEY_SIZE]],
-    ) -> Vec<(u8, [u8; ADDR_KEY_SIZE])> {
+    ) -> Vec<Candidate> {
         used_addrs.extend(copied.iter().copied());
         let part = self.store.partitioner();
-        let mut candidates: Vec<(u8, [u8; ADDR_KEY_SIZE])> = used_addrs
-            .into_iter()
-            .map(|k| (part.of(&k), k))
-            .filter(|(p, k)| !self.store.mem.contains(*p, k))
-            .collect();
-        // By partition, so the hook takes each partition's lock once and
-        // hashes nothing under the writer semaphore.
-        candidates.sort_unstable();
-        candidates
+        // Sorted by partition, so the hook takes each partition's lock
+        // once and hashes nothing under the writer semaphore; and with the
+        // versions, so it searches only the partitions changed since.
+        self.store
+            .mem
+            .filter(used_addrs.into_iter().map(|k| (part.of(&k), k)))
     }
 
     /// A connect's work for `block` that needs no transaction, with
@@ -727,15 +732,31 @@ impl ExistsAddrIndex {
     /// the writer from before the connect until its own hook has run, so
     /// no key arrives between this filter and that hook; a caller outside
     /// the subscriber could commit a connect of its own in between, and
-    /// then the hook's check, made under each partition's write lock,
-    /// skips what that connect added.  Keys leave the memtable when a
-    /// committed flush clears the partitions it merged, whose keys are by
-    /// then in the runs that commit wrote, and when the index is reloaded
-    /// or dropped, which needs the index's lock.  So a key left out here
-    /// as held is, at the hook, still held or in a run, and a key kept
-    /// here is inserted unless the hook finds it held.  The filter a
-    /// connect makes inside its transaction stands on the same argument:
-    /// that commit's own flush can follow it too.
+    /// then the hook finds the versions of the partitions that connect
+    /// added to moved, searches those under their write locks, and skips
+    /// what it added.  Keys leave the memtable when a committed flush
+    /// clears the partitions it merged, whose keys are by then in the
+    /// runs that commit wrote, and when the index is reloaded or dropped,
+    /// which needs the index's lock.  So a key left out here as held is,
+    /// at the hook, still held or in a run, and a key kept here is
+    /// inserted unless the hook finds it held.  The filter a connect
+    /// makes inside its transaction stands on the same argument: that
+    /// commit's own flush can follow it too.
+    ///
+    /// **What the hook searches.**  Each key kept here carries the
+    /// version its partition had when the key was found missing, and
+    /// every change to a partition moves its version
+    /// ([`crate::existsaddr::memtable`]).  So the hook, under a
+    /// partition's write lock, knows from an unmoved version that the
+    /// partition still holds none of the keys kept for it, and inserts
+    /// them without a second search.  On the subscriber's path that is
+    /// every partition no flush has folded or cleared since the filter.
+    /// Where a version has moved, by another connect's keys, a flush's
+    /// fold or clear, or a load, the hook searches as the filter did.
+    /// The keys it inserts are the same either way.  A version says this
+    /// only of the memtable it was read from, so what is prepared here
+    /// names this index's store, and a connect takes it for no other
+    /// ([`connect_block`](Self::connect_block)).
     ///
     /// A flush between this filter and the transaction, which another
     /// thread's commit can make, does change one thing.  A key of a
@@ -750,6 +771,7 @@ impl ExistsAddrIndex {
     ) -> PreparedConnect {
         let candidates = self.candidates(self.used_addrs(block), &copied);
         PreparedConnect {
+            store: Arc::clone(&self.store),
             block: Arc::clone(block),
             hash: block.header.block_hash(),
             candidates,
@@ -780,9 +802,11 @@ impl ExistsAddrIndex {
     ///
     /// `prepared` is the part of this that needs no transaction, when the
     /// subscriber had it done before the transaction began
-    /// ([`Indexer::prepare_notification`]).  It is used only for the very
-    /// block it was made for; without one, all of it is done here.  The
-    /// bucket check, the tip row and the hook are the same either way.
+    /// ([`Indexer::prepare_notification`]).  It is used only by the index
+    /// that made it, which is the one whose store it names, and only for
+    /// the very block it was made for; otherwise, and without one, all of
+    /// it is done here.  The bucket check, the tip row and the hook are
+    /// the same either way.
     fn connect_block(
         &mut self,
         db_tx: &Transaction,
@@ -790,7 +814,12 @@ impl ExistsAddrIndex {
         prepared: Option<PreparedConnect>,
     ) -> Result<(), IdxError> {
         let (hash, candidates, copied) = match prepared {
-            Some(prepared) if Arc::ptr_eq(&prepared.block, block) => {
+            // An index's store is never replaced, so the store's
+            // allocation is the index's identity.
+            Some(prepared)
+                if Arc::ptr_eq(&prepared.store, &self.store)
+                    && Arc::ptr_eq(&prepared.block, block) =>
+            {
                 #[cfg(test)]
                 self.store
                     .faults
@@ -842,7 +871,8 @@ impl ExistsAddrIndex {
             // A flush, this commit's own or an earlier one, may have
             // merged some candidates' partitions since they were
             // filtered, and a connect outside the subscriber may have
-            // handed some of them over; the insert checks again.
+            // handed some of them over; the insert searches again every
+            // partition whose version has moved since.
             store.mem.insert_candidates(&candidates);
             let mut overlay = overlay.write().expect("unconfirmed overlay lock poisoned");
             for key in &copied {
@@ -953,7 +983,9 @@ impl Indexer for ExistsAddrIndex {
     ) -> Result<(), IdxError> {
         match ntfn.ntfn_type {
             CONNECT_NTFN => {
-                // Another index's, or nothing: the connect does it all.
+                // Another kind of index's, or nothing: the connect does it
+                // all.  It does too when handed what another instance of
+                // this index prepared, which it tells by the store.
                 let prepared = prepared
                     .and_then(|prepared| prepared.downcast::<PreparedConnect>().ok())
                     .map(|prepared| *prepared);

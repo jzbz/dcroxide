@@ -20,6 +20,13 @@
 //! semaphore.  Every vector is grown by exact-capacity merges, so the
 //! memtable costs 21 bytes a key plus a transient copy of one partition.
 //!
+//! A partition also counts the changes to its vectors, its version.  A
+//! connect filters its keys against the memtable before its hook inserts
+//! them, and each key the filter keeps carries the version its partition
+//! had when it was searched for.  The hook searches again only where a
+//! version has moved since: an insert by another connect, a flush's fold
+//! or clear, a load.
+//!
 //! Sorted is by the keys' bytes.  The searches, merges and sorts of a
 //! lookup, a connect and a flush compare with [`super::cmp_keys`], which
 //! gives that order without a call to the C library for each comparison.
@@ -42,6 +49,15 @@ struct Part {
     fresh: Vec<Vec<Key>>,
     /// Keys in `fresh`.
     fresh_len: usize,
+    /// Moved by every change to the vectors, which only [`Part::add_run`]
+    /// and [`Part::replace`] make, both under the partition's write lock.
+    /// So a search under the read lock that pairs its answer with this,
+    /// and a holder of the write lock that finds this where the search
+    /// left it, agree on every key: nothing was added or removed in
+    /// between.  It counts up from the partition's creation and is never
+    /// set back, a flush's clear and a load included, so it never returns
+    /// to a value it has had.
+    version: u64,
 }
 
 impl Part {
@@ -63,6 +79,7 @@ impl Part {
     /// once per run it passes as the newest, of which there are at most
     /// `log2(n) + 1`.
     fn add_run(&mut self, run: Vec<Key>) -> usize {
+        self.version = self.version.wrapping_add(1);
         self.fresh_len = self.fresh_len.saturating_add(run.len());
         self.fresh.push(run);
         let mut copied = 0usize;
@@ -76,6 +93,15 @@ impl Part {
             self.fresh.push(merged);
         }
         copied
+    }
+
+    /// Replace the keys with `journaled`, sorted and all of them
+    /// journaled: what a flush's fold or clear and a load leave.
+    fn replace(&mut self, journaled: Vec<Key>) {
+        self.version = self.version.wrapping_add(1);
+        self.journaled = journaled;
+        self.fresh = Vec::new();
+        self.fresh_len = 0;
     }
 
     /// The unjournaled keys, sorted, in one vector.
@@ -110,6 +136,20 @@ pub(crate) fn merge_sorted(a: &[Key], b: &[Key]) -> Vec<Key> {
     out
 }
 
+/// A key [`Memtable::filter`] found its partition not to hold.
+///
+/// The order is by partition and then by the key's bytes; no two
+/// candidates of one filter share both, so the version never decides it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct Candidate {
+    /// The key's partition.
+    pub(crate) p: u8,
+    /// The key.
+    pub(crate) key: Key,
+    /// The partition's version when it was searched for the key.
+    pub(crate) seen: u64,
+}
+
 /// The keys of indexed blocks not yet merged into a run, partitioned by
 /// the index's partition hash.
 pub(crate) struct Memtable {
@@ -122,6 +162,14 @@ pub(crate) struct Memtable {
     /// bounds the insert cost.
     #[cfg(test)]
     copied: AtomicUsize,
+    /// The tests' control: an insert searches for every key it is handed,
+    /// whatever the versions say.
+    #[cfg(test)]
+    pub(crate) search_always: std::sync::atomic::AtomicBool,
+    /// Keys inserted without a search, for the tests that must see which
+    /// way an insert went.
+    #[cfg(test)]
+    unsearched: AtomicUsize,
 }
 
 impl Memtable {
@@ -135,6 +183,10 @@ impl Memtable {
             unjournaled: AtomicUsize::new(0),
             #[cfg(test)]
             copied: AtomicUsize::new(0),
+            #[cfg(test)]
+            search_always: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            unsearched: AtomicUsize::new(0),
         }
     }
 
@@ -162,43 +214,109 @@ impl Memtable {
         self.part(usize::from(p)).contains(key)
     }
 
+    /// The keys of `keys`, each given with its partition, that the
+    /// memtable does not hold, sorted by partition and key: what a connect
+    /// hands to [`Self::insert_candidates`].
+    ///
+    /// Each key is searched for under its partition's read lock, and the
+    /// version that goes with it is read under that same hold, before
+    /// the search.  The one hold is what makes the pair exact: no change
+    /// can fall between the two.  The order is a second defence, should
+    /// the hold ever be split.  A version read first and overtaken by a
+    /// change is only out of date, which costs the key a second search.
+    /// A version read after the search could be the one that followed
+    /// another connect's insert of this very key, and the hook would then
+    /// put the key in a second time.
+    pub(crate) fn filter(&self, keys: impl IntoIterator<Item = (u8, Key)>) -> Vec<Candidate> {
+        let mut candidates: Vec<Candidate> = keys
+            .into_iter()
+            .filter_map(|(p, key)| {
+                let part = self.part(usize::from(p));
+                let seen = part.version;
+                (!part.contains(&key)).then_some(Candidate { p, key, seen })
+            })
+            .collect();
+        candidates.sort_unstable();
+        candidates
+    }
+
     /// Insert every key not already held; returns how many were new.
     ///
-    /// `keys` pairs each key with its partition, sorted by partition (and
-    /// best by key within one); each partition's lock is taken once, and
-    /// its new keys go in as one run.
+    /// `keys` must be sorted by partition (and best by key within one);
+    /// each partition's lock is taken once, and its new keys go in as one
+    /// run.
+    ///
+    /// A partition whose version is the one every key of its group was
+    /// filtered at has not changed since, so it holds none of them; when
+    /// the group's keys also ascend, the group is the run as it stands,
+    /// and goes in without a search or a sort.  Any other group is
+    /// searched for key by key and what is left sorted, each key once,
+    /// which makes the same run wherever the first way applies.  The
+    /// versions are compared under the partition's write lock, the lock
+    /// every change to the partition is made under.
+    ///
+    /// A version says that only of the memtable it was read from.  So
+    /// every candidate must come from a [`Self::filter`] of this very
+    /// memtable, or carry a version its partition has never had, which
+    /// has it searched for: a key filtered against another memtable goes
+    /// in unsearched wherever the two partitions' versions happen to be
+    /// equal, held here or not.
     ///
     /// Only for a holder of the database's writer semaphore: the
     /// participant reads the memtable without locks of its own between
     /// `contribute` and `finished`, relying on nothing else writing then.
-    pub(crate) fn insert_candidates(&self, keys: &[(u8, Key)]) -> usize {
+    pub(crate) fn insert_candidates(&self, keys: &[Candidate]) -> usize {
         debug_assert!(
-            keys.windows(2).all(|w| w[0].0 <= w[1].0),
+            keys.windows(2).all(|w| w[0].p <= w[1].p),
             "candidates must be grouped by partition"
         );
         let mut added = 0usize;
         let mut copied = 0usize;
+        #[cfg(test)]
+        let mut unsearched = 0usize;
         let mut rest = keys;
-        while let Some(&(p, _)) = rest.first() {
-            let end = rest.partition_point(|&(q, _)| q == p);
+        while let Some(&Candidate { p, .. }) = rest.first() {
+            let end = rest.partition_point(|c| c.p == p);
             let (group, tail) = rest.split_at(end);
             rest = tail;
             let mut part = self.part_mut(usize::from(p));
-            let mut run: Vec<Key> = group
-                .iter()
-                .map(|&(_, key)| key)
-                .filter(|key| !part.contains(key))
-                .collect();
+            let stands = group.iter().all(|c| c.seen == part.version)
+                && group
+                    .windows(2)
+                    .all(|w| cmp_keys(&w[0].key, &w[1].key).is_lt());
+            #[cfg(test)]
+            let stands = stands && !self.search_always.load(Ordering::SeqCst);
+            let run: Vec<Key> = if stands {
+                debug_assert!(
+                    group.iter().all(|c| !part.contains(&c.key)),
+                    "partition {p} holds a key its version says it does not"
+                );
+                #[cfg(test)]
+                {
+                    unsearched = unsearched.saturating_add(group.len());
+                }
+                group.iter().map(|c| c.key).collect()
+            } else {
+                let mut run: Vec<Key> = group
+                    .iter()
+                    .map(|c| c.key)
+                    .filter(|key| !part.contains(key))
+                    .collect();
+                run.sort_unstable_by(cmp_keys);
+                run.dedup();
+                run
+            };
             if run.is_empty() {
                 continue;
             }
-            run.sort_unstable_by(cmp_keys);
-            run.dedup();
             added = added.saturating_add(run.len());
             copied = copied.saturating_add(part.add_run(run));
         }
         #[cfg(test)]
-        self.copied.fetch_add(copied, Ordering::SeqCst);
+        {
+            self.copied.fetch_add(copied, Ordering::SeqCst);
+            self.unsearched.fetch_add(unsearched, Ordering::SeqCst);
+        }
         let _ = copied;
         self.len.fetch_add(added, Ordering::SeqCst);
         self.unjournaled.fetch_add(added, Ordering::SeqCst);
@@ -248,14 +366,13 @@ impl Memtable {
             let mut part = self.part_mut(p);
             if was_merged {
                 removed = removed.saturating_add(part.len());
-                *part = Part::default();
+                part.replace(Vec::new());
                 continue;
             }
             if part.fresh_len > 0 {
                 let fresh = part.unjournaled();
-                part.journaled = merge_sorted(&part.journaled, &fresh);
-                part.fresh = Vec::new();
-                part.fresh_len = 0;
+                let folded = merge_sorted(&part.journaled, &fresh);
+                part.replace(folded);
             }
         }
         self.len.fetch_sub(removed, Ordering::SeqCst);
@@ -274,11 +391,7 @@ impl Memtable {
             let journaled = parts.next().unwrap_or_default();
             debug_assert!(journaled.windows(2).all(|w| w[0] < w[1]));
             len = len.saturating_add(journaled.len());
-            *self.part_mut(p) = Part {
-                journaled,
-                fresh: Vec::new(),
-                fresh_len: 0,
-            };
+            self.part_mut(p).replace(journaled);
         }
         self.len.store(len, Ordering::SeqCst);
         self.unjournaled.store(0, Ordering::SeqCst);
@@ -306,6 +419,18 @@ impl Memtable {
         self.copied.load(Ordering::SeqCst)
     }
 
+    /// Keys inserted without a search so far, for tests.
+    #[cfg(test)]
+    pub(crate) fn unsearched(&self) -> usize {
+        self.unsearched.load(Ordering::SeqCst)
+    }
+
+    /// Partition `p`'s version, for tests.
+    #[cfg(test)]
+    pub(crate) fn version(&self, p: usize) -> u64 {
+        self.part(p).version
+    }
+
     /// Partition `p`'s journaled vector's spare capacity, for tests.
     #[cfg(test)]
     pub(crate) fn spare_capacity(&self, p: usize) -> usize {
@@ -322,6 +447,10 @@ impl Memtable {
     reason = "test arithmetic over small counts"
 )]
 mod tests {
+    use std::collections::BTreeSet;
+
+    use dcroxide_testutil::SplitMix64;
+
     use super::*;
 
     fn key(t: u8, p: u8, rest: u8) -> Key {
@@ -331,10 +460,29 @@ mod tests {
         k
     }
 
-    /// Candidates with the partition the tests file them under: the
-    /// key's second byte, sorted as a connect sorts them.
-    fn cands(keys: &[Key]) -> Vec<(u8, Key)> {
-        let mut c: Vec<(u8, Key)> = keys.iter().map(|k| (k[1], *k)).collect();
+    /// What a connect's filter keeps of `keys`, under the partition the
+    /// tests file them under: the key's second byte.
+    fn filtered(m: &Memtable, keys: &[Key]) -> Vec<Candidate> {
+        m.filter(keys.iter().map(|k| (k[1], *k)))
+    }
+
+    /// Filter `keys` and insert what the filter kept, as a connect does
+    /// when nothing comes between the two; returns how many were new.
+    fn insert(m: &Memtable, keys: &[Key]) -> usize {
+        m.insert_candidates(&filtered(m, keys))
+    }
+
+    /// `keys` as a filter would hand them had it kept them all at a
+    /// version no partition has: the insert searches for every one.
+    fn stale(keys: &[Key]) -> Vec<Candidate> {
+        let mut c: Vec<Candidate> = keys
+            .iter()
+            .map(|k| Candidate {
+                p: k[1],
+                key: *k,
+                seen: u64::MAX,
+            })
+            .collect();
         c.sort_unstable();
         c
     }
@@ -351,7 +499,7 @@ mod tests {
         let m = Memtable::new();
         let mut keys: Vec<Key> = (0..=200u8).map(|r| key(0, 7, r)).collect();
         keys.push(key(3, 9, 1));
-        assert_eq!(m.insert_candidates(&cands(&keys)), 202);
+        assert_eq!(insert(&m, &keys), 202);
         assert_eq!(m.len(), 202);
         assert_eq!(m.unjournaled(), 202);
         for k in &keys {
@@ -360,27 +508,35 @@ mod tests {
         assert!(!m.contains(7, &key(0, 7, 255)));
         assert!(!m.contains(7, &key(1, 7, 3)), "same hash, other type");
         assert!(!m.contains(8, &key(0, 7, 3)), "another partition");
-        // A second insert of held keys adds nothing.
-        assert_eq!(m.insert_candidates(&cands(&keys[..5])), 0);
+        // A second insert of held keys adds nothing, and one of held and
+        // new keys adds the new.
+        assert_eq!(m.insert_candidates(&stale(&keys[..5])), 0);
         assert_eq!(m.len(), 202);
+        let mixed = [keys[0], key(3, 7, 0), keys[1], key(3, 9, 2), keys[201]];
+        assert_eq!(m.insert_candidates(&stale(&mixed)), 2);
+        assert_eq!(m.len(), 204);
+        assert_eq!(m.unjournaled(), 204);
         // One key at a time, then a batch: the runs keep falling, each
         // more than twice the next.
         for r in 0..=255u8 {
-            m.insert_candidates(&cands(&[key(1, 7, r)]));
+            insert(&m, &[key(1, 7, r)]);
             assert!(runs_fall_geometrically(&m, 7), "{:?}", m.shape(7));
         }
         let batch: Vec<Key> = (0..=255u8).map(|r| key(2, 7, r)).collect();
-        m.insert_candidates(&cands(&batch));
+        insert(&m, &batch);
         assert!(runs_fall_geometrically(&m, 7), "{:?}", m.shape(7));
-        assert_eq!(m.len(), 202 + 256 + 256);
+        assert_eq!(m.len(), 204 + 256 + 256);
         let all = m.all_sorted(7);
-        assert_eq!(all.len(), 201 + 512);
+        assert_eq!(all.len(), 202 + 512);
         assert!(all.windows(2).all(|w| w[0] < w[1]));
     }
 
-    /// A partition's keys need not arrive in order: the insert sorts the
-    /// run they go in as, and every later search and merge rests on that.
-    /// A connect hands its keys sorted, so no other test shows the sort.
+    /// A partition's keys need not arrive in order, or each once: the
+    /// insert sorts the run they go in as and drops a repeat, and every
+    /// later search and merge rests on that.  A connect hands its keys
+    /// sorted, so no other test shows the sort.  Each batch here is
+    /// filtered just before it is handed, so its versions stand, and it
+    /// is the keys' order alone that has the insert sort them.
     #[test]
     fn a_partitions_keys_are_sorted_however_they_are_handed() {
         let m = Memtable::new();
@@ -388,23 +544,31 @@ mod tests {
             .flat_map(|t| (0..60u8).map(move |r| key(t, 9, r)))
             .collect();
         assert!(ascending.windows(2).all(|w| w[0] < w[1]));
-        // Every other key, last first; then the rest, last first, which
-        // merges with the run the first batch left.
+        // Every other key, last first; then the rest, last first and the
+        // lowest of them twice, which merges with the run the first batch
+        // left.
         for batch in [0usize, 1] {
-            let handed: Vec<(u8, Key)> = ascending
+            let keys: Vec<Key> = ascending
                 .iter()
-                .rev()
+                .copied()
                 .filter(|k| usize::from(k[2]) % 2 == batch)
-                .map(|k| (9u8, *k))
                 .collect();
-            assert_eq!(m.insert_candidates(&handed), handed.len());
+            let mut handed = filtered(&m, &keys);
+            assert_eq!(handed.len(), keys.len());
+            handed.reverse();
+            if batch == 1 {
+                handed.push(*handed.last().expect("keys"));
+            }
+            assert_eq!(m.insert_candidates(&handed), keys.len());
         }
+        assert_eq!(m.unsearched(), 0, "keys out of order went in unsorted");
         assert_eq!(m.all_sorted(9), ascending);
+        assert_eq!(m.len(), ascending.len());
         for k in &ascending {
             assert!(m.contains(9, k));
         }
         assert!(!m.contains(9, &key(0, 9, 60)));
-        assert_eq!(m.insert_candidates(&cands(&ascending)), 0);
+        assert_eq!(m.insert_candidates(&stale(&ascending)), 0);
     }
 
     /// Inserting n keys into one partition copies O(n log n) keys,
@@ -430,10 +594,10 @@ mod tests {
                         k[2..6].copy_from_slice(&i.reverse_bits().to_be_bytes());
                         (0, k)
                     })
-                    .collect::<std::collections::BTreeSet<_>>()
+                    .collect::<BTreeSet<_>>()
                     .into_iter()
                     .collect();
-                m.insert_candidates(&keys);
+                m.insert_candidates(&m.filter(keys));
                 next = end;
             }
             assert_eq!(m.len(), n as usize);
@@ -455,7 +619,7 @@ mod tests {
             .flat_map(|r| [key(0, 1, r), key(2, 2, r)])
             .collect();
         for chunk in keys.chunks(9) {
-            m.insert_candidates(&cands(chunk));
+            insert(&m, chunk);
         }
         let mut merged = [false; PARTITIONS];
         merged[2] = true;
@@ -499,7 +663,7 @@ mod tests {
         let keys: Vec<Key> = (0..=255u8)
             .flat_map(|p| (0..40u8).map(move |r| key(0, p, r)))
             .collect();
-        m.insert_candidates(&cands(&keys));
+        insert(&m, &keys);
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let readers: Vec<_> = (0..4)
             .map(|t| {
@@ -518,7 +682,7 @@ mod tests {
             .collect();
         for round in 0..50u8 {
             let more: Vec<Key> = (0..=255u8).map(|p| key(1, p, round)).collect();
-            m.insert_candidates(&cands(&more));
+            insert(&m, &more);
             m.commit_flush(&[false; PARTITIONS]);
         }
         stop.store(true, Ordering::SeqCst);
@@ -526,5 +690,289 @@ mod tests {
             r.join().expect("reader");
         }
         assert_eq!(m.len(), keys.len() + 50 * 256);
+    }
+
+    /// Every change to a partition's vectors moves its version and no
+    /// other's, what changes nothing leaves it, and nothing sets it back:
+    /// a cleared or reloaded partition counts on from where it was.
+    #[test]
+    fn a_version_moves_with_every_change_to_its_partition_and_never_back() {
+        let m = Memtable::new();
+        let versions = |m: &Memtable| [m.version(3), m.version(5)];
+        assert_eq!(versions(&m), [0, 0]);
+        // An insert that adds keys, and one that adds none.
+        assert_eq!(insert(&m, &[key(0, 3, 1), key(0, 3, 2), key(0, 3, 3)]), 3);
+        assert_eq!(versions(&m), [1, 0]);
+        assert_eq!(m.insert_candidates(&stale(&[key(0, 3, 1)])), 0);
+        assert_eq!(versions(&m), [1, 0]);
+        // An insert into a partition that has a run already: one whose
+        // run stays beside the first, and one whose run merges with both.
+        assert_eq!(insert(&m, &[key(0, 3, 4)]), 1);
+        assert_eq!((m.shape(3), versions(&m)), ((0, vec![3, 1]), [2, 0]));
+        assert_eq!(insert(&m, &[key(0, 3, 5)]), 1);
+        assert_eq!((m.shape(3), versions(&m)), ((0, vec![5]), [3, 0]));
+        // A flush folds 3's unjournaled keys; the next finds none to fold.
+        m.commit_flush(&[false; PARTITIONS]);
+        assert_eq!((m.shape(3), versions(&m)), ((5, vec![]), [4, 0]));
+        m.commit_flush(&[false; PARTITIONS]);
+        assert_eq!(versions(&m), [4, 0]);
+        // A flush clears the partition it merged.
+        let mut merged = [false; PARTITIONS];
+        merged[3] = true;
+        m.commit_flush(&merged);
+        assert_eq!(m.len(), 0);
+        assert_eq!(versions(&m), [5, 0]);
+        // A load and a clear replace every partition.
+        let mut parts = vec![Vec::new(); PARTITIONS];
+        parts[3] = vec![key(0, 3, 1)];
+        m.load(parts);
+        assert_eq!(versions(&m), [6, 1]);
+        m.clear();
+        assert_eq!(versions(&m), [7, 2]);
+    }
+
+    /// A filter's keys go in without a search while their partition is as
+    /// the filter saw it, and are searched for once anything has changed
+    /// it.  A change to one partition leaves another's keys unsearched.
+    #[test]
+    fn an_insert_searches_only_the_partitions_changed_since_its_filter() {
+        // Partitions 3 and 5 hold a journaled key each, and the filter
+        // keeps two keys for 3 and one for 5.  Returns how many keys the
+        // insert added and how many of them it did not search for.
+        let kept = [key(0, 3, 7), key(0, 3, 8), key(0, 5, 7)];
+        let run = |change: &dyn Fn(&Memtable)| {
+            let m = Memtable::new();
+            assert_eq!(insert(&m, &[key(0, 3, 1), key(0, 5, 1)]), 2);
+            m.commit_flush(&[false; PARTITIONS]);
+            let filter = filtered(&m, &kept);
+            assert_eq!(filter.len(), 3);
+            change(&m);
+            let before = m.unsearched();
+            let added = m.insert_candidates(&filter);
+            let held = m.snapshot();
+            assert!(held.windows(2).all(|w| w[0] < w[1]), "a key twice");
+            assert!(kept.iter().all(|k| m.contains(k[1], k)));
+            (added, m.unsearched() - before)
+        };
+        // Nothing in between.
+        assert_eq!(run(&|_| ()), (3, 3));
+        // Another insert hands 3 one of the filter's keys and one more:
+        // 3 is searched and the key skipped.
+        let theirs = [key(0, 3, 7), key(1, 3, 0)];
+        assert_eq!(run(&|m| assert_eq!(insert(m, &theirs), 2)), (2, 1));
+        // An insert that adds nothing to 3, and a flush that finds
+        // nothing to fold, leave both as the filter saw them.
+        let held = stale(&[key(0, 3, 1)]);
+        assert_eq!(run(&|m| assert_eq!(m.insert_candidates(&held), 0)), (3, 3));
+        assert_eq!(run(&|m| m.commit_flush(&[false; PARTITIONS])), (3, 3));
+        // A flush that merged 3 cleared it.
+        let mut merged = [false; PARTITIONS];
+        merged[3] = true;
+        assert_eq!(run(&|m| m.commit_flush(&merged)), (3, 1));
+        // A load replaces every partition, and brings 3 one of the keys.
+        let mut parts = vec![Vec::new(); PARTITIONS];
+        parts[3] = vec![key(0, 3, 8)];
+        assert_eq!(run(&|m| m.load(parts.clone())), (2, 0));
+    }
+
+    /// Connects on several threads filter with no lock held and insert
+    /// one at a time, as connects that each hold the database's writer
+    /// for their hook do, with flushes among them: no key is ever held
+    /// twice.  Their keys overlap, so a key one thread found missing is
+    /// often inserted by another before the first hands it over, and the
+    /// first must then search for it.  It does, because the version its
+    /// filter recorded was read no later than the search was made.  A
+    /// filter that read the version under a second hold of the lock,
+    /// after its search, hands such a key over with the version that
+    /// followed the other thread's insert, and the key goes in again.
+    ///
+    /// A race, and a one-sided one: correct code passes however the
+    /// threads interleave, and that filter is caught only when an insert
+    /// falls between its two holds, which it does readily where two
+    /// threads run at once.  The mutex stands for the writer.
+    #[test]
+    fn filters_that_race_inserts_leave_no_key_twice() {
+        const THREADS: u64 = 4;
+        const ROUNDS: u32 = 30_000;
+        let m = std::sync::Arc::new(Memtable::new());
+        let writer = std::sync::Arc::new(std::sync::Mutex::new(()));
+        let threads: Vec<_> = (0..THREADS)
+            .map(|t| {
+                let m = std::sync::Arc::clone(&m);
+                let writer = std::sync::Arc::clone(&writer);
+                std::thread::spawn(move || {
+                    let mut rng = SplitMix64(0x6d65_6d74_6162_0002 + t);
+                    for round in 0..ROUNDS {
+                        let keys: BTreeSet<Key> = (0..1 + rng.below(6))
+                            .map(|_| key(0, 0, rng.below(48) as u8))
+                            .collect();
+                        let keys: Vec<Key> = keys.into_iter().collect();
+                        let kept = filtered(&m, &keys);
+                        let _writer = writer.lock().expect("writer");
+                        m.insert_candidates(&kept);
+                        let all = m.all_sorted(0);
+                        assert!(
+                            all.windows(2).all(|w| w[0] < w[1]),
+                            "thread {t}, round {round}: a key twice"
+                        );
+                        assert_eq!(m.len(), all.len());
+                        // A flush now and then, which half the time
+                        // merges the partition and so empties it.
+                        if rng.below(24) == 0 {
+                            let mut merged = [false; PARTITIONS];
+                            merged[0] = rng.below(2) == 0;
+                            m.commit_flush(&merged);
+                        }
+                    }
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().expect("no key twice");
+        }
+    }
+
+    /// Two memtables taken through the same random filters, inserts,
+    /// flushes and loads hold the same vectors after every step, and both
+    /// agree with a model that keeps sets.  One trusts its versions.  The
+    /// other searches for every key at every insert, which is what an
+    /// insert did when a partition had no version.
+    ///
+    /// The filters wait, several at a time, and go in in any order, so
+    /// inserts, flushes and loads fall between a filter and its insert.
+    /// The keys come from four partitions and eighty values each, so the
+    /// waiting filters share keys, and what one inserts another must
+    /// skip.  Two waiting filters are sometimes handed as one, whose
+    /// groups then hold keys filtered at different versions, or a key
+    /// twice.
+    #[test]
+    fn random_interleavings_leave_what_a_search_for_every_key_leaves() {
+        const PARTS: [u8; 4] = [0, 1, 7, 255];
+        let mut rng = SplitMix64(0x6d65_6d74_6162_0001);
+        let trusting = Memtable::new();
+        let searching = Memtable::new();
+        searching.search_always.store(true, Ordering::SeqCst);
+        let tables = [&trusting, &searching];
+        // Per partition, the journaled keys and the unjournaled ones.
+        let mut model: Vec<[BTreeSet<Key>; 2]> = vec![Default::default(); PARTITIONS];
+        // The filters not yet inserted, as each table returned them.
+        let mut waiting: Vec<[Vec<Candidate>; 2]> = Vec::new();
+        let (mut handed, mut added) = (0usize, 0usize);
+        let (mut joined, mut flushes, mut loads) = (0usize, 0usize, 0usize);
+        for step in 0..40_000u32 {
+            match rng.below(16) {
+                0..=5 => {
+                    let keys: BTreeSet<Key> = (0..1 + rng.below(8))
+                        .map(|_| {
+                            let p = PARTS[rng.below(4) as usize];
+                            key(rng.below(2) as u8, p, rng.below(40) as u8)
+                        })
+                        .collect();
+                    let keys: Vec<Key> = keys.into_iter().collect();
+                    waiting.push(tables.map(|m| filtered(m, &keys)));
+                }
+                6..=11 if !waiting.is_empty() => {
+                    let filter = waiting.swap_remove(rng.below(waiting.len() as u64) as usize);
+                    let mut want = 0usize;
+                    for c in &filter[0] {
+                        let [journaled, unjournaled] = &mut model[usize::from(c.p)];
+                        if !journaled.contains(&c.key) && unjournaled.insert(c.key) {
+                            want += 1;
+                        }
+                    }
+                    let got = [0, 1].map(|t| tables[t].insert_candidates(&filter[t]));
+                    assert_eq!(got, [want, want], "step {step}");
+                    handed += filter[0].len();
+                    added += want;
+                }
+                12 if waiting.len() >= 2 => {
+                    let [a0, a1] = waiting.swap_remove(rng.below(waiting.len() as u64) as usize);
+                    let [b0, b1] = waiting.swap_remove(rng.below(waiting.len() as u64) as usize);
+                    let join = |mut a: Vec<Candidate>, b: Vec<Candidate>| {
+                        a.extend(b);
+                        a.sort_unstable();
+                        a
+                    };
+                    waiting.push([join(a0, b0), join(a1, b1)]);
+                    joined += 1;
+                }
+                13 | 14 => {
+                    let mut merged = [false; PARTITIONS];
+                    for p in PARTS {
+                        merged[usize::from(p)] = rng.below(3) == 0;
+                    }
+                    for m in tables {
+                        m.commit_flush(&merged);
+                    }
+                    for (p, [journaled, unjournaled]) in model.iter_mut().enumerate() {
+                        if merged[p] {
+                            journaled.clear();
+                            unjournaled.clear();
+                        } else {
+                            journaled.append(unjournaled);
+                        }
+                    }
+                    flushes += 1;
+                }
+                15 => {
+                    // Most of what each partition held and a few keys it
+                    // may not have, all of them journaled.
+                    let mut parts = vec![Vec::new(); PARTITIONS];
+                    for p in PARTS {
+                        let [journaled, unjournaled] = &mut model[usize::from(p)];
+                        let mut keys: BTreeSet<Key> = journaled
+                            .union(unjournaled)
+                            .copied()
+                            .filter(|_| rng.below(4) != 0)
+                            .collect();
+                        for _ in 0..rng.below(4) {
+                            keys.insert(key(rng.below(2) as u8, p, rng.below(40) as u8));
+                        }
+                        parts[usize::from(p)] = keys.iter().copied().collect();
+                        *journaled = keys;
+                        unjournaled.clear();
+                    }
+                    for m in tables {
+                        m.load(parts.clone());
+                    }
+                    loads += 1;
+                }
+                _ => {}
+            }
+            let mut held = 0usize;
+            let mut fresh_held = 0usize;
+            for p in PARTS.map(usize::from) {
+                let [journaled, unjournaled] = &model[p];
+                let all: Vec<Key> = journaled.union(unjournaled).copied().collect();
+                let fresh: Vec<Key> = unjournaled.iter().copied().collect();
+                for m in tables {
+                    assert_eq!(m.all_sorted(p), all, "step {step}, partition {p}");
+                    assert_eq!(m.unjournaled_sorted(p), fresh, "step {step}, partition {p}");
+                }
+                assert_eq!(
+                    (trusting.shape(p), trusting.version(p)),
+                    (searching.shape(p), searching.version(p)),
+                    "step {step}, partition {p}"
+                );
+                held += all.len();
+                fresh_held += fresh.len();
+            }
+            for m in tables {
+                assert_eq!((m.len(), m.unjournaled()), (held, fresh_held));
+            }
+        }
+        // Both ways of inserting ran in the one table and only the search
+        // in the other; the search was needed, for the keys handed over
+        // that were held by then; and every kind of step ran.
+        assert_eq!(searching.unsearched(), 0);
+        let unsearched = trusting.unsearched();
+        assert!(unsearched > 10_000, "{unsearched} keys went in unsearched");
+        assert!(handed - unsearched > 30_000, "{handed} handed");
+        assert!(
+            handed - added > 2_000,
+            "{} held keys handed",
+            handed - added
+        );
+        assert!(joined > 1_000 && flushes > 4_000 && loads > 2_000);
     }
 }
