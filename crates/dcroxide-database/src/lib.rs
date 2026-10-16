@@ -319,7 +319,35 @@ impl Drop for WriterGuard<'_> {
         let mut busy = self.db.writer_busy.lock().expect("writer flag poisoned");
         *busy = false;
         self.db.writer_cv.notify_one();
+        #[cfg(test)]
+        release_hook();
     }
+}
+
+/// A test's probe into the release of the writer semaphore.
+#[cfg(test)]
+pub(crate) type ReleaseHook = Box<dyn Fn()>;
+
+#[cfg(test)]
+thread_local! {
+    /// Run on the calling thread each time it releases the writer
+    /// semaphore, by a guard's drop or a writable transaction's end, as
+    /// it releases it, so a test can see what that thread still holds
+    /// then: the layers its flush retired, which it must not have freed
+    /// yet.  The semaphore's flag is still locked when this runs, so it
+    /// must not come for the semaphore itself.
+    pub(crate) static RELEASE_HOOK: std::cell::RefCell<Option<ReleaseHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Run [`RELEASE_HOOK`], if a test set one.
+#[cfg(test)]
+pub(crate) fn release_hook() {
+    RELEASE_HOOK.with(|hook| {
+        if let Some(hook) = hook.borrow().as_ref() {
+            hook();
+        }
+    });
 }
 
 pub(crate) struct DbInner {
@@ -819,7 +847,18 @@ pub const DEFAULT_DB_CACHE_BYTES: usize = 1024 * 1024 * 1024;
 /// and calls `contribute` within the write transaction.  After the
 /// retirement, and after a failure has latched the store, this calls
 /// `finished` with the outcome, still under the caller's semaphore.
-pub(crate) fn flush_locked(inner: &DbInner, only_if_needed: bool) -> Result<(), Error> {
+///
+/// Returns the overlay layers the flush retired, none when it did not
+/// flush.  Dropping them frees every row the flush wrote, unless a
+/// transaction begun before the flush still reads them.  A commit and
+/// [`Database::flush`] drop them once they have released the semaphore,
+/// so that the next writer does not wait for the frees;
+/// [`Database::close`] drops them where it flushed, since no transaction
+/// begins behind a close.
+pub(crate) fn flush_locked(
+    inner: &DbInner,
+    only_if_needed: bool,
+) -> Result<crate::dbcache::RetiredLayers, Error> {
     // One clone for the whole flush: registration changes only under the
     // writer semaphore the caller holds, so this is the participant the
     // flush runs with from capture to `finished`.
@@ -835,7 +874,7 @@ pub(crate) fn flush_locked(inner: &DbInner, only_if_needed: bool) -> Result<(), 
     let mut batch = {
         let mut cache = inner.cache.lock().expect("cache lock poisoned");
         if only_if_needed && !cache.needs_flush() && !wanted {
-            return Ok(());
+            return Ok(Vec::new());
         }
         cache.begin_flush()
     };
@@ -856,10 +895,10 @@ pub(crate) fn flush_locked(inner: &DbInner, only_if_needed: bool) -> Result<(), 
     // Retire (or restore) under the lock either way: on failure the
     // overlay still holds every captured byte, and the accounting has to
     // go back or the cache never trips its own ceiling again.
-    {
+    let retired = {
         let mut cache = inner.cache.lock().expect("cache lock poisoned");
-        cache.finish_flush(batch, outcome);
-    }
+        cache.finish_flush(batch, outcome)
+    };
     // Latch before telling the participant, so a participant told its
     // rows were discarded finds the store already refusing writes.
     let failure = failure.map(|e| inner.mark_fatal(e));
@@ -868,7 +907,7 @@ pub(crate) fn flush_locked(inner: &DbInner, only_if_needed: bool) -> Result<(), 
     }
     match failure {
         Some(e) => Err(e),
-        None => Ok(()),
+        None => Ok(retired),
     }
 }
 
@@ -1956,7 +1995,7 @@ impl Database {
     pub fn flush(&self) -> Result<(), Error> {
         self.check_open()?;
         self.inner.check_writable()?;
-        let _writer = self.exclusive_writer();
+        let writer = self.exclusive_writer();
         // No second `closed` check once the writer is held, unlike
         // `begin_seed`.  dcrd's `Flush` queues on `closeLock` itself,
         // and Go's `RWMutex.Lock` takes the writer mutex before it waits
@@ -1971,7 +2010,11 @@ impl Database {
         // Again with the writer held: the transaction waited out may be
         // the one whose flush failed and latched the store.
         self.inner.check_writable()?;
-        flush_locked(&self.inner, false)
+        let retired = flush_locked(&self.inner, false);
+        // The layers the flush retired are freed once the writer is
+        // released, so the next writer does not wait for the frees.
+        drop(writer);
+        retired.map(drop)
     }
 }
 

@@ -88,6 +88,11 @@ fn node_size(key_len: usize, value: Option<&[u8]>) -> u64 {
     NODE_FIELDS_SIZE + key_len as u64 + value.map_or(0, |v| v.len() as u64)
 }
 
+/// The layers a flush retired, as [`DbCache::finish_flush`] hands them
+/// back: no longer published, and freed when the last handle on each is
+/// dropped.
+pub(crate) type RetiredLayers = Vec<Arc<CacheLayer>>;
+
 /// An overlay capture handed to [`DbCache::run_flush`], which persists it
 /// with no lock held.
 ///
@@ -986,12 +991,22 @@ impl DbCache {
 
     /// Retire a batch under the cache lock once its commit has landed,
     /// or put its bytes back when it failed.
+    ///
+    /// Returns the batch's handles on the layers it retired, and none when
+    /// the commit failed.  Once the snapshots taken before the flush are
+    /// gone these are the last handles, and dropping them frees every row
+    /// the flush wrote.  That is left to the caller, to do after it has
+    /// let this lock go, so that no reader waits here for the frees.
     #[allow(
         clippy::arithmetic_side_effects,
         reason = "the only site is the debug_assert's layers.len() - pinned, which its && \
                   evaluates only once layers.len() >= pinned"
     )]
-    pub(crate) fn finish_flush(&mut self, batch: FlushBatch, outcome: Option<FlushOutcome>) {
+    pub(crate) fn finish_flush(
+        &mut self,
+        batch: FlushBatch,
+        outcome: Option<FlushOutcome>,
+    ) -> RetiredLayers {
         let pinned = self.in_flight_layers;
         self.in_flight_layers = 0;
         let bytes = self.in_flight_size;
@@ -1002,7 +1017,7 @@ impl DbCache {
             // byte, so the accounting has to go back or the cache grows
             // without ever tripping its own ceiling again.
             self.total_size = self.total_size.saturating_add(bytes);
-            return;
+            return RetiredLayers::new();
         };
 
         let mut layers = self.cached.layers.clone();
@@ -1023,7 +1038,7 @@ impl DbCache {
         // participant drives on its own (an index catch-up, `wants_flush`)
         // would be invisible to the observer.
         if outcome.dirty_entries == 0 && outcome.participant.is_none() {
-            return;
+            return batch.layers;
         }
         self.flush_seq = self.flush_seq.saturating_add(1);
         if let Some(observer) = &self.observer {
@@ -1041,6 +1056,7 @@ impl DbCache {
                 writer_waits: batch.writer_waits,
             });
         }
+        batch.layers
     }
 }
 
@@ -2274,6 +2290,100 @@ mod tests {
             total as f64 / ROUNDS as f64
         );
     }
+
+    /// The layers a flush retired are freed by the thread that flushed,
+    /// once it has released the writer semaphore, and so after the cache
+    /// lock too, which it let go before that.  `flush_locked` hands them
+    /// back alive.  A commit that flushed still holds them when its hooks
+    /// run and when it releases the semaphore, as `Database::flush` does
+    /// when it releases its own, and they are gone once either has
+    /// returned.  So the next writer does not wait for the frees.
+    ///
+    /// The count at each release is read by the probe the release runs
+    /// on this thread, [`crate::RELEASE_HOOK`].
+    #[test]
+    fn the_layers_a_flush_retired_are_freed_once_the_writer_is_released() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        let (_dir, db) = new_db();
+        {
+            let tx = db.begin(true).expect("begin write");
+            tx.metadata().create_bucket(b"cache").expect("create");
+            tx.commit().expect("commit");
+        }
+        // A weak handle on the overlay's one layer.
+        let layer = || {
+            let cache = db.inner.cache.lock().expect("cache");
+            assert_eq!(cache.cached.layers.len(), 1);
+            Arc::downgrade(&cache.cached.layers[0])
+        };
+        let published = || db.inner.cache.lock().expect("cache").cached.layers.len();
+        // The handles on `layer` at each release of the writer semaphore
+        // that `act` makes.
+        let at_each_release = |layer: &std::sync::Weak<super::CacheLayer>, act: &dyn Fn()| {
+            let counts = Rc::new(RefCell::new(Vec::new()));
+            let (seen, layer) = (Rc::clone(&counts), layer.clone());
+            crate::RELEASE_HOOK.with(|hook| {
+                let count = move || seen.borrow_mut().push(layer.strong_count());
+                *hook.borrow_mut() = Some(Box::new(count));
+            });
+            act();
+            crate::RELEASE_HOOK.with(|hook| *hook.borrow_mut() = None);
+            counts.take()
+        };
+
+        // The flush itself, under the writer: unpublished, handed back,
+        // and freed when the caller drops what it was handed.
+        let retiring = layer();
+        let writer = db.exclusive_writer();
+        let retired = crate::flush_locked(&db.inner, false).expect("flush");
+        assert_eq!(published(), 0);
+        assert_eq!(retired.len(), 1);
+        assert_eq!(retiring.strong_count(), 1, "the flush freed it");
+        drop(writer);
+        drop(retired);
+        assert_eq!(retiring.strong_count(), 0);
+
+        // `Database::flush`: its handle is the only one left when it
+        // releases the writer, and is gone when it returns.
+        commit_one(&db, b"k1", b"v1");
+        let retiring = layer();
+        let held = at_each_release(&retiring, &|| db.flush().expect("flush"));
+        assert_eq!(held, [1], "freed before the writer was released");
+        assert_eq!((published(), retiring.strong_count()), (0, 0));
+
+        // A commit whose own flush retires the layer its snapshot names.
+        // In its hook the snapshot and the commit's handle both hold it;
+        // at the release the snapshot has gone and the handle has not.
+        commit_one(&db, b"k2", b"v2");
+        let retiring = layer();
+        db.inner
+            .cache
+            .lock()
+            .expect("cache")
+            .set_limits(1, DEFAULT_FLUSH_SECS);
+        let tx = db.begin(true).expect("begin write");
+        let bucket = tx.metadata().bucket(b"cache").expect("bucket");
+        bucket.put(b"k3", b"v3").expect("put");
+        let in_hook = Arc::new(std::sync::atomic::AtomicUsize::new(usize::MAX));
+        let (seen, handles) = (Arc::clone(&in_hook), retiring.clone());
+        tx.on_commit(move || {
+            seen.store(handles.strong_count(), std::sync::atomic::Ordering::SeqCst);
+        })
+        .expect("hook");
+        let held = at_each_release(&retiring, &|| tx.commit().expect("commit"));
+        assert_eq!(in_hook.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(held, [1], "freed before the writer was released");
+        assert_eq!(retiring.strong_count(), 0, "it outlived the commit");
+        // What is published now is the commit's own row, in a new layer.
+        assert_eq!(published(), 1);
+        let tx = db.begin(false).expect("begin read");
+        let bucket = tx.metadata().bucket(b"cache").expect("bucket");
+        for key in [&b"k1"[..], b"k2", b"k3"] {
+            assert!(bucket.get(key).is_some(), "{key:?} is missing");
+        }
+        tx.rollback().expect("rollback");
+    }
 }
 
 #[cfg(test)]
@@ -2423,6 +2533,54 @@ mod flush_barrier_tests {
             view.get(b"captured-a").is_none(),
             "the flushed keys left the overlay -- they are in the store now"
         );
+    }
+
+    /// A flush that committed hands back its handles on the layers it
+    /// retired, alive, rather than freeing them under the cache lock.
+    /// They are the last handles unless a reader that began before the
+    /// flush still holds its snapshot, and then that reader goes on
+    /// reading the layers after the handles are dropped.  A failed flush
+    /// retired nothing and hands nothing back.
+    #[test]
+    fn a_flush_hands_back_the_layers_it_retired_alive() {
+        // An outcome that takes a sequence number, and one that does not.
+        let counted = || FlushOutcome {
+            dirty_entries: 2,
+            ..FlushOutcome::for_test()
+        };
+        for (outcome, held_by_a_reader) in [
+            (FlushOutcome::for_test(), false),
+            (counted(), false),
+            (counted(), true),
+        ] {
+            let mut cache = DbCache::new();
+            put(&mut cache, &["a", "b"]);
+            let layer = Arc::downgrade(&cache.cached.layers[0]);
+
+            let batch = cache.begin_flush();
+            let retired = cache.finish_flush(batch, None);
+            assert!(retired.is_empty(), "a failed flush retired a layer");
+            assert_eq!(cache.cached.layers.len(), 1);
+            assert_eq!(layer.strong_count(), 1);
+
+            let reader = held_by_a_reader.then(|| Arc::clone(&cache.cached));
+            let batch = cache.begin_flush();
+            let retired = cache.finish_flush(batch, Some(outcome));
+            assert!(cache.cached.layers.is_empty(), "still published");
+            assert_eq!(retired.len(), 1);
+            let readers = usize::from(held_by_a_reader);
+            assert_eq!(
+                layer.strong_count(),
+                1 + readers,
+                "the layer was freed, or is held, where it should not be"
+            );
+            assert!(std::ptr::eq(retired[0].as_ref(), layer.as_ptr()));
+            drop(retired);
+            assert_eq!(layer.strong_count(), readers);
+            if let Some(reader) = reader {
+                assert!(reader.get(b"a").is_some() && reader.get(b"b").is_some());
+            }
+        }
     }
 
     /// A failed commit puts the bytes back, or the overlay grows without

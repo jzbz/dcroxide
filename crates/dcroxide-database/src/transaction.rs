@@ -1005,6 +1005,8 @@ impl Transaction {
             let mut busy = self.db.writer_busy.lock().expect("writer flag poisoned");
             *busy = false;
             self.db.writer_cv.notify_one();
+            #[cfg(test)]
+            crate::release_hook();
         }
         state.pending_blocks.clear();
         state.pending_index.clear();
@@ -1201,8 +1203,10 @@ impl Transaction {
         // helper, so the capture, the unlocked commit and the
         // retirement cannot drift between the two; this transaction
         // holds the writer semaphore throughout, which is what keeps two
-        // flushes from overlapping.
-        if let Err(e) = crate::flush_locked(&self.db, true) {
+        // flushes from overlapping.  The layers a flush retired are kept
+        // until that semaphore is released, at the end.
+        let retired = crate::flush_locked(&self.db, true);
+        if let Err(e) = retired {
             // Already latched by `flush_locked`: the dirty set is still
             // in the cache, so without the latch the next commit retries
             // it and can report success after this failure (see
@@ -1249,6 +1253,13 @@ impl Transaction {
             .expect("cache lock poisoned")
             .commit_pending(puts, removes.into_iter());
         self.close();
+        // Freed here, with the cache lock and the writer semaphore both
+        // released, so no other thread waits for either while this one
+        // frees the rows of a whole flush.  Nothing could read them any
+        // more: the flush unpublished them, and this transaction's own
+        // snapshot, the last to name them unless a reader that began
+        // before the flush still does, was let go above.
+        drop(retired);
         Ok(())
     }
 
