@@ -8,6 +8,10 @@
 //!   error for a session that records a message the pool dropped.
 //! - `38811b0b`: at most `MAX_MESSAGES_PER_IDENTITY` messages per
 //!   identity over its pair request's life, on all three paths.
+//! - `3ce5cc41` and `874f6772`: a key exchange's epoch must be no more
+//!   than twenty minutes past and a whole minute, judged against the
+//!   wall clock to the nanosecond, which the vectors, captured at a
+//!   whole second, cannot reach.
 
 // Test-harness arithmetic over bounded values.
 #![allow(clippy::arithmetic_side_effects)]
@@ -784,4 +788,90 @@ fn the_limit_is_checked_between_the_conflict_and_the_pair_requests() {
         limit_error(&id)
     );
     assert!(!pool.have_message(&hash_of(&misplaced)));
+}
+
+fn rule(text: &str) -> PoolError {
+    PoolError::Rule(RuleKind::Other(text.into()))
+}
+
+const TOO_LATE: &str = "KE received too late for stated epoch";
+const TOO_EARLY: &str = "KE received too early for stated epoch";
+const OFF_MINUTE: &str = "KE epoch is not a multiple of one minute";
+
+/// `3ce5cc41`: a key exchange whose epoch is more than twenty minutes
+/// past is refused, compared as dcrd compares `now.Add(-20 *
+/// time.Minute).After(keEpoch)`: an epoch exactly twenty minutes back is
+/// in time with the clock on the second and too late a nanosecond
+/// after.  An epoch at or above 2**63 is an int64 in the far past, and
+/// too late.  The refusal is not bannable.
+#[test]
+fn key_exchanges_late_for_their_epoch_are_refused() {
+    let (mut pool, wall, _) = new_pool();
+    let (key, id) = identity(10);
+    let pr = pair_request(&key, id, 10);
+    accept(&mut pool, PoolMessage::PR(pr.clone())).expect("pair request");
+    let edge = (NOW_SECS - 20 * 60) as u64;
+
+    let at_edge = key_exchange(&key, id, &with_unknown(&pr, 0, 1), &pr, edge);
+    wall.store(NOW_SECS * NANOS + 1, Ordering::SeqCst);
+    let err = accept_ke(&mut pool, &at_edge).err().expect("too late");
+    assert_eq!(err, rule(TOO_LATE));
+    assert!(!err.is_bannable(ServiceFlag(u64::MAX)));
+    assert!(!pool.have_message(&hash_of(&at_edge)));
+    wall.store(NOW_SECS * NANOS, Ordering::SeqCst);
+    accept_ke(&mut pool, &at_edge).expect("twenty minutes back, on the second");
+
+    let minute_before = key_exchange(&key, id, &with_unknown(&pr, 1, 1), &pr, edge - 60);
+    assert_eq!(
+        accept_ke(&mut pool, &minute_before)
+            .err()
+            .expect("too late"),
+        rule(TOO_LATE)
+    );
+    let far_past = key_exchange(
+        &key,
+        id,
+        &with_unknown(&pr, 2, 1),
+        &pr,
+        (1u64 << 63) + 4_000_000_020,
+    );
+    assert_eq!(
+        accept_ke(&mut pool, &far_past).err().expect("too late"),
+        rule(TOO_LATE)
+    );
+    assert_eq!(pool.identity_key_exchange_count(&id), 1);
+}
+
+/// `874f6772`: an epoch inside the window that is not a whole minute is
+/// refused, five seconds ahead as well as behind.  Both gates come
+/// first, so an epoch too late or too early and off the minute is
+/// refused for its time.  The refusal is not bannable.
+#[test]
+fn key_exchange_epochs_off_the_minute_are_refused() {
+    let (mut pool, _, _) = new_pool();
+    let (key, id) = identity(11);
+    let pr = pair_request(&key, id, 11);
+    accept(&mut pool, PoolMessage::PR(pr.clone())).expect("pair request");
+    let now = NOW_SECS as u64;
+
+    let cases = [
+        (now - 30, Some(OFF_MINUTE)),
+        (now - 20 * 60 + 30, Some(OFF_MINUTE)),
+        (now + 5, Some(OFF_MINUTE)),
+        (now - 20 * 60 - 30, Some(TOO_LATE)),
+        (now + 6, Some(TOO_EARLY)),
+        (now - 60, None),
+        (now, None),
+    ];
+    for (n, (epoch, want)) in cases.into_iter().enumerate() {
+        let ke = key_exchange(&key, id, &with_unknown(&pr, n as u32, 1), &pr, epoch);
+        match (accept_ke(&mut pool, &ke), want) {
+            (Ok(accepted), None) => assert_eq!(accepted.len(), 1, "epoch {epoch}"),
+            (Err(err), Some(text)) => {
+                assert_eq!(err, rule(text), "epoch {epoch}");
+                assert!(!err.is_bannable(ServiceFlag(u64::MAX)));
+            }
+            (got, _) => panic!("epoch {epoch}: {:?}", got.map(|m| m.len())),
+        }
+    }
 }

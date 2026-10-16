@@ -29,8 +29,9 @@ use dcroxide_wire::{MixPairReqUTXO, MsgMixKeyExchange, MsgMixPairReq, OutPoint};
 /// The tip the pool validates pair request expiries against.
 const TIP_HEIGHT: i64 = 100;
 
-/// A fixed wall clock for the pool, in seconds.
-const NOW_SECS: i64 = 1_700_000_000;
+/// A fixed wall clock for the pool, in seconds: a whole minute, so the
+/// key exchanges that state it as their epoch are inside dcrd's window.
+const NOW_SECS: i64 = 1_699_999_980;
 
 /// A chain view pinned at [`TIP_HEIGHT`].
 struct StubChain {

@@ -17,7 +17,7 @@ JSON-RPC/websocket server, the tool commands, the pipe IPC lifecycle,
 and the Windows service wrapper. The deliberate non-ports are small
 and documented in PARITY.md (Go GC tuning, the pprof servers, UPnP,
 the Windows event log, and the wallet-side mixclient). The test suite
-runs 2,315 tests across 431 suites on Linux, most differential against
+runs 2,320 tests across 431 suites on Linux, most differential against
 dcrd itself or replaying sessions generated inside dcrd's own packages.
 
 Since the surface completed, four rounds of work have landed on it. A
@@ -413,6 +413,10 @@ dcrd data directory will not work). Currently implemented:
 - `tools/powerloss` — an `LD_PRELOAD` shim over the write path plus a
   replay driver, so crash consistency is tested the same way against
   any storage engine (C + Python)
+- `tools/mixpoolgen` — the generator of `mixpool_vectors.txt`, run as a
+  test inside a dcrd checkout's `mixing/mixpool` package through
+  `go test -overlay` with the pool's clock frozen, writing nothing into
+  the checkout (Go + sh)
 
 ## Performance
 
@@ -828,6 +832,8 @@ changes, on slower storage and four cores.
 - `tools/dsample/` — per-thread scheduler-state sampler (Python)
 - `tools/powerloss/` — write-interception shim and replay driver for
   engine-independent crash-consistency testing (C + Python)
+- `tools/mixpoolgen/` — the mixpool vector generator, an overlay test for
+  dcrd's `mixing/mixpool` (Go + sh)
 - `fuzz/` — `cargo-fuzz` targets (nightly toolchain)
 - `docs/adr/` — architecture decision records
 

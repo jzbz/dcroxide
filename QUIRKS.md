@@ -60,7 +60,8 @@ Entry format:
   the fold has nothing to reduce.
 - **Pinned by:** `mixpool_vectors`, regenerated from dcrd master so the
   session rows now carry the real minimum expiries rather than
-  `4294967295`.
+  `4294967295` (regenerated again at `382ff4dd` by `tools/mixpoolgen`;
+  the session rows still carry real expiries).
 
 ## QK-0003 — mixpool `Receive` capacity misuse wedges dcrd's pool
 
@@ -77,7 +78,8 @@ Entry format:
   and reproducing it would serve no compatibility purpose.
 - **Pinned by:** `mixpool_vectors` (the `receive … twocaps` row, kept
   as the final operation against that pool because generating the
-  vectors from dcrd trips the deadlock for any later write)
+  vectors from dcrd trips the deadlock for any later write;
+  `tools/mixpoolgen` keeps it there)
 
 ## QK-0004 — addrmgr never restores serialized address timestamps
 

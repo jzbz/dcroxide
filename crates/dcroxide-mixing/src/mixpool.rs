@@ -46,6 +46,7 @@ const MINCONF: i64 = 1;
 const FEE_RATE: i64 = 10_000; // 0.0001e8
 const MAX_RELAY_FEE_MULTIPLIER: i64 = 10_000; // 1e4
 const EARLY_KE_DURATION_NANOS: i64 = 5_000_000_000; // 5 seconds
+const LATE_KE_DURATION_NANOS: i64 = 20 * 60 * 1_000_000_000; // 20 minutes
 
 /// The maximum number of orphans allowed in the orphan pool at one
 /// time (dcrd `maxOrphans`).
@@ -96,6 +97,30 @@ fn go_before_unix(now: i64, d: i64, secs: i64) -> bool {
     t_sec < secs.wrapping_add(UNIX_TO_INTERNAL)
 }
 
+/// Go's `time.Now().Add(d).After(time.Unix(secs, 0))` for a wall
+/// reading `now`, compared like [`go_before_unix`]: on the wall clock and
+/// in Go's internal seconds, then nanoseconds, of which `time.Unix(secs,
+/// 0)` has none.
+fn go_after_unix(now: i64, d: i64, secs: i64) -> bool {
+    let (t_sec, t_nsec) = go_wall(now.saturating_add(d));
+    let u_sec = secs.wrapping_add(UNIX_TO_INTERNAL);
+    t_sec > u_sec || (t_sec == u_sec && t_nsec > 0)
+}
+
+/// Whether Go's `t.Sub(t.Truncate(time.Minute))` is nonzero for `t =
+/// time.Unix(secs, 0)`.  `Truncate` counts from Go's zero time, a whole
+/// number of minutes before the Unix epoch, on the absolute value of the
+/// internal seconds, so with no nanoseconds the remainder is zero
+/// exactly when those seconds are a multiple of 60, whatever their sign,
+/// with one exception.  At internal second -(2**63-1) `Truncate`'s
+/// `Add` of the negative remainder saturates and leaves `t` as it was,
+/// so Go reports a whole minute where this answers off the minute.  The
+/// late gate refuses that epoch, as it does every epoch whose internal
+/// seconds wrap, before the minute rule is reached.
+fn go_unix_off_minute(secs: i64) -> bool {
+    secs.wrapping_add(UNIX_TO_INTERNAL).rem_euclid(60) != 0
+}
+
 /// Go's `time.Since(time.Unix(secs, 0))` for a wall reading `now`: the
 /// wall-clock difference in nanoseconds, saturated to the Duration
 /// range as `Time.Sub` does when it overflows.
@@ -138,12 +163,15 @@ pub const MAX_MESSAGES_PER_IDENTITY: usize = 7 * 2 * MAX_PEERS as usize;
 /// exchange per identity and session (`ffb42adf`) and
 /// [`MAX_MESSAGES_PER_IDENTITY`] messages over the pair request's life
 /// (`38811b0b`), both enforced here too, which leave room for 128
-/// sessions' worth.  With the one-message-per-type rule below a session
-/// holds at most about 1 MiB of one identity's messages (a slot
-/// reservation alone may be 512 KiB), so this cap holds an identity to
-/// about 65 MiB, where dcrd's limit admits about 447 MiB, mostly slot
-/// reservations un-orphaned into a session in bulk.  Both figures are
-/// arithmetic from the message limits, not measurements.
+/// sessions' worth; its refusal of key exchanges whose epoch is not a
+/// whole minute of the last twenty (`3ce5cc41`, `874f6772`) bounds when
+/// they can be minted, not how many.  With the one-message-per-type
+/// rule below a session holds at most about 1 MiB of one identity's
+/// messages (a slot reservation alone may be 512 KiB), so this cap
+/// holds an identity to about 65 MiB, where dcrd's limit admits about
+/// 447 MiB, mostly slot reservations un-orphaned into a session in
+/// bulk.  Both figures are arithmetic from the message limits, not
+/// measurements.
 ///
 /// The bound counts session *runs*, not epochs, and is set for the
 /// headroom honest use needs.  A wallet broadcasts one key exchange per
@@ -1920,8 +1948,23 @@ impl<B: MixBlockChain> Pool<B> {
         // compared in Go's internal seconds rather than as nanoseconds,
         // which would overflow for epochs past the year 2262.
         let now = (self.now_fn)();
-        if go_before_unix(now, EARLY_KE_DURATION_NANOS, ke.epoch as i64) {
+        let epoch = ke.epoch as i64;
+        if go_before_unix(now, EARLY_KE_DURATION_NANOS, epoch) {
             return Err(rule_other("KE received too early for stated epoch"));
+        }
+
+        // dcrd `3ce5cc41` and `874f6772`
+        // (`mixing/mixpool/mixpool.go:1685-1692`): an epoch more than
+        // twenty minutes past, or not on a whole minute, is refused.  An
+        // epoch at or above 2**63 is a negative int64 there, in the far
+        // past, and so too late; dcrd accepted it before.  Once both
+        // gates pass, the epoch's internal seconds are within minutes of
+        // now, so the minute rule is the Unix epoch's remainder by 60.
+        if go_after_unix(now, -LATE_KE_DURATION_NANOS, epoch) {
+            return Err(rule_other("KE received too late for stated epoch"));
+        }
+        if go_unix_off_minute(epoch) {
+            return Err(rule_other("KE epoch is not a multiple of one minute"));
         }
 
         Ok(())
@@ -3081,6 +3124,81 @@ mod tests {
             .accept_message(&msg, 1, &no_mempool_spent)
             .unwrap_or_else(|err| panic!("accepted: {err}"));
         assert_eq!(accepted.len(), 1);
+    }
+
+    /// Go's `t.Sub(t.Truncate(time.Minute)) != 0` for `t =
+    /// time.Unix(secs, 0)`, as Go prints it for these seconds, those
+    /// whose internal seconds wrap included, and the one value where the
+    /// answer is not Go's, which the late gate refuses first.
+    #[test]
+    fn the_minute_rule_answers_as_gos_truncate() {
+        let cases: [(i64, bool); 16] = [
+            (0, false),
+            (-1, true),
+            (-60, false),
+            (59, true),
+            (60, false),
+            (1_699_999_980, false),
+            (1_699_999_950, true),
+            (1_699_999_981, true),
+            (i64::MAX, true),
+            (i64::MIN, true),
+            (i64::MAX - UNIX_TO_INTERNAL + 1, true),
+            (i64::MIN + 30, true),
+            (((1u64 << 63) + 4_000_000_000) as i64, true),
+            (((1u64 << 63) + 4_000_000_020) as i64, true),
+            (-UNIX_TO_INTERNAL, false),
+            (-UNIX_TO_INTERNAL - 1, true),
+        ];
+        for (secs, off) in cases {
+            assert_eq!(go_unix_off_minute(secs), off, "{secs}");
+        }
+
+        // Internal second -(2**63-1), where Go's `Truncate` saturates and
+        // Go prints false.
+        let secs = i64::MAX - UNIX_TO_INTERNAL + 2;
+        assert_eq!(secs.wrapping_add(UNIX_TO_INTERNAL), i64::MIN + 1);
+        assert!(go_unix_off_minute(secs));
+        let now = NOW_SECS as i64 * NANOS_PER_SEC;
+        assert!(go_after_unix(now, -LATE_KE_DURATION_NANOS, secs));
+    }
+
+    /// Go's `time.Unix(0, now).Add(d).After(time.Unix(secs, 0))`, as Go
+    /// prints it: a reading on the second is not after it, a nanosecond
+    /// past is, and an epoch whose internal seconds wrap is in the far
+    /// past.
+    #[test]
+    fn the_late_gate_compares_as_gos_after() {
+        let now = NOW_SECS as i64 * NANOS_PER_SEC;
+        let late = -LATE_KE_DURATION_NANOS;
+        let edge = NOW_SECS as i64 - 1200;
+        let cases: [(i64, i64, i64, bool); 9] = [
+            (now, late, edge, false),
+            (now + 1, late, edge, true),
+            (now - 1, late, edge, false),
+            (now, late, edge - 60, true),
+            (now, late, ((1u64 << 63) + 4_000_000_000) as i64, true),
+            (now, late, i64::MAX, true),
+            (now, late, i64::MIN, true),
+            (-1, 0, -1, true),
+            (-1, 0, -2, true),
+        ];
+        for (now, d, secs, after) in cases {
+            assert_eq!(go_after_unix(now, d, secs), after, "{now} {d} {secs}");
+        }
+    }
+
+    /// Go's `Time.Sub` saturates, so the orphan sweep's `time.Since` of
+    /// an epoch at or above 2**63, an int64 in the far past, is the
+    /// largest duration rather than an overflow.  Since the late gate no
+    /// such key exchange is orphaned, but the sweep keeps Go's answer.
+    #[test]
+    fn time_since_a_far_past_epoch_saturates() {
+        let now = NOW_SECS as i64 * NANOS_PER_SEC;
+        let far_past = ((1u64 << 63) + 10_000_000_000) as i64;
+        assert_eq!(go_since_unix(now, far_past), i64::MAX);
+        assert_eq!(go_since_unix(now, NOW_SECS as i64 - 60), 60 * NANOS_PER_SEC);
+        assert_eq!(go_since_unix(now + 7, NOW_SECS as i64), 7);
     }
 
     /// `70485d9e`: a key exchange counts as active in its epoch when its

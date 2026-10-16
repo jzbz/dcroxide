@@ -29,8 +29,9 @@ use dcroxide_wire::{
 /// The tip the pool validates pair request expiries against.
 const TIP_HEIGHT: i64 = 100;
 
-/// The wall clock the pool starts at, in seconds.
-const NOW_SECS: i64 = 1_700_000_000;
+/// The wall clock the pool starts at, in seconds: a whole minute, so the
+/// key exchanges that state it as their epoch are inside dcrd's window.
+const NOW_SECS: i64 = 1_699_999_980;
 
 const NANOS: i64 = 1_000_000_000;
 
@@ -342,19 +343,20 @@ fn negative_mix_amounts_wrap_like_go() {
     );
 }
 
-/// X1-c#6: the early key exchange gate compares Go times, not a
-/// wrapped epoch-times-1e9 product.  An epoch past the year 2262 is
-/// too early, as in dcrd, and an epoch at or above 2**63 is an int64 in
-/// the far past, which dcrd accepts.
+/// X1-c#6: the key exchange epoch gates compare Go times, not a
+/// wrapped epoch-times-1e9 product.  An epoch past the year 2262 is too
+/// early, as in dcrd, and an epoch at or above 2**63 is an int64 in the
+/// far past, which dcrd accepted until its late gate (`3ce5cc41`) made
+/// it too late.
 #[test]
-fn early_key_exchange_gate_compares_seconds_like_go() {
+fn key_exchange_epoch_gates_compare_seconds_like_go() {
     let (mut pool, _clocks) = new_pool();
     let (priv_key, id) = identity(5);
     let pr = pair_request(&priv_key, id, 5);
     accept(&mut pool, PoolMessage::PR(pr.clone())).expect("pair request is accepted");
     let unknown = unknown_pair_request(11);
 
-    let far_future = key_exchange(&priv_key, id, [&pr, &unknown], &pr, 10_000_000_000);
+    let far_future = key_exchange(&priv_key, id, [&pr, &unknown], &pr, 10_000_000_020);
     let err = rejected(
         accept(&mut pool, PoolMessage::KE(Box::new(far_future))),
         "too early",
@@ -371,37 +373,52 @@ fn early_key_exchange_gate_compares_seconds_like_go() {
         id,
         [&pr, &unknown],
         &pr,
-        (1u64 << 63) + 4_000_000_000,
+        (1u64 << 63) + 4_000_000_020,
     );
-    let accepted = accept(&mut pool, PoolMessage::KE(Box::new(far_past))).expect("accepted");
-    assert_eq!(accepted.len(), 1);
+    let err = rejected(
+        accept(&mut pool, PoolMessage::KE(Box::new(far_past))),
+        "too late",
+    );
+    assert_eq!(
+        err,
+        PoolError::Rule(RuleKind::Other(
+            "KE received too late for stated epoch".into()
+        ))
+    );
 }
 
-/// X1-c#6: the orphan sweep takes `time.Since` of the key exchange
-/// epoch the way Go does, saturating, where the port's plain
-/// subtraction overflowed (a debug-build panic) for an epoch whose
-/// nanosecond product wrapped far negative.
+/// X1-c#6: the orphan sweep takes `time.Since` of an orphaned key
+/// exchange's epoch on the wall clock, as Go does.  Since dcrd's late
+/// gate an orphan's epoch is at most twenty minutes old when it arrives,
+/// so the sweep removes it once the wall clock has moved on; the
+/// saturation that kept a far-past epoch from overflowing is pinned
+/// where it lives (`mixpool::tests`).
 #[test]
-fn far_past_orphan_key_exchange_expires_without_overflow() {
-    let (mut pool, _clocks) = new_pool();
+fn orphan_key_exchange_expires_with_its_epoch() {
+    let (mut pool, clocks) = new_pool();
     let (priv_key, id) = identity(6);
     // The identity's own pair request is never sent, so the key
     // exchange is orphaned.
     let pr = pair_request(&priv_key, id, 6);
     let unknown = unknown_pair_request(13);
-    let ke = key_exchange(
-        &priv_key,
-        id,
-        [&pr, &unknown],
-        &pr,
-        (1u64 << 63) + 10_000_000_000,
-    );
+    let epoch = NOW_SECS as u64 - 60;
+    let ke = key_exchange(&priv_key, id, [&pr, &unknown], &pr, epoch);
     let err = rejected(accept(&mut pool, PoolMessage::KE(Box::new(ke))), "orphaned");
     assert!(matches!(err, PoolError::MissingOwnPR(_)));
     assert_eq!(orphan_count(&pool), 1);
 
+    // Nineteen minutes after its epoch it stays; twenty and it goes,
+    // though the monotonic clock says no time passed.
+    clocks.advance_wall(18 * 60 * NANOS);
     pool.expire_messages(0);
-    assert_eq!(orphan_count(&pool), 0, "an epoch in the far past expires");
+    assert_eq!(orphan_count(&pool), 1);
+    clocks.advance_wall(60 * NANOS);
+    pool.expire_messages(0);
+    assert_eq!(
+        orphan_count(&pool),
+        0,
+        "an epoch twenty minutes old expires"
+    );
 }
 
 /// PW17#2: dcrd measures orphan age with `time.Since` over two
