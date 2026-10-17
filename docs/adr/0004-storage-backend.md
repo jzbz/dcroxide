@@ -1827,3 +1827,20 @@ thread; it is `02b802c`, ported onto the commits that followed
 `8fc9160`, and that tree has not been run in a sync. The store's end
 state with it was not compared with the control's. The engine decision
 and the levers this ADR closed are unchanged.
+
+> **Note, 2026-10-17, after the syncs of that day.** The tree was run:
+> `88c46c3`, which holds `02b802c`, took a median of 396.25 s over four
+> default syncs on m3, and 430.4 s and 428.0 s with
+> `DCROXIDE_DB_SYNC_COMMIT=1`, so the background commit as committed is
+> 32.95 s or 7.7% less by the medians and was faster in every pairing,
+> for 32.3 s and 33.7 s more process CPU time and 205.5 and 254.5 MiB
+> more peak resident memory to the tip. The flushes held the threads
+> that sync for a median of 47.1 s against 103.6 s and 100.8 s. Both
+> arms, and dcrd's syncs of the session, ended with the same UTXO set by
+> `gettxoutsetinfo` and the same block files; the exists-address index's
+> digest and the rest of the store were not compared. The session of
+> 2026-10-17 ran with transparent huge pages at `madvise`, where the one
+> above ran at `always`, and the two set different builds against their
+> controls, so the figures of the two are not to be subtracted
+> ([bench-ledger.md](../bench-ledger.md), "`88c46c3`, the background
+> commit as committed, dcrd v2.1.7 and two preloaded allocators").

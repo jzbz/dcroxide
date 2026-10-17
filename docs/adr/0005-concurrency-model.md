@@ -538,6 +538,15 @@ beside the reading thread's added work. D2 is unchanged.
 > commit and dcrd v2.1.7"). What the pool adds there was not measured
 > apart, and the threshold was not varied.
 
+> **Note, 2026-10-17, after the syncs of that day.** The code as it
+> stands, `88c46c3`, which holds the pool and every commit after it,
+> took 395.3 s to 397.8 s in four default syncs on m3, a median of
+> 396.25 s, with the threshold at 4 items and the reading thread's
+> added work ([bench-ledger.md](../bench-ledger.md),
+> "`88c46c3`, the background commit as committed, dcrd v2.1.7 and two
+> preloaded allocators"). What the pool adds there was not measured
+> apart, and the threshold was not varied.
+
 ## Addendum, 2026-10-16 (second) — a short-lived thread for the metadata commit
 
 In the daemon a flush of the metadata write cache that a commit's own

@@ -186,17 +186,20 @@ read from the code: no run on record opened a directory written before
 them with a build made after them.
 
 Budget for it: on the one machine where a sync from genesis has been
-measured with the current layout, it took less time than dcrd v2.1.6
-did, and more disk. Each figure below is of the code named with it. The
-code as it stands has not been run in a sync; the paragraph on
-2026-10-16 below says what was. The last commit that has been run as
-committed, `8fc9160`, took a median of 430.7 s over four runs at the
-defaults on 2026-10-16, **7.2 minutes**, against 2,944.4 s, 49.1
-minutes, for dcrd v2.1.7 in one run of the same session (that
-paragraph has what to make of the ratio). `4700cf1` took 504.2 s,
-513.4 s and 513.5 s at the defaults on 2026-10-13, **8.4 to 8.6
-minutes**, in a session not to be set beside the earlier ones without
-its label (the paragraph on 2026-10-13 says why).
+measured with the current layout, it took less time than dcrd did, and
+more disk. Each figure below is of the code named with it. The code as
+it stands, `88c46c3`, took a median of 396.25 s over four runs at the
+defaults on 2026-10-17, **6.6 minutes**, against 2,944.4 s and
+2,926.4 s, 49.1 and 48.8 minutes, for dcrd v2.1.7 in two runs of the
+same session, and peaked at 3,464 to 3,710 MiB up to the tip (the
+paragraph on 2026-10-17 below has the rest). `8fc9160` took a median of
+430.7 s over four runs at the defaults on 2026-10-16, **7.2 minutes**,
+against 2,944.4 s, 49.1 minutes, for dcrd v2.1.7 in one run of the same
+session (the paragraph on 2026-10-16 has what to make of that ratio).
+`4700cf1` took 504.2 s, 513.4 s and 513.5 s at the defaults on
+2026-10-13, **8.4 to 8.6 minutes**, in a session not to be set beside
+the earlier ones without its label (the paragraph on 2026-10-13 says
+why).
 On 2026-10-12 two runs of a build of `b4ceb1c` made before the
 last fixes to it took **8.2 minutes** each, and `540b203` took 10.2
 minutes in one run; a median of **12.1 minutes** over three runs on
@@ -308,7 +311,7 @@ the script checks below, was run on `4700cf1` alone, twice: 491.3 s and
 493.4 s, about 12 to 16 s less than the code it was added to, depending
 on the measure, all of it after the assume-valid block. No build holding
 both was run, so the two are not to be added, and the code as it stands
-has not been run. dcrd was run once in that session. The ledger's
+was not run in that session. dcrd was run once in it. The ledger's
 section "Seven cumulative builds, the validation pool, a background
 commit and dcrd" has every run, what each step is good to, and what was
 not measured.
@@ -330,9 +333,30 @@ resident memory was 2,952 to 3,339 MiB with the index on and 2,162 MiB
 with it off. The same session measured the background commit (the
 storage section below) on a build that is not the code of a commit, and
 the code after `8fc9160`, which ports dcrd's changes since `6f6cf21b`
-and carries the background commit, has not been run in a sync. The
+and carries the background commit, was not run in a sync that day. The
 ledger's section "`8fc9160`, a background commit and dcrd v2.1.7" has
 every run.
+
+On 2026-10-17, on m3, in the same harness, `88c46c3`, the code as it
+stands, took 397.8 s, 396.6 s, 395.9 s and 395.3 s at the defaults, a
+median of **6.6 minutes** (396.25 s), and two later runs 391.1 s and
+395.8 s. dcrd v2.1.7 took 2,944.4 s and 2,926.4 s, so dcroxide was 7.43x
+and 7.39x as fast in one session. dcrd ran slower on 2026-10-16 and
+2026-10-17 than in the quiet runs of 2026-10-09 to 2026-10-13, where
+v2.1.6 took 2,848.8 to 2,920.3 s, some of them from a dcroxide block
+server, in sessions whose huge-page setting was not recorded; why is not
+established. The block server read nothing from its drive in any run,
+and transparent huge pages were `madvise` where they had been `always`
+on 2026-10-16, so this session is not a later point on the same curve as
+that one. With `--noexistsaddrindex` `88c46c3` took 343.9 s and 344.0 s,
+and dcrd 1,317.2 s in one run, 3.83x. `88c46c3`'s peak resident memory
+to the tip was 3,464 to 3,710 MiB with the index on and 2,202 and
+2,203 MiB with it off; through the harness's `gettxoutsetinfo` call
+after the tip, which flushes, and the shutdown, its high-water mark
+reached 3,764 to 4,052 MiB with the index on. Every full sync, dcrd's
+included, ended with the same UTXO set and block files. The ledger's
+section "`88c46c3`, the background commit as committed, dcrd v2.1.7 and
+two preloaded allocators" has every run.
 
 The rate falls as the chain grows, and falls again where full
 validation begins: by default both daemons skip connect validation,
@@ -347,9 +371,12 @@ about 586 blocks/s. On 2026-10-12 the one run of `540b203` reached it
 in 8.2 minutes and took 2.1 for the blocks after it, about 727
 blocks/s, and the two runs with the read-ahead, of the build before its
 review's fixes, reached it in 6.4 minutes and took 1.8, about 826 and
-815 blocks/s.) New blocks are past that point too, so a chain longer
+815 blocks/s. On 2026-10-17 the four runs of `88c46c3` reached it in a
+median of 5.2 minutes and took 1.4 for the blocks after it, about
+1,096 blocks/s.) New blocks are past that point too, so a chain longer
 than the one measured should add time, on a machine like m3, at the
-rate of the code that is run: about 586 blocks/s by the three runs of
+rate of the code that is run: about 1,096 blocks/s by the four runs of
+the code as it stands on 2026-10-17, about 586 by the three runs of
 2026-10-11, about 727 by the one run of `540b203`, and about 820 by the
 two runs of the read-ahead build, which is not the committed code (the
 four runs before 2026-10-11's changes gave a median of about 461),
@@ -527,16 +554,19 @@ of later code than the 12.1 minutes above. The read-ahead as `b4ceb1c`
 committed it was run on 2026-10-13, inside `4700cf1` and only on
 (above), so what it gains as committed has not been measured; the
 reading thread's added work, the record and the merkle trees, has been
-run only in builds that are not the code as it stands, where it moved
-about 7 s and 5 s of processor time from the thread that processes
-blocks to the reading thread rather than removing it, which paid there
-because the reading thread, fed by a server on the same machine, waited
-over 320 s for the other. No sync has been run with it over a delayed or
-a real link, where the round trip and not the thread that processes
-blocks may set the pace and it may gain nothing, nor on fewer cores or
-with `--assumevalid=0`, nor on macOS or Windows, where none of its tests
-has been run either; with `--noexistsaddrindex` it was run once, in
-`4700cf1` on 2026-10-13, and never against a run with it off.
+measured apart only in builds that are not the code as it stands, where
+it moved about 7 s and 5 s of processor time from the thread that
+processes blocks to the reading thread rather than removing it, which
+paid there because the reading thread, fed by a server on the same
+machine, waited over 320 s for the other; in the code as it stands, on
+2026-10-17, it waited 275 to 278 s for the other in each default run. No
+sync has been run with it over a delayed or a real link, where the round
+trip and not the thread that processes blocks may set the pace and it
+may gain nothing, nor on fewer cores or with `--assumevalid=0`, nor on
+macOS or Windows, where none of its tests has been run either; with
+`--noexistsaddrindex` it was run once in `4700cf1` on 2026-10-13 and
+twice in the code as it stands on 2026-10-17, and never against a run
+with it off.
 
 Whether reading ahead ever costs anything has not been measured: the
 loopback runs above are all there is. Set `DCROXIDE_READ_AHEAD=off` (or
@@ -712,8 +742,11 @@ against 504.2 s to 513.5 s in three with it on (the sync budget above
 has that session's label). The index's commit hook has changed since
 (`64359e7`). On 2026-10-16 `8fc9160`, which has that hook, took 351.3 s
 with the index off in one run, against a median of 430.7 s over four
-with it on (the sync budget above has that session); the code as it
-stands, after `8fc9160`, has not been run with it off.
+with it on (the sync budget above has that session). On 2026-10-17
+`88c46c3`, the code as it stands, took 343.9 s and 344.0 s with the
+index off against a median of 396.25 s over four with it on, so the
+index cost it 52.3 s, 13.2% of its sync, and its data directory was
+2.0 GiB smaller.
 With the index off, both RPCs fail with "exists address index
 disabled", as dcrd's do. With it on, the index is updated on a thread of
 its own and can trail the chain by a little more than 128 blocks while
@@ -778,8 +811,9 @@ index off in one run, 80.6 s to 89.9 s less than each of its three
 runs with it on, two of which had slow commit phases (the sync budget
 above). On 2026-10-16 `8fc9160`, whose index hook is the changed one,
 took 351.3 s with the index off in one run, 69.9 s to 82.7 s less than
-each of its four clean runs with it on. Its share on the code as it
-stands, after `8fc9160`, is not known.
+each of its four clean runs with it on. On 2026-10-17 `88c46c3`, the
+code as it stands, took 52.3 s less with the index off, two runs
+against four, 13.2% of its default sync (the sync budget above).
 
 - **Memory**: the index's in-memory set holds up to about 3 million
   addresses (about 63 MB) after each flush while syncing, and up to about
@@ -819,8 +853,11 @@ stands, after `8fc9160`, is not known.
   defaults, can arrive while a flush's commit is under way, before that
   flush's `finished` lets go of the keys it merged, so the set can hold
   up to 6.0 million (126 MB) then; how many it held in the syncs of
-  2026-10-16 was not read. What the index adds to the peak on the code
-  as it stands has not been measured.
+  2026-10-16 and 2026-10-17 was not read. On the code as it stands,
+  `88c46c3`, on 2026-10-17, the peak to the tip was 2,202 and 2,203 MiB
+  in two runs with the index off against 3,464 to 3,710 MiB in four
+  with it on, so the index adds about 1.2 to 1.5 GiB (1,261–1,508 MiB)
+  there.
 - **Starting**: the node reads the journal back into memory before the
   index catches up, modelled at 1-3 s on mainnet, holding one copy of the
   addresses it reads back, and the journal's pages in the page cache.
@@ -894,7 +931,14 @@ m3 on 2026-10-16 on a build that is not the code of a commit, against
 the same build without it, four runs each: 389.55 s against 429.45 s by
 the medians, 9.3% less, at 27 s more process CPU time and about 256 MiB
 more peak resident memory to the tip (the memory below; the ledger's
-"`8fc9160`, a background commit and dcrd v2.1.7" has the runs).
+"`8fc9160`, a background commit and dcrd v2.1.7" has the runs). On
+2026-10-17 the code as it stands, `88c46c3`, was measured against itself
+with the variable set, four runs at the default against two: 396.25 s
+against 429.2 s by the medians, 7.7% less and less in every pairing, at
+32.3 s and 33.7 s more process CPU time and 205.5 and 254.5 MiB more
+peak resident memory to the tip, and both arms ended with the same UTXO
+set (the ledger's "`88c46c3`, the background commit as committed, dcrd
+v2.1.7 and two preloaded allocators").
 
 **Since 2026-10-11 a sync commits less often, and the overlay's default
 ceiling is 300 MiB.** Until then every UTXO cache flush forced a durable
@@ -1291,12 +1335,14 @@ a thread of its own and the next flush waits for it with the writer
 held. A flush that `Database::flush` or the close asks for commits on
 the thread that asked for it whatever the variable says, since it
 acknowledges durability. The default was measured on m3 only, on one
-NVMe drive under btrfs, where on 2026-10-16 it took a sync of a build
-that is not the code of a commit from 429.45 s to 389.55 s, 9.3%, at
-27 s more process CPU time and about 256 MiB more peak memory (the
-storage tuning above); the form of 2026-08-16, on m1, lost 9.5% where
-commits ran back to back. On slower storage, or with few spare cores,
-measure it with the variable set before relying on the default.
+NVMe drive under btrfs, where on 2026-10-17 it took a sync of the code
+as it stands, `88c46c3`, from 429.2 s with the variable set to 396.25 s
+by the medians, 7.7%, at 32.3 s and 33.7 s more process CPU time and
+205.5 and 254.5 MiB more peak memory to the tip (the storage tuning
+above, which also has the measurement of 2026-10-16); the form of
+2026-08-16, on m1, lost 9.5% where commits ran back to back. On slower
+storage, or with few spare cores, measure it with the variable set
+before relying on the default.
 A malformed or zero value in any of the tuning variables warns and
 falls back to the default rather than refusing to start, since they are
 hints; `DCROXIDE_READ_AHEAD` alone takes `0`, which turns it off.

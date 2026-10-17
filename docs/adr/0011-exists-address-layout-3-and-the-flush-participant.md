@@ -896,6 +896,17 @@ was not run again, and none of the plan's criteria is judged again.
 > was not measured apart there, and the index's share of the sync is
 > known for `8fc9160` from that one run.
 
+> **Note, 2026-10-17, after the syncs of that day.** The code as it
+> stands, `88c46c3`, took a median of 396.25 s over four default syncs
+> on m3 and 343.9 s and 344.0 s in two with `--noexistsaddrindex`, so
+> the index cost it 52.3 s, 13.2% of its sync, and about 1.2 to 1.5 GiB
+> of peak resident memory to the tip (3,464 to 3,710 MiB against 2,202
+> and 2,203 MiB); dcrd v2.1.7's index cost it 1,627.2 s and 1,609.2 s
+> against its one run with the index off
+> ([bench-ledger.md](../bench-ledger.md), "`88c46c3`, the background
+> commit as committed, dcrd v2.1.7 and two preloaded allocators"). The
+> index's digest was not compared between runs.
+
 The tests are in `crates/dcroxide-indexers/src/existsaddr/memtable.rs`
 (the first four) and `existsaddr/tests.rs`: a partition's version moves
 with every change to its vectors and to no other partition's, and never

@@ -265,7 +265,22 @@ What Phase 15 has covered so far:
   not measured. Only m3's storage was measured; the form of 2026-08-16
   lost 9.5% on m1, and `DCROXIDE_DB_SYNC_COMMIT=1` restores the committing
   thread. The commits after `8fc9160`, the dcrd port's and this one among
-  them, have not been run in a sync.
+  them, were first run in syncs on 2026-10-17 (next item).
+- **On 2026-10-17 the code as it stands, `88c46c3`, took a median of
+  396.25 s, 6.6 minutes, over four syncs against dcrd v2.1.7's
+  2,944.4 s and 2,926.4 s, 7.43x and 7.39x in one session**, on m3 from
+  the same dcrd block server, whose data stayed cached throughout, with
+  transparent huge pages at `madvise` where 2026-10-16 ran at `always`.
+  With the exists-address index off, two runs of 343.9 s and 344.0 s
+  against one dcrd run of 1,317.2 s, 3.83x. Two runs with
+  `DCROXIDE_DB_SYNC_COMMIT=1` took 430.4 s and 428.0 s, so the
+  background commit as committed is 32.95 s or 7.7% less by the
+  medians, for 32.3 s and 33.7 s more process CPU time and 205.5 and
+  254.5 MiB more peak resident memory to the tip. All eighteen full
+  syncs of the session, dcrd's included, ended with the same block files
+  and the same UTXO set by `gettxoutsetinfo`; the rest of the metadata
+  store was not compared. The [bench ledger](docs/bench-ledger.md) has
+  every run, and the README's Performance section the summary.
 - **The daemon's default download window is now its own, not dcrd's,
   and was measured on 2026-10-12 in short runs only** (PARITY.md,
   *Block download window*). It keeps up to 128 blocks requested from
@@ -315,7 +330,7 @@ Named open items, tracked and not fixed:
   copy-out rebuild packs *worse*, 58.29%, on a larger live tree, 10.92 GiB
   against 9.79. The 1.536 GiB of intra-page slack in `spendjournalv3` is real
   and unreachable inside this engine.
-- The node was flush-bound under fast ingest as measured in 2026-08 (the 48%-of-wall stall figure above, 90–98% of it inside a metadata-flush window). With the height-first block keys and the exists-address index's own layout, metadata flushes took 15–16% of a from-genesis sync on another machine in 2026-10 ([docs/bench-ledger.md](docs/bench-ledger.md), "Daemon against daemon, each from the other"). In the nine syncs of 2026-10-12 listed above with the eleven commits they took 104.3–111.4 s whichever code ran, so their share grew as the rest shrank: 14.7% of the 728.5 s run and 21.3% of each of the two runs with the read-ahead on.
+- The node was flush-bound under fast ingest as measured in 2026-08 (the 48%-of-wall stall figure above, 90–98% of it inside a metadata-flush window). With the height-first block keys and the exists-address index's own layout, metadata flushes took 15–16% of a from-genesis sync on another machine in 2026-10 ([docs/bench-ledger.md](docs/bench-ledger.md), "Daemon against daemon, each from the other"). In the nine syncs of 2026-10-12 listed above with the eleven commits they took 104.3–111.4 s whichever code ran, so their share grew as the rest shrank: 14.7% of the 728.5 s run and 21.3% of each of the two runs with the read-ahead on. On 2026-10-17, with the commit on a thread of its own, the four default syncs of `88c46c3` had a flush under way for a median of 110.2 s, 27.8% of the wall, of which the flushes held the threads that sync for 47.1 s, 11.9%.
 
 **The node is still pre-alpha. Do not expose it to the internet and do not use
 it with funds.**
