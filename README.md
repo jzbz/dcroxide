@@ -17,7 +17,7 @@ JSON-RPC/websocket server, the tool commands, the pipe IPC lifecycle,
 and the Windows service wrapper. The deliberate non-ports are small
 and documented in PARITY.md (Go GC tuning, the pprof servers, UPnP,
 the Windows event log, and the wallet-side mixclient). The test suite
-runs 2,362 tests across 436 suites on Linux, most differential against
+runs 2,364 tests across 437 suites on Linux, most differential against
 dcrd itself or replaying sessions generated inside dcrd's own packages.
 
 Since the surface completed, four rounds of work have landed on it. A
@@ -429,6 +429,10 @@ dcrd data directory will not work). Currently implemented:
   package: it gives every input of the files' blocks the fraud proof of
   the output it spends and recomputes every expectation, from the seeds,
   blocks and operations the files hold (Go sources overlaid on a dcrd
+  checkout by `run.sh`)
+- `tools/disapprovalgen` — runs dcrd's disapproval scenarios inside
+  dcrd's own `internal/blockchain` package and dumps the chains
+  `tests/disapproval_vectors.rs` replays (Go sources overlaid on a dcrd
   checkout by `run.sh`)
 
 ## Performance
@@ -853,6 +857,8 @@ changes, on slower storage and four cores.
   sources)
 - `tools/chainopsgen/` — the block processing, invalidation and
   reorganization vector generator (Go, overlay sources)
+- `tools/disapprovalgen/` — the disapproval scenario vector generator
+  (Go, overlay sources)
 - `fuzz/` — `cargo-fuzz` targets (nightly toolchain)
 - `docs/adr/` — architecture decision records
 

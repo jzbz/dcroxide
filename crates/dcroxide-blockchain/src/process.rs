@@ -201,6 +201,27 @@ impl UtxoCacheMap {
     }
 }
 
+/// Test hooks on the UTXO cache flushes, in the place of the wrapper
+/// dcrd's tests put around its cache (`testUtxoCache`,
+/// `utxocache_test.go:200-235`); see [`Chain::utxo_flush_test_hooks`].
+#[doc(hidden)]
+#[derive(Debug, Default)]
+pub struct UtxoFlushTestHooks {
+    /// Skip every cache flush, a forced one included, as dcrd's test
+    /// cache does while its `disableFlush` is set
+    /// (`utxocache_test.go:215-218`): after a connect, the forced ones
+    /// after a disconnect, on latching to current and for the UTXO set
+    /// statistics, and those of the startup catch-up.  dcrd's shutdown
+    /// flush also goes through `MaybeFlush` (`utxocache.go:1073`), so
+    /// its test cache skips that one too; the port's writes the block
+    /// index in the same transaction and is not skipped, which no test
+    /// that sets the switch reaches, since none shuts the chain down.
+    pub disabled: bool,
+    /// When set, the hash and height of the block every completed flush
+    /// recorded as the utxo set state, in order.
+    pub log: Option<Vec<(Hash, u32)>>,
+}
+
 /// The growing chain state: the block tree arena and index together
 /// with the chain state and configuration (the subset of dcrd's
 /// `BlockChain` struct this port reads).  dcrd's locks are not
@@ -304,6 +325,12 @@ pub struct Chain {
     /// Whether several validation checks are skipped for bulk imports
     /// (dcrd `bulkImportMode`).
     pub bulk_import_mode: bool,
+    /// Test hooks on the UTXO cache flushes, which tests use to turn
+    /// flushing off and to see where the cache flushed, as dcrd's
+    /// disapproval scenarios do (`common_test.go:1044-1079`).  The
+    /// node leaves them at their defaults.
+    #[doc(hidden)]
+    pub utxo_flush_test_hooks: UtxoFlushTestHooks,
     /// The periodic clock reading of the last prune of the in-memory
     /// state (dcrd `chainPruner.lastPruneTime`); see
     /// [`Chain::periodic_clock`].  `None` only before a chain with no
@@ -823,6 +850,7 @@ impl Chain {
             header_commitments: BTreeMap::new(),
             state_snapshot,
             bulk_import_mode: false,
+            utxo_flush_test_hooks: UtxoFlushTestHooks::default(),
             // dcrd stamps the pruner and the cache at construction
             // (`prune.go:71`, `utxocache.go:236`).
             last_prune_nanos: crate::gotime::monotonic_nanos(),
@@ -2132,6 +2160,9 @@ impl Chain {
         last_flush_height: u32,
         durable: bool,
     ) -> Result<(), crate::chaindb::ChainDbError> {
+        if self.utxo_flush_test_hooks.disabled {
+            return Ok(());
+        }
         let eviction_height = self.utxo_calc_flush_eviction_height(last_flush_height);
         if let Some(db) = &self.db {
             // The rows are serialized straight out of the cache, which
@@ -2160,6 +2191,9 @@ impl Chain {
         // overlay until that reaches disk, and a crash before then loses
         // the in-memory state along with it.
         self.utxo_flush_finish(eviction_height, last_flush_hash);
+        if let Some(log) = self.utxo_flush_test_hooks.log.as_mut() {
+            log.push((last_flush_hash, last_flush_height));
+        }
         // A forced or periodic flush is the chain's durability barrier,
         // as dcrd's `flushBlockDB` is for every flush of its cache.  A
         // size-triggered one returns here, and its rows ride in the
