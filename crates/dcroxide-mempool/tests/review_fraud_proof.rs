@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: ISC
 //! The acceptance gauntlet borrows the candidate and copies it only to
 //! rewrite its fraud proof data, as dcrd copies with
-//! `dcrutil.NewTxDeepTxIns` (`mempool.go:1498-1520`).  The pool keeps
+//! `dcrutil.NewTxDeepTxIns` (`mempool.go:1689-1711`).  The pool keeps
 //! the corrected copy, while the caller's transaction, which is what
 //! `ProcessTransaction` hands back for relay, stays as it was.
 

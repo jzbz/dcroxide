@@ -133,7 +133,7 @@ jobs:
       # The same commit as DCRD_PARITY_COMMIT in dcroxide-testutil, which
       # refuses any other stamped revision; its unit tests fail when the
       # two drift apart.
-      DCRD_COMMIT: 6f6cf21bd26d523ade261a683e7617a8e3f0ab56
+      DCRD_COMMIT: 382ff4ddb2aa64426e711fff53b834daa8fd1f76
       # A missing binary must fail this job rather than skip its tests.
       DCROXIDE_REQUIRE_DCRD: "1"
     steps:
@@ -169,15 +169,16 @@ jobs:
   go-tools:
     name: go vet + go test (tools/)
     runs-on: ubuntu-latest
-    # Each tool under tools/ is its own Go module, and no cargo command
+    # Five tools under tools/ are separate Go modules, and no cargo command
     # vets or tests one: the Rust suites only build the oracle. So
     # tools/pinbump's main_test.go, which pins the bump review list
     # keeping upstream `_test.go` changes and both sides of a move, ran
     # only when someone ran it by hand, and a stale tool surfaced only
     # at the next manual regeneration. fullblockgen is left out: its
     # go.mod asks for a newer Go than the oracle's toolchain here.
-    # mempoolvectors is not a module but an overlay that compiles only
-    # inside a dcrd checkout's internal/mempool, so it is left out too.
+    # chainopsgen, disapprovalgen, mempoolvectors, mixpoolgen and
+    # utxoviewgen are not modules but overlays that compile only inside
+    # a dcrd checkout's packages, so they are left out too.
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7

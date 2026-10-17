@@ -4,7 +4,7 @@
 //! (`ErrMultipleTreasurybases`), a treasury spend off a treasury vote
 //! interval (`ErrNotTVI`), and a treasury spend on one before a full
 //! voting window is possible (`ErrInvalidTVoteWindow`), dcrd
-//! validate.go:2140-2146 and 2313-2336, exercised in dcrd by
+//! validate.go:2220-2226 and 2503-2526, exercised in dcrd by
 //! treasury_test.go's `twotb0`, `bnottvi0` and `boink1` blocks.
 //!
 //! The chain, the parent stake node and the block come from the

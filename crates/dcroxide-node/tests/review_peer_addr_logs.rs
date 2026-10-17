@@ -368,7 +368,7 @@ fn a_redialed_peer_logs_the_three_address_errors_again() {
     // dcrd keeps no record of a failed update: the dial, the version
     // handler and the admission each make theirs at every connection,
     // and a persistent peer that hung up is redialed through the same
-    // dial (`internal/connmgr/connmanager.go:1986`, `server.go:4286`).
+    // dial (`internal/connmgr/connmanager.go:1986`, `server.go:4296`).
     // A connection that lasted less than the retry interval is redialed
     // after a backoff of 2.5 to 5 seconds (`connmanager.go:1950-1962`,
     // `:1883-1903`), which is how long this test takes.

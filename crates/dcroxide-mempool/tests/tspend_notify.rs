@@ -2,8 +2,8 @@
 //! An accepted treasury spend notifies (RVW-065, RVW-066).
 //!
 //! dcrd fires `OnTSpendReceived` inside the tspend policy block
-//! (`mempool.go:1737-1740`), and the server forwards it to
-//! `rpcServer.NotifyTSpend` (`server.go:4097-4101`), which is what
+//! (`mempool.go:1926-1929`), and the server forwards it to
+//! `rpcServer.NotifyTSpend` (`server.go:4104-4108`), which is what
 //! delivers `tspendnew` to a websocket client that issued
 //! `notifytspend`.
 //!

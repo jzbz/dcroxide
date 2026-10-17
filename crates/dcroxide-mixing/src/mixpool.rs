@@ -344,7 +344,7 @@ impl PoolMessage {
 /// message (`WriteHash`) and every later `Hash()` call returns, and its
 /// signature verdict, which `AcceptMessage` computes with
 /// `mixing.VerifySignedMessage` before it takes the pool's mutex
-/// (`mixing/mixpool/mixpool.go:1198`).
+/// (`mixing/mixpool/mixpool.go:1214`).
 ///
 /// Build it before taking the sync manager's and the pool's locks, with
 /// [`HashedMessage::with_hash`] when the hash was already computed as the
@@ -694,12 +694,13 @@ pub struct Pool<B: MixBlockChain> {
 ///
 /// A predicate rather than a pool handle on purpose.  dcrd asks this from
 /// its utxo fetcher inside `checkAcceptPR`, which `AcceptMessage` runs
-/// before it takes the mixpool's mutex (`mixing/mixpool/mixpool.go:
-/// 1206-1210`).  Here the whole acceptance runs under the mixpool guard,
-/// so asking from inside would take the tx-pool lock while holding the
-/// mixpool's, closing an AB-BA against the acceptance gauntlet's mixpool
-/// probe, which takes them the other way round.  The caller answers it
-/// before taking the guard and passes the answer in.
+/// before it takes the mixpool's mutex
+/// (`mixing/mixpool/mixpool.go:1222-1226`).  Here the whole acceptance
+/// runs under the mixpool guard, so asking from inside would take the
+/// tx-pool lock while holding the mixpool's, closing an AB-BA against the
+/// acceptance gauntlet's mixpool probe, which takes them the other way
+/// round.  The caller answers it before taking the guard and passes the
+/// answer in.
 pub type MempoolSpent<'a> = &'a dyn Fn(&OutPoint) -> bool;
 
 /// The answer for a pool with no transaction memory pool behind it
@@ -917,13 +918,13 @@ impl<B: MixBlockChain> Pool<B> {
     /// The timing differs too, and that is part of the same divergence.
     /// dcrd's goroutine sleeps until the second epoch boundary after the
     /// call (`waitForExpiry`, `now.Truncate(p.epoch).Add(2 * p.epoch)`,
-    /// `mixing/mixpool/mixpool.go:439-444`), so an expired pair request
+    /// `mixing/mixpool/mixpool.go:447-452`), so an expired pair request
     /// survives at least one full epoch after the block that expired it.
     /// The daemon's ticker drains the latch at the next boundary, which
     /// can be seconds after that block, so such a pair request -- and the
     /// sessions built on it -- can go up to an epoch sooner here.  dcrd's
     /// own mix client expires its pool on every epoch tick with the latest
-    /// height (`mixing/mixclient/client.go:917`, `:1070-1071`), so wallets
+    /// height (`mixing/mixclient/client.go:938`, `:1108-1109`), so wallets
     /// stop pairing it at that same boundary.
     pub fn expire_messages_in_background(&mut self, height: u32) {
         if height > self.expire_height {
@@ -1390,7 +1391,7 @@ impl<B: MixBlockChain> Pool<B> {
 
     /// Whether dcrd's `AcceptMessage` would go on to verify the message's
     /// signature: it is a run-0 message with a hash, and the pool has not
-    /// already accepted it (`mixing/mixpool/mixpool.go:1172-1198`, whose
+    /// already accepted it (`mixing/mixpool/mixpool.go:1188-1214`, whose
     /// already-accepted check runs under the read lock and returns before
     /// `VerifySignedMessage`).  The daemon asks this under a brief guard
     /// and verifies with the guard released, as dcrd does between its
@@ -1658,7 +1659,7 @@ impl<B: MixBlockChain> Pool<B> {
             if let Some(fetcher) = &self.utxo_fetcher {
                 // dcrd asks the memory pool before the chain
                 // (`server.go:3752-3754`) and returns a nil entry when it
-                // answers yes, which `mixpool.go:1448` folds into the
+                // answers yes, which `mixpool.go:1468` folds into the
                 // same rejection as a spent one.  A pair request whose
                 // output an unmined transaction already spends is
                 // therefore refused rather than pooled and relayed.

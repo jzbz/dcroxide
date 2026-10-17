@@ -1899,7 +1899,7 @@ mod tests {
     /// dcrd's `AddPersistent` checks its capacity before it converts the
     /// address (`internal/connmgr/connmanager.go:1826-1835`), and
     /// `addrStringToNetAddr` hands it a Tor v3 target unconverted, port
-    /// unparsed (`server.go:4481-4485`), so with the persistent table
+    /// unparsed (`server.go:4491-4495`), so with the persistent table
     /// full a v3 target with a bad port gets the capacity error.  The
     /// port parsed a v3 target's port while resolving it on the RPC
     /// thread and answered "invalid port for address" before the gate.

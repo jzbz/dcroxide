@@ -4,7 +4,7 @@
 //!
 //! dcrd's `mixpoolChain.FetchUtxoEntry` asks the mempool before the
 //! chain (`server.go:3752-3754`) and returns a nil entry when it answers
-//! yes; `mixpool.go:1448` folds nil into the same rejection as a spent
+//! yes; `mixpool.go:1468` folds nil into the same rejection as a spent
 //! entry. So a pair request whose claimed output an unmined transaction
 //! already spends is refused.
 //!
@@ -16,7 +16,7 @@
 //! The answer arrives as a predicate rather than a pool handle. dcrd
 //! answers it inside the fetcher, from `checkAcceptPR`, which
 //! `AcceptMessage` runs before it takes the mixpool's mutex
-//! (`mixing/mixpool/mixpool.go:1206-1210`); the port's acceptance runs
+//! (`mixing/mixpool/mixpool.go:1222-1226`); the port's acceptance runs
 //! wholly under the mixpool guard, so asking from inside would take the
 //! tx-pool lock while holding the mixpool's, against an acceptance
 //! gauntlet that already takes them the other way round.
@@ -160,7 +160,7 @@ fn a_pair_request_over_a_mempool_spent_output_is_rejected() {
 /// which is the point: the *verdict changes* with the predicate, and
 /// only the mempool branch produces the not-unspent text. dcrd orders
 /// the two the same way, consulting the mempool inside its fetch, ahead
-/// of the proof (`mixpool.go:1443-1470`).
+/// of the proof (`mixpool.go:1463-1490`).
 #[test]
 fn the_same_request_reaches_past_that_check_when_the_mempool_says_no() {
     let mut pool = new_pool();

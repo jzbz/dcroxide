@@ -1405,7 +1405,7 @@ fn block_path_log_lines() {
 /// `request_from_peer` honours the pending-request caps (RVW-063).
 ///
 /// dcrd breaks out of both loops once the map is full
-/// (`manager.go:2107` for blocks, `:2136` for transactions). The port's
+/// (`manager.go:2108` for blocks, `:2137` for transactions). The port's
 /// on-headers path already did; this entry point did not, so a peer
 /// could grow the maps past the bound that exists to hold them.
 #[test]

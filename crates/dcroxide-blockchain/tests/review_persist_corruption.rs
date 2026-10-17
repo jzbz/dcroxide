@@ -6,7 +6,7 @@
 //! the database error's kind only in its rendered text.  The daemon's
 //! sync adapter reads it back with `is_persisted_db_corruption` to emit
 //! dcrd's corruption-only `Critical failure` line (netsync
-//! `manager.go:1265-1269`, `:1646-1648`), so a change to the rendering
+//! `manager.go:1266-1270`, `:1647-1649`), so a change to the rendering
 //! that the reader does not follow would silently drop that line.
 
 use dcroxide_blockchain::chaindb::ChainDbError;

@@ -22,7 +22,7 @@
 //! later block spending it fails with `ErrMissingTxOut`, and that once
 //! the cache is flushed the backend holds no row for it, as dcrd's
 //! disapproval scenarios check spendability through the cache
-//! (`utxoviewpoint_test.go:259-740`).
+//! (`utxoviewpoint_test.go:259-733`).
 //!
 //! - Disapproval twice: G confirms T1 and a flush makes G's T1:0 a
 //!   backend row; P disapproves G, reincludes T1 and spends T1:0 later

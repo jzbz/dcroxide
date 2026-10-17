@@ -358,8 +358,8 @@ pub struct Chain {
     /// The periodic clock reading of the last utxo cache flush that
     /// ended in a durable database flush; see
     /// [`Chain::periodic_clock`].  dcrd's `lastFlushTime` is stamped by
-    /// every flush (`utxocache.go:760`), and every dcrd flush follows a
-    /// durable flush of the block database (`utxocache.go:713`).  Here
+    /// every flush (`utxocache.go:769`), and every dcrd flush follows a
+    /// durable flush of the block database (`utxocache.go:722`).  Here
     /// a flush only the size limit tripped leaves its rows in the
     /// database's write cache and does not move the stamp, so the
     /// periodic interval counts from the last flush a crash cannot
@@ -460,7 +460,7 @@ pub struct Chain {
     /// The clock the three periodic jobs are timed on: the chain
     /// pruner, the utxo cache's periodic flush and the cached-tip
     /// prune.  dcrd times each with `time.Now()` differences
-    /// (`prune.go:82-84`, `utxocache.go:669`, `blockindex.go:1052`),
+    /// (`prune.go:82-84`, `utxocache.go:678`, `blockindex.go:1052`),
     /// which Go takes from the monotonic clock, so a step of the wall
     /// clock or of the median time offset neither stalls nor hastens
     /// them; this defaults to [`crate::gotime::monotonic_nanos`].  A
@@ -730,7 +730,7 @@ impl Chain {
     /// explicitly requested or the network has no hard-coded assumed
     /// valid hash).
     ///
-    /// Like `New` (`chain.go:2148-2154`), it first makes the agendas
+    /// Like `New` (`chain.go:2153-2159`), it first makes the agendas
     /// for the parameters with the network's historical activations,
     /// validating every deployment.  `New` returns that error; this
     /// constructor is infallible and panics with the error's text
@@ -746,7 +746,7 @@ impl Chain {
 
     /// Make the agendas for the parameters with the network's
     /// historical activations, which validates the deployments (dcrd
-    /// `New`, `chain.go:2148-2154`).  The map itself is not kept: each
+    /// `New`, `chain.go:2153-2159`).  The map itself is not kept: each
     /// agenda query resolves its agenda with
     /// [`crate::agendas::lookup_agenda`], which builds the same entry.
     fn make_agendas(params: &Params) -> Result<(), RuleError> {
@@ -958,7 +958,7 @@ impl Chain {
     /// [`crate::chaindb::ChainDbError::OlderVersion`] where dcrd would
     /// upgrade it (see [`crate::chaindb::CURRENT_DATABASE_VERSION`]).
     ///
-    /// Nor is `New`'s version 3 test network pass (`chain.go:2261-2291`),
+    /// Nor is `New`'s version 3 test network pass (`chain.go:2266-2296`),
     /// which invalidates, with notifications suppressed, every chain
     /// tip whose ancestor at `testNet3MaxDiffActivationHeight` is not
     /// `block962928Hash`.  It cleans up databases that stored the
@@ -988,7 +988,7 @@ impl Chain {
 
     /// [`Chain::open`] with the shutdown interrupt, which dcrd's `New`
     /// takes as its context and keeps as `interrupt: ctx.Done()`
-    /// (`chain.go:2219`).  Setting it stops the startup UTXO catch-up
+    /// (`chain.go:2224`).  Setting it stops the startup UTXO catch-up
     /// replay at the next block with
     /// [`crate::chaindb::ChainDbError::Interrupted`], as dcrd's
     /// `UtxoCache.Initialize` returns `errInterruptRequested`, and any
@@ -1018,9 +1018,9 @@ impl Chain {
     /// node lines (`process.go:86`, `chainio.go:1758`), "Deployment
     /// version N loaded" (`:1570`), "UTXO cache initializing (max size: N
     /// MiB)..." and "UTXO cache initialization completed" around the
-    /// catch-up replay (`utxocache.go:816`, `:854`, `:1039`), and the
+    /// catch-up replay (`utxocache.go:825`, `:863`, `:1050`), and the
     /// version, best header and chain state lines that end
-    /// `blockchain.New` (`chain.go:2249-2300`).  A fresh database logs
+    /// `blockchain.New` (`chain.go:2254-2305`).  A fresh database logs
     /// them too, as dcrd's `initChainState` loads the state
     /// `createChainState` has just written.
     pub fn open_with_config(
@@ -1032,7 +1032,7 @@ impl Chain {
 
         // Make the agendas for the parameters, validating the
         // deployments, before anything else (dcrd `New`,
-        // `chain.go:2148-2154`).
+        // `chain.go:2153-2159`).
         Self::make_agendas(params).map_err(chaindb::ChainDbError::Rule)?;
         let mut chain = Chain::new_validated(params, config.assume_valid, config.allow_old_forks);
         chain.interrupt = config.interrupt;
@@ -1266,7 +1266,7 @@ impl Chain {
     }
 
     /// Log the lines that end dcrd's `blockchain.New` once the UTXO
-    /// cache is initialized (`chain.go:2249-2300`): the block and UTXO
+    /// cache is initialized (`chain.go:2254-2305`): the block and UTXO
     /// database versions, the best known header, and the chain state.
     ///
     /// The UTXO database line carries the versions the port's UTXO rows
@@ -1727,7 +1727,7 @@ impl Chain {
 
     /// Flush the modified block index rows and warn rather than fail
     /// on the write (dcrd `flushBlockIndexWarnOnly`,
-    /// `chain.go:1504-1508`).
+    /// `chain.go:1509-1513`).
     ///
     /// The administrative paths use this: their work is already done by
     /// the time they reach it, and dcrd does not fail an
@@ -1794,7 +1794,7 @@ impl Chain {
     {
         let modified = self.index.take_modified();
         // Reload any pruned ticket info for the modified nodes that can
-        // be validated (dcrd `flushBlockIndex`, `chain.go:1478-1491`).
+        // be validated (dcrd `flushBlockIndex`, `chain.go:1483-1496`).
         // `can_validate` rather than `have_data` is dcrd's gate: it
         // guarantees every ancestor has its data, which the maturing
         // tickets lookup reads.
@@ -2075,7 +2075,7 @@ impl Chain {
     }
 
     /// Whether the periodic flush interval has been reached: the time
-    /// test of dcrd `UtxoCache.shouldFlush` (`utxocache.go:669`),
+    /// test of dcrd `UtxoCache.shouldFlush` (`utxocache.go:678`),
     /// counted from the last durable flush.
     fn utxo_periodic_flush_due(&self) -> bool {
         let (Some(now), Some(last)) = (self.periodic_now(), self.utxo_last_durable_flush_nanos)
@@ -2090,7 +2090,7 @@ impl Chain {
     ///
     /// A forced flush, and one the periodic interval has come due for,
     /// ends in a durable database flush, as every dcrd flush follows
-    /// one (`flushBlockDB`, `utxocache.go:713`).  A flush only the size
+    /// one (`flushBlockDB`, `utxocache.go:722`).  A flush only the size
     /// limit tripped commits its rows and the set state in one
     /// transaction and returns with them in the database's write cache,
     /// where the next durable commit picks them up: the write cache's
@@ -2277,7 +2277,7 @@ impl Chain {
     }
 
     /// Stamp a flush that ended in a durable database flush (dcrd
-    /// `c.lastFlushTime = c.timeNow()`, `utxocache.go:760`, which every
+    /// `c.lastFlushTime = c.timeNow()`, `utxocache.go:769`, which every
     /// dcrd flush reaches).  With no monotonic clock, a flush before
     /// the first processing call (gettxoutsetinfo's) has no time to
     /// stamp, and leaves the stamp for that call's adjusted time to
@@ -2300,7 +2300,7 @@ impl Chain {
     ///
     /// It opens and closes with dcrd's two Info lines, "UTXO cache
     /// initializing (max size: N MiB)..." and "UTXO cache initialization
-    /// completed" (`utxocache.go:816`, `:854`, `:1039`), so a catch-up
+    /// completed" (`utxocache.go:825`, `:863`, `:1050`), so a catch-up
     /// after a crash is visible between them.  The size is the cache's
     /// maximum at the time, which is why the daemon sets it before the
     /// open ([`OpenConfig::utxo_cache_max_bytes`]).  A failed or
@@ -2432,7 +2432,7 @@ impl Chain {
                 break;
             }
             // Stop promptly on a shutdown request, before each block
-            // (dcrd `utxocache.go:884-889`).  The replay so far stays
+            // (dcrd `utxocache.go:893-898`).  The replay so far stays
             // in the cache, unflushed, exactly as dcrd leaves it.
             if self.interrupt_requested() {
                 return Err(crate::chaindb::ChainDbError::Interrupted);
@@ -2501,7 +2501,7 @@ impl Chain {
         let mut prev_block_attached: Option<Arc<MsgBlock>> = None;
         for id in attach_nodes {
             // dcrd checks for a shutdown request before each block here
-            // too (`utxocache.go:974-979`).
+            // too (`utxocache.go:984-989`).
             if self.interrupt_requested() {
                 return Err(crate::chaindb::ChainDbError::Interrupted);
             }
@@ -2703,11 +2703,11 @@ impl Chain {
     /// Force the UTXO cache out to the backend at the current tip, so
     /// the backend holds the full set for a stats walk (dcrd's
     /// `FetchStats` opens with `maybeFlushFn(…, force: true, …)`,
-    /// `utxocache.go:532`).
+    /// `utxocache.go:536`).
     ///
     /// This is the half of the stats path that must run with exclusive
     /// chain access, and it is deliberately kept that way.  dcrd reads
-    /// `bestChain.Tip()` in `FetchUtxoStats` (`utxocache.go:1084`)
+    /// `bestChain.Tip()` in `FetchUtxoStats` (`utxocache.go:1095`)
     /// without holding `chainLock`, while its connect path commits to
     /// the cache and flushes *before* publishing the tip
     /// (`chain.go:717`, `:728`, `:735`).  A stats call landing in that
@@ -3534,7 +3534,7 @@ impl Chain {
     /// observers (dcrd's read them from the `*dcrutil.Block` the event
     /// carries).  The count is a function of the block alone, and the
     /// caller that sized the spend journal with it
-    /// (`chain.go:1184-1185`) passes it on, where dcrd classifies the
+    /// (`chain.go:1185-1186`) passes it on, where dcrd classifies the
     /// block's stake transactions a second time (`chain.go:605`).
     #[allow(clippy::too_many_arguments)]
     fn connect_block_with_hashes(
@@ -4014,7 +4014,7 @@ impl Chain {
     /// A shutdown requested through the chain's interrupt stops the
     /// reorganization before the next block either loop would detach or
     /// attach, with dcrd's `errInterruptRequested`
-    /// (`chain.go:1053-1057`, `:1148-1152`); the blocks already moved
+    /// (`chain.go:1053-1057`, `:1149-1153`); the blocks already moved
     /// stay moved, as in dcrd.
     pub fn reorganize_chain_internal(
         &mut self,
@@ -4187,7 +4187,7 @@ impl Chain {
                 }
 
                 // Mark the block as recently checked to avoid checking
-                // it again when processing (dcrd `chain.go:1216-1218`).
+                // it again when processing (dcrd `chain.go:1217-1219`).
                 self.recent_context_checks.put(node_hash);
 
                 let run_scripts = !self.bulk_import_mode && !self.is_assume_valid_ancestor(node);
@@ -4288,7 +4288,7 @@ impl Chain {
     /// before every attempt and ends the call at once with dcrd's
     /// `errInterruptRequested` alone, whether it is seen here or by
     /// [`Self::reorganize_chain_internal`], without trying another
-    /// candidate (`chain.go:1281-1285`, `:1316-1319`): the current
+    /// candidate (`chain.go:1286-1290`, `:1321-1324`): the current
     /// latch update, its flush and the reorganization notification are
     /// skipped, and only the completion event dcrd defers still fires.
     pub fn reorganize_chain(
@@ -4365,7 +4365,7 @@ impl Chain {
                     // the reorganization-outcome notification below
                     // (its deferred completion event still fires), and
                     // it is the whole result: the reorg errors gathered
-                    // above are dropped (`chain.go:1353-1359`).
+                    // above are dropped (`chain.go:1358-1364`).
                     reorg_errs = alloc::vec![persist_rule_error(e)];
                     latch_flush_failed = true;
                 }
@@ -5389,7 +5389,7 @@ impl Chain {
         // dcrd flushes warn-only after the reorganization whether or
         // not it succeeded, "as the only time the index will be
         // modified is if the block failed to connect"
-        // (`chain.go:1441-1446`).
+        // (`chain.go:1446-1451`).
         let errs = self.reorganize_chain(Some(new_best_node), adjusted_time_unix, params);
         self.flush_block_index_warn_only(params);
         errs
@@ -5417,7 +5417,7 @@ impl Chain {
         };
         let Some(prev_node) = prev_node else {
             // dcrd names the tip's parent when there is one
-            // (`validate.go:4665-4675`).
+            // (`validate.go:4654-4664`).
             let str = match tip_parent {
                 Some(tp) => format!(
                     "previous block must be the current chain tip {tip_hash} or its parent \
@@ -5435,7 +5435,7 @@ impl Chain {
 
         // The block must pass all preconditions that are required
         // before any further validation of the block data (dcrd
-        // `validate.go:4678-4682`, which discards the proven flag).
+        // `validate.go:4667-4671`, which discards the proven flag).
         self.check_block_data_preconditions(block, Some(prev_node), params)?;
 
         // Context-free sanity checks, skipping the proof of work.
@@ -5447,7 +5447,7 @@ impl Chain {
         // fork rejection checkpoint and block index, so the check is
         // live on this path (`validate.go:1298-1312`, reached through
         // `checkBlockPositional` at `:1380-1412`, whose sole caller is
-        // `CheckConnectBlockTemplate` at `:4693`).  Supplying `None`
+        // `CheckConnectBlockTemplate` at `:4682`).  Supplying `None`
         // here made `ErrForkTooOld` structurally unreachable for the
         // one consumer dcrd has.
         //
@@ -5534,7 +5534,7 @@ impl Chain {
             // Use the chain state as is when extending the main chain.
             // dcrd wraps a failed parent fetch here, and only here, as
             // `ErrMissingParent` carrying the fetch error's text
-            // (`validate.go:4712-4715`); the tip-parent arm below
+            // (`validate.go:4701-4704`); the tip-parent arm below
             // returns the fetch error itself.
             let parent = self
                 .block_arc(tip)
@@ -6166,7 +6166,7 @@ impl Chain {
     /// consensus rule violation.
     ///
     /// dcrd marks on `errors.As(err, &RuleError)` alone
-    /// (`chain.go:1223-1230`).  Database corruption, assertion and
+    /// (`chain.go:1224-1231`).  Database corruption, assertion and
     /// context errors fail the operation without branding the block, so
     /// it stays a candidate and is retried after a restart or repair.
     /// The port carries those failures as the kinds
@@ -6185,7 +6185,7 @@ impl Chain {
     /// [`Self::mark_block_failed_on_rule_violation`] for a block whose
     /// contextual checks failed, which dcrd's `maybeAcceptBlocks` and
     /// `reorganizeChainInternal` do not mark when the failure is
-    /// `ErrBadMerkleRoot` (`process.go:367-374`, `chain.go:1208-1214`):
+    /// `ErrBadMerkleRoot` (`process.go:367-374`, `chain.go:1209-1215`):
     /// the header has then not been shown to commit to that data.
     fn mark_block_failed_on_context_violation(&mut self, node: NodeId, err: &RuleError) {
         if err.kind != RuleErrorKind::BadMerkleRoot {
@@ -6499,7 +6499,7 @@ impl Chain {
 
     /// The main chain block hashes in the half-open height range
     /// `[start_height, end_height)`, with the end limited to the best
-    /// chain height (dcrd `HeightRange`, `chain.go:1762-1810`).  A
+    /// chain height (dcrd `HeightRange`, `chain.go:1767-1815`).  A
     /// negative start or an end below the start is dcrd's plain error,
     /// with its text.
     pub fn height_range(&self, start_height: i64, end_height: i64) -> Result<Vec<Hash>, String> {
@@ -6726,8 +6726,8 @@ impl Chain {
     }
 
     /// The maximum allowed block size for the block after the given
-    /// one (dcrd `BlockChain.MaxBlockSize`, `chain.go:1640-1656`, over
-    /// `maxBlockSize`, `chain.go:1615-1638`).
+    /// one (dcrd `BlockChain.MaxBlockSize`, `chain.go:1645-1661`, over
+    /// `maxBlockSize`, `chain.go:1620-1643`).
     ///
     /// The larger size, `MaximumBlockSizes[1]`, applies only when the
     /// max block size agenda is active for that block and the
@@ -7282,7 +7282,7 @@ impl Chain {
     /// the no-filter error kind; the filter and commitment leaves are
     /// served from the recent window or the database, and a failed read
     /// or a row that does not decode is the database error dcrd
-    /// returns (`headercmt.go:167-183`), never a missing filter or a
+    /// returns (`headercmt.go:169-185`), never a missing filter or a
     /// proof over no leaves.
     pub fn filter_by_block_hash(&self, hash: &Hash) -> Result<(FilterV2, HeaderProof), RuleError> {
         // Avoid a lookup when there is no way the filter data for the
@@ -7386,7 +7386,7 @@ impl Chain {
             // database).  dcrd serves the stored bytes without decoding
             // them (`dbFetchRawGCSFilter`), but returns a commitments
             // row that fails to read or decode as the error
-            // (`headercmt.go:249-268`).
+            // (`headercmt.go:251-270`).
             let Some(filter) = self
                 .raw_gcs_filter(hash, *height)
                 .map_err(db_read_rule_error)?
@@ -8138,7 +8138,7 @@ pub fn persist_rule_error(err: crate::chaindb::ChainDbError) -> RuleError {
 /// The kind keeps the split dcrd's sync manager makes with its
 /// `Critical failure` line, which it prints only for
 /// `database.ErrCorruption` and `ErrUtxoBackendCorruption`
-/// (`internal/netsync/manager.go:1265-1269`).  A read that fails as
+/// (`internal/netsync/manager.go:1266-1270`).  A read that fails as
 /// corruption -- the database's own `ErrCorruption` (a block whose
 /// checksum does not match), or a stored row that does not decode,
 /// which dcrd also returns as `ErrCorruption` (`chainio.go:858-859`,
@@ -8358,7 +8358,7 @@ impl TSpendVoteWindow {
 /// `Corruption` (dcrd `database.ErrCorruption`), whose kind the rule
 /// error keeps only in its rendered text.  The daemon's sync adapter
 /// reads it for dcrd's corruption-only `Critical failure` line
-/// (netsync `manager.go:1265-1269`, `:1646-1648`).
+/// (netsync `manager.go:1266-1270`, `:1647-1649`).
 pub fn is_persisted_db_corruption(err: &RuleError) -> bool {
     err.kind == RuleErrorKind::UnknownBlock
         && err
@@ -8641,7 +8641,7 @@ mod tests {
     }
 
     /// Accepted blocks are recorded as context-checked and as having
-    /// proven merkle roots (dcrd `process.go:386`, `chain.go:1218`,
+    /// proven merkle roots (dcrd `process.go:386`, `chain.go:1219`,
     /// `validate.go:2134-2143`), and invalidating a block forgets both
     /// (`process.go:708-709`), so it is fully checked again should it
     /// need to be; reconsidering it records it again.
@@ -8970,7 +8970,7 @@ mod tests {
     /// The chain pruner, the utxo cache's periodic flush and the
     /// cached-tip prune are timed on the monotonic clock, as dcrd times
     /// them with `time.Now()` differences (`prune.go:82-84`,
-    /// `utxocache.go:669`, `blockindex.go:1052`): a step of the adjusted
+    /// `utxocache.go:678`, `blockindex.go:1052`): a step of the adjusted
     /// clock neither hastens them nor, stepping back, stops them until
     /// it has made the step up.  The port timed all three on the
     /// adjusted clock, so correcting a clock that ran eight hours fast
@@ -9138,9 +9138,9 @@ mod tests {
     /// flush; the first flush 120 s or more after the last durable one
     /// ends in one, however often the size limit tripped in between.
     /// Every flush ended in a durable commit before, as each of dcrd's
-    /// follows `flushBlockDB` (`utxocache.go:713`).  The interval counts
+    /// follows `flushBlockDB` (`utxocache.go:722`).  The interval counts
     /// from the last durable flush, not from the last flush as dcrd's
-    /// `lastFlushTime` does (`utxocache.go:760`): size-triggered flushes
+    /// `lastFlushTime` does (`utxocache.go:769`): size-triggered flushes
     /// would otherwise postpone the periodic one for as long as they
     /// kept coming.
     #[test]
@@ -9345,7 +9345,7 @@ mod tests {
     /// wait in, so each of its flushes moves the durable-flush stamp, a
     /// size-triggered one inside the periodic interval included, and
     /// its interval counts from the last flush as dcrd's does
-    /// (`utxocache.go:760`).
+    /// (`utxocache.go:769`).
     #[test]
     fn a_chain_without_a_database_stamps_every_utxo_flush() {
         let params = dcroxide_chaincfg::regnet_params();
@@ -9480,7 +9480,7 @@ mod tests {
     /// exactly as the commit that searched the view did: that one
     /// copied the view's keys, looked each entry up again, removed it
     /// and applied it to the cache, in outpoint key order (dcrd
-    /// `UtxoCache.Commit`, `utxocache.go:548-625`).  The flush that
+    /// `UtxoCache.Commit`, `utxocache.go:552-634`).  The flush that
     /// follows then writes the same rows.
     #[test]
     fn committing_a_view_leaves_the_cache_as_the_searching_commit_did() {
@@ -9694,7 +9694,7 @@ mod tests {
     /// `blocks` mirror's own copy, together with its parent's, not as
     /// fresh copies of either: dcrd shares one `*dcrutil.Block` from its
     /// recent block cache and reuses the fork block as the first
-    /// parent (`chain.go:1134-1166`).  The port deep-copied both out of
+    /// parent (`chain.go:1135-1167`).  The port deep-copied both out of
     /// the mirror for every connect (review finding B2-p#4).
     #[test]
     fn connecting_a_block_shares_the_mirrored_block_and_parent() {
@@ -11705,7 +11705,7 @@ mod tests {
     /// `height_range` is dcrd's half-open `[start, end)` range capped at
     /// the best chain height, and a negative start or an end below the
     /// start is dcrd's plain error with its text rather than an empty
-    /// list (`chain.go:1769-1810`; review finding B3-p#8).
+    /// list (`chain.go:1774-1815`; review finding B3-p#8).
     #[test]
     fn height_range_is_half_open_and_rejects_dcrd_argument_errors() {
         let params = dcroxide_chaincfg::regnet_params();

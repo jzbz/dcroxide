@@ -4,7 +4,7 @@
 //!
 //! dcrd's reorganization and acceptance paths call
 //! `MarkBlockFailedValidation` only when `errors.As(err, &RuleError)`
-//! (`chain.go:1208-1231`, `process.go:367-371`).  A corrupt spend
+//! (`chain.go:1209-1232`, `process.go:367-371`).  A corrupt spend
 //! journal row is `database.ErrCorruption`, not a `RuleError`, so the
 //! reorg fails but the block stays a candidate and is retried once the
 //! row is repaired.  The port carries that failure as

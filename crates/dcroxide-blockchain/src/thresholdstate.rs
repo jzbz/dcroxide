@@ -156,7 +156,7 @@ pub trait VoteChainView: VersionChainView {
 
     /// The hard-coded historical agenda activations for the network
     /// the view's chain belongs to: dcrd `makeHistoricalAgendas`, which
-    /// `New` attaches to the chain's agendas (`chain.go:2151`).
+    /// `New` attaches to the chain's agendas (`chain.go:2156`).
     ///
     /// The default is the network's table, which the block index view
     /// keeps.  A view that models a synthetic main or version 3 test

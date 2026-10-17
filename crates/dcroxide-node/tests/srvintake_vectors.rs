@@ -219,8 +219,8 @@ fn get_data_ban_state(out: OnGetDataOutcome, prior_pending: u32) -> BanState {
 /// netsync switch handles.
 ///
 /// `SyncManager.OnInv` calls `AddKnownInventory` inside its block,
-/// transaction and mixing cases (`internal/netsync/manager.go:1908`,
-/// `:1917`, `:1942`) and the switch closes at `:1961` with no default
+/// transaction and mixing cases (`internal/netsync/manager.go:1909`,
+/// `:1918`, `:1943`) and the switch closes at `:1962` with no default
 /// arm, so anything else is forwarded without entering the set.
 #[test]
 fn inv_marks_only_the_types_dcrds_switch_handles() {

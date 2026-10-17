@@ -6,11 +6,11 @@
 //! The confirmed anchor is set whenever the contextual difficulty
 //! calculation resolves it (difficulty.go:314-316) and from then on
 //! `checkDifficultyPositional` holds every descendant header to the
-//! ASERT difficulty from it (validate.go:1115-1126), with no EMA
+//! ASERT difficulty from it (validate.go:1111-1122), with no EMA
 //! fallback.  A synced dcrd is therefore stricter at the header stage
 //! than a cold one, and the vectors generated from fresh dcrd
 //! processes only ever replay the cold path.  The candidate anchor is
-//! tried before the candidate walk (validate.go:1188-1194).
+//! tried before the candidate walk (validate.go:1184-1190).
 //!
 //! The synthetic chains vote BLAKE3 in far below the real main network
 //! activation, so their views drop blake3pow from the network's

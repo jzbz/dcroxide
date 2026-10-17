@@ -1,6 +1,6 @@
 # Quirks ledger
 
-dcrd's behavior at the pinned upstream (master `6f6cf21b`, version `2.2.0-pre`)
+dcrd's behavior at the pinned upstream (master `382ff4dd`, version `2.2.0-pre`)
 is the specification — including where it deviates from written documentation
 (DCPs, `docs/`). Every intentional reproduction of such a deviation is recorded
 here, with a test pinning it so it cannot silently regress; where that test has
@@ -24,7 +24,7 @@ Entry format:
 
 ## QK-0001 — `reject` messages are write-only
 
-- **Where:** dcrd `wire` (v1.7.5) `makeEmptyMessage` / dcroxide-wire
+- **Where:** dcrd `wire` (v1.8.0) `makeEmptyMessage` / dcroxide-wire
   `message.rs` read-path dispatch
 - **What:** dcrd's message reader has no dispatch case for the `reject`
   command, so received reject frames fail with `ErrUnknownCmd` at *every*
@@ -227,7 +227,7 @@ Entry format:
   syncing peer nothing at all. The requests of a departing peer that
   move to another peer known to hold the data go out in one message
   that is not held to that count, in dcrd
-  (`internal/netsync/manager.go:916-938`) and here. An earlier revision
+  (`internal/netsync/manager.go:917-939`) and here. An earlier revision
   of this port carried the truncated remainder into the next request
   so that repeated 505-item batches were no longer free; that change
   charges an ordinary peer the full per-item rate, and at ~1 KiB
@@ -312,7 +312,7 @@ Entry format:
 - **Why it does not matter to dcrd:** height 1 is unreachable on any
   live network. Genesis pays a single zero-value output,
   `createChainState` records no utxo entries for it, and zero-value
-  spends are rejected (`internal/blockchain/validate.go:3589-3592`), so
+  spends are rejected (`internal/blockchain/validate.go:3593-3596`), so
   no chain arrives at height 1 with a spendable parent to chain from.
 - **What this port does:** clones unconditionally
   (`generator.rs`'s copy ahead of both passes), so the source's
@@ -393,8 +393,8 @@ Entry format:
 
 ## QK-0014 — `--maxpeers` yields two different outbound targets, which disagree
 
-- **Where:** dcrd `server.go:4132-4142` (the netsync target) against
-  `server.go:3927` / `:4273-4274` (the server field), both downstream of
+- **Where:** dcrd `server.go:4142-4152` (the netsync target) against
+  `server.go:3927` / `:4283-4284` (the server field), both downstream of
   `server.go:3931-3932` / dcroxide-node `server.rs`
   `netsync_max_outbound_peers` and `server_target_outbound`
 - **What:** `newServer` derives an outbound target from `cfg.MaxPeers` twice,
@@ -452,7 +452,7 @@ Entry format:
 
 - **Where:** dcrd `internal/blockchain/process.go:356-386`
   (`maybeAcceptBlocks`), `validate.go:2110-2114` (`checkBlockContext`'s
-  cache short circuit) and `chain.go:1207-1218` (the reorganization attach
+  cache short circuit) and `chain.go:1208-1219` (the reorganization attach
   loop) / dcroxide-blockchain `process.rs` `maybe_accept_blocks`,
   `reorganize_chain_internal`, `recent_context_checks` (an `LruHashSet`)
 - **What:** `ProcessBlock` sets `BFFastAdd` when the processed block is an

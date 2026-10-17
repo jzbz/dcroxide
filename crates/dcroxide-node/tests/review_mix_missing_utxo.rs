@@ -4,7 +4,7 @@
 //!
 //! dcrd's `mixpoolChain.FetchUtxoEntry` returns `nil, nil` for a missing
 //! output (`server.go:3761-3763`), and `checkAcceptPR` folds a nil entry
-//! into the spent-output rejection (`mixing/mixpool/mixpool.go:1448-1451`):
+//! into the spent-output rejection (`mixing/mixpool/mixpool.go:1468-1471`):
 //! `ruleError("output %v is not unspent")`.  The daemon's fetcher used to
 //! answer `Err("no utxo entry for …")`, which the pool surfaced as the
 //! untyped `PoolError::UtxoFetch` with different text, so

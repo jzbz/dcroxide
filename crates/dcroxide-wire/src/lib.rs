@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: ISC
 //! Decred P2P wire protocol types and codecs, mirroring dcrd's `wire`
-//! package at master `6f6cf21b` (the parity pin; wire protocol 12).
+//! package at master `382ff4dd` (the parity pin, whose `wire` is the
+//! v1.8.0 release; wire protocol 12).
 //! Its code changes since the earlier `452c1a6c` target are
 //! `SerializeSize` on every message, ported as
 //! [`Message::serialize_size`], and the refusal of a negative outpoint

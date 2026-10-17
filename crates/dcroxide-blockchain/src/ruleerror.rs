@@ -190,7 +190,7 @@ impl RuleErrorKind {
     /// `errors.As(err, &blockchain.RuleError{})` in two places that
     /// matter: its sync manager, which otherwise logs
     /// `Rejected block %v from %s` and blames the peer
-    /// (`internal/netsync/manager.go:1258-1264`), and its getwork
+    /// (`internal/netsync/manager.go:1259-1265`), and its getwork
     /// submission arm, which otherwise returns an internal RPC error
     /// (`internal/rpcserver/rpcserver.go:4102-4113`).
     ///
@@ -198,7 +198,7 @@ impl RuleErrorKind {
     /// `contextError` in production code.  `ErrMissingParent` and
     /// `ErrSerializeHeader` are deliberately absent: they appear with
     /// `contextError` only in dcrd's tests, while production builds
-    /// both with `ruleError` (`process.go:194`, `validate.go:2748`),
+    /// both with `ruleError` (`process.go:186`, `validate.go:2938`),
     /// so an orphan block stays a peer's problem.
     #[must_use]
     pub fn is_rule_violation(self) -> bool {

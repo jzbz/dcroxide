@@ -41,7 +41,7 @@ pub const DEFAULT_TARGET_OUTBOUND: i64 = 8;
 
 /// dcrd's server-level outbound target: the default, lowered to
 /// `--maxpeers` only when that is smaller *as a `uint32`*
-/// (`server.go:3927` sets the field, `:4273-4274` lowers it).
+/// (`server.go:3927` sets the field, `:4283-4284` lowers it).
 ///
 /// ```text
 /// s.targetOutbound = defaultTargetOutbound
@@ -65,7 +65,7 @@ pub fn server_target_outbound(max_peers: i64) -> u32 {
 
 /// dcrd's netsync outbound target: the default, lowered to `--maxpeers`
 /// when that is smaller *as a signed `int`*, and widened only
-/// afterwards (`server.go:4132-4142`).
+/// afterwards (`server.go:4142-4152`).
 ///
 /// ```text
 /// targetOutbound := defaultTargetOutbound
@@ -2316,8 +2316,8 @@ pub fn on_inv_classify(inv_list: &[dcroxide_wire::InvVect], blocks_only: bool) -
 /// Whether an announced inventory vector enters the peer's known
 /// inventory (dcrd `SyncManager.OnInv`).  dcrd's switch handles the
 /// block, transaction and mixing cases and has no default arm
-/// (`internal/netsync/manager.go:1894-1961`, with `AddKnownInventory`
-/// at `:1908`, `:1917` and `:1942`), so an error, filtered-block or
+/// (`internal/netsync/manager.go:1895-1962`, with `AddKnownInventory`
+/// at `:1909`, `:1918` and `:1943`), so an error, filtered-block or
 /// unknown vector is forwarded without ever entering the set.  That
 /// matters beyond bookkeeping: the set holds only
 /// `dcroxide_peer::MAX_KNOWN_INVENTORY` entries, so a type dcrd

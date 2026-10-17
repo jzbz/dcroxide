@@ -71,7 +71,7 @@ fn target_outbound_arithmetic_matches_dcrd() {
                 let netsync = netsync_max_outbound_peers(max_peers);
                 assert_eq!(netsync, want_netsync, "line {lineno}: netsync target");
 
-                // dcrd `server.go:4283`: a truncating cast, not a clamp.
+                // dcrd `server.go:4293`: a truncating cast, not a clamp.
                 let normal = max_peers as u32;
                 assert_eq!(normal, want_normal, "line {lineno}: max normal conns");
 
@@ -100,7 +100,7 @@ fn target_outbound_arithmetic_matches_dcrd() {
                 assert_eq!(f.len(), 3, "line {lineno}: field count");
                 let max_same_ip: i64 = f[1].parse().expect("maxsameip");
                 let want: u32 = f[2].parse().expect("max conns per host");
-                // dcrd `server.go:4284`.
+                // dcrd `server.go:4294`.
                 assert_eq!(max_same_ip as u32, want, "line {lineno}: conns per host");
                 tsip += 1;
             }

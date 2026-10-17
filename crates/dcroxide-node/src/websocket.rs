@@ -1877,7 +1877,7 @@ fn write_handshake_error<S: Write>(
 
 /// Forwards accepted treasury spends from the transaction pool to the
 /// websocket notification manager (dcrd's mempool `OnTSpendReceived`
-/// firing `s.rpcServer.NotifyTSpend`, `server.go:4097-4101`).
+/// firing `s.rpcServer.NotifyTSpend`, `server.go:4104-4108`).
 pub struct NodeTSpendReceiver {
     ntfn: NodeNtfnMgr,
 }

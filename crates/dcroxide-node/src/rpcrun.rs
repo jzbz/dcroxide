@@ -682,7 +682,7 @@ impl RpcChain for NodeRpcChain {
         // Split the way dcrd's FetchStats does: force the cache out to
         // the backend under exclusive access, then walk the backend
         // holding nothing.  dcrd's walk (`utxobackend.go:529`, reached
-        // from `utxocache.go:537`) runs with neither `chainLock` nor
+        // from `utxocache.go:541`) runs with neither `chainLock` nor
         // `cacheLock` held, which is why `gettxoutsetinfo` does not stall
         // block connection there; holding the chain mutex across a walk
         // of millions of entries is what made it stall here.

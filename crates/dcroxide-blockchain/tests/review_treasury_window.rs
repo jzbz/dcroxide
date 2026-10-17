@@ -183,7 +183,7 @@ fn treasury_verdicts_hold_with_the_mirror_pruned_to_two_blocks() {
 /// dcrd's `sumPastTreasuryChanges` ends its walk only on
 /// `errDbTreasury`, the missing key (`treasury.go:595-606`); a row that
 /// does not decode is returned as the error, and `tspendChecks` turns
-/// it into `ErrInvalidExpenditure` (`validate.go:4138-4145`).  Only
+/// it into `ErrInvalidExpenditure` (`validate.go:4327-4334`).  Only
 /// `calculateTreasuryBalance` reads every fetch error as a zero balance
 /// (`treasury.go:379-391`).  With the mirror a recent window, the
 /// damaged row is read from the database, and reading it as the end of

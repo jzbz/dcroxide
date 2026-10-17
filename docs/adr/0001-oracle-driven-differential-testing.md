@@ -111,3 +111,26 @@ had stayed at `036b7090` through the whole `b9634e01` move, because nothing
 read its `go.mod`. It now links `6f6cf21b` under the oracle's rule, and
 `the_dcrd_pin_matches_ci_and_the_oracle` checks both `go.mod` files against
 the harness pin.
+
+## Addendum, 2026-10-16 — target, oracle and battery generator at `382ff4dd`
+
+The parity target moved to dcrd master `382ff4dd` (still 2.2.0-pre), and
+`tools/oracle/go.mod` and `tools/fullblockgen/go.mod` moved with it. The split
+was re-derived at the new commit rather than carried forward. Three of dcrd's
+nested modules were tagged after `6f6cf21b`: `wire` v1.8.0, `blockchain/stake`
+v5.0.3 and `mixing` v0.7.5. The oracle links the first two; neither changed
+code between the pins, and at `382ff4dd` each directory is byte-identical to
+its new tag, so both moved from the pseudo-version to the tag: the oracle now
+pins nine modules by pseudo-version where it pinned eleven, and `fullblockgen`,
+whose `wire` moved the same way, seven where it pinned eight. Every other
+module sits on the new pseudo-version or keeps its tag. `fullblockgen` moved
+without a regeneration, since `blockchain/fullblocktests` and the code it links
+are the same at both pins.
+
+The exporters behind the vector files this move regenerated or added are kept
+in the tree, as `tools/fullblockgen` and `tools/helpgen` already were; earlier
+moves left their other exporters as scratch code. The five are
+`tools/mixpoolgen`, `tools/mempoolvectors`, `tools/utxoviewgen`,
+`tools/chainopsgen` and `tools/disapprovalgen`, each an overlay that runs
+inside a dcrd checkout's own package and writes its committed files back byte
+for byte when run at the pin.

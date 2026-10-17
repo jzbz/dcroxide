@@ -162,7 +162,7 @@ pub trait PoolChain {
     /// origin: the monotonic half of dcrd's `time.Now()`, which the
     /// orphan expiration compares (`expiration: time.Now().Add(orphanTTL)`
     /// and `now.After(otx.expiration)` over two `time.Now()` readings,
-    /// `internal/mempool/mempool.go:463-475, :521`), so a wall-clock
+    /// `internal/mempool/mempool.go:554-566, :612`), so a wall-clock
     /// step moves neither the orphan TTL nor the expiry-scan interval.
     /// Injected for determinism, like [`PoolChain::now_unix`].
     fn now_mono_nanos(&self) -> i64;
@@ -352,7 +352,7 @@ pub trait UnconfirmedAddrIndexer: Send {
 /// RVW-001's fix (consulting mempool spentness during pair-request
 /// acceptance) must therefore do so BEFORE taking the mixpool lock, which
 /// is also how dcrd structures it -- `checkAcceptPR` runs ahead of
-/// `p.mtx.Lock()` at `mixpool.go:1206-1211`.
+/// `p.mtx.Lock()` at `mixpool.go:1222-1227`.
 pub trait MixpoolProbe: Send {
     /// Whether a NON-mix transaction spends an outpoint a current pair
     /// request depends on (dcrd `NonMixSpendsPairRequest`).
@@ -574,7 +574,7 @@ impl<C: PoolChain> TxPool<C> {
     /// its parent for a disconnect (`internal/blockchain/chain.go:735,
     /// :764` and `:917, :932`) -- so a transaction a handler admits
     /// records that height (`mp.newTxDesc(tx, txType, bestHeight, ...)`,
-    /// `internal/mempool/mempool.go:1747`).  The daemon runs those
+    /// `internal/mempool/mempool.go:1936`).  The daemon runs those
     /// handlers after the whole processing call, with the tip already
     /// final, and passes each event's height here, so the recorded
     /// height, which `getrawmempool` reports and the stake prunes key on,
@@ -1229,7 +1229,7 @@ impl<C: PoolChain> TxPool<C> {
     fn add_transaction(&mut self, tx_desc: Arc<TxDesc>) {
         // Notify about the vote first, before the transaction is in the
         // pool at all.  dcrd fires `OnVoteReceived` as the opening
-        // statement of `addTransaction` (`mempool.go:905-908`) and
+        // statement of `addTransaction` (`mempool.go:996-999`) and
         // inserts afterwards, so a synchronous receiver -- the port's
         // is a direct call, where dcrd's reaches the background template
         // generator -- observes the pool without this vote.  Firing it
@@ -2123,7 +2123,7 @@ impl<C: PoolChain> TxPool<C> {
         if is_treasury_enabled && is_tspend {
             self.check_tspend_policy(&tx, &tx_hash, next_block_height)?;
             // dcrd notifies here, inside the policy block and before the
-            // transaction is added (`mempool.go:1737-1740`), so a tspend
+            // transaction is added (`mempool.go:1926-1929`), so a tspend
             // that clears policy is announced even if a later step keeps
             // it out of the pool.
             if let Some(receiver) = &mut self.tspend_receiver {
@@ -2303,7 +2303,7 @@ impl<C: PoolChain> TxPool<C> {
     /// Whether dcrd, with its tip still at the block whose maintenance
     /// is running, finds every input of `tx`, an orphan a later block of
     /// the batch mined (dcrd `fetchInputUtxos`,
-    /// `internal/mempool/mempool.go:1048-1088`).  An input whose
+    /// `internal/mempool/mempool.go:1240-1276`).  An input whose
     /// transaction was mined no later than this block is a chain output
     /// there, since nothing before the later block spends it.  One whose
     /// transaction a later block mined is there only when the pool or
@@ -2384,7 +2384,7 @@ impl<C: PoolChain> TxPool<C> {
                 // ranges over a Go map, so its choice is unpredictable
                 // per execution, and it treats tracking several
                 // children of one output as anti-griefing machinery
-                // (`mempool.go:1968-1990`).  `orphans_by_prev`'s inner
+                // (`mempool.go:2155-2177`).  `orphans_by_prev`'s inner
                 // map is a `BTreeMap` keyed by child hash, so iterating
                 // it would hand the win to the numerically smallest
                 // hash every time, which an attacker reaches by

@@ -429,7 +429,7 @@ fn the_base_block_passes_the_checks_the_shapes_fail() {
 /// height.  It does so twice in the one call, as the block is accepted
 /// and as the reorganization that follows comes to it, because a
 /// contextual merkle failure does not mark the block (dcrd
-/// `process.go:367-371`, `chain.go:1208-1214`).  The contextual check
+/// `process.go:367-371`, `chain.go:1209-1215`).  The contextual check
 /// builds its trees from the block, so the roots a block arrived with
 /// play no part in it.
 #[test]

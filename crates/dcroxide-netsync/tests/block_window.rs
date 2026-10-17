@@ -4,7 +4,7 @@
 //!
 //! dcrd keeps at most 16 blocks requested and asks for more once fewer
 //! than 10 are (`internal/netsync/manager.go:31-38`, `:490-546`,
-//! `:1359-1371`), so over a link with a round trip of tens of
+//! `:1360-1372`), so over a link with a round trip of tens of
 //! milliseconds the round trip, not the machine, sets the pace of the
 //! sync.  A manager built with `SyncManager::new` keeps that window, and
 //! the dcrd-generated vectors run against it.
@@ -794,7 +794,7 @@ fn a_partly_moved_window_still_rebuilds_the_list() {
 }
 
 /// dcrd's window leaves its list of needed blocks alone when the sync
-/// peer leaves (`internal/netsync/manager.go:873-893`, `:938-945`): the
+/// peer leaves (`internal/netsync/manager.go:874-894`, `:939-946`): the
 /// next sync peer is asked for the blocks after the forgotten ones, the
 /// chain is not asked again, and nothing is narrowed.
 #[test]
@@ -815,7 +815,7 @@ fn dcrds_window_leaves_the_list_alone_when_the_sync_peer_leaves() {
 /// Nor is dcrd's window narrowed by a sync peer that leaves with more
 /// than 16 blocks requested from it, which the requests made outside the
 /// window can come to under dcrd's rule as well
-/// (`internal/netsync/manager.go:2086-2120`).  With 20 more requested
+/// (`internal/netsync/manager.go:2087-2121`).  With 20 more requested
 /// from the sync peer, its departure logs nothing about the window, and
 /// the next sync peer is asked for what dcrd asks it for, from the list
 /// as it was.
@@ -840,7 +840,7 @@ fn dcrds_window_is_not_narrowed_by_more_than_its_count_requested() {
 
 /// dcrd's window does not rebuild its list for a block reported as not
 /// found either: `OnNotFound` only deletes the request
-/// (`internal/netsync/manager.go:1803-1828`), so the next refill is for
+/// (`internal/netsync/manager.go:1804-1829`), so the next refill is for
 /// the blocks after the window.
 #[test]
 fn dcrds_window_leaves_the_list_alone_after_a_notfound() {
@@ -863,7 +863,7 @@ fn dcrds_window_leaves_the_list_alone_after_a_notfound() {
 
 /// dcrd's refill counts every requested block, whoever it was requested
 /// from, and only a block from the sync peer triggers it
-/// (`internal/netsync/manager.go:1361-1370`).  With one block requested
+/// (`internal/netsync/manager.go:1362-1371`).  With one block requested
 /// from another peer, seven deliveries from the sync peer leave ten
 /// requested in all and ask for nothing; the other peer's block leaves
 /// nine and asks for nothing, of either peer; the sync peer's next block
@@ -1955,7 +1955,7 @@ fn an_announced_block_is_asked_of_its_announcer_once_current() {
 /// Every block requested from the sync peer counts toward a narrowing,
 /// whichever path asked for it.  A node that is current is announced 20
 /// headers by its sync peer and asks it for all 20 blocks at once, as
-/// dcrd does (`internal/netsync/manager.go:1751-1776`); the window asked
+/// dcrd does (`internal/netsync/manager.go:1752-1777`); the window asked
 /// for none of them.  The sync peer leaves, and the window is halved for
 /// the next one, which is asked for the same blocks.
 #[test]

@@ -175,7 +175,7 @@ fn wait_for_daemon_line(tag: &str, args: &[&str], wanted: impl Fn(&str) -> bool)
 fn startup_opens_block_database_and_loads_genesis() {
     // --nolisten because this test is about the database, not the network.
     // The chain reports the tip it loaded in dcrd's closing CHAN line of
-    // the chain open (`chain.go:2297-2299`).
+    // the chain open (`chain.go:2302-2304`).
     let loaded = wait_for_daemon_line("db", &["--nolisten"], |line| {
         line.contains("[INF] CHAN: Chain state: ")
     });
@@ -251,7 +251,7 @@ fn help_inside_a_short_cluster_requests_help() {
 /// dcrd runs the dump inside `newServer`, after the index catch-up, and
 /// returns an error either way -- so nothing binds a listener and the
 /// exit is non-zero even when the dump succeeded
-/// (`server.go:4149-4157`). The option parsed and appeared in --help
+/// (`server.go:4159-4167`). The option parsed and appeared in --help
 /// here while nothing read it, so asking for a one-shot offline dump
 /// started a normal node that dialled the network instead.
 ///

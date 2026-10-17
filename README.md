@@ -3,7 +3,7 @@
 A from-scratch Rust implementation of the Decred full-node daemon, built as a
 drop-in replacement for [dcrd](https://github.com/decred/dcrd).
 
-Parity target: **dcrd master `6f6cf21b`** (version 2.2.0-pre) — wire protocol
+Parity target: **dcrd master `382ff4dd`** (version 2.2.0-pre) — wire protocol
 12, JSON-RPC API 8.3.0. dcrd's behavior at that commit is the specification; see
 [QUIRKS.md](QUIRKS.md) for deliberate bug-for-bug reproductions and
 [PARITY.md](PARITY.md) for per-package status. The full plan lives in
@@ -395,7 +395,7 @@ dcrd data directory will not work). Currently implemented:
   interval, so an optimization is measured on the same blocks before
   and after
 - `tools/oracle` — Go shim linking dcrd's own packages (pinned to the
-  parity target, master `6f6cf21b`: each dcrd module at that commit's
+  parity target, master `382ff4dd`: each dcrd module at that commit's
   pseudo-version or at a tag whose source is byte-identical to it, as the
   header of `tools/oracle/go.mod` records) as a test oracle over
   line-delimited JSON
@@ -634,11 +634,12 @@ sync, and more memory, for the time;
 [docs/operating.md](docs/operating.md) has the trade and the [bench
 ledger](docs/bench-ledger.md) every step.
 
-**The commit dcroxide ports syncs like the release.** dcrd master
-`6f6cf21b` (2.2.0-pre), the parity target, built under go1.26.2 with the
-flags of its release image, took 2,909.8 s and 2,869.8 s from a dcroxide
-server in two runs on 2026-10-10. One is inside the release's range
-above and the other 0.5% over its slowest run.
+**The commit dcroxide then tracked syncs like the release.** dcrd
+master `6f6cf21b` (2.2.0-pre), then the parity target, built under
+go1.26.2 with the flags of its release image, took 2,909.8 s and
+2,869.8 s from a dcroxide server in two runs on 2026-10-10. One is
+inside the release's range above and the other 0.5% over its slowest
+run.
 
 **Much of the lead is the exists-address index.** One run of each daemon
 with `--noexistsaddrindex`, dcroxide's on 2026-10-11 and dcrd's on

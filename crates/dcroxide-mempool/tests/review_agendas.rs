@@ -25,7 +25,7 @@
 //!   dropped `SubsidySplitVariant` fails here.
 //!
 //! dcrd's stage pool holds only ticket purchases, so its revocation
-//! prune branch (`pruneStakeTx`, `mempool.go:2071-2079`) has nothing
+//! prune branch (`pruneStakeTx`, `mempool.go:2258-2266`) has nothing
 //! to reach, in dcrd's tests or here.
 
 // Test-harness arithmetic over bounded lengths.

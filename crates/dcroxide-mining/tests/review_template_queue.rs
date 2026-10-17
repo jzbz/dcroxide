@@ -470,7 +470,7 @@ fn a_skipped_child_is_repromoted_at_its_refreshed_rate() {
 
 /// With the tip known disapproved the fetched view holds the tip's
 /// regular-tree outputs spent, and dcrd's `PriorityInput`
-/// (`utxoviewpoint.go:226-233`) reports those as missing, so a child
+/// (`utxoviewpoint.go:211-218`) reports those as missing, so a child
 /// spending one gets no input age.
 ///
 /// P (from the disapproved tip, back in the mempool), its child T, and

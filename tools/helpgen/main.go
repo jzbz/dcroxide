@@ -2,7 +2,7 @@
 // The dcrd -h vector generator: renders the help text dcroxide's -h
 // must reproduce, through the exact path dcrd's loadConfig takes — a
 // parser over the config struct (extracted verbatim from dcrd's
-// config.go at the parity target, master 6f6cf21b; the service group is
+// config.go at the parity target, master 382ff4dd; the service group is
 // NOT added, matching dcrd's dedicated help pre-parse), filled with
 // loadConfig's defaults first so go-flags prints their "(default: X)"
 // notes, with the HelpFlag error written out.

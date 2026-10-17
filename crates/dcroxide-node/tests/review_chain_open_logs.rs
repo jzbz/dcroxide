@@ -128,7 +128,7 @@ fn run_bounded(mut command: Command) -> (Option<i32>, String) {
 
 /// A daemon run that stops once the chain has loaded: `--dumpblockchain`
 /// dumps and exits one straight after the chain open and the index
-/// catch-up, as dcrd's `newServer` does (`server.go:4149-4157`).
+/// catch-up, as dcrd's `newServer` does (`server.go:4159-4167`).
 fn run_daemon_to_dump(appdata: &Path, extra: &[&str]) -> String {
     let mut command = Command::new(env!("CARGO_BIN_EXE_dcroxide"));
     command

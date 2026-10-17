@@ -350,7 +350,7 @@ fn a_chain_without_a_database_folds_its_memory_backend_the_same_way() {
 ///
 /// dcrd's `FetchStats` force-flushes under `cacheLock`, releases it, and
 /// then walks the backend holding nothing at all
-/// (`utxocache.go:532`/`:537`, `utxobackend.go:529`), so `gettxoutsetinfo`
+/// (`utxocache.go:536`/`:541`, `utxobackend.go:529`), so `gettxoutsetinfo`
 /// never stalls block connection there.  The port used to hold the
 /// exclusive chain mutex across the walk, which on mainnet is millions of
 /// entries.

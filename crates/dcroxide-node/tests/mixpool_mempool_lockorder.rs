@@ -12,7 +12,7 @@
 //! outputs a request claims. dcrd asks that inside
 //! `mixpoolChain.FetchUtxoEntry`, from `checkAcceptPR`, which
 //! `AcceptMessage` runs before it takes the mixpool's mutex
-//! (`mixing/mixpool/mixpool.go:1206-1210`). The port's acceptance runs
+//! (`mixing/mixpool/mixpool.go:1222-1226`). The port's acceptance runs
 //! wholly under the mixpool guard, so asking from inside the fetcher
 //! would take the tx-pool lock while holding the mixpool's, and close an
 //! AB-BA against the gauntlet.

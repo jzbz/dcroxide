@@ -9,7 +9,7 @@
 //! is borrowed, and the chain is handed a copy of it.
 //!
 //! dcrd's `OnBlock` also reads the block's hash from that
-//! `dcrutil.Block` (`internal/netsync/manager.go:1221`).  The manager
+//! `dcrutil.Block` (`internal/netsync/manager.go:1222`).  The manager
 //! asks the chain for the hash of a block of its type, so a type that
 //! carries the hash computed from the block saves hashing the header
 //! again.

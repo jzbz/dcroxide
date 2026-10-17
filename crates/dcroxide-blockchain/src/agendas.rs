@@ -1209,7 +1209,7 @@ pub fn is_blake3_pow_agenda_forced_active(params: &Params) -> bool {
 }
 
 /// The maximum allowed block size for the block AFTER the given node
-/// (dcrd `maxBlockSize`, `chain.go:1615-1638`).
+/// (dcrd `maxBlockSize`, `chain.go:1620-1643`).
 ///
 /// The larger size applies only when the max block size agenda is
 /// active and the parameters actually define a second size: agendas a

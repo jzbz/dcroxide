@@ -3101,7 +3101,7 @@ pub fn check_vote_inputs<'a, SP: dcroxide_standalone::SubsidyParams>(
             extra = 1;
         }
     }
-    // Signed, because dcrd's is (`validate.go:2996` over Go ints).  A
+    // Signed, because dcrd's is (`validate.go:3186` over Go ints).  A
     // vote carrying fewer outputs than the two mandatory ones plus the
     // treasury vote makes this negative, and dcrd falls straight into
     // the rejection below.  The same expression over usize underflows
@@ -6450,7 +6450,7 @@ pub(crate) fn check_connect_block_with_hashes<SP: dcroxide_standalone::SubsidyPa
     // and returned for the caller to store rather than rebuilt there
     // (dcrd sets it into the caller's `hdrCommitments`).
     // dcrd returns `ruleError(ErrMissingTxOut, err.Error())`
-    // (`validate.go:4390-4393`): for a missing script that is
+    // (`validate.go:4575-4578`): for a missing script that is
     // blockcf2's `PrevScriptError` text, which prints the tree too.
     let filter = dcroxide_gcs::blockcf2::regular(block, &ViewScripts(view))
         .map_err(|e| rule_error(RuleErrorKind::MissingTxOut, format!("{e}")))?;
@@ -6509,7 +6509,7 @@ pub(crate) fn check_connect_block_with_hashes<SP: dcroxide_standalone::SubsidyPa
 ///
 /// An entry is missing only when the lookup returns none: dcrd's
 /// `UtxoViewpoint.PrevScript` checks `entry == nil` and nothing else
-/// (utxoviewpoint.go:211-220), so a spent entry still supplies its
+/// (utxoviewpoint.go:196-205), so a spent entry still supplies its
 /// script, as it does in [`check_block_scripts`].
 pub fn validate_transaction_scripts<'a>(
     tx: &MsgTx,
@@ -6791,7 +6791,7 @@ mod tests {
     }
 
     /// A revocation of a ticket whose stored minimal outputs decode to
-    /// nothing: dcrd panics (validate.go:3083-3087) where the port used
+    /// nothing: dcrd panics (validate.go:3273-3277) where the port used
     /// to underflow `len() - 1` into a rule error in release builds.
     #[test]
     #[should_panic(expected = "missing extra stake data for ticket")]
@@ -7012,7 +7012,7 @@ mod tests {
 
     /// dcrd returns `AssertError` when the treasurybase height check
     /// is handed a block with no stake transactions
-    /// (validate.go:1666-1670); the port used to `assert!`, which kills
+    /// (validate.go:1668-1672); the port used to `assert!`, which kills
     /// the node under `panic = "abort"` for a peer-supplied block.
     #[test]
     fn treasurybase_height_check_without_stake_txs_is_an_assert_error() {
@@ -7103,7 +7103,7 @@ mod tests {
     }
 
     /// dcrd's `UtxoViewpoint.PrevScript` reports a script as found for
-    /// any entry the view holds, spent or not (utxoviewpoint.go:211-220),
+    /// any entry the view holds, spent or not (utxoviewpoint.go:196-205),
     /// so `ValidateTransactionScripts` runs the script of a spent entry
     /// rather than failing with `ErrMissingTxOut`.  Only a missing entry
     /// is missing.

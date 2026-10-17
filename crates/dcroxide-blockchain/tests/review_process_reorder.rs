@@ -712,7 +712,7 @@ fn a_known_header_is_not_sanity_checked_again() {
 }
 
 /// A block template's data preconditions come before its sanity checks
-/// (dcrd `validate.go:4678-4688`): a template whose header no longer
+/// (dcrd `validate.go:4667-4677`): a template whose header no longer
 /// commits to its data and whose size commitment is wrong fails the
 /// merkle check.
 #[test]

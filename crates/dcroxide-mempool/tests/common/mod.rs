@@ -78,7 +78,7 @@ pub struct FakeChain {
     pub treasury_active: bool,
     /// dcrd's harness `autoRevocationsActive`, `subsidySplitActive` and
     /// `subsidySplitR2Active` toggles, which answer the pool's agenda
-    /// queries (`newPoolHarness`, `mempool_test.go:857-865`).
+    /// queries (`newPoolHarness`, `mempool_test.go:901-909`).
     pub auto_revocations_active: bool,
     pub subsidy_split_active: bool,
     pub subsidy_split_r2_active: bool,

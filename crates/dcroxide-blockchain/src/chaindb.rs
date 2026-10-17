@@ -137,7 +137,7 @@ pub enum ChainDbError {
     Interrupted,
     /// A consensus rule or context error raised while opening the
     /// chain, which dcrd's `New` returns unchanged: a deployment or
-    /// historical agenda that `makeAgendas` refuses (`chain.go:2151`),
+    /// historical agenda that `makeAgendas` refuses (`chain.go:2156`),
     /// or an agenda query failing in the startup state load
     /// (`chainio.go:1749-1752`).
     Rule(crate::RuleError),
@@ -648,7 +648,7 @@ pub fn db_put_utxo_set_state(tx: &Transaction, state: &UtxoSetState) -> Result<(
 /// An empty row is not a fresh backend, and answering "no state" for
 /// one makes `initialize_utxo_state` record the state at the current
 /// tip and return early (dcrd's `UtxoCache.Initialize`,
-/// `utxocache.go:831-856`), skipping the disconnect/replay a set
+/// `utxocache.go:840-865`), skipping the disconnect/replay a set
 /// lagging the chain needs — so the fold would turn a damaged marker
 /// into a silently wrong UTXO set that every descendant inherits.  It
 /// is a laxity local to `FetchState` rather than a storage limit: the

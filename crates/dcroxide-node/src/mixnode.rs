@@ -64,7 +64,7 @@ impl MixUtxoFetcher for NodeMixUtxoFetcher {
         // dcrd's `mixpoolChain.FetchUtxoEntry` returns `nil, nil` for an
         // output the chain does not hold (`server.go:3761-3763`), and
         // `checkAcceptPR` rejects `entry == nil || entry.IsSpent()` with
-        // one rule error (`mixpool.go:1448-1451`).  The port's fetcher
+        // one rule error (`mixpool.go:1468-1471`).  The port's fetcher
         // interface has no nil entry, so a missing output answers with
         // one that reads as spent: the pool then rejects it with that
         // same rule error rather than as a fetch failure.
@@ -279,11 +279,12 @@ impl SyncMixPool for NodeSyncMixPool {
     ) -> Result<Vec<HashedMessage>, PoolError> {
         // dcrd's `AcceptMessage` returns for an already-accepted message
         // under the pool's read lock and only then verifies the
-        // signature, with no lock held (`mixing/mixpool/mixpool.go:
-        // 1189-1198`), so a replay costs a lookup, not a Schnorr verify.
-        // The same here: a brief guard for the check, the verify with it
-        // released, and `accept_hashed` repeating the checks under the
-        // guard as dcrd does under its write lock.
+        // signature, with no lock held
+        // (`mixing/mixpool/mixpool.go:1205-1214`), so a replay costs a
+        // lookup, not a Schnorr verify.  The same here: a brief guard for
+        // the check, the verify with it released, and `accept_hashed`
+        // repeating the checks under the guard as dcrd does under its
+        // write lock.
         let check = self
             .pool
             .lock()
@@ -296,7 +297,7 @@ impl SyncMixPool for NodeSyncMixPool {
         // Answered before the mixpool guard is taken, as dcrd does too:
         // its utxo fetcher asks inside `checkAcceptPR`, which
         // `AcceptMessage` runs before taking the mixpool's mutex
-        // (`mixing/mixpool/mixpool.go:1206-1210`).  Here the whole
+        // (`mixing/mixpool/mixpool.go:1222-1226`).  Here the whole
         // acceptance runs under the guard, so asking from inside would
         // take the tx-pool lock while holding the mixpool's, and the
         // acceptance gauntlet's mixpool probe already takes them the

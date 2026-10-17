@@ -2,7 +2,7 @@
 
 **A full Rust re-implementation of the Decred full-node daemon (`dcrd`), built as a drop-in replacement.**
 
-Prepared for the implementing developer/team. Parity target: **dcrd master `6f6cf21b`** (version `2.2.0-pre`) — moved up five times, from the `release-v2.1.5` tag this plan was originally written against and then through `452c1a6c`, `29f17894`, `036b7090` and `b9634e01`; see the status block below. Wire protocol version **12**, JSON-RPC API version **8.3.0**.
+Prepared for the implementing developer/team. Parity target: **dcrd master `382ff4dd`** (version `2.2.0-pre`) — moved up six times, from the `release-v2.1.5` tag this plan was originally written against and then through `452c1a6c`, `29f17894`, `036b7090`, `b9634e01` and `6f6cf21b`; see the status block below. Wire protocol version **12**, JSON-RPC API version **8.3.0**.
 
 ---
 
@@ -44,12 +44,12 @@ P2P server with sync, relay, and StakeShuffle mixing message relay, the
 JSON-RPC/websocket server, the tool commands, the pipe IPC lifecycle, and the
 Windows service wrapper. The gate runs 2,364 tests across 437 suites on Linux,
 most of them differential against dcrd or replaying sessions generated inside dcrd's own
-packages. The parity target moved five times during the port, from
+packages. The parity target moved six times during the port, from
 `release-v2.1.5` to upstream master `452c1a6c` and then through `29f17894`,
-`036b7090` and `b9634e01` to `6f6cf21b` (2.2.0-pre); the oracle rig was
-re-pinned for the first move, kept at `452c1a6c` for the second, since
+`036b7090`, `b9634e01` and `6f6cf21b` to `382ff4dd` (2.2.0-pre); the oracle
+rig was re-pinned for the first move, kept at `452c1a6c` for the second, since
 nothing in that delta changes what the exporters emit, and has moved with the
-target since, so it now links `6f6cf21b` (see PARITY.md and
+target since, so it now links `382ff4dd` (see PARITY.md and
 `tools/oracle/go.mod`).
 
 Work from earlier phases that is genuinely still outstanding. "Complete" above
@@ -150,8 +150,8 @@ What Phase 15 has covered so far:
   index's own layout (ADR-0011). Chain on disk at that block: dcrd
   24.16 GiB, dcroxide 27.90 GiB. Not a later point on the 2.2x and 1.29x
   curve above: the machine, the dcrd version and the harness all differ.
-  Later on 2026-10-10 the parity commit `6f6cf21b` took 2,909.8 s and
-  2,869.8 s there, like the release, and with the exists-address index
+  Later on 2026-10-10 `6f6cf21b`, then the parity commit, took 2,909.8 s
+  and 2,869.8 s there, like the release, and with the exists-address index
   off in both, one run each, dcroxide took 880.8 s against dcrd v2.1.6's
   1,247.8 s, 1.42x: most of the lead at the defaults is that index. Full
   record in [docs/bench-ledger.md](docs/bench-ledger.md).
@@ -303,7 +303,7 @@ it with funds.**
 | Item | Fact |
 |---|---|
 | Reference implementation | [decred/dcrd](https://github.com/decred/dcrd), Go, ISC license, in production since Feb 2016, ~7,300 commits |
-| Parity target | Planned as the `release-v2.1.5` tag (Apr 2026), tracking upstream releases thereafter. It did move: the target is now master `6f6cf21b` (2.2.0-pre), reached via `452c1a6c`, `29f17894`, `036b7090` and `b9634e01` |
+| Parity target | Planned as the `release-v2.1.5` tag (Apr 2026), tracking upstream releases thereafter. It did move: the target is now master `382ff4dd` (2.2.0-pre), reached via `452c1a6c`, `29f17894`, `036b7090`, `b9634e01` and `6f6cf21b` |
 | Implementation size | ~168,000 lines of non-test Go; ~134,000 lines of Go tests |
 | Protocol facts | P2P wire protocol 12 (mixing added at v10, batched cfilters at v11); JSON-RPC API semver 8.3.0; mainnet ports 9108 (p2p) / 9109 (RPC) |
 | RPC surface | 77 HTTP methods + 17 websocket methods, spec in `docs/json_rpc_api.mediawiki` |
@@ -390,7 +390,7 @@ Every task in this project serves one of six compatibility surfaces. They are li
 4. **Memory safety as a feature.** `#![forbid(unsafe_code)]` in all dcroxide crates; `unsafe` allowed only inside vetted third-party dependencies, tracked via `cargo-deny`/`cargo-vet`/`cargo-audit` in CI. This is a headline advantage of the project — protect it. One audited exception exists: `dcroxide-winsvc` denies rather than forbids `unsafe_code`, for the `windows-service` entry macro's shim and for the Windows console control handler and pipe-handle adoption that std does not wrap, each unsafe block allowed individually with a `SAFETY` comment ([ADR-0008](docs/adr/0008-clippy-lint-policy.md)'s 2026-09-25 addendum).
 5. **Consensus code is boring code.** No cleverness in validation paths: explicit integer widths, checked arithmetic mirroring dcrd's `checkedmath`, no floating point anywhere near consensus, deterministic iteration orders, and exhaustive error enums mapped 1:1 to dcrd's error kinds (RPC and reject messages leak error identity — parity matters).
 6. **DoS posture parity.** dcrd's limits (message sizes, orphan pools, ban scores, per-peer rate limits, mixpool limits, APBF sizing) are consensus-adjacent: divergence lets an attacker partition mixed networks. Port limits verbatim; test them.
-7. **Pin, then track.** All parity claims reference one pinned upstream commit — `release-v2.1.5` when this plan was written, master `6f6cf21b` now. A standing "upstream watch" task reviews every dcrd release/merged consensus PR and files parity issues. A `PARITY.md` ledger maps each dcrd package to its dcroxide crate and status.
+7. **Pin, then track.** All parity claims reference one pinned upstream commit — `release-v2.1.5` when this plan was written, master `382ff4dd` now. A standing "upstream watch" task reviews every dcrd release/merged consensus PR and files parity issues. A `PARITY.md` ledger maps each dcrd package to its dcroxide crate and status.
 
 ---
 
@@ -654,7 +654,7 @@ pins this policy asks for.
 > - **D5** (upstream tracking cadence) and **D7** (MSRV, platform tiers,
 >   release signing and reproducibility) have no ADR. Facts on the ground:
 >   the parity target did move to master `452c1a6c` and on through `29f17894`,
->   `036b7090` and `b9634e01` to `6f6cf21b`,
+>   `036b7090`, `b9634e01` and `6f6cf21b` to `382ff4dd`,
 >   MSRV is the pinned toolchain itself, 1.98.1, through the workspace
 >   `rust-version`, with no separate CI job, and CI tests on Linux, macOS, and
 >   Windows. Release signing

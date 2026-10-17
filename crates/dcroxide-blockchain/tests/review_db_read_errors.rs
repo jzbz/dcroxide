@@ -6,8 +6,8 @@
 //! journal row, filter and header commitments are read back from the
 //! database.  dcrd returns every failure of those reads as an error --
 //! `fetchBlockByNode`, the `db.View` around `dbFetchSpendJournalEntry`,
-//! and `FilterByBlockHash`/`LocateCFiltersV2` (`headercmt.go:167-183`,
-//! `:249-268`) -- so the reorganization or request fails with the node
+//! and `FilterByBlockHash`/`LocateCFiltersV2` (`headercmt.go:169-185`,
+//! `:251-270`) -- so the reorganization or request fails with the node
 //! still running.  The port discarded the read result: a block body
 //! that could not be read became a `None` its callers `expect`ed, which
 //! under the release profile's `panic = "abort"` killed the process;
@@ -201,7 +201,7 @@ fn an_unreadable_block_body_fails_the_template_view() {
 
 /// A template built on the tip reads the tip's body as its parent, and
 /// dcrd wraps a failed read there as `ErrMissingParent` carrying the
-/// read error's text (`validate.go:4510-4513`).
+/// read error's text (`validate.go:4701-4704`).
 #[test]
 fn a_template_on_the_tip_reports_an_unreadable_parent_as_missing() {
     let params = regnet_params();
@@ -232,7 +232,7 @@ fn a_template_on_the_tip_reports_an_unreadable_parent_as_missing() {
 
 /// A template built on the tip's parent reads the tip and its parent,
 /// and dcrd returns a failed read there as the read error itself
-/// (`validate.go:4527-4534`), which the port carries as a local
+/// (`validate.go:4718-4725`), which the port carries as a local
 /// corruption error rather than a rule violation.
 #[test]
 fn a_template_on_the_tip_parent_reports_an_unreadable_body_as_the_read_error() {

@@ -496,8 +496,8 @@ impl SyncPeers {
 
     /// Mark a whole announcement's inventory as known to the peer
     /// (dcrd `AddKnownInventory` per vector inside
-    /// `SyncManager.OnInv`, `internal/netsync/manager.go:1908`,
-    /// `:1917`, `:1942`).
+    /// `SyncManager.OnInv`, `internal/netsync/manager.go:1909`,
+    /// `:1918`, `:1943`).
     ///
     /// The registry handle is cloned out and the map lock released
     /// before any put -- as [`SyncPeers::outbound_mix_counts`] does --
@@ -3154,7 +3154,7 @@ impl ServerPeerHandler {
 /// known-inventory set, in announcement order (dcrd's
 /// `SyncManager.OnInv` calling `AddKnownInventory` inside its block,
 /// transaction and mixing cases only -- `internal/netsync/manager.go`
-/// `:1908`, `:1917`, `:1942`).
+/// `:1909`, `:1918`, `:1943`).
 pub(crate) fn announcement_known_inventory(inv: &MsgInv) -> impl Iterator<Item = InvVect> + '_ {
     inv.inv_list
         .iter()
@@ -3185,7 +3185,7 @@ impl ServerPeerHandler {
                 // The announced inventory is known to the peer, so the
                 // relay never echoes it back.  dcrd records it inside
                 // `SyncManager.OnInv` (`internal/netsync/manager.go`
-                // `:1908`, `:1917`, `:1942`), which is reached only
+                // `:1909`, `:1918`, `:1943`), which is reached only
                 // after the two gates above return
                 // (`server.go:1382`, `:1402`), and only for the three
                 // types that switch handles -- it has no default arm,
@@ -3480,7 +3480,7 @@ impl ServerPeerHandler {
         // later, only once the rejected-message filter and the pool's
         // already-accepted check have passed it, and with no lock held
         // (`NodeSyncMixPool::accept_message`), as dcrd verifies inside
-        // `AcceptMessage` (`mixpool.go:1189-1198`).  No peer lock is held
+        // `AcceptMessage` (`mixpool.go:1205-1214`).  No peer lock is held
         // here either, as dcrd's `inHandler` holds none.  Without a hash
         // from the loop (hashing failed there, or a caller that computes
         // none), the message is hashed here.
@@ -3729,7 +3729,7 @@ mod tests {
     ///
     /// dcrd's `SyncManager.OnInv` switch calls `AddKnownInventory` in
     /// its block, transaction and mixing cases only and has no default
-    /// arm (`internal/netsync/manager.go:1895-1961`).  The set holds
+    /// arm (`internal/netsync/manager.go:1896-1962`).  The set holds
     /// `dcroxide_peer::MAX_KNOWN_INVENTORY` entries, so marking every
     /// announced type -- as this port did -- lets a peer flush its own
     /// record with vectors upstream would have skipped.

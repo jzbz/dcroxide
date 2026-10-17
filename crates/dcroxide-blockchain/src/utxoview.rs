@@ -161,7 +161,7 @@ pub fn entry_to_spent_tx_out(entry: &UtxoEntry) -> SpentTxOut {
         block_index: entry.block_index(),
         script_version: entry.script_version(),
         // dcrd encodes `encodeFlags(IsCoinBase(), HasExpiry(),
-        // TransactionType())` (utxoviewpoint.go:246-247), and
+        // TransactionType())` (utxoviewpoint.go:231-232), and
         // `TransactionType` is an unchecked cast of the raw type bits,
         // so every value 0-15 survives into the journal.  The txout
         // flags share the utxo flags' layout (bit 0 coinbase, bit 1
@@ -970,7 +970,7 @@ impl UtxoView {
         for (tx_idx, stx) in block.stransactions.iter().enumerate() {
             // Treasurybases and treasury spends have no inputs.  dcrd
             // uses the strict stake.IsTreasuryBase here
-            // (utxoviewpoint.go:904), not the minimal standalone check.
+            // (utxoviewpoint.go:1262), not the minimal standalone check.
             let should_be_treasury_base = is_treasury_enabled && tx_idx == 0;
             if should_be_treasury_base && dcroxide_stake::is_treasury_base(stx) {
                 continue;
@@ -1798,7 +1798,7 @@ mod tests {
 
     /// dcrd `fetchInputUtxos` skips the stake-tree input set only for
     /// what the strict `stake.IsTreasuryBase` accepts
-    /// (utxoviewpoint.go:904), so the input of a transaction that
+    /// (utxoviewpoint.go:1262), so the input of a transaction that
     /// merely passes the minimal check is requested from the backend.
     #[test]
     fn fetch_input_utxos_uses_the_strict_treasury_base_check() {
@@ -2021,7 +2021,7 @@ mod tests {
     /// The commit hands the cache the same entries in the same order,
     /// and leaves the same entries in the view, as the commit that
     /// looked every key up again (dcrd `UtxoCache.Commit`,
-    /// `utxocache.go:548-625`: unmodified entries are skipped and stay,
+    /// `utxocache.go:552-634`: unmodified entries are skipped and stay,
     /// zero-confirmation spends are deleted from the view, the rest are
     /// spent or added in the cache and deleted from the view).
     #[test]

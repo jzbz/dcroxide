@@ -752,7 +752,7 @@ fn run_node(cfg: Config) -> ExitCode {
     // The flat-file dump runs here and the daemon then stops: dcrd
     // puts it inside `newServer` after the index catch-up and returns
     // an error, so nothing binds a listener and the exit is non-zero
-    // even on success (`server.go:4149-4157`).
+    // even on success (`server.go:4159-4167`).
     if !cfg.dump_blockchain.is_empty() {
         let tip_height = {
             let guard = chain.lock().expect("chain poisoned");
@@ -1097,7 +1097,7 @@ fn run_node(cfg: Config) -> ExitCode {
         Arc::new(std::sync::Mutex::new(dcroxide_connmgr::ConnManager::new(
             dcroxide_connmgr::ManagerConfig {
                 default_port,
-                // dcrd casts both straight to uint32 (`server.go:4283-4284`:
+                // dcrd casts both straight to uint32 (`server.go:4293-4294`:
                 // `MaxNormalConns: uint32(cfg.MaxPeers)`,
                 // `MaxConnsPerHost: uint32(cfg.MaxSameIP)`), which truncates
                 // rather than clamping.  Neither dcrd nor this port validates
@@ -1720,7 +1720,7 @@ fn build_server(
             params,
             cfg.no_mining_state_sync,
             // dcrd's OTHER outbound target -- signed comparison, widened
-            // afterwards (`server.go:4132-4142`).  Deliberately not the same
+            // afterwards (`server.go:4142-4152`).  Deliberately not the same
             // computation as the server's; see QK-0014.
             dcroxide_node::netsync_max_outbound_peers(cfg.max_peers),
             cfg.max_orphan_txs as usize,

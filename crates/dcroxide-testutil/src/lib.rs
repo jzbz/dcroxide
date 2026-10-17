@@ -2,7 +2,7 @@
 //! Internal test utilities for dcroxide differential tests.
 //!
 //! Provides the harness for `tools/oracle` (the Go shim linking dcrd's own
-//! packages at the parity target, master `6f6cf21b`; its `go.mod` records how
+//! packages at the parity target, master `382ff4dd`; its `go.mod` records how
 //! each module is pinned) plus a deterministic PRNG and hex helpers, so every
 //! crate's differential tests share one implementation, and the power-loss
 //! storage rig the crash suites cut power under ([`powerloss`]).
@@ -299,7 +299,7 @@ impl Drop for Oracle {
 /// match it.  CI's `DCRD_COMMIT` and the pseudo-versions in
 /// `tools/oracle/go.mod` and `tools/fullblockgen/go.mod` must name the same
 /// commit; a unit test below holds them all together.
-pub const DCRD_PARITY_COMMIT: &str = "6f6cf21b";
+pub const DCRD_PARITY_COMMIT: &str = "382ff4dd";
 
 /// A dcrd process running on simnet, for interop tests over a real socket.
 ///

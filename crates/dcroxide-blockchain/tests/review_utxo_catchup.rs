@@ -5,7 +5,7 @@
 //!
 //! dcrd's `UtxoCache.Initialize` checks `b.interrupt` before every block
 //! it detaches or replays and returns `errInterruptRequested`
-//! (`utxocache.go:884-889`, `:974-979`), so SIGINT or SIGTERM during a
+//! (`utxocache.go:893-898`, `:984-989`), so SIGINT or SIGTERM during a
 //! post-crash catch-up stops the node within a block.  The port's replay
 //! took no interrupt at all: a stop request waited for the whole replay.
 //!

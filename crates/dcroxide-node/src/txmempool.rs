@@ -102,7 +102,7 @@ pub(crate) fn chain_fetch_utxo_view(
         // Disconnect the disapproved regular tree of the tip block
         // (dcrd `disconnectDisapprovedBlock`) only once per tip, and
         // afterwards clone the cached result so the caller can mutate
-        // its copy (dcrd `FetchUtxoView`, `utxoviewpoint.go:984-1011`).
+        // its copy (dcrd `FetchUtxoView`, `utxoviewpoint.go:1342-1369`).
         // A failed build leaves the cache as it was, as dcrd's early
         // returns do.
         let mut cached = disapproved.0.lock().expect("disapproved view poisoned");
@@ -390,7 +390,7 @@ impl PoolChain for NodePoolChain {
     /// attacker grinds against to keep their own orphans resident.
     ///
     /// dcrd draws nothing at that seam: `limitNumOrphans` walks a Go
-    /// map and breaks (`internal/mempool/mempool.go:490-501`), and its
+    /// map and breaks (`internal/mempool/mempool.go:581-592`), and its
     /// mempool imports no randomness package at all.  What is borrowed
     /// from dcrd here is the *source's* contract, not the seam.
     /// `crypto/rand` acquires kernel entropy fatally exactly once, in
@@ -560,7 +560,7 @@ impl NodeRpcTxMempooler {
 /// The pool transactions the transaction redeems: one entry per input
 /// whose previous outpoint's transaction is in the pool, in input
 /// order, repeats included (dcrd `VerboseTxDescs` appends a `Depends`
-/// entry for every such input, `internal/mempool/mempool.go:2289-2293`,
+/// entry for every such input, `internal/mempool/mempool.go:2481-2485`,
 /// and `handleGetRawMempool` copies the slice one for one, so a child
 /// spending two outputs of one pool parent lists that parent twice).
 fn verbose_depends(tx: &MsgTx, in_pool: impl Fn(&Hash) -> bool) -> Vec<Hash> {
@@ -756,7 +756,7 @@ mod tests {
     }
 
     /// dcrd `VerboseTxDescs` appends a dependency per redeeming input
-    /// (`internal/mempool/mempool.go:2289-2293`) and `getrawmempool`
+    /// (`internal/mempool/mempool.go:2481-2485`) and `getrawmempool`
     /// renders the slice one for one: a child spending two outputs of
     /// one pool parent lists that parent twice, in input order, and an
     /// input whose parent is not in the pool adds nothing.
@@ -786,7 +786,7 @@ mod tests {
 
     /// dcrd `FetchUtxoView` disconnects the tip's regular tree once per
     /// tip and afterwards clones the cached `disapprovedView`
-    /// (`utxoviewpoint.go:984-1011`).  An entry planted in the memo
+    /// (`utxoviewpoint.go:1342-1369`).  An entry planted in the memo
     /// comes back from the next disapproved fetch -- so that fetch was
     /// served from the memo, not rebuilt -- while a fetch that includes
     /// the regular tree never reads it and a new tip rebuilds it.

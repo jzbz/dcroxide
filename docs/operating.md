@@ -193,15 +193,15 @@ its median, with each daemon syncing over loopback from the other. Both
 ran at their defaults apart from the flags that point them at the
 server, so the exists-address index was on. Which daemon served the
 blocks moved either figure by about 1% or less. dcrd at the commit this
-port tracks, `6f6cf21b`, took 47.8 and 48.5 minutes in two runs later on
-2026-10-10, so the release stands for it. With `--noexistsaddrindex`
-dcroxide's sync took **14.7 minutes** and dcrd v2.1.6's 20.8 (one run
-each, in that later session; see the index's section below). In that
-session's three dcrd runs the dcroxide block server read its block
-files from the drive as it served them, which it did not in the
-runs above; whether that slowed dcrd was not measured. At the defaults
-the chain cost more on
-disk: 27.90 GiB against dcrd's 24.16 GiB at that block.
+port then tracked, `6f6cf21b`, took 47.8 and 48.5 minutes in two runs
+later on 2026-10-10, so the release stands for it. With
+`--noexistsaddrindex` dcroxide's sync took **14.7 minutes** and dcrd
+v2.1.6's 20.8 (one run each, in that later session; see the index's
+section below). In that session's three dcrd runs the dcroxide block
+server read its block files from the drive as it served them, which it
+did not in the runs above; whether that slowed dcrd was not measured.
+At the defaults the chain cost more on disk: 27.90 GiB against dcrd's
+24.16 GiB at that block.
 
 Five changes to block processing on 2026-10-11 shortened dcroxide's
 sync. Two runs of the same sync with all five, at the defaults, took

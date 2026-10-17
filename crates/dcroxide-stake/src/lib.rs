@@ -1,13 +1,15 @@
 // SPDX-License-Identifier: ISC
 //! Decred stake transaction primitives and ticket state, mirroring dcrd's
-//! `blockchain/stake` package at the parity pin, master `6f6cf21b`: stake
+//! `blockchain/stake` package at the parity pin, master `382ff4dd`: stake
 //! transaction classification and format rule checks (tickets, votes,
 //! revocations, and the treasury transactions),
 //! commitment/vote-bits/block-reference extraction, reward calculation,
 //! and the deterministic ticket lottery PRNG.  The package's two changes
 //! since the 2.2 campaign target `452c1a6c` are carried: `036b7090`
 //! (`tickettreap`'s `getByIndex` bound) and `5dd4ca59` (the revocation
-//! helper accepting zero-valued outputs).
+//! helper accepting zero-valued outputs).  `7e3dd854`, which prepares
+//! the v5.0.3 release, changes only the module's `go.mod` and `go.sum`
+//! and one test's copyright line.
 //!
 //! The live-ticket state machinery lives in the submodules: the ticket
 //! treap (`tickettreap`, dcrd `internal/tickettreap`), the ticket

@@ -28,7 +28,7 @@ extend-ignore-re = [
 transacion = "transacion"
 eligibile = "eligibile"
 inintial = "inintial"
-# netsync reproduces dcrd's "Criticial failure" log line (manager.go:1647).
+# netsync reproduces dcrd's "Criticial failure" log line (manager.go:1648).
 criticial = "criticial"
 # Truncated JSON literals in the Go scanner-parity tests, which pin Go's
 # errors for input cut off inside `true` and `false`.

@@ -6,7 +6,7 @@
 //! finds the utxo set state behind the best state, and the open replays
 //! the blocks between them (dcrd `UtxoCache.Initialize`).  dcrd makes its
 //! block database durable before every flush of its cache
-//! (`flushBlockDB`, `utxocache.go:713`) because its UTXO set is a
+//! (`flushBlockDB`, `utxocache.go:722`) because its UTXO set is a
 //! separate database that must never run ahead of the block index.  Here
 //! both are rows of one store: a durable state holds whole transactions
 //! in the order they committed, and a flush writes its rows and the set

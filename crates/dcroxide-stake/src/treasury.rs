@@ -294,7 +294,7 @@ pub fn is_tspend(tx: &MsgTx) -> bool {
 /// The signature and public key of a treasury spend, or `None` when the
 /// transaction is not one: `check_tspend(tx).ok()`, for a caller that
 /// only asks whether the check passed (dcrd reads `err == nil`,
-/// `validate.go:3469-3470`), with the version and the counts tested
+/// `validate.go:3473-3474`), with the version and the counts tested
 /// first for the reason given at [`is_tadd`].
 pub fn tspend_signature_and_pub_key(tx: &MsgTx) -> Option<(Vec<u8>, Vec<u8>)> {
     if fails_tspend_shape(tx) {

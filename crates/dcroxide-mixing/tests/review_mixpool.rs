@@ -626,7 +626,7 @@ fn recent_cache_expires_on_the_wall_clock() {
 
 /// X1-p#2: dcrd verifies a mix message's signature only after the
 /// rerun check and the already-accepted check (`AcceptMessage`,
-/// `mixpool.go:1172-1198`; netsync's rejected filter runs before that),
+/// `mixpool.go:1188-1214`; netsync's rejected filter runs before that),
 /// so a replay of a pooled message, or a rerun, costs no Schnorr verify.
 /// Hashing a message no longer verifies it; the pool says when dcrd
 /// would, and verifies under its guard only if the caller did not.

@@ -57,7 +57,7 @@ pub const BUDGET_WINDOW_BLOCKS: usize = 128;
 /// more than its count in one message.  The requests of a departing
 /// peer that move to another peer known to hold the data go out in one
 /// message, blocks, transactions and mixing messages together, as in
-/// dcrd (`internal/netsync/manager.go:916-938`), and that message is not
+/// dcrd (`internal/netsync/manager.go:917-939`), and that message is not
 /// held to the count.
 pub const MAX_BUDGET_WINDOW_BLOCKS: usize = (MAX_INV_PER_MSG / 99) as usize;
 
@@ -130,7 +130,7 @@ pub enum BlockWindow {
     /// [`MIN_IN_FLIGHT_BLOCKS`] are requested in all, from a list of
     /// [`NEXT_BLOCKS_BUF_SIZE`] needed blocks that is rebuilt when one to
     /// nine remain (`internal/netsync/manager.go:434-448`, `:490-546`,
-    /// `:1359-1371`).
+    /// `:1360-1372`).
     Dcrd,
     /// A window budgeted in bytes, which dcrd does not have.
     ///
@@ -547,7 +547,7 @@ pub trait SyncChain {
 
     /// The hash of the block's header, which `on_block` asks for once
     /// (dcrd `block.Hash()` in `OnBlock`,
-    /// `internal/netsync/manager.go:1221`: a `dcrutil.Block` computes
+    /// `internal/netsync/manager.go:1222`: a `dcrutil.Block` computes
     /// its hash as it is made and hands that out from then on,
     /// `dcrutil/block.go:92-94`, `:288-293`).  The default hashes the
     /// header.  A chain whose block type carries the hash computed from
@@ -1077,8 +1077,8 @@ impl<C: SyncChain, T: SyncTxPool, M: SyncMixPool> SyncManager<C, T, M> {
     /// for it: the window, the requests of a departed peer that moved to
     /// it, the blocks it announced once the chain was current, and
     /// [`Self::request_from_peer`].  The last three are dcrd's
-    /// (`internal/netsync/manager.go:875-893`, `:1751-1776`,
-    /// `:2086-2120`) and can leave its sync peer with more than sixteen
+    /// (`internal/netsync/manager.go:876-894`, `:1752-1777`,
+    /// `:2087-2121`) and can leave its sync peer with more than sixteen
     /// requested as well, so a sync peer the window asked for sixteen
     /// blocks or fewer can narrow the window by leaving.
     ///
@@ -1824,7 +1824,7 @@ impl<C: SyncChain, T: SyncTxPool, M: SyncMixPool> SyncManager<C, T, M> {
         // sync peer is first asked for the blocks after the forgotten
         // ones, which the chain stores without being able to connect
         // them, and for the forgotten ones when the list is next
-        // rebuilt (`internal/netsync/manager.go:875-893`, `:940-945`).
+        // rebuilt (`internal/netsync/manager.go:876-894`, `:941-946`).
         // The budgeted window forgets up to a whole window here, so it
         // rebuilds the list on the next fetch and asks for the lowest
         // missing block first.
@@ -1916,7 +1916,7 @@ impl<C: SyncChain, T: SyncTxPool, M: SyncMixPool> SyncManager<C, T, M> {
     /// dcrd holds no manager-wide lock across `ProcessTransaction`:
     /// the mempool validates under its own mutex, and only the
     /// request-map delete afterwards takes `requestMtx`
-    /// (`internal/netsync/manager.go:994-1003`).
+    /// (`internal/netsync/manager.go:995-1004`).
     pub fn begin_tx(&mut self, peer_id: i32, tx_hash: &Hash) -> Option<bool> {
         if self.shutdown {
             return None;
@@ -2006,7 +2006,7 @@ impl<C: SyncChain, T: SyncTxPool, M: SyncMixPool> SyncManager<C, T, M> {
     ///
     /// dcrd holds no manager-wide lock across `AcceptMessage`, only
     /// `requestMtx` around the request-map delete afterwards
-    /// (`internal/netsync/manager.go:1060-1068`).
+    /// (`internal/netsync/manager.go:1061-1069`).
     pub fn begin_mix_msg(&mut self, peer_id: i32, msg: &M::Msg) -> Option<Hash> {
         if self.shutdown {
             return None;
@@ -2655,7 +2655,7 @@ impl<C: SyncChain, T: SyncTxPool, M: SyncMixPool> SyncManager<C, T, M> {
                     });
                 }
                 // dcrd's header path spells this line `Criticial`
-                // (`manager.go:1647`), unlike the block path's.  It
+                // (`manager.go:1648`), unlike the block path's.  It
                 // tests only `database.ErrCorruption`; header
                 // processing never reaches the UTXO backend, so the
                 // combined flag is the same test here.
@@ -3326,7 +3326,7 @@ impl<C: SyncChain, T: SyncTxPool, M: SyncMixPool> SyncManager<C, T, M> {
         // Request as many needed blocks as possible at once.
         let mut inv_list = Vec::new();
         for block_hash in blocks {
-            // The pending-request map is bounded (dcrd `manager.go:2107`).
+            // The pending-request map is bounded (dcrd `manager.go:2108`).
             // The on-headers path already honours this; this one did not,
             // so a peer could grow the map past the cap that exists to
             // bound it.
@@ -3362,7 +3362,7 @@ impl<C: SyncChain, T: SyncTxPool, M: SyncMixPool> SyncManager<C, T, M> {
         // as possible at once.
         for hashes in [vote_hashes, tspend_hashes] {
             for tx_hash in hashes {
-                // Bounded the same way (dcrd `manager.go:2136`).
+                // Bounded the same way (dcrd `manager.go:2137`).
                 if self.requested_txns.len() + 1 > MAX_REQUESTED_TXNS {
                     break;
                 }
