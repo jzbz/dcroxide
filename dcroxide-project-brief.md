@@ -229,19 +229,43 @@ What Phase 15 has covered so far:
   time, and a replay with full validation. The [bench
   ledger](docs/bench-ledger.md) has every run, and what else was
   measured that day and is not in the repository.
-- **Eighteen more commits to the node's code followed, and the code as
-  it stands has not been run in a sync.** `4700cf1` adds a log line dcrd
-  writes; the seventeen of 2026-10-16 after it change how the node does
-  its work, among them the reading thread's work for each block and
-  threads kept for the scripts of a connected block (ADR-0005, addendum
-  of that date), and one more commit of that day adds tests only. On
-  2026-10-13 `4700cf1` was run three times at the defaults and once with
-  the exists-address index off, and dcrd once, in one session, beside a
-  series of builds holding sixteen of the seventeen and a build of
-  `4700cf1` with the seventeenth alone; no build run held all of them,
-  and every build of the series also held a developer variable that is
-  not in the tree. The [bench ledger](docs/bench-ledger.md) has that
-  session. The README sets out no figure from it.
+- **Eighteen more commits to the node's code followed.** `4700cf1` adds
+  a log line dcrd writes; the seventeen of 2026-10-16 after it change how
+  the node does its work, among them the reading thread's work for each
+  block and threads kept for the scripts of a connected block (ADR-0005,
+  addendum of that date), and one more commit of that day adds tests
+  only. On 2026-10-13 `4700cf1` was run three times at the defaults and
+  once with the exists-address index off, and dcrd once, in one session,
+  beside a series of builds holding sixteen of the seventeen and a build
+  of `4700cf1` with the seventeenth alone; the [bench
+  ledger](docs/bench-ledger.md) has that session.
+- **On 2026-10-16 the code of the eighteen, `8fc9160`, took a median of
+  430.7 s over four syncs against dcrd v2.1.7's 2,944.4 s, 6.84x in one
+  session.** `8fc9160` is those commits with a test-only commit, a
+  patch release of `rustls` and a fix to two tests. `4700cf1` took a
+  median of 516.2 s in the same session, so the seventeen took 85.5 s,
+  16.6%, off it. The ratio rests on one dcrd run, whose block server
+  read 18.0 GB from the drive where the four runs of `8fc9160` read
+  none, and the day's two dcrd runs (v2.1.6 took 2,944.5 s) are the
+  slowest clean dcrd runs on record, which suggests, and does not
+  prove, a cost of 1 to 3% to dcrd; against dcrd's runs of earlier
+  sessions it is 6.70x and 6.65x. With the exists-address index off,
+  one run: 351.3 s.
+- **The metadata commit now runs on a thread of its own in the daemon,
+  since `02b802c`** (ADR-0009 and ADR-0005, addenda of 2026-10-16; the
+  project owner made it the default). Measured the same day as part of a
+  build of `4700cf1` with the seventeen commits' changes, the validation
+  pool among them, as measured on 2026-10-13, which does what `8fc9160`
+  does but for comments, an unset developer variable and the `rustls`
+  release, against that build without it, four runs each: 389.55 s against
+  429.45 s, 39.9 s or 9.3% less, faster in every pairing, for 27 s more
+  process CPU time (2.6%) and about 256 MiB more peak resident memory to
+  the tip. About 75 s of flush work left the threads that sync, but the
+  rest of the sync ran about 35 s slower beside the commit, for a cause
+  not measured. Only m3's storage was measured; the form of 2026-08-16
+  lost 9.5% on m1, and `DCROXIDE_DB_SYNC_COMMIT=1` restores the committing
+  thread. The commits after `8fc9160`, the dcrd port's and this one among
+  them, have not been run in a sync.
 - **The daemon's default download window is now its own, not dcrd's,
   and was measured on 2026-10-12 in short runs only** (PARITY.md,
   *Block download window*). It keeps up to 128 blocks requested from

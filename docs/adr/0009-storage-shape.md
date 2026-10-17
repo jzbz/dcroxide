@@ -1048,8 +1048,11 @@ been measured once and not decided.
 The addendum above left two things to the project owner: whether a
 commit that reports its failure to the next write, flush or close may be
 the daemon's default, and a rewording of condition 1 for it. On
-2026-10-16 the owner decided both, after the syncs of that day: the
-background commit is kept, and it is on by default in the daemon.
+2026-10-16 the owner decided both, after the syncs of that day
+([bench-ledger.md](../bench-ledger.md), "`8fc9160`, a background commit
+and dcrd v2.1.7", has them, and [ADR-0004](0004-storage-backend.md) the
+measurement that takes this ADR's branch up again): the background
+commit is kept, and it is on by default in the daemon.
 
 **What it is.** A flush that a commit's own check trips is captured, its
 block files synced and its rows and the participant's written into

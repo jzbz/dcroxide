@@ -530,6 +530,14 @@ run with the other commits of 2026-10-16, so the code as it stands has
 not been run in a sync, and its threshold of 4 items has not been tried
 beside the reading thread's added work. D2 is unchanged.
 
+> **Note, 2026-10-16, after the syncs of that day.** `8fc9160`, which
+> holds the pool and the commits of 2026-10-16 before it as committed,
+> took 421.2 s to 434.0 s in four default syncs on m3, a median of
+> 430.7 s, with the threshold at 4 items
+> ([bench-ledger.md](../bench-ledger.md), "`8fc9160`, a background
+> commit and dcrd v2.1.7"). What the pool adds there was not measured
+> apart, and the threshold was not varied.
+
 ## Addendum, 2026-10-16 (second) — a short-lived thread for the metadata commit
 
 In the daemon a flush of the metadata write cache that a commit's own

@@ -1778,3 +1778,52 @@ fail-closed condition that a failure reported after the tripping commit
 has returned requires. So the result of 2026-08-16 stands as m1's of
 that date and is no longer the only measurement of the idea, and
 nothing in the tree commits off the committing thread.
+
+## Addendum, 2026-10-16 — the background commit measured on a build that does what `8fc9160` does, and kept
+
+The addendum above records a background commit measured on 2026-10-12
+and not adopted, the decisions it needs being the project owner's;
+ADR-0009's addendum of that date left its branch "restructure the
+commit" closed for m1's layout of 2026-08 and, for the layout of
+2026-10, measured once and not decided. A third form, whose commit on
+its second thread holds a read snapshot of the store, was built on
+`231997b` in a scratch tree and on 2026-10-13 took 35.4 s and 40.0 s
+less than its own control in two pairs of syncs
+([bench-ledger.md](../bench-ledger.md), "Seven cumulative builds, the
+validation pool, a background commit and dcrd"). On 2026-10-16 that form
+was measured again on m3 ([bench-ledger.md](../bench-ledger.md),
+"`8fc9160`, a background commit and dcrd v2.1.7"), in the harness of the
+addenda above, on a build of `4700cf1` with the changes of the seventeen
+commits to the node's code after it, the validation pool among them, as
+they were measured on 2026-10-13, which does what `8fc9160` does but for
+comments, a developer variable left unset and a patch release of
+`rustls` ([ADR-0009](0009-storage-shape.md), addendum of this date, has
+the snapshot).
+
+| build | runs | wall, each | median | peak resident memory to the tip, median |
+|---|---:|---|---:|---:|
+| without the background commit | 4 | 432.4, 428.9, 430.0, 427.5 s | 429.45 s | 3,277 MiB |
+| with it | 4 | 388.3, 391.7, 388.8, 390.3 s | 389.55 s | 3,533 MiB |
+
+The arms were interleaved over four rounds with `8fc9160` and `4700cf1`,
+and the background commit was faster in every pairing: 39.9 s or 9.3% by
+the medians, 38.6 s or 9.0% on the runs whose block server read no more
+than 11 MB from its drive. The threads that sync spent about 48 s in
+their flushes (47.8 to 49.1 s) against 118 to 129 s, so about 75 s of
+flush work left them, but the wall fell 40 s: the rest of the sync ran
+about 35 s slower beside the commit, for a cause not measured. Process
+CPU time was 27 s or 2.6% higher, so the gain depends on spare cores.
+The peak to the tip was about 256 MiB higher; the true peak with it is
+in the shutdown flush, 3.84 to 4.14 GiB by its flush log, and the
+control's there is not recorded.
+
+On m3 a sync's flushes took 118.5 to 128.8 s in all in this session,
+well under half of its wall time, where on m1 in 2026-08 they took
+68–71% of it and commits ran back to back, which is why the form of
+2026-08-16 lost 9.5% there. Only m3's storage was measured. The project
+owner kept the change, on by default in the daemon, with
+`DCROXIDE_DB_SYNC_COMMIT=1` putting every commit back on the committing
+thread; it is `02b802c`, ported onto the commits that followed
+`8fc9160`, and that tree has not been run in a sync. The store's end
+state with it was not compared with the control's. The engine decision
+and the levers this ADR closed are unchanged.

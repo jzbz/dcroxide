@@ -888,6 +888,14 @@ index's share of a sync and of its peak is known for `4700cf1` from one
 run, and not for the code as it stands. The fallback's flush-time test
 was not run again, and none of the plan's criteria is judged again.
 
+> **Note, 2026-10-16, after the syncs of that day.** `8fc9160`, which
+> holds this change and `85a5dc8` as committed, took 421.2 s to 434.0 s
+> in four default syncs on m3, a median of 430.7 s, and 351.3 s in one
+> with `--noexistsaddrindex` ([bench-ledger.md](../bench-ledger.md),
+> "`8fc9160`, a background commit and dcrd v2.1.7"). What the two add
+> was not measured apart there, and the index's share of the sync is
+> known for `8fc9160` from that one run.
+
 The tests are in `crates/dcroxide-indexers/src/existsaddr/memtable.rs`
 (the first four) and `existsaddr/tests.rs`: a partition's version moves
 with every change to its vectors and to no other partition's, and never

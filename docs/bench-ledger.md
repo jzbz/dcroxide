@@ -83,6 +83,8 @@ path) has been measured yet, so this crossover is unconfirmed.
 | 2026-10-13 | m3 | `4700cf1` (the code of `b4ceb1c` and one log line more) | release v2.1.6 (go1.25.4), one run | mainnet, genesis to 1,116,035 | dcroxide from the dcrd v2.1.6 block server at the defaults, in the same harness, in a session in which that server read 15.7–18.0 GB from the drive during every run, where it read none in the runs of 2026-10-11 and at most 1.5 GB in those of 2026-10-12, none in the read-ahead runs of the row above. Three runs: 513.4 s, 513.5 s and 504.2 s — **2,173.8, 2,173.3 and 2,213.3 blk/s** at 2.19–2.23 mean cores. The first two spent about 10 s longer in their flushes' commit phase, for a reason the records do not give; with the commit seconds taken out the three are 432.8–433.7 s. With `--noexistsaddrindex`, one run: 423.6 s — 2,634.6 blk/s. dcrd from the same block server, one run: 2,920.3 s — **382.2 blk/s** at 1.94 mean cores, so dcroxide is **5.69x to 5.79x** as fast over the three pairings with that one run. The 494.6 s and 490.8 s of the row above are another session and another build | this file, "Seven cumulative builds, the validation pool, a background commit and dcrd" |
 | 2026-10-13 | m3 | seven builds on `4700cf1` that add, one group at a time, the changes of the seventeen commits from `d76e8ec` to `6376eeb`, in another order than the commits and each with a developer variable the tree does not have, left unset; none is the tree of a commit | release v2.1.6, the one run of the row above | mainnet, genesis to 1,116,035 | The same session and harness. The first build (`4700cf1` with the flush log's processor times and the variable): 505.6 s and 502.8 s, the speed of `4700cf1` within its spread. The last: 441.9 s and 442.2 s — **2,525.5 and 2,524.1 blk/s** at 2.39–2.40 mean cores, 62.2 s or 12.3% under the first by wall, 62.6 s with the commit seconds taken out and 63.6 s by the node's clock less its flush time, with two runs at each end. The five builds between ran once each. The tree these commits leave with `f60ae3a` has not been run in a sync | this file, "Seven cumulative builds, the validation pool, a background commit and dcrd" |
 | 2026-10-13 | m3 | `4700cf1` with the persistent validation pool that `f60ae3a` carries on top of the other seventeen commits; the tree of `f60ae3a` has not been run | release v2.1.6, the one run of the first 2026-10-13 row | mainnet, genesis to 1,116,035 | The same session and harness. Two runs: 491.3 s and 493.4 s — **2,271.8 and 2,262.1 blk/s** at 2.19 mean cores. About 12 to 16 s, 2.4–3.2%, under the code without the pool, by the measure: 11.9 s by wall against its runs with an ordinary commit phase and those of the first cumulative build, 15.8 s with the commit seconds taken out. All of it falls after the assume-valid block | this file, "Seven cumulative builds, the validation pool, a background commit and dcrd" |
+| 2026-10-16 | m3 | `8fc9160`, which holds `4700cf1`, the seventeen commits to the node's code after it, one that adds tests, a patch release of `rustls` and a fix to two tests | release v2.1.7, built from its tag as its release image builds it, one run; release v2.1.6, one run | mainnet, genesis to 1,116,035 | dcroxide from the dcrd block server of the rows above at the defaults, in the same harness, four rounds interleaved with the builds of the next row and `4700cf1`; the server read 17.9–18.6 GB from its drive in each run of the first round and 0–11 MB in every later dcroxide run. Four clean runs: 421.2 s, 429.3 s, 432.1 s and 434.0 s, median 430.7 s — **2,649.9 to 2,571.6 blk/s** at 2.34–2.40 mean cores; a fifth, of the first round, was disturbed and repeated. `4700cf1`, four runs: median 516.2 s (513.1–517.9 s), so the commits after it took 85.5 s, 16.6%, off it. With `--noexistsaddrindex`, one run: 351.3 s — 3,176.9 blk/s. dcrd v2.1.7, one run: 2,944.4 s — **379.0 blk/s** at 1.94 mean cores; v2.1.6, one run, 2,944.5 s. So dcroxide is **6.84x** as fast in one session, against one dcrd run that read 18.0 GB of server data from the drive where the four runs of `8fc9160` read none. Against dcrd's 2,883.9 s and 2,863.9 s of earlier sessions it is 6.70x and 6.65x | this file, "`8fc9160`, a background commit and dcrd v2.1.7" |
+| 2026-10-16 | m3 | a background commit, as it was measured, on `4700cf1` with the changes of those seventeen commits, the validation pool among them, as they were measured on 2026-10-13, against the same build without it; neither is the tree of a commit, and `02b802c`, which carries the change, has not been run | the runs of the row above | mainnet, genesis to 1,116,035 | The same session and harness, four runs of each interleaved with the row above. With it: 388.3 s, 391.7 s, 388.8 s and 390.3 s — **2,849.2 to 2,874.3 blk/s** at 2.65–2.69 mean cores. Without it: 432.4 s, 428.9 s, 430.0 s and 427.5 s, at 2.35–2.38. Medians 389.55 s and 429.45 s: **39.9 s or 9.3% less**, less in every pairing, and 38.6 s or 9.0% on the runs whose block server read no more than 11 MB from its drive. Process CPU time 27 s or 2.6% higher, and peak resident memory to the tip about 256 MiB higher at the median | this file, "`8fc9160`, a background commit and dcrd v2.1.7" |
 
 > **The headline 1.29x predates the fan-out fix, so it is conservative for
 > master.** That figure was measured on `b6d0c63`; `c091b46` (one validation
@@ -1291,6 +1293,15 @@ implementation.**
 > cost detected at a resolution of about 300 MiB. That form is not in
 > the repository either. See "Seven cumulative builds, the validation
 > pool, a background commit and dcrd" below.
+>
+> **Note (2026-10-16): kept, in the form of 2026-10-13.** On m3, on a
+> build of `4700cf1` with the cumulative builds' changes and the pool,
+> it took 389.55 s against 429.45 s for that build without it, four runs
+> each, 9.3% less, where the flushes are well under half of the wall
+> time. It is `02b802c`, on by default in the daemon, with
+> `DCROXIDE_DB_SYNC_COMMIT=1` putting every commit back on the
+> committing thread. It was not run on m1 or on slower storage. See
+> "`8fc9160`, a background commit and dcrd v2.1.7" below.
 
 The design: a committer thread per flush, holding an `Arc<DbInner>` so the
 database cannot be destroyed mid-commit; the previous commit joined before the
@@ -3453,6 +3464,15 @@ the commit that tripped the flush.
 > form is not in the repository either, and it was not built on
 > `4700cf1`. See "Seven cumulative builds, the validation pool, a
 > background commit and dcrd" below.
+>
+> **Note (2026-10-16): built in full and kept.** The stage after the
+> measurement was built in the form of 2026-10-13: the sweeps of unclean
+> stops with commits on their own thread, the rest of the tests and the
+> mutation tests. The project owner made it the daemon's default and
+> accepted ADR-0009's reworded rule. On a build of `4700cf1` with the
+> cumulative builds' changes and the pool it took 389.55 s against
+> 429.45 s, four runs each. It is `02b802c`. See "`8fc9160`, a
+> background commit and dcrd v2.1.7" below.
 
 **A persistent validation pool: the gate.** "Script validation fan-out
 (2026-08-14)" above has asked for this arm to be measured. On
@@ -3940,6 +3960,13 @@ build of the repository reads them. Two pairs, each with the snapshot
 arm before its control (09:43 and 09:58, 12:39 and 12:54), not
 alternated, and one run without the snapshot.
 
+> **Note (2026-10-16): one of the two is now the daemon's.** Since
+> `02b802c` the daemon commits a flush that a commit trips on `dbcommit`
+> by default, holding the snapshot, and reads `DCROXIDE_DB_SYNC_COMMIT`,
+> which puts every commit back on the committing thread.
+> `DCROXIDE_DB_BARE_COMMIT` is read by no build of the repository. See
+> "`8fc9160`, a background commit and dcrd v2.1.7" below.
+
 - **With the snapshot it took 465.7 s and 460.5 s, against its control
   arm's 501.1 s and 500.5 s**: 35.4 s and 40.0 s less, 7.1% and 8.0% of
   its own control. That is against its control, on `231997b`, and not
@@ -3977,6 +4004,15 @@ On 2026-10-12 the form without the snapshot had peaked 981 and 748 MiB
 above its control runs, one pair each on other code. This form is not
 in the repository either. It was not built on `4700cf1`, and it was
 not run with the cumulative builds' changes or the pool.
+
+> **Note (2026-10-16): this form is the one kept.** On the build of
+> `4700cf1` with the cumulative builds' changes and the pool it took
+> 389.55 s against 429.45 s for that build without it, four runs each,
+> 9.3% less, with 27 s more process CPU time and about 256 MiB more peak
+> resident memory to the tip at the median. Ported onto the later
+> commits, without `DCROXIDE_DB_BARE_COMMIT`, it is `02b802c`, on by
+> default in the daemon. See "`8fc9160`, a background commit and dcrd
+> v2.1.7" below.
 
 **Settings, on L0.** Five runs of the L0 binary, against its two
 default runs (mean 504.2 s). The flush request is the developer
@@ -4048,6 +4084,15 @@ tunable.
 - A profile of any of this code, or a run on m1, m2, another filesystem
   or fewer cores.
 
+> **Note (2026-10-16): two of these were run.** `8fc9160`, which holds
+> the seventeen commits and the pool as committed, took a median of
+> 430.7 s over four runs, and the background commit, on a build of
+> `4700cf1` with the cumulative builds' changes and the pool, 389.55 s
+> against 429.45 s for that build without it, four runs each, its peak
+> to the tip about 256 MiB higher at the median. The background commit
+> on the code as committed, `02b802c`, has not been run. See "`8fc9160`,
+> a background commit and dcrd v2.1.7" below.
+
 Raw: the comparison's `runs.jsonl` rows labelled `n-head-1`,
 `n-L0-1`, `n-L1-A`, `n-L2-R3`, `n-L3-R4`, `n-L4-R5`, `n-L5-R6`,
 `n-L6-B-1`, `n-L6-B-2`, `n-L0-2`, `n-head-2`, `n-pool-1`, `n-pool-2`,
@@ -4059,3 +4104,172 @@ Raw: the comparison's `runs.jsonl` rows labelled `n-head-1`,
 above; the queue's log; the scripts that reconciled the figures from
 those records, with the tables they wrote; and the patches of the
 measured trees and of the background-commit experiment.
+
+## `8fc9160`, a background commit and dcrd v2.1.7 (2026-10-16)
+
+"Seven cumulative builds, the validation pool, a background commit and
+dcrd" above left the commits after `4700cf1` up to `f60ae3a` unrun as
+committed, the cumulative builds' changes and the validation pool never
+run together, the background commit measured only on `231997b`, and dcrd
+at v2.1.6. On 2026-10-16, between 07:59 and 14:00, 20 syncs were run on
+m3:
+
+- six of `8fc9160`, the head of master when the syncs ran, which holds
+  `4700cf1`, the seventeen commits to the node's code after it, one that
+  adds tests, a patch release of `rustls` and a fix to two tests: five
+  at the defaults, one of which was disturbed and repeated, and one with
+  the exists-address index off;
+- four of `4700cf1`;
+- four of the pool build: `4700cf1` with the changes of sixteen of the
+  seventeen as the last cumulative build (L6) above had them, and the
+  validation pool, the seventeenth, as it was measured beside them. Its
+  code does what `8fc9160` does but for comments, tests, a developer
+  variable for the exists-address index's flush request that is left
+  unset, and the patch release;
+- four of the background-commit build: the pool build with the
+  background commit as it was then, in the form of 2026-10-13 above with
+  the snapshot, which `02b802c` carries after its port onto the commits
+  that followed `8fc9160`;
+- one of dcrd v2.1.7, built from its release tag as its release image
+  builds it, and one of dcrd v2.1.6.
+
+The syncs are in the harness of the sections above, from the same block
+server, at the defaults but for what a row names, with the flush log on
+in every dcroxide run. The node had the eight cores and their siblings
+it had before, and the block server four others. Four rounds of the four
+dcroxide builds, each round in another order (`8fc9160`, `4700cf1`,
+pool, background; background, pool, `4700cf1`, `8fc9160`; `4700cf1`,
+`8fc9160`, background, pool; pool, background, `8fc9160`, `4700cf1`),
+with dcrd v2.1.7 after the first round, the index-off run after the
+second and dcrd v2.1.6 after the third. Every run exited 0 on the
+server's tip, and the block files hashed to `33b7ac837a45c74f` over 36
+files and 19,202,596,910 B in all 20, dcrd's included. As above, that is
+the equality of a 64-bit prefix of one hash, and the metadata store is
+not compared.
+
+| run | started | build | setting | wall | peak RSS | block server read from its drive |
+|---|---|---|---|---:|---:|---:|
+| o16-head-1 | 07:59 | `8fc9160` | defaults (disturbed, below) | 431.5 s | 3,264 MiB | 18,583 MB |
+| o16-base-1 | 08:14 | `4700cf1` | defaults | 517.9 s | 2,865 MiB | 17,936 MB |
+| o16-pool-1 | 08:29 | pool | defaults | 432.4 s | 3,272 MiB | 17,930 MB |
+| o16-bg-1 | 08:43 | background commit | defaults | 388.3 s | 3,432 MiB | 17,930 MB |
+| o16-dcrd-217 | 08:57 | dcrd v2.1.7 | defaults | 2,944.4 s | 1,848 MiB | 17,951 MB |
+| o16-bg-2 | 09:53 | background commit | defaults | 391.7 s | 3,538 MiB | 11 MB |
+| o16-pool-2 | 10:06 | pool | defaults | 428.9 s | 3,282 MiB | 0 MB |
+| o16-base-2 | 10:20 | `4700cf1` | defaults | 516.2 s | 2,926 MiB | 0 MB |
+| o16-head-2 | 10:36 | `8fc9160` | defaults | 421.2 s | 2,952 MiB | 0 MB |
+| o16-head-noindex | 10:50 | `8fc9160` | `--noexistsaddrindex` | 351.3 s | 2,162 MiB | 0 MB |
+| o16-base-3 | 11:02 | `4700cf1` | defaults | 516.2 s | 3,263 MiB | 0 MB |
+| o16-head-3 | 11:18 | `8fc9160` | defaults | 429.3 s | 3,262 MiB | 0 MB |
+| o16-bg-3 | 11:32 | background commit | defaults | 388.8 s | 3,617 MiB | 0 MB |
+| o16-pool-3 | 11:45 | pool | defaults | 430.0 s | 3,016 MiB | 0 MB |
+| o16-dcrd-216 | 12:00 | dcrd v2.1.6 | defaults | 2,944.5 s | 1,852 MiB | 12,001 MB |
+| o16-pool-4 | 12:55 | pool | defaults | 427.5 s | 3,291 MiB | 0 MB |
+| o16-bg-4 | 13:09 | background commit | defaults | 390.3 s | 3,529 MiB | 0 MB |
+| o16-head-4 | 13:23 | `8fc9160` | defaults | 432.1 s | 3,339 MiB | 0 MB |
+| o16-base-4 | 13:37 | `4700cf1` | defaults | 513.1 s | 3,233 MiB | 0 MB |
+| o16-head-1-again2 | 13:52 | `8fc9160` | defaults | 434.0 s | 3,208 MiB | 0 MB |
+
+Wall is the harness's clock, as above. Peak RSS is `VmHWM` read after
+the clock stops and before the harness signals the node, so before the
+closing flush. The figures below are the medians of the four clean runs
+of each build.
+
+**`8fc9160` against `4700cf1`: 430.7 s against 516.2 s, 85.5 s or 16.6%
+less.** `4700cf1` took 513.1 to 517.9 s, and `8fc9160` 421.2 to 434.0 s.
+The spread of `8fc9160`'s four, 12.8 s, follows its flush time run by
+run, 118.5 s in the fastest and 128.8 s in the slowest; less the flush
+time inside the clock its runs are about 306 to 309 s.
+
+**`8fc9160` against dcrd v2.1.7: 6.84x in this session, 2,944.4 s
+against 430.7 s.** Three caveats go with it. It rests on one dcrd run.
+That run's block server read 18.0 GB of its data from the drive, where
+none of the four clean runs of `8fc9160` read any. And the day's two
+dcrd runs are the slowest clean dcrd runs on record, which suggests, and
+does not prove, that the uncached server cost dcrd 1 to 3%. Against
+dcrd's runs of earlier sessions, 2,883.9 s on 2026-10-11 and the
+2,863.9 s median of 2026-10-09 and 2026-10-10, the ratio is 6.70x and
+6.65x, across sessions.
+
+**The index off: 351.3 s**, one run of `8fc9160` with
+`--noexistsaddrindex`, peaking at 2,162 MiB.
+
+**dcrd v2.1.7 and v2.1.6 took the same time**, 2,944.4 s and 2,944.5 s
+in one run each, their progress within 0.3% of each other throughout.
+v2.1.7 passed about 7% more bytes to write calls. Equality finer than
+about 2% is not established by one run each.
+
+**The pool build and `8fc9160` are the same within the noise**: 429.45 s
+against 430.7 s, and 428.9 s against 430.7 s on the runs whose server
+read nothing from its drive.
+
+**The background commit: 389.55 s against 429.45 s, 39.9 s or 9.3%
+less**, against its own build without it.
+
+- It was faster in every pairing: its slowest run took 391.7 s and the
+  pool build's fastest 427.5 s. On the runs whose server read no more
+  than 11 MB from its drive it was 38.6 s or 9.0% less.
+- It took about 75 s of flush work off the threads that sync. Their
+  flushes took about 48 s (47.8 to 49.1 s) against 118 to 129 s without
+  it. But the wall fell only 40 s: the rest of the sync ran about 35 s
+  slower beside the commit, for a cause not measured.
+- Process CPU time was 27 s higher, 2.6%, so the gain depends on spare
+  cores.
+- Peak resident memory to the tip was about 256 MiB higher: medians of
+  3,533 against 3,277 MiB. Its true peak is in the shutdown flush, 3.84
+  to 4.14 GiB by its flush log; the pool build's peak there is not
+  recorded.
+
+**The flushes.** A run's flushes took 118.5 to 128.8 s in all, the
+medians by build 124.0 to 126.5 s. Without the background commit the
+block thread carried 84.5 to 113.6 s of that and the index thread the
+rest. The totals include the shutdown flush, 1.6 to 3.3 s, after the
+tip.
+
+**The disturbed run.** o16-head-1, 431.5 s, had 119.8 s of other
+userland, 0.87% of the machine, where every other dcroxide run had 22 to
+53 s; the record attributes almost none of it. It is left out of every
+figure above, and was repeated as o16-head-1-again2. A system monitor
+took about 10 to 16 s of each run's other userland.
+
+**The block server's cache.** In the first round the server's data did
+not stay cached: each run of that round read 17.9 to 18.6 GB from the
+drive. The machine's samples show the kernel's background reclaim
+evicting about 13 GiB of freshly warmed page cache within seconds while
+39 to 49 GB was free and the free blocks of huge-page size had run out.
+Transparent huge pages are `always` there and proactive compaction is
+off, so reclaim for huge pages is the likely cause; it is not
+demonstrated. From o16-bg-2 on every dcroxide run read 0 to 11 MB from
+the server, for reasons not known, and the dcrd v2.1.6 run still read
+12.0 GB. The session of 2026-10-13 was uncached throughout. The pool
+build, `4700cf1` and the background-commit build each have one uncached
+run, of the first round, which differs from their cached medians by
++3.5 s, +1.7 s and −2.0 s; `8fc9160` has no clean uncached run.
+
+**What was not measured.**
+
+- The tree that carries the background commit, `02b802c`, or any tree
+  after `8fc9160`: the commits that port dcrd's changes since
+  `6f6cf21b`, and the background commit as ported onto them, have not
+  been run in a sync.
+- The store's end state with the background commit against its control
+  (the exists-address index's digest and the UTXO statistics at the
+  tip).
+- Slower storage: only m3's NVMe drive under btrfs was measured. The
+  form of 2026-08-16 lost 9.5% on m1, where commits ran back to back
+  (`DCROXIDE_DB_SYNC_COMMIT=1` is the way back).
+- Windows and macOS.
+- Two proposals of the background-commit work, neither built: a read
+  snapshot for the flushes `Database::flush` and the close make, which
+  still commit with no reader open, and a committer thread kept for the
+  life of the process, should allocator arenas turn out to hold the
+  extra memory. Its memory is not settled.
+
+Raw: the comparison's `runs.jsonl` rows labelled `o16-head-1`,
+`o16-base-1`, `o16-pool-1`, `o16-bg-1`, `o16-dcrd-217`, `o16-bg-2`,
+`o16-pool-2`, `o16-base-2`, `o16-head-2`, `o16-head-noindex`,
+`o16-base-3`, `o16-head-3`, `o16-bg-3`, `o16-pool-3`, `o16-dcrd-216`,
+`o16-pool-4`, `o16-bg-4`, `o16-head-4`, `o16-base-4` and
+`o16-head-1-again2`, with per-run samples, flush logs and node logs; the
+queue's steps and log; the machine's memory samples of the first round;
+and the patches of the two builds that are not the tree of a commit.

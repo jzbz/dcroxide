@@ -60,8 +60,11 @@ made with it put that to the 89,438 blocks after the assume-valid block
 and to none before it. The eighteen commits to the node's code after the
 eleven, several of which change code that applies the consensus rules,
 among them where a connected block's scripts are checked, have been put
-to blocks only in syncs, and only in builds that are not the code as it
-stands, which has been run in none (Performance). That the rules reject
+to blocks only in syncs: `8fc9160`, which holds them, was run in four on
+2026-10-16 (Performance). The commits after it, which port dcrd's
+changes since `6f6cf21b`, some of them to the consensus rules, and move
+the metadata commit to a thread of its own, have been run in none, and
+the code as it stands has not been run in a sync. That the rules reject
 what dcrd's reject rests on the test batteries described below, not on a
 sync, and none of it says the node is safe to operate. **Do not expose
 it to the internet and do not use it with funds** — see
@@ -437,24 +440,73 @@ dcrd data directory will not work). Currently implemented:
 
 ## Performance
 
-The figures here are of two kinds. The last complete comparison set out
-on this page, with three runs of dcroxide, a run with the exists-address
-index off and dcrd in the same session, is of dcroxide `b4a5d2d` on
-2026-10-11: a median of 12.1 minutes against dcrd's 48.1, 3.96x. Eleven
-commits that change the node's code followed it. Their steps were
-measured on 2026-10-12 in one or two syncs each, dcrd was not run that
-day, and the last step was measured in a build that is not the code as
-committed. They come first. Eighteen more commits that change the
-node's code have followed those eleven, and the code as it stands has
-not been run in a sync. A session of the same kind was run on
-2026-10-13 with `4700cf1`, the first of the eighteen, beside builds
-that held the changes of the other seventeen in parts, none of the
-builds run holding them all. The [bench ledger](docs/bench-ledger.md)
-has that session, and this page sets out no figure from it. From *The
-last complete comparison* on, every table, and every measurement of
-dcroxide not dated 2026-10-12, is of `b4a5d2d` or of the code before
-it. Every sync time on this page is from one machine, over loopback,
-into a fresh data directory.
+The latest comparison, with four runs of dcroxide, a run with the
+exists-address index off and dcrd in the same session, is of dcroxide
+`8fc9160` on 2026-10-16: a median of 7.2 minutes against dcrd v2.1.7's
+49.1, 6.84x in one session, with the caveats set out with it. It comes
+first, and with it the background commit, measured that day on a build
+that is not the code of a commit. The commits after `8fc9160`, which
+port dcrd's changes since `6f6cf21b` and carry the background commit
+(`02b802c`), have not been run in a sync. The steps of 2026-10-12 and
+the complete comparison of `b4a5d2d` on 2026-10-11 follow as they were
+set out then: eleven commits that change the node's code followed
+`b4a5d2d`, their steps were measured on 2026-10-12 in one or two syncs
+each, dcrd was not run that day, and the last step was measured in a
+build that is not the code as committed. A session of the same kind was
+run on 2026-10-13 with `4700cf1`, beside builds that held the changes of
+the seventeen commits after it in parts; the [bench
+ledger](docs/bench-ledger.md) has it, and this page sets out no figure
+from it. From *The last complete comparison* on, every table, and every
+measurement of dcroxide not dated 2026-10-12 or 2026-10-16, is of
+`b4a5d2d` or of the code before it. Every sync time on this page is from
+one machine, over loopback, into a fresh data directory.
+
+**`8fc9160` against dcrd v2.1.7, on 2026-10-16.** `8fc9160`, the head of
+master when the syncs ran, holds `4700cf1`, the seventeen commits to the
+node's code after it, one that adds tests, a patch release of `rustls`
+and a fix to two tests. Four clean syncs of mainnet from genesis to
+block 1,116,035, from the dcrd block server and in the harness of the
+comparisons below, interleaved with runs of `4700cf1` and of two builds
+described below, took 421.2 s, 429.3 s, 432.1 s and 434.0 s: a median of
+**430.7 s, 7.2 minutes**. A fifth, disturbed by other work on the
+machine, was repeated. `4700cf1` took a median of 516.2 s in the same
+session, so the commits after it took 85.5 s, 16.6%, off it. dcrd v2.1.7
+took 2,944.4 s, 49.1 minutes, in one run, so dcroxide was **6.84x as
+fast in one session**. Three things temper that figure. It rests on one
+dcrd run. That run's block server read 18.0 GB of its data from the
+drive, where none of the four runs of `8fc9160` read any. And the day's
+two dcrd runs (v2.1.6 took 2,944.5 s) are the slowest clean dcrd runs on
+record, which suggests, and does not prove, that the uncached server
+cost dcrd 1 to 3%. Against dcrd's runs of earlier sessions, 2,883.9 s
+and 2,863.9 s, the ratio is 6.70x and 6.65x. With `--noexistsaddrindex`,
+`8fc9160` took 351.3 s in one run.
+
+**The background commit, kept.** Since `02b802c` the daemon makes the
+storage engine's commit of most metadata flushes on a thread of its own
+([PARITY.md](PARITY.md), *Where a cache flush's commit runs*). It was
+measured on 2026-10-16 as part of a build that is not the code of any
+commit: `4700cf1` with the changes of the seventeen commits, the
+validation pool among them, as they were measured on 2026-10-13, whose
+code does what `8fc9160` does but for comments, a developer variable
+left unset and the `rustls` patch release, and which took 429.45 s
+without the background commit, the same as `8fc9160` within the noise.
+With it, in four runs interleaved with four without, a sync took 388.3
+to 391.7 s, a median of **389.55 s: 39.9 s or 9.3% less**, and less in
+every pairing (38.6 s or 9.0% on the runs whose block server read no
+more than 11 MB from its drive). About 75 s of flush work left the
+threads that sync, whose flushes took about 48 s against 118 to 129 s,
+but the wall fell 40 s: the rest of the sync ran about 35 s slower
+beside the commit, for a cause not measured. It costs 27 s more process
+CPU time, 2.6%, so the gain depends on spare cores, and about 256 MiB
+more peak resident memory up to the tip (medians 3,533 against
+3,277 MiB); its true peak is in the shutdown flush, 3.84 to 4.14 GiB by
+its flush log, and the control's there is not recorded. Only m3's
+storage was measured. The form of 2026-08-16 lost 9.5% on m1, where
+commits ran back to back, and `DCROXIDE_DB_SYNC_COMMIT=1` puts every
+commit back on the committing thread
+([docs/operating.md](docs/operating.md)). The commit as ported has not
+been run in a sync, and the store's end state was not compared between
+the two arms.
 
 **Eleven commits to the node's code since `b4a5d2d`, measured a step at
 a time on 2026-10-12.** Each run was a sync of mainnet from genesis to
@@ -584,7 +636,8 @@ and were not redone. The
 what else was measured then and is not in the repository.
 
 **The last complete comparison set out here is of `b4a5d2d`, on
-2026-10-11.** It synced mainnet from genesis to block 1,116,035 in a
+2026-10-11**, until that of `8fc9160`
+above. It synced mainnet from genesis to block 1,116,035 in a
 median of 12.1 minutes over three runs that day. dcrd release v2.1.6
 (go1.25.4) took 48.1 minutes in one run that evening, so
 dcroxide was **3.96x as fast** in one session. dcrd's median over four
