@@ -941,3 +941,62 @@ and its rows published at `:1420`, the hooks dropped by a rollback at
 `common.rs`, `indexes.rs`, `participant.rs:64` and `dcroxide.rs` did not
 move. The functions named are unchanged but for the hook's insert and
 `connect_block`, as above.
+
+## Addendum, 2026-10-16 (second) — a flush seals the keys it wrote until it is finished
+
+The participant's `contribute` reads each partition's unjournaled keys
+and writes them into the flush's journal row or runs, and until now
+left memory alone; `finished(true)` then marked every unjournaled key
+journaled and emptied the partitions the flush merged
+(`Memtable::commit_flush`). That is right only if nothing is inserted
+between the two calls. It holds today because both run under the
+writer semaphore with the commit between them, and the commit hooks
+that insert run after `finished`. A flush whose commit ends on another
+thread, after later connects' hooks have run, would mark their keys
+journaled, or drop them with a merged partition, without any flush
+having written them.
+
+So `contribute` now ends by sealing what it read (`Memtable::seal`):
+each partition's unjournaled runs are moved, not copied, to a sealed
+list beside them, and the count of unjournaled keys, which
+`wants_flush` and `has_work` read, goes to zero. A sealed key is still
+held and found by every lookup. `finished(true)` folds the sealed keys
+into the journaled ones, or, in a partition the flush merged, drops
+them with the journaled keys, and leaves whatever was inserted since
+the seal unjournaled and counted (`Memtable::fold_sealed`).
+`finished(false)` puts the sealed keys back among the unjournaled ones
+(`Memtable::unseal`). Every key is in exactly one of the journaled,
+sealed and unjournaled vectors.
+
+The version rule of the addendum above is restated. A partition's
+version counts the changes to which keys it holds and to which of them
+are journaled: an insert that adds a run, a fold, a merged partition's
+clear and a load move it, each under the partition's write lock, and
+nothing sets it back. A seal and an unseal move keys between the
+unjournaled and sealed runs, leave the partition holding the same keys,
+and leave its version, so a filter made before a seal still stands
+after it. `Part::replace` now serves only a load, and clears the sealed
+runs as well.
+
+Nothing the node does changes. `finished` is still called under the
+writer straight after the commit, with nothing inserted in between, so
+the seal and the fold together leave what the one step left: the same
+keys, the same versions moved, the same journal and run rows and every
+answer the same. The test-only `commit_flush` is now the seal followed
+by the fold, and the memtable's earlier tests run through it unchanged.
+The new steps are pinned in `existsaddr/memtable.rs` by
+`a_fold_leaves_keys_inserted_since_the_seal`,
+`an_unseal_puts_the_sealed_keys_back`,
+`a_seal_leaves_a_filter_standing_and_the_fold_after_it_does_not` and
+`inserts_beside_a_fold_lose_nothing`. A fold that also empties the
+keys inserted since the seal, one that zeroes the unjournaled count,
+a lookup that misses a sealed key, a seal or an unseal that moves the
+version, a fold that moves none or only a merged partition's, and a
+load that sets the version back each fail them or the earlier
+version tests. They have run on Linux only.
+
+The seal moved lines cited above, whose numbers stay as they were
+written: `Memtable::filter` is now at `existsaddr/memtable.rs:275` and
+`insert_candidates` at `:316`, and in `existsaddr/store.rs` `has_work`,
+`contribute`, `finished` and the journal load are at `:216`, `:224`,
+`:338` and `:383`.

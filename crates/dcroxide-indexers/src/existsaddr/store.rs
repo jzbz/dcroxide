@@ -22,9 +22,14 @@
 //! a second flush in a row -- the one `Database::close` makes after the
 //! node's own shutdown flush -- commits nothing.
 //!
-//! Nothing changes in memory until `finished(true)`, after the commit:
-//! then the journaled keys are folded and the merged partitions cleared.
-//! A failed flush leaves memory as it was; the store is latched by then.
+//! A flush that wrote its rows ends by sealing the keys it journaled or
+//! merged (`Memtable::seal`): they stay in memory, found by every lookup,
+//! but apart from any keys handed over later.  Nothing else changes in
+//! memory until `finished(true)`, after the commit: then the sealed keys
+//! are folded into the journaled ones, and the merged partitions lose
+//! their journaled and sealed keys.  Keys handed over since the seal are
+//! left for the next flush.  A failed flush unseals, which leaves memory
+//! holding what it held; the store is latched by then.
 //!
 //! **Invariant.**  In every durable state, every key of every connect
 //! whose tip row is durable is in a run of its partition, or in a journal
@@ -319,6 +324,9 @@ impl FlushParticipant for AddrStore {
             });
         }
         state.plan = Some(Plan { meta, merged });
+        // Every key read above is now in this flush's rows.  Set them
+        // apart, so that `finished` changes these and no others.
+        self.mem.seal();
         let mut stats = ParticipantStats::default();
         stats.keys_journaled = keys_journaled;
         stats.merges = merges;
@@ -337,15 +345,17 @@ impl FlushParticipant for AddrStore {
         let mut state = self.state();
         let plan = state.plan.take();
         if !committed {
-            // The store is latched; memory stays as it was, and the next
-            // open decides from what is on disk.
+            // The store is latched.  The keys this flush sealed are
+            // unjournaled again, so memory holds what it held, and the
+            // next open decides from what is on disk.
+            self.mem.unseal();
             return;
         }
         let Some(plan) = plan else {
             debug_assert!(false, "finished(true) without a contribute");
             return;
         };
-        self.mem.commit_flush(&plan.merged);
+        self.mem.fold_sealed(&plan.merged);
         state.meta = plan.meta;
     }
 }
