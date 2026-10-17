@@ -10,6 +10,16 @@
 //! its known-invalid and invalid-ancestor short circuits, and a
 //! losing-branch extension — comparing verdicts, fork lengths, node
 //! status bytes, the best state, and the final utxo universe.
+//!
+//! `tools/chainopsgen` regenerates the file inside dcrd's package: it
+//! reads the seeded outputs, the blocks, the operations and the
+//! universe's outpoints, and writes every other field from dcrd's
+//! chain.  Regenerated at dcrd `382ff4dd`, every input's fraud proof
+//! names the amount, height and block index of the output it spends,
+//! as `assertBlockUtxoView` requires of every block the chain
+//! attaches; the blocks committing to changed transactions were
+//! relinked and ground again, and every verdict, status and count
+//! stayed as it was.
 
 // Test-harness arithmetic over bounded lengths.
 #![allow(clippy::arithmetic_side_effects)]

@@ -9,6 +9,17 @@
 //! longer competing branch, the reorganization back, and a tip
 //! extension — comparing the best state snapshot and the presence and
 //! fields of every outpoint in the utxo universe after each step.
+//!
+//! `tools/chainopsgen` regenerates the file inside dcrd's package: it
+//! reads the seeded outputs, the blocks, the reorganization targets
+//! and the universe's outpoints, and writes every other field from
+//! dcrd's chain.  Regenerated at dcrd `382ff4dd`, every input's fraud
+//! proof names the amount, height and block index of the output it
+//! spends, as `assertBlockUtxoView` requires of every block the chain
+//! attaches.  The skeleton headers commit to no transactions, so
+//! every hash stayed as it was; the outputs a reorganization brings
+//! back from the spend journal now carry their own amounts, heights
+//! and block indexes.
 
 // Test-harness arithmetic over bounded lengths.
 #![allow(clippy::arithmetic_side_effects)]

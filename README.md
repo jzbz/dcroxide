@@ -423,6 +423,13 @@ dcrd data directory will not work). Currently implemented:
   viewpoint states inside dcrd's own `internal/blockchain` package, from
   the base view and blocks the vector file holds (Go sources overlaid on
   a dcrd checkout by `run.sh`)
+- `tools/chainopsgen` — regenerates the vector files of
+  `tests/processblock_vectors.rs`, `tests/invalidate_vectors.rs` and
+  `tests/reorg_vectors.rs` inside dcrd's own `internal/blockchain`
+  package: it gives every input of the files' blocks the fraud proof of
+  the output it spends and recomputes every expectation, from the seeds,
+  blocks and operations the files hold (Go sources overlaid on a dcrd
+  checkout by `run.sh`)
 
 ## Performance
 
@@ -844,6 +851,8 @@ changes, on slower storage and four cores.
   dcrd's `internal/mempool` (Go)
 - `tools/utxoviewgen/` — the utxo viewpoint vector generator (Go, overlay
   sources)
+- `tools/chainopsgen/` — the block processing, invalidation and
+  reorganization vector generator (Go, overlay sources)
 - `fuzz/` — `cargo-fuzz` targets (nightly toolchain)
 - `docs/adr/` — architecture decision records
 
