@@ -540,6 +540,14 @@ impl Memtable {
         self.part(p).sealed.iter().map(Vec::len).collect()
     }
 
+    /// Keys a flush has sealed and not yet finished with, over every
+    /// partition, for tests: above zero only between a `contribute` and
+    /// its `finished`.
+    #[cfg(test)]
+    pub(crate) fn sealed_keys(&self) -> usize {
+        (0..PARTITIONS).fold(0usize, |n, p| n.saturating_add(self.part(p).sealed_len))
+    }
+
     /// Keys copied by unjournaled-run merges so far, for tests.
     #[cfg(test)]
     pub(crate) fn copied(&self) -> usize {

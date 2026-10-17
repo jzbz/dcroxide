@@ -5,7 +5,8 @@
   against the swap on crash safety. The evidence below stands as the record of
   what was measured and remains the basis for reopening if the trade changes.
 - **Date:** 2026-08-10 (proposed), 2026-08-13 (prerequisites complete),
-  2026-08-17 (decided)
+  2026-08-17 (decided), 2026-10-16 (addendum: condition 1 restated for
+  a commit on a thread of its own, on by default)
 
 ## Decision: redb stays
 
@@ -1041,3 +1042,88 @@ would have to be reworded for that, and the rewording, like the
 daemon's default, is the project owner's to decide. So the branch stays
 closed for m1's layout of 2026-08, and for the layout of 2026-10 it has
 been measured once and not decided.
+
+## Addendum, 2026-10-16 — the commit on a thread of its own, condition 1 restated, and the durable-defaults guardrail
+
+The addendum above left two things to the project owner: whether a
+commit that reports its failure to the next write, flush or close may be
+the daemon's default, and a rewording of condition 1 for it. On
+2026-10-16 the owner decided both, after the syncs of that day: the
+background commit is kept, and it is on by default in the daemon.
+
+**What it is.** A flush that a commit's own check trips is captured, its
+block files synced and its rows and the participant's written into
+redb's write transaction on the committing thread under the writer, as
+before. That transaction's commit, the retirement of the captured
+layers, the latch on a failure and the participant's `finished` run on a
+thread named `dbcommit`, at most one at a time
+([ADR-0005](0005-concurrency-model.md) and
+[ADR-0011](0011-exists-address-layout-3-and-the-flush-participant.md),
+addenda of this date; PARITY.md's `database` row and *Where a cache
+flush's commit runs*). The library's default is off
+(`Options::background_commit`), so addblock, `dcroxide-bench` and the
+tests that do not ask commit on the committing thread; the daemon turns
+it on unless `DCROXIDE_DB_SYNC_COMMIT` is a positive whole number, which
+puts every commit back where dcrd makes it.
+
+**Condition 1, restated.** "Once a durable write fails, no later write
+on that store can report success" no longer holds as written: a
+transaction that committed after a flush was handed over and before that
+flush's commit failed has reported success. The rule is now: once the
+store has latched, no write that checks the latch afterwards reports
+success, and no call that acknowledges durability (`Database::flush`,
+`Database::close`, a commit whose flush ran inline) reports success
+after any durable write failed, however the two are timed. Transaction
+commits that returned between a hand-off and the latch reported `Ok`;
+they were published to the write cache, were never acknowledged as
+durable, and are lost at restart with the failed batch. What the latch
+was for still holds: no flush retries a batch the engine mishandled,
+since the committer latches before anything else and every capture
+checks the latch after it has waited for the commit under way, and
+nothing reports a durability the store will not honour. A commit that
+waited for a failing commit is refused with the first failure's cause.
+
+**The durable-defaults guardrail.** "Any deferred-sync mode ships opt-in
+with the risk documented." This is not a deferred sync. Every commit is
+still `Durability::Immediate`, opened by the one helper the
+source-scanning test holds to it; nothing is acknowledged as durable
+before its sync returned, since `Database::flush` and the close wait for
+the commit under way and report its failure; and nothing in the chain
+treats a returning commit as durable, now as before (PARITY.md, *Commit
+that trips a cache flush*). What is deferred is the report of a failure,
+by up to one commit's duration; what an unclean stop can lose grows by
+the commits made while one is under way, which nothing had acknowledged
+either. That is why it is on by default, by the owner's decision, with
+the risk stated in the operating guide and in PARITY.md. It supersedes
+the open question the addendum above ends on: for the layout of 2026-10
+the branch is decided.
+
+**The read snapshot.** With no read transaction open when a durable
+commit lands, redb 4.3.0 frees the pages it replaced at once, in a
+second commit that is not synced and whose pages it keeps in its write
+buffer (`transactions.rs:2207-2288`, `page_manager.rs:1880-1894`); until
+the next durable commit empties that buffer, a read that misses a full
+page cache writes a buffered page out (`cached_file.rs:698-712`), and by
+then the buffer holds the next flush's own pages. A commit made on the
+committing thread never takes that path: the transaction that tripped
+the flush is still open. A commit handed over lands after it has ended,
+so it holds a read snapshot of its own across the commit
+(`Options::commit_snapshot`, on by default). A build of the form on
+`231997b`, in a scratch tree, measured the difference on 2026-10-13: in
+one run without the snapshot it wrote 3,587 MiB before its commits where
+its two runs with it wrote 133 and 89 MiB, and took 471.1 s against
+465.7 s and 460.5 s. The daemon has no switch for it: the variable that
+took it away for that measurement is gone, and the library keeps the
+option for the tests that pin both paths. `Database::flush` and the
+close still commit with no reader open, as they did before; a snapshot
+for them is not done.
+
+The latch's tests are as before, and more: a failed commit on that
+thread latches and the next write, flush and close name its cause
+(`tests/background_commit.rs`), a transaction begun before it is refused
+after it and leaves no block bytes, a commit that waited for it is
+refused with its cause, a real ENOSPC on that thread reaches the latch
+(`tests/enospc.rs`), and the power-cut sweeps of the participant, of the
+exists-address index and of the UTXO cache's flushes run in both modes;
+those of `tests/crash.rs` and of the bucket index run on the committing
+thread only. They have run on Linux only.

@@ -90,13 +90,14 @@ fn node_size(key_len: usize, value: Option<&[u8]>) -> u64 {
     NODE_FIELDS_SIZE + key_len as u64 + value.map_or(0, |v| v.len() as u64)
 }
 
-/// The layers a flush retired, as [`DbCache::finish_flush`] hands them
+/// The layers a flush retired, as [`FlushBatch::into_retired`] hands them
 /// back: no longer published, and freed when the last handle on each is
 /// dropped.
 pub(crate) type RetiredLayers = Vec<Arc<CacheLayer>>;
 
-/// An overlay capture handed to [`DbCache::run_flush`], which persists it
-/// with no lock held.
+/// An overlay capture handed to [`DbCache::sync_blocks`],
+/// [`DbCache::fill`] and [`DbCache::commit`], which persist it with no
+/// lock held.
 ///
 /// It owns `Arc`s on the captured layers, which does two things: the
 /// contents cannot change under the commit (every `Arc::try_unwrap` in
@@ -115,6 +116,108 @@ pub(crate) struct FlushBatch {
     /// The waits for the writer semaphore as of this flush, for the
     /// observer; set by the flush's caller, which holds the semaphore.
     pub(crate) writer_waits: crate::WriterWaits,
+    /// Whether `Database::flush` or `Database::close` asked for this
+    /// flush, rather than a commit's own flush check; set by the flush's
+    /// caller.
+    pub(crate) explicit: bool,
+    /// What the caller spent waiting for the previous flush's commit to
+    /// end before it captured this one; set by the flush's caller.
+    pub(crate) waited: Duration,
+    /// Whether the commit was handed to another thread
+    /// ([`Self::hand_off`]).
+    background: bool,
+    /// The time from the capture to that hand-off; unused for a flush
+    /// whose commit ran on the capturing thread.
+    foreground: Duration,
+    /// What the flush pinned and what the process held around it, for
+    /// the observer ([`crate::FlushMemory`]).  The capture fills in the
+    /// layers, the flush's caller the readings it takes on the way, and
+    /// [`DbCache::retire`] the rest.
+    pub(crate) memory: crate::FlushMemory,
+    /// Whether the commit is made with a read snapshot of the store held
+    /// across it ([`crate::FlushObservation::snapshot`]); set by the
+    /// flush's caller.
+    pub(crate) snapshot: bool,
+    /// A test's probe, run as the batch is dropped.  Fields are dropped
+    /// in the order they are declared, so a batch dropped whole has let
+    /// go of [`Self::layers`] by then; one taken apart by
+    /// [`Self::into_retired`] runs it with those handles still held.
+    #[cfg(test)]
+    pub(crate) on_drop: DropProbe,
+}
+
+/// A closure a test plants for [`FlushBatch::on_drop`].
+#[cfg(test)]
+pub(crate) type BatchProbe = Arc<dyn Fn() + Send + Sync>;
+
+/// Runs its closure, if it has one, when it is dropped.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct DropProbe(pub(crate) Option<BatchProbe>);
+
+#[cfg(test)]
+impl Drop for DropProbe {
+    fn drop(&mut self) {
+        if let Some(probe) = self.0.take() {
+            probe();
+        }
+    }
+}
+
+impl FlushBatch {
+    /// Whether an observer will see this flush: the readings of
+    /// [`crate::FlushMemory`] are taken only for one.
+    pub(crate) fn observed(&self) -> bool {
+        self.observed
+    }
+
+    /// Record that this flush's commit is leaving the capturing thread:
+    /// everything from the capture to here ran on it, with the writer
+    /// semaphore held.
+    pub(crate) fn hand_off(&mut self) {
+        self.background = true;
+        self.foreground = self.started.elapsed();
+    }
+
+    /// Undo [`Self::hand_off`] for a commit that could not leave after
+    /// all, and so runs on the capturing thread like any other.
+    pub(crate) fn take_back(&mut self) {
+        self.background = false;
+        self.foreground = Duration::ZERO;
+    }
+
+    /// The batch's handles on the layers it captured, and nothing else of
+    /// it: what a flush that [`DbCache::retire`] took out of the overlay
+    /// still holds of them, for its caller to drop once that caller holds
+    /// no lock another thread waits on.
+    pub(crate) fn into_retired(self) -> RetiredLayers {
+        self.layers
+    }
+}
+
+/// A flush's write transaction, filled and not yet committed: what
+/// [`DbCache::fill`] hands to [`DbCache::commit`].
+pub(crate) struct CommitJob {
+    tx: redb::WriteTransaction,
+    /// What the flush has measured so far; the commit adds its own phase.
+    outcome: FlushOutcome,
+    /// [`FlushBatch::observed`], for the commit's timer.
+    observed: bool,
+}
+
+/// What [`DbCache::fill`] made of a captured batch.
+#[allow(
+    clippy::large_enum_variant,
+    reason = "one is made per flush and handed straight to its caller; boxing the write \
+              transaction would add an allocation and save nothing"
+)]
+pub(crate) enum Filled {
+    /// Nothing to commit: an empty overlay and no participant work.  The
+    /// block files were still synced.
+    Empty(FlushOutcome),
+    /// A write transaction holding the overlay's rows and the
+    /// participant's, ready for [`DbCache::commit`].
+    Tx(CommitJob),
 }
 
 /// What a completed commit reports back for the observer.
@@ -133,7 +236,7 @@ impl FlushOutcome {
     /// A successful outcome with nothing to report, for tests that drive
     /// retirement without running a real commit.
     #[cfg(test)]
-    fn for_test() -> FlushOutcome {
+    pub(crate) fn for_test() -> FlushOutcome {
         FlushOutcome {
             dirty_entries: 0,
             stats_elapsed: Duration::ZERO,
@@ -214,9 +317,10 @@ fn thread_sched() -> Option<(u64, u64)> {
 }
 
 /// The contents of the `/proc` file at `path`; `None` when it cannot be
-/// read.  The counters above all read through here.
+/// read.  The counters above all read through here, and so do the
+/// readings of the process's memory ([`crate::ProcessMemory`]).
 #[cfg(target_os = "linux")]
-fn read_proc(path: &str) -> Option<Vec<u8>> {
+pub(crate) fn read_proc(path: &str) -> Option<Vec<u8>> {
     #[cfg(test)]
     PROC_READS.with(|reads| reads.set(reads.get().saturating_add(1)));
     std::fs::read(path).ok()
@@ -632,7 +736,7 @@ pub(crate) struct DbCache {
     ///
     /// They stay published for the whole commit, because the durable
     /// store does not hold them yet and a reader must still find them.
-    /// Non-zero only between `begin_flush` and `finish_flush`, and the
+    /// Non-zero only between `begin_flush` and `retire`, and the
     /// barrier [`compact`] honours so their identity survives.
     in_flight_layers: usize,
     /// Retained bytes those layers account for, moved out of
@@ -644,6 +748,13 @@ pub(crate) struct DbCache {
     /// data already being written. Restored to `total_size` if the
     /// commit fails, since the overlay still holds it.
     in_flight_size: u64,
+    /// Whether a flush has been captured and not yet retired.
+    ///
+    /// The two figures above cannot say so: a flush in which only the
+    /// participant has work captures no layer and no byte.  Set by
+    /// `begin_flush` and cleared by `retire`, and what `flush_locked`
+    /// refuses a second capture on.
+    in_flight: bool,
 }
 
 impl DbCache {
@@ -660,6 +771,7 @@ impl DbCache {
             flush_seq: 0,
             in_flight_layers: 0,
             in_flight_size: 0,
+            in_flight: false,
             write_log: None,
         }
     }
@@ -825,10 +937,35 @@ impl DbCache {
         total > self.max_size
     }
 
+    /// Whether a flush has been captured and not yet retired.
+    pub(crate) fn in_flight(&self) -> bool {
+        self.in_flight
+    }
+
+    /// Whether the overlay holds more than its maximum while a flush is
+    /// in flight: the layers that flush captured, which stay published
+    /// until it retires, plus everything committed since.
+    ///
+    /// `needs_flush` cannot bound this.  It gates on the bytes committed
+    /// since the capture alone, so that a flush under way is not asked
+    /// for again, and those can reach its trigger with the captured
+    /// layers still held beside them.  A commit that finds this true
+    /// waits for the flush in flight to retire before it adds more
+    /// (`flush_locked`); it does not flush for this reason alone.
+    pub(crate) fn over_ceiling(&self) -> bool {
+        self.in_flight && self.total_size.saturating_add(self.in_flight_size) > self.max_size
+    }
+
+    /// The counted bytes of everything the overlay has published: what a
+    /// flush in flight captured and what was committed since.
+    pub(crate) fn overlay_bytes(&self) -> u64 {
+        self.total_size.saturating_add(self.in_flight_size)
+    }
+
     /// Capture the overlay for a flush, under the cache lock.
     ///
     /// Always returns a batch, an empty one when there is nothing to
-    /// write: `run_flush` still syncs the block files for it. The captured
+    /// write: `sync_blocks` still syncs the block files for it. The captured
     /// layers STAY PUBLISHED: the durable store does not hold them yet,
     /// so a reader must still be able to find them, and they are retired
     /// only once the commit that persisted them succeeds. That is what
@@ -847,13 +984,21 @@ impl DbCache {
         self.last_flush = Instant::now();
         let layers = self.cached.layers.clone();
         let bytes = self.total_size;
+        let memory = crate::FlushMemory {
+            pinned_layers: layers.len(),
+            pinned_entries: layers
+                .iter()
+                .fold(0usize, |n, layer| n.saturating_add(layer.len())),
+            ..crate::FlushMemory::default()
+        };
         // Move the bytes out of the figure `needs_flush` gates on, so
         // the trigger disarms at handoff rather than staying armed for
         // the whole commit and re-firing on every commit inside it.
         self.total_size = 0;
         self.in_flight_size = bytes;
         self.in_flight_layers = layers.len();
-        // The sequence is assigned in `finish_flush`, so an empty flush --
+        self.in_flight = true;
+        // The sequence is assigned in `retire`, so an empty flush --
         // which syncs block files and commits nothing -- does not consume
         // a number the observer would then appear to skip.
         let take_stats = self.stats_every > 0
@@ -869,19 +1014,22 @@ impl DbCache {
             observed: self.observer.is_some(),
             started: Instant::now(),
             writer_waits: crate::WriterWaits::default(),
+            explicit: false,
+            waited: Duration::ZERO,
+            background: false,
+            foreground: Duration::ZERO,
+            memory,
+            snapshot: false,
+            #[cfg(test)]
+            on_drop: DropProbe::default(),
         }
     }
 
-    /// Persist a captured batch. Runs WITHOUT the cache lock held, so
-    /// readers and the overlay's writers proceed while it works.
-    ///
-    /// With a registered flush participant (ADR-0011), the participant is
-    /// asked `has_work` once, after the block sync.  When it has work, it
-    /// contributes its rows inside this flush's write transaction, after
-    /// the overlay's rows and before the commit, so both land in the one
-    /// durable commit, and the flush commits even an empty overlay.
-    /// `contributed` is set just before `contribute` is called, so the
-    /// caller knows to call `finished` whether or not this then fails.
+    /// Persist a captured batch: [`Self::sync_blocks`], [`Self::fill`]
+    /// and [`Self::commit`] in a row, as `flush_locked` runs them for a
+    /// flush whose commit stays on the capturing thread.  For the tests of
+    /// this module, which drive a flush without a database around it.
+    #[cfg(test)]
     pub(crate) fn run_flush(
         batch: &FlushBatch,
         kv: &redb::Database,
@@ -889,6 +1037,21 @@ impl DbCache {
         participant: Option<&Registration>,
         contributed: &mut bool,
     ) -> Result<FlushOutcome, Error> {
+        let block_sync = Self::sync_blocks(batch, block_store)?;
+        match Self::fill(batch, kv, participant, contributed, block_sync)? {
+            Filled::Empty(outcome) => Ok(outcome),
+            Filled::Tx(job) => Self::commit(job),
+        }
+    }
+
+    /// The first step of persisting a captured batch: sync the block
+    /// files written since the last flush.  Runs WITHOUT the cache lock
+    /// held, as [`Self::fill`] and [`Self::commit`] do, so readers and the
+    /// overlay's writers proceed while a flush works.
+    pub(crate) fn sync_blocks(
+        batch: &FlushBatch,
+        block_store: &std::sync::Mutex<BlockStore>,
+    ) -> Result<crate::FlushPhase, Error> {
         // Block files before metadata, so the metadata never describes
         // bytes that could vanish in a crash.
         //
@@ -908,17 +1071,36 @@ impl DbCache {
             .expect("block store lock poisoned")
             .finish_sync(&synced);
         sync_result?;
-        let block_sync = timer.finish();
+        Ok(timer.finish())
+    }
 
+    /// The second step: open the flush's write transaction and hand it
+    /// every row of the batch, leaving it uncommitted.  `block_sync` is
+    /// what [`Self::sync_blocks`] returned, carried into the outcome.
+    ///
+    /// With a registered flush participant (ADR-0011), the participant is
+    /// asked `has_work` once, after the block sync.  When it has work, it
+    /// contributes its rows inside this flush's write transaction, after
+    /// the overlay's rows and before the commit, so both land in the one
+    /// durable commit, and the flush commits even an empty overlay.
+    /// `contributed` is set just before `contribute` is called, so the
+    /// caller knows to call `finished` whether or not this then fails.
+    pub(crate) fn fill(
+        batch: &FlushBatch,
+        kv: &redb::Database,
+        participant: Option<&Registration>,
+        contributed: &mut bool,
+        block_sync: crate::FlushPhase,
+    ) -> Result<Filled, Error> {
         let view = CacheSnapshot {
             layers: batch.layers.clone(),
         };
         let contributing = participant.filter(|r| r.participant.has_work());
         if view.is_empty() && contributing.is_none() {
-            // Nothing to commit, but the block files above still needed
-            // their sync -- that is the half of a flush that runs even on
-            // an empty overlay.
-            return Ok(FlushOutcome {
+            // Nothing to commit, but the block files still needed their
+            // sync -- that is the half of a flush that runs even on an
+            // empty overlay.
+            return Ok(Filled::Empty(FlushOutcome {
                 dirty_entries: 0,
                 stats_elapsed: Duration::ZERO,
                 sampled: None,
@@ -926,7 +1108,7 @@ impl DbCache {
                 insert: crate::FlushPhase::default(),
                 commit: crate::FlushPhase::default(),
                 participant: None,
-            });
+            }));
         }
         // The participant's prefix, which no overlay row may lie under.
         let guarded = participant.map(|r| &*r.prefix);
@@ -1008,62 +1190,90 @@ impl DbCache {
                 stats_elapsed = stats_started.elapsed();
             }
         }
-        let timer = PhaseTimer::start(batch.observed);
-        tx.commit().map_err(crate::storage_error)?;
-        let commit = timer.finish();
-        Ok(FlushOutcome {
-            dirty_entries,
-            stats_elapsed,
-            sampled,
-            block_sync,
-            insert,
-            commit,
-            participant: participant_stats,
-        })
+        Ok(Filled::Tx(CommitJob {
+            tx,
+            outcome: FlushOutcome {
+                dirty_entries,
+                stats_elapsed,
+                sampled,
+                block_sync,
+                insert,
+                commit: crate::FlushPhase::default(),
+                participant: participant_stats,
+            },
+            observed: batch.observed,
+        }))
     }
 
-    /// Retire a batch under the cache lock once its commit has landed,
-    /// or put its bytes back when it failed.
+    /// The last step: redb's durable commit of the transaction
+    /// [`Self::fill`] left, timed on the thread that makes it.
+    pub(crate) fn commit(job: CommitJob) -> Result<FlushOutcome, Error> {
+        let CommitJob {
+            tx,
+            mut outcome,
+            observed,
+        } = job;
+        let timer = PhaseTimer::start(observed);
+        tx.commit().map_err(crate::storage_error)?;
+        outcome.commit = timer.finish();
+        Ok(outcome)
+    }
+
+    /// Retire a batch under the cache lock once its commit has landed
+    /// (`Some`), or put its bytes back when the flush failed (`None`).
     ///
-    /// Returns the batch's handles on the layers it retired, and none when
-    /// the commit failed.  Once the snapshots taken before the flush are
-    /// gone these are the last handles, and dropping them frees every row
-    /// the flush wrote.  That is left to the caller, to do after it has
-    /// let this lock go, so that no reader waits here for the frees.
-    #[allow(
-        clippy::arithmetic_side_effects,
-        reason = "the only site is the debug_assert's layers.len() - pinned, which its && \
-                  evaluates only once layers.len() >= pinned"
-    )]
-    pub(crate) fn finish_flush(
+    /// The batch is borrowed, so the captured layers are freed after this
+    /// lock is released, and not under it: by whoever drops the batch, or
+    /// the handles taken out of it ([`FlushBatch::into_retired`]).  Once
+    /// the snapshots taken before the flush are gone those are the last
+    /// handles, and dropping them frees every row the flush wrote.
+    ///
+    /// A retirement checks that the pinned tail is still the layers the
+    /// batch captured, which [`compact`]'s barrier guarantees.  Were it
+    /// not, truncating the tail would drop rows no commit holds, so
+    /// nothing is truncated: the accounting goes back as for a failed
+    /// flush and the error is returned for the caller to latch the store
+    /// with.  Putting the bytes back cannot fail.
+    pub(crate) fn retire(
         &mut self,
-        batch: FlushBatch,
+        batch: &FlushBatch,
         outcome: Option<FlushOutcome>,
-    ) -> RetiredLayers {
+    ) -> Result<(), Error> {
         let pinned = self.in_flight_layers;
         self.in_flight_layers = 0;
         let bytes = self.in_flight_size;
         self.in_flight_size = 0;
+        self.in_flight = false;
+        // What the overlay held with the captured layers still in it.
+        let overlay_at_retirement = self.total_size.saturating_add(bytes);
+        let layers_at_retirement = self.cached.layers.len();
 
         let Some(outcome) = outcome else {
             // The commit failed: the overlay still holds every captured
             // byte, so the accounting has to go back or the cache grows
             // without ever tripping its own ceiling again.
             self.total_size = self.total_size.saturating_add(bytes);
-            return RetiredLayers::new();
+            return Ok(());
         };
 
         let mut layers = self.cached.layers.clone();
-        debug_assert!(
-            layers.len() >= pinned
-                && layers[layers.len() - pinned..]
+        let kept = layers.len().checked_sub(pinned);
+        let intact = pinned == batch.layers.len()
+            && kept.is_some_and(|kept| {
+                layers[kept..]
                     .iter()
                     .zip(batch.layers.iter())
-                    .all(|(a, b)| Arc::ptr_eq(a, b)),
-            "the pinned tail is no longer the layers this flush captured; \
-             `compact`'s barrier is the thing that guarantees it"
-        );
-        layers.truncate(layers.len().saturating_sub(pinned));
+                    .all(|(a, b)| Arc::ptr_eq(a, b))
+            });
+        let Some(kept) = kept.filter(|_| intact) else {
+            self.total_size = self.total_size.saturating_add(bytes);
+            return Err(db_error(
+                ErrorKind::DriverSpecific,
+                "the metadata overlay's pinned layers are no longer the ones the flush captured; \
+                 refusing to retire them",
+            ));
+        };
+        layers.truncate(kept);
         self.publish(layers);
 
         // A flush that committed takes a sequence number, including one in
@@ -1071,15 +1281,31 @@ impl DbCache {
         // participant drives on its own (an index catch-up, `wants_flush`)
         // would be invisible to the observer.
         if outcome.dirty_entries == 0 && outcome.participant.is_none() {
-            return batch.layers;
+            return Ok(());
         }
         self.flush_seq = self.flush_seq.saturating_add(1);
         if let Some(observer) = &self.observer {
+            let elapsed = batch.started.elapsed();
+            // The stack published above no longer names the captured
+            // layers, so a count above one is a snapshot some transaction
+            // still holds: that transaction's thread frees the layer, and
+            // the flush's own reference goes first.  A flush whose commit
+            // ran on the capturing thread hands that reference to its
+            // caller, which may then be the one to free the layer: a
+            // commit and `Database::flush` let it go once they have
+            // released the writer semaphore, and `Database::close` where
+            // it flushed, under the semaphore.
+            let shared = || {
+                batch
+                    .layers
+                    .iter()
+                    .filter(|layer| Arc::strong_count(layer) > 1)
+            };
             observer(&crate::FlushObservation {
                 sequence: self.flush_seq,
                 dirty_entries: outcome.dirty_entries,
                 dirty_bytes: batch.bytes,
-                elapsed: batch.started.elapsed(),
+                elapsed,
                 stats_elapsed: outcome.stats_elapsed,
                 block_sync: outcome.block_sync,
                 insert: outcome.insert,
@@ -1087,9 +1313,70 @@ impl DbCache {
                 stats: outcome.sampled,
                 participant: outcome.participant,
                 writer_waits: batch.writer_waits,
+                explicit: batch.explicit,
+                background: batch.background,
+                foreground: if batch.background {
+                    batch.foreground
+                } else {
+                    elapsed
+                },
+                waited: batch.waited,
+                snapshot: batch.snapshot,
+                memory: crate::FlushMemory {
+                    overlay_at_retirement,
+                    layers_at_retirement,
+                    shared_layers: shared().count(),
+                    shared_entries: shared().fold(0usize, |n, layer| n.saturating_add(layer.len())),
+                    ..batch.memory
+                },
             });
         }
-        batch.layers
+        Ok(())
+    }
+
+    /// Weak handles on the layers published now, newest first, for the
+    /// tests outside this module that follow a layer to its free.
+    #[cfg(test)]
+    pub(crate) fn published_layers_for_test(&self) -> Vec<std::sync::Weak<CacheLayer>> {
+        self.cached.layers.iter().map(Arc::downgrade).collect()
+    }
+
+    /// Replace every published layer by a copy of itself: the same rows
+    /// in layers of another identity, which is what a merge across the
+    /// pin would leave.  For the tests of a retirement that finds its
+    /// layers changed.
+    #[cfg(test)]
+    pub(crate) fn reidentify_layers_for_test(&mut self) {
+        let layers = self
+            .cached
+            .layers
+            .iter()
+            .map(|layer| Arc::new((**layer).clone()))
+            .collect();
+        self.publish(layers);
+    }
+
+    /// [`Self::retire`] with the batch taken by value, for the tests of
+    /// this module, none of which changes the pinned tail under a flush.
+    /// It hands back the batch's handles on the layers it retired, and
+    /// none when the commit failed, as `finish` in the crate root does
+    /// for a flush whose commit ran on the capturing thread; it is a copy
+    /// of that rule and not `finish`, which the tests that drive
+    /// `flush_locked` pin.
+    #[cfg(test)]
+    pub(crate) fn finish_flush(
+        &mut self,
+        batch: FlushBatch,
+        outcome: Option<FlushOutcome>,
+    ) -> RetiredLayers {
+        let committed = outcome.is_some();
+        self.retire(&batch, outcome)
+            .expect("the pinned tail is the layers this flush captured");
+        if committed {
+            batch.into_retired()
+        } else {
+            RetiredLayers::new()
+        }
     }
 }
 
@@ -1685,10 +1972,17 @@ mod tests {
     /// and, on Linux, the storage I/O the flushing thread did in each and
     /// the processor time it used.  A single `elapsed` over all three
     /// cannot say which phase a stall inside a flush window was in.
+    ///
+    /// It is told as well who asked for the flush, which thread made its
+    /// commit, and what the flushing thread spent in it and waiting
+    /// before it.
     #[test]
     fn a_flush_observation_splits_the_flush_into_its_phases() {
         let dir = TempDir::new().expect("tempdir");
         let mut opts = Options::new(dir.path().join("db"), NET);
+        // Any row is over this ceiling, for the commit-path flush at the
+        // end.
+        opts.cache_max_size = 1;
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
         let sink = Arc::clone(&seen);
         opts.flush_observer = Some(Arc::new(move |obs: &crate::FlushObservation| {
@@ -1705,6 +1999,7 @@ mod tests {
         }
         db.flush().expect("flush");
 
+        let observations = Arc::clone(&seen);
         let seen = seen.lock().expect("observations");
         let obs = seen.last().expect("the flush was observed");
         let phases =
@@ -1750,6 +2045,105 @@ mod tests {
             assert_eq!(phase.stime_ms.unwrap_or(0) % 10, 0, "whole ticks");
         }
         assert!(obs.commit.to_json().starts_with("{\"ms\":"));
+        // `Database::flush` asked for it and its commit ran on the
+        // flushing thread, which spent the whole flush in it and waited
+        // for no earlier commit first.
+        assert!(obs.explicit, "an asked-for flush says so");
+        assert!(!obs.background);
+        assert_eq!(obs.foreground, obs.elapsed);
+        assert_eq!(obs.waited, Duration::ZERO);
+        // What it pinned: the one layer the commit above wrote, whose
+        // every entry it wrote out.  Nothing was committed while it ran,
+        // and no transaction was open to hold the layer past it.
+        let memory = obs.memory;
+        assert!(!obs.snapshot, "a commit made here is given no snapshot");
+        assert_eq!(memory.pinned_layers, 1);
+        assert_eq!(memory.pinned_entries, obs.dirty_entries);
+        assert_eq!(memory.overlay_at_hand_off, obs.dirty_bytes);
+        assert_eq!(memory.overlay_at_retirement, obs.dirty_bytes);
+        assert_eq!(memory.layers_at_retirement, 1);
+        assert_eq!((memory.shared_layers, memory.shared_entries), (0, 0));
+        assert_eq!(
+            (
+                memory.process_after_previous_finished,
+                memory.process_after_previous
+            ),
+            (None, None),
+            "no flush ended before the first"
+        );
+        #[cfg(target_os = "linux")]
+        {
+            let at_capture = memory.process_at_capture.expect("read at the capture");
+            let at_hand_off = memory.process_at_hand_off.expect("read before the commit");
+            let at_commit = memory.process_at_commit.expect("read after the commit");
+            assert!(at_capture.resident > 0 && at_capture.threads > 0);
+            assert!(
+                at_capture.arenas.is_some() && at_commit.arenas.is_some(),
+                "the heap's mappings are listed at the capture and after the commit"
+            );
+            assert_eq!(at_hand_off.arenas, None, "and not in between");
+            assert!(at_commit.peak_resident >= at_capture.peak_resident);
+        }
+        let flushes = seen.len();
+        drop(seen);
+
+        // A flush a commit's own check trips is not explicit.  The check
+        // comes before the commit's rows are published, so the second of
+        // two commits is the one that finds the overlay over its ceiling.
+        for key in [b"one", b"two"] {
+            let tx = db.begin(true).expect("begin write");
+            tx.metadata()
+                .bucket(b"cache")
+                .expect("bucket")
+                .put(key, b"value")
+                .expect("put");
+            tx.commit().expect("commit");
+        }
+        let seen = observations.lock().expect("observations");
+        assert_eq!(seen.len(), flushes + 1, "the second commit flushed");
+        let obs = seen.last().expect("the flush was observed");
+        assert!(!obs.explicit, "a commit's own flush is not asked for");
+        assert!(!obs.background);
+        assert_eq!(obs.foreground, obs.elapsed);
+        assert_eq!(obs.waited, Duration::ZERO);
+        // The commit that tripped it is still open, with the snapshot it
+        // began with: that transaction, not the flush, frees the layer.
+        let memory = obs.memory;
+        assert_eq!(memory.pinned_layers, 1);
+        assert_eq!(
+            (memory.shared_layers, memory.shared_entries),
+            (1, memory.pinned_entries),
+            "the open transaction still names the captured layer"
+        );
+        assert_eq!(memory.overlay_at_retirement, obs.dirty_bytes);
+        #[cfg(target_os = "linux")]
+        assert!(
+            memory.process_after_previous_finished.is_some()
+                && memory.process_after_previous.is_some(),
+            "the flush before this one left its readings"
+        );
+        assert!(
+            memory.previous_finished <= memory.previous_release,
+            "the participant is told before the layers are freed: {memory:?}"
+        );
+    }
+
+    /// With no observer nothing of the process is read: the readings are
+    /// taken for an observation and for nothing else.
+    #[test]
+    fn an_unobserved_flush_reads_nothing_of_the_process() {
+        let mut cache = DbCache::new();
+        let mut puts = BTreeMap::new();
+        puts.insert(b"key".to_vec(), b"value".to_vec());
+        cache.commit_pending(puts, std::iter::empty());
+        let batch = cache.begin_flush();
+        assert!(!batch.observed());
+        assert_eq!(batch.memory.pinned_layers, 1);
+        assert_eq!(batch.memory.pinned_entries, 1);
+        assert_eq!(batch.memory.process_at_capture, None);
+        assert_eq!(cache.overlay_bytes(), batch.bytes);
+        cache.finish_flush(batch, Some(super::FlushOutcome::for_test()));
+        assert_eq!(cache.overlay_bytes(), 0);
     }
 
     /// A phase renders as one JSON object: the three fields it always
@@ -1913,10 +2307,46 @@ mod tests {
             .sum()
     }
 
+    /// The `/proc` reads an observed flush makes of the process's memory
+    /// ([`crate::FlushMemory`]) when its commit runs on the thread that
+    /// captured it: `/proc/self/status` at the capture, at the hand-off,
+    /// after the commit, once the participant has been told and at the
+    /// end, and `/proc/self/maps` beside the first and the third.  None
+    /// off Linux.
+    fn reads_of_the_process_in_an_observed_flush() -> u64 {
+        if cfg!(target_os = "linux") { 5 + 2 } else { 0 }
+    }
+
+    /// Commit two rows over an overlay ceiling that any row is over, so
+    /// that the second commit's own flush check trips a flush: the first
+    /// commit's row is published after its check.  The flush has
+    /// committed when this returns, as every flush of a store without
+    /// background commits has by the time its commit returns.
+    fn trip_a_commits_flush(db: &Database) {
+        let flushed = || db.inner.cache.lock().expect("cache").flush_seq;
+        let before = flushed();
+        db.inner
+            .cache
+            .lock()
+            .expect("cache")
+            .set_limits(1, DEFAULT_FLUSH_SECS);
+        commit_one(db, b"tripping-1", b"value");
+        commit_one(db, b"tripping-2", b"value");
+        assert_eq!(
+            flushed(),
+            before.saturating_add(1),
+            "the second commit flushed"
+        );
+    }
+
     /// With no observer nothing is read from `/proc`, by a phase's timer
-    /// or by a whole flush, and a phase has its wall time and no counter;
-    /// with one, each counter file is read once at either end of a phase.
-    /// A flush runs on the thread that calls it, which is this one.
+    /// or by a whole flush, whether `Database::flush` asked for it or a
+    /// commit's own check tripped it, and a phase has its wall time and
+    /// no counter.  With one, each counter file is read once at either
+    /// end of a phase, and the process's memory is read around the flush
+    /// ([`reads_of_the_process_in_an_observed_flush`]).  A flush runs on
+    /// the thread that calls it, which is this one: the stores are opened
+    /// without background commits.
     #[test]
     fn the_counters_are_read_only_for_an_observer() {
         use super::PhaseTimer;
@@ -1941,6 +2371,12 @@ mod tests {
         commit_one(&db, b"key", b"value");
         db.flush().expect("flush");
         assert_eq!(proc_reads(), before, "an unobserved flush read /proc");
+        trip_a_commits_flush(&db);
+        assert_eq!(
+            proc_reads(),
+            before,
+            "an unobserved flush a commit tripped read /proc"
+        );
         drop(db);
 
         // Observed: one phase, then a flush of three.
@@ -1973,6 +2409,7 @@ mod tests {
             tx.metadata().create_bucket(b"cache").expect("create");
             tx.commit().expect("commit");
         }
+        let per_flush = 3 * per_phase + reads_of_the_process_in_an_observed_flush();
         let before = proc_reads();
         let flushed = flushes.load(std::sync::atomic::Ordering::SeqCst);
         db.flush().expect("flush");
@@ -1983,9 +2420,19 @@ mod tests {
         );
         assert_eq!(
             proc_reads() - before,
-            3 * per_phase,
-            "the block sync, the insert loop and the commit"
+            per_flush,
+            "the block sync, the insert loop, the commit and the process"
         );
+
+        // A flush a commit's own check tripped reads as much.
+        let before = proc_reads();
+        trip_a_commits_flush(&db);
+        assert_eq!(
+            flushes.load(std::sync::atomic::Ordering::SeqCst),
+            flushed + 2,
+            "the commit's flush was observed"
+        );
+        assert_eq!(proc_reads() - before, per_flush);
     }
 
     /// A flush participant that writes one row under its prefix in every
@@ -2046,7 +2493,8 @@ mod tests {
     /// The participant's part of a flush is a fourth phase, counted as
     /// the other three are.  With no observer a flush the participant
     /// writes in reads nothing from `/proc`; with one, that phase has the
-    /// counters of a phase and the flush makes four phases' reads.
+    /// counters of a phase and the flush makes four phases' reads, beside
+    /// its readings of the process's memory.
     #[test]
     fn the_participants_phase_is_counted_only_for_an_observer() {
         let contributed = |journal: &OneRow| {
@@ -2082,8 +2530,8 @@ mod tests {
         assert_eq!(contributed(&journal), 1, "the participant wrote");
         assert_eq!(
             proc_reads() - before,
-            4 * reads_of_an_observed_phase(),
-            "the block sync, the insert loop, the participant and the commit"
+            4 * reads_of_an_observed_phase() + reads_of_the_process_in_an_observed_flush(),
+            "the block sync, the insert loop, the participant, the commit and the process"
         );
         let obs = {
             let seen = seen.lock().expect("observations");
@@ -2332,6 +2780,14 @@ mod tests {
     /// when it releases its own, and they are gone once either has
     /// returned.  So the next writer does not wait for the frees.
     ///
+    /// That is every flush of a store opened without background commits,
+    /// as this one is, and every flush `Database::flush` asks for, but
+    /// the flush of `Database::close`, which drops the layers where it
+    /// flushed, under the semaphore: no transaction begins behind a
+    /// close.  A flush whose commit is handed to a thread of its own is
+    /// retired by that thread, which holds no semaphore and lets go of
+    /// the layers itself; `flush_locked` hands back none of them.
+    ///
     /// The count at each release is read by the probe the release runs
     /// on this thread, [`crate::RELEASE_HOOK`].
     #[test]
@@ -2568,52 +3024,147 @@ mod flush_barrier_tests {
         );
     }
 
-    /// A flush that committed hands back its handles on the layers it
-    /// retired, alive, rather than freeing them under the cache lock.
-    /// They are the last handles unless a reader that began before the
-    /// flush still holds its snapshot, and then that reader goes on
-    /// reading the layers after the handles are dropped.  A failed flush
-    /// retired nothing and hands nothing back.
+    /// A store over storage whose power a test can cut, with a bucket
+    /// `rows` holding two rows in the overlay, in one layer; and a weak
+    /// handle on that layer.
+    fn store_with_a_layer() -> (
+        tempfile::TempDir,
+        Arc<dcroxide_testutil::powerloss::PowerLossBackend>,
+        crate::Database,
+        std::sync::Weak<super::CacheLayer>,
+    ) {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let db_dir = dir.path().join("db");
+        std::fs::create_dir_all(&db_dir).expect("mkdir");
+        let power = dcroxide_testutil::powerloss::PowerLossBackend::create(
+            &db_dir.join(crate::METADATA_FILE),
+            true,
+        );
+        let mut opts = crate::Options::new(&db_dir, 0x1214_1c16);
+        opts.backend = Some(Arc::clone(&power) as crate::SharedBackend);
+        let db = crate::Database::create(&opts).expect("create");
+        db.update(|tx| {
+            let rows = tx.metadata().create_bucket(b"rows")?;
+            rows.put(b"a", b"1")?;
+            rows.put(b"b", b"2")
+        })
+        .expect("the rows");
+        let layers = db
+            .inner
+            .cache
+            .lock()
+            .expect("cache")
+            .published_layers_for_test();
+        assert_eq!(layers.len(), 1, "one layer");
+        let layer = layers[0].clone();
+        (dir, power, db, layer)
+    }
+
+    /// A flush that committed on the thread that captured it hands back
+    /// its handles on the layers it retired, alive, rather than freeing
+    /// them under the cache lock: `flush_locked` returns them to its
+    /// caller.  They are the last handles unless a reader that began
+    /// before the flush still holds its snapshot, and then that reader
+    /// goes on reading the layers after the handles are dropped.  A
+    /// flush whose commit failed retired nothing: `flush_locked` returns
+    /// the error, and the layer is still published, held by the overlay
+    /// alone.
     #[test]
     fn a_flush_hands_back_the_layers_it_retired_alive() {
-        // An outcome that takes a sequence number, and one that does not.
-        let counted = || FlushOutcome {
-            dirty_entries: 2,
-            ..FlushOutcome::for_test()
+        let published = |db: &crate::Database| {
+            db.inner
+                .cache
+                .lock()
+                .expect("cache")
+                .published_layers_for_test()
         };
-        for (outcome, held_by_a_reader) in [
-            (FlushOutcome::for_test(), false),
-            (counted(), false),
-            (counted(), true),
-        ] {
-            let mut cache = DbCache::new();
-            put(&mut cache, &["a", "b"]);
-            let layer = Arc::downgrade(&cache.cached.layers[0]);
-
-            let batch = cache.begin_flush();
-            let retired = cache.finish_flush(batch, None);
-            assert!(retired.is_empty(), "a failed flush retired a layer");
-            assert_eq!(cache.cached.layers.len(), 1);
-            assert_eq!(layer.strong_count(), 1);
-
-            let reader = held_by_a_reader.then(|| Arc::clone(&cache.cached));
-            let batch = cache.begin_flush();
-            let retired = cache.finish_flush(batch, Some(outcome));
-            assert!(cache.cached.layers.is_empty(), "still published");
+        for held_by_a_reader in [false, true] {
+            let (_dir, _power, db, layer) = store_with_a_layer();
+            let reader = held_by_a_reader.then(|| db.begin(false).expect("begin a reader"));
+            let writer = db.exclusive_writer();
+            let retired = crate::flush_locked(&db.inner, false).expect("flush");
+            drop(writer);
+            assert!(published(&db).is_empty(), "still published");
             assert_eq!(retired.len(), 1);
+            assert!(std::ptr::eq(retired[0].as_ref(), layer.as_ptr()));
             let readers = usize::from(held_by_a_reader);
             assert_eq!(
                 layer.strong_count(),
                 1 + readers,
                 "the layer was freed, or is held, where it should not be"
             );
-            assert!(std::ptr::eq(retired[0].as_ref(), layer.as_ptr()));
             drop(retired);
             assert_eq!(layer.strong_count(), readers);
             if let Some(reader) = reader {
-                assert!(reader.get(b"a").is_some() && reader.get(b"b").is_some());
+                let rows = reader.metadata().bucket(b"rows").expect("bucket");
+                assert!(rows.get(b"a").is_some() && rows.get(b"b").is_some());
+                reader.rollback().expect("end the reader");
             }
         }
+
+        let (_dir, power, db, layer) = store_with_a_layer();
+        power.power_fails_after(0);
+        let writer = db.exclusive_writer();
+        let failed = crate::flush_locked(&db.inner, false);
+        drop(writer);
+        assert!(failed.is_err() && power.power_failed(), "the commit failed");
+        let still = published(&db);
+        assert_eq!(still.len(), 1);
+        assert!(std::ptr::eq(still[0].as_ptr(), layer.as_ptr()));
+        assert_eq!(layer.strong_count(), 1, "held by the overlay alone");
+    }
+
+    /// A retirement checks that the pinned tail is still the layers the
+    /// batch captured.  Over a tail of another identity, or of another
+    /// length, it truncates nothing, puts the captured bytes back as a
+    /// failed flush does, and returns the error its caller latches the
+    /// store with: the tail may hold rows no commit has.
+    #[test]
+    fn a_retirement_refuses_a_pinned_tail_it_did_not_capture() {
+        let filled = || {
+            let mut cache = DbCache::new();
+            let mut puts = BTreeMap::new();
+            puts.insert(b"key".to_vec(), b"value".to_vec());
+            cache.commit_pending(puts, std::iter::empty());
+            cache
+        };
+
+        // The same rows in a layer that is not the captured one.
+        let mut cache = filled();
+        let held = cache.total_size;
+        let batch = cache.begin_flush();
+        cache.reidentify_layers_for_test();
+        let err = cache
+            .retire(&batch, Some(super::FlushOutcome::for_test()))
+            .expect_err("the tail is not the captured layer");
+        assert!(
+            err.description
+                .contains("no longer the ones the flush captured"),
+            "{err}"
+        );
+        assert_eq!(cache.cached.layers.len(), 1, "nothing was truncated");
+        assert_eq!(cache.cached.get(b"key"), Some(&Some(b"value".to_vec())));
+        assert_eq!(cache.total_size, held, "the bytes went back");
+        assert!(!cache.in_flight() && cache.in_flight_layers == 0);
+
+        // A pin that no longer counts the captured layers.
+        let mut cache = filled();
+        let batch = cache.begin_flush();
+        cache.in_flight_layers = 0;
+        cache
+            .retire(&batch, Some(super::FlushOutcome::for_test()))
+            .expect_err("the pin does not cover what was captured");
+        assert_eq!(cache.cached.layers.len(), 1, "nothing was truncated");
+        assert_eq!(cache.total_size, held);
+
+        // More pinned than the overlay holds.
+        let mut cache = filled();
+        let batch = cache.begin_flush();
+        cache.publish(Vec::new());
+        cache
+            .retire(&batch, Some(super::FlushOutcome::for_test()))
+            .expect_err("the pinned layers are gone");
+        assert_eq!(cache.total_size, held);
     }
 
     /// A failed commit puts the bytes back, or the overlay grows without

@@ -36,8 +36,22 @@ panic.
 
 A storage failure now stops the node rather than being retried. If a
 durable write to the metadata store fails — a full disk, an I/O error — the
-store refuses every later write, so the node makes no further progress until
-it is restarted. Reads keep working, so RPC still answers. This trades
+store refuses every write from the moment it has recorded the failure,
+so the node makes no further progress until it is restarted. Reads of
+what is still in memory keep working, so RPC still answers what they
+cover; from the failed write on, a read that needs a page of the
+metadata file that is not cached fails. Most of a sync's commits to the
+metadata store run on a thread of their own (`dbcommit`; the flush log
+below), so such a failure is logged under BCDB as `Background commit of
+the metadata write cache failed: ...` when it happens, and the refusal,
+with the same cause, comes at the next write, flush or close. In a sync
+the node often stops sooner, and harder: the next block with an input
+that is not in the UTXO cache reads the UTXO set, that read fails, and
+the process aborts with a panic that reads `corrupt utxo backend entry`
+or `utxo backend read` and names `Previous I/O error occurred`, just
+before or just after that BCDB line. Despite its wording it is the same
+storage failure, not damage to the store, and an unclean stop like any
+other. This trades
 availability for integrity deliberately: the alternative is retrying a write
 whose failure may have left the store in a state that a restart silently
 rolls back, which is worse for a consensus daemon than stopping. Two things
@@ -85,7 +99,9 @@ nothing commits, and what is waiting stays in memory until the next
 block or a clean shutdown: the loss is bounded in work, not in time. So
 a kill or a power cut in that phase loses about two minutes of
 processing at most, where it lost one fill of the UTXO cache, and the
-node downloads and connects those blocks again.
+node downloads and connects those blocks again. With the commit on a
+thread of its own it can also lose what was committed while the commit
+under way ran, which nothing had acknowledged as durable either.
 Nothing is corrupted: what is on disk is always a state the chain was
 in. Once the chain is current every block is flushed to disk as it
 connects, as before, and a clean shutdown loses nothing in either phase.
@@ -831,9 +847,13 @@ The choice is not permanent, but changing it costs time:
 
 ## Storage tuning: four knobs, and what each has measured
 
-Four settings change how the metadata store behaves. Three are measured and
-one is not; the numbers are in [bench-ledger.md](bench-ledger.md) and the
-reasoning in [ADR-0004](adr/0004-storage-backend.md).
+Four settings tune the metadata store: how much it caches and how often
+it commits. Three are measured and one is not; the numbers are in
+[bench-ledger.md](bench-ledger.md) and the reasoning in
+[ADR-0004](adr/0004-storage-backend.md). A fifth,
+`DCROXIDE_DB_SYNC_COMMIT`, sets which thread makes its commits rather
+than how often, and is described with the environment variables
+below.
 
 **Since 2026-10-11 a sync commits less often, and the overlay's default
 ceiling is 300 MiB.** Until then every UTXO cache flush forced a durable
@@ -1045,6 +1065,7 @@ configuration, every name changes.
 | metadata overlay flush size | `DCROXIDE_DB_OVERLAY` (MiB, default 300) | — |
 | metadata overlay flush interval | `DCROXIDE_DB_FLUSH_SECS` (s, default 300) | — |
 | metadata flush log (JSONL path) | `DCROXIDE_DB_FLUSHLOG` (unset = off) | — |
+| metadata commit on the committing thread | `DCROXIDE_DB_SYNC_COMMIT` (unset, or not valid Unicode, = on a thread of its own; a positive whole number = on the committing thread, as dcrd; anything else warns and keeps the default) | — |
 | exists-address memtable target (developer-only) | `DCROXIDE_EXISTSADDR_MEMTABLE_KEYS` (keys, default 2,000,000) | — |
 | block download window | `DCROXIDE_BLOCK_WINDOW` (`dcrd`, or a whole number of blocks from 16 to 505; default this port's own window, at most 128 blocks and 3,145,728 bytes) | — |
 | block read-ahead | `DCROXIDE_READ_AHEAD` (unset = on; `off` or `0` = off; anything else warns and stays on) | — |
@@ -1054,17 +1075,23 @@ defaults to `<home>/data` with the network appended, so on Linux the
 blocks are in `~/.dcroxide/data/mainnet` while `dcroxide.conf`,
 `rpc.cert` and `rpc.key` sit in `~/.dcroxide` itself.
 
-Those nine are the only `DCROXIDE_*` variables read; only the first
-two have dcrd counterparts, since the page cache, the overlay and the
-flush log are properties of redb, which dcrd does not use, the
+Those ten are the only `DCROXIDE_*` variables read; only the first
+two have dcrd counterparts, since the page cache, the overlay, the
+flush log and the thread a commit runs on are properties of this
+port's metadata store over redb, which dcrd does not use (dcrd
+commits on the thread that holds its write lock, as
+`DCROXIDE_DB_SYNC_COMMIT` does; [PARITY.md](../PARITY.md), *Where a
+cache flush's commit runs*), the
 memtable is a property of this port's exists-address layout, the
 download window is this port's own rule for requesting blocks
 ([PARITY.md](../PARITY.md), *Block download window*), and the
 read-ahead is a thread dcrd does not have (*Reading ahead of the block
-handler*). Of the four
+handler*). Of the five
 storage variables, `DCROXIDE_DB_CACHE` is the one to leave unset, the
-next two are untuned instruments — see the storage tuning above — and
-`DCROXIDE_DB_FLUSHLOG` is diagnostic: it appends one JSON object per
+next two are untuned instruments (see the storage tuning above),
+`DCROXIDE_DB_SYNC_COMMIT` is the way back to dcrd's place for a
+metadata commit (below), and `DCROXIDE_DB_FLUSHLOG` is diagnostic: it
+appends one JSON object per
 metadata flush (sequence, end instant, duration, entries, bytes), which
 is how the 90–98% attribution above was measured, and also, for each of
 the flush's three phases (block-file sync, insert loop, commit), its time
@@ -1086,13 +1113,52 @@ tick or a context switch, so a figure can be off by a tick at either
 end of a phase, and a phase of a millisecond or two can show more
 processor time than its `ms`: sums over a sync mean something, single
 short phases do not. No field the lines had changed its name, place or
-format. Each line's `participant` is what the exists-address index wrote
+format. Since 2026-10-17 eight more keys follow `commit`, before
+`participant`: `explicit`, whether the flush was asked for
+(`Database::flush` or the close) rather than tripped by a commit; `bg`,
+whether its commit ran on the thread `dbcommit`; `fg_ms`, the part of
+`elapsed_ms` the capturing thread spent holding the database's writer,
+all of it unless `bg` and then the capture to the hand-off; `wait_ms`,
+the time spent since the flush before was captured, outside
+`elapsed_ms`, waiting with the writer held for an earlier flush's commit
+to end: the capturing thread's wait before its capture, and any other
+thread's, such as a commit's at the write cache's ceiling, which counts
+against the next capture whichever thread makes it; `snap`, whether the
+commit held a read snapshot of the store, which a flush takes only for a
+commit it hands to `dbcommit`, so in the daemon it is `bg` but on the
+rare line of a flush whose thread the operating system refused (`snap`
+true, `bg` false) or for which no snapshot could be had (`bg` true,
+`snap` false); `layers` and `overlay`, what the flush pinned in the
+write cache; and `mem`, the process's resident memory, its peak, its
+anonymous part and its thread count at the capture (`capture`), the
+hand-off (`handoff`), when the commit returned (`commit`) and twice at
+the end of the flush before (`prev_finished`, once the index was told,
+and `prev_end`), with `prev_finished_ms` and `prev_release_ms`, the
+times from that flush's retirement to each. The readings at the capture
+and when the commit returned add `arena_maps`, `arena_bytes` and
+`brk_bytes`, the count and span of the anonymous mappings that start on
+the 64 MiB boundary where glibc's allocator places a thread arena's
+heaps, and the program break: a heuristic for glibc, which says nothing
+of what an allocator holds free, and meaningless under another. Every
+reading is `null` off Linux. `elapsed_ms` on a `bg` line runs from the
+capture to the retirement of what was captured, on `dbcommit`, and
+`fg_ms` plus `wait_ms` is what the flush, with the waits counted against
+it, kept every other writer out for, so sums of it by thread divide that
+time only roughly. A flush that committed on its capturing thread frees
+the layers it retired once that thread has released the writer, after
+its own line's readings, so the next line's `prev_end` and
+`prev_release_ms` do not hold those frees; after a `bg` line they do.
+Each line's `participant` is what the exists-address index wrote
 inside that flush -- its rows, reads, journaled keys, merges, base
 rewrites and memtable size, with its own time, I/O and processor time
 as a fourth phase -- or `null` when it had nothing to write. Since
 2026-10-12 each line ends with two more fields. `thread` is the name of
-the thread that ran the flush, which held the database's writer for
-the flush's `elapsed_ms`, or `null` for a thread without a name. In a
+the thread that ended the flush, or `null` for a thread without a
+name: the thread that ran it, which held the database's writer for its
+`elapsed_ms`, or on a `bg` line `dbcommit`, which never holds the
+writer. On a `bg` line `commit`'s processor time and I/O are
+`dbcommit`'s, and those of `sync`, `insert` and the participant's
+phase are the capturing thread's, which the line does not name. In a
 sync from an outbound peer, as in the syncs measured that day, the
 lines read
 `peer-outbound`, the thread that connects the sync peer's blocks
@@ -1116,16 +1182,27 @@ calls that write and the shutdown are counted with it. The lines whose
 their `elapsed_ms` is the most the thread that connects blocks can have
 waited behind those flushes, and the rest of `other` was waited behind
 the index thread's transactions for each block, or behind another
-thread that is not the index thread. `dcroxide-bench`'s own
+thread that is not the index thread. That holds only where every
+flush committed where it was captured, as with
+`DCROXIDE_DB_SYNC_COMMIT=1`. Otherwise the index thread's flushes
+are the `index` lines and those of the `bg` lines it captured, which a
+line does not tell from the others, each of which kept the thread
+that connects blocks out for about its `fg_ms` plus `wait_ms`, so
+grouping the lines by `thread` keeps one thread's phases apart from
+another's only for the lines that are not `bg`. `dcroxide-bench`'s own
 `--flushlog` writes lines of another shape, which carry neither field,
 though their three phases carry the four processor-time fields. Leave
 `DCROXIDE_DB_FLUSHLOG` unset in normal operation; it writes a line
 inside each flush, and on a Linux kernel with all three counter files
 (`io`, `stat` and `schedstat` under `/proc/thread-self`) it has each
-flush read `/proc` 18 times where it read it 6 times before
-2026-10-16, or 24 where 8 when the index writes in the flush,
-outside each phase's `ms` and inside the line's `elapsed_ms`; what
-those reads cost was not measured apart. Without it a flush reads
+flush read `/proc` 18 times for the phases where it read it 6 times
+before 2026-10-16, or 24 where 8 when the index writes in the flush,
+outside each phase's `ms` and inside the line's `elapsed_ms`, and the
+memory readings add seven more, five of `/proc/self/status` and two of
+`/proc/self/maps`: 25 in all, or 31. All seven are read with the writer
+held for a flush that commits where it was captured, and three of them
+for a `bg` flush. What those reads cost was not measured apart. Without
+it a flush reads
 nothing from `/proc`. `DCROXIDE_EXISTSADDR_MEMTABLE_KEYS` is
 for measurements only: it sets how many keys the exists-address index
 holds in memory before its flushes merge them into its sorted runs (the
@@ -1151,6 +1228,22 @@ disabled by DCROXIDE_READ_AHEAD`. Any other value, `on` and `1`
 included, is the warning `DCROXIDE_READ_AHEAD=V is neither off nor 0;
 using the default`, and the read-ahead stays on. Unset, it is on and
 nothing is logged.
+`DCROXIDE_DB_SYNC_COMMIT` is read once at startup and is the way back
+to dcrd's place for a metadata commit. Unset, a flush that a commit
+trips makes its commit on the thread `dbcommit`, and nothing is
+logged. A positive whole number puts every commit back on the thread
+that ran the flush, under the database's writer, and is logged at
+startup as `Metadata write cache commits on the committing thread by
+DCROXIDE_DB_SYNC_COMMIT`. Any other value, `0` included, is the
+warning `DCROXIDE_DB_SYNC_COMMIT=V is not a positive whole number;
+committing the metadata write cache on a thread of its own`, and the
+default stays; a value that is not valid Unicode reads as unset, with
+no warning. Set it where commits run back to back, which the flush
+log shows as `wait_ms` on most lines: the commit then gains nothing on
+a thread of its own and the next flush waits for it with the writer
+held. A flush that `Database::flush` or the close asks for commits on
+the thread that asked for it whatever the variable says, since it
+acknowledges durability.
 A malformed or zero value in any of the tuning variables warns and
 falls back to the default rather than refusing to start, since they are
 hints; `DCROXIDE_READ_AHEAD` alone takes `0`, which turns it off.

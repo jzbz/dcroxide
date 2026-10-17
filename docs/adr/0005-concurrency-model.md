@@ -9,7 +9,8 @@
   thread, for the indexes), 2026-10-12 (addendum: a thread dcrd does not
   have, reading ahead on the sync peer's connection), 2026-10-16
   (addendum: more work on the reading thread, and threads kept for the
-  scripts of a connected block)
+  scripts of a connected block; second addendum: a short-lived thread
+  for the metadata commit)
 
 ## Context
 
@@ -528,3 +529,34 @@ validation pool, a background commit and dcrd"). The pool has not been
 run with the other commits of 2026-10-16, so the code as it stands has
 not been run in a sync, and its threshold of 4 items has not been tried
 beside the reading thread's added work. D2 is unchanged.
+
+## Addendum, 2026-10-16 (second) — a short-lived thread for the metadata commit
+
+In the daemon a flush of the metadata write cache that a commit's own
+check trips now makes its redb commit on a thread of its own, named
+`dbcommit` ([ADR-0009](0009-storage-shape.md), addendum of this date,
+for what it means for durability and failure; PARITY.md's `database` row
+and *Where a cache flush's commit runs*). dcrd commits on the goroutine
+that holds its database write lock.
+
+The thread is made with `std::thread::Builder` at the hand-off, with the
+default stack, and ends when the commit, the retirement of what the
+flush captured, the latch on a failure and the participant's `finished`
+are done. At most one is alive: the next capture, `Database::flush`, the
+close, and the registration or removal of a participant each wait for
+it, with the writer held, before they go on. It takes neither the writer
+semaphore nor the block store's lock; it takes the cache lock to retire
+the captured layers and frees them after releasing it. There is no pool
+and no channel, and no new dependency. If the operating system refuses
+the thread, the flush commits on the thread that ran it, as it does for
+`Database::flush`, the close and a flush that a participant which has
+not opted in contributed to. A panic on it aborts a release build, as on
+any thread; in a build that unwinds, the wait for it latches the store.
+
+`DCROXIDE_DB_SYNC_COMMIT` set to a positive whole number puts every
+commit back on the thread that ran the flush. The library's default is
+that placement, so addblock, `dcroxide-bench` and the tests that do not
+ask make no such thread.
+
+D2 is unchanged: this is one more OS thread, made for each flush a
+commit trips and ended with it, never more than one at a time.

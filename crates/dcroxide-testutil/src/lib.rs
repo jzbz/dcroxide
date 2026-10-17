@@ -4,11 +4,14 @@
 //! Provides the harness for `tools/oracle` (the Go shim linking dcrd's own
 //! packages at the parity target, master `382ff4dd`; its `go.mod` records how
 //! each module is pinned) plus a deterministic PRNG and hex helpers, so every
-//! crate's differential tests share one implementation, and the power-loss
-//! storage rig the crash suites cut power under ([`powerloss`]).
+//! crate's differential tests share one implementation, the power-loss
+//! storage rig the crash suites cut power under ([`powerloss`]), and the
+//! gate that holds a metadata commit running on a thread of its own
+//! ([`gate`]).
 //!
 //! This crate is a dev-dependency only and is never published.
 
+pub mod gate;
 pub mod powerloss;
 
 use std::env;

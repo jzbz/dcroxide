@@ -196,19 +196,19 @@ impl SyncChain for NodeSyncChain {
     }
 
     fn process_block_header(&mut self, header: &BlockHeader) -> Result<(), ProcessBlockFailure> {
-        let mut chain = self.locked();
-        let err = match chain.process_block_header(header, adjusted_time_unix(), &self.params) {
-            Ok(()) => return Ok(()),
-            Err(err) => err,
+        let (err, db) = {
+            let mut chain = self.locked();
+            match chain.process_block_header(header, adjusted_time_unix(), &self.params) {
+                Ok(()) => return Ok(()),
+                Err(err) => (err, chain.db.clone()),
+            }
         };
 
         // Classified the way a block failure is (see
         // `combine_process_block_result`): a persistence failure
         // latched by the store is a disk fault, not a rejected header.
-        let storage_failed = chain
-            .db
-            .as_ref()
-            .is_some_and(dcroxide_database::Database::is_fatal);
+        // Asked with the chain released ([`storage_failed`]).
+        let storage_failed = storage_failed(db);
         Err(ProcessBlockFailure {
             is_duplicate_block: false,
             is_rule_error: !storage_failed && err.kind.is_rule_violation(),
@@ -248,15 +248,38 @@ impl SyncChain for NodeSyncChain {
         // chain renders a persistence failure as a RuleError so it can
         // flow through the existing error paths, which makes a disk fault
         // indistinguishable from a peer sending a bad block unless
-        // something checks.
-        let storage_failed = self
-            .locked()
-            .db
-            .as_ref()
-            .is_some_and(dcroxide_database::Database::is_fatal);
+        // something checks.  Only a block that failed asks: the answer
+        // can wait for a commit ([`storage_failed`]), and a block that
+        // was accepted has no use for it.
+        let storage_failed = !errs.is_empty() && {
+            let db = self.locked().db.clone();
+            storage_failed(db)
+        };
 
         combine_process_block_result(fork_len, errs, storage_failed)
     }
+}
+
+/// Whether the chain's store has failed, for a caller that has just seen
+/// the chain refuse something and must say whether storage was the cause.
+///
+/// `db` is the chain's handle, cloned out of the chain so that the chain
+/// is released before this is called: the answer waits for any flush
+/// whose commit is still under way on a thread of its own
+/// (`Database::is_fatal_settled`), and with it for whichever thread holds
+/// the database's writer, and that thread may want the chain.  The wait
+/// matters because such a commit fails in two steps.  The storage engine
+/// refuses reads of pages it has not cached from its first failed write
+/// on, so a block connected meanwhile can fail on a read that reports
+/// its error; the store is latched only when the commit has returned.
+/// Read in between, the latch would call that block's failure a rule
+/// violation and the peer that sent a good block would be blamed for a
+/// failing disk.  A failed read of the UTXO set never comes back here:
+/// the chain aborts the process on it, beside any failing commit.
+///
+/// A chain with no store has none to fail.
+pub(crate) fn storage_failed(db: Option<dcroxide_database::Database>) -> bool {
+    db.is_some_and(|db| db.is_fatal_settled())
 }
 
 /// Fold the chain's block-processing outcome into the manager's result,

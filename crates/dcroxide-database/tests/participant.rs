@@ -37,11 +37,22 @@
 //!   semaphore, so the order shows only to a reader;
 //! - running them before the commit's own flush fails seven tests, both
 //!   power-cut sweeps among them;
-//! - counting only flushes with overlay rows in `finish_flush` fails
+//! - counting only flushes with overlay rows in `DbCache::retire` (then
+//!   `finish_flush`) fails
 //!   `the_flush_log_counts_a_flush_only_the_participant_wrote`;
 //! - releasing the participant before the close's flush, which is what a
 //!   `Weak` registration amounts to once its owner has dropped it, fails
 //!   `close_runs_a_participant_whose_owner_has_dropped_it`.
+//!
+//! **The same sweeps run with the redb commit on a thread of its own**
+//! (`Options::background_commit`, [`Mode::Background`]).  There the
+//! participant allows its `finished` to be deferred, and the hooks of the
+//! commit that tripped a flush, and of up to two more connects, run while
+//! that flush's commit is held at its first write: between a `contribute`
+//! and its `finished`, where no hook could run before.  The invariant is
+//! the same, and one more control breaks it: a participant that takes
+//! `finished(true)` to cover everything it holds, rather than what its
+//! `contribute` wrote, forgets the keys handed in meanwhile.
 
 // Test-harness arithmetic over bounded counts.
 #![allow(clippy::arithmetic_side_effects)]
@@ -58,6 +69,7 @@ use dcroxide_database::{
     ParticipantStats, SharedBackend,
 };
 use dcroxide_testutil::SplitMix64;
+use dcroxide_testutil::gate::GateBackend;
 use dcroxide_testutil::powerloss::PowerLossBackend;
 use tempfile::TempDir;
 
@@ -91,6 +103,22 @@ enum Placement {
     /// All but the newest: a participant one flush behind the chain,
     /// which the checker must catch.
     Lagging,
+    /// Every generation pending, as [`Self::Current`], but a committed
+    /// flush is taken to have written everything pending by the time
+    /// `finished` is called: right while nothing can be handed in
+    /// between the two, and a loss of keys once a commit on its own
+    /// thread lets hooks run there, which the checker must catch.
+    Forgetful,
+}
+
+/// Where the redb commit of a flush that a commit trips is made.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    /// On the thread that tripped it, under the writer semaphore.
+    Inline,
+    /// On a thread of its own (`Options::background_commit`), with the
+    /// participant allowing its `finished` to be deferred.
+    Background,
 }
 
 /// A participant shaped like the exists-address index.
@@ -112,10 +140,17 @@ struct Journal {
     calls: Arc<Mutex<Vec<Call>>>,
     /// Run at the end of `contribute`, before it returns.
     during: Mutex<Option<Box<dyn Fn() + Send>>>,
+    /// Whether `finished` may be called after the commit that tripped
+    /// the flush has returned, with later hooks run in between.
+    deferred: bool,
 }
 
 impl Journal {
     fn new(prefix: &[u8], placement: Placement) -> Arc<Journal> {
+        Journal::for_mode(prefix, placement, Mode::Inline)
+    }
+
+    fn for_mode(prefix: &[u8], placement: Placement, mode: Mode) -> Arc<Journal> {
         Arc::new(Journal {
             prefix: prefix.to_vec(),
             placement,
@@ -127,6 +162,7 @@ impl Journal {
             handed_in: Mutex::new(BTreeSet::new()),
             calls: Arc::new(Mutex::new(Vec::new())),
             during: Mutex::new(None),
+            deferred: mode == Mode::Background,
         })
     }
 
@@ -148,6 +184,30 @@ impl Journal {
             .map(|(_, keys)| keys.len())
             .sum()
     }
+
+    /// How many times `contribute` has been called.
+    fn contributes(&self) -> usize {
+        self.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|call| **call == Call::Contribute)
+            .count()
+    }
+
+    /// The keys handed in that no flush has written: what is pending
+    /// beyond the generations a flush in progress wrote.  Outside a
+    /// flush that is everything pending.
+    fn unwritten_keys(&self) -> usize {
+        let written = *self.in_flight.lock().unwrap();
+        self.pending
+            .lock()
+            .unwrap()
+            .iter()
+            .skip(written)
+            .map(|(_, keys)| keys.len())
+            .sum()
+    }
 }
 
 fn row_key(prefix: &[u8], generation: u32, key: u32) -> Vec<u8> {
@@ -165,20 +225,26 @@ fn meta_key(prefix: &[u8]) -> Vec<u8> {
 }
 
 impl FlushParticipant for Journal {
+    /// Only keys no flush has written count: with a flush's commit still
+    /// under way, the ones it wrote are no reason for another.
     fn wants_flush(&self) -> bool {
         let at = self.want_at.load(Ordering::SeqCst);
-        at > 0 && self.pending_keys() >= at
+        at > 0 && self.unwritten_keys() >= at
     }
 
     fn has_work(&self) -> bool {
         self.always_work.load(Ordering::SeqCst) || !self.pending.lock().unwrap().is_empty()
     }
 
+    fn allows_deferred_finish(&self) -> bool {
+        self.deferred
+    }
+
     fn contribute(&self, w: &mut FlushWriter<'_, '_>) -> Result<ParticipantStats, Error> {
         self.calls.lock().unwrap().push(Call::Contribute);
         let pending = self.pending.lock().unwrap();
         let n = match self.placement {
-            Placement::Current => pending.len(),
+            Placement::Current | Placement::Forgetful => pending.len(),
             Placement::Lagging => pending.len().saturating_sub(1),
         };
         let mut journaled = 0u64;
@@ -218,7 +284,11 @@ impl FlushParticipant for Journal {
         self.calls.lock().unwrap().push(Call::Finished(committed));
         let n = std::mem::take(&mut *self.in_flight.lock().unwrap());
         if committed {
-            self.pending.lock().unwrap().drain(..n);
+            let mut pending = self.pending.lock().unwrap();
+            match self.placement {
+                Placement::Forgetful => pending.clear(),
+                Placement::Current | Placement::Lagging => drop(pending.drain(..n)),
+            }
         }
     }
 }
@@ -270,6 +340,18 @@ fn power_loss_opts(dir: &Path, honest_sync: bool) -> (Options, Arc<PowerLossBack
     let mut opts = Options::new(dir, NET);
     opts.backend = Some(Arc::clone(&backend) as SharedBackend);
     (opts, backend)
+}
+
+/// [`power_loss_opts`] with a gate over the storage that holds the
+/// committer thread while it is armed, and background commits on.
+fn held_commit_opts(dir: &Path) -> (Options, Arc<PowerLossBackend>, Arc<GateBackend>) {
+    std::fs::create_dir_all(dir).expect("mkdir");
+    let backend = PowerLossBackend::create(&dir.join("metadata.redb"), true);
+    let gate = GateBackend::new(Arc::clone(&backend) as SharedBackend);
+    let mut opts = Options::new(dir, NET);
+    opts.backend = Some(Arc::clone(&gate) as SharedBackend);
+    opts.background_commit = true;
+    (opts, backend, gate)
 }
 
 /// Reopen a store and hold it to the invariant: the participant's rows
@@ -425,6 +507,8 @@ struct Run {
     calls: Vec<Call>,
     handed_in: BTreeSet<u32>,
     committed: BTreeMap<u32, Vec<u32>>,
+    /// Connects made while a flush's commit was held on its own thread.
+    beside: usize,
 }
 
 impl Run {
@@ -467,13 +551,48 @@ impl Run {
 /// `cut_after` storage operations when given, then cut the power and
 /// check what survived.
 fn run(script: &Script, placement: Placement, cut_after: Option<u64>) -> Run {
+    run_in(Mode::Inline, script, placement, cut_after)
+}
+
+/// How long a step that cannot block is given before the run is called
+/// stuck.
+const STUCK: Duration = Duration::from_secs(60);
+
+/// [`run`] in either mode.
+///
+/// In [`Mode::Background`] every connect is made with the gate shut.  A
+/// connect whose flush the participant contributed to leaves that
+/// flush's commit held at its first write, with its own hook already
+/// run; one or two of the connects that follow it in the script, by the
+/// generation's number, are made while it is held, so their hooks too
+/// come between the `contribute` and its `finished`.  A connect that
+/// would trip a flush of its own has
+/// to wait for the held commit first, so one that finds the participant
+/// asking for a flush is left for after the gate opens.  So are they all
+/// when the commit was stopped growing the file, where redb lets no
+/// transaction begin (`GateBackend::holds_a_length_change`).  Then the
+/// gate opens and the commit is waited for, before the next step.  A commit
+/// under way makes no storage operation until the gate opens and has
+/// made all of its own before the step after it begins, so the
+/// operations come in one order however the threads are scheduled, and a
+/// cut after the `n`th lands in the same place every time.
+fn run_in(mode: Mode, script: &Script, placement: Placement, cut_after: Option<u64>) -> Run {
     let dir = TempDir::new().expect("tempdir");
     let db_dir = dir.path().join("db");
-    let (mut opts, backend) = power_loss_opts(&db_dir, true);
+    let (mut opts, backend, gate) = match mode {
+        Mode::Inline => {
+            let (opts, backend) = power_loss_opts(&db_dir, true);
+            (opts, backend, None)
+        }
+        Mode::Background => {
+            let (opts, backend, gate) = held_commit_opts(&db_dir);
+            (opts, backend, Some(gate))
+        }
+    };
     opts.cache_max_size = script.cache_max_size;
     let db = Database::create(&opts).expect("create");
     let prefix = setup(&db);
-    let journal = Journal::new(&prefix, placement);
+    let journal = Journal::for_mode(&prefix, placement, mode);
     journal.want_at.store(script.want_at, Ordering::SeqCst);
     db.set_flush_participant(&prefix, Arc::clone(&journal) as Arc<dyn FlushParticipant>)
         .expect("register the participant");
@@ -483,19 +602,74 @@ fn run(script: &Script, placement: Placement, cut_after: Option<u64>) -> Run {
         backend.power_fails_after(n);
     }
     let mut committed = BTreeMap::new();
-    for step in &script.steps {
-        let result = match step {
-            Step::Connect(generation, keys) => {
-                let result = connect(&db, &journal, *generation, keys);
-                if result.is_ok() {
-                    committed.insert(*generation, keys.clone());
+    let mut beside = 0usize;
+    let mut steps = script.steps.iter().peekable();
+    'steps: while let Some(step) = steps.next() {
+        match step {
+            Step::Flush => {
+                if db.flush().is_err() {
+                    break;
                 }
-                result
             }
-            Step::Flush => db.flush(),
-        };
-        if result.is_err() {
-            break;
+            Step::Connect(generation, keys) => {
+                if let Some(gate) = &gate {
+                    gate.arm();
+                }
+                let contributes = journal.contributes();
+                if connect(&db, &journal, *generation, keys).is_err() {
+                    break;
+                }
+                committed.insert(*generation, keys.clone());
+                let Some(gate) = &gate else {
+                    continue;
+                };
+                // A contribute during the connect means a flush the
+                // participant wrote in was handed over: its commit is on
+                // its way to the gate.
+                let mut refused = false;
+                if journal.contributes() > contributes {
+                    assert!(
+                        gate.wait_held(STUCK),
+                        "generation {generation}: the handed-over commit never reached storage"
+                    );
+                    // A commit stopped while redb grows the file lets no
+                    // transaction begin: nothing is connected beside
+                    // that one.
+                    let beside_it = if gate.holds_a_length_change() {
+                        0
+                    } else {
+                        1 + generation % 2
+                    };
+                    for _ in 0..beside_it {
+                        if journal.wants_flush() {
+                            break;
+                        }
+                        let Some(Step::Connect(generation, keys)) =
+                            steps.next_if(|next| matches!(next, Step::Connect(..)))
+                        else {
+                            break;
+                        };
+                        match connect_while_held(&db, &journal, *generation, keys) {
+                            Ok(()) => {
+                                committed.insert(*generation, keys.clone());
+                                beside += 1;
+                            }
+                            Err(_) => {
+                                refused = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+                gate.open();
+                // The commit under way ends before the next step: its
+                // failure, if the power went under it, is the next
+                // step's refusal.
+                let _ = db.wait_background_commit();
+                if refused {
+                    break 'steps;
+                }
+            }
         }
     }
     let ops = backend.ops() - start;
@@ -516,7 +690,31 @@ fn run(script: &Script, placement: Placement, cut_after: Option<u64>) -> Run {
         calls: journal.calls(),
         handed_in,
         committed,
+        beside,
     }
+}
+
+/// [`connect`] while a commit is held at the gate.  A connect that had
+/// to wait for that commit, at a flush of its own or at the overlay's
+/// ceiling, would wait for ever, so it is made on a thread and a run in
+/// which it does not return is failed: its script let too much be
+/// committed above the captured layers ([`background_script`]).
+fn connect_while_held(
+    db: &Database,
+    journal: &Arc<Journal>,
+    generation: u32,
+    keys: &[u32],
+) -> Result<(), Error> {
+    let (done, result) = mpsc::channel();
+    let (db, journal, keys) = (db.clone(), Arc::clone(journal), keys.to_vec());
+    std::thread::spawn(move || {
+        let outcome = connect(&db, &journal, generation, &keys);
+        drop(db);
+        let _ = done.send(outcome);
+    });
+    result.recv_timeout(STUCK).unwrap_or_else(|_| {
+        panic!("generation {generation}: a connect made beside a held commit waited for it")
+    })
 }
 
 /// Cut the power at every storage operation a scripted run makes, and
@@ -548,6 +746,7 @@ fn power_cut_at_every_storage_operation_keeps_participant_and_chain_rows_togethe
         "the script must make the participant contribute to several flushes: {:?}",
         whole.calls
     );
+    assert_eq!(whole.beside, 0, "no commit leaves the committing thread");
 
     let total = whole.ops;
     let mut felt = 0u64;
@@ -594,6 +793,106 @@ fn power_cut_after_random_runs_keeps_participant_and_chain_rows_together() {
     }
 }
 
+/// A script for [`Mode::Background`]: [`Script::random`] with an overlay
+/// ceiling roomy enough that the three small commits made above a held
+/// flush's layers -- the connect that tripped it and two more -- stay
+/// under it, so none of them waits for the commit they are there to
+/// overlap.
+///
+/// The participant asks for a flush at four to seven pending keys, so
+/// most flushes are tripped by a commit, and the keys handed in behind
+/// one, at most six a connect, often leave room for another connect
+/// before it asks again.
+fn background_script(rng: &mut SplitMix64, connects: u32) -> Script {
+    let mut script = Script::random(rng, connects);
+    script.cache_max_size = 3000 + rng.below(3000);
+    script.want_at = 4 + rng.below(4) as usize;
+    script
+}
+
+/// The sweep above with every flush a commit trips committed on a thread
+/// of its own, and connects made while that commit is held: the power
+/// goes at every storage operation, and every surviving store holds the
+/// participant's rows and the chain's together.
+///
+/// A flush captures the tip rows published before it and the keys of
+/// exactly those connects.  The keys of the connect that tripped it, and
+/// of the connects made while its commit was held, are handed in after
+/// the participant's `contribute` and before its `finished`; they belong
+/// to the next flush, whose commit lands after this one's.
+#[test]
+fn power_cut_at_every_storage_operation_with_commits_on_their_own_thread() {
+    // A fixed script: how many connects land beside a held commit depends
+    // on it, and the sweep is only worth its name if several do.
+    let mut rng = SplitMix64(0x6261_636b_6772_6f75);
+    let script = background_script(&mut rng, 20);
+
+    let whole = run_in(Mode::Background, &script, Placement::Current, None);
+    let tip = whole
+        .survived
+        .clone()
+        .unwrap_or_else(|e| panic!("the uncut run: {e}"));
+    whole.assert_protocol("the uncut run");
+    assert_eq!(
+        tip,
+        Some(20),
+        "the script ends in a flush, so the whole run is durable"
+    );
+    assert!(
+        whole.calls.len() >= 6,
+        "the script must make the participant contribute to several flushes: {:?}",
+        whole.calls
+    );
+    assert!(
+        whole.beside >= 2,
+        "only {} connects were made while a flush's commit was held",
+        whole.beside
+    );
+
+    let total = whole.ops;
+    let mut felt = 0u64;
+    let mut tips = BTreeSet::new();
+    for n in 0..=total {
+        let cut = run_in(Mode::Background, &script, Placement::Current, Some(n));
+        let context = format!("power cut after {n} of {total} storage operations");
+        let tip = cut
+            .survived
+            .clone()
+            .unwrap_or_else(|e| panic!("{context}: {e}"));
+        cut.assert_protocol(&context);
+        felt += u64::from(cut.power_failed);
+        tips.insert(tip);
+    }
+    assert!(
+        felt >= total,
+        "every cut short of the end must be felt: {felt} of {total}"
+    );
+    assert!(
+        tips.len() >= 3,
+        "the cuts must land on several different durable states, got {tips:?}"
+    );
+}
+
+/// Many scripts with commits on a thread of their own, each cut once at
+/// its end, after a window of connects no flush was asked for.
+#[test]
+fn power_cut_after_random_runs_with_commits_on_their_own_thread() {
+    let mut rng = SplitMix64::from_entropy("participant-power-cut-scripts-background");
+    for round in 0..12 {
+        let connects = 6 + rng.below(20) as u32;
+        let mut script = background_script(&mut rng, connects);
+        script.steps.pop();
+        let next = script.steps.len() as u32 + 100;
+        for g in next..next + rng.below(4) as u32 {
+            script.steps.push(Step::Connect(g, vec![g]));
+        }
+        let r = run_in(Mode::Background, &script, Placement::Current, None);
+        let context = format!("round {round}");
+        r.assert_protocol(&context);
+        r.survived.unwrap_or_else(|e| panic!("{context}: {e}"));
+    }
+}
+
 // ---------------------------------------------------------------------
 // Controls: each breaks one of the three conditions, and the checker
 // has to notice.  If one of these starts passing, the tests above have
@@ -611,6 +910,72 @@ fn the_checker_catches_a_participant_one_flush_behind() {
         .survived
         .expect_err("a lagging participant must be caught");
     assert!(err.contains("holds none of its rows"), "{err}");
+}
+
+/// The same participant with commits on a thread of their own is caught
+/// the same way.
+#[test]
+fn the_checker_catches_a_lagging_participant_with_commits_on_their_own_thread() {
+    let mut rng = SplitMix64::from_entropy("participant-control-lagging-background");
+    let script = background_script(&mut rng, 8);
+    let r = run_in(Mode::Background, &script, Placement::Lagging, None);
+    let err = r
+        .survived
+        .expect_err("a lagging participant must be caught");
+    assert!(err.contains("holds none of its rows"), "{err}");
+}
+
+/// A participant that takes a committed flush to have written everything
+/// it holds is right while its `finished` is called under the writer
+/// semaphore, before any hook can run: nothing is handed in between a
+/// `contribute` and its `finished`.  With the commit on a thread of its
+/// own the hook of the very commit that tripped the flush runs there,
+/// and its keys are forgotten: a later flush makes that generation's tip
+/// durable with none of its keys.  This is what a participant must not
+/// do once it allows its `finished` to be deferred, and what the
+/// exists-address index's seal is for.
+#[test]
+fn the_checker_catches_a_participant_that_forgets_keys_handed_in_during_a_commit() {
+    // Three keys a connect and a flush wanted at six: every third
+    // connect trips a flush of the two before it, and hands its own keys
+    // in while that flush's commit is held.
+    let script = Script {
+        steps: (1..=12u32)
+            .map(|g| Step::Connect(g, vec![g * 10, g * 10 + 1, g * 10 + 2]))
+            .chain([Step::Flush])
+            .collect(),
+        cache_max_size: 6000,
+        want_at: 6,
+    };
+
+    let inline = run_in(Mode::Inline, &script, Placement::Forgetful, None);
+    inline.assert_protocol("the same participant with the commit on the committing thread");
+    assert_eq!(
+        inline.survived,
+        Ok(Some(12)),
+        "under the writer semaphore nothing is handed in before `finished`"
+    );
+
+    let r = run_in(Mode::Background, &script, Placement::Forgetful, None);
+    let err = r
+        .survived
+        .expect_err("keys handed in during a commit and then forgotten must be caught");
+    assert!(
+        err.contains("generation 3 is durable") && err.contains("holds none of its rows"),
+        "{err}"
+    );
+
+    // The participant that keeps them apart loses nothing over the same
+    // script.
+    let kept = run_in(Mode::Background, &script, Placement::Current, None);
+    kept.assert_protocol("the same script with what was handed in kept apart");
+    assert_eq!(kept.survived, Ok(Some(12)));
+    assert!(
+        kept.calls.len() >= 8 && kept.beside >= 2,
+        "the script made too few flushes to show anything: {:?}, {} connects beside a held commit",
+        kept.calls,
+        kept.beside
+    );
 }
 
 /// Keys handed in before the commit instead of from its hook: the

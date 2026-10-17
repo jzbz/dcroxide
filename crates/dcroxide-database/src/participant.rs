@@ -43,7 +43,9 @@ use crate::{FlushPhase, Transaction, WriteLogSink};
 /// this crate: not the cache lock, not the block-store lock.  The
 /// semaphore serializes the calls against each other, against every
 /// writable transaction and its [`crate::Transaction::on_commit`] hooks,
-/// and against registration.  So none of them may begin a writable
+/// and against registration.  The one exception is [`Self::finished`] of
+/// a participant that allows it to be deferred
+/// ([`Self::allows_deferred_finish`]).  So none of them may begin a writable
 /// transaction, flush, close, or register or clear a participant on the
 /// same database: each of those waits for the semaphore the caller holds,
 /// and the thread deadlocks.  A read-only transaction would not deadlock,
@@ -67,7 +69,10 @@ pub trait FlushParticipant: Send + Sync {
     ///
     /// Asked by every writable commit before its flush check, so it must
     /// be cheap.  Not asked by [`crate::Database::flush`] or
-    /// [`crate::Database::close`], which flush regardless.
+    /// [`crate::Database::close`], which flush regardless.  For a
+    /// participant that allows its `finished` to be deferred, it can be
+    /// asked while an earlier flush's commit is still under way and
+    /// before that flush's `finished` ([`Self::allows_deferred_finish`]).
     fn wants_flush(&self) -> bool;
 
     /// Whether this flush should call [`Self::contribute`].
@@ -96,14 +101,46 @@ pub trait FlushParticipant: Send + Sync {
     /// every transaction that begins from now on: the flush has committed
     /// and retired the overlay layers it captured.  `false` means the
     /// flush failed and the store is already latched fatal, so no later
-    /// flush will run.  Its rows are normally discarded with the
-    /// transaction, but an engine that fails after its sync can leave them
-    /// durable, so a participant should leave its memory as it was and
-    /// let the next open decide from what is on disk.  Either way the call
+    /// flush will run, whichever thread the commit failed on.  Its rows
+    /// are normally discarded with the transaction, but an engine that
+    /// fails after its sync can leave them durable, so a participant
+    /// should leave its memory as it was and let the next open decide
+    /// from what is on disk.  Either way the call
     /// is made before the writer semaphore is released, so no commit,
     /// flush or [`crate::Transaction::on_commit`] hook runs between the
-    /// flush and this call.
+    /// flush and this call -- unless the participant allows otherwise
+    /// ([`Self::allows_deferred_finish`]).
     fn finished(&self, committed: bool);
+
+    /// Whether [`Self::finished`] may be called after the writer
+    /// semaphore has been released, on another thread, with the hooks of
+    /// later commits run in between.  `false` unless overridden.
+    ///
+    /// A database opened with [`crate::Options::background_commit`] hands
+    /// the redb commit of a flush that a commit's own check tripped to a
+    /// thread of its own, and `finished` can then only follow the commit
+    /// there: the commit that tripped the flush runs its hooks and
+    /// returns meanwhile, and so may any number after it.  A participant
+    /// that answers `false` is never put in that position.  A flush it
+    /// contributed to commits on the thread that ran it, and `finished`
+    /// is called as described there.
+    ///
+    /// One that answers `true` accepts that between a `contribute` and
+    /// its `finished` its hooks run, and so does [`Self::wants_flush`],
+    /// which each later commit asks on its own thread before its flush
+    /// check, and so possibly while `finished` runs on the thread that
+    /// made the earlier flush's commit.  No other method of this trait
+    /// does: the next flush waits for the commit, and for this call,
+    /// before it asks `has_work`.  It must therefore keep what
+    /// `contribute` wrote apart from what hooks add after it, so that
+    /// `finished(true)` retires the first and none of the second, it
+    /// must take whatever locks its own state needs against those hooks,
+    /// and its `wants_flush` must be safe against both the hooks and
+    /// `finished`.  `finished(false)` is called with the store already
+    /// latched, as ever.
+    fn allows_deferred_finish(&self) -> bool {
+        false
+    }
 }
 
 /// What a participant's part of one flush did, carried in

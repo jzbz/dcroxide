@@ -31,6 +31,15 @@
 //! because the best state moves to the parent one transaction before the
 //! flush does.
 //!
+//! The same is held with each of those flushes committed on a thread of
+//! its own (`Options::background_commit`), as the daemon commits them.
+//! The copy is then taken by that thread, when its commit has landed,
+//! while the chain goes on: the commit that tripped the flush publishes
+//! its rows, and the next transaction may be appending its block to the
+//! block files, which the copy then holds a part of, as a crash at that
+//! moment would leave them.  Each battery row waits for the commit under
+//! way before its copies are opened.
+//!
 //! The tests sample the prefixes: every commit of a battery row that
 //! disconnects a block, and every `stride`th of the rest.
 //! `DCROXIDE_CRASH_SWEEP_EVERY=1` takes every prefix, which is a few
@@ -237,8 +246,10 @@ impl Sampling {
 }
 
 /// Run the battery on a chain whose UTXO cache holds `cache` bytes (the
-/// default size for `None`), and open the sampled durable states.
-fn sweep(cache: Option<u64>, sampling: Sampling) -> Tally {
+/// default size for `None`), and open the sampled durable states.  With
+/// `background`, each flush a commit trips makes its redb commit on a
+/// thread of its own.
+fn sweep(cache: Option<u64>, sampling: Sampling, background: bool) -> Tally {
     let params = regnet_params();
     let rows = battery();
     let dir = TempDir::new().expect("tempdir");
@@ -247,12 +258,16 @@ fn sweep(cache: Option<u64>, sampling: Sampling) -> Tally {
 
     // The observer runs inside each durable flush, with the commits
     // before it on disk and the committing transaction's own rows not
-    // yet published.
+    // yet published; or, for a commit on a thread of its own, once that
+    // commit has landed, with whatever the chain has committed since
+    // still in the write cache.
     let commits = Arc::new(AtomicU64::new(0));
     let disconnecting = Arc::new(AtomicBool::new(false));
     let pending: Arc<Mutex<Vec<(u64, PathBuf)>>> = Arc::default();
+    let background_flushes = Arc::new(AtomicU64::new(0));
     let mut opts = Options::new(&db_path, params.net.0);
     opts.cache_max_size = 0;
+    opts.background_commit = background;
     opts.flush_observer = Some({
         let (commits, disconnecting, pending) = (
             Arc::clone(&commits),
@@ -260,7 +275,11 @@ fn sweep(cache: Option<u64>, sampling: Sampling) -> Tally {
             Arc::clone(&pending),
         );
         let (db_path, copies) = (db_path.clone(), copies.clone());
-        Arc::new(move |_: &FlushObservation| {
+        let background_flushes = Arc::clone(&background_flushes);
+        Arc::new(move |obs: &FlushObservation| {
+            if obs.background {
+                background_flushes.fetch_add(1, Ordering::SeqCst);
+            }
             let n = commits.fetch_add(1, Ordering::SeqCst) + 1;
             let stride = if disconnecting.load(Ordering::SeqCst) {
                 sampling.in_a_disconnecting_row
@@ -276,6 +295,7 @@ fn sweep(cache: Option<u64>, sampling: Sampling) -> Tally {
         })
     });
     let db = Database::create(&opts).expect("create database");
+    let settle = db.clone();
     let mut chain = open_chain(db, &params, cache).expect("open chain");
 
     // The same rows on a chain nothing interrupts, one row ahead: it
@@ -318,6 +338,11 @@ fn sweep(cache: Option<u64>, sampling: Sampling) -> Tally {
         disconnecting.store(disconnected.load(Ordering::SeqCst), Ordering::SeqCst);
         process(&mut chain, *now, block, &params, "the swept run");
         assert_eq!(chain.best_snapshot().hash, tip, "row {row}: the tips agree");
+        // A commit still under way on its own thread has yet to take its
+        // copy.
+        settle
+            .wait_background_commit()
+            .unwrap_or_else(|e| panic!("row {row}: the commit under way failed: {e:?}"));
 
         let landed: Vec<(u64, PathBuf)> = std::mem::take(&mut *pending.lock().expect("pending"));
         for (n, copy) in landed {
@@ -386,6 +411,18 @@ fn sweep(cache: Option<u64>, sampling: Sampling) -> Tally {
     }
     assert!(tally.opened > 0, "no durable state was opened");
     assert!(tally.continued > 0, "no reopened chain took more blocks");
+    let on_their_own_thread = background_flushes.load(Ordering::SeqCst);
+    let flushes = commits.load(Ordering::SeqCst);
+    if background {
+        // All but the few the chain asks for outright, which commit on
+        // the thread that asked.
+        assert!(
+            on_their_own_thread * 10 >= flushes * 9,
+            "{on_their_own_thread} of {flushes} flushes committed on a thread of their own"
+        );
+    } else {
+        assert_eq!(on_their_own_thread, 0);
+    }
     tally
 }
 
@@ -404,6 +441,27 @@ fn every_durable_state_reopens_to_the_right_set_with_the_cache_at_its_limit() {
             continued: 16,
         }
         .or_from_env(),
+        false,
+    );
+    assert!(tally.at_the_tip > 0, "{tally:?}");
+    assert!(tally.behind > 0, "{tally:?}");
+    assert!(tally.off_the_best_chain > 0, "{tally:?}");
+}
+
+/// The same sweep with every flush a commit trips committed on a thread
+/// of its own: each durable state is still a whole-transaction prefix of
+/// the commit order, and all three kinds are still met.
+#[test]
+fn every_durable_state_reopens_to_the_right_set_with_commits_on_their_own_thread() {
+    let tally = sweep(
+        Some(1),
+        Sampling {
+            every: 29,
+            in_a_disconnecting_row: 3,
+            continued: 16,
+        }
+        .or_from_env(),
+        true,
     );
     assert!(tally.at_the_tip > 0, "{tally:?}");
     assert!(tally.behind > 0, "{tally:?}");
@@ -424,6 +482,29 @@ fn every_durable_state_reopens_to_the_right_set_with_a_large_cache() {
             continued: 7,
         }
         .or_from_env(),
+        false,
+    );
+    assert!(tally.behind > 0, "{tally:?}");
+    assert!(
+        tally.most_behind >= 50,
+        "no open replayed a long run of blocks: {tally:?}"
+    );
+}
+
+/// The large cache with commits on a thread of their own: the long
+/// replays start from states those commits made durable.
+#[test]
+fn every_durable_state_reopens_to_the_right_set_with_a_large_cache_and_commits_on_their_own_thread()
+{
+    let tally = sweep(
+        None,
+        Sampling {
+            every: 43,
+            in_a_disconnecting_row: 43,
+            continued: 7,
+        }
+        .or_from_env(),
+        true,
     );
     assert!(tally.behind > 0, "{tally:?}");
     assert!(

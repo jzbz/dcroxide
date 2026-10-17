@@ -36,7 +36,8 @@
 //! that does not use them ([ADR-0011]): a [`FlushParticipant`], whose rows
 //! ride inside the metadata flush's own redb transaction beside the
 //! overlay's, and [`Transaction::on_commit`], which runs a closure once a
-//! commit's own flush has succeeded and before its rows are published.
+//! commit's own flush has taken the rows it will write and before the
+//! commit's rows are published.
 //!
 //! [`Transaction::store_block_record`] has none either.  It stores a
 //! block that was laid out as its block-file record ahead of the commit
@@ -57,6 +58,7 @@ mod bucketindex;
 pub(crate) mod dbcache;
 mod error;
 mod participant;
+mod procmem;
 mod transaction;
 
 use std::path::{Path, PathBuf};
@@ -69,6 +71,7 @@ use blockfile::{BlockStore, deserialize_write_row, serialize_write_row};
 pub use bootstrap::ImportStats;
 pub use error::{Error, ErrorKind};
 pub use participant::{FlushParticipant, FlushWriter, ParticipantStats};
+pub use procmem::{ARENA_HEAP_ALIGN, ArenaMaps, ProcessMemory};
 
 /// A raw key, bucket id included, and its value, as the raw-keyspace
 /// reads return them ([`Transaction::try_first_after`],
@@ -80,6 +83,7 @@ use transaction::{
 };
 pub use transaction::{BlockRegion, Bucket, Cursor, Transaction};
 
+use crate::dbcache::{CommitJob, DbCache, Filled, FlushBatch, FlushOutcome};
 use crate::error::db_error;
 
 // redb 4 moved `begin_read` onto a trait; importing it keeps the call
@@ -217,10 +221,21 @@ impl DbInner {
     /// not report success after a failure.
     ///
     /// A path that waits for the writer semaphore checks again once it
-    /// holds it. The latch is only ever set by the semaphore's holder, so
-    /// a check made before the wait can pass while the writer being
-    /// waited on is the one whose durable write fails, and a caller
-    /// admitted past that would re-run the failed flush.
+    /// holds it.  The latch is set by the semaphore's holder, or by the
+    /// thread a flush handed its commit to, so a check made before the
+    /// wait can pass while the writer being waited on is the one whose
+    /// durable write fails, and a caller admitted past that would re-run
+    /// the failed flush.  A holder that waits for a commit on its own
+    /// thread ([`drain_flight`]) checks again after that wait for the
+    /// same reason.
+    ///
+    /// A commit made on its own thread can also fail between a writer's
+    /// last check and that writer's return.  Such a writer reports `Ok`:
+    /// its rows were published to the write cache, nothing told it they
+    /// were durable, and they are lost with the failed batch at the next
+    /// start.  What cannot happen is a capture, or an acknowledgement of
+    /// durability, after the failure: both follow a wait for the commit
+    /// and a check made after it.
     pub(crate) fn check_writable(&self) -> Result<(), Error> {
         if self.fatal.load(Ordering::SeqCst) {
             let mut text = String::from(
@@ -269,6 +284,22 @@ impl DbInner {
             writer_waits_index: WaitTotal::default(),
             writer_waits_other: WaitTotal::default(),
             participant: Mutex::new(None),
+            background: opts.background_commit,
+            flight: Mutex::new(None),
+            waited_nanos: AtomicU64::new(0),
+            log: opts.log.clone(),
+            commit_snapshot: opts.commit_snapshot,
+            flush_end: Mutex::new(None),
+            #[cfg(test)]
+            before_retire: Mutex::new(None),
+            #[cfg(test)]
+            between_snapshots: Mutex::new(None),
+            #[cfg(test)]
+            refuse_commit_thread: AtomicBool::new(false),
+            #[cfg(test)]
+            skip_drain: AtomicBool::new(false),
+            #[cfg(test)]
+            batch_dropped: Mutex::new(None),
         })
     }
 
@@ -398,10 +429,84 @@ pub(crate) struct DbInner {
     /// participant then, or the keys it holds in memory for blocks whose
     /// tip rows that flush persists would be lost.  Changed only with the
     /// writer semaphore held ([`Database::set_flush_participant`],
-    /// [`Database::clear_flush_participant`], [`Database::close`]), so a
-    /// flush, which runs under the semaphore, sees one value throughout.
+    /// [`Database::clear_flush_participant`], [`Database::close`]), and
+    /// only after a wait for the flush in flight, so a flush sees one
+    /// value throughout: it is captured under the semaphore, and the
+    /// part of it that may run later, on a committer thread, uses the
+    /// clone it took then.
     /// The lock is a leaf: nothing else is locked while it is held.
     participant: Mutex<Option<participant::Registration>>,
+    /// [`Options::background_commit`].
+    background: bool,
+    /// The thread committing the flush in flight, when a flush handed its
+    /// commit over and nothing has waited for it since.
+    ///
+    /// Read and written only by the holder of the writer semaphore, which
+    /// is what makes "at most one" hold: a flush stores a handle here
+    /// only after [`drain_flight`] emptied the slot under the same hold.
+    /// The committer never touches the slot and never takes the
+    /// semaphore, so a holder that joins it cannot deadlock with it.  The
+    /// lock is a leaf.
+    flight: Mutex<Option<std::thread::JoinHandle<()>>>,
+    /// What semaphore holders have spent in [`drain_flight`] since the
+    /// last capture, in nanoseconds; the next captured flush reports it
+    /// as its [`FlushObservation::waited`].
+    waited_nanos: AtomicU64,
+    /// [`Options::log`], for the line a commit that fails on its own
+    /// thread logs, having no caller to return its error to.
+    log: Option<LogSink>,
+    /// [`Options::commit_snapshot`].
+    commit_snapshot: bool,
+    /// What the last observed flush left when it ended, for the next
+    /// one's observation ([`FlushMemory::process_after_previous`]).
+    /// Written by the thread that ends a flush and taken at the next
+    /// capture, which follows a wait for that thread.  The lock is a
+    /// leaf.
+    flush_end: Mutex<Option<FlushEnd>>,
+    /// Run by a committer thread between its commit and the retirement
+    /// of the layers it captured, for a test that needs a reader there.
+    #[cfg(test)]
+    before_retire: Mutex<Option<TestHook>>,
+    /// Run once by the next transaction to begin, between the two
+    /// snapshots it takes, for a test that lets a commit land there.
+    #[cfg(test)]
+    between_snapshots: Mutex<Option<TestHook>>,
+    /// Makes a hand-off find no thread to be had, as when the operating
+    /// system refuses one.
+    #[cfg(test)]
+    refuse_commit_thread: AtomicBool,
+    /// Skips the wait that precedes a capture, for the test of what a
+    /// capture does when it finds a flush in flight.
+    #[cfg(test)]
+    skip_drain: AtomicBool,
+    /// Planted in each batch a flush captures, to run as that batch is
+    /// dropped ([`crate::dbcache::FlushBatch::on_drop`]), for a test of
+    /// where a flush lets go of the layers it retired.
+    #[cfg(test)]
+    batch_dropped: Mutex<Option<crate::dbcache::BatchProbe>>,
+}
+
+/// A closure a test plants in [`DbInner`].
+#[cfg(test)]
+type TestHook = Box<dyn Fn() + Send + Sync>;
+
+/// How an observed flush ended, kept for the next one's observation.
+#[derive(Clone, Copy)]
+struct FlushEnd {
+    /// The process's memory once the participant's `finished` had
+    /// returned, the flush still holding its captured layers.
+    told: Option<ProcessMemory>,
+    /// The time from its retirement to then.
+    telling: std::time::Duration,
+    /// The process's memory once the flush had let go of everything it
+    /// frees itself: all of it on a committer thread, and all but the
+    /// layers it retired on the capturing thread, whose caller frees
+    /// those after this reading: a commit and [`Database::flush`] once
+    /// they have released the writer semaphore, and [`Database::close`]
+    /// under it.
+    memory: Option<ProcessMemory>,
+    /// The time from its retirement to then.
+    release: std::time::Duration,
 }
 
 /// The name of the thread whose waits for the writer semaphore are
@@ -410,6 +515,12 @@ pub(crate) struct DbInner {
 /// index update while the thread connecting blocks wants it for the
 /// next block.
 pub const INDEX_THREAD_NAME: &str = "index";
+
+/// The name of the thread that makes a flush's redb commit when the
+/// flush hands it over ([`Options::background_commit`]): one thread a
+/// flush, at most one alive at a time.  A [`FlushObserver`] is called on
+/// it for such a flush.
+pub const COMMIT_THREAD_NAME: &str = "dbcommit";
 
 /// The running total of one kind of thread's waits for the writer
 /// semaphore.
@@ -506,6 +617,11 @@ pub struct FlushObservation {
     /// [`ParticipantStats::contribute`] when one was called, and the stats
     /// walk account for all of it but the capture and the handoffs
     /// between them.
+    ///
+    /// From the capture to the retirement of what was captured.  When the
+    /// commit ran on a thread of its own ([`Self::background`]) the
+    /// writer semaphore was held for [`Self::foreground`] of it, not for
+    /// all of it.
     pub elapsed: std::time::Duration,
     /// Of `elapsed`, the part spent walking the tree for
     /// [`Self::stats`]. Zero on unsampled flushes.
@@ -544,8 +660,166 @@ pub struct FlushObservation {
     ///
     /// The observer is called on the thread that ran the flush, so
     /// `std::thread::current()` there says which of the two kinds of
-    /// thread held the semaphore for [`Self::elapsed`].
+    /// thread held the semaphore for [`Self::elapsed`].  The exception is
+    /// a flush whose commit ran on a thread of its own
+    /// ([`Self::background`]): the observer is called on that thread,
+    /// named [`COMMIT_THREAD_NAME`], which never holds the semaphore.
     pub writer_waits: WriterWaits,
+    /// Whether [`Database::flush`] or [`Database::close`] asked for this
+    /// flush.  `false` for one a commit's own flush check tripped, by the
+    /// overlay's thresholds or a participant's `wants_flush`.
+    pub explicit: bool,
+    /// Whether the flush's redb commit ran on another thread than the
+    /// one that captured the overlay ([`Options::background_commit`]).
+    pub background: bool,
+    /// Of `elapsed`, the part the capturing thread spent in the flush,
+    /// holding the writer semaphore: all of it when that thread made the
+    /// commit too, and the time from the capture to the hand-off when
+    /// [`Self::background`] is set.
+    pub foreground: std::time::Duration,
+    /// What was spent, since the capture before this one and so outside
+    /// `elapsed`, waiting for an earlier flush's commit on another thread
+    /// to end, with the writer semaphore held: the capturing thread's own
+    /// wait before the capture, and any other thread's, such as a
+    /// commit's at the overlay's ceiling or
+    /// [`Database::is_fatal_settled`]'s, which each count against the
+    /// next capture whoever makes it.  Every other writer was kept out
+    /// meanwhile, so `foreground + waited` is what this flush, with the
+    /// waits counted against it, kept every other writer out for.
+    pub waited: std::time::Duration,
+    /// Whether the redb commit was made with a read snapshot of the
+    /// store, as it stood before the commit, held across it by the flush
+    /// itself ([`Options::commit_snapshot`]).  A flush takes one only for
+    /// a commit it hands to another thread, and keeps it if no thread was
+    /// to be had; any other commit made on the capturing thread reads
+    /// `false` here whether or not a transaction was open across it, and
+    /// so does a handed-over commit for which no snapshot could be had.
+    pub snapshot: bool,
+    /// What the flush pinned in the overlay and what the process held in
+    /// memory around it.
+    pub memory: FlushMemory,
+}
+
+/// What a flush pinned in the overlay, and the process's memory around
+/// it, in a [`FlushObservation`].
+///
+/// A flush captures the overlay's layers and keeps them published until
+/// its commit has landed.  While the commit runs on the capturing thread
+/// nothing else is committed, so the overlay holds what was captured and
+/// no more.  While it runs on a thread of its own
+/// ([`Options::background_commit`]) commits go on above the captured
+/// layers, and those are freed later and by another thread than before.
+/// These figures say how much was held at each step and by whom, so that
+/// a rise in the process's resident memory can be laid at the overlay, at
+/// what was allocated while the commit ran, or at neither.
+///
+/// The byte counts are the overlay's own accounting, as
+/// [`FlushObservation::dirty_bytes`] is: about the bytes requested from
+/// the allocator, not what the allocator holds for them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FlushMemory {
+    /// Layers the flush captured, which stay published until it retires.
+    pub pinned_layers: usize,
+    /// Entries in those layers, a key counted once for each layer that
+    /// holds it; [`FlushObservation::dirty_entries`] counts it once.
+    pub pinned_entries: usize,
+    /// Bytes the overlay held when the write transaction was filled and
+    /// its commit about to start, on this thread or another: the hand-off
+    /// of a flush whose commit is handed over.  The capturing thread has
+    /// held the writer semaphore since the capture, so this is
+    /// [`FlushObservation::dirty_bytes`] unless something committed that
+    /// should not have.
+    pub overlay_at_hand_off: u64,
+    /// Bytes the overlay held when the commit had returned and the
+    /// captured layers were about to be retired: the captured bytes plus
+    /// what was committed while the commit ran.
+    pub overlay_at_retirement: u64,
+    /// Layers the overlay had then, the captured ones included.
+    pub layers_at_retirement: usize,
+    /// Captured layers that something other than the flush still
+    /// referenced once the overlay had let go of them: a transaction that
+    /// began before the retirement holds them in its snapshot, and frees
+    /// them on its own thread when it ends.  The others are freed by the
+    /// thread that ends the flush.
+    pub shared_layers: usize,
+    /// Entries in those layers.
+    pub shared_entries: usize,
+    /// The process's memory just after the capture, heap mappings
+    /// included.  `None`, as the four below are, off Linux and when no
+    /// observer is attached: the readings are taken only for one.
+    pub process_at_capture: Option<ProcessMemory>,
+    /// The process's memory when the write transaction was filled and
+    /// its commit about to start, as [`Self::overlay_at_hand_off`].
+    pub process_at_hand_off: Option<ProcessMemory>,
+    /// The process's memory when the commit had returned, before the
+    /// captured layers were retired or anything of the flush was freed,
+    /// heap mappings included.
+    pub process_at_commit: Option<ProcessMemory>,
+    /// The process's memory when the thread that ended the flush before
+    /// this one had told the participant: after `finished` had returned,
+    /// or at the point where it is called for a flush the participant had
+    /// no part in, and before the flush's references to its captured
+    /// layers were dropped.  Taken whether or not that flush committed
+    /// anything, as the next is.
+    pub process_after_previous_finished: Option<ProcessMemory>,
+    /// The process's memory at the end of the flush before this one:
+    /// after that thread had dropped those references too, when it made
+    /// the commit on a thread of its own.  A flush that committed on the
+    /// capturing thread hands them to that thread's caller instead, which
+    /// drops them after this reading, so the frees of its layers are not
+    /// in it: a commit and [`Database::flush`] once they have released
+    /// the writer semaphore, [`Database::close`] under it.
+    pub process_after_previous: Option<ProcessMemory>,
+    /// What that thread spent between the retirement of the flush before
+    /// this one and the return of the participant's `finished`.
+    pub previous_finished: std::time::Duration,
+    /// What it spent between that retirement and the flush's end: the
+    /// participant's `finished` and, for a commit made on a thread of its
+    /// own, the frees of whatever captured layers no transaction still
+    /// held (see [`Self::process_after_previous`]).  For such a commit
+    /// this is part of what the next capture waits for
+    /// ([`FlushObservation::waited`]).
+    pub previous_release: std::time::Duration,
+}
+
+impl FlushMemory {
+    /// Render the layer counts as one JSON object.
+    pub fn layers_json(&self) -> String {
+        format!(
+            "{{\"pinned\":{},\"entries\":{},\"at_retire\":{},\"shared\":{},\"shared_entries\":{}}}",
+            self.pinned_layers,
+            self.pinned_entries,
+            self.layers_at_retirement,
+            self.shared_layers,
+            self.shared_entries,
+        )
+    }
+
+    /// Render the overlay's byte counts as one JSON object.
+    pub fn overlay_json(&self) -> String {
+        format!(
+            "{{\"handoff\":{},\"retire\":{}}}",
+            self.overlay_at_hand_off, self.overlay_at_retirement,
+        )
+    }
+
+    /// Render the readings of the process's memory as one JSON object,
+    /// `null` for one that was not taken.
+    pub fn process_json(&self) -> String {
+        let reading =
+            |m: &Option<ProcessMemory>| m.map_or_else(|| "null".to_string(), |m| m.to_json());
+        format!(
+            "{{\"capture\":{},\"handoff\":{},\"commit\":{},\"prev_finished\":{},\
+             \"prev_end\":{},\"prev_finished_ms\":{:.3},\"prev_release_ms\":{:.3}}}",
+            reading(&self.process_at_capture),
+            reading(&self.process_at_hand_off),
+            reading(&self.process_at_commit),
+            reading(&self.process_after_previous_finished),
+            reading(&self.process_after_previous),
+            self.previous_finished.as_secs_f64() * 1000.0,
+            self.previous_release.as_secs_f64() * 1000.0,
+        )
+    }
 }
 
 /// One phase of a metadata flush, in a [`FlushObservation`].
@@ -564,6 +838,13 @@ pub struct FlushObservation {
 /// time on a processor, which `utime_ms` and `stime_ms` divide between
 /// its own code and the kernel's, and what `elapsed` holds beyond that
 /// and `runq_wait_ns` it spent asleep.
+///
+/// Every counter of a phase is read on the thread that ran the phase, at
+/// its start and its end, and "the flushing thread" below is that
+/// thread.  For a flush whose commit ran on a thread of its own
+/// ([`FlushObservation::background`]) the commit's figures are that
+/// thread's, and those of the block-file sync, the insert loop and the
+/// participant's `contribute` are the capturing thread's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct FlushPhase {
     /// Wall time the phase took.
@@ -634,16 +915,20 @@ impl FlushPhase {
 
 /// A callback invoked after each metadata flush.
 ///
-/// Called on the flushing thread with the cache lock held, so it must not
-/// block or re-enter the database; append to a buffer and analyse later.
+/// Called with the cache lock held, so it must not block or re-enter the
+/// database; append to a buffer and analyse later.  It is called on the
+/// thread that made the flush's commit: the flushing thread, or the
+/// thread named [`COMMIT_THREAD_NAME`] for a flush that handed its
+/// commit over ([`Options::background_commit`]), in which case the
+/// thread that tripped the flush may be many commits further on.
 pub type FlushObserver = Arc<dyn Fn(&FlushObservation) + Send + Sync>;
 
 /// A callback invoked once per key/value the engine is handed, in the
 /// order it is handed them, with `None` for a delete.
 ///
 /// Called inside the flush's redb write transaction, on the flushing
-/// thread, WITHOUT the cache lock (`DbCache::run_flush` runs unlocked so
-/// readers are not held for the commit) but with the writer semaphore
+/// thread, WITHOUT the cache lock (`DbCache::fill` runs unlocked so
+/// readers are not held for the flush) but with the writer semaphore
 /// held, so it must not block or re-enter the database. It exists to
 /// capture the engine-level write sequence for ADR-0009's candidate
 /// engine benchmark: the order the storage engine actually sees is
@@ -766,6 +1051,53 @@ pub struct Options {
     /// unclean-shutdown repair on open, the `ROLLBACK` warnings, and the
     /// progress of a redb repair of the metadata store.
     pub log: Option<LogSink>,
+    /// Whether a flush that a commit's own check trips hands its redb
+    /// commit to a thread of its own, so that the commit that tripped it
+    /// returns once the write cache is captured, the block files are
+    /// synced and the rows are in redb's write transaction.
+    ///
+    /// `false` by default, in which case every flush commits on the
+    /// thread that ran it, under the writer semaphore, as dcrd's does.
+    ///
+    /// When set, the redb commit is still `Durability::Immediate` and at
+    /// most one is under way: the next flush, and any commit that finds
+    /// the overlay over [`Self::cache_max_size`] meanwhile, waits for it.
+    /// [`Database::flush`] and [`Database::close`] wait for it too and
+    /// then commit on their own thread, so what they acknowledge is
+    /// durable as before.  What changes is who is told of a failure: the
+    /// commit that tripped the flush, and those made while its redb
+    /// commit ran, have returned `Ok` by then and are lost with it at the
+    /// next start; the store latches, and the next write, flush or close
+    /// reports it ([`Database::is_fatal_settled`]).  A flush a
+    /// [`FlushParticipant`] contributed to is handed over only if the
+    /// participant allows it
+    /// ([`FlushParticipant::allows_deferred_finish`]).
+    pub background_commit: bool,
+    /// Whether a commit handed to a thread of its own
+    /// ([`Self::background_commit`]) is made with a read snapshot of the
+    /// store held across it.  `true` by default, and without effect
+    /// unless `background_commit` is set.
+    ///
+    /// A commit made on the committing thread always has one: the
+    /// transaction that tripped the flush is still open there, with the
+    /// snapshot it began with.  A handed-over commit lands after that
+    /// transaction has ended, and with no reader open redb takes another
+    /// path.  It frees the pages the commit replaced at once, in a second
+    /// commit that is not synced and whose pages it keeps in its write
+    /// buffer (redb-4.3.0 `transactions.rs:2207-2288`,
+    /// `page_manager.rs:1880-1894`).  From then until the next durable
+    /// commit has emptied that buffer, a read that misses redb's page
+    /// cache while the cache is full makes room by writing a buffered
+    /// page to the file (`cached_file.rs:698-712`), and the buffer by
+    /// then holds the pages of the next flush's write transaction: each
+    /// is written when it is evicted, read back when its commit needs it
+    /// and written again.  The snapshot keeps a handed-over commit on the
+    /// path every other commit takes, in which the pages a commit
+    /// replaced are freed by the commit after it.
+    ///
+    /// It delays nothing a commit on the committing thread does not
+    /// delay, and changes no result.
+    pub commit_snapshot: bool,
 }
 
 /// Storage shared between the caller and redb, so a test can keep a
@@ -834,6 +1166,35 @@ impl redb::StorageBackend for SharedBackendHandle {
 /// `--utxocachemaxsize`; one sync on m3 on 2026-10-10 gained 3.7% from it.
 pub const DEFAULT_DB_CACHE_BYTES: usize = 1024 * 1024 * 1024;
 
+/// Wait for the flush in flight, if there is one, to end: its commit to
+/// return and [`finish`] to retire its layers or latch the store.
+///
+/// The caller holds the writer semaphore and no other lock of this crate.
+/// A committer takes the cache lock and may call the participant, so a
+/// caller holding either would deadlock with it; it never takes the
+/// semaphore.  With [`Options::background_commit`] off nothing is ever in
+/// flight and this finds the slot empty.
+///
+/// A committer that panicked did not finish its flush.  Release builds
+/// abort on a panic; where one unwinds instead, the store is latched
+/// here, as for any flush that did not end in a commit.
+fn drain_flight(inner: &DbInner) {
+    let handle = inner.flight.lock().expect("flight slot poisoned").take();
+    let Some(handle) = handle else {
+        return;
+    };
+    let started = std::time::Instant::now();
+    let joined = handle.join();
+    let nanos = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    inner.waited_nanos.fetch_add(nanos, Ordering::Relaxed);
+    if joined.is_err() {
+        inner.mark_fatal(db_error(
+            ErrorKind::DriverSpecific,
+            "the background commit thread panicked",
+        ));
+    }
+}
+
 /// Run one flush with the cache lock released across the commit.
 ///
 /// The caller must already hold the writer semaphore, which is what
@@ -843,88 +1204,447 @@ pub const DEFAULT_DB_CACHE_BYTES: usize = 1024 * 1024 * 1024;
 /// the process for the commit's fsync. The median flush took 26.9 s in
 /// m1's sync of 2026-08-16 (about 1.3 s on m3 in 2026-10).
 ///
-/// Synchronous to durability: it returns only once the data is on disk,
-/// because `Database::flush` and `Database::close` are the chain's
-/// durability barrier and the daemon's shutdown path.
-///
 /// `only_if_needed` is the commit path's flush (dcrd `commitTx`, which
 /// flushes only when `needsFlush` says so): the thresholds are checked
 /// under the same lock hold as the capture.  `Database::flush` and
 /// `Database::close` flush unconditionally.
 ///
-/// A failure latches the store here, while the caller still holds the
-/// writer semaphore: releasing it first wakes the next queued writer
-/// unlatched, to re-run the failed flush (see [`DbInner::mark_fatal`]).
+/// **Synchronous to durability for those two.**  A flush that
+/// `Database::flush` or `Database::close` asked for returns only once the
+/// data is on disk, because they are the chain's durability barrier and
+/// the daemon's shutdown path.  So does every flush of a database opened
+/// without [`Options::background_commit`].  With it, a flush on the
+/// commit path stops being synchronous at its last step: the capture, the
+/// block-file sync, the insert loop and the participant's `contribute`
+/// run here, under the caller's semaphore, and the redb commit is handed
+/// to a thread of its own ([`hand_off`]), which retires the layers and
+/// calls `finished` when it lands.  The commit that tripped the flush is
+/// then told `Ok` with nothing of that batch acknowledged as durable; no
+/// caller of a commit is promised durability.  A participant that
+/// contributed must allow the deferral
+/// ([`FlushParticipant::allows_deferred_finish`]), or the commit stays
+/// here.
+///
+/// **One flush at a time.**  A flush is in flight from its capture to its
+/// retirement, and nothing is captured while one is: every capture is
+/// made here, after [`drain_flight`] has waited for the flush before it
+/// to end, and that is the only wait a capture depends on.  Should a
+/// capture find a flush in flight all the same, the store is latched and
+/// nothing is captured.  The latch is looked at on the way in and again
+/// after the wait, because the flush waited for may be the one that
+/// failed.  The same wait bounds the overlay: a commit that finds it over
+/// its maximum with a flush in flight waits for that flush and adds
+/// nothing until its layers are retired.
+///
+/// A failure latches the store in [`finish`].  For a flush that fails
+/// here that is while the caller still holds the writer semaphore:
+/// releasing it first wakes the next queued writer unlatched, to re-run
+/// the failed flush (see [`DbInner::mark_fatal`]).  A commit that fails
+/// on its own thread latches the store there, and whoever next reaches
+/// one of the latch checks, here or at the start of a write, is refused.
 /// Every flush goes through this one helper so that ordering cannot
 /// drift between copies.
 ///
 /// A registered [`FlushParticipant`] is driven from here too (ADR-0011).
 /// On the commit path its `wants_flush` can trip a flush the overlay's
-/// thresholds would not.  Inside the flush, `run_flush` asks `has_work`
-/// and calls `contribute` within the write transaction.  After the
-/// retirement, and after a failure has latched the store, this calls
-/// `finished` with the outcome, still under the caller's semaphore.
+/// thresholds would not.  Inside the flush, `DbCache::fill` asks
+/// `has_work` and calls `contribute` within the write transaction.  After
+/// the retirement, or after a failure has latched the store, [`finish`]
+/// calls `finished` with the outcome: under the caller's semaphore for a
+/// flush that commits here, and on the committer's thread otherwise.
 ///
 /// Returns the overlay layers the flush retired, none when it did not
-/// flush.  Dropping them frees every row the flush wrote, unless a
-/// transaction begun before the flush still reads them.  A commit and
-/// [`Database::flush`] drop them once they have released the semaphore,
-/// so that the next writer does not wait for the frees;
-/// [`Database::close`] drops them where it flushed, since no transaction
-/// begins behind a close.
+/// flush or handed its commit to a thread of its own, which retires them
+/// and lets go of them itself, holding no semaphore.  Dropping them frees
+/// every row the flush wrote, unless a transaction begun before the
+/// flush still reads them.  A commit and [`Database::flush`] drop them
+/// once they have released the semaphore, so that the next writer does
+/// not wait for the frees; [`Database::close`] drops them where it
+/// flushed, since no transaction begins behind a close.
 pub(crate) fn flush_locked(
-    inner: &DbInner,
+    inner: &Arc<DbInner>,
     only_if_needed: bool,
 ) -> Result<crate::dbcache::RetiredLayers, Error> {
+    // Nothing is captured, and no block file synced, on a latched store.
+    inner.check_writable()?;
     // One clone for the whole flush: registration changes only under the
-    // writer semaphore the caller holds, so this is the participant the
-    // flush runs with from capture to `finished`.
+    // writer semaphore, after a wait for the flush in flight, so this is
+    // the participant the flush runs with from capture to `finished`.
     let registered = inner.registered();
     // Asked before the cache lock is taken, so a participant's own locks
-    // never nest inside it.  Nothing can change the answer between here
-    // and the capture: only an `on_commit` hook adds to a participant's
-    // work, and hooks run under the semaphore this caller holds.
+    // never nest inside it.  Only an `on_commit` hook adds to a
+    // participant's work, and hooks run under the semaphore this caller
+    // holds, so the answer cannot rise between here and the capture.
     let wanted = only_if_needed
         && registered
             .as_ref()
             .is_some_and(|r| r.participant.wants_flush());
+    // The answer of nearly every commit: nothing to flush and nothing to
+    // wait for.
+    if only_if_needed {
+        let cache = inner.cache.lock().expect("cache lock poisoned");
+        if !cache.needs_flush() && !wanted && !cache.over_ceiling() {
+            return Ok(Vec::new());
+        }
+    }
+    // The flush before this one has to be over before anything is
+    // captured, and a commit that found the overlay over its ceiling
+    // adds nothing until the layers in flight are retired.  The caller
+    // waits with the semaphore held, so every other writer queues behind
+    // it.
+    #[cfg(test)]
+    let waits = !inner.skip_drain.load(Ordering::SeqCst);
+    #[cfg(not(test))]
+    let waits = true;
+    if waits {
+        drain_flight(inner);
+    }
+    // The flush waited for may have failed.
+    inner.check_writable()?;
     let mut batch = {
         let mut cache = inner.cache.lock().expect("cache lock poisoned");
         if only_if_needed && !cache.needs_flush() && !wanted {
+            // The ceiling alone brought this commit here, and the wait
+            // was all it asked for.
             return Ok(Vec::new());
+        }
+        if cache.in_flight() {
+            drop(cache);
+            return Err(inner.mark_fatal(db_error(
+                ErrorKind::DriverSpecific,
+                "a flush was captured while another was in flight",
+            )));
         }
         cache.begin_flush()
     };
+    #[cfg(test)]
+    {
+        batch.on_drop = crate::dbcache::DropProbe(
+            inner
+                .batch_dropped
+                .lock()
+                .expect("test hook poisoned")
+                .clone(),
+        );
+    }
     // Final for this flush already: a wait ends when the semaphore is
-    // taken, and the caller holds it until the flush is over.
+    // taken, and the caller holds it until the capture is handed on.
     batch.writer_waits = inner.writer_waits();
+    batch.explicit = !only_if_needed;
+    batch.waited = std::time::Duration::from_nanos(inner.waited_nanos.swap(0, Ordering::Relaxed));
+    if batch.observed() {
+        batch.memory.process_at_capture = ProcessMemory::read(true);
+        if let Some(end) = inner.flush_end.lock().expect("flush end poisoned").take() {
+            batch.memory.process_after_previous_finished = end.told;
+            batch.memory.process_after_previous = end.memory;
+            batch.memory.previous_finished = end.telling;
+            batch.memory.previous_release = end.release;
+        }
+    }
     let mut contributed = false;
-    let (outcome, failure) = match crate::dbcache::DbCache::run_flush(
-        &batch,
-        &inner.kv,
-        &inner.block_store,
+    // The block files are synced, and what the sync owed is discharged,
+    // on this thread before the transaction can leave it: nothing writes
+    // a block between the plan and its discharge, because the semaphore
+    // is held throughout both.
+    let filled = DbCache::sync_blocks(&batch, &inner.block_store).and_then(|block_sync| {
+        DbCache::fill(
+            &batch,
+            &inner.kv,
+            registered.as_ref(),
+            &mut contributed,
+            block_sync,
+        )
+    });
+    let job = match filled {
+        Ok(Filled::Tx(job)) => job,
+        Ok(Filled::Empty(outcome)) => {
+            return finish(
+                inner,
+                batch,
+                Ok(outcome),
+                registered.as_ref(),
+                contributed,
+                false,
+            );
+        }
+        // A failure before the commit fails the caller, as it always
+        // has: the commit that tripped the flush is unapplied and rolls
+        // its block files back.
+        Err(e) => {
+            return finish(
+                inner,
+                batch,
+                Err(e),
+                registered.as_ref(),
+                contributed,
+                false,
+            );
+        }
+    };
+    // Only a commit's own flush is handed over.  `Database::flush` and
+    // `Database::close` acknowledge durability, so theirs commits here.
+    // So does one a participant contributed to without allowing its
+    // `finished` to be deferred.
+    let deferred = inner.background
+        && only_if_needed
+        && (!contributed
+            || registered
+                .as_ref()
+                .is_some_and(|r| r.participant.allows_deferred_finish()));
+    if batch.observed() {
+        batch.memory.overlay_at_hand_off = inner
+            .cache
+            .lock()
+            .expect("cache lock poisoned")
+            .overlay_bytes();
+        batch.memory.process_at_hand_off = ProcessMemory::read(false);
+    }
+    // A commit made here has the caller's transaction open across it, or
+    // was asked for with none; one that leaves this thread would land
+    // with no reader open, and is given one ([`Options::commit_snapshot`]).
+    // A snapshot that cannot be had is done without: the commit then
+    // fails or lands as it would have.
+    let snapshot = (deferred && inner.commit_snapshot)
+        .then(|| inner.kv.begin_read().ok())
+        .flatten();
+    batch.snapshot = snapshot.is_some();
+    let mut flight = Flight {
+        job,
+        batch,
+        registered,
+        contributed,
+        snapshot,
+    };
+    if deferred {
+        match hand_off(inner, flight) {
+            // The committer retires the layers and lets go of them.
+            None => return Ok(Vec::new()),
+            // No thread was to be had: the same transaction commits here.
+            Some(refused) => flight = refused,
+        }
+    }
+    let Flight {
+        job,
+        batch,
+        registered,
+        contributed,
+        snapshot,
+    } = flight;
+    let result = DbCache::commit(job);
+    drop(snapshot);
+    finish(
+        inner,
+        batch,
+        result,
         registered.as_ref(),
-        &mut contributed,
-    ) {
-        Ok(outcome) => (Some(outcome), None),
-        Err(e) => (None, Some(e)),
+        contributed,
+        false,
+    )
+}
+
+/// A flush from its filled write transaction on: what the capturing
+/// thread hands the thread that commits it.
+struct Flight {
+    job: CommitJob,
+    batch: FlushBatch,
+    /// The participant registered when the flush was captured.
+    registered: Option<participant::Registration>,
+    /// Whether its `contribute` was called, and `finished` is owed.
+    contributed: bool,
+    /// A read snapshot of the store taken before the hand-off, to be held
+    /// until the commit has returned ([`Options::commit_snapshot`]).
+    snapshot: Option<redb::ReadTransaction>,
+}
+
+/// Start the thread that commits `flight` and record it as the flush in
+/// flight; `None` once it is started.  When the operating system has no
+/// thread to give, the flight is returned for the caller to commit
+/// itself, so a refused thread loses no flush.
+///
+/// The caller holds the writer semaphore and has just waited out the
+/// flight before this one ([`drain_flight`]), so the slot is empty.
+fn hand_off(inner: &Arc<DbInner>, mut flight: Flight) -> Option<Flight> {
+    flight.batch.hand_off();
+    // The closure owns the flight only through this slot, so a closure
+    // dropped unrun leaves it here to be taken back.
+    let slot = Arc::new(Mutex::new(Some(flight)));
+    #[cfg(test)]
+    let refused = inner.refuse_commit_thread.load(Ordering::SeqCst);
+    #[cfg(not(test))]
+    let refused = false;
+    let spawned = if refused {
+        Err(std::io::Error::other("no thread, by a test's request"))
+    } else {
+        let committer = Arc::clone(inner);
+        let taken = Arc::clone(&slot);
+        std::thread::Builder::new()
+            .name(COMMIT_THREAD_NAME.to_string())
+            .spawn(move || commit_in_background(committer, taken))
     };
-    // Retire (or restore) under the lock either way: on failure the
-    // overlay still holds every captured byte, and the accounting has to
-    // go back or the cache never trips its own ceiling again.
-    let retired = {
-        let mut cache = inner.cache.lock().expect("cache lock poisoned");
-        cache.finish_flush(batch, outcome)
+    match spawned {
+        Ok(handle) => {
+            *inner.flight.lock().expect("flight slot poisoned") = Some(handle);
+            None
+        }
+        Err(_) => {
+            let mut flight = slot
+                .lock()
+                .expect("flight poisoned")
+                .take()
+                .expect("a thread that never started took nothing");
+            flight.batch.take_back();
+            Some(flight)
+        }
+    }
+}
+
+/// The body of a committer thread: make the redb commit of the flight in
+/// `slot`, then end the flush as its capturing thread would have.
+///
+/// It takes the cache lock, in [`finish`], and calls the participant's
+/// `finished`; it never takes the writer semaphore, the block-store lock
+/// or the participant slot's lock, and never touches the flight slot
+/// that holds its own handle.  A semaphore holder can therefore always
+/// wait for it.
+///
+/// It keeps the database's shared state alive until it has ended, and
+/// lets go of it last: a handle dropped meanwhile does not close the
+/// store under the commit.
+fn commit_in_background(inner: Arc<DbInner>, slot: Arc<Mutex<Option<Flight>>>) {
+    let flight = slot.lock().expect("flight poisoned").take();
+    drop(slot);
+    let Some(Flight {
+        job,
+        batch,
+        registered,
+        contributed,
+        snapshot,
+    }) = flight
+    else {
+        return;
     };
-    // Latch before telling the participant, so a participant told its
-    // rows were discarded finds the store already refusing writes.
-    let failure = failure.map(|e| inner.mark_fatal(e));
-    if contributed && let Some(registered) = &registered {
+    let result = DbCache::commit(job);
+    drop(snapshot);
+    // A failure is in the latch and the log by the time this returns;
+    // there is no caller here to hand it to.
+    let _ = finish(
+        &inner,
+        batch,
+        result,
+        registered.as_ref(),
+        contributed,
+        true,
+    );
+}
+
+/// End a flush whose commit has returned, or which failed before it:
+/// retire the captured layers or latch the store, then tell the
+/// participant.  Run by the thread that made, or would have made, the
+/// commit; `background` says it is a committer thread.
+///
+/// On success the layers are retired under the cache lock, which is where
+/// the observer is called, and only then is a participant that
+/// contributed told `finished(true)`: both follow the commit, so neither
+/// reports rows that are not durable.  A retirement that finds the pinned
+/// layers changed is a failure like any other, though the commit has
+/// landed.  In that one case the accounting goes back before the store
+/// is latched, since `DbCache::retire` restores it as it refuses.
+/// Nothing can be captured in between: a capture follows a wait for this
+/// thread to end, or is made by the thread running this.
+///
+/// On failure the store is latched before anything else.  The accounting
+/// then goes back under the cache lock, since the overlay still holds
+/// every captured byte and the cache would otherwise never trip its own
+/// ceiling again, and a participant that contributed is told
+/// `finished(false)` with the store already refusing writes.  A
+/// committer thread has no caller to return the error to, so it logs it
+/// as well, once.
+///
+/// The batch, and with it the flush's references to the captured layers,
+/// is dropped only after the cache lock is released.  A committer thread
+/// drops it here.  A flush that committed on the capturing thread returns
+/// those references instead, for [`flush_locked`]'s caller to drop: a
+/// commit and [`Database::flush`] once they have released the writer
+/// semaphore as well, and [`Database::close`] where it flushed, under it.
+fn finish(
+    inner: &DbInner,
+    mut batch: FlushBatch,
+    result: Result<FlushOutcome, Error>,
+    registered: Option<&participant::Registration>,
+    contributed: bool,
+    background: bool,
+) -> Result<crate::dbcache::RetiredLayers, Error> {
+    let observed = batch.observed();
+    let failure = match result {
+        Ok(outcome) => {
+            // Read for the observer, which sees only a flush that
+            // committed; a failed one is latched with nothing before it.
+            if observed {
+                batch.memory.process_at_commit = ProcessMemory::read(true);
+            }
+            #[cfg(test)]
+            if background
+                && let Some(hook) = &*inner.before_retire.lock().expect("test hook poisoned")
+            {
+                hook();
+            }
+            let retired = inner
+                .cache
+                .lock()
+                .expect("cache lock poisoned")
+                .retire(&batch, Some(outcome));
+            // `retire` put the accounting back itself before it refused.
+            retired.err().map(|e| inner.mark_fatal(e))
+        }
+        Err(e) => {
+            let e = inner.mark_fatal(e);
+            let restored = inner
+                .cache
+                .lock()
+                .expect("cache lock poisoned")
+                .retire(&batch, None);
+            debug_assert!(restored.is_ok(), "putting the bytes back cannot fail");
+            Some(e)
+        }
+    };
+    if background && let Some(e) = &failure {
+        log_line(
+            inner.log.as_ref(),
+            LogLevel::Error,
+            &format!("Background commit of the metadata write cache failed: {e}"),
+        );
+    }
+    let retired = observed.then(std::time::Instant::now);
+    if contributed && let Some(registered) = registered {
         registered.participant.finished(failure.is_none());
+    }
+    // Read between the two, so that what `finished` allocated can be told
+    // from what the frees below give back.
+    let told = retired.map(|retired| (ProcessMemory::read(false), retired.elapsed()));
+    // A committer holds no semaphore and lets go of the layers here.  A
+    // flush that committed on the capturing thread hands them back, and
+    // its caller frees them after the reading below: a commit and
+    // `Database::flush` once they have released the writer, a close
+    // under it.  One that failed hands back nothing: its layers are
+    // still published, and the drop frees none of them.
+    let handed_back = if background || failure.is_some() {
+        drop(batch);
+        crate::dbcache::RetiredLayers::new()
+    } else {
+        batch.into_retired()
+    };
+    if let (Some(retired), Some((told, telling))) = (retired, told) {
+        let end = FlushEnd {
+            told,
+            telling,
+            memory: ProcessMemory::read(false),
+            release: retired.elapsed(),
+        };
+        *inner.flush_end.lock().expect("flush end poisoned") = Some(end);
     }
     match failure {
         Some(e) => Err(e),
-        None => Ok(retired),
+        None => Ok(handed_back),
     }
 }
 
@@ -963,6 +1683,8 @@ impl Options {
             cache_flush_interval_secs: crate::dbcache::DEFAULT_FLUSH_SECS,
             backend: None,
             log: None,
+            background_commit: false,
+            commit_snapshot: true,
         }
     }
 }
@@ -1762,6 +2484,49 @@ impl Database {
             .laid_out_written
     }
 
+    /// [`Self::is_fatal`], once any flush whose commit is still under way
+    /// on its own thread has ended ([`Options::background_commit`]).
+    ///
+    /// For a caller that has just seen something fail and must decide
+    /// whether storage was the cause.  redb refuses reads of pages it has
+    /// not cached from the moment a write of its commit fails, which is
+    /// before the commit returns and the store latches.  A read made in
+    /// between fails, or answers absence where an ffldb-layout read takes
+    /// a store error for a missing row, with [`Self::is_fatal`] still
+    /// `false`.  Waiting for the commit closes that window.
+    ///
+    /// With the option off, or the store already latched, this is
+    /// [`Self::is_fatal`] and waits for nothing.  So `true` does not say
+    /// the committer has ended: it latches the store first, and may
+    /// still be logging the failure or telling the participant.  A flush
+    /// or a close waits for that; this only answers.  Otherwise it waits
+    /// out any writable transaction, as [`Self::flush`] does: calling it
+    /// from a thread that holds one, or from a participant or
+    /// `on_commit` hook, deadlocks.
+    pub fn is_fatal_settled(&self) -> bool {
+        if !self.inner.background || self.is_fatal() {
+            return self.is_fatal();
+        }
+        let _writer = self.exclusive_writer();
+        drain_flight(&self.inner);
+        self.is_fatal()
+    }
+
+    /// Wait for the flush whose commit is under way on its own thread, if
+    /// there is one, and report the latch: `Ok` when the store is
+    /// writable afterwards, the latch's refusal when that commit, or any
+    /// durable write before it, failed.
+    ///
+    /// For tests, which must not drop or reopen a store with a commit
+    /// still running: the committer holds the store open until it ends.
+    /// Waits out any writable transaction, as [`Self::flush`] does.
+    #[doc(hidden)]
+    pub fn wait_background_commit(&self) -> Result<(), Error> {
+        let _writer = self.exclusive_writer();
+        drain_flight(&self.inner);
+        self.inner.check_writable()
+    }
+
     /// Acquire everything a new transaction needs, in the safe order:
     /// the writer semaphore (writable only, dcrd's `writeLock`), the
     /// cache overlay snapshot, and only then the redb read snapshot.
@@ -1810,21 +2575,38 @@ impl Database {
         // commit -- it is not: `flush_locked` releases it for the redb
         // commit so readers are not held for its fsync.  It is three
         // things together.  A flush's captured layers stay published
-        // until `DbCache::finish_flush` retires them, after its commit
+        // until `DbCache::retire` retires them, after its commit
         // is visible, and that retirement takes the cache lock, so it
         // cannot happen inside this hold.  `DbCache::begin_flush` takes
         // the lock too, so no new flush can be captured inside it.  And
-        // flushes are serialized by the writer semaphore, so at most one
-        // is in flight -- captured before this hold, retired after it --
-        // and its commit is the only one that can land between the two
-        // snapshots, with its layers still in the overlay snapshot.  A
-        // flush that ran without the writer semaphore would break the
-        // last of these and with it this view.  The order is writer
-        // flag, then cache, then redb on both paths, so the two cannot
-        // deadlock against each other.
+        // at most one flush is captured and not yet retired: every
+        // capture is made by a holder of the writer semaphore after it
+        // has waited for the flush before it to end (`drain_flight` in
+        // `flush_locked`), and a flush ends only once it has retired or
+        // latched the store, on whichever thread made its commit.  So
+        // one flush at most is in flight across this hold -- captured
+        // before it, retired after it -- and its commit is the only one
+        // that can land between the two snapshots, with its layers still
+        // in the overlay snapshot.  A capture made without that wait
+        // would break the last of these and with it this view, which is
+        // why `flush_locked` refuses one in release builds too.  The
+        // order is writer flag, then cache, then redb on both paths, so
+        // the two cannot deadlock against each other.
         let cache = self.inner.cache.lock().expect("cache lock poisoned");
         let cache_snap = std::sync::Arc::clone(&cache.cached);
         let buckets = std::sync::Arc::clone(&cache.buckets);
+        #[cfg(test)]
+        {
+            let hook = self
+                .inner
+                .between_snapshots
+                .lock()
+                .expect("test hook poisoned")
+                .take();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
         let kv = match self.inner.kv.begin_read() {
             Ok(t) => t,
             Err(e) => {
@@ -1929,7 +2711,18 @@ impl Database {
         // first, matching dcrd's `Close`, which marks it closed even
         // when the cache close fails (`ffldb/db.go:1978-1989`).
         if let Err(e) = self.inner.check_writable() {
+            // No committer outlives the close, latched or not: the one
+            // that latched the store may still be telling the
+            // participant, which is released only after it.  That is a
+            // wait for the writer, as on the path below, so it is made
+            // only where a committer can exist.
+            let writer = self.inner.background.then(|| {
+                let writer = self.exclusive_writer();
+                drain_flight(&self.inner);
+                writer
+            });
             drop(self.inner.take_participant());
+            drop(writer);
             return Err(e);
         }
         // Flush the metadata write cache so a clean shutdown persists
@@ -1938,6 +2731,9 @@ impl Database {
         // which can be the one that latches, so look again once it is
         // out of the way.
         let _writer = self.exclusive_writer();
+        // And any flush whose commit is still under way: `close_locked`
+        // looks at the latch before its own flush would wait for it.
+        drain_flight(&self.inner);
         let closed = self.close_locked();
         drop(self.inner.take_participant());
         closed
@@ -1965,9 +2761,10 @@ impl Database {
     /// gone.  It must not hold a clone of this database (see the trait).
     ///
     /// Waits out any writable transaction and any flush, as a flush does,
-    /// so a flush runs with one participant from start to end.  Calling it
-    /// from a thread that holds a writable transaction of this database,
-    /// or from a participant or `on_commit` hook, deadlocks.
+    /// a flush whose commit is still under way on its own thread
+    /// included, so a flush runs with one participant from start to end.
+    /// Calling it from a thread that holds a writable transaction of this
+    /// database, or from a participant or `on_commit` hook, deadlocks.
     ///
     /// Refused with:
     /// - [`ErrorKind::DbNotOpen`] once the database is closed;
@@ -2004,6 +2801,9 @@ impl Database {
             ));
         }
         let _writer = self.exclusive_writer();
+        // A flush whose commit is still under way ends with the
+        // registration it began with.
+        drain_flight(&self.inner);
         // The close may have run while this waited.
         self.check_open()?;
         if self.inner.registered().is_some() {
@@ -2050,6 +2850,10 @@ impl Database {
     /// index's rows back.
     pub fn clear_flush_participant(&self) -> Option<Arc<dyn FlushParticipant>> {
         let _writer = self.exclusive_writer();
+        // `finished` included even when it is called by the thread that
+        // made the flush's commit, after the flush's own caller has gone
+        // on.
+        drain_flight(&self.inner);
         self.inner.take_participant()
     }
 
@@ -2069,10 +2873,13 @@ impl Database {
         // above comes before the close in the same way.  Should the
         // close wake first here, it has already flushed and no writer
         // can begin after it, so the flush below is empty and commits
-        // nothing (`DbCache::run_flush`; the close released any flush
+        // nothing (`DbCache::fill`; the close released any flush
         // participant, so none has work for it either): still dcrd's `Ok`.
         // Again with the writer held: the transaction waited out may be
-        // the one whose flush failed and latched the store.
+        // the one whose flush failed and latched the store.  So may a
+        // flush whose commit is still under way, which is waited for
+        // first: nothing is acknowledged here until it has ended.
+        drain_flight(&self.inner);
         self.inner.check_writable()?;
         let retired = flush_locked(&self.inner, false);
         // The layers the flush retired are freed once the writer is
@@ -2419,12 +3226,15 @@ mod fatal_latch_tests {
     /// latch. That wiring is two sites: every durable flush
     /// (`Database::flush`, `Database::close`, and the flush inside
     /// `Transaction::commit_internal`) goes through `flush_locked`,
-    /// which latches a failure before the writer semaphore is released,
-    /// and `Database::close` latches a failure of its allocator-state
-    /// commit (`record_allocator_state`). `tests/enospc.rs` closes that
-    /// gap: it fills a 2 MiB filesystem under a live database and asserts
-    /// that the resulting `ENOSPC` arrives as an error, latches the
-    /// store, and leaves reads working. It is Linux-only and skips
+    /// whose `finish` latches a failure before the writer semaphore is
+    /// released, or, for a commit handed to a thread of its own, on that
+    /// thread before anything else; and `Database::close` latches a
+    /// failure of its allocator-state commit
+    /// (`record_allocator_state`). `tests/enospc.rs` closes that gap,
+    /// for a commit on either thread: it fills a 2 MiB filesystem under
+    /// a live database and asserts that the resulting `ENOSPC` arrives
+    /// as an error, latches the store, and leaves reads working. It is
+    /// Linux-only and skips
     /// loudly where it cannot mount one, with CI setting
     /// `DCROXIDE_REQUIRE_FAULT_INJECTION=1` so a skip there is a
     /// failure.
@@ -2612,6 +3422,1307 @@ mod late_flush_tests {
             })
             .expect("view");
         drop(db);
+    }
+}
+
+/// The parts of a handed-over commit (`Options::background_commit`) that
+/// only a seam inside the crate can reach: a reader placed between the
+/// commit and the retirement, a commit made to land between a reader's
+/// two snapshots, a thread the system refuses, a capture made without the
+/// wait before it, a retirement that finds the pinned layers changed, a
+/// committer that panics before it retires, each of the two looks a
+/// commit takes at the latch on its own, and which thread syncs the block
+/// files.  What can be shown from outside is in
+/// `tests/background_commit.rs`.
+#[cfg(test)]
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "test arithmetic over small counts"
+)]
+mod background_commit_tests {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    use dcroxide_testutil::gate::GateBackend;
+    use dcroxide_testutil::powerloss::PowerLossBackend;
+
+    use super::*;
+
+    const NET: u32 = 0x1214_1c16;
+
+    /// The overlay's maximum: one [`fill`] arms the next commit's flush.
+    const CACHE_MAX: u64 = 64 * 1024;
+
+    /// Longer than anything here takes.
+    const NEVER: Duration = Duration::from_secs(60);
+
+    /// A store with background commits on, over storage that can hold the
+    /// committer thread and lose power, and every flush it observed.
+    struct Rig {
+        dir: tempfile::TempDir,
+        db: Database,
+        power: Arc<PowerLossBackend>,
+        gate: Arc<GateBackend>,
+        seen: Arc<Mutex<Vec<FlushObservation>>>,
+    }
+
+    impl Rig {
+        fn new() -> Rig {
+            assert_eq!(
+                COMMIT_THREAD_NAME,
+                dcroxide_testutil::gate::COMMITTER_THREAD_NAME,
+                "the gate holds the thread the database names"
+            );
+            let dir = tempfile::tempdir().expect("temp dir");
+            let db_dir = dir.path().join("db");
+            std::fs::create_dir_all(&db_dir).expect("mkdir");
+            let power = PowerLossBackend::create(&db_dir.join(METADATA_FILE), true);
+            let gate = GateBackend::new(Arc::clone(&power) as SharedBackend);
+            let mut opts = Options::new(&db_dir, NET);
+            opts.backend = Some(Arc::clone(&gate) as SharedBackend);
+            opts.background_commit = true;
+            opts.cache_max_size = CACHE_MAX;
+            let seen: Arc<Mutex<Vec<FlushObservation>>> = Arc::default();
+            let sink = Arc::clone(&seen);
+            opts.flush_observer = Some(Arc::new(move |obs: &FlushObservation| {
+                sink.lock().expect("observations").push(*obs);
+            }));
+            let db = Database::create(&opts).expect("create");
+            db.update(|tx| tx.metadata().create_bucket(b"rows").map(|_| ()))
+                .expect("the bucket");
+            db.flush().expect("flush");
+            seen.lock().expect("observations").clear();
+            Rig {
+                dir,
+                db,
+                power,
+                gate,
+                seen,
+            }
+        }
+
+        /// Commit 48 rows of a kibibyte under `tag`: enough to arm the
+        /// next commit's flush, and too little to trip this one's over an
+        /// empty overlay.
+        fn fill(&self, tag: u8) {
+            self.db
+                .update(|tx| {
+                    let rows = tx.metadata().bucket(b"rows").expect("bucket");
+                    for i in 0..48u8 {
+                        rows.put(&[tag, i], &[tag; 1024])?;
+                    }
+                    Ok(())
+                })
+                .expect("fill");
+        }
+
+        /// Commit one small row under `tag`.
+        fn small(&self, tag: u8) -> Result<(), Error> {
+            self.db.update(|tx| {
+                tx.metadata()
+                    .bucket(b"rows")
+                    .expect("bucket")
+                    .put(&[tag, 0xff], &[tag])
+            })
+        }
+
+        /// Commit a fill under `tag`, shut the gate, and commit a small
+        /// row under `tag + 1`, whose flush check captures the fill and
+        /// hands its commit over: on return the committer is held at its
+        /// first write.
+        fn hold_a_commit(&self, tag: u8) {
+            self.fill(tag);
+            self.gate.arm();
+            self.small(tag + 1)
+                .expect("the commit that trips the flush");
+            assert!(self.gate.wait_held(NEVER), "the commit is under way");
+            assert!(
+                !self.gate.holds_a_length_change(),
+                "the commit was stopped growing the file, where no transaction can begin beside it"
+            );
+        }
+
+        /// The keys a reader finds under the bucket, in order, each with
+        /// the first byte of its value.
+        fn rows(tx: &Transaction) -> Vec<(Vec<u8>, u8)> {
+            let mut found = Vec::new();
+            tx.metadata()
+                .bucket(b"rows")
+                .expect("bucket")
+                .for_each(|key, value| {
+                    found.push((key.to_vec(), value[0]));
+                    Ok(())
+                })
+                .expect("scan");
+            found
+        }
+
+        /// Wait for any commit under way, let go of the store without
+        /// closing it, lose power, and reopen the file alone.
+        fn crash_and_reopen(self) -> (tempfile::TempDir, Database) {
+            let Rig { dir, db, power, .. } = self;
+            let _ = db.wait_background_commit();
+            *db.inner.before_retire.lock().expect("test hook poisoned") = None;
+            drop(db);
+            power.cut_power();
+            let reopened =
+                Database::open(&Options::new(dir.path().join("db"), NET)).expect("reopen");
+            (dir, reopened)
+        }
+
+        /// Create a bucket for a participant's rows and make it durable;
+        /// its id is the participant's prefix.
+        fn journal_prefix(&self) -> [u8; 4] {
+            let mut prefix = [0u8; 4];
+            self.db
+                .update(|tx| {
+                    prefix = tx.metadata().create_bucket(b"journal")?.raw_id();
+                    Ok(())
+                })
+                .expect("the journal bucket");
+            self.db.flush().expect("flush");
+            self.seen.lock().expect("observations").clear();
+            prefix
+        }
+
+        /// The bytes in the store's block files.
+        ///
+        /// Each file's size is read from the file itself: on Windows a
+        /// directory entry's metadata is what the directory recorded,
+        /// which can lag behind a file the store still holds open.
+        fn block_file_bytes(&self) -> u64 {
+            std::fs::read_dir(self.dir.path().join("db"))
+                .expect("the database directory")
+                .map(|entry| entry.expect("an entry").path())
+                .filter(|path| path.extension().is_some_and(|e| e == "fdb"))
+                .map(|path| std::fs::metadata(&path).expect("metadata").len())
+                .sum()
+        }
+    }
+
+    /// A participant that allows its `finished` to be deferred, writes
+    /// one row in every flush, asks for a flush when a test says so, and
+    /// records how each flush ended and whether the store was latched by
+    /// then.
+    struct Asker {
+        /// The store, for its latch; not a handle, which a participant
+        /// must not keep.
+        store: std::sync::Weak<DbInner>,
+        want: AtomicBool,
+        /// `(committed, latched)` for each `finished`, in order.
+        finished: Mutex<Vec<(bool, bool)>>,
+    }
+
+    impl Asker {
+        fn new(db: &Database) -> Arc<Asker> {
+            Arc::new(Asker {
+                store: Arc::downgrade(&db.inner),
+                want: AtomicBool::new(false),
+                finished: Mutex::default(),
+            })
+        }
+
+        fn finished(&self) -> Vec<(bool, bool)> {
+            self.finished.lock().expect("finished").clone()
+        }
+    }
+
+    impl FlushParticipant for Asker {
+        fn wants_flush(&self) -> bool {
+            self.want.load(Ordering::SeqCst)
+        }
+
+        fn has_work(&self) -> bool {
+            true
+        }
+
+        fn contribute(&self, w: &mut FlushWriter<'_, '_>) -> Result<ParticipantStats, Error> {
+            let mut key = w.prefix().to_vec();
+            key.push(b'K');
+            w.insert(&key, b"")?;
+            Ok(ParticipantStats::default())
+        }
+
+        fn finished(&self, committed: bool) {
+            let latched = self
+                .store
+                .upgrade()
+                .is_some_and(|inner| inner.fatal.load(Ordering::SeqCst));
+            self.finished
+                .lock()
+                .expect("finished")
+                .push((committed, latched));
+        }
+
+        fn allows_deferred_finish(&self) -> bool {
+            true
+        }
+    }
+
+    /// A reader that begins after a handed-over commit has landed and
+    /// before its layers are retired holds both: the overlay with the
+    /// captured rows and a store that has them too.  It sees each row
+    /// once, with the value the batch gave it, and a row the batch
+    /// deleted not at all; and so does it still after the retirement,
+    /// with the layers gone from the overlay under it.
+    #[test]
+    fn a_reader_between_the_commit_and_its_retirement_sees_the_captured_rows_once() {
+        let rig = Rig::new();
+        // Durable before the batch: one row it will rewrite and one it
+        // will delete.
+        rig.db
+            .update(|tx| {
+                let rows = tx.metadata().bucket(b"rows").expect("bucket");
+                rows.put(&[0, 1], &[0xaa])?;
+                rows.put(&[0, 2], &[0xbb])
+            })
+            .expect("the earlier rows");
+        rig.db.flush().expect("flush");
+        rig.seen.lock().expect("observations").clear();
+
+        // The batch: the fill, a rewrite and a delete.
+        rig.db
+            .update(|tx| {
+                let rows = tx.metadata().bucket(b"rows").expect("bucket");
+                for i in 0..48u8 {
+                    rows.put(&[1, i], &[1; 1024])?;
+                }
+                rows.put(&[0, 1], &[0xcc])?;
+                rows.delete(&[0, 2])
+            })
+            .expect("the batch");
+
+        // Hold the committer between its commit and the retirement.
+        let (reached, at_hook) = mpsc::channel();
+        let (go, resume) = mpsc::channel::<()>();
+        let resume = Mutex::new(resume);
+        *rig.db
+            .inner
+            .before_retire
+            .lock()
+            .expect("test hook poisoned") = Some(Box::new(move || {
+            let _ = reached.send(());
+            let _ = resume.lock().expect("resume").recv_timeout(NEVER);
+        }));
+        rig.small(2).expect("the commit that trips the flush");
+        at_hook
+            .recv_timeout(NEVER)
+            .expect("the commit landed and its thread is at the hook");
+        assert!(
+            rig.seen.lock().expect("observations").is_empty(),
+            "nothing is retired yet"
+        );
+
+        let mut expected: Vec<(Vec<u8>, u8)> = vec![(vec![0, 1], 0xcc)];
+        expected.extend((0..48u8).map(|i| (vec![1, i], 1)));
+        expected.push((vec![2, 0xff], 2));
+        let reader = rig.db.begin(false).expect("begin a reader");
+        assert_eq!(
+            Rig::rows(&reader),
+            expected,
+            "between the commit and the retirement"
+        );
+
+        go.send(()).expect("let the committer retire");
+        rig.db.wait_background_commit().expect("the flush ended");
+        assert_eq!(rig.seen.lock().expect("observations").len(), 1);
+        assert_eq!(
+            Rig::rows(&reader),
+            expected,
+            "the same reader, after the retirement"
+        );
+        reader.rollback().expect("end the reader");
+        let later = rig.db.begin(false).expect("begin a reader");
+        assert_eq!(Rig::rows(&later), expected, "a reader of the store alone");
+        later.rollback().expect("end the reader");
+
+        let (_dir, reopened) = rig.crash_and_reopen();
+        let durable = reopened.begin(false).expect("begin a reader");
+        expected.pop();
+        assert_eq!(
+            Rig::rows(&durable),
+            expected,
+            "the batch is durable, the commit that tripped it is not"
+        );
+        durable.rollback().expect("end the reader");
+        reopened.close().expect("close");
+    }
+
+    /// A flush's commit can land between the two snapshots a beginning
+    /// transaction takes; its retirement cannot.  The overlay's snapshot
+    /// is taken first and the store's second, under one hold of the cache
+    /// lock, which a retirement needs.  So a reader that begins across a
+    /// commit has the batch in both, and reads each row once.  It never
+    /// has a store from before the commit under an overlay from after the
+    /// retirement, which would hold the batch in neither.
+    ///
+    /// The committer is held at its first write until the reader has its
+    /// first snapshot, and the reader then waits where it is for the
+    /// commit to land and, for a moment, for a retirement that must not
+    /// come.
+    #[test]
+    fn a_commit_that_lands_inside_a_begin_is_retired_only_after_it() {
+        let rig = Rig::new();
+        rig.hold_a_commit(1);
+
+        // The committer says when its commit has landed.
+        let (landed, has_landed) = mpsc::channel();
+        *rig.db
+            .inner
+            .before_retire
+            .lock()
+            .expect("test hook poisoned") = Some(Box::new(move || {
+            let _ = landed.send(());
+        }));
+        let retired_inside = Arc::new(AtomicBool::new(false));
+        {
+            let gate = Arc::clone(&rig.gate);
+            let seen = Arc::clone(&rig.seen);
+            let has_landed = Mutex::new(has_landed);
+            let retired_inside = Arc::clone(&retired_inside);
+            *rig.db
+                .inner
+                .between_snapshots
+                .lock()
+                .expect("test hook poisoned") = Some(Box::new(move || {
+                gate.open();
+                has_landed
+                    .lock()
+                    .expect("landed")
+                    .recv_timeout(NEVER)
+                    .expect("the commit landed");
+                let deadline = std::time::Instant::now() + Duration::from_millis(300);
+                while std::time::Instant::now() < deadline {
+                    if !seen.lock().expect("observations").is_empty() {
+                        retired_inside.store(true, Ordering::SeqCst);
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }));
+        }
+
+        let reader = rig.db.begin(false).expect("begin a reader");
+        assert!(
+            !retired_inside.load(Ordering::SeqCst),
+            "a flush was retired between a reader's two snapshots"
+        );
+        let mut expected: Vec<(Vec<u8>, u8)> = (0..48u8).map(|i| (vec![1, i], 1)).collect();
+        expected.push((vec![2, 0xff], 2));
+        assert_eq!(
+            Rig::rows(&reader),
+            expected,
+            "a reader that began across the commit"
+        );
+        rig.db.wait_background_commit().expect("the flush ended");
+        assert_eq!(rig.seen.lock().expect("observations").len(), 1);
+        assert_eq!(
+            Rig::rows(&reader),
+            expected,
+            "the same reader, after the retirement"
+        );
+        reader.rollback().expect("end the reader");
+
+        let (_dir, reopened) = rig.crash_and_reopen();
+        let durable = reopened.begin(false).expect("begin a reader");
+        expected.pop();
+        assert_eq!(
+            Rig::rows(&durable),
+            expected,
+            "the batch is durable, the commit that tripped it is not"
+        );
+        durable.rollback().expect("end the reader");
+        reopened.close().expect("close");
+    }
+
+    /// When the system has no thread to give, the flush is not lost: the
+    /// same transaction commits on the thread that tripped it, before the
+    /// tripping commit returns, and the observation says so.
+    #[test]
+    fn a_refused_commit_thread_commits_inline() {
+        let rig = Rig::new();
+        rig.db
+            .inner
+            .refuse_commit_thread
+            .store(true, Ordering::SeqCst);
+        rig.fill(1);
+        // Were the commit handed over after all, it would be held.
+        rig.gate.arm();
+        rig.small(2).expect("the commit that trips the flush");
+        {
+            let seen = rig.seen.lock().expect("observations");
+            assert_eq!(
+                seen.len(),
+                1,
+                "the flush had ended when the commit that tripped it returned"
+            );
+            assert!(!seen[0].background && !seen[0].explicit, "{:?}", seen[0]);
+            assert_eq!(seen[0].foreground, seen[0].elapsed);
+        }
+        assert!(
+            rig.db
+                .inner
+                .flight
+                .lock()
+                .expect("flight slot poisoned")
+                .is_none(),
+            "nothing is in flight"
+        );
+        assert!(!rig.gate.is_held() && !rig.db.is_fatal());
+
+        let (_dir, reopened) = rig.crash_and_reopen();
+        let durable = reopened.begin(false).expect("begin a reader");
+        assert_eq!(
+            Rig::rows(&durable).len(),
+            48,
+            "the batch was committed and synced"
+        );
+        durable.rollback().expect("end the reader");
+        reopened.close().expect("close");
+    }
+
+    /// A capture made while a flush is in flight is refused, and latches
+    /// the store, in a build of any kind: the wait that precedes every
+    /// capture is all that keeps two flushes from being captured at
+    /// once, so this is what a capture without it does.  The commit that
+    /// attempted it fails unapplied; the flush in flight is untouched and
+    /// lands.
+    #[test]
+    fn a_capture_during_a_flight_is_refused_and_the_flight_lands() {
+        let rig = Rig::new();
+        rig.hold_a_commit(1);
+        // Arms the next commit's flush, with the first still in flight.
+        rig.fill(3);
+        rig.db.inner.skip_drain.store(true, Ordering::SeqCst);
+        // On a thread: a capture that was not refused would go on to
+        // open a second write transaction, and wait for the held one.
+        let attempt = {
+            let (done, result) = mpsc::channel();
+            let db = rig.db.clone();
+            std::thread::spawn(move || {
+                let outcome = db.update(|tx| {
+                    tx.metadata()
+                        .bucket(b"rows")
+                        .expect("bucket")
+                        .put(&[4, 0xff], &[4])
+                });
+                drop(db);
+                let _ = done.send(outcome);
+            });
+            result
+        };
+        let err = attempt
+            .recv_timeout(Duration::from_secs(10))
+            .expect("a capture made during a flight went ahead and is waiting on it")
+            .expect_err("a second capture");
+        assert!(
+            err.description
+                .contains("a flush was captured while another was in flight"),
+            "{err}"
+        );
+        assert!(rig.db.is_fatal(), "the refusal latched the store");
+        rig.db.inner.skip_drain.store(false, Ordering::SeqCst);
+        let refused = rig.small(5).expect_err("a write on a latched store");
+        assert_eq!(refused.kind, ErrorKind::Fatal, "{refused}");
+        assert!(
+            refused
+                .description
+                .contains("the first failure: a flush was captured while another was in flight"),
+            "{refused}"
+        );
+        assert!(
+            rig.seen.lock().expect("observations").is_empty(),
+            "the flight is still held"
+        );
+
+        rig.gate.open();
+        let settled = rig.db.wait_background_commit().expect_err("latched");
+        assert_eq!(settled.kind, ErrorKind::Fatal);
+        {
+            let seen = rig.seen.lock().expect("observations");
+            assert_eq!(seen.len(), 1, "the flight landed and was retired");
+            assert!(seen[0].background, "{:?}", seen[0]);
+        }
+        let reader = rig.db.begin(false).expect("begin a reader");
+        let tags: std::collections::BTreeSet<u8> =
+            Rig::rows(&reader).iter().map(|(key, _)| key[0]).collect();
+        assert_eq!(
+            tags.into_iter().collect::<Vec<_>>(),
+            vec![1, 2, 3],
+            "the refused commit published nothing"
+        );
+        reader.rollback().expect("end the reader");
+
+        let (_dir, reopened) = rig.crash_and_reopen();
+        let durable = reopened.begin(false).expect("begin a reader");
+        let rows = Rig::rows(&durable);
+        assert_eq!(rows.len(), 48, "exactly the flight's batch: {rows:?}");
+        assert!(rows.iter().all(|(key, _)| key[0] == 1));
+        durable.rollback().expect("end the reader");
+        reopened.close().expect("close");
+    }
+
+    /// A retirement that finds the overlay's pinned layers are not the
+    /// ones the flush captured truncates nothing, puts the flush's bytes
+    /// back and latches the store: the commit has landed, but dropping
+    /// layers of unknown content could drop rows no commit holds.  A
+    /// participant that contributed is told the flush failed, with the
+    /// store already latched: what it holds in memory is not retired on
+    /// the word of a flush that did not end as one.
+    #[test]
+    fn a_retirement_over_changed_layers_latches_and_drops_nothing() {
+        let rig = Rig::new();
+        let asker = Asker::new(&rig.db);
+        let registration = participant::Registration {
+            prefix: Arc::from([0u8, 0, 0, 9].as_slice()),
+            participant: Arc::clone(&asker) as Arc<dyn FlushParticipant>,
+        };
+        rig.fill(1);
+        let (batch, held) = {
+            let mut cache = rig.db.inner.cache.lock().expect("cache lock poisoned");
+            let held = cache.overlay_bytes();
+            let batch = cache.begin_flush();
+            // The same rows in layers of another identity, as a merge
+            // across the pin would leave them.
+            cache.reidentify_layers_for_test();
+            (batch, held)
+        };
+        let err = finish(
+            &rig.db.inner,
+            batch,
+            Ok(FlushOutcome::for_test()),
+            Some(&registration),
+            true,
+            false,
+        )
+        .expect_err("the pinned layers changed");
+        assert!(
+            err.description
+                .contains("no longer the ones the flush captured"),
+            "{err}"
+        );
+        assert!(rig.db.is_fatal(), "the refusal latched the store");
+        assert_eq!(
+            asker.finished(),
+            vec![(false, true)],
+            "the participant is told the flush failed, after the latch"
+        );
+        {
+            let cache = rig.db.inner.cache.lock().expect("cache lock poisoned");
+            assert!(!cache.in_flight(), "the flush is over");
+            assert_eq!(cache.overlay_bytes(), held, "the bytes went back");
+        }
+        let reader = rig.db.begin(false).expect("begin a reader");
+        assert_eq!(Rig::rows(&reader).len(), 48, "no row was dropped");
+        reader.rollback().expect("end the reader");
+        assert!(rig.seen.lock().expect("observations").is_empty());
+    }
+
+    /// A committer thread that panics has not ended its flush, and the
+    /// next wait for it latches the store, as for any flush that did not
+    /// end in a commit.  Here it panics between its commit and the
+    /// retirement, so the layers it captured are never retired: they stay
+    /// published, a reader still finds every row, and no write, flush or
+    /// close goes on from there.  What the commit made durable before the
+    /// panic is durable.
+    ///
+    /// Only a build whose panics unwind has this path, which a test build
+    /// is; a release build aborts.
+    #[test]
+    fn a_committer_that_panics_latches_the_store() {
+        let rig = Rig::new();
+        rig.fill(1);
+        *rig.db
+            .inner
+            .before_retire
+            .lock()
+            .expect("test hook poisoned") = Some(Box::new(|| {
+            panic!("a committer thread that panics, by this test's request")
+        }));
+        rig.small(2).expect("the commit that trips the flush");
+
+        let err = rig
+            .db
+            .wait_background_commit()
+            .expect_err("the committer panicked");
+        assert_eq!(err.kind, ErrorKind::Fatal, "{err}");
+        assert!(
+            err.description
+                .contains("the first failure: the background commit thread panicked"),
+            "{err}"
+        );
+        assert!(rig.db.is_fatal_settled());
+        assert!(
+            rig.seen.lock().expect("observations").is_empty(),
+            "the flush was never retired"
+        );
+        let reader = rig.db.begin(false).expect("begin a reader");
+        assert_eq!(
+            Rig::rows(&reader).len(),
+            49,
+            "the captured rows and the commit after them are still read"
+        );
+        reader.rollback().expect("end the reader");
+        for refused in [
+            rig.small(3).expect_err("a write on a latched store"),
+            rig.db.flush().expect_err("a flush on a latched store"),
+            rig.db.close().expect_err("a close of a latched store"),
+        ] {
+            assert_eq!(refused.kind, ErrorKind::Fatal, "{refused}");
+            assert!(refused.description.contains("panicked"), "{refused}");
+        }
+
+        // Not through `crash_and_reopen`: the panic poisoned the hook's
+        // lock, and the wait above has already joined the thread.
+        let Rig { dir, db, power, .. } = rig;
+        drop(db);
+        power.cut_power();
+        let reopened = Database::open(&Options::new(dir.path().join("db"), NET)).expect("reopen");
+        let durable = reopened.begin(false).expect("begin a reader");
+        let rows = Rig::rows(&durable);
+        assert_eq!(rows.len(), 48, "the batch had landed: {rows:?}");
+        assert!(rows.iter().all(|(key, _)| key[0] == 1));
+        durable.rollback().expect("end the reader");
+        reopened.close().expect("close");
+    }
+
+    /// A commit looks at the latch before it writes anything.  One that
+    /// began on a healthy store and commits after a background commit has
+    /// failed is refused there, with no block I/O at all: not a record
+    /// written to a block file and rolled back out of it again, which is
+    /// what the flush check's own look at the latch would leave.  Seen
+    /// through the block store's hook on this thread.
+    #[test]
+    fn a_commit_on_a_store_latched_since_it_began_writes_no_block_bytes() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let rig = Rig::new();
+        rig.hold_a_commit(1);
+        let tx = rig
+            .db
+            .begin(true)
+            .expect("begin while the store is healthy");
+        tx.metadata()
+            .bucket(b"rows")
+            .expect("bucket")
+            .put(&[3, 0xff], &[3])
+            .expect("a row");
+        let raw = vec![0x5au8; 300];
+        let hash = dcroxide_chainhash::hash_h(&raw[..180]);
+        tx.store_block_raw(&hash, raw).expect("a pending block");
+
+        rig.power.power_fails_after(0);
+        rig.gate.open();
+        let deadline = std::time::Instant::now() + NEVER;
+        while !rig.db.is_fatal() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the held commit never failed"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        let seen: Rc<RefCell<Vec<&'static str>>> = Rc::default();
+        let log = Rc::clone(&seen);
+        crate::blockfile::IO_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |what| log.borrow_mut().push(what)));
+        });
+        let err = tx.commit().expect_err("a commit on a latched store");
+        crate::blockfile::IO_HOOK.with(|hook| *hook.borrow_mut() = None);
+        assert_eq!(err.kind, ErrorKind::Fatal, "{err}");
+        assert!(err.description.contains("power cut"), "{err}");
+        assert!(
+            seen.borrow().is_empty(),
+            "a commit refused at its start did block I/O: {:?}",
+            seen.borrow()
+        );
+        drop(tx);
+
+        let (_dir, reopened) = rig.crash_and_reopen();
+        let durable = reopened.begin(false).expect("begin a reader");
+        assert!(Rig::rows(&durable).is_empty(), "the held commit failed");
+        durable.rollback().expect("end the reader");
+        reopened.close().expect("close");
+    }
+
+    /// A commit's flush check looks at the latch again, after the commit
+    /// has written its blocks: a background commit can fail between the
+    /// commit's first look and that one.  Here it fails while the commit
+    /// is writing its block.  The flush that failed was one the
+    /// participant asked for, over an overlay far below its trigger, so
+    /// the check finds nothing to flush and no commit to wait for, and
+    /// only its look at the latch keeps the commit from running its hook
+    /// and publishing its rows above a batch the store has lost.  The
+    /// block it wrote is rolled back out of the block files.
+    #[test]
+    fn a_commit_latched_between_its_block_write_and_its_flush_check_is_refused() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        let rig = Rig::new();
+        let prefix = rig.journal_prefix();
+        let asker = Asker::new(&rig.db);
+        rig.db
+            .set_flush_participant(&prefix, Arc::clone(&asker) as Arc<dyn FlushParticipant>)
+            .expect("register");
+        rig.small(1).expect("a small commit");
+        asker.want.store(true, Ordering::SeqCst);
+        rig.gate.arm();
+        rig.small(2)
+            .expect("the commit whose flush the participant asked for");
+        assert!(rig.gate.wait_held(NEVER), "the commit is under way");
+        asker.want.store(false, Ordering::SeqCst);
+
+        let tx = rig
+            .db
+            .begin(true)
+            .expect("begin while the store is healthy");
+        let hook_ran = Arc::new(AtomicBool::new(false));
+        {
+            let hook_ran = Arc::clone(&hook_ran);
+            tx.on_commit(move || hook_ran.store(true, Ordering::SeqCst))
+                .expect("a hook");
+        }
+        tx.metadata()
+            .bucket(b"rows")
+            .expect("bucket")
+            .put(&[3, 0xff], &[3])
+            .expect("a row");
+        let raw = vec![0x5au8; 300];
+        let hash = dcroxide_chainhash::hash_h(&raw[..180]);
+        tx.store_block_raw(&hash, raw).expect("a pending block");
+        let before = rig.block_file_bytes();
+        let published = || {
+            rig.db
+                .inner
+                .cache
+                .lock()
+                .expect("cache lock poisoned")
+                .overlay_bytes()
+        };
+        let held = published();
+
+        // The held commit fails, and the store latches, inside this
+        // commit's write of its block.
+        let wrote = Rc::new(Cell::new(false));
+        {
+            let wrote = Rc::clone(&wrote);
+            let power = Arc::clone(&rig.power);
+            let gate = Arc::clone(&rig.gate);
+            let inner = Arc::clone(&rig.db.inner);
+            crate::blockfile::IO_HOOK.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move |what| {
+                    if what != "write" || wrote.replace(true) {
+                        return;
+                    }
+                    power.power_fails_after(0);
+                    gate.open();
+                    let deadline = std::time::Instant::now() + NEVER;
+                    while !inner.fatal.load(Ordering::SeqCst) {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "the held commit never failed"
+                        );
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                }));
+            });
+        }
+        let outcome = tx.commit();
+        // The hook holds the store open; let go of it before anything
+        // is asserted.
+        crate::blockfile::IO_HOOK.with(|hook| *hook.borrow_mut() = None);
+        drop(tx);
+        assert!(wrote.get(), "the commit wrote its block");
+        let err = outcome.expect_err("a commit whose flush check finds the store latched");
+        assert_eq!(err.kind, ErrorKind::Fatal, "{err}");
+        assert!(
+            err.description.contains("(the first failure: ")
+                && err.description.contains("power cut"),
+            "{err}"
+        );
+        assert!(
+            !hook_ran.load(Ordering::SeqCst),
+            "a refused commit ran its hook"
+        );
+        assert_eq!(
+            rig.block_file_bytes(),
+            before,
+            "a refused commit left block bytes behind"
+        );
+        rig.db.wait_background_commit().expect_err("latched");
+        assert_eq!(
+            asker.finished(),
+            vec![(false, true)],
+            "the failed flush told the participant once, after the latch"
+        );
+        // The failed flush put back what it had captured, so the write
+        // cache holds what it held before the refused commit, and no row
+        // of that commit's: not its own, not its block's.
+        assert_eq!(published(), held, "a refused commit published its rows");
+
+        let (_dir, reopened) = rig.crash_and_reopen();
+        let durable = reopened.begin(false).expect("begin a reader");
+        assert!(Rig::rows(&durable).is_empty(), "the held commit failed");
+        durable.rollback().expect("end the reader");
+        reopened.close().expect("close");
+    }
+
+    /// The block files are synced by the thread that captured the flush,
+    /// before the commit leaves it: the metadata a handed-over commit
+    /// makes durable never names block bytes that are not.  Seen through
+    /// the block store's hook, which runs on the thread doing the I/O and
+    /// is set here for this thread alone.
+    #[test]
+    fn the_block_files_are_synced_before_the_commit_is_handed_over() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let rig = Rig::new();
+        let raw = vec![0x5au8; 300];
+        let hash = dcroxide_chainhash::hash_h(&raw[..180]);
+        rig.db
+            .update(|tx| {
+                tx.store_block_raw(&hash, raw.clone())?;
+                let rows = tx.metadata().bucket(b"rows").expect("bucket");
+                for i in 0..48u8 {
+                    rows.put(&[1, i], &[1; 1024])?;
+                }
+                Ok(())
+            })
+            .expect("a block and enough rows to arm the flush");
+
+        let seen: Rc<RefCell<Vec<&'static str>>> = Rc::default();
+        let log = Rc::clone(&seen);
+        crate::blockfile::IO_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |what| log.borrow_mut().push(what)));
+        });
+        rig.gate.arm();
+        rig.small(2).expect("the commit that trips the flush");
+        assert!(rig.gate.wait_held(NEVER), "the commit is under way");
+        crate::blockfile::IO_HOOK.with(|hook| *hook.borrow_mut() = None);
+        assert_eq!(
+            seen.borrow()
+                .iter()
+                .filter(|what| **what == "fsync")
+                .count(),
+            1,
+            "the capturing thread synced the block file before the hand-off: {:?}",
+            seen.borrow()
+        );
+        rig.gate.open();
+        rig.db.wait_background_commit().expect("the commit landed");
+        rig.db.close().expect("close");
+    }
+
+    /// A block handed in laid out as its record
+    /// ([`Transaction::store_block_record`]) is written as it stands by
+    /// the commit that stores it, on that commit's thread, and synced by
+    /// the thread that captures the next flush before that flush's commit
+    /// is handed over, as a block the commit lays out itself is.  Once the
+    /// handed-over commit has landed, a power cut leaves the block's row
+    /// naming the record's bytes.
+    #[test]
+    fn a_record_handed_in_is_written_and_synced_before_the_commit_is_handed_over() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let rig = Rig::new();
+        let block: Vec<u8> = (0..300u32).map(|i| (i % 251) as u8).collect();
+        let hash = dcroxide_chainhash::hash_h(&block[..180]);
+        let height =
+            crate::transaction::serialized_block_height(&block).expect("a header's height");
+        let mut buf = vec![0u8; 24];
+        buf.extend_from_slice(&block);
+        buf.reserve_exact(BlockRecord::SUFFIX_LEN);
+        let record = Arc::new(BlockRecord::lay_out(buf, 24, NET).expect("a record"));
+
+        let seen: Rc<RefCell<Vec<&'static str>>> = Rc::default();
+        let log = Rc::clone(&seen);
+        crate::blockfile::IO_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |what| log.borrow_mut().push(what)));
+        });
+        rig.db
+            .update(|tx| {
+                tx.store_block_record(&hash, &record)?;
+                let rows = tx.metadata().bucket(b"rows").expect("bucket");
+                for i in 0..48u8 {
+                    rows.put(&[1, i], &[1; 1024])?;
+                }
+                Ok(())
+            })
+            .expect("a record and enough rows to arm the flush");
+        assert_eq!(rig.db.records_written_as_laid_out(), 1);
+        rig.gate.arm();
+        rig.small(2).expect("the commit that trips the flush");
+        assert!(rig.gate.wait_held(NEVER), "the commit is under way");
+        crate::blockfile::IO_HOOK.with(|hook| *hook.borrow_mut() = None);
+        let seen = seen.borrow().clone();
+        assert_eq!(
+            seen,
+            ["write", "fsync"],
+            "this thread wrote the record as it stood and then synced it, before the hand-off"
+        );
+        rig.gate.open();
+        rig.db.wait_background_commit().expect("the commit landed");
+
+        let (_dir, reopened) = rig.crash_and_reopen();
+        let tx = reopened.begin(false).expect("begin a reader");
+        assert_eq!(
+            tx.fetch_block(&hash, height).expect("the block is durable"),
+            block
+        );
+        tx.rollback().expect("end the reader");
+        reopened.close().expect("close");
+    }
+
+    /// A bucket is found from the bucket index its transaction began with
+    /// (`bucketindex`), and that answer is what a read of the bucket's
+    /// index row through the same transaction gives, however a commit
+    /// handed to a thread of its own falls around the transaction: begun
+    /// before or after a commit made while that commit is held, between
+    /// its landing and the retirement of what it captured, after the
+    /// retirement, as a writer with buckets of its own staged, and over
+    /// the store alone once the power is cut.  The flush changes no
+    /// bucket: the buckets its batch created and deleted reached the
+    /// index at their own commits, and so did those committed while it
+    /// ran, which the power cut takes away again.
+    #[test]
+    fn a_bucket_lookup_is_the_read_of_its_row_around_a_handed_over_commit() {
+        // Each bucket's lookup and the read of its row, which must agree;
+        // whether it was found.
+        let found = |tx: &Transaction, when: &str| -> Vec<bool> {
+            let meta = tx.metadata();
+            let mut found = Vec::new();
+            let names: [&[u8]; 6] = [b"rows", b"fresh", b"gone", b"kept", b"during", b"staged"];
+            for name in names {
+                let lookup = meta.bucket(name).map(|b| b.raw_id());
+                let row = meta.bucket_from_rows(name).map(|b| b.raw_id());
+                assert_eq!(lookup, row, "{when}: {}", String::from_utf8_lossy(name));
+                found.push(lookup.is_some());
+            }
+            let lookup = meta
+                .bucket(b"fresh")
+                .and_then(|b| b.bucket(b"inner"))
+                .map(|b| b.raw_id());
+            let row = meta
+                .bucket_from_rows(b"fresh")
+                .and_then(|b| b.bucket_from_rows(b"inner"))
+                .map(|b| b.raw_id());
+            assert_eq!(lookup, row, "{when}: fresh/inner");
+            found.push(lookup.is_some());
+            found
+        };
+        // rows, fresh, gone, kept, during, staged, fresh/inner
+        let before_during = [true, true, false, true, false, false, true];
+        let after_during = [true, true, false, false, true, false, true];
+
+        let rig = Rig::new();
+        rig.db
+            .update(|tx| {
+                tx.metadata().create_bucket(b"gone")?;
+                tx.metadata().create_bucket(b"kept").map(|_| ())
+            })
+            .expect("two buckets");
+        rig.db.flush().expect("flush");
+        rig.seen.lock().expect("observations").clear();
+        // The batch creates a bucket with one nested in it and deletes
+        // another; the commit that trips its flush is then held.
+        rig.db
+            .update(|tx| {
+                tx.metadata()
+                    .create_bucket(b"fresh")?
+                    .create_bucket(b"inner")?;
+                tx.metadata().delete_bucket(b"gone")
+            })
+            .expect("the batch's buckets");
+        rig.hold_a_commit(1);
+        let early = rig.db.begin(false).expect("begin a reader");
+        assert_eq!(
+            found(&early, "begun while the commit is held"),
+            before_during
+        );
+        // Committed beside the held commit.
+        rig.db
+            .update(|tx| {
+                tx.metadata().create_bucket(b"during")?;
+                tx.metadata().delete_bucket(b"kept")
+            })
+            .expect("buckets changed beside the commit");
+        assert_eq!(rig.seen.lock().expect("observations").len(), 0);
+        let held = rig.db.begin(false).expect("begin a reader");
+        assert_eq!(found(&held, "begun after a commit beside it"), after_during);
+        assert_eq!(found(&early, "the first reader again"), before_during);
+
+        // Let the commit land, and hold its thread before the retirement.
+        let (reached, at_hook) = mpsc::channel();
+        let (go, resume) = mpsc::channel::<()>();
+        let resume = Mutex::new(resume);
+        *rig.db
+            .inner
+            .before_retire
+            .lock()
+            .expect("test hook poisoned") = Some(Box::new(move || {
+            let _ = reached.send(());
+            let _ = resume.lock().expect("resume").recv_timeout(NEVER);
+        }));
+        rig.gate.open();
+        at_hook
+            .recv_timeout(NEVER)
+            .expect("the commit landed and its thread is at the hook");
+        let landed = rig.db.begin(false).expect("begin a reader");
+        assert_eq!(found(&landed, "begun before the retirement"), after_during);
+        go.send(()).expect("let the committer retire");
+        rig.db.wait_background_commit().expect("the flush ended");
+        assert_eq!(rig.seen.lock().expect("observations").len(), 1);
+
+        for (tx, when, expected) in [
+            (
+                &early,
+                "the first reader, after the retirement",
+                before_during,
+            ),
+            (&held, "the second, after it", after_during),
+            (&landed, "the third, after it", after_during),
+        ] {
+            assert_eq!(found(tx, when), expected);
+        }
+        for tx in [early, held, landed] {
+            tx.rollback().expect("end the reader");
+        }
+        let later = rig.db.begin(false).expect("begin a reader");
+        assert_eq!(found(&later, "begun after the retirement"), after_during);
+        later.rollback().expect("end the reader");
+        let writer = rig.db.begin(true).expect("begin a writer");
+        writer
+            .metadata()
+            .create_bucket(b"staged")
+            .expect("create a bucket");
+        writer
+            .metadata()
+            .delete_bucket(b"during")
+            .expect("delete one");
+        assert_eq!(
+            found(&writer, "a writer's own changes"),
+            [true, true, false, false, false, true, true]
+        );
+        writer.rollback().expect("roll the writer back");
+
+        let (_dir, reopened) = rig.crash_and_reopen();
+        let durable = reopened.begin(false).expect("begin a reader");
+        assert_eq!(
+            found(&durable, "the store after the power cut"),
+            [true, true, false, true, false, false, true],
+            "the batch is durable, and the commit beside it is not"
+        );
+        durable.rollback().expect("end the reader");
+        reopened.close().expect("close");
+    }
+
+    /// What the probe in a flush's batch saw as the batch was dropped.
+    #[derive(Debug, PartialEq, Eq)]
+    struct AtDrop {
+        /// The name of the thread that dropped it.
+        thread: Option<String>,
+        /// The handles left on the layers the test follows.
+        handles: usize,
+        /// Whether the cache lock was free.
+        cache_free: bool,
+        /// Whether the end of the flush had been recorded for the next
+        /// capture's observation; `None` when that record's lock was held.
+        end_recorded: Option<bool>,
+    }
+
+    /// Plant a probe in every batch the flushes of `db` capture from now
+    /// on, which records what it sees of `layers` and of the store as the
+    /// batch is dropped.
+    fn probe_batch_drops(
+        db: &Database,
+        layers: Vec<std::sync::Weak<crate::dbcache::CacheLayer>>,
+    ) -> Arc<Mutex<Vec<AtDrop>>> {
+        let seen: Arc<Mutex<Vec<AtDrop>>> = Arc::default();
+        let sink = Arc::clone(&seen);
+        let store = Arc::downgrade(&db.inner);
+        *db.inner.batch_dropped.lock().expect("test hook poisoned") = Some(Arc::new(move || {
+            let Some(inner) = store.upgrade() else {
+                return;
+            };
+            let at = AtDrop {
+                thread: std::thread::current().name().map(str::to_owned),
+                handles: layers.iter().map(std::sync::Weak::strong_count).sum(),
+                cache_free: inner.cache.try_lock().is_ok(),
+                end_recorded: inner.flush_end.try_lock().ok().map(|end| end.is_some()),
+            };
+            sink.lock().expect("drops").push(at);
+        }));
+        seen
+    }
+
+    /// The thread a commit was handed to lets go of the layers it retired
+    /// itself, with the cache lock free, and before it reads the process's
+    /// memory for the flush's end.  The commit that tripped the flush let
+    /// go of its snapshot when it returned, and the retirement unpublished
+    /// the layers, so the batch holds the last handles on them.  The probe
+    /// runs inside the batch's drop, after those handles have gone: what
+    /// it sees is the drop that frees the rows, and so a lock taken around
+    /// that drop, or handles kept past it, would show.
+    #[test]
+    fn a_committer_frees_the_layers_it_retired_unlocked_and_before_its_end_reading() {
+        let rig = Rig::new();
+        rig.fill(1);
+        let captured = rig
+            .db
+            .inner
+            .cache
+            .lock()
+            .expect("cache")
+            .published_layers_for_test();
+        assert!(!captured.is_empty(), "the fill is in the overlay");
+        let drops = probe_batch_drops(&rig.db, captured.clone());
+
+        // A row whose flush check captures the fill and hands its commit
+        // over, which is held at its first write.
+        rig.gate.arm();
+        rig.small(2).expect("the commit that trips the flush");
+        assert!(rig.gate.wait_held(NEVER), "the commit is under way");
+        assert!(
+            captured.iter().all(|layer| layer.strong_count() > 0),
+            "the overlay and the batch hold the captured layers"
+        );
+        assert!(
+            rig.db.inner.flush_end.lock().expect("flush end").is_none(),
+            "the capture took the record the flush before it left"
+        );
+        rig.gate.open();
+        rig.db.wait_background_commit().expect("the flush ended");
+
+        let drops = std::mem::take(&mut *drops.lock().expect("drops"));
+        assert_eq!(
+            drops,
+            [AtDrop {
+                thread: Some(COMMIT_THREAD_NAME.to_string()),
+                handles: 0,
+                cache_free: true,
+                end_recorded: Some(false),
+            }],
+            "the committer's drop of the batch freed the layers"
+        );
+        assert!(
+            rig.db.inner.flush_end.lock().expect("flush end").is_some(),
+            "the end was recorded after the frees"
+        );
+        {
+            let seen = rig.seen.lock().expect("observations");
+            assert_eq!(seen.len(), 1);
+            assert!(seen[0].background, "{:?}", seen[0]);
+            assert_eq!(
+                (seen[0].memory.shared_layers, seen[0].memory.shared_entries),
+                (0, 0),
+                "nothing but the batch held the layers at the retirement"
+            );
+        }
+        *rig.db
+            .inner
+            .batch_dropped
+            .lock()
+            .expect("test hook poisoned") = None;
+    }
+
+    /// A handed-over commit's processor time and I/O are read on the
+    /// thread that made it, at either end of the commit, and those of the
+    /// block sync and the insert loop on the thread that captured the
+    /// flush.  The capturing thread computes for a while just before, so a
+    /// commit timed from its counters to the committer's would show no
+    /// time on a processor at all.  The committer is held at its first
+    /// write until it has surely been switched out, which has the kernel
+    /// bring its time on a processor up to date inside the commit, so a
+    /// commit timed on the committer shows some.
+    #[test]
+    fn a_handed_over_commit_is_timed_on_the_thread_that_made_it() {
+        /// Compute for `wall` on the calling thread, never sleeping.
+        fn compute_for(wall: Duration) -> u64 {
+            let began = std::time::Instant::now();
+            let mut x = 1u64;
+            while began.elapsed() < wall {
+                for i in 0..10_000u64 {
+                    x = x.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(i);
+                    x = std::hint::black_box(x);
+                }
+            }
+            x
+        }
+        let has = |file: &str| {
+            cfg!(target_os = "linux") && Path::new("/proc/thread-self").join(file).exists()
+        };
+        let nanos = |d: Duration| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX);
+
+        let rig = Rig::new();
+        rig.fill(1);
+        compute_for(Duration::from_millis(200));
+        // Switched out, so the kernel brings this thread's times up to
+        // date here and none of the computing is counted into the flush's
+        // phases, however seldom its tick comes.
+        std::thread::sleep(Duration::from_millis(1));
+        // Whether the kernel keeps scheduler accounting: one that has the
+        // file but does not writes zeros in it.
+        let accounted = std::fs::read_to_string("/proc/thread-self/schedstat")
+            .ok()
+            .and_then(|s| s.split_ascii_whitespace().next()?.parse::<u64>().ok())
+            .is_some_and(|on_cpu| on_cpu > 0);
+        rig.gate.arm();
+        rig.small(2).expect("the commit that trips the flush");
+        assert!(rig.gate.wait_held(NEVER), "the commit is under way");
+        // Long enough for the committer to be asleep at the gate.
+        std::thread::sleep(Duration::from_millis(50));
+        rig.gate.open();
+        rig.db.wait_background_commit().expect("the flush ended");
+
+        let obs = {
+            let seen = rig.seen.lock().expect("observations");
+            assert_eq!(seen.len(), 1);
+            seen[0]
+        };
+        assert!(obs.background, "{obs:?}");
+        for phase in [obs.block_sync, obs.insert, obs.commit] {
+            assert_eq!(
+                (phase.read_bytes.is_some(), phase.write_bytes.is_some()),
+                (has("io"), has("io")),
+                "{phase:?}"
+            );
+            assert_eq!(
+                (phase.utime_ms.is_some(), phase.stime_ms.is_some()),
+                (has("stat"), has("stat")),
+                "{phase:?}"
+            );
+            assert_eq!(
+                (phase.on_cpu_ns.is_some(), phase.runq_wait_ns.is_some()),
+                (has("schedstat"), has("schedstat")),
+                "{phase:?}"
+            );
+        }
+        // Each phase's time on a processor fits in the part of the flush
+        // that ran on its thread, give or take the tick the kernel's
+        // figure can trail by at each end.
+        let tick = Duration::from_millis(20);
+        assert!(
+            obs.commit.on_cpu_ns.unwrap_or(0) <= nanos(obs.commit.elapsed + tick),
+            "{:?}",
+            obs.commit
+        );
+        assert!(
+            obs.insert.on_cpu_ns.unwrap_or(0) <= nanos(obs.foreground + tick),
+            "{:?} in a foreground of {:?}",
+            obs.insert,
+            obs.foreground
+        );
+        if accounted {
+            assert!(
+                obs.commit.on_cpu_ns.expect("time on a processor") > 0,
+                "the committer worked in its commit: {:?}",
+                obs.commit
+            );
+        }
     }
 }
 

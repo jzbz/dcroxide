@@ -2051,6 +2051,58 @@ fn apply_overlay_tuning(opts: &mut Options) {
     }
 }
 
+/// Whether a flush that a commit trips makes its redb commit on a thread
+/// of its own (`Options::background_commit`): yes, unless
+/// `DCROXIDE_DB_SYNC_COMMIT` is set to a positive whole number.
+///
+/// On that thread the commit no longer holds up the thread that connects
+/// blocks or the one that updates the indexes: the commit that tripped
+/// the flush returns once the write cache is captured, the block files
+/// are synced and the rows are handed to redb.  Every commit is still
+/// synced before anything acknowledges it as durable, at most one is
+/// under way, and a flush, the close and the next flush all wait for it.
+/// What moves is the report of a failure: the store latches when the
+/// commit fails, a `BCDB` error line says so, and the next write, flush
+/// or close is refused, where dcrd fails the commit that tripped the
+/// flush.
+///
+/// `DCROXIDE_DB_SYNC_COMMIT=1` restores that: every flush then commits
+/// on the thread that ran it, under the database's writer.  An
+/// environment variable for `DCROXIDE_DB_CACHE`'s reason, and with its
+/// policy for a value that does not parse: a warning and the default.
+fn background_commit() -> bool {
+    !env_switch(
+        "DCROXIDE_DB_SYNC_COMMIT",
+        "Metadata write cache commits on the committing thread",
+        "committing the metadata write cache on a thread of its own",
+    )
+}
+
+/// Whether the switch `var` is set to a positive whole number.  One
+/// that is logs `set` and the variable's name once; a value that is
+/// anything else is a warning that names `kept`, what the daemon does
+/// without the switch, and reads as unset.  The policy of
+/// `DCROXIDE_DB_CACHE` for a value that does not parse, and for one
+/// that is not valid Unicode, which reads as unset with no warning.
+fn env_switch(var: &str, set: &str, kept: &str) -> bool {
+    let Ok(raw) = std::env::var(var) else {
+        return false;
+    };
+    let trimmed = raw.trim();
+    match trimmed.parse::<u64>() {
+        Ok(value) if value > 0 => {
+            log_info(&format!("{set} by {var}"));
+            true
+        }
+        _ => {
+            log_warn(&format!(
+                "{var}={trimmed} is not a positive whole number; {kept}"
+            ));
+            false
+        }
+    }
+}
+
 /// The exists address index's memtable target, from the developer-only
 /// `DCROXIDE_EXISTSADDR_MEMTABLE_KEYS` (keys), with the hard bound one and
 /// a half times it; the defaults when it is unset.
@@ -2114,16 +2166,73 @@ fn exists_addr_policy(enabled: bool) -> dcroxide_indexers::ExistsAddrPolicy {
 /// write.
 ///
 /// `thread` is the name of the thread that ran the flush, which held
-/// the database's writer for the flush's `elapsed_ms`.  `writer_wait`
-/// is what threads have spent waiting for that writer from the opening
-/// of the database to this flush: for the thread named `index`, which
-/// updates the indexes, and for every other thread together, the number
-/// of times one found the writer held and the nanoseconds it then
-/// waited.  The threads that connect blocks are among the others, so
-/// the growth of `other` over a sync bounds what block processing spent
-/// waiting for the index thread's transactions and flushes; the flushes
-/// among them are the lines whose `thread` is `index`, each of which
-/// held the writer for its `elapsed_ms`.
+/// the database's writer for the flush's `elapsed_ms`; for a flush whose
+/// commit ran on a thread of its own it is that thread, `dbcommit`,
+/// which never holds the writer.  On such a line `commit`'s processor
+/// time and I/O are that thread's, and those of `sync`, `insert` and the
+/// participant's phase are the capturing thread's, which the line does
+/// not name: lines grouped by `thread` keep one thread's phases apart
+/// from another's only for flushes that committed where they were
+/// captured.  `writer_wait` is what threads have spent waiting for that
+/// writer from the opening of the database to this flush: for the
+/// thread named `index`, which updates the indexes, and for every other
+/// thread together, the number of times one found the writer held and
+/// the nanoseconds it then waited.  The threads that connect blocks are
+/// among the others, so the growth of `other` over a sync bounds what
+/// block processing spent waiting for the index thread's transactions
+/// and flushes.  The flushes among them are the lines whose `thread` is
+/// `index` and, among the `bg` lines, those the index thread captured,
+/// which a line does not tell from the others; each held the writer for
+/// its `fg_ms` plus its `wait_ms`.
+///
+/// `explicit` is whether the flush was asked for (`Database::flush`, the
+/// close) rather than tripped by a commit's own flush check.  `bg` is
+/// whether its commit ran on a thread of its own ([`background_commit`]);
+/// `elapsed_ms` then runs from the capture of the write cache to the
+/// retirement of what was captured, on that thread.  `fg_ms` is the part
+/// of `elapsed_ms` the capturing thread spent in the flush holding the
+/// writer: all of it unless `bg`, and then the time from the capture to
+/// the hand-off.  `wait_ms` is what was spent since the capture of the
+/// flush before, and so outside `elapsed_ms`, waiting with the writer
+/// held for an earlier flush's commit to end: the capturing thread's
+/// wait before its capture, and any other thread's, such as a commit's
+/// at the write cache's ceiling, which counts against the next capture
+/// whichever thread makes it.  `fg_ms` plus `wait_ms` is what a flush,
+/// with the waits counted against it, kept every other writer out for,
+/// so sums of it by thread divide that time only roughly.
+///
+/// `snap` is whether the flush held a read snapshot of the store across
+/// its commit ([`Options::commit_snapshot`], which the daemon leaves on),
+/// which a flush takes only for a commit it hands to a thread of its
+/// own.  So in the daemon it is `bg`, but for a flush whose thread the
+/// operating system refused, which commits where it was captured and
+/// keeps the snapshot, and one for which no snapshot could be had.
+/// `layers` and `overlay` are what the flush pinned
+/// in the write cache: the layers it captured and the entries in them,
+/// how many layers the cache had when the commit returned, how many of
+/// the captured ones a transaction still held then, and the bytes the
+/// cache held at the hand-off and when the commit returned, the second
+/// being the captured bytes plus what was committed while the commit
+/// ran.  `mem` is the process's memory, from `/proc/self/status`, at five
+/// instants: after the capture, at the hand-off, when the commit
+/// returned, and twice at the end of the flush before this one, once the
+/// participant's `finished` had returned (`prev_finished`) and once that
+/// flush had freed what it held (`prev_end`); `prev_finished_ms` and
+/// `prev_release_ms` are the times from that flush's retirement to each.
+/// A flush whose commit ran on the thread that ran it frees the layers
+/// it retired after those two readings, once that thread has released
+/// the writer (the close's flush, which no line follows, frees them
+/// under it), so the next line's `prev_end` and `prev_release_ms` do
+/// not hold those frees; on a line that follows a `bg` line they do.
+/// Each reading is the resident memory, its peak so far, its anonymous
+/// part and the thread count; the readings at the capture and when the
+/// commit returned add, from `/proc/self/maps`, the number and total size
+/// of the anonymous mappings that start where the allocator puts a
+/// thread arena's heaps, and the size of the program break.  A reading is
+/// `null` off Linux.  Together they say whether resident memory rises
+/// while a commit is under way, whether it rises again while the
+/// participant is told, whether it comes back when the flush has freed
+/// its layers, and how much of it lies in those mappings.
 ///
 /// Stats sampling is deliberately left off (`flush_stats_every` stays
 /// 0). redb's `stats()` walks every branch and leaf page, which on a
@@ -2159,7 +2268,8 @@ fn flush_log_writer(out: impl std::io::Write + Send + 'static) -> dcroxide_datab
         // only a few hundred of them, so the write is far below the
         // seconds-long commit it describes.
         if let Ok(mut out) = sink.lock() {
-            // The observer runs on the thread that ran the flush.
+            // The observer runs on the thread that ended the flush: the
+            // one that ran it, or the one its commit was handed to.
             let line = flush_log_line(obs, end, std::thread::current().name());
             let _ = writeln!(out, "{line}");
             let _ = out.flush();
@@ -2175,7 +2285,7 @@ fn flush_log_line(
     thread: Option<&str>,
 ) -> String {
     format!(
-        "{{\"seq\":{},\"end\":{:.3},\"elapsed_ms\":{:.3},\"entries\":{},\"bytes\":{},\"sync\":{},\"insert\":{},\"commit\":{},\"participant\":{},\"thread\":{},\"writer_wait\":{}}}",
+        "{{\"seq\":{},\"end\":{:.3},\"elapsed_ms\":{:.3},\"entries\":{},\"bytes\":{},\"sync\":{},\"insert\":{},\"commit\":{},\"explicit\":{},\"bg\":{},\"fg_ms\":{:.3},\"wait_ms\":{:.3},\"snap\":{},\"layers\":{},\"overlay\":{},\"mem\":{},\"participant\":{},\"thread\":{},\"writer_wait\":{}}}",
         obs.sequence,
         end,
         obs.elapsed.as_secs_f64() * 1000.0,
@@ -2184,6 +2294,14 @@ fn flush_log_line(
         obs.block_sync.to_json(),
         obs.insert.to_json(),
         obs.commit.to_json(),
+        obs.explicit,
+        obs.background,
+        obs.foreground.as_secs_f64() * 1000.0,
+        obs.waited.as_secs_f64() * 1000.0,
+        obs.snapshot,
+        obs.memory.layers_json(),
+        obs.memory.overlay_json(),
+        obs.memory.process_json(),
         obs.participant
             .map_or_else(|| "null".to_string(), |p| p.to_json()),
         // The daemon's thread names are plain ASCII words, which Rust
@@ -2226,6 +2344,7 @@ fn open_block_db(cfg: &Config) -> Result<Database, String> {
     let mut opts = Options::new(&db_path, params.net.0);
     opts.db_cache_bytes = db_cache_bytes();
     apply_overlay_tuning(&mut opts);
+    opts.background_commit = background_commit();
     opts.flush_observer = flush_log_observer();
     // dcrd's `log.go:88` hands the database driver the BCDB logger
     // (`database.UseLogger(bcdbLog)`): the unclean-shutdown repair, the
@@ -2524,7 +2643,10 @@ mod tests {
     /// A flush observation with a value of its own in every field the
     /// flush log writes.
     fn a_flush_observation() -> dcroxide_database::FlushObservation {
-        use dcroxide_database::{FlushObservation, FlushPhase, WriterWait, WriterWaits};
+        use dcroxide_database::{
+            ArenaMaps, FlushMemory, FlushObservation, FlushPhase, ProcessMemory, WriterWait,
+            WriterWaits,
+        };
         use std::time::Duration;
 
         // The I/O counters, the processor times and the scheduler's two
@@ -2566,13 +2688,61 @@ mod tests {
                     nanos: 73_000_000_000,
                 },
             },
+            explicit: true,
+            background: false,
+            foreground: Duration::from_micros(1_234_500),
+            waited: Duration::from_micros(2_250),
+            snapshot: true,
+            memory: FlushMemory {
+                pinned_layers: 2,
+                pinned_entries: 1300,
+                overlay_at_hand_off: 345_678,
+                overlay_at_retirement: 400_000,
+                layers_at_retirement: 3,
+                shared_layers: 1,
+                shared_entries: 900,
+                process_at_capture: Some(ProcessMemory {
+                    resident: 3_000_000,
+                    peak_resident: 3_500_000,
+                    anonymous: 2_900_000,
+                    threads: 40,
+                    arenas: Some(ArenaMaps {
+                        mappings: 9,
+                        bytes: 2_500_000,
+                        program_break: 135_168,
+                    }),
+                }),
+                process_at_hand_off: Some(ProcessMemory {
+                    resident: 3_100_000,
+                    peak_resident: 3_500_000,
+                    anonymous: 3_000_000,
+                    threads: 40,
+                    arenas: None,
+                }),
+                process_at_commit: None,
+                process_after_previous_finished: Some(ProcessMemory {
+                    resident: 3_200_000,
+                    peak_resident: 3_600_000,
+                    anonymous: 3_050_000,
+                    threads: 41,
+                    arenas: None,
+                }),
+                process_after_previous: None,
+                previous_finished: Duration::from_micros(7_250),
+                previous_release: Duration::from_micros(12_500),
+            },
         }
     }
 
     /// A line of the metadata flush log is what it was, with the name of
     /// the thread that ran the flush and the waits for the database's
     /// writer after it, and with the flushing thread's processor time in
-    /// each phase as that phase's last four fields.
+    /// each phase as that phase's last four fields.  After the three
+    /// phases it says whether the flush was asked for, whether its commit
+    /// ran on another thread, and what the capturing thread spent in it
+    /// and waiting before it; then whether it held a read snapshot across
+    /// its commit, what it pinned in the write cache, and the process's
+    /// memory around it, a reading that was not taken being `null`.
     #[test]
     fn a_flush_log_line_names_the_flushing_thread_and_the_writer_waits() {
         let obs = a_flush_observation();
@@ -2587,6 +2757,18 @@ mod tests {
                 r#""utime_ms":310,"stime_ms":20,"on_cpu_ns":333000000,"runq_wait_ns":1200000},"#,
                 r#""commit":{"ms":800.000,"read_bytes":null,"write_bytes":null,"#,
                 r#""utime_ms":null,"stime_ms":null,"on_cpu_ns":null,"runq_wait_ns":null},"#,
+                r#""explicit":true,"bg":false,"fg_ms":1234.500,"wait_ms":2.250,"#,
+                r#""snap":true,"#,
+                r#""layers":{"pinned":2,"entries":1300,"at_retire":3,"shared":1,"shared_entries":900},"#,
+                r#""overlay":{"handoff":345678,"retire":400000},"#,
+                r#""mem":{"capture":{"rss":3000000,"hwm":3500000,"anon":2900000,"threads":40,"#,
+                r#""arena_maps":9,"arena_bytes":2500000,"brk_bytes":135168},"#,
+                r#""handoff":{"rss":3100000,"hwm":3500000,"anon":3000000,"threads":40,"#,
+                r#""arena_maps":null,"arena_bytes":null,"brk_bytes":null},"#,
+                r#""commit":null,"#,
+                r#""prev_finished":{"rss":3200000,"hwm":3600000,"anon":3050000,"threads":41,"#,
+                r#""arena_maps":null,"arena_bytes":null,"brk_bytes":null},"#,
+                r#""prev_end":null,"prev_finished_ms":7.250,"prev_release_ms":12.500},"#,
                 r#""participant":null,"thread":"index","#,
                 r#""writer_wait":{"index":{"count":3,"ns":1500000},"other":{"count":41,"ns":73000000000}}}"#,
             )
@@ -2603,6 +2785,18 @@ mod tests {
                 r#""sync":{"ms":3.000,"read_bytes":0,"write_bytes":0},"#,
                 r#""insert":{"ms":400.000,"read_bytes":8192,"write_bytes":4096},"#,
                 r#""commit":{"ms":800.000,"read_bytes":null,"write_bytes":null},"#,
+                r#""explicit":true,"bg":false,"fg_ms":1234.500,"wait_ms":2.250,"#,
+                r#""snap":true,"#,
+                r#""layers":{"pinned":2,"entries":1300,"at_retire":3,"shared":1,"shared_entries":900},"#,
+                r#""overlay":{"handoff":345678,"retire":400000},"#,
+                r#""mem":{"capture":{"rss":3000000,"hwm":3500000,"anon":2900000,"threads":40,"#,
+                r#""arena_maps":9,"arena_bytes":2500000,"brk_bytes":135168},"#,
+                r#""handoff":{"rss":3100000,"hwm":3500000,"anon":3000000,"threads":40,"#,
+                r#""arena_maps":null,"arena_bytes":null,"brk_bytes":null},"#,
+                r#""commit":null,"#,
+                r#""prev_finished":{"rss":3200000,"hwm":3600000,"anon":3050000,"threads":41,"#,
+                r#""arena_maps":null,"arena_bytes":null,"brk_bytes":null},"#,
+                r#""prev_end":null,"prev_finished_ms":7.250,"prev_release_ms":12.500},"#,
                 r#""participant":null,"thread":"index","#,
                 r#""writer_wait":{"index":{"count":3,"ns":1500000},"other":{"count":41,"ns":73000000000}}}"#,
             )

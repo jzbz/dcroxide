@@ -24,21 +24,23 @@
 //!
 //! A flush that wrote its rows ends by sealing the keys it journaled or
 //! merged (`Memtable::seal`): they stay in memory, found by every lookup,
-//! but apart from any keys handed over later.  Nothing else changes in
-//! memory until `finished(true)`, after the commit: then the sealed keys
-//! are folded into the journaled ones, and the merged partitions lose
-//! their journaled and sealed keys.  Keys handed over since the seal are
-//! left for the next flush.  A failed flush unseals, which leaves memory
-//! holding what it held; the store is latched by then.
+//! but apart from the keys later connects hand over.  Nothing else
+//! changes in memory until `finished(true)`, after the commit: then the
+//! sealed keys are folded into the journaled ones, and the merged
+//! partitions lose their journaled and sealed keys.  Keys handed over
+//! since the seal are left for the next flush, so `finished` may come
+//! after any number of later connects' hooks.  A failed flush unseals,
+//! which leaves memory holding what it held; the store is latched by
+//! then.
 //!
 //! **Invariant.**  In every durable state, every key of every connect
 //! whose tip row is durable is in a run of its partition, or in a journal
 //! row numbered at or after its partition's `pend_from`.  The tip rows and
 //! all of these rows share one `Durability::Immediate` commit, and the
 //! hook that hands a connect's keys over runs after the commit's own
-//! flush and before its tip row is published, so the flush that persists
-//! a tip row journals that connect's keys, and no flush journals the keys
-//! of a connect whose tip row it does not persist.
+//! flush has written its rows and before its tip row is published, so the
+//! flush that persists a tip row journals that connect's keys, and no
+//! flush journals the keys of a connect whose tip row it does not persist.
 
 use std::sync::{Mutex, RwLock};
 
@@ -325,7 +327,8 @@ impl FlushParticipant for AddrStore {
         }
         state.plan = Some(Plan { meta, merged });
         // Every key read above is now in this flush's rows.  Set them
-        // apart, so that `finished` changes these and no others.
+        // apart from the keys hooks hand over from here on, which may be
+        // many by the time `finished` is called.
         self.mem.seal();
         let mut stats = ParticipantStats::default();
         stats.keys_journaled = keys_journaled;
@@ -357,6 +360,13 @@ impl FlushParticipant for AddrStore {
         };
         self.mem.fold_sealed(&plan.merged);
         state.meta = plan.meta;
+    }
+
+    /// `contribute` seals the keys it wrote, and `finished` touches only
+    /// those, under the state lock and each partition's own: the keys
+    /// hooks hand over in between are neither retired nor lost.
+    fn allows_deferred_finish(&self) -> bool {
+        true
     }
 }
 

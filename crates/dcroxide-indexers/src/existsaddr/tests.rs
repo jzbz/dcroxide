@@ -19,6 +19,14 @@
 //! a drop cut at any point leaves a store that finishes the drop and
 //! rebuilds.
 //!
+//! They hold too with the redb commit of a flush made on a thread of its
+//! own (`Options::background_commit`), as the daemon makes it.  There a
+//! flush's `finished` comes after the hook of the connect that tripped
+//! it, and after those of any connects made while its commit ran; those
+//! runs hold each such commit at its first write and make up to two more
+//! connects beside it, so that keys are handed over between a flush's
+//! seal and its `finished` at every cut.
+//!
 //! **Controls that must fail**, each a broken index the checks have to
 //! catch: a backend whose sync does nothing, a participant that skips its
 //! journal rows, a participant released before the close's flush (what a
@@ -77,6 +85,7 @@ use chain::{Key, TestChain, address_of, block_on, script_of, tx_paying};
 use dcroxide_chaincfg::{Params, simnet_params};
 use dcroxide_database::{Database, FlushParticipant, Options, SharedBackend};
 use dcroxide_testutil::SplitMix64;
+use dcroxide_testutil::gate::GateBackend;
 use dcroxide_testutil::powerloss::PowerLossBackend;
 use dcroxide_wire::MsgBlock;
 use tempfile::TempDir;
@@ -232,6 +241,9 @@ struct Script {
     cache_max_size: u64,
     /// How the run hands each connect to the subscriber.
     delivery: Delivery,
+    /// Whether a flush that a commit trips makes its redb commit on a
+    /// thread of its own, with connects made while it is held.
+    background: bool,
 }
 
 impl Script {
@@ -265,6 +277,20 @@ impl Script {
             steps,
             cache_max_size: 2000 + rng.below(4000),
             delivery: Delivery::Inline,
+            background: false,
+        }
+    }
+
+    /// The same steps with every flush that a commit trips committed on
+    /// a thread of its own.  The overlay's ceiling is raised so that the
+    /// few tip rows committed above a held flush's layers stay under it:
+    /// a connect that reached it would wait for the commit it is there
+    /// to overlap.
+    fn background(self) -> Script {
+        Script {
+            background: true,
+            cache_max_size: self.cache_max_size + 4000,
+            ..self
         }
     }
 
@@ -299,6 +325,12 @@ struct Run {
     /// prepared before their transaction began.
     connects: usize,
     prepared: usize,
+    /// The flushes whose commit was held on its own thread, each with
+    /// the keys of the connect that tripped it handed over between its
+    /// `contribute` and its `finished`.
+    held: usize,
+    /// The further connects made while such a commit was held.
+    beside: usize,
 }
 
 /// The index tip's height as the store holds it.
@@ -313,16 +345,57 @@ fn tip_height(db: &Database) -> Option<i64> {
     height
 }
 
+/// How long a step that cannot block is given before the run is called
+/// stuck.
+const STUCK: Duration = Duration::from_secs(60);
+
+/// Run `call` while a commit is held at `gate`, on a thread of its own.
+/// A connect that had to wait for the held commit would wait for ever:
+/// the gate is opened for it and the run failed.
+fn beside_a_held_commit<T: Send>(gate: &GateBackend, call: impl FnOnce() -> T + Send) -> T {
+    std::thread::scope(|scope| {
+        let (done, result) = std::sync::mpsc::channel();
+        scope.spawn(move || {
+            let _ = done.send(call());
+        });
+        result.recv_timeout(STUCK).unwrap_or_else(|_| {
+            gate.open();
+            panic!("a connect made beside a held commit waited for it")
+        })
+    })
+}
+
 /// Run `script` over a power-loss backend, cutting the power after
 /// `cut_after` storage operations when given, then hold what survived to
 /// the four properties.
+///
+/// A script that asks for commits on a thread of their own
+/// ([`Script::background`]) makes every connect with a gate shut over
+/// the storage.  A connect whose flush the index wrote in leaves that
+/// flush's commit held at its first write, the memtable's keys sealed
+/// and the connect's own keys handed over behind the seal.  One or two
+/// of the connects that follow it in the script are then made while it
+/// is held, unless the index already asks for another flush, which would
+/// have to wait for this one, or the commit was stopped growing the
+/// file, where redb lets no transaction begin
+/// (`GateBackend::holds_a_length_change`).  Then the gate opens and the
+/// commit is waited for.  A held commit makes no storage operation, and
+/// has made all of its own before the next step, so a cut after the
+/// `n`th operation lands in the same place every run.
 fn run(script: &Script, cut_after: Option<u64>, honest_sync: bool, brk: Break) -> Run {
     let dir = TempDir::new().expect("tempdir");
     let db_dir = dir.path().join("db");
     std::fs::create_dir_all(&db_dir).expect("mkdir");
     let backend = PowerLossBackend::create(&db_dir.join("metadata.redb"), honest_sync);
+    let gate = script
+        .background
+        .then(|| GateBackend::new(Arc::clone(&backend) as SharedBackend));
     let mut opts = Options::new(&db_dir, NET);
-    opts.backend = Some(Arc::clone(&backend) as SharedBackend);
+    opts.backend = Some(match &gate {
+        Some(gate) => Arc::clone(gate) as SharedBackend,
+        None => Arc::clone(&backend) as SharedBackend,
+    });
+    opts.background_commit = script.background;
     opts.cache_max_size = script.cache_max_size;
     let work = Arc::new(Mutex::new([0u64; 4]));
     let seen = Arc::clone(&work);
@@ -357,12 +430,17 @@ fn run(script: &Script, cut_after: Option<u64>, honest_sync: bool, brk: Break) -
     let mut candidates: Vec<BTreeSet<Key>> = vec![BTreeSet::new()];
     let mut mempool = BTreeSet::new();
     let mut salt = 0u32;
-    for step in &script.steps {
+    let (mut held, mut beside) = (0usize, 0usize);
+    let mut steps = script.steps.iter().peekable();
+    while let Some(step) = steps.next() {
         let before = store.mem.snapshot();
         let res = match step {
             Step::Connect(keys) => {
+                if let Some(gate) = &gate {
+                    gate.arm();
+                }
                 salt += 1;
-                let res = deliver(
+                let mut res = deliver(
                     script.delivery,
                     &chain,
                     &mut subber,
@@ -374,6 +452,57 @@ fn run(script: &Script, cut_after: Option<u64>, honest_sync: bool, brk: Break) -
                     let mut handed: BTreeSet<Key> = keys.iter().copied().collect();
                     handed.append(&mut mempool);
                     candidates.push(handed);
+                }
+                if let Some(gate) = &gate {
+                    // Keys still sealed after the connect has returned
+                    // are a flush whose commit left this thread.
+                    if res.is_ok() && store.mem.sealed_keys() > 0 {
+                        assert!(
+                            gate.wait_held(STUCK),
+                            "the handed-over commit never reached storage"
+                        );
+                        held += 1;
+                        // A commit stopped while redb grows the file lets
+                        // no transaction begin: nothing is connected
+                        // beside that one.
+                        let beside_it = if gate.holds_a_length_change() {
+                            0
+                        } else {
+                            1 + salt % 2
+                        };
+                        for _ in 0..beside_it {
+                            if store.wants_flush() {
+                                break;
+                            }
+                            let Some(Step::Connect(keys)) =
+                                steps.next_if(|next| matches!(next, Step::Connect(_)))
+                            else {
+                                break;
+                            };
+                            salt += 1;
+                            res = beside_a_held_commit(gate, || {
+                                deliver(
+                                    script.delivery,
+                                    &chain,
+                                    &mut subber,
+                                    &unconfirmed,
+                                    salt,
+                                    keys,
+                                )
+                            });
+                            if res.is_err() {
+                                break;
+                            }
+                            beside += 1;
+                            let mut handed: BTreeSet<Key> = keys.iter().copied().collect();
+                            handed.append(&mut mempool);
+                            candidates.push(handed);
+                        }
+                    }
+                    gate.open();
+                    // The commit under way ends before the next step; if
+                    // the power went under it, the next step is refused.
+                    let _ = db.wait_background_commit();
                 }
                 // A failed connect leaves its block on the chain; the
                 // restart's catch-up indexes it, without the mempool
@@ -416,6 +545,11 @@ fn run(script: &Script, cut_after: Option<u64>, honest_sync: bool, brk: Break) -
     if power_failed {
         assert!(latched, "a refused write must latch the store");
     }
+    assert_eq!(
+        store.mem.sealed_keys(),
+        0,
+        "every flush has finished, so nothing is left sealed"
+    );
     if brk == Break::WeakClose {
         drop(db.clear_flush_participant());
         let _ = db.close();
@@ -436,6 +570,8 @@ fn run(script: &Script, cut_after: Option<u64>, honest_sync: bool, brk: Break) -
         work,
         connects: candidates.len() - 1,
         prepared,
+        held,
+        beside,
     }
 }
 
@@ -583,10 +719,45 @@ fn a_power_cut_at_every_storage_operation_of_prepared_connects_keeps_index_and_t
     every_cut_keeps_index_and_tip_together(Script::random(&mut rng, 22).queued());
 }
 
+/// The same run and the same cuts with every flush that a connect trips
+/// committed on a thread of its own, and connects made while that commit
+/// is held.  The keys those connects hand over land between a flush's
+/// seal and its `finished`: they must wait for the next flush, whose
+/// commit carries their tip rows, and be lost with those rows when a cut
+/// takes them.
+#[test]
+fn a_power_cut_at_every_storage_operation_with_commits_on_their_own_thread_keeps_index_and_tip_together()
+ {
+    let mut rng = SplitMix64(0x7065_7263_7574_0001);
+    every_cut_keeps_index_and_tip_together(Script::random(&mut rng, 22).background());
+}
+
+/// And as the daemon runs it: each connect prepared before its
+/// transaction begins, each flush it trips committed on a thread of its
+/// own.
+#[test]
+fn a_power_cut_at_every_storage_operation_of_prepared_connects_with_commits_on_their_own_thread_keeps_index_and_tip_together()
+ {
+    let mut rng = SplitMix64(0x7065_7263_7574_0001);
+    every_cut_keeps_index_and_tip_together(Script::random(&mut rng, 22).queued().background());
+}
+
 fn every_cut_keeps_index_and_tip_together(script: Script) {
     let full = run(&script, None, true, Break::None);
     full.survived.expect("the uncut run");
     assert!(full.ops > 50, "the run made only {} operations", full.ops);
+    // Keys were handed over between a flush's seal and its `finished`
+    // only where a commit can leave the thread that tripped it.
+    if script.background {
+        assert!(
+            full.held >= 5 && full.beside >= 2,
+            "{} commits were held and {} connects made beside them",
+            full.held,
+            full.beside
+        );
+    } else {
+        assert_eq!((full.held, full.beside), (0, 0));
+    }
     // Every connect took the path the script names.
     let want = match script.delivery {
         Delivery::Inline => 0,
@@ -614,30 +785,63 @@ fn every_cut_keeps_index_and_tip_together(script: Script) {
 #[test]
 fn random_runs_cut_at_random_points_keep_index_and_tip_together() {
     let rng = SplitMix64::from_entropy("random_runs_cut_at_random_points");
-    random_cuts_keep_index_and_tip_together(rng, Delivery::Inline);
+    random_cuts_keep_index_and_tip_together(rng, Delivery::Inline, false);
 }
 
 /// The same with every connect prepared before its transaction begins.
 #[test]
 fn random_runs_of_prepared_connects_cut_at_random_points_keep_index_and_tip_together() {
     let rng = SplitMix64::from_entropy("random_runs_of_prepared_connects");
-    random_cuts_keep_index_and_tip_together(rng, Delivery::Queued);
+    random_cuts_keep_index_and_tip_together(rng, Delivery::Queued, false);
 }
 
-fn random_cuts_keep_index_and_tip_together(mut rng: SplitMix64, delivery: Delivery) {
+/// The same again with the flushes those connects trip committed on a
+/// thread of their own.
+#[test]
+fn random_runs_with_commits_on_their_own_thread_cut_at_random_points_keep_index_and_tip_together() {
+    let rng = SplitMix64::from_entropy("random_runs_with_commits_on_their_own_thread");
+    random_cuts_keep_index_and_tip_together(rng, Delivery::Queued, true);
+}
+
+/// Twelve random scripts, four run whole and eight cut at a random
+/// storage operation.  With `background`, the runs must between them have
+/// held a commit on a thread of its own at least once a run: scripts
+/// whose flushes all committed where they were tripped would pass as the
+/// inline test does and show nothing of their own.
+fn random_cuts_keep_index_and_tip_together(
+    mut rng: SplitMix64,
+    delivery: Delivery,
+    background: bool,
+) {
+    let mut held = 0usize;
     for round in 0..12 {
         let script = Script {
             delivery,
             ..Script::random(&mut rng, 30)
+        };
+        let script = if background {
+            script.background()
+        } else {
+            script
         };
         let cut = if round % 3 == 0 {
             None
         } else {
             Some(rng.below(1200))
         };
-        if let Err(e) = run(&script, cut, true, Break::None).survived {
+        let run = run(&script, cut, true, Break::None);
+        if let Err(e) = run.survived {
             panic!("round {round}, cut {cut:?}: {e}");
         }
+        held += run.held;
+    }
+    if background {
+        assert!(
+            held >= 12,
+            "only {held} flushes of twelve runs were committed on a thread of their own"
+        );
+    } else {
+        assert_eq!(held, 0, "a flush left the thread that tripped it");
     }
 }
 
@@ -2843,6 +3047,225 @@ fn the_journal_is_collected_below_the_oldest_pending_flush() {
     assert!(check.pending.is_empty());
     assert_eq!(rig.store.meta().min_pend_from(), 5);
     assert_eq!(rig.store.mem.len(), 0);
+}
+
+/// Keys handed over between a flush's `contribute` and its `finished`,
+/// as later connects' hooks hand them over while the flush's commit is
+/// under way, are not that flush's: they stay in memory, counted and
+/// found, and the next flush writes them.  The keys the flush did write
+/// leave memory or stay as it decided, whatever arrived in between.
+///
+/// The observer runs after the commit and before `finished(true)`, which
+/// is where the keys go in here.
+#[test]
+fn keys_handed_over_before_a_flush_finishes_wait_for_the_next_flush() {
+    type Late = Arc<Mutex<Option<Box<dyn FnOnce() + Send>>>>;
+    let dir = TempDir::new().expect("tempdir");
+    let late: Late = Arc::default();
+    let run_late = Arc::clone(&late);
+    let mut opts = Options::new(dir.path().join("db"), NET);
+    opts.flush_observer = Some(Arc::new(move |_: &dcroxide_database::FlushObservation| {
+        if let Some(hand_over) = run_late.lock().expect("late keys").take() {
+            hand_over();
+        }
+    }));
+    let db = Database::create(&opts).expect("db");
+    let mut bucket = [0u8; 4];
+    db.update(|tx| {
+        bucket = tx.metadata().create_bucket(EXISTS_ADDR_INDEX_KEY)?.raw_id();
+        Ok(())
+    })
+    .expect("bucket");
+    db.flush().expect("flush the bucket");
+    // The first merge spends the budget, so one partition is merged and
+    // the other journaled.
+    let store = Arc::new(AddrStore::new(fixed(Policy {
+        k0: 2,
+        k0_hard: 1000,
+        budget_pages: 1,
+        u_max: 1000,
+        ..Policy::tiny()
+    })));
+    store.install_fresh().expect("install");
+    db.set_flush_participant(&bucket, Arc::clone(&store) as Arc<dyn FlushParticipant>)
+        .expect("register");
+    let insert = |store: &AddrStore, keys: &[Key]| {
+        let part = store.partitioner();
+        let cands = store.mem.filter(keys.iter().map(|k| (part.of(k), *k)));
+        store.mem.insert_candidates(&cands)
+    };
+
+    let merged: Vec<Key> = (0..5).map(|n| key_in(200, 0, n)).collect();
+    let journaled: Vec<Key> = (0..3).map(|n| key_in(9, 0, n)).collect();
+    assert_eq!(insert(&store, &merged), 5);
+    assert_eq!(insert(&store, &journaled), 3);
+    // What arrives during the flush: new keys in the merged partition,
+    // in the journaled one and in one the flush did not touch, and two
+    // the flush holds already, which are skipped as held.
+    let arrived = vec![
+        key_in(200, 1, 0),
+        key_in(200, 1, 1),
+        key_in(9, 1, 0),
+        key_in(50, 1, 0),
+    ];
+    {
+        let store = Arc::clone(&store);
+        let arrived = arrived.clone();
+        let sealed = [merged[0], journaled[0]];
+        *late.lock().expect("late keys") = Some(Box::new(move || {
+            let part = store.partitioner();
+            assert_eq!(store.mem.unjournaled(), 0, "the flush sealed its keys");
+            for key in &sealed {
+                assert!(store.mem.contains(part.of(key), key), "a sealed key");
+            }
+            let mut handed = arrived;
+            handed.extend(sealed);
+            assert_eq!(insert(&store, &handed), 4, "the sealed keys are held");
+        }));
+    }
+    db.flush().expect("flush");
+    assert!(
+        late.lock().expect("late keys").is_none(),
+        "the keys went in"
+    );
+    assert_eq!(
+        *store.faults.finished.lock().expect("finished log"),
+        vec![true]
+    );
+
+    // The flush's own keys: 200's are in its run and out of memory, 9's
+    // are journaled and still held.
+    let meta = store.meta();
+    assert_eq!(
+        (u64::from(meta.d_keys[200]) + u64::from(meta.b_keys[200])) as usize,
+        merged.len()
+    );
+    let part = store.partitioner();
+    for key in &merged {
+        assert!(!store.mem.contains(part.of(key), key));
+    }
+    for key in &journaled {
+        assert!(store.mem.contains(part.of(key), key));
+    }
+    // The keys that arrived: all held, all still owed to a flush, and
+    // none on disk yet.
+    for key in &arrived {
+        assert!(store.mem.contains(part.of(key), key), "an arrived key");
+    }
+    assert_eq!(store.mem.len(), journaled.len() + arrived.len());
+    assert_eq!(store.mem.unjournaled(), arrived.len());
+    assert!(store.has_work(), "the next flush has keys to journal");
+    let check = check_layout(&db).expect("layout").expect("bucket");
+    assert_eq!(check.runs, sorted(merged.clone()));
+    assert_eq!(check.pending, sorted(journaled.clone()));
+
+    // The next flush writes them, and the store then holds every key,
+    // in a run or pending in the journal.
+    db.flush().expect("flush");
+    assert_eq!(store.mem.unjournaled(), 0);
+    assert_eq!(
+        *store.faults.finished.lock().expect("finished log"),
+        vec![true, true]
+    );
+    let mut all = merged;
+    all.extend(journaled);
+    all.extend(arrived);
+    let check = check_layout(&db).expect("layout").expect("bucket");
+    let stored = runs::union(&check.runs, &check.pending);
+    assert!(stored == sorted(all), "a key was lost or invented");
+    db.close().expect("close");
+}
+
+/// The index over a database that hands a flush's commit to a thread of
+/// its own (`Options::background_commit`), which is how the daemon opens
+/// it.  The flushes the index asks for are then committed, and their
+/// `finished` called, while later connects hand their keys over and
+/// lookups run.  No lookup misses a key of a connected block at any
+/// point, and the index ends with every key once, in memory and on disk
+/// and after a restart.
+#[test]
+fn the_index_loses_no_key_when_its_flushes_commit_on_a_thread_of_their_own() {
+    let dir = TempDir::new().expect("tempdir");
+    // Whether each flush committed on a thread of its own, and whether
+    // the index wrote in it.
+    let flushes: Arc<Mutex<Vec<(bool, bool)>>> = Arc::default();
+    let seen = Arc::clone(&flushes);
+    let mut opts = Options::new(dir.path().join("db"), NET);
+    opts.background_commit = true;
+    opts.flush_observer = Some(Arc::new(
+        move |obs: &dcroxide_database::FlushObservation| {
+            seen.lock()
+                .expect("flushes")
+                .push((obs.background, obs.participant.is_some()));
+        },
+    ));
+    let db = Arc::new(Database::create(&opts).expect("create"));
+    let chain = TestChain::new(params());
+    let mut subber = new_subber();
+    // `u_max` is 8 keys, so the index asks for a flush every few blocks.
+    let policy = fixed(Policy::tiny());
+    let idx = open_index(&mut subber, &db, &chain, policy);
+    let query = idx.lock().expect("index").query();
+
+    let mut rng = SplitMix64::from_entropy("existsaddr-background-commit");
+    let mut all: Vec<Key> = Vec::new();
+    for salt in 0..240u32 {
+        let keys: Vec<Key> = (0..rng.below(6) + 1)
+            .map(|_| random_key(&mut rng))
+            .collect();
+        connect(&chain, &mut subber, salt, &keys).expect("connect");
+        all.extend(keys);
+        // The newest keys, which are in memory, and older ones, which a
+        // commit that may still be under way is moving into the runs.
+        let newest = all.len().saturating_sub(8);
+        let older = (0..8).map(|_| rng.below(all.len() as u64) as usize);
+        for i in (newest..all.len()).chain(older) {
+            let found = query
+                .exists_address(&address_of(&all[i], params()))
+                .expect("lookup");
+            assert!(found, "{} is missing after block {salt}", hex(&all[i]));
+        }
+    }
+    db.flush().expect("flush");
+
+    let flushes = flushes.lock().expect("flushes").clone();
+    let handed_over = flushes
+        .iter()
+        .filter(|&&(background, wrote)| background && wrote)
+        .count();
+    assert!(
+        handed_over >= 20,
+        "only {handed_over} of {} flushes the index wrote in committed on a thread of their \
+         own, so this test did not exercise them",
+        flushes.len()
+    );
+
+    let want: Vec<Key> = all
+        .iter()
+        .copied()
+        .collect::<BTreeSet<Key>>()
+        .into_iter()
+        .collect();
+    let keys = idx.lock().expect("index").logical_keys().expect("keys");
+    assert!(keys == want, "the index's keys are not the blocks' keys");
+    check_layout(&db).expect("layout").expect("bucket");
+    let stored = super::store::stored_keys(&db)
+        .expect("stored")
+        .expect("index");
+    assert!(stored == want, "the stored keys are not the index's");
+
+    // The same after a restart.
+    drop((subber, idx, query));
+    db.close().expect("close");
+    drop(db);
+    let db = Arc::new(Database::open(&Options::new(dir.path().join("db"), NET)).expect("reopen"));
+    let mut subber = new_subber();
+    let idx = open_index(&mut subber, &db, &chain, policy);
+    let reopened = idx.lock().expect("index").logical_keys().expect("keys");
+    assert!(reopened == want, "after a restart");
+    drop(idx);
+    drop(subber);
+    db.close().expect("close");
 }
 
 /// The same inserts and flushes give byte-identical rows.

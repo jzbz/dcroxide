@@ -279,8 +279,9 @@ struct TxState {
     /// can hold a bucket's index row, and a bucket lookup is answered by
     /// `buckets` alone ([`Transaction::child_bucket_id`]).
     staged_bucket_index: bool,
-    /// Closures to run once a commit's own flush has succeeded and before
-    /// its rows are published, in registration order (see
+    /// Closures to run once a commit's own flush has taken the rows it
+    /// will write and before the commit's are published, in registration
+    /// order (see
     /// [`Transaction::on_commit`]).  Dropped unrun by `close`, so a
     /// rollback, a drop or a failed commit runs none of them.
     on_commit: Vec<OnCommit>,
@@ -1182,19 +1183,27 @@ impl Transaction {
         drop(hooks);
     }
 
-    /// Run `hook` when this transaction commits, once its commit's own
-    /// flush has succeeded and before its rows are published to the
-    /// overlay.  Hooks run in registration order.  There is no dcrd
-    /// counterpart (ADR-0011).
+    /// Run `hook` when this transaction commits, once any flush its
+    /// commit trips has taken the rows it will write and before this
+    /// transaction's rows are published to the overlay.  Hooks run in
+    /// registration order.  There is no dcrd counterpart (ADR-0011).
     ///
     /// When a hook runs, the writer semaphore is held, so no other commit
-    /// or flush can interleave; any flush this commit triggered has
-    /// completed, so a [`crate::FlushParticipant`]'s `finished` for it has
-    /// been called; and the transaction's rows are not yet visible to any
-    /// other transaction.  That is the placement an index needs to hand
-    /// in-memory state over atomically with its tip row: the commit's own
-    /// flush cannot capture state the hook adds, and no reader can see
-    /// the tip before the hook has run.
+    /// can interleave and no flush can start; any flush this commit
+    /// triggered has captured the write cache and called a
+    /// [`crate::FlushParticipant`]'s `contribute`; and the transaction's
+    /// rows are not yet visible to any other transaction.  That is the
+    /// placement an index needs to hand in-memory state over atomically
+    /// with its tip row: the commit's own flush cannot capture state the
+    /// hook adds, and no reader can see the tip before the hook has run.
+    ///
+    /// That flush has also committed, and the participant's `finished`
+    /// for it has been called, unless the database hands commits to a
+    /// thread of their own ([`crate::Options::background_commit`]) and
+    /// the participant allows its `finished` to be deferred
+    /// ([`crate::FlushParticipant::allows_deferred_finish`]).  Then the
+    /// commit may still be under way, and `finished` may come after this
+    /// hook and the hooks of later commits.
     ///
     /// A hook never runs if the commit fails, the transaction is rolled
     /// back, or it is dropped.  After the hooks the commit cannot fail:
@@ -1280,9 +1289,11 @@ impl Transaction {
 
         // Nothing is written on a latched store -- not the block files,
         // not a flush.  `begin` re-checks the latch once it holds the
-        // writer semaphore and only a semaphore holder can set it, so
-        // this cannot fire today; it is here so the latch does not rest
-        // on that ordering alone.
+        // writer semaphore, and without background commits only a
+        // semaphore holder can set it, so this cannot fire then.  With
+        // them it is the check that refuses a transaction begun before a
+        // commit failed on its own thread and committed after: no block
+        // bytes are written and no hook runs.
         if let Err(e) = self.db.check_writable() {
             self.close();
             return Err(e);
@@ -1365,12 +1376,20 @@ impl Transaction {
         // changes to the cache.  The flush is `Database::flush`'s own
         // helper, so the capture, the unlocked commit and the
         // retirement cannot drift between the two; this transaction
-        // holds the writer semaphore throughout, which is what keeps two
-        // flushes from overlapping.  The layers a flush retired are kept
-        // until that semaphore is released, at the end.
+        // holds the writer semaphore throughout, and the helper waits
+        // for a flush whose commit is still under way on its own thread
+        // before it captures another, which together keep two flushes
+        // from overlapping.  With background commits the helper returns
+        // once the window is captured and handed to redb; a failure of
+        // the redb commit itself then latches the store from its own
+        // thread instead of failing this commit.  The layers a flush
+        // retired here are kept until that semaphore is released, at the
+        // end; those of a flush whose commit was handed over are retired
+        // and let go of by the thread it was handed to.
         let retired = crate::flush_locked(&self.db, true);
         if let Err(e) = retired {
-            // Already latched by `flush_locked`: the dirty set is still
+            // Already latched, by `flush_locked` or by the thread an
+            // earlier flush's commit failed on: the dirty set is still
             // in the cache, so without the latch the next commit retries
             // it and can report success after this failure (see
             // DbInner::mark_fatal).  It has to be latched BEFORE `close`
@@ -1389,10 +1408,11 @@ impl Transaction {
             return Err(e);
         }
 
-        // The commit's own flush has succeeded and its rows are not yet
-        // published: the one point at which a hook's in-memory change and
-        // this transaction's rows become visible together, with no flush
-        // able to capture one without the other (see `on_commit`).
+        // The commit's own flush has taken everything it will write and
+        // this transaction's rows are not yet published: the one point
+        // at which a hook's in-memory change and this transaction's rows
+        // become visible together, with no flush able to capture one
+        // without the other (see `on_commit`).
         let hooks = std::mem::take(&mut self.state.borrow_mut().on_commit);
         for hook in hooks {
             hook();

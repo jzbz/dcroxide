@@ -25,10 +25,10 @@
 //!   rows than survive is lost data; a marker that claims fewer is leaked
 //!   data. Both are failures, and a test that only checks one direction
 //!   passes on an engine that silently keeps uncommitted writes.
-//! - **A kill between durability domains.** `DbCache::run_flush` syncs the
-//!   flat block files *before* committing metadata, so the window between
-//!   them is a real state a crash can land in: block bytes on disk that no
-//!   metadata references.
+//! - **A kill between durability domains.** A flush syncs the flat block
+//!   files (`DbCache::sync_blocks`) *before* committing metadata
+//!   (`DbCache::commit`), so the window between them is a real state a
+//!   crash can land in: block bytes on disk that no metadata references.
 //!
 //! There are two crash primitives, and the difference between them is
 //! the whole point.
@@ -52,7 +52,7 @@
 //!
 //! **These tests were checked against a broken store, not just a working
 //! one.** Deleting the state-marker write from the flush
-//! (`DbCache::flush` then, `DbCache::run_flush` now) — so the
+//! (`DbCache::flush` then, `DbCache::fill` now) — so the
 //! rows advance while the marker naming them does not — fails four of the
 //! metadata tests below with the invariant named in the message, and
 //! passes all five of the tests that existed before. That is the whole
@@ -514,8 +514,9 @@ fn paired_commits_never_desync_under_repeated_tears() {
 
 /// Block data and the metadata describing it roll back together.
 ///
-/// `DbCache::run_flush` syncs the flat block files *before* it commits
-/// metadata, so a crash can land between the two durability domains. What
+/// A flush syncs the flat block files (`DbCache::sync_blocks`) *before*
+/// it commits metadata, so a crash can land between the two durability
+/// domains. What
 /// must never happen is a block that recovery keeps while the metadata
 /// naming it is gone, or metadata naming a block whose bytes were rolled
 /// back.

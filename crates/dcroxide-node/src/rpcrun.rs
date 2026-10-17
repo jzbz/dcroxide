@@ -149,16 +149,6 @@ impl NodeRpcChain {
         let tip = chain.best_chain.tip()?;
         chain.store.node(tip).stake_node.as_deref().cloned()
     }
-
-    /// Whether the chain's store has latched a fatal persistence fault,
-    /// which the chain renders as a `RuleError` so it can travel the
-    /// ordinary paths (see `sync::combine_process_block_result`).
-    fn storage_failed(chain: &Chain) -> bool {
-        chain
-            .db
-            .as_ref()
-            .is_some_and(dcroxide_database::Database::is_fatal)
-    }
 }
 
 /// The chain tips known to the block index, sorted by descending height
@@ -956,16 +946,26 @@ impl RpcChain for NodeRpcChain {
         &self,
         hash: &Hash,
     ) -> Result<(), dcroxide_rpc::server::ReconsiderBlockFailure> {
-        let (errs, storage_failed) = {
+        let (errs, db) = {
             let mut chain = self.chain.lock().expect("chain mutex poisoned");
             let errs = chain.reconsider_block(hash, adjusted_time_unix(), &self.params);
-            let storage_failed = Self::storage_failed(&chain);
-            (errs, storage_failed)
+            // The store's handle, for a failure to be classified by once
+            // the chain is released.
+            let db = if errs.is_empty() {
+                None
+            } else {
+                chain.db.clone()
+            };
+            (errs, db)
         };
         self.drain_chain_events();
         let Some(first) = errs.first() else {
             return Ok(());
         };
+        // Whether the chain's store has latched a fatal persistence
+        // fault, which the chain renders as a `RuleError` so it can travel
+        // the ordinary paths (see `sync::combine_process_block_result`).
+        let storage_failed = crate::sync::storage_failed(db);
         Err(dcroxide_rpc::server::ReconsiderBlockFailure {
             is_unknown_block: first.kind == RuleErrorKind::UnknownBlock,
             // dcrd's handler asks whether every member of the (possible)

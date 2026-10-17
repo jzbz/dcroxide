@@ -367,9 +367,9 @@ impl BlockStore {
 
     /// Append the raw block to the store per dcrd `writeBlock`,
     /// returning its location.  Data is not synced until the next flush:
-    /// [`crate::dbcache::DbCache::run_flush`] takes a [`Self::sync_plan`],
-    /// runs it ([`SyncPlan::run`]) and discharges it with
-    /// [`Self::finish_sync`].
+    /// [`crate::dbcache::DbCache::sync_blocks`] takes a
+    /// [`Self::sync_plan`], runs it ([`SyncPlan::run`]) and discharges it
+    /// with [`Self::finish_sync`].
     pub(crate) fn write_block(&mut self, raw_block: &[u8]) -> Result<BlockLocation, Error> {
         self.write_block_as(raw_block, None)
     }
@@ -463,7 +463,7 @@ impl BlockStore {
     }
 
     /// Sync all files written to since the last sync, with the store
-    /// held throughout.  [`crate::dbcache::DbCache::run_flush`] splits
+    /// held throughout.  [`crate::dbcache::DbCache::sync_blocks`] splits
     /// this into its three steps so the fsyncs run without the store
     /// lock.
     #[cfg(test)]

@@ -10,7 +10,8 @@
 //!
 //! - **The memtable** ([`memtable`]) holds every key of an indexed block
 //!   not yet in a run.  A connect's `on_commit` hook inserts its keys
-//!   after the commit's own flush and before its tip row is published.
+//!   after the commit's own flush has written its rows and before its
+//!   tip row is published.
 //! - **The journal** ([`journal`]) records, in each flush, the memtable
 //!   keys not yet journaled, so a restart can rebuild the memtable.
 //! - **The runs** ([`runs`]) hold each partition's keys as a delta run and

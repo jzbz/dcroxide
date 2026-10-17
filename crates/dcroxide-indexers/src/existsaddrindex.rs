@@ -786,12 +786,12 @@ impl ExistsAddrIndex {
     /// The address extraction and the tip row are dcrd's.  The keys do
     /// not go through the transaction: they are handed to the memtable by
     /// an `on_commit` hook, which runs once the commit's own flush has
-    /// succeeded and before the tip row is published.  So no flush can
-    /// journal them without their tip row or persist the tip row without
-    /// them, a reader that sees the tip finds them, and a commit that
-    /// fails hands nothing over.  The block's candidates are filtered
-    /// against the memtable only, with no store read; a key already in a
-    /// run is merged away as a duplicate later.
+    /// written its rows and before the tip row is published.  So no flush
+    /// can journal them without their tip row or persist the tip row
+    /// without them, a reader that sees the tip finds them, and a commit
+    /// that fails hands nothing over.  The block's candidates are
+    /// filtered against the memtable only, with no store read; a key
+    /// already in a run is merged away as a duplicate later.
     ///
     /// dcrd drains the unconfirmed overlay into the block's keys.  This
     /// copies it, here or when the connect was queued, and the hook

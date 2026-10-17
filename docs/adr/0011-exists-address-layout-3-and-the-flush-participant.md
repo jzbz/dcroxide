@@ -1000,3 +1000,77 @@ written: `Memtable::filter` is now at `existsaddr/memtable.rs:275` and
 `insert_candidates` at `:316`, and in `existsaddr/store.rs` `has_work`,
 `contribute`, `finished` and the journal load are at `:216`, `:224`,
 `:338` and `:383`.
+
+## Addendum, 2026-10-16 (third) — a participant's `finished` may come after later commits
+
+In the daemon a flush that a commit's own check trips now makes its redb
+commit on a thread named `dbcommit` ([ADR-0009](0009-storage-shape.md)
+and [ADR-0005](0005-concurrency-model.md), addenda of this date). For a
+participant that allows it, three statements of the decision above no
+longer hold as written, and the latch row of the guardrail table reads
+with ADR-0009's restated condition 1.
+
+- `finished(committed)` is still called exactly once after each
+  `contribute`, after the overlay layers are retired or after the store
+  has latched, but on that thread and not under the writer semaphore.
+  The hooks of the commit that tripped the flush and of later commits,
+  and later commits' `wants_flush`, can run between a `contribute` and
+  its `finished`, or beside the `finished`.
+- `Transaction::on_commit`'s closures run once the commit's own flush
+  has written its rows, not once that flush has completed: its commit
+  may still be under way, and may still fail, after they ran.
+- A failed commit there is reported to the next write, flush or close
+  and not to the commit that tripped the flush, which has returned.
+
+A participant opts in with `FlushParticipant::allows_deferred_finish`,
+false by default. A flush that a participant which has not opted in
+contributed to commits on the committing thread, and its `finished` is
+called there under the semaphore, as before; a flush it has no part in
+is handed over like any other. The exists-address index's participant
+opts in. Its `contribute` seals what it wrote (the addendum above), its
+`finished` touches only the sealed keys, under its state lock and each
+partition's own, and its `wants_flush` is one atomic read of the
+unjournaled count, so a hook's insert or a `wants_flush` beside a
+`finished` loses nothing and counts nothing twice. A key handed over
+while the commit is under way stays unjournaled and goes into the next
+flush, which no commit can capture before the one under way has ended.
+In that window up to `u_max` more keys can arrive before the index's
+`wants_flush` makes a commit wait for it, so the memtable's bound at the
+defaults becomes `k0_hard` plus twice `u_max`, 6.0 million keys
+(126 MB), where it was 4.5 million (94.5 MB). Nothing on disk changes.
+
+The power-cut sweeps of `tests/participant.rs` and of the index now run
+in both modes. In the background mode each commit that trips a flush is
+held at its first write with one or two connects made beside it, and the
+power is cut at every storage operation
+(`power_cut_at_every_storage_operation_with_commits_on_their_own_thread`,
+`a_power_cut_at_every_storage_operation_with_commits_on_their_own_thread_keeps_index_and_tip_together`
+and its prepared-connect twin, and their random companions). A
+participant that opts in and takes `finished(true)` to cover everything
+it holds, and not what its `contribute` wrote, is caught there and is
+harmless inline
+(`the_checker_catches_a_participant_that_forgets_keys_handed_in_during_a_commit`),
+and a flush that a participant left at the trait's default contributed
+to commits inline (`a_participant_that_does_not_opt_in_commits_inline`).
+They have run on Linux only.
+
+The change moved more of the lines cited above, whose numbers stay as
+they were written. In `dcroxide-database`'s `lib.rs`,
+`begin_durable_write` is now at `:162`, the latch's two at `:203` and
+`:239`, the participant's field at `:438`, `flush_locked` at `:1264`
+with `wants_flush` asked at `:1281` and `finished` called at `:1619`,
+`close` at `:2701-2740`, `set_flush_participant` at `:2780` and
+`clear_flush_participant` at `:2851`. The participant trait is at
+`participant.rs:66`, `allows_deferred_finish` at `:141` and the key
+check at `:362`. In `dbcache.rs`, `has_work` is asked at `:1098`, the
+prefix guard is at `:1133`, `contribute` is called at `:1169`, the
+commit at `:1217` and the participant-only flush's count at `:1283`. In
+`transaction.rs`, `raw_id` is at `:1837`, the prefix check at `:1237`
+and its call in the commit at `:1304`, `on_commit` at `:1221`, the
+commit's own flush at `:1389`, its hooks taken at `:1416` and its rows
+published at `:1440`, the hooks dropped by a rollback at `:1181`, and
+`try_first_after` and `try_scan_after` at `:697` and `:713`. In
+`existsaddr/store.rs`, `wants_flush`, `has_work`, `contribute`,
+`finished` and the journal load are at `:207`, `:218`, `:226`, `:341`
+and `:393`, and `allows_deferred_finish` at `:368`. The cited lines of
+`existsaddrindex.rs`, of `policy.rs` and of `dcroxide.rs` did not move.
