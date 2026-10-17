@@ -253,7 +253,21 @@ impl UtxoView {
     /// entries spent by a later transaction in the same block leave
     /// the view with no backing set effect, and unmodified entries
     /// stay in the view untouched.
-    pub fn commit(&mut self) -> Vec<(OutPointKey, UtxoEntry)> {
+    ///
+    /// `cache_holds_unspent` answers whether the cache the changes go
+    /// to holds an unspent entry for an output, which the commit asks
+    /// only of the zero-confirmation spends.
+    ///
+    /// # Panics
+    ///
+    /// With dcrd's texts (`utxocache.go:594-606`, since `e60cedc5` and
+    /// `22fd2431`), when a zero-confirmation spend is not also marked
+    /// spent, or when the cache holds an unspent entry for it: such an
+    /// output only ever existed in the view.
+    pub fn commit(
+        &mut self,
+        cache_holds_unspent: impl Fn(&OutPointKey) -> bool,
+    ) -> Vec<(OutPointKey, UtxoEntry)> {
         // One pass over the map in key order, taking each entry out as
         // it is reached, so no entry is searched for and the map is not
         // rebalanced around each removal.  The view of a connected
@@ -266,19 +280,31 @@ impl UtxoView {
                 continue;
             }
             if entry.is_spent_by_zero_conf() {
-                // dcrd panics here since `e60cedc5`
-                // (`utxocache.go:594-601`).
-                if !entry.is_spent() {
+                // Zero-confirmation spends must also be marked spent and
+                // must not have an unspent cache entry (dcrd
+                // `utxocache.go:594-606`).
+                let outpoint = || {
                     let (hash, index, tree) = key.0;
-                    let outpoint = OutPoint {
+                    OutPoint {
                         hash: Hash(hash),
                         index,
                         tree,
-                    };
+                    }
+                };
+                if !entry.is_spent() {
+                    let outpoint = outpoint();
                     panic!(
-                        "output {outpoint} (tree {tree}) from view@{} is simultaneously marked \
+                        "output {outpoint} (tree {}) from view@{} is simultaneously marked \
                          spent by a transaction later in the same block and not spent",
-                        self.best_hash
+                        outpoint.tree, self.best_hash
+                    );
+                }
+                if cache_holds_unspent(&key.0) {
+                    let outpoint = outpoint();
+                    panic!(
+                        "output {outpoint} (tree {}) from view@{} is marked as only having \
+                         ever existed in the view, but has an unspent cache entry",
+                        outpoint.tree, self.best_hash
                     );
                 }
                 continue;
@@ -466,10 +492,10 @@ impl UtxoView {
     ///
     /// # Panics
     ///
-    /// When the view does not hold an input the transaction spends,
-    /// with dcrd's text (`utxoviewpoint.go:274-280`, since `e60cedc5`):
-    /// a view missing an input is an invariant violation there is no
-    /// recovering from.
+    /// When the view does not hold an input the transaction spends, or
+    /// holds it already spent, with dcrd's texts
+    /// (`utxoviewpoint.go:274-284`, since `e60cedc5` and `22fd2431`):
+    /// either is an invariant violation there is no recovering from.
     pub fn connect_stake_transaction(
         &mut self,
         tx: &MsgTx,
@@ -494,10 +520,18 @@ impl UtxoView {
             if is_vote && tx_in_idx == 0 {
                 continue;
             }
+            // The referenced output must be in the view and not
+            // already spent.
             let prev_out = &tx_in.previous_out_point;
             let Some(entry) = self.entries.get_mut(&key(prev_out)) else {
                 panic!("view missing input {prev_out} (tree {})", prev_out.tree);
             };
+            if entry.is_spent() {
+                panic!(
+                    "attempt to spend already spent output {prev_out} (tree {})",
+                    prev_out.tree
+                );
+            }
             if let Some(stxos) = stxos.as_deref_mut() {
                 stxos.push(entry_to_spent_tx_out(entry));
             }
@@ -512,8 +546,9 @@ impl UtxoView {
     ///
     /// # Panics
     ///
-    /// When the view does not hold an input a transaction spends, as
-    /// [`Self::connect_stake_transaction`] does.
+    /// When the view does not hold an input a transaction spends, or
+    /// holds it already spent, as [`Self::connect_stake_transaction`]
+    /// does.
     pub fn connect_stake_transactions(
         &mut self,
         block: &MsgBlock,
@@ -548,8 +583,9 @@ impl UtxoView {
     ///
     /// # Panics
     ///
-    /// When the view does not hold an input the transaction spends,
-    /// with dcrd's text (`utxoviewpoint.go:342-348`, since `e60cedc5`).
+    /// When the view does not hold an input the transaction spends, or
+    /// holds it already spent, with dcrd's texts
+    /// (`utxoviewpoint.go:342-352`, since `e60cedc5` and `22fd2431`).
     pub fn connect_regular_transaction(
         &mut self,
         tx: &MsgTx,
@@ -564,11 +600,19 @@ impl UtxoView {
             return;
         }
         for tx_in in &tx.tx_in {
+            // The referenced output must be in the view and not
+            // already spent.
             let prev_out = &tx_in.previous_out_point;
             let prev_key = key(prev_out);
             let Some(entry) = self.entries.get_mut(&prev_key) else {
                 panic!("view missing input {prev_out} (tree {})", prev_out.tree);
             };
+            if entry.is_spent() {
+                panic!(
+                    "attempt to spend already spent output {prev_out} (tree {})",
+                    prev_out.tree
+                );
+            }
             if let Some(stxos) = stxos.as_deref_mut() {
                 stxos.push(entry_to_spent_tx_out(entry));
             }
@@ -592,8 +636,9 @@ impl UtxoView {
     ///
     /// # Panics
     ///
-    /// When the view does not hold an input a transaction spends, as
-    /// [`Self::connect_regular_transaction`] does.
+    /// When the view does not hold an input a transaction spends, or
+    /// holds it already spent, as [`Self::connect_regular_transaction`]
+    /// does.
     pub fn connect_regular_transactions(
         &mut self,
         block: &MsgBlock,
@@ -1075,6 +1120,350 @@ impl UtxoView {
                 return;
             }
         }
+    }
+
+    /// Panic unless the view is consistent with the completed
+    /// transition the block represents (dcrd `assertBlockUtxoView`,
+    /// `utxoviewpoint.go:633-917`, since `22fd2431`): every input the
+    /// block spends must have a spent entry whose details match the
+    /// input's fraud proof, and every spendable output it creates must
+    /// have an entry with the output's details, marked modified, and
+    /// spent exactly when a later transaction in the regular tree spends
+    /// it.  The grandfathered same-block stake spends are the one
+    /// exception (see [`Self::add_sbss_violations`]): the regular tree
+    /// adds their output back unspent after the stake tree spends it.
+    ///
+    /// Only for a fully validated block whose transactions have been
+    /// applied to the view.  The reorganization calls it for every block
+    /// it attaches, just before the block is connected
+    /// (`chain.go:1236-1238`).  These are assertions rather than errors,
+    /// as dcrd's commit gives the reason: there is no recovering from a
+    /// view that violates them, and processing more blocks over it could
+    /// corrupt the utxo set.  The texts are dcrd's.
+    pub(crate) fn assert_block_utxo_view(
+        &self,
+        params: &Params,
+        block: &MsgBlock,
+        tx_hashes: &crate::blockhashes::BlockTxHashes,
+        is_treasury_enabled: bool,
+    ) {
+        self.assert_block_utxo_view_with(
+            &sbss_violation_lookup(params),
+            block,
+            tx_hashes,
+            is_treasury_enabled,
+        );
+    }
+
+    /// [`Self::assert_block_utxo_view`] over the given lookup of the
+    /// grandfathered same-block stake spends.
+    fn assert_block_utxo_view_with(
+        &self,
+        sbss_violation: &impl Fn(i64) -> Option<Hash>,
+        block: &MsgBlock,
+        tx_hashes: &crate::blockhashes::BlockTxHashes,
+        is_treasury_enabled: bool,
+    ) {
+        tx_hashes.assert_for(block);
+        let height = i64::from(block.header.height);
+        // The header is hashed only for a panic's text.
+        let block_hash = || block.header.block_hash();
+
+        // Every output the regular tree spends, with the index of the
+        // transaction that spends it, which decides which of the
+        // block's own outputs must be spent.  Sorted, a lookup finds
+        // the last spender of an output, as a later write to dcrd's map
+        // replaces an earlier one.
+        let mut spent_regular_outs: Vec<(UtxoKey, u32)> =
+            Vec::with_capacity(count_spent_regular_outputs(block));
+        for (tx_idx, tx) in block.transactions.iter().enumerate() {
+            // A coinbase has a single null input instead of real ones,
+            // and the input checks below make sure of it.  Only its
+            // first input is skipped, so that a mistake in detecting
+            // the coinbase cannot let other inputs through.
+            let is_coin_base = tx_idx == 0;
+            if is_coin_base && !dcroxide_standalone::is_coin_base_tx(tx, is_treasury_enabled) {
+                panic!(
+                    "block {} first tx {} is not a coinbase",
+                    block_hash(),
+                    tx_hashes.regular()[0]
+                );
+            }
+            for (tx_in_idx, tx_in) in tx.tx_in.iter().enumerate() {
+                if is_coin_base && tx_in_idx == 0 {
+                    continue;
+                }
+                spent_regular_outs.push((key(&tx_in.previous_out_point), tx_idx as u32));
+            }
+        }
+        spent_regular_outs.sort_unstable();
+        let regular_spender = |outpoint: &UtxoKey| {
+            let end = spent_regular_outs.partition_point(|(spent, _)| spent <= outpoint);
+            let (spent, spender) = spent_regular_outs.get(end.checked_sub(1)?)?;
+            (spent == outpoint).then_some(*spender)
+        };
+
+        // Every input the block spends that has a real input must have
+        // a spent entry in the view with the details the input commits
+        // to.
+        let assert_inputs = |transactions: &[MsgTx], hashes: &[Hash], stake_tree: bool| {
+            let tree_name = if stake_tree { "stake" } else { "regular" };
+            for (tx_idx, (tx, tx_hash)) in transactions.iter().zip(hashes).enumerate() {
+                let tx_type = if stake_tree {
+                    dcroxide_stake::determine_tx_type(tx)
+                } else {
+                    TxType::Regular
+                };
+                let is_coin_base = !stake_tree && tx_idx == 0;
+                for (tx_in_idx, tx_in) in tx.tx_in.iter().enumerate() {
+                    // Coinbases, the stakebase of votes, treasurybases
+                    // and treasury spends spend a null outpoint, and
+                    // only at their first input; every other input
+                    // spends a real one.
+                    let prev_out = &tx_in.previous_out_point;
+                    let want_null_out = tx_in_idx == 0
+                        && (is_coin_base
+                            || matches!(
+                                tx_type,
+                                TxType::SSGen | TxType::TreasuryBase | TxType::TSpend
+                            ));
+                    let got_null = crate::validate::is_null_outpoint(prev_out);
+                    if got_null != want_null_out {
+                        let spends = if got_null {
+                            alloc::string::String::from("null outpoint")
+                        } else {
+                            alloc::format!("non-null outpoint {prev_out} (tree {})", prev_out.tree)
+                        };
+                        panic!(
+                            "block {} {tree_name} tree idx {tx_idx}: tx {tx_hash}:{tx_in_idx} \
+                             spends {spends}",
+                            block_hash()
+                        );
+                    }
+                    if want_null_out {
+                        continue;
+                    }
+                    let input = || {
+                        alloc::format!(
+                            "block {} {tree_name} tree idx {tx_idx}: tx {tx_hash}:{tx_in_idx} \
+                             spending input {prev_out} (tree {})",
+                            block_hash(),
+                            prev_out.tree
+                        )
+                    };
+
+                    let Some(entry) = self.entries.get(&key(prev_out)) else {
+                        panic!("{}: input is missing from utxo view", input());
+                    };
+
+                    // A spent input is marked spent, except the
+                    // grandfathered output a stake transaction spends in
+                    // its own block, which the regular tree adds back.
+                    // The assertion would have caught those spends had
+                    // it been in place, though it does not test the rule
+                    // they broke.
+                    let is_historical_sbss = stake_tree
+                        && prev_out.index == 0
+                        && prev_out.tree == dcroxide_wire::TX_TREE_REGULAR
+                        && sbss_violation(height) == Some(prev_out.hash);
+                    if !entry.is_spent() && !is_historical_sbss {
+                        panic!("{}: utxo is not marked spent", input());
+                    }
+
+                    // The entry is the one the input's fraud proof names.
+                    if entry.amount() != tx_in.value_in {
+                        panic!(
+                            "{}: utxo amount mismatch (entry {}, input witness {})",
+                            input(),
+                            entry.amount(),
+                            tx_in.value_in
+                        );
+                    }
+                    if entry.block_height() != i64::from(tx_in.block_height) {
+                        panic!(
+                            "{}: utxo block height mismatch (entry {}, input witness {})",
+                            input(),
+                            entry.block_height(),
+                            tx_in.block_height
+                        );
+                    }
+                    if entry.block_index() != tx_in.block_index {
+                        panic!(
+                            "{}: utxo block index mismatch (entry {}, input witness {})",
+                            input(),
+                            entry.block_index(),
+                            tx_in.block_index
+                        );
+                    }
+
+                    // A stake transaction does not spend an output of its
+                    // own block, the grandfathered spends aside.
+                    if stake_tree && i64::from(tx_in.block_height) == height && !is_historical_sbss
+                    {
+                        panic!("{}: stake tx spends output from same block", input());
+                    }
+                }
+            }
+        };
+
+        // Every spendable output the block creates must have an entry
+        // with the output's details and the spent state the block leaves
+        // it in.
+        let assert_outputs = |transactions: &[MsgTx], hashes: &[Hash], stake_tree: bool| {
+            let (tx_tree, tree_name) = if stake_tree {
+                (dcroxide_wire::TX_TREE_STAKE, "stake")
+            } else {
+                (dcroxide_wire::TX_TREE_REGULAR, "regular")
+            };
+            for (tx_idx, (tx, tx_hash)) in transactions.iter().zip(hashes).enumerate() {
+                let tx_type = if stake_tree {
+                    dcroxide_stake::determine_tx_type(tx)
+                } else {
+                    TxType::Regular
+                };
+
+                // A treasurybase creates no utxos.
+                if stake_tree && is_treasury_enabled && tx_idx == 0 {
+                    continue;
+                }
+
+                let is_coin_base = !stake_tree && tx_idx == 0;
+                let has_expiry = tx.expiry != dcroxide_wire::NO_EXPIRY_VALUE;
+                let want_packed_flags = encode_utxo_flags(is_coin_base, has_expiry, tx_type);
+                for (tx_out_idx, tx_out) in tx.tx_out.iter().enumerate() {
+                    // A treasury add and a provably unspendable output are
+                    // never utxos.
+                    let tx_out_idx = tx_out_idx as u32;
+                    if is_treasury_add_output(tx_type, tx_out_idx)
+                        || dcroxide_txscript::is_unspendable(tx_out.value, &tx_out.pk_script)
+                    {
+                        continue;
+                    }
+
+                    let outpoint = OutPoint {
+                        hash: *tx_hash,
+                        index: tx_out_idx,
+                        tree: tx_tree,
+                    };
+                    let output = || {
+                        alloc::format!(
+                            "block {} {tree_name} tree idx {tx_idx}: output {outpoint}",
+                            block_hash()
+                        )
+                    };
+                    let out_key = key(&outpoint);
+                    let Some(entry) = self.entries.get(&out_key) else {
+                        panic!("{}: output is missing from utxo view", output());
+                    };
+
+                    // An output a later transaction of the regular tree
+                    // spends is spent, and every other output is not.
+                    let want_spent = !stake_tree
+                        && regular_spender(&out_key).is_some_and(|spender| spender > tx_idx as u32);
+                    if entry.is_spent() != want_spent {
+                        panic!(
+                            "{}: spent state mismatch (entry {}, want {want_spent})",
+                            output(),
+                            entry.is_spent()
+                        );
+                    }
+
+                    // Every output is marked modified.
+                    if !entry.is_modified() {
+                        panic!("{}: utxo is not marked modified", output());
+                    }
+
+                    // The entry carries the output's details.
+                    if entry.amount() != tx_out.value {
+                        panic!(
+                            "{}: amount mismatch (entry {}, tx output {})",
+                            output(),
+                            entry.amount(),
+                            tx_out.value
+                        );
+                    }
+                    if entry.script_version() != tx_out.version {
+                        panic!(
+                            "{}: script version mismatch (entry {}, tx output {})",
+                            output(),
+                            entry.script_version(),
+                            tx_out.version
+                        );
+                    }
+                    if entry.pk_script() != tx_out.pk_script.as_slice() {
+                        panic!(
+                            "{}: public key script mismatch (entry {}, tx output {})",
+                            output(),
+                            crate::validate::hex_string(entry.pk_script()),
+                            crate::validate::hex_string(&tx_out.pk_script)
+                        );
+                    }
+                    if entry.block_height() != height {
+                        panic!(
+                            "{}: block height mismatch (entry {}, block {height})",
+                            output(),
+                            entry.block_height()
+                        );
+                    }
+                    if entry.block_index() != tx_idx as u32 {
+                        panic!(
+                            "{}: block index mismatch (entry {}, tx idx {tx_idx})",
+                            output(),
+                            entry.block_index()
+                        );
+                    }
+                    if entry.packed_flags != want_packed_flags {
+                        panic!(
+                            "{}: packed flags mismatch (entry {:x}, want {want_packed_flags:x})",
+                            output(),
+                            entry.packed_flags
+                        );
+                    }
+
+                    // A ticket submission output carries the ticket's
+                    // minimal outputs, and no other output does.
+                    let want_min_outs = is_ticket_submission_output(tx_type as u8, tx_out_idx);
+                    let min_outs = entry.ticket_minimal_outputs_data();
+                    if min_outs.is_some() != want_min_outs {
+                        panic!(
+                            "{}: ticket minimal outputs presence mismatch (entry present {}, \
+                             want {want_min_outs})",
+                            output(),
+                            min_outs.is_some()
+                        );
+                    }
+                    if let Some(min_outs) = min_outs.filter(|_| want_min_outs) {
+                        let mut want_data = alloc::vec![
+                            0u8;
+                            crate::chainio::serialize_size_for_minimal_outputs(tx)
+                        ];
+                        let written = crate::chainio::put_tx_to_minimal_outputs(&mut want_data, tx);
+                        if written != want_data.len() {
+                            panic!(
+                                "{}: ticket minimal outputs serialization size mismatch \
+                                 (written {written}, expected {})",
+                                output(),
+                                want_data.len()
+                            );
+                        }
+                        if min_outs != want_data.as_slice() {
+                            panic!(
+                                "{}: ticket minimal outputs data mismatch (entry size {}, \
+                                 expected size {})",
+                                output(),
+                                min_outs.len(),
+                                want_data.len()
+                            );
+                        }
+                    }
+                }
+            }
+        };
+
+        assert_inputs(&block.transactions, tx_hashes.regular(), false);
+        assert_inputs(&block.stransactions, tx_hashes.stake(), true);
+        assert_outputs(&block.transactions, tx_hashes.regular(), false);
+        assert_outputs(&block.stransactions, tx_hashes.stake(), true);
     }
 
     /// Mark spent the output [`Self::add_sbss_violations`] adds, once
@@ -1653,7 +2042,7 @@ mod tests {
             let mut reference = view.clone();
             let before = view.entries.len();
 
-            let got = view.commit();
+            let got = view.commit(no_cache_entry);
             let want = commit_by_search(&mut reference);
             assert_eq!(got, want, "round {round}: the changes and their order");
             assert!(
@@ -1676,7 +2065,10 @@ mod tests {
             // What stayed is still a working view: a second commit has
             // nothing to hand over and removes nothing.
             let stayed = view.clone();
-            assert!(view.commit().is_empty(), "round {round}: a second commit");
+            assert!(
+                view.commit(no_cache_entry).is_empty(),
+                "round {round}: a second commit"
+            );
             assert!(view.entries().eq(stayed.entries()), "round {round}");
         }
         // Changes handed over, entries kept, zero-confirmation spends
@@ -1707,7 +2099,64 @@ mod tests {
              transaction later in the same block and not spent",
             Hash([0x77; 32])
         );
-        assert_eq!(panic_text(|| drop(view.commit())), want);
+        assert_eq!(panic_text(|| drop(view.commit(no_cache_entry))), want);
+    }
+
+    /// The probe of an empty cache.
+    fn no_cache_entry(_: &OutPointKey) -> bool {
+        false
+    }
+
+    /// dcrd also panics at the commit of a zero-confirmation spend the
+    /// cache holds an unspent entry for, with this text
+    /// (`utxocache.go:602-606`, since `22fd2431`).  The commit asks the
+    /// cache about zero-confirmation spends alone, and only once each
+    /// is known to be spent.
+    #[test]
+    fn commit_refuses_a_zero_conf_spend_the_cache_holds_unspent() {
+        let mut rng = SplitMix64(5);
+        let zero_conf = UTXO_STATE_MODIFIED | UTXO_STATE_SPENT | UTXO_STATE_SPENT_BY_ZERO_CONF;
+        let mut view = commit_test_view(20, &mut rng, |rng| COMMIT_STATES[below(rng, 7)]);
+        let keys: Vec<UtxoKey> = view.entries.keys().copied().collect();
+        let (first, last) = (keys[0], keys[keys.len() - 1]);
+        for key in [first, last] {
+            view.entries
+                .get_mut(&key)
+                .expect("the entry")
+                .set_state_bits(zero_conf);
+        }
+
+        // A cache that holds neither: both leave the view, and the cache
+        // was asked about those two alone.
+        let asked = RefCell::new(Vec::new());
+        let mut copy = view.clone();
+        copy.commit(|key| {
+            asked.borrow_mut().push(*key);
+            false
+        });
+        assert_eq!(asked.into_inner(), [first.0, last.0]);
+        assert!(copy.lookup_entry(&outpoint_of(first)).is_none());
+        assert!(copy.lookup_entry(&outpoint_of(last)).is_none());
+
+        // A cache holding the last unspent.
+        let outpoint = outpoint_of(last);
+        let want = alloc::format!(
+            "output {outpoint} (tree {}) from view@{} is marked as only having ever existed in \
+             the view, but has an unspent cache entry",
+            outpoint.tree,
+            Hash([0x77; 32])
+        );
+        assert_eq!(panic_text(|| drop(view.commit(|key| *key == last.0))), want);
+    }
+
+    /// The outpoint a view key names.
+    fn outpoint_of(key: UtxoKey) -> OutPoint {
+        let (hash, index, tree) = key.0;
+        OutPoint {
+            hash: Hash(hash),
+            index,
+            tree,
+        }
     }
 
     /// The text of the panic `f` raises.
@@ -1933,9 +2382,10 @@ mod tests {
         assert_eq!(view.entries().count(), 0);
     }
 
-    /// Write a committed view to a backend map, as a flush would.
+    /// Write a committed view to a backend map, as a flush would, with
+    /// nothing left in a cache.
     fn commit_to(backend: &mut BTreeMap<OutPointKey, UtxoEntry>, view: &mut UtxoView) {
-        for (key, entry) in view.commit() {
+        for (key, entry) in view.commit(no_cache_entry) {
             if entry.is_spent() {
                 backend.remove(&key);
             } else {
@@ -2465,6 +2915,895 @@ mod tests {
         assert_eq!(
             text,
             alloc::format!("view missing input {ticket_input} (tree 1)")
+        );
+    }
+
+    /// dcrd panics when a transaction spends an input the view holds
+    /// already spent, in either tree, with this text
+    /// (`utxoviewpoint.go:281-284`, `:349-352`, since `22fd2431`).
+    #[test]
+    fn an_input_the_view_holds_spent_panics_in_both_trees() {
+        let (block, origin_hash) = zero_conf_block(&[]);
+        let a = &block.transactions[1];
+        let (external, mut external_entry) = sbss_external();
+        external_entry.spend();
+        let mut view = UtxoView::new();
+        view.insert_entry(&external, external_entry.clone());
+        let text = panic_text(|| {
+            view.connect_regular_transaction(a, &origin_hash, 120, 1, None, false);
+        });
+        assert_eq!(
+            text,
+            alloc::format!("attempt to spend already spent output {external} (tree 0)")
+        );
+
+        let ticket_input = OutPoint {
+            hash: Hash([0x44; 32]),
+            index: 3,
+            tree: 1,
+        };
+        let ticket = ticket_spending(ticket_input, 5_000, 100, 1);
+        let mut view = UtxoView::new();
+        view.insert_entry(&ticket_input, external_entry);
+        let text = panic_text(|| {
+            view.connect_stake_transaction(&ticket, &ticket.tx_hash(), 120, 1, None, false);
+        });
+        assert_eq!(
+            text,
+            alloc::format!("attempt to spend already spent output {ticket_input} (tree 1)")
+        );
+    }
+
+    /// A block's second connect over the same view spends its inputs a
+    /// second time.
+    #[test]
+    #[should_panic(expected = "attempt to spend already spent output")]
+    fn connecting_a_regular_transaction_twice_panics() {
+        let (block, a_hash) = zero_conf_block(&[]);
+        let a = &block.transactions[1];
+        let (external, external_entry) = sbss_external();
+        let mut view = UtxoView::new();
+        view.insert_entry(&external, external_entry);
+        view.connect_regular_transaction(a, &a_hash, 120, 1, None, false);
+        view.connect_regular_transaction(a, &a_hash, 120, 1, None, false);
+    }
+
+    /// The stake tree's counterpart.
+    #[test]
+    #[should_panic(expected = "attempt to spend already spent output")]
+    fn connecting_a_stake_transaction_twice_panics() {
+        let (external, external_entry) = sbss_external();
+        let ticket = ticket_spending(external, 5_000, 100, 1);
+        let ticket_hash = ticket.tx_hash();
+        let mut view = UtxoView::new();
+        view.insert_entry(&external, external_entry);
+        view.connect_stake_transaction(&ticket, &ticket_hash, 120, 1, None, false);
+        view.connect_stake_transaction(&ticket, &ticket_hash, 120, 1, None, false);
+    }
+
+    /// The output the ticket of [`asserted_block`] spends, confirmed
+    /// long before, and its entry.
+    fn ticket_external() -> (OutPoint, UtxoEntry) {
+        let outpoint = OutPoint {
+            hash: Hash([0xdd; 32]),
+            index: 0,
+            tree: 0,
+        };
+        let entry = UtxoEntry::new(
+            3_000,
+            alloc::vec![0x51],
+            100,
+            2,
+            0,
+            false,
+            false,
+            TxType::Regular,
+            None,
+        );
+        (outpoint, entry)
+    }
+
+    /// A block at [`ZERO_CONF_HEIGHT`] with the regular tree
+    /// `[coinbase, A, B]` and the stake tree `[ticket]`: the coinbase pays
+    /// a spendable output and a provably unspendable one, A spends the
+    /// external output into two outputs, B spends A's first, and the
+    /// ticket spends [`ticket_external`].
+    fn asserted_block() -> MsgBlock {
+        let (mut block, a_hash) = zero_conf_block(&[0]);
+        block.transactions[0].tx_out = alloc::vec![
+            op_true_out(1_000),
+            TxOut {
+                value: 0,
+                version: 0,
+                pk_script: alloc::vec![0x6a, 0x01, 0x07],
+            },
+        ];
+        assert_eq!(
+            block.transactions[2].tx_in[0].previous_out_point,
+            origin_out(a_hash, 0)
+        );
+        let (external, _) = ticket_external();
+        block.stransactions = alloc::vec![ticket_spending(external, 3_000, 100, 2)];
+        block
+    }
+
+    /// The view [`asserted_block`] leaves once it is connected, with the
+    /// given lookup of the grandfathered spends and treasury flag.
+    fn asserted_view(
+        block: &MsgBlock,
+        sbss_violation: &impl Fn(i64) -> Option<Hash>,
+        external_entries: &[(OutPoint, UtxoEntry)],
+        is_treasury_enabled: bool,
+    ) -> UtxoView {
+        let tx_hashes = crate::blockhashes::BlockTxHashes::compute(block);
+        let parent = stake_block(Vec::new());
+        let resolve = |op: &OutPoint| {
+            external_entries
+                .iter()
+                .find(|(outpoint, _)| outpoint == op)
+                .map(|(_, entry)| entry.clone())
+        };
+        let mut view = UtxoView::new();
+        view.connect_block_with_lookup(
+            sbss_violation,
+            block,
+            &tx_hashes,
+            &parent,
+            || Ok(Vec::new()),
+            &resolve,
+            None,
+            is_treasury_enabled,
+        )
+        .expect("connect");
+        view
+    }
+
+    fn asserted_externals() -> Vec<(OutPoint, UtxoEntry)> {
+        alloc::vec![sbss_external(), ticket_external()]
+    }
+
+    /// The text `assert_block_utxo_view` panics with over the view and
+    /// block with the given treasury flag, or `None` when it holds.
+    fn assertion_text(
+        view: &UtxoView,
+        block: &MsgBlock,
+        is_treasury_enabled: bool,
+    ) -> Option<String> {
+        let tx_hashes = crate::blockhashes::BlockTxHashes::compute(block);
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            view.assert_block_utxo_view_with(&no_violation, block, &tx_hashes, is_treasury_enabled);
+        }))
+        .err()
+        .map(|payload| {
+            payload
+                .downcast_ref::<String>()
+                .cloned()
+                .expect("a text payload")
+        })
+    }
+
+    /// dcrd `assertBlockUtxoView` (`utxoviewpoint.go:633-917`, since
+    /// `22fd2431`): the view a block leaves once connected holds, and
+    /// each family of its checks panics with dcrd's text when the view,
+    /// or the block, is changed in the one way that check catches.
+    #[test]
+    fn the_block_utxo_view_assertions_panic_with_dcrds_texts() {
+        let block = asserted_block();
+        let view = asserted_view(&block, &no_violation, &asserted_externals(), false);
+        assert_eq!(
+            assertion_text(&view, &block, false),
+            None,
+            "the connected view holds"
+        );
+
+        let block_hash = block.header.block_hash();
+        let hashes = crate::blockhashes::BlockTxHashes::compute(&block);
+        let (coinbase, a, b) = (
+            hashes.regular()[0],
+            hashes.regular()[1],
+            hashes.regular()[2],
+        );
+        let ticket = hashes.stake()[0];
+        let (external, _) = sbss_external();
+        let (ticket_input, _) = ticket_external();
+        let coinbase_out = origin_out(coinbase, 0);
+        let a_out = origin_out(a, 0);
+        let ticket_out = OutPoint {
+            hash: ticket,
+            index: 0,
+            tree: 1,
+        };
+        let a_input = alloc::format!(
+            "block {block_hash} regular tree idx 1: tx {a}:0 spending input {external} (tree 0)"
+        );
+        let ticket_spend = alloc::format!(
+            "block {block_hash} stake tree idx 0: tx {ticket}:0 spending input {ticket_input} \
+             (tree 0)"
+        );
+        let coinbase_output =
+            alloc::format!("block {block_hash} regular tree idx 0: output {coinbase}:0");
+        let ticket_output =
+            alloc::format!("block {block_hash} stake tree idx 0: output {ticket}:0");
+        let min_outs_len = view
+            .lookup_entry(&ticket_out)
+            .and_then(UtxoEntry::ticket_minimal_outputs_data)
+            .expect("the ticket's minimal outputs")
+            .len();
+
+        type Change = Box<dyn Fn(&mut MsgBlock, &mut UtxoView)>;
+        let cases: Vec<(&str, Change, String)> = alloc::vec![
+            (
+                "the first transaction is not a coinbase",
+                Box::new(|block: &mut MsgBlock, _: &mut UtxoView| block.transactions.swap(0, 1)),
+                alloc::format!("block {block_hash} first tx {a} is not a coinbase"),
+            ),
+            (
+                "a real input spends the null outpoint",
+                Box::new(|block: &mut MsgBlock, _: &mut UtxoView| {
+                    block.transactions[2].tx_in[0].previous_out_point = null_outpoint();
+                }),
+                {
+                    let mut changed = block.clone();
+                    changed.transactions[2].tx_in[0].previous_out_point = null_outpoint();
+                    let b = changed.transactions[2].tx_hash();
+                    alloc::format!(
+                        "block {block_hash} regular tree idx 2: tx {b}:0 spends null outpoint"
+                    )
+                },
+            ),
+            (
+                "a coinbase input is not the null outpoint",
+                Box::new(|block: &mut MsgBlock, _: &mut UtxoView| {
+                    block.transactions[0].tx_in[0].previous_out_point.tree = 1;
+                }),
+                {
+                    let mut changed = block.clone();
+                    changed.transactions[0].tx_in[0].previous_out_point.tree = 1;
+                    let cb = changed.transactions[0].tx_hash();
+                    let prev = changed.transactions[0].tx_in[0].previous_out_point;
+                    alloc::format!(
+                        "block {block_hash} regular tree idx 0: tx {cb}:0 spends non-null outpoint \
+                         {prev} (tree 1)"
+                    )
+                },
+            ),
+            (
+                "an input is missing",
+                Box::new(move |_: &mut MsgBlock, view: &mut UtxoView| view.remove_entry(&external)),
+                alloc::format!("{a_input}: input is missing from utxo view"),
+            ),
+            (
+                "an input is not spent",
+                Box::new(move |_: &mut MsgBlock, view: &mut UtxoView| {
+                    view.entries.get_mut(&key(&external)).expect("input").state =
+                        UTXO_STATE_MODIFIED;
+                }),
+                alloc::format!("{a_input}: utxo is not marked spent"),
+            ),
+            (
+                "an input's amount differs from its witness",
+                Box::new(|block: &mut MsgBlock, _: &mut UtxoView| {
+                    block.transactions[1].tx_in[0].value_in = 4_999;
+                }),
+                alloc::format!("{a_input}: utxo amount mismatch (entry 5000, input witness 4999)"),
+            ),
+            (
+                "an input's height differs from its witness",
+                Box::new(|block: &mut MsgBlock, _: &mut UtxoView| {
+                    block.transactions[1].tx_in[0].block_height = 99;
+                }),
+                alloc::format!(
+                    "{a_input}: utxo block height mismatch (entry 100, input witness 99)"
+                ),
+            ),
+            (
+                "an input's index differs from its witness",
+                Box::new(|block: &mut MsgBlock, _: &mut UtxoView| {
+                    block.transactions[1].tx_in[0].block_index = 2;
+                }),
+                alloc::format!("{a_input}: utxo block index mismatch (entry 1, input witness 2)"),
+            ),
+            (
+                "a stake input is not spent",
+                Box::new(move |_: &mut MsgBlock, view: &mut UtxoView| {
+                    view.entries
+                        .get_mut(&key(&ticket_input))
+                        .expect("input")
+                        .state = UTXO_STATE_MODIFIED;
+                }),
+                alloc::format!("{ticket_spend}: utxo is not marked spent"),
+            ),
+            (
+                "a stake input was created in the same block",
+                Box::new(move |block: &mut MsgBlock, view: &mut UtxoView| {
+                    block.stransactions[0].tx_in[0].block_height = ZERO_CONF_HEIGHT;
+                    view.entries
+                        .get_mut(&key(&ticket_input))
+                        .expect("input")
+                        .block_height = ZERO_CONF_HEIGHT;
+                }),
+                alloc::format!("{ticket_spend}: stake tx spends output from same block"),
+            ),
+            (
+                "an output is missing",
+                Box::new(
+                    move |_: &mut MsgBlock, view: &mut UtxoView| view.remove_entry(&coinbase_out)
+                ),
+                alloc::format!("{coinbase_output}: output is missing from utxo view"),
+            ),
+            (
+                "an output no later transaction spends is spent",
+                Box::new(move |_: &mut MsgBlock, view: &mut UtxoView| {
+                    view.entries
+                        .get_mut(&key(&coinbase_out))
+                        .expect("output")
+                        .spend();
+                }),
+                alloc::format!("{coinbase_output}: spent state mismatch (entry true, want false)"),
+            ),
+            // The inputs are checked first, so an output a later
+            // transaction spends and the view holds unspent fails as
+            // that transaction's input.
+            (
+                "an output a later transaction spends is not spent",
+                Box::new(move |_: &mut MsgBlock, view: &mut UtxoView| {
+                    view.entries.get_mut(&key(&a_out)).expect("output").state = UTXO_STATE_MODIFIED;
+                }),
+                alloc::format!(
+                    "block {block_hash} regular tree idx 2: tx {b}:0 spending input {a_out} \
+                     (tree 0): utxo is not marked spent"
+                ),
+            ),
+            (
+                "an output is not modified",
+                Box::new(move |_: &mut MsgBlock, view: &mut UtxoView| {
+                    view.entries
+                        .get_mut(&key(&coinbase_out))
+                        .expect("output")
+                        .state = 0;
+                }),
+                alloc::format!("{coinbase_output}: utxo is not marked modified"),
+            ),
+            (
+                "an output's amount differs",
+                Box::new(move |_: &mut MsgBlock, view: &mut UtxoView| {
+                    view.entries
+                        .get_mut(&key(&coinbase_out))
+                        .expect("output")
+                        .amount = 999;
+                }),
+                alloc::format!("{coinbase_output}: amount mismatch (entry 999, tx output 1000)"),
+            ),
+            (
+                "an output's script version differs",
+                Box::new(move |_: &mut MsgBlock, view: &mut UtxoView| {
+                    view.entries
+                        .get_mut(&key(&coinbase_out))
+                        .expect("output")
+                        .script_version = 1;
+                }),
+                alloc::format!("{coinbase_output}: script version mismatch (entry 1, tx output 0)"),
+            ),
+            (
+                "an output's script differs",
+                Box::new(move |_: &mut MsgBlock, view: &mut UtxoView| {
+                    view.entries
+                        .get_mut(&key(&coinbase_out))
+                        .expect("output")
+                        .pk_script = alloc::vec![0x52, 0x0a];
+                }),
+                alloc::format!(
+                    "{coinbase_output}: public key script mismatch (entry 520a, tx output 51)"
+                ),
+            ),
+            (
+                "an output's height differs",
+                Box::new(move |_: &mut MsgBlock, view: &mut UtxoView| {
+                    view.entries
+                        .get_mut(&key(&coinbase_out))
+                        .expect("output")
+                        .block_height = 119;
+                }),
+                alloc::format!("{coinbase_output}: block height mismatch (entry 119, block 120)"),
+            ),
+            (
+                "an output's index differs",
+                Box::new(move |_: &mut MsgBlock, view: &mut UtxoView| {
+                    view.entries
+                        .get_mut(&key(&coinbase_out))
+                        .expect("output")
+                        .block_index = 3;
+                }),
+                alloc::format!("{coinbase_output}: block index mismatch (entry 3, tx idx 0)"),
+            ),
+            (
+                "an output's packed flags differ",
+                Box::new(move |_: &mut MsgBlock, view: &mut UtxoView| {
+                    view.entries
+                        .get_mut(&key(&ticket_out))
+                        .expect("output")
+                        .packed_flags = 0x1a;
+                }),
+                alloc::format!("{ticket_output}: packed flags mismatch (entry 1a, want 4)"),
+            ),
+            (
+                "a ticket submission output lacks its minimal outputs",
+                Box::new(move |_: &mut MsgBlock, view: &mut UtxoView| {
+                    view.entries
+                        .get_mut(&key(&ticket_out))
+                        .expect("output")
+                        .ticket_min_outs = None;
+                }),
+                alloc::format!(
+                    "{ticket_output}: ticket minimal outputs presence mismatch (entry present \
+                     false, want true)"
+                ),
+            ),
+            (
+                "another output carries minimal outputs",
+                Box::new(move |_: &mut MsgBlock, view: &mut UtxoView| {
+                    view.entries
+                        .get_mut(&key(&coinbase_out))
+                        .expect("output")
+                        .ticket_min_outs = Some(Vec::new());
+                }),
+                alloc::format!(
+                    "{coinbase_output}: ticket minimal outputs presence mismatch (entry present \
+                     true, want false)"
+                ),
+            ),
+            (
+                "a ticket's minimal outputs differ",
+                Box::new(move |_: &mut MsgBlock, view: &mut UtxoView| {
+                    let entry = view.entries.get_mut(&key(&ticket_out)).expect("output");
+                    entry.ticket_min_outs.as_mut().expect("minimal outputs")[0] ^= 1;
+                }),
+                alloc::format!(
+                    "{ticket_output}: ticket minimal outputs data mismatch (entry size \
+                     {min_outs_len}, expected size {min_outs_len})"
+                ),
+            ),
+        ];
+        for (name, change, want) in &cases {
+            let mut changed_block = block.clone();
+            let mut changed_view = view.clone();
+            change(&mut changed_block, &mut changed_view);
+            assert_eq!(
+                assertion_text(&changed_view, &changed_block, false).as_deref(),
+                Some(want.as_str()),
+                "{name}"
+            );
+        }
+    }
+
+    /// A treasury add spending [`ticket_external`], paying 2_000 to the
+    /// treasury and 900 to its change.
+    fn treasury_add() -> MsgTx {
+        let (external, _) = ticket_external();
+        let mut change = alloc::vec![0xbd, 0x76, 0xa9, 0x14]; // OP_SSTXCHANGE p2pkh
+        change.extend_from_slice(&[0x11; 20]);
+        change.extend_from_slice(&[0x88, 0xac]);
+        MsgTx {
+            version: dcroxide_stake::TX_VERSION_TREASURY,
+            tx_in: alloc::vec![input_spending(external, 3_000, 100, 2)],
+            tx_out: alloc::vec![
+                TxOut {
+                    value: 2_000,
+                    version: 0,
+                    pk_script: alloc::vec![0xc1], // OP_TADD
+                },
+                TxOut {
+                    value: 900,
+                    version: 0,
+                    pk_script: change,
+                },
+            ],
+            ..MsgTx::default()
+        }
+    }
+
+    /// A treasury spend paying 1_500 from the treasury.
+    fn treasury_spend() -> MsgTx {
+        let mut signature_script = alloc::vec![0x40]; // OP_DATA_64
+        signature_script.extend_from_slice(&[0x55; 64]);
+        signature_script.extend_from_slice(&[0x21, 0x02]); // OP_DATA_33, even key
+        signature_script.extend_from_slice(&[0x66; 32]);
+        signature_script.push(0xc2); // OP_TSPEND
+        let mut op_return = alloc::vec![0x6a, 0x20]; // OP_RETURN OP_DATA_32
+        op_return.extend_from_slice(&[0x77; 32]);
+        let mut payee = alloc::vec![0xc3, 0x76, 0xa9, 0x14]; // OP_TGEN p2pkh
+        payee.extend_from_slice(&[0x12; 20]);
+        payee.extend_from_slice(&[0x88, 0xac]);
+        MsgTx {
+            version: dcroxide_stake::TX_VERSION_TREASURY,
+            tx_in: alloc::vec![TxIn {
+                previous_out_point: null_outpoint(),
+                sequence: u32::MAX,
+                value_in: 1_600,
+                block_height: 0,
+                block_index: u32::MAX,
+                signature_script,
+            }],
+            tx_out: alloc::vec![
+                TxOut {
+                    value: 0,
+                    version: 0,
+                    pk_script: op_return,
+                },
+                TxOut {
+                    value: 1_500,
+                    version: 0,
+                    pk_script: payee,
+                },
+            ],
+            expiry: ZERO_CONF_HEIGHT + 10,
+            ..MsgTx::default()
+        }
+    }
+
+    /// [`asserted_block`] under the treasury agenda: a version 3
+    /// coinbase, and the stake tree `[treasurybase, treasury add,
+    /// treasury spend]` in place of the ticket, the treasurybase paying
+    /// 1_000 at output 0.
+    fn asserted_treasury_block() -> MsgBlock {
+        let mut block = asserted_block();
+        block.transactions[0].version = dcroxide_stake::TX_VERSION_TREASURY;
+        block.stransactions = alloc::vec![treasury_base(0), treasury_add(), treasury_spend()];
+        let types: Vec<TxType> = block
+            .stransactions
+            .iter()
+            .map(dcroxide_stake::determine_tx_type)
+            .collect();
+        assert_eq!(
+            types,
+            alloc::vec![TxType::TreasuryBase, TxType::TAdd, TxType::TSpend]
+        );
+        block
+    }
+
+    /// dcrd `assertBlockUtxoView` under the treasury agenda: a
+    /// treasurybase's outputs never enter the view and are not checked,
+    /// a treasury spend's first input is a null outpoint, and a treasury
+    /// add's output 0 is not a utxo (`utxoviewpoint.go:705-707`,
+    /// `:804-806`, `:817-818`).  The view a block with all three leaves
+    /// holds; the treasurybase is skipped only with the agenda active,
+    /// and the other parts of those transactions are checked as any
+    /// other transaction's.
+    #[test]
+    fn the_block_utxo_view_assertions_cover_the_treasury_transactions() {
+        let block = asserted_treasury_block();
+        let view = asserted_view(&block, &no_violation, &asserted_externals(), true);
+        assert_eq!(
+            assertion_text(&view, &block, true),
+            None,
+            "the connected view holds"
+        );
+
+        let block_hash = block.header.block_hash();
+        let hashes = crate::blockhashes::BlockTxHashes::compute(&block);
+        let (treasury_base_hash, tadd, tspend) =
+            (hashes.stake()[0], hashes.stake()[1], hashes.stake()[2]);
+        let (ticket_input, _) = ticket_external();
+        let stake_out = |hash: Hash, index: u32| OutPoint {
+            hash,
+            index,
+            tree: 1,
+        };
+        assert_eq!(
+            assertion_text(&view, &block, false),
+            Some(alloc::format!(
+                "block {block_hash} stake tree idx 0: output {treasury_base_hash}:0: output is \
+                 missing from utxo view"
+            )),
+            "without the agenda the treasurybase's output 0 must be a utxo"
+        );
+
+        let not_null = OutPoint {
+            hash: Hash([0x99; 32]),
+            index: 0,
+            tree: 0,
+        };
+        let mut changed_tspend = block.stransactions[2].clone();
+        changed_tspend.tx_in[0].previous_out_point = not_null;
+        type Change = Box<dyn Fn(&mut MsgBlock, &mut UtxoView)>;
+        let cases: Vec<(&str, Change, String)> = alloc::vec![
+            (
+                "a treasury spend's input is not the null outpoint",
+                Box::new(move |block: &mut MsgBlock, _: &mut UtxoView| {
+                    block.stransactions[2].tx_in[0].previous_out_point = not_null;
+                }),
+                alloc::format!(
+                    "block {block_hash} stake tree idx 2: tx {}:0 spends non-null outpoint \
+                     {not_null} (tree 0)",
+                    changed_tspend.tx_hash()
+                ),
+            ),
+            (
+                "a treasury add's input is not spent",
+                Box::new(move |_: &mut MsgBlock, view: &mut UtxoView| {
+                    view.entries
+                        .get_mut(&key(&ticket_input))
+                        .expect("input")
+                        .state = UTXO_STATE_MODIFIED;
+                }),
+                alloc::format!(
+                    "block {block_hash} stake tree idx 1: tx {tadd}:0 spending input \
+                     {ticket_input} (tree 0): utxo is not marked spent"
+                ),
+            ),
+            (
+                "a treasury add's change is missing",
+                Box::new(move |_: &mut MsgBlock, view: &mut UtxoView| {
+                    view.remove_entry(&stake_out(tadd, 1));
+                }),
+                alloc::format!(
+                    "block {block_hash} stake tree idx 1: output {tadd}:1: output is missing \
+                     from utxo view"
+                ),
+            ),
+            (
+                "a treasury spend's payment is missing",
+                Box::new(move |_: &mut MsgBlock, view: &mut UtxoView| {
+                    view.remove_entry(&stake_out(tspend, 1));
+                }),
+                alloc::format!(
+                    "block {block_hash} stake tree idx 2: output {tspend}:1: output is missing \
+                     from utxo view"
+                ),
+            ),
+        ];
+        for (name, change, want) in &cases {
+            let mut changed_block = block.clone();
+            let mut changed_view = view.clone();
+            change(&mut changed_block, &mut changed_view);
+            assert_eq!(
+                assertion_text(&changed_view, &changed_block, true).as_deref(),
+                Some(want.as_str()),
+                "{name}"
+            );
+        }
+    }
+
+    /// Which of a block's outputs must be spent follows dcrd's map of
+    /// the regular tree's spends, which the last spender of an output
+    /// writes (`utxoviewpoint.go:648-674`, `:831-839`): an output of the
+    /// regular tree is spent when that spender comes after its creator,
+    /// and an output of the stake tree never is.  Validation refuses
+    /// every block below before its view is built, so the views are laid
+    /// out, or changed, here by hand.
+    #[test]
+    fn the_spent_state_an_output_needs_follows_its_last_spender() {
+        let (external, external_entry) = sbss_external();
+        let (other, other_entry) = ticket_external();
+        let spending = |outpoint: OutPoint, value: i64, height: u32, index: u32| MsgTx {
+            tx_in: alloc::vec![input_spending(outpoint, value, height, index)],
+            tx_out: alloc::vec![op_true_out(value)],
+            ..MsgTx::default()
+        };
+        let laid_out = |transactions: Vec<MsgTx>| {
+            let (mut header, _) = BlockHeader::from_bytes(&[0u8; 180]).expect("zero header");
+            header.height = ZERO_CONF_HEIGHT;
+            header.vote_bits = 1;
+            let mut coinbase = test_coinbase(0);
+            coinbase.tx_out = alloc::vec![op_true_out(1_000)];
+            let mut regular = alloc::vec![coinbase];
+            regular.extend(transactions);
+            let block = MsgBlock {
+                header,
+                transactions: regular,
+                stransactions: Vec::new(),
+            };
+            let hashes = crate::blockhashes::BlockTxHashes::compute(&block);
+            let mut view = UtxoView::new();
+            for (outpoint, mut entry) in [
+                (external, external_entry.clone()),
+                (other, other_entry.clone()),
+            ] {
+                entry.spend();
+                view.insert_entry(&outpoint, entry);
+            }
+            for (idx, (tx, hash)) in block.transactions.iter().zip(hashes.regular()).enumerate() {
+                view.add_tx_outs_with_hash(
+                    tx,
+                    hash,
+                    i64::from(ZERO_CONF_HEIGHT),
+                    idx as u32,
+                    false,
+                );
+            }
+            for tx in &block.transactions[1..] {
+                view.lookup_entry_mut(&tx.tx_in[0].previous_out_point)
+                    .expect("spent output")
+                    .spend();
+            }
+            (block, view)
+        };
+
+        // B's output is spent by A, which comes before B.
+        let b = spending(external, 5_000, 100, 1);
+        let b_out = origin_out(b.tx_hash(), 0);
+        let a = spending(b_out, 5_000, ZERO_CONF_HEIGHT, 2);
+        let (block, view) = laid_out(alloc::vec![a, b]);
+        assert_eq!(
+            assertion_text(&view, &block, false),
+            Some(alloc::format!(
+                "block {} regular tree idx 2: output {b_out}: spent state mismatch (entry true, \
+                 want false)",
+                block.header.block_hash()
+            ))
+        );
+
+        // A's output is spent by P before A and by Q after it.
+        let a = spending(other, 3_000, 100, 2);
+        let a_out = origin_out(a.tx_hash(), 0);
+        let p = spending(a_out, 3_000, ZERO_CONF_HEIGHT, 2);
+        let mut q = spending(a_out, 3_000, ZERO_CONF_HEIGHT, 2);
+        q.tx_out[0].value = 2_999;
+        let (block, view) = laid_out(alloc::vec![p, a, q]);
+        assert_eq!(assertion_text(&view, &block, false), None);
+
+        // The ticket's payment is spent by C after it, in the regular
+        // tree, and the view holds it spent: an output of the stake tree
+        // must be unspent whatever the regular tree spends.
+        let mut block = asserted_block();
+        let mut view = asserted_view(&block, &no_violation, &asserted_externals(), false);
+        let ticket = crate::blockhashes::BlockTxHashes::compute(&block).stake()[0];
+        let ticket_out = OutPoint {
+            hash: ticket,
+            index: 0,
+            tree: 1,
+        };
+        let c = spending(ticket_out, 3_000, ZERO_CONF_HEIGHT, 0);
+        let c_index = block.transactions.len() as u32;
+        view.add_tx_outs_with_hash(
+            &c,
+            &c.tx_hash(),
+            i64::from(ZERO_CONF_HEIGHT),
+            c_index,
+            false,
+        );
+        view.lookup_entry_mut(&ticket_out)
+            .expect("the ticket's payment")
+            .spend();
+        block.transactions.push(c);
+        assert_eq!(
+            assertion_text(&view, &block, false),
+            Some(alloc::format!(
+                "block {} stake tree idx 0: output {ticket}:0: spent state mismatch (entry true, \
+                 want false)",
+                block.header.block_hash()
+            ))
+        );
+    }
+
+    /// The grandfathered spends are the assertion's one exception: in
+    /// the view a grandfathered block leaves, the ticket's input is
+    /// unspent and was created in the same block, which passes with the
+    /// lookup and fails without it, as dcrd's comment says the
+    /// assertion would have caught those spends.  The exception covers
+    /// output 0 of the regular transaction the lookup names, spent from
+    /// the stake tree, and nothing else (`utxoviewpoint.go:738-740`).
+    #[test]
+    fn the_grandfathered_spend_is_the_assertions_one_exception() {
+        let (block, origin_hash) = sbss_block();
+        let tx_hashes = crate::blockhashes::BlockTxHashes::compute(&block);
+        let parent = stake_block(Vec::new());
+        let (external, external_entry) = sbss_external();
+        let backend = move |op: &OutPoint| (*op == external).then(|| external_entry.clone());
+        let lookup = violation_at(SBSS_HEIGHT, origin_hash);
+        let mut view = UtxoView::new();
+        view.connect_block_with_lookup(
+            &lookup,
+            &block,
+            &tx_hashes,
+            &parent,
+            || Ok(Vec::new()),
+            &backend,
+            None,
+            false,
+        )
+        .expect("connect");
+
+        view.assert_block_utxo_view_with(&lookup, &block, &tx_hashes, false);
+
+        let ticket = tx_hashes.stake()[0];
+        let text = panic_text(|| {
+            view.assert_block_utxo_view_with(&no_violation, &block, &tx_hashes, false);
+        });
+        assert_eq!(
+            text,
+            alloc::format!(
+                "block {} stake tree idx 0: tx {ticket}:0 spending input {origin_hash}:0 (tree 0): \
+                 utxo is not marked spent",
+                block.header.block_hash()
+            )
+        );
+
+        // The exception is the stake tree's alone: a regular transaction
+        // spending the same output, which the view holds unspent, fails.
+        let mut regular_spend = block.clone();
+        regular_spend.transactions.push(MsgTx {
+            tx_in: alloc::vec![input_spending(
+                origin_out(origin_hash, 0),
+                3_000,
+                SBSS_HEIGHT,
+                1
+            )],
+            tx_out: alloc::vec![op_true_out(3_000)],
+            ..MsgTx::default()
+        });
+        let spend_hashes = crate::blockhashes::BlockTxHashes::compute(&regular_spend);
+        let spender = spend_hashes.regular()[2];
+        let text = panic_text(|| {
+            view.assert_block_utxo_view_with(&lookup, &regular_spend, &spend_hashes, false);
+        });
+        assert_eq!(
+            text,
+            alloc::format!(
+                "block {} regular tree idx 2: tx {spender}:0 spending input {origin_hash}:0 \
+                 (tree 0): utxo is not marked spent",
+                block.header.block_hash()
+            )
+        );
+
+        // Nor is any other output of the transaction the lookup names: a
+        // ticket spending its output 1, which the view holds unspent,
+        // fails with the lookup.
+        let spending_instead = |outpoint: OutPoint, value: i64| {
+            let mut changed = block.clone();
+            changed.stransactions[0].tx_in[0] = input_spending(outpoint, value, SBSS_HEIGHT, 1);
+            changed
+        };
+        let changed = spending_instead(origin_out(origin_hash, 1), 2_000);
+        let changed_hashes = crate::blockhashes::BlockTxHashes::compute(&changed);
+        let changed_ticket = changed_hashes.stake()[0];
+        let text = panic_text(|| {
+            view.assert_block_utxo_view_with(&lookup, &changed, &changed_hashes, false);
+        });
+        assert_eq!(
+            text,
+            alloc::format!(
+                "block {} stake tree idx 0: tx {changed_ticket}:0 spending input {origin_hash}:1 \
+                 (tree 0): utxo is not marked spent",
+                block.header.block_hash()
+            )
+        );
+
+        // Nor is output 0 of the stake tree under that hash, given to the
+        // view here unspent.
+        let stake_out = OutPoint {
+            hash: origin_hash,
+            index: 0,
+            tree: 1,
+        };
+        let mut stake_view = view.clone();
+        stake_view.insert_entry(
+            &stake_out,
+            UtxoEntry::new(
+                3_000,
+                alloc::vec![0x51],
+                SBSS_HEIGHT,
+                1,
+                0,
+                false,
+                false,
+                TxType::Regular,
+                None,
+            ),
+        );
+        let changed = spending_instead(stake_out, 3_000);
+        let changed_hashes = crate::blockhashes::BlockTxHashes::compute(&changed);
+        let changed_ticket = changed_hashes.stake()[0];
+        let text = panic_text(|| {
+            stake_view.assert_block_utxo_view_with(&lookup, &changed, &changed_hashes, false);
+        });
+        assert_eq!(
+            text,
+            alloc::format!(
+                "block {} stake tree idx 0: tx {changed_ticket}:0 spending input {origin_hash}:0 \
+                 (tree 1): utxo is not marked spent",
+                block.header.block_hash()
+            )
         );
     }
 }

@@ -3409,7 +3409,7 @@ pub fn check_treasury_spend_inputs(msg_tx: &MsgTx) -> Result<(), RuleError> {
 }
 
 /// Render bytes as the concatenated lowercase hex of Go's `%x` verb.
-fn hex_string(bytes: &[u8]) -> String {
+pub(crate) fn hex_string(bytes: &[u8]) -> String {
     #[allow(
         clippy::arithmetic_side_effects,
         reason = "a byte slice is at most isize::MAX long, so doubling fits in usize"

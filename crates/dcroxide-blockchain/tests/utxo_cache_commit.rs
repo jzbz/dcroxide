@@ -19,6 +19,15 @@
 //! `AssertError` into a panic (`utxocache.go:594-601`), and `TestCommit`
 //! now expects the panic.
 //!
+//! dcrd `22fd2431` added a second panic for a zero-confirmation spend:
+//! such an output only ever existed in the view, so the cache must not
+//! hold an unspent entry for it (`utxocache.go:602-606`).  `6b5bc9d0`
+//! added the `TestCommit` rows for it, and a row for the
+//! zero-confirmation spends a commit drops without touching the cache,
+//! even when the cache holds the output spent: an output spent later in
+//! its own block's regular tree can have a cache or backend entry when
+//! the same transaction was created by a different block.
+//!
 //! The entries are dcrd's fixtures, in the states its
 //! `makeEntryStates` builds.  The cache is seeded with entries in
 //! exactly the given states, as dcrd's `createTestUtxoCache` does.
@@ -55,6 +64,34 @@ fn entry299(state: u8) -> UtxoEntry {
         58_795_424,
         unhex("76a914454017705ab80470d089c7f644e39cc9e0fd308e88ac"),
         299,
+        1,
+        0,
+        false,
+        false,
+        TxType::Regular,
+        None,
+    );
+    entry.set_state_bits(state);
+    entry
+}
+
+/// dcrd `outpoint1100`.
+fn outpoint1100() -> OutPoint {
+    OutPoint {
+        hash: "ce1d0f74440c391d15516015224755a8661e56e796ac25490f30ad1081c5d638"
+            .parse()
+            .expect("hash"),
+        index: 1,
+        tree: 0,
+    }
+}
+
+/// dcrd `entry1100`, in the given state.
+fn entry1100(state: u8) -> UtxoEntry {
+    let mut entry = UtxoEntry::new(
+        52_454_022,
+        unhex("76a9146b65f16ebca9b848158701d5a2eb5124547a214488ac"),
+        1100,
         1,
         0,
         false,
@@ -131,7 +168,7 @@ fn view_with(entries: &[(OutPoint, UtxoEntry)]) -> UtxoView {
 fn cache_of(chain: &Chain) -> Vec<(Key, Option<UtxoEntry>)> {
     let cache = chain.utxo_cache.borrow();
     let mut keys: Vec<Key> = Vec::new();
-    for outpoint in [outpoint299(), outpoint1200()] {
+    for outpoint in [outpoint299(), outpoint1100(), outpoint1200()] {
         if cache.get(&key_of(&outpoint)).is_some() {
             keys.push(key_of(&outpoint));
         }
@@ -268,4 +305,95 @@ fn a_zero_conf_view_entry_that_is_not_spent_panics() {
     }))
     .expect_err("the commit panics");
     assert_eq!(payload.downcast_ref::<String>(), Some(&want));
+}
+
+/// `TestCommit`'s modified spent-by-zero-confirmation view entry, in
+/// dcrd's `modifiedSpentByZeroConf` state.
+const MODIFIED_SPENT_BY_ZERO_CONF: u8 = MODIFIED_SPENT | UTXO_STATE_SPENT_BY_ZERO_CONF;
+
+/// The text of the panic a commit of `outpoint` over an unspent cache
+/// entry raises (dcrd `utxocache.go:602-606`).
+fn unspent_cache_entry_panic(outpoint: &OutPoint) -> String {
+    format!(
+        "output {outpoint} (tree {}) from view@{} is marked as only having ever existed in the \
+         view, but has an unspent cache entry",
+        outpoint.tree,
+        Hash::ZERO
+    )
+}
+
+/// Commit `view` and return the text it panics with.
+fn commit_panic_text(chain: &mut Chain, view: &mut UtxoView) -> Option<String> {
+    let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        chain.commit_view(view);
+    }))
+    .err()?;
+    payload.downcast_ref::<String>().cloned()
+}
+
+/// `TestCommit` "modified spent by zero conf view entry w/ unmodified
+/// unspent cache entry panics": the cache holds a clean copy of the
+/// backend's row for an output the view marks as spent within its own
+/// block.
+#[test]
+fn a_zero_conf_view_entry_over_a_clean_unspent_cache_entry_panics() {
+    let outpoint = outpoint1200();
+    let mut chain = chain_with(
+        &[(outpoint, Some(entry1200(0)))],
+        &[(outpoint, entry1200(0))],
+    );
+    let mut view = view_with(&[(outpoint, entry1200(MODIFIED_SPENT_BY_ZERO_CONF))]);
+    assert_eq!(
+        commit_panic_text(&mut chain, &mut view),
+        Some(unspent_cache_entry_panic(&outpoint))
+    );
+}
+
+/// `TestCommit` "modified spent by zero conf view entry w/ modified
+/// unspent fresh cache entry panics": the cache holds an output no flush
+/// has written yet.
+#[test]
+fn a_zero_conf_view_entry_over_a_fresh_unspent_cache_entry_panics() {
+    let outpoint = outpoint1200();
+    let mut chain = chain_with(
+        &[(
+            outpoint,
+            Some(entry1200(UTXO_STATE_MODIFIED | UTXO_STATE_FRESH)),
+        )],
+        &[],
+    );
+    let mut view = view_with(&[(outpoint, entry1200(MODIFIED_SPENT_BY_ZERO_CONF))]);
+    assert_eq!(
+        commit_panic_text(&mut chain, &mut view),
+        Some(unspent_cache_entry_panic(&outpoint))
+    );
+}
+
+/// `TestCommit` "several modified spent zero conf view entry
+/// combinations": a zero-confirmation spend with no cache or backend
+/// entry, and one over a spent fresh cache entry, both leave the view
+/// and leave the cache as it was.  An explicit spent marker in the
+/// cache, dcrd's nil entry, is no unspent entry either.
+#[test]
+fn zero_conf_view_entries_over_no_or_spent_cache_entries_leave_the_cache_as_it_was() {
+    let spent_fresh = MODIFIED_SPENT | UTXO_STATE_FRESH;
+    let mut chain = chain_with(&[(outpoint1100(), Some(entry1100(spent_fresh)))], &[]);
+    let mut view = view_with(&[
+        (outpoint299(), entry299(MODIFIED_SPENT_BY_ZERO_CONF)),
+        (outpoint1100(), entry1100(MODIFIED_SPENT_BY_ZERO_CONF)),
+    ]);
+
+    chain.commit_view(&mut view);
+
+    assert_eq!(view.entries().count(), 0, "want an empty view");
+    assert_eq!(
+        cache_of(&chain),
+        vec![(key_of(&outpoint1100()), Some(entry1100(spent_fresh)))]
+    );
+
+    let mut chain = chain_with(&[(outpoint1200(), None)], &[]);
+    let mut view = view_with(&[(outpoint1200(), entry1200(MODIFIED_SPENT_BY_ZERO_CONF))]);
+    chain.commit_view(&mut view);
+    assert_eq!(view.entries().count(), 0, "want an empty view");
+    assert_eq!(cache_of(&chain), vec![(key_of(&outpoint1200()), None)]);
 }

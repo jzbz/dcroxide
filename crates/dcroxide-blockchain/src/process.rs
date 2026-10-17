@@ -281,10 +281,10 @@ pub struct Chain {
     /// connect/disconnect paths.  Fresh entries have never been
     /// flushed, spent non-fresh entries are retained as tombstones
     /// until the next flush, and an explicit `None` marks an output
-    /// known to be absent from the backend.  These distinctions are
-    /// observable through the entry fields that survive
-    /// reorganizations.  Interior mutability lets `&self` reads cache
-    /// their misses like dcrd's mutex-guarded cache does.
+    /// known to be absent from the backend.  These distinctions decide
+    /// what the cache holds and what each flush writes to the backend.
+    /// Interior mutability lets `&self` reads cache their misses like
+    /// dcrd's mutex-guarded cache does.
     pub utxo_cache: RefCell<UtxoCacheMap>,
     /// The transaction spend journal by block hash, in dcrd's
     /// serialized journal format: a recent-window mirror of dcrd's
@@ -1807,8 +1807,20 @@ impl Chain {
     /// Apply the view's committed changes to the UTXO cache with dcrd
     /// `UtxoCache.Commit` semantics: spent view entries go through
     /// the spend bookkeeping and everything else is added or updated.
+    ///
+    /// # Panics
+    ///
+    /// When a zero-confirmation spend in the view is not also marked
+    /// spent, or the cache holds an unspent entry for it, with dcrd's
+    /// texts (`utxocache.go:594-606`); see [`UtxoView::commit`].
     pub fn commit_view(&mut self, view: &mut UtxoView) {
-        for (key, entry) in view.commit() {
+        // dcrd reads its cache map directly here, so an explicit spent
+        // marker counts as no entry, as its nil does.
+        let cache = &self.utxo_cache.get_mut().0;
+        let updates = view.commit(
+            |key| matches!(cache.get(&UtxoKey(*key)), Some(Some(entry)) if !entry.is_spent()),
+        );
+        for (key, entry) in updates {
             if entry.is_spent() {
                 self.cache_spend_entry(key);
             } else {
@@ -3873,9 +3885,9 @@ impl Chain {
         // Commit all entries in the view to the UTXO set.  dcrd then
         // forces a cache flush on every disconnect, which drops the
         // spent tombstones; blocks detached after this point resurrect
-        // their spent outputs from the journal's fraud proof fields
-        // rather than the retained originals, and reproducing that
-        // timing matters for field-level parity.  The flush records
+        // their spent outputs from the journal's fraud proof fields,
+        // which the attach asserted equal to the originals; the timing
+        // decides what the cache and backend hold.  The flush records
         // the parent — the new tip — as the utxo set state, exactly
         // the hash and height dcrd's disconnect passes `MaybeFlush`.
         self.commit_view(view);
@@ -4204,6 +4216,12 @@ impl Chain {
                 self.index
                     .set_status_flags(&mut self.store, node, BlockStatus::VALIDATED);
             }
+
+            // Assert the resulting view is consistent with every
+            // transaction of the block, on either branch above, before
+            // anything of the block is written (dcrd
+            // `chain.go:1236-1238`).
+            view.assert_block_utxo_view(params, &block, &tx_hashes, is_treasury_enabled);
 
             // Update the chain state and drop any best chain
             // candidates that now have less work than the new tip.
@@ -9326,7 +9344,9 @@ mod tests {
     /// nothing, a clean copy of the row, an entry the backend has never
     /// seen, a changed copy of the row, a spent tombstone or an absent
     /// marker; and the view holds nothing or an entry in one of the
-    /// states a commit handles.
+    /// states a commit handles.  A zero-confirmation spend sits only
+    /// over a cache slot without an unspent entry, since a commit stops
+    /// on any other (dcrd `utxocache.go:602-606`, since `22fd2431`).
     fn chain_and_view_to_commit(seed: u64) -> (Chain, UtxoView) {
         use crate::utxoentry::{
             UTXO_STATE_FRESH, UTXO_STATE_MODIFIED, UTXO_STATE_SPENT, UTXO_STATE_SPENT_BY_ZERO_CONF,
@@ -9380,6 +9400,7 @@ mod tests {
                 (5, false) => Some(None),
                 _ => None,
             };
+            let cached_unspent = matches!(&cached, Some(Some(entry)) if !entry.is_spent());
             if let Some(cached) = cached {
                 cached_size += cached.as_ref().map_or(0, utxo_entry_size);
                 chain.utxo_cache.get_mut().insert(key, cached);
@@ -9391,7 +9412,9 @@ mod tests {
                 2 => UTXO_STATE_SPENT,
                 3 => UTXO_STATE_MODIFIED,
                 4 => UTXO_STATE_MODIFIED | UTXO_STATE_FRESH,
-                5 => UTXO_STATE_MODIFIED | UTXO_STATE_SPENT | UTXO_STATE_SPENT_BY_ZERO_CONF,
+                5 if !cached_unspent => {
+                    UTXO_STATE_MODIFIED | UTXO_STATE_SPENT | UTXO_STATE_SPENT_BY_ZERO_CONF
+                }
                 // Over a spent tombstone too, which the cache leaves
                 // as it is.
                 _ => UTXO_STATE_MODIFIED | UTXO_STATE_SPENT,
