@@ -124,9 +124,13 @@ path) has been measured yet, so this crossover is unconfirmed.
 > "Daemon against daemon, each from the other" below. It does not
 > re-measure 1.29x on m1. The README no longer cites 1.29x: its
 > Performance section reported this comparison instead, and later ones
-> after it. Since 2026-10-17 it reports only the comparison of that day,
+> after it. From 2026-10-17 it reported only the comparison of that day,
 > and the text it carried until then is in "README Performance text
-> retired on 2026-10-17" below.
+> retired on 2026-10-17" below. Since 2026-10-19 it reports the syncs of
+> that day from a block server on the LAN, with those of 2026-10-17 in
+> one bullet; the text it replaced is in git history, and its figures in
+> "`88c46c3`, the background commit as committed, dcrd v2.1.7 and two
+> preloaded allocators" below.
 
 **Open arm, unmeasured: the maturing-ticket ancestor read.** Every connect
 past stake-enabled height lists the ticket purchases in the block

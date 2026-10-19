@@ -1220,11 +1220,16 @@ against upstream and the port is faithful.
   2,926.4 s for dcrd v2.1.7, 7.43x and 7.39x in one session, its flushes
   holding the threads that sync for 11.9% of the wall (the same ledger,
   "`88c46c3`, the background commit as committed, dcrd v2.1.7 and two
-  preloaded allocators"). So the rest of
-  this passage explains the gap as it
-  was measured on m1 in 2026-08. It has not been re-measured there, and
-  on m3 the node is not flush-bound.) A task-state
-  decomposition on 2026-08-15 measured the
+  preloaded allocators"). On 2026-10-19, from a dcrd v2.1.7 node on
+  another machine on the same LAN, in a series of its own, a build of
+  the code as it stands took a mean of 271.68 s over four default syncs
+  against 3,014.6 s and 3,033.4 s for dcrd v2.1.7, 11.13x in one
+  session, its flushes in the foreground on the threads that sync for
+  2.5 to 2.8 s of each (the same ledger, "One commit thread for the life
+  of the store, a sync that checks every script, and dcrd v2.1.7"). So
+  the rest of this passage explains the gap as it was measured on m1 in
+  2026-08. It has not been re-measured there, and on m3 the node is not
+  flush-bound.) A task-state decomposition on 2026-08-15 measured the
   mechanism: the port drives **11.7x** the kernel-side storage work dcrd does
   (mostly dm-crypt writeback) and blocks **30x more per GiB written**, while
   dcrd writes 1.16x more bytes at 1.74x the rate — so it is the write shape,
@@ -2593,7 +2598,7 @@ closing it would cost.
   (`build_server` in `bin/dcroxide.rs`) locks the chain `Mutex` for
   `best_snapshot()` instead. That is the single-writer lock a block connect
   holds across any UTXO flush it triggers -- 528 to 2,590 ms a flush over the
-  full mainnet replay (`docs/bench-ledger.md:284`) -- and `invalidateblock` or
+  full mainnet replay (`docs/bench-ledger.md:288`) -- and `invalidateblock` or
   `reconsiderblock` holds across a whole reorganization. A handshake that
   arrives then waits the hold out, and one longer than the remote's 30 s
   negotiation timeout fails the connection on both sides, where dcrd answers

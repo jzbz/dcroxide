@@ -52,13 +52,14 @@ and anything requiring an already-privileged local attacker (they can
 read the datadir regardless). Throughput is out of scope as well. How
 fast the port syncs is measured, in the README's
 [Performance](README.md#performance) section and in
-[docs/bench-ledger.md](docs/bench-ledger.md): on 2026-10-17 it synced
-mainnet from genesis in a median of 6.6 minutes on one machine, where
-dcrd v2.1.7 took 49.1 and 48.8 minutes there the same day. Its own
-metadata flushes were under way for 27.8% of that time, mostly on a
-thread of their own, and held the threads that sync for 11.9% of it.
-Those flushes are work the node does to itself rather than work a peer
-can add to, so there is nothing here for a peer to amplify.
+[docs/bench-ledger.md](docs/bench-ledger.md): on 2026-10-19 it synced
+mainnet from genesis in a mean of 4.5 minutes on one machine, from a
+block server on the same LAN, where dcrd v2.1.7 took 50.2 and
+50.6 minutes there in the same session. Its own metadata flushes were in
+the foreground on the threads that sync for 2.5 to 2.8 s of that time,
+their rows and commits being written on a thread of their own. Those
+flushes are work the node does to itself rather than work a peer can add
+to, so there is nothing here for a peer to amplify.
 
 ## Known gaps
 
