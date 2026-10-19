@@ -17,7 +17,7 @@ JSON-RPC/websocket server, the tool commands, the pipe IPC lifecycle,
 and the Windows service wrapper. The deliberate non-ports are small
 and documented in PARITY.md (Go GC tuning, the pprof servers, UPnP,
 the Windows event log, and the wallet-side mixclient). The test suite
-runs 2,527 tests across 444 suites on Linux, most differential against
+runs 2,536 tests across 444 suites on Linux, most differential against
 dcrd itself or replaying sessions generated inside dcrd's own packages.
 
 Since the surface completed, four rounds of work have landed on it. A
@@ -69,12 +69,18 @@ in syncs of `88c46c3` (Performance), each of which validated in full
 only the blocks after the assume-valid block and ended with the UTXO set
 that dcrd's syncs of that day ended with. The commits after `fdd7a83`
 have been put to blocks only in builds made from a worktree, not from
-their trees, in syncs of 2026-10-18 from a block server on another
-machine on the same LAN, each of which validated in full only the blocks
-after the assume-valid block and had dcrd's block at height 1,116,035,
-and in three syncs from the loopback server that ended with that same
-UTXO set (the bench ledger, "Rungs from a block server on the LAN, two
-changes held for their memory, and dcrd v2.1.7").
+their trees. All but one were in syncs of 2026-10-18 from a block server
+on another machine on the same LAN, each of which validated in full only
+the blocks after the assume-valid block and had dcrd's block at height
+1,116,035, and in three syncs from the loopback server that ended with
+that same UTXO set (the bench ledger, "Rungs from a block server on the
+LAN, two changes held for their memory, and dcrd v2.1.7"). The one that
+keeps the metadata commit thread for the life of the store, which
+changes no consensus rule, was in none of those builds: it has been put
+to blocks only in a build that also holds the two changes held that day
+for their memory, in syncs of 2026-10-19 from the same two servers (the
+bench ledger, "One commit thread for the life of the store, a sync that
+checks every script, and dcrd v2.1.7").
 That the rules reject what dcrd's reject rests on the test batteries
 described below, not on a sync, and none of it says the node is safe to
 operate. **Do not expose it to the internet and do not use it with
@@ -531,10 +537,11 @@ What these figures do not cover:
   2026-10-12, through a relay that delays every chunk and on the public
   network (the ledger, "Eleven changes, a background commit not kept and
   a pool gate"), and in no whole sync. The only whole syncs over a real
-  link, on 2026-10-18, took their blocks from a node on another machine
-  on the same LAN (the ledger, "Rungs from a block server on the LAN,
-  two changes held for their memory, and dcrd v2.1.7"), a series of its
-  own.
+  link, on 2026-10-18 and 2026-10-19, took their blocks from a node on
+  another machine on the same LAN (the ledger, "Rungs from a block
+  server on the LAN, two changes held for their memory, and dcrd v2.1.7"
+  and "One commit thread for the life of the store, a sync that checks
+  every script, and dcrd v2.1.7"), a series of its own.
 - **The read-ahead's gain as committed.** Its one comparison with
   `DCROXIDE_READ_AHEAD=off`, on 2026-10-12, was of a build before its
   review's fixes ([PARITY.md](PARITY.md), *Reading ahead of the block

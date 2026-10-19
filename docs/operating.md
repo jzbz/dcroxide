@@ -1365,10 +1365,22 @@ as a fourth phase -- or `null` when it had nothing to write. Since
 the thread that ended the flush, or `null` for a thread without a
 name: the thread that ran it, which held the database's writer for its
 `elapsed_ms`, or on a `bg` line `dbcommit`, which never holds the
-writer. On a `bg` line `commit`'s processor time and I/O are
-`dbcommit`'s, and those of `sync`, `insert` and the participant's
+writer. Since 2026-10-19 `dbcommit` is one thread for the whole run,
+started by the first `bg` flush and asleep between flushes until the
+shutdown's close stops it, where before each `bg` flush made one that
+ended with it. So `ps -L`, `top -H` and a sampler of the node's threads
+list it from that flush on, busy or idle, so its presence says nothing
+of a commit under way, and what `/proc` counts for it, processor time
+and I/O, adds up its part of every `bg` flush so far. A `mem` reading
+taken on another thread while it sleeps counts it, as those at the
+capture and at the hand-off of every `bg` flush after the first do: one
+thread more than before. The readings `dbcommit` takes itself, `commit`
+on a `bg` line and `prev_finished` and `prev_end` on the line after one,
+count as before, and so do those of the shutdown's own flush, made once
+the thread has stopped. On a `bg` line `commit`'s processor time and I/O
+are `dbcommit`'s, and those of `sync`, `insert` and the participant's
 phase are the capturing thread's, which the line does not name. In a
-sync from an outbound peer, as in the syncs measured that day, the
+sync from an outbound peer, as in the syncs measured on 2026-10-12, the
 lines read
 `peer-outbound`, the thread that connects the sync peer's blocks
 (`peer-inbound` when that peer connected to the node, by the code; not
@@ -1440,12 +1452,13 @@ using the default`, and the read-ahead stays on. Unset, it is on and
 nothing is logged.
 `DCROXIDE_DB_SYNC_COMMIT` is read once at startup and is the way back
 to dcrd's place for a metadata commit. Unset, a flush that a commit
-trips makes its commit on the thread `dbcommit`, and nothing is
-logged. A positive whole number puts every commit back on the thread
-that ran the flush, under the database's writer, and is logged at
-startup as `Metadata write cache commits on the committing thread by
-DCROXIDE_DB_SYNC_COMMIT`. Any other value, `0` included, is the
-warning `DCROXIDE_DB_SYNC_COMMIT=V is not a positive whole number;
+trips makes its commit on the thread `dbcommit`, which the node keeps
+from the first such flush to the shutdown, and nothing is logged. A
+positive whole number puts every commit back on the thread that ran the
+flush, under the database's writer, starts no `dbcommit` thread, and is
+logged at startup as `Metadata write cache commits on the committing
+thread by DCROXIDE_DB_SYNC_COMMIT`. Any other value, `0` included, is
+the warning `DCROXIDE_DB_SYNC_COMMIT=V is not a positive whole number;
 committing the metadata write cache on a thread of its own`, and the
 default stays; a value that is not valid Unicode reads as unset, with
 no warning. Set it where commits run back to back, which the flush

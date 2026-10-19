@@ -13,7 +13,9 @@
   for the metadata commit), 2026-10-17 (addendum: the reading thread
   counts signature operations; second addendum: the script pool's
   helpers pre-verify the signatures of blocks read ahead), 2026-10-18
-  (addendum: the reading thread makes the data sanity checks)
+  (addendum: the reading thread makes the data sanity checks),
+  2026-10-19 (addendum: the metadata commit thread kept for the life of
+  the store)
 
 ## Context
 
@@ -759,3 +761,104 @@ documentation cited there is at
 `crates/dcroxide-blockchain/src/validate.rs:5686`.
 
 D2 is unchanged.
+
+## Addendum, 2026-10-19 — the metadata commit thread is kept for the life of the store
+
+The `dbcommit` thread of the second addendum of 2026-10-16 was made at
+each hand-off and ended with its flush. It is now one thread for the
+open store: started by the first flush handed over, asleep between
+flushes, and stopped by `Database::close`, which joins it once the flush
+under way has ended, or by the drop of the last handle, which joins it
+when it is asleep and otherwise lets it end at its next wait, once the
+flush that held the store has ended. A flush reaches it over a
+`std::sync::mpsc` channel that holds one flush, put there without
+waiting on the thread, and the flush's end is signalled on a channel of
+one message made for that flush, once the thread has let go of the
+store; every wait for the thread that the earlier addenda name is now a
+wait for that signal. What runs on it is unchanged: the redb commit, the
+retirement of what the flush captured, the latch on a failure and the
+participant's `finished`, while the capture, the block-file sync, the
+flush's rows and the participant's `contribute` stay on the thread that
+ran the flush, under the writer. The order of every storage operation,
+the latch rule of ADR-0009's addendum of 2026-10-16, the flush log's
+keys and the thread's name are unchanged too. A thread the operating
+system refuses is asked for again at the next hand-off, the flush
+committing on the thread that ran it meanwhile. One found dead at a
+hand-off, which only a panic between flushes in a build that unwinds can
+leave, latches the store and fails the commit that tripped the flush,
+and no second thread is started. With `DCROXIDE_DB_SYNC_COMMIT` set to a
+positive whole number, and with the library's default, none is started.
+Between flushes the thread holds nothing of the store, so the drop of
+the last handle is what ends it when no close does.
+
+Why. A flush's redb commit allocates the pages of its own tree updates
+(redb-4.3.0's `durable_commit` writes the freed and allocated page
+records and the table roots, `transactions.rs`), which redb keeps in its
+page cache after the flush. glibc's allocator binds a thread to an arena
+at its first allocation, hands a starting thread the arena an exited
+thread last left, and reuses memory freed into an arena only for the
+threads bound to it; so a thread made for each flush can land in a
+different arena from one flush to the next and leave what the earlier
+flushes allocated, and the holes their frees left, where no later flush
+reuses them. A thread kept for the store binds once, and while glibc has
+arenas to give, its arena goes to no thread started later while the
+store is open; past glibc's limit (`MALLOC_ARENA_MAX`, or eight per
+processor on a 64-bit system) threads share arenas, this one's included.
+Which arena each thread used is in no record, so this is inferred.
+Nothing in the change depends on the allocator.
+
+What made it matter was more of a flush on that thread. Build J of the
+bench ledger's syncs of 2026-10-18, the code of `2c0665a` with two
+changes held that day for their memory, the first of which makes a
+flush's row inserts and the exists-address index's contribution on
+`dbcommit` as well, peaked at 6,222 to 7,241 MiB of resident memory in
+default mainnet syncs against 3,077 to 3,342 MiB without them, and one
+run with two arenas took nearly all of the extra away at a cost of
+41.9 s ([bench-ledger.md](../bench-ledger.md), "Rungs from a block
+server on the LAN, two changes held for their memory, and dcrd v2.1.7").
+This change is made before those two, so that no commit writes a flush's
+rows on a thread made for each flush.
+
+So the change was measured only on top of those two changes, on m3 on
+2026-10-19, from a dcrd v2.1.7 node on another machine on the same LAN:
+J's code with the thread kept, build K, peaked at 2,456 and 2,470 MiB in
+two default runs alternated with three of J, which peaked at 6,730 to
+6,933 MiB, and took 271.10 s against 273.63 s by the means, a difference
+that session's ±3.9 s does not resolve. One run of J with
+`MALLOC_ARENA_MAX=8` peaked at 5,455 MiB. That fits the mechanism above
+without demonstrating it ([bench-ledger.md](../bench-ledger.md), "One
+commit thread for the life of the store, a sync that checks every
+script, and dcrd v2.1.7"). Those builds were states of a worktree, not
+the tree of a commit, and the series is one of its own. The change
+without the two held ones, where the thread makes only the commit, was
+neither built as a release binary nor synced.
+
+Only `dbcommit` is kept for the store. The thread that connects blocks
+allocates the write cache's layers, the UTXO cache's entries, the pages
+its reads bring into redb's cache and, for the flushes its commits trip,
+the pages their rows are written into, all of which outlive a flush, and
+in a sync it is the sync peer's `peer-outbound` thread, which ends with
+that peer's connection. A sync in which the sync peer changes can
+therefore leave that thread's share stranded in the arena it ran in, in
+the same way. That predates this change, is not covered by it and has
+not been measured: every sync of 2026-10-19 took its blocks from one
+peer.
+
+No test reaches the hand-off's arm for a channel found full, which the
+wait before every capture rules out, nor a thread start the operating
+system refuses for real (a test's stand-in for the refusal takes the
+same path after it). Pinned by the database's own tests
+(`the_commit_thread_is_started_by_the_first_hand_off`,
+`close_ends_the_commit_thread`,
+`dropping_the_last_handle_ends_the_commit_thread`,
+`a_wait_returns_only_after_the_commit_thread_let_go_of_the_store`,
+`a_failure_on_the_commit_thread_latches_and_leaves_the_thread_for_close`,
+`sync_commits_start_no_commit_thread`,
+`a_hand_off_after_the_close_commits_inline`,
+`a_commit_thread_that_died_between_flights_latches_the_next_hand_off`),
+`tests/background_commit.rs`
+(`every_handed_over_flush_runs_on_one_thread`) and the node's
+`tests/background_commit_env.rs`, on Linux only.
+
+D2 is unchanged: one more OS thread, as since 2026-10-16, now kept for
+the store and asleep between flushes.

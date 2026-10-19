@@ -6,13 +6,16 @@
 //! A database opened with `dcroxide_database::Options::background_commit`
 //! makes the redb commit of a flush on a thread named
 //! [`COMMITTER_THREAD_NAME`], while the thread that tripped the flush
-//! goes on.  How far that commit has got when the test looks is a race
-//! unless something holds it.  [`GateBackend`] wraps the store's backend
-//! and, while it is armed, blocks every write, length change and sync
-//! made on a thread of that name until the test opens the gate.  Going
-//! by the thread's name holds the committer and nothing else: the
-//! foreground's own flushes, and redb's writes when the last handle is
-//! dropped, pass an armed gate untouched.
+//! goes on.  The thread is the store's own, started by the first flush
+//! handed to it and asleep between flushes, so an armed gate holds
+//! whichever flush it is writing next.  How far that commit has got when
+//! the test looks is a race unless something holds it.  [`GateBackend`]
+//! wraps the store's backend and, while it is armed, blocks every write,
+//! length change and sync made on a thread of that name until the test
+//! opens the gate.  Going by the thread's name holds the committer and
+//! nothing else: the foreground's own flushes, and redb's writes when the
+//! last handle is dropped, pass an armed gate untouched, unless that last
+//! handle is the one a flush under way holds, which the committer drops.
 //!
 //! It composes with [`crate::powerloss::PowerLossBackend`]: wrap that one
 //! and the test can schedule a power failure while the commit is held,

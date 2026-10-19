@@ -15,6 +15,11 @@
 //! The flushes the daemon asks for, at shutdown, commit on the thread
 //! that asked whatever the variable says: they acknowledge durability.
 //!
+//! On Linux the daemon's threads are listed too, after each block's flush
+//! and before the stop: by default one thread named `dbcommit` is there
+//! from the first flush handed to it on, the same one each time, asleep
+//! between flushes, and with the variable set there is none.
+//!
 //! A commit made on a thread of its own holds a read snapshot of the
 //! store while it runs (`snap`), and one made on the thread that ran the
 //! flush is given none, unless the operating system refused the thread
@@ -100,10 +105,56 @@ fn rpc_call(addr: &str, method: &str, params: &str) -> String {
     }
 }
 
-/// What one run of the daemon left: its log, and its flush log's lines.
+/// What one run of the daemon left: its log, its flush log's lines, and
+/// what each look at its threads found.
 struct Ran {
     log: String,
     flushes: Vec<String>,
+    looks: Vec<Look>,
+}
+
+/// One look at the daemon's threads.
+#[derive(Debug)]
+struct Look {
+    /// The flush log's lines of tripped flushes just before the look.
+    tripped: usize,
+    /// The ids of the daemon's threads named `dbcommit`.
+    committers: Vec<u32>,
+}
+
+/// The lines of tripped flushes in the flush log at `path` so far.  A
+/// flush's line is written when it has landed, on the thread that wrote
+/// it, so a line here means that thread had started.
+fn tripped_so_far(path: &std::path::Path) -> usize {
+    std::fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| line.contains(r#""explicit":false"#))
+        .count()
+}
+
+/// Look at the threads of the process `pid`, on Linux; elsewhere, find
+/// none.  The flush log at `flush_log` is read first, so that a thread
+/// its lines speak of is there by the time the threads are listed.
+fn look(pid: u32, flush_log: &std::path::Path) -> Look {
+    let tripped = tripped_so_far(flush_log);
+    let mut committers = Vec::new();
+    if cfg!(target_os = "linux") {
+        for task in std::fs::read_dir(format!("/proc/{pid}/task")).expect("the daemon's threads") {
+            let Ok(task) = task else { continue };
+            let Ok(name) = std::fs::read_to_string(task.path().join("comm")) else {
+                continue;
+            };
+            if name.trim_end() == "dbcommit" {
+                let tid = task.file_name().to_string_lossy().parse::<u32>();
+                committers.push(tid.expect("a thread id"));
+            }
+        }
+    }
+    Look {
+        tripped,
+        committers,
+    }
 }
 
 impl Ran {
@@ -121,6 +172,44 @@ impl Ran {
             .iter()
             .filter(|line| line.contains(r#""explicit":true"#))
             .collect()
+    }
+
+    /// Assert that, on Linux, every look taken once a tripped flush had
+    /// landed found exactly one thread named `dbcommit`, and the same one
+    /// each time: the store keeps its commit thread between flushes.
+    fn assert_one_commit_thread(&self) {
+        if !cfg!(target_os = "linux") {
+            return;
+        }
+        let after: Vec<&Look> = self.looks.iter().filter(|l| l.tripped > 0).collect();
+        assert!(
+            !after.is_empty(),
+            "no look followed a tripped flush, so this run shows nothing: {:?}",
+            self.looks
+        );
+        let first = &after[0].committers;
+        assert_eq!(
+            first.len(),
+            1,
+            "not one commit thread after a tripped flush: {:?}",
+            self.looks
+        );
+        for look in &after {
+            assert_eq!(
+                &look.committers, first,
+                "the commit thread changed or went: {:?}",
+                self.looks
+            );
+        }
+    }
+
+    /// Assert that no look found a thread named `dbcommit`.
+    fn assert_no_commit_thread(&self) {
+        assert!(
+            !self.looks.is_empty() && self.looks.iter().all(|l| l.committers.is_empty()),
+            "a commit thread was started: {:?}",
+            self.looks
+        );
     }
 }
 
@@ -182,13 +271,25 @@ fn run(value: Option<&str>) -> Ran {
         std::thread::sleep(Duration::from_millis(50));
     };
 
+    let pid = daemon.0.id();
+    let mut looks = Vec::new();
     for _ in 0..3 {
         // Longer than the flush interval, so the next block's commits
         // find it elapsed and flush on their own.
         std::thread::sleep(Duration::from_millis(1500));
+        let before = tripped_so_far(&flush_log);
         let mined = rpc_call(&addr, "generate", "[1]");
         assert!(mined.contains(r#""error":null"#), "{mined}");
+        // Once the block's flush is in the log, and a moment after, by
+        // which a thread made for that flush alone would have ended.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while tripped_so_far(&flush_log) == before && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        std::thread::sleep(Duration::from_millis(200));
+        looks.push(look(pid, &flush_log));
     }
+    looks.push(look(pid, &flush_log));
 
     let _ = rpc_call(&addr, "stop", "[]");
     let deadline = Instant::now() + Duration::from_secs(60);
@@ -218,14 +319,18 @@ fn run(value: Option<&str>) -> Ran {
     Ran {
         log,
         flushes: flushes.lines().map(str::to_string).collect(),
+        looks,
     }
 }
 
 /// By default every flush a commit trips makes its commit on the thread
-/// named `dbcommit`, and the flushes the daemon asks for do not.
+/// named `dbcommit`, and the flushes the daemon asks for do not.  The
+/// thread is the store's own: once a tripped flush has landed, one thread
+/// of that name is there at every look, the same one, between flushes too.
 #[test]
 fn the_daemon_commits_tripped_flushes_on_a_thread_of_their_own_by_default() {
     let ran = run(None);
+    ran.assert_one_commit_thread();
     let tripped = ran.tripped();
     assert!(
         !tripped.is_empty(),
@@ -275,10 +380,12 @@ fn the_daemon_commits_tripped_flushes_on_a_thread_of_their_own_by_default() {
 }
 
 /// `DCROXIDE_DB_SYNC_COMMIT=1` puts every commit back on the thread that
-/// ran the flush, and the daemon says so once.
+/// ran the flush, and the daemon says so once.  No commit thread is ever
+/// started.
 #[test]
 fn sync_commit_keeps_every_flush_on_the_committing_thread() {
     let ran = run(Some("1"));
+    ran.assert_no_commit_thread();
     assert!(
         !ran.tripped().is_empty(),
         "no commit tripped a flush, so this run shows nothing: {:?}",
@@ -312,6 +419,7 @@ fn sync_commit_keeps_every_flush_on_the_committing_thread() {
 #[test]
 fn a_malformed_sync_commit_value_warns_and_keeps_the_default() {
     let ran = run(Some("0"));
+    ran.assert_one_commit_thread();
     let tripped = ran.tripped();
     assert!(!tripped.is_empty(), "{:?}", ran.flushes);
     for line in &tripped {

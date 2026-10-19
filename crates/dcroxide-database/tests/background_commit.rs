@@ -5,11 +5,13 @@
 //! With the option set, a flush that a commit's own check trips stops at
 //! its last step: the overlay is captured, the block files are synced
 //! and the rows are handed to redb on the committing thread, under the
-//! writer semaphore, and the redb commit itself is made by a thread
-//! named `dbcommit` while the commit that tripped the flush returns.
-//! These tests hold that thread at its first write (`GateBackend`) and
-//! look at the database while the commit is under way, then let it land
-//! or fail.
+//! writer semaphore, and the redb commit itself is made by the store's
+//! commit thread, named `dbcommit`, while the commit that tripped the
+//! flush returns.  The thread is one for the open store, started by the
+//! first flush handed to it and kept until the close or the drop of the
+//! last handle.  These tests hold it at its first write (`GateBackend`)
+//! and look at the database while the commit is under way, then let it
+//! land or fail.
 //!
 //! What they hold the store to:
 //!
@@ -23,8 +25,9 @@
 //!   participant is told and before anything can acknowledge durability,
 //!   and the next write, flush and close name its cause; so does a
 //!   committer thread that panics, at the next wait for it;
-//! - no committer outlives a close, and a participant is neither
-//!   registered nor released under a flush it did not start with;
+//! - every flush handed over is committed by the one commit thread,
+//!   which no close outlives, and a participant is neither registered nor
+//!   released under a flush it did not start with;
 //! - one flush is in flight at a time: a commit whose flush the overlay
 //!   or the participant asks for waits for the commit under way, and a
 //!   caller that only asks whether the store has failed does not take
@@ -48,11 +51,12 @@
 //! and the thread that syncs the block files -- are in the crate's own
 //! `background_commit_tests`.
 //!
-//! **A test settles before it lets go of a store.**  The committer keeps
-//! the store open until its commit has ended, and a power cut on the
-//! test's backend does not stop it, so every test waits for the flush in
-//! flight (`Database::wait_background_commit`, or a flush or close that
-//! waits itself) before it drops its last handle or reopens.
+//! **A test settles before it lets go of a store.**  The commit thread
+//! keeps the store open until the flush it is committing has ended, and
+//! a power cut on the test's backend does not stop it, so every test
+//! waits for the flush in flight (`Database::wait_background_commit`, or
+//! a flush or close that waits itself) before it drops its last handle
+//! or reopens.  The thread lets go of the store before that wait returns.
 //!
 //! The waits that show a call is blocked are short sleeps, as in
 //! `writer_wait.rs`: a call that wrongly returned at once is caught, and
@@ -159,6 +163,8 @@ struct Rig {
     power: Arc<PowerLossBackend>,
     gate: Arc<GateBackend>,
     seen: Seen,
+    /// The thread each observation in `seen` was made on.
+    ids: Arc<Mutex<Vec<std::thread::ThreadId>>>,
     log: Arc<Mutex<Vec<(LogLevel, String)>>>,
     /// Shut the gate again as soon as a background flush is observed, so
     /// that a later commit wrongly made on a committer thread is held
@@ -187,14 +193,19 @@ impl Rig {
         opts.background_commit = true;
         opts.cache_max_size = CACHE_MAX;
         let seen: Seen = Arc::default();
+        let ids: Arc<Mutex<Vec<std::thread::ThreadId>>> = Arc::default();
         let rearm = Arc::new(AtomicBool::new(false));
         {
             let seen = Arc::clone(&seen);
+            let ids = Arc::clone(&ids);
             let rearm = Arc::clone(&rearm);
             let gate = Arc::clone(&gate);
             opts.flush_observer = Some(Arc::new(move |obs: &FlushObservation| {
                 let thread = std::thread::current().name().map(str::to_string);
-                seen.lock().unwrap().push((thread, *obs));
+                // One lock order, so the two lists stay in step.
+                let mut seen = seen.lock().unwrap();
+                ids.lock().unwrap().push(std::thread::current().id());
+                seen.push((thread, *obs));
                 if obs.background && rearm.load(Ordering::SeqCst) {
                     gate.arm();
                 }
@@ -224,12 +235,14 @@ impl Rig {
         .expect("the base rows");
         db.flush().expect("flush the base rows");
         seen.lock().unwrap().clear();
+        ids.lock().unwrap().clear();
         Rig {
             dir,
             db,
             power,
             gate,
             seen,
+            ids,
             log,
             rearm,
             log_hold,
@@ -273,6 +286,12 @@ impl Rig {
 
     fn observations(&self) -> Vec<(Option<String>, FlushObservation)> {
         self.seen.lock().unwrap().clone()
+    }
+
+    /// The thread each observation so far was made on, in order.
+    fn observation_threads(&self) -> Vec<std::thread::ThreadId> {
+        let _seen = self.seen.lock().unwrap();
+        self.ids.lock().unwrap().clone()
     }
 
     /// The error lines logged so far.
@@ -1051,7 +1070,18 @@ fn a_committer_that_panics_after_its_commit_latches_the_store_at_the_next_wait()
     );
     assert_eq!(rig.db.flush().unwrap_err().kind, ErrorKind::Fatal);
     assert_eq!(rig.readable(3), vec![1, 2], "reads go on");
-    assert_eq!(rig.db.close().unwrap_err().kind, ErrorKind::Fatal);
+    // The close stops the thread that panicked, and returns.
+    let closed = in_background(&rig.db, |db| db.close());
+    let err = closed
+        .recv_timeout(NEVER)
+        .expect("the close of a store whose commit thread panicked returns")
+        .expect_err("a close of a latched store");
+    assert_eq!(err.kind, ErrorKind::Fatal, "{err}");
+    assert!(
+        err.description
+            .contains("(the first failure: the background commit thread panicked"),
+        "{err}"
+    );
     assert_eq!(
         recorder.calls().len(),
         2,
@@ -1397,6 +1427,57 @@ fn a_flush_the_participant_asks_for_waits_for_the_commit_under_way() {
 
     let (_dir, path) = rig.crash();
     assert_eq!(reopened(&path, 3), vec![1, 2]);
+}
+
+// ---------------------------------------------------------------------
+// The commit thread
+// ---------------------------------------------------------------------
+
+/// Every flush handed over is committed on one thread, the store's
+/// commit thread, whether the flush before it was waited for or its
+/// capture made the wait itself, and a flush that is asked for is made on
+/// the thread that asked.  A thread made for each flush would show a new
+/// one each time.  Every generation is durable once the flush asked for
+/// has returned.
+#[test]
+fn every_handed_over_flush_runs_on_one_thread() {
+    const FLUSHES: u32 = 40;
+    let rig = Rig::new();
+    for i in 0..FLUSHES {
+        let generation = 2 * i + 1;
+        rig.fill(generation);
+        rig.small(generation + 1);
+        // One flush in three is waited for here; the others are waited
+        // for by the capture of the next.
+        if i % 3 == 0 {
+            rig.db.wait_background_commit().expect("the flush landed");
+        }
+    }
+    let last = 2 * FLUSHES + 1;
+    rig.small(last);
+    rig.db.flush().expect("an explicit flush");
+
+    let seen = rig.observations();
+    let ids = rig.observation_threads();
+    assert_eq!(seen.len(), FLUSHES as usize + 1, "{seen:?}");
+    assert_eq!(ids.len(), seen.len());
+    let committer = ids[0];
+    assert_ne!(committer, std::thread::current().id());
+    for (i, ((thread, obs), id)) in seen.iter().zip(&ids).take(FLUSHES as usize).enumerate() {
+        assert!(obs.background && !obs.explicit, "flush {i}: {obs:?}");
+        assert_eq!(thread.as_deref(), Some(COMMIT_THREAD_NAME), "flush {i}");
+        assert_eq!(
+            *id, committer,
+            "flush {i} ran on another thread than the first"
+        );
+    }
+    let (thread, obs) = &seen[FLUSHES as usize];
+    assert!(obs.explicit && !obs.background, "{obs:?}");
+    assert_ne!(thread.as_deref(), Some(COMMIT_THREAD_NAME));
+    assert_eq!(ids[FLUSHES as usize], std::thread::current().id());
+
+    let (_dir, path) = rig.crash();
+    assert_eq!(reopened(&path, last), (1..=last).collect::<Vec<u32>>());
 }
 
 // ---------------------------------------------------------------------

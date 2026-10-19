@@ -2129,6 +2129,19 @@ fn apply_overlay_tuning(opts: &mut Options) {
 /// on the thread that ran it, under the database's writer.  An
 /// environment variable for `DCROXIDE_DB_CACHE`'s reason, and with its
 /// policy for a value that does not parse: a warning and the default.
+///
+/// The thread a flush is handed to, `dbcommit`, is the database's own:
+/// started by the first flush handed over, asleep between flushes, and
+/// stopped by the database's close at shutdown, so that what the commit
+/// of every flush handed over allocates is allocated by one thread, and
+/// with glibc's allocator from one arena, which no thread started later
+/// is given while glibc has arenas to give (past `MALLOC_ARENA_MAX`, or
+/// eight per processor on a 64-bit system, it shares them among threads).
+/// What a flush does before the hand-off, its capture, the sync of the
+/// block files and the writing of its rows included, still allocates on
+/// the thread that ran the flush, and so does all of a flush that is not
+/// handed over, such as the shutdown's and every flush with
+/// `DCROXIDE_DB_SYNC_COMMIT` set, which starts no `dbcommit` thread.
 fn background_commit() -> bool {
     !env_switch(
         "DCROXIDE_DB_SYNC_COMMIT",
@@ -2227,12 +2240,14 @@ fn exists_addr_policy(enabled: bool) -> dcroxide_indexers::ExistsAddrPolicy {
 /// `thread` is the name of the thread that ran the flush, which held
 /// the database's writer for the flush's `elapsed_ms`; for a flush whose
 /// commit ran on a thread of its own it is that thread, `dbcommit`,
-/// which never holds the writer.  On such a line `commit`'s processor
-/// time and I/O are that thread's, and those of `sync`, `insert` and the
-/// participant's phase are the capturing thread's, which the line does
-/// not name: lines grouped by `thread` keep one thread's phases apart
-/// from another's only for flushes that committed where they were
-/// captured.  `writer_wait` is what threads have spent waiting for that
+/// which never holds the writer, and which is one thread for the whole
+/// run, from the first such flush to the shutdown.  On such a line
+/// `commit`'s processor time and I/O are that thread's, and those
+/// of `sync`, `insert` and the participant's phase are the
+/// capturing thread's, which the line does not name: lines grouped
+/// by `thread` keep one thread's phases apart from another's only
+/// for flushes that committed where they were captured.
+/// `writer_wait` is what threads have spent waiting for that
 /// writer from the opening of the database to this flush: for the
 /// thread named `index`, which updates the indexes, and for every other
 /// thread together, the number of times one found the writer held and
@@ -2284,7 +2299,9 @@ fn exists_addr_policy(enabled: bool) -> dcroxide_indexers::ExistsAddrPolicy {
 /// under it), so the next line's `prev_end` and `prev_release_ms` do
 /// not hold those frees; on a line that follows a `bg` line they do.
 /// Each reading is the resident memory, its peak so far, its anonymous
-/// part and the thread count; the readings at the capture and when the
+/// part and the thread count, which takes in the `dbcommit` thread once
+/// the first `bg` flush has started it, asleep in a reading taken on
+/// another thread; the readings at the capture and when the
 /// commit returned add, from `/proc/self/maps`, the number and total size
 /// of the anonymous mappings that start where the allocator puts a
 /// thread arena's heaps, and the size of the program break.  A reading is
