@@ -11,6 +11,15 @@
 //! choices.  Structural sharing uses reference counting in place of
 //! Go's garbage-collected pointers, and the size accounting fixes the
 //! pointer width at dcrd's 64-bit values.
+//!
+//! Every version is persistent: no operation changes a version another
+//! holder keeps.  The operations that return a new version copy the
+//! path they change, as dcrd's do.  The two the stake node's connect
+//! uses, `put_new_in_place` and `take_in_place`, change the version they
+//! are called on and copy a node only when another version holds it too:
+//! a treap that holds its nodes alone is changed where it stands, which
+//! is how a stake node that is about to be dropped hands its treaps to
+//! its child.
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -58,6 +67,9 @@ const NODE_FIELDS_SIZE: u64 = 32 + 8 + 4 + 4 + 2 * 8;
 const NODE_VALUE_SIZE: u64 = 8;
 const NODE_SIZE: u64 = NODE_FIELDS_SIZE + 32 + NODE_VALUE_SIZE;
 
+/// A node; cloned only by `Arc::make_mut`, when an operation in place
+/// has to change a node another version holds too.
+#[derive(Clone)]
 struct TreapNode {
     key: Key,
     value: Value,
@@ -154,6 +166,66 @@ impl<'a> NodeStack<'a> {
         self.len = self.len.checked_sub(1)?;
         // Every slot below the length was filled by a push.
         self.inline[self.len]
+    }
+}
+
+/// The number of words of sides a [`Directions`] holds in place: 256
+/// levels, several times the depth of a treap of ticket hashes, so only
+/// a degenerate spine reaches the overflow.
+const DIRECTIONS_INLINE_WORDS: usize = 4;
+
+/// The side a descent took at each level, one bit a level from the root
+/// down, set for the left: what the read-only descent of an operation in
+/// place hands the pass that changes the nodes, so that pass compares no
+/// key.  Like [`NodeStack`], it holds its first levels in place and the
+/// rest in an overflow.
+struct Directions {
+    inline: [u64; DIRECTIONS_INLINE_WORDS],
+    overflow: Vec<u64>,
+    len: usize,
+}
+
+impl Directions {
+    fn new() -> Directions {
+        Directions {
+            inline: [0; DIRECTIONS_INLINE_WORDS],
+            overflow: Vec::new(),
+            len: 0,
+        }
+    }
+
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "len counts the levels of one path, at most the treap's size, so it cannot \
+                  reach usize::MAX, and word - DIRECTIONS_INLINE_WORDS is taken only when word \
+                  is at least that"
+    )]
+    fn push(&mut self, went_left: bool) {
+        let (word, bit) = (self.len / 64, self.len % 64);
+        let bits = u64::from(went_left) << bit;
+        match self.inline.get_mut(word) {
+            Some(slot) => *slot |= bits,
+            None => match self.overflow.get_mut(word - DIRECTIONS_INLINE_WORDS) {
+                Some(slot) => *slot |= bits,
+                None => self.overflow.push(bits),
+            },
+        }
+        self.len += 1;
+    }
+
+    /// The side taken at the given level, which a push recorded.
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "word - DIRECTIONS_INLINE_WORDS is taken only when word is at least that"
+    )]
+    fn went_left(&self, level: usize) -> bool {
+        debug_assert!(level < self.len, "level {level} of {}", self.len);
+        let (word, bit) = (level / 64, level % 64);
+        let bits = match self.inline.get(word) {
+            Some(bits) => *bits,
+            None => self.overflow[word - DIRECTIONS_INLINE_WORDS],
+        };
+        (bits >> bit) & 1 == 1
     }
 }
 
@@ -561,6 +633,232 @@ impl Immutable {
         Some((del_node.value, treap))
     }
 
+    /// Insert the key, which must not be in the treap yet, into this
+    /// version: it becomes the version [`Immutable::put_new`] returns.
+    /// When the key is present, nothing changes and the answer is false.
+    ///
+    /// A node another version holds too is copied before it is changed
+    /// (`Arc::make_mut`), so no other version sees a change, and a node
+    /// this version holds alone is changed where it stands.  The treap
+    /// made is the one dcrd's rotation cascade makes
+    /// (immutable.go:186-243): the nodes of the path whose priority is
+    /// at most the new ticket's stay above it, ties included, and the
+    /// subtree below them is split by the key into the new node's
+    /// children.  That split is what the rotations that carry the new
+    /// node up to there make of the subtree: each node the descent
+    /// passed on its right ends in the left part with its left subtree,
+    /// linked down its right side, and each node passed on its left in
+    /// the right part, the other way about.
+    pub(crate) fn put_new_in_place(&mut self, key: Key, value: Value) -> bool {
+        let priority = value.height;
+        // Whether the key is there, the side taken at each level, and
+        // what the split puts in the left part: each node it sends there
+        // with the left subtree that node keeps.
+        let mut sides = Directions::new();
+        let mut splitting = false;
+        let mut left_part: u32 = 0;
+        let mut node = self.root.as_deref();
+        while let Some(n) = node {
+            let went_left = match compare_keys(&key, &n.key) {
+                Ordering::Less => true,
+                Ordering::Greater => false,
+                Ordering::Equal => return false,
+            };
+            // Below the first node of greater priority, every node has a
+            // greater priority, by the heap property.
+            splitting |= n.priority > priority;
+            #[allow(
+                clippy::arithmetic_side_effects,
+                reason = "the left part is a subset of the treap's nodes, at most self.count, a \
+                          count of tickets far below u32::MAX (see `insert`)"
+            )]
+            if splitting && !went_left {
+                left_part += 1 + subtree_size(&n.left);
+            }
+            sides.push(went_left);
+            node = if went_left {
+                n.left.as_deref()
+            } else {
+                n.right.as_deref()
+            };
+        }
+
+        // The nodes that stay above the new one gain it.
+        let mut slot = &mut self.root;
+        let mut level = 0;
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "a subtree size is at most self.count + 1, a count of tickets far below \
+                      u32::MAX, and level counts the levels of one path"
+        )]
+        while slot.as_ref().is_some_and(|n| n.priority <= priority) {
+            let n = Arc::make_mut(slot.as_mut().expect("checked by the loop"));
+            n.size += 1;
+            slot = if sides.went_left(level) {
+                &mut n.left
+            } else {
+                &mut n.right
+            };
+            level += 1;
+        }
+
+        // The new node takes the first slot of greater priority, and the
+        // subtree it held is split by the key into its children.  Each
+        // node of a part is given the size of what follows it in the part
+        // with itself, which is the part's total less what came before.
+        let mut rest = slot.take();
+        let below = subtree_size(&rest);
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "the left part is part of the subtree below, so left_part <= below"
+        )]
+        let mut right_part = below - left_part;
+        let (mut left, mut right) = (None, None);
+        let (mut left_end, mut right_end) = (&mut left, &mut right);
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "each part's remainder counts the nodes of the part not yet placed and the \
+                      subtrees they keep, so each subtraction leaves it at zero or above, and \
+                      level counts the levels of one path"
+        )]
+        while let Some(n) = rest {
+            if sides.went_left(level) {
+                // The key is smaller: n and its right subtree go to the
+                // right part, and its left subtree is split further.
+                let n = Arc::make_mut(right_end.insert(n));
+                n.size = right_part;
+                right_part -= 1 + subtree_size(&n.right);
+                rest = n.left.take();
+                right_end = &mut n.left;
+            } else {
+                let n = Arc::make_mut(left_end.insert(n));
+                n.size = left_part;
+                left_part -= 1 + subtree_size(&n.left);
+                rest = n.right.take();
+                left_end = &mut n.right;
+            }
+            level += 1;
+        }
+        debug_assert_eq!(
+            (left_part, right_part),
+            (0, 0),
+            "the parts were placed whole"
+        );
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "below is a subtree size, at most self.count, and count and total_size are \
+                      bounded as in `insert`"
+        )]
+        {
+            *slot = Some(Arc::new(TreapNode {
+                key,
+                value,
+                priority,
+                size: below + 1,
+                left,
+                right,
+            }));
+            self.count += 1;
+            self.total_size += NODE_SIZE;
+        }
+        true
+    }
+
+    /// Remove the key from this version and return the value it held:
+    /// the version becomes the one [`Immutable::take`] returns.  When the
+    /// key is missing, nothing changes and the answer is `None`.
+    ///
+    /// Nodes are copied, or changed where they stand, as by
+    /// [`Immutable::put_new_in_place`].  The removed node's two subtrees
+    /// are merged into its place as dcrd's push-down merges them
+    /// (immutable.go:311-366): of the two roots, the one of smaller
+    /// priority, the left one on a tie, takes the place and keeps its
+    /// outer subtree, and the merge goes on in its inner one.  Once a
+    /// side is empty, the other is put in place as it stands; dcrd, and
+    /// [`Immutable::take`], walk on down its spine and make each node
+    /// again with the children and the size it had.
+    pub(crate) fn take_in_place(&mut self, key: &Key) -> Option<Value> {
+        let mut sides = Directions::new();
+        let mut node = self.root.as_deref();
+        loop {
+            let n = node?;
+            let went_left = match compare_keys(key, &n.key) {
+                Ordering::Less => true,
+                Ordering::Greater => false,
+                Ordering::Equal => break,
+            };
+            sides.push(went_left);
+            node = if went_left {
+                n.left.as_deref()
+            } else {
+                n.right.as_deref()
+            };
+        }
+
+        // The nodes above the key's lose it.
+        let mut slot = &mut self.root;
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "each node above the key's holds itself and the key's node, so its size \
+                      is at least 2"
+        )]
+        for level in 0..sides.len {
+            let n = Arc::make_mut(slot.as_mut().expect("a node of the path the descent took"));
+            n.size -= 1;
+            slot = if sides.went_left(level) {
+                &mut n.left
+            } else {
+                &mut n.right
+            };
+        }
+        // The removed node's own allocation goes with it when this
+        // version held it alone; its subtrees move out as they are.
+        let removed = slot.take().expect("the node the descent found");
+        let TreapNode {
+            value, left, right, ..
+        } = Arc::unwrap_or_clone(removed);
+
+        let (mut left, mut right) = (left, right);
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "the merged sizes sum disjoint subtrees of the removed node, so each is at \
+                      most its size less one"
+        )]
+        loop {
+            match (left, right) {
+                (None, rest) | (rest, None) => {
+                    *slot = rest;
+                    break;
+                }
+                (Some(l), Some(r)) => {
+                    if l.priority <= r.priority {
+                        let n = Arc::make_mut(slot.insert(l));
+                        n.size += r.size;
+                        left = n.right.take();
+                        right = Some(r);
+                        slot = &mut n.right;
+                    } else {
+                        let n = Arc::make_mut(slot.insert(r));
+                        n.size += l.size;
+                        right = n.left.take();
+                        left = Some(l);
+                        slot = &mut n.left;
+                    }
+                }
+            }
+        }
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "the key was found, so count >= 1 and total_size = count * NODE_SIZE >= \
+                      NODE_SIZE"
+        )]
+        {
+            self.count -= 1;
+            self.total_size -= NODE_SIZE;
+        }
+        Some(value)
+    }
+
     /// Every node in pre-order, which with the children each node says
     /// it has gives the whole structure.
     #[cfg(test)]
@@ -702,7 +1000,7 @@ impl Immutable {
 mod tests {
     use super::*;
 
-    use alloc::collections::BTreeMap;
+    use alloc::collections::{BTreeMap, BTreeSet};
     use dcroxide_testutil::SplitMix64;
 
     /// A value in `0..n`.
@@ -883,6 +1181,19 @@ mod tests {
     /// reference's do: a node is one node in two versions here when,
     /// and only when, it is one node in those two versions there.
     fn assert_versions_match<'a>(versions: impl IntoIterator<Item = &'a Version>, context: &str) {
+        assert_versions_hold(versions, context, true);
+    }
+
+    /// [`assert_versions_match`], with the nodes the versions share
+    /// compared with the reference's or not.  A version made in place
+    /// shares more nodes than the reference's: it copies only what
+    /// another version holds, and leaves as it stands what a removal
+    /// puts in place unchanged.
+    fn assert_versions_hold<'a>(
+        versions: impl IntoIterator<Item = &'a Version>,
+        context: &str,
+        same_sharing: bool,
+    ) {
         let mut here_of: BTreeMap<*const (), *const ()> = BTreeMap::new();
         let mut there_of: BTreeMap<*const (), *const ()> = BTreeMap::new();
         for (slot, version) in versions.into_iter().enumerate() {
@@ -936,6 +1247,9 @@ mod tests {
                     ),
                     "{context}: version {slot}, node {position} in pre-order"
                 );
+                if !same_sharing {
+                    continue;
+                }
                 assert_eq!(
                     *here_of.entry(there.address).or_insert(here.address),
                     here.address,
@@ -1320,6 +1634,243 @@ mod tests {
         }
     }
 
+    /// What a run of operations in place did, to show that it did all
+    /// of it.  The pairs count operations on a clone of a live version,
+    /// every node of which another version holds too, and on a version
+    /// taken out of the live ones, which holds some of its nodes alone.
+    #[derive(Default, Debug)]
+    struct InPlaceTally {
+        inserted: [usize; 2],
+        removed: [usize; 2],
+        refused: usize,
+        missing: usize,
+        looked_up: usize,
+        /// Nodes a version held alone that an operation left where they
+        /// stood.
+        kept: usize,
+        largest: usize,
+    }
+
+    /// The nodes of a version, by address and key, that none of the
+    /// other versions holds.
+    fn held_alone(shape: &[NodeShape], others: &[Version]) -> Vec<(*const (), Key)> {
+        let elsewhere: BTreeSet<*const ()> = others
+            .iter()
+            .flat_map(|other| other.shape.iter().map(|n| n.address))
+            .collect();
+        shape
+            .iter()
+            .filter(|n| !elsewhere.contains(&n.address))
+            .map(|n| (n.address, n.key))
+            .collect()
+    }
+
+    /// How many nodes of a version are not nodes of the version it was
+    /// made from.
+    fn made_anew(shape: &[NodeShape], from: &[NodeShape]) -> usize {
+        let from: BTreeSet<*const ()> = from.iter().map(|n| n.address).collect();
+        shape.iter().filter(|n| !from.contains(&n.address)).count()
+    }
+
+    /// A long random run of inserts and removals in place, each made on
+    /// a clone of one of several live versions or on a version taken out
+    /// of them, beside the reference's `put` and `delete` of the same
+    /// ticket.  After every step every live version is compared with the
+    /// reference's, node for node, and with what it was made of; the
+    /// version the step made with the reference's; and the nodes the
+    /// step copied with what it had to copy.
+    fn run_profile_in_place(profile: &Profile, rng: &mut SplitMix64, tally: &mut InPlaceTally) {
+        let mut versions = alloc::vec![Version::empty()];
+        let mut hashes: Vec<Key> = Vec::new();
+        for step in 0..profile.seeded + profile.steps {
+            let context = alloc::format!("{} in place, step {step}", profile.name);
+            let seeding = step < profile.seeded;
+            let pick = below(rng, versions.len());
+            // One time in two the version is taken out of the live ones
+            // and changed itself, as a stake node that is about to be
+            // dropped hands its treaps over; otherwise a clone is.
+            let alone = below(rng, 2) == 0;
+            let source = if alone {
+                versions.swap_remove(pick)
+            } else {
+                let live = &versions[pick];
+                Version {
+                    treap: live.treap.clone(),
+                    reference: live.reference.clone(),
+                    shape: live.shape.clone(),
+                    reference_shape: live.reference_shape.clone(),
+                }
+            };
+            let Version {
+                mut treap,
+                reference,
+                shape: source_shape,
+                reference_shape: source_reference_shape,
+            } = source;
+            let alone_nodes = if alone {
+                held_alone(&source_shape, &versions)
+            } else {
+                Vec::new()
+            };
+
+            // A key the version holds and one it does not, as in
+            // `run_profile`.
+            let present = (!source_shape.is_empty()).then(|| {
+                let node = match below(rng, 4) {
+                    0 => 0,
+                    _ => below(rng, source_shape.len()),
+                };
+                source_shape[node].key
+            });
+            let absent = match profile.counters {
+                Some(range) => (0..8)
+                    .map(|_| rng.below(u64::from(range)) as u32)
+                    .find(|counter| !reference.has(&counter_key(*counter)))
+                    .map(|counter| (counter_key(counter), counter)),
+                None => {
+                    let mut key = random_key(rng);
+                    if !hashes.is_empty() && below(rng, 2) == 0 {
+                        let other = hashes[below(rng, hashes.len())];
+                        let shared = below(rng, 32);
+                        key[..shared].copy_from_slice(&other[..shared]);
+                    }
+                    let serial = hashes.len() as u32;
+                    hashes.push(key);
+                    (!reference.has(&key)).then_some((key, serial))
+                }
+            };
+            let absent = absent.map(|(key, seed)| {
+                let height = (profile.height)(seed, rng.next_u64() as u32);
+                (key, random_value(rng, height))
+            });
+            let room = treap.len() < profile.most;
+
+            // What the step did: an insert, a removal of this key, or
+            // nothing to the version.
+            enum Done {
+                Inserted,
+                Removed(Key),
+                Unchanged,
+            }
+            let operation = if seeding { 0 } else { below(rng, 8) };
+            let (done, reference) = match (operation, present, absent) {
+                (0..=2, _, Some((key, value))) if room => {
+                    assert!(
+                        treap.put_new_in_place(key, value),
+                        "{context}: refused an absent key"
+                    );
+                    tally.inserted[usize::from(alone)] += 1;
+                    (Done::Inserted, reference.put(key, value))
+                }
+                (3 | 4, Some(key), _) => {
+                    let held = treap.take_in_place(&key);
+                    assert_eq!(held, reference.value(&key), "{context}");
+                    assert!(held.is_some(), "{context}: the key is there");
+                    tally.removed[usize::from(alone)] += 1;
+                    (Done::Removed(key), reference.delete(&key))
+                }
+                // An insert of a key the version holds is refused.
+                (5, Some(key), _) => {
+                    let height = rng.next_u64() as u32 % 200;
+                    assert!(
+                        !treap.put_new_in_place(key, random_value(rng, height)),
+                        "{context}: inserted a key already there"
+                    );
+                    tally.refused += 1;
+                    (Done::Unchanged, reference)
+                }
+                // A removal of a key it does not hold finds nothing.
+                (6, _, Some((key, _))) => {
+                    assert!(treap.take_in_place(&key).is_none(), "{context}");
+                    tally.missing += 1;
+                    (Done::Unchanged, reference)
+                }
+                (_, present, absent) => {
+                    for key in present.into_iter().chain(absent.map(|(key, _)| key)) {
+                        tally.looked_up += 1;
+                        assert_eq!(treap.has(&key), reference.has(&key), "{context}");
+                        assert_eq!(treap.value(&key), reference.value(&key), "{context}");
+                    }
+                    (Done::Unchanged, reference)
+                }
+            };
+
+            let made = Version::new(treap, reference);
+            // Every live version is as it was, and the one made is the
+            // reference's.
+            assert_versions_hold(versions.iter().chain([&made]), &context, false);
+            assert_indexes_match(&made, &context);
+            match done {
+                Done::Unchanged => assert_eq!(
+                    made.shape, source_shape,
+                    "{context}: an operation that changed nothing changed a node"
+                ),
+                Done::Inserted | Done::Removed(_) if alone => {
+                    // Every node the version held alone is where it was,
+                    // but the one removed.
+                    let removed = match done {
+                        Done::Removed(key) => Some(key),
+                        _ => None,
+                    };
+                    let nodes: BTreeSet<(*const (), Key)> =
+                        made.shape.iter().map(|n| (n.address, n.key)).collect();
+                    for (address, key) in &alone_nodes {
+                        if Some(*key) == removed {
+                            continue;
+                        }
+                        assert!(
+                            nodes.contains(&(*address, *key)),
+                            "{context}: a node held alone was copied"
+                        );
+                        tally.kept += 1;
+                    }
+                }
+                Done::Inserted | Done::Removed(_) => {
+                    // On a clone every node is shared: an insert copies
+                    // what the reference copies, and a removal no more.
+                    let here = made_anew(&made.shape, &source_shape);
+                    let there = made_anew(&made.reference_shape, &source_reference_shape);
+                    if matches!(done, Done::Inserted) {
+                        assert_eq!(here, there, "{context}: nodes made by the insert");
+                    } else {
+                        assert!(here <= there, "{context}: {here} nodes made, {there} there");
+                    }
+                }
+            }
+            tally.largest = tally.largest.max(made.shape.len());
+            versions.push(made);
+            if seeding && !alone {
+                versions.swap_remove(0);
+            } else if versions.len() > LIVE_VERSIONS {
+                versions.swap_remove(below(rng, versions.len()));
+            }
+        }
+    }
+
+    /// Every insert and removal in place leaves the treap as the
+    /// reference's put and delete leave it, node for node; changes no
+    /// node another live version holds; and copies no node the version
+    /// holds alone.
+    #[test]
+    fn every_operation_in_place_builds_what_the_reference_builds() {
+        let mut rng = SplitMix64::from_entropy("ticket treap in place against its reference");
+        for profile in &PROFILES {
+            let mut tally = InPlaceTally::default();
+            run_profile_in_place(profile, &mut rng, &mut tally);
+            assert!(
+                tally.inserted.iter().all(|&n| n >= 100)
+                    && tally.removed.iter().all(|&n| n >= 60)
+                    && tally.refused >= 30
+                    && tally.missing >= 30
+                    && tally.looked_up >= 30
+                    && tally.kept >= 2_000
+                    && tally.largest >= 50,
+                "{}: {tally:?}",
+                profile.name
+            );
+        }
+    }
+
     /// The treap and the reference holding the counters given at the
     /// heights given, inserted in the order of the counters.
     fn version_of_counters(
@@ -1460,6 +2011,103 @@ mod tests {
         let taken = Version::new(taken, reference.delete(&root.key));
         let made = [between, deleted, taken];
         assert_versions_match(&made, "the root removed");
+        for version in &made {
+            assert_indexes_match(version, "the root removed");
+        }
+    }
+
+    /// An operation in place records the sides of a path of any length:
+    /// on spines of 600 nodes, more than twice what the record holds in
+    /// place, each insert and removal at the far end, on a clone and on
+    /// a version held alone, makes what the reference makes, and a
+    /// removal of the root from between two spines of 300 folds the
+    /// whole cascade.
+    #[test]
+    fn an_operation_in_place_takes_a_path_of_any_length() {
+        const COUNT: u32 = 600;
+        assert!(COUNT as usize > 2 * 64 * DIRECTIONS_INLINE_WORDS);
+        struct Spine {
+            name: &'static str,
+            height: fn(u32) -> u32,
+            deepest: u32,
+            beyond: u32,
+        }
+        let spines = [
+            Spine {
+                name: "to the right",
+                height: |counter| counter,
+                deepest: COUNT,
+                beyond: COUNT + 1,
+            },
+            Spine {
+                name: "to the left",
+                height: |counter| COUNT + 1 - counter,
+                deepest: 1,
+                beyond: 0,
+            },
+        ];
+        for Spine {
+            name,
+            height,
+            deepest,
+            beyond,
+        } in spines
+        {
+            let spine = version_of_counters(1..=COUNT, height);
+            assert_eq!(tallest_path(&spine.shape), COUNT as usize, "{name}");
+            let (deepest, beyond) = (counter_key(deepest), counter_key(beyond));
+            let mut made = Vec::new();
+            for alone in [false, true] {
+                // A version held alone is built again, so that no other
+                // version holds a node of it.
+                let source = || {
+                    if alone {
+                        version_of_counters(1..=COUNT, height).treap
+                    } else {
+                        spine.treap.clone()
+                    }
+                };
+                let mut removed = source();
+                let held = removed.take_in_place(&deepest);
+                assert_eq!(held, spine.reference.value(&deepest), "{name}");
+                made.push(Version::new(removed, spine.reference.delete(&deepest)));
+                // A ticket that stays below the deepest node, and one
+                // low enough to climb the whole spine.
+                for value in [Value::new(COUNT + 5), Value::new(0)] {
+                    let mut inserted = source();
+                    assert!(inserted.put_new_in_place(beyond, value), "{name}");
+                    let put = Version::new(inserted, spine.reference.put(beyond, value));
+                    assert_eq!(put.shape[0].key == beyond, value.height == 0, "{name}");
+                    assert_eq!(tallest_path(&put.shape), COUNT as usize + 1, "{name}");
+                    made.push(put);
+                }
+            }
+            made.push(spine);
+            assert_versions_hold(&made, name, false);
+            for version in &made {
+                assert_indexes_match(version, name);
+            }
+        }
+
+        const ROOT: u32 = COUNT / 2;
+        let height = |counter: u32| match counter.abs_diff(ROOT) {
+            0 => 0,
+            away => COUNT - away,
+        };
+        let between = version_of_counters(0..=COUNT, height);
+        let root = counter_key(ROOT);
+        assert_eq!(between.shape[0].key, root);
+        let mut shared = between.treap.clone();
+        let mut alone = version_of_counters(0..=COUNT, height).treap;
+        let value = between.reference.value(&root);
+        assert_eq!(shared.take_in_place(&root), value);
+        assert_eq!(alone.take_in_place(&root), value);
+        let made = [
+            Version::new(shared, between.reference.delete(&root)),
+            Version::new(alone, between.reference.delete(&root)),
+            between,
+        ];
+        assert_versions_hold(&made, "the root removed", false);
         for version in &made {
             assert_indexes_match(version, "the root removed");
         }

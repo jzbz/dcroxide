@@ -21,7 +21,9 @@ use dcroxide_wire::BlockHeader;
 
 use dcroxide_gcs::FilterV2;
 use dcroxide_stake::ticketdb::UndoTicketData;
-use dcroxide_stake::ticketnode::{MissedTickets, Node as StakeNode, StakeNodeParams};
+use dcroxide_stake::ticketnode::{
+    MissedTickets, Node as StakeNode, ParentRestore, StakeNodeParams,
+};
 use dcroxide_uint256::Uint256;
 use dcroxide_wire::{MsgBlock, MsgTx, OutPoint};
 
@@ -3281,6 +3283,76 @@ impl Chain {
             .expect("requested stake node loaded"))
     }
 
+    /// [`Self::fetch_stake_node`] for a block whose connect drops its
+    /// parent's stake node at its end: the block's node is made of the
+    /// parent's in place ([`StakeNode::connect_in_place`]), so the
+    /// treap nodes no other version holds are changed where they stand
+    /// instead of being copied for the block and freed with the parent.
+    ///
+    /// The parent's node leaves the index for it.  The node returned is
+    /// the one [`Self::fetch_stake_node`] returns, and the index holds it
+    /// as that would; beside it comes what rebuilds the parent's node,
+    /// should the connect fail later on (`connect_block_with_hashes`).
+    /// The parent's node is left in the index, and the block's made from
+    /// it as [`Self::fetch_stake_node`] makes it, when anything else
+    /// holds it; a node the index holds for the block already is
+    /// returned as it is, and one whose parent holds none is fetched.  A
+    /// block whose tickets the parent's treaps refuse is refused with
+    /// the same error, and the parent's node goes back to the index as
+    /// it was.
+    fn fetch_stake_node_taking_parent(
+        &mut self,
+        node: NodeId,
+        params: &Params,
+    ) -> Result<(Arc<StakeNode>, Option<ParentRestore>), dcroxide_stake::RuleError> {
+        let parent = match self.store.node(node).parent {
+            Some(parent)
+                if self.store.node(node).stake_node.is_none()
+                    && self.store.node(parent).stake_node.is_some() =>
+            {
+                parent
+            }
+            _ => return Ok((self.fetch_stake_node(node, params)?, None)),
+        };
+        self.maybe_fetch_ticket_info(node, params)?;
+        let held = self
+            .store
+            .node_mut(parent)
+            .stake_node
+            .take()
+            .expect("checked above");
+        let parent_stake_node = match Arc::try_unwrap(held) {
+            Ok(parent_stake_node) => parent_stake_node,
+            Err(shared) => {
+                self.store.node_mut(parent).stake_node = Some(shared);
+                return Ok((self.fetch_stake_node(node, params)?, None));
+            }
+        };
+        let n = self.store.node(node);
+        let new_tickets = n.new_tickets.as_deref().expect("new tickets loaded");
+        let iv = self.store.lottery_iv(node);
+        match parent_stake_node.connect_in_place(
+            iv,
+            &n.tickets_voted,
+            &n.tickets_revoked,
+            new_tickets,
+        ) {
+            Ok((stake_node, restore)) => {
+                let stake_node = Arc::new(stake_node);
+                self.store.node_mut(node).stake_node = Some(Arc::clone(&stake_node));
+                Ok((stake_node, Some(restore)))
+            }
+            Err(refused) => {
+                let dcroxide_stake::ticketnode::InPlaceRefusal {
+                    error,
+                    parent: parent_stake_node,
+                } = *refused;
+                self.store.node_mut(parent).stake_node = Some(Arc::new(parent_stake_node));
+                Err(error)
+            }
+        }
+    }
+
     /// The error for a block already known to be invalid, either
     /// directly or through an invalid ancestor (dcrd
     /// `checkKnownInvalidBlock`).
@@ -3601,9 +3673,76 @@ impl Chain {
             "provided stxos do not match the outputs the block spends"
         );
 
-        let stake_node = self
-            .fetch_stake_node(node, params)
-            .map_err(stake_rule_error)?;
+        // Whether this connect drops the parent's stake node when it
+        // ends (dcrd `connectBlock`, `chain.go:783-796`), decided before
+        // the block's own stake node is made: when it does, that node is
+        // made of the parent's in place.  The end of the connect drops
+        // the parent's by this same answer, which nothing in between can
+        // change: only accepting a header and marking a block invalid
+        // move the best header, and neither happens in a connect.
+        let prunes_parent = self.connect_prunes_parent(node);
+        let (stake_node, parent_restore) = if prunes_parent {
+            self.fetch_stake_node_taking_parent(node, params)
+        } else {
+            self.fetch_stake_node(node, params)
+                .map(|stake_node| (stake_node, None))
+        }
+        .map_err(stake_rule_error)?;
+
+        let connected = self.connect_block_with_stake_node(
+            node,
+            block,
+            parent,
+            tx_hashes,
+            view,
+            stxos,
+            filter,
+            params,
+            check_tx_flags,
+            &stake_node,
+            prunes_parent,
+        );
+        // A connect that failed leaves the parent the tip, and the tip
+        // needs its stake node: every later fetch starts from it.  When
+        // the block's node was made of the parent's, the parent's is
+        // rebuilt from it; the block's stays in the index, as it does
+        // when it was made of a copy.
+        if connected.is_err()
+            && let Some(restore) = parent_restore
+        {
+            let parent_stake_node = restore.rebuild(&stake_node);
+            self.store.node_mut(parent_id).stake_node = Some(Arc::new(parent_stake_node));
+        }
+        connected
+    }
+
+    /// The connect of [`Self::connect_block_with_hashes`] from the point
+    /// where the block's stake node is in hand: the best state, the
+    /// database rows, the UTXO set, the new tip, the events, and, when
+    /// `prunes_parent` says so, the drop of the parent's stake node and
+    /// mirror entries.  Every error it returns comes before the tip
+    /// moves.
+    #[allow(clippy::too_many_arguments)]
+    fn connect_block_with_stake_node(
+        &mut self,
+        node: NodeId,
+        block: &Arc<MsgBlock>,
+        parent: &Arc<MsgBlock>,
+        tx_hashes: Arc<BlockTxHashes>,
+        view: &mut UtxoView,
+        stxos: Vec<SpentTxOut>,
+        filter: FilterV2,
+        params: &Params,
+        check_tx_flags: crate::validate::AgendaFlags,
+        stake_node: &StakeNode,
+        prunes_parent: bool,
+    ) -> Result<(), RuleError> {
+        let parent_id = self
+            .store
+            .node(node)
+            .parent
+            .expect("connected block has a parent");
+        let prev_height = Some(self.store.node(parent_id).height);
 
         // Calculate the next stake difficulty and the header
         // commitment leaves for the active agendas.
@@ -3718,7 +3857,7 @@ impl Chain {
                     serialized_journal,
                 )
                 .map_err(chain_db_to_db_error)?;
-                dcroxide_stake::stakedb::write_connected_best_node(tx, &stake_node, &node_hash)
+                dcroxide_stake::stakedb::write_connected_best_node(tx, stake_node, &node_hash)
                     .map_err(stake_db_to_db_error)?;
                 if let Some((block_hash, ts, tspend_updates)) = &treasury_records {
                     Self::db_write_treasury_records(
@@ -3797,7 +3936,21 @@ impl Chain {
         // however fast blocks connect, instead of growing until the
         // next timed prune.  The parent's entries in the port's
         // recent-window mirrors go with it when a database backs them:
-        // dcrd holds none of those in memory at all.
+        // dcrd holds none of those in memory at all.  The block's own
+        // stake node was then made of the parent's in place, unless
+        // something else held it, so there is usually no stake node left
+        // here to drop.
+        if prunes_parent {
+            self.prune_node_memory(parent_id, self.db.is_some());
+        }
+        Ok(())
+    }
+
+    /// Whether connecting the node drops its parent's stake node: the
+    /// node is more than [`Self::MIN_MEMORY_STAKE_NODES`] below the best
+    /// header (dcrd `connectBlock`, `chain.go:783-796`), as every block
+    /// of the initial sync is.
+    fn connect_prunes_parent(&self, node: NodeId) -> bool {
         let best_header_height = self
             .index
             .best_header()
@@ -3810,10 +3963,7 @@ impl Chain {
         if best_header_height > Self::MIN_MEMORY_STAKE_NODES {
             prune_height = best_header_height - Self::MIN_MEMORY_STAKE_NODES;
         }
-        if node_height < prune_height {
-            self.prune_node_memory(parent_id, self.db.is_some());
-        }
-        Ok(())
+        self.store.node(node).height < prune_height
     }
 
     /// Disconnect the block from the end of the main chain: restore
@@ -10358,6 +10508,283 @@ mod tests {
             with_new_tickets > 40,
             "{with_new_tickets} blocks with new tickets"
         );
+    }
+
+    /// What a test compares of a stake node: every answer it gives.
+    fn stake_answers(node: &StakeNode) -> impl PartialEq + core::fmt::Debug + use<> {
+        (
+            (node.height(), node.winners().to_vec(), node.final_state()),
+            (
+                node.pool_size(),
+                node.new_tickets().to_vec(),
+                node.undo_data().to_vec(),
+            ),
+            (
+                node.live_tickets(),
+                node.missed_tickets(),
+                node.revoked_tickets(),
+                node.expiring_next_block(),
+            ),
+        )
+    }
+
+    /// The stake node a connect that drops its parent's makes in place
+    /// is the one `fetch_stake_node` makes, and the index holds it as
+    /// that would.  The parent's node leaves the index for it when the
+    /// index alone holds that node, and what comes back beside the block's
+    /// node rebuilds the parent's.  When anything else holds the
+    /// parent's node, it stays in the index, the same node, and nothing
+    /// comes back to rebuild it with.
+    #[test]
+    fn the_stake_node_made_in_place_is_the_one_fetch_stake_node_makes() {
+        let params = dcroxide_chaincfg::regnet_params();
+        let mut chain = Chain::new(&params, Hash::ZERO, false);
+        let (blocks, now) = battery_main_chain();
+
+        let (mut taken, mut left) = (0, 0);
+        for (number, block) in blocks.iter().enumerate() {
+            let (_, errs) = chain.process_block(block, now, &params);
+            assert!(errs.is_empty(), "{errs:?}");
+            let tip = chain.best_chain.tip().expect("tip");
+            let parent = chain.store.node(tip).parent.expect("parent");
+            if chain.store.node(parent).stake_node.is_none() {
+                continue;
+            }
+
+            // The tip's node made again, from a copy of the parent's
+            // that holds no reference to the index's.
+            let want = {
+                let n = chain.store.node(tip);
+                let parent_copy: StakeNode = chain
+                    .store
+                    .node(parent)
+                    .stake_node
+                    .as_deref()
+                    .expect("loaded")
+                    .clone();
+                parent_copy
+                    .connect(
+                        chain.store.lottery_iv(tip),
+                        &n.tickets_voted,
+                        &n.tickets_revoked,
+                        n.new_tickets.as_deref().expect("new tickets"),
+                    )
+                    .expect("connect")
+            };
+            let parent_answers = stake_answers(
+                chain
+                    .store
+                    .node(parent)
+                    .stake_node
+                    .as_deref()
+                    .expect("loaded"),
+            );
+            chain.store.node_mut(tip).stake_node = None;
+
+            // One block in three, something else holds the parent's.
+            let holder = (number % 3 == 0).then(|| {
+                Arc::clone(
+                    chain
+                        .store
+                        .node(parent)
+                        .stake_node
+                        .as_ref()
+                        .expect("loaded"),
+                )
+            });
+            let (made, restore) = chain
+                .fetch_stake_node_taking_parent(tip, &params)
+                .expect("connect");
+            let kept = chain.store.node(tip).stake_node.as_ref().expect("kept");
+            assert!(Arc::ptr_eq(&made, kept));
+            assert_eq!(stake_answers(&made), stake_answers(&want));
+            match (holder, restore) {
+                (Some(holder), None) => {
+                    left += 1;
+                    let index = chain.store.node(parent).stake_node.as_ref();
+                    assert!(index.is_some_and(|index| Arc::ptr_eq(index, &holder)));
+                    assert_eq!(stake_answers(&holder), parent_answers);
+                }
+                (None, Some(restore)) => {
+                    taken += 1;
+                    assert!(chain.store.node(parent).stake_node.is_none());
+                    let rebuilt = restore.rebuild(&made);
+                    assert_eq!(stake_answers(&rebuilt), parent_answers);
+                    assert_eq!(stake_answers(&made), stake_answers(&want));
+                    chain.store.node_mut(parent).stake_node = Some(Arc::new(rebuilt));
+                }
+                (holder, restore) => panic!(
+                    "block {number}: held elsewhere {}, taken {}",
+                    holder.is_some(),
+                    restore.is_some()
+                ),
+            }
+        }
+        assert!(taken > 40 && left > 20, "{taken} taken, {left} left");
+    }
+
+    /// A block the parent's treaps refuse is refused by the fetch that
+    /// takes the parent's node with the error `Node::connect` gives, and
+    /// the parent's node goes back to the index answering as before,
+    /// the block left without one: the parent is still the tip, and the
+    /// next fetch of the block's node starts from the parent's.  When
+    /// something else holds the parent's node, it stays in the index,
+    /// the same node.
+    ///
+    /// Along the battery's main chain each tip is made again in the ways
+    /// its parent's treaps refuse: with a vote for a ticket that is not a
+    /// winner, refused before any ticket moves; with a revocation of a
+    /// ticket it voted, refused after the winners' moves; and with its
+    /// last vote dropped, that winner revoked and a ticket bought twice,
+    /// refused after a winner was spent, one missed, the missed one
+    /// revoked and the block's own tickets bought.  One call in three,
+    /// the parent's node is held elsewhere.
+    #[test]
+    fn a_block_the_parents_treaps_refuse_gives_the_parent_its_node_back() {
+        use dcroxide_stake::ErrorKind;
+
+        let params = dcroxide_chaincfg::regnet_params();
+        let mut chain = Chain::new(&params, Hash::ZERO, false);
+        let (blocks, now) = battery_main_chain();
+        let not_a_winner = Hash([0xa5; 32]);
+        let bought_twice = Hash([0x3c; 32]);
+
+        let (mut taken, mut left) = (0usize, 0usize);
+        let (mut before_any_move, mut after_spent, mut after_every_kind) = (0usize, 0usize, 0usize);
+        for (number, block) in blocks.iter().enumerate() {
+            let (_, errs) = chain.process_block(block, now, &params);
+            assert!(errs.is_empty(), "{errs:?}");
+            let tip = chain.best_chain.tip().expect("tip");
+            let parent = chain.store.node(tip).parent.expect("parent");
+            let Some(parent_node) = chain.store.node(parent).stake_node.as_deref() else {
+                continue;
+            };
+            let parent_answers = stake_answers(parent_node);
+            let tip_node = Arc::clone(chain.store.node(tip).stake_node.as_ref().expect("loaded"));
+            let height = chain.store.node(tip).height;
+            let (voted, revoked, bought) = {
+                let n = chain.store.node(tip);
+                (
+                    n.tickets_voted.clone(),
+                    n.tickets_revoked.clone(),
+                    n.new_tickets.clone().expect("new tickets"),
+                )
+            };
+
+            let mut refusals = Vec::new();
+            if height >= params.stake_enabled_height {
+                let mut with_unknown = voted.clone();
+                with_unknown.push(not_a_winner);
+                refusals.push((
+                    ErrorKind::UnknownTicketSpent,
+                    with_unknown,
+                    revoked.clone(),
+                    bought.clone(),
+                ));
+            }
+            if let Some(&spent) = voted.first() {
+                let mut with_spent = revoked.clone();
+                with_spent.push(spent);
+                refusals.push((
+                    ErrorKind::MissingTicket,
+                    voted.clone(),
+                    with_spent,
+                    bought.clone(),
+                ));
+            }
+            {
+                let mut fewer = voted.clone();
+                let mut with_missed = revoked.clone();
+                if let Some(missed) = fewer.pop() {
+                    with_missed.push(missed);
+                }
+                let mut twice = bought.clone();
+                twice.extend([bought_twice, bought_twice]);
+                refusals.push((ErrorKind::DuplicateTicket, fewer, with_missed, twice));
+            }
+
+            for (kind, tickets_voted, tickets_revoked, new_tickets) in refusals {
+                // The error the connect from the parent's node gives,
+                // which leaves that node as it is.
+                let want = chain
+                    .store
+                    .node(parent)
+                    .stake_node
+                    .as_deref()
+                    .expect("loaded")
+                    .connect(
+                        chain.store.lottery_iv(tip),
+                        &tickets_voted,
+                        &tickets_revoked,
+                        &new_tickets,
+                    )
+                    .expect_err("the connect refuses the block");
+                assert_eq!(want.kind, kind, "block {number}");
+                match kind {
+                    ErrorKind::UnknownTicketSpent => before_any_move += 1,
+                    ErrorKind::MissingTicket => after_spent += 1,
+                    _ => after_every_kind += usize::from(tickets_revoked.len() > revoked.len()),
+                }
+
+                {
+                    let n = chain.store.node_mut(tip);
+                    n.tickets_voted = tickets_voted;
+                    n.tickets_revoked = tickets_revoked;
+                    n.new_tickets = Some(new_tickets);
+                    n.stake_node = None;
+                }
+                let holder = ((taken + left) % 3 == 0).then(|| {
+                    Arc::clone(
+                        chain
+                            .store
+                            .node(parent)
+                            .stake_node
+                            .as_ref()
+                            .expect("loaded"),
+                    )
+                });
+                let error = match chain.fetch_stake_node_taking_parent(tip, &params) {
+                    Ok(_) => panic!("block {number}: {kind:?} accepted"),
+                    Err(error) => error,
+                };
+                assert_eq!(error, want, "block {number}");
+                assert!(
+                    chain.store.node(tip).stake_node.is_none(),
+                    "block {number}: a refused block has a stake node"
+                );
+                let back = chain
+                    .store
+                    .node(parent)
+                    .stake_node
+                    .as_ref()
+                    .expect("the parent's node is back in the index");
+                assert_eq!(stake_answers(back), parent_answers, "block {number}");
+                if let Some(holder) = holder {
+                    left += 1;
+                    assert!(Arc::ptr_eq(back, &holder), "block {number}");
+                } else {
+                    taken += 1;
+                }
+
+                // The block as it is: its node is made of the parent's
+                // again, and the one the chain made goes back.
+                {
+                    let n = chain.store.node_mut(tip);
+                    n.tickets_voted = voted.clone();
+                    n.tickets_revoked = revoked.clone();
+                    n.new_tickets = Some(bought.clone());
+                }
+                let again = chain.fetch_stake_node(tip, &params).expect("connect");
+                assert_eq!(stake_answers(&again), stake_answers(&tip_node));
+                chain.store.node_mut(tip).stake_node = Some(Arc::clone(&tip_node));
+            }
+        }
+        assert!(
+            before_any_move > 100 && after_spent > 15 && after_every_kind > 15,
+            "{before_any_move} before any move, {after_spent} after the winners' moves, \
+             {after_every_kind} after every kind of move"
+        );
+        assert!(taken > 150 && left > 75, "{taken} taken, {left} left");
     }
 
     /// The connect checks refuse hashes that are not their block's, with
