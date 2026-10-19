@@ -120,7 +120,7 @@ fn chainio_vectors() {
                 // stxo <amount> <pk|""> <minouts|-> <h> <i> <sv> <flags>
                 pending_stxos.push(SpentTxOut {
                     amount: f[1].parse().expect("amount"),
-                    pk_script: unhex(f[2]),
+                    pk_script: unhex(f[2]).into(),
                     ticket_min_outs: if f[3] == "-" { None } else { Some(unhex(f[3])) },
                     block_height: f[4].parse().expect("height"),
                     block_index: f[5].parse().expect("index"),
@@ -203,7 +203,7 @@ fn spent_tx_out_size_matches_bytes_written_for_noncanonical_flags() {
     for packed in [0x00u8, 0x01, 0x02, 0x3f, 0x40, 0x80, 0xc1, 0xff] {
         let stxo = SpentTxOut {
             amount: 5,
-            pk_script: vec![0x51],
+            pk_script: vec![0x51].into(),
             ticket_min_outs: None,
             block_height: 1,
             block_index: 0,

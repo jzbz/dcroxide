@@ -91,7 +91,7 @@ fn spend_tx(prev_index: u32, value_in: i64, block_height: u32, block_index: u32)
 fn stxo(pk_script: Vec<u8>, value_in: i64, block_height: u32, block_index: u32) -> SpentTxOut {
     SpentTxOut {
         amount: value_in,
-        pk_script,
+        pk_script: pk_script.into(),
         ticket_min_outs: None,
         block_height,
         block_index,

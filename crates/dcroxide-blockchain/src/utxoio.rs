@@ -20,8 +20,8 @@ use dcroxide_chainhash::{HASH_SIZE, Hash};
 use dcroxide_wire::OutPoint;
 
 use crate::compress::{
-    compressed_tx_out_size, decode_compressed_tx_out, deserialize_vlq, put_compressed_tx_out,
-    put_vlq, serialize_size_vlq,
+    compressed_tx_out_size, decode_compressed_tx_out_script, deserialize_vlq,
+    put_compressed_tx_out, put_vlq, serialize_size_vlq,
 };
 use crate::error::{Error, deserialize_error};
 use crate::utxoentry::{UtxoEntry, is_ticket_submission_output};
@@ -240,7 +240,7 @@ pub fn deserialize_utxo_entry(serialized: &[u8], tx_out_index: u32) -> Result<Ut
 
     // Decode the compressed unspent transaction output.
     let (amount, script_version, script, bytes_read) =
-        decode_compressed_tx_out(&serialized[offset..], true)
+        decode_compressed_tx_out_script(&serialized[offset..], true)
             .map_err(|e| deserialize_error(alloc::format!("unable to decode utxo: {e}")))?;
     offset += bytes_read;
 
@@ -272,7 +272,7 @@ pub fn deserialize_utxo_entry(serialized: &[u8], tx_out_index: u32) -> Result<Ut
         let sz = read_deserialize_size_of_minimal_outputs(&serialized[offset..]).map_err(|e| {
             deserialize_error(alloc::format!("unable to decode ticket outputs: {e}"))
         })?;
-        entry.ticket_min_outs = Some(serialized[offset..offset + sz].to_vec());
+        entry.ticket_min_outs = Some(serialized[offset..offset + sz].into());
     }
 
     Ok(entry)
@@ -347,7 +347,7 @@ mod tests {
             let mut row = vec![0x00, 0x00, 0x04, 0x00, 0x00, 0x40];
             row.extend_from_slice(&tail);
             let entry = deserialize_utxo_entry(&row, 0).expect("decodes like dcrd");
-            assert_eq!(entry.ticket_min_outs, Some(tail));
+            assert_eq!(entry.ticket_minimal_outputs_data(), Some(tail.as_slice()));
         }
 
         // A count below 2^63 still reads its outputs.

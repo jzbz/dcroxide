@@ -10,13 +10,13 @@
 //! a VLQ of `length + 64`.  Amounts use a base-10 exponent scheme
 //! lifted from Bitcoin Core.
 
-use alloc::vec;
 use alloc::vec::Vec;
 
 use dcroxide_dcrec::secp256k1::PublicKey;
 use dcroxide_stake::TxType;
 
 use crate::error::{Error, deserialize_error};
+use crate::pkscript::PkScript;
 
 /// The current UTXO compression version (dcrd
 /// `currentCompressionVersion`).
@@ -297,44 +297,50 @@ pub fn put_compressed_script(target: &mut [u8], _script_version: u16, pk_script:
 /// panics.  [`decode_compressed_tx_out`] reports it as a deserialize
 /// error instead.
 pub fn decompress_script(compressed_pk_script: &[u8]) -> Vec<u8> {
-    try_decompress_script(compressed_pk_script).unwrap_or_default()
+    try_decompress_script(compressed_pk_script)
+        .map(PkScript::into_vec)
+        .unwrap_or_default()
 }
 
-/// [`decompress_script`], returning `None` when the encoding reads past
-/// the end of the input.
-fn try_decompress_script(compressed_pk_script: &[u8]) -> Option<Vec<u8>> {
+/// [`decompress_script`] into the form UTXO entries and spent outputs
+/// hold a script in, which keeps a standard script off the heap,
+/// returning `None` when the encoding reads past the end of the input.
+fn try_decompress_script(compressed_pk_script: &[u8]) -> Option<PkScript> {
     // Empty scripts, specified by 0x00, are considered nil.
     if compressed_pk_script.is_empty() {
-        return Some(Vec::new());
+        return Some(PkScript::new());
     }
 
     let (encoded_script_size, bytes_read) = deserialize_vlq(compressed_pk_script);
     match encoded_script_size {
         // Pay-to-pubkey-hash script.
         CST_PAY_TO_PUB_KEY_HASH => {
-            let mut pk_script = vec![0u8; 25];
+            let mut script = PkScript::zeroed(25);
+            let pk_script = script.as_mut_slice();
             pk_script[0] = OP_DUP;
             pk_script[1] = OP_HASH160;
             pk_script[2] = OP_DATA_20;
             pk_script[3..23].copy_from_slice(payload(compressed_pk_script, bytes_read, 20)?);
             pk_script[23] = OP_EQUALVERIFY;
             pk_script[24] = OP_CHECKSIG;
-            Some(pk_script)
+            Some(script)
         }
 
         // Pay-to-script-hash script.
         CST_PAY_TO_SCRIPT_HASH => {
-            let mut pk_script = vec![0u8; 23];
+            let mut script = PkScript::zeroed(23);
+            let pk_script = script.as_mut_slice();
             pk_script[0] = OP_HASH160;
             pk_script[1] = OP_DATA_20;
             pk_script[2..22].copy_from_slice(payload(compressed_pk_script, bytes_read, 20)?);
             pk_script[22] = OP_EQUAL;
-            Some(pk_script)
+            Some(script)
         }
 
         // Pay-to-compressed-pubkey script.
         CST_PAY_TO_PUB_KEY_COMP_EVEN | CST_PAY_TO_PUB_KEY_COMP_ODD => {
-            let mut pk_script = vec![0u8; 35];
+            let mut script = PkScript::zeroed(35);
+            let pk_script = script.as_mut_slice();
             pk_script[0] = OP_DATA_33;
             pk_script[1] = if encoded_script_size == CST_PAY_TO_PUB_KEY_COMP_ODD {
                 0x03
@@ -343,7 +349,7 @@ fn try_decompress_script(compressed_pk_script: &[u8]) -> Option<Vec<u8>> {
             };
             pk_script[2..34].copy_from_slice(payload(compressed_pk_script, bytes_read, 32)?);
             pk_script[34] = OP_CHECKSIG;
-            Some(pk_script)
+            Some(script)
         }
 
         // Pay-to-uncompressed-pubkey script.
@@ -366,14 +372,15 @@ fn try_decompress_script(compressed_pk_script: &[u8]) -> Option<Vec<u8>> {
             #[allow(clippy::arithmetic_side_effects, reason = "n <= 32")]
             compressed_key[1..1 + n].copy_from_slice(&tail[..n]);
             let Ok(key) = PublicKey::parse(&compressed_key) else {
-                return Some(Vec::new());
+                return Some(PkScript::new());
             };
 
-            let mut pk_script = vec![0u8; 67];
+            let mut script = PkScript::zeroed(67);
+            let pk_script = script.as_mut_slice();
             pk_script[0] = OP_DATA_65;
             pk_script[1..66].copy_from_slice(&key.serialize_uncompressed());
             pk_script[66] = OP_CHECKSIG;
-            Some(pk_script)
+            Some(script)
         }
 
         // When none of the special cases apply, the script was encoded
@@ -383,7 +390,11 @@ fn try_decompress_script(compressed_pk_script: &[u8]) -> Option<Vec<u8>> {
             // `NUM_SPECIAL_SCRIPTS` wraps to a size no input can hold.
             let script_size =
                 usize::try_from(encoded_script_size.wrapping_sub(NUM_SPECIAL_SCRIPTS)).ok()?;
-            Some(payload(compressed_pk_script, bytes_read, script_size)?.to_vec())
+            Some(PkScript::from(payload(
+                compressed_pk_script,
+                bytes_read,
+                script_size,
+            )?))
         }
     }
 }
@@ -533,14 +544,26 @@ pub fn put_compressed_tx_out(
 /// Decode a compressed transaction output from the front of the
 /// serialized bytes, returning the amount, script version, script, and
 /// the number of bytes consumed (dcrd `decodeCompressedTxOut`).
-#[allow(
-    clippy::arithmetic_side_effects,
-    reason = "offset counts bytes read from serialized, so offset <= serialized.len(), and offset + script_size <= serialized.len() by the length check"
-)]
 pub fn decode_compressed_tx_out(
     serialized: &[u8],
     has_amount: bool,
 ) -> Result<(i64, u16, Vec<u8>, usize), Error> {
+    decode_compressed_tx_out_script(serialized, has_amount).map(
+        |(amount, script_version, script, read)| (amount, script_version, script.into_vec(), read),
+    )
+}
+
+/// [`decode_compressed_tx_out`] with the script in the form UTXO
+/// entries and spent outputs hold it in, which keeps a standard script
+/// off the heap.
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "offset counts bytes read from serialized, so offset <= serialized.len(), and offset + script_size <= serialized.len() by the length check"
+)]
+pub(crate) fn decode_compressed_tx_out_script(
+    serialized: &[u8],
+    has_amount: bool,
+) -> Result<(i64, u16, PkScript, usize), Error> {
     let mut amount: i64 = 0;
     let mut offset = 0;
 
@@ -633,6 +656,7 @@ pub fn decode_flags(flags: u8) -> (bool, bool, u8) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::vec;
 
     /// A row whose script size VLQ is overlong: `80 fe .. ff 00` wraps to
     /// the pay-to-pubkey-hash discriminant after ten bytes, so the size
@@ -697,5 +721,26 @@ mod tests {
             let _ = decode_compressed_tx_out(&data, false);
             let _ = decompress_script(&data);
         }
+    }
+
+    /// The decompressor's two empty results, for which dcrd's
+    /// `decompressScript` returns nil: an empty compressed script (a
+    /// row that ends after its script version), and an uncompressed
+    /// public key whose x coordinate is no point of the curve.
+    #[test]
+    fn empty_and_unparsable_scripts_decompress_empty() {
+        assert_eq!(
+            decode_compressed_tx_out(&[0x00], false),
+            Ok((0, 0, Vec::new(), 1))
+        );
+        assert!(decompress_script(&[]).is_empty());
+
+        let mut row = vec![0x00, CST_PAY_TO_PUB_KEY_UNCOMP_EVEN as u8];
+        row.extend_from_slice(&[0xff; 32]);
+        assert_eq!(
+            decode_compressed_tx_out(&row, false),
+            Ok((0, 0, Vec::new(), 34))
+        );
+        assert!(decompress_script(&row[1..]).is_empty());
     }
 }

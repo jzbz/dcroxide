@@ -155,7 +155,7 @@ fn is_treasury_add_output(tx_type: TxType, tx_out_idx: u32) -> bool {
 pub fn entry_to_spent_tx_out(entry: &UtxoEntry) -> SpentTxOut {
     SpentTxOut {
         amount: entry.amount(),
-        pk_script: entry.pk_script().to_vec(),
+        pk_script: entry.pk_script.clone(),
         ticket_min_outs: entry.ticket_minimal_outputs_data().map(|d| d.to_vec()),
         block_height: entry.block_height() as u32,
         block_index: entry.block_index(),
@@ -381,15 +381,15 @@ impl UtxoView {
                 let mut data =
                     alloc::vec![0u8; crate::chainio::serialize_size_for_minimal_outputs(tx)];
                 crate::chainio::put_tx_to_minimal_outputs(&mut data, tx);
-                Some(data)
+                Some(data.into_boxed_slice())
             } else {
                 None
             };
             // The output is always unspent and modified once added.
             entry.state &= !(UTXO_STATE_SPENT | UTXO_STATE_SPENT_BY_ZERO_CONF);
             entry.state |= UTXO_STATE_MODIFIED;
-            if entry.pk_script != tx_out.pk_script {
-                entry.pk_script = tx_out.pk_script.clone();
+            if entry.pk_script.as_slice() != tx_out.pk_script.as_slice() {
+                entry.pk_script = crate::PkScript::from(tx_out.pk_script.as_slice());
             }
         }
     }
@@ -742,13 +742,13 @@ impl UtxoView {
                                 crate::chainio::serialize_size_for_minimal_outputs(tx)
                             ];
                             crate::chainio::put_tx_to_minimal_outputs(&mut data, tx);
-                            Some(data)
+                            Some(data.into_boxed_slice())
                         } else {
                             None
                         };
-                    let mut entry = UtxoEntry::new(
+                    let mut entry = UtxoEntry::with_script(
                         tx_out.value,
-                        tx_out.pk_script.clone(),
+                        crate::PkScript::from(tx_out.pk_script.as_slice()),
                         block.header.height,
                         tx_idx as u32,
                         tx_out.version,
@@ -792,7 +792,7 @@ impl UtxoView {
                 if !self.entries.contains_key(&k) {
                     // Rebuild the entry from the journal, carrying the
                     // journal's packed flags through directly.
-                    let mut entry = UtxoEntry::new(
+                    let mut entry = UtxoEntry::with_script(
                         tx_in.value_in,
                         stxo.pk_script.clone(),
                         stxo.block_height,
@@ -801,7 +801,7 @@ impl UtxoView {
                         false,
                         false,
                         TxType::Regular,
-                        stxo.ticket_min_outs.clone(),
+                        stxo.ticket_min_outs.as_deref().map(Into::into),
                     );
                     entry.packed_flags = stxo.packed_flags;
                     self.entries.insert(k, entry);
@@ -2207,6 +2207,232 @@ mod tests {
         }
     }
 
+    /// A ticket's submission output spent in a block and restored from
+    /// that block's spend journal, over a view that no longer holds it,
+    /// comes back with the script and the minimal outputs it was
+    /// created with.
+    #[test]
+    fn a_ticket_restored_from_the_journal_keeps_its_script_and_minimal_outputs() {
+        let ticket_input = OutPoint {
+            hash: Hash([0x44; 32]),
+            index: 3,
+            tree: 1,
+        };
+        let ticket = ticket_spending(ticket_input, 5_000, 100, 1);
+        let submission = OutPoint {
+            hash: ticket.tx_hash(),
+            index: 0,
+            tree: 1,
+        };
+        let mut created = UtxoView::new();
+        created.add_tx_outs(&ticket, 100, 1, false);
+        let entry = created
+            .lookup_entry(&submission)
+            .expect("submission")
+            .clone();
+        let min_outs = entry
+            .ticket_minimal_outputs_data()
+            .expect("minimal outputs");
+        assert!(!min_outs.is_empty());
+        assert!(entry.pk_script.is_inline(), "a stake-tagged script");
+
+        // Spend it in the stake tree of a block, recording the journal.
+        let spender = MsgTx {
+            tx_in: alloc::vec![input_spending(submission, 5_000, 100, 1)],
+            tx_out: alloc::vec![op_true_out(4_000)],
+            ..MsgTx::default()
+        };
+        let mut block = stake_block(alloc::vec![spender.clone()]);
+        block.transactions = alloc::vec![MsgTx {
+            tx_out: alloc::vec![op_true_out(1)],
+            ..MsgTx::default()
+        }];
+        let mut connected = UtxoView::new();
+        connected.insert_entry(&submission, entry.clone());
+        let mut stxos = Vec::new();
+        connected.connect_stake_transaction(
+            &spender,
+            &spender.tx_hash(),
+            120,
+            1,
+            Some(&mut stxos),
+            false,
+        );
+        assert_eq!(stxos.len(), 1);
+
+        // Disconnect it over a view without the output.
+        let mut view = UtxoView::new();
+        view.disconnect_transactions(&block, &[spender.tx_hash()], &stxos, true, false)
+            .expect("disconnect");
+        let restored = view.lookup_entry(&submission).expect("restored");
+        assert!(!restored.is_spent());
+        assert_eq!(restored.amount(), entry.amount());
+        assert_eq!(restored.pk_script(), entry.pk_script());
+        assert_eq!(restored.ticket_minimal_outputs_data(), Some(min_outs));
+        assert_eq!(restored.block_height(), entry.block_height());
+        assert_eq!(restored.block_index(), entry.block_index());
+        assert_eq!(restored.script_version(), entry.script_version());
+        assert_eq!(restored.packed_flags, entry.packed_flags);
+    }
+
+    /// Scripts too long to be held in place (one byte over the
+    /// capacity, a compressed and an uncompressed pay-to-pubkey, and a
+    /// long raw script) reach the spend journal, its serialized bytes
+    /// and a disconnect's rebuild whole.
+    #[test]
+    fn scripts_on_the_heap_survive_the_journal_and_a_disconnect() {
+        // The secp256k1 generator, a key the compressor accepts.
+        let x = dcroxide_testutil::unhex(
+            "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+        );
+        let y = dcroxide_testutil::unhex(
+            "483ada7726a3c4655da4fbfc0e1108a8fd17b448a68554199c47d08ffb10d4b8",
+        );
+        let scripts = [
+            alloc::vec![0x51; crate::PkScript::INLINE_CAPACITY + 1],
+            [&[0x21, 0x02][..], &x, &[0xac]].concat(),
+            [&[0x41, 0x04][..], &x, &y, &[0xac]].concat(),
+            alloc::vec![0x52; 300],
+        ];
+        let funding = MsgTx {
+            tx_in: alloc::vec![input_spending(
+                OutPoint {
+                    hash: Hash([0x09; 32]),
+                    index: 0,
+                    tree: 0,
+                },
+                1_000,
+                40,
+                1,
+            )],
+            tx_out: scripts
+                .iter()
+                .map(|script| TxOut {
+                    value: 1_000,
+                    version: 0,
+                    pk_script: script.clone(),
+                })
+                .collect(),
+            ..MsgTx::default()
+        };
+        let mut created = UtxoView::new();
+        created.add_tx_outs(&funding, 50, 1, false);
+        let outpoints: Vec<OutPoint> = (0..scripts.len())
+            .map(|index| OutPoint {
+                hash: funding.tx_hash(),
+                index: index as u32,
+                tree: 0,
+            })
+            .collect();
+        let entries: Vec<UtxoEntry> = outpoints
+            .iter()
+            .map(|outpoint| created.lookup_entry(outpoint).expect("output").clone())
+            .collect();
+
+        // Spend them in the regular tree of a block, recording the
+        // journal, and round trip the journal through its bytes.
+        let spender = MsgTx {
+            tx_in: outpoints
+                .iter()
+                .map(|outpoint| input_spending(*outpoint, 1_000, 50, 1))
+                .collect(),
+            tx_out: alloc::vec![op_true_out(3_000)],
+            ..MsgTx::default()
+        };
+        let mut connected = created.clone();
+        let mut stxos = Vec::new();
+        connected.connect_regular_transaction(
+            &spender,
+            &spender.tx_hash(),
+            51,
+            1,
+            Some(&mut stxos),
+            false,
+        );
+        assert_eq!(stxos.len(), scripts.len());
+        let journal = crate::chainio::serialize_spend_journal_entry(&stxos).expect("journal");
+        let decoded = crate::chainio::deserialize_spend_journal_entry(&journal, &[&spender])
+            .expect("journal decodes");
+        assert_eq!(decoded, stxos);
+        for (stxo, script) in stxos.iter().zip(&scripts) {
+            assert_eq!(stxo.pk_script, *script);
+            assert!(!stxo.pk_script.is_inline());
+        }
+
+        // Disconnect the block over a view without the outputs.
+        let mut block = stake_block(Vec::new());
+        block.transactions = alloc::vec![
+            MsgTx {
+                tx_out: alloc::vec![op_true_out(1)],
+                ..MsgTx::default()
+            },
+            spender.clone(),
+        ];
+        let hashes = collect_tx_hashes(&block.transactions);
+        let mut view = UtxoView::new();
+        view.disconnect_transactions(&block, &hashes, &decoded, false, false)
+            .expect("disconnect");
+        for (outpoint, entry) in outpoints.iter().zip(&entries) {
+            let restored = view.lookup_entry(outpoint).expect("restored");
+            assert!(!restored.is_spent());
+            assert_eq!(restored.pk_script(), entry.pk_script());
+            assert!(!restored.pk_script.is_inline());
+            assert_eq!(restored.amount(), entry.amount());
+            assert_eq!(restored.block_height(), entry.block_height());
+            assert_eq!(restored.block_index(), entry.block_index());
+            assert_eq!(restored.packed_flags, entry.packed_flags);
+        }
+    }
+
+    /// An output the view already holds takes the script of the
+    /// transaction that adds it again, also when the two scripts have
+    /// the same length.
+    #[test]
+    fn a_re_added_output_takes_the_new_script_of_the_same_length() {
+        let tx = MsgTx {
+            tx_in: alloc::vec![input_spending(
+                OutPoint {
+                    hash: Hash([0x07; 32]),
+                    index: 0,
+                    tree: 0,
+                },
+                1_000,
+                40,
+                1,
+            )],
+            tx_out: alloc::vec![TxOut {
+                value: 1_000,
+                version: 0,
+                pk_script: alloc::vec![0x51, 0x52, 0x53],
+            }],
+            ..MsgTx::default()
+        };
+        let outpoint = OutPoint {
+            hash: tx.tx_hash(),
+            index: 0,
+            tree: 0,
+        };
+        let mut view = UtxoView::new();
+        view.insert_entry(
+            &outpoint,
+            UtxoEntry::new(
+                5,
+                alloc::vec![0x60, 0x61, 0x62],
+                9,
+                9,
+                0,
+                false,
+                false,
+                TxType::Regular,
+                None,
+            ),
+        );
+        view.add_tx_outs(&tx, 50, 1, false);
+        let entry = view.lookup_entry(&outpoint).expect("output");
+        assert_eq!(entry.pk_script(), &[0x51, 0x52, 0x53]);
+        assert_eq!(entry.amount(), 1_000);
+    }
+
     /// The height the grandfathered same-block stake spend of the
     /// tests below sits at.  No network has one there; the tests hand
     /// the view their own lookup of the violating transaction by
@@ -3290,7 +3516,7 @@ mod tests {
                     view.entries
                         .get_mut(&key(&coinbase_out))
                         .expect("output")
-                        .pk_script = alloc::vec![0x52, 0x0a];
+                        .pk_script = crate::PkScript::from(&[0x52, 0x0a][..]);
                 }),
                 alloc::format!(
                     "{coinbase_output}: public key script mismatch (entry 520a, tx output 51)"
@@ -3345,7 +3571,7 @@ mod tests {
                     view.entries
                         .get_mut(&key(&coinbase_out))
                         .expect("output")
-                        .ticket_min_outs = Some(Vec::new());
+                        .ticket_min_outs = Some(Box::default());
                 }),
                 alloc::format!(
                     "{coinbase_output}: ticket minimal outputs presence mismatch (entry present \

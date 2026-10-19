@@ -2,9 +2,12 @@
 //! Unspent transaction output entries (dcrd internal/blockchain
 //! `utxoentry.go`).
 
+use alloc::boxed::Box;
 use alloc::vec::Vec;
 
 use dcroxide_stake::TxType;
+
+use crate::pkscript::PkScript;
 
 /// In-memory state bit: the entry was modified since load (dcrd
 /// `utxoStateModified`).
@@ -48,11 +51,17 @@ pub fn is_ticket_submission_output(tx_type: u8, tx_out_idx: u32) -> bool {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UtxoEntry {
     pub(crate) amount: i64,
-    pub(crate) pk_script: Vec<u8>,
+    /// The script, held in place when it is short, as the standard
+    /// payment scripts are (see [`PkScript`]).
+    pub(crate) pk_script: PkScript,
     /// The serialized minimal outputs of the ticket purchase, kept when
     /// this entry is a ticket submission output (dcrd
-    /// `ticketMinimalOutputs.data`).
-    pub(crate) ticket_min_outs: Option<Vec<u8>>,
+    /// `ticketMinimalOutputs.data`).  A boxed slice rather than a
+    /// vector: the eight bytes it saves keep the entry at the size it
+    /// had before the script moved in place (72 bytes on 64-bit
+    /// targets), and with it the nodes of the view's and the cache's
+    /// maps.
+    pub(crate) ticket_min_outs: Option<Box<[u8]>>,
     pub(crate) block_height: u32,
     pub(crate) block_index: u32,
     pub(crate) script_version: u16,
@@ -98,6 +107,33 @@ impl UtxoEntry {
         has_expiry: bool,
         tx_type: TxType,
         ticket_min_outs: Option<Vec<u8>>,
+    ) -> UtxoEntry {
+        UtxoEntry::with_script(
+            amount,
+            PkScript::from(pk_script),
+            block_height,
+            block_index,
+            script_version,
+            coinbase,
+            has_expiry,
+            tx_type,
+            ticket_min_outs.map(Vec::into_boxed_slice),
+        )
+    }
+
+    /// [`UtxoEntry::new`] for a script and minimal outputs already in
+    /// the forms the entry holds them in.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn with_script(
+        amount: i64,
+        pk_script: PkScript,
+        block_height: u32,
+        block_index: u32,
+        script_version: u16,
+        coinbase: bool,
+        has_expiry: bool,
+        tx_type: TxType,
+        ticket_min_outs: Option<Box<[u8]>>,
     ) -> UtxoEntry {
         UtxoEntry {
             amount,
@@ -176,7 +212,7 @@ impl UtxoEntry {
 
     /// The output public key script (dcrd `PkScript`).
     pub fn pk_script(&self) -> &[u8] {
-        &self.pk_script
+        self.pk_script.as_slice()
     }
 
     /// The output script version (dcrd `ScriptVersion`).
@@ -197,5 +233,60 @@ impl UtxoEntry {
         self.ticket_min_outs
             .as_ref()
             .map(|data| crate::chainio::deserialize_to_minimal_outputs(data).0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Holding the script in place does not grow the entry: the maps
+    /// of the view and the cache keep nodes of the same size, and the
+    /// cache's `Option` still costs nothing.
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn an_entry_keeps_its_size() {
+        assert_eq!(core::mem::size_of::<UtxoEntry>(), 72);
+        assert_eq!(core::mem::size_of::<Option<UtxoEntry>>(), 72);
+    }
+
+    /// The vector forms [`UtxoEntry::new`] takes land as the same
+    /// bytes, and a standard script is held in place.
+    #[test]
+    fn new_keeps_the_bytes_it_is_given() {
+        let script = [&[0x76, 0xa9, 0x14][..], &[0x5a; 20], &[0x88, 0xac]].concat();
+        let min_outs = alloc::vec![1u8, 2, 3];
+        let entry = UtxoEntry::new(
+            7,
+            script.clone(),
+            1,
+            2,
+            0,
+            false,
+            false,
+            TxType::SStx,
+            Some(min_outs.clone()),
+        );
+        assert_eq!(entry.pk_script(), script.as_slice());
+        assert!(entry.pk_script.is_inline());
+        assert_eq!(
+            entry.ticket_minimal_outputs_data(),
+            Some(min_outs.as_slice())
+        );
+        let long = alloc::vec![0x51; 67];
+        let entry = UtxoEntry::new(
+            7,
+            long.clone(),
+            1,
+            2,
+            0,
+            false,
+            false,
+            TxType::Regular,
+            None,
+        );
+        assert_eq!(entry.pk_script(), long.as_slice());
+        assert!(!entry.pk_script.is_inline());
+        assert_eq!(entry.ticket_minimal_outputs_data(), None);
     }
 }

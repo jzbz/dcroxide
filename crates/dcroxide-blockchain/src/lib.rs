@@ -43,6 +43,7 @@ pub mod difficulty;
 mod error;
 pub mod gotime;
 pub mod notifications;
+mod pkscript;
 pub mod process;
 mod ruleerror;
 #[cfg(any(test, feature = "std"))]
@@ -59,6 +60,7 @@ pub mod validate;
 pub use blockhashes::{BlockTxHashes, HashedBlock};
 pub use compress::CURRENT_COMPRESSION_VERSION;
 pub use error::Error;
+pub use pkscript::PkScript;
 pub use ruleerror::{RuleError, RuleErrorKind, render_multi_error};
 pub use utxoentry::{
     UTXO_STATE_FRESH, UTXO_STATE_MODIFIED, UTXO_STATE_SPENT, UtxoEntry, encode_utxo_flags,

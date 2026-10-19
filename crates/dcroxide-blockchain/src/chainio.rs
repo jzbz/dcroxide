@@ -16,10 +16,11 @@ use dcroxide_uint256::Uint256;
 use dcroxide_wire::{BlockHeader, MAX_BLOCK_HEADER_PAYLOAD, MsgTx};
 
 use crate::compress::{
-    compress_tx_out_amount, compressed_tx_out_size, decode_compressed_tx_out, decode_flags,
+    compress_tx_out_amount, compressed_tx_out_size, decode_compressed_tx_out_script, decode_flags,
     decompress_tx_out_amount, deserialize_vlq, put_compressed_tx_out, put_vlq, serialize_size_vlq,
 };
 use crate::error::{Error, deserialize_error};
+use crate::pkscript::PkScript;
 use crate::utxoio::read_deserialize_size_of_minimal_outputs;
 
 /// The size of a serialized block header (dcrd `blockHdrSize`).
@@ -248,8 +249,9 @@ pub struct SpentTxOut {
     /// The amount of the output (carried by the spending input on
     /// disk, not the journal entry itself).
     pub amount: i64,
-    /// The public key script of the output.
-    pub pk_script: Vec<u8>,
+    /// The public key script of the output, held in place when it is
+    /// short (see [`PkScript`]).
+    pub pk_script: PkScript,
     /// The serialized ticket minimal outputs, present only for ticket
     /// submission outputs.
     pub ticket_min_outs: Option<Vec<u8>>,
@@ -349,9 +351,9 @@ pub fn put_spent_tx_out(target: &mut [u8], stxo: &SpentTxOut) -> usize {
 /// index come from the spending input, exactly as dcrd populates them.
 #[allow(
     clippy::arithmetic_side_effects,
-    reason = "offset <= serialized.len(): it grows only by the bytes decode_compressed_tx_out \
-              and read_deserialize_size_of_minimal_outputs report consuming from \
-              serialized[offset..]"
+    reason = "offset <= serialized.len(): it grows only by the bytes \
+              decode_compressed_tx_out_script and read_deserialize_size_of_minimal_outputs \
+              report consuming from serialized[offset..]"
 )]
 pub fn decode_spent_tx_out(
     serialized: &[u8],
@@ -369,7 +371,7 @@ pub fn decode_spent_tx_out(
 
     // Decode the compressed txout (no amount is serialized).
     let (_, script_version, script, bytes_read) =
-        decode_compressed_tx_out(&serialized[offset..], false)
+        decode_compressed_tx_out_script(&serialized[offset..], false)
             .map_err(|e| deserialize_error(format!("unable to decode txout: {e}")))?;
     offset += bytes_read;
 

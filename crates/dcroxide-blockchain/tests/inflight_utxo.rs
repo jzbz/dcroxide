@@ -271,7 +271,7 @@ fn disapproved_parent() -> (UtxoView, MsgTx, impl Fn(&OutPoint) -> Option<UtxoEn
     };
     let stxos = vec![SpentTxOut {
         amount: ext_entry.amount(),
-        pk_script: ext_entry.pk_script().to_vec(),
+        pk_script: ext_entry.pk_script().into(),
         ticket_min_outs: None,
         block_height: 50,
         block_index: 1,
