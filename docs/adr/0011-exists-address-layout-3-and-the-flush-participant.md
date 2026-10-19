@@ -1093,3 +1093,12 @@ published at `:1440`, the hooks dropped by a rollback at `:1181`, and
 `finished` and the journal load are at `:207`, `:218`, `:226`, `:341`
 and `:393`, and `allows_deferred_finish` at `:368`. The cited lines of
 `existsaddrindex.rs`, of `policy.rs` and of `dcroxide.rs` did not move.
+
+> **Note, 2026-10-18.** The change that folds the overlay's newest layer
+> into the one below once no reader holds that one moved the lines of
+> `dbcache.rs` cited in the addendum above, whose numbers stay as they
+> were written, down by 84: `has_work` is now asked at `:1182`, the
+> prefix guard is at `:1217`, `contribute` is called at `:1253`, the
+> commit at `:1301` and the participant-only flush's count at `:1367`.
+> The cited lines of the other files did not move, and the functions
+> named are unchanged.

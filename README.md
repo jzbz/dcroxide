@@ -17,7 +17,7 @@ JSON-RPC/websocket server, the tool commands, the pipe IPC lifecycle,
 and the Windows service wrapper. The deliberate non-ports are small
 and documented in PARITY.md (Go GC tuning, the pprof servers, UPnP,
 the Windows event log, and the wallet-side mixclient). The test suite
-runs 2,436 tests across 440 suites on Linux, most differential against
+runs 2,442 tests across 440 suites on Linux, most differential against
 dcrd itself or replaying sessions generated inside dcrd's own packages.
 
 Since the surface completed, four rounds of work have landed on it. A
@@ -65,9 +65,16 @@ to blocks only in syncs: `8fc9160`, which holds them, was run in four on
 2026-10-16. The commits after it, which port dcrd's changes since
 `6f6cf21b`, some of them to the consensus rules, and move the metadata
 commit to a thread of its own, were first put to blocks on 2026-10-17,
-in syncs of `88c46c3`, the code as it stands (Performance), each of
-which validated in full only the blocks after the assume-valid block
-and ended with the UTXO set that dcrd's syncs of that day ended with.
+in syncs of `88c46c3` (Performance), each of which validated in full
+only the blocks after the assume-valid block and ended with the UTXO set
+that dcrd's syncs of that day ended with. The commits after `fdd7a83`
+have been put to blocks only in builds made from a worktree, not from
+their trees, in syncs of 2026-10-18 from a block server on another
+machine on the same LAN, each of which validated in full only the blocks
+after the assume-valid block and had dcrd's block at height 1,116,035,
+and in three syncs from the loopback server that ended with that same
+UTXO set (the bench ledger, "Rungs from a block server on the LAN, two
+changes held for their memory, and dcrd v2.1.7").
 That the rules reject what dcrd's reject rests on the test batteries
 described below, not on a sync, and none of it says the node is safe to
 operate. **Do not expose it to the internet and do not use it with

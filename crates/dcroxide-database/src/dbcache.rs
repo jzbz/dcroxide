@@ -16,12 +16,17 @@
 //! commit writes into the newest layer in place while this cache is
 //! that layer's only owner; the moment a reader holds a snapshot
 //! naming it, the layer is frozen and the commit starts a fresh layer
-//! on top.  Layers are merged back together geometrically — the
-//! newest layer merges into the next older one once it has grown to
-//! half that layer's entry count — which keeps the stack shallow
-//! (typically one to three layers, never more than [`MAX_LAYERS`]) at
-//! an amortized cost proportional to the data committed, never to the
-//! size of the whole overlay.
+//! on top.  The newest layer folds into the next older one at the
+//! first commit that finds no snapshot naming that one any more, so a
+//! layer a short reader split off costs about the rows committed while
+//! the reader held it, and the stack is back to one layer, above any
+//! layers a flush in flight captured, as soon as no reader overlaps a
+//! commit.  While readers keep a layer frozen, layers are merged back
+//! together geometrically — the newest layer merges into the next older
+//! one once it has grown to half that layer's entry count — which keeps
+//! the stack shallow (typically one to three layers, never more than
+//! [`MAX_LAYERS`]) at an amortized cost proportional to the data
+//! committed, never to the size of the whole overlay.
 //!
 //! Because a sealed layer is immutable, a key rewritten while a reader
 //! held a snapshot is stored once per layer it was written into, until
@@ -578,45 +583,112 @@ impl<'a> Iterator for LayerMerge<'a> {
 /// The caller subtracts the difference from the running total, which is
 /// what keeps that total a measure of memory actually held rather than of
 /// the overlay's logical contents.
+///
+/// The smaller layer is the one walked: its entries go into the larger
+/// map, so a merge costs one map insert per entry of the smaller layer
+/// whichever of the two is newer.  When that is the older layer, an
+/// older entry the newer layer already holds is dropped rather than
+/// inserted, which leaves the same map and reclaims the same bytes as
+/// walking the newer layer would.
 fn merge_newest_pair(layers: &mut Vec<Arc<CacheLayer>>) -> u64 {
     if layers.len() < 2 {
         return 0;
     }
     let newer = layers.remove(0);
     let older = layers.remove(0);
-    // Start from the older layer — taking it outright when no snapshot
-    // still names it — and let the newer layer overwrite.
-    let mut merged = match Arc::try_unwrap(older) {
-        Ok(map) => map,
-        Err(shared) => (*shared).clone(),
-    };
     let mut reclaimed = 0u64;
-    let mut absorb = |key: Vec<u8>, entry: Option<Vec<u8>>| {
-        let key_len = key.len();
-        if let Some(shadowed) = merged.insert(key, entry) {
-            // The older copy of this key is gone: its entry, its key
-            // bytes and, when it held one, its value bytes are no longer
-            // retained.
-            reclaimed = reclaimed.saturating_add(node_size(key_len, shadowed.as_deref()));
+    let merged = if newer.len() > older.len() {
+        // Start from the newer layer, and add each older entry it does
+        // not shadow.
+        let mut merged = Arc::unwrap_or_clone(newer);
+        let mut keep = |key: Vec<u8>, entry: Option<Vec<u8>>| {
+            #[cfg(test)]
+            count_merge_insert();
+            match merged.entry(key) {
+                std::collections::btree_map::Entry::Vacant(slot) => {
+                    slot.insert(entry);
+                }
+                // The newer copy stays, and this older one is no longer
+                // retained.
+                std::collections::btree_map::Entry::Occupied(slot) => {
+                    reclaimed =
+                        reclaimed.saturating_add(node_size(slot.key().len(), entry.as_deref()));
+                }
+            }
+        };
+        match Arc::try_unwrap(older) {
+            Ok(map) => map.into_iter().for_each(|(key, entry)| keep(key, entry)),
+            Err(shared) => shared
+                .iter()
+                .for_each(|(key, entry)| keep(key.clone(), entry.clone())),
         }
+        merged
+    } else {
+        // Start from the older layer — taking it outright when no
+        // snapshot still names it — and let the newer layer overwrite.
+        let mut merged = Arc::unwrap_or_clone(older);
+        let mut absorb = |key: Vec<u8>, entry: Option<Vec<u8>>| {
+            #[cfg(test)]
+            count_merge_insert();
+            let key_len = key.len();
+            if let Some(shadowed) = merged.insert(key, entry) {
+                // The older copy of this key is gone: its entry, its key
+                // bytes and, when it held one, its value bytes are no
+                // longer retained.
+                reclaimed = reclaimed.saturating_add(node_size(key_len, shadowed.as_deref()));
+            }
+        };
+        // The newer layer is moved rather than copied when nothing else
+        // names it, which inside `compact` is always: it was just built
+        // by `commit_pending` or by the previous merge.
+        match Arc::try_unwrap(newer) {
+            Ok(map) => map.into_iter().for_each(|(key, entry)| absorb(key, entry)),
+            Err(shared) => shared
+                .iter()
+                .for_each(|(key, entry)| absorb(key.clone(), entry.clone())),
+        }
+        merged
     };
-    // The newer layer is moved rather than copied when nothing else
-    // names it, which inside `compact` is always: it was just built by
-    // `commit_pending` or by the previous merge.
-    match Arc::try_unwrap(newer) {
-        Ok(map) => map.into_iter().for_each(|(key, entry)| absorb(key, entry)),
-        Err(shared) => shared
-            .iter()
-            .for_each(|(key, entry)| absorb(key.clone(), entry.clone())),
-    }
     layers.insert(0, Arc::new(merged));
     reclaimed
 }
 
+#[cfg(test)]
+thread_local! {
+    /// How many entries the calling thread's merges have walked into
+    /// another layer, for the tests of what a merge costs.
+    static MERGE_INSERTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Count one entry walked into another layer by a merge.
+#[cfg(test)]
+fn count_merge_insert() {
+    MERGE_INSERTS.with(|n| n.set(n.get().saturating_add(1)));
+}
+
 /// Keep the layer stack shallow, returning the retained bytes the
-/// merges reclaimed.  The newest layer merges down as soon as it has
-/// grown to half the entry count of the layer below it, which keeps two
-/// properties:
+/// merges reclaimed.
+///
+/// The newest layer folds into the one below it at once whenever no
+/// snapshot names that layer any more: the cache then holds the only
+/// handle on it, so the merge takes it without a copy, and costs one map
+/// insert per entry of the smaller of the two.  The folds go on down the
+/// stack for as long as the next layer is unshared too.  A layer that a
+/// reader's snapshot forced the commit to seal holds only what was
+/// committed while some reader held the layer below, typically one
+/// commit's rows, so the stack above any layers a flush in flight
+/// captured returns to a single layer at the first commit no reader
+/// overlaps, as it never leaves one while no reader overlaps any.  The
+/// readers that split the stack in practice are short — a transaction
+/// that reads a few rows while another thread commits — and without the
+/// fold the layer they split off grew in place until the rule below
+/// merged it, re-inserting about half the older layer's entry count at
+/// once and leaving every lookup in between to probe one more layer.
+///
+/// While a snapshot still names the layer below, the newest layer
+/// merges down only once it has grown to half that layer's entry count,
+/// which copies the entries of the layer below (the snapshot keeps the
+/// original), and keeps two properties:
 ///
 /// - a merge costs at most about three times the data that caused it,
 ///   and cannot recur until that much new data arrives again, so the
@@ -654,9 +726,18 @@ fn compact(layers: &mut Vec<Arc<CacheLayer>>, pinned: usize) -> u64 {
     let mut reclaimed = 0u64;
     // `layers.len() - pinned >= 2` keeps both arguments of every merge
     // above the barrier: layers are only ever prepended, so the pinned
-    // region stays the tail for as long as it is pinned.
+    // region stays the tail for as long as it is pinned.  (A pinned
+    // layer is never unshared either, since the flush that pinned it
+    // holds a handle on it until it retires it.)
+    //
+    // A strong count of one means `layers` holds the only handle, and a
+    // handle is made only from another, so the merge's `try_unwrap`
+    // takes the layer without a copy.  Nothing rests on that but the
+    // copy: a layer some snapshot still named would be copied, and the
+    // snapshot would keep the original.
     while layers.len().saturating_sub(pinned) >= 2
-        && layers[0].len().saturating_mul(2) >= layers[1].len()
+        && (Arc::strong_count(&layers[1]) == 1
+            || layers[0].len().saturating_mul(2) >= layers[1].len())
     {
         reclaimed = reclaimed.saturating_add(merge_newest_pair(layers));
     }
@@ -813,7 +894,10 @@ impl DbCache {
     /// one `BTreeMap` insert per key and nothing else.  While a reader
     /// holds a snapshot naming the layer, the layer stays frozen and
     /// this commit seals a fresh layer above it instead, so no
-    /// transaction ever copies the overlay to make progress.
+    /// transaction ever copies the overlay to make progress.  The first
+    /// commit that finds no snapshot naming the frozen layer folds the
+    /// fresh one back into it ([`compact`]), unless a flush in flight
+    /// captured that layer.
     ///
     /// The transaction's bucket index rows are applied to
     /// [`Self::buckets`] as well, here and nowhere else, so the map and
@@ -2770,6 +2854,406 @@ mod tests {
              so the stack is pinned near it",
             total as f64 / ROUNDS as f64
         );
+    }
+
+    /// How many entries this thread's merges have walked so far.
+    fn merge_inserts() -> u64 {
+        super::MERGE_INSERTS.with(|n| n.get())
+    }
+
+    /// Commit `rows` puts of an eight-byte value, keyed `<tag>-<i>`.
+    fn commit_rows(cache: &mut DbCache, tag: &str, rows: usize) {
+        let puts = (0..rows)
+            .map(|i| (format!("{tag}-{i:06}").into_bytes(), vec![0x5a; 8]))
+            .collect();
+        cache.commit_pending(puts, std::iter::empty());
+    }
+
+    /// The overlay as one flat map, from the merged view.
+    fn flat(cache: &DbCache) -> FlatView {
+        cache
+            .cached
+            .merged()
+            .map(|(k, v)| (k.to_vec(), v.clone()))
+            .collect()
+    }
+
+    /// A layer that a reader's snapshot made a commit seal folds back
+    /// into the layer below at the first commit that finds no snapshot
+    /// naming that layer, whatever the two layers' sizes, and the fold
+    /// walks only the rows the sealed layer took, never the wide layer
+    /// below.  While the reader holds its snapshot, its layer stays in
+    /// the stack as it is, with no copy taken.
+    ///
+    /// The geometric rule alone leaves the split for as long as the new
+    /// layer is under half the old one, here 498 more rows: this is the
+    /// stack the exists-address index's tip read, a snapshot open while
+    /// the block thread commits, kept three to four layers deep in the
+    /// flushes of a sync, where the index-off syncs kept one.
+    #[test]
+    fn a_layer_a_reader_split_off_folds_back_once_the_reader_lets_go() {
+        let mut cache = DbCache::new();
+        commit_rows(&mut cache, "bottom", 1000);
+        assert_eq!(cache.cached.layers.len(), 1);
+
+        let reader = Arc::clone(&cache.cached);
+        let frozen = flat(&cache);
+        commit_rows(&mut cache, "split", 2);
+        assert_eq!(cache.cached.layers.len(), 2, "the reader froze the layer");
+        assert!(
+            Arc::ptr_eq(&cache.cached.layers[1], &reader.layers[0]),
+            "the reader's layer is still the one below, not a copy of it"
+        );
+
+        // Still held: the commit writes into the new layer in place and
+        // merges nothing.
+        let before = merge_inserts();
+        commit_rows(&mut cache, "held", 1);
+        assert_eq!(cache.cached.layers.len(), 2);
+        assert!(Arc::ptr_eq(&cache.cached.layers[1], &reader.layers[0]));
+        assert_eq!(merge_inserts(), before, "nothing merged under the reader");
+
+        // Let go: the next commit folds the three rows above into the
+        // wide layer, and walks only those three and its own one.
+        let reader_view: FlatView = reader
+            .merged()
+            .map(|(k, v)| (k.to_vec(), v.clone()))
+            .collect();
+        assert_eq!(reader_view, frozen, "the reader saw no commit after it");
+        drop(reader);
+        commit_rows(&mut cache, "after", 1);
+        assert_eq!(
+            cache.cached.layers.len(),
+            1,
+            "the split layer did not fold back once no reader held the layer below"
+        );
+        assert_eq!(
+            merge_inserts() - before,
+            4,
+            "the fold walked the wide layer"
+        );
+        assert_eq!(cache.cached.layers[0].len(), 1004);
+        assert_eq!(cache.total_size, retained_bytes(&cache));
+        assert_eq!(cache.total_size, logical_bytes(&cache));
+    }
+
+    /// The fold goes on down the stack: a stack two readers split three
+    /// deep, with layers the geometric rule leaves alone (10 rows over
+    /// 100 over 1000), is back to one layer at the first commit after
+    /// both let go.  Each fold walks the smaller layer, so the cascade
+    /// walks the rows above the wide layer and never the wide layer.
+    #[test]
+    fn a_stack_three_deep_folds_to_one_at_the_first_commit_no_reader_overlaps() {
+        let mut cache = DbCache::new();
+        commit_rows(&mut cache, "base", 1000);
+        let first = Arc::clone(&cache.cached);
+        commit_rows(&mut cache, "mid", 100);
+        let second = Arc::clone(&cache.cached);
+        commit_rows(&mut cache, "top", 10);
+        assert_eq!(cache.cached.layers.len(), 3, "each reader froze a layer");
+        let mut expected: BTreeMap<Vec<u8>, Option<Vec<u8>>> = flat(&cache).into_iter().collect();
+
+        drop((first, second));
+        let before = merge_inserts();
+        commit_rows(&mut cache, "after", 1);
+        expected.insert(b"after-000000".to_vec(), Some(vec![0x5a; 8]));
+        assert_eq!(
+            cache.cached.layers.len(),
+            1,
+            "the folds stopped short of the bottom layer"
+        );
+        // The top layer, with this commit's row, folds into the middle
+        // one (11 entries walked), and that into the base (111 walked).
+        assert_eq!(
+            merge_inserts() - before,
+            11 + 111,
+            "a fold walked the wide layer"
+        );
+        assert_eq!(cache.cached.layers[0].len(), 1111);
+        assert_eq!(flat(&cache), expected.into_iter().collect::<FlatView>());
+        assert_eq!(cache.total_size, retained_bytes(&cache));
+        assert_eq!(cache.total_size, logical_bytes(&cache));
+    }
+
+    /// The pattern of a sync with the exists-address index on: once a
+    /// block, a reader holds a snapshot across one commit, and the
+    /// block's other commits run with no reader.  Every commit with no
+    /// reader leaves one layer, and a flush captures one, where the
+    /// geometric rule alone left the stack two deep until the split-off
+    /// layer reached half the one below.
+    ///
+    /// A key rewritten in every block, and a key deleted under the
+    /// reader and written again after it, keep the folded view equal to
+    /// a flat map's, with the size accounting equal to what the one
+    /// layer holds.
+    #[test]
+    fn a_reader_over_one_commit_a_block_leaves_one_layer_to_capture() {
+        let mut cache = DbCache::new();
+        commit_rows(&mut cache, "bottom", 1000);
+        let mut expected: BTreeMap<Vec<u8>, Option<Vec<u8>>> = flat(&cache).into_iter().collect();
+        for block in 0..200u32 {
+            let reader = Arc::clone(&cache.cached);
+            let mut puts = BTreeMap::new();
+            puts.insert(b"hot".to_vec(), block.to_be_bytes().to_vec());
+            puts.insert(format!("blk-{block:06}").into_bytes(), vec![1; 4]);
+            let gone = format!("bottom-{:06}", block % 1000).into_bytes();
+            cache.commit_pending(puts.clone(), std::iter::once(gone.clone()));
+            assert_eq!(
+                cache.cached.layers.len(),
+                2,
+                "block {block}: the reader froze the layer"
+            );
+            for (key, value) in puts {
+                expected.insert(key, Some(value));
+            }
+            expected.insert(gone.clone(), None);
+            drop(reader);
+            for commit in 0..3u32 {
+                let mut puts = BTreeMap::new();
+                puts.insert(format!("row-{block:06}-{commit}").into_bytes(), vec![2; 6]);
+                if commit == 2 {
+                    puts.insert(gone.clone(), b"back".to_vec());
+                }
+                cache.commit_pending(puts.clone(), std::iter::empty());
+                assert_eq!(
+                    cache.cached.layers.len(),
+                    1,
+                    "block {block}, commit {commit}: no reader, yet the stack is split"
+                );
+                for (key, value) in puts {
+                    expected.insert(key, Some(value));
+                }
+            }
+        }
+        assert_eq!(flat(&cache), expected.into_iter().collect::<FlatView>());
+        assert_eq!(cache.total_size, retained_bytes(&cache));
+        let batch = cache.begin_flush();
+        assert_eq!(batch.memory.pinned_layers, 1);
+        cache.finish_flush(batch, Some(super::FlushOutcome::for_test()));
+        assert!(cache.cached.layers.is_empty());
+    }
+
+    /// A merge walks the smaller of its two layers into the larger, and
+    /// leaves the same map and reclaims the same bytes whichever it
+    /// walks: the newer entry wins for a key both hold, a pending
+    /// deletion included, and the older copy's bytes are reclaimed.
+    /// Checked against a merge done the obvious way, for layers of
+    /// either size order, either of them still named by a snapshot or
+    /// not, and the snapshot's layer left as it was.
+    #[test]
+    fn a_merge_walks_the_smaller_layer_and_the_newer_entry_wins() {
+        /// A layer of `len` entries over keys drawn from a small space,
+        /// so the two layers share keys; about one in four a deletion.
+        fn layer(len: usize, seed: &mut u64) -> super::CacheLayer {
+            let mut map = super::CacheLayer::new();
+            while map.len() < len {
+                *seed ^= *seed << 13;
+                *seed ^= *seed >> 7;
+                *seed ^= *seed << 17;
+                let key = format!("k{:05}", *seed % 400).into_bytes();
+                let entry = (!seed.is_multiple_of(4)).then(|| vec![0xab; (*seed % 37) as usize]);
+                map.insert(key, entry);
+            }
+            map
+        }
+
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        for (newer_len, older_len) in [
+            (0, 5),
+            (5, 0),
+            (3, 100),
+            (100, 3),
+            (50, 50),
+            (51, 50),
+            (50, 51),
+            (1, 300),
+            (300, 1),
+            (150, 200),
+            (200, 150),
+        ] {
+            for (newer_shared, older_shared) in
+                [(false, false), (true, false), (false, true), (true, true)]
+            {
+                let newer = layer(newer_len, &mut seed);
+                let older = layer(older_len, &mut seed);
+
+                // The obvious merge: the older map, overwritten by the
+                // newer, counting each older copy overwritten.
+                let mut want = older.clone();
+                let mut want_reclaimed = 0u64;
+                for (key, entry) in &newer {
+                    if let Some(shadowed) = want.insert(key.clone(), entry.clone()) {
+                        want_reclaimed += node_size(key.len(), shadowed.as_deref());
+                    }
+                }
+
+                let (newer_copy, older_copy) = (newer.clone(), older.clone());
+                let mut layers = vec![Arc::new(newer), Arc::new(older)];
+                let snapshot_newer = newer_shared.then(|| Arc::clone(&layers[0]));
+                let snapshot_older = older_shared.then(|| Arc::clone(&layers[1]));
+                let before = merge_inserts();
+                let reclaimed = super::merge_newest_pair(&mut layers);
+                let case = format!(
+                    "newer {newer_len} (shared {newer_shared}), older {older_len} (shared \
+                     {older_shared})"
+                );
+                assert_eq!(layers.len(), 1, "{case}");
+                assert_eq!(*layers[0], want, "{case}");
+                assert_eq!(reclaimed, want_reclaimed, "{case}");
+                assert_eq!(
+                    merge_inserts() - before,
+                    newer_len.min(older_len) as u64,
+                    "{case}: the merge did not walk the smaller layer"
+                );
+                if let Some(snapshot) = snapshot_newer {
+                    assert_eq!(*snapshot, newer_copy, "{case}");
+                }
+                if let Some(snapshot) = snapshot_older {
+                    assert_eq!(*snapshot, older_copy, "{case}");
+                }
+            }
+        }
+    }
+
+    /// Layers committed beside a flush in flight fold among themselves
+    /// and leave the captured layer in place: with a reader over one
+    /// commit, the stack above the captured layer is back to one layer
+    /// at the next commit with no reader, the captured layer is still
+    /// the tail and the same `Arc`, and the retirement leaves exactly the
+    /// rows committed beside the flush.
+    ///
+    /// That no fold reaches into the captured layers this test cannot
+    /// show on its own, since the flush's handle keeps them shared
+    /// whatever [`compact`]'s barrier says; the barrier is pinned by
+    /// `a_commit_during_a_flush_neither_merges_into_it_nor_is_lost_by_it`.
+    #[test]
+    fn layers_committed_beside_a_flush_fold_among_themselves() {
+        let mut cache = DbCache::new();
+        commit_rows(&mut cache, "captured", 1000);
+        let captured = Arc::clone(&cache.cached.layers[0]);
+        let batch = cache.begin_flush();
+
+        commit_rows(&mut cache, "beside", 10);
+        assert_eq!(cache.cached.layers.len(), 2, "the flush froze its layer");
+        let reader = Arc::clone(&cache.cached);
+        commit_rows(&mut cache, "read", 2);
+        assert_eq!(
+            cache.cached.layers.len(),
+            3,
+            "the reader froze the layer above"
+        );
+        drop(reader);
+        commit_rows(&mut cache, "after", 1);
+        assert_eq!(
+            cache.cached.layers.len(),
+            2,
+            "the layers above the flush did not fold together"
+        );
+        assert!(
+            Arc::ptr_eq(&cache.cached.layers[1], &captured),
+            "the captured layer is no longer the tail"
+        );
+        drop(captured);
+
+        cache.finish_flush(batch, Some(super::FlushOutcome::for_test()));
+        assert_eq!(cache.cached.layers.len(), 1);
+        let keys: Vec<Vec<u8>> = flat(&cache).into_iter().map(|(k, _)| k).collect();
+        let mut want: Vec<Vec<u8>> = (0..10)
+            .map(|i| format!("beside-{i:06}"))
+            .chain([
+                "after-000000".into(),
+                "read-000000".into(),
+                "read-000001".into(),
+            ])
+            .map(String::into_bytes)
+            .collect();
+        want.sort();
+        assert_eq!(
+            keys, want,
+            "the retirement kept other rows than those committed beside it"
+        );
+        assert_eq!(cache.total_size, retained_bytes(&cache));
+    }
+
+    /// Through transactions: readers that began before a commit keep the
+    /// view they began with while later commits seal, merge and fold the
+    /// layers around them, and once none is left the next commit returns
+    /// the overlay to one layer holding the newest value of every key.
+    #[test]
+    fn readers_keep_their_view_while_the_layers_around_them_fold() {
+        let (_dir, db) = new_db();
+        {
+            let tx = db.begin(true).expect("begin write");
+            let bucket = tx.metadata().create_bucket(b"cache").expect("create");
+            for i in 0..100u32 {
+                bucket
+                    .put(format!("row-{i:04}").as_bytes(), b"0")
+                    .expect("put");
+            }
+            tx.commit().expect("commit");
+        }
+        let write = |puts: &[(&str, &[u8])], deletes: &[&str]| {
+            let tx = db.begin(true).expect("begin write");
+            let bucket = tx.metadata().bucket(b"cache").expect("bucket");
+            for (key, value) in puts {
+                bucket.put(key.as_bytes(), value).expect("put");
+            }
+            for key in deletes {
+                bucket.delete(key.as_bytes()).expect("delete");
+            }
+            tx.commit().expect("commit");
+        };
+        let read = |tx: &crate::Transaction, key: &str| {
+            tx.metadata()
+                .bucket(b"cache")
+                .expect("bucket")
+                .get(key.as_bytes())
+        };
+
+        let first = db.begin(false).expect("begin read");
+        write(&[("row-0000", b"1"), ("new-a", b"1")], &["row-0001"]);
+        let second = db.begin(false).expect("begin read");
+        write(&[("row-0000", b"2")], &["new-a"]);
+        assert!(db.overlay_layer_count() > 1, "the readers split the stack");
+        drop(first);
+        write(&[("row-0002", b"3")], &[]);
+        let third = db.begin(false).expect("begin read");
+        write(&[("row-0000", b"4"), ("new-b", b"4")], &[]);
+        drop(second);
+        write(&[("row-0003", b"5")], &[]);
+        assert!(
+            db.overlay_layer_count() > 1,
+            "the third reader holds the layer below"
+        );
+
+        assert_eq!(read(&third, "row-0000"), Some(b"2".to_vec()));
+        assert_eq!(read(&third, "row-0001"), None);
+        assert_eq!(read(&third, "row-0002"), Some(b"3".to_vec()));
+        assert_eq!(read(&third, "row-0003"), Some(b"0".to_vec()));
+        assert_eq!(read(&third, "new-a"), None);
+        assert_eq!(read(&third, "new-b"), None);
+        drop(third);
+
+        write(&[("row-0004", b"6")], &[]);
+        assert_eq!(
+            db.overlay_layer_count(),
+            1,
+            "no reader is left, yet the commit left the stack split"
+        );
+        let tx = db.begin(false).expect("begin read");
+        for (key, want) in [
+            ("row-0000", Some(&b"4"[..])),
+            ("row-0001", None),
+            ("row-0002", Some(b"3")),
+            ("row-0003", Some(b"5")),
+            ("row-0004", Some(b"6")),
+            ("row-0005", Some(b"0")),
+            ("new-a", None),
+            ("new-b", Some(b"4")),
+        ] {
+            assert_eq!(read(&tx, key).as_deref(), want, "{key}");
+        }
+        tx.rollback().expect("rollback");
     }
 
     /// The layers a flush retired are freed by the thread that flushed,

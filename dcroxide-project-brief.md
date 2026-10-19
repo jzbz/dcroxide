@@ -42,7 +42,7 @@ assembles them end to end: config and CLI, the chain engine with full
 consensus validation, mempool and fee estimation, mining and the CPU miner, the
 P2P server with sync, relay, and StakeShuffle mixing message relay, the
 JSON-RPC/websocket server, the tool commands, the pipe IPC lifecycle, and the
-Windows service wrapper. The gate runs 2,436 tests across 440 suites on Linux,
+Windows service wrapper. The gate runs 2,442 tests across 440 suites on Linux,
 most of them differential against dcrd or replaying sessions generated inside dcrd's own
 packages. The parity target moved six times during the port, from
 `release-v2.1.5` to upstream master `452c1a6c` and then through `29f17894`,
@@ -266,11 +266,11 @@ What Phase 15 has covered so far:
   lost 9.5% on m1, and `DCROXIDE_DB_SYNC_COMMIT=1` restores the committing
   thread. The commits after `8fc9160`, the dcrd port's and this one among
   them, were first run in syncs on 2026-10-17 (next item).
-- **On 2026-10-17 the code as it stands, `88c46c3`, took a median of
-  396.25 s, 6.6 minutes, over four syncs against dcrd v2.1.7's
-  2,944.4 s and 2,926.4 s, 7.43x and 7.39x in one session**, on m3 from
-  the same dcrd block server, whose data stayed cached throughout, with
-  transparent huge pages at `madvise` where 2026-10-16 ran at `always`.
+- **On 2026-10-17 `88c46c3` took a median of 396.25 s, 6.6 minutes, over
+  four syncs against dcrd v2.1.7's 2,944.4 s and 2,926.4 s, 7.43x and
+  7.39x in one session**, on m3 from the same dcrd block server, whose
+  data stayed cached throughout, with transparent huge pages at
+  `madvise` where 2026-10-16 ran at `always`.
   With the exists-address index off, two runs of 343.9 s and 344.0 s
   against one dcrd run of 1,317.2 s, 3.83x. Two runs with
   `DCROXIDE_DB_SYNC_COMMIT=1` took 430.4 s and 428.0 s, so the
