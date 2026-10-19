@@ -466,11 +466,13 @@ anything over loopback; both are of later code than the 12.1 minutes
 above. No whole sync has been run through
 the default window over a delayed link, or over a real one with a
 longer round trip than a LAN's: the only whole syncs over a real link,
-on 2026-10-18, took their blocks from a node on another machine on the
-same LAN ([bench-ledger.md](bench-ledger.md), "Rungs from a block
-server on the LAN, two changes held for their memory, and dcrd
-v2.1.7"). So there is no sync time to budget from for a longer round
-trip, and the 72 minutes and 3.6 hours above are not its figures.
+on 2026-10-18 and 2026-10-19, took their blocks from a node on another
+machine on the same LAN ([bench-ledger.md](bench-ledger.md), "Rungs from
+a block server on the LAN, two changes held for their memory, and dcrd
+v2.1.7" and "One commit thread for the life of the store, a sync that
+checks every script, and dcrd v2.1.7"). So there is no sync time to
+budget from for a longer round trip, and the 72 minutes and 3.6 hours
+above are not its figures.
 
 The wider window can cost a node its sync peer where dcrd's would not,
 in two cases. Neither has been measured; both are read from the code. A
@@ -573,13 +575,17 @@ it, which paid there because the reading thread, fed by a server on the
 same machine, waited over 320 s for the other; in `88c46c3`, on
 2026-10-17, it waited 275 to 278 s for the other in each default run. No
 sync has been run with it over a delayed link, or over a real one with a
-longer round trip than a LAN's (the syncs of 2026-10-18 from a node on
-another machine on the same LAN had it on), where the round trip and not
-the thread that processes blocks may set the pace and it may gain
-nothing, nor on fewer cores or with `--assumevalid=0`, nor on macOS or
-Windows, where none of its tests has been run either; with
-`--noexistsaddrindex` it was run once in `4700cf1` on 2026-10-13 and
-twice in `88c46c3` on 2026-10-17, and never against a run with it off.
+longer round trip than a LAN's (the syncs of 2026-10-18 and 2026-10-19
+from a node on another machine on the same LAN had it on), where the
+round trip and not the thread that processes blocks may set the pace and
+it may gain nothing, nor on fewer cores, nor on macOS or Windows, where
+none of its tests has been run either. With `--assumevalid=0` it was on
+in one sync, on 2026-10-19 from a block server on the same machine
+([bench-ledger.md](bench-ledger.md), "One commit thread for the life of
+the store, a sync that checks every script, and dcrd v2.1.7"), and with
+`--noexistsaddrindex` in one of `4700cf1` on 2026-10-13, two of
+`88c46c3` on 2026-10-17 and four from that LAN node on 2026-10-18 and
+2026-10-19, none of them against a run with it off.
 
 Whether reading ahead ever costs anything has not been measured: the
 loopback runs above are all there is. Set `DCROXIDE_READ_AHEAD=off` (or

@@ -90,6 +90,8 @@ path) has been measured yet, so this crossover is unconfirmed.
 | 2026-10-17 | m3 | `88c46c3`'s binary with jemalloc 5.4.0 or gperftools 2.18.1's tcmalloc_minimal preloaded (`LD_PRELOAD`), a configuration the daemon does not ship | not run with these | mainnet, genesis to 1,116,035 | The same harness, in a second queue of two rounds, each a default control, then jemalloc, then tcmalloc_minimal. Controls: 391.1 s and 395.8 s. jemalloc: 339.4 s and 341.4 s — 3,288.3 and 3,269.0 blk/s. tcmalloc_minimal: 334.5 s and 334.3 s — **3,336.4 and 3,338.4 blk/s**. 13.2% to 15.5% under the control of their round, with 73.8 to 76.8 s less process CPU time and 653 to 1,146 MiB less peak resident memory to the tip | this file, "`88c46c3`, the background commit as committed, dcrd v2.1.7 and two preloaded allocators" |
 | 2026-10-18 | m3 | `88c46c3` and eight builds on it that add ten changes to the node's code a rung at a time, states of a worktree; none is the tree of a commit | not run in this series | mainnet, genesis to 1,116,035 | From a live dcrd v2.1.7 node on another machine on the same LAN, about 0.3 ms away, at the defaults: a series of its own, not comparable with the loopback rows above. `88c46c3`, three runs: 407.9 s, 407.8 s and 407.0 s, mean 407.57 s — **2,738.3 blk/s** at 2.57–2.59 mean cores. With all ten changes (G), two runs: 319.7 s and 323.2 s, mean 321.45 s — **3,471.9 blk/s** at 2.77–2.78, 86.12 s or 21.1% less, with 158.5 s less node CPU time. Each of the eight steps, 4.30 to 18.70 s, is beyond the 95% interval of these runs, about ±3.5 s; the change of one of them, 5.15 s, was not kept | this file, "Rungs from a block server on the LAN, two changes held for their memory, and dcrd v2.1.7" |
 | 2026-10-18 | m3 | G without the change not kept (G'), G' with a block's data sanity checks made on the thread that read it (H), and H with two more changes, held for their memory (I, J); states of a worktree, none the tree of a commit | release v2.1.7 (go1.25.4), the binary of the rows above, one run, and one with `--noexistsaddrindex` | mainnet, genesis to 1,116,035 | The same LAN server, that afternoon, at the defaults. G': 320.8 s, 314.6 s and 320.9 s, mean 318.77 s; H: 318.0 s and 312.9 s, mean 315.45 s — **3,537.9 blk/s** at 2.84–2.89 mean cores, 3.32 s less, which the session's ±6.5 s does not resolve. J, a build that includes the two held changes: 264.4 s, 267.4 s and 268.9 s, mean 266.90 s — 4,181.5 blk/s, with a peak resident memory of 6,222 to 7,241 MiB against 3,077 to 3,342 MiB for G' and H. dcrd v2.1.7: 2,991.4 s — 373.1 blk/s at 1.89, so J is 11.21x as fast, and 5.37x with the index off (247.3 s and 248.0 s against 1,330.3 s). H was not set against dcrd | this file, "Rungs from a block server on the LAN, two changes held for their memory, and dcrd v2.1.7" |
+| 2026-10-19 | m3 | J, the binary of the row above, and K, J's code with the `dbcommit` thread kept for the life of the store rather than made for each flush; states of a worktree, K's code that of the three commits that follow the commit that records these syncs | the runs of the row below | mainnet, genesis to 1,116,035 | From the LAN server of the two rows above, at the defaults, in runs alternated J, K, J, K, J. J: 274.8 s, 271.8 s and 274.3 s, mean 273.63 s, at a peak resident memory of 6,730 to 6,933 MiB. K: 270.7 s and 271.5 s, mean 271.10 s — 4,116.7 blk/s at 3.31–3.33 mean cores, 2.53 s less, which the session's ±3.9 s does not resolve, at **2,456 and 2,470 MiB**. One run of J with `MALLOC_ARENA_MAX=8`: 284.2 s and 5,455 MiB. J's mean is 6.73 s over that of its three runs of 2026-10-18 | this file, "One commit thread for the life of the store, a sync that checks every script, and dcrd v2.1.7" |
+| 2026-10-19 | m3 | K, the binary of the row above: the code of the three commits that follow the commit that records these syncs, as a state of a worktree | release v2.1.7 (go1.25.4), the binary of the rows above, two runs, and one with `--noexistsaddrindex` | mainnet, genesis to 1,116,035 | The same LAN server and session, at the defaults. K, four runs, two of them those of the row above: 270.7 s, 271.5 s, 272.7 s and 271.8 s, mean 271.68 s — **4,108.0 blk/s** at 3.28–3.33 mean cores, with a peak resident memory of 2,456 to 2,470 MiB. With `--noexistsaddrindex`, two runs: 250.8 s and 249.6 s — 4,449.9 and 4,471.3 blk/s. With `DCROXIDE_DB_SYNC_COMMIT=1`, two runs: 350.2 s and 350.6 s, so the default is 78.7 s or 22.5% less, and peaks lower. dcrd v2.1.7: 3,014.6 s and 3,033.4 s — **370.2 and 367.9 blk/s** at 1.88 mean cores; with the index off, one run, 1,336.3 s — 835.2 blk/s. So K is **11.13x** as fast at the defaults, 11.05x to 11.21x over the eight pairings, and 5.34x with the index off, in one session. One sync of K from the loopback server with `--assumevalid=0`, every block validated in full, ended with the UTXO set and the block files of every full sync from that server since 2026-10-17; its 583.4 s is not a timing, since the server read 19.2 GB from its drive | this file, "One commit thread for the life of the store, a sync that checks every script, and dcrd v2.1.7" |
 
 > **The headline 1.29x predates the fan-out fix, so it is conservative for
 > master.** That figure was measured on `b6d0c63`; `c091b46` (one validation
@@ -4310,6 +4312,20 @@ run, of the first round, which differs from their cached medians by
 > "Rungs from a block server on the LAN, two changes held for their
 > memory, and dcrd v2.1.7" below.
 
+> **Note (2026-10-19): the committer thread was built, and the memory
+> came down.** A build that adds to the one with the two held changes
+> one `dbcommit` thread, started by the first flush handed over and kept
+> until the store's close, peaked at 2,456 to 2,470 MiB of resident
+> memory in four default syncs from the LAN server, against 6,730 to
+> 6,933 MiB without it in three runs of the same session, and was no
+> slower. Those four runs also peaked 489 to 508 MiB below the same
+> build's two runs with `DCROXIDE_DB_SYNC_COMMIT=1`, where in this
+> section's runs the background commit peaked about 256 MiB above its
+> build without it; that is other code in another series. The build's
+> code is that of the three commits that follow the commit that records
+> those syncs. See "One commit thread for the life of the store, a sync
+> that checks every script, and dcrd v2.1.7" below.
+
 Raw: the comparison's `runs.jsonl` rows labelled `o16-head-1`,
 `o16-base-1`, `o16-pool-1`, `o16-bg-1`, `o16-dcrd-217`, `o16-bg-2`,
 `o16-pool-2`, `o16-base-2`, `o16-head-2`, `o16-head-noindex`,
@@ -5174,6 +5190,15 @@ a worktree when they ran. F's change was measured here and not kept.
 The changes of builds I and J are held, after the memory finding
 below.
 
+> **Note (2026-10-19): kept, with a third change.** A build of J's code
+> with the `dbcommit` thread kept for the life of the store, K, peaked
+> at 2,456 to 2,470 MiB in four default syncs from the same LAN server
+> and was no slower than J in the same session. The two held changes and
+> that one are the three commits that follow the commit that records
+> those syncs, the kept thread first. See "One commit thread for the
+> life of the store, a sync that checks every script, and dcrd v2.1.7"
+> below.
+
 **The LAN server.** The block server was a live mainnet node on
 another machine on the same LAN, dcrd v2.1.7 by its user agent
 (`/dcrwire:1.0.0/dcrd:2.1.7/`), about 0.3 ms away (0.1 to 0.65 ms; no
@@ -5550,6 +5575,19 @@ The loopback runs' peaks are those of the end-state checks above.
   the harness after the queue, without its idle and quiet gate, with
   other userland at 0.16% and 0.18%.
 
+> **Note (2026-10-19): one commit thread for the life of the store, and
+> eight arenas.** K, J's code with the `dbcommit` thread started by the
+> first flush handed over and kept until the close, peaked at 2,456 and
+> 2,470 MiB in two default runs alternated with three of J, which peaked
+> at 6,730 to 6,933 MiB, and took 271.10 s against 273.63 s by the
+> means, a difference that session does not resolve. Its thread arenas
+> spanned 1.98 and 1.99 GiB at the last capture, against J's 6.01 to
+> 6.18 GiB. One run of J with `MALLOC_ARENA_MAX=8` peaked at 5,455 MiB
+> and took 284.2 s, 10.6 s more than J's mean there. That fits the
+> mechanism above without demonstrating it: which arena each thread used
+> is still in no record. See "One commit thread for the life of the
+> store, a sync that checks every script, and dcrd v2.1.7" below.
+
 **Where the block thread waits beside a background commit (the
 evening of 2026-10-17).** Two syncs of `88c46c3` from the loopback
 dcrd v2.1.6 server, s17-m1-head at the defaults at 20:51 and
@@ -5628,6 +5666,12 @@ finding. The block thread of s17-m1-head:
   changes' memory, and the diagnostics' repeats.
 - Storage other than m3's NVMe drive under btrfs; Windows and macOS.
 
+> **Note (2026-10-19): a remedy for the held changes' memory was
+> measured**: J's code with one `dbcommit` thread kept for the life of
+> the store. One other arena count, eight, was run on J once; neither
+> diagnostic above was run again. See "One commit thread for the life of
+> the store, a sync that checks every script, and dcrd v2.1.7" below.
+
 Raw: the comparison's `runs-lan.jsonl` rows labelled `l17-H-1`,
 `l17-A1-1`, `l17-A2-1`, `l17-B-1`, `l17-C-1`, `l17-D-1`, `l17-E-1`,
 `l17-F-1`, `l17-G-1`, `l17-H-2`, `l17-G-2`, `l17-F-2`, `l17-E-2`,
@@ -5642,3 +5686,256 @@ Raw: the comparison's `runs-lan.jsonl` rows labelled `l17-H-1`,
 their wait-channel counts; per-run samples, flush logs and node logs;
 the queues' steps and logs; the harness's change for a server on
 another machine; and the two stacks' code states and build notes.
+
+## One commit thread for the life of the store, a sync that checks every script, and dcrd v2.1.7 (2026-10-19)
+
+"Rungs from a block server on the LAN, two changes held for their
+memory, and dcrd v2.1.7" above held back the changes of builds I and J:
+with a flush's row inserts and the exists-address index's contribution
+made on `dbcommit`, a thread made for each flush, J peaked at 6,222 to
+7,241 MiB of resident memory against 3,077 to 3,342 MiB for G' and H,
+and one run with two allocator arenas took nearly all of the extra away
+at a cost of 41.9 s. One more change was then made on J's code, as a
+state of a worktree with nothing committed: the `dbcommit` thread is
+started by the first flush handed to it and kept, asleep between
+flushes, until the store's close or the drop of its last handle. Its
+build is K. Between 02:51 and 07:57 on 2026-10-19, 18 syncs were run on
+m3, in two queues and none outside them:
+
+- one of K from the loopback dcrd v2.1.6 block server at the defaults,
+  for its end state (v19-K-loopback);
+- six from the LAN server of the section above, J, K, J, K and J at the
+  defaults and then K with the exists-address index off (k19-*);
+- one of J with `MALLOC_ARENA_MAX=8` (diag-J-arena8);
+- one of K from the loopback server with `--assumevalid=0`, for its end
+  state with every block validated in full (v19-K-fullval-loopback);
+- in the second queue, from the LAN server, two more of K at the
+  defaults, one with the index off and two with
+  `DCROXIDE_DB_SYNC_COMMIT=1`, two of dcrd v2.1.7 at the defaults and
+  one with the index off (f19-*), and one of a build of K with frame
+  pointers under two `perf` recorders, a profile and not a clean timing
+  (p19-K-profile).
+
+**The builds.** J is the binary of build J above, unchanged: the
+records' `binary_sha` is the same. K is a release build, at the
+workspace's release profile with nothing else set, of J's code and the
+one change, a state of a worktree on `fdd7a83` as the rungs above were.
+A second build of K's code, from a fresh export of `fdd7a83` with the
+changes applied as patches, had the same code and data, every loaded
+section with contents equal, with only the build id, the debug
+information, which names the source directory, and the suffixes ThinLTO
+gives local symbols differing.
+
+K's code is that of the three commits that follow the commit that adds
+this section. They make its three changes in another order: the kept
+thread first, then build I's change, then build J's, so that no commit
+writes a flush's rows on a thread made for each flush. The third
+commit's code differs from K's only by a doc comment in
+`crates/dcroxide-blockchain/src/utxoview.rs` and a test's local name in
+`crates/dcroxide-database/src/dbcache.rs`, the changes of `a752421` and
+`a7f80b9`, which K's state predates and a release build does not
+contain. The trees of the first two were neither built as release
+binaries nor synced, so the kept thread before the rows move onto it is
+not measured, nor build I's change on top of it.
+
+**The session.** The syncs are in the harness of the section above. The
+LAN server was the same live node, dcrd v2.1.7 by its user agent,
+following the network: the starting height it gave each run went from
+1,124,927 to 1,124,981; at the poll that stopped the clock the node was
+4 to 1,818 blocks past block 1,116,035, and its block at that height was
+the frozen chain's in every LAN run. Before each loopback run the
+server's data, 26.0 GB, was read into the page cache, in 30.6 s and
+28.3 s, and the server still read 19.2 GB from its drive in each, as in
+the end-state checks above, so the two loopback walls are not timings.
+Every run exited 0, none stalled, and none was marked disturbed; other
+userland was 0.04% to 0.05% of the machine in the LAN runs and 0.10% and
+0.05% in the loopback ones. Every run of a queue but its first followed
+a `sync`, a 300 s idle and the quiet gate; the first of each,
+v19-K-loopback and f19-K-3, followed the gate alone, f19-K-3 about two
+and a half minutes after the first queue's last run ended. Unlike the
+two diagnostics above, diag-J-arena8 ran inside a queue, after its idle
+and gate. Transparent huge pages were `madvise` throughout: the system
+journal shows no write to the setting after the one of 2026-10-17 at
+05:21 and no restart, and it read `madvise` after the last run. The
+flush log was on in every dcroxide run, and every figure is defined as
+in the section above.
+
+**This session and the last.** The LAN runs are of the series of the
+section above, not comparable with the loopback rows. J's three runs
+took 271.8 to 274.8 s, a mean of 273.63 s, where its three of 2026-10-18
+took 264.4 to 268.9 s, a mean of 266.90 s, and dcrd v2.1.7 took
+3,014.6 s and 3,033.4 s here against 2,991.4 s there. Both were slower
+in this session, for a cause not taken apart, so a figure set against
+one of 2026-10-18 carries a difference of that order. Across the two
+sessions, K's mean at the defaults, 271.68 s, is 135.9 s or 33.3% under
+the 407.57 s of `88c46c3`'s three controls of the morning of 2026-10-18.
+
+| run | started | build | setting | wall | rate | to block 1,026,597 | after it | node CPU time (user + sys) | block thread | index thread | reader thread | `dbcommit` thread | peak RSS | received, highest 10 s |
+|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| k19-J-1 | 03:02 | J | defaults | 274.8 s | 4,061.3 blk/s | 215.0 s | 59.8 s | 902.0 s (828.0 + 74.0) | 212.2 s | 70.7 s | 128.2 s | — | 6,730 MiB | 97.7 MB/s |
+| k19-K-1 | 03:14 | K | defaults | 270.7 s | 4,122.8 blk/s | 212.8 s | 57.9 s | 896.2 s (825.3 + 70.9) | 211.7 s | 70.5 s | 128.4 s | 91.4 s | 2,456 MiB | 100.9 MB/s |
+| k19-J-2 | 03:24 | J | defaults | 271.8 s | 4,106.1 blk/s | 212.6 s | 59.2 s | 901.4 s (826.9 + 74.5) | 211.7 s | 70.8 s | 128.2 s | — | 6,933 MiB | 98.0 MB/s |
+| k19-K-2 | 03:36 | K | defaults | 271.5 s | 4,110.6 blk/s | 211.2 s | 60.3 s | 902.9 s (833.0 + 69.9) | 211.2 s | 70.8 s | 128.3 s | 91.2 s | 2,470 MiB | 103.6 MB/s |
+| k19-J-3 | 03:46 | J | defaults | 274.3 s | 4,068.7 blk/s | 213.3 s | 61.0 s | 908.5 s (834.0 + 74.5) | 212.2 s | 71.9 s | 130.1 s | — | 6,786 MiB | 98.8 MB/s |
+| k19-K-noindex-1 | 03:58 | K | `--noexistsaddrindex` | 250.8 s | 4,449.9 blk/s | 196.6 s | 54.2 s | 794.0 s (741.2 + 52.8) | 211.8 s | — | 127.2 s | 58.2 s | 2,269 MiB | 112.5 MB/s |
+| diag-J-arena8 | 04:08 | J | `MALLOC_ARENA_MAX=8` | 284.2 s | 3,926.9 blk/s | 222.0 s | 62.2 s | 909.3 s (832.3 + 77.0) | 214.9 s | 77.3 s | 128.1 s | — | 5,455 MiB | 97.0 MB/s |
+| f19-K-3 | 04:33 | K | defaults | 272.7 s | 4,092.5 blk/s | 212.6 s | 60.1 s | 894.2 s (824.2 + 70.0) | 211.0 s | 70.4 s | 128.1 s | 90.5 s | 2,457 MiB | 99.6 MB/s |
+| f19-dcrd-1 | 04:44 | dcrd v2.1.7 | defaults | 3,014.6 s | 370.2 blk/s | 2,141.5 s | 873.1 s | 5,665.5 s (4,542.7 + 1,122.8) | — | — | — | — | 1,836 MiB | 15.4 MB/s |
+| f19-K-sync-1 | 05:41 | K | `DCROXIDE_DB_SYNC_COMMIT=1` | 350.2 s | 3,186.9 blk/s | 282.6 s | 67.6 s | 877.8 s (809.0 + 68.8) | 285.6 s | 71.9 s | 126.9 s | — | 2,959 MiB | 86.8 MB/s |
+| f19-K-4 | 05:53 | K | defaults | 271.8 s | 4,106.1 blk/s | 212.4 s | 59.4 s | 893.7 s (823.8 + 69.9) | 210.6 s | 70.5 s | 128.4 s | 90.7 s | 2,460 MiB | 97.3 MB/s |
+| f19-dcrd-noindex | 06:04 | dcrd v2.1.7 | `--noexistsaddrindex` | 1,336.3 s | 835.2 blk/s | 697.6 s | 638.7 s | 2,779.9 s (2,540.0 + 239.9) | — | — | — | — | 1,836 MiB | 37.3 MB/s |
+| f19-K-noindex-2 | 06:32 | K | `--noexistsaddrindex` | 249.6 s | 4,471.3 blk/s | 196.2 s | 53.4 s | 785.8 s (732.8 + 53.0) | 210.1 s | — | 126.7 s | 58.1 s | 2,270 MiB | 109.5 MB/s |
+| f19-K-sync-2 | 06:43 | K | `DCROXIDE_DB_SYNC_COMMIT=1` | 350.6 s | 3,183.2 blk/s | 284.1 s | 66.5 s | 874.6 s (807.7 + 66.9) | 281.6 s | 74.5 s | 126.6 s | — | 2,964 MiB | 85.8 MB/s |
+| p19-K-profile | 06:55 | K with frame pointers | defaults, under `perf` (not a clean timing) | 276.1 s | 4,042.1 blk/s | 216.5 s | 59.6 s | 927.5 s (845.2 + 82.3) | 216.7 s | 73.6 s | 135.0 s | 95.3 s | 2,464 MiB | 98.7 MB/s |
+| f19-dcrd-2 | 07:06 | dcrd v2.1.7 | defaults | 3,033.4 s | 367.9 blk/s | 2,154.6 s | 878.8 s | 5,699.8 s (4,561.0 + 1,138.8) | — | — | — | — | 1,836 MiB | 15.0 MB/s |
+
+The `dbcommit` column is the thread K keeps, by the same count as the
+other threads. J's runs list none, the thread of each flush having ended
+when the counters were read, and none is started with
+`DCROXIDE_DB_SYNC_COMMIT=1`. dcrd is the v2.1.7 binary of the sections
+above.
+
+**J against K (k19).** The runs alternated J, K, J, K, J, so that each
+run of K sits between two of J. **K peaked at 2,456 and 2,470 MiB
+against J's 6,730 to 6,933 MiB, 4,353 MiB or 63.9% less by the means,
+and took 270.7 s and 271.5 s, a mean of 271.10 s, against 274.8 s,
+271.8 s and 274.3 s, a mean of 273.63 s**: 2.53 s less. Pooled over
+those five runs as above (3 degrees of freedom, a standard deviation of
+1.35 s), a step between two runs and three is good to about ±3.9 s, so
+the 2.53 s is not resolved; with K's two later runs as well, 1.96 s less
+against ±2.4 s (5 degrees of freedom), it is not either. K was no slower
+than J.
+
+- **Everything else was J's.** Each default run of either from the LAN
+  server made 52 flushes inside the clock, all of them handed over, with
+  2.5 to 2.8 s of foreground time; in all seven the block thread's time
+  was 210.6 to 212.2 s, the index thread's 70.4 to 71.9 s and the reader
+  thread's 128.1 to 130.1 s. Node CPU time was 893.7 to 902.9 s for K
+  and 901.4 to 908.5 s for J.
+- **The commit thread.** In every default run of K from the LAN server
+  the per-thread counters list one `dbcommit` thread, on a processor for
+  90.5 to 91.4 s, and for 58.2 s and 58.1 s with the index off.
+- **The shape.** By the 10 s samples K climbed to 2,392 to 2,421 MiB by
+  the assume-valid block, and its peak was 49 to 64 MiB above that; J
+  reached 4,399 to 5,047 MiB by that block, and its peak was 1,739 to
+  2,534 MiB above it. At the last flush capture inside the clock the
+  thread arenas' mappings spanned 1.97 to 1.99 GiB in 55 or 56 mappings
+  for K, and 6.01 to 6.18 GiB in 94 to 102 for J.
+- **Below the builds without the held changes.** K peaked lower than G'
+  and H did on 2026-10-18, 3,077 to 3,342 MiB; those hold neither held
+  change, and made a `dbcommit` thread for each flush's commit and what
+  follows it. That is another session, and the difference is not taken
+  apart. With `DCROXIDE_DB_SYNC_COMMIT=1`, which starts no commit
+  thread, K peaked at 2,959 and 2,964 MiB, above its default runs; J's
+  runs with it on 2026-10-18 peaked at 2,966 and 2,888 MiB.
+- **With eight arenas (`MALLOC_ARENA_MAX=8`) one run of J peaked at
+  5,455 MiB** and took 284.2 s, 10.6 s more than J's mean, with 909.3 s
+  of CPU time; its index thread's time was 77.3 s and its block thread's
+  214.9 s. At the last capture its thread arenas spanned 4.27 GiB in 55
+  mappings, and its highest sample before the assume-valid block,
+  5,148 MiB, was above any run of J's. On 2026-10-18 two arenas brought
+  J's peak to 3,423 MiB for 41.9 s.
+- **What it shows.** K's result fits the mechanism inferred above, a
+  thread made for each flush allocating from whichever arena glibc gives
+  it and leaving what earlier flushes freed in theirs, and does not
+  demonstrate it: which arena each thread used is still in no record.
+  The memory after the clock, which the commit thread's arena may keep,
+  is not recorded for the LAN runs.
+
+**K against dcrd v2.1.7 (f19).** K's code is that of the commits that
+follow, so these figures, unlike J's above, are for code the repository
+holds from the third of them on. K's four default runs, 270.7 s,
+271.5 s, 272.7 s and 271.8 s, a mean of 271.68 s, against dcrd's two
+runs, 3,014.6 s and 3,033.4 s, a mean of 3,024.0 s: **11.13x**, 11.05x
+to 11.21x over the eight pairings. To the assume-valid block K took
+212.25 s against 2,148.05 s, 10.1x, and the 89,438 blocks after it
+59.43 s against 875.95 s, 14.7x. With the index off, 250.8 s and 249.6 s
+against one dcrd run of 1,336.3 s, 5.34x (5.33x and 5.35x). The index
+costs K 21.5 s, 7.9% of its default mean, and dcrd 1,687.7 s, 55.8% of
+its mean. dcrd used 5,665.5 s and 5,699.8 s of CPU time, 6.3x K's mean
+of 896.75 s, and peaked at 1,836 MiB; K peaked at 2,456 to 2,470 MiB,
+1.34x to 1.35x that. J's 11.21x of 2026-10-18 rests on one dcrd run of
+another session.
+
+**The background commit with K.** K with `DCROXIDE_DB_SYNC_COMMIT=1`,
+every commit on the committing thread: 350.2 s and 350.6 s, a mean of
+350.40 s, so K at the defaults took 78.7 s or 22.5% less, and peaked
+lower, at 2,456 to 2,470 MiB against 2,959 and 2,964 MiB. With the
+variable the flushes' foreground time was 106.1 s and 106.5 s, and the
+block thread's time 285.6 s and 281.6 s against 210.6 to 211.7 s at the
+defaults. On 2026-10-18 J at the defaults was 90.2 s or 25.3% less than
+its own runs with the variable, and on 2026-10-17 `88c46c3` from the
+loopback server 32.95 s or 7.7% less than its own: other code, and other
+sessions.
+
+**The end state, and every block validated in full (v19).** Two syncs of
+K from the loopback dcrd v2.1.6 server, for the end state that the LAN
+runs do not record: at the defaults at 02:51 and with `--assumevalid=0`
+at 04:20, the node logging that assume-valid was disabled. Each ended on
+the server's tip, `8752fdc9…`, and in each `gettxoutsetinfo` reported
+the UTXO set of every full sync from the loopback server since
+2026-10-17: 760,741 transactions, 1,850,903 outputs, a total amount of
+1,672,716,060,550,750 atoms and the serialized hash
+`eb7f88de7b69f98676ce78072c0f90cc2667b875df0b26637dffcf9da5b3c30c`. The
+block files hashed to `33b7ac837a45c74f` over 36 files and
+19,202,596,910 B in both. The exists-address index and the rest of the
+metadata store were not compared.
+
+| run | started | build | setting | wall | to block 1,026,597 | after it | node CPU time (user + sys) | mean cores | block thread | script pool, 15 threads | `dbcommit` thread | peak RSS |
+|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| v19-K-loopback | 02:51 | K | defaults | 275.0 s | 211.9 s | 63.1 s | 898.1 s (829.6 + 68.5) | 3.27 | 214.0 s | 391.6 s | 94.2 s | 2,462 MiB |
+| v19-K-fullval-loopback | 04:20 | K | `--assumevalid=0` | 583.4 s | 519.8 s | 63.6 s | 4,399.8 s (4,283.3 + 116.5) | 7.54 | 400.1 s | 3,661.2 s | 102.4 s | 2,373 MiB |
+
+The sync with `--assumevalid=0` is the first this ledger records. At the
+defaults the blocks up to the assume-valid block skip the costlier
+checks, their scripts among them; here every block was validated in
+full, and the chain was accepted into the same state. Its 583.4 s is not
+a timing, since the server read 19.2 GB from its drive, but beside the
+default run made under the same condition it took 307.9 s more to the
+assume-valid block and 0.5 s more after it, with 4,399.8 s of CPU time
+against 898.1 s, 3,661.2 s of it on the script pool's 15 threads, at
+7.54 mean cores. Its peak, 2,373 MiB, was below the default run's
+2,462 MiB.
+
+**The profiled run.** p19-K-profile ran a build of K's code with frame
+pointers (`-C force-frame-pointers=yes`), not K's binary, under two
+`perf` recorders on four cores of their own: a flat one at 499 Hz,
+446,721 samples, and a call-graph one at 199 Hz unwinding by frame
+pointer, 179,015 samples, both of user space only. It took 276.1 s,
+4.45 s or 1.6% over the median of K's four default runs, which is not a
+timing of either build. Its analysis is not done, and what the profile
+shows is not set out here.
+
+**What was not measured.**
+
+- The trees of the first two of the three commits that follow: the kept
+  thread without the two held changes, and with build I's change but not
+  build J's. So what the kept thread does before the rows move onto it,
+  and each of the three changes on its own, are not measured.
+- Any end state in the LAN runs; K's end state with the index off or
+  with `DCROXIDE_DB_SYNC_COMMIT=1`; the exists-address index and the
+  rest of the metadata store in the two loopback checks.
+- A timing of the sync with `--assumevalid=0`, from a server whose data
+  stays cached, a second run of it, and dcrd with `--assumevalid=0`.
+- A second dcrd run with the index off.
+- The memory after the clock, which the commit thread's arena may keep;
+  a second run of the arena diagnostic, and other arena counts.
+- A sync whose sync peer changes: the thread that connects the sync
+  peer's blocks ends with its connection, and every run here took its
+  blocks from one peer.
+- The LAN server's load, cache and configuration, the link's speed, and
+  the round trip, in any run record; a link with a longer round trip.
+- `DCROXIDE_READ_AHEAD=off`, and the flush log's own cost: it was on in
+  every dcroxide run.
+- What the profile shows.
+- Storage other than m3's NVMe drive under btrfs; Windows and macOS.
+
+Raw: the comparison's `runs-lan.jsonl` rows labelled `k19-J-1`,
+`k19-K-1`, `k19-J-2`, `k19-K-2`, `k19-J-3`, `k19-K-noindex-1`,
+`f19-K-3`, `f19-dcrd-1`, `f19-K-sync-1`, `f19-K-4`, `f19-dcrd-noindex`,
+`f19-K-noindex-2`, `f19-K-sync-2` and `f19-dcrd-2`; `diag-mem.jsonl`'s
+`diag-J-arena8`; `verify.jsonl`'s `v19-K-loopback` and
+`v19-K-fullval-loopback`; `perf-k19.jsonl`'s `p19-K-profile`, with its
+two recordings; per-run samples, flush logs and node logs; the queues'
+steps and logs; and the code state and build notes of K and of its build
+with frame pointers.
