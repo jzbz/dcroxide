@@ -462,6 +462,12 @@ pub struct Chain {
     /// them: every block that passed the header checks and did not
     /// arrive with its hashes in a [`HashedBlock`].
     pub arrivals_hashed: u64,
+    /// How many arriving blocks the chain made the data sanity checks of
+    /// itself as it processed them: every block that reached those
+    /// checks without a verdict reached, before it arrived, with the
+    /// values of the parameters it was processed with
+    /// ([`HashedBlock::check_data_sanity`]).
+    pub arrivals_checked: u64,
     /// The shutdown interrupt (dcrd `BlockChain.interrupt`, its
     /// context's `Done` channel), set at open from
     /// [`OpenConfig::interrupt`].  The startup UTXO catch-up checks it,
@@ -903,6 +909,7 @@ impl Chain {
             accepted_tx_hashes: None,
             tx_hash_recomputes: 0,
             arrivals_hashed: 0,
+            arrivals_checked: 0,
             interrupt: None,
             cached_tips_last_pruned_nanos: crate::gotime::monotonic_nanos(),
             periodic_clock: crate::gotime::monotonic_nanos,
@@ -4965,7 +4972,14 @@ impl Chain {
     /// A block that also carries its record for the block files
     /// ([`HashedBlock::record`]) is stored as that record where another
     /// block is serialized, which leaves the same bytes in the block
-    /// files.
+    /// files.  A block that also carries the verdict of its data sanity
+    /// checks ([`HashedBlock::check_data_sanity`]), reached with the
+    /// values of `params` those checks read, is not checked again: the
+    /// verdict is returned where [`Self::process_block`] makes the
+    /// checks, after the header and merkle checks and before the data is
+    /// accepted, error, kind and text, and a failure marks the block as
+    /// the checks' own does.  A verdict reached with other values is
+    /// not read, and the checks are made here.
     ///
     /// Each hash is consulted exactly where [`Self::process_block`]
     /// computes it.  The block hash is read at the start, where that
@@ -5123,10 +5137,20 @@ impl Chain {
         // transactions, to quickly eliminate blocks that are obviously
         // incorrect before any attempt to accept the data.  A rule
         // violation marks the block and its descendants when the data
-        // commitment has definitively been proven.
-        if let Err(err) =
-            crate::validate::check_block_data_sanity_with_hashes(block, &tx_hashes, params)
-        {
+        // commitment has definitively been proven.  A block that was
+        // checked before it reached the chain, with the values of these
+        // parameters the checks read, brings their verdict, which is
+        // returned here, where the checks are made for any other block.
+        let (sanity, checked_here) = crate::validate::check_block_data_sanity_with_verdict(
+            block,
+            &tx_hashes,
+            arriving.hashed().and_then(HashedBlock::data_sanity),
+            params,
+        );
+        if checked_here {
+            self.arrivals_checked = self.arrivals_checked.wrapping_add(1);
+        }
+        if let Err(err) = sanity {
             self.mark_block_failed_if_data_commit_proven(node, data_commit_proven, &err);
             return (0, alloc::vec![err]);
         }
@@ -11515,6 +11539,398 @@ mod tests {
                 assert_eq!(result, expected, "{what}, carried: {}", carried.is_some());
             }
         }
+    }
+
+    /// The data sanity checks a processing call made, as the unit tests
+    /// count them (`blockhashes::SANITY_CHECKS`), while `f` ran.
+    fn sanity_checks_made<T>(f: impl FnOnce() -> T) -> (T, u64) {
+        let before = crate::blockhashes::SANITY_CHECKS.get();
+        let result = f();
+        (
+            result,
+            crate::blockhashes::SANITY_CHECKS.get().wrapping_sub(before),
+        )
+    }
+
+    /// A block hashed and checked for its data's sanity before it
+    /// reached the chain, as the reader thread checks it.
+    fn checked(block: &Arc<MsgBlock>, params: &Params) -> HashedBlock {
+        let mut hashed = HashedBlock::new(Arc::clone(block));
+        hashed.check_data_sanity(crate::validate::DataSanityParams::of(params));
+        hashed
+    }
+
+    /// A block that arrives hashed with the verdict of its data sanity
+    /// checks, reached with the values of the parameters it is processed
+    /// with, is not checked again by the processing call, with and
+    /// without full validation.  One that arrives hashed without a
+    /// verdict, or plain, is checked once, as before.  The outcome is the
+    /// same every way.
+    #[test]
+    fn a_checked_block_is_processed_without_its_data_sanity_checks() {
+        let params = dcroxide_chaincfg::regnet_params();
+        let (now, blocks) = tip_extensions(30);
+        for bulk_import in [false, true] {
+            let mut chain = Chain::new(&params, Hash::ZERO, false);
+            chain.bulk_import_mode = bulk_import;
+            // A twin that is handed every block plain.
+            let mut twin = Chain::new(&params, Hash::ZERO, false);
+            twin.bulk_import_mode = bulk_import;
+            for (i, block) in blocks.iter().enumerate() {
+                let what = format!("block {i} (bulk import: {bulk_import})");
+                let (twin_result, twin_checks) =
+                    sanity_checks_made(|| twin.process_block(block, now, &params));
+                assert!(
+                    twin_result.1.is_empty(),
+                    "{what} on the twin: {twin_result:?}"
+                );
+                assert_eq!(twin_checks, 1, "{what} on the twin");
+
+                // In turn: checked, hashed without a verdict, plain.
+                let shared = Arc::new(block.clone());
+                let arrivals_before = chain.arrivals_checked;
+                let (result, checks) = match i % 3 {
+                    0 => {
+                        let hashed = checked(&shared, &params);
+                        sanity_checks_made(|| chain.process_hashed_block(&hashed, now, &params))
+                    }
+                    1 => {
+                        let hashed = HashedBlock::new(Arc::clone(&shared));
+                        sanity_checks_made(|| chain.process_hashed_block(&hashed, now, &params))
+                    }
+                    _ => sanity_checks_made(|| chain.process_shared_block(&shared, now, &params)),
+                };
+                assert_eq!(result, twin_result, "{what}");
+                assert_eq!(checks, u64::from(i % 3 != 0), "{what}");
+                assert_eq!(
+                    chain.arrivals_checked.wrapping_sub(arrivals_before),
+                    checks,
+                    "{what}"
+                );
+                let tip = chain.best_chain.tip().expect("tip");
+                assert_eq!(chain.store.node(tip).hash, block.header.block_hash());
+            }
+        }
+    }
+
+    /// dcrd's full block battery through `process_hashed_block`, every
+    /// block checked for its data's sanity as the reader thread checks
+    /// it, beside `process_block` on a twin chain.  Every row gives the
+    /// same result, and the chain handed the verdicts makes the checks
+    /// for no row, where the twin makes them for every row that gets as
+    /// far as them.  A failing verdict is the result exactly where the
+    /// twin's checks refuse the block, with the same error.  Thirteen
+    /// rows are refused that way, of ten kinds; no row whose verdict
+    /// fails is refused by a check before them.  Each of those blocks
+    /// then arrives a second time and is refused by its verdict again:
+    /// over the battery's chain no data commitment is proven before the
+    /// checks, so none was marked.  Where an earlier check does refuse a
+    /// block whose verdict fails, that refusal is the result
+    /// (`a_failing_verdict_is_not_read_where_an_earlier_check_refuses_the_block`,
+    /// `a_block_refused_by_its_verdict_is_known_invalid_when_it_arrives_again`).
+    #[test]
+    fn the_battery_returns_a_carried_verdict_where_the_checks_are_made() {
+        let params = dcroxide_chaincfg::regnet_params();
+        let mut twin = Chain::new(&params, Hash::ZERO, false);
+        let mut chain = Chain::new(&params, Hash::ZERO, false);
+        let mut now = 0;
+        let (mut reached, mut refused_there, mut failing) = (0usize, Vec::new(), Vec::new());
+        for line in include_str!("../tests/data/fullblock_vectors.txt").lines() {
+            let f: Vec<&str> = line.split(' ').collect();
+            let hex = match f[0] {
+                "now" => {
+                    now = f[1].parse().expect("now");
+                    continue;
+                }
+                "accept" => f[4],
+                "reject" => f[3],
+                "orphanorreject" => f[2],
+                _ => continue,
+            };
+            let name = f[1];
+            let (block, _) = MsgBlock::from_bytes(&dcroxide_testutil::unhex(hex)).expect("block");
+            let hashed = checked(&Arc::new(block.clone()), &params);
+            let verdict = hashed
+                .data_sanity()
+                .and_then(|verdict| verdict.for_params(&params))
+                .expect("a verdict for these parameters")
+                .clone();
+
+            let (twin_result, twin_checks) =
+                sanity_checks_made(|| twin.process_block(&block, now, &params));
+            let (result, checks) =
+                sanity_checks_made(|| chain.process_hashed_block(&hashed, now, &params));
+            assert_eq!(result, twin_result, "{name}");
+            assert_eq!(checks, 0, "{name}");
+            match (twin_checks, verdict) {
+                (1, Ok(())) => reached += 1,
+                (1, Err(err)) => {
+                    reached += 1;
+                    assert_eq!(result, (0, alloc::vec![err.clone()]), "{name}");
+                    refused_there.push((name, err.kind.kind_name()));
+                }
+                (0, Ok(())) => {}
+                (0, Err(err)) => panic!("{name}: refused before the checks, {err:?}"),
+                (n, _) => panic!("{name}: the twin checked {n} times"),
+            }
+            if hashed.data_sanity().is_some_and(|verdict| {
+                verdict
+                    .for_params(&params)
+                    .is_some_and(|verdict| verdict.is_err())
+            }) {
+                failing.push((name, block, hashed));
+            }
+        }
+        assert_eq!(reached, 327);
+        assert_eq!(
+            refused_there,
+            [
+                ("bv1", "ErrDuplicateTxInputs"),
+                ("bv5", "ErrFreshStakeMismatch"),
+                ("bsd0", "ErrNotEnoughStake"),
+                ("bsd1", "ErrStakeBelowMinimum"),
+                ("bmf2", "ErrNoTransactions"),
+                ("bmf7", "ErrWrongBlockSize"),
+                ("bmf14", "ErrDuplicateTx"),
+                ("bcb6", "ErrNoTxInputs"),
+                ("bcb7", "ErrNoTxOutputs"),
+                ("bcb8", "ErrBadTxOutValue"),
+                ("bcb9", "ErrBadTxOutValue"),
+                ("bcb10", "ErrBadTxOutValue"),
+                ("bcb14", "ErrDuplicateTxInputs"),
+            ]
+        );
+
+        // Every block refused with its verdict arrives again, with the
+        // same verdict.  None of them was marked as failed: over the
+        // battery's chain the header commitments agenda is not decided,
+        // so no data commitment is proven before the sanity checks.  So
+        // the twin's checks refuse each again, and the verdict is the
+        // result again.  (A block that was marked is refused before the
+        // checks: `a_block_refused_by_its_verdict_is_known_invalid_when_it_arrives_again`.)
+        assert_eq!(failing.len(), refused_there.len());
+        for (name, block, hashed) in &failing {
+            let verdict = hashed
+                .data_sanity()
+                .and_then(|verdict| verdict.for_params(&params))
+                .expect("a verdict")
+                .clone()
+                .expect_err("failing");
+            let (twin_result, twin_checks) =
+                sanity_checks_made(|| twin.process_block(block, now, &params));
+            let (result, checks) =
+                sanity_checks_made(|| chain.process_hashed_block(hashed, now, &params));
+            assert_eq!(result, twin_result, "{name} again");
+            assert_eq!((checks, twin_checks), (0, 1), "{name} again");
+            assert_eq!(result, (0, alloc::vec![verdict]), "{name} again");
+        }
+        // The chains' own count of the arriving blocks they checked says
+        // the same.
+        assert_eq!(chain.arrivals_checked, 0);
+        assert_eq!(
+            twin.arrivals_checked,
+            u64::try_from(reached + failing.len()).expect("count")
+        );
+    }
+
+    /// A block refused by its verdict where its data commitment is
+    /// proven is marked as failed, as the checks' own refusal marks it,
+    /// and when it arrives again, with the same verdict, it is refused
+    /// as a block known to be invalid, before the sanity checks, on both
+    /// chains.  The block is the next block of the battery with one
+    /// output paying a negative amount, its header committing to the
+    /// changed transactions, over a chain where the header commitments
+    /// agenda is decided, so that the merkle check proves the
+    /// commitment.
+    #[test]
+    fn a_block_refused_by_its_verdict_is_known_invalid_when_it_arrives_again() {
+        let mut params = dcroxide_chaincfg::regnet_params();
+        force_deployment_result(
+            &mut params,
+            crate::agendas::VOTE_ID_HEADER_COMMITMENTS,
+            "no",
+        );
+        let (now, blocks) = tip_extensions(4);
+        let mut chain = Chain::new(&params, Hash::ZERO, false);
+        let mut twin = Chain::new(&params, Hash::ZERO, false);
+        for (i, block) in blocks[..3].iter().enumerate() {
+            for chain in [&mut chain, &mut twin] {
+                let (_, errs) = chain.process_block(block, now, &params);
+                assert!(errs.is_empty(), "block {i}: {errs:?}");
+            }
+        }
+
+        let mut block = blocks[3].clone();
+        block.transactions[0].tx_out[0].value = -1;
+        assert_eq!(
+            block.header.merkle_root,
+            dcroxide_standalone::calc_tx_tree_merkle_root(&blocks[3].transactions),
+            "the battery's block commits to its trees one by one"
+        );
+        block.header.merkle_root =
+            dcroxide_standalone::calc_tx_tree_merkle_root(&block.transactions);
+        let pow_limit = dcroxide_standalone::BigInt::from_bytes_be(
+            dcroxide_standalone::Sign::Plus,
+            &params.pow_limit.to_be_bytes(),
+        );
+        let meets = |header: &BlockHeader| {
+            [header.pow_hash_v1(), header.pow_hash_v2()]
+                .iter()
+                .all(|hash| {
+                    dcroxide_standalone::check_proof_of_work(hash, header.bits, &pow_limit).is_ok()
+                })
+        };
+        while !meets(&block.header) {
+            block.header.nonce = block.header.nonce.wrapping_add(1);
+        }
+        let block = Arc::new(block);
+        let hashed = checked(&block, &params);
+        let refused = hashed
+            .data_sanity()
+            .and_then(|verdict| verdict.for_params(&params))
+            .expect("a verdict")
+            .clone()
+            .expect_err("a negative amount");
+        assert_eq!(refused.kind, RuleErrorKind::BadTxOutValue, "{refused:?}");
+
+        // The first time, the verdict is the result, and marks the block.
+        let (twin_result, twin_checks) =
+            sanity_checks_made(|| twin.process_shared_block(&block, now, &params));
+        let (result, checks) =
+            sanity_checks_made(|| chain.process_hashed_block(&hashed, now, &params));
+        assert_eq!(result, twin_result);
+        assert_eq!((checks, twin_checks), (0, 1));
+        assert_eq!(result, (0, alloc::vec![refused.clone()]));
+        for chain in [&chain, &twin] {
+            let node = chain
+                .index
+                .lookup_node(&block.header.block_hash())
+                .expect("indexed");
+            assert!(
+                chain.index.node_status(&chain.store, node).known_invalid(),
+                "the block is marked"
+            );
+        }
+
+        // The second time, the block is known to be invalid, and the
+        // verdict is not read.
+        let (twin_result, twin_checks) =
+            sanity_checks_made(|| twin.process_shared_block(&block, now, &params));
+        let (result, checks) =
+            sanity_checks_made(|| chain.process_hashed_block(&hashed, now, &params));
+        assert_eq!(result, twin_result);
+        assert_eq!((checks, twin_checks), (0, 0));
+        assert_eq!(result.1.len(), 1, "{result:?}");
+        assert_ne!(result.1[0], refused, "{result:?}");
+        assert_eq!(
+            result.1[0].kind,
+            RuleErrorKind::KnownInvalidBlock,
+            "{result:?}"
+        );
+    }
+
+    /// A block whose verdict fails, and which a check that comes before
+    /// the data sanity checks refuses, is refused by that check, with
+    /// its kind and text, as the block arriving plain is: an accepted
+    /// block's header over transactions of which one pays a negative
+    /// amount is a duplicate block, and the next block's header over
+    /// such transactions fails the merkle check.  Neither chain makes
+    /// the sanity checks.
+    #[test]
+    fn a_failing_verdict_is_not_read_where_an_earlier_check_refuses_the_block() {
+        let params = dcroxide_chaincfg::regnet_params();
+        let (now, blocks) = tip_extensions(4);
+        let mut chain = Chain::new(&params, Hash::ZERO, false);
+        let mut twin = Chain::new(&params, Hash::ZERO, false);
+        for (i, block) in blocks[..3].iter().enumerate() {
+            for chain in [&mut chain, &mut twin] {
+                let (_, errs) = chain.process_block(block, now, &params);
+                assert!(errs.is_empty(), "block {i}: {errs:?}");
+            }
+        }
+        let negative = |block: &MsgBlock| {
+            let mut block = block.clone();
+            block.transactions[0].tx_out[0].value = -1;
+            Arc::new(block)
+        };
+        for (block, kind) in [
+            (negative(&blocks[2]), RuleErrorKind::DuplicateBlock),
+            (negative(&blocks[3]), RuleErrorKind::BadMerkleRoot),
+        ] {
+            let hashed = checked(&block, &params);
+            let verdict = hashed
+                .data_sanity()
+                .and_then(|verdict| verdict.for_params(&params))
+                .expect("a verdict")
+                .clone();
+            let refused = verdict.expect_err("a negative amount");
+            assert_eq!(refused.kind, RuleErrorKind::BadTxOutValue, "{refused:?}");
+
+            let (twin_result, twin_checks) =
+                sanity_checks_made(|| twin.process_shared_block(&block, now, &params));
+            let (result, checks) =
+                sanity_checks_made(|| chain.process_hashed_block(&hashed, now, &params));
+            assert_eq!(result, twin_result);
+            assert_eq!((checks, twin_checks), (0, 0));
+            assert_eq!(result.1.len(), 1, "{result:?}");
+            assert_eq!(result.1[0].kind, kind, "{result:?}");
+        }
+    }
+
+    /// A verdict is read only with the values it was reached with.  A
+    /// block whose coinbase passes the network's largest transaction
+    /// size, checked with that size set one byte under it, is accepted
+    /// by a chain that processes it with the network's parameters, which
+    /// makes the checks itself.  The same block checked with the
+    /// network's values, and processed with that size set under it,
+    /// is refused for its coinbase's size, as a block arriving plain is.
+    #[test]
+    fn a_verdict_reached_with_other_values_is_not_read() {
+        let params = dcroxide_chaincfg::regnet_params();
+        let (now, blocks) = tip_extensions(6);
+        let (last, earlier) = blocks.split_last().expect("blocks");
+        let mut tight = params.clone();
+        tight.max_tx_size = last.transactions[0].serialize_size() - 1;
+        let last = Arc::new(last.clone());
+        let fresh = || {
+            let mut chain = Chain::new(&params, Hash::ZERO, false);
+            for (i, block) in earlier.iter().enumerate() {
+                let (_, errs) = chain.process_block(block, now, &params);
+                assert!(errs.is_empty(), "block {i}: {errs:?}");
+            }
+            chain
+        };
+
+        // Checked with the size under the coinbase's: the verdict says
+        // too big, and is not read.
+        let hashed = checked(&last, &tight);
+        let carried = hashed.data_sanity().expect("a verdict");
+        assert_eq!(carried.for_params(&params), None);
+        let refused = carried
+            .for_params(&tight)
+            .expect("its own values")
+            .clone()
+            .expect_err("too big");
+        assert_eq!(refused.kind, RuleErrorKind::TxTooBig, "{refused:?}");
+        let mut chain = fresh();
+        let (result, checks) =
+            sanity_checks_made(|| chain.process_hashed_block(&hashed, now, &params));
+        assert_eq!(result, (0, Vec::new()));
+        assert_eq!(checks, 1);
+        let tip = chain.best_chain.tip().expect("tip");
+        assert_eq!(chain.store.node(tip).hash, last.header.block_hash());
+
+        // Checked with the network's values and processed with the size
+        // under the coinbase's: the chain's own checks refuse it, as they
+        // refuse the block arriving plain.
+        let hashed = checked(&last, &params);
+        let mut chain = fresh();
+        let (result, checks) =
+            sanity_checks_made(|| chain.process_hashed_block(&hashed, now, &tight));
+        assert_eq!(checks, 1);
+        assert_eq!(result, (0, alloc::vec![refused.clone()]));
+        let mut twin = fresh();
+        assert_eq!(twin.process_shared_block(&last, now, &tight), result);
     }
 
     /// The contextual proof of work check reaches the same verdict, with

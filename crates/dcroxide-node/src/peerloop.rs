@@ -40,15 +40,16 @@
 //! source is normally the read itself, made on the input thread as
 //! dcrd's `inHandler` makes it.  On the sync peer's connection during
 //! the initial chain sync a `peer-reader` thread does the reading, the
-//! checksum, the decoding and the hashing of blocks up to four messages
-//! ahead, which dcrd does not do; the loop, and everything it decides,
-//! is the same either way.
+//! checksum, the decoding, the hashing of blocks and their data sanity
+//! checks up to four messages ahead, which dcrd does not do; the loop,
+//! and everything it decides, is the same either way.
 
 use std::io::{Read, Write};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 use dcroxide_blockchain::HashedBlock;
+use dcroxide_blockchain::validate::DataSanityParams;
 use dcroxide_peer::{
     ArmOutcome, MAX_PROTOCOL_VERSION, MsgTransport, NEGOTIATE_TIMEOUT, NegotiateError,
     NegotiateErrorKind, Peer, PeerEnv, PeerGlobals, ReadError, STALL_RESPONSE_TIMEOUT,
@@ -244,10 +245,13 @@ pub trait ServeHooks {
     /// A block arrived that the connection's reader thread read, ahead
     /// of this loop or in turn, and hashed ([`crate::readahead`]): the
     /// block with its block hash and the hashes of its transactions, all
-    /// computed from it, and with the payload it was read in laid out as
-    /// its block-file record.  The loop gives it exactly the handling a
-    /// `block` message gets, with the hash it carries in place of one
-    /// computed here.
+    /// computed from it, with the payload it was read in laid out as its
+    /// block-file record, and, where [`data_sanity_params`] gave the
+    /// values to make them with, the verdict of its data sanity checks.
+    /// The loop gives it exactly the handling a `block` message gets,
+    /// with the hash it carries in place of one computed here.
+    ///
+    /// [`data_sanity_params`]: ServeHooks::data_sanity_params
     ///
     /// The default hands the block on as the message it arrived as,
     /// without the hashes and the record, so an implementation that has
@@ -271,6 +275,20 @@ pub trait ServeHooks {
     /// reads.
     fn read_ahead_wanted(&mut self) -> bool {
         false
+    }
+    /// The values of the chain parameters with which the connection's
+    /// reader thread, once it has one, makes the data sanity checks of
+    /// each block it hashes (`dcroxide_blockchain::HashedBlock::check_data_sanity`),
+    /// asked once, as the connection's message source is made.  The
+    /// chain returns such a block's verdict where it would have made the
+    /// checks, if it processes the block with parameters that hold these
+    /// values, and makes them itself otherwise.
+    ///
+    /// The default is none: the reader thread then makes no checks, and
+    /// the chain makes them for every block, as it does for a block this
+    /// loop read itself.
+    fn data_sanity_params(&mut self) -> Option<DataSanityParams> {
+        None
     }
     /// The connection is winding down (dcrd `DonePeer`).  The peer
     /// arrives unlocked, as at [`on_connected`](ServeHooks::on_connected):
@@ -1712,8 +1730,16 @@ where
     // Where the input loop gets its messages from: this thread's own
     // reads of the transport, until the server first wants the messages
     // behind a block read ahead ([`ServeHooks::read_ahead_wanted`]).
-    // The source owns the transport from here on.
-    let mut source = ReadAheadSource::new(read_transport, cancel.clone(), label.clone());
+    // The source owns the transport from here on, and a reader thread it
+    // starts makes the data sanity checks of each block it hashes with
+    // the values the server gives, if it gives any
+    // ([`ServeHooks::data_sanity_params`]).
+    let mut source = ReadAheadSource::new(
+        read_transport,
+        cancel.clone(),
+        label.clone(),
+        hooks.data_sanity_params(),
+    );
 
     // Request all block announcements via full headers instead of the
     // inv message (dcrd `serverPeer.Run` queueing `NewMsgSendHeaders`
@@ -3276,7 +3302,7 @@ mod tests {
         // disconnected by a sync-manager action leaves it, it still does.
         let (conn, _remote, _client) = loopback_pair();
         let (transport, cancel) = read_transport(conn);
-        let mut source = ReadAheadSource::new(transport, cancel.clone(), "test".to_string());
+        let mut source = ReadAheadSource::new(transport, cancel.clone(), "test".to_string(), None);
         assert!(!source.is_ahead(), "no block yet");
         source.block_handled(false);
         assert!(!source.is_ahead(), "not wanted");
@@ -3289,7 +3315,7 @@ mod tests {
         // stays when reading ahead is no longer wanted.
         let (conn, _remote, _client) = loopback_pair();
         let (transport, cancel) = read_transport(conn);
-        let mut source = ReadAheadSource::new(transport, cancel, "test".to_string());
+        let mut source = ReadAheadSource::new(transport, cancel, "test".to_string(), None);
         source.block_handled(true);
         assert!(source.is_ahead());
         source.block_handled(false);
@@ -3382,7 +3408,7 @@ mod tests {
         // transport, and it does not try again when threads are back.
         let (conn, _remote, client) = loopback_pair();
         let (transport, cancel) = read_transport(conn);
-        let mut source = ReadAheadSource::new(transport, cancel, "test".to_string());
+        let mut source = ReadAheadSource::new(transport, cancel, "test".to_string(), None);
         crate::runtime::REFUSE_CONN_THREADS.with(|refuse| refuse.set(true));
         source.block_handled(true);
         crate::runtime::REFUSE_CONN_THREADS.with(|refuse| refuse.set(false));
@@ -3401,6 +3427,104 @@ mod tests {
             Err(e) => panic!("the transport was lost with the refused thread: {e}"),
         }
         source.finish();
+    }
+
+    /// Hooks that ask for read-ahead after every block, give the values
+    /// of the chain parameters the reader checks blocks with, if any,
+    /// and report each block they are handed: its nonce, and the values
+    /// it was checked with if it came from the reader thread.
+    struct CheckingHooks {
+        values: Option<DataSanityParams>,
+        seen: mpsc::Sender<(u32, Option<Option<DataSanityParams>>)>,
+    }
+
+    impl ServeHooks for CheckingHooks {
+        fn on_message(
+            &mut self,
+            _peer: &Mutex<Peer>,
+            msg: Message,
+            _mix_hash: Option<dcroxide_chainhash::Hash>,
+            _outbound: &OutboundQueue,
+        ) -> ServeSignal {
+            if let Message::Block(block) = msg {
+                let _ = self.seen.send((block.header.nonce, None));
+            }
+            ServeSignal::Continue
+        }
+
+        fn on_block(
+            &mut self,
+            _peer: &Mutex<Peer>,
+            block: HashedBlock,
+            _outbound: &OutboundQueue,
+        ) -> ServeSignal {
+            let _ = self
+                .seen
+                .send((block.block().header.nonce, Some(block.data_sanity_params())));
+            ServeSignal::Continue
+        }
+
+        fn read_ahead_wanted(&mut self) -> bool {
+            true
+        }
+
+        fn data_sanity_params(&mut self) -> Option<DataSanityParams> {
+            self.values
+        }
+    }
+
+    /// The values the server gives for the data sanity checks reach the
+    /// connection's reader thread: every block it reads arrives checked
+    /// with them, and with none where the server gives none.  The block
+    /// the input thread reads itself, before there is a reader, arrives
+    /// as its message, unchecked, as before.
+    #[test]
+    fn the_reader_checks_blocks_with_the_values_the_server_gives() {
+        let values = DataSanityParams::of(&dcroxide_chaincfg::regnet_params());
+        for given in [Some(values), None] {
+            let (conn, remote, client) = loopback_pair();
+            let (seen, seen_rx) = mpsc::channel();
+            let hooks = CheckingHooks {
+                values: given,
+                seen,
+            };
+            let server = std::thread::spawn(move || {
+                run_peer_connection(
+                    conn,
+                    inbound_peer(remote),
+                    0,
+                    NET,
+                    NEVER,
+                    NEVER,
+                    None,
+                    hooks,
+                )
+            });
+            let mut transport = client_handshake(client);
+            for nonce in 1..=3 {
+                transport
+                    .write_message(&block_msg(nonce))
+                    .expect("send block");
+            }
+            let arrived: Vec<_> = (0..3)
+                .map(|_| {
+                    seen_rx
+                        .recv_timeout(Duration::from_secs(10))
+                        .expect("the block is handled")
+                })
+                .collect();
+            assert_eq!(
+                arrived,
+                vec![(1, None), (2, Some(given)), (3, Some(given))],
+                "given {given:?}"
+            );
+            drop(transport);
+            let reason = server.join().expect("the server must not panic");
+            assert!(
+                matches!(reason, DisconnectReason::ReadError(_)),
+                "the client closing ends the connection: {reason:?}"
+            );
+        }
     }
 
     /// Hooks that say nothing about reading ahead are never read ahead:
@@ -3443,7 +3567,7 @@ mod tests {
     fn a_reader_no_longer_wanted_ahead_reads_only_when_the_handler_waits() {
         let (conn, _remote, client) = loopback_pair();
         let (transport, cancel) = read_transport(conn);
-        let mut source = ReadAheadSource::new(transport, cancel, "test".to_string());
+        let mut source = ReadAheadSource::new(transport, cancel, "test".to_string(), None);
         source.block_handled(true);
         assert!(source.is_ahead());
         source.block_handled(false);
@@ -3481,7 +3605,7 @@ mod tests {
     fn disconnecting_releases_a_reader_parked_on_a_full_queue() {
         let (conn, _remote, client) = loopback_pair();
         let (transport, cancel) = read_transport(conn);
-        let mut source = ReadAheadSource::new(transport, cancel, "test".to_string());
+        let mut source = ReadAheadSource::new(transport, cancel, "test".to_string(), None);
         source.block_handled(true);
         assert!(source.is_ahead());
 

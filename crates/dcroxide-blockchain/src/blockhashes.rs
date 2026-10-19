@@ -14,7 +14,9 @@
 //! the two trees once they have been built from those leaves, for a
 //! block that was hashed before it reached the chain, and
 //! `BlockSigOps` holds that block's counts of signature operations
-//! (see the last section).
+//! (see the section on them).  `DataSanityVerdict` holds the verdict
+//! of such a block's data sanity checks, where they were made before it
+//! reached the chain (see the last section).
 //!
 //! # The rule
 //!
@@ -48,14 +50,17 @@
 //! block that shares a header hash with a good one can never pick up
 //! the good one's hashes.
 //!
-//! That rule is about the hashes.  A [`HashedBlock`] may carry one thing
-//! more, and that one is stored: the block's record for the block files,
+//! That rule is about the hashes.  A [`HashedBlock`] may carry two
+//! things more.  One is stored: the block's record for the block files,
 //! made from the bytes the block was decoded from
 //! ([`HashedBlock::keep_wire_bytes`]).  It is kept only once those bytes
 //! have been compared with the block's serialization, in every build, so
 //! it holds the bytes the chain writes for that block when it has no
 //! record, and it reaches the chain in the one value that owns the
-//! block.  A record is never looked up by a block hash either.
+//! block.  A record is never looked up by a block hash either.  The
+//! other is the verdict of the block's data sanity checks
+//! ([`HashedBlock::check_data_sanity`]), which follows the rule as the
+//! hashes do (see the last section).
 //!
 //! Every function that reads the hashes first checks them against its
 //! block with `assert_for`: one hash per transaction of each tree in
@@ -134,14 +139,49 @@
 //! within the limit says only that the count would pass, and nothing is
 //! compared with the limit where the block was counted.  Under debug
 //! assertions the check counts the block again and compares.
+//!
+//! # The data sanity verdict
+//!
+//! One thing a [`HashedBlock`] may carry is a verdict: that of the
+//! context-free checks of the block's data and of each of its
+//! transactions (dcrd `checkBlockDataSanity`, `validate.go:878-965`),
+//! reached by [`HashedBlock::check_data_sanity`] over the block and the
+//! transaction hashes the value owns.  Block processing makes those
+//! checks right after the data preconditions, once the header's
+//! commitment to the data has been checked, whether or not the agenda's
+//! state let that commitment be proven (dcrd `process.go:496-515`).
+//! They read nothing but the block, its transaction hashes and two
+//! values of the chain parameters ([`crate::validate::DataSanityParams`]).
+//! So the verdict can be reached before the block reaches the chain, on
+//! another thread, and is the verdict the chain would reach.
+//!
+//! It is kept with the two values it was reached with
+//! (`DataSanityVerdict`), and it follows the rule above: it is read only
+//! out of the one value that owns the block, by the processing call that
+//! value is handed to, and only at the point where that call makes the
+//! checks for any other block.  The call returns it there, error, kind
+//! and text, as the checks would have returned it, and goes on exactly
+//! as it does after them; a block refused by an earlier check is
+//! refused by that check, and its verdict is dropped unread.  A verdict
+//! reached with values other than those of the parameters the call
+//! processes the block with is not read at all: the call makes the
+//! checks itself, as it does for every block that arrives without a
+//! verdict.  Nothing else about the block is decided by it, and nothing
+//! outside the chain can read it.  Under debug assertions the call makes
+//! the checks again where it reads a verdict, and compares.
 
+use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
+use dcroxide_chaincfg::Params;
 use dcroxide_chainhash::{HASH_SIZE, Hash, hash_h};
 use dcroxide_database::BlockRecord;
 use dcroxide_standalone::calc_merkle_root;
 use dcroxide_wire::{MsgBlock, MsgTx};
+
+use crate::ruleerror::RuleError;
+use crate::validate::DataSanityParams;
 
 /// The hash of every transaction of one block
 /// (`dcroxide_wire::MsgTx::tx_hash`), per tree and in block order: what
@@ -224,6 +264,23 @@ pub(crate) struct BlockSigOps {
     treasury_active: Option<u32>,
 }
 
+/// The verdict of the context-free checks of one block's data
+/// (`validate::check_block_data_sanity_by`, dcrd `checkBlockDataSanity`),
+/// reached over the block and its own transaction hashes, with the
+/// values of the chain parameters it was reached with.
+///
+/// The fields are private and [`DataSanityVerdict::reach`] is the only
+/// constructor, so a value is always the result of those checks over
+/// some block with the values it holds.  See the module documentation
+/// for the rule that keeps it with that block.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DataSanityVerdict {
+    /// The values of the chain parameters the checks read.
+    params: DataSanityParams,
+    /// What the checks returned.
+    result: Result<(), RuleError>,
+}
+
 /// A block together with its block hash, the hashes of its transactions,
 /// its merkle leaves, the roots of its two transaction merkle trees and
 /// its two counts of signature operations, all computed from that
@@ -248,6 +305,15 @@ pub(crate) struct BlockSigOps {
 /// limit, and the chain makes every check it makes of a block that
 /// arrives without hashes, in the same order
 /// (`Chain::process_hashed_block`).
+///
+/// One verdict may be reached on it before it reaches the chain: that
+/// of the context-free checks of the block's data
+/// ([`HashedBlock::check_data_sanity`]).  The chain returns it at the
+/// point where it makes those checks of any other block, so the order of
+/// the checks and every result are unchanged, and makes the checks
+/// itself where the block carries none, or one reached with other values
+/// of the parameters.  dcrd makes them on the thread that processes the
+/// block (`checkBlockDataSanity`, `process.go:501-515`).
 ///
 /// A block that was decoded from bytes may also carry those bytes, laid
 /// out as its record for the block files ([`HashedBlock::keep_wire_bytes`]):
@@ -274,6 +340,11 @@ pub struct HashedBlock {
     /// record, when they were handed in and are the block's
     /// serialization ([`HashedBlock::keep_wire_bytes`]).
     record: Option<Arc<BlockRecord>>,
+    /// The verdict of the block's data sanity checks, when they were
+    /// made here ([`HashedBlock::check_data_sanity`]).  Boxed, so that
+    /// a block that carries none, as every block but those the reading
+    /// thread checks, is a pointer's width larger and no more.
+    data_sanity: Option<Box<DataSanityVerdict>>,
 }
 
 impl HashedBlock {
@@ -322,7 +393,49 @@ impl HashedBlock {
             merkle_roots,
             sig_ops,
             record: None,
+            data_sanity: None,
         }
+    }
+
+    /// Make the context-free checks of the block's data and of each of
+    /// its transactions (`validate::check_block_data_sanity`, dcrd
+    /// `checkBlockDataSanity`) with the values of the chain parameters
+    /// in `params`, over the block and the transaction hashes this value
+    /// owns, and keep the verdict with those values, in place of any it
+    /// carried.
+    ///
+    /// The verdict is not handed out: a chain that processes the block
+    /// with parameters that hold those values returns it where it would
+    /// have made the checks (`Chain::process_hashed_block`), and one that
+    /// processes it with any other makes the checks itself.  Nothing else
+    /// is decided by it, here or by the chain.
+    ///
+    /// The checks read every transaction once more, for its sanity
+    /// checks and its serialized size, and file the transaction hashes
+    /// in an ordered set for the duplicate check, as the chain does: work
+    /// that grows with the block as the hashing does, and less of it.
+    /// The verdict is kept in one allocation of its own, of 48 bytes on
+    /// a 64-bit target, and one that fails also holds its error's
+    /// description.
+    pub fn check_data_sanity(&mut self, params: DataSanityParams) {
+        self.data_sanity = Some(Box::new(DataSanityVerdict::reach(
+            &self.block,
+            &self.tx_hashes,
+            params,
+        )));
+    }
+
+    /// The values of the chain parameters the block's data sanity checks
+    /// were made with here, if they were ([`Self::check_data_sanity`]).
+    /// The verdict itself is the chain's to read.
+    pub fn data_sanity_params(&self) -> Option<DataSanityParams> {
+        self.data_sanity.as_ref().map(|verdict| verdict.params)
+    }
+
+    /// The verdict of the block's data sanity checks, if they were made
+    /// here ([`Self::check_data_sanity`]).
+    pub(crate) fn data_sanity(&self) -> Option<&DataSanityVerdict> {
+        self.data_sanity.as_deref()
     }
 
     /// Keep the bytes the block was decoded from, `buf[block_at..]`, as
@@ -423,7 +536,8 @@ impl HashedBlock {
         &self.sig_ops
     }
 
-    /// Give the block back, dropping the hashes and the record.
+    /// Give the block back, dropping the hashes, the record and any
+    /// verdict.
     pub fn into_block(self) -> Arc<MsgBlock> {
         self.block
     }
@@ -469,6 +583,17 @@ std::thread_local! {
     /// tell that a check that was handed a block's counts within the
     /// limit did not count.
     pub(crate) static SIG_OP_LOOPS: core::cell::Cell<u64> =
+        const { core::cell::Cell::new(0) };
+
+    /// How many times this thread made a block's data sanity checks with
+    /// the chain's parameters (`validate::check_block_data_sanity_with_hashes`,
+    /// which `validate::check_block_data_sanity` calls too).  The checks
+    /// [`HashedBlock::check_data_sanity`] makes, and those
+    /// `DataSanityVerdict::assert_for` makes again under debug
+    /// assertions, are not counted.  It exists in this crate's unit-test
+    /// builds only, where the tests read it to tell that a processing
+    /// call that read a block's verdict did not make the checks.
+    pub(crate) static SANITY_CHECKS: core::cell::Cell<u64> =
         const { core::cell::Cell::new(0) };
 }
 
@@ -698,6 +823,41 @@ impl BlockSigOps {
         debug_assert!(
             *self == Self::compute(block),
             "signature operation counts do not match the block"
+        );
+    }
+}
+
+impl DataSanityVerdict {
+    /// Make the block's data sanity checks with the values in `params`,
+    /// over the block and its own transaction hashes.
+    pub(crate) fn reach(
+        block: &MsgBlock,
+        tx_hashes: &BlockTxHashes,
+        params: DataSanityParams,
+    ) -> DataSanityVerdict {
+        DataSanityVerdict {
+            params,
+            result: crate::validate::check_block_data_sanity_by(block, tx_hashes, &params),
+        }
+    }
+
+    /// The verdict, where it was reached with the values of the chain
+    /// parameters the checks read that `params` holds, and `None` where
+    /// either value differs.
+    pub(crate) fn for_params(&self, params: &Params) -> Option<&Result<(), RuleError>> {
+        (self.params == DataSanityParams::of(params)).then_some(&self.result)
+    }
+
+    /// Panic, under debug assertions, unless this is the verdict the
+    /// checks reach on the block now, with the values it was reached
+    /// with.  A release build has nothing to check here: the pairing
+    /// rests on the verdict having been read out of the one
+    /// [`HashedBlock`] that reached it on its own block and hashes.
+    #[track_caller]
+    pub(crate) fn assert_for(&self, block: &MsgBlock, tx_hashes: &BlockTxHashes) {
+        debug_assert!(
+            *self == Self::reach(block, tx_hashes, self.params),
+            "the data sanity verdict does not match the block"
         );
     }
 }
@@ -2058,5 +2218,254 @@ mod tests {
         assert!(leaves.stake().is_empty());
         assert_eq!(calc_merkle_root(leaves.stake()), Hash::ZERO);
         assert_eq!(calc_tx_tree_merkle_root(&block.stransactions), Hash::ZERO);
+    }
+
+    /// The blocks of dcrd's block sanity vectors
+    /// (`tests/data/blocksanity_vectors.txt`), made for mainnet, each with
+    /// the kind dcrd's `checkBlockSanity` gave it (`ok` for none) and its
+    /// row number.
+    fn block_sanity_rows() -> Vec<(String, MsgBlock, String)> {
+        include_str!("../tests/data/blocksanity_vectors.txt")
+            .lines()
+            .enumerate()
+            .filter_map(|(row, line)| {
+                let f: Vec<&str> = line.split(' ').collect();
+                (f[0] == "block").then(|| {
+                    let (block, _) =
+                        MsgBlock::from_bytes(&dcroxide_testutil::unhex(f[1])).expect("block");
+                    (format!("block sanity row {row}"), block, f[2].to_string())
+                })
+            })
+            .collect()
+    }
+
+    /// The fixed adjusted time dcrd's block sanity vectors were made at
+    /// (`tests/blocksanity_vectors.rs`).
+    const BLOCK_SANITY_ADJUSTED_TIME: i64 = 1454954400;
+
+    /// The verdict of its data sanity checks a hashed block carries is the
+    /// one the chain's own checks reach on the block, error, kind and
+    /// text: for every block of dcrd's full block battery with the
+    /// parameters of the network it was made for, and for every block of
+    /// dcrd's block sanity vectors with mainnet's.  Where a vector's
+    /// header passes its own checks, the verdict's kind is the one dcrd
+    /// recorded for the block.  The verdicts cover every kind the
+    /// vectors refuse a block's data with.  A verdict is read only with
+    /// the values it was reached with, not with the other network's, and
+    /// reaching it makes none of the checks the chain counts as its own.
+    #[test]
+    fn a_carried_data_sanity_verdict_is_the_checks_own() {
+        let regnet = dcroxide_chaincfg::regnet_params();
+        let mainnet = dcroxide_chaincfg::mainnet_params();
+        assert_ne!(
+            DataSanityParams::of(&regnet),
+            DataSanityParams::of(&mainnet)
+        );
+        let battery: Vec<(String, MsgBlock, Option<String>)> = fixture_blocks()
+            .into_iter()
+            .map(|(name, block)| (name, block, None))
+            .collect();
+        let vectors: Vec<(String, MsgBlock, Option<String>)> = block_sanity_rows()
+            .into_iter()
+            .map(|(name, block, kind)| (name, block, Some(kind)))
+            .collect();
+
+        let mut kinds = BTreeSet::new();
+        let (mut passed, mut failed, mut recorded) = (0usize, 0usize, 0usize);
+        for (params, other, blocks) in [(&regnet, &mainnet, battery), (&mainnet, &regnet, vectors)]
+        {
+            for (name, block, dcrd_kind) in &blocks {
+                let expected = crate::validate::check_block_data_sanity(block, params);
+
+                let mut hashed = HashedBlock::new(Arc::new(block.clone()));
+                assert!(hashed.data_sanity().is_none(), "{name}");
+                assert_eq!(hashed.data_sanity_params(), None, "{name}");
+                let before = SANITY_CHECKS.get();
+                hashed.check_data_sanity(DataSanityParams::of(params));
+                assert_eq!(
+                    SANITY_CHECKS.get(),
+                    before,
+                    "{name}: counted as the chain's"
+                );
+                assert_eq!(
+                    hashed.data_sanity_params(),
+                    Some(DataSanityParams::of(params)),
+                    "{name}"
+                );
+                let verdict = hashed.data_sanity().expect("a verdict");
+                assert_eq!(verdict.for_params(params), Some(&expected), "{name}");
+                assert_eq!(verdict.for_params(other), None, "{name}");
+
+                // dcrd's own record of the block, where its header
+                // passes the header checks the vector's verdict also
+                // made.
+                if let Some(dcrd_kind) = dcrd_kind
+                    && crate::validate::check_block_header_sanity(
+                        &block.header,
+                        BLOCK_SANITY_ADJUSTED_TIME,
+                        true,
+                        params,
+                    )
+                    .is_ok()
+                {
+                    let carried_kind = match &expected {
+                        Ok(()) => "ok",
+                        Err(err) => err.kind.kind_name(),
+                    };
+                    assert_eq!(carried_kind, dcrd_kind, "{name}");
+                    recorded += 1;
+                }
+
+                match expected {
+                    Ok(()) => passed += 1,
+                    Err(err) => {
+                        failed += 1;
+                        kinds.insert(err.kind.kind_name());
+                    }
+                }
+            }
+        }
+        assert_eq!((passed, failed, recorded), (597, 114, 138));
+        assert_eq!(
+            kinds.into_iter().collect::<Vec<_>>(),
+            [
+                "ErrBadTxOutValue",
+                "ErrDuplicateTx",
+                "ErrDuplicateTxInputs",
+                "ErrFreshStakeMismatch",
+                "ErrNoTransactions",
+                "ErrNoTxInputs",
+                "ErrNoTxOutputs",
+                "ErrNotEnoughStake",
+                "ErrStakeBelowMinimum",
+                "ErrWrongBlockSize",
+            ]
+        );
+    }
+
+    /// The three kinds the data sanity checks can refuse a block with
+    /// that no vector reaches, each carried as the checks reach it: a
+    /// transaction over the largest size, here a battery block's
+    /// coinbase checked with that size set one byte under it; an input
+    /// whose fraud proof amount is out of range; and a block over the
+    /// largest the wire protocol carries.  The first is also the check
+    /// that the verdict is reached with the values it is handed: it is
+    /// carried for those values only, and the battery block passes with
+    /// the network's own.
+    #[test]
+    fn the_kinds_no_vector_reaches_are_carried_as_the_checks_reach_them() {
+        let regnet = dcroxide_chaincfg::regnet_params();
+        let carried = |block: &MsgBlock, params: &dcroxide_chaincfg::Params| {
+            let mut hashed = HashedBlock::new(Arc::new(block.clone()));
+            hashed.check_data_sanity(DataSanityParams::of(params));
+            let verdict = hashed.data_sanity().expect("a verdict").clone();
+            let result = verdict
+                .for_params(params)
+                .expect("read with its own values")
+                .clone();
+            assert_eq!(
+                result,
+                crate::validate::check_block_data_sanity(block, params)
+            );
+            (verdict, result)
+        };
+        let resized = |mut block: MsgBlock| {
+            block.header.size = u32::try_from(block.serialize_size()).expect("size");
+            block
+        };
+        let (name, block) = fixture_blocks()
+            .into_iter()
+            .find(|(_, block)| {
+                block.header.height > 0
+                    && crate::validate::check_block_data_sanity(block, &regnet).is_ok()
+            })
+            .expect("a battery block that passes");
+
+        // One byte too small for the coinbase.
+        let mut tight = regnet.clone();
+        tight.max_tx_size = block.transactions[0].serialize_size() - 1;
+        let (verdict, result) = carried(&block, &tight);
+        let err = result.expect_err("over the size");
+        assert_eq!(err.kind, RuleErrorKind::TxTooBig, "{name}: {err:?}");
+        assert_eq!(verdict.for_params(&regnet), None, "{name}");
+        let (_, result) = carried(&block, &regnet);
+        assert_eq!(result, Ok(()), "{name}");
+
+        // A fraud proof amount below zero that is not the sentinel.
+        let mut fraud = block.clone();
+        let input = fraud.transactions[0]
+            .tx_in
+            .first_mut()
+            .expect("a coinbase input");
+        input.value_in = -2;
+        let fraud = resized(fraud);
+        let (_, result) = carried(&fraud, &regnet);
+        let err = result.expect_err("out of range");
+        assert_eq!(err.kind, RuleErrorKind::FraudAmountIn, "{err:?}");
+
+        // A block one transaction longer, its output script taking it
+        // over the largest block the wire protocol carries.
+        let mut big = block.clone();
+        let mut filler = big.transactions[0].clone();
+        filler.tx_out[0].pk_script = alloc::vec![0x51; 1 << 21];
+        big.transactions.push(filler);
+        let big = resized(big);
+        let (_, result) = carried(&big, &regnet);
+        let err = result.expect_err("too big");
+        assert_eq!(err.kind, RuleErrorKind::BlockTooBig, "{err:?}");
+    }
+
+    /// The values a verdict is read with are the two the checks read and
+    /// no others: the same parameters, or parameters that differ in
+    /// anything else, hold the same; a change to either one holds
+    /// others.  Simnet's are regnet's, and mainnet's and testnet's
+    /// differ from them.
+    #[test]
+    fn data_sanity_params_hold_the_two_values_the_checks_read() {
+        let regnet = dcroxide_chaincfg::regnet_params();
+        let of = DataSanityParams::of;
+        assert_eq!(of(&regnet), of(&dcroxide_chaincfg::regnet_params()));
+        let mut elsewhere = regnet.clone();
+        elsewhere.name = "elsewhere";
+        elsewhere.stake_validation_height += 1;
+        elsewhere.max_fresh_stake_per_block += 1;
+        assert_eq!(of(&elsewhere), of(&regnet));
+        let mut larger = regnet.clone();
+        larger.max_tx_size += 1;
+        assert_ne!(of(&larger), of(&regnet));
+        let mut dearer = regnet.clone();
+        dearer.minimum_stake_diff += 1;
+        assert_ne!(of(&dearer), of(&regnet));
+        assert_eq!(of(&dcroxide_chaincfg::simnet_params()), of(&regnet));
+        for other in [
+            dcroxide_chaincfg::mainnet_params(),
+            dcroxide_chaincfg::testnet3_params(),
+        ] {
+            assert_ne!(of(&other), of(&regnet), "{}", other.name);
+        }
+    }
+
+    /// What a verdict costs a hashed block: a pointer in place, whether
+    /// it carries one or not, and the verdict's own allocation, the two
+    /// values and the result.  On a 64-bit target that allocation is 48
+    /// bytes and a `HashedBlock` is 192, 8 more than before it could
+    /// carry a verdict; a field added to either, or the verdict held in
+    /// place, fails here.
+    #[test]
+    fn a_carried_verdict_is_small() {
+        /// The size of the type of the field `field` returns.
+        fn field_size<T>(_field: fn(&HashedBlock) -> &T) -> usize {
+            core::mem::size_of::<T>()
+        }
+        assert_eq!(
+            field_size(|hashed| &hashed.data_sanity),
+            core::mem::size_of::<usize>(),
+            "the verdict is held in place, not behind a pointer"
+        );
+        #[cfg(target_pointer_width = "64")]
+        {
+            assert_eq!(core::mem::size_of::<DataSanityVerdict>(), 48);
+            assert_eq!(core::mem::size_of::<HashedBlock>(), 192);
+        }
     }
 }

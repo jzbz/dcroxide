@@ -523,20 +523,22 @@ ahead of the thread that processes the blocks, which dcrd does not do
 that peer has delivered a first block, a thread of its own reads the
 connection, checks each message's checksum and decodes it, and for a
 block hashes its transactions, builds its two merkle trees, counts its
-signature operations and lays the bytes it arrived in out as its
-block-file record, after comparing them with the block's own
-serialization. It keeps at most four messages ahead of the thread that
-processes blocks, which still handles every message in the order it
-arrived, and stores a block that comes with its record as that record,
-without serializing it again. It changes nothing about which blocks or
-messages are accepted, which peers are dropped or banned, or what is
-logged about them, beyond lines of its own (below, and two more at the
-debug level in PARITY.md): it moves work and decides nothing, and
-PARITY.md names the tests that hold it to that and what they leave
-uncovered. One pair of counters shows it: `getnettotals` counts a
-message's bytes when it is read and `getpeerinfo`'s `bytesrecv` for that
-peer when it is handled, so the total can lead the peer's count by up to
-four messages.
+signature operations, makes the checks of the block's data that need no
+chain state, and lays the bytes it arrived in out as its block-file
+record, after comparing them with the block's own serialization. It
+keeps at most four messages ahead of the thread that processes blocks,
+which still handles every message in the order it arrived, and stores a
+block that comes with its record as that record, without serializing it
+again. It changes nothing about which blocks or messages are accepted,
+which peers are dropped or banned, or what is logged about them, beyond
+lines of its own (below, and two more at the debug level in PARITY.md):
+it moves work, and the one verdict it reaches, on a block's data, is
+acted on only where the thread that processes blocks would have reached
+it, with the same result. PARITY.md names the tests that hold it to that
+and what they leave uncovered. One pair of counters shows it:
+`getnettotals` counts a message's bytes when it is read and
+`getpeerinfo`'s `bytesrecv` for that peer when it is handled, so the
+total can lead the peer's count by up to four messages.
 It costs one more thread and one more descriptor on that one
 connection, kept until the connection ends, and the memory of up to
 four decoded messages, each kept with the frame it was read in. By an
@@ -562,19 +564,20 @@ committed it was run on 2026-10-13, inside `4700cf1` and only on
 reading thread's added work, the record and the merkle trees, has been
 measured apart only in builds that are not the code as it stands (the
 count of signature operations it also makes has been run in syncs only
-beside another change, below, and its scan of each block above the
-floor for inputs to hand to the pre-verifier only on top of a change
-that was not kept), where it moved about 7 s and 5 s of processor time
-from the thread that processes blocks to the reading thread rather than
-removing it, which paid there because the reading thread, fed by a
-server on the same machine, waited over 320 s for the other; in
-`88c46c3`, on 2026-10-17, it waited 275 to 278 s for the other in each
-default run. No sync has been run with it over a delayed link, or over a
-real one with a longer round trip than a LAN's (the syncs of 2026-10-18
-from a node on another machine on the same LAN had it on), where the
-round trip and not the thread that processes blocks may set the pace and
-it may gain nothing, nor on fewer cores or with `--assumevalid=0`, nor
-on macOS or Windows, where none of its tests has been run either; with
+beside another change, its scan of each block above the floor for inputs
+to hand to the pre-verifier only on top of a change that was not kept,
+and the checks of a block's data in one step that did not resolve them,
+below), where it moved about 7 s and 5 s of processor time from the
+thread that processes blocks to the reading thread rather than removing
+it, which paid there because the reading thread, fed by a server on the
+same machine, waited over 320 s for the other; in `88c46c3`, on
+2026-10-17, it waited 275 to 278 s for the other in each default run. No
+sync has been run with it over a delayed link, or over a real one with a
+longer round trip than a LAN's (the syncs of 2026-10-18 from a node on
+another machine on the same LAN had it on), where the round trip and not
+the thread that processes blocks may set the pace and it may gain
+nothing, nor on fewer cores or with `--assumevalid=0`, nor on macOS or
+Windows, where none of its tests has been run either; with
 `--noexistsaddrindex` it was run once in `4700cf1` on 2026-10-13 and
 twice in `88c46c3` on 2026-10-17, and never against a run with it off.
 
@@ -606,9 +609,9 @@ reading threads spent on checksums and decoding and on hashing, which
 the thread that processes blocks no longer spends; the socket reads
 moved too and are not timed. Since `44cf801` Y also covers building each
 block's two merkle trees, and it now also covers counting each block's
-signature operations twice, so it is not to be compared with a Y from
-earlier code. G is how long the reading threads stood still with
-four messages waiting: when it is most of the sync, the
+signature operations twice and checking its data, so it is not to be
+compared with a Y from earlier code. G is how long the reading threads
+stood still with four messages waiting: when it is most of the sync, the
 thread that processes blocks set the pace and the reading kept up. W is
 how long the thread that processes blocks waited for a block with none
 ready. By the counter's definition, and not seen in a run, a large W
@@ -650,7 +653,13 @@ three builds without the counts of signature operations and 56.70 and
 change that runs nothing on the reading thread; that thread's processor
 time rose 3.9 s with them ([bench-ledger.md](bench-ledger.md), "Rungs
 from a block server on the LAN, two changes held for their memory, and
-dcrd v2.1.7", build B).
+dcrd v2.1.7", build B). In that series' runs of the afternoon, another
+session, Y was 57.96 to 57.98 s in the three runs of a build without the
+checks of a block's data and 63.03 and 63.06 s in the two runs of the
+build that added them, whose syncs took 3.32 s less by the means, which
+that session's spread does not resolve; with them that thread's
+processor time rose 5.2 s and that of the thread that processes blocks
+fell 5.3 s (the same section, build H).
 
 After the assume-valid block the node also keeps threads for checking
 scripts. dcrd starts goroutines for each batch of a block's inputs.

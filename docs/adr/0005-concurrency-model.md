@@ -12,7 +12,8 @@
   scripts of a connected block; second addendum: a short-lived thread
   for the metadata commit), 2026-10-17 (addendum: the reading thread
   counts signature operations; second addendum: the script pool's
-  helpers pre-verify the signatures of blocks read ahead)
+  helpers pre-verify the signatures of blocks read ahead), 2026-10-18
+  (addendum: the reading thread makes the data sanity checks)
 
 ## Context
 
@@ -700,3 +701,61 @@ D2 is unchanged.
 > G). The build below it held a change that was not kept, those builds
 > were states of a worktree and not the tree of a commit, and the series
 > is one of its own.
+
+## Addendum, 2026-10-18 — the reading thread makes the data sanity checks
+
+The addenda of 2026-10-12 and 2026-10-16 record that the `peer-reader`
+thread reaches no verdict: making a `HashedBlock` checks nothing, and no
+rule is applied off the input thread; the counts of signature operations
+it keeps carry none either (first addendum of 2026-10-17). One rule now
+is: that choice is reversed for the context-free checks of a block's
+data and stands for everything else the thread does. `HashedBlock::new`
+still checks nothing. For each block it hashes, the reading thread then
+makes those checks, dcrd's `checkBlockDataSanity` (proof of stake, a
+regular tree that is not empty, the block size and the header's
+commitment to it, each transaction's sanity, the ticket count and
+duplicate transactions), as a step of its own
+(`HashedBlock::check_data_sanity`), with the two values of the chain
+parameters those checks read, `MinimumStakeDiff` and `MaxTxSize`, which
+the server gives the connection as its message source is made
+(`ServeHooks::data_sanity_params`; the default is none, and the daemon
+gives the network's). It keeps the verdict in the `HashedBlock` with
+those values and acts on nothing: no ban, no log line, no disconnect.
+
+The verdict is returned on the input thread, by the chain, at the point
+where it makes the checks of a block that arrives without one: after the
+duplicate, known-invalid, header and merkle checks and before the data
+is accepted, with the same error, kind and text, marking the block for a
+failure as the checks' own failure does. The chain reads it only where
+the two values equal those of the parameters it processes the block
+with, and makes the checks itself otherwise; the checks' body takes
+those two values and nothing else of the parameters
+(`DataSanityParams`), so what a verdict depends on is held by its type.
+dcrd makes the checks on the goroutine that processes the block
+(`internal/blockchain/process.go:501-515`). The work moves and the
+verdict does not: what each block is refused with, and when, is what it
+was.
+
+This changes the thread's terms and not its shape: no thread, lock or
+queue is added, and the work grows with the block, as the hashing does.
+It was measured in syncs on m3 on 2026-10-18, from a dcrd v2.1.7 node on
+another machine on the same LAN: the build that added it took 3.32 s
+less than the build below it by the means of two runs and three, which
+that session's spread of about ±6.5 s does not resolve, with 5.3 s less
+of the block thread's time on a processor and 5.2 s more of the reading
+thread's ([bench-ledger.md](../bench-ledger.md), "Rungs from a block
+server on the LAN, two changes held for their memory, and dcrd v2.1.7",
+build H). Those builds were states of a worktree, not the tree of a
+commit, and the series is one of its own. Without the hook's answer the
+thread checks nothing and every block is checked on the input thread, as
+`DCROXIDE_READ_AHEAD=off` also leaves it.
+
+The change moved lines that the first addendum of 2026-10-16 cites, and
+that the first addendum of 2026-10-17 gives anew, whose numbers stay as
+they were written: `HashedBlock::keep_wire_bytes` is now at
+`crates/dcroxide-blockchain/src/blockhashes.rs:485` and
+`HashedBlock::new` at `:383`, and the line of `validate_items`'s
+documentation cited there is at
+`crates/dcroxide-blockchain/src/validate.rs:5686`.
+
+D2 is unchanged.

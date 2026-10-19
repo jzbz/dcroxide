@@ -1706,7 +1706,10 @@ fn a_delivered_block_is_known_to_the_peer_that_delivered_it() {
 /// A block read ahead also arrives with its payload laid out as its
 /// record for the block files, and the chain's database writes that
 /// record as it stands; a block the input thread read is laid out by the
-/// database.  The last three of the twenty blocks buy tickets, which
+/// database.  It arrives too with the verdict of its data sanity checks,
+/// made on the reader thread with the values the server handler gives,
+/// and the chain makes those checks only of the block the input thread
+/// read.  The last three of the twenty blocks buy tickets, which
 /// gives each a stake tree of five script items: a tree the chain runs
 /// on its script pool (on a machine with more than one CPU).  So blocks
 /// in the form the reader thread makes them reach that pool here, on a
@@ -1821,6 +1824,14 @@ fn blocks_read_ahead_over_a_served_connection_are_hashed_once() {
             assert_eq!(
                 chain.arrivals_hashed, expected,
                 "read-ahead {read_ahead}: blocks the chain hashed itself"
+            );
+            // The reader thread also made each block's data sanity
+            // checks, with the values the server handler gave it, and
+            // the chain returned those verdicts in place of making the
+            // checks itself.
+            assert_eq!(
+                chain.arrivals_checked, expected,
+                "read-ahead {read_ahead}: blocks the chain checked itself"
             );
             assert_eq!(chain.tx_hash_recomputes, 0, "read-ahead {read_ahead}");
             // Every block but the first was read ahead.
@@ -2024,14 +2035,31 @@ fn sync_from_two_peers(read_ahead: bool, blocks: &[dcroxide_wire::MsgBlock]) -> 
     );
     let other_peer = other.handler.read_ahead_wanted();
 
+    // The values the reader thread would check each block's data with
+    // are those of the network's parameters, whether reading ahead is
+    // wanted or not.
+    let values = sync_peer.handler.data_sanity_params();
+    assert_eq!(
+        values,
+        Some(dcroxide_blockchain::validate::DataSanityParams::of(
+            &dcroxide_chaincfg::regnet_params()
+        ))
+    );
+
     let (mut answers, mut sync_done) = (Vec::new(), Vec::new());
     for (i, block) in blocks[1..].iter().enumerate() {
         // Every other block arrives hashed, as the reader thread hands
         // them over once it runs: the answer is worked out the same way.
+        // Every other one of those also arrives checked for its data's
+        // sanity with the handler's values, as the reader checks it.
         let signal = if i % 2 == 1 {
-            sync_peer.deliver_hashed(dcroxide_blockchain::HashedBlock::new(Arc::new(
-                block.clone(),
-            )))
+            let mut hashed = dcroxide_blockchain::HashedBlock::new(Arc::new(block.clone()));
+            if i % 4 == 1
+                && let Some(values) = values
+            {
+                hashed.check_data_sanity(values);
+            }
+            sync_peer.deliver_hashed(hashed)
         } else {
             sync_peer.deliver(Message::Block(block.clone()))
         };

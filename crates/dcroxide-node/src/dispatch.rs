@@ -2524,7 +2524,9 @@ impl ServerPeerHandler {
     /// hashes the block carries handed to the chain so it does not
     /// compute them again, and with them the payload the block was read
     /// in, laid out as its block-file record, so the chain does not
-    /// serialize the block to store it.
+    /// serialize the block to store it, and the verdict of its data
+    /// sanity checks ([`Self::data_sanity_params`]), which the chain
+    /// returns where it would have made them.
     pub fn on_block(&mut self, block: dcroxide_blockchain::HashedBlock) -> ServeSignal {
         self.handle_block(ArrivedBlock::Hashed(block))
     }
@@ -2542,6 +2544,18 @@ impl ServerPeerHandler {
     /// connection is read as dcrd reads every connection.
     pub fn read_ahead_wanted(&self) -> bool {
         self.read_ahead_wanted
+    }
+
+    /// The values of the chain parameters the connection's reader thread
+    /// makes the data sanity checks of each block it hashes with
+    /// ([`crate::peerloop::ServeHooks::data_sanity_params`]): those of
+    /// the network's parameters, which the sync chain processes the
+    /// blocks with too, so that it returns the verdict each block
+    /// arrives with where it would have made the checks.
+    pub fn data_sanity_params(&self) -> Option<dcroxide_blockchain::validate::DataSanityParams> {
+        Some(dcroxide_blockchain::validate::DataSanityParams::of(
+            &self.ctx.params,
+        ))
     }
 
     /// Dispatch one incoming message to its server handler, queueing

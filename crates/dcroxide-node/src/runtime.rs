@@ -798,6 +798,13 @@ impl ServeHooks for InboundHooks {
         }
     }
 
+    fn data_sanity_params(&mut self) -> Option<dcroxide_blockchain::validate::DataSanityParams> {
+        match self {
+            InboundHooks::Server(handler) => handler.data_sanity_params(),
+            InboundHooks::NoOp => None,
+        }
+    }
+
     fn on_disconnected(&mut self, peer: &Mutex<Peer>) {
         if let InboundHooks::Server(handler) = self {
             handler.on_disconnected(peer);

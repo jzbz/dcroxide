@@ -14,6 +14,13 @@
 //! them.  The chain that is handed hashed blocks hashes none of them
 //! itself, keeps the allocation each arrived in, and connects with the
 //! hashes it was handed.
+//!
+//! A hashed block may also carry the verdict of its data sanity checks,
+//! reached where it was hashed (`HashedBlock::check_data_sanity`).  That
+//! changes nothing either: the battery gives the same outcomes through
+//! blocks checked with the values of the chain's parameters, which the
+//! chain returns where it makes those checks, and through blocks checked
+//! with another network's, which the chain does not read.
 
 // Test-harness arithmetic over small counts.
 #![allow(clippy::arithmetic_side_effects)]
@@ -21,8 +28,9 @@
 use std::sync::Arc;
 
 use dcroxide_blockchain::process::Chain;
+use dcroxide_blockchain::validate::DataSanityParams;
 use dcroxide_blockchain::{HashedBlock, RuleError, RuleErrorKind};
-use dcroxide_chaincfg::regnet_params;
+use dcroxide_chaincfg::{mainnet_params, regnet_params};
 use dcroxide_chainhash::Hash;
 use dcroxide_testutil::unhex;
 use dcroxide_wire::MsgBlock;
@@ -157,5 +165,58 @@ fn the_battery_gives_the_same_outcomes_through_hashed_blocks() {
     );
     for (hash, block) in &hashed_chain.blocks {
         assert_eq!(**block, *plain_chain.blocks[hash]);
+    }
+}
+
+/// Every row of the battery gives the same result, and leaves the same
+/// tip, whether the block arrives plain or hashed and checked for its
+/// data's sanity, with the values of the chain's parameters or with
+/// mainnet's, and the rows refused by those checks are among them.
+#[test]
+fn the_battery_gives_the_same_outcomes_through_checked_hashed_blocks() {
+    let params = regnet_params();
+    let own = DataSanityParams::of(&params);
+    let other = DataSanityParams::of(&mainnet_params());
+    assert_ne!(own, other);
+    let mut plain_chain = Chain::new(&params, Hash::ZERO, false);
+    let mut own_chain = Chain::new(&params, Hash::ZERO, false);
+    let mut other_chain = Chain::new(&params, Hash::ZERO, false);
+
+    let mut kinds = std::collections::BTreeSet::new();
+    for (name, now, block) in battery_blocks() {
+        let shared = Arc::new(block);
+        let plain_result = plain_chain.process_shared_block(&shared, now, &params);
+        for (values, chain) in [(own, &mut own_chain), (other, &mut other_chain)] {
+            let mut hashed = HashedBlock::new(Arc::clone(&shared));
+            assert_eq!(hashed.data_sanity_params(), None, "{name}");
+            hashed.check_data_sanity(values);
+            assert_eq!(hashed.data_sanity_params(), Some(values), "{name}");
+            let result = chain.process_hashed_block(&hashed, now, &params);
+            assert_eq!(outcome(&result), outcome(&plain_result), "{name}");
+            assert_eq!(tip_hash(chain), tip_hash(&plain_chain), "{name}");
+        }
+        if let Some(err) = plain_result.1.first() {
+            kinds.insert(err.kind.kind_name());
+        }
+    }
+    // The chain handed verdicts reached with its own values checked no
+    // arriving block itself; the one handed mainnet's checked every
+    // block the plain chain checked.
+    assert_eq!(own_chain.arrivals_checked, 0);
+    assert!(plain_chain.arrivals_checked >= 300);
+    assert_eq!(other_chain.arrivals_checked, plain_chain.arrivals_checked);
+    for kind in [
+        "ErrBadTxOutValue",
+        "ErrDuplicateTx",
+        "ErrDuplicateTxInputs",
+        "ErrFreshStakeMismatch",
+        "ErrNoTransactions",
+        "ErrNoTxInputs",
+        "ErrNoTxOutputs",
+        "ErrNotEnoughStake",
+        "ErrStakeBelowMinimum",
+        "ErrWrongBlockSize",
+    ] {
+        assert!(kinds.contains(kind), "{kind} is not among {kinds:?}");
     }
 }

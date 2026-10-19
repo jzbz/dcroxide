@@ -179,17 +179,19 @@ evaluating this code.
   blocks and waste memory (`server.go:1365-1369`). Here up to four
   frames from the sync peer are checksummed and decoded before the
   frame ahead of them has been judged, and a block among them is also
-  hashed, has its two transaction merkle trees built and its signature
-  operations counted twice, is serialized once and compared with the
-  payload it arrived in, and has that payload laid out as its block-file
-  record, with a CRC-32C and a second hash of its header. They are held,
-  decoded and each with its frame, until their turn. None is acted on
-  early: each is handled in the order it arrived by the code that
-  handled it before, and nothing queued is handled once the connection
-  is being torn down. So what a hostile sync peer gains is the work and
-  the memory. The merkle trees add less work than a block's transactions
-  already cost: a tree of n transactions has at most
-  n - 1 + ceil(log2 n) inner nodes, each one hash of 64 bytes, two
+  hashed, has its two transaction merkle trees built, its signature
+  operations counted twice and the checks of its data that need no chain
+  state made, is serialized once and compared with the payload it
+  arrived in, and has that payload laid out as its block-file record,
+  with a CRC-32C and a second hash of its header. They are held, decoded
+  and each with its frame, until their turn. None is acted on early:
+  each is handled in the order it arrived by the code that handled it
+  before, a block's verdict on its data is read only at the point where
+  the chain would have made those checks, and nothing queued is handled
+  once the connection is being torn down. So what a hostile sync peer
+  gains is the work and the memory. The merkle trees add less work than
+  a block's transactions already cost: a tree of n transactions has at
+  most n - 1 + ceil(log2 n) inner nodes, each one hash of 64 bytes, two
   BLAKE-256 compressions, where each transaction takes at least four
   compressions; the decoder allows 43,691 transactions in each tree and
   accepts one of five bytes, so the block whose trees cost the most has
@@ -199,6 +201,10 @@ evaluating this code.
   scripts, each reading a script once at most, with no hashing, and keep
   nothing past a transaction but the two sums; what they cost the
   reading thread on a hostile peer's blocks has not been measured. The
+  checks of a block's data are one more walk of its transactions, each
+  transaction's own checks and an ordered set of their hashes, work the
+  thread that connects blocks made before; what they cost the reading
+  thread on a hostile peer's blocks has not been measured either. The
   signatures of a queued block above the height at and below which the
   chain checks no script are also checked while it waits, on the script
   pool's helper threads, at most two fewer at once than the physical

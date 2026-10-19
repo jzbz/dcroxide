@@ -677,15 +677,97 @@ pub fn check_block_data_sanity(block: &MsgBlock, params: &Params) -> Result<(), 
     check_block_data_sanity_with_hashes(block, &tx_hashes, params)
 }
 
+/// The values of the chain parameters that the context-free checks of a
+/// block's data read ([`check_block_data_sanity`]), and nothing else of
+/// them: the network's minimum stake difficulty and its largest
+/// transaction.  The checks read no chain state, no time and no agenda,
+/// so their verdict on a block is fixed by the block and these two
+/// values.
+///
+/// A [`crate::HashedBlock`] may be checked with these
+/// ([`crate::HashedBlock::check_data_sanity`]) before it reaches the
+/// chain, on another thread.  The chain uses that verdict only where the
+/// values it was reached with are equal to those of the parameters it
+/// processes the block with, and checks the block itself otherwise.
+///
+/// The fields are private and [`DataSanityParams::of`] is the only
+/// constructor, so a value is always the pair some parameters hold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DataSanityParams {
+    /// `Params::minimum_stake_diff`.
+    minimum_stake_diff: i64,
+    /// `Params::max_tx_size`.
+    max_tx_size: usize,
+}
+
+impl DataSanityParams {
+    /// The values `params` holds.
+    pub fn of(params: &Params) -> DataSanityParams {
+        DataSanityParams {
+            minimum_stake_diff: params.minimum_stake_diff,
+            max_tx_size: params.max_tx_size,
+        }
+    }
+}
+
 /// [`check_block_data_sanity`] given the hashes of the block's
 /// transactions: dcrd `checkBlockDataSanity` reading the hashes its
 /// `dcrutil.Block` caches for the duplicate check
 /// (`validate.go:951-961`).  The hashes must have been computed from
 /// this very block.
+///
+/// The checks themselves are [`check_block_data_sanity_by`], over the
+/// values of `params` they read.
 pub(crate) fn check_block_data_sanity_with_hashes(
     block: &MsgBlock,
     tx_hashes: &crate::blockhashes::BlockTxHashes,
     params: &Params,
+) -> Result<(), RuleError> {
+    #[cfg(test)]
+    crate::blockhashes::SANITY_CHECKS.set(crate::blockhashes::SANITY_CHECKS.get().wrapping_add(1));
+    check_block_data_sanity_by(block, tx_hashes, &DataSanityParams::of(params))
+}
+
+/// The data sanity check block processing makes, given the verdict the
+/// block arrived with, if it was checked before it reached the chain
+/// ([`crate::HashedBlock::check_data_sanity`]): that verdict, where it
+/// was reached with the values of `params` the checks read, and
+/// otherwise [`check_block_data_sanity_with_hashes`], here and now.
+/// Returns the result, and whether the checks were made here.
+///
+/// Either way the result is the same: the checks are a function of the
+/// block, its own transaction hashes and those two values alone.  The
+/// caller returns it at the point it has always made the checks, so
+/// nothing about their order moves.  Under debug assertions a verdict
+/// that is used is compared with the checks made again.
+pub(crate) fn check_block_data_sanity_with_verdict(
+    block: &MsgBlock,
+    tx_hashes: &crate::blockhashes::BlockTxHashes,
+    carried: Option<&crate::blockhashes::DataSanityVerdict>,
+    params: &Params,
+) -> (Result<(), RuleError>, bool) {
+    if let Some(carried) = carried
+        && let Some(result) = carried.for_params(params)
+    {
+        carried.assert_for(block, tx_hashes);
+        return (result.clone(), false);
+    }
+    (
+        check_block_data_sanity_with_hashes(block, tx_hashes, params),
+        true,
+    )
+}
+
+/// The context-free checks of a block's data and of each of its
+/// transactions (dcrd `checkBlockDataSanity`, `validate.go:878-965`),
+/// reading of the chain parameters only the values `params` holds: the
+/// body of [`check_block_data_sanity_with_hashes`], and of the verdict a
+/// [`crate::HashedBlock`] may carry.  The hashes must have been computed
+/// from this very block.
+pub(crate) fn check_block_data_sanity_by(
+    block: &MsgBlock,
+    tx_hashes: &crate::blockhashes::BlockTxHashes,
+    params: &DataSanityParams,
 ) -> Result<(), RuleError> {
     tx_hashes.assert_for(block);
 

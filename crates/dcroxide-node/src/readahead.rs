@@ -31,14 +31,22 @@
 //!
 //! - **Order.**  One reader appends, one handler takes from the front,
 //!   so the handler sees the frames in the order they ended on the wire.
-//! - **Values, never verdicts.**  The reader checks nothing but the
-//!   frame.  A block it hands over with the hashes of its transactions,
-//!   the roots of its two transaction merkle trees and its counts of
-//!   signature operations under each answer the treasury agenda can
-//!   give (`dcroxide_blockchain::HashedBlock`), which the chain reads
-//!   where it would have computed them and not before; no merkle root is
-//!   compared with a header, no count with the limit, and no rule
-//!   applied on the reader's thread.
+//! - **Values, and one verdict the chain returns.**  The reader acts on
+//!   nothing but the frame.  A block it hands over with the hashes of
+//!   its transactions, the roots of its two transaction merkle trees and
+//!   its counts of signature operations under each answer the treasury
+//!   agenda can give (`dcroxide_blockchain::HashedBlock`), which the
+//!   chain reads where it would have computed them and not before; no
+//!   merkle root is compared with a header and no count with the limit
+//!   on the reader's thread.  The one rule applied there is the
+//!   context-free checks of the block's data
+//!   (`HashedBlock::check_data_sanity`, dcrd `checkBlockDataSanity`),
+//!   made with the values of the chain parameters the server gives
+//!   (`ServeHooks::data_sanity_params`), and only where it gives them.
+//!   Their verdict goes with the block unread, and the chain returns it
+//!   at the point where it makes those checks of any other block, after
+//!   the header and merkle checks, so the order of the checks and every
+//!   result are unchanged.
 //!   The block also carries the payload it was decoded from, laid out as
 //!   its record for the block files, which the chain writes where it
 //!   would have serialized the block and taken the record's checksum
@@ -97,6 +105,7 @@ use std::time::{Duration, Instant};
 
 use dcroxide_blockchain::HashedBlock;
 use dcroxide_blockchain::preverify::{Preverifier, Ticket};
+use dcroxide_blockchain::validate::DataSanityParams;
 use dcroxide_chainhash::Hash;
 use dcroxide_netsync::manager::LogLevel;
 use dcroxide_peer::{MsgTransport, ReadError};
@@ -273,6 +282,9 @@ pub(crate) struct Shared {
     cancel: Cancel,
     /// The process's signature pre-verifier, if it has one.
     preverify: Option<Arc<Preverifier>>,
+    /// The values of the chain parameters the reader makes each block's
+    /// data sanity checks with, if the server gave any.
+    data_sanity: Option<DataSanityParams>,
 }
 
 /// The state behind [`Shared`]'s lock.
@@ -316,8 +328,13 @@ impl State {
 impl Shared {
     /// The shared state of a connection whose handler has just handled a
     /// block and wants the frames behind it read ahead, with the signature
-    /// pre-verifier its blocks are handed to, if any.
-    fn new(cancel: Cancel, preverify: Option<Arc<Preverifier>>) -> Shared {
+    /// pre-verifier its blocks are handed to, if any, and the values its
+    /// blocks' data sanity checks are made with, if any.
+    fn new(
+        cancel: Cancel,
+        preverify: Option<Arc<Preverifier>>,
+        data_sanity: Option<DataSanityParams>,
+    ) -> Shared {
         Shared {
             state: Mutex::new(State {
                 queue: VecDeque::with_capacity(READ_AHEAD_MAX_ITEMS),
@@ -332,6 +349,7 @@ impl Shared {
             ready: Condvar::new(),
             cancel,
             preverify,
+            data_sanity,
         }
     }
 
@@ -605,13 +623,15 @@ impl Drop for ReaderExit<'_> {
 }
 
 /// The reader thread: read frames as [`Shared::may_read`] allows, hash
-/// the blocks among them, and queue each frame for the handler, until a
-/// read fails or the handler leaves.
+/// the blocks among them, make their data sanity checks when the queue
+/// holds the values to make them with, and queue each frame for the
+/// handler, until a read fails or the handler leaves.
 ///
 /// It is handed the transport, the queue and the counters its own work
 /// is added to, which are the process's ([`STATS`]) for every reader
-/// thread of a node, and nothing else.  It reaches no verdict on what it
-/// reads, and after its first failed read it reads nothing more.
+/// thread of a node, and nothing else.  It acts on no verdict: the one
+/// it may reach, of a block's data sanity checks, goes with the block to
+/// the chain unread.  After its first failed read it reads nothing more.
 fn reader_loop<R: FrameReader>(mut reader: R, shared: &Shared, stats: &Stats) {
     let _exit = ReaderExit(shared);
     let mut read_total = reader.total_bytes_read();
@@ -672,6 +692,16 @@ fn reader_loop<R: FrameReader>(mut reader: R, shared: &Shared, stats: &Stats) {
                         // before it is queued, so that the helpers can
                         // start on it while it waits.
                         ticket = shared.preverify(&hashed);
+                        // Its data sanity checks are made here too, with
+                        // the values the server gave, if it gave any.
+                        // The verdict goes with the block, unread: the
+                        // chain returns it where it makes those checks,
+                        // and nothing is done about it here.
+                        if let Some(params) = shared.data_sanity {
+                            let began = Instant::now();
+                            hashed.check_data_sanity(params);
+                            add_nanos(&stats.hash_nanos, began.elapsed());
+                        }
                         Received::Block(hashed)
                     }
                     // A mixing message is hashed once as it is read, as
@@ -709,6 +739,9 @@ pub(crate) struct ReadAheadSource {
     label: String,
     /// A reader could not be started once, and is not tried again.
     gave_up: bool,
+    /// The values of the chain parameters a reader thread makes each
+    /// block's data sanity checks with, if the server gave any.
+    data_sanity: Option<DataSanityParams>,
 }
 
 /// Who reads the connection.
@@ -731,11 +764,14 @@ enum Mode {
 impl ReadAheadSource {
     /// A source that reads `transport` on the calling thread until
     /// read-ahead is wanted.  `cancel` is the connection's teardown flag
-    /// and `label` names the peer in the log.
+    /// and `label` names the peer in the log.  A reader thread it starts
+    /// makes the data sanity checks of each block it hashes with
+    /// `data_sanity`, if that is given, and of none otherwise.
     pub(crate) fn new(
         transport: WireTransport<Teardown>,
         cancel: Cancel,
         label: String,
+        data_sanity: Option<DataSanityParams>,
     ) -> ReadAheadSource {
         let read_total = transport.bytes_read();
         ReadAheadSource {
@@ -744,6 +780,7 @@ impl ReadAheadSource {
             cancel,
             label,
             gave_up: false,
+            data_sanity,
         }
     }
 
@@ -774,6 +811,7 @@ impl ReadAheadSource {
         let shared = Arc::new(Shared::new(
             self.cancel.clone(),
             crate::preverify::installed().cloned(),
+            self.data_sanity,
         ));
         let (hand_over, handed) = mpsc::sync_channel::<WireTransport<Teardown>>(1);
         let reader_shared = Arc::clone(&shared);
@@ -963,7 +1001,8 @@ struct Stats {
     decode_nanos: AtomicU64,
     /// Time the reader threads spent hashing blocks
     /// (`HashedBlock::new`: the hashes, the merkle trees and the counts
-    /// of signature operations).
+    /// of signature operations) and making their data sanity checks
+    /// (`HashedBlock::check_data_sanity`).
     hash_nanos: AtomicU64,
     /// Blocks the reader threads handed over with the payload they were
     /// decoded from laid out as a block-file record.
@@ -1029,11 +1068,13 @@ fn seconds(nanos: u64) -> String {
 ///
 /// The times are sums over all reader threads.  The checksum and decode
 /// time and the hashing time together are timed work that left the block
-/// thread; the socket reads themselves are not timed.  The two waits say
-/// which side was short: the reader waits for the block thread when the
-/// queue is full, and the block thread waits for the reader when the
-/// queue is empty.  The most items queued is the check on the queue's
-/// bound of four.  The index queue's figure
+/// thread; the socket reads themselves are not timed.  The hashing time
+/// is that of everything `HashedBlock::new` computes and, where the
+/// server gave the values for them, of the blocks' data sanity checks.
+/// The two waits say which side was short: the reader waits for the
+/// block thread when the queue is full, and the block thread waits for
+/// the reader when the queue is empty.  The most items queued is the
+/// check on the queue's bound of four.  The index queue's figure
 /// ([`crate::indexes::notify_blocked_nanos`]) is how long the block
 /// thread was held up handing blocks to the index thread.
 ///
@@ -1216,22 +1257,23 @@ mod tests {
         /// process's, which every reader thread of this test binary
         /// moves.
         fn start_counting(steps: Vec<Step>, stats: Option<Arc<Stats>>) -> Rig {
-            Rig::start_with(steps, stats, None)
+            Rig::start_with(steps, stats, None, None)
         }
 
         /// [`Rig::start`] with the blocks read handed to the given
         /// signature pre-verifier.
         fn start_preverifying(steps: Vec<Step>, preverify: Arc<Preverifier>) -> Rig {
-            Rig::start_with(steps, None, Some(preverify))
+            Rig::start_with(steps, None, Some(preverify), None)
         }
 
         fn start_with(
             steps: Vec<Step>,
             stats: Option<Arc<Stats>>,
             preverify: Option<Arc<Preverifier>>,
+            data_sanity: Option<DataSanityParams>,
         ) -> Rig {
             let cancel = Cancel::new();
-            let shared = Arc::new(Shared::new(cancel.clone(), preverify));
+            let shared = Arc::new(Shared::new(cancel.clone(), preverify, data_sanity));
             let (started_tx, started) = mpsc::channel();
             let (gate, gate_rx) = mpsc::channel();
             let (since_tx, since_at_gate) = mpsc::channel();
@@ -1870,7 +1912,7 @@ mod tests {
             }
         }
 
-        let shared = Arc::new(Shared::new(Cancel::new(), None));
+        let shared = Arc::new(Shared::new(Cancel::new(), None, None));
         let reader_shared = Arc::clone(&shared);
         let reader = std::thread::spawn(move || reader_loop(Panicking, &reader_shared, &STATS));
         assert!(reader.join().is_err(), "the reader thread panicked");
@@ -2078,6 +2120,51 @@ mod tests {
         rig.expect_started(4);
         assert_eq!(preverifier.counts().blocks, 2);
         rig.finish();
+    }
+
+    /// A reader given the values of the chain parameters makes the data
+    /// sanity checks of every block it hashes with them, ahead of the
+    /// handler and in turn alike, and hands each block over carrying that
+    /// verdict.  A reader given none hands every block over without one.
+    /// Messages that are not blocks are handed over as they were read
+    /// either way.
+    #[test]
+    fn blocks_read_carry_the_sanity_checks_made_with_the_values_given() {
+        let values = DataSanityParams::of(&dcroxide_chaincfg::regnet_params());
+        for given in [Some(values), None] {
+            let rig = Rig::start_with(
+                vec![
+                    frame(block(1)),
+                    Step::Gated(block(2), 24),
+                    frame(ping(3)),
+                    frame(block(4)),
+                ],
+                None,
+                None,
+                given,
+            );
+            let take_block = |nonce: u32| match rig.shared.next().result {
+                Ok(Received::Block(hashed)) => {
+                    assert_eq!(hashed.block().header.nonce, nonce);
+                    assert_eq!(hashed.data_sanity_params(), given, "block {nonce}");
+                }
+                Ok(Received::Message { msg, .. }) => panic!("block {nonce} arrived as {msg:?}"),
+                Err(e) => panic!("block {nonce}: {e}"),
+            };
+            // Blocks 1 and 2 are read ahead of the handler.
+            rig.expect_started(0);
+            rig.expect_started(1);
+            rig.shared.set_ahead(false);
+            let _ = rig.gate.send(());
+            take_block(1);
+            take_block(2);
+            // From here each frame is read once the handler waits for it.
+            assert_eq!(rig.take(), ping(3));
+            rig.expect_started(2);
+            take_block(4);
+            rig.expect_started(3);
+            rig.finish();
+        }
     }
 
     /// `DCROXIDE_READ_AHEAD` turns the read-ahead off with `off` or `0`
