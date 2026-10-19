@@ -19,13 +19,15 @@
 //! a drop cut at any point leaves a store that finishes the drop and
 //! rebuilds.
 //!
-//! They hold too with the redb commit of a flush made on a thread of its
-//! own (`Options::background_commit`), as the daemon makes it.  There a
-//! flush's `finished` comes after the hook of the connect that tripped
-//! it, and after those of any connects made while its commit ran; those
-//! runs hold each such commit at its first write and make up to two more
-//! connects beside it, so that keys are handed over between a flush's
-//! seal and its `finished` at every cut.
+//! They hold too with the rows and the redb commit of a flush written on
+//! a thread of its own (`Options::background_commit`), as the daemon
+//! writes them.  There a flush's `contribute` and its `finished` come
+//! after the hook of the connect that tripped it, and after those of any
+//! connects made while the flush ran; those runs hold each such flush at
+//! the start of its `contribute`, then at its commit's first write, and
+//! make up to two more connects beside it, so that keys are handed over
+//! between a flush's seal and its `contribute`, and between its
+//! `contribute` and its `finished`, at every cut.
 //!
 //! **Controls that must fail**, each a broken index the checks have to
 //! catch: a backend whose sync does nothing, a participant that skips its
@@ -325,12 +327,14 @@ struct Run {
     /// prepared before their transaction began.
     connects: usize,
     prepared: usize,
-    /// The flushes whose commit was held on its own thread, each with
-    /// the keys of the connect that tripped it handed over between its
-    /// `contribute` and its `finished`.
+    /// The flushes held on their own thread, each with the keys of the
+    /// connect that tripped it handed over between its seal and its
+    /// `contribute`.
     held: usize,
-    /// The further connects made while such a commit was held.
+    /// The further connects made while such a flush was held.
     beside: usize,
+    /// Of those, the ones made before its `contribute`.
+    before_contribute: usize,
 }
 
 /// The index tip's height as the store holds it.
@@ -349,9 +353,22 @@ fn tip_height(db: &Database) -> Option<i64> {
 /// stuck.
 const STUCK: Duration = Duration::from_secs(60);
 
-/// Run `call` while a commit is held at `gate`, on a thread of its own.
-/// A connect that had to wait for the held commit would wait for ever:
-/// the gate is opened for it and the run failed.
+/// Wait for `done` to hold, for at most [`STUCK`]; whether it did.
+fn wait_for(done: impl Fn() -> bool) -> bool {
+    let deadline = Instant::now() + STUCK;
+    while !done() {
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    true
+}
+
+/// Run `call` while a flush is held on its own thread, at `gate` or at
+/// the start of its `contribute`, on a thread of its own.  A connect that
+/// had to wait for the held flush would wait for ever: the gate is opened
+/// for it and the run failed.
 fn beside_a_held_commit<T: Send>(gate: &GateBackend, call: impl FnOnce() -> T + Send) -> T {
     std::thread::scope(|scope| {
         let (done, result) = std::sync::mpsc::channel();
@@ -369,18 +386,23 @@ fn beside_a_held_commit<T: Send>(gate: &GateBackend, call: impl FnOnce() -> T + 
 /// `cut_after` storage operations when given, then hold what survived to
 /// the four properties.
 ///
-/// A script that asks for commits on a thread of their own
+/// A script that asks for flushes on a thread of their own
 /// ([`Script::background`]) makes every connect with a gate shut over
-/// the storage.  A connect whose flush the index wrote in leaves that
-/// flush's commit held at its first write, the memtable's keys sealed
-/// and the connect's own keys handed over behind the seal.  One or two
-/// of the connects that follow it in the script are then made while it
-/// is held, unless the index already asks for another flush, which would
-/// have to wait for this one, or the commit was stopped growing the
-/// file, where redb lets no transaction begin
-/// (`GateBackend::holds_a_length_change`).  Then the gate opens and the
-/// commit is waited for.  A held commit makes no storage operation, and
-/// has made all of its own before the next step, so a cut after the
+/// the storage and the index's `contribute` held.  A connect whose flush
+/// the index has work in leaves that flush on the committer thread, the
+/// memtable's keys sealed and the connect's own keys handed over behind
+/// the seal: held at the start of its `contribute`, or at the gate,
+/// should writing the overlay's rows reach storage first.  One of the
+/// connects that follow it in the script is made there, between the seal
+/// and the `contribute`.  When the `contribute` was what held it, the
+/// flush is let go to its commit's first write, held at the gate, and one
+/// more connect is made there for an odd salt, between the `contribute`
+/// and its `finished`.  None is made when the index already asks for
+/// another flush, which would have to wait for this one, or when the
+/// flush was stopped growing the file, where redb lets no transaction
+/// begin (`GateBackend::holds_a_length_change`).  Then the gate opens and
+/// the flush is waited for.  A held flush makes no storage operation,
+/// and has made all of its own before the next step, so a cut after the
 /// `n`th operation lands in the same place every run.
 fn run(script: &Script, cut_after: Option<u64>, honest_sync: bool, brk: Break) -> Run {
     let dir = TempDir::new().expect("tempdir");
@@ -430,7 +452,7 @@ fn run(script: &Script, cut_after: Option<u64>, honest_sync: bool, brk: Break) -
     let mut candidates: Vec<BTreeSet<Key>> = vec![BTreeSet::new()];
     let mut mempool = BTreeSet::new();
     let mut salt = 0u32;
-    let (mut held, mut beside) = (0usize, 0usize);
+    let (mut held, mut beside, mut before_contribute) = (0usize, 0usize, 0usize);
     let mut steps = script.steps.iter().peekable();
     while let Some(step) = steps.next() {
         let before = store.mem.snapshot();
@@ -438,6 +460,7 @@ fn run(script: &Script, cut_after: Option<u64>, honest_sync: bool, brk: Break) -
             Step::Connect(keys) => {
                 if let Some(gate) = &gate {
                     gate.arm();
+                    store.faults.hold_contribute.arm();
                 }
                 salt += 1;
                 let mut res = deliver(
@@ -454,53 +477,81 @@ fn run(script: &Script, cut_after: Option<u64>, honest_sync: bool, brk: Break) -
                     candidates.push(handed);
                 }
                 if let Some(gate) = &gate {
+                    let hold = &store.faults.hold_contribute;
                     // Keys still sealed after the connect has returned
-                    // are a flush whose commit left this thread.
+                    // are a flush that left this thread.
                     if res.is_ok() && store.mem.sealed_keys() > 0 {
                         assert!(
-                            gate.wait_held(STUCK),
-                            "the handed-over commit never reached storage"
+                            wait_for(|| hold.is_held() || gate.is_held()),
+                            "the handed-over flush reached neither its contribute nor storage"
                         );
                         held += 1;
-                        // A commit stopped while redb grows the file lets
+                        let at_contribute = !gate.is_held();
+                        // The tripping connect's salt decides whether one
+                        // is made after the contribute too.
+                        let after = (salt % 2) as usize;
+                        // Up to `count` of the connects that come next,
+                        // each beside the held flush; how many were made.
+                        let mut connect_beside = |count: usize| -> Result<usize, crate::IdxError> {
+                            let mut made = 0usize;
+                            for _ in 0..count {
+                                if store.wants_flush() {
+                                    break;
+                                }
+                                let Some(Step::Connect(keys)) =
+                                    steps.next_if(|next| matches!(next, Step::Connect(_)))
+                                else {
+                                    break;
+                                };
+                                salt += 1;
+                                let at = salt;
+                                beside_a_held_commit(gate, || {
+                                    deliver(
+                                        script.delivery,
+                                        &chain,
+                                        &mut subber,
+                                        &unconfirmed,
+                                        at,
+                                        keys,
+                                    )
+                                })?;
+                                made += 1;
+                                let mut handed: BTreeSet<Key> = keys.iter().copied().collect();
+                                handed.append(&mut mempool);
+                                candidates.push(handed);
+                            }
+                            Ok(made)
+                        };
+                        // A flush stopped while redb grows the file lets
                         // no transaction begin: nothing is connected
                         // beside that one.
-                        let beside_it = if gate.holds_a_length_change() {
-                            0
-                        } else {
-                            1 + salt % 2
-                        };
-                        for _ in 0..beside_it {
-                            if store.wants_flush() {
-                                break;
+                        match connect_beside(usize::from(!gate.holds_a_length_change())) {
+                            Ok(made) => {
+                                beside += made;
+                                before_contribute += made;
                             }
-                            let Some(Step::Connect(keys)) =
-                                steps.next_if(|next| matches!(next, Step::Connect(_)))
-                            else {
-                                break;
+                            Err(e) => res = Err(e),
+                        }
+                        hold.release();
+                        if at_contribute && res.is_ok() {
+                            assert!(
+                                gate.wait_held(STUCK),
+                                "the handed-over commit never reached storage"
+                            );
+                            let after = if gate.holds_a_length_change() {
+                                0
+                            } else {
+                                after
                             };
-                            salt += 1;
-                            res = beside_a_held_commit(gate, || {
-                                deliver(
-                                    script.delivery,
-                                    &chain,
-                                    &mut subber,
-                                    &unconfirmed,
-                                    salt,
-                                    keys,
-                                )
-                            });
-                            if res.is_err() {
-                                break;
+                            match connect_beside(after) {
+                                Ok(made) => beside += made,
+                                Err(e) => res = Err(e),
                             }
-                            beside += 1;
-                            let mut handed: BTreeSet<Key> = keys.iter().copied().collect();
-                            handed.append(&mut mempool);
-                            candidates.push(handed);
                         }
                     }
+                    hold.release();
                     gate.open();
-                    // The commit under way ends before the next step; if
+                    // The flush under way ends before the next step; if
                     // the power went under it, the next step is refused.
                     let _ = db.wait_background_commit();
                 }
@@ -572,6 +623,7 @@ fn run(script: &Script, cut_after: Option<u64>, honest_sync: bool, brk: Break) -
         prepared,
         held,
         beside,
+        before_contribute,
     }
 }
 
@@ -750,10 +802,14 @@ fn every_cut_keeps_index_and_tip_together(script: Script) {
     // only where a commit can leave the thread that tripped it.
     if script.background {
         assert!(
-            full.held >= 5 && full.beside >= 2,
-            "{} commits were held and {} connects made beside them",
+            full.held >= 5
+                && full.beside >= 2
+                && full.before_contribute >= 1
+                && full.before_contribute < full.beside,
+            "{} flushes were held and {} connects made beside them, {} before a contribute",
             full.held,
-            full.beside
+            full.beside,
+            full.before_contribute
         );
     } else {
         assert_eq!((full.held, full.beside), (0, 0));
@@ -1129,6 +1185,94 @@ fn a_failed_contribute_latches_and_keeps_the_previous_durable_state() {
     drop(store);
     backend.cut_power();
     // Back to the durable state: the chain as it was at the flush.
+    while chain.tip() != durable_tip {
+        chain.remove_tip();
+    }
+    check_store(&db_dir, &chain, &candidates).expect("the previous durable state");
+}
+
+/// The same failure on a flush that a connect trips with the flush
+/// handed to a thread of its own: the `contribute` fails there, after the
+/// connect that tripped the flush has returned with its keys handed over
+/// behind the seal.  The store latches, the index is told
+/// `finished(false)`, and memory is what it held before plus that
+/// connect's keys, all unjournaled again; the meta row is unchanged, the
+/// next connect is refused with the failure as its cause, and a power cut
+/// afterwards shows the previous durable state, consistent.
+#[test]
+fn a_failed_contribute_on_the_commit_thread_latches_and_keeps_the_previous_durable_state() {
+    let dir = TempDir::new().expect("tempdir");
+    let db_dir = dir.path().join("db");
+    std::fs::create_dir_all(&db_dir).expect("mkdir");
+    let backend = PowerLossBackend::create(&db_dir.join("metadata.redb"), true);
+    let mut opts = Options::new(&db_dir, NET);
+    opts.backend = Some(Arc::clone(&backend) as SharedBackend);
+    opts.background_commit = true;
+    let db = Arc::new(Database::create(&opts).expect("create"));
+    let chain = TestChain::new(params());
+    let mut subber = new_subber();
+    let idx = open_index(&mut subber, &db, &chain, Policy::tiny());
+    let store = Arc::clone(idx.lock().expect("index").store());
+    let mut rng = SplitMix64(22);
+    let mut candidates = vec![BTreeSet::new()];
+    for salt in 0..10 {
+        let keys: Vec<Key> = (0..5).map(|_| random_key(&mut rng)).collect();
+        connect(&chain, &mut subber, salt, &keys).expect("connect");
+        candidates.push(keys.into_iter().collect());
+    }
+    db.flush().expect("flush");
+    let durable_tip = chain.tip();
+
+    // Eight keys, the policy's `u_max`: the next connect's own check
+    // trips a flush the index asks for.
+    let pending: Vec<Key> = (0..8).map(|_| random_key(&mut rng)).collect();
+    connect(&chain, &mut subber, 99, &pending).expect("connect");
+    assert!(store.wants_flush());
+    store.faults.fail_contribute.store(true, Ordering::SeqCst);
+    let before = store.mem.snapshot();
+    let meta_before = store.meta();
+    let tripping: Vec<Key> = (0..5).map(|_| random_key(&mut rng)).collect();
+    connect(&chain, &mut subber, 100, &tripping)
+        .expect("the connect that trips the flush returns before its contribute");
+    let err = db
+        .wait_background_commit()
+        .expect_err("the contribute failed on the commit thread");
+    assert_eq!(err.kind, dcroxide_database::ErrorKind::Fatal, "{err}");
+    assert!(
+        err.description.contains("injected contribute failure"),
+        "{err}"
+    );
+    assert!(db.is_fatal(), "the store latched");
+    assert_eq!(
+        store.faults.finished.lock().expect("log").last(),
+        Some(&false)
+    );
+    let mut want = before.clone();
+    want.extend(tripping.iter().copied());
+    assert_eq!(
+        store.mem.snapshot(),
+        sorted(want),
+        "memory is what it was, with the tripping connect's keys"
+    );
+    assert_eq!(store.mem.sealed_keys(), 0, "the failed flush unsealed");
+    assert_eq!(
+        store.mem.unjournaled(),
+        pending.len() + tripping.len(),
+        "every key the failed flush sealed is owed again"
+    );
+    assert_eq!(store.meta(), meta_before, "the meta changed");
+    let refused = connect(&chain, &mut subber, 101, &[random_key(&mut rng)])
+        .expect_err("a commit succeeded on a latched store");
+    assert!(
+        refused.to_string().contains("injected contribute failure"),
+        "the refusal names the failed contribute: {refused}"
+    );
+
+    drop(idx);
+    drop(subber);
+    drop(db);
+    drop(store);
+    backend.cut_power();
     while chain.tip() != durable_tip {
         chain.remove_tip();
     }
@@ -3263,6 +3407,243 @@ fn the_index_loses_no_key_when_its_flushes_commit_on_a_thread_of_their_own() {
     let idx = open_index(&mut subber, &db, &chain, policy);
     let reopened = idx.lock().expect("index").logical_keys().expect("keys");
     assert!(reopened == want, "after a restart");
+    drop(idx);
+    drop(subber);
+    db.close().expect("close");
+}
+
+/// Rows as the write log sees them: each key with its value, or `None`
+/// for a removal, in the order the engine was handed them.
+type LoggedRows = Vec<(Vec<u8>, Option<Vec<u8>>)>;
+
+/// The index rows one flush writes, as the write log saw them, when the
+/// keys of `beside` connects are handed over while that flush's
+/// `contribute` is held on the thread the flush was handed to (`during`),
+/// or after the flush has landed; then the keys the store holds once a
+/// last flush has written them.  Keys go in from `on_commit` hooks, as a
+/// connect's do, and the flush is the one the index asks for at the
+/// commit after its `u_max` keys are pending.
+fn rows_of_a_flush_with_keys_handed_over_beside(seed: u64, during: bool) -> (LoggedRows, Vec<Key>) {
+    type Log = Arc<Mutex<LoggedRows>>;
+    const U_MAX: usize = 64;
+    let dir = TempDir::new().expect("tempdir");
+    let log: Log = Arc::default();
+    let recording = Arc::new(AtomicBool::new(false));
+    let mut opts = Options::new(dir.path().join("db"), NET);
+    opts.background_commit = true;
+    {
+        let log = Arc::clone(&log);
+        let recording = Arc::clone(&recording);
+        opts.write_log = Some(Arc::new(move |key: &[u8], value: Option<&[u8]>| {
+            if recording.load(Ordering::SeqCst) {
+                log.lock()
+                    .expect("log")
+                    .push((key.to_vec(), value.map(<[u8]>::to_vec)));
+            }
+        }));
+    }
+    let db = Arc::new(Database::create(&opts).expect("db"));
+    let mut bucket = [0u8; 4];
+    db.update(|tx| {
+        bucket = tx.metadata().create_bucket(EXISTS_ADDR_INDEX_KEY)?.raw_id();
+        Ok(())
+    })
+    .expect("bucket");
+    db.flush().expect("flush the bucket");
+    let store = Arc::new(AddrStore::new(fixed(Policy {
+        k0: 24,
+        k0_hard: 48,
+        budget_pages: 1,
+        u_max: U_MAX,
+        ..Policy::tiny()
+    })));
+    store.install_fresh().expect("install");
+    db.set_flush_participant(&bucket, Arc::clone(&store) as Arc<dyn FlushParticipant>)
+        .expect("register");
+    let mut tip = 0u32;
+    let mut hand_over = |keys: Vec<Key>| {
+        tip += 1;
+        let store = Arc::clone(&store);
+        let row = tip.to_be_bytes();
+        db.update(move |tx| {
+            tx.metadata().put(b"test tip", &row)?;
+            tx.on_commit(move || {
+                let part = store.partitioner();
+                let candidates = store.mem.filter(keys.iter().map(|k| (part.of(k), *k)));
+                store.mem.insert_candidates(&candidates);
+            })
+        })
+        .expect("hand over");
+    };
+    let mut rng = SplitMix64(seed);
+    let mut draw = |n: usize| -> Vec<Key> {
+        (0..n)
+            .map(|_| {
+                if rng.below(2) == 0 {
+                    let p = (rng.below(4) as u8) * 64;
+                    random_key_in(&mut rng, p)
+                } else {
+                    random_key(&mut rng)
+                }
+            })
+            .collect()
+    };
+    // History: journal rows and runs from earlier flushes.
+    for _ in 0..5 {
+        for _ in 0..4 {
+            hand_over(draw(8));
+        }
+        db.flush().expect("flush");
+    }
+    // `u_max` keys pending, so the next commit's own check asks for the
+    // flush; that commit's keys and the next ones come after its seal.
+    let pending = draw(U_MAX);
+    let tripping = draw(5);
+    let later: Vec<Vec<Key>> = (0..4).map(|_| draw(6)).collect();
+    hand_over(pending);
+    assert!(store.wants_flush());
+    recording.store(true, Ordering::SeqCst);
+    if during {
+        store.faults.hold_contribute.arm();
+    }
+    hand_over(tripping);
+    if during {
+        assert!(
+            wait_for(|| store.faults.hold_contribute.is_held()),
+            "the flush's contribute runs on the thread it was handed to"
+        );
+        for keys in &later {
+            hand_over(keys.clone());
+        }
+        store.faults.hold_contribute.release();
+    }
+    db.wait_background_commit().expect("the flush landed");
+    recording.store(false, Ordering::SeqCst);
+    if !during {
+        for keys in &later {
+            hand_over(keys.clone());
+        }
+    }
+    db.flush().expect("the last flush");
+    let logged = log.lock().expect("log").clone();
+    // The overlay's rows go in first, then the index's, on whichever
+    // thread writes them.
+    let first = logged
+        .iter()
+        .position(|(key, _)| key.starts_with(&bucket))
+        .expect("the flush wrote index rows");
+    assert!(
+        first > 0
+            && logged[first..]
+                .iter()
+                .all(|(key, _)| key.starts_with(&bucket)),
+        "seed {seed:#x}: the flush's rows were not the overlay's and then the index's"
+    );
+    let rows: Vec<_> = logged.into_iter().skip(first).collect();
+    let check = check_layout(&db).expect("layout").expect("bucket");
+    let stored = runs::union(&check.runs, &check.pending);
+    db.close().expect("close");
+    (rows, stored)
+}
+
+/// A flush's `contribute`, on the thread the flush was handed to, writes
+/// the same rows, in the same order and after the overlay's, whether the
+/// keys of later connects are handed over while it runs or only after its
+/// flush has landed: it reads what the seal set apart and nothing
+/// inserted since.  Once a last
+/// flush has written those keys, the store holds the same keys either
+/// way.  Random scripts, each flush merging and journaling.
+#[test]
+fn contribute_writes_the_same_rows_whether_keys_arrive_during_it_or_after_its_flush() {
+    let mut seeds = SplitMix64::from_entropy("contribute-beside-keys");
+    for _ in 0..6 {
+        let seed = seeds.next_u64();
+        let (during, stored_during) = rows_of_a_flush_with_keys_handed_over_beside(seed, true);
+        let (after, stored_after) = rows_of_a_flush_with_keys_handed_over_beside(seed, false);
+        let tagged = |tag: u8| {
+            during
+                .iter()
+                .filter(|(key, _)| key.get(4) == Some(&tag))
+                .count()
+        };
+        assert!(
+            tagged(runs::RUN_TAG) > 0 && tagged(super::journal::JOURNAL_TAG) > 0,
+            "seed {seed:#x}: the flush must merge and journal to show anything"
+        );
+        assert!(
+            during == after,
+            "seed {seed:#x}: the flush wrote {} rows with keys handed over beside its \
+             contribute and {} without",
+            during.len(),
+            after.len()
+        );
+        assert!(
+            stored_during == stored_after,
+            "seed {seed:#x}: the stores ended with different keys"
+        );
+    }
+}
+
+/// Every key of every connected block is found while a flush's
+/// `contribute` is held on the thread the flush was handed to: the keys
+/// it sealed, which are in memory until it has landed, those of the
+/// connect that tripped it and of connects made beside it, and those
+/// already in the runs.  And still once it has landed.
+#[test]
+fn lookups_find_every_key_while_contribute_is_held() {
+    let dir = TempDir::new().expect("tempdir");
+    let mut opts = Options::new(dir.path().join("db"), NET);
+    opts.background_commit = true;
+    let db = Arc::new(Database::create(&opts).expect("create"));
+    let chain = TestChain::new(params());
+    let mut subber = new_subber();
+    let idx = open_index(&mut subber, &db, &chain, fixed(Policy::tiny()));
+    let store = Arc::clone(idx.lock().expect("index").store());
+    let query = idx.lock().expect("index").query();
+    let mut rng = SplitMix64(0x6c6f_6f6b);
+    let mut all: Vec<Key> = Vec::new();
+    let mut salt = 0u32;
+    let mut held = 0usize;
+    let look_up_all = |all: &[Key], when: &str| {
+        let addrs: Vec<_> = all.iter().map(|k| address_of(k, params())).collect();
+        let found = query.exists_addresses(&addrs).expect("lookup");
+        if let Some(i) = found.iter().position(|&f| !f) {
+            panic!("{} is missing {when}", hex(&all[i]));
+        }
+    };
+    while held < 6 {
+        salt += 1;
+        assert!(salt < 500, "only {held} flushes were held");
+        let keys: Vec<Key> = (0..rng.below(4) + 1)
+            .map(|_| random_key(&mut rng))
+            .collect();
+        let trips = store.wants_flush();
+        if trips {
+            store.faults.hold_contribute.arm();
+        }
+        connect(&chain, &mut subber, salt, &keys).expect("connect");
+        all.extend(keys);
+        if !trips {
+            continue;
+        }
+        assert!(
+            wait_for(|| store.faults.hold_contribute.is_held()),
+            "the flush's contribute runs on the thread it was handed to"
+        );
+        assert!(store.mem.sealed_keys() > 0);
+        look_up_all(&all, "while the flush's contribute is held");
+        // A connect beside it.
+        salt += 1;
+        let beside = vec![random_key(&mut rng)];
+        connect(&chain, &mut subber, salt, &beside).expect("connect beside");
+        all.extend(beside);
+        look_up_all(&all, "beside the held contribute");
+        store.faults.hold_contribute.release();
+        db.wait_background_commit().expect("the flush landed");
+        look_up_all(&all, "once the flush has landed");
+        held += 1;
+    }
+    drop(query);
     drop(idx);
     drop(subber);
     db.close().expect("close");

@@ -41,10 +41,12 @@ so the node makes no further progress until it is restarted. Reads of
 what is still in memory keep working, so RPC still answers what they
 cover; from the failed write on, a read that needs a page of the
 metadata file that is not cached fails. Most of a sync's commits to the
-metadata store run on a thread of their own (`dbcommit`; the flush log
-below), so such a failure is logged under BCDB as `Background commit of
-the metadata write cache failed: ...` when it happens, and the refusal,
-with the same cause, comes at the next write, flush or close. In a sync
+metadata store write their rows and commit on a thread of their own
+(`dbcommit`; the flush log below), so such a failure, in the rows, the
+exists-address index's or the commit, is logged under BCDB as
+`Background commit of the metadata write cache failed: ...` when it
+happens, and the refusal, with the same cause, comes at the next write,
+flush or close. In a sync
 the node often stops sooner, and harder: the next block with an input
 that is not in the UTXO cache reads the UTXO set, that read fails, and
 the process aborts with a panic that reads `corrupt utxo backend entry`
@@ -1325,9 +1327,11 @@ short phases do not. No field the lines had changed its name, place or
 format. Since 2026-10-17 eight more keys follow `commit`, before
 `participant`: `explicit`, whether the flush was asked for
 (`Database::flush` or the close) rather than tripped by a commit; `bg`,
-whether its commit ran on the thread `dbcommit`; `fg_ms`, the part of
-`elapsed_ms` the capturing thread spent holding the database's writer,
-all of it unless `bg` and then the capture to the hand-off; `wait_ms`,
+whether its rows and commit were written on the thread `dbcommit`;
+`fg_ms`, the part of `elapsed_ms` the capturing thread spent holding the
+database's writer, all of it unless `bg` and then the capture to the
+hand-off, which holds the block-file sync, the opening of the write
+transaction and the exists-address index's seal; `wait_ms`,
 the time spent since the flush before was captured, outside
 `elapsed_ms`, waiting with the writer held for an earlier flush's commit
 to end: the capturing thread's wait before its capture, and any other
@@ -1343,7 +1347,17 @@ anonymous part and its thread count at the capture (`capture`), the
 hand-off (`handoff`), when the commit returned (`commit`) and twice at
 the end of the flush before (`prev_finished`, once the index was told,
 and `prev_end`), with `prev_finished_ms` and `prev_release_ms`, the
-times from that flush's retirement to each. The readings at the capture
+times from that flush's retirement to each. Since the rows moved
+onto `dbcommit` on 2026-10-19, after the change of that day that
+keeps the thread, the `handoff` reading is taken once the flush's
+write transaction is open, before any row is written, on every
+flush that commits, handed over or not. Before, it was taken once
+the overlay's rows and the exists-address index's had been written
+into that transaction, so the `mem.handoff` of earlier builds holds
+what writing them had allocated by then, and neither it nor
+`mem.commit` less `mem.handoff` compares across the change.
+`overlay.handoff` reads the same at either point, since nothing
+commits between them. The readings at the capture
 and when the commit returned add `arena_maps`, `arena_bytes` and
 `brk_bytes`, the count and span of the anonymous mappings that start on
 the 64 MiB boundary where glibc's allocator places a thread arena's
@@ -1377,11 +1391,13 @@ capture and at the hand-off of every `bg` flush after the first do: one
 thread more than before. The readings `dbcommit` takes itself, `commit`
 on a `bg` line and `prev_finished` and `prev_end` on the line after one,
 count as before, and so do those of the shutdown's own flush, made once
-the thread has stopped. On a `bg` line `commit`'s processor time and I/O
-are `dbcommit`'s, and those of `sync`, `insert` and the participant's
-phase are the capturing thread's, which the line does not name. In a
-sync from an outbound peer, as in the syncs measured on 2026-10-12, the
-lines read
+the thread has stopped. On a `bg` line the processor time and I/O of
+`insert`, of the participant's phase and of `commit` are `dbcommit`'s,
+and those of `sync` are the capturing thread's, which the line does not
+name. Before the rows moved onto `dbcommit`, `insert` and the
+participant's phase of a `bg` line were the capturing thread's too, and
+counted in its `fg_ms`. In a sync from an outbound peer, as in the syncs
+measured on 2026-10-12, the lines read
 `peer-outbound`, the thread that connects the sync peer's blocks
 (`peer-inbound` when that peer connected to the node, by the code; not
 seen in a run), `index`, the index thread, and `main` for the flush at
@@ -1452,11 +1468,12 @@ using the default`, and the read-ahead stays on. Unset, it is on and
 nothing is logged.
 `DCROXIDE_DB_SYNC_COMMIT` is read once at startup and is the way back
 to dcrd's place for a metadata commit. Unset, a flush that a commit
-trips makes its commit on the thread `dbcommit`, which the node keeps
-from the first such flush to the shutdown, and nothing is logged. A
-positive whole number puts every commit back on the thread that ran the
-flush, under the database's writer, starts no `dbcommit` thread, and is
-logged at startup as `Metadata write cache commits on the committing
+trips writes its rows and makes its commit on the thread `dbcommit`,
+which the node keeps from the first such flush to the shutdown, and
+nothing is logged. A positive whole number puts every commit back on the
+thread that ran the flush, under the database's writer, starts no
+`dbcommit` thread, and is logged at startup as `Metadata write cache
+commits on the committing
 thread by DCROXIDE_DB_SYNC_COMMIT`. Any other value, `0` included, is
 the warning `DCROXIDE_DB_SYNC_COMMIT=V is not a positive whole number;
 committing the metadata write cache on a thread of its own`, and the

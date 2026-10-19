@@ -84,7 +84,7 @@ use transaction::{
 };
 pub use transaction::{BlockRegion, Bucket, Cursor, Transaction};
 
-use crate::dbcache::{CommitJob, DbCache, Filled, FlushBatch, FlushOutcome};
+use crate::dbcache::{DbCache, FillJob, FlushBatch, FlushOutcome, Opened};
 use crate::error::db_error;
 
 // redb 4 moved `begin_read` onto a trait; importing it keeps the call
@@ -293,7 +293,10 @@ impl DbInner {
             waited_nanos: AtomicU64::new(0),
             log: opts.log.clone(),
             commit_snapshot: opts.commit_snapshot,
+            before_commit: opts.before_commit.clone(),
             flush_end: Mutex::new(None),
+            #[cfg(test)]
+            before_fill: Mutex::new(None),
             #[cfg(test)]
             before_retire: Mutex::new(None),
             #[cfg(test)]
@@ -477,12 +480,19 @@ pub(crate) struct DbInner {
     log: Option<LogSink>,
     /// [`Options::commit_snapshot`].
     commit_snapshot: bool,
+    /// [`Options::before_commit`].
+    before_commit: Option<Arc<dyn Fn() + Send + Sync>>,
     /// What the last observed flush left when it ended, for the next
     /// one's observation ([`FlushMemory::process_after_previous`]).
     /// Written by the thread that ends a flush and taken at the next
     /// capture, which follows a wait for that flush to end.  The lock is
     /// a leaf.
     flush_end: Mutex<Option<FlushEnd>>,
+    /// Run once, by the next flush to write its rows, just before it
+    /// writes them, on whichever thread does: for a test that fails the
+    /// storage under the rows of a flush handed to a thread of its own.
+    #[cfg(test)]
+    before_fill: Mutex<Option<TestHook>>,
     /// Run by the commit thread between a commit and the retirement
     /// of the layers it captured, for a test that needs a reader there.
     #[cfg(test)]
@@ -550,20 +560,21 @@ struct FlushEnd {
 /// next block.
 pub const INDEX_THREAD_NAME: &str = "index";
 
-/// The name of the thread that makes a flush's redb commit when the
-/// flush hands it over ([`Options::background_commit`]): one thread for
-/// the open store, started by the first flush handed to it and kept,
-/// asleep between flushes, until [`Database::close`] or the drop of the
-/// last handle stops it.  So the commit of every flush handed over is
-/// made by the same thread, and the pages redb allocates for it, which
-/// outlive the flush in redb's cache, come from that one thread's
-/// allocator state: with glibc's allocator, one arena, which no thread
-/// started later is given while the store is open as long as glibc has
-/// arenas to give (past `MALLOC_ARENA_MAX`, or eight per processor on a
-/// 64-bit system, it shares them among threads, this one's included).
-/// It commits one flush at a time; whether it is listed says nothing of
-/// whether a commit is under way, and its state does.  A
-/// [`FlushObserver`] is called on it for such a flush.
+/// The name of the thread that writes a flush's rows and makes its redb
+/// commit when the flush hands them over ([`Options::background_commit`]):
+/// one thread for the open store, started by the first flush handed to
+/// it and kept, asleep between flushes, until [`Database::close`] or the
+/// drop of the last handle stops it.  So the rows and the commit of every
+/// flush handed over are written by the same thread, and the pages redb
+/// allocates for them, which outlive the flush in redb's cache, come
+/// from that one thread's allocator state: with glibc's allocator, one
+/// arena, which no thread started later is given while the store is
+/// open as long as glibc has arenas to give (past `MALLOC_ARENA_MAX`, or
+/// eight per processor on a 64-bit system, it shares them among threads,
+/// this one's included).  It writes one flush at a time;
+/// whether it is listed says nothing of whether a commit is under way,
+/// and its state does.  A [`FlushObserver`] is called on it for such a
+/// flush.
 pub const COMMIT_THREAD_NAME: &str = "dbcommit";
 
 /// The running total of one kind of thread's waits for the writer
@@ -659,7 +670,8 @@ pub struct FlushObservation {
     ///
     /// The three phases below, the participant's
     /// [`ParticipantStats::contribute`] when one was called, and the stats
-    /// walk account for all of it but the capture and the handoffs
+    /// walk account for all of it but the capture, the opening of the
+    /// write transaction, the participant's `seal` and the handoffs
     /// between them.
     ///
     /// From the capture to the retirement of what was captured.  When the
@@ -673,10 +685,12 @@ pub struct FlushObservation {
     /// Of `elapsed`, the fsync of the block files written since the last
     /// flush, which runs first (dcrd `syncBlocks`).
     pub block_sync: FlushPhase,
-    /// Of `elapsed`, handing the overlay's entries to redb: opening the
-    /// write transaction and every insert and remove, the stats walk
-    /// excluded.  redb copies each leaf it changes, so a leaf it does
-    /// not have cached is read here first.
+    /// Of `elapsed`, handing the overlay's entries to redb: every insert
+    /// and remove, the stats walk excluded.  The write transaction is
+    /// opened before this, on the capturing thread, outside the phases.
+    /// redb copies each leaf it changes, so a leaf it does not have
+    /// cached is read here first, and it allocates the pages it writes,
+    /// growing the file when it has none free.
     pub insert: FlushPhase,
     /// Of `elapsed`, redb's commit: writing the dirty pages and syncing
     /// them.
@@ -705,7 +719,7 @@ pub struct FlushObservation {
     /// The observer is called on the thread that ran the flush, so
     /// `std::thread::current()` there says which of the two kinds of
     /// thread held the semaphore for [`Self::elapsed`].  The exception is
-    /// a flush whose commit ran on a thread of its own
+    /// a flush whose rows and commit were written on a thread of its own
     /// ([`Self::background`]): the observer is called on that thread,
     /// named [`COMMIT_THREAD_NAME`], which never holds the semaphore.
     pub writer_waits: WriterWaits,
@@ -713,13 +727,15 @@ pub struct FlushObservation {
     /// flush.  `false` for one a commit's own flush check tripped, by the
     /// overlay's thresholds or a participant's `wants_flush`.
     pub explicit: bool,
-    /// Whether the flush's redb commit ran on another thread than the
-    /// one that captured the overlay ([`Options::background_commit`]).
+    /// Whether the flush's rows were written and its redb commit made on
+    /// another thread than the one that captured the overlay
+    /// ([`Options::background_commit`]).
     pub background: bool,
     /// Of `elapsed`, the part the capturing thread spent in the flush,
     /// holding the writer semaphore: all of it when that thread made the
     /// commit too, and the time from the capture to the hand-off when
-    /// [`Self::background`] is set.
+    /// [`Self::background`] is set, which is the block-file sync, the
+    /// opening of the write transaction and the participant's `seal`.
     pub foreground: std::time::Duration,
     /// What was spent, since the capture before this one and so outside
     /// `elapsed`, waiting for an earlier flush's commit on another thread
@@ -767,9 +783,9 @@ pub struct FlushMemory {
     /// Entries in those layers, a key counted once for each layer that
     /// holds it; [`FlushObservation::dirty_entries`] counts it once.
     pub pinned_entries: usize,
-    /// Bytes the overlay held when the write transaction was filled and
-    /// its commit about to start, on this thread or another: the hand-off
-    /// of a flush whose commit is handed over.  The capturing thread has
+    /// Bytes the overlay held when the write transaction was open and
+    /// its rows about to be written, on this thread or another: the
+    /// hand-off of a flush that is handed over.  The capturing thread has
     /// held the writer semaphore since the capture, so this is
     /// [`FlushObservation::dirty_bytes`] unless something committed that
     /// should not have.
@@ -792,8 +808,8 @@ pub struct FlushMemory {
     /// included.  `None`, as the four below are, off Linux and when no
     /// observer is attached: the readings are taken only for one.
     pub process_at_capture: Option<ProcessMemory>,
-    /// The process's memory when the write transaction was filled and
-    /// its commit about to start, as [`Self::overlay_at_hand_off`].
+    /// The process's memory when the write transaction was open and its
+    /// rows about to be written, as [`Self::overlay_at_hand_off`].
     pub process_at_hand_off: Option<ProcessMemory>,
     /// The process's memory when the commit had returned, before the
     /// captured layers were retired or anything of the flush was freed,
@@ -885,10 +901,10 @@ impl FlushMemory {
 ///
 /// Every counter of a phase is read on the thread that ran the phase, at
 /// its start and its end, and "the flushing thread" below is that
-/// thread.  For a flush whose commit ran on a thread of its own
-/// ([`FlushObservation::background`]) the commit's figures are that
-/// thread's, and those of the block-file sync, the insert loop and the
-/// participant's `contribute` are the capturing thread's.
+/// thread.  For a flush whose rows and commit were written on a thread of
+/// its own ([`FlushObservation::background`]) the figures of the insert
+/// loop, the participant's `contribute` and the commit are that
+/// thread's, and those of the block-file sync are the capturing thread's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct FlushPhase {
     /// Wall time the phase took.
@@ -970,10 +986,12 @@ pub type FlushObserver = Arc<dyn Fn(&FlushObservation) + Send + Sync>;
 /// A callback invoked once per key/value the engine is handed, in the
 /// order it is handed them, with `None` for a delete.
 ///
-/// Called inside the flush's redb write transaction, on the flushing
-/// thread, WITHOUT the cache lock (`DbCache::fill` runs unlocked so
-/// readers are not held for the flush) but with the writer semaphore
-/// held, so it must not block or re-enter the database. It exists to
+/// Called inside the flush's redb write transaction, on the thread that
+/// writes the flush's rows, WITHOUT the cache lock (`DbCache::fill` runs
+/// unlocked so readers are not held for the flush): the flushing thread,
+/// with the writer semaphore held, or for a flush handed to a thread of
+/// its own ([`Options::background_commit`]) that thread, without it.  So
+/// it must not block or re-enter the database. It exists to
 /// capture the engine-level write sequence for ADR-0009's candidate
 /// engine benchmark: the order the storage engine actually sees is
 /// neither block order nor the sorted contents of the finished store,
@@ -1095,35 +1113,39 @@ pub struct Options {
     /// unclean-shutdown repair on open, the `ROLLBACK` warnings, and the
     /// progress of a redb repair of the metadata store.
     pub log: Option<LogSink>,
-    /// Whether a flush that a commit's own check trips hands its redb
-    /// commit to a thread of its own, so that the commit that tripped it
-    /// returns once the write cache is captured, the block files are
-    /// synced and the rows are in redb's write transaction.
+    /// Whether a flush that a commit's own check trips hands the writing
+    /// of its rows and its redb commit to a thread of its own, so that the
+    /// commit that tripped it returns once the write cache is captured,
+    /// the block files are synced, redb's write transaction is open and a
+    /// [`FlushParticipant`] with work has sealed it.
     ///
-    /// `false` by default, in which case every flush commits on the
-    /// thread that ran it, under the writer semaphore, as dcrd's does.
+    /// `false` by default, in which case every flush writes and commits
+    /// on the thread that ran it, under the writer semaphore, as dcrd's
+    /// does.
     ///
-    /// When set, the redb commit is still `Durability::Immediate` and at
-    /// most one is under way: the next flush, and any commit that finds
-    /// the overlay over [`Self::cache_max_size`] meanwhile, waits for it.
+    /// When set, the redb commit is still `Durability::Immediate`, its
+    /// rows go into the transaction in the same order, and at most one
+    /// flush is under way: the next flush, and any commit that finds the
+    /// overlay over [`Self::cache_max_size`] meanwhile, waits for it.
     /// [`Database::flush`] and [`Database::close`] wait for it too and
-    /// then commit on their own thread, so what they acknowledge is
-    /// durable as before.  What changes is who is told of a failure: the
-    /// commit that tripped the flush, and those made while its redb
-    /// commit ran, have returned `Ok` by then and are lost with it at the
-    /// next start; the store latches, and the next write, flush or close
-    /// reports it ([`Database::is_fatal_settled`]).  A flush a
-    /// [`FlushParticipant`] contributed to is handed over only if the
-    /// participant allows it
-    /// ([`FlushParticipant::allows_deferred_finish`]).
+    /// then write and commit on their own thread, so what they
+    /// acknowledge is durable as before.  What changes is who is told of a
+    /// failure in writing the rows or committing them: the commit that
+    /// tripped the flush, and those made while the flush ran, have
+    /// returned `Ok` by then and are lost with it at the next start; the
+    /// store latches, and the next write, flush or close reports it
+    /// ([`Database::is_fatal_settled`]).  A flush in which a
+    /// [`FlushParticipant`] has work is handed over only if the
+    /// participant allows its `contribute` and `finished` to be deferred
+    /// ([`FlushParticipant::allows_deferred_contribute`]).
     ///
     /// The thread is the store's own, named [`COMMIT_THREAD_NAME`]: started
     /// by the first flush handed over, kept asleep between flushes, and
     /// stopped by [`Database::close`] or by the drop of the last handle.  A
     /// store that never hands a flush over, the option set or not, starts
     /// none.  A thread the operating system refuses is asked for again at
-    /// the next hand-off, the flush committing on its own thread
-    /// meanwhile.
+    /// the next hand-off, the flush writing and committing on its own
+    /// thread meanwhile.
     pub background_commit: bool,
     /// Whether a commit handed to a thread of its own
     /// ([`Self::background_commit`]) is made with a read snapshot of the
@@ -1150,6 +1172,17 @@ pub struct Options {
     /// It delays nothing a commit on the committing thread does not
     /// delay, and changes no result.
     pub commit_snapshot: bool,
+    /// Called on the thread that commits a flush, once the flush's rows
+    /// and its participant's are in redb's write transaction and before
+    /// the transaction's commit, when set.
+    ///
+    /// `None` in [`Options::new`] and in the daemon.  For tests that must
+    /// tell the writes redb makes ahead of a commit, while the rows go in,
+    /// from the commit's own, now that both are made on the thread a
+    /// handed-over flush runs on.  It must not block or re-enter the
+    /// database.
+    #[doc(hidden)]
+    pub before_commit: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 /// Storage shared between the caller and redb, so a test can keep a
@@ -1271,16 +1304,18 @@ fn drain_flight(inner: &DbInner) {
 /// data is on disk, because they are the chain's durability barrier and
 /// the daemon's shutdown path.  So does every flush of a database opened
 /// without [`Options::background_commit`].  With it, a flush on the
-/// commit path stops being synchronous at its last step: the capture, the
-/// block-file sync, the insert loop and the participant's `contribute`
-/// run here, under the caller's semaphore, and the redb commit is handed
-/// to the store's commit thread ([`hand_off`]), which retires the layers
-/// and calls `finished` when it lands.  The commit that tripped the flush
-/// is then told `Ok` with nothing of that batch acknowledged as durable;
-/// no caller of a commit is promised durability.  A participant that
-/// contributed must allow the deferral
-/// ([`FlushParticipant::allows_deferred_finish`]), or the commit stays
-/// here.
+/// commit path stops being synchronous once its write transaction is open:
+/// the capture, the block-file sync, the opening of the transaction and
+/// the participant's `seal` run here, under the caller's semaphore, and
+/// the rest is handed to the store's commit thread ([`hand_off`]), which
+/// writes the overlay's rows and the participant's into the transaction,
+/// makes the redb commit, retires the layers and calls `finished` when it
+/// lands.  The rows go in in the same order on either thread.  The commit
+/// that tripped the flush is then told `Ok` with nothing of that batch
+/// acknowledged as durable; no caller of a commit is promised durability.
+/// A participant with work must allow its `contribute` and `finished` to
+/// be deferred ([`FlushParticipant::allows_deferred_contribute`]), or the
+/// whole flush stays here.
 ///
 /// **One flush at a time.**  A flush is in flight from its capture to its
 /// retirement, and nothing is captured while one is: every capture is
@@ -1296,19 +1331,22 @@ fn drain_flight(inner: &DbInner) {
 /// A failure latches the store in [`finish`].  For a flush that fails
 /// here that is while the caller still holds the writer semaphore:
 /// releasing it first wakes the next queued writer unlatched, to re-run
-/// the failed flush (see [`DbInner::mark_fatal`]).  A commit that fails
-/// on its own thread latches the store there, and whoever next reaches
-/// one of the latch checks, here or at the start of a write, is refused.
-/// Every flush goes through this one helper so that ordering cannot
-/// drift between copies.
+/// the failed flush (see [`DbInner::mark_fatal`]).  A flush that fails on
+/// its own thread, in its rows, the participant's or the commit, latches
+/// the store there, and whoever next reaches one of the latch checks,
+/// here or at the start of a write, is refused.  Every flush goes through
+/// this one helper so that ordering cannot drift between copies.
 ///
 /// A registered [`FlushParticipant`] is driven from here too (ADR-0011).
 /// On the commit path its `wants_flush` can trip a flush the overlay's
-/// thresholds would not.  Inside the flush, `DbCache::fill` asks
-/// `has_work` and calls `contribute` within the write transaction.  After
-/// the retirement, or after a failure has latched the store, [`finish`]
-/// calls `finished` with the outcome: under the caller's semaphore for a
-/// flush that commits here, and on the commit thread otherwise.
+/// thresholds would not.  `DbCache::open` asks `has_work` once the block
+/// files are synced and, with work, calls `seal` once the write
+/// transaction is open, both here; `DbCache::fill` calls `contribute`
+/// within the transaction, after the overlay's rows, on the thread that
+/// commits.  After the retirement, or after a failure has latched the
+/// store, [`finish`] calls `finished` with the outcome, for every flush
+/// that sealed: under the caller's semaphore for a flush that commits
+/// here, and on the commit thread otherwise.
 ///
 /// Returns the overlay layers the flush retired, none when it did not
 /// flush or handed its commit to a thread of its own, which retires them
@@ -1398,56 +1436,39 @@ pub(crate) fn flush_locked(
             batch.memory.previous_release = end.release;
         }
     }
-    let mut contributed = false;
     // The block files are synced, and what the sync owed is discharged,
     // on this thread before the transaction can leave it: nothing writes
     // a block between the plan and its discharge, because the semaphore
-    // is held throughout both.
-    let filled = DbCache::sync_blocks(&batch, &inner.block_store).and_then(|block_sync| {
-        DbCache::fill(
-            &batch,
-            &inner.kv,
-            registered.as_ref(),
-            &mut contributed,
-            block_sync,
-        )
-    });
-    let job = match filled {
-        Ok(Filled::Tx(job)) => job,
-        Ok(Filled::Empty(outcome)) => {
-            return finish(
-                inner,
-                batch,
-                Ok(outcome),
-                registered.as_ref(),
-                contributed,
-                false,
-            );
+    // is held throughout both.  So is the transaction opened and the
+    // participant sealed: no commit hook runs between the capture and
+    // the seal, so what the participant sets apart is exactly what the
+    // captured commits handed it.
+    let opened = DbCache::sync_blocks(&batch, &inner.block_store)
+        .and_then(|block_sync| DbCache::open(&batch, &inner.kv, registered.as_ref(), block_sync));
+    let job = match opened {
+        Ok(Opened::Tx(job)) => job,
+        Ok(Opened::Empty(outcome)) => {
+            return finish(inner, batch, Ok(outcome), registered.as_ref(), false, false);
         }
-        // A failure before the commit fails the caller, as it always
+        // A failure before the hand-off fails the caller, as it always
         // has: the commit that tripped the flush is unapplied and rolls
-        // its block files back.
+        // its block files back.  Nothing was sealed, so the participant
+        // is owed nothing.
         Err(e) => {
-            return finish(
-                inner,
-                batch,
-                Err(e),
-                registered.as_ref(),
-                contributed,
-                false,
-            );
+            return finish(inner, batch, Err(e), registered.as_ref(), false, false);
         }
     };
+    let sealed = job.sealed();
     // Only a commit's own flush is handed over.  `Database::flush` and
-    // `Database::close` acknowledge durability, so theirs commits here.
-    // So does one a participant contributed to without allowing its
-    // `finished` to be deferred.
+    // `Database::close` acknowledge durability, so theirs writes and
+    // commits here.  So does one in which a participant has work without
+    // allowing its `contribute` and `finished` to be deferred.
     let deferred = inner.background
         && only_if_needed
-        && (!contributed
+        && (!sealed
             || registered
                 .as_ref()
-                .is_some_and(|r| r.participant.allows_deferred_finish()));
+                .is_some_and(|r| r.participant.allows_deferred_contribute()));
     if batch.observed() {
         batch.memory.overlay_at_hand_off = inner
             .cache
@@ -1459,8 +1480,10 @@ pub(crate) fn flush_locked(
     // A commit made here has the caller's transaction open across it, or
     // was asked for with none; one that leaves this thread would land
     // with no reader open, and is given one ([`Options::commit_snapshot`]).
-    // A snapshot that cannot be had is done without: the commit then
-    // fails or lands as it would have.
+    // It is taken before the rows are written, which changes nothing it
+    // sees: this flush holds redb's write transaction, so no commit lands
+    // in between.  A snapshot that cannot be had is done without: the
+    // commit then fails or lands as it would have.
     let snapshot = (deferred && inner.commit_snapshot)
         .then(|| inner.kv.begin_read().ok())
         .flatten();
@@ -1469,14 +1492,16 @@ pub(crate) fn flush_locked(
         job,
         batch,
         registered,
-        contributed,
+        sealed,
         snapshot,
     };
     if deferred {
         match hand_off(inner, flight) {
-            // The commit thread retires the layers and lets go of them.
+            // The commit thread writes the rows, commits, retires the
+            // layers and lets go of them.
             HandOff::Taken => return Ok(Vec::new()),
-            // No thread was to be had: the same transaction commits here.
+            // No thread was to be had: the same transaction is written
+            // and committed here.
             HandOff::Inline(refused) => flight = refused,
             // The commit thread had died: the store is latched and the
             // flight ended here as a failure.
@@ -1487,30 +1512,47 @@ pub(crate) fn flush_locked(
         job,
         batch,
         registered,
-        contributed,
+        sealed,
         snapshot,
     } = flight;
-    let result = DbCache::commit(job);
+    let result = write_and_commit(inner, &batch, job, registered.as_ref());
     drop(snapshot);
-    finish(
-        inner,
-        batch,
-        result,
-        registered.as_ref(),
-        contributed,
-        false,
-    )
+    finish(inner, batch, result, registered.as_ref(), sealed, false)
 }
 
-/// A flush from its filled write transaction on: what the capturing
-/// thread hands the thread that commits it.
+/// The part of a flush that may leave the capturing thread: write the
+/// overlay's rows and the participant's into the open transaction
+/// ([`DbCache::fill`]), then make redb's durable commit
+/// ([`DbCache::commit`]), both on the calling thread.
+fn write_and_commit(
+    inner: &DbInner,
+    batch: &FlushBatch,
+    job: FillJob,
+    registered: Option<&participant::Registration>,
+) -> Result<FlushOutcome, Error> {
+    #[cfg(test)]
+    {
+        let hook = inner.before_fill.lock().expect("test hook poisoned").take();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+    let job = DbCache::fill(batch, job, registered)?;
+    if let Some(probe) = &inner.before_commit {
+        probe();
+    }
+    DbCache::commit(job)
+}
+
+/// A flush from its open write transaction on: what the capturing thread
+/// hands the thread that writes its rows and commits it.
 struct Flight {
-    job: CommitJob,
+    job: FillJob,
     batch: FlushBatch,
     /// The participant registered when the flush was captured.
     registered: Option<participant::Registration>,
-    /// Whether its `contribute` was called, and `finished` is owed.
-    contributed: bool,
+    /// Whether its `seal` was called, and `finished` is owed.
+    sealed: bool,
     /// A read snapshot of the store taken before the hand-off, to be held
     /// until the commit has returned ([`Options::commit_snapshot`]).
     snapshot: Option<redb::ReadTransaction>,
@@ -1518,18 +1560,18 @@ struct Flight {
 
 /// A store's commit thread, named [`COMMIT_THREAD_NAME`]
 /// ([`DbInner::committer`]): one for the open store, so that the memory
-/// the commit of every flush handed over allocates is allocated by one
-/// thread.
+/// the rows and the commit of every flush handed over allocate is
+/// allocated by one thread.
 ///
-/// A flush's redb commit allocates the pages of its own tree updates,
-/// which redb then keeps in its page cache, long after the flush.  With
-/// glibc's allocator a thread takes an arena at its first allocation and
-/// keeps it, a starting thread is given the arena that an exited thread
-/// last left, and the memory freed into an arena is reused only by the
-/// threads that hold it.  A thread started for each flush could therefore
-/// land in a different arena from one flush to the next, leaving what the
-/// earlier ones allocated, and the holes their frees left, where no later
-/// flush reuses them.  One thread kept for the store allocates for the
+/// A flush's rows and its redb commit allocate most of what redb then
+/// keeps in its page cache, long after the flush.  With glibc's allocator
+/// a thread takes an arena at its first allocation and keeps it, a
+/// starting thread is given the arena that an exited thread last left,
+/// and the memory freed into an arena is reused only by the threads that
+/// hold it.  A thread started for each flush could therefore land in a
+/// different arena from one flush to the next, leaving what the earlier
+/// ones allocated, and the holes their frees left, where no later flush
+/// reuses them.  One thread kept for the store allocates the rows and
 /// commit of every flush handed over from the one arena, and while glibc
 /// has arenas to give, that arena goes to no thread started later while
 /// the store is open.  Past its limit (`MALLOC_ARENA_MAX`, or eight per
@@ -1538,10 +1580,9 @@ struct Flight {
 /// out of it.
 ///
 /// Only this thread is the store's.  The threads that write to the store
-/// and capture its flushes, which allocate the write cache's layers, the
-/// pages a flush's rows are written into and the pages their reads bring
-/// into redb's cache, are the caller's, and live as long as the caller
-/// keeps them.
+/// and capture its flushes, which allocate the write cache's layers and
+/// the pages their reads bring into redb's cache, are the caller's, and
+/// live as long as the caller keeps them.
 ///
 /// Dropped with the store, which stops a running thread
 /// ([`Running::stop`]): no thread outlives the store, and the drop of the
@@ -1558,8 +1599,8 @@ enum CommitState {
     /// Started by a hand-off, and asleep in `recv` between flushes.
     Running(Running),
     /// Stopped by the close, or found dead by a hand-off, which latched
-    /// the store: a hand-off now commits on the calling thread, and no
-    /// second thread is started.
+    /// the store: a hand-off now writes and commits on the calling
+    /// thread, and no second thread is started.
     Stopped,
 }
 
@@ -1645,9 +1686,9 @@ struct Job {
 }
 
 impl Job {
-    /// The flight, back for the capturing thread to commit: the job's
-    /// hold on the store and its ticket are let go of, and the batch is
-    /// marked as never handed over.
+    /// The flight, back for the capturing thread to write and commit:
+    /// the job's hold on the store and its ticket are let go of, and the
+    /// batch is marked as never handed over.
     fn take_back(self) -> Flight {
         let Job { mut flight, .. } = self;
         flight.batch.take_back();
@@ -1664,7 +1705,7 @@ impl Job {
 enum HandOff {
     /// The commit thread has it.
     Taken,
-    /// No thread was to be had: the caller commits it.
+    /// No thread was to be had: the caller writes and commits it.
     Inline(Flight),
     /// It was ended here as a failure, with the store latched, and
     /// nothing of it committed: what [`finish`] returned for it, for
@@ -1677,8 +1718,8 @@ enum HandOff {
 /// the flush in flight.
 ///
 /// When the operating system has no thread to give, the flight is
-/// returned for the caller to commit itself, so a refused thread
-/// loses no flush, and the next hand-off tries again.  So it is
+/// returned for the caller to write and commit itself, so a refused
+/// thread loses no flush, and the next hand-off tries again.  So it is
 /// after the close has stopped the thread, which no flush reaches through
 /// the public calls: a flush after the close finds the overlay empty and
 /// no participant, and hands nothing over.
@@ -1817,13 +1858,12 @@ impl Drop for MarkEnd {
 }
 
 /// End a flight that cannot be handed over and must not be committed:
-/// latch the store with `cause`, let the filled write transaction go
-/// uncommitted, which redb aborts, and end the flush on this thread as
-/// one that failed ([`finish`]): its accounting goes back and a
-/// participant that contributed is told `finished(false)`, with the
-/// store already latched.  Returns what `finish` returns: the latch's
-/// refusal, which names `cause` unless an earlier failure latched the
-/// store first.
+/// latch the store with `cause`, let the open write transaction go
+/// unused, which redb aborts, and end the flush on this thread as one
+/// that failed ([`finish`]): its accounting goes back and a participant
+/// that was sealed is told `finished(false)`, with the store already
+/// latched.  Returns what `finish` returns: the latch's refusal, which
+/// names `cause` unless an earlier failure latched the store first.
 fn fail_flight(
     inner: &DbInner,
     flight: Flight,
@@ -1837,7 +1877,7 @@ fn fail_flight(
         job,
         batch,
         registered,
-        contributed,
+        sealed,
         snapshot,
     } = flight;
     drop(job);
@@ -1847,14 +1887,14 @@ fn fail_flight(
         batch,
         Err(refusal),
         registered.as_ref(),
-        contributed,
+        sealed,
         false,
     )
 }
 
-/// The body of the commit thread: commit each flush handed to it, in
-/// turn, until its channel is let go of by the close or by the store's
-/// drop.
+/// The body of the commit thread: write and commit each flush handed to
+/// it, in turn, until its channel is let go of by the close or by the
+/// store's drop.
 ///
 /// Asleep in `recv` between flushes, it holds nothing of the store: no
 /// handle, no participant, no snapshot and no lock.  A thread that held
@@ -1866,15 +1906,17 @@ fn commit_thread(jobs: mpsc::Receiver<Job>) {
     }
 }
 
-/// Make the redb commit of a handed-over flush, end the flush as its
-/// capturing thread would have, and then end the job: let go of the store
-/// and of everything of the flush, then signal its ticket ([`JobEnd`]).
+/// Write the rows of a handed-over flush into its transaction, the
+/// overlay's and then the participant's, make the redb commit, end the
+/// flush as its capturing thread would have, and then end the job: let
+/// go of the store and of everything of the flush, then signal its
+/// ticket ([`JobEnd`]).
 ///
 /// It takes the cache lock, in [`finish`], and calls the participant's
-/// `finished`; it never takes the writer semaphore, the block-store lock,
-/// the participant slot's lock or the commit thread's slot, and never
-/// touches the flight slot that holds its ticket.  A semaphore holder can
-/// therefore always wait for it.
+/// `contribute` and `finished`; it never takes the writer semaphore, the
+/// block-store lock, the participant slot's lock or the commit thread's
+/// slot, and never touches the flight slot that holds its ticket.  A
+/// semaphore holder can therefore always wait for it.
 fn run_job(job: Job) {
     let Job {
         inner,
@@ -1896,14 +1938,14 @@ fn run_job(job: Job) {
             job,
             batch,
             registered,
-            contributed,
+            sealed,
             snapshot,
         } = flight;
-        let result = DbCache::commit(job);
+        let result = write_and_commit(inner, &batch, job, registered.as_ref());
         drop(snapshot);
         // A failure is in the latch and the log by the time this returns;
         // there is no caller here to hand it to.
-        let _ = finish(inner, batch, result, registered.as_ref(), contributed, true);
+        let _ = finish(inner, batch, result, registered.as_ref(), sealed, true);
     }
     end.complete();
     #[cfg(test)]
@@ -1973,11 +2015,13 @@ impl Drop for JobEnd {
 /// End a flush whose commit has returned, or which failed before it:
 /// retire the captured layers or latch the store, then tell the
 /// participant.  Run by the thread that made, or would have made, the
-/// commit; `background` says it is the commit thread.
+/// commit; `background` says it is the commit thread.  `sealed` says the
+/// participant was sealed for this flush, and so is owed its `finished`
+/// whether or not its `contribute` was reached.
 ///
 /// On success the layers are retired under the cache lock, which is where
-/// the observer is called, and only then is a participant that
-/// contributed told `finished(true)`: both follow the commit, so neither
+/// the observer is called, and only then is a participant that was
+/// sealed told `finished(true)`: both follow the commit, so neither
 /// reports rows that are not durable.  A retirement that finds the pinned
 /// layers changed is a failure like any other, though the commit has
 /// landed.  In that one case the accounting goes back before the store
@@ -1988,8 +2032,10 @@ impl Drop for JobEnd {
 /// On failure the store is latched before anything else.  The accounting
 /// then goes back under the cache lock, since the overlay still holds
 /// every captured byte and the cache would otherwise never trip its own
-/// ceiling again, and a participant that contributed is told
-/// `finished(false)` with the store already refusing writes.  The
+/// ceiling again, and a participant that was sealed is told
+/// `finished(false)` with the store already refusing writes, whether the
+/// flush failed in the overlay's rows, in its `contribute` or in the
+/// commit.  The
 /// commit thread has no caller to return the error to, so it logs it as
 /// well, once.
 ///
@@ -2004,7 +2050,7 @@ fn finish(
     mut batch: FlushBatch,
     result: Result<FlushOutcome, Error>,
     registered: Option<&participant::Registration>,
-    contributed: bool,
+    sealed: bool,
     background: bool,
 ) -> Result<crate::dbcache::RetiredLayers, Error> {
     let observed = batch.observed();
@@ -2048,7 +2094,7 @@ fn finish(
         );
     }
     let retired = observed.then(std::time::Instant::now);
-    if contributed && let Some(registered) = registered {
+    if sealed && let Some(registered) = registered {
         registered.participant.finished(failure.is_none());
     }
     // Read between the two, so that what `finished` allocated can be told
@@ -2118,6 +2164,7 @@ impl Options {
             log: None,
             background_commit: false,
             commit_snapshot: true,
+            before_commit: None,
         }
     }
 }
@@ -2922,8 +2969,9 @@ impl Database {
     ///
     /// For a caller that has just seen something fail and must decide
     /// whether storage was the cause.  redb refuses reads of pages it has
-    /// not cached from the moment a write of its commit fails, which is
-    /// before the commit returns and the store latches.  A read made in
+    /// not cached from the moment a write of a flush's transaction fails,
+    /// in its rows or its commit, which is before the flush ends and the
+    /// store latches.  A read made in
     /// between fails, or answers absence where an ffldb-layout read takes
     /// a store error for a missing row, with [`Self::is_fatal`] still
     /// `false`.  Waiting for the commit closes that window.
@@ -3137,7 +3185,7 @@ impl Database {
     ///
     /// The store's commit thread ([`COMMIT_THREAD_NAME`]), when one was
     /// started, is stopped and joined here, latched or not, once the flush
-    /// it was committing has ended: none outlives the close.
+    /// it was writing has ended: none outlives the close.
     pub fn close(&self) -> Result<(), Error> {
         if self.inner.closed.swap(true, Ordering::SeqCst) {
             return Err(db_error(ErrorKind::DbNotOpen, "database is not open"));
@@ -3318,7 +3366,7 @@ impl Database {
         // above comes before the close in the same way.  Should the
         // close wake first here, it has already flushed and no writer
         // can begin after it, so the flush below is empty and commits
-        // nothing (`DbCache::fill`; the close released any flush
+        // nothing (`DbCache::open`; the close released any flush
         // participant, so none has work for it either): still dcrd's `Ok`.
         // Again with the writer held: the transaction waited out may be
         // the one whose flush failed and latched the store.  So may a
@@ -3919,16 +3967,21 @@ mod background_commit_tests {
 
     impl Rig {
         fn new() -> Rig {
-            Rig::build(true)
+            Rig::with_page_cache(DEFAULT_DB_CACHE_BYTES)
+        }
+
+        /// A rig whose redb page cache is `db_cache_bytes`.
+        fn with_page_cache(db_cache_bytes: usize) -> Rig {
+            Rig::build(db_cache_bytes, true)
         }
 
         /// A rig with background commits off: every flush commits on the
         /// thread that runs it.
         fn inline() -> Rig {
-            Rig::build(false)
+            Rig::build(DEFAULT_DB_CACHE_BYTES, false)
         }
 
-        fn build(background: bool) -> Rig {
+        fn build(db_cache_bytes: usize, background: bool) -> Rig {
             assert_eq!(
                 COMMIT_THREAD_NAME,
                 dcroxide_testutil::gate::COMMITTER_THREAD_NAME,
@@ -3943,6 +3996,7 @@ mod background_commit_tests {
             opts.backend = Some(Arc::clone(&gate) as SharedBackend);
             opts.background_commit = background;
             opts.cache_max_size = CACHE_MAX;
+            opts.db_cache_bytes = db_cache_bytes;
             let seen: Arc<Mutex<Vec<FlushObservation>>> = Arc::default();
             let threads: Arc<Mutex<Vec<std::thread::ThreadId>>> = Arc::default();
             {
@@ -4122,15 +4176,18 @@ mod background_commit_tests {
         })
     }
 
-    /// A participant that allows its `finished` to be deferred, writes
-    /// one row in every flush, asks for a flush when a test says so, and
-    /// records how each flush ended and whether the store was latched by
-    /// then.
+    /// A participant that allows its `contribute` and `finished` to be
+    /// deferred, writes one row in every flush, asks for a flush when a
+    /// test says so, and records its seals and contributes, how each flush
+    /// ended and whether the store was latched by then.
     struct Asker {
         /// The store, for its latch; not a handle, which a participant
         /// must not keep.
         store: std::sync::Weak<DbInner>,
         want: AtomicBool,
+        /// Calls of `seal` and of `contribute` so far.
+        seals: AtomicU64,
+        contributes: AtomicU64,
         /// `(committed, latched)` for each `finished`, in order.
         finished: Mutex<Vec<(bool, bool)>>,
     }
@@ -4140,12 +4197,22 @@ mod background_commit_tests {
             Arc::new(Asker {
                 store: Arc::downgrade(&db.inner),
                 want: AtomicBool::new(false),
+                seals: AtomicU64::new(0),
+                contributes: AtomicU64::new(0),
                 finished: Mutex::default(),
             })
         }
 
         fn finished(&self) -> Vec<(bool, bool)> {
             self.finished.lock().expect("finished").clone()
+        }
+
+        /// `(seals, contributes)` so far.
+        fn calls(&self) -> (u64, u64) {
+            (
+                self.seals.load(Ordering::SeqCst),
+                self.contributes.load(Ordering::SeqCst),
+            )
         }
     }
 
@@ -4158,7 +4225,12 @@ mod background_commit_tests {
             true
         }
 
+        fn seal(&self) {
+            self.seals.fetch_add(1, Ordering::SeqCst);
+        }
+
         fn contribute(&self, w: &mut FlushWriter<'_, '_>) -> Result<ParticipantStats, Error> {
+            self.contributes.fetch_add(1, Ordering::SeqCst);
             let mut key = w.prefix().to_vec();
             key.push(b'K');
             w.insert(&key, b"")?;
@@ -4176,7 +4248,7 @@ mod background_commit_tests {
                 .push((committed, latched));
         }
 
-        fn allows_deferred_finish(&self) -> bool {
+        fn allows_deferred_contribute(&self) -> bool {
             true
         }
     }
@@ -4488,7 +4560,7 @@ mod background_commit_tests {
     /// ones the flush captured truncates nothing, puts the flush's bytes
     /// back and latches the store: the commit has landed, but dropping
     /// layers of unknown content could drop rows no commit holds.  A
-    /// participant that contributed is told the flush failed, with the
+    /// participant that was sealed is told the flush failed, with the
     /// store already latched: what it holds in memory is not retired on
     /// the word of a flush that did not end as one.
     #[test]
@@ -5162,15 +5234,16 @@ mod background_commit_tests {
             .expect("test hook poisoned") = None;
     }
 
-    /// A handed-over commit's processor time and I/O are read on the
-    /// thread that made it, at either end of the commit, and those of the
-    /// block sync and the insert loop on the thread that captured the
-    /// flush.  The capturing thread computes for a while just before, so a
-    /// commit timed from its counters to the committer's would show no
-    /// time on a processor at all.  The committer is held at its first
-    /// write until it has surely been switched out, which has the kernel
-    /// bring its time on a processor up to date inside the commit, so a
-    /// commit timed on the committer shows some.
+    /// A handed-over flush's insert loop and commit are timed, processor
+    /// time and I/O, on the thread that made them, at either end of each,
+    /// and its block sync on the thread that captured the flush.  The
+    /// capturing thread computes for a while just before, so a phase
+    /// timed from its counters to the committer's would show no time on a
+    /// processor at all, and the insert loop must fit in the part of the
+    /// flush that ran after the hand-off.  The committer is held at its
+    /// first write until it has surely been switched out, which has the
+    /// kernel bring its time on a processor up to date inside the commit,
+    /// so a commit timed on the committer shows some.
     #[test]
     fn a_handed_over_commit_is_timed_on_the_thread_that_made_it() {
         /// Compute for `wall` on the calling thread, never sleeping.
@@ -5244,10 +5317,21 @@ mod background_commit_tests {
             obs.commit
         );
         assert!(
-            obs.insert.on_cpu_ns.unwrap_or(0) <= nanos(obs.foreground + tick),
+            obs.block_sync.on_cpu_ns.unwrap_or(0) <= nanos(obs.foreground + tick),
             "{:?} in a foreground of {:?}",
-            obs.insert,
+            obs.block_sync,
             obs.foreground
+        );
+        let after_hand_off = obs.elapsed.saturating_sub(obs.foreground);
+        assert!(
+            obs.insert.elapsed + obs.commit.elapsed <= after_hand_off,
+            "the insert loop and the commit ran after the hand-off: {obs:?}"
+        );
+        assert!(
+            obs.insert.on_cpu_ns.unwrap_or(0) <= nanos(after_hand_off + tick),
+            "{:?} after a hand-off {:?} from the end",
+            obs.insert,
+            after_hand_off
         );
         if accounted {
             assert!(
@@ -5256,6 +5340,164 @@ mod background_commit_tests {
                 obs.commit
             );
         }
+    }
+
+    /// The rows of a flush handed to a thread of its own are written on
+    /// that thread, so a storage failure while they go in fails there, and
+    /// not in the commit that tripped the flush, which has returned `Ok`.
+    /// It latches the store before anything else, is logged once as a
+    /// background failure, and the participant, sealed and never reached,
+    /// is told `finished(false)`.  The next write is refused with the
+    /// failure as its cause, the rows of the failed batch are still read
+    /// from the write cache, and the store reopens at the flush before.
+    ///
+    /// redb's page cache is a small part of the batch here, so the insert
+    /// loop writes pages to the file ahead of the commit or grows it: the
+    /// power is cut just before the rows go in, and the first of those
+    /// operations fails.  A participant that was reached would show the
+    /// failure came later, in the commit.
+    #[test]
+    fn an_insert_that_fails_on_the_commit_thread_latches_and_the_next_write_names_it() {
+        let rig = Rig::with_page_cache(64 * 1024);
+        let prefix = rig.journal_prefix();
+        let asker = Asker::new(&rig.db);
+        rig.db
+            .set_flush_participant(&prefix, Arc::clone(&asker) as Arc<dyn FlushParticipant>)
+            .expect("register");
+        rig.fill(1);
+        let power = Arc::clone(&rig.power);
+        *rig.db.inner.before_fill.lock().expect("test hook poisoned") =
+            Some(Box::new(move || power.power_fails_after(0)));
+        rig.small(2)
+            .expect("the commit that trips the flush returns before the flush's rows go in");
+        let err = rig
+            .db
+            .wait_background_commit()
+            .expect_err("the rows had no power to go in with");
+        assert_eq!(err.kind, ErrorKind::Fatal, "{err}");
+        assert!(
+            err.description.contains("(the first failure: ")
+                && err.description.contains("power cut"),
+            "{err}"
+        );
+        assert!(rig.power.power_failed());
+        assert_eq!(
+            asker.calls(),
+            (1, 0),
+            "sealed under the writer, and the failure came before its contribute"
+        );
+        assert_eq!(
+            asker.finished(),
+            vec![(false, true)],
+            "told the flush failed, with the store already latched"
+        );
+        let errors = rig.error_lines();
+        assert_eq!(errors.len(), 1, "one line for the failure: {errors:?}");
+        assert!(
+            errors[0].starts_with("Background commit of the metadata write cache failed: ")
+                && errors[0].contains("power cut"),
+            "{errors:?}"
+        );
+        assert!(
+            rig.seen.lock().expect("observations").is_empty(),
+            "a failed flush is not observed"
+        );
+        let refused = rig.small(3).expect_err("a write on a latched store");
+        assert_eq!(refused.kind, ErrorKind::Fatal, "{refused}");
+        assert!(refused.description.contains("power cut"), "{refused}");
+        let reader = rig.db.begin(false).expect("begin a reader");
+        let tags: std::collections::BTreeSet<u8> =
+            Rig::rows(&reader).iter().map(|(key, _)| key[0]).collect();
+        assert_eq!(
+            tags.into_iter().collect::<Vec<_>>(),
+            vec![1, 2],
+            "the failed batch and the commit that tripped it are still read"
+        );
+        reader.rollback().expect("end the reader");
+
+        let (_dir, reopened) = rig.crash_and_reopen();
+        let durable = reopened.begin(false).expect("begin a reader");
+        assert!(
+            Rig::rows(&durable).is_empty(),
+            "the store is at the flush before"
+        );
+        durable.rollback().expect("end the reader");
+        reopened.close().expect("close");
+    }
+
+    /// The backstop against an overlay row under the participant's prefix
+    /// is on the thread that captured the flush, before anything is handed
+    /// over: the commit that tripped the flush is refused with it, the
+    /// store latches, the participant is neither sealed nor written to and
+    /// is owed nothing, and no committer thread is made, so no background
+    /// failure is logged.  No public path makes such a row; it is put into
+    /// the overlay directly.  A debug build stops at the backstop's
+    /// assertion, on the capturing thread; a release build fails the flush
+    /// there.
+    #[test]
+    fn an_overlay_row_under_the_prefix_fails_the_tripping_commit_before_the_hand_off() {
+        let rig = Rig::new();
+        let prefix = rig.journal_prefix();
+        let asker = Asker::new(&rig.db);
+        rig.db
+            .set_flush_participant(&prefix, Arc::clone(&asker) as Arc<dyn FlushParticipant>)
+            .expect("register");
+        {
+            let mut cache = rig.db.inner.cache.lock().expect("cache lock poisoned");
+            let mut puts = std::collections::BTreeMap::new();
+            puts.insert([prefix.as_slice(), b"x"].concat(), b"shadow".to_vec());
+            cache.commit_pending(puts, std::iter::empty());
+            // Every commit's check trips a flush from here on.
+            cache.set_limits(1, crate::dbcache::DEFAULT_FLUSH_SECS);
+        }
+        // Were the flush handed over after all, its commit would be held.
+        rig.gate.arm();
+        let outcome = {
+            let _writer = rig.db.exclusive_writer();
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                flush_locked(&rig.db.inner, true)
+            }))
+        };
+        match outcome {
+            Err(panic) => {
+                let text = panic.downcast_ref::<String>().cloned().unwrap_or_default();
+                if !cfg!(debug_assertions) {
+                    panic!("only a debug build stops at the assertion, and this one did: {text}");
+                }
+                assert!(
+                    text.contains("an overlay row lies under the flush participant's prefix"),
+                    "{text}"
+                );
+            }
+            Ok(result) => {
+                let err = result.expect_err("the backstop refuses the flush");
+                assert_eq!(err.kind, ErrorKind::IncompatibleValue, "{err}");
+                assert!(rig.db.is_fatal(), "the refusal latched the store");
+            }
+        }
+        assert!(
+            rig.db
+                .inner
+                .flight
+                .lock()
+                .expect("flight slot poisoned")
+                .is_none(),
+            "no committer thread was made"
+        );
+        assert_eq!(
+            (slot(&rig.db), started(&rig.db)),
+            (Slot::NotStarted, 0),
+            "nothing was handed over"
+        );
+        assert!(!rig.gate.is_held());
+        assert_eq!(asker.calls(), (0, 0), "nothing was sealed or written");
+        assert!(
+            asker.finished().is_empty(),
+            "a participant never sealed is owed nothing"
+        );
+        assert!(rig.error_lines().is_empty(), "{:?}", rig.error_lines());
+        assert!(rig.seen.lock().expect("observations").is_empty());
+        rig.gate.open();
     }
 
     // -----------------------------------------------------------------
@@ -5569,24 +5811,27 @@ mod background_commit_tests {
     /// A flush that fails on the commit thread latches the store and
     /// leaves the thread asleep, for the close to stop: the latch refuses
     /// every later capture, so nothing reaches the thread again, and no
-    /// other is started.  The failure is a power cut under the commit of a
-    /// flush a participant contributed to.
+    /// other is started.  The failure is the insert failure of
+    /// [`an_insert_that_fails_on_the_commit_thread_latches_and_the_next_write_names_it`].
     #[test]
     fn a_failure_on_the_commit_thread_latches_and_leaves_the_thread_for_close() {
-        let rig = Rig::new();
+        let rig = Rig::with_page_cache(64 * 1024);
         let prefix = rig.journal_prefix();
         let asker = Asker::new(&rig.db);
         rig.db
             .set_flush_participant(&prefix, Arc::clone(&asker) as Arc<dyn FlushParticipant>)
             .expect("register");
-        rig.hold_a_commit(1);
+        rig.fill(1);
+        let power = Arc::clone(&rig.power);
+        *rig.db.inner.before_fill.lock().expect("test hook poisoned") =
+            Some(Box::new(move || power.power_fails_after(0)));
+        rig.small(2)
+            .expect("the commit that trips the flush returns before the flush's rows go in");
         let end = thread_end(&rig.db);
-        rig.power.power_fails_after(0);
-        rig.gate.open();
         let err = rig
             .db
             .wait_background_commit()
-            .expect_err("the commit had no power to land with");
+            .expect_err("the rows had no power to go in with");
         assert_eq!(err.kind, ErrorKind::Fatal, "{err}");
         assert!(err.description.contains("power cut"), "{err}");
         let errors = rig.error_lines();
@@ -5703,10 +5948,10 @@ mod background_commit_tests {
     /// its own loop could make it do, is found dead by the next hand-off:
     /// the store latches with the panic as its first cause, the commit
     /// that tripped the flush fails and rolls its block back out of the
-    /// block files, the participant, which contributed to that flush, is
-    /// told it failed, and no second thread is started.  The flush before
-    /// it ended and was signalled before the thread died, so the wait for
-    /// it found nothing wrong.
+    /// block files, the participant, sealed for that flush, is told it
+    /// failed, and no second thread is started.  The flush before it ended
+    /// and was signalled before the thread died, so the wait for it found
+    /// nothing wrong.
     #[test]
     fn a_commit_thread_that_died_between_flights_latches_the_next_hand_off() {
         let rig = Rig::new();
@@ -5760,6 +6005,7 @@ mod background_commit_tests {
             vec![(true, false), (false, true)],
             "told the flush failed, with the store already latched"
         );
+        assert_eq!(asker.calls(), (2, 1), "sealed, and never contributed");
         assert_eq!(
             (slot(&rig.db), started(&rig.db)),
             (Slot::Stopped, 1),

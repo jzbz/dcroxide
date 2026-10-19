@@ -1209,3 +1209,119 @@ The cited lines of `existsaddrindex.rs`, `existsaddr/store.rs`,
 > not resolved, since two runs of one build differed by up to 235 MiB in
 > that morning's rungs; and the index's contents were not checked after
 > any of those syncs.
+
+## Addendum, 2026-10-19 — the participant writes on the commit thread, from what it sealed at the capture
+
+The flush's own rows and the participant's now go into redb's write
+transaction on the thread that commits it, the one `dbcommit` thread the
+store keeps for its life ([ADR-0009](0009-storage-shape.md) and
+[ADR-0005](0005-concurrency-model.md), addenda of this date). For a
+participant that allows it, the decision above reads as follows.
+
+- **`seal`**, new and empty by default, is called once a flush, right
+  after `has_work` answered true and the flush's write transaction is
+  open, on the flushing thread under the writer semaphore. It fixes what
+  the flush's `contribute` will write: no hook has run since the
+  capture, and every hook from then on hands over keys that `contribute`
+  must leave out.
+- **`contribute`** still writes after the overlay's rows and before the
+  commit, in the same transaction, but on the commit thread, after the
+  semaphore was released, with later commits' hooks and `wants_flush`
+  running beside it.
+- **`finished(committed)`** is called exactly once after each `seal`,
+  whether or not `contribute` ran: a failure in writing the overlay's
+  rows comes after the seal and before `contribute`, and is reported
+  with `finished(false)`, the store already latched.
+- **`allows_deferred_contribute`** replaces `allows_deferred_finish`,
+  false by default. A participant that answered `true` to the old method
+  read everything it held in `contribute`, which would now take in keys
+  of connects whose tip rows the flush does not persist; the rename
+  makes each one show itself. A flush in which a participant that has
+  not opted in has work runs on the committing thread from start to end,
+  as before.
+- **`Transaction::on_commit`**'s closures run once the commit's own
+  flush has captured the write cache and sealed the participant's work;
+  its rows, the participant's and the commit may all still be to come,
+  and may still fail.
+
+The exists-address index opts in. Its `seal` is `Memtable::seal`, moved
+from the end of `contribute` to the capture. Its `contribute` sizes,
+merges and journals from the journaled and sealed keys alone
+(`Memtable::flushed_sizes`, `flushed_sorted`, `sealed_sorted`); a hook's
+insert changes only the unjournaled runs, the filter, the version and
+the memtable's key counts, and the fold and the unseal run only in
+`finished`, so what `contribute` reads is the memtable as it stood at
+the seal, whatever hooks insert meanwhile. At the seal those keys are
+exactly the ones the old `contribute` read at the same point, so the
+rows a flush writes are the same, in the same order, for the same
+capture. A partition the flush merged keeps, after `finished(true)`, the
+keys handed over since the seal, unjournaled, for the next flush, as
+before. The memtable's bound is unchanged. Nothing on disk changes.
+
+The power-cut sweeps of `tests/participant.rs` and of the index now
+hold each flush handed to its own thread at the start of its
+`contribute`, where one connect is made beside it, and then, for an
+odd generation, at its commit's first write, where one more is made,
+so keys are handed in between the seal and the `contribute` and
+between the `contribute` and the `finished`; the power is cut at every
+storage operation
+(`power_cut_at_every_storage_operation_with_commits_on_their_own_thread`,
+`a_power_cut_at_every_storage_operation_with_commits_on_their_own_thread_keeps_index_and_tip_together`
+and its prepared-connect twin, and their random companions). Keys
+handed in between a seal and its `contribute` wait for the next flush
+(`keys_handed_in_between_the_seal_and_the_contribute_wait_for_the_next_flush`),
+and a participant that writes everything it holds in `contribute`,
+rather than what it sealed, is caught there and is harmless inline
+(`the_checker_catches_a_participant_that_writes_what_was_handed_in_after_its_seal`).
+The index writes the same rows, in the same order and after the
+overlay's, whether keys arrive while its `contribute` is held or after
+its flush
+(`contribute_writes_the_same_rows_whether_keys_arrive_during_it_or_after_its_flush`),
+its lookups find every key while it is held
+(`lookups_find_every_key_while_contribute_is_held`), and a `contribute`
+that fails on the commit thread latches the store and leaves memory as
+it was with the tripping connect's keys unsealed
+(`a_contribute_that_fails_on_the_commit_thread_latches_and_keeps_the_previous_state`,
+`a_failed_contribute_on_the_commit_thread_latches_and_keeps_the_previous_durable_state`).
+A failure in writing the overlay's rows on the commit thread tells a
+participant that was sealed, and whose `contribute` was never reached,
+`finished(false)`
+(`an_insert_that_fails_on_the_commit_thread_latches_and_the_next_write_names_it`),
+and a commit thread found dead at a hand-off tells the participant
+sealed for that flush, which never contributed
+(`a_commit_thread_that_died_between_flights_latches_the_next_hand_off`).
+They have run on Linux only. What the move did to a sync is in
+ADR-0009's addendum of this date.
+
+This change, and in `lib.rs` the commit before it, moved lines cited
+above, whose numbers stay as they were written. In `dcroxide-database`'s
+`lib.rs`, `begin_durable_write` is now at `:163`, the latch's two at
+`:204` and `:240` and the participant's field at `:451`; `flush_locked`
+is at `:1359`, with `wants_flush` asked at `:1376`, the deferral decided
+at `:1466-1471` and `finished` called at `:2098`; the rows are written
+and committed by `write_and_commit` at `:1527`, on the commit thread by
+`run_job` at `:1920`, and `finish` is at `:2048`; `close` is at `:3189`,
+`set_flush_participant` at `:3273` and `clear_flush_participant` at
+`:3344`. The participant trait is at `participant.rs:68`, `seal` at
+`:104`, `contribute` at `:120`, `finished` at `:140`,
+`allows_deferred_contribute` at `:172` and the key check at `:393`. In
+`dbcache.rs`, `open` is at `:1317`, with `has_work` asked at `:1326`,
+the prefix backstop at `:1348-1365` and the seal at `:1368`; `fill` is
+at `:1387`, with `contribute` called at `:1457`; the commit is at
+`:1499` and the participant-only flush's count at `:1572`. In
+`transaction.rs`, `on_commit` is at `:1224`, the prefix check at `:1240`
+and its call in the commit at `:1307`, the commit's own flush at
+`:1393`, its hooks taken at `:1420`, its rows published at `:1444` and
+`raw_id` at `:1841`; the hooks dropped by a rollback, `try_first_after`
+and `try_scan_after` did not move. In `existsaddrindex.rs`,
+`connect_block` is at `:812`, the check of what a connect prepared at
+`:822-823`, the hook at `:872`, registered at `:894`, and the drops at
+`:1033` and `:1077`; its other cited lines did not move. In
+`existsaddr/store.rs`, `wants_flush`, `has_work`, `seal`, `contribute`,
+`finished` and the journal load are at `:267`, `:278`, `:286`, `:297`,
+`:414` and `:467`, and `allows_deferred_contribute` at `:442`. In
+`existsaddr/memtable.rs`, `filter` is at `:371`, `insert_candidates` at
+`:413`, the three accessors at `:492`, `:502` and `:508`, `seal` at
+`:541`, `fold_sealed` at `:567` and `unseal` at `:605`. `cmp_keys` at
+`existsaddr/mod.rs:64` and the cited lines of `policy.rs` and
+`dcroxide.rs` did not move.

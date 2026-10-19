@@ -15,7 +15,7 @@
   helpers pre-verify the signatures of blocks read ahead), 2026-10-18
   (addendum: the reading thread makes the data sanity checks),
   2026-10-19 (addendum: the metadata commit thread kept for the life of
-  the store)
+  the store; second addendum: the commit thread writes the flush's rows)
 
 ## Context
 
@@ -862,3 +862,42 @@ same path after it). Pinned by the database's own tests
 
 D2 is unchanged: one more OS thread, as since 2026-10-16, now kept for
 the store and asleep between flushes.
+
+## Addendum, 2026-10-19 (second) — the commit thread writes the flush's rows
+
+The `dbcommit` thread of the addendum above now also writes a flush's
+rows into redb's write transaction and runs the flush participant's
+`contribute` there, before the commit
+([ADR-0011](0011-exists-address-layout-3-and-the-flush-participant.md)
+and [ADR-0009](0009-storage-shape.md), addenda of this date). The thread
+that ran the flush keeps the capture, the block-file sync, the opening
+of the write transaction and the participant's `seal`, under the writer
+semaphore. The thread is still the store's one, kept for its life with
+one flush at a time on it, and still takes neither the writer semaphore
+nor the block store's lock. `contribute` takes the exists-address
+index's state lock and its memtable partitions' read locks, beside the
+commit hooks that take the partitions' write locks; no lock is held
+while another of them is taken in the opposite order. The thread now
+holds redb's allocator lock while the rows allocate pages, and across a
+growth of the file, which every transaction's begin takes briefly.
+
+This is the first of the two changes the addendum above was made before.
+On m3 on 2026-10-18, in syncs from a dcrd v2.1.7 node on another machine
+on the same LAN, with a thread made for each flush, the build that added
+it took 41.45 s less than the build below it by the means of two runs
+each, with 37.6 s less of the block thread's time on a processor, and
+peaked at 6,835 and 7,200 MiB of resident memory against 3,195 and
+3,338 MiB ([bench-ledger.md](../bench-ledger.md), "Rungs from a block
+server on the LAN, two changes held for their memory, and dcrd v2.1.7",
+build I). With the thread kept it was measured only beside one more
+change held that day: build K, on 2026-10-19, peaked at 2,456 and
+2,470 MiB, as the addendum above sets out, and in each of its default
+runs from that LAN node the per-thread counters list one `dbcommit`
+thread, on a processor for 90.5 to 91.4 s
+([bench-ledger.md](../bench-ledger.md), "One commit thread for the life
+of the store, a sync that checks every script, and dcrd v2.1.7"). Those
+builds were states of a worktree, not the tree of a commit; the change
+on the kept thread without that other change was neither built as a
+release binary nor synced.
+
+D2 is unchanged.

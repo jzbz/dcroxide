@@ -22,13 +22,18 @@
 //! a second flush in a row -- the one `Database::close` makes after the
 //! node's own shutdown flush -- commits nothing.
 //!
-//! A flush that wrote its rows ends by sealing the keys it journaled or
-//! merged (`Memtable::seal`): they stay in memory, found by every lookup,
-//! but apart from the keys later connects hand over.  Nothing else
-//! changes in memory until `finished(true)`, after the commit: then the
-//! sealed keys are folded into the journaled ones, and the merged
-//! partitions lose their journaled and sealed keys.  Keys handed over
-//! since the seal are left for the next flush, so `finished` may come
+//! A flush with keys to journal seals them first, at its capture, under
+//! the writer semaphore (`seal`, `Memtable::seal`): they stay in memory,
+//! found by every lookup, but apart from the keys later connects hand
+//! over.  Its `contribute`, which in the daemon runs on the thread the
+//! flush is handed to, beside later connects' hooks, reads only the
+//! journaled and sealed keys (`Memtable::flushed_sizes`,
+//! `Memtable::flushed_sorted`, `Memtable::sealed_sorted`), so what it
+//! writes is the memtable as it stood at the seal.  Nothing else changes
+//! in memory until `finished(true)`, after the commit: then the sealed
+//! keys are folded into the journaled ones, and the merged partitions
+//! lose their journaled and sealed keys.  Keys handed over since the seal
+//! are left for the next flush, so `contribute` and `finished` may come
 //! after any number of later connects' hooks.  A failed flush unseals,
 //! which leaves memory holding what it held; the store is latched by
 //! then.
@@ -38,9 +43,13 @@
 //! row numbered at or after its partition's `pend_from`.  The tip rows and
 //! all of these rows share one `Durability::Immediate` commit, and the
 //! hook that hands a connect's keys over runs after the commit's own
-//! flush has written its rows and before its tip row is published, so the
-//! flush that persists a tip row journals that connect's keys, and no
-//! flush journals the keys of a connect whose tip row it does not persist.
+//! flush has captured the write cache and sealed the keys it will write,
+//! and before its tip row is published.  The seal is made under the same
+//! hold of the writer semaphore as the capture, with no hook in between,
+//! so the sealed keys are exactly those of the connects whose tip rows
+//! the flush persists: the flush that persists a tip row journals that
+//! connect's keys, and no flush journals the keys of a connect whose tip
+//! row it does not persist.
 
 use std::sync::{Mutex, RwLock};
 
@@ -87,12 +96,63 @@ pub(crate) struct Faults {
     pub(crate) fail_contribute: std::sync::atomic::AtomicBool,
     /// Every `finished` outcome, in order.
     pub(crate) finished: Mutex<Vec<bool>>,
+    /// Not a fault: holds `contribute` at its start, on the thread a
+    /// flush was handed to, while it is armed, so that a test can hand
+    /// keys over between a flush's seal and its `contribute`.
+    pub(crate) hold_contribute: Hold,
     /// Not a fault: the connects whose work was prepared before their
     /// transaction began, counted as each prepare returns.
     pub(crate) prepares: std::sync::atomic::AtomicUsize,
     /// Not a fault: the connects that used what was prepared for them
     /// rather than doing that work inside their transaction.
     pub(crate) prepared_connects: std::sync::atomic::AtomicUsize,
+}
+
+/// A point the thread a flush is handed to can be held at, for tests.
+/// It holds that thread and no other, so a flush that runs on the thread
+/// that tripped it passes an armed hold untouched.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct Hold {
+    /// Whether to hold, and whether a thread is held now.
+    state: Mutex<(bool, bool)>,
+    changed: std::sync::Condvar,
+}
+
+#[cfg(test)]
+impl Hold {
+    /// Hold the next thread that passes, if it is the committer.
+    pub(crate) fn arm(&self) {
+        self.state.lock().expect("hold").0 = true;
+    }
+
+    /// Let a held thread go, and hold no other.
+    pub(crate) fn release(&self) {
+        self.state.lock().expect("hold").0 = false;
+        self.changed.notify_all();
+    }
+
+    /// Whether a thread is held now.
+    pub(crate) fn is_held(&self) -> bool {
+        self.state.lock().expect("hold").1
+    }
+
+    /// Called by the thread to hold.
+    fn pass(&self) {
+        if std::thread::current().name() != Some(dcroxide_database::COMMIT_THREAD_NAME) {
+            return;
+        }
+        let mut state = self.state.lock().expect("hold");
+        if !state.0 {
+            return;
+        }
+        state.1 = true;
+        self.changed.notify_all();
+        while state.0 {
+            state = self.changed.wait(state).expect("hold");
+        }
+        state.1 = false;
+    }
 }
 
 /// The exists-address index's in-memory state and flush participant.
@@ -219,12 +279,30 @@ impl FlushParticipant for AddrStore {
         self.mem.unjournaled() > 0
     }
 
+    /// Set apart every key not yet journaled, under the writer semaphore
+    /// and with no hook run since the capture: the keys of exactly the
+    /// connects whose tip rows this flush persists.  Every key a hook
+    /// hands over from here on waits for the next flush.
+    fn seal(&self) {
+        self.mem.seal();
+    }
+
+    /// Reads only the journaled and sealed keys, each partition under its
+    /// read lock, so its rows are those the memtable held at the seal,
+    /// whatever hooks hand over while it runs.
     #[allow(
         clippy::arithmetic_side_effects,
         reason = "counts bounded by the memtable's length, and floating point"
     )]
     fn contribute(&self, w: &mut FlushWriter<'_, '_>) -> Result<ParticipantStats, Error> {
-        let memtable_keys = self.mem.len();
+        #[cfg(test)]
+        self.faults.hold_contribute.pass();
+        // Neither the journaled nor the sealed keys change from the seal
+        // until `finished`: a hook's insert adds to the unjournaled runs
+        // alone, and the fold and the unseal run only in `finished`, after
+        // this, on this thread.
+        let sizes = self.mem.flushed_sizes();
+        let memtable_keys: usize = sizes.iter().sum();
         let part = self.partitioner();
         let mut state = self.state();
         state.plan = None;
@@ -239,8 +317,7 @@ impl FlushParticipant for AddrStore {
 
         // 2. Merge the largest partitions while the memtable is over its
         //    target, within the page budget.
-        let sizes = self.mem.sizes();
-        let mut remaining: usize = sizes.iter().sum();
+        let mut remaining = memtable_keys;
         let mut merged = Box::new([false; PARTITIONS]);
         let mut pages = 0usize;
         let mut merges = 0u64;
@@ -253,7 +330,7 @@ impl FlushParticipant for AddrStore {
                 break;
             }
             let pi = usize::from(p);
-            let held = self.mem.all_sorted(pi);
+            let held = self.mem.flushed_sorted(pi);
             let delta = runs::read_level(w, &part, p, DELTA)?;
             check_count(&delta, meta.d_keys[pi], p, DELTA)?;
             let grown = (u64::from(meta.d_keys[pi]) + held.len() as u64) as f64;
@@ -278,8 +355,8 @@ impl FlushParticipant for AddrStore {
             remaining -= sizes[pi];
         }
 
-        // 3. Journal the keys not yet journaled of every partition left
-        //    in memory, one partition's copy and one batch at a time.
+        // 3. Journal the sealed keys of every partition left in memory,
+        //    one partition's copy and one batch at a time.
         #[cfg(test)]
         let skip = self
             .faults
@@ -291,7 +368,7 @@ impl FlushParticipant for AddrStore {
         if !skip {
             for p in 0..PARTITIONS {
                 if !merged[p] && sizes[p] > 0 {
-                    journal.add(w, &self.mem.unjournaled_sorted(p))?;
+                    journal.add(w, &self.mem.sealed_sorted(p))?;
                 }
             }
         }
@@ -326,10 +403,6 @@ impl FlushParticipant for AddrStore {
             });
         }
         state.plan = Some(Plan { meta, merged });
-        // Every key read above is now in this flush's rows.  Set them
-        // apart from the keys hooks hand over from here on, which may be
-        // many by the time `finished` is called.
-        self.mem.seal();
         let mut stats = ParticipantStats::default();
         stats.keys_journaled = keys_journaled;
         stats.merges = merges;
@@ -362,10 +435,11 @@ impl FlushParticipant for AddrStore {
         state.meta = plan.meta;
     }
 
-    /// `contribute` seals the keys it wrote, and `finished` touches only
-    /// those, under the state lock and each partition's own: the keys
-    /// hooks hand over in between are neither retired nor lost.
-    fn allows_deferred_finish(&self) -> bool {
+    /// `seal` sets the keys apart at the capture, `contribute` reads only
+    /// those and the journaled ones, and `finished` touches only those,
+    /// under the state lock and each partition's own: the keys hooks hand
+    /// over meanwhile are neither written, retired nor lost.
+    fn allows_deferred_contribute(&self) -> bool {
         true
     }
 }

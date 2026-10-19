@@ -5,8 +5,9 @@
   against the swap on crash safety. The evidence below stands as the record of
   what was measured and remains the basis for reopening if the trade changes.
 - **Date:** 2026-08-10 (proposed), 2026-08-13 (prerequisites complete),
-  2026-08-17 (decided), 2026-10-16 (addendum: condition 1 restated for
-  a commit on a thread of its own, on by default)
+  2026-08-17 (decided), 2026-10-16 (addendum: condition 1 restated for a
+  commit on a thread of its own, on by default), 2026-10-19 (addendum:
+  the flush's rows written on the commit thread too)
 
 ## Decision: redb stays
 
@@ -1130,3 +1131,65 @@ refused with its cause, a real ENOSPC on that thread reaches the latch
 exists-address index and of the UTXO cache's flushes run in both modes;
 those of `tests/crash.rs` and of the bucket index run on the committing
 thread only. They have run on Linux only.
+
+## Addendum, 2026-10-19 — the flush's rows are written on the commit thread too
+
+A flush that a commit's own check trips now does less under the writer:
+it is captured, its block files are synced, redb's write transaction is
+opened and the participant seals its work; the overlay's rows, the
+participant's rows and the commit are written on `dbcommit`, the one
+thread the store keeps for its life
+([ADR-0005](0005-concurrency-model.md) and
+[ADR-0011](0011-exists-address-layout-3-and-the-flush-participant.md),
+addenda of this date). The order of the writes inside the transaction is
+unchanged, so is the free space they start from (the commit before has
+landed and nothing is freed while a write transaction fills), and every
+commit is still `Durability::Immediate`.
+
+Condition 1, as restated on 2026-10-16, covers the move without a
+change: a failure in writing the rows on that thread latches the store
+before anything else, exactly as a failed commit there does, and is
+reported by the next write, flush or close. What changes is which
+failures that is. An insert's storage error (a page read, the file's
+growth, an early write of redb's write buffer) and an error the
+participant finds in its own rows no longer fail the commit that tripped
+the flush; they are reported later, by about the time the rows take to
+write. A row of the write cache under the participant's prefix is still
+refused on the writer. `Database::flush`, `Database::close` and every
+flush with `DCROXIDE_DB_SYNC_COMMIT` write and commit on the calling
+thread, as before.
+
+The move was first measured with a thread made for each flush, on m3 on
+2026-10-18, in default mainnet syncs from a dcrd v2.1.7 node on another
+machine on the same LAN: the build that added it took 274.00 s against
+315.45 s for the build below it by the means of two runs each, 41.45 s
+less, beyond that session's ±7.1 s, and the flushes' foreground time,
+what the capturing thread held the writer for (the flush log's `fg_ms`),
+fell to 5.5 and 6.4 s a sync from 45.3 to 47.0 s in the runs of the two
+builds below it. That build peaked at 6,835 and 7,200 MiB of resident
+memory against 3,195 and 3,338 MiB
+([bench-ledger.md](../bench-ledger.md), "Rungs from a block server on
+the LAN, two changes held for their memory, and dcrd v2.1.7", builds G',
+H and I), and the move was held for it. The commit thread kept for the
+life of the store, ADR-0005's first addendum of this date, was measured
+on 2026-10-19 only on top of this change and one more held with it,
+which counts a durable commit that carries a UTXO cache flush toward the
+periodic flush's 120 s and hands that flush's commit over: 2,456 and
+2,470 MiB in two runs against 6,730 to 6,933 MiB in three with a thread
+made for each flush, no slower ([bench-ledger.md](../bench-ledger.md),
+"One commit thread for the life of the store, a sync that checks every
+script, and dcrd v2.1.7"). Those builds were states of a worktree, not
+the tree of a commit, and the series is one of its own; the move on the
+kept thread without that other change was neither built as a release
+binary nor synced.
+
+Pinned by `an_insert_that_fails_on_the_commit_thread_latches_and_the_next_write_names_it`
+and `an_overlay_row_under_the_prefix_fails_the_tripping_commit_before_the_hand_off`
+(the database's own tests; the second, with the older backstop test,
+also in a release build, where the backstop fails the flush with its
+error and the latch), the power-cut sweeps named in ADR-0011's
+addendum of this date, `tests/background_commit.rs`'s paged sweeps,
+whose cuts now land inside the insert loop where it writes pages ahead
+of the commit on `dbcommit`, and the chain's
+`tests/utxo_flush_crash_sweep.rs`, in both modes. They have run on
+Linux only.

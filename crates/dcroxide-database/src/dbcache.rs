@@ -208,8 +208,8 @@ fn node_size(key_len: usize, value: Option<&[u8]>) -> u64 {
 pub(crate) type RetiredLayers = Vec<Arc<CacheLayer>>;
 
 /// An overlay capture handed to [`DbCache::sync_blocks`],
-/// [`DbCache::fill`] and [`DbCache::commit`], which persist it with no
-/// lock held.
+/// [`DbCache::open`], [`DbCache::fill`] and [`DbCache::commit`], which
+/// persist it with no lock held.
 ///
 /// It owns `Arc`s on the captured layers, which does two things: the
 /// contents cannot change under the commit (every `Arc::try_unwrap` in
@@ -283,9 +283,9 @@ impl FlushBatch {
         self.observed
     }
 
-    /// Record that this flush's commit is leaving the capturing thread:
-    /// everything from the capture to here ran on it, with the writer
-    /// semaphore held.
+    /// Record that the rest of this flush, its rows and its commit, is
+    /// leaving the capturing thread: everything from the capture to here
+    /// ran on it, with the writer semaphore held.
     pub(crate) fn hand_off(&mut self) {
         self.background = true;
         self.foreground = self.started.elapsed();
@@ -307,6 +307,27 @@ impl FlushBatch {
     }
 }
 
+/// A flush's write transaction, open and empty: what [`DbCache::open`]
+/// hands to [`DbCache::fill`], on the capturing thread or on the thread
+/// the flush is handed to.
+pub(crate) struct FillJob {
+    tx: redb::WriteTransaction,
+    /// What [`DbCache::sync_blocks`] measured, carried into the outcome.
+    block_sync: crate::FlushPhase,
+    /// Whether the participant was sealed: [`DbCache::fill`] calls its
+    /// `contribute` after the overlay's rows, and its `finished` is owed
+    /// from here on, whatever happens to the flush.
+    sealed: bool,
+}
+
+impl FillJob {
+    /// Whether the participant was sealed for this flush, and so is owed
+    /// its `finished`.
+    pub(crate) fn sealed(&self) -> bool {
+        self.sealed
+    }
+}
+
 /// A flush's write transaction, filled and not yet committed: what
 /// [`DbCache::fill`] hands to [`DbCache::commit`].
 pub(crate) struct CommitJob {
@@ -317,19 +338,19 @@ pub(crate) struct CommitJob {
     observed: bool,
 }
 
-/// What [`DbCache::fill`] made of a captured batch.
+/// What [`DbCache::open`] made of a captured batch.
 #[allow(
     clippy::large_enum_variant,
     reason = "one is made per flush and handed straight to its caller; boxing the write \
               transaction would add an allocation and save nothing"
 )]
-pub(crate) enum Filled {
+pub(crate) enum Opened {
     /// Nothing to commit: an empty overlay and no participant work.  The
     /// block files were still synced.
     Empty(FlushOutcome),
-    /// A write transaction holding the overlay's rows and the
-    /// participant's, ready for [`DbCache::commit`].
-    Tx(CommitJob),
+    /// An open write transaction, the participant sealed if it had work,
+    /// ready for [`DbCache::fill`].
+    Tx(FillJob),
 }
 
 /// What a completed commit reports back for the observer.
@@ -1218,29 +1239,34 @@ impl DbCache {
         }
     }
 
-    /// Persist a captured batch: [`Self::sync_blocks`], [`Self::fill`]
-    /// and [`Self::commit`] in a row, as `flush_locked` runs them for a
-    /// flush whose commit stays on the capturing thread.  For the tests of
-    /// this module, which drive a flush without a database around it.
+    /// Persist a captured batch: [`Self::sync_blocks`], [`Self::open`],
+    /// [`Self::fill`] and [`Self::commit`] in a row, as `flush_locked`
+    /// runs them for a flush that stays on the capturing thread.  For the
+    /// tests of this module, which drive a flush without a database around
+    /// it.  `sealed` is set once the participant has been sealed, so the
+    /// caller knows to call `finished` whether or not the flush then fails.
     #[cfg(test)]
     pub(crate) fn run_flush(
         batch: &FlushBatch,
         kv: &redb::Database,
         block_store: &std::sync::Mutex<BlockStore>,
         participant: Option<&Registration>,
-        contributed: &mut bool,
+        sealed: &mut bool,
     ) -> Result<FlushOutcome, Error> {
         let block_sync = Self::sync_blocks(batch, block_store)?;
-        match Self::fill(batch, kv, participant, contributed, block_sync)? {
-            Filled::Empty(outcome) => Ok(outcome),
-            Filled::Tx(job) => Self::commit(job),
+        match Self::open(batch, kv, participant, block_sync)? {
+            Opened::Empty(outcome) => Ok(outcome),
+            Opened::Tx(job) => {
+                *sealed = job.sealed();
+                Self::commit(Self::fill(batch, job, participant)?)
+            }
         }
     }
 
     /// The first step of persisting a captured batch: sync the block
     /// files written since the last flush.  Runs WITHOUT the cache lock
-    /// held, as [`Self::fill`] and [`Self::commit`] do, so readers and the
-    /// overlay's writers proceed while a flush works.
+    /// held, as [`Self::open`], [`Self::fill`] and [`Self::commit`] do, so
+    /// readers and the overlay's writers proceed while a flush works.
     pub(crate) fn sync_blocks(
         batch: &FlushBatch,
         block_store: &std::sync::Mutex<BlockStore>,
@@ -1267,24 +1293,33 @@ impl DbCache {
         Ok(timer.finish())
     }
 
-    /// The second step: open the flush's write transaction and hand it
-    /// every row of the batch, leaving it uncommitted.  `block_sync` is
-    /// what [`Self::sync_blocks`] returned, carried into the outcome.
+    /// The second step: open the flush's write transaction, on the thread
+    /// that captured the batch and with the writer semaphore held, and
+    /// leave it empty.  `block_sync` is what [`Self::sync_blocks`]
+    /// returned, carried into the outcome.
     ///
     /// With a registered flush participant (ADR-0011), the participant is
     /// asked `has_work` once, after the block sync.  When it has work, it
-    /// contributes its rows inside this flush's write transaction, after
-    /// the overlay's rows and before the commit, so both land in the one
-    /// durable commit, and the flush commits even an empty overlay.
-    /// `contributed` is set just before `contribute` is called, so the
-    /// caller knows to call `finished` whether or not this then fails.
-    pub(crate) fn fill(
+    /// is sealed once the transaction is open ([`FlushParticipant::seal`]):
+    /// the semaphore is still held and no commit hook has run since the
+    /// capture, so what it sets apart is what the captured commits handed
+    /// it.  [`Self::fill`] then has it contribute exactly that, after the
+    /// overlay's rows, and the flush commits even an empty overlay.  A
+    /// [`FillJob`] that says it was sealed owes the participant its
+    /// `finished`, whether or not the flush then fails.
+    ///
+    /// The backstop against an overlay row under the participant's prefix
+    /// is here too, before anything is written or sealed: a captured view
+    /// holding such a row fails the flush on the capturing thread, as it
+    /// did when the rows were written there.
+    ///
+    /// [`FlushParticipant::seal`]: crate::FlushParticipant::seal
+    pub(crate) fn open(
         batch: &FlushBatch,
         kv: &redb::Database,
         participant: Option<&Registration>,
-        contributed: &mut bool,
         block_sync: crate::FlushPhase,
-    ) -> Result<Filled, Error> {
+    ) -> Result<Opened, Error> {
         let view = CacheSnapshot {
             layers: batch.layers.clone(),
         };
@@ -1293,7 +1328,7 @@ impl DbCache {
             // Nothing to commit, but the block files still needed their
             // sync -- that is the half of a flush that runs even on an
             // empty overlay.
-            return Ok(Filled::Empty(FlushOutcome {
+            return Ok(Opened::Empty(FlushOutcome {
                 dirty_entries: 0,
                 stats_elapsed: Duration::ZERO,
                 sampled: None,
@@ -1303,6 +1338,70 @@ impl DbCache {
                 participant: None,
             }));
         }
+        // An overlay row under the participant's prefix would shadow the
+        // participant's newer rows for every reader.  Registration and
+        // commit refuse to create one, so this is a backstop: it fails the
+        // flush, and with it latches the store, rather than persist a row
+        // that should not exist.  The captured layers cannot change, so a
+        // view that passes here holds no such row when its rows are
+        // written.
+        if let Some(registered) = participant
+            && let Some((key, _)) = view
+                .merged_from(&registered.prefix)
+                .next()
+                .filter(|(key, _)| key.starts_with(&registered.prefix))
+        {
+            debug_assert!(
+                false,
+                "an overlay row lies under the flush participant's prefix: {key:02x?}"
+            );
+            return Err(db_error(
+                ErrorKind::IncompatibleValue,
+                format!(
+                    "the metadata overlay holds a row under the flush participant's prefix \
+                     ({key:02x?}); refusing to flush it"
+                ),
+            ));
+        }
+        let tx = crate::begin_durable_write(kv)?;
+        if let Some(registered) = contributing {
+            registered.participant.seal();
+        }
+        Ok(Opened::Tx(FillJob {
+            tx,
+            block_sync,
+            sealed: contributing.is_some(),
+        }))
+    }
+
+    /// The third step: hand the open transaction every row of the batch,
+    /// then the participant's, leaving it uncommitted.  Runs on whichever
+    /// thread makes the commit: the capturing thread, with the writer
+    /// semaphore held, or the thread a flush that a commit tripped is
+    /// handed to, without it.
+    ///
+    /// The overlay's rows go in first, in the merged view's key order.  A
+    /// participant sealed by [`Self::open`] then contributes inside the
+    /// same transaction, so its rows and the overlay's land in the one
+    /// durable commit.
+    pub(crate) fn fill(
+        batch: &FlushBatch,
+        job: FillJob,
+        participant: Option<&Registration>,
+    ) -> Result<CommitJob, Error> {
+        let FillJob {
+            tx,
+            block_sync,
+            sealed,
+        } = job;
+        debug_assert!(
+            !sealed || participant.is_some(),
+            "a flush sealed a participant it does not have"
+        );
+        let contributing = participant.filter(|_| sealed);
+        let view = CacheSnapshot {
+            layers: batch.layers.clone(),
+        };
         // The participant's prefix, which no overlay row may lie under.
         let guarded = participant.map(|r| &*r.prefix);
 
@@ -1312,17 +1411,14 @@ impl DbCache {
         let mut stats_elapsed = Duration::ZERO;
         let timer = PhaseTimer::start(batch.observed);
         let insert;
-        let tx = crate::begin_durable_write(kv)?;
         {
             let mut table = tx
                 .open_table(METADATA_TABLE)
                 .map_err(crate::storage_error)?;
             for (key, entry) in view.merged() {
-                // An overlay row under the participant's prefix would
-                // shadow the participant's newer rows for every reader.
-                // Registration and commit refuse to create one, so this is
-                // a backstop: it fails the flush, and with it latches the
-                // store, rather than persist a row that should not exist.
+                // `open` has already refused a view holding a row under
+                // the participant's prefix; this second look costs a
+                // comparison a row and stays in case that ever changes.
                 if let Some(prefix) = guarded {
                     debug_assert!(
                         !key.starts_with(prefix),
@@ -1355,7 +1451,6 @@ impl DbCache {
             }
             insert = timer.finish();
             if let Some(registered) = contributing {
-                *contributed = true;
                 let timer = PhaseTimer::start(batch.observed);
                 let mut writer =
                     FlushWriter::new(&mut table, &registered.prefix, batch.write_log.as_ref());
@@ -1383,7 +1478,7 @@ impl DbCache {
                 stats_elapsed = stats_started.elapsed();
             }
         }
-        Ok(Filled::Tx(CommitJob {
+        Ok(CommitJob {
             tx,
             outcome: FlushOutcome {
                 dirty_entries,
@@ -1395,11 +1490,12 @@ impl DbCache {
                 participant: participant_stats,
             },
             observed: batch.observed,
-        }))
+        })
     }
 
     /// The last step: redb's durable commit of the transaction
-    /// [`Self::fill`] left, timed on the thread that makes it.
+    /// [`Self::fill`] left, timed on the thread that makes it, which is
+    /// the one that filled it.
     pub(crate) fn commit(job: CommitJob) -> Result<FlushOutcome, Error> {
         let CommitJob {
             tx,
@@ -3491,6 +3587,10 @@ mod participant_guard_tests {
             true
         }
 
+        fn seal(&self) {
+            panic!("seal ran after the overlay guard should have failed the flush");
+        }
+
         fn contribute(&self, _: &mut FlushWriter<'_, '_>) -> Result<ParticipantStats, Error> {
             panic!("contribute ran after the overlay guard should have failed the flush");
         }
@@ -3504,8 +3604,8 @@ mod participant_guard_tests {
     /// Registration and commit both refuse to create such a row, so no
     /// public path reaches this; the row is put into the cache directly.
     /// A debug build stops at the assertion, a release build fails the
-    /// flush before the participant is called -- the error `flush_locked`
-    /// latches.
+    /// flush when its write transaction would open, before the participant
+    /// is sealed or called -- the error `flush_locked` latches.
     #[test]
     #[cfg_attr(
         debug_assertions,
@@ -3525,17 +3625,20 @@ mod participant_guard_tests {
             prefix,
             participant: Arc::new(Unreachable),
         };
-        let mut contributed = false;
+        let mut sealed = false;
         let result = DbCache::run_flush(
             &batch,
             &db.inner.kv,
             &db.inner.block_store,
             Some(&registration),
-            &mut contributed,
+            &mut sealed,
         );
         let err = result.err().expect("the flush must fail");
         assert_eq!(err.kind, crate::ErrorKind::IncompatibleValue, "{err}");
-        assert!(!contributed, "the participant was not called");
+        assert!(
+            !sealed,
+            "the participant was not sealed, so it is owed nothing"
+        );
         cache.finish_flush(batch, None);
     }
 }

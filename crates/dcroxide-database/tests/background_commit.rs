@@ -2,16 +2,18 @@
 //! A flush whose redb commit runs on a thread of its own
 //! (`Options::background_commit`).
 //!
-//! With the option set, a flush that a commit's own check trips stops at
-//! its last step: the overlay is captured, the block files are synced
-//! and the rows are handed to redb on the committing thread, under the
-//! writer semaphore, and the redb commit itself is made by the store's
-//! commit thread, named `dbcommit`, while the commit that tripped the
-//! flush returns.  The thread is one for the open store, started by the
-//! first flush handed to it and kept until the close or the drop of the
-//! last handle.  These tests hold it at its first write (`GateBackend`)
-//! and look at the database while the commit is under way, then let it
-//! land or fail.
+//! With the option set, a flush that a commit's own check trips is
+//! handed over once its write transaction is open: the overlay is
+//! captured, the block files are synced, redb's write transaction is
+//! opened and the participant sealed on the committing thread, under the
+//! writer semaphore, and the rows are written into the transaction and
+//! the redb commit made by the store's commit thread, named `dbcommit`,
+//! while the commit that tripped the flush returns.  The thread is one for
+//! the open store, started by the first flush handed to it and kept until
+//! the close or the drop of the last handle.  These tests hold it at its
+//! first write (`GateBackend`), or a participant's `contribute` at its
+//! start, and look at the database while the flush is under way, then let
+//! it land or fail.
 //!
 //! What they hold the store to:
 //!
@@ -25,8 +27,8 @@
 //!   participant is told and before anything can acknowledge durability,
 //!   and the next write, flush and close name its cause; so does a
 //!   committer thread that panics, at the next wait for it;
-//! - every flush handed over is committed by the one commit thread,
-//!   which no close outlives, and a participant is neither registered nor
+//! - every flush handed over is written by the one commit thread, which
+//!   no close outlives, and a participant is neither registered nor
 //!   released under a flush it did not start with;
 //! - one flush is in flight at a time: a commit whose flush the overlay
 //!   or the participant asks for waits for the commit under way, and a
@@ -37,8 +39,10 @@
 //!   row again, or one commit's rows without another's;
 //! - the overlay is bounded while a commit is under way: a commit that
 //!   finds it over its maximum waits for that commit and adds nothing;
-//! - a participant that has not allowed its `finished` to be deferred is
-//!   never handed over;
+//! - a participant that has not allowed its `contribute` and `finished` to
+//!   be deferred is never handed over, and one that has writes exactly
+//!   what it sealed at the capture, whatever is handed in while its
+//!   `contribute` runs;
 //! - the storage a handed-over commit leaves behind takes writes and
 //!   reads as it does after a commit made on the committing thread, and
 //!   a power cut loses no commit and tears none where redb writes pages
@@ -52,11 +56,11 @@
 //! `background_commit_tests`.
 //!
 //! **A test settles before it lets go of a store.**  The commit thread
-//! keeps the store open until the flush it is committing has ended, and
-//! a power cut on the test's backend does not stop it, so every test
-//! waits for the flush in flight (`Database::wait_background_commit`, or
-//! a flush or close that waits itself) before it drops its last handle
-//! or reopens.  The thread lets go of the store before that wait returns.
+//! keeps the store open until the flush it is writing has ended, and a
+//! power cut on the test's backend does not stop it, so every test waits
+//! for the flush in flight (`Database::wait_background_commit`, or a flush
+//! or close that waits itself) before it drops its last handle or
+//! reopens.  The thread lets go of the store before that wait returns.
 //!
 //! The waits that show a call is blocked are short sleeps, as in
 //! `writer_wait.rs`: a call that wrongly returned at once is caught, and
@@ -437,19 +441,23 @@ fn assert_refused_for_the_power_cut(what: &str, err: &Error) {
 /// One call a participant received, in order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Call {
+    Seal,
     Contribute,
     Finished(bool),
 }
 
-/// A participant that allows its `finished` to be deferred, and so sets
-/// apart what each `contribute` wrote from what hooks hand in after it.
+/// A participant that allows its `contribute` and `finished` to be
+/// deferred, and so sets apart at each seal what that flush's
+/// `contribute` writes from what hooks hand in after it.
 #[derive(Default)]
 struct Recorder {
     prefix: Vec<u8>,
     /// Keys handed in by hooks and not yet in a committed flush.
     pending: Mutex<Vec<u32>>,
-    /// How many of `pending` the flush in progress wrote.
+    /// How many of `pending` the flush in progress sealed, and writes.
     in_flight: Mutex<usize>,
+    /// Holds `contribute` at its start while armed.
+    hold: Hold,
     calls: Mutex<Vec<Call>>,
     /// What [`Self::probe`] answered inside each `finished`.
     latched: Mutex<Vec<bool>>,
@@ -497,16 +505,22 @@ impl FlushParticipant for Recorder {
         !self.pending.lock().unwrap().is_empty()
     }
 
+    fn seal(&self) {
+        self.calls.lock().unwrap().push(Call::Seal);
+        *self.in_flight.lock().unwrap() = self.pending.lock().unwrap().len();
+    }
+
     fn contribute(&self, w: &mut FlushWriter<'_, '_>) -> Result<ParticipantStats, Error> {
         self.calls.lock().unwrap().push(Call::Contribute);
+        self.hold.pass();
+        let sealed = *self.in_flight.lock().unwrap();
         let pending = self.pending.lock().unwrap();
-        for key in pending.iter() {
+        for key in &pending[..sealed] {
             let mut row = self.prefix.clone();
             row.push(b'K');
             row.extend_from_slice(&key.to_be_bytes());
             w.insert(&row, b"")?;
         }
-        *self.in_flight.lock().unwrap() = pending.len();
         Ok(ParticipantStats::default())
     }
 
@@ -524,13 +538,13 @@ impl FlushParticipant for Recorder {
         }
     }
 
-    fn allows_deferred_finish(&self) -> bool {
+    fn allows_deferred_contribute(&self) -> bool {
         true
     }
 }
 
 /// A participant that has not opted in: a [`Recorder`] behind a
-/// participant that leaves `allows_deferred_finish` to the trait's
+/// participant that leaves `allows_deferred_contribute` to the trait's
 /// default, so that what a participant gets for not answering is what a
 /// test of one that has not opted in sees.
 struct NotOptedIn(Arc<Recorder>);
@@ -542,6 +556,10 @@ impl FlushParticipant for NotOptedIn {
 
     fn has_work(&self) -> bool {
         self.0.has_work()
+    }
+
+    fn seal(&self) {
+        self.0.seal();
     }
 
     fn contribute(&self, w: &mut FlushWriter<'_, '_>) -> Result<ParticipantStats, Error> {
@@ -573,9 +591,9 @@ fn connect(
 // A commit under way
 // ---------------------------------------------------------------------
 
-/// The commit that trips a flush returns once the flush's rows are
-/// handed to redb, and so do commits after it, while the redb commit is
-/// still to make its first write.  A reader sees every one of their rows.
+/// The commit that trips a flush returns once the flush's write
+/// transaction is open, and so do commits after it, while the flush's
+/// rows and its redb commit are still to make their first write.  A reader sees every one of their rows.
 /// Nothing is observed, because nothing is durable yet.  Once the commit
 /// lands, one flush is observed, made on the committer thread, and a
 /// power cut then keeps exactly what that flush captured: not the commit
@@ -617,8 +635,9 @@ fn a_commit_that_trips_a_flush_returns_while_its_commit_is_held() {
         "generation 1: {obs:?}"
     );
     assert!(
-        obs.block_sync.elapsed + obs.insert.elapsed <= obs.foreground,
-        "the sync and the insert loop ran before the hand-off: {obs:?}"
+        obs.block_sync.elapsed <= obs.foreground
+            && obs.insert.elapsed + obs.commit.elapsed <= obs.elapsed - obs.foreground,
+        "the sync ran before the hand-off, the insert loop and the commit after it: {obs:?}"
     );
     assert!(
         obs.foreground < obs.elapsed && obs.elapsed >= held_for,
@@ -637,6 +656,112 @@ fn a_commit_that_trips_a_flush_returns_while_its_commit_is_held() {
         vec![1],
         "exactly the captured batch is durable"
     );
+}
+
+/// The commit that trips a flush returns before the flush writes its
+/// rows.  The overlay's and the participant's are written on the thread
+/// the flush is handed to, and the participant writes what it sealed at
+/// the capture, under the writer, and nothing a hook hands in while its
+/// `contribute` runs.  Held at the start of its `contribute` for a while,
+/// the flush reports a foreground shorter than the hold, a `contribute`
+/// longer than it, and every phase but the block sync after the
+/// hand-off, observed on the committer thread.  The key handed in beside
+/// the held `contribute` waits for the next flush, and a power cut keeps
+/// the participant's row of exactly the captured generation.
+#[test]
+fn a_commit_that_trips_a_flush_returns_before_the_flush_writes_its_rows() {
+    const HELD: Duration = Duration::from_millis(300);
+    let rig = Rig::new();
+    let recorder = Recorder::new(&rig.prefix);
+    rig.db
+        .set_flush_participant(
+            &rig.prefix,
+            Arc::clone(&recorder) as Arc<dyn FlushParticipant>,
+        )
+        .expect("register");
+    connect(&rig.db, &recorder, 1, FILL_ROWS).expect("generation 1");
+    recorder.hold.arm();
+    connect(&rig.db, &recorder, 2, 1).expect("generation 2 trips the flush and returns");
+    assert!(
+        recorder.hold.wait_reached(NEVER),
+        "the flush's contribute runs after the commit that tripped it has returned"
+    );
+    assert_eq!(recorder.calls(), vec![Call::Seal, Call::Contribute]);
+    connect(&rig.db, &recorder, 3, 1).expect("generation 3, beside the held contribute");
+    assert_eq!(recorder.pending(), vec![1, 2, 3]);
+    std::thread::sleep(HELD);
+    recorder.hold.release();
+    rig.db.wait_background_commit().expect("the flush landed");
+    assert_eq!(
+        recorder.calls(),
+        vec![Call::Seal, Call::Contribute, Call::Finished(true)]
+    );
+    assert_eq!(
+        recorder.pending(),
+        vec![2, 3],
+        "the flush retired what it sealed and nothing handed in after the seal"
+    );
+
+    let seen = rig.observations();
+    assert_eq!(seen.len(), 1, "{seen:?}");
+    let (thread, obs) = &seen[0];
+    assert_eq!(thread.as_deref(), Some(COMMIT_THREAD_NAME));
+    assert!(obs.background && !obs.explicit, "{obs:?}");
+    assert!(
+        obs.dirty_entries >= FILL_ROWS as usize,
+        "generation 1: {obs:?}"
+    );
+    let contribute = obs.participant.expect("the participant wrote").contribute;
+    assert!(
+        obs.foreground < HELD,
+        "the committing thread waited for the flush's rows: {obs:?}"
+    );
+    assert!(
+        contribute.elapsed >= HELD,
+        "the held contribute is the participant's phase: {obs:?}"
+    );
+    assert!(
+        obs.block_sync.elapsed <= obs.foreground
+            && obs.insert.elapsed + contribute.elapsed + obs.commit.elapsed
+                <= obs.elapsed - obs.foreground,
+        "the rows and the commit were written after the hand-off: {obs:?}"
+    );
+
+    let (_dir, path) = rig.crash();
+    assert_eq!(reopened(&path, 3), vec![1]);
+    let db = Database::open(&Options::new(&path, NET)).expect("reopen");
+    let mut written = Vec::new();
+    db.view(|tx| {
+        written = tx.try_scan_after(&rig_prefix_of(&db), None, usize::MAX)?;
+        Ok(())
+    })
+    .expect("view");
+    let mut row = rig_prefix_of(&db);
+    row.push(b'K');
+    row.extend_from_slice(&1u32.to_be_bytes());
+    assert_eq!(
+        written,
+        vec![(row, Vec::new())],
+        "the participant's rows are those of the captured generation"
+    );
+    db.close().expect("close the reopened store");
+}
+
+/// The journal bucket's id in `db`: the prefix a participant registered
+/// over it writes under.
+fn rig_prefix_of(db: &Database) -> Vec<u8> {
+    let mut prefix = Vec::new();
+    db.view(|tx| {
+        prefix = tx
+            .metadata()
+            .bucket(JOURNAL)
+            .expect("the journal bucket")
+            .raw_id()
+            .to_vec();
+        Ok(())
+    })
+    .expect("view");
+    prefix
 }
 
 /// Until the redb commit has landed nothing of the flush is durable, and
@@ -930,7 +1055,7 @@ fn a_failed_background_commit_latches_and_the_next_write_names_the_cause() {
     rig.gate.arm();
     connect(&rig.db, &recorder, 2, 1).expect("generation 2 trips the flush and returns");
     assert!(rig.gate.wait_held(NEVER), "the commit is under way");
-    assert_eq!(recorder.calls(), vec![Call::Contribute]);
+    assert_eq!(recorder.calls(), vec![Call::Seal, Call::Contribute]);
     connect(&rig.db, &recorder, 3, 1).expect("generation 3, during the commit");
     assert_eq!(recorder.pending(), vec![1, 2, 3]);
 
@@ -950,7 +1075,7 @@ fn a_failed_background_commit_latches_and_the_next_write_names_the_cause() {
     assert_refused_for_the_power_cut("the wait", &err);
     assert_eq!(
         recorder.calls(),
-        vec![Call::Contribute, Call::Finished(false)]
+        vec![Call::Seal, Call::Contribute, Call::Finished(false)]
     );
     assert_eq!(
         *recorder.latched.lock().unwrap(),
@@ -991,7 +1116,7 @@ fn a_failed_background_commit_latches_and_the_next_write_names_the_cause() {
     assert_eq!(rig.db.close().unwrap_err().kind, ErrorKind::DbNotOpen);
     assert_eq!(
         recorder.calls(),
-        vec![Call::Contribute, Call::Finished(false)],
+        vec![Call::Seal, Call::Contribute, Call::Finished(false)],
         "nothing ran the participant again"
     );
     assert_eq!(rig.error_lines().len(), 1);
@@ -1055,7 +1180,7 @@ fn a_committer_that_panics_after_its_commit_latches_the_store_at_the_next_wait()
     assert!(rig.db.is_fatal());
     assert_eq!(
         recorder.calls(),
-        vec![Call::Contribute, Call::Finished(true)]
+        vec![Call::Seal, Call::Contribute, Call::Finished(true)]
     );
     let seen = rig.observations();
     assert_eq!(seen.len(), 1, "the flush was retired: {seen:?}");
@@ -1084,7 +1209,7 @@ fn a_committer_that_panics_after_its_commit_latches_the_store_at_the_next_wait()
     );
     assert_eq!(
         recorder.calls().len(),
-        2,
+        3,
         "nothing ran the participant again"
     );
 
@@ -1149,7 +1274,7 @@ fn a_commit_begun_before_a_background_failure_is_refused_after_it() {
     commit_across_the_failure(&rig, &db_dir);
     assert_eq!(
         recorder.calls(),
-        vec![Call::Contribute, Call::Finished(false)],
+        vec![Call::Seal, Call::Contribute, Call::Finished(false)],
         "the refused commit ran the participant"
     );
     assert_eq!(
@@ -1404,7 +1529,7 @@ fn a_flush_the_participant_asks_for_waits_for_the_commit_under_way() {
         in_background(&rig.db, move |db| connect(db, &recorder, 3, 1))
     };
     assert_waiting(&waiting, "a commit whose participant asks for a flush");
-    assert_eq!(recorder.calls(), vec![Call::Contribute]);
+    assert_eq!(recorder.calls(), vec![Call::Seal, Call::Contribute]);
 
     rig.gate.open();
     waiting
@@ -1417,8 +1542,10 @@ fn a_flush_the_participant_asks_for_waits_for_the_commit_under_way() {
     assert_eq!(
         recorder.calls(),
         vec![
+            Call::Seal,
             Call::Contribute,
             Call::Finished(true),
+            Call::Seal,
             Call::Contribute,
             Call::Finished(true)
         ],
@@ -1433,12 +1560,12 @@ fn a_flush_the_participant_asks_for_waits_for_the_commit_under_way() {
 // The commit thread
 // ---------------------------------------------------------------------
 
-/// Every flush handed over is committed on one thread, the store's
-/// commit thread, whether the flush before it was waited for or its
-/// capture made the wait itself, and a flush that is asked for is made on
-/// the thread that asked.  A thread made for each flush would show a new
-/// one each time.  Every generation is durable once the flush asked for
-/// has returned.
+/// Every flush handed over is written and committed on one thread, the
+/// store's commit thread, whether the flush before it was waited for or
+/// its capture made the wait itself, and a flush that is asked for is made
+/// on the thread that asked.  A thread made for each flush would show a
+/// new one each time.  Every generation is durable once the flush asked
+/// for has returned.
 #[test]
 fn every_handed_over_flush_runs_on_one_thread() {
     const FLUSHES: u32 = 40;
@@ -1694,7 +1821,7 @@ fn set_and_clear_wait_out_a_background_commit() {
     rig.gate.arm();
     connect(&rig.db, &recorder, 4, 1).expect("generation 4 trips the flush and returns");
     assert!(rig.gate.wait_held(NEVER), "the commit is under way");
-    assert_eq!(recorder.calls(), vec![Call::Contribute]);
+    assert_eq!(recorder.calls(), vec![Call::Seal, Call::Contribute]);
 
     let cleared = in_background(&rig.db, |db| db.clear_flush_participant().is_some());
     assert_waiting(&cleared, "the clear");
@@ -1705,7 +1832,7 @@ fn set_and_clear_wait_out_a_background_commit() {
     );
     assert_eq!(
         recorder.calls(),
-        vec![Call::Contribute, Call::Finished(true)],
+        vec![Call::Seal, Call::Contribute, Call::Finished(true)],
         "the participant was released before its flush finished"
     );
     assert_eq!(
@@ -1806,13 +1933,13 @@ fn the_writer_blocks_at_the_overlay_ceiling_while_a_commit_is_in_flight() {
 // A participant that has not opted in
 // ---------------------------------------------------------------------
 
-/// A flush that a participant contributed to is handed over only if the
-/// participant allows its `finished` to be deferred, which it does not
-/// unless it says so.  One that does not gets the commit on the thread
-/// that tripped the flush: its `finished` has been called, after the
-/// commit, by the time the tripping commit's hook runs.  A flush it had
-/// nothing to contribute to is handed over like any other, since no
-/// `finished` is owed.
+/// A flush in which a participant has work is handed over only if the
+/// participant allows its `contribute` and `finished` to be deferred,
+/// which it does not unless it says so.  One that does not gets the whole
+/// flush on the thread that tripped it: its `contribute` and its
+/// `finished` have been called, after the commit, by the time the
+/// tripping commit's hook runs.  A flush it had no work in is handed over
+/// like any other, since nothing is owed.
 #[test]
 fn a_participant_that_does_not_opt_in_commits_inline() {
     let rig = Rig::new();
@@ -1830,7 +1957,7 @@ fn a_participant_that_does_not_opt_in_commits_inline() {
     connect(&rig.db, &recorder, 2, 1).expect("generation 2 trips the flush");
     assert_eq!(
         recorder.calls(),
-        vec![Call::Contribute, Call::Finished(true)],
+        vec![Call::Seal, Call::Contribute, Call::Finished(true)],
         "the participant was finished before the commit that tripped the flush returned"
     );
     assert_eq!(
@@ -1862,8 +1989,8 @@ fn a_participant_that_does_not_opt_in_commits_inline() {
     assert!(seen.last().expect("a flush").1.background, "{seen:?}");
     assert_eq!(
         recorder.calls().len(),
-        4,
-        "two contributes, each with its finished, and none for the last flush: {:?}",
+        6,
+        "two seals, each with its contribute and its finished, and none for the last flush: {:?}",
         recorder.calls()
     );
 
@@ -2107,14 +2234,43 @@ fn a_background_flush_reports_what_it_pinned_and_what_was_committed_meanwhile() 
 // What a handed-over commit leaves redb doing
 // ---------------------------------------------------------------------
 
-/// Storage that counts the writes made by every thread but the committer.
+/// Storage that counts the writes redb makes ahead of a commit: every
+/// write but those a flush's commit makes, from its
+/// `Options::before_commit` probe ([`EarlyWrites::probe`]) to its
+/// observation ([`EarlyWrites::landed`]).  The rows of a handed-over
+/// flush and its commit are written on one thread, so the thread cannot
+/// tell them apart.
 #[derive(Debug)]
-struct ForegroundWrites {
+struct EarlyWrites {
     inner: SharedBackend,
     writes: AtomicU64,
+    /// Whether a flush's commit is being made.
+    committing: AtomicBool,
 }
 
-impl StorageBackend for ForegroundWrites {
+impl EarlyWrites {
+    fn new(inner: SharedBackend) -> Arc<EarlyWrites> {
+        Arc::new(EarlyWrites {
+            inner,
+            writes: AtomicU64::new(0),
+            committing: AtomicBool::new(false),
+        })
+    }
+
+    /// What `Options::before_commit` runs: the writes from here on are
+    /// the commit's own.
+    fn probe(self: &Arc<Self>) -> Arc<dyn Fn() + Send + Sync> {
+        let writes = Arc::clone(self);
+        Arc::new(move || writes.committing.store(true, Ordering::SeqCst))
+    }
+
+    /// What the flush observer runs: the commit has landed.
+    fn landed(&self) {
+        self.committing.store(false, Ordering::SeqCst);
+    }
+}
+
+impl StorageBackend for EarlyWrites {
     fn len(&self) -> Result<u64, std::io::Error> {
         self.inner.len()
     }
@@ -2132,7 +2288,7 @@ impl StorageBackend for ForegroundWrites {
     }
 
     fn write(&self, offset: u64, data: &[u8]) -> Result<(), std::io::Error> {
-        if std::thread::current().name() != Some(COMMIT_THREAD_NAME) {
+        if !self.committing.load(Ordering::SeqCst) {
             self.writes.fetch_add(1, Ordering::SeqCst);
         }
         self.inner.write(offset, data)
@@ -2148,10 +2304,13 @@ fn scattered_key(i: u32) -> Vec<u8> {
 }
 
 /// Over a store several times the size of redb's page cache, with that
-/// cache full, count the storage writes each of six flushes makes on the
-/// committing thread before its handed-over commit has written anything:
-/// the writes of the insert loop, which hands rows to redb and should
-/// write none of them.
+/// cache full, count the storage writes each of six flushes makes from
+/// the commit that trips it until its handed-over commit begins: the
+/// writes of the insert loop, which hands rows to redb on the committer
+/// thread and should write none of them.  The counter is outside the
+/// gate, so a write the insert loop makes is counted as the gate holds
+/// it, and the count ends at the commit's own first write, which the
+/// probe has marked as the commit's.
 ///
 /// Each counted flush follows one whose commit landed with no transaction
 /// open, which is how a handed-over commit lands.  Its sixteen rows dirty
@@ -2165,13 +2324,15 @@ fn fill_writes_before_the_commit(snapshot: bool) -> Vec<u64> {
     let db_dir = dir.path().join("db");
     std::fs::create_dir_all(&db_dir).expect("mkdir");
     let power = PowerLossBackend::create(&db_dir.join("metadata.redb"), true);
-    let counted = Arc::new(ForegroundWrites {
-        inner: power as SharedBackend,
-        writes: AtomicU64::new(0),
-    });
-    let gate = GateBackend::new(Arc::clone(&counted) as SharedBackend);
+    let gate = GateBackend::new(power as SharedBackend);
+    let counted = EarlyWrites::new(Arc::clone(&gate) as SharedBackend);
     let mut opts = Options::new(&db_dir, NET);
-    opts.backend = Some(Arc::clone(&gate) as SharedBackend);
+    opts.backend = Some(Arc::clone(&counted) as SharedBackend);
+    opts.before_commit = Some(counted.probe());
+    {
+        let counted = Arc::clone(&counted);
+        opts.flush_observer = Some(Arc::new(move |_: &FlushObservation| counted.landed()));
+    }
     opts.background_commit = true;
     opts.commit_snapshot = snapshot;
     // Two commits of twelve rows trip a flush; redb caches about a sixth
@@ -2227,7 +2388,7 @@ fn fill_writes_before_the_commit(snapshot: bool) -> Vec<u64> {
 }
 
 /// The insert loop of a flush writes nothing to the store: its rows wait
-/// in redb's write buffer for the commit.  That holds for a flush that
+/// in redb's write buffer for the commit, on the thread that makes it.  That holds for a flush that
 /// follows a handed-over commit only because that commit held a read
 /// snapshot (`Options::commit_snapshot`).  Without one redb frees the
 /// pages the commit replaced in a second commit of its own, keeps that
@@ -2258,7 +2419,8 @@ struct PagedRun {
     committed: u32,
     /// The last commit a flush was seen to have made durable.
     landed: u32,
-    /// Storage writes made by threads other than the committer.
+    /// Storage writes made ahead of a commit: by the insert loops, and by
+    /// reads between the commits ([`EarlyWrites`]).
     early_writes: u64,
     /// Flushes whose commit ran on a thread of its own.
     background: usize,
@@ -2324,12 +2486,10 @@ fn paged_run(base: &std::path::Path, snapshot: bool, cut: Option<u64>) -> PagedR
         std::fs::copy(entry.path(), db_dir.join(entry.file_name())).expect("copy");
     }
     let power = PowerLossBackend::create(&db_dir.join("metadata.redb"), true);
-    let counted = Arc::new(ForegroundWrites {
-        inner: Arc::clone(&power) as SharedBackend,
-        writes: AtomicU64::new(0),
-    });
+    let counted = EarlyWrites::new(Arc::clone(&power) as SharedBackend);
     let mut opts = Options::new(&db_dir, NET);
     opts.backend = Some(Arc::clone(&counted) as SharedBackend);
+    opts.before_commit = Some(counted.probe());
     opts.background_commit = true;
     opts.commit_snapshot = snapshot;
     opts.cache_max_size = 24 * 1024;
@@ -2337,7 +2497,9 @@ fn paged_run(base: &std::path::Path, snapshot: bool, cut: Option<u64>) -> PagedR
     let (flushes, background) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)));
     {
         let (flushes, background) = (Arc::clone(&flushes), Arc::clone(&background));
+        let counted = Arc::clone(&counted);
         opts.flush_observer = Some(Arc::new(move |obs: &FlushObservation| {
+            counted.landed();
             flushes.fetch_add(1, Ordering::SeqCst);
             if obs.background {
                 background.fetch_add(1, Ordering::SeqCst);

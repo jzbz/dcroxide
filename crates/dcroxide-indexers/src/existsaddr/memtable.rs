@@ -4,16 +4,19 @@
 //! 256 partitions, each behind its own `RwLock`, so a lookup reads one
 //! partition and never waits on the others.  Three callers change it.
 //! The connect's `on_commit` hook inserts.  The flush participant's
-//! `contribute` reads it and then seals what it read ([`Memtable::seal`]).
-//! Its `finished` folds the sealed keys in and clears what the flush
-//! merged ([`Memtable::fold_sealed`]), or puts them back
-//! ([`Memtable::unseal`]).  The first two hold the database's writer
-//! semaphore, so no insert lands inside a `contribute`.  `finished` need
-//! not hold it, and hooks may insert between a `contribute` and its
-//! `finished` or beside the `finished` itself: an insert only adds to a
-//! partition's unjournaled keys, a `finished` only touches its journaled
-//! and sealed ones, and each takes the partition's write lock for the
-//! whole of its change.
+//! `seal` sets the unjournaled keys apart for the flush
+//! ([`Memtable::seal`]), its `contribute` reads them and the journaled
+//! ones, and its `finished` folds the sealed keys in and clears what the
+//! flush merged ([`Memtable::fold_sealed`]), or puts them back
+//! ([`Memtable::unseal`]).  The hook and the seal hold the database's
+//! writer semaphore, so no insert lands inside a seal.  `contribute` and
+//! `finished` need not hold it, and hooks may insert beside either of
+//! them and between the two: an insert only adds to a partition's
+//! unjournaled keys, `contribute` reads only its journaled and sealed
+//! ones ([`Memtable::flushed_sizes`], [`Memtable::flushed_sorted`],
+//! [`Memtable::sealed_sorted`]), and `finished` changes only those.
+//! Each takes the partition's lock for the whole of its read or change,
+//! the read lock to read and the write lock to change.
 //!
 //! The memtable does not hash: every call names the partition, which the
 //! caller computes with the index's [`super::policy::Partitioner`].
@@ -73,8 +76,8 @@ struct Part {
     /// Journaled by a committed flush, awaiting a merge.  Sorted.
     journaled: Vec<Key>,
     /// Handed to a flush that has not finished: the runs that were
-    /// `fresh` when its `contribute` sealed them, which it journaled or
-    /// merged.  Empty outside a flush.
+    /// `fresh` when its `seal` set them apart, which its `contribute`
+    /// journals or merges.  Empty outside a flush.
     sealed: Vec<Vec<Key>>,
     /// Keys in `sealed`.
     sealed_len: usize,
@@ -222,6 +225,20 @@ impl Part {
         }
         let sealed = merge_runs(&self.sealed);
         merge_sorted(&merge_sorted(&self.journaled, &sealed), &unjournaled)
+    }
+
+    /// Keys a flush has journaled or sealed.
+    fn flushed_len(&self) -> usize {
+        self.journaled.len().saturating_add(self.sealed_len)
+    }
+
+    /// The journaled and sealed keys, sorted, in one vector: none of the
+    /// keys inserted since the seal.
+    fn flushed(&self) -> Vec<Key> {
+        if self.sealed.is_empty() {
+            return self.journaled.clone();
+        }
+        merge_sorted(&self.journaled, &merge_runs(&self.sealed))
     }
 }
 
@@ -387,11 +404,12 @@ impl Memtable {
     /// equal, held here or not.
     ///
     /// Only for a holder of the database's writer semaphore, which is
-    /// what keeps an insert out of a `contribute`: the participant reads
-    /// the memtable there a partition at a time, relying on nothing else
-    /// writing until it has sealed what it read.  After the seal an
-    /// insert goes to keys the flush in progress no longer touches, so it
-    /// may land before that flush's `finished` or beside it.
+    /// what keeps an insert out of a seal: the seal must not zero the
+    /// count of unjournaled keys over an insert half made.  After the
+    /// seal an insert goes to keys the flush in progress does not touch,
+    /// so it may land beside that flush's `contribute`, which reads only
+    /// the journaled and sealed keys, and before or beside its
+    /// `finished`.
     pub(crate) fn insert_candidates(&self, keys: &[Candidate]) -> usize {
         debug_assert!(
             keys.windows(2).all(|w| w[0].p <= w[1].p),
@@ -450,7 +468,9 @@ impl Memtable {
         added
     }
 
-    /// Keys held in each partition.
+    /// Keys held in each partition, sealed and unjournaled keys
+    /// included, for tests.
+    #[cfg(test)]
     pub(crate) fn sizes(&self) -> [usize; PARTITIONS] {
         let mut sizes = [0usize; PARTITIONS];
         for (p, size) in sizes.iter_mut().enumerate() {
@@ -459,9 +479,34 @@ impl Memtable {
         sizes
     }
 
-    /// Partition `p`'s unjournaled keys that no flush has sealed, sorted.
+    /// Partition `p`'s unjournaled keys that no flush has sealed, sorted,
+    /// for tests.
+    #[cfg(test)]
     pub(crate) fn unjournaled_sorted(&self, p: usize) -> Vec<Key> {
         self.part(p).unjournaled()
+    }
+
+    /// Keys in each partition that a flush has journaled or sealed: what
+    /// the flush in progress starts from, whatever has been inserted
+    /// since its seal.  Each partition is read under its read lock.
+    pub(crate) fn flushed_sizes(&self) -> [usize; PARTITIONS] {
+        let mut sizes = [0usize; PARTITIONS];
+        for (p, size) in sizes.iter_mut().enumerate() {
+            *size = self.part(p).flushed_len();
+        }
+        sizes
+    }
+
+    /// Partition `p`'s journaled and sealed keys, sorted, in one vector:
+    /// what a flush merges into the partition's runs.
+    pub(crate) fn flushed_sorted(&self, p: usize) -> Vec<Key> {
+        self.part(p).flushed()
+    }
+
+    /// Partition `p`'s sealed keys, sorted, in one vector: what a flush
+    /// that does not merge the partition journals.
+    pub(crate) fn sealed_sorted(&self, p: usize) -> Vec<Key> {
+        merge_runs(&self.part(p).sealed)
     }
 
     /// Every key of partition `p`, sealed keys included, sorted.
@@ -479,15 +524,17 @@ impl Memtable {
         all
     }
 
-    /// Seal every unjournaled key: a flush has journaled or merged each
-    /// of them in a transaction that has yet to commit.
+    /// Seal every unjournaled key: a flush whose write transaction is
+    /// open will journal or merge each of them, and commit them with the
+    /// tip rows of the connects that handed them over.
     ///
     /// The keys stay held and found, apart from the ones later inserts
-    /// add, so the flush's `finished` can tell the two apart however
-    /// many inserts land before it.  The runs are moved, not copied, and
-    /// the filters, whose keys are the same, are left as they are.
-    /// Nothing is counted as unjournaled afterwards: the next flush owes
-    /// only what arrives from here on.
+    /// add, so the flush's `contribute` can read exactly these and its
+    /// `finished` can tell the two apart however many inserts land
+    /// beside or before them.  The runs are moved, not copied, and the
+    /// filters, whose keys are the same, are left as they are.  Nothing
+    /// is counted as unjournaled afterwards: the next flush owes only
+    /// what arrives from here on.
     ///
     /// Only for a holder of the database's writer semaphore, as an insert
     /// is, so the count is not zeroed over an insert in progress.
@@ -629,8 +676,8 @@ impl Memtable {
     }
 
     /// Keys a flush has sealed and not yet finished with, over every
-    /// partition, for tests: above zero only between a `contribute` and
-    /// its `finished`.
+    /// partition, for tests: above zero only between a `seal` and its
+    /// `finished`.
     #[cfg(test)]
     pub(crate) fn sealed_keys(&self) -> usize {
         (0..PARTITIONS).fold(0usize, |n, p| n.saturating_add(self.part(p).sealed_len))
@@ -897,6 +944,116 @@ mod tests {
         assert_eq!(m.spare_capacity(1), 0);
         let part = m.part(1);
         assert!(part.journaled.windows(2).all(|w| w[0] < w[1]));
+    }
+
+    /// What a flush reads after its seal is the journaled and the sealed
+    /// keys, and exactly what the memtable held at the seal: the sizes,
+    /// a partition's merge input and its journal input are what the reads
+    /// of every key and of the unjournaled keys gave just before the seal,
+    /// whatever is inserted after it, in partitions with keys of all three
+    /// kinds, with no sealed keys, and with none at all until then.
+    #[test]
+    fn a_flush_reads_only_what_was_journaled_or_sealed() {
+        let m = Memtable::new();
+        // Journaled in partitions 1 and 2; unjournaled in 1, 2 and 3.
+        let first: Vec<Key> = (0..30u8)
+            .flat_map(|r| [key(0, 1, r), key(0, 2, r)])
+            .collect();
+        for chunk in first.chunks(7) {
+            insert(&m, chunk);
+        }
+        m.commit_flush(&[false; PARTITIONS]);
+        let second: Vec<Key> = (0..20u8)
+            .flat_map(|r| [key(1, 1, r), key(1, 2, r), key(1, 3, r)])
+            .collect();
+        for chunk in second.chunks(5) {
+            insert(&m, chunk);
+        }
+        let sizes = m.sizes();
+        let all: Vec<Vec<Key>> = (0..PARTITIONS).map(|p| m.all_sorted(p)).collect();
+        let unjournaled: Vec<Vec<Key>> = (0..PARTITIONS).map(|p| m.unjournaled_sorted(p)).collect();
+
+        m.seal();
+        // After the seal: keys in every partition read above, and in one
+        // that held none.
+        let third: Vec<Key> = (0..15u8)
+            .flat_map(|r| [key(2, 1, r), key(2, 2, r), key(2, 3, r), key(2, 4, r)])
+            .collect();
+        for chunk in third.chunks(6) {
+            insert(&m, chunk);
+        }
+        assert_eq!(m.flushed_sizes(), sizes);
+        assert_eq!((sizes[1], sizes[2], sizes[3], sizes[4]), (50, 50, 20, 0));
+        for p in 0..PARTITIONS {
+            assert_eq!(m.flushed_sorted(p), all[p], "partition {p}");
+            assert_eq!(m.sealed_sorted(p), unjournaled[p], "partition {p}");
+        }
+        // What every other read sees has the new keys.
+        assert_eq!(m.sizes()[4], 15);
+        assert_eq!(m.all_sorted(1).len(), 65);
+        assert_eq!(m.unjournaled_sorted(3).len(), 15);
+        // And once the flush has folded what it sealed, the next one
+        // reads the keys inserted since as its own.
+        m.fold_sealed(&[false; PARTITIONS]);
+        m.seal();
+        assert_eq!(m.sealed_sorted(4).len(), 15);
+        assert_eq!(m.flushed_sizes()[3], 35);
+    }
+
+    /// A flush's reads made beside inserts on another thread, as a
+    /// `contribute` on the thread a flush is handed to runs beside later
+    /// connects' hooks, see what the seal fixed and nothing of the
+    /// inserts, round after round.
+    #[test]
+    fn contribute_beside_inserts_reads_only_what_was_sealed() {
+        for round in 0..40u64 {
+            let mut rng = SplitMix64(round);
+            let m = Memtable::new();
+            let mut draw = |t: u8, n: usize| -> Vec<Key> {
+                (0..n)
+                    .map(|_| {
+                        let mut k = [0u8; 21];
+                        k[0] = t;
+                        k[1] = rng.below(8) as u8;
+                        k[2..10].copy_from_slice(&rng.next_u64().to_be_bytes());
+                        k
+                    })
+                    .collect()
+            };
+            for chunk in draw(0, 300).chunks(17) {
+                insert(&m, chunk);
+            }
+            let mut merged = [false; PARTITIONS];
+            merged[usize::from(round as u8 % 8)] = true;
+            m.commit_flush(&merged);
+            for chunk in draw(1, 200).chunks(13) {
+                insert(&m, chunk);
+            }
+            let sizes = m.sizes();
+            let all: Vec<Vec<Key>> = (0..8).map(|p| m.all_sorted(p)).collect();
+            let unjournaled: Vec<Vec<Key>> = (0..8).map(|p| m.unjournaled_sorted(p)).collect();
+            m.seal();
+            let later = draw(2, 2000);
+            std::thread::scope(|scope| {
+                scope.spawn(|| {
+                    for chunk in later.chunks(9) {
+                        insert(&m, chunk);
+                    }
+                });
+                for _ in 0..20 {
+                    assert_eq!(m.flushed_sizes(), sizes, "round {round}");
+                    for p in 0..8 {
+                        assert_eq!(m.flushed_sorted(p), all[p], "round {round}");
+                        assert_eq!(m.sealed_sorted(p), unjournaled[p], "round {round}");
+                    }
+                }
+            });
+            assert_eq!(m.flushed_sizes(), sizes, "round {round}");
+            let inserted = m.len() - sizes.iter().sum::<usize>();
+            assert_eq!(m.unjournaled(), inserted, "round {round}");
+            m.fold_sealed(&[false; PARTITIONS]);
+            assert_eq!(m.unjournaled(), inserted, "round {round}");
+        }
     }
 
     /// A seal sets the unjournaled keys apart without losing sight of

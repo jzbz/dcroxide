@@ -1190,20 +1190,23 @@ impl Transaction {
     ///
     /// When a hook runs, the writer semaphore is held, so no other commit
     /// can interleave and no flush can start; any flush this commit
-    /// triggered has captured the write cache and called a
-    /// [`crate::FlushParticipant`]'s `contribute`; and the transaction's
+    /// triggered has captured the write cache and sealed a
+    /// [`crate::FlushParticipant`]'s work (`seal`); and the transaction's
     /// rows are not yet visible to any other transaction.  That is the
     /// placement an index needs to hand in-memory state over atomically
     /// with its tip row: the commit's own flush cannot capture state the
     /// hook adds, and no reader can see the tip before the hook has run.
     ///
-    /// That flush has also committed, and the participant's `finished`
-    /// for it has been called, unless the database hands commits to a
-    /// thread of their own ([`crate::Options::background_commit`]) and
-    /// the participant allows its `finished` to be deferred
-    /// ([`crate::FlushParticipant::allows_deferred_finish`]).  Then the
-    /// commit may still be under way, and `finished` may come after this
-    /// hook and the hooks of later commits.
+    /// That flush has also written its rows, the participant's
+    /// `contribute` among them, and committed, and the participant's
+    /// `finished` for it has been called, unless the database hands
+    /// flushes to a thread of their own
+    /// ([`crate::Options::background_commit`]) and the participant allows
+    /// its `contribute` and `finished` to be deferred
+    /// ([`crate::FlushParticipant::allows_deferred_contribute`]).  Then
+    /// the flush's rows, the participant's and the commit may all still be
+    /// to come, and may still fail; `contribute` may run beside this hook
+    /// and the hooks of later commits, and `finished` after them.
     ///
     /// A hook never runs if the commit fails, the transaction is rolled
     /// back, or it is dropped.  After the hooks the commit cannot fail:
@@ -1380,12 +1383,13 @@ impl Transaction {
         // for a flush whose commit is still under way on its own thread
         // before it captures another, which together keep two flushes
         // from overlapping.  With background commits the helper returns
-        // once the window is captured and handed to redb; a failure of
-        // the redb commit itself then latches the store from its own
-        // thread instead of failing this commit.  The layers a flush
-        // retired here are kept until that semaphore is released, at the
-        // end; those of a flush whose commit was handed over are retired
-        // and let go of by the thread it was handed to.
+        // once the window is captured, the block files are synced and
+        // redb's write transaction is open; a failure in writing the rows
+        // or in the redb commit then latches the store from the thread
+        // they were handed to instead of failing this commit.  The
+        // layers a flush retired here are kept until that semaphore is
+        // released, at the end; those of a flush that was handed over
+        // are retired and let go of by the thread it was handed to.
         let retired = crate::flush_locked(&self.db, true);
         if let Err(e) = retired {
             // Already latched, by `flush_locked` or by the thread an

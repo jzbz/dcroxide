@@ -43,14 +43,16 @@ use crate::{FlushPhase, Transaction, WriteLogSink};
 /// this crate: not the cache lock, not the block-store lock.  The
 /// semaphore serializes the calls against each other, against every
 /// writable transaction and its [`crate::Transaction::on_commit`] hooks,
-/// and against registration.  The one exception is [`Self::finished`] of
-/// a participant that allows it to be deferred
-/// ([`Self::allows_deferred_finish`]).  So none of them may begin a writable
+/// and against registration.  The one exception is [`Self::contribute`]
+/// and [`Self::finished`] of a participant that allows them to be
+/// deferred ([`Self::allows_deferred_contribute`]), which may run on the
+/// thread a flush hands its commit to, without the semaphore;
+/// [`Self::seal`] always runs under it.  None of them may begin a writable
 /// transaction, flush, close, or register or clear a participant on the
-/// same database: each of those waits for the semaphore the caller holds,
-/// and the thread deadlocks.  A read-only transaction would not deadlock,
-/// but it reads the store as it stood before this flush; read through the
-/// [`FlushWriter`] instead.
+/// same database: each of those waits for the semaphore the flushing
+/// thread holds, or for the flush in flight, and the thread deadlocks.  A
+/// read-only transaction would not deadlock, but it reads the store as it
+/// stood before this flush; read through the [`FlushWriter`] instead.
 ///
 /// **No database handle inside.**  The database holds its participant by
 /// a strong reference, so that its last flush on [`crate::Database::close`]
@@ -70,12 +72,14 @@ pub trait FlushParticipant: Send + Sync {
     /// Asked by every writable commit before its flush check, so it must
     /// be cheap.  Not asked by [`crate::Database::flush`] or
     /// [`crate::Database::close`], which flush regardless.  For a
-    /// participant that allows its `finished` to be deferred, it can be
-    /// asked while an earlier flush's commit is still under way and
-    /// before that flush's `finished` ([`Self::allows_deferred_finish`]).
+    /// participant that allows its `contribute` and `finished` to be
+    /// deferred, it can be asked while an earlier flush's rows are still
+    /// being written and committed, beside that flush's `contribute` and
+    /// before its `finished` ([`Self::allows_deferred_contribute`]).
     fn wants_flush(&self) -> bool;
 
-    /// Whether this flush should call [`Self::contribute`].
+    /// Whether this flush should call [`Self::seal`] and
+    /// [`Self::contribute`].
     ///
     /// Asked once per flush, after the block files are synced.  When it is
     /// false, the flush runs exactly as it would with no participant: an
@@ -84,8 +88,29 @@ pub trait FlushParticipant: Send + Sync {
     /// so a participant with work never waits for the chain to write.
     fn has_work(&self) -> bool;
 
+    /// Fix what this flush's [`Self::contribute`] will write.  Does
+    /// nothing unless overridden.
+    ///
+    /// Called exactly once a flush, right after [`Self::has_work`]
+    /// answered `true` and the flush's write transaction is open, on the
+    /// flushing thread with the writer semaphore held.  No
+    /// [`crate::Transaction::on_commit`] hook runs inside it, and none has
+    /// run since the flush captured the write cache, so what the
+    /// participant holds now is what the commits whose rows this flush
+    /// persists handed it.  From here until [`Self::finished`], hooks may
+    /// hand it more, and a participant that allows its `contribute` to be
+    /// deferred must write none of that in this flush
+    /// ([`Self::allows_deferred_contribute`]).
+    fn seal(&self) {}
+
     /// Write this flush's rows through `w`, inside the flush's write
     /// transaction, after the overlay's rows and before the commit.
+    ///
+    /// Called at most once after each [`Self::seal`]: writing the
+    /// overlay's rows comes first, and a flush that fails there calls no
+    /// `contribute`.  For a participant that allows it, this runs on the
+    /// thread the flush's commit was handed to, beside later commits'
+    /// hooks ([`Self::allows_deferred_contribute`]).
     ///
     /// The participant reports what only it knows (`keys_journaled`,
     /// `merges`, `base_rewrites`, `memtable_keys`); the database fills in
@@ -94,51 +119,57 @@ pub trait FlushParticipant: Send + Sync {
     /// store; see the trait docs.
     fn contribute(&self, w: &mut FlushWriter<'_, '_>) -> Result<ParticipantStats, Error>;
 
-    /// Called exactly once after each [`Self::contribute`], and never
-    /// without one, with whether the flush's commit landed.
+    /// Called exactly once after each [`Self::seal`], and never without
+    /// one, whether or not [`Self::contribute`] ran, with whether the
+    /// flush's commit landed.
     ///
     /// `true` means the rows `contribute` wrote are durable and visible to
     /// every transaction that begins from now on: the flush has committed
     /// and retired the overlay layers it captured.  `false` means the
     /// flush failed and the store is already latched fatal, so no later
-    /// flush will run, whichever thread the commit failed on.  Its rows
-    /// are normally discarded with the transaction, but an engine that
-    /// fails after its sync can leave them durable, so a participant
-    /// should leave its memory as it was and let the next open decide
-    /// from what is on disk.  Either way the call
-    /// is made before the writer semaphore is released, so no commit,
-    /// flush or [`crate::Transaction::on_commit`] hook runs between the
-    /// flush and this call -- unless the participant allows otherwise
-    /// ([`Self::allows_deferred_finish`]).
+    /// flush will run, whichever thread the flush failed on: in writing
+    /// the overlay's rows, before `contribute` was called, in `contribute`
+    /// itself, or in the commit.  The rows are normally discarded with the
+    /// transaction, but an engine that fails after its sync can leave them
+    /// durable, so a participant should leave its memory as it was and let
+    /// the next open decide from what is on disk.  Either way the call is
+    /// made before the writer semaphore is released, so no commit, flush
+    /// or [`crate::Transaction::on_commit`] hook runs between the seal and
+    /// this call -- unless the participant allows otherwise
+    /// ([`Self::allows_deferred_contribute`]).
     fn finished(&self, committed: bool);
 
-    /// Whether [`Self::finished`] may be called after the writer
-    /// semaphore has been released, on another thread, with the hooks of
-    /// later commits run in between.  `false` unless overridden.
+    /// Whether [`Self::contribute`] and [`Self::finished`] may be called
+    /// after the writer semaphore has been released, on another thread,
+    /// with the hooks of later commits run beside and between them.
+    /// `false` unless overridden.
     ///
     /// A database opened with [`crate::Options::background_commit`] hands
-    /// the redb commit of a flush that a commit's own check tripped to a
-    /// thread of its own, and `finished` can then only follow the commit
-    /// there: the commit that tripped the flush runs its hooks and
-    /// returns meanwhile, and so may any number after it.  A participant
-    /// that answers `false` is never put in that position.  A flush it
-    /// contributed to commits on the thread that ran it, and `finished`
-    /// is called as described there.
+    /// the rest of a flush that a commit's own check tripped to a thread of
+    /// its own once the write cache is captured, the block files are
+    /// synced, the write transaction is open and [`Self::seal`] has
+    /// returned.  That thread writes the overlay's rows, calls
+    /// `contribute`, commits, and calls `finished`, while the commit that
+    /// tripped the flush runs its hooks and returns, and so may any number
+    /// after it.  A participant that answers `false` is never put in that
+    /// position: a flush in which it has work runs from start to end on
+    /// the thread that tripped it, and every call is made as described
+    /// above.
     ///
-    /// One that answers `true` accepts that between a `contribute` and
-    /// its `finished` its hooks run, and so does [`Self::wants_flush`],
-    /// which each later commit asks on its own thread before its flush
-    /// check, and so possibly while `finished` runs on the thread that
-    /// made the earlier flush's commit.  No other method of this trait
-    /// does: the next flush waits for the commit, and for this call,
-    /// before it asks `has_work`.  It must therefore keep what
-    /// `contribute` wrote apart from what hooks add after it, so that
-    /// `finished(true)` retires the first and none of the second, it
-    /// must take whatever locks its own state needs against those hooks,
-    /// and its `wants_flush` must be safe against both the hooks and
+    /// One that answers `true` accepts that from a `seal` to its
+    /// `finished` its hooks run, beside `contribute` and between it and
+    /// `finished`, and so does [`Self::wants_flush`], which each later
+    /// commit asks on its own thread before its flush check.  No other
+    /// method of this trait does: the next flush waits for this one to
+    /// end, `finished` included, before it asks `has_work`.  So
+    /// `contribute` must write exactly what `seal` set apart, whatever
+    /// hooks hand over while it runs, and `finished(true)` must retire
+    /// that and none of what was handed over since.  The participant must
+    /// take whatever locks its own state needs against those hooks, and
+    /// its `wants_flush` must be safe against them, `contribute` and
     /// `finished`.  `finished(false)` is called with the store already
     /// latched, as ever.
-    fn allows_deferred_finish(&self) -> bool {
+    fn allows_deferred_contribute(&self) -> bool {
         false
     }
 }
@@ -171,9 +202,9 @@ pub struct ParticipantStats {
     /// Keys the participant held in memory when the flush began.
     pub memtable_keys: u64,
     /// The call to [`FlushParticipant::contribute`]: its wall time and the
-    /// flushing thread's storage I/O and processor time during it, a
-    /// fourth phase beside [`crate::FlushObservation`]'s three.  Filled by
-    /// the database.
+    /// storage I/O and processor time of the thread that made it, a fourth
+    /// phase beside [`crate::FlushObservation`]'s three.  Filled by the
+    /// database.
     pub contribute: FlushPhase,
 }
 
