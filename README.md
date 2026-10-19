@@ -520,10 +520,14 @@ What these figures do not cover:
 - **A link with a round trip.** Every sync above was over loopback.
   dcroxide's download window, up to 128 blocks where dcrd keeps 16
   ([PARITY.md](PARITY.md), *Block download window*), has been run over a
-  link with a round trip only in short runs on 2026-10-12, through a
-  relay that delays every chunk and on the public network (the ledger,
-  "Eleven changes, a background commit not kept and a pool gate"), and
-  in no whole sync.
+  link with a longer round trip than a LAN's only in short runs on
+  2026-10-12, through a relay that delays every chunk and on the public
+  network (the ledger, "Eleven changes, a background commit not kept and
+  a pool gate"), and in no whole sync. The only whole syncs over a real
+  link, on 2026-10-18, took their blocks from a node on another machine
+  on the same LAN (the ledger, "Rungs from a block server on the LAN,
+  two changes held for their memory, and dcrd v2.1.7"), a series of its
+  own.
 - **The read-ahead's gain as committed.** Its one comparison with
   `DCROXIDE_READ_AHEAD=off`, on 2026-10-12, was of a build before its
   review's fixes ([PARITY.md](PARITY.md), *Reading ahead of the block

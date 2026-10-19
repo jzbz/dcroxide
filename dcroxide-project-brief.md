@@ -304,13 +304,14 @@ What Phase 15 has covered so far:
   machine, one sync each to block 1,116,035: 612.4 s with the window
   against 607.7 s for the code before it (`3a367e5`), 0.8% more, which
   one run each does not settle as a cost or as nothing. Not measured: a
-  whole sync over a delayed or a real link, a sync over a link held to
-  a set rate, or one with a reader made to stop for 20 s or more. The
-  last two are where the wider window can cost sync peers, which is
-  read from the code and from a model over header sizes, not from a
-  run: the public-network starts ran over whatever links their peers
-  had, at rates that were not recorded, and the longest flush of the
-  loopback sync took 3.5 s.
+  whole sync over a delayed link or a real one with a longer round trip
+  than a LAN's (whole syncs from a node on another machine on the same
+  LAN ran on 2026-10-18), a sync over a link held to a set rate, or one
+  with a reader made to stop for 20 s or more. The last two are where
+  the wider window can cost sync peers, which is read from the code and
+  from a model over header sizes, not from a run: the public-network
+  starts ran over whatever links their peers had, at rates that were not
+  recorded, and the longest flush of the loopback sync took 3.5 s.
 - **Security-blocker campaign.** The release blockers, highs, and mediums from
   an audit of the ported surface: RPC authentication and admission, peer
   message-path bounds (stall deadlines, getdata, queue and write limits),

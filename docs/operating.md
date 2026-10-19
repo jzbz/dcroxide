@@ -278,8 +278,9 @@ evening of 2026-10-11 the two 8.2-minute runs are 5.83x and 5.88x as
 fast, and against its 47.7-minute median above 5.79x and 5.84x: ratios
 across sessions, and of a build that is not the committed code. None of
 the eleven changes has been run on another machine or filesystem, or in
-a whole sync over a delayed or a real link, and with
-`--noexistsaddrindex` only once, inside `4700cf1` on 2026-10-13 (below).
+a whole sync over a delayed link or a real one with a longer round trip
+than a LAN's, and with `--noexistsaddrindex` only once, inside
+`4700cf1` on 2026-10-13 (below).
 The ledger's section "Eleven changes, a background commit not kept and a
 pool gate" has each step.
 
@@ -463,9 +464,13 @@ window and 607.7 s with the code before it (`3a367e5`), one run each,
 0.8% more, and one run each does not settle whether the window costs
 anything over loopback; both are of later code than the 12.1 minutes
 above. No whole sync has been run through
-the default window over a delayed or a real link, so there is no sync
-time to budget from for it, and the 72 minutes and 3.6 hours above are
-not its figures.
+the default window over a delayed link, or over a real one with a
+longer round trip than a LAN's: the only whole syncs over a real link,
+on 2026-10-18, took their blocks from a node on another machine on the
+same LAN ([bench-ledger.md](bench-ledger.md), "Rungs from a block
+server on the LAN, two changes held for their memory, and dcrd
+v2.1.7"). So there is no sync time to budget from for a longer round
+trip, and the 72 minutes and 3.6 hours above are not its figures.
 
 The wider window can cost a node its sync peer where dcrd's would not,
 in two cases. Neither has been measured; both are read from the code. A
@@ -560,9 +565,11 @@ processes blocks to the reading thread rather than removing it, which
 paid there because the reading thread, fed by a server on the same
 machine, waited over 320 s for the other; in the code as it stands, on
 2026-10-17, it waited 275 to 278 s for the other in each default run. No
-sync has been run with it over a delayed or a real link, where the round
-trip and not the thread that processes blocks may set the pace and it
-may gain nothing, nor on fewer cores or with `--assumevalid=0`, nor on
+sync has been run with it over a delayed link, or over a real one with
+a longer round trip than a LAN's (the syncs of 2026-10-18 from a node
+on another machine on the same LAN had it on), where the round trip and
+not the thread that processes blocks may set the pace and it may gain
+nothing, nor on fewer cores or with `--assumevalid=0`, nor on
 macOS or Windows, where none of its tests has been run either; with
 `--noexistsaddrindex` it was run once in `4700cf1` on 2026-10-13 and
 twice in the code as it stands on 2026-10-17, and never against a run
