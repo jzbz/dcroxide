@@ -226,6 +226,22 @@ pub struct UtxoFlushTestHooks {
     pub log: Option<Vec<(Hash, u32)>>,
 }
 
+/// How a utxo cache flush ends once its rows and the set state are
+/// committed ([`Chain::maybe_flush_utxo_cache`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UtxoFlushEnd {
+    /// Only the size limit tripped it: its rows wait in the database's
+    /// write cache for the next durable commit.
+    Commit,
+    /// The periodic interval came due: the database is asked for a
+    /// durable commit that may be made on a thread of its own
+    /// (`Database::flush_in_background`).
+    Periodic,
+    /// It was forced: a durable database flush is made before it returns
+    /// (`Database::flush`).
+    Durable,
+}
+
 /// What a processing call files for the block it is processing
 /// (`Chain::accepted_tx_hashes`): the `blocks` mirror's own `Arc` of the
 /// block, its transaction hashes, the hash of its header and, when it
@@ -365,21 +381,35 @@ pub struct Chain {
     /// `lastFlushHash`), compared against the backend's recorded utxo
     /// set state on startup.
     utxo_last_flush_hash: Hash,
-    /// The periodic clock reading of the last utxo cache flush that
-    /// ended in a durable database flush; see
-    /// [`Chain::periodic_clock`].  dcrd's `lastFlushTime` is stamped by
-    /// every flush (`utxocache.go:769`), and every dcrd flush follows a
-    /// durable flush of the block database (`utxocache.go:722`).  Here
-    /// a flush only the size limit tripped leaves its rows in the
-    /// database's write cache and does not move the stamp, so the
-    /// periodic interval counts from the last flush a crash cannot
-    /// lose.  A durable commit the write cache makes on its own does
-    /// not move the stamp either, since the chain is not told of one:
-    /// the periodic flush can then follow such a commit within the
-    /// interval, which adds a durable commit and loses nothing.  `None`
-    /// only before a chain with no monotonic clock first observes the
-    /// adjusted time.
+    /// The periodic clock reading at which the chain finished writing
+    /// the last utxo cache flush known to be in a durable commit of the
+    /// database; see [`Chain::periodic_clock`].  dcrd's `lastFlushTime`
+    /// is stamped by every flush (`utxocache.go:769`), and every dcrd
+    /// flush follows a durable flush of the block database
+    /// (`utxocache.go:722`).  Here a flush leaves its rows in the
+    /// database's write cache unless it was forced, and moves the stamp
+    /// only once a durable commit has carried them
+    /// ([`Chain::utxo_settle_durable`]): the forced flush's own, the
+    /// commit the periodic flush asks for, or any the write cache makes
+    /// on its own after a flush the size limit tripped.  So the periodic
+    /// interval counts from the last flush a crash cannot lose, and
+    /// still from the time that flush was written, not from the time
+    /// its commit landed.  `None` only before a chain with no monotonic
+    /// clock first observes the adjusted time.
     utxo_last_durable_flush_nanos: Option<i64>,
+    /// The utxo cache flushes whose rows and set state are committed and
+    /// not yet known durable, oldest first: for each, the database's
+    /// commit mark once its transaction had committed, and the periodic
+    /// clock reading at which the chain had finished writing it.
+    /// [`Chain::utxo_settle_durable`] takes them off as durable commits
+    /// carry them.  Emptied by every forced flush.
+    utxo_awaiting_durable: VecDeque<(dcroxide_database::CommitMark, Option<i64>)>,
+    /// The mark of the periodic flush whose commit the database may still
+    /// be making on a thread of its own
+    /// (`Database::flush_in_background`): while it is set no periodic
+    /// flush is due, or every block connected meanwhile would ask for
+    /// another and wait for this one's commit to end.
+    utxo_periodic_awaiting: Option<dcroxide_database::CommitMark>,
     /// The block height of the last cache eviction (dcrd
     /// `lastEvictionHeight`).
     utxo_last_eviction_height: u32,
@@ -884,6 +914,8 @@ impl Chain {
             utxo_cache_misses: Cell::new(0),
             utxo_last_flush_hash: Hash::ZERO,
             utxo_last_durable_flush_nanos: crate::gotime::monotonic_nanos(),
+            utxo_awaiting_durable: VecDeque::new(),
+            utxo_periodic_awaiting: None,
             utxo_last_eviction_height: 0,
             utxo_clock_unix: 0,
             adjusted_time_observed: false,
@@ -932,6 +964,21 @@ impl Chain {
     /// run with notifications suppressed.
     pub fn set_notification_callback(&mut self, callback: NotificationCallback) {
         self.notifications = Some(callback);
+    }
+
+    /// Time the chain's periodic jobs on `clock` from now on, and stamp
+    /// each of them at its reading, as the chain stamps them when it is
+    /// built (see [`Chain::periodic_clock`]).
+    ///
+    /// For tests outside this crate that step the clock the periodic utxo
+    /// cache flush is timed on, as dcrd's tests set `UtxoCache.timeNow`.
+    /// The node never calls it.
+    #[doc(hidden)]
+    pub fn set_periodic_clock(&mut self, clock: fn() -> Option<i64>) {
+        self.periodic_clock = clock;
+        self.last_prune_nanos = clock();
+        self.utxo_last_durable_flush_nanos = clock();
+        self.cached_tips_last_pruned_nanos = clock();
     }
 
     /// Invoke the notification callback when one is installed (dcrd
@@ -1746,6 +1793,9 @@ impl Chain {
             return Err(crate::chaindb::ChainDbError::Db(e));
         }
         self.utxo_stamp_durable_flush();
+        // Every flush before this one is in that durable commit too.
+        self.utxo_awaiting_durable.clear();
+        self.utxo_periodic_awaiting = None;
         Ok(())
     }
 
@@ -2085,9 +2135,10 @@ impl Chain {
     /// `UtxoCache.shouldFlush`): not when already flushed through the
     /// best hash, and otherwise when the maximum size or the periodic
     /// flush interval has been reached.  The interval counts from the
-    /// last durable flush, not from the last flush as dcrd's does, so
-    /// a periodic flush can follow a size-triggered one sooner than
-    /// dcrd's would.
+    /// last flush a durable commit has carried, not from the last flush
+    /// as dcrd's does, so a periodic flush can follow a size-triggered
+    /// one sooner than dcrd's would, when no durable commit has carried
+    /// that one yet.
     fn utxo_should_flush(&self, best_hash: &Hash) -> bool {
         if self.utxo_last_flush_hash == *best_hash {
             return false;
@@ -2100,8 +2151,13 @@ impl Chain {
 
     /// Whether the periodic flush interval has been reached: the time
     /// test of dcrd `UtxoCache.shouldFlush` (`utxocache.go:678`),
-    /// counted from the last durable flush.
+    /// counted from the last flush a durable commit has carried.  Never
+    /// while the commit the last periodic flush asked for has not been
+    /// seen to land (`utxo_periodic_awaiting`).
     fn utxo_periodic_flush_due(&self) -> bool {
+        if self.utxo_periodic_awaiting.is_some() {
+            return false;
+        }
         let (Some(now), Some(last)) = (self.periodic_now(), self.utxo_last_durable_flush_nanos)
         else {
             return false;
@@ -2112,17 +2168,23 @@ impl Chain {
     /// Conditionally flush the cache to the backend (dcrd
     /// `UtxoCache.MaybeFlush`).
     ///
-    /// A forced flush, and one the periodic interval has come due for,
-    /// ends in a durable database flush, as every dcrd flush follows
-    /// one (`flushBlockDB`, `utxocache.go:722`).  A flush only the size
-    /// limit tripped commits its rows and the set state in one
-    /// transaction and returns with them in the database's write cache,
-    /// where the next durable commit picks them up: the write cache's
-    /// own (its size, its timer, an index's request), or the next
-    /// forced or periodic flush here.  Each of those is decided as a
-    /// block connects or a transaction commits, so while nothing does
-    /// either, the rows wait there for a clean shutdown: the wait is
+    /// A forced flush ends in a durable database flush, as every dcrd
+    /// flush follows one (`flushBlockDB`, `utxocache.go:722`).  One the
+    /// periodic interval has come due for asks the database for a flush
+    /// whose commit, in the daemon, is made on a thread of its own
+    /// (`Database::flush_in_background`), and returns while it is made.
+    /// A flush only the size limit tripped commits its rows and the set
+    /// state in one transaction and returns with them in the database's
+    /// write cache, where the next durable commit picks them up: the
+    /// write cache's own (its size, its timer, an index's request), or
+    /// the next forced or periodic flush here.  Each of those is decided
+    /// as a block connects or a transaction commits, so while nothing
+    /// does either, the rows wait there for a clean shutdown: the wait is
     /// bounded in work, not in time.
+    ///
+    /// Whichever durable commit carries a flush, the flush counts for
+    /// the periodic interval once it has landed, from the time the flush
+    /// was written ([`Chain::utxo_settle_durable`], called first here).
     ///
     /// dcrd flushes the block database first because its UTXO set is a
     /// separate database that must never run ahead of the block index.
@@ -2143,14 +2205,19 @@ impl Chain {
         best_height: u32,
         force: bool,
     ) -> Result<(), crate::chaindb::ChainDbError> {
+        self.utxo_settle_durable();
         if force {
             return self.flush_utxo_cache(best_hash, best_height);
         }
         if self.utxo_should_flush(&best_hash) {
             // The clock never steps back, so a flush the interval
             // granted is still due at this second reading.
-            let durable = self.utxo_periodic_flush_due();
-            self.flush_utxo_cache_with(best_hash, best_height, durable)?;
+            let end = if self.utxo_periodic_flush_due() {
+                UtxoFlushEnd::Periodic
+            } else {
+                UtxoFlushEnd::Commit
+            };
+            self.flush_utxo_cache_with(best_hash, best_height, end)?;
         }
         Ok(())
     }
@@ -2171,18 +2238,17 @@ impl Chain {
         last_flush_hash: Hash,
         last_flush_height: u32,
     ) -> Result<(), crate::chaindb::ChainDbError> {
-        self.flush_utxo_cache_with(last_flush_hash, last_flush_height, true)
+        self.flush_utxo_cache_with(last_flush_hash, last_flush_height, UtxoFlushEnd::Durable)
     }
 
-    /// [`Chain::flush_utxo_cache`], ending in a durable database flush
-    /// only when `durable` is set; see
-    /// [`Chain::maybe_flush_utxo_cache`] for which flushes leave it
-    /// unset.
+    /// [`Chain::flush_utxo_cache`], ending as `end` says once the rows
+    /// and the set state are committed; see
+    /// [`Chain::maybe_flush_utxo_cache`] for which flush ends how.
     fn flush_utxo_cache_with(
         &mut self,
         last_flush_hash: Hash,
         last_flush_height: u32,
-        durable: bool,
+        end: UtxoFlushEnd,
     ) -> Result<(), crate::chaindb::ChainDbError> {
         if self.utxo_flush_test_hooks.disabled {
             return Ok(());
@@ -2218,19 +2284,88 @@ impl Chain {
         if let Some(log) = self.utxo_flush_test_hooks.log.as_mut() {
             log.push((last_flush_hash, last_flush_height));
         }
-        // A forced or periodic flush is the chain's durability barrier,
-        // as dcrd's `flushBlockDB` is for every flush of its cache.  A
-        // size-triggered one returns here, and its rows ride in the
-        // next durable commit.  A chain without a database has no write
-        // cache, so each of its flushes counts.
-        if let Some(db) = self.db.as_ref() {
-            if !durable {
-                return Ok(());
+        // A chain without a database has no write cache, so each of its
+        // flushes counts.
+        let Some(db) = self.db.as_ref() else {
+            self.utxo_stamp_durable_flush();
+            return Ok(());
+        };
+        // Every commit up to the flush's own, which is the last: a commit
+        // another thread made since only makes the mark later, and a
+        // flush that captures the mark's commits captures this one's.
+        let mark = db.commit_mark();
+        match end {
+            // A size-triggered flush returns here, and its rows ride in
+            // the next durable commit, which counts it once it has
+            // landed.
+            UtxoFlushEnd::Commit => {
+                let written = self.periodic_now();
+                self.utxo_awaiting_durable.push_back((mark, written));
             }
-            db.flush().map_err(crate::chaindb::ChainDbError::Db)?;
+            // The periodic flush asks for the durable commit itself but
+            // does not wait for it; with background commits off it is
+            // made before the call returns, and settles at once.  The
+            // clock is read after the call, which is where it was read
+            // when this flush ended in `Database::flush`.
+            UtxoFlushEnd::Periodic => {
+                db.flush_in_background()
+                    .map_err(crate::chaindb::ChainDbError::Db)?;
+                let written = self.periodic_now();
+                self.utxo_awaiting_durable.push_back((mark, written));
+                self.utxo_periodic_awaiting = Some(mark);
+                self.utxo_settle_durable();
+            }
+            // A forced flush is the chain's durability barrier, as
+            // dcrd's `flushBlockDB` is for every flush of its cache, and
+            // carries every flush before it.
+            UtxoFlushEnd::Durable => {
+                db.flush().map_err(crate::chaindb::ChainDbError::Db)?;
+                self.utxo_stamp_durable_flush();
+                self.utxo_awaiting_durable.clear();
+                self.utxo_periodic_awaiting = None;
+            }
         }
-        self.utxo_stamp_durable_flush();
         Ok(())
+    }
+
+    /// Count every utxo cache flush a durable commit has carried since
+    /// the last look: move the durable-flush stamp to the time the
+    /// newest of them was written, never back, and let the periodic
+    /// interval come due again once the commit the last periodic flush
+    /// asked for has landed.
+    ///
+    /// The database says a commit has landed only after its sync has
+    /// returned and it has retired what it captured
+    /// (`Database::is_durable`), so nothing here counts a flush a crash
+    /// can still lose; one whose commit failed latches the database and
+    /// is never counted.  Looked at each time the chain decides whether
+    /// to flush, after every block it connects, so a commit that lands
+    /// between two blocks counts at the second, from the time its flush
+    /// was written all the same.
+    fn utxo_settle_durable(&mut self) {
+        let Some(db) = self.db.as_ref() else {
+            return;
+        };
+        let mut settled: Option<i64> = None;
+        while let Some(&(mark, written)) = self.utxo_awaiting_durable.front() {
+            if !db.is_durable(mark) {
+                break;
+            }
+            self.utxo_awaiting_durable.pop_front();
+            settled = settled.max(written);
+        }
+        if self
+            .utxo_periodic_awaiting
+            .is_some_and(|mark| db.is_durable(mark))
+        {
+            self.utxo_periodic_awaiting = None;
+        }
+        if let Some(written) = settled {
+            let stamp = self
+                .utxo_last_durable_flush_nanos
+                .map_or(written, |last| last.max(written));
+            self.utxo_last_durable_flush_nanos = Some(stamp);
+        }
     }
 
     /// Apply the modified cache entries to the in-memory backend of a
@@ -2300,12 +2435,14 @@ impl Chain {
         }
     }
 
-    /// Stamp a flush that ended in a durable database flush (dcrd
-    /// `c.lastFlushTime = c.timeNow()`, `utxocache.go:769`, which every
-    /// dcrd flush reaches).  With no monotonic clock, a flush before
-    /// the first processing call (gettxoutsetinfo's) has no time to
-    /// stamp, and leaves the stamp for that call's adjusted time to
-    /// seed.
+    /// Stamp, now, a flush that ended in a durable database flush, or
+    /// any flush of a chain without a database (dcrd `c.lastFlushTime =
+    /// c.timeNow()`, `utxocache.go:769`, which every dcrd flush reaches);
+    /// the other flushes are stamped by [`Chain::utxo_settle_durable`]
+    /// once a durable commit has carried them.  With no monotonic clock,
+    /// a flush before the first processing call (gettxoutsetinfo's) has
+    /// no time to stamp, and leaves the stamp for that call's adjusted
+    /// time to seed.
     fn utxo_stamp_durable_flush(&mut self) {
         if let Some(now) = self.periodic_now() {
             self.utxo_last_durable_flush_nanos = Some(now);
@@ -9408,10 +9545,12 @@ mod tests {
     /// ends in one, however often the size limit tripped in between.
     /// Every flush ended in a durable commit before, as each of dcrd's
     /// follows `flushBlockDB` (`utxocache.go:722`).  The interval counts
-    /// from the last durable flush, not from the last flush as dcrd's
-    /// `lastFlushTime` does (`utxocache.go:769`): size-triggered flushes
-    /// would otherwise postpone the periodic one for as long as they
-    /// kept coming.
+    /// from the last flush a durable commit carried, not from the last
+    /// flush as dcrd's `lastFlushTime` does (`utxocache.go:769`):
+    /// size-triggered flushes would otherwise postpone the periodic one
+    /// for as long as they kept coming.  No durable commit carries them
+    /// here, since the write cache never fills.  Without background
+    /// commits, the periodic flush's commit is made before it returns.
     #[test]
     fn a_size_triggered_utxo_flush_is_durable_only_once_the_interval_has_passed() {
         let params = dcroxide_chaincfg::regnet_params();
@@ -9637,6 +9776,460 @@ mod tests {
             Some(60 * NANOS_PER_SEC),
             "a flush with no write cache to wait in was not stamped"
         );
+    }
+
+    /// A size-triggered UTXO cache flush that a durable commit the chain
+    /// did not ask for has carried counts for the periodic interval, from
+    /// the time it was written, at the first connect after that commit:
+    /// the periodic flush then comes due 120 s after it, not 120 s after
+    /// the last flush the chain made durable itself.  Here the commit is
+    /// a `Database::flush` of the test's; in the daemon it is the write
+    /// cache's own, on its size or its timer, or one the index asks for.
+    #[test]
+    fn a_durable_commit_that_carries_a_size_triggered_flush_moves_the_stamp_to_that_flush() {
+        let params = dcroxide_chaincfg::regnet_params();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut opts = dcroxide_database::Options::new(dir.path().join("chain"), params.net.0);
+        let (mut chain, flushes) = size_limited_chain(&mut opts, &params);
+        let (blocks, now) = battery_main_chain();
+        assert!(blocks.len() > 4, "the battery has a long main chain");
+        // Two days on, every block looks old, so the chain never
+        // latches to current and forces a flush of its own.
+        let fast = now + 48 * 60 * 60;
+        let connect = |chain: &mut Chain, block: &MsgBlock| {
+            let (_, errs) = chain.process_block(block, fast, &params);
+            assert!(errs.is_empty(), "{errs:?}");
+        };
+        let durable = || flushes.load(Ordering::SeqCst);
+        let base = durable();
+        let stamp = |secs: i64| Some(secs * NANOS_PER_SEC);
+
+        // A size-triggered flush at 60 s, then a durable commit that
+        // carries it.
+        set_test_clock(60);
+        connect(&mut chain, &blocks[0]);
+        assert_eq!(durable(), base, "a size-triggered flush was durable");
+        assert_eq!(chain.utxo_last_flush_hash, blocks[0].header.block_hash());
+        chain
+            .db
+            .as_ref()
+            .expect("db")
+            .flush()
+            .expect("a durable commit");
+        assert_eq!(durable(), base + 1);
+        assert_eq!(
+            chain.utxo_last_durable_flush_nanos,
+            stamp(0),
+            "stamped before the chain looked"
+        );
+
+        // The next connect counts it, from the time it was written; its
+        // own flush waits in the write cache.
+        set_test_clock(100);
+        connect(&mut chain, &blocks[1]);
+        assert_eq!(
+            chain.utxo_last_durable_flush_nanos,
+            stamp(60),
+            "a size-triggered flush a durable commit carried was not counted"
+        );
+        assert_eq!(durable(), base + 1);
+
+        // The interval counts from 60 s.
+        set_test_clock(60 + UTXO_PERIODIC_FLUSH_SECS - 1);
+        connect(&mut chain, &blocks[2]);
+        assert_eq!(durable(), base + 1, "a periodic flush within the interval");
+        assert_eq!(chain.utxo_last_durable_flush_nanos, stamp(60));
+        set_test_clock(60 + UTXO_PERIODIC_FLUSH_SECS);
+        connect(&mut chain, &blocks[3]);
+        assert_eq!(durable(), base + 2, "the periodic flush");
+        assert_eq!(
+            chain.utxo_last_durable_flush_nanos,
+            stamp(60 + UTXO_PERIODIC_FLUSH_SECS)
+        );
+        assert!(chain.utxo_awaiting_durable.is_empty());
+    }
+
+    /// A size-triggered flush is counted only once a durable commit holds
+    /// its own transaction, not when one holds the commits before it.
+    /// The database's write cache is given no room here, so every commit
+    /// first makes the commits before it durable, and the flush, the last
+    /// transaction of its connect, is the one commit that is not: looked
+    /// at then, it moves nothing; after a durable commit of it, the stamp
+    /// moves to the time it was written.
+    #[test]
+    fn a_size_triggered_flush_is_not_counted_until_its_own_transaction_is_durable() {
+        let params = dcroxide_chaincfg::regnet_params();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut opts = dcroxide_database::Options::new(dir.path().join("chain"), params.net.0);
+        opts.cache_max_size = 0;
+        let (mut chain, flushes) = size_limited_chain(&mut opts, &params);
+        let (blocks, now) = battery_main_chain();
+        let fast = now + 48 * 60 * 60;
+        set_test_clock(60);
+        let (_, errs) = chain.process_block(&blocks[0], fast, &params);
+        assert!(errs.is_empty(), "{errs:?}");
+        assert_eq!(chain.utxo_last_flush_hash, blocks[0].header.block_hash());
+        assert!(
+            flushes.load(Ordering::SeqCst) > 0,
+            "the connect's commits made those before them durable"
+        );
+        chain.utxo_settle_durable();
+        assert_eq!(
+            chain.utxo_last_durable_flush_nanos,
+            Some(0),
+            "a flush was counted while its own transaction was in the write cache"
+        );
+        assert_eq!(chain.utxo_awaiting_durable.len(), 1);
+        chain
+            .db
+            .as_ref()
+            .expect("db")
+            .flush()
+            .expect("a durable commit");
+        chain.utxo_settle_durable();
+        assert_eq!(
+            chain.utxo_last_durable_flush_nanos,
+            Some(60 * NANOS_PER_SEC)
+        );
+        assert!(chain.utxo_awaiting_durable.is_empty());
+    }
+
+    /// Longer than anything here takes: a step that has not happened by
+    /// then never will.
+    const NEVER: std::time::Duration = std::time::Duration::from_secs(60);
+
+    /// Each flush a database's observer saw, with the name of the thread
+    /// it saw it on.
+    type SeenFlushes =
+        Arc<std::sync::Mutex<Vec<(Option<String>, dcroxide_database::FlushObservation)>>>;
+
+    /// What [`gated_chain`] hands a test.
+    struct GatedChain {
+        chain: Chain,
+        /// Holds the database's commit thread at its first write while
+        /// armed.
+        gate: Arc<dcroxide_testutil::gate::GateBackend>,
+        /// The storage under the gate, which can lose power.
+        power: Arc<dcroxide_testutil::powerloss::PowerLossBackend>,
+        seen: SeenFlushes,
+    }
+
+    /// A database-backed regnet chain in `dir`, on the test clock, with
+    /// background commits on, as in the daemon, and both caches at their
+    /// default sizes, which no battery block fills: the only flushes are
+    /// the periodic one and those a test asks for.  The storage can hold
+    /// the commit thread at its first write and lose power.  What the
+    /// open wrote is flushed, and that flush's observation dropped.
+    fn gated_chain(dir: &std::path::Path, params: &Params) -> GatedChain {
+        use dcroxide_testutil::gate::GateBackend;
+        use dcroxide_testutil::powerloss::PowerLossBackend;
+
+        std::fs::create_dir_all(dir).expect("mkdir");
+        let power = PowerLossBackend::create(&dir.join("metadata.redb"), true);
+        let gate = GateBackend::new(Arc::clone(&power) as dcroxide_database::SharedBackend);
+        let mut opts = dcroxide_database::Options::new(dir, params.net.0);
+        opts.backend = Some(Arc::clone(&gate) as dcroxide_database::SharedBackend);
+        opts.background_commit = true;
+        let seen: SeenFlushes = Arc::default();
+        {
+            let seen = Arc::clone(&seen);
+            opts.flush_observer = Some(Arc::new(
+                move |obs: &dcroxide_database::FlushObservation| {
+                    let thread = std::thread::current().name().map(String::from);
+                    seen.lock().expect("seen").push((thread, *obs));
+                },
+            ));
+        }
+        let db = dcroxide_database::Database::create(&opts).expect("create database");
+        let mut chain = Chain::open(db, params, Hash::ZERO, false, 0).expect("open chain");
+        set_test_clock(0);
+        use_test_clock(&mut chain);
+        let db = chain.db.as_ref().expect("db");
+        db.flush().expect("flush what the open wrote");
+        seen.lock().expect("seen").clear();
+        GatedChain {
+            chain,
+            gate,
+            power,
+            seen,
+        }
+    }
+
+    /// The periodic UTXO cache flush asks the database for a durable
+    /// commit and returns while that commit is made on a thread of its
+    /// own, held here at its first write: the flush's rows and set state
+    /// are written, and the stamp has not moved, since nothing is durable
+    /// yet.  Blocks connected meanwhile start no other periodic flush,
+    /// though the interval is past.  Once the commit has landed, the next
+    /// connect stamps the flush with the time it was asked for, and the
+    /// interval counts from there.  The periodic flush used to end in
+    /// `Database::flush`, which held the thread connecting blocks until
+    /// its commit had synced.
+    #[test]
+    fn a_periodic_flush_hands_its_commit_over_and_is_stamped_once_it_lands() {
+        let params = dcroxide_chaincfg::regnet_params();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let GatedChain {
+            mut chain,
+            gate,
+            seen,
+            ..
+        } = gated_chain(&dir.path().join("chain"), &params);
+        let (blocks, now) = battery_main_chain();
+        assert!(blocks.len() > 15, "the battery has a long main chain");
+        // Two days on, every block looks old, so the chain never
+        // latches to current and forces a flush of its own.
+        let fast = now + 48 * 60 * 60;
+        let connect = |chain: &mut Chain, block: &MsgBlock| {
+            let (_, errs) = chain.process_block(block, fast, &params);
+            assert!(errs.is_empty(), "{errs:?}");
+        };
+        let stamp = |secs: i64| Some(secs * NANOS_PER_SEC);
+        let opened_at = chain.utxo_last_flush_hash;
+
+        for block in &blocks[..5] {
+            connect(&mut chain, block);
+        }
+        assert_eq!(chain.utxo_last_flush_hash, opened_at, "nothing was due");
+
+        // The interval is due: the flush is written and its commit
+        // handed over, and held.
+        set_test_clock(UTXO_PERIODIC_FLUSH_SECS);
+        gate.arm();
+        connect(&mut chain, &blocks[5]);
+        let periodic = blocks[5].header.block_hash();
+        assert_eq!(
+            chain.utxo_last_flush_hash, periodic,
+            "the periodic flush was not written"
+        );
+        assert_eq!(
+            recorded_utxo_set_hash(chain.db.as_ref().expect("db")),
+            periodic
+        );
+        assert!(
+            gate.wait_held(NEVER),
+            "the periodic flush's commit is under way on a thread of its own"
+        );
+        assert!(
+            !gate.holds_a_length_change(),
+            "the commit was stopped growing the file, where no transaction can begin beside it"
+        );
+        assert!(seen.lock().expect("seen").is_empty(), "a commit landed");
+        assert_eq!(
+            chain.utxo_last_durable_flush_nanos,
+            stamp(0),
+            "a flush was stamped before its commit landed"
+        );
+
+        // Past the interval, with the commit held: no flush.
+        set_test_clock(UTXO_PERIODIC_FLUSH_SECS + 1);
+        assert!(
+            !chain.utxo_periodic_flush_due(),
+            "a periodic flush is due while the last one's commit is under way"
+        );
+        for (i, block) in blocks[6..11].iter().enumerate() {
+            set_test_clock(UTXO_PERIODIC_FLUSH_SECS + 1 + i as i64);
+            connect(&mut chain, block);
+        }
+        assert_eq!(
+            chain.utxo_last_flush_hash, periodic,
+            "a periodic flush started while the last one's commit was under way"
+        );
+        assert_eq!(chain.utxo_last_durable_flush_nanos, stamp(0));
+
+        // The commit lands; the chain counts it at the next connect.
+        gate.open();
+        chain
+            .db
+            .as_ref()
+            .expect("db")
+            .wait_background_commit()
+            .expect("the commit landed");
+        {
+            let seen = seen.lock().expect("seen");
+            assert_eq!(seen.len(), 1, "{seen:?}");
+            let (thread, obs) = &seen[0];
+            assert_eq!(
+                thread.as_deref(),
+                Some(dcroxide_database::COMMIT_THREAD_NAME)
+            );
+            assert!(obs.background && !obs.explicit, "{obs:?}");
+        }
+        assert_eq!(chain.utxo_last_durable_flush_nanos, stamp(0));
+        set_test_clock(UTXO_PERIODIC_FLUSH_SECS + 10);
+        connect(&mut chain, &blocks[11]);
+        assert_eq!(
+            chain.utxo_last_durable_flush_nanos,
+            stamp(UTXO_PERIODIC_FLUSH_SECS),
+            "the landed flush was not stamped with the time it was asked for"
+        );
+        assert_eq!(chain.utxo_last_flush_hash, periodic);
+
+        // Due again one interval after it.
+        set_test_clock(2 * UTXO_PERIODIC_FLUSH_SECS - 1);
+        connect(&mut chain, &blocks[12]);
+        assert_eq!(
+            chain.utxo_last_flush_hash, periodic,
+            "flushed within the interval"
+        );
+        set_test_clock(2 * UTXO_PERIODIC_FLUSH_SECS);
+        connect(&mut chain, &blocks[13]);
+        assert_eq!(chain.utxo_last_flush_hash, blocks[13].header.block_hash());
+        chain
+            .db
+            .as_ref()
+            .expect("db")
+            .wait_background_commit()
+            .expect("the commit landed");
+        set_test_clock(2 * UTXO_PERIODIC_FLUSH_SECS + 1);
+        connect(&mut chain, &blocks[14]);
+        assert_eq!(
+            chain.utxo_last_durable_flush_nanos,
+            stamp(2 * UTXO_PERIODIC_FLUSH_SECS)
+        );
+        assert_eq!(seen.lock().expect("seen").len(), 2);
+    }
+
+    /// A periodic flush whose commit fails on the database's commit thread
+    /// latches the database, and is never stamped: the stamp stays where
+    /// it was, no other periodic flush is asked for, and the next connect
+    /// is refused, naming the failure.  An unclean stop then leaves the
+    /// store as the flush before it did.
+    #[test]
+    fn a_failed_periodic_commit_never_moves_the_stamp_and_the_next_write_is_refused() {
+        let params = dcroxide_chaincfg::regnet_params();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_dir = dir.path().join("chain");
+        let GatedChain {
+            mut chain,
+            gate,
+            power,
+            seen,
+        } = gated_chain(&db_dir, &params);
+        let (blocks, now) = battery_main_chain();
+        assert!(blocks.len() > 6, "the battery has a long main chain");
+        let fast = now + 48 * 60 * 60;
+        let genesis = chain.best_snapshot().hash;
+        for block in &blocks[..5] {
+            let (_, errs) = chain.process_block(block, fast, &params);
+            assert!(errs.is_empty(), "{errs:?}");
+        }
+
+        set_test_clock(UTXO_PERIODIC_FLUSH_SECS);
+        gate.arm();
+        let (_, errs) = chain.process_block(&blocks[5], fast, &params);
+        assert!(errs.is_empty(), "{errs:?}");
+        assert!(gate.wait_held(NEVER), "the periodic flush's commit is held");
+        power.power_fails_after(0);
+        gate.open();
+        let db = chain.db.as_ref().expect("db");
+        assert!(
+            db.is_fatal_settled(),
+            "the failed commit latched the database"
+        );
+
+        set_test_clock(UTXO_PERIODIC_FLUSH_SECS + 10);
+        let (_, errs) = chain.process_block(&blocks[6], fast, &params);
+        assert!(
+            errs.iter()
+                .any(|e| e.kind == RuleErrorKind::UnknownBlock
+                    && e.description.contains("power cut")),
+            "the next connect was not refused for the failed commit: {errs:?}"
+        );
+        assert_eq!(chain.utxo_last_durable_flush_nanos, Some(0));
+        assert!(
+            chain.utxo_periodic_awaiting.is_some(),
+            "the failed commit was taken for one that landed"
+        );
+        assert!(seen.lock().expect("seen").is_empty(), "a commit landed");
+
+        drop(chain);
+        power.cut_power();
+        let db = dcroxide_database::Database::open(&dcroxide_database::Options::new(
+            &db_dir,
+            params.net.0,
+        ))
+        .expect("reopen database");
+        let mut best = None;
+        db.view(|tx| {
+            best = Some(crate::chaindb::db_fetch_best_state(tx).expect("best state"));
+            Ok(())
+        })
+        .expect("read the best state");
+        assert_eq!(best.expect("best state").hash, genesis);
+        assert_eq!(recorded_utxo_set_hash(&db), genesis);
+    }
+
+    /// What the stamp counts is on disk: a periodic flush whose commit has
+    /// landed, and been stamped, is what an unclean stop leaves, with the
+    /// block connected after it lost, and the chain reopens at its block
+    /// with the UTXO set of a chain that was never stopped.
+    #[test]
+    fn a_stamped_periodic_flush_survives_a_power_cut() {
+        let params = dcroxide_chaincfg::regnet_params();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_dir = dir.path().join("chain");
+        let GatedChain {
+            mut chain,
+            gate,
+            power,
+            ..
+        } = gated_chain(&db_dir, &params);
+        let (blocks, now) = battery_main_chain();
+        assert!(blocks.len() > 6, "the battery has a long main chain");
+        let fast = now + 48 * 60 * 60;
+        let connect = |chain: &mut Chain, block: &MsgBlock| {
+            let (_, errs) = chain.process_block(block, fast, &params);
+            assert!(errs.is_empty(), "{errs:?}");
+        };
+
+        // The reference: the same six blocks on a chain never stopped.
+        let ref_dir = tempfile::tempdir().expect("tempdir");
+        let ref_opts = dcroxide_database::Options::new(ref_dir.path().join("chain"), params.net.0);
+        let ref_db = dcroxide_database::Database::create(&ref_opts).expect("create database");
+        let mut reference = Chain::open(ref_db, &params, Hash::ZERO, false, 0).expect("open chain");
+        for block in &blocks[..6] {
+            connect(&mut reference, block);
+        }
+        let expected = reference.fetch_utxo_stats().expect("reference stats");
+
+        for block in &blocks[..5] {
+            connect(&mut chain, block);
+        }
+        set_test_clock(UTXO_PERIODIC_FLUSH_SECS);
+        gate.arm();
+        connect(&mut chain, &blocks[5]);
+        assert!(gate.wait_held(NEVER), "the periodic flush's commit is held");
+        gate.open();
+        chain
+            .db
+            .as_ref()
+            .expect("db")
+            .wait_background_commit()
+            .expect("the commit landed");
+        set_test_clock(UTXO_PERIODIC_FLUSH_SECS + 10);
+        connect(&mut chain, &blocks[6]);
+        assert_eq!(
+            chain.utxo_last_durable_flush_nanos,
+            Some(UTXO_PERIODIC_FLUSH_SECS * NANOS_PER_SEC)
+        );
+        drop(chain);
+        power.cut_power();
+
+        let periodic = blocks[5].header.block_hash();
+        let db = dcroxide_database::Database::open(&dcroxide_database::Options::new(
+            &db_dir,
+            params.net.0,
+        ))
+        .expect("reopen database");
+        assert_eq!(recorded_utxo_set_hash(&db), periodic);
+        let mut chain = Chain::open(db, &params, Hash::ZERO, false, 0).expect("reopen chain");
+        assert_eq!(
+            chain.best_snapshot().hash,
+            periodic,
+            "the block after the periodic flush was durable, or the flush was not"
+        );
+        assert_eq!(chain.fetch_utxo_stats().expect("stats"), expected);
     }
 
     /// A chain without a database whose backend, cache and a view over

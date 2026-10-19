@@ -1675,6 +1675,14 @@ rest, and the 120 s rule about five (11, 38 and 5 of 54 in one run;
 [ADR-0011](0011-exists-address-layout-3-and-the-flush-participant.md),
 second addendum of the same date).
 
+> **Note, 2026-10-19.** The flush at least every 120 s of processing no
+> longer ends in `Database::flush`: it asks for a commit, which the
+> daemon makes on the metadata store's commit thread, and counts once
+> that commit has landed; the 120 s now run from the last UTXO cache
+> flush any durable commit carried ([ADR-0009](0009-storage-shape.md),
+> second addendum of 2026-10-19; [PARITY.md](../../PARITY.md), *Periodic
+> UTXO cache flush interval*).
+
 Measured on m3 that afternoon, one default sync each
 ([bench-ledger.md](../bench-ledger.md), "Shared commits for UTXO-cache
 flushes, the filesystem's share and a delayed link"): the code before

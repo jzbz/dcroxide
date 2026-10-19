@@ -95,8 +95,11 @@ Since 2026-10-11 that replay is the usual outcome of an unclean stop
 during the initial sync, and there is more to do again. While the chain
 is catching up, a UTXO cache flush that the cache's size limit trips no
 longer forces the metadata store to disk. Its rows reach disk with the
-store's next commit, and the chain forces one of its own about every
-two minutes while blocks are connecting. If blocks stop arriving
+store's next commit, and the chain asks for one of its own about every
+two minutes while blocks are connecting, counted from the last of its
+flushes a commit has made durable; since 2026-10-19 the daemon makes
+that commit on a thread of its own while blocks go on connecting, and
+the flush counts once it has landed. If blocks stop arriving
 nothing commits, and what is waiting stays in memory until the next
 block or a clean shutdown: the loss is bounded in work, not in time. So
 a kill or a power cut in that phase loses about two minutes of
@@ -1057,8 +1060,12 @@ next commit (the paragraph on unclean stops near the top has what that
 risks). That commit comes when the overlay holds two thirds of its
 ceiling or, with the exists-address index on, when the index has taken
 about 1.5 million new keys since its last flush, which is what trips
-most of them after the first few minutes of a sync; about one in ten is
-the two-minute rule's. On m3 that day the code before the change
+most of them after the first few minutes of a sync; in the syncs of
+2026-10-11 about one in ten was the two-minute rule's, which since
+2026-10-19 counts from the last UTXO cache flush any durable commit
+carried, so how often it comes due in a sync now has not been
+counted ([PARITY.md](../PARITY.md), *Periodic UTXO cache flush
+interval*). On m3 on 2026-10-11 the code before the change
 took 775.6 s with 133 flushes in one sync, a prototype of the change
 took 724.6 s with 52 flushes at 300 MiB and 736.9 s with 63 at 200 MiB,
 and the change as made took a median of 728.7 s over three syncs, with
@@ -1325,14 +1332,18 @@ end of a phase, and a phase of a millisecond or two can show more
 processor time than its `ms`: sums over a sync mean something, single
 short phases do not. No field the lines had changed its name, place or
 format. Since 2026-10-17 eight more keys follow `commit`, before
-`participant`: `explicit`, whether the flush was asked for
-(`Database::flush` or the close) rather than tripped by a commit; `bg`,
-whether its rows and commit were written on the thread `dbcommit`;
-`fg_ms`, the part of `elapsed_ms` the capturing thread spent holding the
-database's writer, all of it unless `bg` and then the capture to the
-hand-off, which holds the block-file sync, the opening of the write
-transaction and the exists-address index's seal; `wait_ms`,
-the time spent since the flush before was captured, outside
+`participant`: `explicit`, whether the flush was asked for by a caller
+that waits for it to be durable (`Database::flush` or the close) rather
+than tripped by a commit or, since 2026-10-19, asked for by the chain's
+periodic UTXO cache flush, which the line does not tell from a tripped
+one, with `DCROXIDE_DB_SYNC_COMMIT` set or not, so the `explicit` lines
+of a sync no longer count the two-minute rule's flushes as those of
+earlier builds did; `bg`, whether its rows and commit were written on
+the thread `dbcommit`; `fg_ms`, the part of `elapsed_ms` the capturing
+thread spent holding the database's writer, all of it unless `bg` and
+then the capture to the hand-off, which holds the block-file sync, the
+opening of the write transaction and the exists-address index's seal;
+`wait_ms`, the time spent since the flush before was captured, outside
 `elapsed_ms`, waiting with the writer held for an earlier flush's commit
 to end: the capturing thread's wait before its capture, and any other
 thread's, such as a commit's at the write cache's ceiling, which counts
@@ -1468,12 +1479,12 @@ using the default`, and the read-ahead stays on. Unset, it is on and
 nothing is logged.
 `DCROXIDE_DB_SYNC_COMMIT` is read once at startup and is the way back
 to dcrd's place for a metadata commit. Unset, a flush that a commit
-trips writes its rows and makes its commit on the thread `dbcommit`,
-which the node keeps from the first such flush to the shutdown, and
-nothing is logged. A positive whole number puts every commit back on the
-thread that ran the flush, under the database's writer, starts no
-`dbcommit` thread, and is logged at startup as `Metadata write cache
-commits on the committing
+trips, or that the chain's periodic UTXO cache flush asks for, writes
+its rows and makes its commit on the thread `dbcommit`, which the node
+keeps from the first such flush to the shutdown, and nothing is logged.
+A positive whole number puts every commit back on the thread that ran
+the flush, under the database's writer, starts no `dbcommit` thread, and
+is logged at startup as `Metadata write cache commits on the committing
 thread by DCROXIDE_DB_SYNC_COMMIT`. Any other value, `0` included, is
 the warning `DCROXIDE_DB_SYNC_COMMIT=V is not a positive whole number;
 committing the metadata write cache on a thread of its own`, and the

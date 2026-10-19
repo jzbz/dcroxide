@@ -1390,7 +1390,7 @@ impl Transaction {
         // layers a flush retired here are kept until that semaphore is
         // released, at the end; those of a flush that was handed over
         // are retired and let go of by the thread it was handed to.
-        let retired = crate::flush_locked(&self.db, true);
+        let retired = crate::flush_locked(&self.db, crate::FlushKind::Commit);
         if let Err(e) = retired {
             // Already latched, by `flush_locked` or by the thread an
             // earlier flush's commit failed on: the dirty set is still

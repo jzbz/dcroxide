@@ -2084,8 +2084,8 @@ fn env_tuning_u64(var: &str, unit: &str) -> Option<u64> {
 /// day that request came before the ceiling for about seven commits in
 /// ten (11 of 54 began past the ceiling's trigger), so raising it buys
 /// few commits. While blocks connect, the UTXO cache's periodic flush
-/// forces a commit 120 s after the last one a UTXO flush forced, and
-/// `DCROXIDE_DB_OVERLAY=100` restores dcrd's ceiling.
+/// asks for a commit 120 s after the last UTXO flush a durable commit
+/// carried, and `DCROXIDE_DB_OVERLAY=100` restores dcrd's ceiling.
 ///
 /// Environment variables rather than flags, for `DCROXIDE_DB_CACHE`'s
 /// reason: dcrd has no counterpart, and the generated `-h` output is
@@ -2110,21 +2110,24 @@ fn apply_overlay_tuning(opts: &mut Options) {
     }
 }
 
-/// Whether a flush that a commit trips writes its rows and makes its redb
-/// commit on a thread of its own (`Options::background_commit`): yes,
-/// unless `DCROXIDE_DB_SYNC_COMMIT` is set to a positive whole number.
+/// Whether a flush that a commit trips, or that the UTXO cache's periodic
+/// flush asks for, writes its rows and makes its redb commit on a thread
+/// of its own (`Options::background_commit`): yes, unless
+/// `DCROXIDE_DB_SYNC_COMMIT` is set to a positive whole number.
 ///
 /// On that thread the flush no longer holds up the thread that connects
 /// blocks or the one that updates the indexes: the commit that tripped
-/// the flush returns once the write cache is captured, the block files
-/// are synced, redb's write transaction is open and the exists-address
-/// index has set apart the keys the flush will write.  Every commit is
-/// still synced before anything acknowledges it as durable, at most one
-/// flush is under way, and a flush, the close and the next flush all wait
-/// for it.  What moves is the report of a failure: the store latches when
-/// writing the rows, the index's or the commit fails, a `BCDB` error line
-/// says so, and the next write, flush or close is refused, where dcrd
-/// fails the commit that tripped the flush.
+/// the flush, or the periodic flush that asked for it, returns once the
+/// write cache is captured, the block files are synced, redb's write
+/// transaction is open and the exists-address index has set apart the
+/// keys the flush will write.  Every commit is still synced before
+/// anything acknowledges it as durable, at most one flush is under way,
+/// and a flush, the close and the next flush all wait for it; the
+/// periodic flush counts only once its commit has landed.  What moves is
+/// the report of a failure: the store latches when writing the rows, the
+/// index's or the commit fails, a `BCDB` error line says so, and the next
+/// write, flush or close is refused, where dcrd fails the commit that
+/// tripped the flush.
 ///
 /// `DCROXIDE_DB_SYNC_COMMIT=1` restores that: every flush then commits
 /// on the thread that ran it, under the database's writer.  An
@@ -2259,8 +2262,11 @@ fn exists_addr_policy(enabled: bool) -> dcroxide_indexers::ExistsAddrPolicy {
 /// which a line does not tell from the others; each held the writer for
 /// its `fg_ms` plus its `wait_ms`.
 ///
-/// `explicit` is whether the flush was asked for (`Database::flush`, the
-/// close) rather than tripped by a commit's own flush check.  `bg` is
+/// `explicit` is whether the flush was asked for by a caller that waits
+/// for it to be durable (`Database::flush`, the close), rather than
+/// tripped by a commit's own flush check or asked for by the UTXO cache's
+/// periodic flush (`Database::flush_in_background`), which waits only
+/// for the flush before it; a line does not tell those two apart.  `bg` is
 /// whether its rows and commit were written on a thread of its own
 /// ([`background_commit`]); `elapsed_ms` then runs from the capture of
 /// the write cache to the retirement of what was captured, on that

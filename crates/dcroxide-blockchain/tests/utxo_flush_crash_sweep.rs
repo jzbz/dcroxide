@@ -40,6 +40,13 @@
 //! moment would leave them.  Each battery row waits for the commit under
 //! way before its copies are opened.
 //!
+//! A third pair of sweeps gives the write cache its default room and
+//! steps the clock the chain's periodic jobs are timed on by 30 s a
+//! battery row, so the durable states are the commits the periodic UTXO
+//! cache flush asks for (`Database::flush_in_background`), which the
+//! daemon makes on the commit thread while the chain goes on, and the
+//! flushes a disconnect forces.
+//!
 //! The tests sample the prefixes: every commit of a battery row that
 //! disconnects a block, and every `stride`th of the rest.
 //! `DCROXIDE_CRASH_SWEEP_EVERY=1` takes every prefix, which is a few
@@ -53,6 +60,7 @@
 // Test-harness arithmetic over small counts.
 #![allow(clippy::arithmetic_side_effects)]
 
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -73,6 +81,21 @@ use tempfile::TempDir;
 /// ahead, so the chain never latches to current and no connect forces a
 /// durable flush.
 const CLOCK_OFFSET: i64 = 48 * 60 * 60;
+
+/// How far the periodic sweeps step the chain's periodic clock a battery
+/// row: four rows to the 120 s of the periodic UTXO cache flush.
+const PERIODIC_STEP_SECS: i64 = 30;
+
+thread_local! {
+    /// The periodic clock a sweep steps, in nanoseconds.  The chain reads
+    /// it on the thread that processes blocks, which is the test's.
+    static PERIODIC_CLOCK: Cell<i64> = const { Cell::new(0) };
+}
+
+/// The clock [`PERIODIC_CLOCK`] holds, for `Chain::set_periodic_clock`.
+fn periodic_clock() -> Option<i64> {
+    Some(PERIODIC_CLOCK.with(Cell::get))
+}
 
 /// The battery's accepted blocks in order, each with the adjusted time it
 /// is processed at.
@@ -212,6 +235,12 @@ struct Tally {
     off_the_best_chain: usize,
     /// Copies that went on to take the rest of the battery.
     continued: usize,
+    /// Copies of a durable state that a flush no caller waited for made:
+    /// one a commit tripped, or one `Database::flush_in_background` asked
+    /// for, which is what the periodic sweeps' are.
+    opened_unwaited: usize,
+    /// Flushes observed that no caller waited for (`explicit` unset).
+    unwaited: u64,
 }
 
 /// Which prefixes a sweep opens: every `every`th durable commit, every
@@ -247,9 +276,12 @@ impl Sampling {
 
 /// Run the battery on a chain whose UTXO cache holds `cache` bytes (the
 /// default size for `None`), and open the sampled durable states.  With
-/// `background`, each flush a commit trips makes its redb commit on a
-/// thread of its own.
-fn sweep(cache: Option<u64>, sampling: Sampling, background: bool) -> Tally {
+/// `background`, each flush a commit trips, or the chain asks for without
+/// waiting, makes its redb commit on a thread of its own.  With
+/// `periodic`, the database's write cache has its default room instead
+/// of none, and the chain's periodic clock steps [`PERIODIC_STEP_SECS`] a
+/// row.
+fn sweep(cache: Option<u64>, sampling: Sampling, background: bool, periodic: bool) -> Tally {
     let params = regnet_params();
     let rows = battery();
     let dir = TempDir::new().expect("tempdir");
@@ -263,10 +295,13 @@ fn sweep(cache: Option<u64>, sampling: Sampling, background: bool) -> Tally {
     // still in the write cache.
     let commits = Arc::new(AtomicU64::new(0));
     let disconnecting = Arc::new(AtomicBool::new(false));
-    let pending: Arc<Mutex<Vec<(u64, PathBuf)>>> = Arc::default();
+    let pending: Arc<Mutex<Vec<(u64, PathBuf, bool)>>> = Arc::default();
     let background_flushes = Arc::new(AtomicU64::new(0));
+    let unwaited = Arc::new(AtomicU64::new(0));
     let mut opts = Options::new(&db_path, params.net.0);
-    opts.cache_max_size = 0;
+    if !periodic {
+        opts.cache_max_size = 0;
+    }
     opts.background_commit = background;
     opts.flush_observer = Some({
         let (commits, disconnecting, pending) = (
@@ -276,9 +311,13 @@ fn sweep(cache: Option<u64>, sampling: Sampling, background: bool) -> Tally {
         );
         let (db_path, copies) = (db_path.clone(), copies.clone());
         let background_flushes = Arc::clone(&background_flushes);
+        let unwaited = Arc::clone(&unwaited);
         Arc::new(move |obs: &FlushObservation| {
             if obs.background {
                 background_flushes.fetch_add(1, Ordering::SeqCst);
+            }
+            if !obs.explicit {
+                unwaited.fetch_add(1, Ordering::SeqCst);
             }
             let n = commits.fetch_add(1, Ordering::SeqCst) + 1;
             let stride = if disconnecting.load(Ordering::SeqCst) {
@@ -291,12 +330,19 @@ fn sweep(cache: Option<u64>, sampling: Sampling, background: bool) -> Tally {
             }
             let copy = copies.join(n.to_string());
             copy_dir(&db_path, &copy);
-            pending.lock().expect("pending").push((n, copy));
+            pending
+                .lock()
+                .expect("pending")
+                .push((n, copy, !obs.explicit));
         })
     });
     let db = Database::create(&opts).expect("create database");
     let settle = db.clone();
     let mut chain = open_chain(db, &params, cache).expect("open chain");
+    if periodic {
+        PERIODIC_CLOCK.with(|clock| clock.set(0));
+        chain.set_periodic_clock(periodic_clock);
+    }
 
     // The same rows on a chain nothing interrupts, one row ahead: it
     // says which rows disconnect a block, and what the set is at each
@@ -336,6 +382,10 @@ fn sweep(cache: Option<u64>, sampling: Sampling, background: bool) -> Tally {
             .or_insert_with(|| lockstep.fetch_utxo_stats().expect("uninterrupted stats"));
 
         disconnecting.store(disconnected.load(Ordering::SeqCst), Ordering::SeqCst);
+        if periodic {
+            let secs = (row as i64 + 1) * PERIODIC_STEP_SECS;
+            PERIODIC_CLOCK.with(|clock| clock.set(secs * 1_000_000_000));
+        }
         process(&mut chain, *now, block, &params, "the swept run");
         assert_eq!(chain.best_snapshot().hash, tip, "row {row}: the tips agree");
         // A commit still under way on its own thread has yet to take its
@@ -344,10 +394,14 @@ fn sweep(cache: Option<u64>, sampling: Sampling, background: bool) -> Tally {
             .wait_background_commit()
             .unwrap_or_else(|e| panic!("row {row}: the commit under way failed: {e:?}"));
 
-        let landed: Vec<(u64, PathBuf)> = std::mem::take(&mut *pending.lock().expect("pending"));
-        for (n, copy) in landed {
+        let landed: Vec<(u64, PathBuf, bool)> =
+            std::mem::take(&mut *pending.lock().expect("pending"));
+        for (n, copy, not_waited_for) in landed {
             let at = format!("row {row}, durable commit {n}");
             tally.opened += 1;
+            if not_waited_for {
+                tally.opened_unwaited += 1;
+            }
 
             // What the durable state records, before anything repairs
             // it.
@@ -362,7 +416,8 @@ fn sweep(cache: Option<u64>, sampling: Sampling, background: bool) -> Tally {
             })
             .unwrap_or_else(|e| panic!("{at}: read the states: {e:?}"));
             let (best, set_state) = recorded.expect("the states");
-            match set_state.map(|hash| reference.depth_below(hash, best)) {
+            let depth = set_state.map(|hash| reference.depth_below(hash, best));
+            match depth {
                 // A store with no set state yet is at genesis.
                 None | Some(Some(0)) => tally.at_the_tip += 1,
                 Some(Some(depth)) => {
@@ -370,6 +425,16 @@ fn sweep(cache: Option<u64>, sampling: Sampling, background: bool) -> Tally {
                     tally.most_behind = tally.most_behind.max(depth);
                 }
                 Some(None) => tally.off_the_best_chain += 1,
+            }
+            // The periodic flush asks for its commit once its rows and
+            // the set state are written, so what that commit makes
+            // durable has the set state at the best state.
+            if periodic && not_waited_for {
+                assert!(
+                    matches!(depth, None | Some(Some(0))),
+                    "{at}: a periodic flush's commit left the set state at {set_state:?}, \
+                     not at the best state {best}"
+                );
             }
 
             // The open an unclean stop is followed by.
@@ -413,7 +478,18 @@ fn sweep(cache: Option<u64>, sampling: Sampling, background: bool) -> Tally {
     assert!(tally.continued > 0, "no reopened chain took more blocks");
     let on_their_own_thread = background_flushes.load(Ordering::SeqCst);
     let flushes = commits.load(Ordering::SeqCst);
-    if background {
+    tally.unwaited = unwaited.load(Ordering::SeqCst);
+    if periodic {
+        // The flushes the periodic one asked for, and those a disconnect
+        // forced, which commit on the thread that asked.
+        let expected = if background { tally.unwaited } else { 0 };
+        assert_eq!(
+            on_their_own_thread, expected,
+            "{on_their_own_thread} of {flushes} flushes committed on a thread of their own, {} \
+             not waited for",
+            tally.unwaited
+        );
+    } else if background {
         // All but the few the chain asks for outright, which commit on
         // the thread that asked.
         assert!(
@@ -442,6 +518,7 @@ fn every_durable_state_reopens_to_the_right_set_with_the_cache_at_its_limit() {
         }
         .or_from_env(),
         false,
+        false,
     );
     assert!(tally.at_the_tip > 0, "{tally:?}");
     assert!(tally.behind > 0, "{tally:?}");
@@ -462,6 +539,7 @@ fn every_durable_state_reopens_to_the_right_set_with_commits_on_their_own_thread
         }
         .or_from_env(),
         true,
+        false,
     );
     assert!(tally.at_the_tip > 0, "{tally:?}");
     assert!(tally.behind > 0, "{tally:?}");
@@ -482,6 +560,7 @@ fn every_durable_state_reopens_to_the_right_set_with_a_large_cache() {
             continued: 7,
         }
         .or_from_env(),
+        false,
         false,
     );
     assert!(tally.behind > 0, "{tally:?}");
@@ -505,10 +584,57 @@ fn every_durable_state_reopens_to_the_right_set_with_a_large_cache_and_commits_o
         }
         .or_from_env(),
         true,
+        false,
     );
     assert!(tally.behind > 0, "{tally:?}");
     assert!(
         tally.most_behind >= 50,
         "no open replayed a long run of blocks: {tally:?}"
     );
+}
+
+/// The write cache with its default room, which the battery never fills,
+/// and the periodic clock stepped 30 s a row: the durable states are the
+/// periodic UTXO cache flush's, every 120 s of that clock unless a forced
+/// flush came between, and those a disconnect forces.  They are few, so
+/// every one is opened.  Every one the periodic flush made has the set
+/// state at the best state it captured, and each reopens to the right
+/// set.
+#[test]
+fn every_durable_state_reopens_to_the_right_set_with_periodic_flushes() {
+    let tally = sweep(
+        None,
+        Sampling {
+            every: 1,
+            in_a_disconnecting_row: 1,
+            continued: 9,
+        }
+        .or_from_env(),
+        false,
+        true,
+    );
+    assert!(tally.unwaited >= 20, "too few periodic flushes: {tally:?}");
+    assert!(tally.opened_unwaited > 0, "{tally:?}");
+    assert!(tally.at_the_tip > 0, "{tally:?}");
+}
+
+/// The periodic sweep with each periodic flush's commit made on a thread
+/// of its own, as the daemon makes it: the copy is taken on that thread
+/// when the commit lands, and each state still reopens to the right set.
+#[test]
+fn every_durable_state_reopens_to_the_right_set_with_periodic_flushes_on_their_own_thread() {
+    let tally = sweep(
+        None,
+        Sampling {
+            every: 1,
+            in_a_disconnecting_row: 1,
+            continued: 9,
+        }
+        .or_from_env(),
+        true,
+        true,
+    );
+    assert!(tally.unwaited >= 20, "too few periodic flushes: {tally:?}");
+    assert!(tally.opened_unwaited > 0, "{tally:?}");
+    assert!(tally.at_the_tip > 0, "{tally:?}");
 }

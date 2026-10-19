@@ -219,6 +219,11 @@ pub(crate) type RetiredLayers = Vec<Arc<CacheLayer>>;
 pub(crate) struct FlushBatch {
     layers: Vec<Arc<CacheLayer>>,
     bytes: u64,
+    /// How many commits had been published when the batch was captured
+    /// ([`DbCache::commits`]): the batch holds every one of them that is
+    /// not already in the store, so once its commit has landed all of
+    /// them are durable.
+    pub(crate) through: u64,
     write_log: Option<crate::WriteLogSink>,
     take_stats: bool,
     /// Whether an observer will see this flush, which is what the I/O
@@ -966,6 +971,12 @@ pub(crate) struct DbCache {
     /// `begin_flush` and cleared by `retire`, and what `flush_locked`
     /// refuses a second capture on.
     in_flight: bool,
+    /// How many transactions have been published since the open, each
+    /// counted by [`Self::commit_pending`] under the cache lock: the
+    /// figure a [`crate::CommitMark`] holds, and the one
+    /// [`Self::begin_flush`] copies into the batch it captures
+    /// ([`FlushBatch::through`]).
+    commits: u64,
 }
 
 impl DbCache {
@@ -983,8 +994,15 @@ impl DbCache {
             in_flight_layers: 0,
             in_flight_size: 0,
             in_flight: false,
+            commits: 0,
             write_log: None,
         }
+    }
+
+    /// How many transactions have been published since the open: every
+    /// one of them is in the overlay or in the store.
+    pub(crate) fn commits(&self) -> u64 {
+        self.commits
     }
 
     /// Set the overlay's size ceiling and time-based flush interval.
@@ -1129,6 +1147,10 @@ impl DbCache {
         let reclaimed = compact(&mut layers, self.in_flight_layers);
         self.total_size = self.total_size.saturating_sub(reclaimed);
         self.publish(layers);
+        // Counted with the publication, under the same hold of the cache
+        // lock, so a capture that sees this transaction's rows sees the
+        // count that includes it.
+        self.commits = self.commits.saturating_add(1);
     }
 
     /// Publish a new layer stack, reusing the snapshot allocation when
@@ -1223,6 +1245,7 @@ impl DbCache {
         FlushBatch {
             layers,
             bytes,
+            through: self.commits,
             write_log: self.write_log.clone(),
             take_stats: take_stats && self.observer.is_some(),
             observed: self.observer.is_some(),
@@ -3514,7 +3537,7 @@ mod tests {
         // and freed when the caller drops what it was handed.
         let retiring = layer();
         let writer = db.exclusive_writer();
-        let retired = crate::flush_locked(&db.inner, false).expect("flush");
+        let retired = crate::flush_locked(&db.inner, crate::FlushKind::Durable).expect("flush");
         assert_eq!(published(), 0);
         assert_eq!(retired.len(), 1);
         assert_eq!(retiring.strong_count(), 1, "the flush freed it");
@@ -3778,7 +3801,7 @@ mod flush_barrier_tests {
             let (_dir, _power, db, layer) = store_with_a_layer();
             let reader = held_by_a_reader.then(|| db.begin(false).expect("begin a reader"));
             let writer = db.exclusive_writer();
-            let retired = crate::flush_locked(&db.inner, false).expect("flush");
+            let retired = crate::flush_locked(&db.inner, crate::FlushKind::Durable).expect("flush");
             drop(writer);
             assert!(published(&db).is_empty(), "still published");
             assert_eq!(retired.len(), 1);
@@ -3801,7 +3824,7 @@ mod flush_barrier_tests {
         let (_dir, power, db, layer) = store_with_a_layer();
         power.power_fails_after(0);
         let writer = db.exclusive_writer();
-        let failed = crate::flush_locked(&db.inner, false);
+        let failed = crate::flush_locked(&db.inner, crate::FlushKind::Durable);
         drop(writer);
         assert!(failed.is_err() && power.power_failed(), "the commit failed");
         let still = published(&db);

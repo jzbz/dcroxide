@@ -70,7 +70,8 @@ pub trait FlushParticipant: Send + Sync {
     /// thresholds (dcrd's `needsFlush`) have not tripped.
     ///
     /// Asked by every writable commit before its flush check, so it must
-    /// be cheap.  Not asked by [`crate::Database::flush`] or
+    /// be cheap.  Not asked by [`crate::Database::flush`],
+    /// [`crate::Database::flush_in_background`] or
     /// [`crate::Database::close`], which flush regardless.  For a
     /// participant that allows its `contribute` and `finished` to be
     /// deferred, it can be asked while an earlier flush's rows are still
@@ -145,16 +146,18 @@ pub trait FlushParticipant: Send + Sync {
     /// `false` unless overridden.
     ///
     /// A database opened with [`crate::Options::background_commit`] hands
-    /// the rest of a flush that a commit's own check tripped to a thread of
+    /// the rest of a flush that a commit's own check tripped, or that
+    /// [`crate::Database::flush_in_background`] asked for, to a thread of
     /// its own once the write cache is captured, the block files are
     /// synced, the write transaction is open and [`Self::seal`] has
     /// returned.  That thread writes the overlay's rows, calls
     /// `contribute`, commits, and calls `finished`, while the commit that
-    /// tripped the flush runs its hooks and returns, and so may any number
+    /// tripped the flush runs its hooks and returns, or
+    /// `flush_in_background` returns, and so may any number of commits
     /// after it.  A participant that answers `false` is never put in that
     /// position: a flush in which it has work runs from start to end on
-    /// the thread that tripped it, and every call is made as described
-    /// above.
+    /// the thread that tripped it or asked for it, and every call is made
+    /// as described above.
     ///
     /// One that answers `true` accepts that from a `seal` to its
     /// `finished` its hooks run, beside `contribute` and between it and

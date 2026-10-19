@@ -1787,6 +1787,405 @@ fn close_of_a_latched_store_waits_for_the_committer_that_latched_it() {
 }
 
 // ---------------------------------------------------------------------
+// Commit marks, and a flush asked for without a wait
+// ---------------------------------------------------------------------
+
+/// A store with background commits off, over storage that can lose
+/// power, its base rows durable, and the observations of its flushes from
+/// then on.  Returns the directory and the store's path with it, for a
+/// reopen.
+fn inline_store() -> (TempDir, PathBuf, Database, Arc<PowerLossBackend>, Seen) {
+    let dir = TempDir::new().expect("tempdir");
+    let db_dir = dir.path().join("db");
+    std::fs::create_dir_all(&db_dir).expect("mkdir");
+    let power = PowerLossBackend::create(&db_dir.join("metadata.redb"), true);
+    let mut opts = Options::new(&db_dir, NET);
+    opts.backend = Some(Arc::clone(&power) as SharedBackend);
+    let seen: Seen = Arc::default();
+    {
+        let seen = Arc::clone(&seen);
+        opts.flush_observer = Some(Arc::new(move |obs: &FlushObservation| {
+            let thread = std::thread::current().name().map(str::to_string);
+            seen.lock().unwrap().push((thread, *obs));
+        }));
+    }
+    let db = Database::create(&opts).expect("create");
+    db.update(|tx| tx.metadata().put(BASE, b"durable"))
+        .expect("the base row");
+    db.flush().expect("flush the base row");
+    seen.lock().unwrap().clear();
+    (dir, db_dir, db, power, seen)
+}
+
+/// A commit mark turns durable once a flush that captured every commit
+/// it covers has made its redb commit, and not before.  Without
+/// background commits that is at the next flush; with them a flush a
+/// commit trips covers the commits before that commit and not the
+/// commit itself, whose rows are published after the capture, and its
+/// marks are not durable while its commit is held.  A transaction that
+/// stages nothing of its own is counted like any other: it still records
+/// the block files' write cursor, as dcrd's commit does.
+#[test]
+fn a_commit_mark_is_durable_once_a_flush_that_captured_it_has_landed() {
+    let (_dir, path, db, power, _seen) = inline_store();
+    let opened = db.commit_mark();
+    assert!(db.is_durable(opened), "what the flush wrote is durable");
+    db.update(|tx| put_generation(tx, 1, 1, 8))
+        .expect("generation 1");
+    let one = db.commit_mark();
+    assert!(one > opened, "a commit moves the mark");
+    assert!(
+        !db.is_durable(one),
+        "a commit still in the write cache is durable"
+    );
+    db.flush().expect("flush");
+    assert!(db.is_durable(one), "the flush made generation 1 durable");
+    db.update(|_| Ok(()))
+        .expect("a transaction that stages nothing");
+    let empty = db.commit_mark();
+    assert!(
+        empty > one,
+        "a transaction that stages nothing is not counted"
+    );
+    assert!(!db.is_durable(empty));
+    db.flush().expect("flush");
+    assert!(db.is_durable(empty));
+    drop(db);
+    power.cut_power();
+    assert_eq!(reopened(&path, 1), vec![1]);
+
+    let rig = Rig::new();
+    rig.fill(1);
+    let first = rig.db.commit_mark();
+    rig.gate.arm();
+    rig.small(2);
+    let second = rig.db.commit_mark();
+    assert!(
+        rig.gate.wait_held(NEVER),
+        "the flush generation 2 tripped is under way on a thread of its own"
+    );
+    assert!(
+        !rig.db.is_durable(first),
+        "a mark the held commit carries is durable before the commit lands"
+    );
+    rig.gate.open();
+    rig.db.wait_background_commit().expect("the commit landed");
+    assert!(
+        rig.db.is_durable(first),
+        "generation 1 is in the commit that landed"
+    );
+    assert!(
+        !rig.db.is_durable(second),
+        "generation 2 was published after the capture, and is in no durable commit"
+    );
+    rig.db.flush().expect("flush");
+    assert!(rig.db.is_durable(second));
+    let (_dir, path) = rig.crash();
+    assert_eq!(reopened(&path, 2), vec![1, 2]);
+}
+
+/// A mark that a commit which failed on its own thread was to carry
+/// never turns durable: not when the failure latches the store, and not
+/// after, when every flush is refused, `Database::flush_in_background`
+/// included.
+#[test]
+fn a_mark_whose_commit_failed_never_turns_durable() {
+    let rig = Rig::new();
+    rig.fill(1);
+    let first = rig.db.commit_mark();
+    rig.gate.arm();
+    rig.small(2);
+    assert!(rig.gate.wait_held(NEVER), "the commit is under way");
+    rig.power.power_fails_after(0);
+    rig.gate.open();
+    let err = rig
+        .db
+        .wait_background_commit()
+        .expect_err("the commit failed");
+    assert_refused_for_the_power_cut("the wait", &err);
+    assert!(
+        !rig.db.is_durable(first),
+        "a failed commit's mark is durable"
+    );
+    let err = rig
+        .db
+        .flush_in_background()
+        .expect_err("a flush on a latched store");
+    assert_refused_for_the_power_cut("the requested flush", &err);
+    let err = rig.db.flush().expect_err("a flush on a latched store");
+    assert_refused_for_the_power_cut("the flush", &err);
+    assert!(!rig.db.is_durable(first));
+    assert!(rig.observations().is_empty(), "nothing landed");
+
+    let (_dir, path) = rig.crash();
+    assert_eq!(reopened(&path, 2), Vec::<u32>::new());
+}
+
+/// `Database::flush_in_background` captures the write cache and returns
+/// while its commit is made on a thread of its own, held here at its
+/// first write, unlike `Database::flush`: the mark taken before it is not
+/// durable until that commit lands, commits go on beside it, and it is
+/// observed on the commit thread as a flush that was handed over and not
+/// asked for by a caller that waits.  A power cut then keeps exactly what
+/// it captured.
+#[test]
+fn flush_in_background_returns_while_its_commit_is_held() {
+    let rig = Rig::new();
+    rig.small(1);
+    let mark = rig.db.commit_mark();
+    rig.gate.arm();
+    // On a thread of its own, so that a call that waited for its commit
+    // would show as one that has not returned rather than hang the test.
+    let asked = in_background(&rig.db, |db| db.flush_in_background());
+    asked
+        .recv_timeout(NEVER)
+        .expect("the requested flush returns while its commit is held")
+        .expect("the requested flush");
+    assert!(
+        rig.gate.wait_held(NEVER),
+        "its commit is under way on a thread of its own"
+    );
+    assert!(
+        !rig.gate.holds_a_length_change(),
+        "the commit was stopped growing the file, where no transaction can begin beside it"
+    );
+    assert!(!rig.db.is_durable(mark), "durable before its commit landed");
+    assert!(rig.observations().is_empty());
+    rig.small(2);
+    assert_eq!(rig.readable(2), vec![1, 2]);
+
+    rig.gate.open();
+    rig.db.wait_background_commit().expect("the commit landed");
+    assert!(rig.db.is_durable(mark));
+    let seen = rig.observations();
+    assert_eq!(seen.len(), 1, "{seen:?}");
+    let (thread, obs) = &seen[0];
+    assert_eq!(thread.as_deref(), Some(COMMIT_THREAD_NAME));
+    assert!(obs.background && !obs.explicit, "{obs:?}");
+    assert!(obs.foreground < obs.elapsed, "{obs:?}");
+
+    let (_dir, path) = rig.crash();
+    assert_eq!(
+        reopened(&path, 2),
+        vec![1],
+        "exactly the captured batch is durable"
+    );
+}
+
+/// With background commits off, `Database::flush_in_background` commits
+/// on the calling thread before it returns, as `Database::flush` does:
+/// the mark is durable at once and survives a power cut.  Only the
+/// observation tells the two apart.
+#[test]
+fn flush_in_background_commits_before_it_returns_without_background_commits() {
+    let (_dir, path, db, power, seen) = inline_store();
+    db.update(|tx| put_generation(tx, 1, 1, 8))
+        .expect("generation 1");
+    let mark = db.commit_mark();
+    db.flush_in_background().expect("the requested flush");
+    assert!(db.is_durable(mark), "not durable when it returned");
+    {
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1, "{seen:?}");
+        let (thread, obs) = &seen[0];
+        assert_ne!(thread.as_deref(), Some(COMMIT_THREAD_NAME));
+        assert!(!obs.background && !obs.explicit, "{obs:?}");
+        assert_eq!(obs.foreground, obs.elapsed);
+    }
+    drop(db);
+    power.cut_power();
+    assert_eq!(reopened(&path, 1), vec![1]);
+}
+
+/// `Database::flush_in_background` waits for the commit under way, as
+/// every flush does, and then hands its own over: it returns once the
+/// first has landed, with its own held at the gate, and its mark turns
+/// durable only when that one lands too.  It reports what it waited.
+#[test]
+fn flush_in_background_waits_for_the_commit_under_way_first() {
+    let rig = Rig::new();
+    rig.hold_a_commit();
+    rig.small(3);
+    let mark = rig.db.commit_mark();
+    // Shut the gate again behind the first commit, so the requested
+    // flush's commit is held in its turn.
+    rig.rearm.store(true, Ordering::SeqCst);
+    let asked = in_background(&rig.db, |db| db.flush_in_background());
+    assert_waiting(&asked, "the requested flush");
+    rig.gate.open();
+    asked
+        .recv_timeout(NEVER)
+        .expect("the requested flush returns")
+        .expect("the requested flush");
+    assert!(
+        rig.gate.wait_held(NEVER),
+        "the requested flush's commit is under way on a thread of its own"
+    );
+    assert!(!rig.db.is_durable(mark), "durable before its commit landed");
+    assert_eq!(rig.observations().len(), 1, "the first commit landed");
+
+    rig.rearm.store(false, Ordering::SeqCst);
+    rig.gate.open();
+    rig.db.wait_background_commit().expect("the commit landed");
+    assert!(rig.db.is_durable(mark));
+    let seen = rig.observations();
+    assert_eq!(seen.len(), 2, "{seen:?}");
+    let (thread, second) = &seen[1];
+    assert_eq!(thread.as_deref(), Some(COMMIT_THREAD_NAME));
+    assert!(second.background && !second.explicit, "{second:?}");
+    assert!(
+        second.waited > Duration::ZERO,
+        "the requested flush reports what it waited for the commit before it: {second:?}"
+    );
+
+    let (_dir, path) = rig.crash();
+    assert_eq!(reopened(&path, 3), vec![1, 2, 3]);
+}
+
+/// A closed store refuses `Database::flush_in_background` as it refuses
+/// `Database::flush`.
+#[test]
+fn flush_in_background_is_refused_after_a_close() {
+    let rig = Rig::new();
+    rig.db.close().expect("close");
+    assert_eq!(
+        rig.db.flush_in_background().unwrap_err().kind,
+        ErrorKind::DbNotOpen
+    );
+}
+
+/// The generations whose keys a participant over the journal bucket
+/// wrote durably to the store at `path`, reopened on its file alone.
+fn durable_participant_keys(path: &std::path::Path) -> Vec<u32> {
+    let db = Database::open(&Options::new(path, NET)).expect("reopen");
+    let prefix = rig_prefix_of(&db);
+    let mut rows = Vec::new();
+    db.view(|tx| {
+        rows = tx.try_scan_after(&prefix, None, usize::MAX)?;
+        Ok(())
+    })
+    .expect("view");
+    db.close().expect("close the reopened store");
+    rows.into_iter()
+        .map(|(key, value)| {
+            assert!(value.is_empty(), "a participant row has no value");
+            let generation = key
+                .strip_prefix(prefix.as_slice())
+                .and_then(|rest| rest.strip_prefix(b"K"))
+                .expect("a participant row");
+            u32::from_be_bytes(generation.try_into().expect("a generation"))
+        })
+        .collect()
+}
+
+/// Beside a participant with work that allows it, a flush
+/// `Database::flush_in_background` asks for is handed over as a commit's
+/// own flush is: the participant is sealed before the call returns, its
+/// `contribute` and `finished` run on the commit thread, and a key
+/// handed in beside the held `contribute` waits for the next flush.  A
+/// power cut then keeps exactly the generation and the participant row
+/// the flush captured.
+#[test]
+fn flush_in_background_hands_a_participant_that_allows_it_over_with_its_flush() {
+    let rig = Rig::new();
+    let recorder = Recorder::new(&rig.prefix);
+    rig.db
+        .set_flush_participant(
+            &rig.prefix,
+            Arc::clone(&recorder) as Arc<dyn FlushParticipant>,
+        )
+        .expect("register");
+    connect(&rig.db, &recorder, 1, 1).expect("generation 1");
+    let mark = rig.db.commit_mark();
+    recorder.hold.arm();
+    // On a thread of its own, so that a call that ran `contribute` itself
+    // would show as one that has not returned rather than hang the test.
+    let asked = in_background(&rig.db, |db| db.flush_in_background());
+    asked
+        .recv_timeout(NEVER)
+        .expect("the requested flush returns while its contribute is held")
+        .expect("the requested flush");
+    assert!(
+        recorder.hold.wait_reached(NEVER),
+        "the flush's contribute runs after the call has returned"
+    );
+    assert_eq!(recorder.calls(), vec![Call::Seal, Call::Contribute]);
+    assert!(!rig.db.is_durable(mark), "durable before its commit landed");
+    connect(&rig.db, &recorder, 2, 1).expect("generation 2, beside the held contribute");
+    recorder.hold.release();
+    rig.db.wait_background_commit().expect("the flush landed");
+    assert_eq!(
+        recorder.calls(),
+        vec![Call::Seal, Call::Contribute, Call::Finished(true)]
+    );
+    assert_eq!(
+        recorder.pending(),
+        vec![2],
+        "the flush retired what it sealed and nothing handed in after the seal"
+    );
+    assert!(rig.db.is_durable(mark));
+    let seen = rig.observations();
+    assert_eq!(seen.len(), 1, "{seen:?}");
+    let (thread, obs) = &seen[0];
+    assert_eq!(thread.as_deref(), Some(COMMIT_THREAD_NAME));
+    assert!(obs.background && !obs.explicit, "{obs:?}");
+    assert!(obs.participant.is_some(), "the participant wrote: {obs:?}");
+
+    let (_dir, path) = rig.crash();
+    assert_eq!(reopened(&path, 2), vec![1]);
+    assert_eq!(
+        durable_participant_keys(&path),
+        vec![1],
+        "the participant's rows are those of the captured generation"
+    );
+}
+
+/// Beside a participant with work that has not opted in,
+/// `Database::flush_in_background` commits before it returns, as a
+/// commit's own flush does there: the participant is sealed, written and
+/// finished on the calling thread, the mark taken before the call is
+/// durable when it returns, and the flush is observed as neither handed
+/// over nor asked for by a caller that waits.
+#[test]
+fn flush_in_background_commits_before_it_returns_beside_a_participant_that_has_not_opted_in() {
+    let rig = Rig::new();
+    let recorder = Recorder::new(&rig.prefix);
+    rig.db
+        .set_flush_participant(
+            &rig.prefix,
+            Arc::new(NotOptedIn(Arc::clone(&recorder))) as Arc<dyn FlushParticipant>,
+        )
+        .expect("register");
+    connect(&rig.db, &recorder, 1, 1).expect("generation 1");
+    let mark = rig.db.commit_mark();
+    // Were the flush handed over after all, its commit would be held.
+    rig.gate.arm();
+    rig.db.flush_in_background().expect("the requested flush");
+    assert_eq!(
+        recorder.calls(),
+        vec![Call::Seal, Call::Contribute, Call::Finished(true)],
+        "the participant was finished before the call returned"
+    );
+    assert!(recorder.pending().is_empty());
+    assert!(
+        rig.db.is_durable(mark),
+        "not durable when the call returned"
+    );
+    assert!(!rig.gate.is_held(), "no commit left this thread");
+    let seen = rig.observations();
+    assert_eq!(seen.len(), 1, "{seen:?}");
+    let (thread, obs) = &seen[0];
+    assert_ne!(thread.as_deref(), Some(COMMIT_THREAD_NAME));
+    assert!(!obs.background && !obs.explicit, "{obs:?}");
+    assert_eq!(obs.foreground, obs.elapsed, "{obs:?}");
+
+    rig.gate.open();
+    let (_dir, path) = rig.crash();
+    assert_eq!(reopened(&path, 1), vec![1]);
+    assert_eq!(durable_participant_keys(&path), vec![1]);
+}
+
+// ---------------------------------------------------------------------
 // Registration
 // ---------------------------------------------------------------------
 

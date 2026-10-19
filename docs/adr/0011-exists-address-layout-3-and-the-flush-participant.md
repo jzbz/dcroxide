@@ -1325,3 +1325,45 @@ and `try_scan_after` did not move. In `existsaddrindex.rs`,
 `:541`, `fold_sealed` at `:567` and `unseal` at `:605`. `cmp_keys` at
 `existsaddr/mod.rs:64` and the cited lines of `policy.rs` and
 `dcroxide.rs` did not move.
+
+> **Note, 2026-10-19, on the addendum above.** A flush that
+> `Database::flush_in_background` asks for is now handed over as a
+> tripped one is. Like `Database::flush` it does not ask `wants_flush`,
+> which only a commit's own check asks. For a participant that allows
+> it, its `seal` is called on the calling thread under the writer, and
+> its `contribute` and `finished` on the commit thread, beside later
+> commits' hooks and `wants_flush`; a flush in which a participant that
+> has not opted in has work, or for which no thread is to be had, writes
+> and commits before the call returns. The chain's periodic UTXO cache
+> flush asks for one while it catches up
+> ([ADR-0009](0009-storage-shape.md), second addendum of this date), so
+> with the index on, the exists-address participant can also contribute
+> on `dbcommit` in a flush that no commit tripped and no `wants_flush`
+> asked for. Nothing else in the contract changes; the trait's
+> documentation (`participant.rs`) says the same. Pinned by
+> `tests/background_commit.rs`
+> (`flush_in_background_hands_a_participant_that_allows_it_over_with_its_flush`,
+> `flush_in_background_commits_before_it_returns_beside_a_participant_that_has_not_opted_in`)
+> and the database's own
+> `a_requested_flush_whose_thread_is_refused_commits_before_it_returns`,
+> on Linux only.
+
+> **Note, 2026-10-19 (second).** The change the note above describes
+> moved lines the addendum of this date cites, whose numbers stay as
+> they were written. In `dcroxide-database`'s `lib.rs`, the
+> participant's field is now at `:452` and `flush_locked` at `:1409`,
+> with `wants_flush` asked at `:1426`, the deferral decided at
+> `:1517-1522` and `finished` called at `:2164`; `write_and_commit` is
+> at `:1578`, `run_job` at `:1971` and `finish` at `:2104`; `close` is
+> at `:3255`, `set_flush_participant` at `:3339` and
+> `clear_flush_participant` at `:3410`. In `participant.rs`, `seal` is
+> at `:105`, `contribute` at `:121`, `finished` at `:141`,
+> `allows_deferred_contribute` at `:175` and the key check at `:396`. In
+> `dbcache.rs`, `open` is at `:1340`, with `has_work` asked at `:1349`,
+> the prefix backstop at `:1371-1388` and the seal at `:1391`; `fill` is
+> at `:1410`, with `contribute` called at `:1480`; the commit is at
+> `:1522` and the participant-only flush's count at `:1595`.
+> `begin_durable_write` and the latch's two, the participant trait, the
+> cited lines of `transaction.rs`, the commit's own flush at `:1393` and
+> `raw_id` at `:1841` among them, and those of `existsaddrindex.rs`,
+> `existsaddr/store.rs` and `existsaddr/memtable.rs` did not move.

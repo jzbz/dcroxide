@@ -291,6 +291,7 @@ impl DbInner {
             }),
             flight: Mutex::new(None),
             waited_nanos: AtomicU64::new(0),
+            durable_through: AtomicU64::new(0),
             log: opts.log.clone(),
             commit_snapshot: opts.commit_snapshot,
             before_commit: opts.before_commit.clone(),
@@ -475,6 +476,13 @@ pub(crate) struct DbInner {
     /// last capture, in nanoseconds; the next captured flush reports it
     /// as its [`FlushObservation::waited`].
     waited_nanos: AtomicU64,
+    /// The commits known durable: every commit counted up to this figure
+    /// ([`CommitMark`]) is in a durable commit of the store.  Raised by
+    /// [`finish`] to the [`FlushBatch::through`] of a flush whose commit
+    /// has landed and whose layers are retired, on whichever thread ends
+    /// that flush, and never lowered; a flush that fails leaves it, and a
+    /// latched store makes no flush that could raise it again.
+    durable_through: AtomicU64,
     /// [`Options::log`], for the line a commit that fails on its own
     /// thread logs, having no caller to return its error to.
     log: Option<LogSink>,
@@ -576,6 +584,20 @@ pub const INDEX_THREAD_NAME: &str = "index";
 /// and its state does.  A [`FlushObserver`] is called on it for such a
 /// flush.
 pub const COMMIT_THREAD_NAME: &str = "dbcommit";
+
+/// A point in the order of a database's commits: every transaction
+/// committed on the handle, by any of its clones, up to the moment
+/// [`Database::commit_mark`] was read.  [`Database::is_durable`] says
+/// whether a durable commit of the store has carried all of them.
+///
+/// Marks of one open database compare in the order they were read.  A
+/// mark means nothing to another open, the same store reopened
+/// included: the count starts again at every open.  dcrd's database has
+/// no such figure; it is for a caller that has handed a flush to a
+/// thread of its own ([`Database::flush_in_background`]) and must not
+/// count on the flush's rows until they are on disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct CommitMark(u64);
 
 /// The running total of one kind of thread's waits for the writer
 /// semaphore.
@@ -723,9 +745,12 @@ pub struct FlushObservation {
     /// ([`Self::background`]): the observer is called on that thread,
     /// named [`COMMIT_THREAD_NAME`], which never holds the semaphore.
     pub writer_waits: WriterWaits,
-    /// Whether [`Database::flush`] or [`Database::close`] asked for this
-    /// flush.  `false` for one a commit's own flush check tripped, by the
-    /// overlay's thresholds or a participant's `wants_flush`.
+    /// Whether a caller that waits for the flush to be durable,
+    /// [`Database::flush`] or [`Database::close`], asked for it.  `false`
+    /// for one a commit's own flush check tripped, by the overlay's
+    /// thresholds or a participant's `wants_flush`, and for one
+    /// [`Database::flush_in_background`] asked for, whose commit is handed
+    /// over as a tripped one's is.
     pub explicit: bool,
     /// Whether the flush's rows were written and its redb commit made on
     /// another thread than the one that captured the overlay
@@ -1113,10 +1138,11 @@ pub struct Options {
     /// unclean-shutdown repair on open, the `ROLLBACK` warnings, and the
     /// progress of a redb repair of the metadata store.
     pub log: Option<LogSink>,
-    /// Whether a flush that a commit's own check trips hands the writing
-    /// of its rows and its redb commit to a thread of its own, so that the
-    /// commit that tripped it returns once the write cache is captured,
-    /// the block files are synced, redb's write transaction is open and a
+    /// Whether a flush that a commit's own check trips, or that
+    /// [`Database::flush_in_background`] asks for, hands the writing of its
+    /// rows and its redb commit to a thread of its own, so that its caller
+    /// returns once the write cache is captured, the block files are
+    /// synced, redb's write transaction is open and a
     /// [`FlushParticipant`] with work has sealed it.
     ///
     /// `false` by default, in which case every flush writes and commits
@@ -1285,6 +1311,26 @@ fn drain_flight(inner: &DbInner) {
     }
 }
 
+/// Who asked for a flush, which decides whether it is made at all and
+/// whether its rows and commit may leave the thread that captures it
+/// ([`flush_locked`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FlushKind {
+    /// A commit's own flush check (dcrd `commitTx`, which flushes only
+    /// when `needsFlush` says so): made only when the overlay's
+    /// thresholds or a participant's `wants_flush` ask for it, and handed
+    /// over with background commits.
+    Commit,
+    /// [`Database::flush`] and [`Database::close`]: made whatever the
+    /// thresholds say, and committed on the calling thread, which is told
+    /// `Ok` only once the commit is durable.
+    Durable,
+    /// [`Database::flush_in_background`]: made whatever the thresholds
+    /// say, and handed over with background commits as a commit's own
+    /// flush is.
+    Requested,
+}
+
 /// Run one flush with the cache lock released across the commit.
 ///
 /// The caller must already hold the writer semaphore, which is what
@@ -1294,28 +1340,32 @@ fn drain_flight(inner: &DbInner) {
 /// the process for the commit's fsync. The median flush took 26.9 s in
 /// m1's sync of 2026-08-16 (about 1.3 s on m3 in 2026-10).
 ///
-/// `only_if_needed` is the commit path's flush (dcrd `commitTx`, which
-/// flushes only when `needsFlush` says so): the thresholds are checked
-/// under the same lock hold as the capture.  `Database::flush` and
-/// `Database::close` flush unconditionally.
+/// [`FlushKind::Commit`] is the commit path's flush (dcrd `commitTx`,
+/// which flushes only when `needsFlush` says so): the thresholds are
+/// checked under the same lock hold as the capture.  `Database::flush`,
+/// `Database::close` ([`FlushKind::Durable`]) and
+/// `Database::flush_in_background` ([`FlushKind::Requested`]) flush
+/// unconditionally.
 ///
-/// **Synchronous to durability for those two.**  A flush that
-/// `Database::flush` or `Database::close` asked for returns only once the
-/// data is on disk, because they are the chain's durability barrier and
-/// the daemon's shutdown path.  So does every flush of a database opened
-/// without [`Options::background_commit`].  With it, a flush on the
-/// commit path stops being synchronous once its write transaction is open:
-/// the capture, the block-file sync, the opening of the transaction and
-/// the participant's `seal` run here, under the caller's semaphore, and
-/// the rest is handed to the store's commit thread ([`hand_off`]), which
-/// writes the overlay's rows and the participant's into the transaction,
-/// makes the redb commit, retires the layers and calls `finished` when it
-/// lands.  The rows go in in the same order on either thread.  The commit
-/// that tripped the flush is then told `Ok` with nothing of that batch
-/// acknowledged as durable; no caller of a commit is promised durability.
-/// A participant with work must allow its `contribute` and `finished` to
-/// be deferred ([`FlushParticipant::allows_deferred_contribute`]), or the
-/// whole flush stays here.
+/// **Synchronous to durability for `Database::flush` and
+/// `Database::close`.**  A flush that either asked for returns only once
+/// the data is on disk, because they are the chain's durability barrier
+/// and the daemon's shutdown path.  So does every flush of a database
+/// opened without [`Options::background_commit`].  With it, a flush on the
+/// commit path, or one `Database::flush_in_background` asked for, stops
+/// being synchronous once its write transaction is open: the capture, the
+/// block-file sync, the opening of the transaction and the participant's
+/// `seal` run here, under the caller's semaphore, and the rest is handed
+/// to the store's commit thread ([`hand_off`]), which writes the overlay's
+/// rows and the participant's into the transaction, makes the redb commit,
+/// retires the layers and calls `finished` when it lands.  The rows go in
+/// in the same order on either thread.  The caller is then told `Ok` with
+/// nothing of that batch acknowledged as durable; no caller of a commit is
+/// promised durability, and the caller of `Database::flush_in_background`
+/// learns of it from [`Database::is_durable`].  A participant with work
+/// must allow its `contribute` and `finished` to be deferred
+/// ([`FlushParticipant::allows_deferred_contribute`]), or the whole flush
+/// stays here.
 ///
 /// **One flush at a time.**  A flush is in flight from its capture to its
 /// retirement, and nothing is captured while one is: every capture is
@@ -1358,7 +1408,7 @@ fn drain_flight(inner: &DbInner) {
 /// flushed, since no transaction begins behind a close.
 pub(crate) fn flush_locked(
     inner: &Arc<DbInner>,
-    only_if_needed: bool,
+    kind: FlushKind,
 ) -> Result<crate::dbcache::RetiredLayers, Error> {
     // Nothing is captured, and no block file synced, on a latched store.
     inner.check_writable()?;
@@ -1370,13 +1420,13 @@ pub(crate) fn flush_locked(
     // never nest inside it.  Only an `on_commit` hook adds to a
     // participant's work, and hooks run under the semaphore this caller
     // holds, so the answer cannot rise between here and the capture.
-    let wanted = only_if_needed
+    let wanted = kind == FlushKind::Commit
         && registered
             .as_ref()
             .is_some_and(|r| r.participant.wants_flush());
     // The answer of nearly every commit: nothing to flush and nothing to
     // wait for.
-    if only_if_needed {
+    if kind == FlushKind::Commit {
         let cache = inner.cache.lock().expect("cache lock poisoned");
         if !cache.needs_flush() && !wanted && !cache.over_ceiling() {
             return Ok(Vec::new());
@@ -1398,7 +1448,7 @@ pub(crate) fn flush_locked(
     inner.check_writable()?;
     let mut batch = {
         let mut cache = inner.cache.lock().expect("cache lock poisoned");
-        if only_if_needed && !cache.needs_flush() && !wanted {
+        if kind == FlushKind::Commit && !cache.needs_flush() && !wanted {
             // The ceiling alone brought this commit here, and the wait
             // was all it asked for.
             return Ok(Vec::new());
@@ -1425,7 +1475,7 @@ pub(crate) fn flush_locked(
     // Final for this flush already: a wait ends when the semaphore is
     // taken, and the caller holds it until the capture is handed on.
     batch.writer_waits = inner.writer_waits();
-    batch.explicit = !only_if_needed;
+    batch.explicit = kind == FlushKind::Durable;
     batch.waited = std::time::Duration::from_nanos(inner.waited_nanos.swap(0, Ordering::Relaxed));
     if batch.observed() {
         batch.memory.process_at_capture = ProcessMemory::read(true);
@@ -1459,12 +1509,13 @@ pub(crate) fn flush_locked(
         }
     };
     let sealed = job.sealed();
-    // Only a commit's own flush is handed over.  `Database::flush` and
+    // A commit's own flush is handed over, and so is one
+    // `Database::flush_in_background` asked for.  `Database::flush` and
     // `Database::close` acknowledge durability, so theirs writes and
     // commits here.  So does one in which a participant has work without
     // allowing its `contribute` and `finished` to be deferred.
     let deferred = inner.background
-        && only_if_needed
+        && kind != FlushKind::Durable
         && (!sealed
             || registered
                 .as_ref()
@@ -2020,12 +2071,17 @@ impl Drop for JobEnd {
 /// whether or not its `contribute` was reached.
 ///
 /// On success the layers are retired under the cache lock, which is where
-/// the observer is called, and only then is a participant that was
-/// sealed told `finished(true)`: both follow the commit, so neither
-/// reports rows that are not durable.  A retirement that finds the pinned
-/// layers changed is a failure like any other, though the commit has
-/// landed.  In that one case the accounting goes back before the store
-/// is latched, since `DbCache::retire` restores it as it refuses.
+/// the observer is called, then the commits the batch held are recorded
+/// as durable ([`DbInner::durable_through`], which
+/// [`Database::is_durable`] reads), and only then is a participant that
+/// was sealed told `finished(true)`: all three follow the commit, so none
+/// reports rows that are not durable.  A flush that had nothing to
+/// commit records them too: an empty overlay means every commit before
+/// the capture was retired by a flush that landed.  A retirement that
+/// finds the pinned layers changed is a failure like any other, though
+/// the commit has landed.  In that one case the accounting goes back
+/// before the store is latched, since `DbCache::retire` restores it as
+/// it refuses.
 /// Nothing can be captured in between: a capture follows a wait for this
 /// flush to end, or is made by the thread running this.
 ///
@@ -2086,6 +2142,16 @@ fn finish(
             Some(e)
         }
     };
+    // Only once the retirement has succeeded as well: one that fails
+    // latches the store though its commit landed, and a latched store
+    // acknowledges no durability.  Never lowered, and never raised by a
+    // flush that failed, so a store that latched leaves every mark read
+    // after the last flush that landed short of it for good.
+    if failure.is_none() {
+        inner
+            .durable_through
+            .fetch_max(batch.through, Ordering::SeqCst);
+    }
     if background && let Some(e) = &failure {
         log_line(
             inner.log.as_ref(),
@@ -3236,7 +3302,7 @@ impl Database {
     /// writer semaphore held.
     fn close_locked(&self) -> Result<(), Error> {
         self.inner.check_writable()?;
-        flush_locked(&self.inner, false)?;
+        flush_locked(&self.inner, FlushKind::Durable)?;
         // Then record the allocator state, which redb otherwise does
         // only when its handle drops -- and this handle's clones can
         // outlive the close by as long as the threads holding them do.
@@ -3374,11 +3440,80 @@ impl Database {
         // first: nothing is acknowledged here until it has ended.
         drain_flight(&self.inner);
         self.inner.check_writable()?;
-        let retired = flush_locked(&self.inner, false);
+        let retired = flush_locked(&self.inner, FlushKind::Durable);
         // The layers the flush retired are freed once the writer is
         // released, so the next writer does not wait for the frees.
         drop(writer);
         retired.map(drop)
+    }
+
+    /// Write all outstanding cached entries to disk as [`Self::flush`]
+    /// does, except that the redb commit may be left under way: with
+    /// [`Options::background_commit`] the flush is handed to a thread of
+    /// its own as a commit's own flush is, and this returns once the
+    /// write cache is captured, the block files are synced and the
+    /// flush's write transaction is open.  dcrd has no such call.
+    ///
+    /// `Ok` acknowledges nothing as durable.  Read a [`CommitMark`]
+    /// ([`Self::commit_mark`]) before calling it and ask
+    /// [`Self::is_durable`] afterwards: the flush captures every commit
+    /// the mark covers, so the mark is durable once its commit has landed,
+    /// or once any later flush's has.  A failure in writing the flush's
+    /// rows or in its commit latches the store from that thread, and the
+    /// next write, flush or close reports it; the mark then never becomes
+    /// durable.
+    ///
+    /// Like [`Self::flush`] it waits out any writable transaction and a
+    /// flush whose commit is still under way, and is refused on a closed
+    /// or latched store.  It commits before it returns, and the mark is
+    /// durable then, when the option is off, when a participant that does
+    /// not allow its `contribute` and `finished` to be deferred has work,
+    /// and when no thread is to be had.  The flush it makes is observed
+    /// with [`FlushObservation::explicit`] unset, and calling it from a
+    /// thread that holds a writable transaction of this database, or from
+    /// a participant or `on_commit` hook, deadlocks, as for
+    /// [`Self::flush`].
+    ///
+    /// For the chain's periodic UTXO cache flush, which needs its rows on
+    /// disk within the interval but need not wait for them there.
+    pub fn flush_in_background(&self) -> Result<(), Error> {
+        self.check_open()?;
+        self.inner.check_writable()?;
+        let writer = self.exclusive_writer();
+        // As in `flush`: the transaction or the commit waited out may be
+        // the one that latched the store.
+        drain_flight(&self.inner);
+        self.inner.check_writable()?;
+        let retired = flush_locked(&self.inner, FlushKind::Requested);
+        drop(writer);
+        retired.map(drop)
+    }
+
+    /// A mark covering every transaction committed on this database so
+    /// far, by this handle or any clone of it, the caller's last commit
+    /// included ([`CommitMark`]).
+    pub fn commit_mark(&self) -> CommitMark {
+        CommitMark(
+            self.inner
+                .cache
+                .lock()
+                .expect("cache lock poisoned")
+                .commits(),
+        )
+    }
+
+    /// Whether every transaction `mark` covers is in a durable commit of
+    /// the store: a flush that captured all of them has made its redb
+    /// commit, `Durability::Immediate`, and retired what it captured.
+    ///
+    /// One atomic read; it waits for nothing.  With
+    /// [`Options::background_commit`] a mark can turn durable at any
+    /// moment after a commit has tripped a flush or
+    /// [`Self::flush_in_background`] has returned; without it, only
+    /// during a call that flushes.  `false` for good once the store has
+    /// latched, for a mark that the last flush to land did not cover.
+    pub fn is_durable(&self, mark: CommitMark) -> bool {
+        self.inner.durable_through.load(Ordering::SeqCst) >= mark.0
     }
 }
 
@@ -3881,7 +4016,8 @@ mod late_flush_tests {
         {
             let _writer = db.exclusive_writer();
             db.inner.check_writable().expect("not latched");
-            flush_locked(&db.inner, false).expect("the late flush succeeds, as dcrd's does");
+            flush_locked(&db.inner, FlushKind::Durable)
+                .expect("the late flush succeeds, as dcrd's does");
         }
 
         // It committed nothing, so the allocator state `close` recorded
@@ -4475,6 +4611,60 @@ mod background_commit_tests {
         reopened.close().expect("close");
     }
 
+    /// A flush `Database::flush_in_background` asks for whose thread the
+    /// system refuses is not lost either: it was to be handed over, and
+    /// took the read snapshot a handed-over commit holds, but commits on
+    /// the calling thread before the call returns, so the mark taken
+    /// before the call is durable when it returns.
+    #[test]
+    fn a_requested_flush_whose_thread_is_refused_commits_before_it_returns() {
+        let rig = Rig::new();
+        rig.db
+            .inner
+            .refuse_commit_thread
+            .store(true, Ordering::SeqCst);
+        rig.fill(1);
+        let mark = rig.db.commit_mark();
+        assert!(!rig.db.is_durable(mark));
+        // Were the commit handed over after all, it would be held.
+        rig.gate.arm();
+        rig.db.flush_in_background().expect("the requested flush");
+        assert!(
+            rig.db.is_durable(mark),
+            "the flush had not landed when the call returned"
+        );
+        {
+            let seen = rig.seen.lock().expect("observations");
+            assert_eq!(seen.len(), 1, "{seen:?}");
+            assert!(
+                !seen[0].background && !seen[0].explicit && seen[0].snapshot,
+                "{:?}",
+                seen[0]
+            );
+            assert_eq!(seen[0].foreground, seen[0].elapsed);
+        }
+        assert!(
+            rig.db
+                .inner
+                .flight
+                .lock()
+                .expect("flight slot poisoned")
+                .is_none(),
+            "nothing is in flight"
+        );
+        assert!(!rig.gate.is_held() && !rig.db.is_fatal());
+
+        let (_dir, reopened) = rig.crash_and_reopen();
+        let durable = reopened.begin(false).expect("begin a reader");
+        assert_eq!(
+            Rig::rows(&durable).len(),
+            48,
+            "the batch was committed and synced"
+        );
+        durable.rollback().expect("end the reader");
+        reopened.close().expect("close");
+    }
+
     /// A capture made while a flush is in flight is refused, and latches
     /// the store, in a build of any kind: the wait that precedes every
     /// capture is all that keeps two flushes from being captured at
@@ -4662,6 +4852,9 @@ mod background_commit_tests {
         for refused in [
             rig.small(3).expect_err("a write on a latched store"),
             rig.db.flush().expect_err("a flush on a latched store"),
+            rig.db
+                .flush_in_background()
+                .expect_err("a requested flush on a latched store"),
             rig.db.close().expect_err("a close of a latched store"),
         ] {
             assert_eq!(refused.kind, ErrorKind::Fatal, "{refused}");
@@ -5455,7 +5648,7 @@ mod background_commit_tests {
         let outcome = {
             let _writer = rig.db.exclusive_writer();
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                flush_locked(&rig.db.inner, true)
+                flush_locked(&rig.db.inner, FlushKind::Commit)
             }))
         };
         match outcome {
@@ -5843,6 +6036,13 @@ mod background_commit_tests {
         let refused = rig.small(3).expect_err("a write on a latched store");
         assert_eq!(refused.kind, ErrorKind::Fatal, "{refused}");
         assert!(refused.description.contains("power cut"), "{refused}");
+        assert_eq!(
+            rig.db
+                .flush_in_background()
+                .expect_err("a requested flush on a latched store")
+                .kind,
+            ErrorKind::Fatal
+        );
         assert!(
             !end.ended.load(Ordering::SeqCst),
             "the thread survives a failed flush"
@@ -5864,8 +6064,9 @@ mod background_commit_tests {
 
     /// With background commits off no flush is handed over, so no commit
     /// thread is ever started: forty flushes, twenty tripped by commits
-    /// and twenty asked for by `Database::flush`, all run on the thread
-    /// that made them.
+    /// and twenty asked for, ten of them by `Database::flush` and ten by
+    /// `Database::flush_in_background`, all run on the thread that made
+    /// them.
     #[test]
     fn sync_commits_start_no_commit_thread() {
         let rig = Rig::inline();
@@ -5874,7 +6075,11 @@ mod background_commit_tests {
             rig.fill(tag);
             rig.small(tag + 1).expect("the commit that trips a flush");
             rig.small(tag + 2).expect("a small commit");
-            rig.db.flush().expect("an explicit flush");
+            if round % 2 == 0 {
+                rig.db.flush().expect("an explicit flush");
+            } else {
+                rig.db.flush_in_background().expect("a requested flush");
+            }
         }
         let observed = rig.observed();
         assert_eq!(observed.len(), 40, "{observed:?}");
@@ -5887,7 +6092,7 @@ mod background_commit_tests {
         );
         assert_eq!(
             observed.iter().filter(|(_, obs)| obs.explicit).count(),
-            20,
+            10,
             "{observed:?}"
         );
         assert_eq!((slot(&rig.db), started(&rig.db)), (Slot::NotStarted, 0));
@@ -5899,8 +6104,7 @@ mod background_commit_tests {
     /// commits on the thread that made it, and no thread is started for
     /// it.  No public call gets a flush there: one made after the close
     /// finds the overlay empty and no participant, and commits nothing.
-    /// Here a row is put into the overlay directly, and the overlay's
-    /// ceiling lowered so that a commit's flush check takes it.
+    /// Here a row is put into the overlay directly.
     #[test]
     fn a_hand_off_after_the_close_commits_inline() {
         let rig = Rig::new();
@@ -5916,14 +6120,13 @@ mod background_commit_tests {
                 b"row".to_vec(),
             );
             cache.commit_pending(puts, std::iter::empty());
-            // Every commit's check trips a flush from here on.
-            cache.set_limits(1, crate::dbcache::DEFAULT_FLUSH_SECS);
         }
         // Were the flush handed over after all, its commit would be held.
         rig.gate.arm();
         {
             let _writer = rig.db.exclusive_writer();
-            flush_locked(&rig.db.inner, true).expect("the flush commits on this thread");
+            flush_locked(&rig.db.inner, FlushKind::Requested)
+                .expect("the flush commits on this thread");
         }
         let observed = rig.observed();
         assert_eq!(observed.len(), 1, "{observed:?}");
@@ -6118,7 +6321,7 @@ mod participant_close_tests {
         {
             let _writer = db.exclusive_writer();
             db.inner.check_writable().expect("not latched");
-            flush_locked(&db.inner, false).expect("the late flush succeeds");
+            flush_locked(&db.inner, FlushKind::Durable).expect("the late flush succeeds");
         }
         assert_eq!(
             calls.load(Ordering::SeqCst),

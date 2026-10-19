@@ -7,7 +7,8 @@
 - **Date:** 2026-08-10 (proposed), 2026-08-13 (prerequisites complete),
   2026-08-17 (decided), 2026-10-16 (addendum: condition 1 restated for a
   commit on a thread of its own, on by default), 2026-10-19 (addendum:
-  the flush's rows written on the commit thread too)
+  the flush's rows written on the commit thread too; second addendum:
+  the periodic UTXO cache flush counts once its commit lands)
 
 ## Decision: redb stays
 
@@ -1193,3 +1194,61 @@ whose cuts now land inside the insert loop where it writes pages ahead
 of the commit on `dbcommit`, and the chain's
 `tests/utxo_flush_crash_sweep.rs`, in both modes. They have run on
 Linux only.
+
+## Addendum, 2026-10-19 (second) — the periodic UTXO cache flush counts once its commit lands
+
+While the chain catches up, the UTXO cache's periodic flush, once every
+120 s of processing, ended in `Database::flush`, which writes and
+commits on the thread that connects blocks. It now asks for a flush that
+is handed to the commit thread as a commit's own flush is
+(`Database::flush_in_background`), and counts it once
+`Database::is_durable` says a flush that captured it has landed: a flush
+records the commits it captured only after its commit has returned and
+its layers are retired, and never after a failure. Any durable commit
+that carries a UTXO cache flush counts the same way, the write cache's
+own after a size-triggered one included, so the interval runs from the
+last flush a durable commit carried, from the time read as the chain's
+flush returned, after `flush_in_background` for the periodic flush
+(PARITY.md, *Periodic UTXO cache flush interval*).
+
+Condition 1, as restated on 2026-10-16, covers it without a change:
+nothing the chain does counts a flush before that flush's commit has
+synced, the commit is `Durability::Immediate`, and a failure in it
+latches the store, so the flush is never counted and the next write is
+refused. What an unclean stop during catch-up can lose grows by what is
+processed while the periodic flush's commit is under way.
+`Database::flush`, `Database::close`, every forced UTXO cache flush and
+every flush with `DCROXIDE_DB_SYNC_COMMIT` acknowledge durability as
+before.
+
+The change was measured on m3 on 2026-10-18, in default mainnet syncs
+from a dcrd v2.1.7 node on another machine on the same LAN, on top of
+the change of the addendum above, with a thread made for each flush: the
+build that added it took 266.90 s against 274.00 s by the means of three
+runs and two, 7.10 s less, at the edge of that session's ±6.5 s for a
+step between two runs and three, 4.93 s of it after the assume-valid
+block, and the flushes' foreground time fell to 2.6 to 3.2 s a sync from
+5.5 and 6.4 s ([bench-ledger.md](../bench-ledger.md), "Rungs from a
+block server on the LAN, two changes held for their memory, and dcrd
+v2.1.7", builds I and J). It was held with that change for their memory.
+Build K, that code with the commit thread kept, which is the code this
+addendum describes, made 52 flushes inside the clock in each default
+sync from that server on 2026-10-19, every one of them handed over, and
+its two syncs from the loopback server, at the defaults and with
+`--assumevalid=0`, ended with the UTXO set and the block files of every
+full sync from that server since 2026-10-17
+([bench-ledger.md](../bench-ledger.md), "One commit thread for the life
+of the store, a sync that checks every script, and dcrd v2.1.7"). Those
+builds were states of a worktree, not the tree of a commit, and the
+series is one of its own. Whether the periodic flush came due in those
+syncs at all, and how often a size-triggered flush now postpones it,
+were not counted: the flush log's `explicit` no longer marks the
+periodic flush.
+
+Pinned by the chain's stamp tests named in that PARITY.md row, the
+database's commit-mark and `flush_in_background` tests in
+`tests/background_commit.rs`, and the periodic sweeps of
+`tests/utxo_flush_crash_sweep.rs`, which step the chain's periodic clock
+30 s a battery row with the write cache at its default size, copy every
+durable state as it lands and reopen each one, inline and with commits
+on their own thread. They have run on Linux only.
