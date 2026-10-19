@@ -2593,7 +2593,7 @@ closing it would cost.
   (`build_server` in `bin/dcroxide.rs`) locks the chain `Mutex` for
   `best_snapshot()` instead. That is the single-writer lock a block connect
   holds across any UTXO flush it triggers -- 528 to 2,590 ms a flush over the
-  full mainnet replay (`docs/bench-ledger.md:268`) -- and `invalidateblock` or
+  full mainnet replay (`docs/bench-ledger.md:282`) -- and `invalidateblock` or
   `reconsiderblock` holds across a whole reorganization. A handshake that
   arrives then waits the hold out, and one longer than the remote's 30 s
   negotiation timeout fails the connection on both sides, where dcrd answers

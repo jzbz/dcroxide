@@ -1682,9 +1682,9 @@ impl UtxoView {
 /// least as many as [`UtxoView::fetch_input_utxos`] queues, since each
 /// input queues at most one outpoint, so the queue is allocated once at
 /// this size rather than grown as the inputs are queued.  A block's
-/// queue used to grow from four outpoints by doubling, a reallocation
-/// and a copy each time, which a profile of a mainnet sync put at about
-/// 1.1 s of the block thread before the assume-valid block.
+/// queue used to grow from four outpoints by doubling, with a
+/// reallocation at each step, which copies what the queue held unless
+/// the allocator can extend it where it is.
 fn block_input_count(block: &MsgBlock) -> usize {
     block
         .transactions
