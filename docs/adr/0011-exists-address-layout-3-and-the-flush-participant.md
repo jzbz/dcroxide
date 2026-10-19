@@ -1102,3 +1102,11 @@ and `:393`, and `allows_deferred_finish` at `:368`. The cited lines of
 > commit at `:1301` and the participant-only flush's count at `:1367`.
 > The cited lines of the other files did not move, and the functions
 > named are unchanged.
+
+> **Note, 2026-10-18 (second).** The change that compares overlay keys
+> through their first sixteen bytes, held inline, moved the same lines
+> down by another 109, 193 in all: `has_work` is now asked at `:1291`,
+> the prefix guard is at `:1326`, `contribute` is called at `:1362`, the
+> commit at `:1410` and the participant-only flush's count at `:1476`.
+> The cited lines of the other files did not move, and the functions
+> named are unchanged.

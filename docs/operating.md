@@ -1058,10 +1058,19 @@ first was reachable. The overlay has its own ceiling, 300 MiB since
 2026-10-11 and 100 MiB before, and its own interval, 300 seconds; both were
 fixed at compile time, so half the cadence lever could not be pulled. `DCROXIDE_DB_OVERLAY` sets the ceiling in MiB and
 `DCROXIDE_DB_FLUSH_SECS` the interval in seconds. The ceiling counts each
-overlay entry as dcrd does, at 72 bytes plus its key and value, so the
-configured MiB tracks the overlay's resident memory to within allocator
-overhead. Before 2026-09-23 entries were counted at key and value bytes
-only, which let the overlay hold 2–4× the configured figure. The 12.7%
+overlay entry as dcrd does, at 72 bytes plus its key and value, while an
+entry, since its key holds its first sixteen bytes inline, asks the
+allocator for about 97 bytes beside its key and value (74 before, about
+its count), so what the overlay holds runs about 10% above its count for
+a mainnet sync's rows (about 260 counted bytes an entry) and about a
+quarter above it for rows as small as a 25-byte key with no value, with
+the allocator's own overhead on top. The 97 is a counting allocator's
+figure over 200,000 entries; the excess has not been measured in a sync,
+and the peak memory of builds A1 and A2 in the ledger's "Rungs from a
+block server on the LAN, two changes held for their memory, and dcrd
+v2.1.7" does not resolve it.
+Before 2026-09-23 entries were counted at key and value bytes only, which
+let the overlay hold 2–4× the configured figure. The 12.7%
 measurement for `DCROXIDE_DB_OVERLAY=800` below was taken under that older
 accounting, so the same setting now flushes a smaller overlay. The
 re-measurements since, on m3, found no gain: the one above, and one run

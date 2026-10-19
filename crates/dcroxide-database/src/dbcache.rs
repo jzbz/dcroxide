@@ -67,7 +67,113 @@ pub(crate) const DEFAULT_FLUSH_SECS: u64 = 300;
 
 /// One immutable layer of the cache overlay: key to live value, or
 /// `None` for a pending deletion of a stored key.
-pub(crate) type CacheLayer = BTreeMap<Vec<u8>, Option<Vec<u8>>>;
+pub(crate) type CacheLayer = BTreeMap<LayerKey, Option<Vec<u8>>>;
+
+/// The key of an overlay entry: its bytes, with the first sixteen of
+/// them also held inline, where a search of the layer compares them
+/// without following the key's pointer.
+///
+/// A layer's searches run through the comparisons of [`KeyProbe`],
+/// which order keys exactly as their bytes order (`[u8]`'s `Ord`), so a
+/// layer's order, and every walk of it, is the order of the bytes.
+/// Comparing the bytes themselves cost a call into the C library's
+/// `memcmp`, on two pointers into the heap, for every key a descent
+/// visited.  Overlay keys start with a four-byte bucket id, and a UTXO
+/// row's with the two bytes `[3, 3]` after it, so sixteen bytes still
+/// hold ten bytes of its hash: two keys a search compares go on to
+/// their heap bytes only when they share those eighty bits as well.
+///
+/// The words cost memory: an entry of a layer holds about 23 bytes more
+/// than with the bytes alone (see [`NODE_FIELDS_SIZE`]), which the size
+/// the flush gates on does not count, as dcrd's figure does not.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct LayerKey(KeyProbe<'static>);
+
+impl LayerKey {
+    /// The key whose bytes are `bytes`.
+    pub(crate) fn new(bytes: Vec<u8>) -> LayerKey {
+        LayerKey(KeyProbe {
+            head: head_words(&bytes),
+            bytes: std::borrow::Cow::Owned(bytes),
+        })
+    }
+
+    /// The key's bytes.
+    pub(crate) fn as_bytes(&self) -> &[u8] {
+        &self.0.bytes
+    }
+}
+
+impl<'a> std::borrow::Borrow<KeyProbe<'a>> for LayerKey {
+    fn borrow(&self) -> &KeyProbe<'a> {
+        &self.0
+    }
+}
+
+/// A key as the searches of a layer compare it: the first sixteen bytes
+/// as two big-endian words, zero after the end of a shorter key, then
+/// the bytes.  A layer's [`LayerKey`]s own their bytes; a lookup borrows
+/// the caller's slice ([`KeyProbe::of`]), so it allocates nothing.
+///
+/// The words decide every comparison they can, and they order keys as
+/// the bytes do: where the padded words first differ at a byte both
+/// keys have, the bytes differ there too, and where one key has run
+/// out, its zero is below the other's byte there, which is then not
+/// zero, and the shorter key is a prefix of the longer one.  Equal words
+/// fall through to the bytes.
+#[derive(Clone, Debug)]
+pub(crate) struct KeyProbe<'a> {
+    head: [u64; 2],
+    bytes: std::borrow::Cow<'a, [u8]>,
+}
+
+impl<'a> KeyProbe<'a> {
+    /// The probe for a lookup of `key`.
+    pub(crate) fn of(key: &'a [u8]) -> KeyProbe<'a> {
+        KeyProbe {
+            head: head_words(key),
+            bytes: std::borrow::Cow::Borrowed(key),
+        }
+    }
+}
+
+impl PartialEq for KeyProbe<'_> {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        self.head == other.head && *self.bytes == *other.bytes
+    }
+}
+
+impl Eq for KeyProbe<'_> {}
+
+impl PartialOrd for KeyProbe<'_> {
+    #[inline]
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for KeyProbe<'_> {
+    #[inline]
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.head
+            .cmp(&other.head)
+            .then_with(|| (*self.bytes).cmp(&*other.bytes))
+    }
+}
+
+/// The first sixteen bytes of `key` as two big-endian words, zero past
+/// its end.
+#[inline]
+fn head_words(key: &[u8]) -> [u64; 2] {
+    let mut head = [0u8; 16];
+    let len = key.len().min(16);
+    head[..len].copy_from_slice(&key[..len]);
+    let ([high, low], _) = head.as_chunks::<8>() else {
+        unreachable!("sixteen bytes are two words")
+    };
+    [u64::from_be_bytes(*high), u64::from_be_bytes(*low)]
+}
 
 /// The bytes each overlay entry is counted at beyond its key and value
 /// (dcrd treap `nodeFieldsSize`,
@@ -75,14 +181,15 @@ pub(crate) type CacheLayer = BTreeMap<Vec<u8>, Option<Vec<u8>>>;
 /// deletions alike: dcrd's `nodeSize` is this plus the key and value
 /// lengths, and `needsFlush` gates on the sum.
 ///
-/// dcrd sizes it from a treap node's fields, but it also fits this
-/// port's own per-entry cost: 200,000 random-keyed `CacheLayer`
-/// entries hold about 74 bytes each beyond their keys and values
-/// (bytes requested from the allocator, before its own overhead), for
-/// live values and deletions alike.  Counting key and value bytes alone
-/// put the figure 2-4x under the memory held for the small rows that
-/// dominated this store then: before ADR-0011, an `existsaddridx` row
-/// went through the overlay as a 25-byte key and an empty value.
+/// dcrd sizes it from a treap node's fields, and it is near this port's
+/// own per-entry cost: 200,000 random-keyed `CacheLayer` entries hold
+/// about 97 bytes each beyond their keys and values (bytes requested
+/// from the allocator, before its own overhead), for live values and
+/// deletions alike; 74 before the keys held their first sixteen bytes
+/// inline ([`LayerKey`]).  Counting key and value bytes alone put the
+/// figure 2-4x under the memory held for the small rows that dominated
+/// this store then: before ADR-0011, an `existsaddridx` row went
+/// through the overlay as a 25-byte key and an empty value.
 const NODE_FIELDS_SIZE: u64 = 72;
 
 /// The size one entry is counted at (dcrd treap `nodeSize`).
@@ -460,8 +567,9 @@ impl CacheSnapshot {
     /// the key — a deletion in a newer layer hides a value in an older
     /// one.
     pub(crate) fn get(&self, key: &[u8]) -> Option<&Option<Vec<u8>>> {
+        let probe = KeyProbe::of(key);
         for layer in &self.layers {
-            if let Some(entry) = layer.get(key) {
+            if let Some(entry) = layer.get(&probe) {
                 return Some(entry);
             }
         }
@@ -515,21 +623,22 @@ pub(crate) struct LayerMerge<'a> {
 
 /// An ascending range over one layer, one entry of lookahead deep.
 type LayerRange<'a> =
-    std::iter::Peekable<std::collections::btree_map::Range<'a, Vec<u8>, Option<Vec<u8>>>>;
+    std::iter::Peekable<std::collections::btree_map::Range<'a, LayerKey, Option<Vec<u8>>>>;
 
 impl<'a> LayerMerge<'a> {
     fn new(layers: &'a [Arc<CacheLayer>], from: Option<&[u8]>) -> LayerMerge<'a> {
-        // An explicit bound pair: the `RangeFrom<&T>` shorthand cannot
-        // carry an unsized `[u8]` bound.
-        let start = match from {
-            Some(key) => std::ops::Bound::Included(key),
+        let probe = from.map(KeyProbe::of);
+        // One bound pair for a walk from a key and for a walk from the
+        // start.
+        let start = match &probe {
+            Some(probe) => std::ops::Bound::Included(probe),
             None => std::ops::Bound::Unbounded,
         };
         let iters = layers
             .iter()
             .map(|layer| {
                 layer
-                    .range::<[u8], _>((start, std::ops::Bound::Unbounded))
+                    .range::<KeyProbe<'_>, _>((start, std::ops::Bound::Unbounded))
                     .peekable()
             })
             .collect();
@@ -542,7 +651,7 @@ impl<'a> Iterator for LayerMerge<'a> {
 
     fn next(&mut self) -> Option<Self::Item> {
         // The smallest key across the layer heads.
-        let mut min: Option<&'a Vec<u8>> = None;
+        let mut min: Option<&'a LayerKey> = None;
         for iter in self.iters.iter_mut() {
             if let Some(&(key, _)) = iter.peek() {
                 match min {
@@ -565,7 +674,7 @@ impl<'a> Iterator for LayerMerge<'a> {
                 continue;
             };
             if newest.is_none() {
-                newest = Some((key.as_slice(), entry));
+                newest = Some((key.as_bytes(), entry));
             }
         }
         newest
@@ -601,7 +710,7 @@ fn merge_newest_pair(layers: &mut Vec<Arc<CacheLayer>>) -> u64 {
         // Start from the newer layer, and add each older entry it does
         // not shadow.
         let mut merged = Arc::unwrap_or_clone(newer);
-        let mut keep = |key: Vec<u8>, entry: Option<Vec<u8>>| {
+        let mut keep = |key: LayerKey, entry: Option<Vec<u8>>| {
             #[cfg(test)]
             count_merge_insert();
             match merged.entry(key) {
@@ -611,8 +720,8 @@ fn merge_newest_pair(layers: &mut Vec<Arc<CacheLayer>>) -> u64 {
                 // The newer copy stays, and this older one is no longer
                 // retained.
                 std::collections::btree_map::Entry::Occupied(slot) => {
-                    reclaimed =
-                        reclaimed.saturating_add(node_size(slot.key().len(), entry.as_deref()));
+                    reclaimed = reclaimed
+                        .saturating_add(node_size(slot.key().as_bytes().len(), entry.as_deref()));
                 }
             }
         };
@@ -627,10 +736,10 @@ fn merge_newest_pair(layers: &mut Vec<Arc<CacheLayer>>) -> u64 {
         // Start from the older layer — taking it outright when no
         // snapshot still names it — and let the newer layer overwrite.
         let mut merged = Arc::unwrap_or_clone(older);
-        let mut absorb = |key: Vec<u8>, entry: Option<Vec<u8>>| {
+        let mut absorb = |key: LayerKey, entry: Option<Vec<u8>>| {
             #[cfg(test)]
             count_merge_insert();
-            let key_len = key.len();
+            let key_len = key.as_bytes().len();
             if let Some(shadowed) = merged.insert(key, entry) {
                 // The older copy of this key is gone: its entry, its key
                 // bytes and, when it held one, its value bytes are no
@@ -954,7 +1063,7 @@ impl DbCache {
                 Arc::make_mut(&mut self.buckets).remove_row(&key);
             }
             let key_len = key.len();
-            match top.insert(key, None) {
+            match top.insert(LayerKey::new(key), None) {
                 // Replaced an entry in the mutable layer: the key stays,
                 // any value it held is freed.
                 Some(displaced) => {
@@ -975,7 +1084,7 @@ impl DbCache {
             }
             let key_len = key.len();
             let added = value.len() as u64;
-            match top.insert(key, Some(value)) {
+            match top.insert(LayerKey::new(key), Some(value)) {
                 Some(displaced) => {
                     self.total_size = self
                         .total_size
@@ -1791,7 +1900,7 @@ mod tests {
             .layers
             .iter()
             .flat_map(|layer| layer.iter())
-            .map(|(k, v)| node_size(k.len(), v.as_deref()))
+            .map(|(k, v)| node_size(k.as_bytes().len(), v.as_deref()))
             .sum()
     }
 
@@ -3052,7 +3161,7 @@ mod tests {
                 *seed ^= *seed << 17;
                 let key = format!("k{:05}", *seed % 400).into_bytes();
                 let entry = (!seed.is_multiple_of(4)).then(|| vec![0xab; (*seed % 37) as usize]);
-                map.insert(key, entry);
+                map.insert(super::LayerKey::new(key), entry);
             }
             map
         }
@@ -3083,7 +3192,7 @@ mod tests {
                 let mut want_reclaimed = 0u64;
                 for (key, entry) in &newer {
                     if let Some(shadowed) = want.insert(key.clone(), entry.clone()) {
-                        want_reclaimed += node_size(key.len(), shadowed.as_deref());
+                        want_reclaimed += node_size(key.as_bytes().len(), shadowed.as_deref());
                     }
                 }
 
@@ -3671,5 +3780,150 @@ mod flush_barrier_tests {
             cache.cached.get(b"a").is_some(),
             "the data is still readable"
         );
+    }
+}
+
+#[cfg(test)]
+mod layer_key_tests {
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    use super::{CacheLayer, CacheSnapshot, KeyProbe, LayerKey};
+
+    /// Keys that meet the edges of the inline words: empty and short keys,
+    /// keys that are prefixes of others, zero bytes where a shorter key's
+    /// words are padded with zeros, keys that differ only past the
+    /// sixteenth byte, and keys shaped as the overlay's rows are, a bucket
+    /// id then a UTXO row's `[3, 3]` and a hash.
+    fn edge_keys() -> Vec<Vec<u8>> {
+        let mut keys: Vec<Vec<u8>> = vec![
+            vec![],
+            vec![0],
+            vec![0, 0],
+            vec![1],
+            vec![0xff],
+            b"ab".to_vec(),
+            b"ab\0".to_vec(),
+            b"ab\0\0".to_vec(),
+            b"ab\x01".to_vec(),
+            b"abc".to_vec(),
+        ];
+        let sixteen: Vec<u8> = (1..=16).collect();
+        for len in [7usize, 8, 9, 15, 16, 17, 24, 40] {
+            let mut key: Vec<u8> = (1..=len as u8).collect();
+            keys.push(key.clone());
+            // The same with its last byte one higher, and with a zero
+            // appended.
+            if let Some(last) = key.last_mut() {
+                *last = last.wrapping_add(1);
+            }
+            keys.push(key.clone());
+            key.push(0);
+            keys.push(key);
+        }
+        for tail in [&[][..], &[0], &[0, 0], &[1], &[0xff], &[0, 1], &[7; 20]] {
+            let mut key = sixteen.clone();
+            key.extend_from_slice(tail);
+            keys.push(key);
+        }
+        // Rows sharing the bucket id and `[3, 3]`, hashes alike in their
+        // first ten bytes and apart only past the inline words.
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for shared in [0usize, 4, 10, 12, 31] {
+            for _ in 0..6 {
+                let mut key = vec![0, 0, 0, 7, 3, 3];
+                key.extend((0..32).map(|i| if i < shared { 0x5a } else { next() as u8 }));
+                key.push(u8::from(next() % 2 == 0));
+                key.push((next() % 4) as u8);
+                keys.push(key);
+            }
+        }
+        keys.sort();
+        keys.dedup();
+        keys
+    }
+
+    /// A layer key and a probe order and compare as their bytes do, in
+    /// every pair of the edge keys and either way round, an owned key
+    /// against a borrowing probe included: a layer's order, and so the
+    /// order every walk of the overlay and every flush writes in, is the
+    /// order of the bytes.
+    #[test]
+    fn layer_keys_order_as_their_bytes_do() {
+        let keys = edge_keys();
+        assert!(keys.len() >= 64, "{} keys", keys.len());
+        for a in &keys {
+            for b in &keys {
+                let want = a.cmp(b);
+                let (owned_a, owned_b) = (LayerKey::new(a.clone()), LayerKey::new(b.clone()));
+                assert_eq!(owned_a.cmp(&owned_b), want, "{a:02x?} against {b:02x?}");
+                assert_eq!(owned_a == owned_b, a == b, "{a:02x?} against {b:02x?}");
+                let (probe_a, probe_b) = (KeyProbe::of(a), KeyProbe::of(b));
+                assert_eq!(probe_a.cmp(&probe_b), want, "{a:02x?} against {b:02x?}");
+                let borrowed: &KeyProbe<'_> = std::borrow::Borrow::borrow(&owned_a);
+                assert_eq!(borrowed.cmp(&probe_b), want, "{a:02x?} against {b:02x?}");
+                assert_eq!(*borrowed == probe_b, a == b, "{a:02x?} against {b:02x?}");
+            }
+            assert_eq!(LayerKey::new(a.clone()).as_bytes(), a.as_slice());
+        }
+    }
+
+    /// Lookups and walks of a layer agree with a map of byte keys: every
+    /// key the layer holds is found with its entry, a key it does not
+    /// hold is not, whatever its inline words share with one it holds,
+    /// and a walk from any key, held or not, a prefix of held keys or
+    /// past all of them, yields the same entries in the same order.
+    #[test]
+    fn a_layer_looks_up_and_walks_as_a_map_of_byte_keys() {
+        let keys = edge_keys();
+        // Every other key in the layer, so that each held key has absent
+        // neighbours; a deletion for every third held key.
+        let mut want: BTreeMap<Vec<u8>, Option<Vec<u8>>> = BTreeMap::new();
+        let mut layer = CacheLayer::new();
+        for (i, key) in keys.iter().enumerate().filter(|(i, _)| i % 2 == 0) {
+            let entry = (i % 3 != 0).then(|| vec![u8::try_from(i % 251).expect("fits"); i % 5]);
+            want.insert(key.clone(), entry.clone());
+            layer.insert(LayerKey::new(key.clone()), entry);
+        }
+        let snapshot = CacheSnapshot {
+            layers: vec![Arc::new(layer)],
+        };
+        for key in &keys {
+            assert_eq!(snapshot.get(key), want.get(key), "lookup of {key:02x?}");
+        }
+        let mut froms = keys.clone();
+        froms.extend(
+            keys.iter()
+                .filter(|k| !k.is_empty())
+                .map(|k| k[..k.len() - 1].to_vec()),
+        );
+        froms.push(vec![0xff; 50]);
+        for from in &froms {
+            let walked: Vec<(Vec<u8>, Option<Vec<u8>>)> = snapshot
+                .merged_from(from)
+                .map(|(k, v)| (k.to_vec(), v.clone()))
+                .collect();
+            let expected: Vec<(Vec<u8>, Option<Vec<u8>>)> = want
+                .range::<[u8], _>((
+                    std::ops::Bound::Included(&from[..]),
+                    std::ops::Bound::Unbounded,
+                ))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            assert_eq!(walked, expected, "a walk from {from:02x?}");
+            assert_eq!(
+                snapshot.holds_prefix(from),
+                want.keys().any(|k| k.starts_with(from)),
+                "a prefix {from:02x?}"
+            );
+        }
+        let all: Vec<Vec<u8>> = snapshot.merged().map(|(k, _)| k.to_vec()).collect();
+        assert_eq!(all, want.keys().cloned().collect::<Vec<_>>());
     }
 }

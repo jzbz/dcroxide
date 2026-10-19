@@ -1077,13 +1077,17 @@ against upstream and the port is faithful.
   before the fold. Each entry is counted at dcrd's treap node size:
   `nodeFieldsSize` (72) plus its key and value bytes, for tombstones as for
   live values. For a single layer that is exactly the figure dcrd's
-  `needsFlush` gates the 100 MiB ceiling on. The 72 also tracks this port's
-  memory: a `BTreeMap` overlay entry holds about 74 bytes beyond its key and
-  value. Counting a rewritten key once (as a single treap legitimately does)
-  put the figure ~5× under the bytes actually held. Counting key and value
-  bytes without the per-entry term put small-row overlays 2–4× under (an
-  `existsaddridx` row was a 25-byte key and an empty value before layout 3).
-  Pinned by `dbcache.rs`'s own suite, which sizes entries as treap nodes
+  `needsFlush` gates the 100 MiB ceiling on. The 72 is near this port's memory
+  without matching it: a `BTreeMap` overlay entry holds about 97 bytes beyond
+  its key and value, 74 before each key also held its first sixteen bytes
+  inline for the layer's searches (`LayerKey`, which compares those bytes as
+  two big-endian words and falls through to the whole key when they are equal,
+  an order identical to the bytes'). The counted figure stays dcrd's. Counting
+  a rewritten key once (as a single treap legitimately does) put the figure
+  ~5× under the bytes actually held. Counting key and value bytes without the
+  per-entry term put small-row overlays 2–4× under (an `existsaddridx` row was
+  a 25-byte key and an empty value before layout 3). Pinned by `dbcache.rs`'s
+  own suite, which sizes entries as treap nodes
   (`entries_are_sized_as_dcrds_treap_nodes`), asserts the running total
   against what the layers hold, exercises the flush against a genuinely
   three-deep stack, fails if the merge rule is deleted, and fails if a layer a
@@ -1097,8 +1101,11 @@ against upstream and the port is faithful.
   committed beside a flush in flight do not fold among themselves above the
   layer it captured (`layers_committed_beside_a_flush_fold_among_themselves`),
   or a reader loses its view while the layers around it fold
-  (`readers_keep_their_view_while_the_layers_around_them_fold`). One boundary:
-  a reader's snapshot can name a layer the stack has already merged away, and
+  (`readers_keep_their_view_while_the_layers_around_them_fold`), or if a
+  layer's key order departs from its bytes' or a lookup or walk departs from a
+  map of byte keys (`layer_keys_order_as_their_bytes_do`,
+  `a_layer_looks_up_and_walks_as_a_map_of_byte_keys`). One boundary: a
+  reader's snapshot can name a layer the stack has already merged away, and
   those bytes stay allocated until the reader drops — uncounted, because they
   belong to a transaction's lifetime rather than the overlay's, which is where
   dcrd's accounting draws the same line.
