@@ -3897,14 +3897,14 @@ mod layer_key_tests {
         for key in &keys {
             assert_eq!(snapshot.get(key), want.get(key), "lookup of {key:02x?}");
         }
-        let mut froms = keys.clone();
-        froms.extend(
+        let mut starts = keys.clone();
+        starts.extend(
             keys.iter()
                 .filter(|k| !k.is_empty())
                 .map(|k| k[..k.len() - 1].to_vec()),
         );
-        froms.push(vec![0xff; 50]);
-        for from in &froms {
+        starts.push(vec![0xff; 50]);
+        for from in &starts {
             let walked: Vec<(Vec<u8>, Option<Vec<u8>>)> = snapshot
                 .merged_from(from)
                 .map(|(k, v)| (k.to_vec(), v.clone()))
