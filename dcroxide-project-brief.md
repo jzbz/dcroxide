@@ -42,7 +42,7 @@ assembles them end to end: config and CLI, the chain engine with full
 consensus validation, mempool and fee estimation, mining and the CPU miner, the
 P2P server with sync, relay, and StakeShuffle mixing message relay, the
 JSON-RPC/websocket server, the tool commands, the pipe IPC lifecycle, and the
-Windows service wrapper. The gate runs 2,482 tests across 442 suites on Linux,
+Windows service wrapper. The gate runs 2,483 tests across 442 suites on Linux,
 most of them differential against dcrd or replaying sessions generated inside dcrd's own
 packages. The parity target moved six times during the port, from
 `release-v2.1.5` to upstream master `452c1a6c` and then through `29f17894`,

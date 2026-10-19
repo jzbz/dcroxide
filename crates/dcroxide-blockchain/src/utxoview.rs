@@ -1038,7 +1038,7 @@ impl UtxoView {
         resolver: &impl UtxoResolver,
         is_treasury_enabled: bool,
     ) {
-        let mut needed = Vec::new();
+        let mut needed = Vec::with_capacity(block_input_count(block));
         self.queue_regular_input_utxos(block, regular_tx_hashes, &mut needed, is_treasury_enabled);
         self.queue_stake_input_utxos(block, &mut needed, is_treasury_enabled);
         self.resolve_queued(resolver, &needed);
@@ -1678,6 +1678,22 @@ impl UtxoView {
     }
 }
 
+/// The number of inputs of the block's transactions in both trees: at
+/// least as many as [`UtxoView::fetch_input_utxos`] queues, since each
+/// input queues at most one outpoint, so the queue is allocated once at
+/// this size rather than grown as the inputs are queued.  A block's
+/// queue used to grow from four outpoints by doubling, a reallocation
+/// and a copy each time, which a profile of a mainnet sync put at about
+/// 1.1 s of the block thread before the assume-valid block.
+fn block_input_count(block: &MsgBlock) -> usize {
+    block
+        .transactions
+        .iter()
+        .chain(&block.stransactions)
+        .map(|tx| tx.tx_in.len())
+        .sum()
+}
+
 /// The lookup of the grandfathered same-block stake spends on the
 /// given network, by height.
 fn sbss_violation_lookup(params: &Params) -> impl Fn(i64) -> Option<Hash> + '_ {
@@ -2205,6 +2221,43 @@ mod tests {
                 assert_eq!(stxo.transaction_type(), tx_type);
             }
         }
+    }
+
+    /// The fetch queue's size is every input of both trees, which no
+    /// fetch can queue more outpoints than.
+    #[test]
+    fn the_fetch_queue_is_sized_by_every_input_of_the_block() {
+        let spend = |byte: u8, inputs: u32| MsgTx {
+            tx_in: (0..inputs)
+                .map(|index| {
+                    let outpoint = OutPoint {
+                        hash: Hash([byte; 32]),
+                        index,
+                        tree: 0,
+                    };
+                    input_spending(outpoint, 1_000, 100, 1)
+                })
+                .collect(),
+            tx_out: alloc::vec![op_true_out(1_000)],
+            ..MsgTx::default()
+        };
+        let ticket_input = OutPoint {
+            hash: Hash([0x44; 32]),
+            index: 3,
+            tree: 1,
+        };
+        let mut block = stake_block(alloc::vec![ticket_spending(ticket_input, 5_000, 100, 1)]);
+        block.transactions = alloc::vec![spend(0x01, 1), spend(0x02, 3), spend(0x03, 2)];
+        assert_eq!(block_input_count(&block), 7);
+        let hashes = collect_tx_hashes(&block.transactions);
+        let mut view = UtxoView::new();
+        let mut needed = Vec::new();
+        view.queue_regular_input_utxos(&block, &hashes, &mut needed, false);
+        view.queue_stake_input_utxos(&block, &mut needed, false);
+        // The first transaction is taken for the coinbase.
+        assert_eq!(needed.len(), 6);
+        assert!(needed.len() <= block_input_count(&block));
+        assert_eq!(block_input_count(&stake_block(Vec::new())), 0);
     }
 
     /// A ticket's submission output spent in a block and restored from
