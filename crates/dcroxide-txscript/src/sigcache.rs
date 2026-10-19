@@ -165,6 +165,23 @@ impl SigCache {
         })
     }
 
+    /// The number of verifications cached.  It only reads: every entry
+    /// still comes from the engine's own verify alone.  dcrd's cache
+    /// exports no count; this one is for tests that must tell whether a
+    /// run put entries in the cache that a later run found.
+    pub fn len(&self) -> usize {
+        self.valid_sigs
+            .read()
+            .expect("sigcache lock poisoned")
+            .entries
+            .len()
+    }
+
+    /// Whether no verification is cached.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     /// Record a SUCCESSFUL verification of `signature` over
     /// `sig_hash` under `pub_key` (dcrd `SigCache.Add`).  Callers
     /// must never add failed verifications.  When the cache is full
@@ -274,6 +291,16 @@ impl SigCache {
         false
     }
 
+    /// None: the inert cache stores nothing.
+    pub fn len(&self) -> usize {
+        0
+    }
+
+    /// Always: the inert cache stores nothing.
+    pub fn is_empty(&self) -> bool {
+        true
+    }
+
     /// Dropped: the inert cache stores nothing.
     pub(crate) fn add(
         &self,
@@ -319,9 +346,11 @@ mod tests {
 
         // Nothing cached yet.
         assert!(!cache.exists(&sig_hash, SigCacheSuite::EcdsaSecp256k1, &sig, &key));
+        assert!(cache.is_empty());
 
         cache.add(&sig_hash, SigCacheSuite::EcdsaSecp256k1, &sig, &key);
         assert!(cache.exists(&sig_hash, SigCacheSuite::EcdsaSecp256k1, &sig, &key));
+        assert_eq!((cache.len(), cache.is_empty()), (1, false));
 
         // A key hit still misses when the signature bytes, public key
         // bytes, or suite differ.
@@ -351,6 +380,7 @@ mod tests {
         // always keeps the newest.
         cache.add(&[3u8; 32], SigCacheSuite::EcdsaSecp256k1, &sig, &key);
         assert_eq!(entry_count(&cache), 2);
+        assert_eq!(cache.len(), 2);
         assert!(cache.exists(&[3u8; 32], SigCacheSuite::EcdsaSecp256k1, &sig, &key));
         let survivors = [
             cache.exists(&[1u8; 32], SigCacheSuite::EcdsaSecp256k1, &sig, &key),
@@ -434,6 +464,7 @@ mod tests {
             &[4, 5, 6]
         ));
         assert_eq!(entry_count(&cache), 0);
+        assert!(cache.is_empty());
     }
 
     /// A minimal signed pay-to-pubkey spend: the coinbase-style

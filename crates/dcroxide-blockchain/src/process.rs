@@ -8743,6 +8743,49 @@ pub struct VoteInfo {
     pub agenda_status: Vec<ThresholdStateTuple>,
 }
 
+/// What the node's signature pre-verification asks of the chain, kept
+/// apart from the processing above.
+impl Chain {
+    /// The height at and below which the blocks of the best header's
+    /// branch are connected without their scripts checked: `i64::MAX`
+    /// in bulk import mode, the height of the assumed valid node clamped
+    /// as [`Chain::is_assume_valid_ancestor`] clamps it when that node is
+    /// an ancestor of the best header, and -1 otherwise, with no assumed
+    /// valid node or a best header less than two weeks of blocks in.
+    ///
+    /// For the node's signature pre-verification
+    /// (`crate::preverify::Preverifier::set_floor`), which needs no more
+    /// than a good guess: a block off that branch, or an assumed valid
+    /// node on another, is only a block pre-verified for nothing or not
+    /// pre-verified.  Nothing is decided from it.
+    pub fn script_skip_floor(&self) -> i64 {
+        if self.bulk_import_mode {
+            return i64::MAX;
+        }
+        let (Some(assume_valid_node), Some(best_header)) =
+            (self.assume_valid_node, self.index.best_header())
+        else {
+            return -1;
+        };
+        if !self.store.is_ancestor_of(assume_valid_node, best_header) {
+            return -1;
+        }
+        let best_height = self.store.node(best_header).height;
+        if best_height < self.expected_blocks_in_two_weeks {
+            return -1;
+        }
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "best_height >= expected_blocks_in_two_weeks by the early return above"
+        )]
+        let clamp_to_height = best_height - self.expected_blocks_in_two_weeks;
+        self.store
+            .node(assume_valid_node)
+            .height
+            .min(clamp_to_height)
+    }
+}
+
 #[cfg(test)]
 #[allow(
     clippy::arithmetic_side_effects,

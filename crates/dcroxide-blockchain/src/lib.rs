@@ -44,6 +44,7 @@ mod error;
 pub mod gotime;
 pub mod notifications;
 mod pkscript;
+pub mod preverify;
 pub mod process;
 mod ruleerror;
 #[cfg(any(test, feature = "std"))]

@@ -11,7 +11,8 @@
   (addendum: more work on the reading thread, and threads kept for the
   scripts of a connected block; second addendum: a short-lived thread
   for the metadata commit), 2026-10-17 (addendum: the reading thread
-  counts signature operations)
+  counts signature operations; second addendum: the script pool's
+  helpers pre-verify the signatures of blocks read ahead)
 
 ## Context
 
@@ -619,3 +620,83 @@ D2 is unchanged: no thread is added.
 > B). Those builds were states of a worktree, not the tree of a commit,
 > and the series is one of its own. A link that leaves the reading
 > thread no time to spare was not tried.
+
+## Addendum, 2026-10-17 (second) — the script pool's helpers pre-verify the signatures of blocks read ahead
+
+While the sync peer's connection is read ahead, which it is until the
+initial chain sync is done, the helpers of the script pool
+(`scriptval-N`, first addendum of 2026-10-16) also check, while no batch
+of a connected block wants them, the signatures of the blocks the
+reading thread holds, so that the chain finds them in the signature
+cache when it connects those blocks (PARITY.md, *Signature
+pre-verification ahead of the block thread*). dcrd verifies a block's
+signatures when it connects the block, or earlier only at mempool
+acceptance.
+
+No thread is added. The pool gains lanes
+(`crates/dcroxide-blockchain/src/scriptpool.rs`, *Lanes*): a lane is a
+queue of jobs, each a run of units a helper claims one at a time, with
+the most helpers it may hold at once and the most bytes its queued jobs
+may hold. A helper that scans the queue of batches and finds none that
+wants it takes up the oldest job of a lane with room, and before each
+unit compares a count of the batches queued so far, which every batch
+bumps under the pool's mutex, with the value it read under the
+acquisition in which it found no batch; once the count has moved it
+leaves the job and scans again. So batches come first: the parked
+helpers are woken for a batch as before, and a helper in a lane joins a
+batch that still has a ticket after the unit it holds. The lanes' state
+is guarded by the pool's one mutex, so the argument that no wake-up is
+lost is the one the pool had: a helper is on the stack of parked helpers
+only after a scan under the same acquisition found neither a batch nor a
+lane job, and a lane's submitter pops parked helpers under it. Of a job
+only two methods are called under the mutex, and they only read and
+write its atomics (whether it has a unit left, and its withdrawal); a
+lane's queue may allocate under the mutex, and a closed lane's last
+helper notifies its closer under it. A lane is closed with its jobs
+withdrawn, and the close waits on a condition variable of the pool until
+no helper is inside one; a helper inside a unit finishes it first. In an
+unwinding build a unit that panics withdraws its job and the helper goes
+on serving; that is the pool's second `catch_unwind`, inert under the
+release profile like the first. A lane holds no verdict: nothing waits
+for its work, and the batches' verdict rule is not touched.
+
+The one lane is the pre-verifier's
+(`crates/dcroxide-blockchain/src/preverify.rs`), of at most two fewer
+helpers than the physical cores the process may run on, at least one
+from two cores, counted from `/proc/self/status` and each allowed CPU's
+topology in `/sys` and taken as half the logical CPUs where those cannot
+be read (`crates/dcroxide-node/src/preverify.rs`), so that one core is
+left to the block thread and one to the reading, index and commit
+threads; what a helper on the block thread's SMT sibling would cost that
+thread was not measured. A unit is one input whose signature script has
+the guessed shape, a `SigHashAll` signature and a public key: one hash
+of its transaction's witness serialization and at most one signature
+verification. The reading thread submits each block it has hashed while
+reading ahead is wanted, taking the pool's mutex for it (never with the
+read-ahead queue's), and the thread that processes blocks withdraws a
+block as it takes it. `Preverifier::shutdown` runs right after block
+processing stops. The helpers it creates are counted against the pool's
+width, as a batch's are, and a refusal of a thread is handled as for a
+batch.
+
+`DCROXIDE_PREVERIFY=off` (or any whole number that is zero) leaves the
+node as it was; a positive whole number sets the most helpers instead,
+never more than the pool's width.
+
+The change moved a line that the first addendum of 2026-10-16 cites,
+whose number stays as it was written: `Pool::global` is now at
+`crates/dcroxide-blockchain/src/scriptpool.rs:571`.
+
+D2 is unchanged.
+
+> **Note, 2026-10-18, after the syncs of that day.** Pre-verification
+> was measured in syncs on m3, from a dcrd v2.1.7 node on another
+> machine on the same LAN: the build that added it took 7.95 s less than
+> the build below it by the means of two runs each, 8.50 s less after
+> the assume-valid block, with 13.9 s less of the block thread's time on
+> a processor and 29.0 s less of the script pool's threads'
+> ([bench-ledger.md](../bench-ledger.md), "Rungs from a block server on
+> the LAN, two changes held for their memory, and dcrd v2.1.7", build
+> G). The build below it held a change that was not kept, those builds
+> were states of a worktree and not the tree of a commit, and the series
+> is one of its own.

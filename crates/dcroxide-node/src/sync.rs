@@ -103,7 +103,21 @@ pub struct NodeSyncChain {
     chain: Arc<Mutex<Chain>>,
     params: Params,
     ntfn_handler: Option<crate::chainntfns::ChainNtfnHandler>,
+    /// The signature pre-verifier the blocks read ahead are handed to,
+    /// told after each block the height whose blocks the chain checks
+    /// no script of ([`crate::preverify`]).
+    preverifier: Option<Arc<dcroxide_blockchain::preverify::Preverifier>>,
+    /// What that floor was last worked out from: the best header, the
+    /// assumed valid node and the bulk import mode.
+    floor_from: Option<FloorFrom>,
 }
+
+/// What [`Chain::script_skip_floor`] depends on that can change.
+type FloorFrom = (
+    Option<dcroxide_blockchain::blockindex::NodeId>,
+    Option<dcroxide_blockchain::blockindex::NodeId>,
+    bool,
+);
 
 impl NodeSyncChain {
     /// Adapt the shared chain for the sync manager.
@@ -112,6 +126,8 @@ impl NodeSyncChain {
             chain,
             params,
             ntfn_handler: None,
+            preverifier: None,
+            floor_from: None,
         }
     }
 
@@ -121,6 +137,16 @@ impl NodeSyncChain {
     /// callback runs under the chain mutex, so the lookup waits here).
     pub fn set_chain_ntfn_handler(&mut self, handler: crate::chainntfns::ChainNtfnHandler) {
         self.ntfn_handler = Some(handler);
+    }
+
+    /// Keep the signature pre-verifier's floor up to date after each
+    /// block from here on (`Chain::script_skip_floor`).
+    pub fn set_preverifier(
+        &mut self,
+        preverifier: Arc<dcroxide_blockchain::preverify::Preverifier>,
+    ) {
+        self.preverifier = Some(preverifier);
+        self.floor_from = None;
     }
 
     fn locked(&self) -> std::sync::MutexGuard<'_, Chain> {
@@ -225,15 +251,31 @@ impl SyncChain for NodeSyncChain {
         // goes in without: the chain hashes it at the point it always
         // has, after its duplicate and header checks.
         let (fork_len, errs) = {
-            let mut chain = self.locked();
-            match block {
+            let mut chain = self.chain.lock().expect("chain mutex poisoned");
+            let result = match block {
                 ArrivedBlock::Plain(block) => {
                     chain.process_shared_block(block, adjusted_time_unix(), &self.params)
                 }
                 ArrivedBlock::Hashed(hashed) => {
                     chain.process_hashed_block(hashed, adjusted_time_unix(), &self.params)
                 }
+            };
+            // The blocks read ahead are pre-verified only above the
+            // height whose blocks the chain checks no script of.  It is
+            // worked out again only when what it depends on has moved,
+            // which during the sync is seldom.
+            if let Some(preverifier) = &self.preverifier {
+                let from = (
+                    chain.index.best_header(),
+                    chain.assume_valid_node,
+                    chain.bulk_import_mode,
+                );
+                if self.floor_from != Some(from) {
+                    self.floor_from = Some(from);
+                    preverifier.set_floor(chain.script_skip_floor());
+                }
             }
+            result
         };
 
         // Run the deferred mempool maintenance and winning-tickets
@@ -923,6 +965,32 @@ mod tests {
         let chain = Arc::new(Mutex::new(Chain::new(&params, Hash::ZERO, false)));
         let sync_chain = NodeSyncChain::new(Arc::clone(&chain), params);
         (sync_chain, chain, blocks)
+    }
+
+    /// The pre-verifier's floor follows the chain: nothing is taken until
+    /// a block has been processed, then every block above the height the
+    /// chain checks no script at or below, which a chain without an
+    /// assumed valid block does not have; and the floor is worked out
+    /// again when what it depends on moves, here the bulk import mode.
+    #[test]
+    fn the_preverifier_floor_follows_the_chain() {
+        let (mut sync_chain, chain, blocks) = regnet_sync_chain();
+        let cache = Arc::new(dcroxide_txscript::SigCache::new(100));
+        let Some(preverifier) = dcroxide_blockchain::preverify::Preverifier::new(cache, 1, 1 << 20)
+        else {
+            return;
+        };
+        let preverifier = Arc::new(preverifier);
+        sync_chain.set_preverifier(Arc::clone(&preverifier));
+        assert_eq!(preverifier.floor(), i64::MAX);
+        let arrived = ArrivedBlock::from(Arc::clone(&blocks[0]));
+        assert_eq!(sync_chain.process_block(&arrived).expect("accepted"), 0);
+        assert_eq!(preverifier.floor(), -1);
+
+        chain.lock().expect("chain").bulk_import_mode = true;
+        let arrived = ArrivedBlock::from(Arc::clone(&blocks[1]));
+        assert_eq!(sync_chain.process_block(&arrived).expect("accepted"), 0);
+        assert_eq!(preverifier.floor(), i64::MAX);
     }
 
     /// A block that arrives without hashes is handed to the chain

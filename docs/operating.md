@@ -562,20 +562,21 @@ committed it was run on 2026-10-13, inside `4700cf1` and only on
 reading thread's added work, the record and the merkle trees, has been
 measured apart only in builds that are not the code as it stands (the
 count of signature operations it also makes has been run in syncs only
-beside another change, below), where it moved about 7 s and 5 s of
-processor time from the thread that processes blocks to the reading
-thread rather than removing it, which paid there because the reading
-thread, fed by a server on the same machine, waited over 320 s for the
-other; in `88c46c3`, on 2026-10-17, it waited 275 to 278 s for the other
-in each default run. No sync has been run with it over a delayed link,
-or over a real one with a longer round trip than a LAN's (the syncs of
-2026-10-18 from a node on another machine on the same LAN had it on),
-where the round trip and not the thread that processes blocks may set
-the pace and it may gain nothing, nor on fewer cores or with
-`--assumevalid=0`, nor on macOS or Windows, where none of its tests has
-been run either; with `--noexistsaddrindex` it was run once in `4700cf1`
-on 2026-10-13 and twice in `88c46c3` on 2026-10-17, and never against a
-run with it off.
+beside another change, below, and its scan of each block above the
+floor for inputs to hand to the pre-verifier only on top of a change
+that was not kept), where it moved about 7 s and 5 s of processor time
+from the thread that processes blocks to the reading thread rather than
+removing it, which paid there because the reading thread, fed by a
+server on the same machine, waited over 320 s for the other; in
+`88c46c3`, on 2026-10-17, it waited 275 to 278 s for the other in each
+default run. No sync has been run with it over a delayed link, or over a
+real one with a longer round trip than a LAN's (the syncs of 2026-10-18
+from a node on another machine on the same LAN had it on), where the
+round trip and not the thread that processes blocks may set the pace and
+it may gain nothing, nor on fewer cores or with `--assumevalid=0`, nor
+on macOS or Windows, where none of its tests has been run either; with
+`--noexistsaddrindex` it was run once in `4700cf1` on 2026-10-13 and
+twice in `88c46c3` on 2026-10-17, and never against a run with it off.
 
 Whether reading ahead ever costs anything has not been measured: the
 loopback runs above are all there is. Set `DCROXIDE_READ_AHEAD=off` (or
@@ -591,7 +592,8 @@ read-ahead thread for peer P: E -- reading on the input thread`, when
 the operating system refuses the thread: that connection goes on being
 read by its own thread, as it was until then. A node that read ahead
 also logs one line under `SRVR` as it shuts down, just before `Server
-shutdown complete`:
+shutdown complete`, or before the pre-verification's line (below) when
+there is one:
 
 ```text
 Read-ahead: N blocks (B bytes) on C connections; checksum and decode X s and hashing Y s done off the block thread; the reader waited G s for the block thread; the block thread waited W s for the reader; at most Q items queued; index queue full for I s; block-file records laid out for R blocks in Z s, K written as laid out
@@ -656,22 +658,83 @@ dcroxide, since `f60ae3a`, checks each transaction tree with 4 script
 items or more of a block it connects on helper threads that live as long
 as the process, the thread that processes blocks checking with them
 ([PARITY.md](../PARITY.md), *Script checks of a connected block*). They
-are named `scriptval-N`, are created as batches want them, as many as
-the widest batch so far less one and never more than one fewer than the
-logical CPUs the process may run on, and are parked, using no processor
-time, while there is nothing to check. Before the assume-valid block no
-script is checked, so a sync from genesis starts none until then, and a
-node that has checked scripts keeps the ones it made until it exits.
-Count them against a task limit (`TasksMax` under systemd, a cgroup's
+are named `scriptval-N`, are created as batches or the signature
+pre-verification below want them, as many as the widest batch so far
+less one, or as the pre-verification may hold if that is more, and never
+more than one fewer than the logical CPUs the process may run on, and
+are parked, using no processor time, while there is nothing to check.
+Before the assume-valid block no script is checked and no signature
+pre-verified, so a sync from genesis starts none until then, and a node
+that has checked scripts keeps the ones it made until it exits. Count
+them against a task limit (`TasksMax` under systemd, a cgroup's
 `pids.max`, `RLIMIT_NPROC`). A helper the operating system refuses costs
 speed only: the thread that processes blocks and the helpers there are
 do its share, nothing is logged, and no creation is tried again before
 the 1,024th batch after that one. No `DCROXIDE_` variable sets their
-number. In the two syncs of 2026-10-13 of `4700cf1` with these threads
-added (above), on a node held to eight cores, 16 hardware threads, 15 of
-them were there at the end, and peak resident memory, read before the
-closing flush, was 2,998 and 2,908 MiB, inside the 2,832 to 3,128 MiB of
-the three runs of `4700cf1` without them.
+number; `DCROXIDE_PREVERIFY` (below) sets only how many of them may
+pre-verify at once. In the two syncs of 2026-10-13 of `4700cf1` with
+these threads added (above), on a node held to eight cores, 16 hardware
+threads, 15 of them were there at the end, and peak resident memory,
+read before the closing flush, was 2,998 and 2,908 MiB, inside the 2,832
+to 3,128 MiB of the three runs of `4700cf1` without them.
+
+During the initial chain sync the same helpers also check signatures
+ahead of the thread that processes blocks, which dcrd does not do
+([PARITY.md](../PARITY.md), *Signature pre-verification ahead of the
+block thread*). While the sync peer's connection is read ahead, its
+reading thread hands each block it has read to them, unless the chain
+will check none of its scripts, and the inputs that spend a
+pay-to-pubkey-hash output, told by the shape of their signature scripts
+(a signature of the `SigHashAll` type and a public key), are verified
+into the signature cache, where the chain then finds them as it connects
+the block. Once the initial chain sync is done, nothing more is handed
+to them. At most two fewer helpers than the physical cores the process
+may run on do this at once, at least one from two cores, and only while
+no block being connected wants them; the thread that processes blocks
+takes a block back as it reaches it and checks whatever was not reached
+itself. Set `DCROXIDE_PREVERIFY=off` (or a whole number that is zero,
+such as `0`, `00` or `+0`) and restart the node to turn it off, from
+the same binary; the node then logs `Signature pre-verification disabled
+by DCROXIDE_PREVERIFY` at startup. A positive whole number sets the most
+helpers instead, never more than one fewer than the logical CPUs the
+process may run on; the node logs the number in effect as `Signature
+pre-verification on at most N helper threads by DCROXIDE_PREVERIFY`, or,
+when it can start none, `Signature pre-verification not started:` and
+the reason. Any other value is the warning `DCROXIDE_PREVERIFY=V is
+neither off, 0 nor a whole number of helper threads; using the default`,
+and the default stays. It does nothing with `DCROXIDE_READ_AHEAD=off`,
+which has no reading thread, or with `--sigcachemaxsize=0`, which keeps
+no entry; with `--assumevalid=0` it starts at the first block read
+ahead. A cache much smaller than the default 100,000 entries keeps the
+entries made for the blocks ahead for less long; how many of them are
+evicted before their block is connected has not been measured. It was
+measured in syncs on 2026-10-18, from a block server on another machine
+on the same LAN, in a series of its own: the build that added it, on top
+of other changes, one of them not kept, took 7.95 s less than the build
+below it by the means of two runs each, 8.50 s less after the
+assume-valid block, and the script threads' processor time 29.0 s less;
+and one build of `88c46c3`'s code with it, run once with it on and once
+with `DCROXIDE_PREVERIFY=off`, took 7.4 s less with it on, its connect
+checks finding 60.5% of the signatures they looked up in the cache
+([bench-ledger.md](bench-ledger.md), "Rungs from a block server on the
+LAN, two changes held for their memory, and dcrd v2.1.7", build G and
+the prototype pair). A node that pre-verified also logs one line under
+`SRVR` as it shuts down, after the read-ahead's:
+
+```text
+Signature pre-verification: B blocks with I inputs to guess for on at most W helpers; C inputs checked ahead of the block thread, V verified; K blocks cut short by the block thread or the shutdown; R refused for room
+```
+
+B blocks were handed to the helpers, with I inputs of the guessed shape
+among them; W is the most helpers at once. C of those inputs were
+checked before the thread that processes blocks took their block, and V
+of them verified against the guessed script, which puts or keeps their
+signatures in the cache; C less V are inputs whose spent script the
+guess got wrong or whose signature does not verify. K blocks were taken
+back by the thread that processes blocks, or let go at shutdown, with
+inputs left unchecked: when K is close to B the helpers fell behind. R
+blocks were refused because the queue held as many bytes as it may,
+which is not expected.
 
 The disk difference is all in the metadata store. Block files make up
 17.88 GiB of each data directory at block 1,116,035, and the rest is
@@ -1198,13 +1261,14 @@ configuration, every name changes.
 | exists-address memtable target (developer-only) | `DCROXIDE_EXISTSADDR_MEMTABLE_KEYS` (keys, default 2,000,000) | — |
 | block download window | `DCROXIDE_BLOCK_WINDOW` (`dcrd`, or a whole number of blocks from 16 to 505; default this port's own window, at most 128 blocks and 3,145,728 bytes) | — |
 | block read-ahead | `DCROXIDE_READ_AHEAD` (unset = on; `off` or `0` = off; anything else warns and stays on) | — |
+| signature pre-verification | `DCROXIDE_PREVERIFY` (unset = on, on at most two helper threads fewer than the physical cores; `off`, or a whole number that is zero, = off; a positive whole number = at most that many helpers, never more than one fewer than the logical CPUs; anything else warns and keeps the default) | — |
 
 The chain itself lives under the home directory, not at it: `--datadir`
 defaults to `<home>/data` with the network appended, so on Linux the
 blocks are in `~/.dcroxide/data/mainnet` while `dcroxide.conf`,
 `rpc.cert` and `rpc.key` sit in `~/.dcroxide` itself.
 
-Those ten are the only `DCROXIDE_*` variables read; only the first
+Those eleven are the only `DCROXIDE_*` variables read; only the first
 two have dcrd counterparts, since the page cache, the overlay, the
 flush log and the thread a commit runs on are properties of this
 port's metadata store over redb, which dcrd does not use (dcrd
@@ -1215,7 +1279,8 @@ memtable is a property of this port's exists-address layout, the
 download window is this port's own rule for requesting blocks
 ([PARITY.md](../PARITY.md), *Block download window*), and the
 read-ahead is a thread dcrd does not have (*Reading ahead of the block
-handler*). Of the five
+handler*), and pre-verification is work dcrd does not do (*Signature
+pre-verification ahead of the block thread*). Of the five
 storage variables, `DCROXIDE_DB_CACHE` is the one to leave unset, the
 next two are untuned instruments (see the storage tuning above),
 `DCROXIDE_DB_SYNC_COMMIT` is the way back to dcrd's place for a
@@ -1381,9 +1446,14 @@ peak memory to the tip (the storage tuning above, which also has the
 measurement of 2026-10-16); the form of 2026-08-16, on m1, lost 9.5%
 where commits ran back to back. On slower storage, or with few spare
 cores, measure it with the variable set before relying on the default.
+`DCROXIDE_PREVERIFY` is read once at startup too, and turns off, or
+sets the most helpers of, the signature pre-verification of the blocks
+read ahead; the paragraph on the threads kept for checking scripts above
+says what it does, what each value does and what the node logs.
 A malformed or zero value in any of the tuning variables warns and
 falls back to the default rather than refusing to start, since they are
-hints; `DCROXIDE_READ_AHEAD` alone takes `0`, which turns it off.
+hints; `DCROXIDE_READ_AHEAD` and `DCROXIDE_PREVERIFY` alone take `0`,
+which turns each off.
 Everything else is a command-line flag or a `dcroxide.conf` entry,
 and the flag set is a verbatim port of dcrd's — same names, same semantics,
 and the same help text apart from the two environment annotations, which

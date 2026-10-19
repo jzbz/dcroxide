@@ -718,6 +718,7 @@ fn run_node(cfg: Config) -> ExitCode {
     // Share the chain with the served peers' message handlers (dcrd's
     // server holding the chain the serverPeer callbacks consult).
     let chain = Arc::new(Mutex::new(chain));
+    start_preverification(&cfg, &chain);
 
     // Create the enabled indexes and catch them up to the main chain
     // (dcrd `newServer`'s index block: the transaction index under
@@ -1037,12 +1038,19 @@ fn run_node(cfg: Config) -> ExitCode {
     // invalidateblock/reconsiderblock reorganizations (dcrd runs
     // `handleBlockchainNotification` whichever caller moved the tip).
     let rpc_ntfn_handler = handler.clone();
-    server
-        .sync_manager
-        .lock()
-        .expect("sync manager mutex poisoned")
-        .chain_mut()
-        .set_chain_ntfn_handler(handler);
+    {
+        let mut manager = server
+            .sync_manager
+            .lock()
+            .expect("sync manager mutex poisoned");
+        let sync_chain = manager.chain_mut();
+        sync_chain.set_chain_ntfn_handler(handler);
+        // The pre-verifier of the blocks read ahead learns after each
+        // block which blocks the chain checks no script of.
+        if let Some(preverifier) = dcroxide_node::preverify::installed() {
+            sync_chain.set_preverifier(Arc::clone(preverifier));
+        }
+    }
 
     // The CPU miner (dcrd `s.cpuMiner`), built and started whenever a
     // block template generator runs — i.e. mining addresses are
@@ -1529,6 +1537,9 @@ fn run_node(cfg: Config) -> ExitCode {
     dcroxide_node::logging::warn("SRVR", "Server shutting down");
     // No block is processed from here on, whoever delivers it.
     stop_block_processing(&server.sync_manager);
+    // Nor pre-verified: the queued blocks are let go of, and no helper
+    // checks a signature of one once this returns.
+    dcroxide_node::preverify::shutdown();
 
     // Stop seeding and dialing, stop the watchdog, disconnect the live
     // peers, and stop accepting new connections (dcrd's server
@@ -1644,6 +1655,11 @@ fn run_node(cfg: Config) -> ExitCode {
         .as_ref()
         .map_or(0, dcroxide_database::Database::records_written_as_laid_out);
     if let Some(line) = dcroxide_node::readahead::shutdown_line(records_written) {
+        dcroxide_node::logging::info("SRVR", &line);
+    }
+    // And what pre-verifying the blocks read ahead did, if it did
+    // anything (dcrd has no such line either).
+    if let Some(line) = dcroxide_node::preverify::shutdown_line() {
         dcroxide_node::logging::info("SRVR", &line);
     }
     dcroxide_node::logging::info("SRVR", "Server shutdown complete");
@@ -1970,6 +1986,47 @@ fn read_ahead_setting() -> bool {
         None => {}
     }
     read_ahead
+}
+
+/// Start the signature pre-verification of the blocks read ahead during
+/// the initial chain sync, as `DCROXIDE_PREVERIFY` says
+/// (`dcroxide_node::preverify`), filling the chain's signature cache.
+/// dcrd does not pre-verify (PARITY *Signature pre-verification ahead of
+/// the block thread*).
+///
+/// Unset, it is on, on two helper threads fewer than the physical cores
+/// the process may run on.  `off`, or a whole number that is zero, turns
+/// it off, from the same binary, and a positive whole number sets the
+/// most helpers, never more than the script pool holds (one fewer than
+/// the logical CPUs).
+/// An environment variable for `DCROXIDE_READ_AHEAD`'s reason: dcrd has
+/// no counterpart, and the generated `-h` output is pinned byte-for-byte
+/// against dcrd's.  Any other value is ignored with a warning, and so is
+/// one that is not valid Unicode.  Nothing is started with
+/// `--sigcachemaxsize=0`, whose cache drops every entry.  What was
+/// started, or why nothing was, is logged at info level when the
+/// variable names a number and at debug level otherwise.
+fn start_preverification(cfg: &Config, chain: &Mutex<Chain>) {
+    use dcroxide_node::preverify::{
+        PREVERIFY_VAR, PreverifySetting, install, preverify_setting, started_line,
+    };
+    let setting = std::env::var_os(PREVERIFY_VAR).map(|value| value.to_string_lossy().into_owned());
+    let (setting, notice) = preverify_setting(setting.as_deref());
+    match notice {
+        Some((dcroxide_netsync::LogLevel::Info, line)) => log_info(&line),
+        Some((_, line)) => log_warn(&line),
+        None => {}
+    }
+    let started = install(
+        &chain.lock().expect("chain mutex poisoned"),
+        cfg.sig_cache_max_size,
+        setting,
+    );
+    match (started_line(setting, started), setting) {
+        (Some(line), PreverifySetting::Helpers(_)) => log_info(&line),
+        (Some(line), _) => dcroxide_node::logging::debug("SRVR", &line),
+        (None, _) => {}
+    }
 }
 
 /// A positive whole number from `var`, or `None` when it is unset,

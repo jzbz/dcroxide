@@ -91,7 +91,13 @@
 //! unpark or a park, nothing a batch implements is called under it, and
 //! no other lock is taken while it is held.  Its critical sections only
 //! move counters, stack and queue entries, so they cannot panic and the
-//! mutex cannot be poisoned.
+//! mutex cannot be poisoned.  It guards the lanes too (*Lanes* below),
+//! which add three things: of a lane's job, the two methods that only
+//! read or set its atomics are called under it, never a unit; a lane's
+//! queue of jobs may allocate under it as a job is queued or withdrawn,
+//! where a failed allocation aborts the process rather than panicking;
+//! and a closed lane's last helper notifies, under it, the condition
+//! variable the lane's closer waits on.
 //!
 //! # Panics
 //!
@@ -106,13 +112,39 @@
 //! the message is printed where that thread's output goes.  Any other
 //! payload is resumed as it is, without the hook.  A panic is never
 //! turned into a verdict.
+//!
+//! # Lanes
+//!
+//! A helper that finds no batch wanting it may take up work of a lane
+//! before it parks: the signature pre-verification of blocks the chain
+//! has not reached yet (`crate::preverify`), which dcrd does not do.  A
+//! lane is a queue of [`LaneJob`]s, each a run of units claimed one at a
+//! time, with the most helpers it may hold at once and the most bytes
+//! its queued jobs may hold.  A lane has no verdict and nothing waits
+//! for its work.
+//!
+//! Batches come first.  Every batch queued for helpers bumps a counter
+//! under the mutex ([`Inner::queued`]).  A helper reads it under the
+//! same acquisition in which it found no batch and takes up a lane job,
+//! and compares it before each unit: once it has moved, the helper
+//! leaves the job and scans the queue again.  So a lane holds a helper a
+//! batch wants for at most the unit it is in, and the parked helpers are
+//! woken for a batch as they are without lanes.
+//!
+//! A lane's state is guarded by the pool's mutex, so a helper that
+//! scans the queue and the lanes and finds nothing is on the stack of
+//! parked helpers before any submitter can look for one to wake.  Of a
+//! job only [`LaneJob::exhausted`] and [`LaneJob::withdraw`] are called
+//! under it, and both only read or write atomics.  A lane is closed
+//! with its jobs withdrawn, and the close returns once no helper is
+//! inside one of them.
 
 use std::any::Any;
 use std::collections::VecDeque;
 use std::io;
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::thread::{self, JoinHandle, Thread};
 
 use crate::ruleerror::RuleError;
@@ -317,6 +349,24 @@ impl<B: Batch> Job for Run<B> {
     }
 }
 
+/// Work of a lane: units a helper claims and does one at a time, when
+/// no batch wants it (see the module documentation).  A job owns what
+/// its units read, as a batch does.
+pub(crate) trait LaneJob: Send + Sync + 'static {
+    /// Claim the next unit and do it.  `false` when there was none to
+    /// claim: every unit is claimed, or the job was withdrawn.
+    fn step(&self) -> bool;
+
+    /// Whether a helper that came now would find no unit to claim.
+    /// Called under the pool's mutex: it reads atomics and nothing else.
+    fn exhausted(&self) -> bool;
+
+    /// Hand out no more units: every later [`LaneJob::step`] returns
+    /// `false`.  Called under the pool's mutex: it reads and writes
+    /// atomics and nothing else.
+    fn withdraw(&self);
+}
+
 /// The body of a helper thread.
 type HelperMain = Box<dyn FnOnce() + Send>;
 
@@ -346,7 +396,13 @@ struct Inner {
     spawn_retry: u64,
     /// The number of the next batch that wants a helper.
     seq: AtomicU64,
+    /// The batches queued for helpers so far, bumped under the mutex as
+    /// each is queued.  A helper inside a lane job watches it, to leave
+    /// the job for a batch that may want it.
+    queued: AtomicU64,
     state: Mutex<State>,
+    /// Notified when a closed lane's last helper has left it.
+    lane_left: Condvar,
     spawner: Spawner,
     /// How often a submitter found helpers still inside its closed
     /// batch and parked.
@@ -375,8 +431,43 @@ struct State {
     closed: bool,
     /// The helpers' threads, for the join when a pool is dropped.
     handles: Vec<JoinHandle<()>>,
+    /// The lanes, in the order they were opened.  A closed lane stays
+    /// until its last helper has left it.
+    lanes: Vec<LaneState>,
+    /// The number the next lane is given.
+    next_lane: u64,
     #[cfg(test)]
     stats: Stats,
+}
+
+/// One lane, as the pool's mutex guards it.
+struct LaneState {
+    id: u64,
+    /// The most helpers inside its jobs at once.
+    width: usize,
+    /// The most bytes its queued jobs may hold, as their submitters
+    /// count them.
+    max_bytes: usize,
+    /// What its queued jobs hold.
+    bytes: usize,
+    /// The helpers inside one of its jobs.
+    active: usize,
+    /// Set by the close: nothing more is queued, and the state goes
+    /// once `active` is zero.
+    closed: bool,
+    /// The number the next job is given.
+    next_seq: u64,
+    /// The jobs queued, oldest first.  A job leaves when it is
+    /// withdrawn through [`LaneHandle::withdraw_through`] or the lane is
+    /// closed.
+    jobs: VecDeque<LaneEntry>,
+}
+
+/// A job queued in a lane.
+struct LaneEntry {
+    seq: u64,
+    bytes: usize,
+    job: Arc<dyn LaneJob>,
 }
 
 /// A batch open to helpers.
@@ -430,6 +521,10 @@ struct Stats {
     exhausted_skips: u64,
     /// Times a helper put itself on the stack of parked helpers.
     idle_pushes: u64,
+    /// Times a helper took up a lane job.
+    lane_takes: u64,
+    /// Lane units that panicked, in an unwinding build.
+    lane_panics: u64,
     /// The helpers put on and taken off that stack, in order, when a
     /// test asked for the record.
     idle_order: Option<Vec<IdleEvent>>,
@@ -471,7 +566,7 @@ impl Pool {
     /// The process-wide pool: one helper fewer than the logical CPUs the
     /// process may run on, so that with the submitting thread a batch
     /// has one worker per CPU, as the scoped path gives it.  The helpers
-    /// are created when a batch first wants them, are named
+    /// are created when a batch or a lane first wants them, are named
     /// `scriptval-N` and are never joined: the pool lives in a static.
     pub(crate) fn global() -> &'static Pool {
         static POOL: OnceLock<Pool> = OnceLock::new();
@@ -500,6 +595,7 @@ impl Pool {
                 width,
                 spawn_retry,
                 seq: AtomicU64::new(0),
+                queued: AtomicU64::new(0),
                 state: Mutex::new(State {
                     queue: VecDeque::with_capacity(QUEUE_ROOM),
                     // Room for every helper, so that parking never
@@ -510,9 +606,12 @@ impl Pool {
                     spawn_after: 0,
                     closed: false,
                     handles: Vec::new(),
+                    lanes: Vec::new(),
+                    next_lane: 0,
                     #[cfg(test)]
                     stats: Stats::default(),
                 }),
+                lane_left: Condvar::new(),
                 spawner,
                 #[cfg(test)]
                 waits: AtomicU64::new(0),
@@ -520,6 +619,22 @@ impl Pool {
                 woke: OnceLock::new(),
             }),
         }
+    }
+
+    /// A pool of at most `width` helpers on threads the OS is asked for,
+    /// named `test-scriptval-N`: for the tests of the crate's other
+    /// modules, which want a pool of a width of their own.
+    #[cfg(test)]
+    pub(crate) fn for_tests(width: usize) -> Pool {
+        Pool::with_spawner(
+            width,
+            SPAWN_RETRY_BATCHES,
+            Box::new(|id, main| {
+                thread::Builder::new()
+                    .name(format!("test-scriptval-{id}"))
+                    .spawn(main)
+            }),
+        )
     }
 
     /// The most helpers the pool holds.  Zero on a machine with one
@@ -591,6 +706,10 @@ impl Pool {
         let (first, grow) = {
             let mut st = inner.state.lock().expect("pool state poisoned");
             st.queue.push_back(entry);
+            // Under the mutex, after the entry: a helper inside a lane
+            // job that sees the count move finds the entry when it
+            // scans.
+            inner.queued.fetch_add(1, Ordering::Relaxed);
             while wake.len() < want {
                 let Some((_helper, parked)) = st.idle.pop() else {
                     break;
@@ -624,7 +743,7 @@ impl Pool {
             helper.unpark();
         }
         if grow > 0 {
-            self.create_helpers(id, first, grow);
+            self.inner.create_helpers(id, first, grow);
         }
 
         run.work();
@@ -663,25 +782,54 @@ impl Pool {
         run.result()
     }
 
+    /// Open a lane whose jobs hold at most `width` helpers at once,
+    /// never more than the pool's width, and at most `max_bytes` bytes
+    /// as [`LaneHandle::submit`] is told them.  The lane is closed when
+    /// the handle is dropped.
+    pub(crate) fn open_lane(&self, width: usize, max_bytes: usize) -> LaneHandle {
+        let width = width.min(self.inner.width);
+        let mut st = self.inner.state.lock().expect("pool state poisoned");
+        let id = st.next_lane;
+        st.next_lane = id.wrapping_add(1);
+        st.lanes.push(LaneState {
+            id,
+            width,
+            max_bytes,
+            bytes: 0,
+            active: 0,
+            closed: false,
+            next_seq: 0,
+            jobs: VecDeque::new(),
+        });
+        LaneHandle {
+            inner: Arc::clone(&self.inner),
+            id,
+            width,
+        }
+    }
+}
+
+impl Inner {
     /// Create the `grow` helpers reserved for batch `id`, numbered from
     /// `first`, stopping at the first one the OS refuses.  The batch
     /// then runs on the helpers there are and on its caller; the unused
     /// reservations are returned, and no creation is tried again until
-    /// `spawn_retry` more batches have been submitted.
-    fn create_helpers(&self, id: u64, first: usize, grow: usize) {
-        let inner: &Inner = &self.inner;
+    /// `spawn_retry` more batches have been submitted.  A lane's
+    /// submitter reserves helpers the same way, under the number of the
+    /// next batch.
+    fn create_helpers(self: &Arc<Inner>, id: u64, first: usize, grow: usize) {
         let mut handles = Vec::with_capacity(grow);
         for offset in 0..grow {
             let helper = first.wrapping_add(offset);
-            let shared = Arc::clone(&self.inner);
+            let shared = Arc::clone(self);
             let main: HelperMain = Box::new(move || helper_main(shared, helper));
-            match (inner.spawner)(helper, main) {
+            match (self.spawner)(helper, main) {
                 Ok(handle) => handles.push(handle),
                 Err(_) => break,
             }
         }
         let refused = grow.saturating_sub(handles.len());
-        let mut st = inner.state.lock().expect("pool state poisoned");
+        let mut st = self.state.lock().expect("pool state poisoned");
         #[cfg(test)]
         {
             st.stats.helpers_created = st.stats.helpers_created.wrapping_add(handles.len() as u64);
@@ -690,19 +838,238 @@ impl Pool {
         st.handles.append(&mut handles);
         if refused > 0 {
             st.helpers = st.helpers.saturating_sub(refused);
-            st.spawn_after = id.wrapping_add(inner.spawn_retry);
+            st.spawn_after = id.wrapping_add(self.spawn_retry);
         }
     }
+
+    fn lock(&self) -> MutexGuard<'_, State> {
+        self.state.lock().expect("pool state poisoned")
+    }
+}
+
+/// The handle on one lane of a pool: what its owner submits jobs
+/// through, withdraws them through and closes it through.  Dropping it
+/// closes the lane.
+pub(crate) struct LaneHandle {
+    inner: Arc<Inner>,
+    id: u64,
+    width: usize,
+}
+
+/// Why a lane refused a job.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Refusal {
+    /// The lane is closed, or holds no helper at all.
+    Closed,
+    /// The job's bytes would take the lane past its bound.
+    Full,
+}
+
+impl LaneHandle {
+    /// The most helpers the lane holds at once.
+    pub(crate) fn width(&self) -> usize {
+        self.width
+    }
+
+    /// Queue `job`, which holds `bytes` bytes and has `units` units,
+    /// and wake parked helpers for it, as many as the lane has room for
+    /// and the job has units, creating helpers the pool does not have
+    /// yet up to the lane's width.  Returns the job's number in the
+    /// lane, which [`LaneHandle::withdraw_through`] takes.
+    pub(crate) fn submit(
+        &self,
+        bytes: usize,
+        units: usize,
+        job: Arc<dyn LaneJob>,
+    ) -> Result<u64, Refusal> {
+        let inner = &self.inner;
+        // The room for the helpers to wake is made before the mutex is
+        // taken, as `Pool::run` makes it.
+        let mut wake: Vec<Thread> = Vec::with_capacity(self.width.min(units));
+        let (seq, first, grow, batch) = {
+            let mut st = inner.lock();
+            let state = &mut *st;
+            let Some(lane) = state.lanes.iter_mut().find(|lane| lane.id == self.id) else {
+                return Err(Refusal::Closed);
+            };
+            if lane.closed || lane.width == 0 {
+                return Err(Refusal::Closed);
+            }
+            let total = match lane.bytes.checked_add(bytes) {
+                Some(total) if total <= lane.max_bytes => total,
+                _ => return Err(Refusal::Full),
+            };
+            let seq = lane.next_seq;
+            lane.next_seq = seq.wrapping_add(1);
+            lane.bytes = total;
+            lane.jobs.push_back(LaneEntry { seq, bytes, job });
+            let room = lane.width.saturating_sub(lane.active).min(units);
+            let lane_width = lane.width;
+            while wake.len() < room {
+                let Some((_helper, parked)) = state.idle.pop() else {
+                    break;
+                };
+                #[cfg(test)]
+                state.stats.idle_event(IdleEvent::Popped(_helper));
+                wake.push(parked);
+            }
+            // The helpers the lane may hold beyond those that exist are
+            // reserved here, as a batch reserves them.
+            let batch = inner.seq.load(Ordering::Relaxed);
+            let grow = lane_width.saturating_sub(state.helpers);
+            if grow > 0 && batch >= state.spawn_after {
+                let first = state.next_helper;
+                state.helpers = lane_width;
+                state.next_helper = first.wrapping_add(grow);
+                (seq, first, grow, batch)
+            } else {
+                (seq, 0, 0, batch)
+            }
+        };
+        for helper in &wake {
+            helper.unpark();
+        }
+        if grow > 0 {
+            inner.create_helpers(batch, first, grow);
+        }
+        Ok(seq)
+    }
+
+    /// Withdraw every job of the lane numbered `seq` or lower: no
+    /// helper starts another unit of them, and the lane lets go of
+    /// them.  A helper inside one finishes the unit it holds.
+    pub(crate) fn withdraw_through(&self, seq: u64) {
+        let withdrawn = {
+            let mut st = self.inner.lock();
+            let Some(lane) = st.lanes.iter_mut().find(|lane| lane.id == self.id) else {
+                return;
+            };
+            // Numbers rise along the queue, so the jobs withdrawn are
+            // the ones in front.
+            let count = lane
+                .jobs
+                .iter()
+                .take_while(|entry| entry.seq <= seq)
+                .count();
+            let kept = lane.jobs.split_off(count);
+            let withdrawn = core::mem::replace(&mut lane.jobs, kept);
+            for entry in &withdrawn {
+                entry.job.withdraw();
+                lane.bytes = lane.bytes.saturating_sub(entry.bytes);
+            }
+            withdrawn
+        };
+        // The jobs' references go outside the mutex.
+        drop(withdrawn);
+    }
+
+    /// Close the lane: refuse further jobs, withdraw the queued ones,
+    /// and return once no helper is inside one of them.  A helper inside
+    /// a unit finishes that unit first.  Closing a closed lane only
+    /// waits.
+    pub(crate) fn close(&self) {
+        let withdrawn = {
+            let mut st = self.inner.lock();
+            let Some(at) = st.lanes.iter().position(|lane| lane.id == self.id) else {
+                return;
+            };
+            let lane = &mut st.lanes[at];
+            lane.closed = true;
+            lane.bytes = 0;
+            let withdrawn = core::mem::take(&mut lane.jobs);
+            for entry in &withdrawn {
+                entry.job.withdraw();
+            }
+            if lane.active == 0 {
+                st.lanes.remove(at);
+            }
+            withdrawn
+        };
+        drop(withdrawn);
+        let mut st = self.inner.lock();
+        while st.lanes.iter().any(|lane| lane.id == self.id) {
+            st = self.inner.lane_left.wait(st).expect("pool state poisoned");
+        }
+    }
+}
+
+impl Drop for LaneHandle {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
+/// Take up a job of the first lane that has room for another helper
+/// and a job with a unit left, counting the helper in.  `None` when no
+/// lane has.
+fn take_lane_job(st: &mut State) -> Option<(u64, Arc<dyn LaneJob>)> {
+    for lane in &mut st.lanes {
+        if lane.closed || lane.active >= lane.width {
+            continue;
+        }
+        let Some(entry) = lane.jobs.iter().find(|entry| !entry.job.exhausted()) else {
+            continue;
+        };
+        let job = Arc::clone(&entry.job);
+        // Below the lane's width, checked above.
+        lane.active = lane.active.saturating_add(1);
+        #[cfg(test)]
+        {
+            st.stats.lane_takes = st.stats.lane_takes.wrapping_add(1);
+        }
+        return Some((lane.id, job));
+    }
+    None
+}
+
+/// Count a helper out of lane `id`.  The last helper to leave a closed
+/// lane removes it and wakes its closer.
+fn leave_lane(inner: &Inner, st: &mut State, id: u64) {
+    let Some(at) = st.lanes.iter().position(|lane| lane.id == id) else {
+        return;
+    };
+    let lane = &mut st.lanes[at];
+    lane.active = lane.active.saturating_sub(1);
+    if lane.closed && lane.active == 0 {
+        st.lanes.remove(at);
+        inner.lane_left.notify_all();
+    }
+}
+
+/// Do units of `job` until it has none left or a batch has been queued
+/// since the count read `seen`.  In an unwinding build a unit that
+/// panics withdraws the job, and the helper goes on serving; the panic
+/// hook has run, and nothing waits for the job.  Whether one panicked.
+fn lane_work(inner: &Inner, job: &dyn LaneJob, seen: u64) -> bool {
+    let outcome = catch_unwind(AssertUnwindSafe(|| {
+        loop {
+            if inner.queued.load(Ordering::Relaxed) != seen || !job.step() {
+                break;
+            }
+        }
+    }));
+    if outcome.is_err() {
+        job.withdraw();
+        return true;
+    }
+    false
 }
 
 impl Drop for Pool {
     /// Close the pool and join its helpers.  The process-wide pool is
     /// never dropped; this is for the pools tests make.  No batch can be
-    /// running: [`Pool::run`] borrows the pool for the whole call.
+    /// running: [`Pool::run`] borrows the pool for the whole call.  The
+    /// jobs of its lanes are withdrawn, so a helper inside one leaves it
+    /// after the unit it holds.
     fn drop(&mut self) {
         let (idle, handles) = {
             let mut st = self.inner.state.lock().expect("pool state poisoned");
             st.closed = true;
+            for lane in &st.lanes {
+                for entry in &lane.jobs {
+                    entry.job.withdraw();
+                }
+            }
             (
                 core::mem::take(&mut st.idle),
                 core::mem::take(&mut st.handles),
@@ -832,9 +1199,30 @@ fn helper_main(inner: Arc<Inner>, id: usize) {
 
         match found {
             None => {
+                // No batch wants this helper: a lane may.  The count of
+                // queued batches is read under the acquisition whose
+                // scan found none, so any batch queued from here on
+                // moves it.
+                if let Some((lane, job)) = take_lane_job(&mut st) {
+                    let seen = inner.queued.load(Ordering::Relaxed);
+                    drop(st);
+                    let _panicked = lane_work(&inner, &*job, seen);
+                    // The job goes before the helper is counted out, so
+                    // a closer that sees the lane gone knows no helper
+                    // holds its jobs.
+                    drop(job);
+                    st = inner.state.lock().expect("pool state poisoned");
+                    #[cfg(test)]
+                    {
+                        st.stats.lane_panics =
+                            st.stats.lane_panics.wrapping_add(u64::from(_panicked));
+                    }
+                    leave_lane(&inner, &mut st, lane);
+                    continue;
+                }
                 // On the stack only after a scan under this same
                 // acquisition found nothing: a batch queued later pops
-                // this helper and wakes it.
+                // this helper and wakes it, and so does a lane job.
                 st.idle.push((id, me.clone()));
                 #[cfg(test)]
                 st.stats.idle_event(IdleEvent::Pushed(id));
@@ -2569,6 +2957,396 @@ mod tests {
             names.sort();
             names.dedup();
             assert_eq!(names.len(), threads - 1, "one item per helper");
+        });
+    }
+
+    // Lanes.
+
+    /// A lane job of `units` units for the tests: it counts the units
+    /// done and the most in progress at once, notes the threads that did
+    /// them, raises `entered` as each starts, and holds unit `k` until
+    /// `gate`, when there is one, has been raised `k + 1` times.  Unit
+    /// `panic_at` panics.
+    struct TestJob {
+        units: usize,
+        next: AtomicUsize,
+        withdrawn: AtomicBool,
+        done: AtomicUsize,
+        inside: AtomicUsize,
+        most_inside: AtomicUsize,
+        entered: Arc<Signal>,
+        gate: Option<Arc<Signal>>,
+        panic_at: Option<usize>,
+        threads: Mutex<Vec<ThreadId>>,
+        /// Units started and batch items checked, in order, when the
+        /// test shares a log.
+        log: Option<Arc<Mutex<Vec<String>>>>,
+    }
+
+    impl TestJob {
+        fn new(units: usize) -> TestJob {
+            TestJob {
+                units,
+                next: AtomicUsize::new(0),
+                withdrawn: AtomicBool::new(false),
+                done: AtomicUsize::new(0),
+                inside: AtomicUsize::new(0),
+                most_inside: AtomicUsize::new(0),
+                entered: Signal::new(),
+                gate: None,
+                panic_at: None,
+                threads: Mutex::new(Vec::new()),
+                log: None,
+            }
+        }
+
+        fn gated(units: usize, gate: &Arc<Signal>) -> TestJob {
+            TestJob {
+                gate: Some(Arc::clone(gate)),
+                ..TestJob::new(units)
+            }
+        }
+
+        fn done(&self) -> usize {
+            self.done.load(Ordering::SeqCst)
+        }
+    }
+
+    impl LaneJob for TestJob {
+        fn step(&self) -> bool {
+            if self.withdrawn.load(Ordering::SeqCst) {
+                return false;
+            }
+            let unit = self.next.fetch_add(1, Ordering::SeqCst);
+            if unit >= self.units {
+                return false;
+            }
+            let now = self.inside.fetch_add(1, Ordering::SeqCst) + 1;
+            self.most_inside.fetch_max(now, Ordering::SeqCst);
+            self.threads
+                .lock()
+                .expect("threads poisoned")
+                .push(thread::current().id());
+            if let Some(log) = &self.log {
+                log.lock()
+                    .expect("log poisoned")
+                    .push(format!("unit {unit}"));
+            }
+            self.entered.raise();
+            if self.panic_at == Some(unit) {
+                self.inside.fetch_sub(1, Ordering::SeqCst);
+                panic!("lane unit {unit} panicked");
+            }
+            match &self.gate {
+                Some(gate) => {
+                    let _ = gate.wait(unit + 1);
+                }
+                None => busy(unit),
+            }
+            self.inside.fetch_sub(1, Ordering::SeqCst);
+            self.done.fetch_add(1, Ordering::SeqCst);
+            true
+        }
+
+        fn exhausted(&self) -> bool {
+            self.withdrawn.load(Ordering::SeqCst) || self.next.load(Ordering::SeqCst) >= self.units
+        }
+
+        fn withdraw(&self) {
+            self.withdrawn.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// Submit `job` to `lane` as holding `bytes` bytes.
+    fn submit(lane: &LaneHandle, bytes: usize, job: &Arc<TestJob>) -> Result<u64, Refusal> {
+        let units = job.units;
+        let job: Arc<dyn LaneJob> = Arc::clone(job) as Arc<dyn LaneJob>;
+        lane.submit(bytes, units, job)
+    }
+
+    /// The bytes a lane's queued jobs hold, its helpers inside and
+    /// whether it is closed, or `None` when it is gone.
+    fn lane_state(pool: &Pool, lane: &LaneHandle) -> Option<(usize, usize, bool)> {
+        let st = pool.inner.state.lock().expect("pool state poisoned");
+        st.lanes
+            .iter()
+            .find(|state| state.id == lane.id)
+            .map(|state| (state.bytes, state.active, state.closed))
+    }
+
+    /// L1.  A lane's job is done by the pool's helpers, every unit once,
+    /// and not by the thread that submitted it.
+    #[test]
+    fn a_lane_job_is_done_by_the_helpers() {
+        watched(|| {
+            let pool = pool(3);
+            let lane = pool.open_lane(2, usize::MAX);
+            assert_eq!(lane.width(), 2);
+            let job = Arc::new(TestJob::new(200));
+            submit(&lane, 1, &job).expect("queued");
+            wait_until("the job is done", || job.done() == 200);
+            assert!(job.exhausted());
+            let me = thread::current().id();
+            let threads = job.threads.lock().expect("threads poisoned").clone();
+            assert_eq!(threads.len(), 200, "every unit once");
+            assert!(threads.iter().all(|id| *id != me));
+            assert!(job.most_inside.load(Ordering::SeqCst) <= 2);
+            assert!(stats(&pool).lane_takes >= 1);
+            // A lane is no wider than its pool.
+            assert_eq!(pool.open_lane(9, usize::MAX).width(), 3);
+            assert_eq!(super::tests::pool(0).open_lane(4, usize::MAX).width(), 0);
+        });
+    }
+
+    /// L2.  However many helpers come back from batches looking for
+    /// work, no more than the lane's width are inside its jobs at once.
+    #[test]
+    fn a_lane_holds_no_more_helpers_than_its_width() {
+        watched(|| {
+            const WIDTH: usize = 4;
+            let pool = pool(WIDTH);
+            // Every helper exists and is parked.
+            assert_eq!(pool.run(all_hands(WIDTH + 1)), Ok(()));
+            parked(&pool, WIDTH);
+            let lane = pool.open_lane(2, usize::MAX);
+            let job = Arc::new(TestJob::new(1_000_000));
+            submit(&lane, 1, &job).expect("queued");
+            // Each batch brings every helper out of the lane and back to
+            // it once the batch is over.
+            for _ in 0..200 {
+                assert_eq!(pool.run(all_hands(WIDTH + 1)), Ok(()));
+                if job.exhausted() {
+                    break;
+                }
+            }
+            lane.close();
+            assert!(job.done() > 0);
+            assert!(
+                job.most_inside.load(Ordering::SeqCst) <= 2,
+                "{} helpers in a lane of two",
+                job.most_inside.load(Ordering::SeqCst)
+            );
+        });
+    }
+
+    /// L3.  A batch queued while a helper is inside a lane job gets that
+    /// helper as soon as the unit it holds is done, ahead of the job's
+    /// next unit.
+    #[test]
+    fn a_batch_takes_a_helper_away_from_a_lane_after_its_unit() {
+        watched(|| {
+            let pool = pool(1);
+            let lane = pool.open_lane(1, usize::MAX);
+            let gate = Signal::new();
+            let log = Arc::new(Mutex::new(Vec::new()));
+            let job = Arc::new(TestJob {
+                log: Some(Arc::clone(&log)),
+                ..TestJob::gated(10, &gate)
+            });
+            submit(&lane, 1, &job).expect("queued");
+            assert!(job.entered.wait(1), "the helper is inside unit 0");
+
+            thread::scope(|s| {
+                let _release = Release(&gate);
+                // The unit is let go once the batch is queued.
+                s.spawn(|| {
+                    wait_until("the batch is queued", || queued(&pool) == 1);
+                    gate.raise();
+                });
+                let arrived = Signal::new();
+                let batch = checks(2, {
+                    let log = Arc::clone(&log);
+                    move |index| {
+                        log.lock()
+                            .expect("log poisoned")
+                            .push(format!("item {index}"));
+                        arrived.raise();
+                        // Both the caller and the helper are inside the
+                        // batch at once.
+                        held(&arrived, 2)
+                    }
+                });
+                assert_eq!(pool.run(batch), Ok(()));
+            });
+            let order = log.lock().expect("log poisoned").clone();
+            assert_eq!(
+                order.first().map(String::as_str),
+                Some("unit 0"),
+                "{order:?}"
+            );
+            let unit_1 = order.iter().position(|entry| entry == "unit 1");
+            let items: Vec<usize> = order
+                .iter()
+                .enumerate()
+                .filter(|(_, entry)| entry.starts_with("item"))
+                .map(|(at, _)| at)
+                .collect();
+            assert_eq!(items.len(), 2, "{order:?}");
+            assert!(
+                unit_1.is_none_or(|unit_1| items.iter().all(|item| *item < unit_1)),
+                "{order:?}"
+            );
+            // The helper goes back to the job afterwards.
+            for _ in 0..10 {
+                gate.raise();
+            }
+            wait_until("the job is done", || job.done() == 10);
+        });
+    }
+
+    /// L4.  Withdrawn jobs stop at the units their helpers hold, leave
+    /// the lane and its byte count, and the lane goes on with the jobs
+    /// after them.
+    #[test]
+    fn withdrawn_jobs_stop_and_leave_the_lane() {
+        watched(|| {
+            let pool = pool(2);
+            let lane = pool.open_lane(2, 1_000);
+            let gate = Signal::new();
+            let first = Arc::new(TestJob::gated(10, &gate));
+            let second = Arc::new(TestJob::new(10));
+            let third = Arc::new(TestJob::new(10));
+            let _release = Release(&gate);
+            assert_eq!(submit(&lane, 100, &first), Ok(0));
+            assert!(
+                first.entered.wait(2),
+                "both helpers are inside the first job"
+            );
+            assert_eq!(submit(&lane, 200, &second), Ok(1));
+            assert_eq!(submit(&lane, 300, &third), Ok(2));
+            assert_eq!(lane_state(&pool, &lane), Some((600, 2, false)));
+
+            lane.withdraw_through(1);
+            assert_eq!(lane_state(&pool, &lane).map(|state| state.0), Some(300));
+            assert!(first.exhausted() && second.exhausted());
+            for _ in 0..10 {
+                gate.raise();
+            }
+            wait_until("the third job is done", || third.done() == 10);
+            // A helper lets go of a job only once its unit is done.
+            wait_until("the helpers let go of the withdrawn jobs", || {
+                Arc::strong_count(&first) == 1 && Arc::strong_count(&second) == 1
+            });
+            assert_eq!(first.done(), 2, "only the units the helpers held");
+            assert_eq!(second.done(), 0);
+
+            // Withdrawing again, or past the end, is harmless.
+            lane.withdraw_through(1);
+            lane.withdraw_through(u64::MAX);
+            assert_eq!(lane_state(&pool, &lane).map(|state| state.0), Some(0));
+        });
+    }
+
+    /// L5.  A lane refuses a job past its bytes, has room again once
+    /// jobs are withdrawn, and refuses every job once closed, as does a
+    /// lane without a helper.
+    #[test]
+    fn a_lane_refuses_past_its_bytes_and_when_closed() {
+        watched(|| {
+            let pool = pool(1);
+            let lane = pool.open_lane(1, 100);
+            let gate = Signal::new();
+            let _release = Release(&gate);
+            let held_job = Arc::new(TestJob::gated(1, &gate));
+            assert_eq!(submit(&lane, 60, &held_job), Ok(0));
+            assert_eq!(
+                submit(&lane, 41, &Arc::new(TestJob::new(1))),
+                Err(Refusal::Full)
+            );
+            assert_eq!(
+                submit(&lane, usize::MAX, &Arc::new(TestJob::new(1))),
+                Err(Refusal::Full)
+            );
+            assert_eq!(submit(&lane, 40, &Arc::new(TestJob::new(1))), Ok(1));
+            lane.withdraw_through(0);
+            assert_eq!(submit(&lane, 60, &Arc::new(TestJob::new(1))), Ok(2));
+            gate.raise();
+            lane.close();
+            assert_eq!(
+                submit(&lane, 1, &Arc::new(TestJob::new(1))),
+                Err(Refusal::Closed)
+            );
+            let narrow = super::tests::pool(0);
+            let none = narrow.open_lane(1, 100);
+            assert_eq!(
+                submit(&none, 1, &Arc::new(TestJob::new(1))),
+                Err(Refusal::Closed)
+            );
+        });
+    }
+
+    /// L6.  Closing a lane with jobs queued drops them unstarted, waits
+    /// for the helper inside a unit to finish it, and leaves no helper
+    /// holding a job of the lane.
+    #[test]
+    fn closing_a_lane_waits_for_the_helper_inside_and_drops_queued_jobs() {
+        watched(|| {
+            let pool = pool(1);
+            let lane = pool.open_lane(1, usize::MAX);
+            let gate = Signal::new();
+            let _release = Release(&gate);
+            let first = Arc::new(TestJob::gated(5, &gate));
+            let queued_jobs = [Arc::new(TestJob::new(5)), Arc::new(TestJob::new(5))];
+            submit(&lane, 1, &first).expect("queued");
+            for job in &queued_jobs {
+                submit(&lane, 1, job).expect("queued");
+            }
+            assert!(first.entered.wait(1), "the helper is inside the first job");
+
+            thread::scope(|s| {
+                let closer = s.spawn(|| lane.close());
+                wait_until("the lane is closed", || {
+                    lane_state(&pool, &lane).is_some_and(|state| state.2)
+                });
+                // The helper still holds its unit, so the close waits,
+                // and the closing lane takes no job meanwhile.
+                assert_eq!(lane_state(&pool, &lane), Some((0, 1, true)));
+                assert!(!closer.is_finished());
+                assert_eq!(
+                    submit(&lane, 1, &Arc::new(TestJob::new(1))),
+                    Err(Refusal::Closed)
+                );
+                assert_eq!(lane_state(&pool, &lane), Some((0, 1, true)));
+                gate.raise();
+                closer.join().expect("the close returns");
+            });
+            assert_eq!(lane_state(&pool, &lane), None, "the lane is gone");
+            assert_eq!(first.done(), 1);
+            for job in &queued_jobs {
+                assert_eq!(job.done(), 0);
+                assert_eq!(Arc::strong_count(job), 1);
+            }
+            assert_eq!(Arc::strong_count(&first), 1);
+            assert_eq!(
+                submit(&lane, 1, &Arc::new(TestJob::new(1))),
+                Err(Refusal::Closed)
+            );
+            // Closing again only waits, and returns.
+            lane.close();
+            // The helper serves batches as before.
+            assert_eq!(pool.run(all_hands(2)), Ok(()));
+        });
+    }
+
+    /// L7.  A unit that panics withdraws its job, and the helper goes on
+    /// serving batches and lanes.
+    #[test]
+    fn a_panicking_lane_unit_leaves_the_helper_serving() {
+        watched(|| {
+            let pool = pool(1);
+            let lane = pool.open_lane(1, usize::MAX);
+            let job = Arc::new(TestJob {
+                panic_at: Some(3),
+                ..TestJob::new(10)
+            });
+            submit(&lane, 1, &job).expect("queued");
+            wait_until("the unit has panicked", || stats(&pool).lane_panics == 1);
+            assert!(job.withdrawn.load(Ordering::SeqCst));
+            assert_eq!(job.done(), 3);
+            assert_eq!(pool.run(all_hands(2)), Ok(()));
+            let next = Arc::new(TestJob::new(10));
+            submit(&lane, 1, &next).expect("queued");
+            wait_until("the next job is done", || next.done() == 10);
         });
     }
 }

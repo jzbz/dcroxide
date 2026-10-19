@@ -51,6 +51,7 @@ pub mod params;
 pub mod peerconn;
 pub mod peerloop;
 pub mod pipeserve;
+pub mod preverify;
 pub mod progresslog;
 pub mod readahead;
 pub mod rebroadcast;

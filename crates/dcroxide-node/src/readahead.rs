@@ -67,8 +67,27 @@
 //!   reader began to read it, and not from when the handler began
 //!   waiting for a frame before it.
 //!
-//! The reader takes no lock but the queue's, calls no hook, logs nothing
-//! about the peer and queues nothing to it.
+//! The reader takes no lock but the queue's and, to hand a block to
+//! signature pre-verification, the script pool's, never the two at once.
+//! It calls no hook, logs nothing about the peer and queues nothing to
+//! it.
+//!
+//! # Signature pre-verification
+//!
+//! When the process has a signature pre-verifier
+//! ([`crate::preverify::installed`]), the reader hands it each block it
+//! has hashed before queueing the block, as long as the handler's latest
+//! answer was that reading ahead is wanted, and the block goes to the
+//! script pool's helpers unless the chain will check none of its
+//! scripts.  Once reading ahead is no longer wanted, after the initial
+//! chain sync, the reader that is kept hands over nothing: a block read
+//! in turn is taken as soon as it is queued, before a helper could do
+//! anything for it.  The helpers fill the signature cache the chain's
+//! connect checks read, and reach no verdict (PARITY *Signature
+//! pre-verification ahead of the block thread*).  The handler withdraws
+//! a block from it as it takes the block, and every block still queued
+//! when it leaves, so the pre-verifier holds no block the read-ahead has
+//! let go of.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -77,6 +96,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use dcroxide_blockchain::HashedBlock;
+use dcroxide_blockchain::preverify::{Preverifier, Ticket};
 use dcroxide_chainhash::Hash;
 use dcroxide_netsync::manager::LogLevel;
 use dcroxide_peer::{MsgTransport, ReadError};
@@ -251,12 +271,15 @@ pub(crate) struct Shared {
     ready: Condvar,
     /// The connection's teardown flag.
     cancel: Cancel,
+    /// The process's signature pre-verifier, if it has one.
+    preverify: Option<Arc<Preverifier>>,
 }
 
 /// The state behind [`Shared`]'s lock.
 struct State {
-    /// The frames read and not yet taken, oldest first.
-    queue: VecDeque<ReadItem>,
+    /// The frames read and not yet taken, oldest first, each block with
+    /// the ticket of its pre-verification, if it was queued for one.
+    queue: VecDeque<(ReadItem, Option<Ticket>)>,
     /// Whether reading ahead is wanted, as the handler last said.
     ahead: bool,
     /// Since when the handler has been waiting with nothing to take, if
@@ -292,8 +315,9 @@ impl State {
 
 impl Shared {
     /// The shared state of a connection whose handler has just handled a
-    /// block and wants the frames behind it read ahead.
-    fn new(cancel: Cancel) -> Shared {
+    /// block and wants the frames behind it read ahead, with the signature
+    /// pre-verifier its blocks are handed to, if any.
+    fn new(cancel: Cancel, preverify: Option<Arc<Preverifier>>) -> Shared {
         Shared {
             state: Mutex::new(State {
                 queue: VecDeque::with_capacity(READ_AHEAD_MAX_ITEMS),
@@ -307,6 +331,7 @@ impl Shared {
             room: Condvar::new(),
             ready: Condvar::new(),
             cancel,
+            preverify,
         }
     }
 
@@ -356,15 +381,41 @@ impl Shared {
         }
     }
 
-    /// Queue a frame the reader read.  `false` once the handler has
-    /// left, when the frame is dropped.
-    fn push(&self, item: ReadItem) -> bool {
+    /// Hand a block the reader hashed to signature pre-verification, if
+    /// the process does it and reading ahead is wanted: the ticket to
+    /// withdraw it with, when the block was queued for it.  Called with
+    /// the queue's lock released; it takes that lock to read whether
+    /// reading ahead is wanted, and lets go of it before the pool's.
+    fn preverify(&self, block: &HashedBlock) -> Option<Ticket> {
+        let preverify = self.preverify.as_ref()?;
+        let ahead = self.lock().ahead;
+        if !ahead {
+            return None;
+        }
+        preverify.submit(block)
+    }
+
+    /// Withdraw from pre-verification the block of `ticket` and every
+    /// block handed to it before.  Called with the queue's lock released.
+    fn withdraw(&self, ticket: Option<Ticket>) {
+        if let (Some(preverify), Some(ticket)) = (&self.preverify, ticket) {
+            preverify.withdraw_through(ticket);
+        }
+    }
+
+    /// Queue a frame the reader read, with the ticket of its
+    /// pre-verification when it is a block that has one.  `false` once
+    /// the handler has left, when the frame is dropped and its block
+    /// withdrawn.
+    fn push(&self, item: ReadItem, ticket: Option<Ticket>) -> bool {
         let mut state = self.lock();
         if state.handler_gone {
+            drop(state);
+            self.withdraw(ticket);
             return false;
         }
         debug_assert!(!state.reader_done, "a frame behind the reader's last item");
-        state.queue.push_back(item);
+        state.queue.push_back((item, ticket));
         debug_assert!(state.queue.len() <= READ_AHEAD_MAX_ITEMS);
         state.note_queued();
         // The handler is parked only while it is waiting with nothing to
@@ -381,7 +432,7 @@ impl Shared {
     fn push_last(&self, item: ReadItem) {
         let mut state = self.lock();
         if !state.handler_gone {
-            state.queue.push_back(item);
+            state.queue.push_back((item, None));
             state.note_queued();
         }
         state.reader_done = true;
@@ -433,7 +484,7 @@ impl Shared {
             if self.cancel.is_cancelled() {
                 return ReadItem::torn_down();
             }
-            if let Some(item) = state.queue.pop_front() {
+            if let Some((item, ticket)) = state.queue.pop_front() {
                 let waited = state.waiting_since.take();
                 // Taking an item makes room, which the reader is only
                 // waiting for while reading ahead is wanted.
@@ -446,6 +497,10 @@ impl Shared {
                 {
                     add_nanos(&STATS.handler_waited_nanos, since.elapsed());
                 }
+                // The block is the handler's from here: its scripts are
+                // checked by the chain, and pre-verification moves on.
+                drop(state);
+                self.withdraw(ticket);
                 return item;
             }
             if state.reader_done {
@@ -480,13 +535,15 @@ impl Shared {
     }
 
     /// The handler has left: nothing more is taken, what is queued is
-    /// dropped, and a parked reader is woken to exit.
+    /// dropped and withdrawn from pre-verification, and a parked reader
+    /// is woken to exit.
     fn leave(&self) {
         let dropped = {
             let mut state = self.lock();
             state.handler_gone = true;
             std::mem::take(&mut state.queue)
         };
+        self.withdraw(dropped.iter().filter_map(|(_, ticket)| *ticket).max());
         self.room.notify_one();
         drop(dropped);
     }
@@ -578,6 +635,7 @@ fn reader_loop<R: FrameReader>(mut reader: R, shared: &Shared, stats: &Stats) {
                 break;
             }
             Ok(msg) => {
+                let mut ticket = None;
                 let received = match msg {
                     // Hash the block here, and count its signature
                     // operations, off the thread that connects blocks.
@@ -610,6 +668,10 @@ fn reader_loop<R: FrameReader>(mut reader: R, shared: &Shared, stats: &Stats) {
                                 stats.records.fetch_add(1, Ordering::Relaxed);
                             }
                         }
+                        // The block goes to signature pre-verification
+                        // before it is queued, so that the helpers can
+                        // start on it while it waits.
+                        ticket = shared.preverify(&hashed);
                         Received::Block(hashed)
                     }
                     // A mixing message is hashed once as it is read, as
@@ -624,7 +686,7 @@ fn reader_loop<R: FrameReader>(mut reader: R, shared: &Shared, stats: &Stats) {
                     result: Ok(received),
                     read_delta,
                 };
-                if !shared.push(item) {
+                if !shared.push(item, ticket) {
                     break;
                 }
                 after_block = is_block;
@@ -709,7 +771,10 @@ impl ReadAheadSource {
                 return Mode::Inline(transport);
             }
         };
-        let shared = Arc::new(Shared::new(self.cancel.clone()));
+        let shared = Arc::new(Shared::new(
+            self.cancel.clone(),
+            crate::preverify::installed().cloned(),
+        ));
         let (hand_over, handed) = mpsc::sync_channel::<WireTransport<Teardown>>(1);
         let reader_shared = Arc::clone(&shared);
         let spawned = crate::runtime::spawn_conn_thread("peer-reader", move || {
@@ -1151,8 +1216,22 @@ mod tests {
         /// process's, which every reader thread of this test binary
         /// moves.
         fn start_counting(steps: Vec<Step>, stats: Option<Arc<Stats>>) -> Rig {
+            Rig::start_with(steps, stats, None)
+        }
+
+        /// [`Rig::start`] with the blocks read handed to the given
+        /// signature pre-verifier.
+        fn start_preverifying(steps: Vec<Step>, preverify: Arc<Preverifier>) -> Rig {
+            Rig::start_with(steps, None, Some(preverify))
+        }
+
+        fn start_with(
+            steps: Vec<Step>,
+            stats: Option<Arc<Stats>>,
+            preverify: Option<Arc<Preverifier>>,
+        ) -> Rig {
             let cancel = Cancel::new();
-            let shared = Arc::new(Shared::new(cancel.clone()));
+            let shared = Arc::new(Shared::new(cancel.clone(), preverify));
             let (started_tx, started) = mpsc::channel();
             let (gate, gate_rx) = mpsc::channel();
             let (since_tx, since_at_gate) = mpsc::channel();
@@ -1791,7 +1870,7 @@ mod tests {
             }
         }
 
-        let shared = Arc::new(Shared::new(Cancel::new()));
+        let shared = Arc::new(Shared::new(Cancel::new(), None));
         let reader_shared = Arc::clone(&shared);
         let reader = std::thread::spawn(move || reader_loop(Panicking, &reader_shared, &STATS));
         assert!(reader.join().is_err(), "the reader thread panicked");
@@ -1804,6 +1883,201 @@ mod tests {
             .recv_timeout(READ_POLL_INTERVAL * 4)
             .expect("the handler is left waiting for a reader that is gone");
         assert_eq!(answer, Err(ReadError::io(READ_TORN_DOWN_TEXT)));
+    }
+
+    /// A block at `height` whose one transaction has an input of the
+    /// shape signature pre-verification guesses a script for, told apart
+    /// by its header's nonce.  Its signature does not verify, which only
+    /// makes the lane's work on it short.
+    fn guessable_block(nonce: u32, height: u32) -> Message {
+        let Message::Block(mut block) = block(nonce) else {
+            unreachable!("a block");
+        };
+        block.header.height = height;
+        // Nine bytes of signature, the last its hash type, SigHashAll.
+        let mut signature_script = vec![0x09];
+        signature_script.extend([0x30; 8]);
+        signature_script.push(0x01);
+        signature_script.push(0x21);
+        signature_script.extend([0x02; 33]);
+        let mut tx = MsgTx::default();
+        tx.tx_in.push(dcroxide_wire::TxIn {
+            previous_out_point: dcroxide_wire::OutPoint {
+                hash: Hash([nonce as u8; 32]),
+                index: 0,
+                tree: dcroxide_wire::TX_TREE_REGULAR,
+            },
+            sequence: u32::MAX,
+            signature_script,
+            ..dcroxide_wire::TxIn::default()
+        });
+        block.transactions.push(tx);
+        Message::Block(block)
+    }
+
+    /// A pre-verifier on the process-wide script pool whose queue has
+    /// room for `blocks` blocks of [`guessable_block`]'s size, or `None`
+    /// on a machine whose pool has no helper.
+    fn preverifier(blocks: usize, floor: i64) -> Option<Arc<Preverifier>> {
+        let Message::Block(sample) = guessable_block(0, 0) else {
+            unreachable!("a block");
+        };
+        let room = sample.serialize_size() * blocks;
+        let cache = Arc::new(dcroxide_txscript::SigCache::new(100));
+        let preverifier = Preverifier::new(cache, 1, room)?;
+        preverifier.set_floor(floor);
+        Some(Arc::new(preverifier))
+    }
+
+    /// The reader hands the blocks above the floor to signature
+    /// pre-verification, which holds each until the handler takes it:
+    /// with room for one block, the block behind one not yet taken is
+    /// refused, and the one behind one taken is queued.
+    #[test]
+    fn blocks_read_ahead_are_preverified_above_the_floor_until_taken() {
+        let Some(preverifier) = preverifier(1, 10) else {
+            return;
+        };
+        let rig = Rig::start_preverifying(
+            vec![
+                frame(guessable_block(0, 10)),
+                frame(guessable_block(1, 11)),
+                Step::Gated(guessable_block(2, 12), 24),
+                Step::Gated(guessable_block(3, 13), 24),
+                frame(ping(4)),
+            ],
+            Arc::clone(&preverifier),
+        );
+        // Block 0 is at the floor and is not handed over; block 1 is.
+        for index in 0..3 {
+            rig.expect_started(index);
+        }
+        let counts = preverifier.counts();
+        assert_eq!((counts.blocks, counts.refused), (1, 0));
+        // Block 2 finds block 1 still held.
+        let _ = rig.gate.send(());
+        rig.expect_started(3);
+        assert_eq!(preverifier.counts().refused, 1);
+        // Taking block 1 lets it go: block 3 is queued.
+        assert_eq!(rig.take(), guessable_block(0, 10));
+        assert_eq!(rig.take(), guessable_block(1, 11));
+        let _ = rig.gate.send(());
+        rig.expect_started(4);
+        let counts = preverifier.counts();
+        assert_eq!((counts.blocks, counts.refused), (2, 1));
+        assert_eq!(counts.inputs, 2);
+        assert_eq!(rig.take(), guessable_block(2, 12));
+        assert_eq!(rig.take(), guessable_block(3, 13));
+        assert_eq!(rig.take(), ping(4));
+        rig.finish();
+        // Nothing is held once every block was taken.
+        let Message::Block(block) = guessable_block(5, 15) else {
+            unreachable!("a block");
+        };
+        let hashed = HashedBlock::new(Arc::new(block));
+        assert!(preverifier.submit(&hashed).is_some());
+    }
+
+    /// A handler that leaves withdraws the blocks still queued, and a
+    /// block the reader read as the handler left is withdrawn as it is
+    /// dropped.
+    #[test]
+    fn a_handler_that_leaves_lets_preverification_go_of_its_blocks() {
+        let Some(preverifier) = preverifier(2, -1) else {
+            return;
+        };
+        let rig = Rig::start_preverifying(
+            vec![
+                frame(guessable_block(0, 1)),
+                frame(guessable_block(1, 2)),
+                Step::Hang,
+            ],
+            Arc::clone(&preverifier),
+        );
+        for index in 0..3 {
+            rig.expect_started(index);
+        }
+        assert_eq!(preverifier.counts().blocks, 2);
+        rig.finish();
+        let submit = |nonce: u32| {
+            let Message::Block(block) = guessable_block(nonce, 9) else {
+                unreachable!("a block");
+            };
+            preverifier.submit(&HashedBlock::new(Arc::new(block)))
+        };
+        let first = submit(7).expect("the queue has room again");
+        let _second = submit(8).expect("for both blocks");
+        preverifier.withdraw_through(first);
+
+        // A block read after the handler left: queued for
+        // pre-verification, then dropped with the frame.
+        let Some(preverifier) = preverifier_for_one() else {
+            return;
+        };
+        let mut rig = Rig::start_preverifying(
+            vec![Step::Gated(guessable_block(0, 1), 24)],
+            Arc::clone(&preverifier),
+        );
+        rig.expect_started(0);
+        rig.shared.leave();
+        let _ = rig.gate.send(());
+        rig.join_reader();
+        assert_eq!(preverifier.counts().blocks, 1);
+        let Message::Block(block) = guessable_block(9, 9) else {
+            unreachable!("a block");
+        };
+        assert!(
+            preverifier
+                .submit(&HashedBlock::new(Arc::new(block)))
+                .is_some(),
+            "the dropped block was let go"
+        );
+    }
+
+    /// [`preverifier`] with room for one block and no floor.
+    fn preverifier_for_one() -> Option<Arc<Preverifier>> {
+        preverifier(1, -1)
+    }
+
+    /// Once the handler says reading ahead is no longer wanted, as it
+    /// does after the initial chain sync, the reader hands no block to
+    /// pre-verification: not the block it was reading when it was told,
+    /// nor those it reads in turn after, and again once it is wanted.
+    #[test]
+    fn blocks_read_while_read_ahead_is_not_wanted_are_not_preverified() {
+        let Some(preverifier) = preverifier(8, -1) else {
+            return;
+        };
+        let rig = Rig::start_preverifying(
+            vec![
+                frame(guessable_block(0, 1)),
+                Step::Gated(guessable_block(1, 2), 24),
+                frame(guessable_block(2, 3)),
+                frame(guessable_block(3, 4)),
+                frame(guessable_block(4, 5)),
+            ],
+            Arc::clone(&preverifier),
+        );
+        rig.expect_started(0);
+        rig.expect_started(1);
+        // Block 0 was read ahead and handed over.
+        assert_eq!(preverifier.counts().blocks, 1);
+        rig.shared.set_ahead(false);
+        let _ = rig.gate.send(());
+        assert_eq!(rig.take(), guessable_block(0, 1));
+        assert_eq!(rig.take(), guessable_block(1, 2));
+        // Each from here is read once the handler waits for it.
+        assert_eq!(rig.take(), guessable_block(2, 3));
+        rig.expect_started(2);
+        assert_eq!(rig.take(), guessable_block(3, 4));
+        rig.expect_started(3);
+        assert_eq!(preverifier.counts().blocks, 1);
+        // Wanted again, the next block read is handed over.
+        rig.shared.set_ahead(true);
+        assert_eq!(rig.take(), guessable_block(4, 5));
+        rig.expect_started(4);
+        assert_eq!(preverifier.counts().blocks, 2);
+        rig.finish();
     }
 
     /// `DCROXIDE_READ_AHEAD` turns the read-ahead off with `off` or `0`

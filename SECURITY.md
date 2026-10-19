@@ -199,15 +199,26 @@ evaluating this code.
   scripts, each reading a script once at most, with no hashing, and keep
   nothing past a transaction but the two sums; what they cost the
   reading thread on a hostile peer's blocks has not been measured. The
-  memory is at worst about 62 MB held on that connection, with about
-  1.3 MB more for a moment while one frame is compared with its block's
-  serialization, or up to about 1.4 MB while one block's trees are
-  built, against about 12.5 MB without the read-ahead: estimates from
-  struct layouts, not measurements. It also costs one more thread and
-  one more descriptor on that connection.
-  `DCROXIDE_READ_AHEAD=off` removes it: every connection is then read as
-  dcrd reads, and no frame is kept. Details are in PARITY.md, *Reading
-  ahead of the block handler*.
+  signatures of a queued block above the height at and below which the
+  chain checks no script are also checked while it waits, on the script
+  pool's helper threads, at most two fewer at once than the physical
+  cores: for each input of the one guessed shape, one hash of its
+  transaction's witness serialization, a byte for each other input, and
+  at most one signature verification, whose success leaves an entry in
+  the signature cache. A peer whose block the chain rejects stays
+  connected, as in dcrd, and its later blocks are checked alike, so that
+  work is bounded per block and by the time each block waits, not per
+  peer; what it costs on a hostile peer's blocks has not been measured,
+  and `DCROXIDE_PREVERIFY=off` removes it (PARITY.md, *Signature
+  pre-verification ahead of the block thread*). The memory is at worst
+  about 62 MB held on that connection, with about 1.3 MB more for a
+  moment while one frame is compared with its block's serialization, or
+  up to about 1.4 MB while one block's trees are built, against about
+  12.5 MB without the read-ahead: estimates from struct layouts, not
+  measurements. It also costs one more thread and one more descriptor on
+  that connection. `DCROXIDE_READ_AHEAD=off` removes it: every
+  connection is then read as dcrd reads, and no frame is kept. Details
+  are in PARITY.md, *Reading ahead of the block handler*.
 - **Fuzzing reaches the stateless parsers, not the state machines.**
   Seventeen `cargo-fuzz` targets run for 60 seconds apiece on every push
   to `master` and every pull request, and for ten minutes apiece
