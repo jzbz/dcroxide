@@ -873,7 +873,20 @@ default sync (the sync budget above).
   2026-10-16 and 2026-10-17 was not read. On `88c46c3`, on 2026-10-17,
   the peak to the tip was 2,202 and 2,203 MiB in two runs with the index
   off against 3,464 to 3,710 MiB in four with it on, so the index adds
-  about 1.2 to 1.5 GiB (1,261–1,508 MiB) there.
+  about 1.2 to 1.5 GiB (1,261–1,508 MiB) there. The megabytes given
+  above for the set count its keys alone, 21 bytes each. Each memtable
+  partition now also keeps a Bloom filter of its keys
+  ([ADR-0011](adr/0011-exists-address-layout-3-and-the-flush-participant.md),
+  addendum of 2026-10-17), which adds at most 2 bytes a key and one
+  64-byte block a partition: up to about 8 MB at 4 million keys, 9 MB at
+  4.5 million and 12 MB at 6.0 million. None of the peaks above is of a
+  build with the filters. They were first run in syncs on 2026-10-18,
+  from a block server on another machine on the same LAN, where two runs
+  of one build differed by up to 235 MiB in peak resident memory in the
+  morning's rungs, and by more in the afternoon's, so what the filters
+  add to it is not resolved ([bench-ledger.md](bench-ledger.md), "Rungs
+  from a block server on the LAN, two changes held for their memory, and
+  dcrd v2.1.7").
 - **Starting**: the node reads the journal back into memory before the
   index catches up, modelled at 1-3 s on mainnet, holding one copy of the
   addresses it reads back, and the journal's pages in the page cache.
@@ -1323,7 +1336,8 @@ nothing from `/proc`. `DCROXIDE_EXISTSADDR_MEMTABLE_KEYS` is
 for measurements only: it sets how many keys the exists-address index
 holds in memory before its flushes merge them into its sorted runs (the
 hard bound is one and a half times it), trading the index's memory, 21
-bytes a key, against the pages its flushes write. It never changes an
+bytes a key and up to 2 more for its partition's Bloom filter, against
+the pages its flushes write. It never changes an
 answer; leave it unset. `DCROXIDE_BLOCK_WINDOW` is read once at startup
 and is the way back to dcrd's download window; the sync budget above
 says when to use it. `dcrd`, in any letter case, selects dcrd's window

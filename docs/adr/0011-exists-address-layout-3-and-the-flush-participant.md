@@ -1110,3 +1110,102 @@ and `:393`, and `allows_deferred_finish` at `:368`. The cited lines of
 > commit at `:1410` and the participant-only flush's count at `:1476`.
 > The cited lines of the other files did not move, and the functions
 > named are unchanged.
+
+## Addendum, 2026-10-17 — a Bloom filter in front of each memtable partition
+
+A connect's filter, the hook's search where a version moved and every
+lookup ask a memtable partition whether it holds a key, and the
+partition answered by a binary search of its journaled vector, its
+sealed runs and its unjournaled runs. Every key handed in that the
+memtable did not hold, every key a flush later journals among them, cost
+a search that missed.
+
+Each partition now keeps a Bloom filter of the keys it holds
+(`existsaddr/bloom.rs`), and `Part::contains` asks it first. A key the
+filter rules out is not held; a key it lets through is searched for as
+before. So every answer is the search's, and the filter only spares
+searches that would miss. The filter is an array of 64-byte blocks, and
+a key sets one bit in each of its block's eight 64-bit words, so a probe
+reads one cache line: Apache Parquet's split-block filter, with its
+salts, there with 32-bit words and here with 64-bit ones. The hash folds
+the key's three words by two 64-by-64-bit multiplications. It is not
+keyed: whoever pays to addresses can grind keys the filter lets through,
+and a lookup of such a key then costs the search it cost before plus one
+probe. No answer depends on the hash.
+
+The filter changes with the partition's keys, under its write lock. An
+insert sets the bits of the run it adds, or builds the filter again at
+sixteen bits a key when the keys would leave it fewer than eight. A fold
+that clears a merged partition builds it from the keys inserted since
+the seal, and a load from the keys it reads back. A seal, an unseal and
+a fold that journals change no key held and leave it. The filter moves
+no version and reads none, so the version rule of the addenda above
+stands as written. A partition's filter is therefore always the one its
+keys build at its size, eight to sixteen bits a key rounded up to a
+whole block, and lets through about one key in 34 that it does not hold
+at eight bits a key and one in 1,100 at sixteen; the filter's tests hold
+the share to 2-4% and under 0.2%. The filters take at most two bytes a
+key and one 64-byte block a partition: at the defaults' bound of
+6.0 million keys (126 MB), 12 MB more. A rebuild hashes every key of its
+partition. An insert's comes at more than twice the keys of the build
+before, so since the partition was last built smaller its rebuilds have
+hashed fewer than two keys for each key it holds; they run in the commit
+hook, under the writer semaphore, beside the run's merges. Nothing on
+disk changes, nor do the policy, the journal, the runs, the flush log or
+the hooks' contract. The debug assertion on the hook's unsearched path
+searches the sorted vectors without the filter, so it checks the version
+rule alone.
+
+Pinned in `existsaddr/memtable.rs` by
+`the_filter_answers_as_a_search_does_through_every_change`, which takes
+four partitions through random connects, seals, folds, unseals, loads
+and clears and checks every filter and every probe after each step, by
+`the_filter_spares_most_searches_for_keys_not_held`, by
+`an_insert_builds_the_filter_again_only_when_it_must`, which checks when
+each rebuild comes, its size and the keys the rebuilds hash, by
+`readers_see_the_keys_a_merged_fold_keeps`, and by the filter check
+added to
+`random_interleavings_leave_what_a_search_for_every_key_leaves`; and in
+`existsaddr/bloom.rs` by `a_filter_is_sized_by_the_keys_it_stands_for`,
+`a_filter_lets_every_key_it_holds_through`,
+`a_filter_lets_few_keys_it_does_not_hold_through` and
+`the_hash_reads_every_byte`. An insert that sets no bits, a rebuild from
+the journaled keys only, a fold that clears a merged partition and keeps
+its filter or empties it, a load that keeps it, a lookup that takes the
+filter's maybe as a yes or skips the filter, a filter that lets every
+key through, never grows, is built at eight bits a key or sets its bits
+in half of each word, a growth check that leaves the run out or counts
+it twice, an insert that outgrows the filter without building it again,
+that builds it again at every run or with a quarter of its room left,
+and a growth that builds it twice each fail at least one of them. They
+have run on Linux only.
+
+The filter moved lines cited above, whose numbers stay as they were
+written: `Memtable::filter` is now at `existsaddr/memtable.rs:354` and
+`insert_candidates` at `:395`, and `cmp_keys` at `existsaddr/mod.rs:64`.
+The cited lines of `existsaddrindex.rs`, `existsaddr/store.rs`,
+`policy.rs` and `dcroxide.rs` did not move.
+
+> **Note, 2026-10-18, after the syncs of that day.** The filter was
+> first run in syncs on m3, from a dcrd v2.1.7 node on another machine
+> on the same LAN, on top of five other changes and against those five
+> alone, two runs each ([bench-ledger.md](../bench-ledger.md), "Rungs
+> from a block server on the LAN, two changes held for their memory, and
+> dcrd v2.1.7", build D). Those builds were states of a worktree, not
+> the tree of a commit, and the series is one of its own, not comparable
+> with the ledger's loopback figures. The index thread's time on a
+> processor fell from 133.1 and 132.5 s to 71.5 and 72.4 s, 60.9 s or
+> 46%, and the node's CPU time 53.8 s; the wall fell 7.70 s by the
+> means, beyond the morning session's 95% interval of about ±3.5 s,
+> 5.80 s of it before the assume-valid block. The time the index's queue
+> was full, by the node's line at shutdown, was 3.45 and 3.48 s against
+> 3.69 and 3.80 s in the build below it; in every run of that morning it
+> was 3.20 to 3.80 s, `88c46c3`'s 3.20 to 3.30 s among them. The block
+> thread's time rose 7.5 s, which the records do not explain. Each step
+> there is a change on top of those below it, not its effect alone. How
+> many searches the filter spares in a sync, which nothing in the node
+> counts, and what its bits and rebuilds add to the hook's time under
+> the writer were not taken apart; what the filters add to the peak is
+> not resolved, since two runs of one build differed by up to 235 MiB in
+> that morning's rungs; and the index's contents were not checked after
+> any of those syncs.

@@ -2108,11 +2108,11 @@ fn env_switch(var: &str, set: &str, kept: &str) -> bool {
 /// a half times it; the defaults when it is unset.
 ///
 /// A measurement knob, not an operator setting: it trades the memory the
-/// index holds (21 bytes a key) against the pages its flushes write, and
-/// changes no answer.  An environment variable for `DCROXIDE_DB_CACHE`'s
-/// reason -- dcrd has no counterpart and the `-h` output is pinned to
-/// dcrd's -- and read only when the index is on, so a node without it
-/// logs nothing about it.
+/// index holds (21 bytes a key, and up to 2 more for the memtable's Bloom
+/// filters) against the pages its flushes write, and changes no answer.
+/// An environment variable for `DCROXIDE_DB_CACHE`'s reason -- dcrd has
+/// no counterpart and the `-h` output is pinned to dcrd's -- and read
+/// only when the index is on, so a node without it logs nothing about it.
 fn exists_addr_policy(enabled: bool) -> dcroxide_indexers::ExistsAddrPolicy {
     const VAR: &str = "DCROXIDE_EXISTSADDR_MEMTABLE_KEYS";
     if !enabled {

@@ -25,7 +25,24 @@
 //! O(log n) times before the flush that journals it, so a partition an
 //! adversary crowds costs n log n, not n squared, under the writer
 //! semaphore.  Every vector is grown by exact-capacity merges, so the
-//! memtable costs 21 bytes a key plus a transient copy of one partition.
+//! memtable costs 21 bytes a key, and its filters (below) at most two
+//! more, plus a transient copy of one partition.
+//!
+//! A partition also keeps a Bloom filter of the keys it holds
+//! ([`super::bloom`]), and every search for a key starts there.  A key
+//! the filter rules out is not held; only a key it lets through is
+//! searched for in the sorted vectors, so every answer is the search's,
+//! and the filter only spares the searches that would miss.  It changes
+//! under the partition's write lock with the keys: an insert sets the
+//! bits of the run it adds, or builds the filter again at sixteen bits a
+//! key once the partition's keys would leave it fewer than eight; a
+//! flush's clear of a partition it merged, and a load, build it from the
+//! keys left.  A seal, an unseal and a fold that journals change no key
+//! held and leave it.  So a partition's filter is always the one its
+//! keys build at its size, which stands at eight to sixteen bits a key
+//! held, rounded up to a whole block: the filters take at most two bytes
+//! a key and one 64-byte block a partition, 12 MB at the 6.0 million
+//! keys the memtable can hold at the default policy.
 //!
 //! A partition also counts the changes to the keys it holds and to which
 //! of them are journaled, its version.  A connect filters its keys
@@ -45,6 +62,7 @@
 use std::sync::RwLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use super::bloom::Bloom;
 use super::policy::PARTITIONS;
 use super::{Key, cmp_keys};
 
@@ -78,14 +96,56 @@ struct Part {
     /// partition's creation and is never set back, a flush's clear and a
     /// load included, so it never returns to a value it has had.
     version: u64,
+    /// The Bloom filter of every key in `journaled`, `sealed` and
+    /// `fresh`, and of no other: the filter those keys build at its size,
+    /// which [`Part::add_run`] and [`Part::rebuild_bloom`] keep at eight
+    /// to sixteen bits a key, rounded up to a whole block.
+    bloom: Bloom,
+    /// Searches of the sorted vectors, for the tests that must see which
+    /// lookups the filter spared.
+    #[cfg(test)]
+    searches: AtomicUsize,
+    /// Keys hashed by the filter's rebuilds, for the test that bounds
+    /// them.
+    #[cfg(test)]
+    rebuilt: usize,
 }
 
 impl Part {
+    /// Whether the partition holds `key`: false where its filter rules
+    /// the key out, and otherwise the answer of [`Part::search`].
     fn contains(&self, key: &Key) -> bool {
+        self.bloom.may_hold(key) && self.search(key)
+    }
+
+    /// Whether a binary search of the sorted vectors finds `key`, filter
+    /// or no filter.
+    fn search(&self, key: &Key) -> bool {
+        #[cfg(test)]
+        self.searches.fetch_add(1, Ordering::Relaxed);
         let holds = |keys: &[Key]| keys.binary_search_by(|held| cmp_keys(held, key)).is_ok();
         holds(&self.journaled)
             || self.sealed.iter().any(|run| holds(run))
             || self.fresh.iter().any(|run| holds(run))
+    }
+
+    /// Every sorted vector, journaled first.
+    fn vectors(&self) -> impl Iterator<Item = &[Key]> {
+        std::iter::once(self.journaled.as_slice())
+            .chain(self.sealed.iter().map(Vec::as_slice))
+            .chain(self.fresh.iter().map(Vec::as_slice))
+    }
+
+    /// Build the filter afresh from the keys held, sized for them: what
+    /// an insert does when the keys would leave the filter fewer than
+    /// eight bits each, and what a change that removes keys does, so the
+    /// filter neither holds bits of keys gone nor keeps their room.
+    fn rebuild_bloom(&mut self) {
+        #[cfg(test)]
+        {
+            self.rebuilt = self.rebuilt.saturating_add(self.len());
+        }
+        self.bloom = Bloom::of(self.len(), self.vectors());
     }
 
     fn len(&self) -> usize {
@@ -103,8 +163,21 @@ impl Part {
     /// with it, so a key is copied O(log n) times as an older run, plus
     /// once per run it passes as the newest, of which there are at most
     /// `log2(n) + 1`.
+    ///
+    /// The run's keys go into the filter, which is built again, at sixteen
+    /// bits a key, when it cannot stand for them at eight.  A rebuild
+    /// hashes every key the partition holds, and each comes at more than
+    /// twice the keys of the one before, so since the partition was last
+    /// built smaller the rebuilds have hashed fewer than two keys for
+    /// each key it holds.
     fn add_run(&mut self, run: Vec<Key>) -> usize {
         self.version = self.version.wrapping_add(1);
+        let rebuild = !self.bloom.fits(self.len().saturating_add(run.len()));
+        if !rebuild {
+            for key in &run {
+                self.bloom.add(key);
+            }
+        }
         self.fresh_len = self.fresh_len.saturating_add(run.len());
         self.fresh.push(run);
         let mut copied = 0usize;
@@ -117,11 +190,15 @@ impl Part {
             copied = copied.saturating_add(merged.len());
             self.fresh.push(merged);
         }
+        if rebuild {
+            self.rebuild_bloom();
+        }
         copied
     }
 
     /// Replace the keys with `journaled`, sorted and all of them
-    /// journaled, none sealed by a flush: what a load leaves.
+    /// journaled, none sealed by a flush: what a load leaves.  The filter
+    /// is built from them.
     fn replace(&mut self, journaled: Vec<Key>) {
         self.version = self.version.wrapping_add(1);
         self.journaled = journaled;
@@ -129,6 +206,7 @@ impl Part {
         self.sealed_len = 0;
         self.fresh = Vec::new();
         self.fresh_len = 0;
+        self.rebuild_bloom();
     }
 
     /// The unjournaled keys no flush holds, sorted, in one vector.
@@ -253,7 +331,8 @@ impl Memtable {
         self.unjournaled.load(Ordering::SeqCst)
     }
 
-    /// Whether partition `p` holds `key`, sealed keys included: a binary
+    /// Whether partition `p` holds `key`, sealed keys included: a probe of
+    /// the partition's filter and, unless it rules the key out, a binary
     /// search of each sorted vector, under the partition's read lock.
     pub(crate) fn contains(&self, p: u8, key: &Key) -> bool {
         self.part(usize::from(p)).contains(key)
@@ -336,7 +415,7 @@ impl Memtable {
             let stands = stands && !self.search_always.load(Ordering::SeqCst);
             let run: Vec<Key> = if stands {
                 debug_assert!(
-                    group.iter().all(|c| !part.contains(&c.key)),
+                    group.iter().all(|c| !part.search(&c.key)),
                     "partition {p} holds a key its version says it does not"
                 );
                 #[cfg(test)]
@@ -405,7 +484,8 @@ impl Memtable {
     ///
     /// The keys stay held and found, apart from the ones later inserts
     /// add, so the flush's `finished` can tell the two apart however
-    /// many inserts land before it.  The runs are moved, not copied.
+    /// many inserts land before it.  The runs are moved, not copied, and
+    /// the filters, whose keys are the same, are left as they are.
     /// Nothing is counted as unjournaled afterwards: the next flush owes
     /// only what arrives from here on.
     ///
@@ -441,10 +521,10 @@ impl Memtable {
         let mut removed = 0usize;
         for (p, &was_merged) in merged.iter().enumerate() {
             let mut part = self.part_mut(p);
+            let mut gone = 0usize;
             if was_merged {
-                removed = removed
-                    .saturating_add(part.journaled.len())
-                    .saturating_add(part.sealed_len);
+                gone = part.journaled.len().saturating_add(part.sealed_len);
+                removed = removed.saturating_add(gone);
                 part.journaled = Vec::new();
             } else if part.sealed_len > 0 {
                 let sealed = merge_runs(&part.sealed);
@@ -457,6 +537,13 @@ impl Memtable {
             }
             part.sealed = Vec::new();
             part.sealed_len = 0;
+            // A merged partition keeps only the keys inserted since the
+            // seal, and its filter is built from them: it keeps neither
+            // the bits nor the room of the keys gone.  A fold that
+            // journals changes no key held, and leaves the filter.
+            if gone > 0 {
+                part.rebuild_bloom();
+            }
         }
         self.len.fetch_sub(removed, Ordering::SeqCst);
     }
@@ -466,7 +553,8 @@ impl Memtable {
     ///
     /// A partition nothing was inserted into gets its runs back as they
     /// were; in any other the sealed and the newer keys become one run,
-    /// which keeps the runs' lengths falling.
+    /// which keeps the runs' lengths falling.  The filters, whose keys
+    /// are the same, are left as they are.
     pub(crate) fn unseal(&self) {
         let mut restored = 0usize;
         for p in 0..PARTITIONS {
@@ -573,6 +661,47 @@ impl Memtable {
         part.journaled
             .capacity()
             .saturating_sub(part.journaled.len())
+    }
+
+    /// Partition `p`'s filter's blocks, once checked to be the filter its
+    /// keys build at that size, of at least one block for every 64 keys
+    /// held and at most one for every 32 rounded up, so none when it
+    /// holds none.  For tests.
+    #[cfg(test)]
+    pub(crate) fn checked_bloom(&self, p: usize) -> Result<usize, String> {
+        let part = self.part(p);
+        let (len, blocks) = (part.len(), part.bloom.blocks());
+        if blocks < len.div_ceil(64) || blocks > len.div_ceil(32) {
+            return Err(format!("partition {p}: {blocks} blocks for {len} keys"));
+        }
+        if part.bloom != part.bloom.same_size_of(part.vectors()) {
+            return Err(format!(
+                "partition {p}: the filter is not the one its {len} keys build"
+            ));
+        }
+        Ok(blocks)
+    }
+
+    /// Searches of sorted vectors so far, over every partition, for
+    /// tests.
+    #[cfg(test)]
+    pub(crate) fn searches(&self) -> usize {
+        (0..PARTITIONS).fold(0usize, |n, p| {
+            n.saturating_add(self.part(p).searches.load(Ordering::Relaxed))
+        })
+    }
+
+    /// Whether a search of partition `p`'s sorted vectors alone, without
+    /// its filter, finds `key`, for tests.
+    #[cfg(test)]
+    pub(crate) fn search(&self, p: u8, key: &Key) -> bool {
+        self.part(usize::from(p)).search(key)
+    }
+
+    /// Keys partition `p`'s filter rebuilds have hashed so far, for tests.
+    #[cfg(test)]
+    pub(crate) fn rebuilt(&self, p: usize) -> usize {
+        self.part(p).rebuilt
     }
 }
 
@@ -1263,6 +1392,8 @@ mod tests {
                 for m in tables {
                     assert_eq!(m.all_sorted(p), all, "step {step}, partition {p}");
                     assert_eq!(m.unjournaled_sorted(p), fresh, "step {step}, partition {p}");
+                    m.checked_bloom(p)
+                        .unwrap_or_else(|e| panic!("step {step}: {e}"));
                 }
                 assert_eq!(
                     (trusting.shape(p), trusting.version(p)),
@@ -1328,5 +1459,332 @@ mod tests {
         }
         held.sort_unstable();
         assert_eq!(m.snapshot(), held);
+    }
+
+    /// A key of the index's shape with a random hash160 and type, filed
+    /// under whatever partition a test names.
+    fn random_key(rng: &mut SplitMix64) -> Key {
+        let mut k = [0u8; 21];
+        rng.fill(&mut k);
+        k[0] %= 4;
+        k
+    }
+
+    /// Filter `keys` into partition `p` and insert what the filter kept;
+    /// returns how many were new.
+    fn insert_into(m: &Memtable, p: u8, keys: &[Key]) -> usize {
+        m.insert_candidates(&m.filter(keys.iter().map(|k| (p, *k))))
+    }
+
+    /// A partition's filter answers as a search of its sorted vectors
+    /// does, and as a model that keeps sets does, through every change
+    /// the partition sees: connects of any size, before a seal and
+    /// between a seal and its end, their keys new, held or gone; a fold
+    /// that journals; a fold that clears a merged partition but for the
+    /// keys inserted since the seal; an unseal; a load; a clear.  After
+    /// every step each filter is the one its keys build at its size, so
+    /// it keeps no bit of a key gone, and its size is within its bounds;
+    /// every key held is let through and found, and a key not held, gone
+    /// or never there, is found by neither way.
+    #[test]
+    fn the_filter_answers_as_a_search_does_through_every_change() {
+        const PARTS: [u8; 4] = [0, 3, 128, 255];
+        let mut rng = SplitMix64(0x6d65_6d74_6162_0003);
+        let m = Memtable::new();
+        // Per partition: the journaled, sealed and unjournaled keys.
+        let mut model: Vec<[BTreeSet<Key>; 3]> = vec![Default::default(); PARTITIONS];
+        let holds = |model: &[[BTreeSet<Key>; 3]], p: u8, k: &Key| {
+            model[usize::from(p)].iter().any(|set| set.contains(k))
+        };
+        // Every key ever handed over, held now or not.
+        let mut seen: Vec<(u8, Key)> = Vec::new();
+        let mut sealed = false;
+        let mut blocks = [0usize; PARTITIONS];
+        let (mut grown, mut shrunk, mut cleared, mut loads) = (0usize, 0usize, 0usize, 0usize);
+        let (mut missing, mut spared) = (0usize, 0usize);
+        for step in 0..4_000u32 {
+            match rng.below(20) {
+                0..=11 => {
+                    // A connect: new keys and keys handed over before.
+                    let most = if rng.below(10) == 0 { 400 } else { 40 };
+                    let n = 1 + rng.below(most);
+                    let mut keys: BTreeSet<(u8, Key)> = BTreeSet::new();
+                    for _ in 0..n {
+                        if !seen.is_empty() && rng.below(4) == 0 {
+                            keys.insert(seen[rng.below(seen.len() as u64) as usize]);
+                        } else {
+                            keys.insert((PARTS[rng.below(4) as usize], random_key(&mut rng)));
+                        }
+                    }
+                    let mut want = 0usize;
+                    for &(p, k) in &keys {
+                        if !holds(&model, p, &k) {
+                            model[usize::from(p)][2].insert(k);
+                            seen.push((p, k));
+                            want += 1;
+                        }
+                    }
+                    let mut candidates = m.filter(keys.iter().copied());
+                    // Now and then as a filter whose versions moved, so
+                    // the insert searches under the write lock.
+                    if rng.below(4) == 0 {
+                        for c in &mut candidates {
+                            c.seen = u64::MAX;
+                        }
+                    }
+                    assert_eq!(m.insert_candidates(&candidates), want, "step {step}");
+                }
+                12 | 13 if !sealed => {
+                    for [_, s, fresh] in model.iter_mut() {
+                        s.append(fresh);
+                    }
+                    m.seal();
+                    sealed = true;
+                }
+                14 | 15 if sealed => {
+                    let mut merged = [false; PARTITIONS];
+                    for p in PARTS {
+                        merged[usize::from(p)] = rng.below(6) == 0;
+                    }
+                    for (p, [journaled, s, _]) in model.iter_mut().enumerate() {
+                        if merged[p] {
+                            cleared += usize::from(!journaled.is_empty() || !s.is_empty());
+                            journaled.clear();
+                            s.clear();
+                        } else {
+                            journaled.append(s);
+                        }
+                    }
+                    m.fold_sealed(&merged);
+                    sealed = false;
+                }
+                16 if sealed => {
+                    for [_, s, fresh] in model.iter_mut() {
+                        fresh.append(s);
+                    }
+                    m.unseal();
+                    sealed = false;
+                }
+                17 if !sealed && rng.below(4) == 0 => {
+                    // Most of what each partition held and a few new keys,
+                    // all of them journaled.
+                    let mut parts = vec![Vec::new(); PARTITIONS];
+                    for p in PARTS {
+                        let sets = &mut model[usize::from(p)];
+                        let mut keys: BTreeSet<Key> = sets
+                            .iter()
+                            .flatten()
+                            .copied()
+                            .filter(|_| rng.below(4) != 0)
+                            .collect();
+                        for _ in 0..rng.below(20) {
+                            let k = random_key(&mut rng);
+                            keys.insert(k);
+                            seen.push((p, k));
+                        }
+                        parts[usize::from(p)] = keys.iter().copied().collect();
+                        *sets = [keys, BTreeSet::new(), BTreeSet::new()];
+                    }
+                    m.load(parts);
+                    loads += 1;
+                }
+                18 if !sealed && rng.below(20) == 0 => {
+                    model = vec![Default::default(); PARTITIONS];
+                    m.clear();
+                    loads += 1;
+                }
+                _ => {}
+            }
+            for p in PARTS {
+                let b = m
+                    .checked_bloom(usize::from(p))
+                    .unwrap_or_else(|e| panic!("step {step}: {e}"));
+                let was = blocks[usize::from(p)];
+                grown += usize::from(b > was);
+                shrunk += usize::from(b < was);
+                blocks[usize::from(p)] = b;
+            }
+            // Keys held or gone, and keys never handed over.
+            let mut probes: Vec<(u8, Key)> = (0..30)
+                .map(|_| (PARTS[rng.below(4) as usize], random_key(&mut rng)))
+                .collect();
+            if !seen.is_empty() {
+                probes.extend((0..30).map(|_| seen[rng.below(seen.len() as u64) as usize]));
+            }
+            if step % 250 == 0 {
+                for p in PARTS {
+                    probes.extend(model[usize::from(p)].iter().flatten().map(|k| (p, *k)));
+                }
+            }
+            for (p, k) in probes {
+                let want = holds(&model, p, &k);
+                let before = m.searches();
+                assert_eq!(m.contains(p, &k), want, "step {step}, partition {p}");
+                if !want {
+                    missing += 1;
+                    spared += usize::from(m.searches() == before);
+                }
+                assert_eq!(m.search(p, &k), want, "step {step}, partition {p}");
+            }
+        }
+        // Every kind of change ran, the filters grew and shrank, and they
+        // spared most searches for keys not held.
+        assert!(grown > 100 && shrunk > 50, "grown {grown}, shrunk {shrunk}");
+        assert!(
+            cleared > 50 && loads > 10,
+            "cleared {cleared}, loads {loads}"
+        );
+        assert!(
+            spared * 100 > missing * 95,
+            "{spared} of {missing} searches spared"
+        );
+        assert!(seen.len() > 50_000, "{} keys handed over", seen.len());
+    }
+
+    /// A partition of 30,000 keys, journaled, sealed and unjournaled:
+    /// the filter spares all but a few hundredths of the searches for
+    /// keys it does not hold, and every search for a key it does.
+    #[test]
+    fn the_filter_spares_most_searches_for_keys_not_held() {
+        let mut rng = SplitMix64(0x6d65_6d74_6162_0004);
+        let m = Memtable::new();
+        let keys: Vec<Key> = (0..30_000).map(|_| random_key(&mut rng)).collect();
+        let (journaled, rest) = keys.split_at(20_000);
+        let (sealed, fresh) = rest.split_at(6_000);
+        for chunk in journaled.chunks(97) {
+            insert_into(&m, 9, chunk);
+        }
+        m.commit_flush(&[false; PARTITIONS]);
+        for chunk in sealed.chunks(97) {
+            insert_into(&m, 9, chunk);
+        }
+        m.seal();
+        for chunk in fresh.chunks(97) {
+            insert_into(&m, 9, chunk);
+        }
+        assert_eq!(m.len(), 30_000);
+        assert_eq!(m.shape(9).0, 20_000);
+        assert_eq!(m.sealed_keys(), 6_000);
+        let blocks = m.checked_bloom(9).expect("the filter of the keys");
+        assert!(blocks >= 30_000 / 64, "{blocks}");
+
+        let probes: Vec<Key> = (0..100_000).map(|_| random_key(&mut rng)).collect();
+        let before = m.searches();
+        let kept = m.filter(probes.iter().map(|k| (9, *k)));
+        let searched = m.searches() - before;
+        assert_eq!(kept.len(), probes.len());
+        assert!(searched * 25 < probes.len(), "{searched} searched");
+
+        let before = m.searches();
+        assert!(m.filter(keys.iter().map(|k| (9, *k))).is_empty());
+        assert_eq!(m.searches() - before, keys.len());
+    }
+
+    /// An insert builds a partition's filter again only when its keys
+    /// would leave it fewer than eight bits each, and then at sixteen, so
+    /// each rebuild comes at more than twice the keys of the one before,
+    /// and the rebuilds since the partition was last built smaller have
+    /// hashed fewer than two keys for each key it holds.  Runs of one
+    /// key, of half the partition and of sizes in between, into an empty
+    /// partition and again after a fold has cleared it but for a few.
+    #[test]
+    fn an_insert_builds_the_filter_again_only_when_it_must() {
+        let mut rng = SplitMix64(0x6d65_6d74_6162_0005);
+        let m = Memtable::new();
+        let mut rebuilds = 0usize;
+        // The keys hashed by rebuilds before the partition was last built
+        // smaller: none for an empty one.
+        let mut start = 0usize;
+        for round in 0..2 {
+            let mut held = m.sizes()[9];
+            // The keys and blocks of the partition's last build.
+            let (mut built, mut blocks) = (held, m.checked_bloom(9).expect("the filter"));
+            while held < 150_000 {
+                let n = match rng.below(3) {
+                    0 => 1,
+                    1 => held / 2 + 1,
+                    _ => 1 + rng.below(held as u64 + 1) as usize,
+                };
+                let keys: Vec<Key> = (0..n).map(|_| random_key(&mut rng)).collect();
+                assert_eq!(insert_into(&m, 9, &keys), n, "round {round}");
+                held += n;
+                let b = m
+                    .checked_bloom(9)
+                    .unwrap_or_else(|e| panic!("round {round}: {e}"));
+                if b != blocks {
+                    assert!(
+                        held > 64 * blocks,
+                        "round {round}: built again at {held} keys, room for {}",
+                        64 * blocks
+                    );
+                    assert_eq!(b, held.div_ceil(32), "round {round}: {held} keys");
+                    assert!(held > 2 * built, "round {round}: {held} after {built}");
+                    (built, blocks) = (held, b);
+                    rebuilds += 1;
+                }
+                let hashed = m.rebuilt(9) - start;
+                assert!(
+                    hashed < 2 * held,
+                    "round {round}: rebuilds hashed {hashed} keys for {held} held"
+                );
+            }
+            // A fold that clears the partition but for the keys inserted
+            // since the seal builds its filter again, smaller.
+            m.seal();
+            let late: Vec<Key> = (0..40).map(|_| random_key(&mut rng)).collect();
+            assert_eq!(insert_into(&m, 9, &late), late.len());
+            start = m.rebuilt(9);
+            m.fold_sealed(&[true; PARTITIONS]);
+            assert_eq!(m.sizes()[9], late.len());
+            assert_eq!(m.checked_bloom(9), Ok(2));
+            assert_eq!(m.rebuilt(9) - start, late.len());
+        }
+        assert!(rebuilds > 16, "{rebuilds} rebuilds");
+    }
+
+    /// Readers on other threads see every key a merged partition keeps
+    /// through the fold that clears it and builds its filter again from
+    /// the keys inserted since the seal: one write lock covers both.
+    #[test]
+    fn readers_see_the_keys_a_merged_fold_keeps() {
+        let m = std::sync::Arc::new(Memtable::new());
+        for round in 0..30u8 {
+            let sealed: Vec<Key> = (0..=255u8)
+                .flat_map(|p| (0..8u8).map(move |r| key(round, p, r)))
+                .collect();
+            insert(&m, &sealed);
+            m.seal();
+            let late: Vec<Key> = (0..=255u8)
+                .flat_map(|p| (0..4u8).map(move |r| key(round, p, 100 + r)))
+                .collect();
+            assert_eq!(insert(&m, &late), late.len());
+            let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let readers: Vec<_> = (0..3usize)
+                .map(|t| {
+                    let m = std::sync::Arc::clone(&m);
+                    let stop = std::sync::Arc::clone(&stop);
+                    let late = late.clone();
+                    std::thread::spawn(move || {
+                        let mut i = t;
+                        while !stop.load(Ordering::SeqCst) {
+                            let k = late[i % late.len()];
+                            assert!(m.contains(k[1], &k), "a key inserted since the seal");
+                            i = i.wrapping_add(5);
+                        }
+                    })
+                })
+                .collect();
+            m.fold_sealed(&[true; PARTITIONS]);
+            stop.store(true, Ordering::SeqCst);
+            for r in readers {
+                r.join().expect("reader");
+            }
+            assert_eq!(m.len(), late.len());
+            assert!(sealed.iter().all(|k| !m.contains(k[1], k)));
+            for p in 0..PARTITIONS {
+                assert_eq!(m.checked_bloom(p), Ok(1));
+            }
+            // The next round's seal takes them.
+        }
     }
 }

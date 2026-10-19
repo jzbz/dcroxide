@@ -11,7 +11,9 @@
 //! - **The memtable** ([`memtable`]) holds every key of an indexed block
 //!   not yet in a run.  A connect's `on_commit` hook inserts its keys
 //!   after the commit's own flush has written its rows and before its
-//!   tip row is published.
+//!   tip row is published.  Each partition keeps a Bloom filter of its
+//!   keys ([`bloom`]), which spares a lookup the search of a partition
+//!   that does not hold its key.
 //! - **The journal** ([`journal`]) records, in each flush, the memtable
 //!   keys not yet journaled, so a restart can rebuild the memtable.
 //! - **The runs** ([`runs`]) hold each partition's keys as a delta run and
@@ -25,6 +27,7 @@
 //!
 //! [ADR-0011]: ../../../../docs/adr/0011-exists-address-layout-3-and-the-flush-participant.md
 
+pub(crate) mod bloom;
 pub(crate) mod journal;
 pub(crate) mod memtable;
 pub(crate) mod meta;
