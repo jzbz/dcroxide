@@ -250,7 +250,9 @@ impl Filter {
             _ => write_var_int(&mut ndata, u64::from(f.n)),
         }
 
-        // Golomb/Rice-code the sorted deltas.
+        // Golomb/Rice-code the sorted deltas: the quotient in unary
+        // (dcrd writes its one bits and the zero after them a bit at a
+        // time), then the B remainder bits.
         let mut w = BitWriter::after(ndata);
         for (i, v) in values.iter().enumerate() {
             #[allow(clippy::arithmetic_side_effects, reason = "i > 0 in the else arm")]
@@ -265,20 +267,12 @@ impl Filter {
                 clippy::arithmetic_side_effects,
                 reason = "remainder = delta & mod_b_mask <= delta"
             )]
-            let mut quotient = (delta - remainder) >> f.b;
-            #[allow(
-                clippy::arithmetic_side_effects,
-                reason = "quotient > 0 by the loop condition"
-            )]
-            while quotient > 0 {
-                w.write_one();
-                quotient -= 1;
-            }
-            w.write_zero();
+            let quotient = (delta - remainder) >> f.b;
+            w.write_unary(quotient);
             w.write_n_bits(remainder, u32::from(f.b));
         }
 
-        f.filter_n_data = w.bytes;
+        f.filter_n_data = w.finish();
         f.data_offset = n_size;
         Ok(f)
     }
@@ -660,6 +654,102 @@ mod tests {
                 sorted_values(version, m, k0, k1, &refs),
                 dcrd_values(version, m, k0, k1, &refs),
                 "round {round}: version {version}, m {m}"
+            );
+        }
+    }
+
+    /// The serialized filter as the port built it before the word at a
+    /// time writer: the same values and entry count, coded a bit at a
+    /// time by dcrd's `bitWriter`.
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "the values are sorted, so v >= prev; b <= 32, so 1 << b >= 1; and the remainder is the low bits of the delta"
+    )]
+    fn bit_at_a_time_filter(
+        version: u16,
+        b: u8,
+        m: u64,
+        key: [u8; KEY_SIZE],
+        data: &[&[u8]],
+    ) -> Vec<u8> {
+        let k0 = u64::from_le_bytes(key[0..8].try_into().expect("8 bytes"));
+        let k1 = u64::from_le_bytes(key[8..16].try_into().expect("8 bytes"));
+        let (_, values) = sorted_values(version, m, k0, k1, data);
+        if values.is_empty() {
+            return Vec::new();
+        }
+        let mut ndata = Vec::new();
+        match version {
+            1 => ndata.extend_from_slice(&(values.len() as u32).to_be_bytes()),
+            _ => write_var_int(&mut ndata, values.len() as u64),
+        }
+        let mut w = bits::tests::SingleBitWriter::after(ndata);
+        let mut prev = 0;
+        for &v in &values {
+            let delta = v - prev;
+            prev = v;
+            let remainder = delta & ((1u64 << b) - 1);
+            w.write_unary((delta - remainder) >> b);
+            w.write_n_bits(remainder, u32::from(b));
+        }
+        w.bytes
+    }
+
+    /// The filter build makes the bytes the bit at a time writer made,
+    /// for both versions, with the block filters' B and M, the other
+    /// parameters dcrd's own gcs tests use, version 1's M = 2^P, and
+    /// random B up to 32 with M near 2^B, over empty to block-sized
+    /// entry sets with duplicates and empty entries.
+    #[test]
+    fn filter_bytes_match_the_bit_at_a_time_build() {
+        let mut rng = SplitMix64::from_entropy("gcs-filter-coding");
+        for round in 0..800 {
+            let version = 1 + (round % 2) as u16;
+            let (b, m) = match rng.below(6) {
+                0 | 1 => (blockcf2::B, blockcf2::M),
+                2 => (20, 1_569_862),
+                3 => (10, 1534),
+                4 => {
+                    let b = rng.below(33) as u8;
+                    (b, 1u64 << b)
+                }
+                _ => {
+                    // M within a few doublings of 2^B keeps the unary
+                    // quotients short (see the oracle differential).
+                    let b = rng.below(33) as u8;
+                    (b, rng.below(1u64 << (u32::from(b) + 6)) + 1)
+                }
+            };
+            let mut key = [0u8; KEY_SIZE];
+            rng.fill(&mut key);
+            let n = match rng.below(4) {
+                0 => rng.below(4),
+                1 => rng.below(64),
+                2 => rng.below(1000),
+                _ => rng.below(6000),
+            } as usize;
+            let mut entries: Vec<Vec<u8>> = Vec::with_capacity(n);
+            for _ in 0..n {
+                match rng.below(16) {
+                    0 => entries.push(Vec::new()),
+                    1 if !entries.is_empty() => {
+                        let i = rng.below(entries.len() as u64) as usize;
+                        entries.push(entries[i].clone());
+                    }
+                    _ => {
+                        let len = rng.below(40) as usize + 1;
+                        let mut e = vec![0u8; len];
+                        rng.fill(&mut e);
+                        entries.push(e);
+                    }
+                }
+            }
+            let refs: Vec<&[u8]> = entries.iter().map(Vec::as_slice).collect();
+            let built = Filter::new(version, b, m, key, &refs).expect("n is small");
+            assert_eq!(
+                built.filter_n_data,
+                bit_at_a_time_filter(version, b, m, key, &refs),
+                "round {round}: version {version}, B {b}, M {m}, {n} entries"
             );
         }
     }
