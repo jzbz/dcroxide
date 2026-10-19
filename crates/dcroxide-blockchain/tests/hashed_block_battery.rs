@@ -4,13 +4,16 @@
 //! twin chain.
 //!
 //! A block may be hashed before it reaches the chain, into a
-//! `HashedBlock`, so that the thread connecting blocks does not hash it.
-//! That changes nothing the chain decides: every row of the battery,
-//! accepted, rejected or orphaned, gives the same fork length and the
-//! same errors with the same texts, and leaves the same tip, as the
-//! block processed without hashes.  The chain that is handed hashed
-//! blocks hashes none of them itself, keeps the allocation each arrived
-//! in, and connects with the hashes it was handed.
+//! `HashedBlock`, and have its signature operations counted there too,
+//! so that the thread connecting blocks does not hash it and counts it
+//! only where that count is over the limit.  That changes nothing the
+//! chain decides: every row of the battery, accepted, rejected or
+//! orphaned, gives the same fork length and the same errors with the
+//! same texts, and leaves the same tip, as the block processed without
+//! hashes, the rows refused for too many signature operations among
+//! them.  The chain that is handed hashed blocks hashes none of them
+//! itself, keeps the allocation each arrived in, and connects with the
+//! hashes it was handed.
 
 // Test-harness arithmetic over small counts.
 #![allow(clippy::arithmetic_side_effects)]
@@ -114,9 +117,21 @@ fn the_battery_gives_the_same_outcomes_through_hashed_blocks() {
     );
     assert!(mirrored >= 200, "{mirrored} blocks kept by the mirror");
     // The rejections are of many kinds, the merkle and duplicate checks
-    // that read the hashes among them.
+    // that read the hashes among them, and the rows refused for too many
+    // signature operations are among those compared.  That the chain
+    // counts a hashed block again where its count is over the limit is
+    // shown in the crate's own tests
+    // (`process::tests::the_battery_counts_a_hashed_block_only_over_the_limit`),
+    // not here: a block over the limit that the contextual check let
+    // through would be refused as it is connected, with the same kind
+    // and text, by the count that includes pay-to-script-hash inputs.
     assert!(kinds.len() >= 40, "{} kinds: {kinds:?}", kinds.len());
-    for kind in ["ErrBadMerkleRoot", "ErrDuplicateTx", "ErrDuplicateBlock"] {
+    for kind in [
+        "ErrBadMerkleRoot",
+        "ErrDuplicateTx",
+        "ErrDuplicateBlock",
+        "ErrTooManySigOps",
+    ] {
         assert!(kinds.contains(kind), "{kind} is not among {kinds:?}");
     }
 

@@ -12,7 +12,9 @@
 //! for that cache, and `BlockMerkleLeaves` holds the full hashes the
 //! merkle roots are built from.  `BlockMerkleRoots` holds the roots of
 //! the two trees once they have been built from those leaves, for a
-//! block that was hashed before it reached the chain.
+//! block that was hashed before it reached the chain, and
+//! `BlockSigOps` holds that block's counts of signature operations
+//! (see the last section).
 //!
 //! # The rule
 //!
@@ -112,6 +114,26 @@
 //! every build each of its items has its transaction and its hash
 //! compared by address with the block's and the hashes' own at the
 //! item's position (`validate::ScriptRunner`).
+//!
+//! # The signature operation counts
+//!
+//! The contextual block check counts the signature operations of every
+//! transaction of the block and refuses a block whose sum exceeds the
+//! limit (dcrd `checkBlockContext`, `validate.go:2378-2408`, over
+//! `countSigOps`, `:3765-3814`).  The count reads nothing but the
+//! block and one answer the chain gives, whether the treasury agenda is
+//! active.  A [`HashedBlock`] counts the block both ways as it is made
+//! (`BlockSigOps`), and carries the two sums.  They follow the rule
+//! above as the block hash does: the processing call files them in the
+//! slot beside the hashes, and the contextual check made as that same
+//! allocation is accepted reads them, and no other check.  There the
+//! chain picks the sum its agenda answer selects and compares it with
+//! the limit; it runs its own count, which gives the verdict and its
+//! text, wherever that sum is over the limit, and for every block that
+//! did not arrive counted.  Carrying the sums decides nothing: a sum
+//! within the limit says only that the count would pass, and nothing is
+//! compared with the limit where the block was counted.  Under debug
+//! assertions the check counts the block again and compares.
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -177,13 +199,40 @@ pub(crate) struct BlockMerkleRoots {
     stake: Hash,
 }
 
+/// The number of signature operations in one block, as the contextual
+/// block check counts them, once for each answer the treasury agenda
+/// query can give: what `validate::count_block_sig_ops` returns for the
+/// block with the agenda inactive and with it active.
+///
+/// The count is dcrd's (`checkBlockContext`, `validate.go:2378-2408`):
+/// `countSigOps` of each regular transaction and then each stake
+/// transaction, with the coinbase and vote flags that loop gives it,
+/// summed in a `u32`.  The agenda changes it in three places: which
+/// transaction is a coinbase, whose input scripts are not counted;
+/// a treasurybase counts nothing once it is active; and `OP_TSPEND`
+/// counts as one only once it is active (`GetSigOpCount`).  No limit is
+/// applied here.  A sum is `None` where an accumulator would overflow,
+/// which no block within the wire protocol's size limit can make.
+///
+/// The fields are private and [`BlockSigOps::compute`] is the only
+/// constructor, so a value is always the pair of counts of some block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BlockSigOps {
+    /// The count with the treasury agenda inactive.
+    treasury_inactive: Option<u32>,
+    /// The count with the treasury agenda active.
+    treasury_active: Option<u32>,
+}
+
 /// A block together with its block hash, the hashes of its transactions,
-/// its merkle leaves and the roots of its two transaction merkle trees,
-/// all computed from that block: what dcrd holds in one `dcrutil.Block`,
-/// whose transactions carry their hashes (`dcrutil/block.go:162-224`)
-/// and whose block hash is computed as the block is wrapped (`NewBlock`,
-/// `dcrutil/block.go:288-293`).  dcrd caches no merkle root: it builds
-/// both trees inside `checkMerkleRoots`.
+/// its merkle leaves, the roots of its two transaction merkle trees and
+/// its two counts of signature operations, all computed from that
+/// block: what dcrd holds in one `dcrutil.Block`, whose transactions
+/// carry their hashes (`dcrutil/block.go:162-224`) and whose block hash
+/// is computed as the block is wrapped (`NewBlock`,
+/// `dcrutil/block.go:288-293`).  dcrd caches no merkle root and no
+/// count: it builds both trees inside `checkMerkleRoots` and counts
+/// inside `checkBlockContext`.
 ///
 /// The fields are private and [`HashedBlock::new`] is the only
 /// constructor, so the hashes are always those of the block the value
@@ -195,8 +244,9 @@ pub(crate) struct BlockMerkleRoots {
 /// It exists so that the hashing can be done before the block reaches
 /// the chain, away from the thread that connects blocks.  Making one
 /// reaches no verdict about the block: nothing is checked, no merkle
-/// root is compared with the header, and the chain makes every check it
-/// makes of a block that arrives without hashes, in the same order
+/// root is compared with the header, no count is compared with the
+/// limit, and the chain makes every check it makes of a block that
+/// arrives without hashes, in the same order
 /// (`Chain::process_hashed_block`).
 ///
 /// A block that was decoded from bytes may also carry those bytes, laid
@@ -218,6 +268,8 @@ pub struct HashedBlock {
     merkle_leaves: BlockMerkleLeaves,
     /// The roots of the two trees over `merkle_leaves`.
     merkle_roots: BlockMerkleRoots,
+    /// The block's two counts of signature operations.
+    sig_ops: BlockSigOps,
     /// The bytes the block was decoded from, laid out as its block-file
     /// record, when they were handed in and are the block's
     /// serialization ([`HashedBlock::keep_wire_bytes`]).
@@ -249,9 +301,18 @@ impl HashedBlock {
     /// (dcrd `MsgBlock.BtcDecode`, `wire/msgblock.go:101-131`), whatever
     /// its size.  Each tree is built in a copy of its leaves that is
     /// freed before this returns.
+    ///
+    /// It also counts the block's signature operations twice, once for
+    /// each answer the treasury agenda query can give
+    /// (`BlockSigOps::compute`): two passes of the count the
+    /// contextual check makes, each reading every input and output
+    /// script once and the transaction's shape for the coinbase, vote
+    /// and treasurybase tests, linear in the size of the block and
+    /// allocating nothing that outlives a transaction.
     pub fn new(block: Arc<MsgBlock>) -> HashedBlock {
         let (tx_hashes, merkle_leaves) = BlockTxHashes::compute_with_merkle_leaves(&block);
         let merkle_roots = BlockMerkleRoots::compute(&merkle_leaves);
+        let sig_ops = BlockSigOps::compute(&block);
         let hash = block.header.block_hash();
         HashedBlock {
             block,
@@ -259,6 +320,7 @@ impl HashedBlock {
             tx_hashes: Arc::new(tx_hashes),
             merkle_leaves,
             merkle_roots,
+            sig_ops,
             record: None,
         }
     }
@@ -356,6 +418,11 @@ impl HashedBlock {
         &self.merkle_roots
     }
 
+    /// The block's counts of signature operations.
+    pub(crate) fn sig_ops(&self) -> &BlockSigOps {
+        &self.sig_ops
+    }
+
     /// Give the block back, dropping the hashes and the record.
     pub fn into_block(self) -> Arc<MsgBlock> {
         self.block
@@ -391,6 +458,17 @@ std::thread_local! {
     /// unit-test builds only, where the tests read it to tell that a
     /// processing call that was handed a block's roots built no tree.
     pub(crate) static TREES_BUILT: core::cell::Cell<u64> =
+        const { core::cell::Cell::new(0) };
+
+    /// How many times this thread ran the contextual check's own count
+    /// of a block's signature operations, the loop that gives its
+    /// verdict (`validate::check_block_sig_ops`).  The counts a
+    /// [`HashedBlock`] is made with and the count `BlockSigOps::assert_for`
+    /// makes again under debug assertions are not counted.  It exists in
+    /// this crate's unit-test builds only, where the tests read it to
+    /// tell that a check that was handed a block's counts within the
+    /// limit did not count.
+    pub(crate) static SIG_OP_LOOPS: core::cell::Cell<u64> =
         const { core::cell::Cell::new(0) };
 }
 
@@ -586,6 +664,40 @@ impl BlockMerkleRoots {
             self.regular == calc_merkle_root(leaves.regular())
                 && self.stake == calc_merkle_root(leaves.stake()),
             "merkle roots do not match the block's merkle leaves"
+        );
+    }
+}
+
+impl BlockSigOps {
+    /// Count the block's signature operations with the treasury agenda
+    /// inactive and with it active.
+    pub(crate) fn compute(block: &MsgBlock) -> BlockSigOps {
+        BlockSigOps {
+            treasury_inactive: crate::validate::count_block_sig_ops(block, false),
+            treasury_active: crate::validate::count_block_sig_ops(block, true),
+        }
+    }
+
+    /// The count for the answer the treasury agenda query gave, `None`
+    /// where an accumulator would overflow.
+    pub(crate) fn get(&self, is_treasury_enabled: bool) -> Option<u32> {
+        if is_treasury_enabled {
+            self.treasury_active
+        } else {
+            self.treasury_inactive
+        }
+    }
+
+    /// Panic, under debug assertions, unless these are the block's
+    /// counts.  A release build has nothing to check here: the pairing
+    /// rests on the counts having been read out of the one
+    /// [`HashedBlock`] that counted them, or out of the slot beside that
+    /// block's own allocation.
+    #[track_caller]
+    pub(crate) fn assert_for(&self, block: &MsgBlock) {
+        debug_assert!(
+            *self == Self::compute(block),
+            "signature operation counts do not match the block"
         );
     }
 }
@@ -1322,6 +1434,462 @@ mod tests {
             !seen.contains_key("both trees are others: ErrBadMerkleRoot, block stake merkle root"),
             "{seen:#?}"
         );
+    }
+
+    /// The block's signature operations by dcrd's count, written out
+    /// here (`checkBlockContext`, `validate.go:2378-2408`, over
+    /// `countSigOps`, `:3765-3814`): the script engine's quick count of
+    /// every output script and of every input script but a coinbase's
+    /// and a vote's first, for every transaction but a treasurybase
+    /// once the treasury agenda is active.  The sum is taken in a `u64`
+    /// and nothing is limited.
+    fn reference_sig_ops(block: &MsgBlock, treasury: bool) -> u64 {
+        block
+            .transactions
+            .iter()
+            .chain(&block.stransactions)
+            .map(|tx| {
+                if treasury && dcroxide_stake::is_treasury_base(tx) {
+                    return 0;
+                }
+                let inputs = if dcroxide_standalone::is_coin_base_tx(tx, treasury) {
+                    &tx.tx_in[..0]
+                } else if dcroxide_stake::is_ssgen(tx) && !tx.tx_in.is_empty() {
+                    &tx.tx_in[1..]
+                } else {
+                    &tx.tx_in[..]
+                };
+                inputs
+                    .iter()
+                    .map(|tx_in| &tx_in.signature_script)
+                    .chain(tx.tx_out.iter().map(|tx_out| &tx_out.pk_script))
+                    .map(|script| dcroxide_txscript::get_sig_op_count(script, treasury) as u64)
+                    .sum::<u64>()
+            })
+            .sum()
+    }
+
+    /// The contextual check's own count of the block, the loop that
+    /// gives its verdict, with the sum where the block passes.  Before
+    /// it returns that, it checks the limit on the block the two ways
+    /// the chain can, with the counts the block carries and without,
+    /// and asserts that both give that verdict, error and text
+    /// included; that the check without counts counts the block, and
+    /// the check with them only where the block fails; and that where
+    /// the block passes the count it carries is the sum the loop ends
+    /// on, and where it fails is over the limit or none.
+    fn checked_both_ways(
+        block: &MsgBlock,
+        counted: &BlockSigOps,
+        treasury: bool,
+        what: &str,
+    ) -> Result<u32, RuleError> {
+        use crate::validate::{
+            MAX_SIG_OPS_PER_BLOCK, check_block_sig_op_limit, check_block_sig_ops,
+        };
+        let loops = || SIG_OP_LOOPS.get();
+
+        let before = loops();
+        let verdict = check_block_sig_ops(block, treasury);
+        assert_eq!(loops() - before, 1, "{what}");
+
+        let before = loops();
+        let with_counts = check_block_sig_op_limit(block, Some(counted), treasury);
+        let loops_with_counts = loops() - before;
+        let before = loops();
+        let without = check_block_sig_op_limit(block, None, treasury);
+        let loops_without = loops() - before;
+
+        assert_eq!(with_counts, verdict.clone().map(drop), "{what}");
+        assert_eq!(without, verdict.clone().map(drop), "{what}");
+        assert_eq!(loops_without, 1, "{what}");
+        assert_eq!(loops_with_counts, u64::from(verdict.is_err()), "{what}");
+        match &verdict {
+            Ok(total) => {
+                assert_eq!(counted.get(treasury), Some(*total), "{what}");
+                assert!(i64::from(*total) <= MAX_SIG_OPS_PER_BLOCK, "{what}");
+            }
+            Err(err) => {
+                assert_eq!(err.kind, RuleErrorKind::TooManySigOps, "{what}");
+                assert!(
+                    counted
+                        .get(treasury)
+                        .is_none_or(|count| i64::from(count) > MAX_SIG_OPS_PER_BLOCK),
+                    "{what}: {:?}",
+                    counted.get(treasury)
+                );
+            }
+        }
+        verdict
+    }
+
+    /// A block hashed ahead carries the count of signature operations
+    /// the contextual check makes, for each answer the treasury agenda
+    /// query can give, for every block of the battery: the count dcrd's
+    /// loop gives, written out here, and where the check's own count
+    /// passes, the sum it ends on.  The limit checked with the carried
+    /// counts gives the verdict it gives without them, with the same
+    /// error and text, and counts the block itself only where the block
+    /// is over the limit.
+    #[test]
+    fn carried_sig_op_counts_are_the_counts_of_the_block_check() {
+        let blocks = fixture_blocks();
+        assert_eq!(blocks.len(), 561, "the battery's blocks");
+        let (mut within, mut over) = (0usize, Vec::new());
+        for (name, block) in &blocks {
+            let hashed = HashedBlock::new(Arc::new(block.clone()));
+            assert_eq!(*hashed.sig_ops(), BlockSigOps::compute(block), "{name}");
+            hashed.sig_ops().assert_for(block);
+            for treasury in [false, true] {
+                let what = format!("{name}, treasury: {treasury}");
+                assert_eq!(
+                    hashed.sig_ops().get(treasury).map(u64::from),
+                    Some(reference_sig_ops(block, treasury)),
+                    "{what}"
+                );
+                match checked_both_ways(block, hashed.sig_ops(), treasury, &what) {
+                    Ok(_) => within += 1,
+                    Err(_) => over.push(what),
+                }
+            }
+        }
+        // The battery's blocks over the limit by this count, each under
+        // both answers: the rows dcrd refuses for it, and one row it
+        // refuses for another reason first.  None is over the limit
+        // under one answer only.
+        let mut expected = Vec::new();
+        for name in ["bcs2", "bmo2", "bmo4", "bmo6", "bsc1", "bsc2"] {
+            for treasury in [false, true] {
+                expected.push(format!("{name}, treasury: {treasury}"));
+            }
+        }
+        assert_eq!(over, expected);
+        assert_eq!(within, 2 * blocks.len() - over.len());
+    }
+
+    /// A script of `n` signature checks, each counted as one.
+    fn checksigs(n: usize) -> Vec<u8> {
+        vec![dcroxide_txscript::OP_CHECKSIG; n]
+    }
+
+    /// A transaction that spends one output of another transaction with
+    /// the given signature script and pays to each of the given scripts.
+    fn spending(signature_script: Vec<u8>, pk_scripts: Vec<Vec<u8>>) -> MsgTx {
+        MsgTx {
+            tx_in: vec![dcroxide_wire::TxIn {
+                previous_out_point: dcroxide_wire::OutPoint {
+                    hash: Hash([1; HASH_SIZE]),
+                    index: 0,
+                    tree: 0,
+                },
+                signature_script,
+                ..Default::default()
+            }],
+            tx_out: pk_scripts
+                .into_iter()
+                .map(|pk_script| dcroxide_wire::TxOut {
+                    value: 1,
+                    pk_script,
+                    ..Default::default()
+                })
+                .collect(),
+            ..MsgTx::default()
+        }
+    }
+
+    /// A block of the given trees, under a header made for them that
+    /// commits to them.  Each transaction [`spending`] made spends an
+    /// output of its own, so that no two of them are the same.  The
+    /// counts read the transactions only.
+    fn block_of(regular: Vec<MsgTx>, stake: Vec<MsgTx>) -> MsgBlock {
+        let mut block = one_transaction_block();
+        block.transactions = regular;
+        block.stransactions = stake;
+        let txs = block
+            .transactions
+            .iter_mut()
+            .chain(&mut block.stransactions);
+        for (index, tx) in (0u32..).zip(txs) {
+            if let Some(tx_in) = tx.tx_in.first_mut()
+                && tx_in.previous_out_point.hash == Hash([1; HASH_SIZE])
+            {
+                tx_in.previous_out_point.index = index;
+            }
+        }
+        block.header.merkle_root = calc_tx_tree_merkle_root(&block.transactions);
+        block.header.stake_root = calc_tx_tree_merkle_root(&block.stransactions);
+        block.header.size = block.serialize_size() as u32;
+        block
+    }
+
+    /// The text the contextual check fails a block with whose sum went
+    /// over the limit at `got`.
+    fn too_many(got: u32) -> String {
+        format!("block contains too many signature operations - got {got}, max 5000")
+    }
+
+    /// The carried counts against the check's own, at and around the
+    /// limit and where the treasury agenda's answer changes the count.
+    /// For each block and each answer the carried count is the count
+    /// written out here; where the block passes it is the sum the
+    /// check's count ends on and the check does not count; where the
+    /// block fails, the check counts it, and fails it at the transaction
+    /// that took the sum over the limit, with the sum at that point in
+    /// the text, not the block's whole count.
+    #[test]
+    fn carried_sig_op_counts_at_the_limit_and_by_agenda_answer() {
+        use dcroxide_txscript::{OP_CHECKMULTISIG, OP_TADD, OP_TSPEND};
+
+        // A coinbase in shape whose input script counts 4,001 and whose
+        // output counts 1,000.  Its version is 1, so it is a coinbase
+        // only while the treasury agenda is inactive, and its input
+        // script is counted once it is active.
+        let mut coinbase = spending(checksigs(4_001), vec![checksigs(1_000)]);
+        coinbase.tx_in[0].previous_out_point = dcroxide_wire::OutPoint {
+            hash: Hash::ZERO,
+            index: u32::MAX,
+            tree: 0,
+        };
+        coinbase.version = 1;
+        assert!(dcroxide_standalone::is_coin_base_tx(&coinbase, false));
+        assert!(!dcroxide_standalone::is_coin_base_tx(&coinbase, true));
+
+        // A treasurybase, which counts nothing either way.
+        let treasurybase = MsgTx {
+            version: dcroxide_stake::TX_VERSION_TREASURY,
+            tx_in: vec![dcroxide_wire::TxIn {
+                previous_out_point: dcroxide_wire::OutPoint {
+                    hash: Hash::ZERO,
+                    index: u32::MAX,
+                    tree: 0,
+                },
+                ..Default::default()
+            }],
+            tx_out: vec![
+                dcroxide_wire::TxOut {
+                    pk_script: vec![OP_TADD],
+                    ..Default::default()
+                },
+                dcroxide_wire::TxOut {
+                    pk_script: [&[0x6a, 0x0c][..], &[0u8; 12]].concat(),
+                    ..Default::default()
+                },
+            ],
+            ..MsgTx::default()
+        };
+        assert!(dcroxide_stake::is_treasury_base(&treasurybase));
+
+        // A vote of the battery with signature checks in both its
+        // inputs: those of its first, the stakebase, are not counted.
+        let mut vote = fixture_blocks()
+            .into_iter()
+            .flat_map(|(_, block)| block.stransactions)
+            .find(dcroxide_stake::is_ssgen)
+            .expect("the battery has votes");
+        assert_eq!(vote.tx_in.len(), 2);
+        let vote_alone = u32::try_from(reference_sig_ops(
+            &block_of(Vec::new(), vec![vote.clone()]),
+            false,
+        ))
+        .expect("count");
+        vote.tx_in[0].signature_script.extend(checksigs(9));
+        vote.tx_in[1].signature_script.extend(checksigs(4));
+        assert!(dcroxide_stake::is_ssgen(&vote));
+        let vote_count = vote_alone + 4;
+
+        let mut tspend_outputs = checksigs(4_999);
+        tspend_outputs.extend([OP_TSPEND, OP_TSPEND]);
+        let multisig = |n: usize| vec![OP_CHECKMULTISIG; n];
+
+        // Each block, with its count and its verdict with the agenda
+        // inactive and then active: `Ok` with the sum, or `Err` with the
+        // sum at which the check stops.
+        type Expected = (u32, Result<u32, u32>);
+        let cases: Vec<(&str, MsgBlock, [Expected; 2])> = vec![
+            (
+                "no transactions",
+                block_of(Vec::new(), Vec::new()),
+                [(0, Ok(0)), (0, Ok(0))],
+            ),
+            (
+                "at the limit",
+                block_of(
+                    vec![
+                        spending(Vec::new(), vec![checksigs(4_000)]),
+                        spending(checksigs(1_000), Vec::new()),
+                    ],
+                    Vec::new(),
+                ),
+                [(5_000, Ok(5_000)), (5_000, Ok(5_000))],
+            ),
+            (
+                "one over the limit",
+                block_of(
+                    vec![spending(Vec::new(), vec![checksigs(5_001)])],
+                    Vec::new(),
+                ),
+                [(5_001, Err(5_001)), (5_001, Err(5_001))],
+            ),
+            (
+                "over the limit with more to count",
+                block_of(
+                    vec![
+                        spending(Vec::new(), vec![checksigs(3_000)]),
+                        spending(Vec::new(), vec![checksigs(3_000)]),
+                        spending(Vec::new(), vec![checksigs(10)]),
+                    ],
+                    Vec::new(),
+                ),
+                [(6_010, Err(6_000)), (6_010, Err(6_000))],
+            ),
+            (
+                "over the limit in the stake tree, after the regular one",
+                block_of(
+                    vec![spending(Vec::new(), vec![checksigs(3_000)])],
+                    vec![
+                        spending(Vec::new(), vec![checksigs(2_001)]),
+                        spending(Vec::new(), vec![checksigs(7)]),
+                    ],
+                ),
+                [(5_008, Err(5_001)), (5_008, Err(5_001))],
+            ),
+            (
+                "multisignature checks at the limit",
+                block_of(vec![spending(Vec::new(), vec![multisig(250)])], Vec::new()),
+                [(5_000, Ok(5_000)), (5_000, Ok(5_000))],
+            ),
+            (
+                "multisignature checks over the limit",
+                block_of(vec![spending(Vec::new(), vec![multisig(251)])], Vec::new()),
+                [(5_020, Err(5_020)), (5_020, Err(5_020))],
+            ),
+            (
+                "treasury spend opcodes over the limit once they count",
+                block_of(vec![spending(Vec::new(), vec![tspend_outputs])], Vec::new()),
+                [(4_999, Ok(4_999)), (5_001, Err(5_001))],
+            ),
+            (
+                "a coinbase until the treasury agenda is active",
+                block_of(vec![coinbase], Vec::new()),
+                [(1_000, Ok(1_000)), (5_001, Err(5_001))],
+            ),
+            (
+                "a treasurybase",
+                block_of(
+                    vec![spending(Vec::new(), vec![checksigs(5)])],
+                    vec![treasurybase],
+                ),
+                [(5, Ok(5)), (5, Ok(5))],
+            ),
+            (
+                "a vote with signature checks in its stakebase",
+                block_of(Vec::new(), vec![vote]),
+                [(vote_count, Ok(vote_count)), (vote_count, Ok(vote_count))],
+            ),
+        ];
+
+        for (name, block, expected) in &cases {
+            let hashed = HashedBlock::new(Arc::new(block.clone()));
+            assert_eq!(*hashed.sig_ops(), BlockSigOps::compute(block), "{name}");
+            for (treasury, (count, verdict)) in [false, true].into_iter().zip(expected) {
+                let what = format!("{name}, treasury: {treasury}");
+                assert_eq!(hashed.sig_ops().get(treasury), Some(*count), "{what}");
+                assert_eq!(
+                    reference_sig_ops(block, treasury),
+                    u64::from(*count),
+                    "{what}"
+                );
+                let got = checked_both_ways(block, hashed.sig_ops(), treasury, &what);
+                match verdict {
+                    Ok(total) => assert_eq!(got, Ok(*total), "{what}"),
+                    Err(at) => {
+                        let err = got.expect_err("over the limit");
+                        assert_eq!(err.description, too_many(*at), "{what}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// A carried count spares the check its own count only when it is
+    /// a count, and at most the limit.
+    #[test]
+    fn only_a_count_at_most_the_limit_is_within_it() {
+        use crate::validate::sig_op_count_is_within_limit;
+
+        for (count, within) in [
+            (Some(0), true),
+            (Some(4_999), true),
+            (Some(5_000), true),
+            (Some(5_001), false),
+            (Some(u32::MAX), false),
+            (None, false),
+        ] {
+            assert_eq!(sig_op_count_is_within_limit(count), within, "{count:?}");
+        }
+    }
+
+    /// The sum of a block's counts is `None` once a count is, or once
+    /// the `u32` it is taken in overflows, where the check's own count
+    /// fails; and no block within the wire protocol's size limit comes
+    /// near that, at 20 operations a script byte at most.
+    #[test]
+    fn a_sum_that_overflows_its_accumulator_is_none() {
+        use crate::validate::sum_sig_op_counts;
+
+        assert_eq!(sum_sig_op_counts([]), Some(0));
+        assert_eq!(sum_sig_op_counts([Some(5), Some(7)]), Some(12));
+        assert_eq!(sum_sig_op_counts([Some(u32::MAX), Some(0)]), Some(u32::MAX));
+        assert_eq!(sum_sig_op_counts([Some(u32::MAX), Some(1)]), None);
+        assert_eq!(
+            sum_sig_op_counts([Some(u32::MAX - 1), Some(1), Some(1)]),
+            None
+        );
+        assert_eq!(sum_sig_op_counts([Some(1), None, Some(1)]), None);
+        assert_eq!(sum_sig_op_counts([None]), None);
+
+        // The most one script byte counts, under either answer.
+        for treasury in [false, true] {
+            let most = (0..=u8::MAX)
+                .map(|op| dcroxide_txscript::get_sig_op_count(&[op], treasury))
+                .max();
+            assert_eq!(most, Some(20), "treasury: {treasury}");
+            assert_eq!(
+                dcroxide_txscript::get_sig_op_count(&[0xae; 1_000], treasury),
+                20_000
+            );
+        }
+        let most_in_a_block = 20 * u64::from(dcroxide_wire::MAX_BLOCK_PAYLOAD);
+        assert!(most_in_a_block < 27_000_000);
+        assert!(most_in_a_block < u64::from(u32::MAX));
+    }
+
+    /// A transaction whose own count overflows the `u32` that
+    /// `count_sig_ops` takes it in makes the block's count none, not the
+    /// sum of the other transactions' counts, so a block carrying it is
+    /// never taken to be within the limit.  Each of its two outputs
+    /// counts 20 a byte and fits the accumulator alone; together they do
+    /// not.  No block within the wire protocol's size limit can hold
+    /// such a transaction, which takes more than 214 million bytes of
+    /// script: the path is tested here, not a block that can arrive.
+    /// One answer of the treasury agenda is enough, since none of these
+    /// bytes is `OP_TSPEND`, and each count reads all of them.
+    #[test]
+    fn a_transaction_whose_own_count_overflows_makes_the_count_none() {
+        use crate::validate::count_block_sig_ops;
+
+        let half = vec![dcroxide_txscript::OP_CHECKMULTISIG; 107_374_183];
+        let half_count = 20 * half.len() as u64;
+        assert!(half_count <= u64::from(u32::MAX));
+        assert!(2 * half_count > u64::from(u32::MAX));
+
+        let mut block = one_transaction_block();
+        let small = count_block_sig_ops(&block, false).expect("the genesis block's count");
+        assert!(u64::from(small) + half_count <= u64::from(u32::MAX));
+        block
+            .transactions
+            .push(spending(Vec::new(), vec![half.clone(), half]));
+        assert_eq!(count_block_sig_ops(&block, false), None);
     }
 
     /// The regression network's genesis block: one regular transaction

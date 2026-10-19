@@ -10,7 +10,8 @@
   have, reading ahead on the sync peer's connection), 2026-10-16
   (addendum: more work on the reading thread, and threads kept for the
   scripts of a connected block; second addendum: a short-lived thread
-  for the metadata commit)
+  for the metadata commit), 2026-10-17 (addendum: the reading thread
+  counts signature operations)
 
 ## Context
 
@@ -577,3 +578,44 @@ ask make no such thread.
 
 D2 is unchanged: this is one more OS thread, made for each flush a
 commit trips and ended with it, never more than one at a time.
+
+## Addendum, 2026-10-17 — the reading thread counts signature operations
+
+The `peer-reader` thread of the addenda of 2026-10-12 and 2026-10-16 now
+also counts each block's signature operations, once for each answer the
+treasury agenda can give, and keeps the two sums in the `HashedBlock`
+(`BlockSigOps`). The input thread's contextual check, made as that very
+block is accepted, compares the sum its agenda answer selects with the
+limit, and counts the block itself, which gives the error and its text,
+wherever that sum is over the limit; every block that arrives otherwise
+is counted there as before. dcrd counts inside `checkBlockContext`
+(PARITY.md's row *Reading ahead of the block handler*). The counts carry
+no verdict: making a `HashedBlock` still reaches none, and no count is
+compared with the limit off the input thread. Counting adds no lock, no
+queue and no allocation that outlives a transaction to the thread, and a
+`HashedBlock` is 16 bytes larger.
+
+The work moved and was not removed, and the reading thread counts each
+block twice.
+
+The change moved lines that the first addendum of 2026-10-16 cites,
+whose numbers stay as they were written: `HashedBlock::keep_wire_bytes`
+is now at `crates/dcroxide-blockchain/src/blockhashes.rs:372` and
+`HashedBlock::new` at `:312`, and the line of `validate_items`'s
+documentation cited there is at
+`crates/dcroxide-blockchain/src/validate.rs:5604`.
+
+D2 is unchanged: no thread is added.
+
+> **Note, 2026-10-18, after the syncs of that day.** The counts have
+> been measured only together with the change that writes GCS filter
+> bits a word at a time, which runs nothing on the reading thread, and
+> the changes below them: on m3, from a dcrd v2.1.7 node on another
+> machine on the same LAN, the build that added the two took 3.9 s more
+> of the reading thread's time on a processor and 8.9 s less of the
+> block thread's than the build below it
+> ([bench-ledger.md](../bench-ledger.md), "Rungs from a block server on
+> the LAN, two changes held for their memory, and dcrd v2.1.7", build
+> B). Those builds were states of a worktree, not the tree of a commit,
+> and the series is one of its own. A link that leaves the reading
+> thread no time to spare was not tried.

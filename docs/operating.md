@@ -522,20 +522,21 @@ ahead of the thread that processes the blocks, which dcrd does not do
 ([PARITY.md](../PARITY.md), *Reading ahead of the block handler*). Once
 that peer has delivered a first block, a thread of its own reads the
 connection, checks each message's checksum and decodes it, and for a
-block hashes its transactions, builds its two merkle trees and lays
-the bytes it arrived in out as its block-file record, after comparing
-them with the block's own serialization. It keeps at most four
-messages ahead of the thread that processes blocks, which still
-handles every message in the order it arrived, and stores a block
-that comes with its record as that record, without serializing it
-again. It changes nothing about which blocks or messages are
-accepted, which peers are dropped or banned, or what is logged about
-them, beyond lines of its own (below, and two more at the debug level
-in PARITY.md): it moves work and decides nothing, and PARITY.md names
-the tests that hold it to that and what they leave uncovered. One pair
-of counters shows it: `getnettotals` counts a message's bytes when it
-is read and `getpeerinfo`'s `bytesrecv` for that peer when it is
-handled, so the total can lead the peer's count by up to four messages.
+block hashes its transactions, builds its two merkle trees, counts its
+signature operations and lays the bytes it arrived in out as its
+block-file record, after comparing them with the block's own
+serialization. It keeps at most four messages ahead of the thread that
+processes blocks, which still handles every message in the order it
+arrived, and stores a block that comes with its record as that record,
+without serializing it again. It changes nothing about which blocks or
+messages are accepted, which peers are dropped or banned, or what is
+logged about them, beyond lines of its own (below, and two more at the
+debug level in PARITY.md): it moves work and decides nothing, and
+PARITY.md names the tests that hold it to that and what they leave
+uncovered. One pair of counters shows it: `getnettotals` counts a
+message's bytes when it is read and `getpeerinfo`'s `bytesrecv` for that
+peer when it is handled, so the total can lead the peer's count by up to
+four messages.
 It costs one more thread and one more descriptor on that one
 connection, kept until the connection ends, and the memory of up to
 four decoded messages, each kept with the frame it was read in. By an
@@ -559,20 +560,22 @@ of later code than the 12.1 minutes above. The read-ahead as `b4ceb1c`
 committed it was run on 2026-10-13, inside `4700cf1` and only on
 (above), so what it gains as committed has not been measured; the
 reading thread's added work, the record and the merkle trees, has been
-measured apart only in builds that are not the code as it stands, where
-it moved about 7 s and 5 s of processor time from the thread that
-processes blocks to the reading thread rather than removing it, which
-paid there because the reading thread, fed by a server on the same
-machine, waited over 320 s for the other; in `88c46c3`, on 2026-10-17,
-it waited 275 to 278 s for the other in each default run. No sync has
-been run with it over a delayed link, or over a real one with a longer
-round trip than a LAN's (the syncs of 2026-10-18 from a node on another
-machine on the same LAN had it on), where the round trip and not the
-thread that processes blocks may set the pace and it may gain nothing,
-nor on fewer cores or with `--assumevalid=0`, nor on macOS or Windows,
-where none of its tests has been run either; with `--noexistsaddrindex`
-it was run once in `4700cf1` on 2026-10-13 and twice in `88c46c3` on
-2026-10-17, and never against a run with it off.
+measured apart only in builds that are not the code as it stands (the
+count of signature operations it also makes has been run in syncs only
+beside another change, below), where it moved about 7 s and 5 s of
+processor time from the thread that processes blocks to the reading
+thread rather than removing it, which paid there because the reading
+thread, fed by a server on the same machine, waited over 320 s for the
+other; in `88c46c3`, on 2026-10-17, it waited 275 to 278 s for the other
+in each default run. No sync has been run with it over a delayed link,
+or over a real one with a longer round trip than a LAN's (the syncs of
+2026-10-18 from a node on another machine on the same LAN had it on),
+where the round trip and not the thread that processes blocks may set
+the pace and it may gain nothing, nor on fewer cores or with
+`--assumevalid=0`, nor on macOS or Windows, where none of its tests has
+been run either; with `--noexistsaddrindex` it was run once in `4700cf1`
+on 2026-10-13 and twice in `88c46c3` on 2026-10-17, and never against a
+run with it off.
 
 Whether reading ahead ever costs anything has not been measured: the
 loopback runs above are all there is. Set `DCROXIDE_READ_AHEAD=off` (or
@@ -599,9 +602,10 @@ the first block of a connection is not among them, since the thread
 that processes blocks read that one itself. X and Y are the time the
 reading threads spent on checksums and decoding and on hashing, which
 the thread that processes blocks no longer spends; the socket reads
-moved too and are not timed. Since `44cf801` Y also covers building
-each block's two merkle trees, so it is not to be compared with a Y
-from earlier code. G is how long the reading threads stood still with
+moved too and are not timed. Since `44cf801` Y also covers building each
+block's two merkle trees, and it now also covers counting each block's
+signature operations twice, so it is not to be compared with a Y from
+earlier code. G is how long the reading threads stood still with
 four messages waiting: when it is most of the sync, the
 thread that processes blocks set the pace and the reading kept up. W is
 how long the thread that processes blocks waited for a block with none
@@ -635,8 +639,16 @@ established. In the three runs of 2026-10-13 whose builds held the
 record, none of them the code as it stands, R and K were both
 1,116,034, every block read ahead, and Z was 7.078 s, 7.128 s and
 7.165 s; Y was 47.369 s in the first, whose build had no merkle trees
-on the reading thread, and 52.536 s and 52.562 s in the two whose
-build had them.
+on the reading thread, and 52.536 s and 52.562 s in the two whose build
+had them. On 2026-10-18, from a block server on another machine on the
+same LAN, in a series of its own whose line counted blocks past
+1,116,035 up to the shutdown, Y was 52.52 to 52.94 s in the runs of
+three builds without the counts of signature operations and 56.70 and
+57.00 s in the two runs of the build that added them, together with a
+change that runs nothing on the reading thread; that thread's processor
+time rose 3.9 s with them ([bench-ledger.md](bench-ledger.md), "Rungs
+from a block server on the LAN, two changes held for their memory, and
+dcrd v2.1.7", build B).
 
 After the assume-valid block the node also keeps threads for checking
 scripts. dcrd starts goroutines for each batch of a block's inputs.

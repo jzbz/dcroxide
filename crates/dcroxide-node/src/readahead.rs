@@ -32,11 +32,13 @@
 //! - **Order.**  One reader appends, one handler takes from the front,
 //!   so the handler sees the frames in the order they ended on the wire.
 //! - **Values, never verdicts.**  The reader checks nothing but the
-//!   frame.  A block it hands over with the hashes of its transactions
-//!   and the roots of its two transaction merkle trees
-//!   (`dcroxide_blockchain::HashedBlock`), which the chain reads where
-//!   it would have computed them and not before; no merkle root is
-//!   compared with a header and no rule applied on the reader's thread.
+//!   frame.  A block it hands over with the hashes of its transactions,
+//!   the roots of its two transaction merkle trees and its counts of
+//!   signature operations under each answer the treasury agenda can
+//!   give (`dcroxide_blockchain::HashedBlock`), which the chain reads
+//!   where it would have computed them and not before; no merkle root is
+//!   compared with a header, no count with the limit, and no rule
+//!   applied on the reader's thread.
 //!   The block also carries the payload it was decoded from, laid out as
 //!   its record for the block files, which the chain writes where it
 //!   would have serialized the block and taken the record's checksum
@@ -128,10 +130,12 @@ pub(crate) enum Received {
     /// that thread (what dcrd's `dcrutil.Block` holds, made lazily while
     /// the chain processes the block), with the roots of its two
     /// transaction merkle trees, which dcrd builds inside its merkle
-    /// check, and with the payload it arrived in laid out as its
-    /// block-file record.  A block the input thread read for itself, on a
-    /// connection that has no reader thread, arrives as a
-    /// [`Received::Message`] and is hashed inside the chain.
+    /// check, with its two counts of signature operations, which dcrd
+    /// makes inside its contextual block check, and with the payload it
+    /// arrived in laid out as its block-file record.  A block the input
+    /// thread read for itself, on a connection that has no reader
+    /// thread, arrives as a [`Received::Message`] and is hashed inside
+    /// the chain.
     Block(HashedBlock),
 }
 
@@ -575,8 +579,9 @@ fn reader_loop<R: FrameReader>(mut reader: R, shared: &Shared, stats: &Stats) {
             }
             Ok(msg) => {
                 let received = match msg {
-                    // Hash the block here, off the thread that connects
-                    // blocks.  The hashes travel with the block they
+                    // Hash the block here, and count its signature
+                    // operations, off the thread that connects blocks.
+                    // The hashes and counts travel with the block they
                     // were computed from, and nothing about the block is
                     // decided by computing them.
                     Message::Block(block) => {
@@ -891,7 +896,9 @@ struct Stats {
     block_bytes: AtomicU64,
     /// Time the reader threads spent on checksums and decoding.
     decode_nanos: AtomicU64,
-    /// Time the reader threads spent hashing blocks.
+    /// Time the reader threads spent hashing blocks
+    /// (`HashedBlock::new`: the hashes, the merkle trees and the counts
+    /// of signature operations).
     hash_nanos: AtomicU64,
     /// Blocks the reader threads handed over with the payload they were
     /// decoded from laid out as a block-file record.

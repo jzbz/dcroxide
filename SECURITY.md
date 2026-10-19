@@ -179,27 +179,32 @@ evaluating this code.
   blocks and waste memory (`server.go:1365-1369`). Here up to four
   frames from the sync peer are checksummed and decoded before the
   frame ahead of them has been judged, and a block among them is also
-  hashed, has its two transaction merkle trees built, is serialized
-  once and compared with the payload it arrived in, and has that
-  payload laid out as its block-file record, with a CRC-32C and a
-  second hash of its header. They are held, decoded and each with its
-  frame, until their turn. None is acted on early: each is handled in
-  the order it arrived by the code that handled it before, and nothing
-  queued is handled once the connection is being torn down. So what a
-  hostile sync peer gains is the work and the memory. The merkle trees
-  add less work than a block's transactions already cost: a tree of n
-  transactions has at most n - 1 + ceil(log2 n) inner nodes, each one
-  hash of 64 bytes, two BLAKE-256 compressions, where each transaction
-  takes at least four compressions; the decoder allows 43,691
-  transactions in each tree and accepts one of five bytes, so the block
-  whose trees cost the most has a payload of 437,096 bytes and 87,396
-  inner nodes, 174,792 compressions beside at least 349,528 for its
-  transactions. The memory is at worst about 62 MB held on that
-  connection, with about 1.3 MB more for a moment while one frame is
-  compared with its block's serialization, or up to about 1.4 MB while
-  one block's trees are built, against about 12.5 MB without the
-  read-ahead: estimates from struct layouts, not measurements. It also
-  costs one more thread and one more descriptor on that connection.
+  hashed, has its two transaction merkle trees built and its signature
+  operations counted twice, is serialized once and compared with the
+  payload it arrived in, and has that payload laid out as its block-file
+  record, with a CRC-32C and a second hash of its header. They are held,
+  decoded and each with its frame, until their turn. None is acted on
+  early: each is handled in the order it arrived by the code that
+  handled it before, and nothing queued is handled once the connection
+  is being torn down. So what a hostile sync peer gains is the work and
+  the memory. The merkle trees add less work than a block's transactions
+  already cost: a tree of n transactions has at most
+  n - 1 + ceil(log2 n) inner nodes, each one hash of 64 bytes, two
+  BLAKE-256 compressions, where each transaction takes at least four
+  compressions; the decoder allows 43,691 transactions in each tree and
+  accepts one of five bytes, so the block whose trees cost the most has
+  a payload of 437,096 bytes and 87,396 inner nodes, 174,792
+  compressions beside at least 349,528 for its transactions. The two
+  counts of signature operations are two passes over the block's
+  scripts, each reading a script once at most, with no hashing, and keep
+  nothing past a transaction but the two sums; what they cost the
+  reading thread on a hostile peer's blocks has not been measured. The
+  memory is at worst about 62 MB held on that connection, with about
+  1.3 MB more for a moment while one frame is compared with its block's
+  serialization, or up to about 1.4 MB while one block's trees are
+  built, against about 12.5 MB without the read-ahead: estimates from
+  struct layouts, not measurements. It also costs one more thread and
+  one more descriptor on that connection.
   `DCROXIDE_READ_AHEAD=off` removes it: every connection is then read as
   dcrd reads, and no frame is kept. Details are in PARITY.md, *Reading
   ahead of the block handler*.

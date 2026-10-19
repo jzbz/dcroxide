@@ -26,7 +26,9 @@ use dcroxide_uint256::Uint256;
 use dcroxide_wire::{MsgBlock, MsgTx, OutPoint};
 
 use crate::RuleError;
-use crate::blockhashes::{BlockMerkleLeaves, BlockMerkleRoots, BlockTxHashes, HashedBlock};
+use crate::blockhashes::{
+    BlockMerkleLeaves, BlockMerkleRoots, BlockSigOps, BlockTxHashes, HashedBlock,
+};
 use crate::blockindex::{BlockIndex, BlockStatus, NodeId, NodeStore};
 use crate::chainio::SpentTxOut;
 use crate::chainview_nodes::{NodeBranchView, NodeChainView};
@@ -221,6 +223,12 @@ pub struct UtxoFlushTestHooks {
     /// recorded as the utxo set state, in order.
     pub log: Option<Vec<(Hash, u32)>>,
 }
+
+/// What a processing call files for the block it is processing
+/// (`Chain::accepted_tx_hashes`): the `blocks` mirror's own `Arc` of the
+/// block, its transaction hashes, the hash of its header and, when it
+/// arrived with them, its counts of signature operations.
+type AcceptedHashes = (Arc<MsgBlock>, Arc<BlockTxHashes>, Hash, Option<BlockSigOps>);
 
 /// The growing chain state: the block tree arena and index together
 /// with the chain state and configuration (the subset of dcrd's
@@ -435,7 +443,14 @@ pub struct Chain {
     /// hash the header again: the contextual checks made as the block is
     /// accepted, and the filter lookup made as a block that needs no
     /// full validation is attached.
-    accepted_tx_hashes: Option<(Arc<MsgBlock>, Arc<BlockTxHashes>, Hash)>,
+    ///
+    /// The fourth member is the block's counts of signature operations
+    /// when it arrived with them in a [`HashedBlock`], and `None` when
+    /// it did not.  The contextual checks made as that very allocation
+    /// is accepted read them (`accepted_block_sig_ops`), and count the
+    /// block themselves only when the count the treasury agenda selects
+    /// is over the limit.
+    accepted_tx_hashes: Option<AcceptedHashes>,
     /// How many connects hashed their block's transactions again
     /// because the block was not the one being processed: the other
     /// blocks a reorganization attaches, a block linked by a later
@@ -4164,16 +4179,18 @@ impl Chain {
                     let parent_stake_node = self
                         .fetch_stake_node(parent_id, params)
                         .map_err(stake_rule_error)?;
-                    // No hash is handed in.  The block being processed
-                    // reaches this check only when the one made as it
-                    // was accepted failed without marking it, or when
-                    // enough blocks were linked with it to push it out
-                    // of the recent checks; like any other block checked
-                    // here, it then has its header hashed by the check.
+                    // No hash and no counts are handed in.  The block
+                    // being processed reaches this check only when the
+                    // one made as it was accepted failed without marking
+                    // it, or when enough blocks were linked with it to
+                    // push it out of the recent checks; like any other
+                    // block checked here, it then has its header hashed
+                    // and its signature operations counted by the check.
                     let context_result = check_block_context_for(
                         &self.store,
                         parent_id,
                         &block,
+                        None,
                         None,
                         &parent_stake_node,
                         false,
@@ -4613,10 +4630,18 @@ impl Chain {
         // the one the connect that follows in this call is handed.  It
         // is the block they were computed from or a field for field copy
         // of it, so they are its hashes either way, and the block hash
-        // is its header's.
+        // is its header's.  A block that arrived counted files its
+        // counts of signature operations with them: the mirror then
+        // holds the very allocation that was counted.
+        let sig_ops = arriving.hashed().map(|hashed| *hashed.sig_ops());
         self.accepted_tx_hashes = tx_hashes.map(|tx_hashes| {
             tx_hashes.assert_for(&mirrored);
-            (Arc::clone(&mirrored), Arc::clone(tx_hashes), block_hash)
+            (
+                Arc::clone(&mirrored),
+                Arc::clone(tx_hashes),
+                block_hash,
+                sig_ops,
+            )
         });
         #[cfg(test)]
         FILED_TX_HASHES.set(tx_hashes.map_or(core::ptr::null(), Arc::as_ptr));
@@ -4701,15 +4726,19 @@ impl Chain {
                 }
             };
             // The block being processed is checked with the hash the
-            // call already holds for it; any other linked block's header
-            // is hashed by the check.
+            // call already holds for it, and with its counts of signature
+            // operations when it arrived with them; any other linked
+            // block's header is hashed, and its signature operations
+            // counted, by the check.
             let block_hash = self.accepted_block_hash(&block);
+            let sig_ops = self.accepted_block_sig_ops(&block);
             if let Some(parent_stake_node) = &parent_stake_node
                 && let Err(err) = check_block_context_for(
                     &self.store,
                     parent_id,
                     &block,
                     block_hash.as_ref(),
+                    sig_ops.as_ref(),
                     parent_stake_node,
                     fast_add,
                     &mut self.recent_merkle_checks,
@@ -4780,11 +4809,13 @@ impl Chain {
     /// [`Self::process_shared_block`] for a block that arrives with its
     /// hashes, made before it reached the chain ([`HashedBlock`]): the
     /// same checks in the same order and the same results, with the
-    /// block's header and transactions not hashed again here and its two
-    /// merkle trees not built here.  A block that also carries its
-    /// record for the block files ([`HashedBlock::record`]) is stored as
-    /// that record where another block is serialized, which leaves the
-    /// same bytes in the block files.
+    /// block's header and transactions not hashed again here, its two
+    /// merkle trees not built here, and its signature operations not
+    /// counted here unless the count it arrived with is over the limit.
+    /// A block that also carries its record for the block files
+    /// ([`HashedBlock::record`]) is stored as that record where another
+    /// block is serialized, which leaves the same bytes in the block
+    /// files.
     ///
     /// Each hash is consulted exactly where [`Self::process_block`]
     /// computes it.  The block hash is read at the start, where that
@@ -4794,7 +4825,12 @@ impl Chain {
     /// and is refused as it would have been.  The roots of the trees are
     /// compared with the header where [`Self::process_block`] builds and
     /// compares them, by the same code, which selects the commitment by
-    /// the agenda and combines the two under DCP0005.  The block kept in
+    /// the agenda and combines the two under DCP0005.  The counts of
+    /// signature operations are read by the contextual check made as the
+    /// block is accepted, where [`Self::process_block`] counts: the one
+    /// the treasury agenda selects is compared with the limit there, and
+    /// where it is over, the block is counted as [`Self::process_block`]
+    /// counts it, which gives the error and its text.  The block kept in
     /// the `blocks` mirror is the `Arc` the [`HashedBlock`] owns.
     pub fn process_hashed_block(
         &mut self,
@@ -5852,7 +5888,7 @@ impl Chain {
     /// hashes), and freshly computed ones for any other block, counted
     /// in [`Chain::tx_hash_recomputes`].
     fn tx_hashes_for(&mut self, block: &Arc<MsgBlock>) -> Arc<BlockTxHashes> {
-        if let Some((accepted, tx_hashes, _)) = &self.accepted_tx_hashes
+        if let Some((accepted, tx_hashes, _, _)) = &self.accepted_tx_hashes
             && Arc::ptr_eq(accepted, block)
         {
             return Arc::clone(tx_hashes);
@@ -5869,7 +5905,20 @@ impl Chain {
     /// its hash is needed.
     fn accepted_block_hash(&self, block: &Arc<MsgBlock>) -> Option<Hash> {
         match &self.accepted_tx_hashes {
-            Some((accepted, _, block_hash)) if Arc::ptr_eq(accepted, block) => Some(*block_hash),
+            Some((accepted, _, block_hash, _)) if Arc::ptr_eq(accepted, block) => Some(*block_hash),
+            _ => None,
+        }
+    }
+
+    /// The block's counts of signature operations when `block` is the
+    /// very allocation the processing call filed its hashes with (the
+    /// pointers are compared, as in [`Self::tx_hashes_for`]) and it
+    /// arrived with them in a [`HashedBlock`].  `None` for any other
+    /// block, and for that one when it arrived without, and the
+    /// contextual checks then count it themselves.
+    fn accepted_block_sig_ops(&self, block: &Arc<MsgBlock>) -> Option<BlockSigOps> {
+        match &self.accepted_tx_hashes {
+            Some((accepted, _, _, sig_ops)) if Arc::ptr_eq(accepted, block) => *sig_ops,
             _ => None,
         }
     }
@@ -8482,13 +8531,15 @@ fn agenda_without_deployment_error(agenda_id: &str) -> RuleError {
 /// candidate over its parent branch (the dcrd `checkBlockContext` calls
 /// in `maybeAcceptBlocks` and the reorg attach loop), consulting and
 /// updating the chain's recent merkle checks.  `block_hash` is the hash
-/// of the block's header when the caller holds it.
+/// of the block's header when the caller holds it, and `sig_ops` the
+/// block's counts of signature operations when it arrived with them.
 #[allow(clippy::too_many_arguments)]
 fn check_block_context_for(
     store: &NodeStore,
     parent_id: NodeId,
     block: &MsgBlock,
     block_hash: Option<&Hash>,
+    sig_ops: Option<&BlockSigOps>,
     parent_stake_node: &StakeNode,
     fast_add: bool,
     merkle_checks: &mut LruHashSet,
@@ -8503,6 +8554,7 @@ fn check_block_context_for(
         &parent_view,
         block,
         block_hash,
+        sig_ops,
         prev_height,
         fast_add,
         false,
@@ -9758,7 +9810,8 @@ mod tests {
     /// equal block in another allocation, not for a block with the same
     /// header -- so the same block hash -- and other transactions, and
     /// not for another block.  Nothing is keyed by block hash.  The
-    /// block hash filed with them is handed out by the same rule.
+    /// block hash filed with them is handed out by the same rule, and so
+    /// are the counts of signature operations filed with them.
     #[test]
     fn hashes_are_only_reused_for_the_very_block_they_were_filed_with() {
         let params = dcroxide_chaincfg::regnet_params();
@@ -9782,7 +9835,13 @@ mod tests {
         let filed = Arc::new(BlockTxHashes::compute(&a));
         let arc_a = Arc::new(a.clone());
         let hash_a = a.header.block_hash();
-        chain.accepted_tx_hashes = Some((Arc::clone(&arc_a), Arc::clone(&filed), hash_a));
+        let counts_a = BlockSigOps::compute(&a);
+        chain.accepted_tx_hashes = Some((
+            Arc::clone(&arc_a),
+            Arc::clone(&filed),
+            hash_a,
+            Some(counts_a),
+        ));
 
         // The very allocation: the filed hashes, and nothing is hashed.
         let got = chain.tx_hashes_for(&arc_a);
@@ -9794,6 +9853,7 @@ mod tests {
             dcroxide_wire::header_hashes_on_this_thread(),
             headers_hashed
         );
+        assert_eq!(chain.accepted_block_sig_ops(&arc_a), Some(counts_a));
 
         // An equal block in another allocation: equal hashes, computed
         // again, and no block hash is handed out for it.
@@ -9802,6 +9862,7 @@ mod tests {
         assert_eq!(*got, *filed);
         assert_eq!(chain.tx_hash_recomputes, 1);
         assert_eq!(chain.accepted_block_hash(&Arc::new(a.clone())), None);
+        assert_eq!(chain.accepted_block_sig_ops(&Arc::new(a.clone())), None);
 
         // The same header, hence the same block hash, over one stake
         // transaction fewer.
@@ -9823,18 +9884,27 @@ mod tests {
         assert_eq!(*got, BlockTxHashes::compute(&altered));
         assert_ne!(*got, *filed);
         assert_eq!(chain.tx_hash_recomputes, 3);
-        assert_eq!(chain.accepted_block_hash(&Arc::new(altered)), None);
+        assert_eq!(chain.accepted_block_hash(&Arc::new(altered.clone())), None);
+        assert_eq!(chain.accepted_block_sig_ops(&Arc::new(altered)), None);
 
         // Another block.
         let got = chain.tx_hashes_for(&Arc::new(b.clone()));
         assert_eq!(*got, BlockTxHashes::compute(&b));
         assert_eq!(chain.tx_hash_recomputes, 4);
         assert_eq!(chain.accepted_block_hash(&Arc::new(b.clone())), None);
+        assert_eq!(chain.accepted_block_sig_ops(&Arc::new(b.clone())), None);
 
         // None of that disturbed the slot.
         assert!(Arc::ptr_eq(&chain.tx_hashes_for(&arc_a), &filed));
         assert_eq!(chain.tx_hash_recomputes, 4);
         assert_eq!(chain.accepted_block_hash(&arc_a), Some(hash_a));
+        assert_eq!(chain.accepted_block_sig_ops(&arc_a), Some(counts_a));
+
+        // Hashes filed for a block that arrived without counts hand out
+        // none, for that very allocation too.
+        chain.accepted_tx_hashes = Some((Arc::clone(&arc_a), Arc::clone(&filed), hash_a, None));
+        assert_eq!(chain.accepted_block_hash(&arc_a), Some(hash_a));
+        assert_eq!(chain.accepted_block_sig_ops(&arc_a), None);
 
         // With nothing filed, every block is hashed.
         chain.accepted_tx_hashes = None;
@@ -9843,6 +9913,7 @@ mod tests {
         assert_eq!(*got, *filed);
         assert_eq!(chain.tx_hash_recomputes, 5);
         assert_eq!(chain.accepted_block_hash(&arc_a), None);
+        assert_eq!(chain.accepted_block_sig_ops(&arc_a), None);
     }
 
     /// The network's genesis block, and the hashes of a block with one
@@ -10617,6 +10688,365 @@ mod tests {
         }
     }
 
+    /// A block that arrives with its hashes brings its counts of
+    /// signature operations, and the contextual check made as it is
+    /// accepted reads the one its treasury agenda answer selects in
+    /// place of counting the block, with and without full validation.
+    /// The same block arriving without is counted by that check once,
+    /// and neither is counted again when it is connected.  The outcome
+    /// is the same either way.
+    #[test]
+    fn a_hashed_block_is_processed_without_counting_its_sig_ops() {
+        let params = dcroxide_chaincfg::regnet_params();
+        let (now, blocks) = tip_extensions(30);
+        for bulk_import in [false, true] {
+            let mut chain = Chain::new(&params, Hash::ZERO, false);
+            chain.bulk_import_mode = bulk_import;
+            // A twin that is handed every block without hashes.
+            let mut twin = Chain::new(&params, Hash::ZERO, false);
+            twin.bulk_import_mode = bulk_import;
+            for (i, block) in blocks.iter().enumerate() {
+                let what = format!("block {i} (bulk import: {bulk_import})");
+                let before = crate::blockhashes::SIG_OP_LOOPS.get();
+                let twin_result = twin.process_block(block, now, &params);
+                assert!(
+                    twin_result.1.is_empty(),
+                    "{what} on the twin: {twin_result:?}"
+                );
+                assert_eq!(
+                    crate::blockhashes::SIG_OP_LOOPS.get().wrapping_sub(before),
+                    1,
+                    "{what} on the twin"
+                );
+
+                let shared = Arc::new(block.clone());
+                // Every other block arrives hashed.
+                let hashed = (i % 2 == 0).then(|| HashedBlock::new(Arc::clone(&shared)));
+                let before = crate::blockhashes::SIG_OP_LOOPS.get();
+                let result = match &hashed {
+                    Some(hashed) => chain.process_hashed_block(hashed, now, &params),
+                    None => chain.process_shared_block(&shared, now, &params),
+                };
+                assert_eq!(result, twin_result, "{what}");
+                assert_eq!(
+                    crate::blockhashes::SIG_OP_LOOPS.get().wrapping_sub(before),
+                    u64::from(hashed.is_none()),
+                    "{what} (hashed: {})",
+                    hashed.is_some()
+                );
+                let tip = chain.best_chain.tip().expect("tip");
+                assert_eq!(chain.store.node(tip).hash, block.header.block_hash());
+                assert!(chain.accepted_tx_hashes.is_none(), "{what}");
+            }
+        }
+    }
+
+    /// dcrd's full block battery through `process_hashed_block`, beside
+    /// `process_block` on a twin chain: every row gives the same result,
+    /// and the chain handed hashed blocks counts the signature
+    /// operations of the block a call processes only where the count
+    /// the block arrived with is over the limit.  Each call counts the
+    /// blocks it checks in context other than that one, those linked
+    /// with it and those a reorganization attaches, on both chains.  So
+    /// a row costs the hashed chain the twin's counts, less one where
+    /// the block was checked as it was accepted and its count is within
+    /// the limit; over the limit, the hashed chain counts the block
+    /// itself.  Five of the six rows dcrd refuses for too many signature
+    /// operations are refused through that count.  The sixth has a count
+    /// within the limit and is refused as it is connected, by the count
+    /// that includes pay-to-script-hash inputs, on both chains.
+    #[test]
+    fn the_battery_counts_a_hashed_block_only_over_the_limit() {
+        let params = dcroxide_chaincfg::regnet_params();
+        let mut twin = Chain::new(&params, Hash::ZERO, false);
+        let mut chain = Chain::new(&params, Hash::ZERO, false);
+        let mut now = 0;
+        let (mut spared, mut counted_over, mut refused_within) = (0u64, Vec::new(), Vec::new());
+        for line in include_str!("../tests/data/fullblock_vectors.txt").lines() {
+            let f: Vec<&str> = line.split(' ').collect();
+            let hex = match f[0] {
+                "now" => {
+                    now = f[1].parse().expect("now");
+                    continue;
+                }
+                "accept" => f[4],
+                "reject" => f[3],
+                "orphanorreject" => f[2],
+                _ => continue,
+            };
+            let name = f[1];
+            let (block, _) = MsgBlock::from_bytes(&dcroxide_testutil::unhex(hex)).expect("block");
+            let hashed = HashedBlock::new(Arc::new(block.clone()));
+            // No block of the battery has a count over the limit under
+            // one answer of the treasury agenda only.
+            let counts = hashed.sig_ops();
+            let over = !crate::validate::sig_op_count_is_within_limit(counts.get(false));
+            assert_eq!(
+                over,
+                !crate::validate::sig_op_count_is_within_limit(counts.get(true)),
+                "{name}"
+            );
+
+            let loops = || crate::blockhashes::SIG_OP_LOOPS.get();
+            let before = loops();
+            let twin_result = twin.process_block(&block, now, &params);
+            let twin_loops = loops() - before;
+            let before = loops();
+            let result = chain.process_hashed_block(&hashed, now, &params);
+            let hashed_loops = loops() - before;
+
+            assert_eq!(result, twin_result, "{name}");
+            if over {
+                assert_eq!(hashed_loops, twin_loops, "{name}");
+                if twin_loops > 0 {
+                    let err = result.1.first().expect("refused");
+                    assert_eq!(err.kind, RuleErrorKind::TooManySigOps, "{name}");
+                    counted_over.push(name);
+                }
+            } else {
+                let fewer = twin_loops
+                    .checked_sub(hashed_loops)
+                    .unwrap_or_else(|| panic!("{name}: {twin_loops} against {hashed_loops}"));
+                assert!(fewer <= 1, "{name}: {twin_loops} against {hashed_loops}");
+                spared += fewer;
+                if result
+                    .1
+                    .iter()
+                    .any(|err| err.kind == RuleErrorKind::TooManySigOps)
+                {
+                    refused_within.push(name);
+                }
+            }
+        }
+        assert_eq!(counted_over, ["bcs2", "bmo2", "bmo4", "bmo6", "bsc1"]);
+        assert_eq!(refused_within, ["bshso1"]);
+        // One for each row whose block was checked in context as it was
+        // accepted, within the limit.
+        assert_eq!(spared, 266);
+    }
+
+    /// Counts reach the contextual check only for the block the
+    /// processing call is processing.  A block whose data arrived, hashed
+    /// and counted, before its parent's is checked when the parent's
+    /// data links it, by the call that processes the parent, and that
+    /// check counts it: its counts went with the call that delivered it.
+    /// The parent is checked with the counts it arrived with.
+    #[test]
+    fn a_block_linked_by_its_parent_is_counted_by_the_check() {
+        let params = dcroxide_chaincfg::regnet_params();
+        let (now, blocks) = tip_extensions(12);
+        let (parent, child) = (&blocks[10], &blocks[11]);
+        let mut chain = Chain::new(&params, Hash::ZERO, false);
+        for (i, block) in blocks[..10].iter().enumerate() {
+            let (_, errs) = chain.process_block(block, now, &params);
+            assert!(errs.is_empty(), "block {i}: {errs:?}");
+        }
+        for header in [&parent.header, &child.header] {
+            chain
+                .process_block_header(header, now, &params)
+                .expect("header");
+        }
+
+        // The child first: its data is accepted and waits for the
+        // parent's, and nothing is checked in context.
+        let before = crate::blockhashes::SIG_OP_LOOPS.get();
+        let (_, errs) =
+            chain.process_hashed_block(&HashedBlock::new(Arc::new(child.clone())), now, &params);
+        assert!(errs.is_empty(), "{errs:?}");
+        assert_eq!(crate::blockhashes::SIG_OP_LOOPS.get(), before);
+        assert_ne!(
+            chain.store.node(chain.best_chain.tip().expect("tip")).hash,
+            child.header.block_hash()
+        );
+
+        // The parent links both: one count, the child's.
+        let before = crate::blockhashes::SIG_OP_LOOPS.get();
+        let (_, errs) =
+            chain.process_hashed_block(&HashedBlock::new(Arc::new(parent.clone())), now, &params);
+        assert!(errs.is_empty(), "{errs:?}");
+        assert_eq!(
+            crate::blockhashes::SIG_OP_LOOPS.get().wrapping_sub(before),
+            1
+        );
+        let tip = chain.best_chain.tip().expect("tip");
+        assert_eq!(chain.store.node(tip).hash, child.header.block_hash());
+    }
+
+    /// The contextual check counts, and reads the carried count, by the
+    /// answer its treasury agenda query gives for the block.  A block
+    /// one transaction longer than a block of the battery, whose count
+    /// is at the limit while `OP_TSPEND` does not count and two over it
+    /// once it does, passes the check over the battery's chain, where
+    /// the agenda is inactive.  The same block shaped for the agenda,
+    /// with a version 3 coinbase and a treasurybase, fails it over the
+    /// same chain with the agenda forced active, with the error and text
+    /// of the check's own count under that answer.  Each is checked
+    /// with the counts it carries and without, to the same result.
+    #[test]
+    fn the_contextual_check_counts_by_its_treasury_agenda_answer() {
+        use crate::validate::{
+            MAX_SIG_OPS_PER_BLOCK, check_block_sig_ops, count_block_sig_ops,
+            determine_check_tx_flags,
+        };
+        use dcroxide_txscript::{OP_CHECKSIG, OP_DATA_12, OP_RETURN, OP_TADD, OP_TSPEND};
+        use dcroxide_wire::{TxIn, TxOut};
+
+        let inactive = dcroxide_chaincfg::regnet_params();
+        let mut active = dcroxide_chaincfg::regnet_params();
+        force_deployment_result(&mut active, crate::agendas::VOTE_ID_TREASURY, "yes");
+
+        let (now, blocks) = tip_extensions(30);
+        let (last, earlier) = blocks.split_last().expect("blocks");
+        let mut chain = Chain::new(&inactive, Hash::ZERO, false);
+        for (i, block) in earlier.iter().enumerate() {
+            let (_, errs) = chain.process_block(block, now, &inactive);
+            assert!(errs.is_empty(), "block {i}: {errs:?}");
+        }
+        let parent_id = chain.best_chain.tip().expect("tip");
+        let parent_stake_node = chain
+            .fetch_stake_node(parent_id, &inactive)
+            .expect("stake node");
+        let prev_height = chain.store.node(parent_id).height;
+        let view = NodeBranchView {
+            store: &chain.store,
+            tip: parent_id,
+        };
+        for (params, treasury) in [(&inactive, false), (&active, true)] {
+            let flags = determine_check_tx_flags(&view, Some(prev_height), params).expect("flags");
+            assert_eq!(flags.is_treasury_enabled(), treasury);
+        }
+        let height = u32::try_from(prev_height + 1).expect("height");
+
+        // The block shaped for the agenda: a version 3 coinbase, whose
+        // first output then commits to the height, without the output
+        // that pays the project subsidy, which a treasurybase pays once
+        // the agenda is active.
+        let mut shaped = last.clone();
+        let coinbase = &mut shaped.transactions[0];
+        coinbase.version = dcroxide_stake::TX_VERSION_TREASURY;
+        coinbase.tx_out.remove(0);
+        let mut height_commitment = vec![OP_RETURN, OP_DATA_12];
+        height_commitment.extend(height.to_le_bytes());
+        height_commitment.extend([0; 8]);
+        shaped.stransactions.insert(
+            0,
+            MsgTx {
+                version: dcroxide_stake::TX_VERSION_TREASURY,
+                tx_in: vec![TxIn {
+                    previous_out_point: OutPoint {
+                        hash: Hash::ZERO,
+                        index: u32::MAX,
+                        tree: 0,
+                    },
+                    block_index: u32::MAX,
+                    ..TxIn::default()
+                }],
+                tx_out: vec![
+                    TxOut {
+                        value: 1,
+                        pk_script: vec![OP_TADD],
+                        ..TxOut::default()
+                    },
+                    TxOut {
+                        pk_script: height_commitment,
+                        ..TxOut::default()
+                    },
+                ],
+                ..MsgTx::default()
+            },
+        );
+        assert!(dcroxide_stake::is_treasury_base(&shaped.stransactions[0]));
+
+        let pow_limit = dcroxide_standalone::BigInt::from_bytes_be(
+            dcroxide_standalone::Sign::Plus,
+            &inactive.pow_limit.to_be_bytes(),
+        );
+        for (params, treasury, mut block) in
+            [(&inactive, false, last.clone()), (&active, true, shaped)]
+        {
+            let what = format!("treasury: {treasury}");
+            let combined = dcroxide_standalone::calc_combined_tx_tree_merkle_root(
+                &last.transactions,
+                &last.stransactions,
+            ) == last.header.merkle_root;
+
+            // One more regular transaction, whose output takes the count
+            // to the limit and whose input script holds two treasury
+            // spend opcodes (an output may not hold one once the agenda
+            // is active, `ErrRegTxCreateStakeOut`).
+            let counted = count_block_sig_ops(&block, false).expect("count");
+            assert_eq!(count_block_sig_ops(&block, true), Some(counted), "{what}");
+            let room = usize::try_from(MAX_SIG_OPS_PER_BLOCK).expect("limit")
+                - usize::try_from(counted).expect("count");
+            block.transactions.push(MsgTx {
+                tx_in: vec![TxIn {
+                    previous_out_point: OutPoint {
+                        hash: Hash([7; 32]),
+                        index: 0,
+                        tree: 0,
+                    },
+                    signature_script: vec![OP_TSPEND, OP_TSPEND],
+                    ..TxIn::default()
+                }],
+                tx_out: vec![TxOut {
+                    value: 1,
+                    pk_script: vec![OP_CHECKSIG; room],
+                    ..TxOut::default()
+                }],
+                ..MsgTx::default()
+            });
+
+            // The header commits to the trees as the battery's did, and
+            // meets its target under either proof of work hash.
+            if combined {
+                block.header.merkle_root = dcroxide_standalone::calc_combined_tx_tree_merkle_root(
+                    &block.transactions,
+                    &block.stransactions,
+                );
+            } else {
+                block.header.merkle_root =
+                    dcroxide_standalone::calc_tx_tree_merkle_root(&block.transactions);
+                block.header.stake_root =
+                    dcroxide_standalone::calc_tx_tree_merkle_root(&block.stransactions);
+            }
+            block.header.size = u32::try_from(block.serialize_size()).expect("size");
+            let meets = |header: &BlockHeader| {
+                [header.pow_hash_v1(), header.pow_hash_v2()]
+                    .iter()
+                    .all(|hash| {
+                        dcroxide_standalone::check_proof_of_work(hash, header.bits, &pow_limit)
+                            .is_ok()
+                    })
+            };
+            while !meets(&block.header) {
+                block.header.nonce += 1;
+            }
+
+            let counts = BlockSigOps::compute(&block);
+            assert_eq!(counts.get(false), Some(5_000), "{what}");
+            assert_eq!(counts.get(true), Some(5_002), "{what}");
+            let expected = check_block_sig_ops(&block, treasury).map(drop);
+            assert_eq!(expected.is_err(), treasury, "{what}: {expected:?}");
+            if let Err(err) = &expected {
+                assert_eq!(err.kind, RuleErrorKind::TooManySigOps, "{what}");
+            }
+            for carried in [Some(&counts), None] {
+                let result = check_block_context_for(
+                    &chain.store,
+                    parent_id,
+                    &block,
+                    None,
+                    carried,
+                    &parent_stake_node,
+                    false,
+                    &mut LruHashSet::new(4),
+                    params,
+                );
+                assert_eq!(result, expected, "{what}, carried: {}", carried.is_some());
+            }
+        }
+    }
+
     /// The contextual proof of work check reaches the same verdict, with
     /// the same text, when it is handed the header's block hash as when
     /// it hashes the header itself, for a header that meets its target
@@ -10756,6 +11186,7 @@ mod tests {
                         parent_id,
                         case,
                         block_hash,
+                        None,
                         &parent_stake_node,
                         false,
                         &mut merkle_checks,

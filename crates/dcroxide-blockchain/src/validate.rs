@@ -3929,6 +3929,121 @@ pub fn count_sig_ops(
     Ok(total_sig_ops)
 }
 
+/// The number of signature operations in the block as the contextual
+/// block check accumulates them ([`check_block_sig_ops`], dcrd
+/// `checkBlockContext`, `validate.go:2378-2408`): [`count_sig_ops`] of
+/// each regular and then each stake transaction, with the coinbase and
+/// vote flags that check gives it, summed in a `u32`.  No limit is
+/// applied.  `None` where an accumulator overflows, the transaction's
+/// own inside [`count_sig_ops`] or the block's, as that check's does.
+///
+/// Neither can overflow for a block within the wire protocol's size
+/// limit, which the chain checks before the contextual check: a script
+/// byte adds at most `MAX_PUB_KEYS_PER_MULTI_SIG`, 20, so such a block
+/// has fewer than 27 million.
+///
+/// This is the count a block that was hashed before it reached the
+/// chain carries ([`crate::blockhashes::HashedBlock`]), made on the
+/// thread that hashed it, for each answer the treasury agenda query can
+/// give.
+pub(crate) fn count_block_sig_ops(block: &MsgBlock, is_treasury_enabled: bool) -> Option<u32> {
+    sum_sig_op_counts(
+        block
+            .transactions
+            .iter()
+            .chain(&block.stransactions)
+            .map(|tx| {
+                let is_coin_base = dcroxide_standalone::is_coin_base_tx(tx, is_treasury_enabled);
+                let is_ssgen = dcroxide_stake::is_ssgen(tx);
+                count_sig_ops(tx, is_coin_base, is_ssgen, is_treasury_enabled).ok()
+            }),
+    )
+}
+
+/// The sum of the counts of a block's transactions in a `u32`, `None`
+/// when a count is `None` or the sum overflows.
+pub(crate) fn sum_sig_op_counts(counts: impl IntoIterator<Item = Option<u32>>) -> Option<u32> {
+    counts
+        .into_iter()
+        .try_fold(0u32, |total, count| total.checked_add(count?))
+}
+
+/// The limit on a block's signature operations, as the contextual block
+/// check applies it (dcrd `checkBlockContext`, `validate.go:2378-2408`).
+///
+/// `counted` are the block's counts when it arrived with them
+/// ([`crate::blockhashes::HashedBlock`]), which must be this very
+/// block's.  When the count for the agenda answer `is_treasury_enabled`
+/// is within the limit, the check's own count would pass and is not
+/// made: its running sum never exceeds the sum it ends on, which is
+/// that count, and no accumulator overflows on the way, or the count
+/// would be `None`.  In every other case, and for every block that
+/// arrived without counts, the check counts the block itself
+/// ([`check_block_sig_ops`]), so a block over the limit, or whose count
+/// overflows, fails at the same transaction with the same error and
+/// text whether or not it arrived counted.
+pub(crate) fn check_block_sig_op_limit(
+    block: &MsgBlock,
+    counted: Option<&crate::blockhashes::BlockSigOps>,
+    is_treasury_enabled: bool,
+) -> Result<(), RuleError> {
+    if let Some(counted) = counted {
+        counted.assert_for(block);
+        if sig_op_count_is_within_limit(counted.get(is_treasury_enabled)) {
+            return Ok(());
+        }
+    }
+    check_block_sig_ops(block, is_treasury_enabled).map(drop)
+}
+
+/// Whether a block's carried count says that the contextual check's own
+/// count of it would pass: a count, and one no greater than
+/// [`MAX_SIG_OPS_PER_BLOCK`].  A count that overflowed is none, and is
+/// not.
+pub(crate) fn sig_op_count_is_within_limit(count: Option<u32>) -> bool {
+    count.is_some_and(|total| i64::from(total) <= MAX_SIG_OPS_PER_BLOCK)
+}
+
+/// The contextual block check's count of the block's signature
+/// operations, which fails the block on the first transaction that
+/// overflows an accumulator or takes the sum over the limit (dcrd
+/// `checkBlockContext`, `validate.go:2378-2408`), and otherwise returns
+/// the sum.
+pub(crate) fn check_block_sig_ops(
+    block: &MsgBlock,
+    is_treasury_enabled: bool,
+) -> Result<u32, RuleError> {
+    #[cfg(test)]
+    crate::blockhashes::SIG_OP_LOOPS.set(crate::blockhashes::SIG_OP_LOOPS.get().wrapping_add(1));
+    let mut total_sig_ops: u32 = 0;
+    for tx in block.transactions.iter().chain(&block.stransactions) {
+        let is_coin_base = dcroxide_standalone::is_coin_base_tx(tx, is_treasury_enabled);
+        let is_ssgen = dcroxide_stake::is_ssgen(tx);
+        let num_sig_ops = count_sig_ops(tx, is_coin_base, is_ssgen, is_treasury_enabled)?;
+        let ok;
+        (total_sig_ops, ok) = total_sig_ops.add_unsigned(num_sig_ops);
+        if !ok {
+            return Err(rule_error(
+                RuleErrorKind::TooManySigOps,
+                format!(
+                    "tx {} causes block signature operation count to overflow",
+                    tx.tx_hash()
+                ),
+            ));
+        }
+        if i64::from(total_sig_ops) > MAX_SIG_OPS_PER_BLOCK {
+            return Err(rule_error(
+                RuleErrorKind::TooManySigOps,
+                format!(
+                    "block contains too many signature operations - got \
+                     {total_sig_ops}, max {MAX_SIG_OPS_PER_BLOCK}"
+                ),
+            ));
+        }
+    }
+    Ok(total_sig_ops)
+}
+
 /// The number of signature operations for all input transactions of
 /// the pay-to-script-hash type, using the precise counting mechanism
 /// from the script engine (dcrd `countP2SHSigOps` at 2.2).
@@ -4245,6 +4360,7 @@ pub fn check_block_context(
         view,
         block,
         None,
+        None,
         prev_height,
         fast_add,
         no_pow_check,
@@ -4263,11 +4379,17 @@ pub fn check_block_context(
 /// hash in hand is the key of the recent merkle checks and, where the
 /// version 1 proof of work applies, the hash compared with the target;
 /// without one the header is hashed for each.
+///
+/// `sig_ops` are the block's counts of signature operations when it
+/// arrived with them (`crate::blockhashes::HashedBlock`), which must be
+/// this very block's.  They are read at the point where the check
+/// counts, and nowhere else ([`check_block_sig_op_limit`]).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn check_block_context_with_hash(
     view: &impl FullChainView,
     block: &MsgBlock,
     block_hash: Option<&Hash>,
+    sig_ops: Option<&crate::blockhashes::BlockSigOps>,
     prev_height: Option<i64>,
     fast_add: bool,
     no_pow_check: bool,
@@ -4558,33 +4680,10 @@ pub(crate) fn check_block_context_with_hash(
     }
 
     // The number of signature operations must not overflow the
-    // accumulator and be less than the maximum allowed per block.
-    let mut total_sig_ops: u32 = 0;
-    for tx in block.transactions.iter().chain(&block.stransactions) {
-        let is_coin_base = dcroxide_standalone::is_coin_base_tx(tx, is_treasury_enabled);
-        let is_ssgen = dcroxide_stake::is_ssgen(tx);
-        let num_sig_ops = count_sig_ops(tx, is_coin_base, is_ssgen, is_treasury_enabled)?;
-        let ok;
-        (total_sig_ops, ok) = total_sig_ops.add_unsigned(num_sig_ops);
-        if !ok {
-            return Err(rule_error(
-                RuleErrorKind::TooManySigOps,
-                format!(
-                    "tx {} causes block signature operation count to overflow",
-                    tx.tx_hash()
-                ),
-            ));
-        }
-        if i64::from(total_sig_ops) > MAX_SIG_OPS_PER_BLOCK {
-            return Err(rule_error(
-                RuleErrorKind::TooManySigOps,
-                format!(
-                    "block contains too many signature operations - got \
-                     {total_sig_ops}, max {MAX_SIG_OPS_PER_BLOCK}"
-                ),
-            ));
-        }
-    }
+    // accumulator and be less than the maximum allowed per block.  A
+    // block handed in with its counts is counted here only when the
+    // count its treasury agenda answer selects is over the limit.
+    check_block_sig_op_limit(block, sig_ops, is_treasury_enabled)?;
 
     // The header's claimed size must not exceed the agenda-driven
     // maximum block size.  Checked even on the fast-add path: dcrd
