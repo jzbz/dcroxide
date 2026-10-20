@@ -492,7 +492,7 @@ figures; the delayed-link runs of 2026-10-11 are in
 has been measured.
 
 By default dcroxide now requests blocks through a window of its own
-([PARITY.md](../PARITY.md), *Block download window*): up to 128 blocks
+([PARITY.md](PARITY.md), *Block download window*): up to 128 blocks
 requested from the sync peer and, beyond the first 16, no more than
 3,145,728 bytes of them by the sizes in their headers. It was measured
 on m3 on 2026-10-12 in short runs only, one binary and one run per arm.
@@ -571,7 +571,7 @@ startup.
 
 During the initial sync dcroxide also reads its sync peer's connection
 ahead of the thread that processes the blocks, which dcrd does not do
-([PARITY.md](../PARITY.md), *Reading ahead of the block handler*). Once
+([PARITY.md](PARITY.md), *Reading ahead of the block handler*). Once
 that peer has delivered a first block, a thread of its own reads the
 connection, checks each message's checksum and decodes it, and for a
 block hashes its transactions, builds its two merkle trees, counts its
@@ -734,7 +734,7 @@ scripts. dcrd starts goroutines for each batch of a block's inputs.
 dcroxide, since `f60ae3a`, checks each transaction tree with 4 script
 items or more of a block it connects on helper threads that live as long
 as the process, the thread that processes blocks checking with them
-([PARITY.md](../PARITY.md), *Script checks of a connected block*). They
+([PARITY.md](PARITY.md), *Script checks of a connected block*). They
 are named `scriptval-N`, are created as batches or the signature
 pre-verification below want them, as many as the widest batch so far
 less one, or as the pre-verification may hold if that is more, and never
@@ -757,7 +757,7 @@ to 3,128 MiB of the three runs of `4700cf1` without them.
 
 During the initial chain sync the same helpers also check signatures
 ahead of the thread that processes blocks, which dcrd does not do
-([PARITY.md](../PARITY.md), *Signature pre-verification ahead of the
+([PARITY.md](PARITY.md), *Signature pre-verification ahead of the
 block thread*). While the sync peer's connection is read ahead, its
 reading thread hands each block it has read to them, unless the chain
 will check none of its scripts, and the inputs that spend a
@@ -928,7 +928,7 @@ the addresses of recent blocks in memory, and the rest in sorted runs of
 4 KiB chunks, written inside the metadata flushes that already carry the
 chain's rows, with a journal so a restart can rebuild the memory. It gives
 dcrd's answers with two exceptions, both in
-[PARITY.md](../PARITY.md): a storage read error answers "Could not query
+[PARITY.md](PARITY.md): a storage read error answers "Could not query
 address: ..." instead of "never seen", and an address seen only in the
 mempool no longer answers "never seen" while its block is being indexed.
 On m2 ([bench-ledger.md](bench-ledger.md), "Exists-address index layout
@@ -1142,7 +1142,7 @@ most of them after the first few minutes of a sync; in the syncs of
 2026-10-11 about one in ten was the two-minute rule's, which since
 2026-10-19 counts from the last UTXO cache flush any durable commit
 carried, so how often it comes due in a sync now has not been
-counted ([PARITY.md](../PARITY.md), *Periodic UTXO cache flush
+counted ([PARITY.md](PARITY.md), *Periodic UTXO cache flush
 interval*). On m3 on 2026-10-11 the code before the change
 took 775.6 s with 133 flushes in one sync, a prototype of the change
 took 724.6 s with 52 flushes at 300 MiB and 736.9 s with 63 at 200 MiB,
@@ -1378,11 +1378,11 @@ two have dcrd counterparts, since the page cache, the overlay, the
 flush log and the thread a commit runs on are properties of this
 port's metadata store over redb, which dcrd does not use (dcrd
 commits on the thread that holds its write lock, as
-`DCROXIDE_DB_SYNC_COMMIT` does; [PARITY.md](../PARITY.md), *Where a
+`DCROXIDE_DB_SYNC_COMMIT` does; [PARITY.md](PARITY.md), *Where a
 cache flush's commit runs*), the
 memtable is a property of this port's exists-address layout, the
 download window is this port's own rule for requesting blocks
-([PARITY.md](../PARITY.md), *Block download window*), and the
+([PARITY.md](PARITY.md), *Block download window*), and the
 read-ahead is a thread dcrd does not have (*Reading ahead of the block
 handler*), and pre-verification is work dcrd does not do (*Signature
 pre-verification ahead of the block thread*). Of the five
@@ -1654,7 +1654,7 @@ the top of the chain: within its validity window, with no critical
 extension Go does not handle, an extended key usage that allows client
 authentication, and a path length constraint the chain's intermediates
 stay within. The client certificate shapes the daemon still refuses
-where dcrd accepts them are listed in [PARITY.md](../PARITY.md).
+where dcrd accepts them are listed in [PARITY.md](PARITY.md).
 
 Default ports are dcrd's, unchanged: mainnet 9108 (P2P) and 9109 (RPC).
 
@@ -1702,14 +1702,14 @@ unaffected. The first line comes at every dial, retries included; the
 second when the peer's version message arrives; the third once the
 handshake completes. None is logged on simnet or regnet, for an inbound
 peer, or for a peer with a public address. See QK-0028 in
-[QUIRKS.md](../QUIRKS.md).
+[QUIRKS.md](QUIRKS.md).
 
 ## Status of what you are running
 
-Per-package parity status is in [PARITY.md](../PARITY.md), which also
+Per-package parity status is in [PARITY.md](PARITY.md), which also
 records every deliberate divergence from dcrd and the known remaining
 gaps. Bug-for-bug reproductions of dcrd behavior — the ones that look
-like defects and are not — are catalogued in [QUIRKS.md](../QUIRKS.md).
+like defects and are not — are catalogued in [QUIRKS.md](QUIRKS.md).
 
 There is no per-RPC-method status ledger yet. It is planned alongside
 the ecosystem-acceptance work (the `dcrdtest` harness, a `dcrctl`

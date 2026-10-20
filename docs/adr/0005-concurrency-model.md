@@ -431,7 +431,7 @@ paragraph above, and nothing else in this ADR depends on the thread.
 > by the means of two runs each, and the step from sixteen to thirty-two
 > was not resolved ([bench-ledger.md](../bench-ledger.md), "Where
 > `797a213`'s block thread waits, a deeper read-ahead and a rung of four
-> changes"; [PARITY.md](../../PARITY.md), *Reading ahead of the block
+> changes"; [PARITY.md](../PARITY.md), *Reading ahead of the block
 > handler*). That build was not the tree of a commit, and the series is
 > one of its own. Nothing else here changes: one reading thread on one
 > connection, the same lock and condition variables, and the

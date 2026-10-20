@@ -1680,7 +1680,7 @@ second addendum of the same date).
 > daemon makes on the metadata store's commit thread, and counts once
 > that commit has landed; the 120 s now run from the last UTXO cache
 > flush any durable commit carried ([ADR-0009](0009-storage-shape.md),
-> second addendum of 2026-10-19; [PARITY.md](../../PARITY.md), *Periodic
+> second addendum of 2026-10-19; [PARITY.md](../PARITY.md), *Periodic
 > UTXO cache flush interval*).
 
 Measured on m3 that afternoon, one default sync each
@@ -1701,7 +1701,7 @@ often the chain asks for a commit while it is catching up, and with it
 what an unclean stop in that phase loses: about 120 s of processing,
 replayed or downloaded again, where it was one fill of the UTXO cache.
 Every durable state is still a prefix of the commit order
-([PARITY.md](../../PARITY.md), the row "UTXO cache flush and the durable
+([PARITY.md](../PARITY.md), the row "UTXO cache flush and the durable
 commit"). The cost is memory: peak resident memory was 3,090–3,285 MiB
 in those three runs against 2,635 MiB, and 2,138 MiB with the
 exists-address index off, where the index-off sync of `c128a93` peaked

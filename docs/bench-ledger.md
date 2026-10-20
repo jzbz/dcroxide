@@ -4711,7 +4711,7 @@ and 2,863.9 s, the ratio is 6.70x and 6.65x. With `--noexistsaddrindex`,
 
 **The background commit, kept.** Since `02b802c` the daemon makes the
 storage engine's commit of most metadata flushes on a thread of its own
-([PARITY.md](../PARITY.md), *Where a cache flush's commit runs*). It was
+([PARITY.md](PARITY.md), *Where a cache flush's commit runs*). It was
 measured on 2026-10-16 as part of a build that is not the code of any
 commit: `4700cf1` with the changes of the seventeen commits, the
 validation pool among them, as they were measured on 2026-10-13, whose
@@ -4813,14 +4813,14 @@ What the eleven are, in the order they were made:
   where dcrd serializes and hashes the transaction's prefix again for
   every signature. dcrd carries the shortcut in its source and ships it
   switched off, with a warning that it has not been vetted
-  (`txscript/opcode.go:27-32`); [PARITY.md](../PARITY.md) records it under
+  (`txscript/opcode.go:27-32`); [PARITY.md](PARITY.md) records it under
   the accepted departures, with its tests. The 89,438 blocks validated
   in full took 121.6 s against 140.3 s, and the node's user CPU time
   was 1,058.0 s against 1,298.6 s.
 - **`540b203`, the block download window: 612.4 s against 607.7 s over
   loopback.** During the initial sync the node keeps up to 128 blocks
   requested from its sync peer, within a byte budget, where dcrd keeps
-  16 ([PARITY.md](../PARITY.md), *Block download window*). Its
+  16 ([PARITY.md](PARITY.md), *Block download window*). Its
   measurements over a delayed link are below.
 - **`5cf9e04`, not measured alone.** A block a peer delivers is handed
   to the chain as the allocation its message was decoded into, where
@@ -4836,7 +4836,7 @@ What the eleven are, in the order they were made:
   node's code give that thread more to do for each block: since
   `a589c4a` it lays the block out as its block-file record from the
   bytes it arrived in, and since `44cf801` it builds the block's two
-  merkle trees. [PARITY.md](../PARITY.md), *Reading ahead of the block
+  merkle trees. [PARITY.md](PARITY.md), *Reading ahead of the block
   handler*, has the rule and what a peer can see of it, and
   [SECURITY.md](../SECURITY.md) what it gives a hostile sync peer.
 
@@ -5013,7 +5013,7 @@ What these figures do not say:
   and beyond the first 16 no more than 3,145,728 bytes of them by the
   sizes in their headers, and it halves both limits, down to dcrd's 16
   blocks, each time a sync peer leaves with more than 16 requested
-  ([PARITY.md](../PARITY.md), *Block download window*). On 2026-10-12, on
+  ([PARITY.md](PARITY.md), *Block download window*). On 2026-10-12, on
   m3, one binary was run through the same relay for 300 s per arm,
   header sync included, on a quiet machine with the node on four cores,
   once with `DCROXIDE_BLOCK_WINDOW=dcrd` and once at the default: at a
@@ -5049,7 +5049,7 @@ What these figures do not say:
   reads its sync peer's connection up to four messages ahead of the
   thread that connects blocks, on a thread of its own, and reads as
   dcrd does when started with `DCROXIDE_READ_AHEAD=off`
-  ([PARITY.md](../PARITY.md), *Reading ahead of the block handler*). The
+  ([PARITY.md](PARITY.md), *Reading ahead of the block handler*). The
   494.6 s and 490.8 s at the top of this section, against 597.6 s and
   599.0 s with it off, are of 2026-10-12 on m3, on a quiet machine
   with the node on eight cores, and of the build made before the
@@ -5105,7 +5105,7 @@ the same chain, so the difference then was redb's page layout and not
 extra data. The exists-address index has since moved to a layout of its
 own ([ADR-0011](adr/0011-exists-address-layout-3-and-the-flush-participant.md)),
 and that payload comparison has not been repeated.
-[PARITY.md](../PARITY.md) records the divergence from dcrd's two-database
+[PARITY.md](PARITY.md) records the divergence from dcrd's two-database
 layout.
 
 Earlier measurements are kept in the

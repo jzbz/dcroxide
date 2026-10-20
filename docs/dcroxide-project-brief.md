@@ -30,7 +30,7 @@ Explicit non-goals: wallet functionality (that is `dcrwallet`), the mixing **cli
 
 *A signpost, not a second README. Per-package detail lives in
 [PARITY.md](PARITY.md), deliberate bug-for-bug reproductions in
-[QUIRKS.md](QUIRKS.md), operational caveats in [SECURITY.md](SECURITY.md).
+[QUIRKS.md](QUIRKS.md), operational caveats in [SECURITY.md](../SECURITY.md).
 Everything below this block is the original plan. Its text stands, with two
 exceptions: the parity target is corrected wherever the plan names it, and
 where the build diverged from the plan an "as built" note sits beside the
@@ -76,7 +76,7 @@ exit criteria have not been demonstrated, and those are listed here too:
   and every pull request — and a nightly
   10-minute-per-target run over the 17 fuzz targets. Not wired: coverage
   reporting (`cargo-llvm-cov`), `cargo-vet`, `cargo-mutants`, and any sanitizer
-  coverage beyond the AddressSanitizer `cargo fuzz` builds in by default. [docs/dependency-ledger.md](docs/dependency-ledger.md) records a decision per load-bearing crate — vendored, reviewed@V, accepted, or declined — while stating outright that it is not a review; a full manual audit and a version freeze are still Phase 15 items.
+  coverage beyond the AddressSanitizer `cargo fuzz` builds in by default. [docs/dependency-ledger.md](dependency-ledger.md) records a decision per load-bearing crate — vendored, reviewed@V, accepted, or declined — while stating outright that it is not a review; a full manual audit and a version freeze are still Phase 15 items.
 - Three further ledger rows sit at "—" for reasons that are not debt:
   `crypto/rand` (the daemon seeds its CSPRNGs from `getrandom` rather than
   porting dcrd's package), `dcrutil` (its contents were distributed rather than
@@ -157,7 +157,7 @@ What Phase 15 has covered so far:
   and 2,869.8 s there, like the release, and with the exists-address index
   off in both, one run each, dcroxide took 880.8 s against dcrd v2.1.6's
   1,247.8 s, 1.42x: most of the lead at the defaults is that index. Full
-  record in [docs/bench-ledger.md](docs/bench-ledger.md).
+  record in [docs/bench-ledger.md](bench-ledger.md).
 - **Five changes on 2026-10-11 took that sync from 1,058.3 s to
   756.2–759.1 s, 28.3–28.5% less, in one session.**
   A wider table for the block-file checksum, the BLAKE-256 rounds
@@ -230,7 +230,7 @@ What Phase 15 has covered so far:
   2026-10-13), another machine or filesystem, a whole sync over a
   delayed or a real link, the changes within the two batches one at a
   time, and a replay with full validation. The [bench
-  ledger](docs/bench-ledger.md) has every run, and what else was
+  ledger](bench-ledger.md) has every run, and what else was
   measured that day and is not in the repository.
 - **Eighteen more commits to the node's code followed.** `4700cf1` adds
   a log line dcrd writes; the seventeen of 2026-10-16 after it change how
@@ -241,7 +241,7 @@ What Phase 15 has covered so far:
   once with the exists-address index off, and dcrd once, in one session,
   beside a series of builds holding sixteen of the seventeen and a build
   of `4700cf1` with the seventeenth alone; the [bench
-  ledger](docs/bench-ledger.md) has that session.
+  ledger](bench-ledger.md) has that session.
 - **On 2026-10-16 the code of the eighteen, `8fc9160`, took a median of
   430.7 s over four syncs against dcrd v2.1.7's 2,944.4 s, 6.84x in one
   session.** `8fc9160` is those commits with a test-only commit, a
@@ -282,7 +282,7 @@ What Phase 15 has covered so far:
   254.5 MiB more peak resident memory to the tip. All eighteen full
   syncs of the session, dcrd's included, ended with the same block files
   and the same UTXO set by `gettxoutsetinfo`; the rest of the metadata
-  store was not compared. The [bench ledger](docs/bench-ledger.md) has
+  store was not compared. The [bench ledger](bench-ledger.md) has
   every run.
 - **On 2026-10-19 a build of the code of `797a213`, the bench ledger's
   K, took a mean of 271.68 s over four syncs against dcrd v2.1.7's
@@ -302,7 +302,7 @@ What Phase 15 has covered so far:
   the same build from the loopback server, at the defaults and with
   `--assumevalid=0`, every block validated in full, ended with the block
   files and the UTXO set of every full sync from that server since
-  2026-10-17. The [bench ledger](docs/bench-ledger.md) has every run,
+  2026-10-17. The [bench ledger](bench-ledger.md) has every run,
   and the README's Performance section the summary.
 - **The daemon's default download window is now its own, not dcrd's,
   and was measured on 2026-10-12 in short runs only** (PARITY.md,
@@ -355,7 +355,7 @@ Named open items, tracked and not fixed:
   copy-out rebuild packs *worse*, 58.29%, on a larger live tree, 10.92 GiB
   against 9.79. The 1.536 GiB of intra-page slack in `spendjournalv3` is real
   and unreachable inside this engine.
-- The node was flush-bound under fast ingest as measured in 2026-08 (the 48%-of-wall stall figure above, 90–98% of it inside a metadata-flush window). With the height-first block keys and the exists-address index's own layout, metadata flushes took 15–16% of a from-genesis sync on another machine in 2026-10 ([docs/bench-ledger.md](docs/bench-ledger.md), "Daemon against daemon, each from the other"). In the nine syncs of 2026-10-12 listed above with the eleven commits they took 104.3–111.4 s whichever code ran, so their share grew as the rest shrank: 14.7% of the 728.5 s run and 21.3% of each of the two runs with the read-ahead on. On 2026-10-17, with the commit on a thread of its own, the four default syncs of `88c46c3` had a flush under way for a median of 110.2 s, 27.8% of the wall, of which the flushes held the threads that sync for 47.1 s, 11.9%. On 2026-10-19, from a block server on the LAN, the flushes of a build of the code of `797a213`, which writes their rows on that thread too, were in the foreground on the threads that sync for 2.5 to 2.8 s of each default sync.
+- The node was flush-bound under fast ingest as measured in 2026-08 (the 48%-of-wall stall figure above, 90–98% of it inside a metadata-flush window). With the height-first block keys and the exists-address index's own layout, metadata flushes took 15–16% of a from-genesis sync on another machine in 2026-10 ([docs/bench-ledger.md](bench-ledger.md), "Daemon against daemon, each from the other"). In the nine syncs of 2026-10-12 listed above with the eleven commits they took 104.3–111.4 s whichever code ran, so their share grew as the rest shrank: 14.7% of the 728.5 s run and 21.3% of each of the two runs with the read-ahead on. On 2026-10-17, with the commit on a thread of its own, the four default syncs of `88c46c3` had a flush under way for a median of 110.2 s, 27.8% of the wall, of which the flushes held the threads that sync for 47.1 s, 11.9%. On 2026-10-19, from a block server on the LAN, the flushes of a build of the code of `797a213`, which writes their rows on that thread too, were in the foreground on the threads that sync for 2.5 to 2.8 s of each default sync.
 
 **The node is still pre-alpha. Do not expose it to the internet and do not use
 it with funds.**
@@ -430,7 +430,7 @@ Every task in this project serves one of six compatibility surfaces. They are li
 
 **C6 — On-disk data directory.** dcrd stores blocks in flat `.fdb` files with goleveldb metadata (`ffldb`), plus a dedicated UTXO backend and index databases. Reading an existing dcrd datadir in place is a *stretch goal*; the default plan is fresh sync (plus an `addblock`-style bulk importer that can ingest dcrd's exported block files to accelerate it). Do not let C6 hold earlier milestones hostage.
 
-> **Decided and built:** [ADR-0004](docs/adr/0004-storage-backend.md) (Accepted)
+> **Decided and built:** [ADR-0004](adr/0004-storage-backend.md) (Accepted)
 > settled this — dcrd's `database` interface semantics over `redb` for metadata
 > plus dcrd-style flat block files, **fresh sync only**, `addblock`-format
 > import as the migration path, and ffldb/goleveldb read-compat explicitly out
@@ -451,7 +451,7 @@ Every task in this project serves one of six compatibility surfaces. They are li
 1. **dcrd is the specification.** Written docs (DCPs, `docs/`) are secondary. When in doubt, read dcrd source at the pinned upstream commit and reproduce it — including quirks. Every intentional quirk reproduction gets an entry in `QUIRKS.md` and a pinning test.
 2. **Oracle-driven development.** Every consensus-relevant module ships with (a) test vectors extracted from dcrd's own tests or generated by small Go shim programs we write against dcrd packages, and (b) where feasible, a differential fuzz target comparing dcroxide to dcrd live. The dcrd clone plus our `tools/oracle/` Go shims are first-class parts of this repo.
 3. **No hand-rolled cryptography for standard algorithms.** secp256k1 arithmetic, SHA-2 family, RIPEMD-160, Ed25519 field math, and BLAKE3 come from audited/widely-used crates. We own only Decred-specific constructions: BLAKE-256 (vendored, KAT-pinned), EC-Schnorr-DCRv0 (composed on top of a vetted arithmetic backend), the sighash, and the mixing DC-net math (ported with vectors).
-4. **Memory safety as a feature.** `#![forbid(unsafe_code)]` in all dcroxide crates; `unsafe` allowed only inside vetted third-party dependencies, tracked via `cargo-deny`/`cargo-vet`/`cargo-audit` in CI. This is a headline advantage of the project — protect it. One audited exception exists: `dcroxide-winsvc` denies rather than forbids `unsafe_code`, for the `windows-service` entry macro's shim and for the Windows console control handler and pipe-handle adoption that std does not wrap, each unsafe block allowed individually with a `SAFETY` comment ([ADR-0008](docs/adr/0008-clippy-lint-policy.md)'s 2026-09-25 addendum).
+4. **Memory safety as a feature.** `#![forbid(unsafe_code)]` in all dcroxide crates; `unsafe` allowed only inside vetted third-party dependencies, tracked via `cargo-deny`/`cargo-vet`/`cargo-audit` in CI. This is a headline advantage of the project — protect it. One audited exception exists: `dcroxide-winsvc` denies rather than forbids `unsafe_code`, for the `windows-service` entry macro's shim and for the Windows console control handler and pipe-handle adoption that std does not wrap, each unsafe block allowed individually with a `SAFETY` comment ([ADR-0008](adr/0008-clippy-lint-policy.md)'s 2026-09-25 addendum).
 5. **Consensus code is boring code.** No cleverness in validation paths: explicit integer widths, checked arithmetic mirroring dcrd's `checkedmath`, no floating point anywhere near consensus, deterministic iteration orders, and exhaustive error enums mapped 1:1 to dcrd's error kinds (RPC and reject messages leak error identity — parity matters).
 6. **DoS posture parity.** dcrd's limits (message sizes, orphan pools, ban scores, per-peer rate limits, mixpool limits, APBF sizing) are consensus-adjacent: divergence lets an attacker partition mixed networks. Port limits verbatim; test them.
 7. **Pin, then track.** All parity claims reference one pinned upstream commit — `release-v2.1.5` when this plan was written, master `382ff4dd` now. A standing "upstream watch" task reviews every dcrd release/merged consensus PR and files parity issues. A `PARITY.md` ledger maps each dcrd package to its dcroxide crate and status.
@@ -683,7 +683,7 @@ the port carries a runtime Go type model with `encoding/json` reimplemented over
 it, Go float formatting and all (ADR-0007). `certgen` is a direct port of dcrd's
 package rather than `rcgen`, with the divergences PARITY.md records (dcrd's
 RSA4096 algorithm is omitted, among others). Storage went to `redb` per
-ADR-0004. Of the policy half: `cargo-deny` gates licenses, advisories, sources, and bans in CI against `deny.toml`, but `cargo-vet` was never adopted, [docs/dependency-ledger.md](docs/dependency-ledger.md) records a decision per load-bearing crate rather than a review of the whole set, no version freeze has been recorded, and the
+ADR-0004. Of the policy half: `cargo-deny` gates licenses, advisories, sources, and bans in CI against `deny.toml`, but `cargo-vet` was never adopted, [docs/dependency-ledger.md](dependency-ledger.md) records a decision per load-bearing crate rather than a review of the whole set, no version freeze has been recorded, and the
 manifests carry caret ranges with a committed `Cargo.lock` rather than the exact
 pins this policy asks for.
 
@@ -691,25 +691,25 @@ pins this policy asks for.
 
 ## 9. Decisions the developer must surface in the first two weeks
 
-> **These were surfaced, and the record is in [docs/adr/](docs/adr/).** D1–D4
+> **These were surfaced, and the record is in [docs/adr/](adr/).** D1–D4
 > were drafted as ADR-0004 through ADR-0007 in the first sprint; ADR-0001
 > (the oracle rig), ADR-0002 (vendoring BLAKE-256), and ADR-0003 (slice-based
 > wire decoding) cover early decisions this list did not anticipate. Where the
 > outcome differs from the recommendation below, the difference is worth
 > knowing:
 >
-> - **D1** — ratified as [ADR-0004](docs/adr/0004-storage-backend.md)
+> - **D1** — ratified as [ADR-0004](adr/0004-storage-backend.md)
 >   (Accepted): `redb` behind dcrd's database semantics, flat block files,
 >   fresh sync only.
-> - **D2** — [ADR-0005](docs/adr/0005-concurrency-model.md), *Accepted*
+> - **D2** — [ADR-0005](adr/0005-concurrency-model.md), *Accepted*
 >   (ratified 2026-08-07). The recommendation was not taken: there is no
 >   tokio in the dependency graph and the node is OS-threaded throughout,
 >   which is the ADR's own documented fallback. Its addenda record what
 >   shipped and the evidence behind ratification.
-> - **D3** — [ADR-0006](docs/adr/0006-secp256k1-backend.md), still *Proposed*.
+> - **D3** — [ADR-0006](adr/0006-secp256k1-backend.md), still *Proposed*.
 >   The split held: libsecp256k1 bindings for ECDSA, `k256` for
 >   Schnorr-DCRv0, curve25519-dalek for Ed25519.
-> - **D4** — [ADR-0007](docs/adr/0007-json-emission-strategy.md), still
+> - **D4** — [ADR-0007](adr/0007-json-emission-strategy.md), still
 >   *Proposed*. Both halves were built but neither in the proposed shape: the
 >   emission layer uses no serde at all (a runtime Go type model with a
 >   reimplementation of `encoding/json` over it), and the regression corpus is
@@ -724,7 +724,7 @@ pins this policy asks for.
 >   Windows. Release signing
 >   and reproducible builds are neither decided nor built.
 > - **D6** is partially covered by
->   [ADR-0002](docs/adr/0002-vendor-blake256-from-dcr-rs.md): dcr-rs is
+>   [ADR-0002](adr/0002-vendor-blake256-from-dcr-rs.md): dcr-rs is
 >   vendored at a pinned commit with attribution.
 >
 > The original list follows unchanged.

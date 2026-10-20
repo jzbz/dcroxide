@@ -253,7 +253,7 @@ func main() {
 	repo := flag.String("dcrd", "", "path to a dcrd checkout (required)")
 	from := flag.String("from", "", "the current parity pin (required)")
 	to := flag.String("to", "", "the candidate parity pin (required)")
-	parity := flag.String("parity", "PARITY.md", "path to PARITY.md")
+	parity := flag.String("parity", "docs/PARITY.md", "path to PARITY.md")
 	flag.Parse()
 
 	if *repo == "" || *from == "" || *to == "" {

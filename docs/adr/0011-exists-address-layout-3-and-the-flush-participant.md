@@ -529,7 +529,7 @@ write-buffer overflow and the merge tuning stay open.
 Since 2026-10-11 the daemon no longer updates the indexes on the
 block-processing thread. Each drained block event's notification goes
 onto a 128-deep bounded queue served by one thread, as dcrd's subscriber
-does with its channel and goroutine ([PARITY.md](../../PARITY.md), the
+does with its channel and goroutine ([PARITY.md](../PARITY.md), the
 `internal/blockchain/indexers` row). Three statements above are no
 longer exact for the daemon:
 

@@ -44,7 +44,7 @@ like a correctness bug).
 
 **Out of scope.** Behaviour that faithfully reproduces dcrd, including
 dcrd's own quirks and limits — those are the specification, and the
-deliberate ones are catalogued in [QUIRKS.md](QUIRKS.md). If you think
+deliberate ones are catalogued in [QUIRKS.md](docs/QUIRKS.md). If you think
 dcrd itself is wrong, report it to
 [dcrd](https://github.com/decred/dcrd/security/policy) instead. Also out
 of scope: resource use under a workload dcrd would also struggle with,
@@ -69,7 +69,7 @@ message path, authentication and admission on the RPC surface,
 owner-only permissions on the secret files the daemon generates for itself,
 OS-seeded CSPRNGs, and the panic policy below. Every fix, the reasoning
 behind it, and the divergences from dcrd it introduced are itemized in
-[PARITY.md](PARITY.md) under "Deliberate divergences from dcrd" and its
+[PARITY.md](docs/PARITY.md) under "Deliberate divergences from dcrd" and its
 "Known remaining gaps" subsection, rather than being hidden. What
 follows is the residue: the standing gaps that matter most for anyone
 evaluating this code.

@@ -5,9 +5,9 @@ drop-in replacement for [dcrd](https://github.com/decred/dcrd).
 
 Parity target: **dcrd master `382ff4dd`** (version 2.2.0-pre) — wire protocol
 12, JSON-RPC API 8.3.0. dcrd's behavior at that commit is the specification; see
-[QUIRKS.md](QUIRKS.md) for deliberate bug-for-bug reproductions and
-[PARITY.md](PARITY.md) for per-package status. The full plan lives in
-[dcroxide-project-brief.md](dcroxide-project-brief.md).
+[QUIRKS.md](docs/QUIRKS.md) for deliberate bug-for-bug reproductions and
+[PARITY.md](docs/PARITY.md) for per-package status. The full plan lives in
+[dcroxide-project-brief.md](docs/dcroxide-project-brief.md).
 
 **Status: pre-alpha — the dcrd surface is ported end to end.** Every
 dcrd package has a Rust counterpart and the threaded daemon assembles
@@ -536,7 +536,7 @@ the node still syncing.
 **The background commit.** Since `02b802c` most metadata commits run on
 a thread of their own, and since 2026-10-19 that thread, `dbcommit`,
 writes each flush's rows as well and is kept from the first flush handed
-to it to the store's close ([PARITY.md](PARITY.md), *Where a cache
+to it to the store's close ([PARITY.md](docs/PARITY.md), *Where a cache
 flush's commit runs*). Two runs with `DCROXIDE_DB_SYNC_COMMIT=1`, which
 puts every commit back on the committing thread, took 350.2 s and
 350.6 s: the default is 78.7 s or 22.5% less by the means, and it peaks
@@ -573,7 +573,7 @@ What these figures do not cover:
 
 - **A link with a longer round trip.** The LAN server was about 0.3 ms
   away, and dcroxide's download window, up to 128 blocks where dcrd
-  keeps 16 ([PARITY.md](PARITY.md), *Block download window*), has been
+  keeps 16 ([PARITY.md](docs/PARITY.md), *Block download window*), has been
   run over a longer round trip only in short runs on 2026-10-12, through
   a relay and on the public network, and in no whole sync.
 - **The syncs over loopback.** Until 2026-10-19 this section gave
@@ -585,7 +585,7 @@ What these figures do not cover:
   to 407.9 s, against 391.1 to 397.8 s over loopback.
 - **The read-ahead's gain as committed.** Its one comparison with
   `DCROXIDE_READ_AHEAD=off`, on 2026-10-12, was of a build before its
-  review's fixes ([PARITY.md](PARITY.md), *Reading ahead of the block
+  review's fixes ([PARITY.md](docs/PARITY.md), *Reading ahead of the block
   handler*), and no run here turned it off.
 - **Other machines.** Every figure above is of m3 (the ledger has older
   runs on m2), and no sync has been timed on Windows or macOS.
