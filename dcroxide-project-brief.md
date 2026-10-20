@@ -290,20 +290,20 @@ What Phase 15 has covered so far:
   v2.1.7 node on another machine on the same LAN: a series of its own,
   not comparable with the loopback figures above. The build was made
   from a worktree before its code was committed, and its code differs
-  from the code as it stands only by a doc comment, a test's local name
-  and a test's assertion. With the exists-address index off, 250.8 s and
-  249.6 s against one dcrd run of 1,336.3 s, 5.34x. Its peak resident
-  memory, read when the clock stopped with the node still syncing, was
-  2,456 to 2,470 MiB, against dcrd's 1,836 MiB, and 2,959 and 2,964 MiB
-  in two runs with `DCROXIDE_DB_SYNC_COMMIT=1`, which took 350.2 s and
-  350.6 s: the background commit, its thread now kept for the life of
-  the store and writing each flush's rows as well, is 78.7 s or 22.5%
-  less by the means, and peaks lower. The LAN runs record no end state;
-  two syncs of the same build from the loopback server, at the defaults
-  and with `--assumevalid=0`, every block validated in full, ended with
-  the block files and the UTXO set of every full sync from that server
-  since 2026-10-17. The [bench ledger](docs/bench-ledger.md) has every
-  run, and the README's Performance section the summary.
+  from the code as it stands only in tests and comments. With the
+  exists-address index off, 250.8 s and 249.6 s against one dcrd run of
+  1,336.3 s, 5.34x. Its peak resident memory, read when the clock
+  stopped with the node still syncing, was 2,456 to 2,470 MiB, against
+  dcrd's 1,836 MiB, and 2,959 and 2,964 MiB in two runs with
+  `DCROXIDE_DB_SYNC_COMMIT=1`, which took 350.2 s and 350.6 s: the
+  background commit, its thread now kept for the life of the store and
+  writing each flush's rows as well, is 78.7 s or 22.5% less by the
+  means, and peaks lower. The LAN runs record no end state; two syncs of
+  the same build from the loopback server, at the defaults and with
+  `--assumevalid=0`, every block validated in full, ended with the block
+  files and the UTXO set of every full sync from that server since
+  2026-10-17. The [bench ledger](docs/bench-ledger.md) has every run,
+  and the README's Performance section the summary.
 - **The daemon's default download window is now its own, not dcrd's,
   and was measured on 2026-10-12 in short runs only** (PARITY.md,
   *Block download window*). It keeps up to 128 blocks requested from

@@ -9961,10 +9961,10 @@ mod tests {
     /// are written, and the stamp has not moved, since nothing is durable
     /// yet.  Blocks connected meanwhile start no other periodic flush,
     /// though the interval is past.  Once the commit has landed, the next
-    /// connect stamps the flush with the time it was asked for, and the
-    /// interval counts from there.  The periodic flush used to end in
-    /// `Database::flush`, which held the thread connecting blocks until
-    /// its commit had synced.
+    /// connect stamps the flush with the time the clock showed throughout
+    /// the periodic flush, and the interval counts from there.  The
+    /// periodic flush used to end in `Database::flush`, which held the
+    /// thread connecting blocks until its commit had synced.
     #[test]
     fn a_periodic_flush_hands_its_commit_over_and_is_stamped_once_it_lands() {
         let params = dcroxide_chaincfg::regnet_params();
@@ -10061,7 +10061,7 @@ mod tests {
         assert_eq!(
             chain.utxo_last_durable_flush_nanos,
             stamp(UTXO_PERIODIC_FLUSH_SECS),
-            "the landed flush was not stamped with the time it was asked for"
+            "the landed flush was not stamped with the clock's reading at the periodic flush"
         );
         assert_eq!(chain.utxo_last_flush_hash, periodic);
 

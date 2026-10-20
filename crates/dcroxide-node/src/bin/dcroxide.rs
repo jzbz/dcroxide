@@ -2238,29 +2238,28 @@ fn exists_addr_policy(enabled: bool) -> dcroxide_indexers::ExistsAddrPolicy {
 /// what divides a commit between work and waiting.  `participant` is
 /// what the exists address index wrote inside the flush (its rows, reads,
 /// journal keys, merges and memtable size, and a fourth phase for its
-/// time, I/O and processor time), or `null` when it had nothing to
-/// write.
+/// time, I/O and processor time), or `null` when it had nothing to write.
 ///
 /// `thread` is the name of the thread that ran the flush, which held
 /// the database's writer for the flush's `elapsed_ms`; for a flush whose
 /// rows and commit were written on a thread of its own it is that thread,
 /// `dbcommit`, which never holds the writer, and which is one thread for
-/// the whole run, from the first such flush to the shutdown.  On such a line the
-/// processor time and I/O of `insert`, of the participant's phase and of
-/// `commit` are that thread's, and those of `sync` are the capturing
-/// thread's, which the line does not name: lines grouped by `thread` keep
-/// one thread's phases apart from another's only for flushes that
-/// committed where they were captured.  `writer_wait` is what threads have spent waiting for that
-/// writer from the opening of the database to this flush: for the
-/// thread named `index`, which updates the indexes, and for every other
-/// thread together, the number of times one found the writer held and
-/// the nanoseconds it then waited.  The threads that connect blocks are
-/// among the others, so the growth of `other` over a sync bounds what
-/// block processing spent waiting for the index thread's transactions
-/// and flushes.  The flushes among them are the lines whose `thread` is
-/// `index` and, among the `bg` lines, those the index thread captured,
-/// which a line does not tell from the others; each held the writer for
-/// its `fg_ms` plus its `wait_ms`.
+/// the whole run, from the first such flush to the shutdown.  On such a
+/// line the processor time and I/O of `insert`, of the participant's
+/// phase and of `commit` are that thread's, and those of `sync` are the
+/// capturing thread's, which the line does not name: lines grouped by
+/// `thread` keep one thread's phases apart from another's only for
+/// flushes that committed where they were captured.  `writer_wait` is
+/// what threads have spent waiting for that writer from the opening of
+/// the database to this flush: for the thread named `index`, which
+/// updates the indexes, and for every other thread together, the number
+/// of times one found the writer held and the nanoseconds it then waited.
+/// The threads that connect blocks are among the others, so the growth of
+/// `other` over a sync bounds what block processing spent waiting for the
+/// index thread's transactions and flushes.  The flushes among them are
+/// the lines whose `thread` is `index` and, among the `bg` lines, those
+/// the index thread captured, which a line does not tell from the others;
+/// each held the writer for its `fg_ms` plus its `wait_ms`.
 ///
 /// `explicit` is whether the flush was asked for by a caller that waits
 /// for it to be durable (`Database::flush`, the close), rather than
@@ -2273,14 +2272,15 @@ fn exists_addr_policy(enabled: bool) -> dcroxide_indexers::ExistsAddrPolicy {
 /// thread.  `fg_ms` is the part of `elapsed_ms` the capturing thread
 /// spent in the flush holding the writer: all of it unless `bg`, and then
 /// the time from the capture to the hand-off, which holds the block-file
-/// sync, the opening of the write transaction and the index's seal.  `wait_ms` is what was spent since the capture of the
-/// flush before, and so outside `elapsed_ms`, waiting with the writer
-/// held for an earlier flush's commit to end: the capturing thread's
-/// wait before its capture, and any other thread's, such as a commit's
-/// at the write cache's ceiling, which counts against the next capture
-/// whichever thread makes it.  `fg_ms` plus `wait_ms` is what a flush,
-/// with the waits counted against it, kept every other writer out for,
-/// so sums of it by thread divide that time only roughly.
+/// sync, the opening of the write transaction and the index's seal.
+/// `wait_ms` is what was spent since the capture of the flush before,
+/// and so outside `elapsed_ms`, waiting with the writer held for an
+/// earlier flush's commit to end: the capturing thread's wait before
+/// its capture, and any other thread's, such as a commit's at the write
+/// cache's ceiling, which counts against the next capture whichever
+/// thread makes it.  `fg_ms` plus `wait_ms` is what a flush, with the
+/// waits counted against it, kept every other writer out for, so sums
+/// of it by thread divide that time only roughly.
 ///
 /// `snap` is whether the flush held a read snapshot of the store across
 /// its commit ([`Options::commit_snapshot`], which the daemon leaves on),
@@ -2288,14 +2288,14 @@ fn exists_addr_policy(enabled: bool) -> dcroxide_indexers::ExistsAddrPolicy {
 /// own.  So in the daemon it is `bg`, but for a flush whose thread the
 /// operating system refused, which commits where it was captured and
 /// keeps the snapshot, and one for which no snapshot could be had.
-/// `layers` and `overlay` are what the flush pinned
-/// in the write cache: the layers it captured and the entries in them,
-/// how many layers the cache had when the commit returned, how many of
-/// the captured ones a transaction still held then, and the bytes the
-/// cache held at the hand-off, before the rows were written, and when the
-/// commit returned, the second being the captured bytes plus what was
-/// committed while the flush ran.  `mem` is the process's memory, from `/proc/self/status`, at five
-/// instants: after the capture, at the hand-off, when the commit
+/// `layers` and `overlay` are what the flush pinned in the write cache:
+/// the layers it captured and the entries in them, how many layers the
+/// cache had when the commit returned, how many of the captured ones a
+/// transaction still held then, and the bytes the cache held at the
+/// hand-off, before the rows were written, and when the commit returned,
+/// the second being the captured bytes plus what was committed while the
+/// flush ran.  `mem` is the process's memory, from `/proc/self/status`,
+/// at five instants: after the capture, at the hand-off, when the commit
 /// returned, and twice at the end of the flush before this one, once the
 /// participant's `finished` had returned (`prev_finished`) and once that
 /// flush had freed what it held (`prev_end`); `prev_finished_ms` and
@@ -2303,19 +2303,19 @@ fn exists_addr_policy(enabled: bool) -> dcroxide_indexers::ExistsAddrPolicy {
 /// A flush whose commit ran on the thread that ran it frees the layers
 /// it retired after those two readings, once that thread has released
 /// the writer (the close's flush, which no line follows, frees them
-/// under it), so the next line's `prev_end` and `prev_release_ms` do
-/// not hold those frees; on a line that follows a `bg` line they do.
-/// Each reading is the resident memory, its peak so far, its anonymous
-/// part and the thread count, which takes in the `dbcommit` thread once
-/// the first `bg` flush has started it, asleep in a reading taken on
-/// another thread; the readings at the capture and when the
-/// commit returned add, from `/proc/self/maps`, the number and total size
-/// of the anonymous mappings that start where the allocator puts a
-/// thread arena's heaps, and the size of the program break.  A reading is
-/// `null` off Linux.  Together they say whether resident memory rises
-/// while a commit is under way, whether it rises again while the
-/// participant is told, whether it comes back when the flush has freed
-/// its layers, and how much of it lies in those mappings.
+/// under it), so the next line's `prev_end` and `prev_release_ms` do not
+/// hold those frees; on a line that follows a `bg` line they do.  Each
+/// reading is the resident memory, its peak (`VmHWM`, which can fall),
+/// its anonymous part and the thread count, which takes in the
+/// `dbcommit` thread once the first `bg` flush has started it, asleep in
+/// a reading taken on another thread; the readings at the capture and
+/// when the commit returned add, from `/proc/self/maps`, the number and
+/// total size of the anonymous mappings that start where the allocator
+/// puts a thread arena's heaps, and the size of the program break.  A
+/// reading is `null` off Linux.  Together they say whether resident
+/// memory rises while a commit is under way, whether it rises again
+/// while the participant is told, whether it comes back when the flush
+/// has freed its layers, and how much of it lies in those mappings.
 ///
 /// Stats sampling is deliberately left off (`flush_stats_every` stays
 /// 0). redb's `stats()` walks every branch and leaf page, which on a

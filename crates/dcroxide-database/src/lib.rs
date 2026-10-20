@@ -579,10 +579,10 @@ pub const INDEX_THREAD_NAME: &str = "index";
 /// arena, which no thread started later is given while the store is
 /// open as long as glibc has arenas to give (past `MALLOC_ARENA_MAX`, or
 /// eight per processor on a 64-bit system, it shares them among threads,
-/// this one's included).  It writes one flush at a time;
-/// whether it is listed says nothing of whether a commit is under way,
-/// and its state does.  A [`FlushObserver`] is called on it for such a
-/// flush.
+/// this one's included).  It writes one flush at a time, and is listed
+/// from the first flush handed to it on, busy or idle, so its presence
+/// says nothing of whether a commit is under way.  A [`FlushObserver`]
+/// is called on it for such a flush.
 pub const COMMIT_THREAD_NAME: &str = "dbcommit";
 
 /// A point in the order of a database's commits: every transaction
@@ -6004,8 +6004,8 @@ mod background_commit_tests {
     /// A flush that fails on the commit thread latches the store and
     /// leaves the thread asleep, for the close to stop: the latch refuses
     /// every later capture, so nothing reaches the thread again, and no
-    /// other is started.  The failure is the insert failure of
-    /// [`an_insert_that_fails_on_the_commit_thread_latches_and_the_next_write_names_it`].
+    /// other is started.  The power is cut just before the rows go in,
+    /// as in the test of an insert that fails on the commit thread.
     #[test]
     fn a_failure_on_the_commit_thread_latches_and_leaves_the_thread_for_close() {
         let rig = Rig::with_page_cache(64 * 1024);

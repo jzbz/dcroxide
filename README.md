@@ -85,9 +85,9 @@ bench ledger, "One commit thread for the life of the store, a sync that
 checks every script, and dcrd v2.1.7"). One of those syncs, from the
 loopback server with `--assumevalid=0`, validated every block in full,
 script checks included, and ended with that same UTXO set and the same
-block files: a build whose code is the code as it stands but for a doc
-comment, a test's local name and a test's assertion accepted every block
-of mainnet's chain up to 1,116,035 with each one validated in full.
+block files: a build whose code is the code as it stands but for tests
+and comments accepted every block of mainnet's chain up to 1,116,035
+with each one validated in full.
 On the evening of 2026-10-19 a release build of the tree of `797a213`,
 which holds every commit above, was put to blocks in six syncs from the
 LAN server, each of which validated in full only the blocks after the
@@ -499,17 +499,17 @@ ledger](docs/bench-ledger.md), a 16-core desktop with one encrypted NVMe
 drive under btrfs and transparent huge pages at `madvise`, from a live
 dcrd v2.1.7 node following the network, about 0.3 ms away. The dcroxide
 build is the ledger's K, made from a worktree before its code was
-committed: its code differs from the code as it stands only by a doc
-comment, a test's local name and a test's assertion, which a release
-build does not contain. The runs went one at a time in two queues (the
-ledger has the order), each after a `sync`, 300 s idle and a quiet
-check, the first of each queue after the check alone; none was marked
-disturbed, and dcroxide's flush log was on in all, at a cost not
-measured. The clock runs from the node's start to the first
-once-a-second `getblockcount` poll at or past 1,116,035, which came 4 to
-1,818 blocks past it. CPU time is the node process's, without the kernel
-threads that encrypt and write back its bytes, and peak memory is
-`VmHWM`, both read when the clock stops, with the node still syncing.
+committed: its code differs from the code as it stands only in tests and
+comments, which a release build does not contain. The runs went one at a
+time in two queues (the ledger has the order), each after a `sync`,
+300 s idle and a quiet check, the first of each queue after the check
+alone; none was marked disturbed, and dcroxide's flush log was on in
+all, at a cost not measured. The clock runs from the node's start to the
+first once-a-second `getblockcount` poll at or past 1,116,035, which
+came 4 to 1,818 blocks past it. CPU time is the node process's, without
+the kernel threads that encrypt and write back its bytes, and peak
+memory is `VmHWM`, both read when the clock stops, with the node still
+syncing.
 
 **The background commit.** Since `02b802c` most metadata commits run on
 a thread of their own, and since 2026-10-19 that thread, `dbcommit`,

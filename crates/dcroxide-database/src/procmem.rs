@@ -19,8 +19,8 @@
 pub struct ProcessMemory {
     /// Resident memory (`VmRSS`).
     pub resident: u64,
-    /// The most resident memory has been since the process started
-    /// (`VmHWM`).
+    /// The kernel's high-water mark of resident memory (`VmHWM`), which
+    /// can trail the true peak and fall between two readings.
     pub peak_resident: u64,
     /// The part of [`Self::resident`] that is anonymous memory, which is
     /// where the heap is (`RssAnon`).
