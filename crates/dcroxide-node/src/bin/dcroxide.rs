@@ -1967,9 +1967,9 @@ fn with_block_window_setting(
 /// the sync peer's connection, checks each frame's checksum, decodes it,
 /// hashes a block's transactions and makes the block's data sanity
 /// checks, whose verdict the chain returns where it would have made
-/// them, up to four frames ahead of the thread that connects the blocks
-/// (`dcroxide_node::readahead`), which dcrd does not do (PARITY *Reading
-/// ahead of the block handler*).
+/// them, up to sixteen frames ahead of the thread that connects the
+/// blocks (`dcroxide_node::readahead`), which dcrd does not do (PARITY
+/// *Reading ahead of the block handler*).
 /// `off` or `0` leaves every connection to its input thread alone, as
 /// dcrd reads, from the same binary.
 ///

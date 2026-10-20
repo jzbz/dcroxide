@@ -2,7 +2,7 @@
 //! Reading ahead of the block handler, over real loopback connections.
 //!
 //! A served connection whose server asks for it gets a `peer-reader`
-//! thread that reads the socket up to four frames ahead of the input
+//! thread that reads the socket up to sixteen frames ahead of the input
 //! thread (`dcroxide_node::readahead`), which dcrd does not have: its
 //! `inHandler` reads a message only when its listener has returned from
 //! the one before (`peer/peer.go:1535-1599`).  These tests pin what must
@@ -1330,6 +1330,10 @@ fn pings_are_answered_in_stream_order_while_blocks_are_queued() {
 /// handled, and the reader thread is gone when the connection returns.
 #[test]
 fn shutdown_with_blocks_queued_ends_the_connection_without_handling_them() {
+    // The read-ahead's bound (`READ_AHEAD_MAX_ITEMS`, private to the
+    // crate), so that the blocks behind the held one fill the queue and
+    // the reader waits for room when the shutdown comes.
+    const DEPTH: u32 = 16;
     let handled = Arc::new(Mutex::new(Vec::new()));
     let seen = Arc::clone(&handled);
     let (entered_tx, entered) = mpsc::channel();
@@ -1354,12 +1358,13 @@ fn shutdown_with_blocks_queued_ends_the_connection_without_handling_them() {
     });
 
     let mut transport = dial(addr);
-    let blocks: Vec<MsgBlock> = (0..6).map(|i| block(i, 1)).collect();
+    let blocks: Vec<MsgBlock> = (0..DEPTH + 2).map(|i| block(i, 1)).collect();
     send_blocks(&mut transport, &blocks);
     entered
         .recv_timeout(PATIENCE)
         .expect("the handler reaches the second block");
-    // The blocks behind it are read ahead while it is held.
+    // The blocks behind it are read ahead while it is held, until the
+    // queue is full.
     thread::sleep(Duration::from_millis(200));
 
     // The node shuts down: every connection is torn down from another

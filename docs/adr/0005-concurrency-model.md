@@ -423,6 +423,20 @@ loopback syncs on one machine in place of dcrd's shape, are enough to
 keep the thread is the project owner's decision. Declining it is the
 paragraph above, and nothing else in this ADR depends on the thread.
 
+> **Note, 2026-10-19, after the syncs of that day.** The queue now holds
+> at most sixteen frames where this addendum, and the first addendum of
+> 2026-10-16, say four. On m3, from a dcrd v2.1.7 node on another
+> machine on the same LAN, one build of `797a213`'s code that read the
+> depth from a variable took 9.70 s less at sixteen frames than at four
+> by the means of two runs each, and the step from sixteen to thirty-two
+> was not resolved ([bench-ledger.md](../bench-ledger.md), "Where
+> `797a213`'s block thread waits, a deeper read-ahead and a rung of four
+> changes"; [PARITY.md](../../PARITY.md), *Reading ahead of the block
+> handler*). That build was not the tree of a commit, and the series is
+> one of its own. Nothing else here changes: one reading thread on one
+> connection, the same lock and condition variables, and the
+> pre-verifier's bound in bytes still follows the depth.
+
 ## Addendum, 2026-10-16 — more work on the reading thread, and threads kept for the scripts of a connected block
 
 Commits of 2026-10-16 bear on this ADR in two places. None adds a

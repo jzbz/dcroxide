@@ -252,9 +252,16 @@ impl<T: MsgTransport> MsgSource for InlineSource<'_, T> {
 /// (`dcroxide_netsync::manager::BUDGET_WINDOW_BLOCKS`); this bounds how
 /// much of that is decoded in memory ahead of the block being connected
 /// instead of waiting in the socket's buffers.  The reader is several
-/// times faster than the connect, so a deeper queue would only hold more
-/// decoded blocks, and a hostile sync peer could fill it with blocks of
-/// the largest size.
+/// times faster than the connect, so the queue is full for much of a
+/// sync.  What a deeper queue gives is more blocks waiting: the
+/// signature pre-verifier's helpers check a block only while it waits,
+/// and their queue's bound follows this one
+/// ([`crate::preverify::max_queued_bytes`]), and the thread that
+/// connects blocks finds the queue empty less often.  It was four until
+/// syncs that compared four, sixteen and thirty-two frames picked
+/// sixteen (PARITY *Reading ahead of the block handler*).  Each frame
+/// more holds one more decoded block, and a hostile sync peer could
+/// fill the queue with blocks of the largest size.
 ///
 /// A block the reader read holds the frame it arrived in as well, as its
 /// block-file record, from the read until the handler has finished with
@@ -263,7 +270,7 @@ impl<T: MsgTransport> MsgSource for InlineSource<'_, T> {
 /// else, so this bound is the bound on them too.  While the reader
 /// checks a frame it also holds that one block's serialization, which
 /// it lets go of before the block is queued.
-pub(crate) const READ_AHEAD_MAX_ITEMS: usize = 4;
+pub(crate) const READ_AHEAD_MAX_ITEMS: usize = 16;
 
 /// What the reader and the handler of one connection share.
 ///
@@ -1074,7 +1081,7 @@ fn seconds(nanos: u64) -> String {
 /// The two waits say which side was short: the reader waits for the
 /// block thread when the queue is full, and the block thread waits for
 /// the reader when the queue is empty.  The most items queued is the
-/// check on the queue's bound of four.  The index queue's figure
+/// check on the queue's bound of sixteen.  The index queue's figure
 /// ([`crate::indexes::notify_blocked_nanos`]) is how long the block
 /// thread was held up handing blocks to the index thread.
 ///
@@ -1444,11 +1451,16 @@ mod tests {
         rig.finish();
     }
 
-    /// With the handler busy, exactly four frames are read and the fifth
-    /// read waits; each item the handler takes lets one more be read.
+    /// With the handler busy, exactly as many frames as the bound allows,
+    /// sixteen, are read and the next read waits; each item the handler
+    /// takes lets one more be read.
     #[test]
-    fn at_most_four_items_are_ahead_and_the_fifth_read_waits() {
-        let rig = Rig::start((0..10).map(|i| frame(block(i))).collect());
+    fn at_most_the_bound_is_read_ahead_and_the_next_read_waits() {
+        let rig = Rig::start(
+            (0..READ_AHEAD_MAX_ITEMS as u32 + 6)
+                .map(|i| frame(block(i)))
+                .collect(),
+        );
         for index in 0..READ_AHEAD_MAX_ITEMS {
             rig.expect_started(index);
         }
@@ -1517,7 +1529,8 @@ mod tests {
     /// included; when it is wanted again the reader goes ahead again.
     #[test]
     fn when_read_ahead_is_no_longer_wanted_each_frame_waits_for_the_handler() {
-        let rig = Rig::start((0..12).map(|i| frame(block(i))).collect());
+        let full = READ_AHEAD_MAX_ITEMS as u32;
+        let rig = Rig::start((0..2 * full + 4).map(|i| frame(block(i))).collect());
         for index in 0..READ_AHEAD_MAX_ITEMS {
             rig.expect_started(index);
         }
@@ -1526,13 +1539,13 @@ mod tests {
         // What was read ahead is handed over; nothing more is read
         // meanwhile, although every one of these is a block.
         rig.shared.set_ahead(false);
-        for nonce in 0..READ_AHEAD_MAX_ITEMS as u32 {
+        for nonce in 0..full {
             assert_eq!(rig.take(), block(nonce));
             rig.expect_no_start();
         }
 
         // From here each frame is read when the handler waits for it.
-        for nonce in 4..7 {
+        for nonce in full..full + 3 {
             assert_eq!(rig.take(), block(nonce));
             rig.expect_started(nonce as usize);
             rig.expect_no_start();
@@ -1540,7 +1553,8 @@ mod tests {
 
         // Wanted again: the parked reader goes ahead without being asked.
         rig.shared.set_ahead(true);
-        for index in 7..7 + READ_AHEAD_MAX_ITEMS {
+        let next = READ_AHEAD_MAX_ITEMS + 3;
+        for index in next..next + READ_AHEAD_MAX_ITEMS {
             rig.expect_started(index);
         }
         rig.expect_no_start();
@@ -1589,14 +1603,18 @@ mod tests {
     /// the handler gets the read error an inline read gives then.
     #[test]
     fn nothing_queued_is_handed_over_once_the_connection_is_cancelled() {
-        let rig = Rig::start((0..4).map(|i| frame(block(i))).collect());
+        let rig = Rig::start(
+            (0..READ_AHEAD_MAX_ITEMS as u32)
+                .map(|i| frame(block(i)))
+                .collect(),
+        );
         for index in 0..READ_AHEAD_MAX_ITEMS {
             rig.expect_started(index);
         }
         assert_eq!(rig.take(), block(0));
 
         rig.cancel.cancel();
-        for _ in 0..3 {
+        for _ in 1..READ_AHEAD_MAX_ITEMS {
             let item = rig.shared.next();
             assert_eq!(item.read_delta, 0);
             match item.result {
@@ -1639,8 +1657,12 @@ mod tests {
     /// ended that read.
     #[test]
     fn leaving_wakes_a_parked_reader_and_one_blocked_in_a_read() {
-        // Parked: four frames are queued and nobody takes them.
-        let mut parked = Rig::start((0..10).map(|i| frame(block(i))).collect());
+        // Parked: the queue is full and nobody takes from it.
+        let mut parked = Rig::start(
+            (0..READ_AHEAD_MAX_ITEMS as u32 + 6)
+                .map(|i| frame(block(i)))
+                .collect(),
+        );
         for index in 0..READ_AHEAD_MAX_ITEMS {
             parked.expect_started(index);
         }

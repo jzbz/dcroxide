@@ -13,11 +13,11 @@
 //! over the loopback interface, one reading ahead and one not.  Both
 //! reach the miner's tip, neither has its sync peer dropped, and the
 //! line the one that read ahead logs as it shuts down says how many
-//! blocks its reader thread read and hashed, and that no more than four
-//! frames were ever queued.  The reader thread also hands each block on
-//! with the payload it arrived in laid out as its block-file record,
-//! which the daemon writes as it stands: the block files of the two
-//! syncing daemons are the same byte for byte, and are the miner's.
+//! blocks its reader thread read and hashed, and that no more than
+//! sixteen frames were ever queued.  The reader thread also hands each
+//! block on with the payload it arrived in laid out as its block-file
+//! record, which the daemon writes as it stands: the block files of the
+//! two syncing daemons are the same byte for byte, and are the miner's.
 
 // The bound addresses arrive over a pipe the daemon re-opens through
 // /proc/self/fd.
@@ -333,7 +333,7 @@ fn a_daemon_syncs_a_chain_with_and_without_read_ahead() {
     );
     assert_eq!(number_before(line, " connections;"), 1, "{line}");
     let queued = number_before(line, " items queued;");
-    assert!((1..=4).contains(&queued), "{line}");
+    assert!((1..=16).contains(&queued), "{line}");
     // Every block the reader thread read went on with its payload laid
     // out as its block-file record, and the daemon's database wrote
     // every one of those records as it stood: it laid out none of them

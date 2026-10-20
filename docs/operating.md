@@ -578,31 +578,42 @@ block hashes its transactions, builds its two merkle trees, counts its
 signature operations, makes the checks of the block's data that need no
 chain state, and lays the bytes it arrived in out as its block-file
 record, after comparing them with the block's own serialization. It
-keeps at most four messages ahead of the thread that processes blocks,
-which still handles every message in the order it arrived, and stores a
-block that comes with its record as that record, without serializing it
-again. It changes nothing about which blocks or messages are accepted,
-which peers are dropped or banned, or what is logged about them, beyond
-lines of its own (below, and two more at the debug level in PARITY.md):
-it moves work, and the one verdict it reaches, on a block's data, is
-acted on only where the thread that processes blocks would have reached
-it, with the same result. PARITY.md names the tests that hold it to that
-and what they leave uncovered. One pair of counters shows it:
+keeps at most sixteen messages ahead of the thread that processes
+blocks, which still handles every message in the order it arrived, and
+stores a block that comes with its record as that record, without
+serializing it again. It changes nothing about which blocks or messages
+are accepted, which peers are dropped or banned, or what is logged about
+them, beyond lines of its own (below, and two more at the debug level in
+PARITY.md): it moves work, and the one verdict it reaches, on a block's
+data, is acted on only where the thread that processes blocks would have
+reached it, with the same result. PARITY.md names the tests that hold it
+to that and what they leave uncovered. One pair of counters shows it:
 `getnettotals` counts a message's bytes when it is read and
 `getpeerinfo`'s `bytesrecv` for that peer when it is handled, so the
-total can lead the peer's count by up to four messages.
+total can lead the peer's count by up to sixteen messages.
 It costs one more thread and one more descriptor on that one
 connection, kept until the connection ends, and the memory of up to
-four decoded messages, each kept with the frame it was read in. By an
+sixteen decoded messages, each kept with the frame it was read in. By an
 estimate from the sizes of the structures, not a measurement, those
-four are about 220 kB for main network blocks of mean size, well under
-1 MiB; at worst, from a hostile sync peer sending the largest blocks
-made of the smallest transactions, the connection holds about 62 MB
-with the block being handled and every frame counted, with about
-1.3 MB more for a moment while one frame is compared with its block's
-serialization, or up to about 1.4 MB while one block's merkle trees are
-built, against about 12.5 MB for one such block without the
-read-ahead. It was measured on m3 on 2026-10-12, on a quiet machine
+sixteen are about 880 kB for main network blocks of mean size, under
+1 MiB. At worst, from a hostile sync peer sending the largest blocks
+made of the smallest transactions, the connection holds about 211 MB
+with the block being handled and every frame counted: the frames, at
+most 22,282,716 bytes, which is a bound (sixteen queued and the one
+being handled, each at most the largest block message and 28 bytes), and
+the blocks decoded from them, about 189 MB, which is the estimate. About
+1.3 MB more is held for a moment while one frame is compared with its
+block's serialization, or up to about 1.4 MB while one block's merkle
+trees are built, against about 12.5 MB for one such block without the
+read-ahead. The signature pre-verification (below) holds those same
+blocks, not copies: its bound, 22,282,240 bytes of serialized blocks,
+the sixteen messages and one more of the largest size, is counted in the
+blocks above, and its own list of the inputs it guesses for, 12 bytes
+for each, comes to at most about 2.8 MB at that bound, an input taking
+at least 94 bytes of a block, in an allocation grown by doubling that
+stays under about 5.7 MB. With four messages, the bound before sixteen,
+the estimates were about 220 kB and about 62 MB. The read-ahead
+was measured on m3 on 2026-10-12, on a quiet machine
 with the node held to eight of the machine's cores, with one binary:
 two default syncs to block 1,116,035 over loopback took 494.6 s and
 490.8 s with it, and two with `DCROXIDE_READ_AHEAD=off` took 597.6 s
@@ -667,13 +678,14 @@ moved too and are not timed. Since `44cf801` Y also covers building each
 block's two merkle trees, and it now also covers counting each block's
 signature operations twice and checking its data, so it is not to be
 compared with a Y from earlier code. G is how long the reading threads
-stood still with four messages waiting: when it is most of the sync, the
-thread that processes blocks set the pace and the reading kept up. W is
-how long the thread that processes blocks waited for a block with none
-ready. By the counter's definition, and not seen in a run, a large W
-means the peer, the link or the reading itself was the slower side, and
-reading ahead had less to give. Q is the most messages that waited at
-once, and is never more than four. I is how long handing blocks to the
+stood still with sixteen messages waiting: when it is most of the sync,
+the thread that processes blocks set the pace and the reading kept up. W
+is how long the thread that processes blocks waited for a block with
+none ready. By the counter's definition, and not seen in a run, a large
+W means the peer, the link or the reading itself was the slower side,
+and reading ahead had less to give. Q is the most messages that waited
+at once, and is never more than sixteen (four in builds before the bound
+was raised). I is how long handing blocks to the
 index thread waited for room in its queue, which is time the indexes
 set the pace; it is counted whether or not anything is read ahead, and
 printed in this line only. R is the blocks the reading threads handed

@@ -379,7 +379,7 @@ mod tests {
     /// as large as a block message may be.
     #[test]
     fn the_queue_holds_what_the_read_ahead_may() {
-        assert_eq!(max_queued_bytes(), 5 * 1_310_720);
+        assert_eq!(max_queued_bytes(), 17 * 1_310_720);
     }
 
     /// Nothing is started with the setting off, without a cache, with a

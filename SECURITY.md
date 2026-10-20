@@ -174,10 +174,10 @@ evaluating this code.
   Details are in PARITY.md's open gaps.
 - **The sync peer's connection is read ahead of its block handler.**
   During the initial sync a thread of its own reads the sync peer's
-  connection up to four frames ahead of the thread that handles that
+  connection up to sixteen frames ahead of the thread that handles that
   peer's blocks. dcrd holds further receives back until a block is
   known good or bad, so that a malicious peer cannot queue up bad
-  blocks and waste memory (`server.go:1365-1369`). Here up to four
+  blocks and waste memory (`server.go:1365-1369`). Here up to sixteen
   frames from the sync peer are checksummed and decoded before the
   frame ahead of them has been judged, and a block among them is also
   hashed, has its two transaction merkle trees built, its signature
@@ -218,11 +218,18 @@ evaluating this code.
   peer; what it costs on a hostile peer's blocks has not been measured,
   and `DCROXIDE_PREVERIFY=off` removes it (PARITY.md, *Signature
   pre-verification ahead of the block thread*). The memory is at worst
-  about 62 MB held on that connection, with about 1.3 MB more for a
-  moment while one frame is compared with its block's serialization, or
-  up to about 1.4 MB while one block's trees are built, against about
-  12.5 MB without the read-ahead: estimates from struct layouts, not
-  measurements. It also costs one more thread and one more descriptor on
+  about 211 MB held on that connection: seventeen frames of the largest
+  block message, the sixteen queued and the one being handled, at most
+  22,282,716 bytes, and the blocks decoded from them, about 189 MB.
+  About 1.3 MB more is held for a moment while one frame is compared
+  with its block's serialization, or up to about 1.4 MB while one
+  block's trees are built, against about 12.5 MB without the read-ahead.
+  The frames' bytes are a bound; the other figures are estimates from
+  struct layouts, not measurements. At the four frames of the bound
+  before sixteen the worst case was about 62 MB. The signature
+  pre-verification holds those same blocks, not copies, at most
+  22,282,240 bytes of them by their serialized size. The read-ahead also
+  costs one more thread and one more descriptor on
   that connection. `DCROXIDE_READ_AHEAD=off` removes it: every
   connection is then read as dcrd reads, and no frame is kept. Details
   are in PARITY.md, *Reading ahead of the block handler*.

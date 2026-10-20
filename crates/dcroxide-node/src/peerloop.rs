@@ -41,8 +41,8 @@
 //! dcrd's `inHandler` makes it.  On the sync peer's connection during
 //! the initial chain sync a `peer-reader` thread does the reading, the
 //! checksum, the decoding, the hashing of blocks and their data sanity
-//! checks up to four messages ahead, which dcrd does not do; the loop,
-//! and everything it decides, is the same either way.
+//! checks up to sixteen messages ahead, which dcrd does not do; the
+//! loop, and everything it decides, is the same either way.
 
 use std::io::{Read, Write};
 use std::sync::{Arc, Mutex, mpsc};
@@ -3613,7 +3613,7 @@ mod tests {
         // parks with two still unread.
         let full = crate::readahead::READ_AHEAD_MAX_ITEMS;
         let mut peer = WireTransport::new(client, MAX_PROTOCOL_VERSION, NET);
-        for nonce in 1..=6 {
+        for nonce in 1..=full as u32 + 2 {
             peer.write_message(&block_msg(nonce)).expect("send block");
         }
         let deadline = Instant::now() + Duration::from_secs(10);

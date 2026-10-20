@@ -11,8 +11,9 @@
 //!
 //! - a first block, which the input thread reads for itself and behind
 //!   which the connection is read ahead;
-//! - a block whose handler is slow, with five more behind it, so that
-//!   the reader fills its queue and waits for the handler;
+//! - a block whose handler is slow, with seventeen more behind it, one
+//!   more than the queue holds, so that the reader fills its queue and
+//!   waits for the handler;
 //! - after a pause, a ping whose handler is slow too.  The handler's
 //!   wait for the ping is not a wait for a block, and the reader's wait
 //!   while the ping is handled is not a wait on a full queue: it reads
@@ -115,8 +116,14 @@ struct Handled {
     ended: Instant,
 }
 
-/// The nonce of the block from which reading ahead is no longer wanted.
-const LAST_WANTED: u32 = 7;
+/// The read-ahead's bound, the most frames read and not yet taken
+/// (`READ_AHEAD_MAX_ITEMS`, private to the crate).
+const DEPTH: u32 = 16;
+
+/// The nonce of the block from which reading ahead is no longer wanted:
+/// the large block, which follows the first block, the slow one and the
+/// `DEPTH + 1` behind the slow one.
+const LAST_WANTED: u32 = DEPTH + 3;
 
 /// Hooks that ask for read-ahead until they have handled the block with
 /// nonce [`LAST_WANTED`], take [`SLOW`] over the block with nonce 1 and
@@ -254,12 +261,15 @@ fn the_shutdown_line_reports_the_figures_of_a_known_stream() {
     .expect("outbound negotiation");
     let mut sender = transport.get_ref().try_clone().expect("clone the socket");
 
-    // The first block, the slow one and the five behind it, at once.
-    let small: Vec<Vec<u8>> = (0..=6).map(|nonce| framed(&block(nonce, 1))).collect();
+    // The first block, the slow one and the seventeen behind it, at
+    // once.
+    let small: Vec<Vec<u8>> = (0..=DEPTH + 2)
+        .map(|nonce| framed(&block(nonce, 1)))
+        .collect();
     sender.write_all(&small.concat()).expect("send the blocks");
     let first = expect_handled(&handled, Some(0));
     let slow = expect_handled(&handled, Some(1));
-    for nonce in 2..=6 {
+    for nonce in 2..=DEPTH + 2 {
         expect_handled(&handled, Some(nonce));
     }
 
@@ -299,7 +309,11 @@ fn the_shutdown_line_reports_the_figures_of_a_known_stream() {
     let line = dcroxide_node::readahead::shutdown_line(3).expect("a reader thread read blocks");
     // Every block but the first was read by the reader thread, on the
     // one connection there was.
-    assert_eq!(count(&line, "Read-ahead: ", " blocks ("), 8, "{line}");
+    assert_eq!(
+        count(&line, "Read-ahead: ", " blocks ("),
+        u64::from(LAST_WANTED) + 1,
+        "{line}"
+    );
     let bytes: usize = small[1..].iter().map(Vec::len).sum::<usize>() + large.len() + after.len();
     assert_eq!(
         count(&line, " blocks (", " bytes) on "),
@@ -307,8 +321,12 @@ fn the_shutdown_line_reports_the_figures_of_a_known_stream() {
         "{line}"
     );
     assert_eq!(count(&line, " bytes) on ", " connections; "), 1, "{line}");
-    // The four blocks behind the slow one filled the queue.
-    assert_eq!(count(&line, "; at most ", " items queued; "), 4, "{line}");
+    // Sixteen of the blocks behind the slow one filled the queue.
+    assert_eq!(
+        count(&line, "; at most ", " items queued; "),
+        u64::from(DEPTH),
+        "{line}"
+    );
 
     // The work that left the input thread was timed.  The large block
     // alone takes milliseconds to check and decode, and to hash.
@@ -365,7 +383,7 @@ fn the_shutdown_line_reports_the_figures_of_a_known_stream() {
     // hundreds of kilobytes.
     assert_eq!(
         count(&line, "; block-file records laid out for ", " blocks in "),
-        8,
+        u64::from(LAST_WANTED) + 1,
         "{line}"
     );
     let laid_out = time(&line, " blocks in ", " s, 3 written as laid out");
