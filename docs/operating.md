@@ -633,7 +633,7 @@ in one sync, on 2026-10-19 from a block server on the same machine
 ([bench-ledger.md](bench-ledger.md), "One commit thread for the life of
 the store, a sync that checks every script, and dcrd v2.1.7"), and with
 `--noexistsaddrindex` in one of `4700cf1` on 2026-10-13, two of
-`88c46c3` on 2026-10-17 and four from that LAN node on 2026-10-18 and
+`88c46c3` on 2026-10-17 and five from that LAN node on 2026-10-18 and
 2026-10-19, none of them against a run with it off.
 
 Whether reading ahead ever costs anything has not been measured: the

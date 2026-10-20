@@ -92,6 +92,8 @@ path) has been measured yet, so this crossover is unconfirmed.
 | 2026-10-18 | m3 | G without the change not kept (G'), G' with a block's data sanity checks made on the thread that read it (H), and H with two more changes, held for their memory (I, J); states of a worktree, none the tree of a commit | release v2.1.7 (go1.25.4), the binary of the rows above, one run, and one with `--noexistsaddrindex` | mainnet, genesis to 1,116,035 | The same LAN server, that afternoon, at the defaults. G': 320.8 s, 314.6 s and 320.9 s, mean 318.77 s; H: 318.0 s and 312.9 s, mean 315.45 s — **3,537.9 blk/s** at 2.84–2.89 mean cores, 3.32 s less, which the session's ±6.5 s does not resolve. J, a build that includes the two held changes: 264.4 s, 267.4 s and 268.9 s, mean 266.90 s — 4,181.5 blk/s, with a peak resident memory of 6,222 to 7,241 MiB against 3,077 to 3,342 MiB for G' and H. dcrd v2.1.7: 2,991.4 s — 373.1 blk/s at 1.89, so J is 11.21x as fast, and 5.37x with the index off (247.3 s and 248.0 s against 1,330.3 s). H was not set against dcrd | this file, "Rungs from a block server on the LAN, two changes held for their memory, and dcrd v2.1.7" |
 | 2026-10-19 | m3 | J, the binary of the row above, and K, J's code with the `dbcommit` thread kept for the life of the store rather than made for each flush; states of a worktree, K's code that of the three commits that follow the commit that records these syncs | the runs of the row below | mainnet, genesis to 1,116,035 | From the LAN server of the two rows above, at the defaults, in runs alternated J, K, J, K, J. J: 274.8 s, 271.8 s and 274.3 s, mean 273.63 s, at a peak resident memory of 6,730 to 6,933 MiB. K: 270.7 s and 271.5 s, mean 271.10 s — 4,116.7 blk/s at 3.31–3.33 mean cores, 2.53 s less, which the session's ±3.9 s does not resolve, at **2,456 and 2,470 MiB**. One run of J with `MALLOC_ARENA_MAX=8`: 284.2 s and 5,455 MiB. J's mean is 6.73 s over that of its three runs of 2026-10-18 | this file, "One commit thread for the life of the store, a sync that checks every script, and dcrd v2.1.7" |
 | 2026-10-19 | m3 | K, the binary of the row above: the code of the three commits that follow the commit that records these syncs, as a state of a worktree | release v2.1.7 (go1.25.4), the binary of the rows above, two runs, and one with `--noexistsaddrindex` | mainnet, genesis to 1,116,035 | The same LAN server and session, at the defaults. K, four runs, two of them those of the row above: 270.7 s, 271.5 s, 272.7 s and 271.8 s, mean 271.68 s — **4,108.0 blk/s** at 3.28–3.33 mean cores, with a peak resident memory of 2,456 to 2,470 MiB. With `--noexistsaddrindex`, two runs: 250.8 s and 249.6 s — 4,449.9 and 4,471.3 blk/s. With `DCROXIDE_DB_SYNC_COMMIT=1`, two runs: 350.2 s and 350.6 s, so the default is 78.7 s or 22.5% less, and peaks lower. dcrd v2.1.7: 3,014.6 s and 3,033.4 s — **370.2 and 367.9 blk/s** at 1.88 mean cores; with the index off, one run, 1,336.3 s — 835.2 blk/s. So K is **11.13x** as fast at the defaults, 11.05x to 11.21x over the eight pairings, and 5.34x with the index off, in one session. One sync of K from the loopback server with `--assumevalid=0`, every block validated in full, ended with the UTXO set and the block files of every full sync from that server since 2026-10-17; its 583.4 s is not a timing, since the server read 19.2 GB from its drive | this file, "One commit thread for the life of the store, a sync that checks every script, and dcrd v2.1.7" |
+| 2026-10-19, evening | m3 | `797a213`, the head of master when the syncs ran, and R1, `797a213` with four changes as a state of a worktree, R1's code that of the sixth commit after the commit that records these syncs but for tests and comments | not run in this session | mainnet, genesis to 1,116,035 | From the LAN server of the rows above, at the defaults, the two alternated. `797a213`: 273.1 s, 270.9 s, 273.2 s and 269.8 s, mean 271.75 s — **4,106.8 blk/s** at 3.30–3.35 mean cores, where K's four runs of that morning had a mean of 271.68 s. R1: 263.1 s, 266.3 s, 265.5 s and 264.9 s, mean 264.95 s — **4,212.2 blk/s** at 3.38–3.40, 6.80 s or 2.5% less, beyond the session's ±2.6 s, at a peak resident memory of 2,460 to 2,470 MiB against 2,465 to 2,500 MiB. One sync of R1 from the loopback server ended with the UTXO set and the block files of every full sync from that server since 2026-10-17 | this file, "Where `797a213`'s block thread waits, a deeper read-ahead and a rung of four changes" |
+| 2026-10-19, evening | m3 | a diagnostic build of `797a213` that reads the read-ahead's depth, four frames in the code, and the index notification buffer, 128, from the environment, not for commit; the depth of sixteen is that of the seventh commit after the commit that records these syncs, which also holds R1's changes and was not run | not run in this session | mainnet, genesis to 1,116,035 | The same LAN server and session, at the defaults but for the setting, two runs of each, alternated. Depth 4: 273.3 s and 272.9 s. Depth 16: 263.4 s and 263.4 s, mean 263.40 s — 4,237.0 blk/s at 3.39–3.40 mean cores, 9.70 s or 3.6% less than depth 4, beyond the queue's ±4.8 s, with 66.2% and 65.5% of the inputs of the guessed shape pre-verified against 51.7% and 52.2%. Depth 32: 267.2 s and 263.5 s, 7.75 s less than depth 4. A buffer of 512 at depth 4: 273.3 s and 270.1 s, 1.40 s less, which is not resolved. In a later queue, depth 16 once more, 264.8 s, and depth 16 with `DCROXIDE_PREVERIFY=10`, at most ten helpers where the default is six: 258.1 s and 259.6 s, 5.02 s under the three runs at depth 16, for 29.83 s more node CPU time | this file, "Where `797a213`'s block thread waits, a deeper read-ahead and a rung of four changes" |
 
 > **The headline 1.29x predates the fan-out fix, so it is conservative for
 > master.** That figure was measured on `b6d0c63`; `c091b46` (one validation
@@ -127,10 +129,10 @@ path) has been measured yet, so this crossover is unconfirmed.
 > after it. From 2026-10-17 it reported only the comparison of that day,
 > and the text it carried until then is in "README Performance text
 > retired on 2026-10-17" below. Since 2026-10-19 it reports the syncs of
-> that day from a block server on the LAN, with those of 2026-10-17 in
-> one bullet; the text it replaced is in git history, and its figures in
-> "`88c46c3`, the background commit as committed, dcrd v2.1.7 and two
-> preloaded allocators" below.
+> that morning from a block server on the LAN, with those of 2026-10-17
+> in one bullet; the text it replaced is in git history, and its figures
+> in "`88c46c3`, the background commit as committed, dcrd v2.1.7 and
+> two preloaded allocators" below.
 
 **Open arm, unmeasured: the maturing-ticket ancestor read.** Every connect
 past stake-enabled height lists the ticket purchases in the block
@@ -5647,6 +5649,15 @@ finding. The block thread of s17-m1-head:
   cached, since its reads from the drive may have added to these waits;
   the system call of each wait; any remedy.
 
+> **Note (2026-10-19, evening): sampled again, from a server on another
+> machine.** Under the same sampler, changed for a commit thread kept
+> for the life of the store, the block thread of `797a213` was
+> uninterruptible for 35.8 s of a default sync from the LAN server,
+> 25.4 s of it while a commit was under way, nearly all of it in the
+> same three btrfs functions. The system call of each wait is still not
+> sampled, and no remedy was measured. See "Where `797a213`'s block
+> thread waits, a deeper read-ahead and a rung of four changes" below.
+
 **What was not measured.**
 
 - The tree of any commit: every build here was a state of a worktree.
@@ -5943,3 +5954,330 @@ Raw: the comparison's `runs-lan.jsonl` rows labelled `k19-J-1`,
 two recordings; per-run samples, flush logs and node logs; the queues'
 steps and logs; and the code state and build notes of K and of its build
 with frame pointers.
+
+## Where `797a213`'s block thread waits, a deeper read-ahead and a rung of four changes (2026-10-19, evening)
+
+"One commit thread for the life of the store, a sync that checks every
+script, and dcrd v2.1.7" above ran K. The three commits that follow that
+section make its changes, and `797a213`, the head of master when the
+syncs below ran, holds them. The syncs below put three questions to that
+code: where its block thread now waits; whether the read-ahead gains
+from a deeper queue, the index thread from a longer queue of
+notifications, and the pre-verification from more helpers; and what four
+more changes gain, as one rung on top of it. Between 16:30 and 20:17 on
+2026-10-19, 22 syncs were run on m3, in three queues and none outside
+them, all but one from the LAN server of the two sections above:
+
+- two of `797a213` under a sampler of where its threads wait, at the
+  defaults and with the exists-address index off (m1k-*);
+- eight of a diagnostic build of `797a213` that reads the read-ahead's
+  depth and the index notification buffer from the environment, two at
+  each of four settings (ra4-*, ra16-*, ra32-* and ra4b512-*);
+- in the second queue, four of `797a213` and four of R1, `797a213` with
+  four changes, alternated (r1s-*), and then one of R1 from the loopback
+  dcrd v2.1.6 block server, for its end state (v20-R1-loopback);
+- in the third, two of the diagnostic build at depth 16 with
+  `DCROXIDE_PREVERIFY=10`, either side of a third run at depth 16 alone
+  (ra16pv10-* and ra16-3).
+
+In the run labels H stands for `797a213`, not for build H above.
+
+**The builds.** `797a213` is a release build of that commit's tree, at
+the workspace's release profile with nothing else set, made in a
+worktree at the commit with nothing changed. Every loaded section of it
+is equal to that of K's binary, whose code differs from the commit's
+only by a doc comment and a test's local name, which a release build
+does not contain. The diagnostic build is `797a213` with two environment
+variables of its own, read once at startup, which are in no commit and
+not meant for one: `DCROXIDE_DIAG_READ_AHEAD_DEPTH`, the most frames the
+reading thread keeps ahead of the thread that processes blocks, four in
+the code, and `DCROXIDE_DIAG_INDEX_NTFN_BUFFER`, how many index
+notifications queue for the index thread before the thread that connects
+blocks waits, 128 in the code, as dcrd's `bufferSize`. Everything the
+code derives from the depth follows the variable: the reading thread's
+bound, its queue's capacity, and the pre-verifier's bound, the largest
+block message times one more than the depth, 6,553,600 B at four,
+22,282,240 B at 16 and 43,253,760 B at 32. Unset, the build runs at four
+and 128 with an atomic load where the code reads a constant, and logs
+one line more at startup, so its runs at depth 4, and not `797a213`'s,
+are the control of its other settings. R1 is a release build of
+`797a213` with four changes, made one after another as states of a
+worktree:
+
+- a block's transactions are classified once, as the block is processed,
+  for every step that reads their types, where five steps of its connect
+  classified each one again;
+- a block filter's list of entries is allocated once, at a bound worked
+  out from the block, where it started at dcrd's hint and grew by
+  doubling;
+- a handed-over flush's block-file sync runs on `dbcommit`, before the
+  flush's rows, where the capturing thread ran it, holding the
+  database's writer, before the hand-off;
+- a block filter's previous scripts are read from the spend journal the
+  block's connect built, where each was looked up in the UTXO view.
+
+Each of the three was built a second time, from a fresh export of
+`797a213` with its changes, if any, applied as patches, and had every
+loaded section equal to the first, with only the build id, the debug
+information, which names the source directory, and the suffixes ThinLTO
+gives local symbols differing.
+
+The seven commits that follow the commit that adds this section hold
+R1's changes and the depth: two that change only tests and comments,
+then R1's four changes in R1's order, one a commit, then one that sets
+the read-ahead's depth to sixteen frames in the code. R1's code is that
+of the sixth, but for tests and comments, which a release build does not
+contain. The seventh sets in the code, at the same places, what the
+diagnostic build set at depth 16 through its variable, without the
+variables or the line they log; it does so on top of R1's changes, and
+the depth of sixteen with R1's changes was neither built nor synced. No
+tree of the seven was built as a release binary or synced, and R1's four
+changes were measured together, not one at a time.
+
+**The session.** The syncs are in the harness of the sections above. The
+LAN server was the same live node, dcrd v2.1.7 by its user agent,
+following the network: the starting height it gave each run went from
+1,125,081 to 1,125,126; at the poll that stopped the clock the node was
+186 to 1,735 blocks past block 1,116,035, and its block at that height
+was the frozen chain's in every LAN run. Every run exited 0, none
+stalled, and none was marked disturbed; other userland was 0.05% to
+0.06% of the machine. Every run of a queue but its first followed a
+`sync`, a 300 s idle and the quiet gate; the first of each, m1k-H-1,
+r1s-H-1 and ra16pv10-1, followed the gate alone, the last two 142 s and
+149 s after the queue before them ended. Before the loopback run the
+server's data, 26.0 GB, was read into the page cache in 29.1 s, and the
+server still read 19.2 GB from its drive, as in the end-state checks
+above, so that run's wall is not a timing. Transparent huge pages were
+`madvise` throughout: the system journal shows no write to the setting
+after the one of 2026-10-17 at 05:21 and no restart, and it read
+`madvise` after the last run. The flush log was on in every run, and
+every figure is defined as in the sections above; the read-ahead's and
+the pre-verifier's lines at shutdown count to the shutdown, past the
+clock.
+
+**This session and the morning's.** `797a213`'s four runs of the second
+queue took 269.8 to 273.2 s, a mean of 271.75 s, where K's four default
+runs of the morning, with the same loaded code, took a mean of 271.68 s.
+
+| run | started | build | setting | wall | rate | to block 1,026,597 | after it | node CPU time (user + sys) | block thread | index thread | reader thread | `dbcommit` thread | peak RSS | received, highest 10 s |
+|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| m1k-H-1 | 16:30 | `797a213` | defaults, under the wait sampler | 271.0 s | 4,118.2 blk/s | 213.3 s | 57.7 s | 908.1 s (831.4 + 76.7) | 210.1 s | 71.3 s | 128.5 s | 97.0 s | 2,473 MiB | 98.9 MB/s |
+| m1k-H-noindex-1 | 16:41 | `797a213` | `--noexistsaddrindex`, under the wait sampler | 254.8 s | 4,380.0 blk/s | 199.9 s | 54.9 s | 795.3 s (740.8 + 54.5) | 211.0 s | — | 127.5 s | 59.9 s | 2,271 MiB | 108.0 MB/s |
+| ra4-1 | 16:51 | diagnostic | depth 4 | 273.3 s | 4,083.6 blk/s | 213.6 s | 59.7 s | 907.3 s (831.1 + 76.2) | 211.3 s | 70.8 s | 128.4 s | 96.5 s | 2,451 MiB | 98.0 MB/s |
+| ra16-1 | 17:02 | diagnostic | depth 16 | 263.4 s | 4,237.0 blk/s | 209.5 s | 53.9 s | 893.9 s (820.2 + 73.7) | 207.9 s | 71.5 s | 129.2 s | 95.6 s | 2,471 MiB | 97.9 MB/s |
+| ra32-1 | 17:13 | diagnostic | depth 32 | 267.2 s | 4,176.8 blk/s | 211.9 s | 55.3 s | 891.6 s (817.1 + 74.5) | 207.6 s | 71.7 s | 129.0 s | 96.4 s | 2,481 MiB | 97.7 MB/s |
+| ra4b512-1 | 17:24 | diagnostic | depth 4, buffer 512 | 273.3 s | 4,083.6 blk/s | 213.7 s | 59.6 s | 908.7 s (833.3 + 75.4) | 211.9 s | 70.9 s | 129.4 s | 96.2 s | 2,486 MiB | 100.3 MB/s |
+| ra32-2 | 17:35 | diagnostic | depth 32 | 263.5 s | 4,235.4 blk/s | 210.4 s | 53.1 s | 891.0 s (816.0 + 75.0) | 206.9 s | 71.6 s | 129.0 s | 96.8 s | 2,467 MiB | 102.1 MB/s |
+| ra16-2 | 17:46 | diagnostic | depth 16 | 263.4 s | 4,237.0 blk/s | 209.0 s | 54.4 s | 894.7 s (820.7 + 74.0) | 207.6 s | 71.5 s | 129.6 s | 95.2 s | 2,466 MiB | 100.5 MB/s |
+| ra4-2 | 17:57 | diagnostic | depth 4 | 272.9 s | 4,089.5 blk/s | 213.3 s | 59.6 s | 909.6 s (832.4 + 77.2) | 211.8 s | 71.1 s | 128.8 s | 97.6 s | 2,460 MiB | 95.4 MB/s |
+| ra4b512-2 | 18:08 | diagnostic | depth 4, buffer 512 | 270.1 s | 4,131.9 blk/s | 211.4 s | 58.7 s | 900.8 s (826.6 + 74.2) | 211.1 s | 70.9 s | 128.8 s | 94.9 s | 2,493 MiB | 96.3 MB/s |
+| r1s-H-1 | 18:15 | `797a213` | defaults | 273.1 s | 4,086.5 blk/s | 211.1 s | 62.0 s | 905.8 s (831.1 + 74.7) | 210.3 s | 71.1 s | 128.3 s | 95.5 s | 2,471 MiB | 98.3 MB/s |
+| r1s-R1-1 | 18:26 | R1 | defaults | 263.1 s | 4,241.9 blk/s | 206.2 s | 56.9 s | 895.9 s (823.6 + 72.3) | 205.2 s | 70.9 s | 128.1 s | 94.6 s | 2,463 MiB | 103.0 MB/s |
+| r1s-H-2 | 18:37 | `797a213` | defaults | 270.9 s | 4,119.7 blk/s | 212.6 s | 58.3 s | 899.0 s (824.1 + 74.9) | 209.2 s | 70.9 s | 127.9 s | 96.2 s | 2,465 MiB | 99.4 MB/s |
+| r1s-R1-2 | 18:48 | R1 | defaults | 266.3 s | 4,190.9 blk/s | 210.5 s | 55.8 s | 899.9 s (822.2 + 77.7) | 205.9 s | 70.7 s | 128.0 s | 99.2 s | 2,467 MiB | 100.6 MB/s |
+| r1s-R1-3 | 18:59 | R1 | defaults | 265.5 s | 4,203.5 blk/s | 209.2 s | 56.3 s | 901.0 s (824.3 + 76.7) | 206.6 s | 71.2 s | 128.1 s | 98.2 s | 2,470 MiB | 101.7 MB/s |
+| r1s-H-3 | 19:10 | `797a213` | defaults | 273.2 s | 4,085.0 blk/s | 211.6 s | 61.6 s | 900.8 s (827.5 + 73.3) | 210.9 s | 71.2 s | 128.6 s | 93.7 s | 2,473 MiB | 101.5 MB/s |
+| r1s-R1-4 | 19:21 | R1 | defaults | 264.9 s | 4,213.0 blk/s | 205.3 s | 59.6 s | 899.2 s (823.8 + 75.4) | 205.6 s | 70.7 s | 128.5 s | 96.9 s | 2,460 MiB | 101.1 MB/s |
+| r1s-H-4 | 19:31 | `797a213` | defaults | 269.8 s | 4,136.5 blk/s | 212.4 s | 57.4 s | 903.6 s (827.4 + 76.2) | 210.7 s | 71.2 s | 128.4 s | 96.4 s | 2,500 MiB | 97.9 MB/s |
+| ra16pv10-1 | 19:51 | diagnostic | depth 16, `DCROXIDE_PREVERIFY=10` | 258.1 s | 4,324.0 blk/s | 210.5 s | 47.6 s | 924.6 s (852.0 + 72.6) | 204.5 s | 72.3 s | 131.8 s | 95.0 s | 2,460 MiB | 99.4 MB/s |
+| ra16-3 | 20:02 | diagnostic | depth 16 | 264.8 s | 4,214.6 blk/s | 210.1 s | 54.7 s | 895.4 s (821.5 + 73.9) | 207.8 s | 71.1 s | 129.4 s | 95.4 s | 2,469 MiB | 100.5 MB/s |
+| ra16pv10-2 | 20:12 | diagnostic | depth 16, `DCROXIDE_PREVERIFY=10` | 259.6 s | 4,299.1 blk/s | 210.9 s | 48.7 s | 924.4 s (851.4 + 73.0) | 202.7 s | 72.2 s | 131.6 s | 96.2 s | 2,470 MiB | 98.8 MB/s |
+
+The `dbcommit` column is the thread kept for the life of the store, by
+the same count as the other threads.
+
+**Where the block thread waits (m1k).** m1k-H-1 at the defaults at 16:30
+and m1k-H-noindex-1 with the index off at 16:41 ran under the sampler of
+"Where the block thread waits beside a background commit" above, at
+200 Hz, on four cores of its own, changed for a commit thread that lives
+as long as the store. It reads, as before, the scheduler state of the
+block thread and the index thread and, for a thread not running, the
+kernel function it waits in, and now reads them for the `dbcommit`
+thread too. It counts a commit as under way when that thread is anything
+but asleep on a futex (`futex_wait`), where it waits for the next flush,
+and no longer when a `dbcommit` thread exists, which since `0ffe161` it
+does from the first flush handed over to the close. A commit's own waits
+for a lock look the same as that idle wait and count as no commit. Since
+`c94cd26` the thread also writes each flush's rows and the index's
+contribution, so a commit under way now spans those as well as the
+commit and the retirement. By the flush log the 52 flushes inside the
+clock of m1k-H-1, every one handed over, spent 115.0 s on that thread
+from the hand-off to the retirement; the sampler counted a commit under
+way for 123.0 s, 45.4% of its 270.7 s, a difference not taken apart. The
+sampler used 6.6 s and 4.9 s of processor time, and the two walls,
+271.0 s and 254.8 s, are not set beside the other runs as timings.
+
+| block thread | m1k-H-1, no commit under way (147.7 s) | m1k-H-1, a commit under way (123.0 s) | m1k-H-noindex-1, no commit under way (181.8 s) | m1k-H-noindex-1, a commit under way (72.8 s) |
+|---|---:|---:|---:|---:|
+| running or runnable | 124.4 s (84.2%) | 90.9 s (73.9%) | 159.3 s (87.6%) | 58.7 s (80.6%) |
+| uninterruptible, a page under writeback or locked (`folio_wait_bit_common`) | 4.4 s | 8.9 s | 4.4 s | 3.3 s |
+| uninterruptible, a write's space reservation (`reserve_bytes`) | 0.0 s | 11.9 s | 0.0 s | 5.4 s |
+| uninterruptible, the ordered extents over a range written (`btrfs_start_ordered_extent_nowriteback`) | 5.8 s | 4.1 s | 8.5 s | 3.0 s |
+| uninterruptible, elsewhere | 0.2 s | 0.5 s | 0.3 s | 0.3 s |
+| asleep on a futex | 10.1 s | 5.2 s | 6.7 s | 1.5 s |
+| asleep elsewhere | 2.8 s | 1.6 s | 2.6 s | 0.7 s |
+
+- **The waits are the filesystem's, as on 2026-10-17.** At the defaults
+  the block thread was uninterruptible for 35.8 s, 25.4 s of it while a
+  commit was under way, nearly all of it in the same three functions of
+  btrfs's buffered-write paths, and `reserve_bytes` only while a commit
+  was under way. It was asleep on a futex for 15.3 s, and on a processor
+  for 210.1 s by its counters. On 2026-10-17, from the loopback server
+  reading its drive, the block thread of `88c46c3` was uninterruptible
+  for 56.4 s, 38.4 s of it while a commit was under way by that
+  sampler's test.
+- **With the index off** a commit was under way for 72.8 s of 254.6 s,
+  and the block thread was uninterruptible for 25.1 s, 11.9 s of it
+  then, against 35.8 s with the index on, and asleep on a futex for
+  8.2 s, against 15.3 s.
+- **The commit thread.** While a commit was under way at the defaults,
+  `dbcommit` was running or runnable for 98.6 s and uninterruptible for
+  23.9 s: in `reserve_bytes` 13.9 s, `btrfs_btree_wait_writeback_range`
+  3.8 s, `wait_for_commit` 2.7 s, `folio_wait_bit_common` 2.3 s and
+  elsewhere 1.3 s. Its counters give it 97.0 s on a processor.
+- **Which file is by elimination, again.** The sampler still cannot read
+  which system call a wait is in. In `797a213` the flushes' row inserts
+  and commits run on `dbcommit`; their block-file syncs, 2.7 s in all
+  with 2.3 s of it off a processor, run on whichever thread captured the
+  flush, the block thread or the index thread; the index thread was
+  uninterruptible for 0.2 s in all; and the node logged 55 lines inside
+  the clock. What is left on the block thread is its write of each
+  block's record into the current block file, as on 2026-10-17. That is
+  inferred, not observed. R1 moves the syncs to `dbcommit` (below); no
+  change to the writes themselves was built or measured.
+
+**The read-ahead's depth and the index buffer (ra).** The first queue
+ran the diagnostic build at depth 4, 16 and 32, and at depth 4 with a
+buffer of 512 notifications, two runs each, in the order 4, 16, 32,
+buffer 512, 32, 16, 4, buffer 512. Pooled over those eight runs
+(4 degrees of freedom, a standard deviation of 1.74 s), a step between
+two runs and two is good to about ±4.8 s. The lines the node logs at
+shutdown:
+
+| run | setting | most frames queued | block thread waited for the reader | reader waited for the block thread | index queue full | inputs checked ahead | blocks cut short | helpers |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| ra4-1 | depth 4 | 4 | 3.60 s | 137.8 s | 3.69 s | 4,813,117 of 9,316,214 (51.7%) | 23,255 of 91,074 (25.5%) | 6 |
+| ra16-1 | depth 16 | 16 | 0.45 s | 126.8 s | 3.76 s | 6,134,021 of 9,267,088 (66.2%) | 19,453 of 90,556 (21.5%) | 6 |
+| ra32-1 | depth 32 | 32 | 0.30 s | 129.9 s | 3.79 s | 6,234,158 of 9,219,821 (67.6%) | 18,458 of 90,067 (20.5%) | 6 |
+| ra4b512-1 | depth 4, buffer 512 | 4 | 3.72 s | 136.7 s | 2.24 s | 4,821,544 of 9,313,338 (51.8%) | 23,313 of 91,046 (25.6%) | 6 |
+| ra32-2 | depth 32 | 32 | 0.32 s | 127.0 s | 3.79 s | 6,174,640 of 9,203,081 (67.1%) | 18,688 of 89,909 (20.8%) | 6 |
+| ra16-2 | depth 16 | 16 | 0.51 s | 125.1 s | 3.74 s | 6,078,200 of 9,278,226 (65.5%) | 19,771 of 90,676 (21.8%) | 6 |
+| ra4-2 | depth 4 | 4 | 3.62 s | 137.1 s | 3.73 s | 4,865,057 of 9,313,338 (52.2%) | 23,073 of 91,046 (25.3%) | 6 |
+| ra4b512-2 | depth 4, buffer 512 | 4 | 3.64 s | 134.1 s | 2.29 s | 4,747,419 of 9,182,711 (51.7%) | 22,900 of 89,700 (25.5%) | 6 |
+| ra16pv10-1 | depth 16, `DCROXIDE_PREVERIFY=10` | 16 | 0.46 s | 119.0 s | 3.73 s | 8,310,053 of 9,209,970 (90.2%) | 6,097 of 89,966 (6.8%) | 10 |
+| ra16-3 | depth 16 | 16 | 0.46 s | 127.9 s | 3.69 s | 6,167,540 of 9,313,603 (66.2%) | 19,519 of 91,047 (21.4%) | 6 |
+| ra16pv10-2 | depth 16, `DCROXIDE_PREVERIFY=10` | 16 | 0.48 s | 120.4 s | 3.71 s | 8,233,201 of 9,222,517 (89.3%) | 6,837 of 90,095 (7.6%) | 10 |
+
+- **Depth 16: 263.4 s and 263.4 s against 273.3 s and 272.9 s at
+  depth 4, 9.70 s or 3.6% less**, 4.2 s of it before the assume-valid
+  block and 5.5 s after. ra16-3, a third run at depth 16 in the third
+  queue, took 264.8 s. The block thread waited for the reader 0.45 s and
+  0.51 s in all, against 3.60 s and 3.62 s, and the pre-verifier checked
+  66.2% and 65.5% of the inputs it guessed for ahead of the block
+  thread, against 51.7% and 52.2%. The block thread's time on a
+  processor fell 3.78 s by the means, that of the script pool's 15
+  threads 10.00 s, and node CPU time 14.15 s.
+- **Depth 32: 267.2 s and 263.5 s, 7.75 s less than depth 4 and 1.95 s
+  more than depth 16**, which the ±4.8 s does not resolve, with 67.6%
+  and 67.1% of the inputs checked ahead and 0.30 s and 0.32 s of waiting
+  for the reader. Each setting queued at most its depth, by the
+  read-ahead's line.
+- **The buffer at 512, at depth 4: 273.3 s and 270.1 s, 1.40 s less than
+  depth 4**, which is not resolved. The index queue was full for 2.24 s
+  and 2.29 s in all, against 3.69 s and 3.73 s.
+- **Memory.** Peak RSS, read when the clock stopped, was 2,451 and
+  2,460 MiB at depth 4, 2,466 to 2,471 MiB at depth 16, 2,481 and
+  2,467 MiB at depth 32 and 2,486 and 2,493 MiB with the buffer at 512.
+  No run filled the queue with the largest blocks, so what the depth's
+  bound costs in memory is not measured.
+
+**More helpers at depth 16 (ra16pv10).** At depth 16 the pre-verifier
+still checked only about two thirds of its inputs ahead, so the third
+queue ran depth 16 with `DCROXIDE_PREVERIFY=10`, at most ten helpers
+where the default on the node's eight cores is six, two fewer than the
+cores. **258.1 s and 259.6 s, a mean of 258.85 s, against 263.87 s for
+the three runs at depth 16 alone, 5.02 s less**: pooled over those five
+runs (3 degrees of freedom, a standard deviation of 0.90 s), about
+±2.6 s, though two of the five ran in the first queue; against ra16-3
+alone, which the two bracket, 5.95 s less. They took 6.2 s less after
+the assume-valid block and 1.2 s more before it. The pre-verifier
+checked 90.2% and 89.3% of its inputs ahead, against 65.5% to 66.2%, and
+6.8% and 7.6% of its blocks were cut short by the block thread or the
+shutdown, against 21.4% to 21.8%; node CPU time rose 29.83 s by the
+means and the script pool's threads' time 30.64 s, at 3.58 and
+3.56 mean cores. Which hardware threads the ten helpers ran on is not
+recorded.
+
+**R1 against `797a213` (r1s).** The runs alternated `797a213`, R1,
+`797a213`, R1, R1, `797a213`, R1, `797a213`. **R1 took 263.1 s, 266.3 s,
+265.5 s and 264.9 s, a mean of 264.95 s, against 273.1 s, 270.9 s,
+273.2 s and 269.8 s, a mean of 271.75 s: 6.80 s or 2.5% less**, beyond
+the session's 95% interval for a step between four runs and four, about
+±2.6 s (6 degrees of freedom, a standard deviation of 1.53 s), and less
+in each of the 16 pairings, by 3.5 to 10.1 s. 4.1 s of it came before
+the assume-valid block and 2.7 s after.
+
+- **The threads.** The block thread was on a processor for 205.2 to
+  206.6 s against 209.2 to 210.9 s, 4.45 s less by the means, and node
+  CPU time was 895.9 to 901.0 s against 899.0 to 905.8 s. `dbcommit`,
+  which now also syncs the block files, was on a processor for 94.6 to
+  99.2 s against 93.7 to 96.4 s, the index thread for 70.7 to 71.2 s
+  against 70.9 to 71.2 s, and the reader for 128.0 to 128.5 s against
+  127.9 to 128.6 s.
+- **The flushes.** Each run made 52 flushes inside the clock, every one
+  handed over. Their foreground time was 0.016 to 0.030 s in a run of
+  R1, against 2.38 to 2.69 s for `797a213`, and R1's block-file syncs,
+  timed on `dbcommit`, took 2.59 to 2.98 s in a run.
+- **The rest.** The block thread waited for the reader 3.91 to 4.02 s in
+  all, against 3.61 to 3.66 s; the pre-verifier checked 50.9% to 51.2%
+  of its inputs ahead, against 51.4% to 51.8%; and peak RSS was 2,460 to
+  2,470 MiB, against 2,465 to 2,500 MiB.
+
+**R1's end state (v20).** One sync of R1 from the loopback dcrd v2.1.6
+server at the defaults at 19:43, for the end state that the LAN runs do
+not record. It ended on the server's tip, `8752fdc9…`, and
+`gettxoutsetinfo` reported the UTXO set of every full sync from the
+loopback server since 2026-10-17: 760,741 transactions, 1,850,903
+outputs, a total amount of 1,672,716,060,550,750 atoms and the
+serialized hash
+`eb7f88de7b69f98676ce78072c0f90cc2667b875df0b26637dffcf9da5b3c30c`. The
+block files hashed to `33b7ac837a45c74f` over 36 files and
+19,202,596,910 B. The exists-address index and the rest of the metadata
+store, the block filters R1 builds another way among them, were not
+compared. Its wall, 274.5 s, is not a timing; it peaked at 2,481 MiB.
+
+**What was not measured.**
+
+- The trees of the seven commits that follow, and each of R1's four
+  changes on its own.
+- R1's changes with the depth at sixteen, which the seventh of those
+  commits holds: the depth was run only in the diagnostic build, on
+  `797a213`'s code, so whether its gain adds to R1's is not known. Ten
+  helpers at any depth but 16, or with R1's changes.
+- Depths other than 4, 16 and 32, a bound of the read-ahead in bytes,
+  buffers other than 128 and 512 notifications, and helper counts other
+  than six and ten.
+- The memory at the depth's bound, with the queue full of the largest
+  blocks, and how many of the entries pre-verified into the signature
+  cache were evicted before their block was connected.
+- The system call of each wait the sampler saw; the sampler on R1 or the
+  diagnostic build; any change to the block-file writes.
+- Any end state in the LAN runs; the exists-address index, the block
+  filters and the rest of the metadata store in R1's loopback check.
+- The memory after the clock.
+- A sync whose sync peer changes; the LAN server's load, cache and
+  configuration, the link's speed, and the round trip, in any run
+  record; a link with a longer round trip.
+- `DCROXIDE_READ_AHEAD=off`, the flush log's own cost, on in every run,
+  and the sampler's.
+- Storage other than m3's NVMe drive under btrfs; Windows and macOS.
+
+Raw: `wchan-k.jsonl`'s `m1k-H-1` and `m1k-H-noindex-1`, with their
+wait-channel counts; `arms.jsonl`'s `ra4-1`, `ra16-1`, `ra32-1`,
+`ra4b512-1`, `ra32-2`, `ra16-2`, `ra4-2`, `ra4b512-2`, `ra16pv10-1`,
+`ra16-3` and `ra16pv10-2`; the comparison's `runs-lan.jsonl` rows
+labelled `r1s-H-1`, `r1s-R1-1`, `r1s-H-2`, `r1s-R1-2`, `r1s-R1-3`,
+`r1s-H-3`, `r1s-R1-4` and `r1s-H-4`; `verify.jsonl`'s `v20-R1-loopback`;
+per-run samples, flush logs and node logs; the queues' steps and logs;
+the sampler and its change; and the code states and build notes of the
+three builds.

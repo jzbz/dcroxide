@@ -69,8 +69,8 @@ were first put to blocks on 2026-10-17, in syncs of `88c46c3` (the bench
 ledger, "`88c46c3`, the background commit as committed, dcrd v2.1.7 and
 two preloaded allocators"), each of which validated in full only the
 blocks after the assume-valid block and ended with the UTXO set that
-dcrd's syncs of that day ended with. The commits after `fdd7a83` have
-been put to blocks only in builds made from a worktree, not from their
+dcrd's syncs of that day ended with. The commits after `fdd7a83` were
+put to blocks first in builds made from a worktree, not from their
 trees. All but one were in syncs of 2026-10-18 from a block server on
 another machine on the same LAN, each of which validated in full only
 the blocks after the assume-valid block and had dcrd's block at height
@@ -88,6 +88,12 @@ script checks included, and ended with that same UTXO set and the same
 block files: a build whose code is the code as it stands but for a doc
 comment and a test's local name accepted every block of mainnet's chain
 up to 1,116,035 with each one validated in full.
+On the evening of 2026-10-19 a release build of the tree of `797a213`,
+which holds every commit above, was put to blocks in six syncs from the
+LAN server, each of which validated in full only the blocks after the
+assume-valid block and had dcrd's block at height 1,116,035 (the bench
+ledger, "Where `797a213`'s block thread waits, a deeper read-ahead and a
+rung of four changes").
 That the rules reject what dcrd's reject rests on the test batteries
 described below, not on a sync, and none of it says the node is safe to
 operate. **Do not expose it to the internet and do not use it with
@@ -562,10 +568,10 @@ What these figures do not cover:
 - **Other machines.** Every figure above is of m3 (the ledger has older
   runs on m2), and no sync has been timed on Windows or macOS.
 
-The [bench ledger](docs/bench-ledger.md) has every run of 2026-10-19
-("One commit thread for the life of the store, a sync that checks every
-script, and dcrd v2.1.7"), those of 2026-10-17 ("`88c46c3`, the
-background commit as committed, dcrd v2.1.7 and two preloaded
+The [bench ledger](docs/bench-ledger.md) has every run of the morning of
+2026-10-19 ("One commit thread for the life of the store, a sync that
+checks every script, and dcrd v2.1.7"), those of 2026-10-17 ("`88c46c3`,
+the background commit as committed, dcrd v2.1.7 and two preloaded
 allocators"), the earlier measurements, and this section's text until
 2026-10-17 ("README Performance text retired on 2026-10-17"). The LAN
 runs record no data directory's size; after the syncs of 2026-10-17 it
