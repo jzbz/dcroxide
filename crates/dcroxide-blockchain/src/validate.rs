@@ -117,6 +117,25 @@ pub fn check_transaction_context(
     params: &Params,
     flags: AgendaFlags,
 ) -> Result<(), RuleError> {
+    check_transaction_context_typed(tx, crate::blockhashes::classify_tx(tx), params, flags)
+}
+
+/// [`check_transaction_context`] given the transaction's type, which
+/// must be `dcroxide_stake::determine_tx_type` of this very transaction:
+/// the contextual block check hands in the type the block's
+/// `BlockTxTypes` holds, where dcrd's `checkTransactionContext`
+/// classifies the transaction itself.
+pub(crate) fn check_transaction_context_typed(
+    tx: &MsgTx,
+    tx_type: dcroxide_stake::TxType,
+    params: &Params,
+    flags: AgendaFlags,
+) -> Result<(), RuleError> {
+    debug_assert_eq!(
+        tx_type,
+        dcroxide_stake::determine_tx_type(tx),
+        "the type handed in is not the transaction's"
+    );
     let is_treasury_enabled = flags.is_treasury_enabled();
     let explicit_upgrades_active = flags.is_explicit_ver_upgrades_enabled();
     let is_auto_revocations_enabled = flags.is_auto_revocations_enabled();
@@ -146,7 +165,7 @@ pub fn check_transaction_context(
     let mut is_treasury_base = false;
     let mut is_treasury_add = false;
     let mut is_treasury_spend = false;
-    match dcroxide_stake::determine_tx_type(tx) {
+    match tx_type {
         dcroxide_stake::TxType::SSGen => is_vote = true,
         dcroxide_stake::TxType::SStx => is_ticket = true,
         dcroxide_stake::TxType::SSRtx => is_revocation = true,
@@ -4443,6 +4462,7 @@ pub fn check_block_context(
         block,
         None,
         None,
+        None,
         prev_height,
         fast_add,
         no_pow_check,
@@ -4466,12 +4486,19 @@ pub fn check_block_context(
 /// arrived with them (`crate::blockhashes::HashedBlock`), which must be
 /// this very block's.  They are read at the point where the check
 /// counts, and nowhere else ([`check_block_sig_op_limit`]).
+///
+/// `tx_types` is the classification of the block's transactions when
+/// the caller holds it (`crate::blockhashes::BlockTxTypes`), which must
+/// be this very block's; without it the block is classified here, once,
+/// where dcrd classifies each transaction in `checkTransactionContext`
+/// and again in this check's own loops.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn check_block_context_with_hash(
     view: &impl FullChainView,
     block: &MsgBlock,
     block_hash: Option<&Hash>,
     sig_ops: Option<&crate::blockhashes::BlockSigOps>,
+    tx_types: Option<&crate::blockhashes::BlockTxTypes>,
     prev_height: Option<i64>,
     fast_add: bool,
     no_pow_check: bool,
@@ -4553,17 +4580,36 @@ pub(crate) fn check_block_context_with_hash(
         check_treasurybase_unique_height(block_height, block)?;
     }
 
+    // Each transaction's type, read by the checks of both trees below:
+    // the caller's, or classified here once.
+    let classified;
+    let tx_types = match tx_types {
+        Some(tx_types) => {
+            tx_types.assert_for(block);
+            tx_types
+        }
+        None => {
+            classified = crate::blockhashes::BlockTxTypes::compute(block);
+            &classified
+        }
+    };
+
     // Contextual per-transaction checks over the regular tree, plus
     // the second-coinbase and misplaced-stake-transaction rules.
-    for (tx_idx, tx) in block.transactions.iter().enumerate() {
-        check_transaction_context(tx, params, check_tx_flags)?;
+    for (tx_idx, (tx, &tx_type)) in block
+        .transactions
+        .iter()
+        .zip(tx_types.regular())
+        .enumerate()
+    {
+        check_transaction_context_typed(tx, tx_type, params, check_tx_flags)?;
         if tx_idx > 0 && dcroxide_standalone::is_coin_base_tx(tx, is_treasury_enabled) {
             return Err(rule_error(
                 RuleErrorKind::MultipleCoinbases,
                 format!("block contains second coinbase at index {tx_idx}"),
             ));
         }
-        if dcroxide_stake::determine_tx_type(tx) != dcroxide_stake::TxType::Regular {
+        if tx_type != dcroxide_stake::TxType::Regular {
             return Err(rule_error(
                 RuleErrorKind::StakeTxInRegularTree,
                 format!(
@@ -4576,8 +4622,8 @@ pub(crate) fn check_block_context_with_hash(
 
     // Contextual per-transaction checks over the stake tree plus the
     // second-treasurybase rule.
-    for (tx_idx, stx) in block.stransactions.iter().enumerate() {
-        check_transaction_context(stx, params, check_tx_flags)?;
+    for (tx_idx, (stx, &tx_type)) in block.stransactions.iter().zip(tx_types.stake()).enumerate() {
+        check_transaction_context_typed(stx, tx_type, params, check_tx_flags)?;
         if tx_idx > 0 && is_treasury_enabled && dcroxide_standalone::is_treasury_base(stx) {
             return Err(rule_error(
                 RuleErrorKind::MultipleTreasurybases,
@@ -4602,8 +4648,7 @@ pub(crate) fn check_block_context_with_hash(
         reason = "each tally counts at most one per stake transaction, so at most \
                   block.stransactions.len()"
     )]
-    for (tx_idx, stx) in block.stransactions.iter().enumerate() {
-        let tx_type = dcroxide_stake::determine_tx_type(stx);
+    for (tx_idx, (stx, &tx_type)) in block.stransactions.iter().zip(tx_types.stake()).enumerate() {
         if tx_type == dcroxide_stake::TxType::Regular {
             return Err(rule_error(
                 RuleErrorKind::RegTxInStakeTree,
@@ -4946,6 +4991,52 @@ pub fn check_transactions_and_connect<SP: dcroxide_standalone::SubsidyParams>(
     txs: &[MsgTx],
     tx_hashes: &[Hash],
     view: &mut crate::utxoview::UtxoView,
+    stxos: Option<&mut Vec<crate::chainio::SpentTxOut>>,
+    stake_tree: bool,
+    is_treasury_enabled: bool,
+    is_auto_revocations_enabled: bool,
+    subsidy_split_variant: dcroxide_standalone::SubsidySplitVariant,
+    params: &Params,
+) -> Result<i64, RuleError> {
+    let tx_types: Vec<dcroxide_stake::TxType> =
+        txs.iter().map(crate::blockhashes::classify_tx).collect();
+    check_transactions_and_connect_typed(
+        subsidy_cache,
+        input_fees,
+        node_height,
+        node_hash,
+        node_voters,
+        prev_header,
+        txs,
+        tx_hashes,
+        &tx_types,
+        view,
+        stxos,
+        stake_tree,
+        is_treasury_enabled,
+        is_auto_revocations_enabled,
+        subsidy_split_variant,
+        params,
+    )
+}
+
+/// [`check_transactions_and_connect`] given the type of each
+/// transaction in `txs` (`dcroxide_stake::determine_tx_type`), which the
+/// connect of each transaction reads for the outputs it adds: the
+/// connect checks hand in the types their block's `BlockTxTypes` holds,
+/// where dcrd's `AddTxOuts` classifies each transaction itself.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn check_transactions_and_connect_typed<SP: dcroxide_standalone::SubsidyParams>(
+    subsidy_cache: &mut dcroxide_standalone::SubsidyCache<SP>,
+    input_fees: i64,
+    node_height: i64,
+    node_hash: Hash,
+    node_voters: u16,
+    prev_header: &dcroxide_wire::BlockHeader,
+    txs: &[MsgTx],
+    tx_hashes: &[Hash],
+    tx_types: &[dcroxide_stake::TxType],
+    view: &mut crate::utxoview::UtxoView,
     mut stxos: Option<&mut Vec<crate::chainio::SpentTxOut>>,
     stake_tree: bool,
     is_treasury_enabled: bool,
@@ -4959,9 +5050,10 @@ pub fn check_transactions_and_connect<SP: dcroxide_standalone::SubsidyParams>(
     // caller can carry the stake tree fees into the regular tree
     // (dcrd 2.2 folded getStakeTreeFees into this return).
     debug_assert_eq!(txs.len(), tx_hashes.len(), "one hash per transaction");
+    assert_eq!(txs.len(), tx_types.len(), "one type per transaction");
     let mut total_fees: i64 = input_fees; // Stake tx tree carry forward
     let mut cumulative_sig_ops: u32 = 0;
-    for (idx, (tx, tx_hash)) in txs.iter().zip(tx_hashes).enumerate() {
+    for (idx, ((tx, tx_hash), &tx_type)) in txs.iter().zip(tx_hashes).zip(tx_types).enumerate() {
         // Since the first (and only the first) transaction has already
         // been verified to be a coinbase transaction, use (idx == 0)
         // && !stake_tree as an optimization rather than a full
@@ -5030,8 +5122,9 @@ pub fn check_transactions_and_connect<SP: dcroxide_standalone::SubsidyParams>(
         // zero-confirmation set, which the caller's fetch of the
         // block's inputs filled.
         if !stake_tree {
-            view.connect_regular_transaction(
+            view.connect_regular_transaction_typed(
                 tx,
+                tx_type,
                 tx_hash,
                 node_height,
                 idx as u32,
@@ -5039,8 +5132,9 @@ pub fn check_transactions_and_connect<SP: dcroxide_standalone::SubsidyParams>(
                 is_treasury_enabled,
             );
         } else {
-            view.connect_stake_transaction(
+            view.connect_stake_transaction_typed(
                 tx,
+                tx_type,
                 tx_hash,
                 node_height,
                 idx as u32,
@@ -6375,6 +6469,7 @@ pub fn check_connect_block<SP: dcroxide_standalone::SubsidyParams>(
     params: &Params,
 ) -> Result<dcroxide_gcs::FilterV2, RuleError> {
     let tx_hashes = crate::blockhashes::BlockTxHashes::compute(block);
+    let tx_types = crate::blockhashes::BlockTxTypes::compute(block);
     check_connect_block_with_hashes(
         view_chain,
         subsidy_cache,
@@ -6384,6 +6479,7 @@ pub fn check_connect_block<SP: dcroxide_standalone::SubsidyParams>(
         node_vote_bits,
         block,
         &tx_hashes,
+        &tx_types,
         parent,
         parent_stxos,
         view,
@@ -6401,6 +6497,11 @@ pub fn check_connect_block<SP: dcroxide_standalone::SubsidyParams>(
 /// which must have been computed from this very block, and told through
 /// `script_runner` where the script checks run.  A pooled runner must
 /// hold this very block and these very hashes.
+///
+/// `tx_types` is the classification of the block's transactions, which
+/// must be this very block's: the connect of each transaction and the
+/// filter read the types from it, where dcrd's `AddTxOuts` and
+/// `blockcf2.Regular` classify each transaction themselves.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn check_connect_block_with_hashes<SP: dcroxide_standalone::SubsidyParams>(
     view_chain: &impl FullChainView,
@@ -6411,6 +6512,7 @@ pub(crate) fn check_connect_block_with_hashes<SP: dcroxide_standalone::SubsidyPa
     node_vote_bits: u16,
     block: &MsgBlock,
     tx_hashes: &crate::blockhashes::BlockTxHashes,
+    tx_types: &crate::blockhashes::BlockTxTypes,
     parent: &MsgBlock,
     parent_stxos: impl FnOnce() -> Result<Vec<crate::chainio::SpentTxOut>, RuleError>,
     view: &mut crate::utxoview::UtxoView,
@@ -6439,6 +6541,7 @@ pub(crate) fn check_connect_block_with_hashes<SP: dcroxide_standalone::SubsidyPa
     // `MsgTx::tx_hash` re-serializes per call).
     tx_hashes.assert_for(block);
     script_runner.assert_for(block, tx_hashes);
+    tx_types.assert_for(block);
     let regular_tx_hashes: &[Hash] = tx_hashes.regular();
     let stake_tx_hashes: &[Hash] = tx_hashes.stake();
 
@@ -6514,7 +6617,7 @@ pub(crate) fn check_connect_block_with_hashes<SP: dcroxide_standalone::SubsidyPa
     // carried forward into the regular tree (dcrd 2.2 folded
     // getStakeTreeFees into this return).
     let prev_header = &parent.header;
-    let stake_tree_fees = check_transactions_and_connect(
+    let stake_tree_fees = check_transactions_and_connect_typed(
         subsidy_cache,
         0,
         node_height,
@@ -6523,6 +6626,7 @@ pub(crate) fn check_connect_block_with_hashes<SP: dcroxide_standalone::SubsidyPa
         prev_header,
         &block.stransactions,
         stake_tx_hashes,
+        tx_types.stake(),
         view,
         stxos.as_deref_mut(),
         true,
@@ -6584,7 +6688,7 @@ pub(crate) fn check_connect_block_with_hashes<SP: dcroxide_standalone::SubsidyPa
 
     // Connect the regular tree with full checks, carrying the stake
     // tree fees forward.
-    let _ = check_transactions_and_connect(
+    let _ = check_transactions_and_connect_typed(
         subsidy_cache,
         stake_tree_fees,
         node_height,
@@ -6593,6 +6697,7 @@ pub(crate) fn check_connect_block_with_hashes<SP: dcroxide_standalone::SubsidyPa
         prev_header,
         &block.transactions,
         regular_tx_hashes,
+        tx_types.regular(),
         view,
         stxos,
         false,
@@ -6633,8 +6738,9 @@ pub(crate) fn check_connect_block_with_hashes<SP: dcroxide_standalone::SubsidyPa
     // dcrd returns `ruleError(ErrMissingTxOut, err.Error())`
     // (`validate.go:4575-4578`): for a missing script that is
     // blockcf2's `PrevScriptError` text, which prints the tree too.
-    let filter = dcroxide_gcs::blockcf2::regular(block, &ViewScripts(view))
-        .map_err(|e| rule_error(RuleErrorKind::MissingTxOut, format!("{e}")))?;
+    let filter =
+        dcroxide_gcs::blockcf2::regular_with_types(block, tx_types.stake(), &ViewScripts(view))
+            .map_err(|e| rule_error(RuleErrorKind::MissingTxOut, format!("{e}")))?;
     let filter_hash = filter.hash();
 
     let hdr_commitments_active =

@@ -29,7 +29,7 @@ use dcroxide_wire::{MsgBlock, MsgTx, OutPoint};
 
 use crate::RuleError;
 use crate::blockhashes::{
-    BlockMerkleLeaves, BlockMerkleRoots, BlockSigOps, BlockTxHashes, HashedBlock,
+    BlockMerkleLeaves, BlockMerkleRoots, BlockSigOps, BlockTxHashes, BlockTxTypes, HashedBlock,
 };
 use crate::blockindex::{BlockIndex, BlockStatus, NodeId, NodeStore};
 use crate::chainio::SpentTxOut;
@@ -244,9 +244,16 @@ enum UtxoFlushEnd {
 
 /// What a processing call files for the block it is processing
 /// (`Chain::accepted_tx_hashes`): the `blocks` mirror's own `Arc` of the
-/// block, its transaction hashes, the hash of its header and, when it
-/// arrived with them, its counts of signature operations.
-type AcceptedHashes = (Arc<MsgBlock>, Arc<BlockTxHashes>, Hash, Option<BlockSigOps>);
+/// block, its transaction hashes, the hash of its header, when it
+/// arrived with them its counts of signature operations, and the
+/// classification of its transactions.
+type AcceptedHashes = (
+    Arc<MsgBlock>,
+    Arc<BlockTxHashes>,
+    Hash,
+    Option<BlockSigOps>,
+    Arc<BlockTxTypes>,
+);
 
 /// The growing chain state: the block tree arena and index together
 /// with the chain state and configuration (the subset of dcrd's
@@ -482,6 +489,13 @@ pub struct Chain {
     /// is accepted read them (`accepted_block_sig_ops`), and count the
     /// block themselves only when the count the treasury agenda selects
     /// is over the limit.
+    ///
+    /// The fifth member is the stake classification of every transaction
+    /// of that block (`BlockTxTypes`), made where the hashes are filed, on
+    /// the thread that processes the block.  The contextual checks made as
+    /// that very allocation is accepted and the connect that follows read
+    /// it (`accepted_block_tx_types`, `tx_types_for`), where dcrd
+    /// classifies each transaction at each step that reads its type.
     accepted_tx_hashes: Option<AcceptedHashes>,
     /// How many connects hashed their block's transactions again
     /// because the block was not the one being processed: the other
@@ -4285,7 +4299,7 @@ impl Chain {
         block: &MsgBlock,
         view: &UtxoView,
     ) -> Result<FilterV2, RuleError> {
-        self.load_or_create_filter_with_hash(block, None, view)
+        self.load_or_create_filter_with_hash(block, None, None, view)
     }
 
     /// [`Self::load_or_create_filter`] given the block's hash when the
@@ -4293,10 +4307,18 @@ impl Chain {
     /// header: the key a stored filter is looked up under (dcrd reads
     /// `block.Hash()`, `chain.go:989`).  Without it the header is hashed
     /// here.
+    ///
+    /// `tx_types` is the classification of the block's transactions
+    /// when the caller holds it, which must be this very block's: a
+    /// filter made here is then built from the stake transactions' types
+    /// (`blockcf2::regular_with_types`), where dcrd's `blockcf2.Regular`
+    /// classifies each stake transaction itself.  Without it they are
+    /// classified here, which is what `regular` does.
     fn load_or_create_filter_with_hash(
         &self,
         block: &MsgBlock,
         block_hash: Option<&Hash>,
+        tx_types: Option<&BlockTxTypes>,
         view: &UtxoView,
     ) -> Result<FilterV2, RuleError> {
         let block_hash = match block_hash {
@@ -4309,9 +4331,23 @@ impl Chain {
         if let Some(filter) = self.filters.get(&block_hash.0) {
             return Ok(filter.clone());
         }
+        let scripts = crate::validate::ViewScripts(view);
+        let built = match tx_types {
+            Some(tx_types) => {
+                tx_types.assert_for(block);
+                dcroxide_gcs::blockcf2::regular_with_types(block, tx_types.stake(), &scripts)
+            }
+            None => {
+                let stake_types: Vec<dcroxide_stake::TxType> = block
+                    .stransactions
+                    .iter()
+                    .map(crate::blockhashes::classify_tx)
+                    .collect();
+                dcroxide_gcs::blockcf2::regular_with_types(block, &stake_types, &scripts)
+            }
+        };
         // dcrd `ruleError(ErrMissingTxOut, err.Error())`.
-        dcroxide_gcs::blockcf2::regular(block, &crate::validate::ViewScripts(view))
-            .map_err(|e| rule_error(RuleErrorKind::MissingTxOut, format!("{e}")))
+        built.map_err(|e| rule_error(RuleErrorKind::MissingTxOut, format!("{e}")))
     }
 
     /// Reorganize the chain to the given target without attempting to
@@ -4413,8 +4449,11 @@ impl Chain {
             let block = self.stored_block_arc(node)?;
             // This block's transaction hashes: the ones the processing
             // call computed, or the block arrived with, when it is the
-            // block being processed, fresh ones for any other.
+            // block being processed, fresh ones for any other.  Its
+            // transactions' classification likewise: the one the call
+            // made, or one made here.
             let tx_hashes = self.tx_hashes_for(&block);
+            let tx_types = self.tx_types_for(&block);
             let parent_id = self.store.node(node).parent.expect("attach parent");
             let parent = match prev_block_attached.take().or_else(|| fork_block.take()) {
                 Some(parent) => parent,
@@ -4443,10 +4482,14 @@ impl Chain {
             let mut stxos: Vec<SpentTxOut> = Vec::with_capacity(num_spent_outputs);
             let filter;
             if self.index.node_status(&self.store, node).has_validated() {
+                // The connect of each transaction and the filter read the
+                // classification this loop holds for the block, as the
+                // connect checks do on the other branch.
                 view.connect_block_with_hashes(
                     params,
                     &block,
                     &tx_hashes,
+                    Some(&tx_types),
                     &parent,
                     || self.fetch_spend_journal(&parent, is_treasury_enabled),
                     &ChainUtxoResolver { chain: self },
@@ -4459,8 +4502,12 @@ impl Chain {
                 // holds its hash; any other block's header is hashed by
                 // the lookup.
                 let block_hash = self.accepted_block_hash(&block);
-                filter =
-                    self.load_or_create_filter_with_hash(&block, block_hash.as_ref(), &view)?;
+                filter = self.load_or_create_filter_with_hash(
+                    &block,
+                    block_hash.as_ref(),
+                    Some(&tx_types),
+                    &view,
+                )?;
             } else {
                 // The block must pass all of the validation rules
                 // which depend on having the full block data for all
@@ -4480,12 +4527,15 @@ impl Chain {
                     // push it out of the recent checks; like any other
                     // block checked here, it then has its header hashed
                     // and its signature operations counted by the check.
+                    // The classification of its transactions is the one
+                    // this loop holds for it.
                     let context_result = check_block_context_for(
                         &self.store,
                         parent_id,
                         &block,
                         None,
                         None,
+                        Some(&tx_types),
                         &parent_stake_node,
                         false,
                         &mut self.recent_merkle_checks,
@@ -4521,6 +4571,7 @@ impl Chain {
                         node_info.3,
                         &block,
                         &tx_hashes,
+                        &tx_types,
                         &parent,
                         || self.fetch_spend_journal(&parent, is_treasury_enabled),
                         &mut view,
@@ -4566,7 +4617,7 @@ impl Chain {
             // transaction of the block, on either branch above, before
             // anything of the block is written (dcrd
             // `chain.go:1236-1238`).
-            view.assert_block_utxo_view(params, &block, &tx_hashes, is_treasury_enabled);
+            view.assert_block_utxo_view(params, &block, &tx_hashes, &tx_types, is_treasury_enabled);
 
             // Update the chain state and drop any best chain
             // candidates that now have less work than the new tip.
@@ -4926,15 +4977,19 @@ impl Chain {
         // of it, so they are its hashes either way, and the block hash
         // is its header's.  A block that arrived counted files its
         // counts of signature operations with them: the mirror then
-        // holds the very allocation that was counted.
+        // holds the very allocation that was counted.  The block's
+        // transactions are classified here, once, from that allocation,
+        // for the contextual checks and the connect that follow.
         let sig_ops = arriving.hashed().map(|hashed| *hashed.sig_ops());
         self.accepted_tx_hashes = tx_hashes.map(|tx_hashes| {
             tx_hashes.assert_for(&mirrored);
+            let tx_types = Arc::new(BlockTxTypes::compute(&mirrored));
             (
                 Arc::clone(&mirrored),
                 Arc::clone(tx_hashes),
                 block_hash,
                 sig_ops,
+                tx_types,
             )
         });
         #[cfg(test)]
@@ -5020,12 +5075,14 @@ impl Chain {
                 }
             };
             // The block being processed is checked with the hash the
-            // call already holds for it, and with its counts of signature
+            // call already holds for it, the classification of its
+            // transactions the call made, and its counts of signature
             // operations when it arrived with them; any other linked
-            // block's header is hashed, and its signature operations
-            // counted, by the check.
+            // block's header is hashed, its transactions classified and
+            // its signature operations counted, by the check.
             let block_hash = self.accepted_block_hash(&block);
             let sig_ops = self.accepted_block_sig_ops(&block);
+            let tx_types = self.accepted_block_tx_types(&block);
             if let Some(parent_stake_node) = &parent_stake_node
                 && let Err(err) = check_block_context_for(
                     &self.store,
@@ -5033,6 +5090,7 @@ impl Chain {
                     &block,
                     block_hash.as_ref(),
                     sig_ops.as_ref(),
+                    tx_types.as_deref(),
                     parent_stake_node,
                     fast_add,
                     &mut self.recent_merkle_checks,
@@ -6199,13 +6257,36 @@ impl Chain {
     /// hashes), and freshly computed ones for any other block, counted
     /// in [`Chain::tx_hash_recomputes`].
     fn tx_hashes_for(&mut self, block: &Arc<MsgBlock>) -> Arc<BlockTxHashes> {
-        if let Some((accepted, tx_hashes, _, _)) = &self.accepted_tx_hashes
+        if let Some((accepted, tx_hashes, _, _, _)) = &self.accepted_tx_hashes
             && Arc::ptr_eq(accepted, block)
         {
             return Arc::clone(tx_hashes);
         }
         self.tx_hash_recomputes = self.tx_hash_recomputes.wrapping_add(1);
         Arc::new(BlockTxHashes::compute(block))
+    }
+
+    /// The classification of the transactions of a block about to be
+    /// connected: the one the processing call filed when `block` is the
+    /// very allocation it was filed with (the pointers are compared, as
+    /// in [`Self::tx_hashes_for`]), and a fresh one for any other block.
+    fn tx_types_for(&self, block: &Arc<MsgBlock>) -> Arc<BlockTxTypes> {
+        self.accepted_block_tx_types(block)
+            .unwrap_or_else(|| Arc::new(BlockTxTypes::compute(block)))
+    }
+
+    /// The classification of the block's transactions when `block` is the
+    /// very allocation the processing call filed its hashes with (the
+    /// pointers are compared, as in [`Self::tx_hashes_for`]): the one that
+    /// call made from this block.  `None` for any other block, which the
+    /// contextual checks classify themselves.
+    fn accepted_block_tx_types(&self, block: &Arc<MsgBlock>) -> Option<Arc<BlockTxTypes>> {
+        match &self.accepted_tx_hashes {
+            Some((accepted, _, _, _, tx_types)) if Arc::ptr_eq(accepted, block) => {
+                Some(Arc::clone(tx_types))
+            }
+            _ => None,
+        }
     }
 
     /// The hash of the block's header when `block` is the very
@@ -6216,7 +6297,9 @@ impl Chain {
     /// its hash is needed.
     fn accepted_block_hash(&self, block: &Arc<MsgBlock>) -> Option<Hash> {
         match &self.accepted_tx_hashes {
-            Some((accepted, _, block_hash, _)) if Arc::ptr_eq(accepted, block) => Some(*block_hash),
+            Some((accepted, _, block_hash, _, _)) if Arc::ptr_eq(accepted, block) => {
+                Some(*block_hash)
+            }
             _ => None,
         }
     }
@@ -6229,7 +6312,7 @@ impl Chain {
     /// contextual checks then count it themselves.
     fn accepted_block_sig_ops(&self, block: &Arc<MsgBlock>) -> Option<BlockSigOps> {
         match &self.accepted_tx_hashes {
-            Some((accepted, _, _, sig_ops)) if Arc::ptr_eq(accepted, block) => *sig_ops,
+            Some((accepted, _, _, sig_ops, _)) if Arc::ptr_eq(accepted, block) => *sig_ops,
             _ => None,
         }
     }
@@ -8842,8 +8925,10 @@ fn agenda_without_deployment_error(agenda_id: &str) -> RuleError {
 /// candidate over its parent branch (the dcrd `checkBlockContext` calls
 /// in `maybeAcceptBlocks` and the reorg attach loop), consulting and
 /// updating the chain's recent merkle checks.  `block_hash` is the hash
-/// of the block's header when the caller holds it, and `sig_ops` the
-/// block's counts of signature operations when it arrived with them.
+/// of the block's header when the caller holds it, `sig_ops` the block's
+/// counts of signature operations when it arrived with them, and
+/// `tx_types` the classification of its transactions when the caller
+/// holds it.
 #[allow(clippy::too_many_arguments)]
 fn check_block_context_for(
     store: &NodeStore,
@@ -8851,6 +8936,7 @@ fn check_block_context_for(
     block: &MsgBlock,
     block_hash: Option<&Hash>,
     sig_ops: Option<&BlockSigOps>,
+    tx_types: Option<&BlockTxTypes>,
     parent_stake_node: &StakeNode,
     fast_add: bool,
     merkle_checks: &mut LruHashSet,
@@ -8866,6 +8952,7 @@ fn check_block_context_for(
         block,
         block_hash,
         sig_ops,
+        tx_types,
         prev_height,
         fast_add,
         false,
@@ -10621,7 +10708,8 @@ mod tests {
     /// header -- so the same block hash -- and other transactions, and
     /// not for another block.  Nothing is keyed by block hash.  The
     /// block hash filed with them is handed out by the same rule, and so
-    /// are the counts of signature operations filed with them.
+    /// are the counts of signature operations and the classification of
+    /// the transactions filed with them.
     #[test]
     fn hashes_are_only_reused_for_the_very_block_they_were_filed_with() {
         let params = dcroxide_chaincfg::regnet_params();
@@ -10646,11 +10734,13 @@ mod tests {
         let arc_a = Arc::new(a.clone());
         let hash_a = a.header.block_hash();
         let counts_a = BlockSigOps::compute(&a);
+        let types_a = Arc::new(BlockTxTypes::compute(&a));
         chain.accepted_tx_hashes = Some((
             Arc::clone(&arc_a),
             Arc::clone(&filed),
             hash_a,
             Some(counts_a),
+            Arc::clone(&types_a),
         ));
 
         // The very allocation: the filed hashes, and nothing is hashed.
@@ -10664,15 +10754,33 @@ mod tests {
             headers_hashed
         );
         assert_eq!(chain.accepted_block_sig_ops(&arc_a), Some(counts_a));
+        let classified = crate::blockhashes::BLOCKS_CLASSIFIED.get();
+        let types = chain.accepted_block_tx_types(&arc_a).expect("filed types");
+        assert!(Arc::ptr_eq(&types, &types_a));
+        assert!(Arc::ptr_eq(&chain.tx_types_for(&arc_a), &types_a));
+        assert_eq!(crate::blockhashes::BLOCKS_CLASSIFIED.get(), classified);
 
         // An equal block in another allocation: equal hashes, computed
-        // again, and no block hash is handed out for it.
+        // again, and no block hash is handed out for it, nor the filed
+        // classification: the connect classifies it again.
         let got = chain.tx_hashes_for(&Arc::new(a.clone()));
         assert!(!Arc::ptr_eq(&got, &filed));
         assert_eq!(*got, *filed);
         assert_eq!(chain.tx_hash_recomputes, 1);
         assert_eq!(chain.accepted_block_hash(&Arc::new(a.clone())), None);
         assert_eq!(chain.accepted_block_sig_ops(&Arc::new(a.clone())), None);
+        assert!(
+            chain
+                .accepted_block_tx_types(&Arc::new(a.clone()))
+                .is_none()
+        );
+        let types = chain.tx_types_for(&Arc::new(a.clone()));
+        assert!(!Arc::ptr_eq(&types, &types_a));
+        assert_eq!(*types, *types_a);
+        assert_eq!(
+            crate::blockhashes::BLOCKS_CLASSIFIED.get(),
+            classified.wrapping_add(1)
+        );
 
         // The same header, hence the same block hash, over one stake
         // transaction fewer.
@@ -10695,7 +10803,11 @@ mod tests {
         assert_ne!(*got, *filed);
         assert_eq!(chain.tx_hash_recomputes, 3);
         assert_eq!(chain.accepted_block_hash(&Arc::new(altered.clone())), None);
-        assert_eq!(chain.accepted_block_sig_ops(&Arc::new(altered)), None);
+        assert_eq!(
+            chain.accepted_block_sig_ops(&Arc::new(altered.clone())),
+            None
+        );
+        assert!(chain.accepted_block_tx_types(&Arc::new(altered)).is_none());
 
         // Another block.
         let got = chain.tx_hashes_for(&Arc::new(b.clone()));
@@ -10703,16 +10815,32 @@ mod tests {
         assert_eq!(chain.tx_hash_recomputes, 4);
         assert_eq!(chain.accepted_block_hash(&Arc::new(b.clone())), None);
         assert_eq!(chain.accepted_block_sig_ops(&Arc::new(b.clone())), None);
+        assert!(
+            chain
+                .accepted_block_tx_types(&Arc::new(b.clone()))
+                .is_none()
+        );
+        assert_eq!(
+            *chain.tx_types_for(&Arc::new(b.clone())),
+            BlockTxTypes::compute(&b)
+        );
 
         // None of that disturbed the slot.
         assert!(Arc::ptr_eq(&chain.tx_hashes_for(&arc_a), &filed));
         assert_eq!(chain.tx_hash_recomputes, 4);
         assert_eq!(chain.accepted_block_hash(&arc_a), Some(hash_a));
         assert_eq!(chain.accepted_block_sig_ops(&arc_a), Some(counts_a));
+        assert!(Arc::ptr_eq(&chain.tx_types_for(&arc_a), &types_a));
 
         // Hashes filed for a block that arrived without counts hand out
         // none, for that very allocation too.
-        chain.accepted_tx_hashes = Some((Arc::clone(&arc_a), Arc::clone(&filed), hash_a, None));
+        chain.accepted_tx_hashes = Some((
+            Arc::clone(&arc_a),
+            Arc::clone(&filed),
+            hash_a,
+            None,
+            Arc::clone(&types_a),
+        ));
         assert_eq!(chain.accepted_block_hash(&arc_a), Some(hash_a));
         assert_eq!(chain.accepted_block_sig_ops(&arc_a), None);
 
@@ -10724,6 +10852,8 @@ mod tests {
         assert_eq!(chain.tx_hash_recomputes, 5);
         assert_eq!(chain.accepted_block_hash(&arc_a), None);
         assert_eq!(chain.accepted_block_sig_ops(&arc_a), None);
+        assert!(chain.accepted_block_tx_types(&arc_a).is_none());
+        assert!(!Arc::ptr_eq(&chain.tx_types_for(&arc_a), &types_a));
     }
 
     /// The network's genesis block, and the hashes of a block with one
@@ -11473,6 +11603,7 @@ mod tests {
             0,
             &genesis,
             &wrong,
+            &BlockTxTypes::compute(&genesis),
             &genesis,
             || Ok(Vec::new()),
             &mut view,
@@ -11529,6 +11660,84 @@ mod tests {
                 }
             }
             assert_eq!(checked, 30);
+        }
+    }
+
+    /// A block that extends the tip has each of its transactions
+    /// classified exactly once by the whole call, into a `BlockTxTypes`,
+    /// with and without full validation, whether it arrives hashed or
+    /// not: the contextual checks made as it is accepted, the connect
+    /// checks, the connect of each transaction, the filter and the view
+    /// assertion all read the classification filed with its hashes.  A
+    /// block added without full validation, as in a bulk import and as the
+    /// ancestors of the assumed valid block are, is connected and has its
+    /// filter built from it too.
+    ///
+    /// The count is of every classification this crate makes
+    /// (`crate::blockhashes::classify_tx`), the filter build handed no
+    /// types included; those the debug assertions make to check a type
+    /// handed in, here and in the gcs crate's typed build, are not
+    /// counted.
+    #[test]
+    fn a_tip_extension_classifies_its_transactions_exactly_once() {
+        let params = dcroxide_chaincfg::regnet_params();
+        for (bulk_import, hashed) in [(false, false), (true, false), (false, true), (true, true)] {
+            let mut chain = Chain::new(&params, Hash::ZERO, false);
+            chain.bulk_import_mode = bulk_import;
+            let (mut now, mut checked, mut stake_txs) = (0, 0, 0);
+            for line in include_str!("../tests/data/fullblock_vectors.txt").lines() {
+                let f: Vec<&str> = line.split(' ').collect();
+                match f[0] {
+                    "now" => now = f[1].parse().expect("now"),
+                    "accept" if f[2] == "true" && checked < 30 => {
+                        let (block, _) =
+                            MsgBlock::from_bytes(&dcroxide_testutil::unhex(f[4])).expect("block");
+                        stake_txs += block.stransactions.len();
+                        let txs = (block.transactions.len() + block.stransactions.len()) as u64;
+                        let tip_before = chain.best_chain.tip();
+                        let block_hash = block.header.block_hash();
+                        let blocks_before = crate::blockhashes::BLOCKS_CLASSIFIED.get();
+                        let txs_before = crate::blockhashes::TXS_CLASSIFIED.get();
+                        let (_, errs) = if hashed {
+                            let hashed = HashedBlock::new(Arc::new(block));
+                            chain.process_hashed_block(&hashed, now, &params)
+                        } else {
+                            chain.process_block(&block, now, &params)
+                        };
+                        assert!(errs.is_empty(), "{}: {errs:?}", f[1]);
+                        let tip = chain.best_chain.tip().expect("tip");
+                        let tip_node = chain.store.node(tip);
+                        assert!(
+                            tip_node.hash == block_hash && tip_node.parent == tip_before,
+                            "{}: not a tip extension",
+                            f[1]
+                        );
+                        assert_eq!(
+                            crate::blockhashes::BLOCKS_CLASSIFIED
+                                .get()
+                                .wrapping_sub(blocks_before),
+                            1,
+                            "{} (bulk import: {bulk_import}, hashed: {hashed}): classified \
+                             other than once",
+                            f[1]
+                        );
+                        assert_eq!(
+                            crate::blockhashes::TXS_CLASSIFIED
+                                .get()
+                                .wrapping_sub(txs_before),
+                            txs,
+                            "{} (bulk import: {bulk_import}, hashed: {hashed}): a transaction \
+                             classified other than once",
+                            f[1]
+                        );
+                        checked += 1;
+                    }
+                    "accept" => break,
+                    _ => {}
+                }
+            }
+            assert_eq!(checked, 30);
+            assert!(stake_txs > 30, "the blocks have stake trees: {stake_txs}");
         }
     }
 
@@ -12124,6 +12333,7 @@ mod tests {
                     &block,
                     None,
                     carried,
+                    None,
                     &parent_stake_node,
                     false,
                     &mut LruHashSet::new(4),
@@ -12666,6 +12876,7 @@ mod tests {
                         case,
                         block_hash,
                         None,
+                        None,
                         &parent_stake_node,
                         false,
                         &mut merkle_checks,
@@ -12780,6 +12991,7 @@ mod tests {
             0,
             &genesis,
             &tx_hashes,
+            &BlockTxTypes::compute(&genesis),
             &genesis,
             || Ok(Vec::new()),
             &mut view,

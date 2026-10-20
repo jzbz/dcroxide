@@ -6,7 +6,7 @@ use alloc::vec::Vec;
 
 use dcroxide_chainhash::Hash;
 use dcroxide_stake as stake;
-use dcroxide_wire::{MsgBlock, OutPoint};
+use dcroxide_wire::{MsgBlock, MsgTx, OutPoint};
 
 use crate::{Error, FilterV2, KEY_SIZE};
 
@@ -190,8 +190,60 @@ pub trait PrevScripter {
 
 /// Build the version 2 block committed filter for the block per
 /// DCP0005 (dcrd `Regular`).
+///
+/// Each stake transaction is classified here
+/// (`dcroxide_stake::determine_tx_type`), as dcrd classifies it.  A
+/// caller that holds the classifications already hands them to
+/// [`regular_with_types`] instead.
 pub fn regular(
     block: &MsgBlock,
+    prev_scripts: &impl PrevScripter,
+) -> Result<FilterV2, RegularError> {
+    build(block, |_, tx| stake::determine_tx_type(tx), prev_scripts)
+}
+
+/// [`regular`] given the classification of each of the block's stake
+/// transactions, in block order: `stake_types[i]` must be
+/// `dcroxide_stake::determine_tx_type` of `block.stransactions[i]`.  The
+/// filter is [`regular`]'s, byte for byte.
+///
+/// dcrd classifies each stake transaction where it builds the filter
+/// (`blockcf2.go`'s `Regular`) and again at each other step of a block's
+/// connect that reads the type.  The chain classifies each once per
+/// block instead and hands the types to every step that reads them.
+///
+/// # Panics
+///
+/// When `stake_types` is not one type per stake transaction of the
+/// block, in every build: a short list would leave transactions out of
+/// the filter.  Under debug assertions also when a type is not that
+/// transaction's.
+pub fn regular_with_types(
+    block: &MsgBlock,
+    stake_types: &[stake::TxType],
+    prev_scripts: &impl PrevScripter,
+) -> Result<FilterV2, RegularError> {
+    assert_eq!(
+        stake_types.len(),
+        block.stransactions.len(),
+        "stake transaction types are not one per stake transaction of the block"
+    );
+    debug_assert!(
+        block
+            .stransactions
+            .iter()
+            .zip(stake_types)
+            .all(|(tx, tx_type)| stake::determine_tx_type(tx) == *tx_type),
+        "stake transaction types do not match the block's stake transactions"
+    );
+    build(block, |i, _| stake_types[i], prev_scripts)
+}
+
+/// The body of [`regular`] and [`regular_with_types`]: `stake_type`
+/// gives the classification of the stake transaction at each index.
+fn build(
+    block: &MsgBlock,
+    stake_type: impl Fn(usize, &MsgTx) -> stake::TxType,
     prev_scripts: &impl PrevScripter,
 ) -> Result<FilterV2, RegularError> {
     // Room for at least one output and one input per regular
@@ -242,8 +294,8 @@ pub fn regular(
     }
 
     // Stake tree.
-    for tx in &block.stransactions {
-        match stake::determine_tx_type(tx) {
+    for (i, tx) in block.stransactions.iter().enumerate() {
+        match stake_type(i, tx) {
             stake::TxType::SStx => {
                 for (tx_in_idx, tx_in) in tx.tx_in.iter().enumerate() {
                     let prev_out = &tx_in.previous_out_point;

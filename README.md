@@ -17,7 +17,7 @@ JSON-RPC/websocket server, the tool commands, the pipe IPC lifecycle,
 and the Windows service wrapper. The deliberate non-ports are small
 and documented in PARITY.md (Go GC tuning, the pprof servers, UPnP,
 the Windows event log, and the wallet-side mixclient). The test suite
-runs 2,563 tests across 444 suites on Linux, most differential against
+runs 2,567 tests across 444 suites on Linux, most differential against
 dcrd itself or replaying sessions generated inside dcrd's own packages.
 
 Since the surface completed, four rounds of work have landed on it. A
@@ -85,15 +85,24 @@ bench ledger, "One commit thread for the life of the store, a sync that
 checks every script, and dcrd v2.1.7"). One of those syncs, from the
 loopback server with `--assumevalid=0`, validated every block in full,
 script checks included, and ended with that same UTXO set and the same
-block files: a build whose code is the code as it stands but for tests
-and comments accepted every block of mainnet's chain up to 1,116,035
-with each one validated in full.
+block files: a build whose code is that of `797a213` but for a doc
+comment and a test's local name accepted every block of mainnet's chain
+up to 1,116,035 with each one validated in full.
 On the evening of 2026-10-19 a release build of the tree of `797a213`,
 which holds every commit above, was put to blocks in six syncs from the
 LAN server, each of which validated in full only the blocks after the
 assume-valid block and had dcrd's block at height 1,116,035 (the bench
 ledger, "Where `797a213`'s block thread waits, a deeper read-ahead and a
 rung of four changes").
+Of the commits after `797a213`, one changes the node's code beyond tests
+and comments: it classifies a block's transactions once for every step
+that reads their types, among them checks that apply the consensus
+rules, and changes no rule. In syncs it has been put to blocks only in a
+build made from a worktree that also holds three other changes, R1 of
+that section: in four from the LAN server, each of which validated in
+full only the blocks after the assume-valid block and had dcrd's block
+at height 1,116,035, and in one from the loopback server that ended with
+that same UTXO set and the same block files.
 That the rules reject what dcrd's reject rests on the test batteries
 described below, not on a sync, and none of it says the node is safe to
 operate. **Do not expose it to the internet and do not use it with
@@ -470,7 +479,7 @@ work). Currently implemented:
 
 ## Performance
 
-On 2026-10-19 a build of the code as it stands synced mainnet from
+On 2026-10-19 a build of the code of `797a213` synced mainnet from
 genesis to block 1,116,035 in a mean of **4.5 minutes** over four runs
 at the defaults, where dcrd v2.1.7 took **50.2 and 50.6 minutes** in two
 runs of the same session: dcroxide was **11.13x as fast** by the means,
@@ -499,17 +508,17 @@ ledger](docs/bench-ledger.md), a 16-core desktop with one encrypted NVMe
 drive under btrfs and transparent huge pages at `madvise`, from a live
 dcrd v2.1.7 node following the network, about 0.3 ms away. The dcroxide
 build is the ledger's K, made from a worktree before its code was
-committed: its code differs from the code as it stands only in tests and
-comments, which a release build does not contain. The runs went one at a
-time in two queues (the ledger has the order), each after a `sync`,
-300 s idle and a quiet check, the first of each queue after the check
-alone; none was marked disturbed, and dcroxide's flush log was on in
-all, at a cost not measured. The clock runs from the node's start to the
-first once-a-second `getblockcount` poll at or past 1,116,035, which
-came 4 to 1,818 blocks past it. CPU time is the node process's, without
-the kernel threads that encrypt and write back its bytes, and peak
-memory is `VmHWM`, both read when the clock stops, with the node still
-syncing.
+committed: its code differs from that of `797a213` only by a doc comment
+and a test's local name, which a release build does not contain. The
+runs went one at a time in two queues (the ledger has the order), each
+after a `sync`, 300 s idle and a quiet check, the first of each queue
+after the check alone; none was marked disturbed, and dcroxide's flush
+log was on in all, at a cost not measured. The clock runs from the
+node's start to the first once-a-second `getblockcount` poll at or past
+1,116,035, which came 4 to 1,818 blocks past it. CPU time is the node
+process's, without the kernel threads that encrypt and write back its
+bytes, and peak memory is `VmHWM`, both read when the clock stops, with
+the node still syncing.
 
 **The background commit.** Since `02b802c` most metadata commits run on
 a thread of their own, and since 2026-10-19 that thread, `dbcommit`,

@@ -336,10 +336,16 @@ impl UtxoView {
     /// The unspendable test comes before the ticket minimal outputs
     /// are built, so an unspendable output costs no serialization, as
     /// in dcrd since `248a9d40`.
+    ///
+    /// `tx_type` is `dcroxide_stake::determine_tx_type` of the
+    /// transaction, which dcrd computes here: the public callers classify
+    /// the transaction, and the block connect hands in the type its
+    /// `BlockTxTypes` holds.
     #[allow(clippy::too_many_arguments)]
     fn add_tx_outs_internal(
         &mut self,
         tx: &MsgTx,
+        tx_type: TxType,
         tx_hash: &Hash,
         start: u32,
         end: u32,
@@ -347,9 +353,13 @@ impl UtxoView {
         block_index: u32,
         is_treasury_enabled: bool,
     ) {
+        debug_assert_eq!(
+            tx_type,
+            dcroxide_stake::determine_tx_type(tx),
+            "the type handed in is not the transaction's"
+        );
         let is_coin_base = dcroxide_standalone::is_coin_base_tx(tx, is_treasury_enabled);
         let has_expiry = tx.expiry != dcroxide_wire::NO_EXPIRY_VALUE;
-        let tx_type = dcroxide_stake::determine_tx_type(tx);
         let tree: i8 = if tx_type != TxType::Regular { 1 } else { 0 };
         let flags = encode_utxo_flags(is_coin_base, has_expiry, tx_type);
         for tx_out_idx in start..end {
@@ -436,6 +446,7 @@ impl UtxoView {
         )]
         self.add_tx_outs_internal(
             tx,
+            crate::blockhashes::classify_tx(tx),
             tx_hash,
             tx_out_idx,
             tx_out_idx + 1,
@@ -474,8 +485,31 @@ impl UtxoView {
         block_index: u32,
         is_treasury_enabled: bool,
     ) {
+        self.add_tx_outs_typed(
+            tx,
+            crate::blockhashes::classify_tx(tx),
+            tx_hash,
+            block_height,
+            block_index,
+            is_treasury_enabled,
+        );
+    }
+
+    /// [`Self::add_tx_outs_with_hash`] given the transaction's type, which
+    /// must be `dcroxide_stake::determine_tx_type` of this very
+    /// transaction.
+    fn add_tx_outs_typed(
+        &mut self,
+        tx: &MsgTx,
+        tx_type: TxType,
+        tx_hash: &Hash,
+        block_height: i64,
+        block_index: u32,
+        is_treasury_enabled: bool,
+    ) {
         self.add_tx_outs_internal(
             tx,
+            tx_type,
             tx_hash,
             0,
             tx.tx_out.len() as u32,
@@ -502,6 +536,36 @@ impl UtxoView {
         tx_hash: &Hash,
         block_height: i64,
         block_index: u32,
+        stxos: Option<&mut Vec<SpentTxOut>>,
+        is_treasury_enabled: bool,
+    ) {
+        self.connect_stake_transaction_typed(
+            tx,
+            crate::blockhashes::classify_tx(tx),
+            tx_hash,
+            block_height,
+            block_index,
+            stxos,
+            is_treasury_enabled,
+        );
+    }
+
+    /// [`Self::connect_stake_transaction`] given the transaction's type,
+    /// which must be `dcroxide_stake::determine_tx_type` of this very
+    /// transaction, for the outputs it adds: the block connect checks
+    /// hand in the type their block's `BlockTxTypes` holds.
+    ///
+    /// # Panics
+    ///
+    /// As [`Self::connect_stake_transaction`] does.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn connect_stake_transaction_typed(
+        &mut self,
+        tx: &MsgTx,
+        tx_type: TxType,
+        tx_hash: &Hash,
+        block_height: i64,
+        block_index: u32,
         mut stxos: Option<&mut Vec<SpentTxOut>>,
         is_treasury_enabled: bool,
     ) {
@@ -511,7 +575,14 @@ impl UtxoView {
         }
         // Treasury spends source from the treasury account.
         if is_treasury_enabled && dcroxide_stake::is_tspend(tx) {
-            self.add_tx_outs_with_hash(tx, tx_hash, block_height, block_index, is_treasury_enabled);
+            self.add_tx_outs_typed(
+                tx,
+                tx_type,
+                tx_hash,
+                block_height,
+                block_index,
+                is_treasury_enabled,
+            );
             return;
         }
         let is_vote = dcroxide_stake::is_ssgen(tx);
@@ -537,7 +608,14 @@ impl UtxoView {
             }
             entry.spend();
         }
-        self.add_tx_outs_with_hash(tx, tx_hash, block_height, block_index, is_treasury_enabled);
+        self.add_tx_outs_typed(
+            tx,
+            tx_type,
+            tx_hash,
+            block_height,
+            block_index,
+            is_treasury_enabled,
+        );
     }
 
     /// Connect every stake tree transaction of the block (dcrd
@@ -553,6 +631,33 @@ impl UtxoView {
         &mut self,
         block: &MsgBlock,
         stake_tx_hashes: &[Hash],
+        stxos: Option<&mut Vec<SpentTxOut>>,
+        is_treasury_enabled: bool,
+    ) {
+        self.connect_stake_transactions_typed(
+            block,
+            stake_tx_hashes,
+            None,
+            stxos,
+            is_treasury_enabled,
+        );
+    }
+
+    /// [`Self::connect_stake_transactions`] given the type of each stake
+    /// transaction when the caller holds them, which must be the block's
+    /// (`BlockTxTypes::stake`): the attach loop hands in the ones its
+    /// block's `BlockTxTypes` holds.  Without them each transaction is
+    /// classified as it is connected, as dcrd's `AddTxOuts` classifies it.
+    ///
+    /// # Panics
+    ///
+    /// As [`Self::connect_stake_transactions`] does, and on a list of
+    /// types that is not one per stake transaction.
+    pub(crate) fn connect_stake_transactions_typed(
+        &mut self,
+        block: &MsgBlock,
+        stake_tx_hashes: &[Hash],
+        stake_types: Option<&[TxType]>,
         mut stxos: Option<&mut Vec<SpentTxOut>>,
         is_treasury_enabled: bool,
     ) {
@@ -561,10 +666,22 @@ impl UtxoView {
             stake_tx_hashes.len(),
             "one hash per stake transaction"
         );
+        if let Some(stake_types) = stake_types {
+            assert_eq!(
+                block.stransactions.len(),
+                stake_types.len(),
+                "one type per stake transaction"
+            );
+        }
         let height = i64::from(block.header.height);
         for (i, (tx, tx_hash)) in block.stransactions.iter().zip(stake_tx_hashes).enumerate() {
-            self.connect_stake_transaction(
+            let tx_type = match stake_types {
+                Some(stake_types) => stake_types[i],
+                None => crate::blockhashes::classify_tx(tx),
+            };
+            self.connect_stake_transaction_typed(
                 tx,
+                tx_type,
                 tx_hash,
                 height,
                 i as u32,
@@ -592,11 +709,48 @@ impl UtxoView {
         tx_hash: &Hash,
         block_height: i64,
         block_index: u32,
+        stxos: Option<&mut Vec<SpentTxOut>>,
+        is_treasury_enabled: bool,
+    ) {
+        self.connect_regular_transaction_typed(
+            tx,
+            crate::blockhashes::classify_tx(tx),
+            tx_hash,
+            block_height,
+            block_index,
+            stxos,
+            is_treasury_enabled,
+        );
+    }
+
+    /// [`Self::connect_regular_transaction`] given the transaction's
+    /// type, which must be `dcroxide_stake::determine_tx_type` of this
+    /// very transaction, for the outputs it adds: the block connect
+    /// checks hand in the type their block's `BlockTxTypes` holds.
+    ///
+    /// # Panics
+    ///
+    /// As [`Self::connect_regular_transaction`] does.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn connect_regular_transaction_typed(
+        &mut self,
+        tx: &MsgTx,
+        tx_type: TxType,
+        tx_hash: &Hash,
+        block_height: i64,
+        block_index: u32,
         mut stxos: Option<&mut Vec<SpentTxOut>>,
         is_treasury_enabled: bool,
     ) {
         if dcroxide_standalone::is_coin_base_tx(tx, is_treasury_enabled) {
-            self.add_tx_outs_with_hash(tx, tx_hash, block_height, block_index, is_treasury_enabled);
+            self.add_tx_outs_typed(
+                tx,
+                tx_type,
+                tx_hash,
+                block_height,
+                block_index,
+                is_treasury_enabled,
+            );
             return;
         }
         for tx_in in &tx.tx_in {
@@ -624,7 +778,14 @@ impl UtxoView {
                 entry.state |= UTXO_STATE_SPENT_BY_ZERO_CONF;
             }
         }
-        self.add_tx_outs_with_hash(tx, tx_hash, block_height, block_index, is_treasury_enabled);
+        self.add_tx_outs_typed(
+            tx,
+            tx_type,
+            tx_hash,
+            block_height,
+            block_index,
+            is_treasury_enabled,
+        );
     }
 
     /// Connect every regular tree transaction of the block, marking the
@@ -643,6 +804,34 @@ impl UtxoView {
         &mut self,
         block: &MsgBlock,
         regular_tx_hashes: &[Hash],
+        stxos: Option<&mut Vec<SpentTxOut>>,
+        is_treasury_enabled: bool,
+    ) {
+        self.connect_regular_transactions_typed(
+            block,
+            regular_tx_hashes,
+            None,
+            stxos,
+            is_treasury_enabled,
+        );
+    }
+
+    /// [`Self::connect_regular_transactions`] given the type of each
+    /// regular transaction when the caller holds them, which must be the
+    /// block's (`BlockTxTypes::regular`): the attach loop hands in the
+    /// ones its block's `BlockTxTypes` holds.  Without them each
+    /// transaction is classified as it is connected, as dcrd's
+    /// `AddTxOuts` classifies it.
+    ///
+    /// # Panics
+    ///
+    /// As [`Self::connect_regular_transactions`] does, and on a list of
+    /// types that is not one per regular transaction.
+    pub(crate) fn connect_regular_transactions_typed(
+        &mut self,
+        block: &MsgBlock,
+        regular_tx_hashes: &[Hash],
+        regular_types: Option<&[TxType]>,
         mut stxos: Option<&mut Vec<SpentTxOut>>,
         is_treasury_enabled: bool,
     ) {
@@ -651,10 +840,22 @@ impl UtxoView {
             regular_tx_hashes.len(),
             "one hash per regular transaction"
         );
+        if let Some(regular_types) = regular_types {
+            assert_eq!(
+                block.transactions.len(),
+                regular_types.len(),
+                "one type per regular transaction"
+            );
+        }
         let height = i64::from(block.header.height);
         for (i, (tx, tx_hash)) in block.transactions.iter().zip(regular_tx_hashes).enumerate() {
-            self.connect_regular_transaction(
+            let tx_type = match regular_types {
+                Some(regular_types) => regular_types[i],
+                None => crate::blockhashes::classify_tx(tx),
+            };
+            self.connect_regular_transaction_typed(
                 tx,
+                tx_type,
                 tx_hash,
                 height,
                 i as u32,
@@ -708,7 +909,7 @@ impl UtxoView {
             let tx = &transactions[tx_idx];
             let tx_hash = tx_hashes[tx_idx];
             let tx_type = if stake_tree {
-                dcroxide_stake::determine_tx_type(tx)
+                crate::blockhashes::classify_tx(tx)
             } else {
                 TxType::Regular
             };
@@ -1140,17 +1341,23 @@ impl UtxoView {
     /// as dcrd's commit gives the reason: there is no recovering from a
     /// view that violates them, and processing more blocks over it could
     /// corrupt the utxo set.  The texts are dcrd's.
+    ///
+    /// Each stake transaction's type is read from `tx_types`, which must
+    /// be this very block's, where dcrd classifies each stake transaction
+    /// twice, once for its inputs and once for its outputs.
     pub(crate) fn assert_block_utxo_view(
         &self,
         params: &Params,
         block: &MsgBlock,
         tx_hashes: &crate::blockhashes::BlockTxHashes,
+        tx_types: &crate::blockhashes::BlockTxTypes,
         is_treasury_enabled: bool,
     ) {
         self.assert_block_utxo_view_with(
             &sbss_violation_lookup(params),
             block,
             tx_hashes,
+            tx_types,
             is_treasury_enabled,
         );
     }
@@ -1162,9 +1369,11 @@ impl UtxoView {
         sbss_violation: &impl Fn(i64) -> Option<Hash>,
         block: &MsgBlock,
         tx_hashes: &crate::blockhashes::BlockTxHashes,
+        tx_types: &crate::blockhashes::BlockTxTypes,
         is_treasury_enabled: bool,
     ) {
         tx_hashes.assert_for(block);
+        tx_types.assert_for(block);
         let height = i64::from(block.header.height);
         // The header is hashed only for a panic's text.
         let block_hash = || block.header.block_hash();
@@ -1210,7 +1419,7 @@ impl UtxoView {
             let tree_name = if stake_tree { "stake" } else { "regular" };
             for (tx_idx, (tx, tx_hash)) in transactions.iter().zip(hashes).enumerate() {
                 let tx_type = if stake_tree {
-                    dcroxide_stake::determine_tx_type(tx)
+                    tx_types.stake()[tx_idx]
                 } else {
                     TxType::Regular
                 };
@@ -1317,7 +1526,7 @@ impl UtxoView {
             };
             for (tx_idx, (tx, tx_hash)) in transactions.iter().zip(hashes).enumerate() {
                 let tx_type = if stake_tree {
-                    dcroxide_stake::determine_tx_type(tx)
+                    tx_types.stake()[tx_idx]
                 } else {
                     TxType::Regular
                 };
@@ -1534,6 +1743,7 @@ impl UtxoView {
             params,
             block,
             &tx_hashes,
+            None,
             parent,
             parent_stxos,
             resolver,
@@ -1545,11 +1755,46 @@ impl UtxoView {
     /// [`Self::connect_block`] given the hashes of the block's
     /// transactions (dcrd `connectBlock` reading them from its
     /// `dcrutil.Block`), which must have been computed from this very
-    /// block.
+    /// block, and the classification of its transactions when the caller
+    /// holds it, which must be this very block's: the attach loop hands
+    /// in its block's `BlockTxTypes`, which the connect of each
+    /// transaction reads for the outputs it adds, where dcrd's
+    /// `AddTxOuts` classifies each transaction itself.  Without it each
+    /// transaction is classified as it is connected.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn connect_block_with_hashes(
         &mut self,
         params: &Params,
+        block: &MsgBlock,
+        tx_hashes: &crate::blockhashes::BlockTxHashes,
+        tx_types: Option<&crate::blockhashes::BlockTxTypes>,
+        parent: &MsgBlock,
+        parent_stxos: impl FnOnce() -> Result<Vec<SpentTxOut>, RuleError>,
+        resolver: &impl UtxoResolver,
+        stxos: Option<&mut Vec<SpentTxOut>>,
+        is_treasury_enabled: bool,
+    ) -> Result<(), RuleError> {
+        self.connect_block_with_lookup_typed(
+            &sbss_violation_lookup(params),
+            block,
+            tx_hashes,
+            tx_types,
+            parent,
+            parent_stxos,
+            resolver,
+            stxos,
+            is_treasury_enabled,
+        )
+    }
+
+    /// [`Self::connect_block_with_hashes`] over the given lookup of
+    /// the grandfathered same-block stake spends, classifying each
+    /// transaction as it is connected: the tests' way in.
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    fn connect_block_with_lookup(
+        &mut self,
+        sbss_violation: &impl Fn(i64) -> Option<Hash>,
         block: &MsgBlock,
         tx_hashes: &crate::blockhashes::BlockTxHashes,
         parent: &MsgBlock,
@@ -1558,10 +1803,11 @@ impl UtxoView {
         stxos: Option<&mut Vec<SpentTxOut>>,
         is_treasury_enabled: bool,
     ) -> Result<(), RuleError> {
-        self.connect_block_with_lookup(
-            &sbss_violation_lookup(params),
+        self.connect_block_with_lookup_typed(
+            sbss_violation,
             block,
             tx_hashes,
+            None,
             parent,
             parent_stxos,
             resolver,
@@ -1573,11 +1819,12 @@ impl UtxoView {
     /// [`Self::connect_block_with_hashes`] over the given lookup of
     /// the grandfathered same-block stake spends.
     #[allow(clippy::too_many_arguments)]
-    fn connect_block_with_lookup(
+    fn connect_block_with_lookup_typed(
         &mut self,
         sbss_violation: &impl Fn(i64) -> Option<Hash>,
         block: &MsgBlock,
         tx_hashes: &crate::blockhashes::BlockTxHashes,
+        tx_types: Option<&crate::blockhashes::BlockTxTypes>,
         parent: &MsgBlock,
         parent_stxos: impl FnOnce() -> Result<Vec<SpentTxOut>, RuleError>,
         resolver: &impl UtxoResolver,
@@ -1585,6 +1832,9 @@ impl UtxoView {
         is_treasury_enabled: bool,
     ) -> Result<(), RuleError> {
         tx_hashes.assert_for(block);
+        if let Some(tx_types) = tx_types {
+            tx_types.assert_for(block);
+        }
         if !crate::validate::header_approves_parent(&block.header) {
             let parent_stxos = parent_stxos()?;
             self.disconnect_disapproved_block(
@@ -1601,13 +1851,20 @@ impl UtxoView {
             is_treasury_enabled,
         );
         self.fetch_input_utxos(block, tx_hashes.regular(), resolver, is_treasury_enabled);
-        self.connect_stake_transactions(
+        self.connect_stake_transactions_typed(
             block,
             tx_hashes.stake(),
+            tx_types.map(crate::blockhashes::BlockTxTypes::stake),
             stxos.as_deref_mut(),
             is_treasury_enabled,
         );
-        self.connect_regular_transactions(block, tx_hashes.regular(), stxos, is_treasury_enabled);
+        self.connect_regular_transactions_typed(
+            block,
+            tx_hashes.regular(),
+            tx_types.map(crate::blockhashes::BlockTxTypes::regular),
+            stxos,
+            is_treasury_enabled,
+        );
         self.set_best_hash(block.header.block_hash());
         Ok(())
     }
@@ -3350,7 +3607,13 @@ mod tests {
     ) -> Option<String> {
         let tx_hashes = crate::blockhashes::BlockTxHashes::compute(block);
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            view.assert_block_utxo_view_with(&no_violation, block, &tx_hashes, is_treasury_enabled);
+            view.assert_block_utxo_view_with(
+                &no_violation,
+                block,
+                &tx_hashes,
+                &crate::blockhashes::BlockTxTypes::compute(block),
+                is_treasury_enabled,
+            );
         }))
         .err()
         .map(|payload| {
@@ -3983,11 +4246,12 @@ mod tests {
         )
         .expect("connect");
 
-        view.assert_block_utxo_view_with(&lookup, &block, &tx_hashes, false);
+        let tx_types = crate::blockhashes::BlockTxTypes::compute(&block);
+        view.assert_block_utxo_view_with(&lookup, &block, &tx_hashes, &tx_types, false);
 
         let ticket = tx_hashes.stake()[0];
         let text = panic_text(|| {
-            view.assert_block_utxo_view_with(&no_violation, &block, &tx_hashes, false);
+            view.assert_block_utxo_view_with(&no_violation, &block, &tx_hashes, &tx_types, false);
         });
         assert_eq!(
             text,
@@ -4014,7 +4278,13 @@ mod tests {
         let spend_hashes = crate::blockhashes::BlockTxHashes::compute(&regular_spend);
         let spender = spend_hashes.regular()[2];
         let text = panic_text(|| {
-            view.assert_block_utxo_view_with(&lookup, &regular_spend, &spend_hashes, false);
+            view.assert_block_utxo_view_with(
+                &lookup,
+                &regular_spend,
+                &spend_hashes,
+                &crate::blockhashes::BlockTxTypes::compute(&regular_spend),
+                false,
+            );
         });
         assert_eq!(
             text,
@@ -4037,7 +4307,13 @@ mod tests {
         let changed_hashes = crate::blockhashes::BlockTxHashes::compute(&changed);
         let changed_ticket = changed_hashes.stake()[0];
         let text = panic_text(|| {
-            view.assert_block_utxo_view_with(&lookup, &changed, &changed_hashes, false);
+            view.assert_block_utxo_view_with(
+                &lookup,
+                &changed,
+                &changed_hashes,
+                &crate::blockhashes::BlockTxTypes::compute(&changed),
+                false,
+            );
         });
         assert_eq!(
             text,
@@ -4074,7 +4350,13 @@ mod tests {
         let changed_hashes = crate::blockhashes::BlockTxHashes::compute(&changed);
         let changed_ticket = changed_hashes.stake()[0];
         let text = panic_text(|| {
-            stake_view.assert_block_utxo_view_with(&lookup, &changed, &changed_hashes, false);
+            stake_view.assert_block_utxo_view_with(
+                &lookup,
+                &changed,
+                &changed_hashes,
+                &crate::blockhashes::BlockTxTypes::compute(&changed),
+                false,
+            );
         });
         assert_eq!(
             text,

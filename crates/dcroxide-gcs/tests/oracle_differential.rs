@@ -3,7 +3,9 @@
 //! the oracle, over random entry sets and keys for both filter
 //! versions (serialization, hashes, and match verdicts), and DCP0005
 //! version 2 block filters over structured blocks with real stake
-//! transactions and randomized previous-script sets.
+//! transactions and randomized previous-script sets.  With no oracle,
+//! and over blocks from the same generator drawn with a seed of their
+//! own, `blockcf2::regular_with_types` is held to `blockcf2::regular`.
 
 // Test-harness arithmetic over bounded lengths.
 #![allow(clippy::arithmetic_side_effects)]
@@ -434,6 +436,135 @@ fn build_regular(rng: &mut SplitMix64, coinbase: bool) -> MsgTx {
     tx
 }
 
+/// A block of a coinbase and up to three more regular transactions, and
+/// up to three stake transactions of any kind.
+fn random_block(rng: &mut SplitMix64, params: &dcroxide_chaincfg::Params) -> MsgBlock {
+    let mut raw_header = [0u8; 180];
+    rng.fill(&mut raw_header);
+    let (mut header, _) = BlockHeader::from_bytes(&raw_header).expect("header");
+
+    let mut transactions = vec![build_regular(rng, true)];
+    for _ in 0..rng.below(3) {
+        transactions.push(build_regular(rng, false));
+    }
+    let mut stransactions = Vec::new();
+    for _ in 0..rng.below(4) {
+        stransactions.push(match rng.below(4) {
+            0 => build_ticket(rng, params),
+            1 => build_vote(rng, params),
+            2 => build_revocation(rng, params),
+            _ => build_treasury(rng, params),
+        });
+    }
+    header.fresh_stake = stransactions.len() as u8;
+    MsgBlock {
+        header,
+        transactions,
+        stransactions,
+    }
+}
+
+/// Previous scripts for every input in the block; occasionally one is
+/// dropped, to exercise the missing-script error.
+///
+/// Ordered, not hashed: both the dropped key and the oracle request's
+/// field order are read straight out of this map, and under a `HashMap`
+/// both would follow `RandomState`, which the seed printed by
+/// `from_entropy` does not capture.  A failure would then be
+/// unreproducible from its own seed.
+fn random_prevs(
+    rng: &mut SplitMix64,
+    block: &MsgBlock,
+) -> BTreeMap<(Hash, u32, i8), (u16, Vec<u8>)> {
+    let mut prevs: BTreeMap<(Hash, u32, i8), (u16, Vec<u8>)> = BTreeMap::new();
+    for tx in block
+        .transactions
+        .iter()
+        .skip(1)
+        .chain(&block.stransactions)
+    {
+        for tx_in in &tx.tx_in {
+            let op = &tx_in.previous_out_point;
+            prevs.insert((op.hash, op.index, op.tree), random_prev_script(rng));
+        }
+    }
+    let drop_one = rng.below(8) == 0 && !prevs.is_empty();
+    if drop_one {
+        let key = *prevs.keys().next().expect("non-empty");
+        prevs.remove(&key);
+    }
+    prevs
+}
+
+/// What a build returned, as the differential below compares it: the
+/// filter's key, bytes, entry count and hash, or the missing-script
+/// error alone.
+fn built(block: &MsgBlock, result: Result<FilterV2, blockcf2::RegularError>) -> String {
+    match result {
+        Ok(f) => format!(
+            "key={}\nbytes={}\nn={}\nhash={}\n",
+            hex(&blockcf2::key(&block.header.merkle_root)),
+            hex(f.bytes()),
+            f.n(),
+            f.hash()
+        ),
+        Err(blockcf2::RegularError::PrevScript(e)) => format!("prevscripterror: {e}"),
+        Err(e) => panic!("unexpected error: {e:?}"),
+    }
+}
+
+/// The build handed each stake transaction's type
+/// (`blockcf2::regular_with_types`) is the build that classifies them
+/// (`blockcf2::regular`), filter or missing-script error and its text,
+/// over 600 blocks from the generator the differential below uses
+/// (`random_block`, `random_prevs`), drawn with a seed of their own, so
+/// not the blocks the differential hands dcrd.  Needs no oracle.
+#[test]
+fn the_typed_build_is_the_classifying_build() {
+    let mut rng = SplitMix64::from_entropy("gcs-blockcf2-typed");
+    let params = mainnet_params();
+    let (mut built_ok, mut missing, mut stake_txs) = (0, 0, 0);
+    for round in 0..600 {
+        let block = random_block(&mut rng, &params);
+        let prevs = MapPrevScripts(random_prevs(&mut rng, &block));
+        let types: Vec<dcroxide_stake::TxType> = block
+            .stransactions
+            .iter()
+            .map(dcroxide_stake::determine_tx_type)
+            .collect();
+        stake_txs += types.len();
+        let classifying = built(&block, blockcf2::regular(&block, &prevs));
+        let typed = built(&block, blockcf2::regular_with_types(&block, &types, &prevs));
+        assert_eq!(typed, classifying, "round {round}");
+        if classifying.starts_with("prevscripterror") {
+            missing += 1;
+        } else {
+            built_ok += 1;
+        }
+    }
+    assert!(
+        built_ok > 400 && missing > 10 && stake_txs > 600,
+        "{built_ok} built, {missing} missing a script, {stake_txs} stake transactions"
+    );
+}
+
+/// The typed build refuses a list of types that is not one per stake
+/// transaction, in every build.
+#[test]
+#[should_panic(expected = "stake transaction types are not one per stake transaction")]
+fn the_typed_build_refuses_types_of_another_shape() {
+    let mut rng = SplitMix64::from_entropy("gcs-blockcf2-typed-shape");
+    let params = mainnet_params();
+    let mut block = random_block(&mut rng, &params);
+    block.stransactions.push(build_ticket(&mut rng, &params));
+    let prevs = MapPrevScripts(random_prevs(&mut rng, &block));
+    let short: Vec<dcroxide_stake::TxType> = block.stransactions[1..]
+        .iter()
+        .map(dcroxide_stake::determine_tx_type)
+        .collect();
+    let _ = blockcf2::regular_with_types(&block, &short, &prevs);
+}
+
 #[test]
 fn blockcf2_differential() {
     let Some(mut oracle) = oracle_or_skip() else {
@@ -445,55 +576,8 @@ fn blockcf2_differential() {
     const ROUNDS: usize = 120;
     for round in 0..ROUNDS {
         // Build the block: a coinbase plus regular txs, plus stake txs.
-        let mut raw_header = [0u8; 180];
-        rng.fill(&mut raw_header);
-        let (mut header, _) = BlockHeader::from_bytes(&raw_header).expect("header");
-
-        let mut transactions = vec![build_regular(&mut rng, true)];
-        for _ in 0..rng.below(3) {
-            transactions.push(build_regular(&mut rng, false));
-        }
-        let mut stransactions = Vec::new();
-        for _ in 0..rng.below(4) {
-            stransactions.push(match rng.below(4) {
-                0 => build_ticket(&mut rng, &params),
-                1 => build_vote(&mut rng, &params),
-                2 => build_revocation(&mut rng, &params),
-                _ => build_treasury(&mut rng, &params),
-            });
-        }
-        header.fresh_stake = stransactions.len() as u8;
-        let block = MsgBlock {
-            header,
-            transactions,
-            stransactions,
-        };
-
-        // Previous scripts for every input in the block; occasionally
-        // drop one to exercise the missing-script error.
-        //
-        // Ordered, not hashed: both the dropped key below and the
-        // oracle request's field order are read straight out of this
-        // map, and under a `HashMap` both would follow `RandomState`,
-        // which the seed printed by `from_entropy` does not capture.
-        // A failure would then be unreproducible from its own seed.
-        let mut prevs: BTreeMap<(Hash, u32, i8), (u16, Vec<u8>)> = BTreeMap::new();
-        for tx in block
-            .transactions
-            .iter()
-            .skip(1)
-            .chain(&block.stransactions)
-        {
-            for tx_in in &tx.tx_in {
-                let op = &tx_in.previous_out_point;
-                prevs.insert((op.hash, op.index, op.tree), random_prev_script(&mut rng));
-            }
-        }
-        let drop_one = rng.below(8) == 0 && !prevs.is_empty();
-        if drop_one {
-            let key = *prevs.keys().next().expect("non-empty");
-            prevs.remove(&key);
-        }
+        let block = random_block(&mut rng, &params);
+        let prevs = random_prevs(&mut rng, &block);
 
         // Ours.
         let ours = match blockcf2::regular(&block, &MapPrevScripts(prevs.clone())) {

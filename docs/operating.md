@@ -193,7 +193,7 @@ them with a build made after them.
 Budget for it: on the one machine where a sync from genesis has been
 measured with the current layout, it took less time than dcrd did, and
 more disk. Each figure below is of the code named with it. A build of
-the code as it stands took a mean of 271.68 s over four runs at the
+the code of `797a213` took a mean of 271.68 s over four runs at the
 defaults on 2026-10-19, **4.5 minutes**, against 3,014.6 s and
 3,033.4 s, 50.2 and 50.6 minutes, for dcrd v2.1.7 in two runs of the
 same session, both syncing from a block server on another machine on the
@@ -371,31 +371,32 @@ included, ended with the same UTXO set and block files. The ledger's
 section "`88c46c3`, the background commit as committed, dcrd v2.1.7 and
 two preloaded allocators" has every run.
 
-On 2026-10-19, on m3, a build of the code as it stands, the ledger's K,
+On 2026-10-19, on m3, a build of the code of `797a213`, the ledger's K,
 was run from a block server on another machine on the same LAN, a live
 dcrd v2.1.7 node about 0.3 ms away that went on following the network,
 in a series of its own, not to be set beside the loopback figures above:
 from that server on 2026-10-18 `88c46c3` took 407.0 to 407.9 s, against
 391.1 to 397.8 s from the loopback one the day before. The build was
 made from a worktree before its code was committed, and its code differs
-from the code as it stands only in tests and comments. It took 270.7 s,
-271.5 s, 272.7 s and 271.8 s at the defaults, a mean of **4.5 minutes**
-(271.68 s), and dcrd v2.1.7 took 3,014.6 s and 3,033.4 s, so dcroxide
-was 11.13x as fast in one session by the means, 11.05x to 11.21x over
-the eight pairings. dcrd ran slower than from the same server on
-2026-10-18, where it took 2,991.4 s, for a cause not taken apart. With
-`--noexistsaddrindex` the build took 250.8 s and 249.6 s, and dcrd
-1,336.3 s in one run, 5.34x. The build's peak resident memory, read when
-the clock stopped with the node still syncing, was 2,456 to 2,470 MiB
-with the index on and 2,269 and 2,270 MiB with it off, against dcrd's
-1,836 MiB; nothing after the clock is recorded for these runs. Since the
-node goes on syncing from a live server, they record no end state
-either: in each the node's block at 1,116,035 was the one every loopback
-sync ends on, and two syncs of the build from the loopback server, at
-the defaults and with `--assumevalid=0` (below), ended with the UTXO set
-and block files of every full sync from that server since 2026-10-17.
-The ledger's section "One commit thread for the life of the store, a
-sync that checks every script, and dcrd v2.1.7" has every run.
+from that of `797a213` only by a doc comment and a test's local name. It
+took 270.7 s, 271.5 s, 272.7 s and 271.8 s at the defaults, a mean of
+**4.5 minutes** (271.68 s), and dcrd v2.1.7 took 3,014.6 s and
+3,033.4 s, so dcroxide was 11.13x as fast in one session by the means,
+11.05x to 11.21x over the eight pairings. dcrd ran slower than from the
+same server on 2026-10-18, where it took 2,991.4 s, for a cause not
+taken apart. With `--noexistsaddrindex` the build took 250.8 s and
+249.6 s, and dcrd 1,336.3 s in one run, 5.34x. The build's peak resident
+memory, read when the clock stopped with the node still syncing, was
+2,456 to 2,470 MiB with the index on and 2,269 and 2,270 MiB with it
+off, against dcrd's 1,836 MiB; nothing after the clock is recorded for
+these runs. Since the node goes on syncing from a live server, they
+record no end state either: in each the node's block at 1,116,035 was
+the one every loopback sync ends on, and two syncs of the build from the
+loopback server, at the defaults and with `--assumevalid=0` (below),
+ended with the UTXO set and block files of every full sync from that
+server since 2026-10-17. The ledger's section "One commit thread for the
+life of the store, a sync that checks every script, and dcrd v2.1.7" has
+every run.
 
 The rate falls as the chain grows, and falls again where full
 validation begins: by default both daemons skip connect validation,
@@ -412,12 +413,12 @@ blocks/s, and the two runs with the read-ahead, of the build before its
 review's fixes, reached it in 6.4 minutes and took 1.8, about 826 and
 815 blocks/s. On 2026-10-17 the four runs of `88c46c3` reached it in a
 median of 5.2 minutes and took 1.4 for the blocks after it, about
-1,096 blocks/s. On 2026-10-19 the four runs of a build of the code as it
-stands, from the LAN server, reached it in a mean of 3.5 minutes and
+1,096 blocks/s. On 2026-10-19 the four runs of a build of the code of
+`797a213`, from the LAN server, reached it in a mean of 3.5 minutes and
 took 1.0 for the blocks after it, about 1,505 blocks/s.) New blocks are
 past that point too, so a chain longer than the one measured should add
 time, on a machine like m3, at the rate of the code that is run: about
-1,505 blocks/s by the four runs of the code as it stands on 2026-10-19,
+1,505 blocks/s by the four runs of the code of `797a213` on 2026-10-19,
 about 1,096 by the four runs of `88c46c3` on 2026-10-17, about 586 by
 the three runs of 2026-10-11, about 727 by the one run of `540b203`, and
 about 820 by the two runs of the read-ahead build, which is not the
@@ -890,7 +891,7 @@ with it on (the sync budget above has that session). On 2026-10-17
 `88c46c3` took 343.9 s and 344.0 s with the index off against a median
 of 396.25 s over four with it on, so the index cost it 52.3 s, 13.2% of
 its sync, and its data directory was 2.0 GiB smaller. On 2026-10-19 a
-build of the code as it stands took 250.8 s and 249.6 s with the index
+build of the code of `797a213` took 250.8 s and 249.6 s with the index
 off against a mean of 271.68 s over four with it on, from a block server
 on the LAN, so the index cost it 21.5 s, 7.9% of its sync; those runs
 record no data directory's size.
@@ -961,7 +962,7 @@ took 351.3 s with the index off in one run, 69.9 s to 82.7 s less than
 each of its four clean runs with it on. On 2026-10-17 `88c46c3` took
 52.3 s less with the index off, two runs against four, 13.2% of its
 default sync (the sync budget above). On 2026-10-19, from the LAN
-server, a build of the code as it stands took 21.5 s less, two runs
+server, a build of the code of `797a213` took 21.5 s less, two runs
 against four, 7.9% of its default sync, and dcrd v2.1.7 1,687.7 s less
 in one run against two, 55.8% of its own (the sync budget above).
 
@@ -1020,7 +1021,7 @@ in one run against two, 55.8% of its own (the sync budget above).
   add to it is not resolved ([bench-ledger.md](bench-ledger.md), "Rungs
   from a block server on the LAN, two changes held for their memory, and
   dcrd v2.1.7"). On 2026-10-19, from the same server, a build of the
-  code as it stands, which has the filters, peaked at 2,456 to 2,470 MiB
+  code of `797a213`, which has the filters, peaked at 2,456 to 2,470 MiB
   in four runs with the index on and at 2,269 and 2,270 MiB in two with
   it off, read with the node still syncing (the sync budget above).
 - **Starting**: the node reads the journal back into memory before the
@@ -1103,7 +1104,7 @@ medians, 7.7% less and less in every pairing, at 32.3 s and 33.7 s more
 process CPU time and 205.5 and 254.5 MiB more peak resident memory to
 the tip, and both arms ended with the same UTXO set (the ledger's
 "`88c46c3`, the background commit as committed, dcrd v2.1.7 and two
-preloaded allocators"). On 2026-10-19 a build of the code as it stands,
+preloaded allocators"). On 2026-10-19 a build of the code of `797a213`,
 whose `dbcommit` thread writes each flush's rows as well as its commit
 and is kept for the life of the store, was measured against itself with
 the variable set, from a block server on another machine on the same
@@ -1145,7 +1146,7 @@ build with it peaked about 256 MiB higher to the tip than the same
 build without it (medians 3,533 and 3,277 MiB, four runs each), and
 its shutdown flush took it to 3.84 to 4.14 GiB by its flush log; the
 build without it was not read there. On 2026-10-19 a build of the code
-as it stands, whose `dbcommit` thread writes the rows as well and lives
+of `797a213`, whose `dbcommit` thread writes the rows as well and lives
 as long as the store, peaked lower with the commit on that thread than
 with `DCROXIDE_DB_SYNC_COMMIT=1` (above). `DCROXIDE_DB_OVERLAY=100`
 should put the overlay's part of the cadence back to about one commit
@@ -1563,7 +1564,7 @@ held. A flush that `Database::flush` or the close asks for commits on
 the thread that asked for it whatever the variable says, since it
 acknowledges durability. The default was measured on m3 only, on one
 NVMe drive under btrfs, where on 2026-10-19 it took a sync of a build of
-the code as it stands, from a block server on the LAN, from 350.40 s
+the code of `797a213`, from a block server on the LAN, from 350.40 s
 with the variable set to 271.68 s by the means, 22.5%, and peaked lower,
 at 2,456 to 2,470 MiB against 2,959 and 2,964 MiB when the clock
 stopped, for 893.7 to 902.9 s of process CPU time against 877.8 s and

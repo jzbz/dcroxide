@@ -42,7 +42,7 @@ assembles them end to end: config and CLI, the chain engine with full
 consensus validation, mempool and fee estimation, mining and the CPU miner, the
 P2P server with sync, relay, and StakeShuffle mixing message relay, the
 JSON-RPC/websocket server, the tool commands, the pipe IPC lifecycle, and the
-Windows service wrapper. The gate runs 2,563 tests across 444 suites on Linux,
+Windows service wrapper. The gate runs 2,567 tests across 444 suites on Linux,
 most of them differential against dcrd or replaying sessions generated inside dcrd's own
 packages. The parity target moved six times during the port, from
 `release-v2.1.5` to upstream master `452c1a6c` and then through `29f17894`,
@@ -93,7 +93,7 @@ What Phase 15 has covered so far:
   connect validation up to the assume-valid block, as dcrd's does; in 2026-08
   the replay harness drove mainnet's blocks up to 1,100,392 through full
   validation, and on 2026-10-10 every block up to 1,116,035 at `337779d`. On
-  2026-10-19 one sync of a build of the code as it stands with
+  2026-10-19 one sync of a build of the code of `797a213` with
   `--assumevalid=0` validated every block up to 1,116,035 in full and ended
   with the UTXO set and the block files of the default syncs.
 - **Performance campaign.** Storage-commit policy, the release build profile,
@@ -284,17 +284,17 @@ What Phase 15 has covered so far:
   and the same UTXO set by `gettxoutsetinfo`; the rest of the metadata
   store was not compared. The [bench ledger](docs/bench-ledger.md) has
   every run.
-- **On 2026-10-19 a build of the code as it stands, the bench ledger's
+- **On 2026-10-19 a build of the code of `797a213`, the bench ledger's
   K, took a mean of 271.68 s over four syncs against dcrd v2.1.7's
   3,014.6 s and 3,033.4 s, 11.13x in one session**, on m3 from a dcrd
   v2.1.7 node on another machine on the same LAN: a series of its own,
   not comparable with the loopback figures above. The build was made
   from a worktree before its code was committed, and its code differs
-  from the code as it stands only in tests and comments. With the
-  exists-address index off, 250.8 s and 249.6 s against one dcrd run of
-  1,336.3 s, 5.34x. Its peak resident memory, read when the clock
-  stopped with the node still syncing, was 2,456 to 2,470 MiB, against
-  dcrd's 1,836 MiB, and 2,959 and 2,964 MiB in two runs with
+  from that of `797a213` only by a doc comment and a test's local name.
+  With the exists-address index off, 250.8 s and 249.6 s against one
+  dcrd run of 1,336.3 s, 5.34x. Its peak resident memory, read when the
+  clock stopped with the node still syncing, was 2,456 to 2,470 MiB,
+  against dcrd's 1,836 MiB, and 2,959 and 2,964 MiB in two runs with
   `DCROXIDE_DB_SYNC_COMMIT=1`, which took 350.2 s and 350.6 s: the
   background commit, its thread now kept for the life of the store and
   writing each flush's rows as well, is 78.7 s or 22.5% less by the
@@ -355,7 +355,7 @@ Named open items, tracked and not fixed:
   copy-out rebuild packs *worse*, 58.29%, on a larger live tree, 10.92 GiB
   against 9.79. The 1.536 GiB of intra-page slack in `spendjournalv3` is real
   and unreachable inside this engine.
-- The node was flush-bound under fast ingest as measured in 2026-08 (the 48%-of-wall stall figure above, 90–98% of it inside a metadata-flush window). With the height-first block keys and the exists-address index's own layout, metadata flushes took 15–16% of a from-genesis sync on another machine in 2026-10 ([docs/bench-ledger.md](docs/bench-ledger.md), "Daemon against daemon, each from the other"). In the nine syncs of 2026-10-12 listed above with the eleven commits they took 104.3–111.4 s whichever code ran, so their share grew as the rest shrank: 14.7% of the 728.5 s run and 21.3% of each of the two runs with the read-ahead on. On 2026-10-17, with the commit on a thread of its own, the four default syncs of `88c46c3` had a flush under way for a median of 110.2 s, 27.8% of the wall, of which the flushes held the threads that sync for 47.1 s, 11.9%. On 2026-10-19, from a block server on the LAN, the flushes of a build of the code as it stands, which writes their rows on that thread too, were in the foreground on the threads that sync for 2.5 to 2.8 s of each default sync.
+- The node was flush-bound under fast ingest as measured in 2026-08 (the 48%-of-wall stall figure above, 90–98% of it inside a metadata-flush window). With the height-first block keys and the exists-address index's own layout, metadata flushes took 15–16% of a from-genesis sync on another machine in 2026-10 ([docs/bench-ledger.md](docs/bench-ledger.md), "Daemon against daemon, each from the other"). In the nine syncs of 2026-10-12 listed above with the eleven commits they took 104.3–111.4 s whichever code ran, so their share grew as the rest shrank: 14.7% of the 728.5 s run and 21.3% of each of the two runs with the read-ahead on. On 2026-10-17, with the commit on a thread of its own, the four default syncs of `88c46c3` had a flush under way for a median of 110.2 s, 27.8% of the wall, of which the flushes held the threads that sync for 47.1 s, 11.9%. On 2026-10-19, from a block server on the LAN, the flushes of a build of the code of `797a213`, which writes their rows on that thread too, were in the foreground on the threads that sync for 2.5 to 2.8 s of each default sync.
 
 **The node is still pre-alpha. Do not expose it to the internet and do not use
 it with funds.**

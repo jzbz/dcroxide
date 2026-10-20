@@ -16,7 +16,10 @@
 //! `BlockSigOps` holds that block's counts of signature operations
 //! (see the section on them).  `DataSanityVerdict` holds the verdict
 //! of such a block's data sanity checks, where they were made before it
-//! reached the chain (see the last section).
+//! reached the chain (see the last section).  `BlockTxTypes` holds the
+//! stake classification of every transaction, made once on the thread
+//! that processes the block, and follows the rule below as the hashes
+//! do.
 //!
 //! # The rule
 //!
@@ -177,6 +180,7 @@ use alloc::vec::Vec;
 use dcroxide_chaincfg::Params;
 use dcroxide_chainhash::{HASH_SIZE, Hash, hash_h};
 use dcroxide_database::BlockRecord;
+use dcroxide_stake::TxType;
 use dcroxide_standalone::calc_merkle_root;
 use dcroxide_wire::{MsgBlock, MsgTx};
 
@@ -196,6 +200,44 @@ pub struct BlockTxHashes {
     regular: Vec<Hash>,
     /// The hash of `block.stransactions[i]`.
     stake: Vec<Hash>,
+}
+
+/// The stake classification of every transaction of one block
+/// (`dcroxide_stake::determine_tx_type`), per tree and in block order.
+///
+/// dcrd classifies a transaction wherever a step of block processing
+/// reads its type: the contextual checks of each transaction
+/// (`checkTransactionContext`) and of the block (`checkBlockContext`),
+/// the adding of its outputs to the view (`AddTxOuts`), the version 2
+/// filter (`blockcf2.Regular`) and the view assertion
+/// (`assertBlockUtxoView`) each call `stake.DetermineTxType` again: six
+/// classifications of each stake transaction, the assertion's two among
+/// them, and three of each regular one for a block validated in full.
+/// The chain classifies each transaction of the block it processes once,
+/// on the thread that processes it, and hands the types to those steps,
+/// whether it validates the block in full or adds it without, as it adds
+/// a bulk import's blocks and the ancestors of the assumed valid block.
+/// The classification is a function of the transaction alone and
+/// reaches no verdict, so what each step reads is what it would have
+/// computed.
+///
+/// It follows the rule of the module documentation as the transaction
+/// hashes do: computed from a block in the function that holds it, or
+/// filed in the chain's slot for the block being processed beside its
+/// hashes and read from there by allocation identity, and never kept
+/// past the processing call.  Every function that reads the types first
+/// checks them against its block with `assert_for`: one type per
+/// transaction of each tree in every build, and a full classification
+/// and comparison under debug assertions.
+///
+/// The fields are private and [`BlockTxTypes::compute`] is the only
+/// constructor, so a value is always the classification of some block.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BlockTxTypes {
+    /// The type of `block.transactions[i]`.
+    regular: Vec<TxType>,
+    /// The type of `block.stransactions[i]`.
+    stake: Vec<TxType>,
 }
 
 /// The full hash of every transaction of one block
@@ -595,6 +637,36 @@ std::thread_local! {
     /// call that read a block's verdict did not make the checks.
     pub(crate) static SANITY_CHECKS: core::cell::Cell<u64> =
         const { core::cell::Cell::new(0) };
+
+    /// How many times this thread classified a block's transactions into
+    /// a `BlockTxTypes` (`BlockTxTypes::compute`).  The classification
+    /// `BlockTxTypes::assert_for` makes again under debug assertions is
+    /// not counted.  It exists in this crate's unit-test builds only,
+    /// where the tests read it to tell how often one processing call
+    /// classified its block.
+    pub(crate) static BLOCKS_CLASSIFIED: core::cell::Cell<u64> =
+        const { core::cell::Cell::new(0) };
+
+    /// How many transactions this thread classified ([`classify_tx`]).
+    /// Every classification this crate makes goes through that function,
+    /// save those the debug assertions make to check a type handed in,
+    /// which are not counted; so does the classification the filter
+    /// build makes when it is handed no types
+    /// (`Chain::load_or_create_filter`).  It exists in this crate's
+    /// unit-test builds only, where the tests read it to tell how often
+    /// one processing call classified each transaction.
+    pub(crate) static TXS_CLASSIFIED: core::cell::Cell<u64> =
+        const { core::cell::Cell::new(0) };
+}
+
+/// The stake type of a transaction (`dcroxide_stake::determine_tx_type`,
+/// dcrd `stake.DetermineTxType`).  Every classification this crate
+/// makes goes through here, save those the debug assertions make to
+/// check a type handed in, so that its unit tests can count them.
+pub(crate) fn classify_tx(tx: &MsgTx) -> TxType {
+    #[cfg(test)]
+    TXS_CLASSIFIED.set(TXS_CLASSIFIED.get().wrapping_add(1));
+    dcroxide_stake::determine_tx_type(tx)
 }
 
 /// The hash of each transaction, in order.
@@ -690,6 +762,76 @@ impl BlockTxHashes {
         debug_assert!(
             self.is_for(block),
             "transaction hashes do not match the block's transactions"
+        );
+    }
+}
+
+/// The type of each transaction, in order.
+fn classify(txs: &[MsgTx]) -> Vec<TxType> {
+    txs.iter().map(classify_tx).collect()
+}
+
+/// Whether `types` are the types of `txs`, in order, by classifying each
+/// transaction again; the check is not counted as a classification.
+fn are_types_of(types: &[TxType], txs: &[MsgTx]) -> bool {
+    types.len() == txs.len()
+        && types
+            .iter()
+            .zip(txs)
+            .all(|(&tx_type, tx)| tx_type == dcroxide_stake::determine_tx_type(tx))
+}
+
+impl BlockTxTypes {
+    /// Classify every transaction of the block.
+    pub(crate) fn compute(block: &MsgBlock) -> BlockTxTypes {
+        #[cfg(test)]
+        BLOCKS_CLASSIFIED.set(BLOCKS_CLASSIFIED.get().wrapping_add(1));
+        BlockTxTypes {
+            regular: classify(&block.transactions),
+            stake: classify(&block.stransactions),
+        }
+    }
+
+    /// The types of the block's regular transactions, in block order.
+    pub(crate) fn regular(&self) -> &[TxType] {
+        &self.regular
+    }
+
+    /// The types of the block's stake transactions, in block order.
+    pub(crate) fn stake(&self) -> &[TxType] {
+        &self.stake
+    }
+
+    /// Whether there is exactly one type per transaction of each of the
+    /// block's trees.
+    pub(crate) fn fits(&self, block: &MsgBlock) -> bool {
+        self.regular.len() == block.transactions.len()
+            && self.stake.len() == block.stransactions.len()
+    }
+
+    /// Whether these are the types of the block's transactions, by
+    /// classifying them again.
+    pub(crate) fn is_for(&self, block: &MsgBlock) -> bool {
+        are_types_of(&self.regular, &block.transactions)
+            && are_types_of(&self.stake, &block.stransactions)
+    }
+
+    /// Panic unless these types belong to the block: [`Self::fits`] in
+    /// every build, and [`Self::is_for`] under debug assertions.
+    ///
+    /// Every consumer of the types calls this first.  A failure is a
+    /// pairing fault inside the node: the steps that read the types walk
+    /// them beside the transactions, and a short list would skip
+    /// transactions silently.
+    #[track_caller]
+    pub(crate) fn assert_for(&self, block: &MsgBlock) {
+        assert!(
+            self.fits(block),
+            "transaction types are not one per transaction of the block"
+        );
+        debug_assert!(
+            self.is_for(block),
+            "transaction types do not match the block's transactions"
         );
     }
 }
@@ -2138,6 +2280,26 @@ mod tests {
             &dcroxide_chaincfg::regnet_params(),
             &a_block_of_another_shape(),
             &hashes,
+            None,
+            &one_transaction_block(),
+            || Ok(Vec::new()),
+            &|_: &dcroxide_wire::OutPoint| -> Option<crate::utxoentry::UtxoEntry> { None },
+            None,
+            false,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "transaction types are not one per transaction")]
+    fn the_view_connect_refuses_types_of_another_shape() {
+        let block = a_block_of_another_shape();
+        let hashes = BlockTxHashes::compute(&block);
+        let types = BlockTxTypes::compute(&one_transaction_block());
+        let _ = crate::utxoview::UtxoView::new().connect_block_with_hashes(
+            &dcroxide_chaincfg::regnet_params(),
+            &block,
+            &hashes,
+            Some(&types),
             &one_transaction_block(),
             || Ok(Vec::new()),
             &|_: &dcroxide_wire::OutPoint| -> Option<crate::utxoentry::UtxoEntry> { None },
