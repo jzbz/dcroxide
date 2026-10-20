@@ -15,7 +15,8 @@
   helpers pre-verify the signatures of blocks read ahead), 2026-10-18
   (addendum: the reading thread makes the data sanity checks),
   2026-10-19 (addendum: the metadata commit thread kept for the life of
-  the store; second addendum: the commit thread writes the flush's rows)
+  the store; second addendum: the commit thread writes the flush's rows;
+  third addendum: the commit thread syncs the block files)
 
 ## Context
 
@@ -899,5 +900,34 @@ of the store, a sync that checks every script, and dcrd v2.1.7"). Those
 builds were states of a worktree, not the tree of a commit; the change
 on the kept thread without that other change was neither built as a
 release binary nor synced.
+
+D2 is unchanged.
+
+## Addendum, 2026-10-19 (third) — the commit thread syncs the block files
+
+The `dbcommit` thread now also runs the block-file sync of a flush handed
+to it, before the flush's rows, where the thread that ran the flush ran
+it before the hand-off ([ADR-0009](0009-storage-shape.md), third
+addendum of this date). The thread that ran the flush keeps the capture,
+the taking of what the sync owes, the opening of the write transaction
+and the participant's `seal`, under the writer semaphore. The commit
+thread now takes the block store's lock, to discharge what it synced,
+where the addendum above says it took neither the semaphore nor that
+lock. The lock is held around block writes, the handing out of read
+handles and rollbacks, none of which waits for the commit thread, so a
+thread holding the semaphore can still always wait for a flush on it.
+Block writes go on beside the sync.
+
+The change was measured only as one of four, in the bench ledger's R1,
+on m3 on 2026-10-19, in default mainnet syncs from a dcrd v2.1.7 node on
+another machine on the same LAN, four runs alternated with four of a
+release build of the tree of `797a213`: `dbcommit` was on a processor
+for 94.6 to 99.2 s a sync against 93.7 to 96.4 s, and the block-file
+syncs it ran took 2.59 to 2.98 s; the block thread was on a processor
+for 205.2 to 206.6 s against 209.2 to 210.9 s, 4.45 s less by the means,
+for the four changes together ([bench-ledger.md](../bench-ledger.md),
+"Where `797a213`'s block thread waits, a deeper read-ahead and a rung of
+four changes"). R1 was a state of a worktree, not the tree of a commit;
+this change on its own was neither built as a release binary nor synced.
 
 D2 is unchanged.

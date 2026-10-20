@@ -17,7 +17,7 @@ JSON-RPC/websocket server, the tool commands, the pipe IPC lifecycle,
 and the Windows service wrapper. The deliberate non-ports are small
 and documented in PARITY.md (Go GC tuning, the pprof servers, UPnP,
 the Windows event log, and the wallet-side mixclient). The test suite
-runs 2,568 tests across 444 suites on Linux, most differential against
+runs 2,573 tests across 444 suites on Linux, most differential against
 dcrd itself or replaying sessions generated inside dcrd's own packages.
 
 Since the surface completed, four rounds of work have landed on it. A
@@ -94,13 +94,16 @@ LAN server, each of which validated in full only the blocks after the
 assume-valid block and had dcrd's block at height 1,116,035 (the bench
 ledger, "Where `797a213`'s block thread waits, a deeper read-ahead and a
 rung of four changes").
-Of the commits after `797a213`, two change the node's code beyond tests
-and comments: one classifies a block's transactions once for every step
-that reads their types, among them checks that apply the consensus
-rules, and changes no rule; the other allocates a block filter's list of
-entries once, and changes no filter's bytes. In syncs they have been put
-to blocks only in a build made from a worktree that also holds two other
-changes, R1 of that section: in four from the LAN server, each of which
+Of the commits after `797a213`, three change the node's code beyond
+tests and comments: one classifies a block's transactions once for every
+step that reads their types, among them checks that apply the consensus
+rules, and changes no rule; another allocates a block filter's list of
+entries once, and changes no filter's bytes; the third moves a
+handed-over metadata flush's block-file sync onto the commit thread, and
+reports a failure of that sync to the next write, flush or close rather
+than to the commit that tripped the flush. In syncs they have been put
+to blocks only in a build made from a worktree that also holds one other
+change, R1 of that section: in four from the LAN server, each of which
 validated in full only the blocks after the assume-valid block and had
 dcrd's block at height 1,116,035, and in one from the loopback server
 that ended with that same UTXO set and the same block files.

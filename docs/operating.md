@@ -41,9 +41,10 @@ so the node makes no further progress until it is restarted. Reads of
 what is still in memory keep working, so RPC still answers what they
 cover; from the failed write on, a read that needs a page of the
 metadata file that is not cached fails. Most of a sync's commits to the
-metadata store write their rows and commit on a thread of their own
-(`dbcommit`; the flush log below), so such a failure, in the rows, the
-exists-address index's or the commit, is logged under BCDB as
+metadata store sync their block files, write their rows and commit on a
+thread of their own (`dbcommit`; the flush log below), so such a
+failure, in the block files' sync, the rows, the exists-address index's
+or the commit, is logged under BCDB as
 `Background commit of the metadata write cache failed: ...` when it
 happens, and the refusal, with the same cause, comes at the next write,
 flush or close. In a sync
@@ -1406,11 +1407,13 @@ than tripped by a commit or, since 2026-10-19, asked for by the chain's
 periodic UTXO cache flush, which the line does not tell from a tripped
 one, with `DCROXIDE_DB_SYNC_COMMIT` set or not, so the `explicit` lines
 of a sync no longer count the two-minute rule's flushes as those of
-earlier builds did; `bg`, whether its rows and commit were written on
-the thread `dbcommit`; `fg_ms`, the part of `elapsed_ms` the capturing
-thread spent holding the database's writer, all of it unless `bg` and
-then the capture to the hand-off, which holds the block-file sync, the
-opening of the write transaction and the exists-address index's seal;
+earlier builds did; `bg`, whether its block files were synced and its
+rows and commit written on the thread `dbcommit`; `fg_ms`, the part of
+`elapsed_ms` the capturing thread spent holding the database's writer,
+all of it unless `bg` and then the capture to the hand-off, which holds
+the taking of what the block-file sync owes, the opening of the write
+transaction and the exists-address index's seal, and, since
+2026-10-19, not the sync itself;
 `wait_ms`, the time spent since the flush before was captured, outside
 `elapsed_ms`, waiting with the writer held for an earlier flush's commit
 to end: the capturing thread's wait before its capture, and any other
@@ -1471,11 +1474,12 @@ thread more than before. The readings `dbcommit` takes itself, `commit`
 on a `bg` line and `prev_finished` and `prev_end` on the line after one,
 count as before, and so do those of the shutdown's own flush, made once
 the thread has stopped. On a `bg` line the processor time and I/O of
-`insert`, of the participant's phase and of `commit` are `dbcommit`'s,
-and those of `sync` are the capturing thread's, which the line does not
-name. Before the rows moved onto `dbcommit`, `insert` and the
-participant's phase of a `bg` line were the capturing thread's too, and
-counted in its `fg_ms`. In a sync from an outbound peer, as in the syncs
+`sync`, of `insert`, of the participant's phase and of `commit` are
+`dbcommit`'s. Before the block-file sync moved onto `dbcommit` on
+2026-10-19, `sync` on a `bg` line was the capturing thread's, which the
+line does not name, and counted in its `fg_ms`, and before the rows
+moved there `insert` and the participant's phase were too.
+In a sync from an outbound peer, as in the syncs
 measured on 2026-10-12, the lines read
 `peer-outbound`, the thread that connects the sync peer's blocks
 (`peer-inbound` when that peer connected to the node, by the code; not
@@ -1503,9 +1507,8 @@ flush committed where it was captured, as with
 `DCROXIDE_DB_SYNC_COMMIT=1`. Otherwise the index thread's flushes
 are the `index` lines and those of the `bg` lines it captured, which a
 line does not tell from the others, each of which kept the thread
-that connects blocks out for about its `fg_ms` plus `wait_ms`, so
-grouping the lines by `thread` keeps one thread's phases apart from
-another's only for the lines that are not `bg`. `dcroxide-bench`'s own
+that connects blocks out for about its `fg_ms` plus `wait_ms`.
+`dcroxide-bench`'s own
 `--flushlog` writes lines of another shape, which carry neither field,
 though their three phases carry the four processor-time fields. Leave
 `DCROXIDE_DB_FLUSHLOG` unset in normal operation; it writes a line
@@ -1547,9 +1550,10 @@ using the default`, and the read-ahead stays on. Unset, it is on and
 nothing is logged.
 `DCROXIDE_DB_SYNC_COMMIT` is read once at startup and is the way back
 to dcrd's place for a metadata commit. Unset, a flush that a commit
-trips, or that the chain's periodic UTXO cache flush asks for, writes
-its rows and makes its commit on the thread `dbcommit`, which the node
-keeps from the first such flush to the shutdown, and nothing is logged.
+trips, or that the chain's periodic UTXO cache flush asks for, syncs its
+block files, writes its rows and makes its commit on the thread
+`dbcommit`, which the node keeps from the first such flush to the
+shutdown, and nothing is logged.
 A positive whole number puts every commit back on the thread that ran
 the flush, under the database's writer, starts no `dbcommit` thread, and
 is logged at startup as `Metadata write cache commits on the committing

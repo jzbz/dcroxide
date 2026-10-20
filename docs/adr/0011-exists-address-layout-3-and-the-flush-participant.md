@@ -1367,3 +1367,41 @@ and `try_scan_after` did not move. In `existsaddrindex.rs`,
 > cited lines of `transaction.rs`, the commit's own flush at `:1393` and
 > `raw_id` at `:1841` among them, and those of `existsaddrindex.rs`,
 > `existsaddr/store.rs` and `existsaddr/memtable.rs` did not move.
+
+## Addendum, 2026-10-19 (second) — `has_work` is asked before a handed-over flush's block sync
+
+A flush that may be handed to the commit thread now syncs its block
+files there, before its rows ([ADR-0009](0009-storage-shape.md), third
+addendum of this date), so `has_work`, and `seal` with it, are asked on
+the flushing thread after the capture and before the block files are
+synced, where the decision above has `has_work` asked after the
+block-file sync. A flush that cannot be handed over, `Database::flush`,
+`Database::close` and every flush with `DCROXIDE_DB_SYNC_COMMIT`, still
+syncs first. Nothing the participant sees depends on the block files: the
+seal still follows the capture with no hook between them, and a failed
+sync, which now fails the flush on the commit thread, tells a sealed
+participant `finished(false)` after the latch, as a failed insert there
+does. The participant trait's documentation says when `has_work` is
+asked and that the commit thread syncs the block files.
+
+This change moved lines the addendum of 2026-10-19 above cites, whose
+numbers stay as they were written, and some of those the second note
+after it gives. In `dcroxide-database`'s `lib.rs`,
+`begin_durable_write` is now at `:165`, the latch's two at `:206` and
+`:242` and the participant's field at `:454`; `flush_locked` is at
+`:1421`, with `wants_flush` asked at `:1438`, the deferral decided at
+`:1561-1566` and `finished` called at `:2212`; `write_and_commit` is at
+`:1623`, `run_job` at `:2019` and `finish` at `:2152`; `close` is at
+`:3303`, `set_flush_participant` at `:3387` and
+`clear_flush_participant` at `:3458`. In `participant.rs`, `seal` is at
+`:111`, `contribute` at `:127`, `finished` at `:147`,
+`allows_deferred_contribute` at `:181` and the key check at `:402`. In
+`dbcache.rs`, `open` is at `:1394`, with `has_work` asked at `:1403`,
+the prefix backstop at `:1425-1442` and the seal at `:1445`; `fill` is
+at `:1468`, with `contribute` called at `:1543`; the commit is at
+`:1585` and the participant-only flush's count at `:1658`. In
+`transaction.rs`, the commit's own flush is at `:1394`, its hooks taken
+at `:1421`, its rows published at `:1445` and `raw_id` at `:1842`. The
+participant trait, `on_commit`, the prefix check and its call in the
+commit, and the cited lines of `existsaddrindex.rs`,
+`existsaddr/store.rs` and `existsaddr/memtable.rs` did not move.

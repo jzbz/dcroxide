@@ -1383,10 +1383,11 @@ impl Transaction {
         // for a flush whose commit is still under way on its own thread
         // before it captures another, which together keep two flushes
         // from overlapping.  With background commits the helper returns
-        // once the window is captured, the block files are synced and
-        // redb's write transaction is open; a failure in writing the rows
-        // or in the redb commit then latches the store from the thread
-        // they were handed to instead of failing this commit.  The
+        // once the window is captured, what the block-file sync owes is
+        // taken and redb's write transaction is open; a failure in
+        // syncing the block files, writing the rows or the redb commit
+        // then latches the store from the thread they were handed to
+        // instead of failing this commit.  The
         // layers a flush retired here are kept until that semaphore is
         // released, at the end; those of a flush that was handed over
         // are retired and let go of by the thread it was handed to.

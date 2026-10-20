@@ -2111,23 +2111,25 @@ fn apply_overlay_tuning(opts: &mut Options) {
 }
 
 /// Whether a flush that a commit trips, or that the UTXO cache's periodic
-/// flush asks for, writes its rows and makes its redb commit on a thread
-/// of its own (`Options::background_commit`): yes, unless
-/// `DCROXIDE_DB_SYNC_COMMIT` is set to a positive whole number.
+/// flush asks for, syncs the block files, writes its rows and makes its
+/// redb commit on a thread of its own (`Options::background_commit`):
+/// yes, unless `DCROXIDE_DB_SYNC_COMMIT` is set to a positive whole
+/// number.
 ///
 /// On that thread the flush no longer holds up the thread that connects
 /// blocks or the one that updates the indexes: the commit that tripped
 /// the flush, or the periodic flush that asked for it, returns once the
-/// write cache is captured, the block files are synced, redb's write
-/// transaction is open and the exists-address index has set apart the
-/// keys the flush will write.  Every commit is still synced before
+/// write cache is captured, what the block-file sync owes is taken,
+/// redb's write transaction is open and the exists-address index has set
+/// apart the keys the flush will write.  The block files are still synced
+/// before the redb commit, and every commit is still synced before
 /// anything acknowledges it as durable, at most one flush is under way,
 /// and a flush, the close and the next flush all wait for it; the
 /// periodic flush counts only once its commit has landed.  What moves is
-/// the report of a failure: the store latches when writing the rows, the
-/// index's or the commit fails, a `BCDB` error line says so, and the next
-/// write, flush or close is refused, where dcrd fails the commit that
-/// tripped the flush.
+/// the report of a failure: the store latches when syncing the block
+/// files, writing the rows, the index's or the commit fails, a `BCDB`
+/// error line says so, and the next write, flush or close is refused,
+/// where dcrd fails the commit that tripped the flush.
 ///
 /// `DCROXIDE_DB_SYNC_COMMIT=1` restores that: every flush then commits
 /// on the thread that ran it, under the database's writer.  An
@@ -2242,45 +2244,46 @@ fn exists_addr_policy(enabled: bool) -> dcroxide_indexers::ExistsAddrPolicy {
 ///
 /// `thread` is the name of the thread that ran the flush, which held
 /// the database's writer for the flush's `elapsed_ms`; for a flush whose
-/// rows and commit were written on a thread of its own it is that thread,
-/// `dbcommit`, which never holds the writer, and which is one thread for
-/// the whole run, from the first such flush to the shutdown.  On such a
-/// line the processor time and I/O of `insert`, of the participant's
-/// phase and of `commit` are that thread's, and those of `sync` are the
-/// capturing thread's, which the line does not name: lines grouped by
-/// `thread` keep one thread's phases apart from another's only for
-/// flushes that committed where they were captured.  `writer_wait` is
-/// what threads have spent waiting for that writer from the opening of
-/// the database to this flush: for the thread named `index`, which
-/// updates the indexes, and for every other thread together, the number
-/// of times one found the writer held and the nanoseconds it then waited.
-/// The threads that connect blocks are among the others, so the growth of
-/// `other` over a sync bounds what block processing spent waiting for the
-/// index thread's transactions and flushes.  The flushes among them are
-/// the lines whose `thread` is `index` and, among the `bg` lines, those
-/// the index thread captured, which a line does not tell from the others;
-/// each held the writer for its `fg_ms` plus its `wait_ms`.
+/// block files were synced and rows and commit written on a thread of its
+/// own it is that thread, `dbcommit`, which never holds the writer, and
+/// which is one thread for the whole run, from the first such flush to
+/// the shutdown.  On such a line the processor time and I/O of `sync`, of
+/// `insert`, of the participant's phase and of `commit` are that
+/// thread's, so lines grouped by `thread` keep one thread's phases apart
+/// from another's.  `writer_wait` is what threads have spent waiting for
+/// that writer from the opening of the database to this flush: for the
+/// thread named `index`, which updates the indexes, and for every other
+/// thread together, the number of times one found the writer held and the
+/// nanoseconds it then waited.  The threads that connect blocks are among
+/// the others, so the growth of `other` over a sync bounds what block
+/// processing spent waiting for the index thread's transactions and
+/// flushes.  The flushes among them are the lines whose `thread` is
+/// `index` and, among the `bg` lines, those the index thread captured,
+/// which a line does not tell from the others; each held the writer for
+/// its `fg_ms` plus its `wait_ms`.
 ///
 /// `explicit` is whether the flush was asked for by a caller that waits
 /// for it to be durable (`Database::flush`, the close), rather than
 /// tripped by a commit's own flush check or asked for by the UTXO cache's
 /// periodic flush (`Database::flush_in_background`), which waits only
 /// for the flush before it; a line does not tell those two apart.  `bg` is
-/// whether its rows and commit were written on a thread of its own
-/// ([`background_commit`]); `elapsed_ms` then runs from the capture of
-/// the write cache to the retirement of what was captured, on that
-/// thread.  `fg_ms` is the part of `elapsed_ms` the capturing thread
-/// spent in the flush holding the writer: all of it unless `bg`, and then
-/// the time from the capture to the hand-off, which holds the block-file
-/// sync, the opening of the write transaction and the index's seal.
-/// `wait_ms` is what was spent since the capture of the flush before,
-/// and so outside `elapsed_ms`, waiting with the writer held for an
-/// earlier flush's commit to end: the capturing thread's wait before
-/// its capture, and any other thread's, such as a commit's at the write
-/// cache's ceiling, which counts against the next capture whichever
-/// thread makes it.  `fg_ms` plus `wait_ms` is what a flush, with the
-/// waits counted against it, kept every other writer out for, so sums
-/// of it by thread divide that time only roughly.
+/// whether its block files were synced and its rows and commit written
+/// on a thread of its own ([`background_commit`]); `elapsed_ms` then
+/// runs from the capture of the write cache to the retirement of what
+/// was captured, on that thread, and `sync` was timed there.  `fg_ms`
+/// is the part of `elapsed_ms` the capturing thread spent in the flush
+/// holding the writer: all of it unless `bg`, and then the time from
+/// the capture to the hand-off, which holds the taking of what the
+/// block-file sync owes, the opening of the write transaction and the
+/// index's seal, and not the sync itself.  `wait_ms` is what was spent
+/// since the capture of the flush before, and so outside `elapsed_ms`,
+/// waiting with the writer held for an earlier flush's commit to end:
+/// the capturing thread's wait before its capture, and any other
+/// thread's, such as a commit's at the write cache's ceiling, which
+/// counts against the next capture whichever thread makes it.  `fg_ms`
+/// plus `wait_ms` is what a flush, with the waits counted against it,
+/// kept every other writer out for, so sums of it by thread divide that
+/// time only roughly.
 ///
 /// `snap` is whether the flush held a read snapshot of the store across
 /// its commit ([`Options::commit_snapshot`], which the daemon leaves on),

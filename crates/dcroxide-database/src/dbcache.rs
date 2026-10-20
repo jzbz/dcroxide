@@ -46,7 +46,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::METADATA_TABLE;
-use crate::blockfile::BlockStore;
+use crate::blockfile::{BlockStore, SyncPlan};
 use crate::bucketindex::BucketIndex;
 use crate::error::{Error, ErrorKind, db_error};
 use crate::participant::{FlushWriter, Registration};
@@ -317,8 +317,14 @@ impl FlushBatch {
 /// the flush is handed to.
 pub(crate) struct FillJob {
     tx: redb::WriteTransaction,
-    /// What [`DbCache::sync_blocks`] measured, carried into the outcome.
+    /// What [`DbCache::sync_blocks`] measured, carried into the outcome;
+    /// for a flush whose block sync is left to [`DbCache::fill`], what
+    /// that sync measures.
     block_sync: crate::FlushPhase,
+    /// The block sync the capture left to the thread that commits
+    /// ([`Self::defer_block_sync`]), which [`DbCache::fill`] runs before
+    /// it writes anything.
+    pending_sync: Option<SyncPlan>,
     /// Whether the participant was sealed: [`DbCache::fill`] calls its
     /// `contribute` after the overlay's rows, and its `finished` is owed
     /// from here on, whatever happens to the flush.
@@ -330,6 +336,17 @@ impl FillJob {
     /// its `finished`.
     pub(crate) fn sealed(&self) -> bool {
         self.sealed
+    }
+
+    /// Leave the flush's block sync, taken as `plan` on the capturing
+    /// thread at the capture, to [`DbCache::fill`], which runs it on the
+    /// thread that commits before any row goes into the transaction.
+    pub(crate) fn defer_block_sync(&mut self, plan: SyncPlan) {
+        debug_assert!(
+            self.pending_sync.is_none(),
+            "a flush's block sync was deferred twice"
+        );
+        self.pending_sync = Some(plan);
     }
 }
 
@@ -371,6 +388,14 @@ pub(crate) struct FlushOutcome {
 }
 
 impl FlushOutcome {
+    /// This outcome with the block sync phase measured after it was made:
+    /// that of an empty flush whose block sync was left to run after the
+    /// write transaction would have been opened.
+    pub(crate) fn with_block_sync(mut self, block_sync: crate::FlushPhase) -> FlushOutcome {
+        self.block_sync = block_sync;
+        self
+    }
+
     /// A successful outcome with nothing to report, for tests that drive
     /// retirement without running a real commit.
     #[cfg(test)]
@@ -1281,33 +1306,61 @@ impl DbCache {
             Opened::Empty(outcome) => Ok(outcome),
             Opened::Tx(job) => {
                 *sealed = job.sealed();
-                Self::commit(Self::fill(batch, job, participant)?)
+                Self::commit(Self::fill(batch, job, participant, block_store)?)
             }
         }
     }
 
     /// The first step of persisting a captured batch: sync the block
-    /// files written since the last flush.  Runs WITHOUT the cache lock
+    /// files written since the last flush, [`Self::plan_block_sync`] and
+    /// [`Self::run_block_sync`] in a row.  Runs WITHOUT the cache lock
     /// held, as [`Self::open`], [`Self::fill`] and [`Self::commit`] do, so
     /// readers and the overlay's writers proceed while a flush works.
+    ///
+    /// A flush that may be handed to the commit thread takes its plan at
+    /// the capture instead and leaves running it to [`Self::fill`], on
+    /// the thread that commits ([`FillJob::defer_block_sync`]).
     pub(crate) fn sync_blocks(
         batch: &FlushBatch,
         block_store: &std::sync::Mutex<BlockStore>,
     ) -> Result<crate::FlushPhase, Error> {
-        // Block files before metadata, so the metadata never describes
-        // bytes that could vanish in a crash.
-        //
-        // The store lock is held to capture what is owed and again to
-        // discharge it, not across the fsyncs: block reads go on while
-        // they run, as dcrd's do beside `syncBlocks`, which takes read
-        // locks alone (`blockio.go:603-625`).  The writer semaphore the
-        // caller holds keeps every block write out until the discharge.
-        let timer = PhaseTimer::start(batch.observed);
-        let plan = block_store
+        let plan = Self::plan_block_sync(block_store);
+        Self::run_block_sync(batch.observed, plan, block_store)
+    }
+
+    /// What the flush's block sync owes: every block file written to and
+    /// not yet discharged, which covers every block the captured metadata
+    /// names.  Taken on the capturing thread, under the writer semaphore,
+    /// after the capture, so no block the captured commits wrote is left
+    /// out of it.
+    pub(crate) fn plan_block_sync(block_store: &std::sync::Mutex<BlockStore>) -> SyncPlan {
+        block_store
             .lock()
             .expect("block store lock poisoned")
-            .sync_plan();
+            .sync_plan()
+    }
+
+    /// Run a flush's block sync and discharge what it synced
+    /// ([`BlockStore::finish_sync`]), on the thread that captured the
+    /// flush or on the thread that commits it, before the redb commit
+    /// either way: block files before metadata, so the metadata never
+    /// describes bytes that could vanish in a crash.
+    ///
+    /// The store lock is held to discharge what was synced, not across
+    /// the fsyncs: block reads go on while they run, as dcrd's do beside
+    /// `syncBlocks`, which takes read locks alone (`blockio.go:603-625`),
+    /// and so do the block writes of commits made while a handed-over
+    /// flush syncs.  A file such a commit writes keeps its place on the
+    /// dirty list for the next flush's sync.
+    pub(crate) fn run_block_sync(
+        observed: bool,
+        plan: SyncPlan,
+        block_store: &std::sync::Mutex<BlockStore>,
+    ) -> Result<crate::FlushPhase, Error> {
+        let timer = PhaseTimer::start(observed);
         let (synced, sync_result) = plan.run();
+        #[cfg(test)]
+        plan.ran();
         block_store
             .lock()
             .expect("block store lock poisoned")
@@ -1319,10 +1372,11 @@ impl DbCache {
     /// The second step: open the flush's write transaction, on the thread
     /// that captured the batch and with the writer semaphore held, and
     /// leave it empty.  `block_sync` is what [`Self::sync_blocks`]
-    /// returned, carried into the outcome.
+    /// returned, carried into the outcome, or nothing for a flush whose
+    /// block sync is left to [`Self::fill`].
     ///
     /// With a registered flush participant (ADR-0011), the participant is
-    /// asked `has_work` once, after the block sync.  When it has work, it
+    /// asked `has_work` once, after the capture.  When it has work, it
     /// is sealed once the transaction is open ([`FlushParticipant::seal`]):
     /// the semaphore is still held and no commit hook has run since the
     /// capture, so what it sets apart is what the captured commits handed
@@ -1393,30 +1447,39 @@ impl DbCache {
         Ok(Opened::Tx(FillJob {
             tx,
             block_sync,
+            pending_sync: None,
             sealed: contributing.is_some(),
         }))
     }
 
-    /// The third step: hand the open transaction every row of the batch,
-    /// then the participant's, leaving it uncommitted.  Runs on whichever
-    /// thread makes the commit: the capturing thread, with the writer
-    /// semaphore held, or the thread a flush that a commit tripped is
-    /// handed to, without it.
+    /// The third step: run the block sync the capture left to the thread
+    /// that commits, if it left one ([`FillJob::defer_block_sync`]), then
+    /// hand the open transaction every row of the batch, then the
+    /// participant's, leaving it uncommitted.  Runs on whichever thread
+    /// makes the commit: the capturing thread, with the writer semaphore
+    /// held, or the thread a flush that a commit tripped is handed to,
+    /// without it.
     ///
-    /// The overlay's rows go in first, in the merged view's key order.  A
-    /// participant sealed by [`Self::open`] then contributes inside the
-    /// same transaction, so its rows and the overlay's land in the one
-    /// durable commit.
+    /// The block sync comes first, so a failed one writes no row and the
+    /// transaction is never committed.  The overlay's rows go in next, in
+    /// the merged view's key order.  A participant sealed by
+    /// [`Self::open`] then contributes inside the same transaction, so
+    /// its rows and the overlay's land in the one durable commit.
     pub(crate) fn fill(
         batch: &FlushBatch,
         job: FillJob,
         participant: Option<&Registration>,
+        block_store: &std::sync::Mutex<BlockStore>,
     ) -> Result<CommitJob, Error> {
         let FillJob {
             tx,
-            block_sync,
+            mut block_sync,
+            pending_sync,
             sealed,
         } = job;
+        if let Some(plan) = pending_sync {
+            block_sync = Self::run_block_sync(batch.observed, plan, block_store)?;
+        }
         debug_assert!(
             !sealed || participant.is_some(),
             "a flush sealed a participant it does not have"

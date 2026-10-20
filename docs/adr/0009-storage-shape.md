@@ -8,7 +8,9 @@
   2026-08-17 (decided), 2026-10-16 (addendum: condition 1 restated for a
   commit on a thread of its own, on by default), 2026-10-19 (addendum:
   the flush's rows written on the commit thread too; second addendum:
-  the periodic UTXO cache flush counts once its commit lands)
+  the periodic UTXO cache flush counts once its commit lands; third
+  addendum: a handed-over flush's block files synced on the commit
+  thread)
 
 ## Decision: redb stays
 
@@ -1252,3 +1254,80 @@ database's commit-mark and `flush_in_background` tests in
 30 s a battery row with the write cache at its default size, copy every
 durable state as it lands and reopen each one, inline and with commits
 on their own thread. They have run on Linux only.
+
+## Addendum, 2026-10-19 (third) — a handed-over flush syncs its block files on the commit thread
+
+A flush that a commit's own check trips, or that
+`Database::flush_in_background` asks for, now syncs its block files on
+`dbcommit` too, where it synced them on the capturing thread before the
+hand-off. The capturing thread takes what the sync owes, the plan, under
+the writer and after the capture, so the plan covers every block the
+captured metadata names; `dbcommit` runs it before it writes a row and
+so before its redb commit. Files before metadata holds as before, and as
+in dcrd, whose `syncBlocks` runs inside the same flush before the
+metadata commit. A flush that stays on the capturing thread after its
+transaction is open (a thread refused, a participant with work that has
+not opted in) runs the plan there before its rows; `Database::flush`,
+`Database::close` and every flush with `DCROXIDE_DB_SYNC_COMMIT` sync
+before the transaction is opened, as before.
+
+What makes the move safe is the discharge. The capturing thread goes on
+writing blocks while the plan runs, so a file the plan syncs can be
+written again before its fsync or after it. The block store's list of
+files owed a sync now holds each file's latest write generation, a
+count of the records the store has written, and a sync discharges a
+file only when its generation is still the one the plan captured; a file
+written after the plan stays owed to the next flush's sync. Before, the
+writer semaphore kept every block write out between a plan and its
+discharge.
+
+**Condition 1, extended to the block-file sync.** Condition 1, as
+restated on 2026-10-16, was written for a failed commit on `dbcommit`,
+and the first addendum of this date carried it to the flush's rows. This
+change carries it to the block-file sync: a failed fsync on `dbcommit`
+fails the flush there, which latches the store before anything else, as
+a failed commit there does, and the files stay owed. What changes,
+against dcrd and against the code before it, is which call reports the
+failure. dcrd's `commitTx` runs `syncBlocks` inside the flush and fails
+the commit whose flush it is, and so did this store, which rolled back
+that commit's block-file writes. Now that commit has returned `Ok` and
+its rows are published to the write cache, and the failure is reported
+by the next write, flush or close. Nothing is acknowledged as durable
+meanwhile, so the store stays consistent, but the chain goes on as
+though the block whose commit tripped the flush were connected until
+that next call fails. This is a divergence from dcrd's error timing, of
+the kind the decision of 2026-10-16 accepted for the commit; PARITY.md's
+*Commit that trips a cache flush* lists it.
+
+The project owner decided on 2026-10-19, after the syncs below, to
+commit this change.
+
+The change was measured on m3 on 2026-10-19, in default mainnet syncs
+from a dcrd v2.1.7 node on another machine on the same LAN, only as one
+of four changes, in the build the bench ledger calls R1, a state of a
+worktree on `797a213`: R1 took 264.95 s against 271.75 s for a release
+build of the tree of `797a213` by the means of four runs each, 6.80 s or
+2.5% less, beyond that session's ±2.6 s, a step for the four together
+and not this change's own. Each run of either build made 52 flushes
+inside the clock, every one handed over. Their foreground time, what the
+capturing thread held the writer for (the flush log's `fg_ms`), was
+0.016 to 0.030 s a sync in R1's runs against 2.38 to 2.69 s, and R1's
+block-file syncs, timed on `dbcommit`, took 2.59 to 2.98 s a sync. One
+sync of R1 from the loopback server ended with the UTXO set and the
+block files of every full sync from that server since 2026-10-17
+([bench-ledger.md](../bench-ledger.md), "Where `797a213`'s block thread
+waits, a deeper read-ahead and a rung of four changes"); the rest of its
+metadata store was not compared. The series is one of its own, and this
+change on its own was neither built as a release binary nor synced.
+
+Pinned by the database's own power-cut sweeps of 2026-10-19
+(`flush_sync_tests`), which cut the power at every storage operation of
+a scripted run of six flushes, the block files' fsyncs counted among
+them through a test hook and the block files cut back at the cut to
+what an fsync before it covered, with background commits on and with
+them off; with them on, a block is written in each round while the sync
+of one handed-over flush is held between its fsync and its discharge.
+Also by the block store's tests of the discharge, and by
+`tests/utxo_flush_crash_sweep.rs` and `tests/background_commit.rs`'s
+paged sweeps, which take every prefix with
+`DCROXIDE_CRASH_SWEEP_EVERY=1`. They have run on Linux only.

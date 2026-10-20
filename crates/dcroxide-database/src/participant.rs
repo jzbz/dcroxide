@@ -82,7 +82,13 @@ pub trait FlushParticipant: Send + Sync {
     /// Whether this flush should call [`Self::seal`] and
     /// [`Self::contribute`].
     ///
-    /// Asked once per flush, after the block files are synced.  When it is
+    /// Asked once per flush, after the write cache is captured.  A flush
+    /// that acknowledges durability ([`crate::Database::flush`],
+    /// [`crate::Database::close`]), and every flush of a store opened
+    /// without [`crate::Options::background_commit`], asks it after the
+    /// block files are synced.  Any other flush asks it before: the sync
+    /// then runs where the flush's rows are written, before the first of
+    /// them, or before the flush ends when it writes none.  When it is
     /// false, the flush runs exactly as it would with no participant: an
     /// empty overlay commits nothing, a non-empty one commits its rows
     /// alone.  When it is true, the flush commits even an empty overlay,
@@ -148,11 +154,11 @@ pub trait FlushParticipant: Send + Sync {
     /// A database opened with [`crate::Options::background_commit`] hands
     /// the rest of a flush that a commit's own check tripped, or that
     /// [`crate::Database::flush_in_background`] asked for, to a thread of
-    /// its own once the write cache is captured, the block files are
-    /// synced, the write transaction is open and [`Self::seal`] has
-    /// returned.  That thread writes the overlay's rows, calls
-    /// `contribute`, commits, and calls `finished`, while the commit that
-    /// tripped the flush runs its hooks and returns, or
+    /// its own once the write cache is captured, what the block-file sync
+    /// owes is taken, the write transaction is open and [`Self::seal`] has
+    /// returned.  That thread syncs the block files, writes the overlay's
+    /// rows, calls `contribute`, commits, and calls `finished`, while the
+    /// commit that tripped the flush runs its hooks and returns, or
     /// `flush_in_background` returns, and so may any number of commits
     /// after it.  A participant that answers `false` is never put in that
     /// position: a flush in which it has work runs from start to end on

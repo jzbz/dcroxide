@@ -135,6 +135,16 @@ impl PowerLossBackend {
         self.syncs.load(Ordering::SeqCst)
     }
 
+    /// Count one operation on storage this backend does not hold, such as
+    /// a block file's fsync, in the one sequence its own writes, length
+    /// changes and syncs are counted in: admitted while the power is on,
+    /// and refused with the same error once a cut scheduled by
+    /// [`Self::power_fails_after`] has come.  What the operation makes
+    /// durable is the caller's to model.
+    pub fn admit_external(&self) -> Result<(), std::io::Error> {
+        self.admit()
+    }
+
     /// Admit one mutating operation, or refuse it once the power is out.
     fn admit(&self) -> Result<(), std::io::Error> {
         let fail_at = self.fail_at.load(Ordering::SeqCst);

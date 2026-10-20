@@ -4,11 +4,12 @@
 //!
 //! With the option set, a flush that a commit's own check trips is
 //! handed over once its write transaction is open: the overlay is
-//! captured, the block files are synced, redb's write transaction is
-//! opened and the participant sealed on the committing thread, under the
-//! writer semaphore, and the rows are written into the transaction and
-//! the redb commit made by the store's commit thread, named `dbcommit`,
-//! while the commit that tripped the flush returns.  The thread is one for
+//! captured, what the block-file sync owes is taken, redb's write
+//! transaction is opened and the participant sealed on the committing
+//! thread, under the writer semaphore, and the block files are synced,
+//! the rows written into the transaction and the redb commit made by the
+//! store's commit thread, named `dbcommit`, while the commit that tripped
+//! the flush returns.  The thread is one for
 //! the open store, started by the first flush handed to it and kept until
 //! the close or the drop of the last handle.  These tests hold it at its
 //! first write (`GateBackend`), or a participant's `contribute` at its
@@ -635,9 +636,9 @@ fn a_commit_that_trips_a_flush_returns_while_its_commit_is_held() {
         "generation 1: {obs:?}"
     );
     assert!(
-        obs.block_sync.elapsed <= obs.foreground
-            && obs.insert.elapsed + obs.commit.elapsed <= obs.elapsed - obs.foreground,
-        "the sync ran before the hand-off, the insert loop and the commit after it: {obs:?}"
+        obs.block_sync.elapsed + obs.insert.elapsed + obs.commit.elapsed
+            <= obs.elapsed - obs.foreground,
+        "the block sync, the insert loop and the commit ran after the hand-off: {obs:?}"
     );
     assert!(
         obs.foreground < obs.elapsed && obs.elapsed >= held_for,
@@ -664,8 +665,8 @@ fn a_commit_that_trips_a_flush_returns_while_its_commit_is_held() {
 /// the capture, under the writer, and nothing a hook hands in while its
 /// `contribute` runs.  Held at the start of its `contribute` for a while,
 /// the flush reports a foreground shorter than the hold, a `contribute`
-/// longer than it, and every phase but the block sync after the
-/// hand-off, observed on the committer thread.  The key handed in beside
+/// longer than it, and every phase after the hand-off, observed on the
+/// committer thread.  The key handed in beside
 /// the held `contribute` waits for the next flush, and a power cut keeps
 /// the participant's row of exactly the captured generation.
 #[test]
@@ -721,10 +722,9 @@ fn a_commit_that_trips_a_flush_returns_before_the_flush_writes_its_rows() {
         "the held contribute is the participant's phase: {obs:?}"
     );
     assert!(
-        obs.block_sync.elapsed <= obs.foreground
-            && obs.insert.elapsed + contribute.elapsed + obs.commit.elapsed
-                <= obs.elapsed - obs.foreground,
-        "the rows and the commit were written after the hand-off: {obs:?}"
+        obs.block_sync.elapsed + obs.insert.elapsed + contribute.elapsed + obs.commit.elapsed
+            <= obs.elapsed - obs.foreground,
+        "the block sync, the rows and the commit came after the hand-off: {obs:?}"
     );
 
     let (_dir, path) = rig.crash();
@@ -2403,10 +2403,10 @@ fn a_participant_that_does_not_opt_in_commits_inline() {
 
 /// Blocks stored by commits whose flushes land on a thread of their own
 /// keep to the durable generation across a power cut, each under its own
-/// height: the block files are synced before the commit is handed over,
-/// and the rows that name the blocks are in the handed-over commit.  The
-/// blocks of the commit that tripped the flush, written to the block
-/// files after that sync and named by no durable row, are gone.
+/// height: the block files are synced on the commit thread before its
+/// commit, and the rows that name the blocks are in that commit.  The
+/// blocks of the commit that tripped the flush, which that sync may
+/// cover but no durable row names, are gone.
 #[test]
 fn power_loss_keeps_blocks_of_a_landed_background_commit_under_their_heights() {
     let rig = Rig::new();

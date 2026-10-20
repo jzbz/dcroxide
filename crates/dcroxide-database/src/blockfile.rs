@@ -250,6 +250,13 @@ impl BlockRecord {
 /// read lock does, and a sync captures what it owes ([`Self::sync_plan`])
 /// and fsyncs without it, as dcrd's `syncBlocks` does under read locks
 /// alone.
+///
+/// A sync may also run while blocks are written: a flush handed to the
+/// store's commit thread takes its plan on the thread that captured it
+/// and runs it on the commit thread, while the capturing thread goes on
+/// appending.  Each file owed a sync is listed with the generation of
+/// its latest write ([`DirtyFile`]), and a sync discharges a file only
+/// when no write has reached it since the plan was taken.
 pub(crate) struct BlockStore {
     db_path: PathBuf,
     network: u32,
@@ -262,8 +269,12 @@ pub(crate) struct BlockStore {
     open_files: HashMap<u32, Arc<File>>,
     /// The current write handle, shared with a sync in progress.
     write_file: Option<Arc<File>>,
-    /// Files written to since the last sync, for commit-time fsync.
-    dirty_files: Vec<u32>,
+    /// Files written to since a sync last discharged them, in the order
+    /// first written, each with the generation of its latest write.
+    dirty_files: Vec<DirtyFile>,
+    /// Records written since the store was opened, which numbers each
+    /// write's generation.
+    writes: u64,
     /// The driver's log sink (see [`crate::LogSink`]), for the
     /// `ROLLBACK:` lines dcrd's `handleRollback` logs.
     log: Option<LogSink>,
@@ -273,7 +284,45 @@ pub(crate) struct BlockStore {
     /// [`crate::Database::records_written_as_laid_out`]: nothing here
     /// reads it.
     pub(crate) laid_out_written: u64,
+    /// A test's probe into the syncs, copied into each plan
+    /// ([`SyncHook`]).
+    #[cfg(test)]
+    pub(crate) sync_hook: Option<SyncHook>,
 }
+
+/// A block file owed a sync, with the generation of the latest write to
+/// it: the store's count of records written ([`BlockStore`]'s `writes`)
+/// as of that write.
+///
+/// A plan captures each owed file with its generation, and the sync that
+/// runs the plan discharges the file only when its generation is still
+/// that one ([`BlockStore::finish_sync`]).  A write after the plan was
+/// taken gives the file a later generation, so its bytes, which the
+/// plan's fsync may have run before, stay owed to the next sync.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DirtyFile {
+    /// The file's number.
+    pub(crate) num: u32,
+    /// The generation of the latest write to it.
+    pub(crate) generation: u64,
+}
+
+/// What a [`SyncHook`] is told.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum SyncEvent<'a> {
+    /// A plan is about to fsync this file, which is at this path.  An
+    /// error from the hook is that fsync's failure.
+    Fsync(u32, &'a Path),
+    /// A plan has run, and its discharge comes next.
+    Ran,
+}
+
+/// A test's probe into the store's syncs, run on the thread that runs
+/// the plan, whichever that is: before each fsync, which it can fail, as
+/// a power cut stops it, and once the plan has run.
+#[cfg(test)]
+pub(crate) type SyncHook = Arc<dyn Fn(SyncEvent<'_>) -> std::io::Result<()> + Send + Sync>;
 
 fn io_err(err: &std::io::Error, what: &str) -> Error {
     db_error(ErrorKind::DriverSpecific, format!("{what}: {err}"))
@@ -317,8 +366,11 @@ impl BlockStore {
             open_files: HashMap::new(),
             write_file: None,
             dirty_files: Vec::new(),
+            writes: 0,
             log,
             laid_out_written: 0,
+            #[cfg(test)]
+            sync_hook: None,
         })
     }
 
@@ -456,8 +508,11 @@ impl BlockStore {
             file_offset: orig_offset,
             block_len: full_len,
         };
-        if !self.dirty_files.contains(&self.write_file_num) {
-            self.dirty_files.push(self.write_file_num);
+        self.writes = self.writes.wrapping_add(1);
+        let (num, generation) = (self.write_file_num, self.writes);
+        match self.dirty_files.iter_mut().find(|dirty| dirty.num == num) {
+            Some(dirty) => dirty.generation = generation,
+            None => self.dirty_files.push(DirtyFile { num, generation }),
         }
         Ok(loc)
     }
@@ -474,37 +529,56 @@ impl BlockStore {
         result
     }
 
-    /// What a sync owes: every file written to since the last sync, in
-    /// the order written, with the write handle for the current one.
-    /// Taken under the store lock; [`SyncPlan::run`] then does the
-    /// fsyncs without it, and [`Self::finish_sync`] discharges them.
+    /// What a sync owes: every file written to since a sync last
+    /// discharged it, in the order first written, each with the
+    /// generation of its latest write, and the write handle for the
+    /// current one.  Taken under the store lock; [`SyncPlan::run`] then
+    /// does the fsyncs without it, and [`Self::finish_sync`] discharges
+    /// them.
     ///
-    /// Nothing may write between the plan and its discharge, or a file
-    /// dirtied again after its fsync would be discharged with the new
-    /// bytes unsynced.  Every sync runs inside a flush, and every flush
-    /// holds the writer semaphore, which is what excludes the writes.
+    /// Blocks may be written between the plan and its discharge: a flush
+    /// handed to the commit thread takes its plan on the thread that
+    /// captured it, which goes on writing blocks while the commit thread
+    /// runs the plan.  The plan covers every byte written before it was
+    /// taken, since an fsync covers everything written to the file before
+    /// it is called.  A file written again after the plan was taken keeps
+    /// its place on the list at the discharge, its generation having
+    /// moved on, so the bytes written after the plan, which the plan's
+    /// fsync may not have covered, stay owed to the next sync.
     pub(crate) fn sync_plan(&self) -> SyncPlan {
         let files = self
             .dirty_files
             .iter()
-            .map(|&num| {
-                let handle = if num == self.write_file_num {
+            .map(|&dirty| {
+                let handle = if dirty.num == self.write_file_num {
                     self.write_file.clone()
                 } else {
                     None
                 };
-                (num, block_file_path(&self.db_path, num), handle)
+                (dirty, block_file_path(&self.db_path, dirty.num), handle)
             })
             .collect();
-        SyncPlan { files }
+        SyncPlan {
+            files,
+            #[cfg(test)]
+            hook: self.sync_hook.clone(),
+        }
     }
 
-    /// Discharge the files a [`SyncPlan::run`] synced.  Entries leave the
-    /// dirty list only after their fsync succeeds, so a transient failure
-    /// keeps the files-before-metadata invariant armed for the next
-    /// attempt.
-    pub(crate) fn finish_sync(&mut self, synced: &[u32]) {
-        self.dirty_files.retain(|num| !synced.contains(num));
+    /// Discharge the files a [`SyncPlan::run`] synced, each only when no
+    /// write has reached it since the plan was taken: an entry leaves the
+    /// dirty list only when it still holds the generation the plan
+    /// captured.  Entries leave the list only after their fsync succeeds,
+    /// so a transient failure keeps the files-before-metadata invariant
+    /// armed for the next attempt.
+    pub(crate) fn finish_sync(&mut self, synced: &[DirtyFile]) {
+        self.dirty_files.retain(|dirty| !synced.contains(dirty));
+    }
+
+    /// The numbers of the files owed a sync, in the order first written.
+    #[cfg(test)]
+    pub(crate) fn dirty_nums(&self) -> Vec<u32> {
+        self.dirty_files.iter().map(|dirty| dirty.num).collect()
     }
 
     /// A shared handle for reading the given file, opened on first use
@@ -586,7 +660,7 @@ impl BlockStore {
         // a full disk, an `EIO` out of `sync_all`.  Each returns an
         // error, and the store keeps running — the next `sync` has to
         // still know about it.
-        self.dirty_files.retain(|&num| num <= file_num);
+        self.dirty_files.retain(|dirty| dirty.num <= file_num);
 
         // Remove any files that are entirely after the target.  A file
         // that cannot be removed ends the rollback, as in dcrd -- a
@@ -614,7 +688,7 @@ impl BlockStore {
         if offset == 0 && !path.exists() {
             // Rolling back to the very start of a file that was never
             // created: there are no bytes to truncate and none to sync.
-            self.dirty_files.retain(|&num| num != file_num);
+            self.dirty_files.retain(|dirty| dirty.num != file_num);
             return Ok(());
         }
         let file = OpenOptions::new()
@@ -641,7 +715,7 @@ impl BlockStore {
         })?;
         // The truncation is on the platter, so the target file owes
         // nothing further.
-        self.dirty_files.retain(|&num| num != file_num);
+        self.dirty_files.retain(|dirty| dirty.num != file_num);
         Ok(())
     }
 }
@@ -872,22 +946,33 @@ impl BlockReader {
 }
 
 /// The fsyncs a sync owes, captured by [`BlockStore::sync_plan`] under
-/// the store lock and run without it.
+/// the store lock and run without it, on the thread that took it or on
+/// the thread its flush was handed to.
 pub(crate) struct SyncPlan {
-    /// File number, path, and the write handle when the file is the
-    /// current write file, in the order the files were written.
-    files: Vec<(u32, PathBuf, Option<Arc<File>>)>,
+    /// File, with the generation of its latest write when the plan was
+    /// taken, its path, and the write handle when the file was the current
+    /// write file, in the order the files were first written.
+    files: Vec<(DirtyFile, PathBuf, Option<Arc<File>>)>,
+    /// The store's [`SyncHook`] when the plan was taken.
+    #[cfg(test)]
+    hook: Option<SyncHook>,
 }
 
 impl SyncPlan {
     /// Fsync each owed file in order, stopping at the first failure.
     /// Returns the files synced, for [`BlockStore::finish_sync`], and the
     /// failure if there was one.
-    pub(crate) fn run(&self) -> (Vec<u32>, Result<(), Error>) {
+    pub(crate) fn run(&self) -> (Vec<DirtyFile>, Result<(), Error>) {
         let mut synced = Vec::with_capacity(self.files.len());
-        for (num, path, handle) in &self.files {
+        for (dirty, path, handle) in &self.files {
             #[cfg(test)]
             io_hook("fsync");
+            #[cfg(test)]
+            if let Some(hook) = &self.hook
+                && let Err(e) = hook(SyncEvent::Fsync(dirty.num, path))
+            {
+                return (synced, Err(io_err(&e, "failed to sync file")));
+            }
             let result = match handle {
                 Some(f) => f.sync_all().map_err(|e| io_err(&e, "failed to sync file")),
                 None => {
@@ -910,9 +995,18 @@ impl SyncPlan {
             if let Err(e) = result {
                 return (synced, Err(e));
             }
-            synced.push(*num);
+            synced.push(*dirty);
         }
         (synced, Ok(()))
+    }
+
+    /// Tell the store's [`SyncHook`] that the plan has run and its
+    /// discharge comes next.
+    #[cfg(test)]
+    pub(crate) fn ran(&self) {
+        if let Some(hook) = &self.hook {
+            let _ = hook(SyncEvent::Ran);
+        }
     }
 }
 
@@ -932,6 +1026,102 @@ mod tests {
             .expect("open store")
     }
 
+    /// A block written to a file after a plan was taken keeps that file
+    /// owed a sync once the plan has run, whether the write came before
+    /// or after the plan's fsync: the plan's discharge leaves a file whose
+    /// generation moved on, and the next plan syncs it.  A file the plan
+    /// synced and no write reached since is discharged, a rotation to
+    /// the next file in between included.
+    #[test]
+    fn a_write_after_the_plan_stays_owed_to_the_next_sync() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut store = small_store(dir.path());
+
+        // Written after the plan's fsync and before its discharge: the
+        // bytes the fsync may have missed.
+        store.write_block(&[1; 8]).expect("write block");
+        let plan = store.sync_plan();
+        let (synced, result) = plan.run();
+        result.expect("sync");
+        store.write_block(&[2; 8]).expect("write block");
+        store.finish_sync(&synced);
+        assert_eq!(store.dirty_nums(), vec![0], "the second write is owed");
+        let generation = store.dirty_files[0].generation;
+        let plan = store.sync_plan();
+        let (synced, result) = plan.run();
+        result.expect("sync");
+        assert_eq!(synced, [DirtyFile { num: 0, generation }]);
+        store.finish_sync(&synced);
+        assert!(store.dirty_nums().is_empty());
+
+        // Written after the plan was taken and before its fsync, and
+        // rotating to file 1 with a third: file 1 was never in the plan,
+        // and file 0, written since, stays too.
+        store.rollback_to(0, 0).expect("rollback");
+        store.write_block(&[3; 8]).expect("write block");
+        let plan = store.sync_plan();
+        store.write_block(&[4; 8]).expect("write block");
+        store.write_block(&[5; 8]).expect("write block");
+        assert_eq!(store.write_file_num, 1);
+        let (synced, result) = plan.run();
+        result.expect("sync");
+        store.finish_sync(&synced);
+        assert_eq!(store.dirty_nums(), vec![0, 1]);
+
+        // Taken after those writes, a plan covers both and leaves nothing
+        // owed; a write to file 1 after it keeps file 1 alone.
+        let plan = store.sync_plan();
+        store.write_block(&[6; 8]).expect("write block");
+        let (synced, result) = plan.run();
+        result.expect("sync");
+        store.finish_sync(&synced);
+        assert_eq!(store.dirty_nums(), vec![1]);
+        store.sync().expect("sync");
+        assert!(store.dirty_nums().is_empty());
+    }
+
+    /// A plan that fails part way discharges only the files it synced,
+    /// each only if no write reached it since the plan: a file whose
+    /// fsync failed stays owed, and so does one written after the plan.
+    #[test]
+    fn a_failed_plan_discharges_only_what_it_synced_and_nothing_written_since() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut store = small_store(dir.path());
+        for i in 0..3u8 {
+            store.write_block(&[i; 8]).expect("write block");
+        }
+        assert_eq!(store.dirty_nums(), vec![0, 1]);
+        let failing: SyncHook = Arc::new(|event| match event {
+            SyncEvent::Fsync(1, _) => Err(std::io::Error::other("a failed fsync")),
+            _ => Ok(()),
+        });
+        store.sync_hook = Some(failing);
+        let plan = store.sync_plan();
+        store.sync_hook = None;
+        let (synced, result) = plan.run();
+        assert!(result.is_err(), "file 1's fsync failed");
+        assert_eq!(synced.len(), 1, "file 0 was synced: {synced:?}");
+        store.finish_sync(&synced);
+        assert_eq!(store.dirty_nums(), vec![1], "file 1 is still owed");
+
+        // File 1 again, and a write to file 0 between that plan and its
+        // discharge: both stay owed.
+        store
+            .rollback_to(0, 8 + BLOCK_RECORD_OVERHEAD)
+            .expect("rollback");
+        assert!(store.dirty_nums().is_empty(), "the rollback synced file 0");
+        store.write_block(&[7; 8]).expect("write block");
+        store.write_block(&[8; 8]).expect("write block");
+        assert_eq!(store.dirty_nums(), vec![0, 1]);
+        let plan = store.sync_plan();
+        store.rollback_to(1, 0).expect("rollback");
+        store.write_block(&[9; 8]).expect("write block");
+        let (synced, result) = plan.run();
+        result.expect("sync");
+        store.finish_sync(&synced);
+        assert_eq!(store.dirty_nums(), vec![1], "file 1, written since");
+    }
+
     /// Rolling back must not discard the pending fsync for files that
     /// survive the rollback.  Those files still hold bytes the metadata
     /// will refer to, and the dirty list is what guarantees they reach
@@ -947,20 +1137,20 @@ mod tests {
             store.write_block(&[i; 8]).expect("write block");
         }
         assert_eq!(store.write_file_num, 1, "the writes must span two files");
-        assert_eq!(store.dirty_files, vec![0, 1]);
+        assert_eq!(store.dirty_nums(), vec![0, 1]);
 
         // Roll back to the start of file 1: file 0 is untouched and its
         // bytes remain live, so its fsync is still owed.
         store.rollback_to(1, 0).expect("rollback");
         assert_eq!(
-            store.dirty_files,
+            store.dirty_nums(),
             vec![0],
             "file 0 survived the rollback and still needs its fsync"
         );
 
         // The sync must then actually reach it, leaving nothing owed.
         store.sync().expect("sync");
-        assert!(store.dirty_files.is_empty());
+        assert!(store.dirty_nums().is_empty());
     }
 
     /// A rollback whose truncation fails still owes the target file its
@@ -992,7 +1182,7 @@ mod tests {
         for i in 0..2u8 {
             store.write_block(&[i; 8]).expect("write block");
         }
-        assert_eq!(store.dirty_files, vec![0]);
+        assert_eq!(store.dirty_nums(), vec![0]);
 
         // Make file 0 unwritable, so the rollback cannot open it to
         // truncate.
@@ -1007,7 +1197,7 @@ mod tests {
             "the failure is the truncating open: {err}"
         );
         assert_eq!(
-            store.dirty_files,
+            store.dirty_nums(),
             vec![0],
             "the fsync the truncation would have discharged is still owed"
         );
@@ -1056,7 +1246,7 @@ mod tests {
             store.write_block(&[i; 8]).expect("write block");
         }
         assert_eq!(store.write_file_num, 1, "the writes must span two files");
-        assert_eq!(store.dirty_files, vec![0, 1]);
+        assert_eq!(store.dirty_nums(), vec![0, 1]);
 
         // File 0 has been rolled past: its handle is closed and the sync
         // has to reopen it by path.  Make it unwritable.
@@ -1072,7 +1262,7 @@ mod tests {
             "the failure must name the reopen, got: {err}"
         );
         assert_eq!(
-            store.dirty_files,
+            store.dirty_nums(),
             vec![0, 1],
             "a failed sync must keep the whole dirty list so the barrier stays armed"
         );
@@ -1082,7 +1272,7 @@ mod tests {
         fs::set_permissions(&rolled_past, fs::Permissions::from_mode(0o644))
             .expect("restore the mode");
         store.sync().expect("sync");
-        assert!(store.dirty_files.is_empty());
+        assert!(store.dirty_nums().is_empty());
     }
 
     /// A rollback that fails still puts the write cursor back, as dcrd's
@@ -1166,14 +1356,14 @@ mod tests {
         for i in 0..3u8 {
             store.write_block(&[i; 8]).expect("write block");
         }
-        assert_eq!(store.dirty_files, vec![0, 1]);
+        assert_eq!(store.dirty_nums(), vec![0, 1]);
 
         // Back to the very start: file 1 is removed, file 0 truncated.
         store.rollback_to(0, 0).expect("rollback");
         assert!(
-            store.dirty_files.is_empty(),
+            store.dirty_nums().is_empty(),
             "discarded files must not be left owing a sync: {:?}",
-            store.dirty_files
+            store.dirty_nums()
         );
         assert!(!block_file_path(dir.path(), 1).exists());
         store.sync().expect("sync must not fail on a removed file");
@@ -1388,7 +1578,7 @@ mod tests {
         assert_eq!((store.write_file_num, store.write_offset), (2, 89));
         assert_eq!(file(1), record_of(NET, &[]), "nothing of it in file 1");
         assert_eq!(file(2), record_of(NET, &c));
-        assert_eq!(store.dirty_files, vec![0, 1, 2]);
+        assert_eq!(store.dirty_nums(), vec![0, 1, 2]);
     }
 
     /// Set in the child that runs under a file-size limit.
@@ -1523,7 +1713,7 @@ mod tests {
                 "{what}: the cursor moves by what landed"
             );
             assert!(
-                store.dirty_files.is_empty(),
+                store.dirty_nums().is_empty(),
                 "{what}: a failed write owes no sync"
             );
             let left = fs::read(&path).expect("read block file");

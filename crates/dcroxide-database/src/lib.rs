@@ -57,6 +57,8 @@ pub mod bootstrap;
 mod bucketindex;
 pub(crate) mod dbcache;
 mod error;
+#[cfg(test)]
+mod flush_sync_tests;
 mod participant;
 mod procmem;
 mod transaction;
@@ -705,7 +707,10 @@ pub struct FlushObservation {
     /// [`Self::stats`]. Zero on unsampled flushes.
     pub stats_elapsed: std::time::Duration,
     /// Of `elapsed`, the fsync of the block files written since the last
-    /// flush, which runs first (dcrd `syncBlocks`).
+    /// flush, which runs first (dcrd `syncBlocks`): on the capturing
+    /// thread, before the write transaction is opened, or, for a flush
+    /// that could be handed over ([`Options::background_commit`]), on the
+    /// thread that writes its rows, before it writes them.
     pub block_sync: FlushPhase,
     /// Of `elapsed`, handing the overlay's entries to redb: every insert
     /// and remove, the stats walk excluded.  The write transaction is
@@ -752,15 +757,17 @@ pub struct FlushObservation {
     /// [`Database::flush_in_background`] asked for, whose commit is handed
     /// over as a tripped one's is.
     pub explicit: bool,
-    /// Whether the flush's rows were written and its redb commit made on
-    /// another thread than the one that captured the overlay
-    /// ([`Options::background_commit`]).
+    /// Whether the flush's block files were synced, its rows written and
+    /// its redb commit made on another thread than the one that captured
+    /// the overlay ([`Options::background_commit`]).
     pub background: bool,
     /// Of `elapsed`, the part the capturing thread spent in the flush,
     /// holding the writer semaphore: all of it when that thread made the
     /// commit too, and the time from the capture to the hand-off when
-    /// [`Self::background`] is set, which is the block-file sync, the
-    /// opening of the write transaction and the participant's `seal`.
+    /// [`Self::background`] is set, which is the taking of what the
+    /// block-file sync owes, the opening of the write transaction and the
+    /// participant's `seal`.  The block-file sync itself then runs on the
+    /// thread the flush was handed to.
     pub foreground: std::time::Duration,
     /// What was spent, since the capture before this one and so outside
     /// `elapsed`, waiting for an earlier flush's commit on another thread
@@ -927,9 +934,9 @@ impl FlushMemory {
 /// Every counter of a phase is read on the thread that ran the phase, at
 /// its start and its end, and "the flushing thread" below is that
 /// thread.  For a flush whose rows and commit were written on a thread of
-/// its own ([`FlushObservation::background`]) the figures of the insert
-/// loop, the participant's `contribute` and the commit are that
-/// thread's, and those of the block-file sync are the capturing thread's.
+/// its own ([`FlushObservation::background`]) the figures of the
+/// block-file sync, the insert loop, the participant's `contribute` and
+/// the commit are that thread's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct FlushPhase {
     /// Wall time the phase took.
@@ -1139,11 +1146,14 @@ pub struct Options {
     /// progress of a redb repair of the metadata store.
     pub log: Option<LogSink>,
     /// Whether a flush that a commit's own check trips, or that
-    /// [`Database::flush_in_background`] asks for, hands the writing of its
-    /// rows and its redb commit to a thread of its own, so that its caller
-    /// returns once the write cache is captured, the block files are
-    /// synced, redb's write transaction is open and a
-    /// [`FlushParticipant`] with work has sealed it.
+    /// [`Database::flush_in_background`] asks for, hands the sync of the
+    /// block files, the writing of its rows and its redb commit to a
+    /// thread of its own, so that its caller returns once the write cache
+    /// is captured, what the block-file sync owes is taken, redb's write
+    /// transaction is open and a [`FlushParticipant`] with work has sealed
+    /// it.  The block files are still synced before the redb commit, on
+    /// that thread, and a block written meanwhile is left owed to the next
+    /// flush's sync.
     ///
     /// `false` by default, in which case every flush writes and commits
     /// on the thread that ran it, under the writer semaphore, as dcrd's
@@ -1354,12 +1364,14 @@ pub(crate) enum FlushKind {
 /// opened without [`Options::background_commit`].  With it, a flush on the
 /// commit path, or one `Database::flush_in_background` asked for, stops
 /// being synchronous once its write transaction is open: the capture, the
-/// block-file sync, the opening of the transaction and the participant's
-/// `seal` run here, under the caller's semaphore, and the rest is handed
-/// to the store's commit thread ([`hand_off`]), which writes the overlay's
-/// rows and the participant's into the transaction, makes the redb commit,
-/// retires the layers and calls `finished` when it lands.  The rows go in
-/// in the same order on either thread.  The caller is then told `Ok` with
+/// taking of what the block-file sync owes, the opening of the transaction
+/// and the participant's `seal` run here, under the caller's semaphore,
+/// and the rest is handed to the store's commit thread ([`hand_off`]),
+/// which syncs the block files, writes the overlay's rows and the
+/// participant's into the transaction, makes the redb commit, retires the
+/// layers and calls `finished` when it lands.  The rows go in in the same
+/// order on either thread, and the block files are synced before the
+/// redb commit on either.  The caller is then told `Ok` with
 /// nothing of that batch acknowledged as durable; no caller of a commit is
 /// promised durability, and the caller of `Database::flush_in_background`
 /// learns of it from [`Database::is_durable`].  A participant with work
@@ -1389,9 +1401,9 @@ pub(crate) enum FlushKind {
 ///
 /// A registered [`FlushParticipant`] is driven from here too (ADR-0011).
 /// On the commit path its `wants_flush` can trip a flush the overlay's
-/// thresholds would not.  `DbCache::open` asks `has_work` once the block
-/// files are synced and, with work, calls `seal` once the write
-/// transaction is open, both here; `DbCache::fill` calls `contribute`
+/// thresholds would not.  `DbCache::open` asks `has_work` after the
+/// capture and, with work, calls `seal` once the write transaction is
+/// open, both here; `DbCache::fill` calls `contribute`
 /// within the transaction, after the overlay's rows, on the thread that
 /// commits.  After the retirement, or after a failure has latched the
 /// store, [`finish`] calls `finished` with the outcome, for every flush
@@ -1486,24 +1498,56 @@ pub(crate) fn flush_locked(
             batch.memory.previous_release = end.release;
         }
     }
-    // The block files are synced, and what the sync owed is discharged,
-    // on this thread before the transaction can leave it: nothing writes
-    // a block between the plan and its discharge, because the semaphore
-    // is held throughout both.  So is the transaction opened and the
-    // participant sealed: no commit hook runs between the capture and
-    // the seal, so what the participant sets apart is exactly what the
-    // captured commits handed it.
-    let opened = DbCache::sync_blocks(&batch, &inner.block_store)
-        .and_then(|block_sync| DbCache::open(&batch, &inner.kv, registered.as_ref(), block_sync));
+    // What the block sync owes is taken here, under the semaphore,
+    // after the capture, so it covers every block the captured metadata
+    // names.  A flush that may leave this thread leaves running it to the
+    // thread that commits (`DbCache::fill`), which syncs before it
+    // writes a row and so before its redb commit: block files before
+    // metadata, wherever the commit is made.  Blocks written meanwhile
+    // keep their files owed to the next flush's sync.  Any other flush
+    // syncs here before the transaction is opened, as it always has.  The
+    // transaction is opened and the participant sealed on this thread
+    // either way: no commit hook runs between the capture and the seal,
+    // so what the participant sets apart is exactly what the captured
+    // commits handed it.
+    let may_hand_off = inner.background && kind != FlushKind::Durable;
+    let opened = if may_hand_off {
+        let plan = DbCache::plan_block_sync(&inner.block_store);
+        DbCache::open(
+            &batch,
+            &inner.kv,
+            registered.as_ref(),
+            crate::FlushPhase::default(),
+        )
+        .map(|opened| (opened, Some(plan)))
+    } else {
+        DbCache::sync_blocks(&batch, &inner.block_store)
+            .and_then(|block_sync| {
+                DbCache::open(&batch, &inner.kv, registered.as_ref(), block_sync)
+            })
+            .map(|opened| (opened, None))
+    };
     let job = match opened {
-        Ok(Opened::Tx(job)) => job,
-        Ok(Opened::Empty(outcome)) => {
-            return finish(inner, batch, Ok(outcome), registered.as_ref(), false, false);
+        Ok((Opened::Tx(mut job), plan)) => {
+            if let Some(plan) = plan {
+                job.defer_block_sync(plan);
+            }
+            job
+        }
+        // Nothing to commit: a sync left for the commit is run here.
+        Ok((Opened::Empty(outcome), plan)) => {
+            let outcome = match plan {
+                Some(plan) => DbCache::run_block_sync(batch.observed(), plan, &inner.block_store)
+                    .map(|block_sync| outcome.with_block_sync(block_sync)),
+                None => Ok(outcome),
+            };
+            return finish(inner, batch, outcome, registered.as_ref(), false, false);
         }
         // A failure before the hand-off fails the caller, as it always
         // has: the commit that tripped the flush is unapplied and rolls
         // its block files back.  Nothing was sealed, so the participant
-        // is owed nothing.
+        // is owed nothing, and a sync left for the commit is dropped
+        // unrun, its files still owed.
         Err(e) => {
             return finish(inner, batch, Err(e), registered.as_ref(), false, false);
         }
@@ -1571,10 +1615,11 @@ pub(crate) fn flush_locked(
     finish(inner, batch, result, registered.as_ref(), sealed, false)
 }
 
-/// The part of a flush that may leave the capturing thread: write the
-/// overlay's rows and the participant's into the open transaction
-/// ([`DbCache::fill`]), then make redb's durable commit
-/// ([`DbCache::commit`]), both on the calling thread.
+/// The part of a flush that may leave the capturing thread: run the block
+/// sync the capture left to it, if any, write the overlay's rows and the
+/// participant's into the open transaction ([`DbCache::fill`]), then make
+/// redb's durable commit ([`DbCache::commit`]), all on the calling
+/// thread.
 fn write_and_commit(
     inner: &DbInner,
     batch: &FlushBatch,
@@ -1588,7 +1633,7 @@ fn write_and_commit(
             hook();
         }
     }
-    let job = DbCache::fill(batch, job, registered)?;
+    let job = DbCache::fill(batch, job, registered, &inner.block_store)?;
     if let Some(probe) = &inner.before_commit {
         probe();
     }
@@ -1963,11 +2008,14 @@ fn commit_thread(jobs: mpsc::Receiver<Job>) {
 /// go of the store and of everything of the flush, then signal its
 /// ticket ([`JobEnd`]).
 ///
-/// It takes the cache lock, in [`finish`], and calls the participant's
-/// `contribute` and `finished`; it never takes the writer semaphore, the
-/// block-store lock, the participant slot's lock or the commit thread's
-/// slot, and never touches the flight slot that holds its ticket.  A
-/// semaphore holder can therefore always wait for it.
+/// It takes the block-store lock, to discharge the block sync it runs
+/// ([`DbCache::run_block_sync`]), and the cache lock, in [`finish`], and
+/// calls the participant's `contribute` and `finished`; it never takes the
+/// writer semaphore, the participant slot's lock or the commit thread's
+/// slot, and never touches the flight slot that holds its ticket.  The
+/// block-store lock is held only around block writes, block reads'
+/// handles and rollbacks, none of which waits for this thread, so a
+/// semaphore holder can still always wait for it.
 fn run_job(job: Job) {
     let Job {
         inner,
@@ -3451,8 +3499,8 @@ impl Database {
     /// does, except that the redb commit may be left under way: with
     /// [`Options::background_commit`] the flush is handed to a thread of
     /// its own as a commit's own flush is, and this returns once the
-    /// write cache is captured, the block files are synced and the
-    /// flush's write transaction is open.  dcrd has no such call.
+    /// write cache is captured, what the block-file sync owes is taken
+    /// and the flush's write transaction is open.  dcrd has no such call.
     ///
     /// `Ok` acknowledges nothing as durable.  Read a [`CommitMark`]
     /// ([`Self::commit_mark`]) before calling it and ask
@@ -5067,30 +5115,62 @@ mod background_commit_tests {
         reopened.close().expect("close");
     }
 
-    /// The block files are synced by the thread that captured the flush,
-    /// before the commit leaves it: the metadata a handed-over commit
-    /// makes durable never names block bytes that are not.  Seen through
-    /// the block store's hook, which runs on the thread doing the I/O and
-    /// is set here for this thread alone.
+    /// Record the name of the thread that runs each of `db`'s block-file
+    /// fsyncs, through the block store's sync hook, which runs on that
+    /// thread.
+    fn record_sync_threads(db: &Database) -> Arc<Mutex<Vec<Option<String>>>> {
+        let seen: Arc<Mutex<Vec<Option<String>>>> = Arc::default();
+        let log = Arc::clone(&seen);
+        db.inner
+            .block_store
+            .lock()
+            .expect("block store lock poisoned")
+            .sync_hook = Some(Arc::new(move |event| {
+            if let crate::blockfile::SyncEvent::Fsync(..) = event {
+                log.lock()
+                    .expect("sync threads")
+                    .push(std::thread::current().name().map(String::from));
+            }
+            Ok(())
+        }));
+        seen
+    }
+
+    /// Store a block and enough rows to arm the next commit's flush.
+    fn store_a_block_and_fill(db: &Database) {
+        let raw = vec![0x5au8; 300];
+        let hash = dcroxide_chainhash::hash_h(&raw[..180]);
+        db.update(|tx| {
+            tx.store_block_raw(&hash, raw.clone())?;
+            let rows = tx.metadata().bucket(b"rows").expect("bucket");
+            for i in 0..48u8 {
+                rows.put(&[1, i], &[1; 1024])?;
+            }
+            Ok(())
+        })
+        .expect("a block and enough rows to arm the flush");
+    }
+
+    /// A flush's block files are synced by the thread that commits it.  A
+    /// flush handed over is synced on the commit thread, before that
+    /// thread's first write to the metadata file and so before its redb
+    /// commit: the metadata a handed-over commit makes durable never names
+    /// block bytes that are not, and the capturing thread syncs nothing.
+    /// A flush that stays on the capturing thread is synced there: one
+    /// whose thread the system refuses, one `Database::flush` asks for,
+    /// and every flush with background commits off.
     #[test]
-    fn the_block_files_are_synced_before_the_commit_is_handed_over() {
+    fn a_flush_syncs_its_block_files_on_the_thread_that_commits_it() {
         use std::cell::RefCell;
         use std::rc::Rc;
 
-        let rig = Rig::new();
-        let raw = vec![0x5au8; 300];
-        let hash = dcroxide_chainhash::hash_h(&raw[..180]);
-        rig.db
-            .update(|tx| {
-                tx.store_block_raw(&hash, raw.clone())?;
-                let rows = tx.metadata().bucket(b"rows").expect("bucket");
-                for i in 0..48u8 {
-                    rows.put(&[1, i], &[1; 1024])?;
-                }
-                Ok(())
-            })
-            .expect("a block and enough rows to arm the flush");
+        let here = std::thread::current().name().map(String::from);
+        let committer = Some(COMMIT_THREAD_NAME.to_string());
 
+        // Handed over.
+        let rig = Rig::new();
+        let synced = record_sync_threads(&rig.db);
+        store_a_block_and_fill(&rig.db);
         let seen: Rc<RefCell<Vec<&'static str>>> = Rc::default();
         let log = Rc::clone(&seen);
         crate::blockfile::IO_HOOK.with(|hook| {
@@ -5100,33 +5180,68 @@ mod background_commit_tests {
         rig.small(2).expect("the commit that trips the flush");
         assert!(rig.gate.wait_held(NEVER), "the commit is under way");
         crate::blockfile::IO_HOOK.with(|hook| *hook.borrow_mut() = None);
+        assert!(
+            !seen.borrow().contains(&"fsync"),
+            "the capturing thread synced nothing: {:?}",
+            seen.borrow()
+        );
         assert_eq!(
-            seen.borrow()
-                .iter()
-                .filter(|what| **what == "fsync")
-                .count(),
-            1,
-            "the capturing thread synced the block file before the hand-off: {:?}",
-            seen.borrow()
+            *synced.lock().expect("sync threads"),
+            vec![committer],
+            "the commit thread synced the block file before its first metadata write"
         );
         rig.gate.open();
         rig.db.wait_background_commit().expect("the commit landed");
+        let observed = rig.observed();
+        assert!(
+            observed.len() == 1 && observed[0].1.background,
+            "{observed:?}"
+        );
+        rig.db.close().expect("close");
+
+        // A thread refused: synced, and committed, here.
+        let rig = Rig::new();
+        rig.db
+            .inner
+            .refuse_commit_thread
+            .store(true, Ordering::SeqCst);
+        let synced = record_sync_threads(&rig.db);
+        store_a_block_and_fill(&rig.db);
+        rig.small(2).expect("the commit that trips the flush");
+        assert_eq!(*synced.lock().expect("sync threads"), vec![here.clone()]);
+        assert!(!rig.seen.lock().expect("observations")[0].background);
+        rig.db.close().expect("close");
+
+        // `Database::flush`, with background commits on.
+        let rig = Rig::new();
+        let synced = record_sync_threads(&rig.db);
+        store_a_block_and_fill(&rig.db);
+        rig.db.flush().expect("flush");
+        assert_eq!(*synced.lock().expect("sync threads"), vec![here.clone()]);
+        rig.db.close().expect("close");
+
+        // Background commits off.
+        let rig = Rig::inline();
+        let synced = record_sync_threads(&rig.db);
+        store_a_block_and_fill(&rig.db);
+        rig.small(2).expect("the commit that trips the flush");
+        assert_eq!(*synced.lock().expect("sync threads"), vec![here]);
         rig.db.close().expect("close");
     }
 
     /// A block handed in laid out as its record
     /// ([`Transaction::store_block_record`]) is written as it stands by
     /// the commit that stores it, on that commit's thread, and synced by
-    /// the thread that captures the next flush before that flush's commit
-    /// is handed over, as a block the commit lays out itself is.  Once the
-    /// handed-over commit has landed, a power cut leaves the block's row
-    /// naming the record's bytes.
+    /// the commit thread before the next flush's commit, as a block the
+    /// commit lays out itself is.  Once the handed-over commit has landed,
+    /// a power cut leaves the block's row naming the record's bytes.
     #[test]
-    fn a_record_handed_in_is_written_and_synced_before_the_commit_is_handed_over() {
+    fn a_record_handed_in_is_written_as_it_stands_and_synced_before_the_commit() {
         use std::cell::RefCell;
         use std::rc::Rc;
 
         let rig = Rig::new();
+        let synced = record_sync_threads(&rig.db);
         let block: Vec<u8> = (0..300u32).map(|i| (i % 251) as u8).collect();
         let hash = dcroxide_chainhash::hash_h(&block[..180]);
         let height =
@@ -5159,8 +5274,13 @@ mod background_commit_tests {
         let seen = seen.borrow().clone();
         assert_eq!(
             seen,
-            ["write", "fsync"],
-            "this thread wrote the record as it stood and then synced it, before the hand-off"
+            ["write"],
+            "this thread wrote the record as it stood, and synced nothing"
+        );
+        assert_eq!(
+            *synced.lock().expect("sync threads"),
+            [Some(COMMIT_THREAD_NAME.to_string())],
+            "the commit thread synced it before its first metadata write"
         );
         rig.gate.open();
         rig.db.wait_background_commit().expect("the commit landed");
@@ -5427,16 +5547,15 @@ mod background_commit_tests {
             .expect("test hook poisoned") = None;
     }
 
-    /// A handed-over flush's insert loop and commit are timed, processor
-    /// time and I/O, on the thread that made them, at either end of each,
-    /// and its block sync on the thread that captured the flush.  The
-    /// capturing thread computes for a while just before, so a phase
-    /// timed from its counters to the committer's would show no time on a
-    /// processor at all, and the insert loop must fit in the part of the
-    /// flush that ran after the hand-off.  The committer is held at its
-    /// first write until it has surely been switched out, which has the
-    /// kernel bring its time on a processor up to date inside the commit,
-    /// so a commit timed on the committer shows some.
+    /// A handed-over flush's block sync, insert loop and commit are timed,
+    /// processor time and I/O, on the thread that made them, at either end
+    /// of each.  The capturing thread computes for a while just before, so
+    /// a phase timed from its counters to the committer's would show no
+    /// time on a processor at all, and the three phases must fit in the
+    /// part of the flush that ran after the hand-off.  The committer is
+    /// held at its first write until it has surely been switched out,
+    /// which has the kernel bring its time on a processor up to date
+    /// inside the commit, so a commit timed on the committer shows some.
     #[test]
     fn a_handed_over_commit_is_timed_on_the_thread_that_made_it() {
         /// Compute for `wall` on the calling thread, never sleeping.
@@ -5509,16 +5628,16 @@ mod background_commit_tests {
             "{:?}",
             obs.commit
         );
-        assert!(
-            obs.block_sync.on_cpu_ns.unwrap_or(0) <= nanos(obs.foreground + tick),
-            "{:?} in a foreground of {:?}",
-            obs.block_sync,
-            obs.foreground
-        );
         let after_hand_off = obs.elapsed.saturating_sub(obs.foreground);
         assert!(
-            obs.insert.elapsed + obs.commit.elapsed <= after_hand_off,
-            "the insert loop and the commit ran after the hand-off: {obs:?}"
+            obs.block_sync.elapsed + obs.insert.elapsed + obs.commit.elapsed <= after_hand_off,
+            "the block sync, the insert loop and the commit ran after the hand-off: {obs:?}"
+        );
+        assert!(
+            obs.block_sync.on_cpu_ns.unwrap_or(0) <= nanos(after_hand_off + tick),
+            "{:?} after a hand-off {:?} from the end",
+            obs.block_sync,
+            after_hand_off
         );
         assert!(
             obs.insert.on_cpu_ns.unwrap_or(0) <= nanos(after_hand_off + tick),
