@@ -378,25 +378,25 @@ in a series of its own, not to be set beside the loopback figures above:
 from that server on 2026-10-18 `88c46c3` took 407.0 to 407.9 s, against
 391.1 to 397.8 s from the loopback one the day before. The build was
 made from a worktree before its code was committed, and its code differs
-from the code as it stands only by a doc comment and a test's local
-name. It took 270.7 s, 271.5 s, 272.7 s and 271.8 s at the defaults, a
-mean of **4.5 minutes** (271.68 s), and dcrd v2.1.7 took 3,014.6 s and
-3,033.4 s, so dcroxide was 11.13x as fast in one session by the means,
-11.05x to 11.21x over the eight pairings. dcrd ran slower than from the
-same server on 2026-10-18, where it took 2,991.4 s, for a cause not
-taken apart. With `--noexistsaddrindex` the build took 250.8 s and
-249.6 s, and dcrd 1,336.3 s in one run, 5.34x. The build's peak resident
-memory, read when the clock stopped with the node still syncing, was
-2,456 to 2,470 MiB with the index on and 2,269 and 2,270 MiB with it
-off, against dcrd's 1,836 MiB; nothing after the clock is recorded for
-these runs. Since the node goes on syncing from a live server, they
-record no end state either: in each the node's block at 1,116,035 was
-the one every loopback sync ends on, and two syncs of the build from the
-loopback server, at the defaults and with `--assumevalid=0` (below),
-ended with the UTXO set and block files of every full sync from that
-server since 2026-10-17. The ledger's section "One commit thread for the
-life of the store, a sync that checks every script, and dcrd v2.1.7" has
-every run.
+from the code as it stands only by a doc comment, a test's local name
+and a test's assertion. It took 270.7 s, 271.5 s, 272.7 s and 271.8 s at
+the defaults, a mean of **4.5 minutes** (271.68 s), and dcrd v2.1.7 took
+3,014.6 s and 3,033.4 s, so dcroxide was 11.13x as fast in one session
+by the means, 11.05x to 11.21x over the eight pairings. dcrd ran slower
+than from the same server on 2026-10-18, where it took 2,991.4 s, for a
+cause not taken apart. With `--noexistsaddrindex` the build took 250.8 s
+and 249.6 s, and dcrd 1,336.3 s in one run, 5.34x. The build's peak
+resident memory, read when the clock stopped with the node still
+syncing, was 2,456 to 2,470 MiB with the index on and 2,269 and
+2,270 MiB with it off, against dcrd's 1,836 MiB; nothing after the clock
+is recorded for these runs. Since the node goes on syncing from a live
+server, they record no end state either: in each the node's block at
+1,116,035 was the one every loopback sync ends on, and two syncs of the
+build from the loopback server, at the defaults and with
+`--assumevalid=0` (below), ended with the UTXO set and block files of
+every full sync from that server since 2026-10-17. The ledger's section
+"One commit thread for the life of the store, a sync that checks every
+script, and dcrd v2.1.7" has every run.
 
 The rate falls as the chain grows, and falls again where full
 validation begins: by default both daemons skip connect validation,

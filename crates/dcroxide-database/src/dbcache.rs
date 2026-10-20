@@ -2394,7 +2394,16 @@ mod tests {
                 "the heap's mappings are listed at the capture and after the commit"
             );
             assert_eq!(at_hand_off.arenas, None, "and not in between");
-            assert!(at_commit.peak_resident >= at_capture.peak_resident);
+            // No reading's peak is compared with another's: `VmHWM` can
+            // fall between two readings.  The kernel prints it as the
+            // larger of a mark it keeps and the `VmRSS` it prints beside
+            // it (`task_mem` in `fs/proc/task_mmu.c`), and raises the
+            // mark only on its way to unmapping memory, and then to a
+            // count that can trail the pages mapped by what each
+            // processor has yet to add in (`update_hiwater_rss`).  So a
+            // reading taken while resident memory stood above the mark
+            // shows that memory as the peak, and a later one, once any of
+            // the process's memory has been unmapped, can show less.
         }
         let flushes = seen.len();
         drop(seen);
