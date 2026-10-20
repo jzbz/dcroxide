@@ -639,6 +639,7 @@ impl UtxoView {
             stake_tx_hashes,
             None,
             stxos,
+            None,
             is_treasury_enabled,
         );
     }
@@ -648,6 +649,12 @@ impl UtxoView {
     /// (`BlockTxTypes::stake`): the attach loop hands in the ones its
     /// block's `BlockTxTypes` holds.  Without them each transaction is
     /// classified as it is connected, as dcrd's `AddTxOuts` classifies it.
+    ///
+    /// With `journal_starts` and `stxos`, the spend journal's length is
+    /// recorded before each transaction is connected and once after the
+    /// last, as the connect checks record it, so that the filter of a
+    /// block attached without full validation can read each input's
+    /// previous script from the journal (`crate::journalscripts`).
     ///
     /// # Panics
     ///
@@ -659,6 +666,7 @@ impl UtxoView {
         stake_tx_hashes: &[Hash],
         stake_types: Option<&[TxType]>,
         mut stxos: Option<&mut Vec<SpentTxOut>>,
+        mut journal_starts: Option<&mut crate::journalscripts::JournalStarts>,
         is_treasury_enabled: bool,
     ) {
         debug_assert_eq!(
@@ -679,6 +687,9 @@ impl UtxoView {
                 Some(stake_types) => stake_types[i],
                 None => crate::blockhashes::classify_tx(tx),
             };
+            if let (Some(starts), Some(stxos)) = (journal_starts.as_deref_mut(), stxos.as_deref()) {
+                starts.push(stxos.len());
+            }
             self.connect_stake_transaction_typed(
                 tx,
                 tx_type,
@@ -688,6 +699,9 @@ impl UtxoView {
                 stxos.as_deref_mut(),
                 is_treasury_enabled,
             );
+        }
+        if let (Some(starts), Some(stxos)) = (journal_starts, stxos.as_deref()) {
+            starts.push(stxos.len());
         }
     }
 
@@ -812,6 +826,7 @@ impl UtxoView {
             regular_tx_hashes,
             None,
             stxos,
+            None,
             is_treasury_enabled,
         );
     }
@@ -821,7 +836,9 @@ impl UtxoView {
     /// block's (`BlockTxTypes::regular`): the attach loop hands in the
     /// ones its block's `BlockTxTypes` holds.  Without them each
     /// transaction is classified as it is connected, as dcrd's
-    /// `AddTxOuts` classifies it.
+    /// `AddTxOuts` classifies it.  `journal_starts` records where each
+    /// transaction's entries begin in the spend journal, as
+    /// [`Self::connect_stake_transactions_typed`] records it.
     ///
     /// # Panics
     ///
@@ -833,6 +850,7 @@ impl UtxoView {
         regular_tx_hashes: &[Hash],
         regular_types: Option<&[TxType]>,
         mut stxos: Option<&mut Vec<SpentTxOut>>,
+        mut journal_starts: Option<&mut crate::journalscripts::JournalStarts>,
         is_treasury_enabled: bool,
     ) {
         debug_assert_eq!(
@@ -853,6 +871,9 @@ impl UtxoView {
                 Some(regular_types) => regular_types[i],
                 None => crate::blockhashes::classify_tx(tx),
             };
+            if let (Some(starts), Some(stxos)) = (journal_starts.as_deref_mut(), stxos.as_deref()) {
+                starts.push(stxos.len());
+            }
             self.connect_regular_transaction_typed(
                 tx,
                 tx_type,
@@ -862,6 +883,9 @@ impl UtxoView {
                 stxos.as_deref_mut(),
                 is_treasury_enabled,
             );
+        }
+        if let (Some(starts), Some(stxos)) = (journal_starts, stxos.as_deref()) {
+            starts.push(stxos.len());
         }
         self.clear_zero_conf_outs();
     }
@@ -1744,6 +1768,7 @@ impl UtxoView {
             block,
             &tx_hashes,
             None,
+            None,
             parent,
             parent_stxos,
             resolver,
@@ -1761,6 +1786,11 @@ impl UtxoView {
     /// transaction reads for the outputs it adds, where dcrd's
     /// `AddTxOuts` classifies each transaction itself.  Without it each
     /// transaction is classified as it is connected.
+    ///
+    /// With `journal_starts` and `stxos`, where each transaction's entries
+    /// begin in the spend journal is recorded as the trees connect, for
+    /// the filter the attach loop builds from the journal
+    /// (`crate::journalscripts`).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn connect_block_with_hashes(
         &mut self,
@@ -1768,6 +1798,7 @@ impl UtxoView {
         block: &MsgBlock,
         tx_hashes: &crate::blockhashes::BlockTxHashes,
         tx_types: Option<&crate::blockhashes::BlockTxTypes>,
+        journal_starts: Option<&mut crate::journalscripts::BlockJournalStarts>,
         parent: &MsgBlock,
         parent_stxos: impl FnOnce() -> Result<Vec<SpentTxOut>, RuleError>,
         resolver: &impl UtxoResolver,
@@ -1779,6 +1810,7 @@ impl UtxoView {
             block,
             tx_hashes,
             tx_types,
+            journal_starts,
             parent,
             parent_stxos,
             resolver,
@@ -1808,6 +1840,7 @@ impl UtxoView {
             block,
             tx_hashes,
             None,
+            None,
             parent,
             parent_stxos,
             resolver,
@@ -1825,6 +1858,7 @@ impl UtxoView {
         block: &MsgBlock,
         tx_hashes: &crate::blockhashes::BlockTxHashes,
         tx_types: Option<&crate::blockhashes::BlockTxTypes>,
+        journal_starts: Option<&mut crate::journalscripts::BlockJournalStarts>,
         parent: &MsgBlock,
         parent_stxos: impl FnOnce() -> Result<Vec<SpentTxOut>, RuleError>,
         resolver: &impl UtxoResolver,
@@ -1851,11 +1885,16 @@ impl UtxoView {
             is_treasury_enabled,
         );
         self.fetch_input_utxos(block, tx_hashes.regular(), resolver, is_treasury_enabled);
+        let (stake_starts, regular_starts) = match journal_starts {
+            Some(starts) => (Some(&mut starts.stake), Some(&mut starts.regular)),
+            None => (None, None),
+        };
         self.connect_stake_transactions_typed(
             block,
             tx_hashes.stake(),
             tx_types.map(crate::blockhashes::BlockTxTypes::stake),
             stxos.as_deref_mut(),
+            stake_starts,
             is_treasury_enabled,
         );
         self.connect_regular_transactions_typed(
@@ -1863,6 +1902,7 @@ impl UtxoView {
             tx_hashes.regular(),
             tx_types.map(crate::blockhashes::BlockTxTypes::regular),
             stxos,
+            regular_starts,
             is_treasury_enabled,
         );
         self.set_best_hash(block.header.block_hash());

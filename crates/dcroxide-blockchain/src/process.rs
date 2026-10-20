@@ -4299,7 +4299,7 @@ impl Chain {
         block: &MsgBlock,
         view: &UtxoView,
     ) -> Result<FilterV2, RuleError> {
-        self.load_or_create_filter_with_hash(block, None, None, view)
+        self.load_or_create_filter_with_hash(block, None, None, None, view)
     }
 
     /// [`Self::load_or_create_filter`] given the block's hash when the
@@ -4308,17 +4308,24 @@ impl Chain {
     /// `block.Hash()`, `chain.go:989`).  Without it the header is hashed
     /// here.
     ///
-    /// `tx_types` is the classification of the block's transactions
-    /// when the caller holds it, which must be this very block's: a
-    /// filter made here is then built from the stake transactions' types
-    /// (`blockcf2::regular_with_types`), where dcrd's `blockcf2.Regular`
-    /// classifies each stake transaction itself.  Without it they are
-    /// classified here, which is what `regular` does.
+    /// `tx_types` is the classification of the block's transactions when
+    /// the caller holds it, which must be this very block's: a filter
+    /// made here is then built from the stake transactions' types
+    /// (`regular_by_input`, or `regular_with_types` with no journal),
+    /// where dcrd's `blockcf2.Regular` classifies each stake transaction
+    /// itself.  Without it they are classified here, as `regular` does.
+    ///
+    /// `journal` is, when the caller holds it, the spend journal the
+    /// connect of the block to `view` built, with where each
+    /// transaction's entries begin in it: a filter made here then reads
+    /// the previous scripts from it where it can place them, where dcrd
+    /// looks each up in the view (`crate::validate::connected_block_filter`).
     fn load_or_create_filter_with_hash(
         &self,
         block: &MsgBlock,
         block_hash: Option<&Hash>,
         tx_types: Option<&BlockTxTypes>,
+        journal: Option<(&[SpentTxOut], &crate::journalscripts::BlockJournalStarts)>,
         view: &UtxoView,
     ) -> Result<FilterV2, RuleError> {
         let block_hash = match block_hash {
@@ -4331,11 +4338,10 @@ impl Chain {
         if let Some(filter) = self.filters.get(&block_hash.0) {
             return Ok(filter.clone());
         }
-        let scripts = crate::validate::ViewScripts(view);
         let built = match tx_types {
             Some(tx_types) => {
                 tx_types.assert_for(block);
-                dcroxide_gcs::blockcf2::regular_with_types(block, tx_types.stake(), &scripts)
+                crate::validate::connected_block_filter(block, tx_types.stake(), view, journal)
             }
             None => {
                 let stake_types: Vec<dcroxide_stake::TxType> = block
@@ -4343,7 +4349,7 @@ impl Chain {
                     .iter()
                     .map(crate::blockhashes::classify_tx)
                     .collect();
-                dcroxide_gcs::blockcf2::regular_with_types(block, &stake_types, &scripts)
+                crate::validate::connected_block_filter(block, &stake_types, view, journal)
             }
         };
         // dcrd `ruleError(ErrMissingTxOut, err.Error())`.
@@ -4483,13 +4489,18 @@ impl Chain {
             let filter;
             if self.index.node_status(&self.store, node).has_validated() {
                 // The connect of each transaction and the filter read the
-                // classification this loop holds for the block, as the
-                // connect checks do on the other branch.
+                // classification this loop holds for the block, and the
+                // filter reads the previous scripts from the spend journal
+                // the connect builds, as the connect checks do on the other
+                // branch.
+                let mut journal_starts =
+                    crate::journalscripts::BlockJournalStarts::for_block(&block);
                 view.connect_block_with_hashes(
                     params,
                     &block,
                     &tx_hashes,
                     Some(&tx_types),
+                    Some(&mut journal_starts),
                     &parent,
                     || self.fetch_spend_journal(&parent, is_treasury_enabled),
                     &ChainUtxoResolver { chain: self },
@@ -4506,6 +4517,7 @@ impl Chain {
                     &block,
                     block_hash.as_ref(),
                     Some(&tx_types),
+                    Some((stxos.as_slice(), &journal_starts)),
                     &view,
                 )?;
             } else {
@@ -11738,6 +11750,63 @@ mod tests {
             }
             assert_eq!(checked, 30);
             assert!(stake_txs > 30, "the blocks have stake trees: {stake_txs}");
+        }
+    }
+
+    /// The filter the chain builds as it attaches a block reads every
+    /// previous script from the spend journal the block's connect built,
+    /// whether the chain validates the block in full (the connect checks)
+    /// or adds it without, as in a bulk import and as the ancestors of the
+    /// assumed valid block are (the view's connect in the attach loop):
+    /// over dcrd's full block battery, every block attached reads each
+    /// input the filter commits to from the journal and none from the
+    /// view, and the battery's blocks spend enough to show it.  A bulk
+    /// import takes the battery's accepted blocks up to the first that does
+    /// not join the main chain, 162 of them, and none of the blocks dcrd
+    /// refuses, which a bulk import would add unchecked.  (Under debug
+    /// assertions each such filter is also built from the view and
+    /// compared.)
+    #[test]
+    fn an_attached_blocks_filter_reads_its_scripts_from_the_spend_journal() {
+        let params = dcroxide_chaincfg::regnet_params();
+        for bulk_import in [false, true] {
+            let mut chain = Chain::new(&params, Hash::ZERO, false);
+            chain.bulk_import_mode = bulk_import;
+            let before = crate::journalscripts::JOURNAL_READS.get();
+            let (mut now, mut added) = (0, 0);
+            for line in include_str!("../tests/data/fullblock_vectors.txt").lines() {
+                let f: Vec<&str> = line.split(' ').collect();
+                match f[0] {
+                    "now" => now = f[1].parse().expect("now"),
+                    "accept" if bulk_import && f[2] != "true" => break,
+                    "accept" => {
+                        let (block, _) =
+                            MsgBlock::from_bytes(&dcroxide_testutil::unhex(f[4])).expect("block");
+                        let (_, errs) = chain.process_block(&block, now, &params);
+                        if bulk_import {
+                            assert!(errs.is_empty(), "{}: {errs:?}", f[1]);
+                            added += 1;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let (journal, view) = crate::journalscripts::JOURNAL_READS.get();
+            let (journal, view) = (journal - before.0, view - before.1);
+            let floor = if bulk_import {
+                assert_eq!(
+                    added, 162,
+                    "the battery's blocks before its first refused one"
+                );
+                400
+            } else {
+                1_000
+            };
+            assert!(
+                journal > floor && view == 0,
+                "bulk import {bulk_import}: {journal} scripts read from the journal and {view} \
+                 from the view"
+            );
         }
     }
 

@@ -5,7 +5,8 @@
 //! version 2 block filters over structured blocks with real stake
 //! transactions and randomized previous-script sets.  With no oracle,
 //! and over blocks from the same generator drawn with a seed of their
-//! own, `blockcf2::regular_with_types` is held to `blockcf2::regular`.
+//! own, `blockcf2::regular_with_types` and `blockcf2::regular_by_input`
+//! are held to `blockcf2::regular`.
 
 // Test-harness arithmetic over bounded lengths.
 #![allow(clippy::arithmetic_side_effects)]
@@ -513,10 +514,41 @@ fn built(block: &MsgBlock, result: Result<FilterV2, blockcf2::RegularError>) -> 
     }
 }
 
+/// The previous scripts of [`MapPrevScripts`] by the place of the input
+/// that spends each: the source finds the input at the place the build
+/// names and looks its outpoint up, so a build that named another place
+/// would read another script.  It also checks that the outpoint the
+/// build hands in is that input's.
+struct ByPlace<'a> {
+    block: &'a MsgBlock,
+    prevs: &'a MapPrevScripts,
+}
+
+impl blockcf2::InputScripts for ByPlace<'_> {
+    fn input_script(
+        &self,
+        tree: i8,
+        tx_idx: usize,
+        tx_in_idx: usize,
+        prev_out: &OutPoint,
+    ) -> Option<(u16, &[u8])> {
+        let txs = if tree == 1 {
+            &self.block.stransactions
+        } else {
+            &self.block.transactions
+        };
+        let at = &txs[tx_idx].tx_in[tx_in_idx].previous_out_point;
+        assert_eq!(at, prev_out, "the outpoint handed in is the input's");
+        blockcf2::PrevScripter::prev_script(self.prevs, at)
+    }
+}
+
 /// The build handed each stake transaction's type
-/// (`blockcf2::regular_with_types`) is the build that classifies them
-/// (`blockcf2::regular`), filter or missing-script error and its text,
-/// over 600 blocks from the generator the differential below uses
+/// (`blockcf2::regular_with_types`), and the one that also finds each
+/// previous script by the place of its input (`blockcf2::regular_by_input`),
+/// are the build that classifies them and looks each script up by its
+/// outpoint (`blockcf2::regular`), filter or missing-script error and its
+/// text, over 600 blocks from the generator the differential below uses
 /// (`random_block`, `random_prevs`), drawn with a seed of their own, so
 /// not the blocks the differential hands dcrd.  Needs no oracle.
 #[test]
@@ -536,6 +568,15 @@ fn the_typed_build_is_the_classifying_build() {
         let classifying = built(&block, blockcf2::regular(&block, &prevs));
         let typed = built(&block, blockcf2::regular_with_types(&block, &types, &prevs));
         assert_eq!(typed, classifying, "round {round}");
+        let by_place = ByPlace {
+            block: &block,
+            prevs: &prevs,
+        };
+        let placed = built(
+            &block,
+            blockcf2::regular_by_input(&block, &types, &by_place),
+        );
+        assert_eq!(placed, classifying, "round {round}");
         if classifying.starts_with("prevscripterror") {
             missing += 1;
         } else {

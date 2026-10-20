@@ -6,7 +6,7 @@ use alloc::vec::Vec;
 
 use dcroxide_chainhash::Hash;
 use dcroxide_stake as stake;
-use dcroxide_wire::{MsgBlock, MsgTx, OutPoint};
+use dcroxide_wire::{MsgBlock, MsgTx, OutPoint, TX_TREE_REGULAR, TX_TREE_STAKE};
 
 use crate::{Error, FilterV2, KEY_SIZE};
 
@@ -188,6 +188,38 @@ pub trait PrevScripter {
     fn prev_script(&self, out: &OutPoint) -> Option<(u16, &[u8])>;
 }
 
+/// Provides the script version and script of the output each input of a
+/// block spends, by the input's place in the block, for
+/// [`regular_by_input`].  dcrd has no counterpart: its `Regular` looks
+/// each script up by the outpoint ([`PrevScripter`]).
+///
+/// A source that knows a block's inputs by their place, such as the
+/// spend journal the block's connect built, answers without a search.
+pub trait InputScripts {
+    /// The script version and script of the output spent by input
+    /// `tx_in_idx` of the transaction at `tx_idx` in the block's tree
+    /// `tree` (`dcroxide_wire::TX_TREE_REGULAR` or `TX_TREE_STAKE`), which
+    /// is `prev_out`, or `None` when unknown.  It must be the script a
+    /// [`PrevScripter`] over the same state gives for `prev_out`.
+    fn input_script(
+        &self,
+        tree: i8,
+        tx_idx: usize,
+        tx_in_idx: usize,
+        prev_out: &OutPoint,
+    ) -> Option<(u16, &[u8])>;
+}
+
+/// A [`PrevScripter`] read as [`InputScripts`]: each input's script
+/// looked up by the outpoint it spends.
+struct ByOutPoint<'a, P: ?Sized>(&'a P);
+
+impl<P: PrevScripter + ?Sized> InputScripts for ByOutPoint<'_, P> {
+    fn input_script(&self, _: i8, _: usize, _: usize, prev_out: &OutPoint) -> Option<(u16, &[u8])> {
+        self.0.prev_script(prev_out)
+    }
+}
+
 /// Build the version 2 block committed filter for the block per
 /// DCP0005 (dcrd `Regular`).
 ///
@@ -199,7 +231,11 @@ pub fn regular(
     block: &MsgBlock,
     prev_scripts: &impl PrevScripter,
 ) -> Result<FilterV2, RegularError> {
-    build(block, |_, tx| stake::determine_tx_type(tx), prev_scripts)
+    build(
+        block,
+        |_, tx| stake::determine_tx_type(tx),
+        &ByOutPoint(prev_scripts),
+    )
 }
 
 /// [`regular`] given the classification of each of the block's stake
@@ -223,6 +259,24 @@ pub fn regular_with_types(
     stake_types: &[stake::TxType],
     prev_scripts: &impl PrevScripter,
 ) -> Result<FilterV2, RegularError> {
+    regular_by_input(block, stake_types, &ByOutPoint(prev_scripts))
+}
+
+/// [`regular_with_types`] with each previous script found by the place
+/// of the input that spends it ([`InputScripts`]) rather than by its
+/// outpoint.  The filter is [`regular`]'s, byte for byte, when every
+/// script the source gives is the one a [`PrevScripter`] over the same
+/// state gives for the input's outpoint, and a script the source does
+/// not know is [`regular`]'s missing-script error for that input.
+///
+/// # Panics
+///
+/// As [`regular_with_types`] does.
+pub fn regular_by_input(
+    block: &MsgBlock,
+    stake_types: &[stake::TxType],
+    input_scripts: &impl InputScripts,
+) -> Result<FilterV2, RegularError> {
     assert_eq!(
         stake_types.len(),
         block.stransactions.len(),
@@ -236,15 +290,17 @@ pub fn regular_with_types(
             .all(|(tx, tx_type)| stake::determine_tx_type(tx) == *tx_type),
         "stake transaction types do not match the block's stake transactions"
     );
-    build(block, |i, _| stake_types[i], prev_scripts)
+    build(block, |i, _| stake_types[i], input_scripts)
 }
 
-/// The body of [`regular`] and [`regular_with_types`]: `stake_type`
-/// gives the classification of the stake transaction at each index.
+/// The body of [`regular`], [`regular_with_types`] and
+/// [`regular_by_input`]: `stake_type` gives the classification of the
+/// stake transaction at each index, and `prev_scripts` the script each
+/// input spends.
 fn build(
     block: &MsgBlock,
     stake_type: impl Fn(usize, &MsgTx) -> stake::TxType,
-    prev_scripts: &impl PrevScripter,
+    prev_scripts: &impl InputScripts,
 ) -> Result<FilterV2, RegularError> {
     // Room for every entry the block can commit ([`entries_bound`]), so
     // the list is allocated once.  dcrd sizes it by `numEntriesHint`,
@@ -271,7 +327,9 @@ fn build(
 
         for (tx_in_idx, tx_in) in tx.tx_in.iter().enumerate() {
             let prev_out = &tx_in.previous_out_point;
-            let Some((script_ver, prev_out_script)) = prev_scripts.prev_script(prev_out) else {
+            let Some((script_ver, prev_out_script)) =
+                prev_scripts.input_script(TX_TREE_REGULAR, i, tx_in_idx, prev_out)
+            else {
                 return Err(RegularError::PrevScript(PrevScriptError {
                     prev_out: *prev_out,
                     tx_hash: tx.tx_hash(),
@@ -296,7 +354,8 @@ fn build(
             stake::TxType::SStx => {
                 for (tx_in_idx, tx_in) in tx.tx_in.iter().enumerate() {
                     let prev_out = &tx_in.previous_out_point;
-                    let Some((script_ver, prev_out_script)) = prev_scripts.prev_script(prev_out)
+                    let Some((script_ver, prev_out_script)) =
+                        prev_scripts.input_script(TX_TREE_STAKE, i, tx_in_idx, prev_out)
                     else {
                         return Err(RegularError::PrevScript(PrevScriptError {
                             prev_out: *prev_out,
@@ -353,7 +412,8 @@ fn build(
             stake::TxType::TAdd => {
                 for (tx_in_idx, tx_in) in tx.tx_in.iter().enumerate() {
                     let prev_out = &tx_in.previous_out_point;
-                    let Some((script_ver, prev_out_script)) = prev_scripts.prev_script(prev_out)
+                    let Some((script_ver, prev_out_script)) =
+                        prev_scripts.input_script(TX_TREE_STAKE, i, tx_in_idx, prev_out)
                     else {
                         return Err(RegularError::PrevScript(PrevScriptError {
                             prev_out: *prev_out,

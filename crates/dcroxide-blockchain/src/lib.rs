@@ -42,6 +42,7 @@ pub mod compress;
 pub mod difficulty;
 mod error;
 pub mod gotime;
+mod journalscripts;
 pub mod notifications;
 mod pkscript;
 pub mod preverify;

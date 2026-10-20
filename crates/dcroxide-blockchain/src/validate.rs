@@ -5012,6 +5012,7 @@ pub fn check_transactions_and_connect<SP: dcroxide_standalone::SubsidyParams>(
         &tx_types,
         view,
         stxos,
+        None,
         stake_tree,
         is_treasury_enabled,
         is_auto_revocations_enabled,
@@ -5025,6 +5026,12 @@ pub fn check_transactions_and_connect<SP: dcroxide_standalone::SubsidyParams>(
 /// connect of each transaction reads for the outputs it adds: the
 /// connect checks hand in the types their block's `BlockTxTypes` holds,
 /// where dcrd's `AddTxOuts` classifies each transaction itself.
+///
+/// With `journal_starts`, the spend journal's length is recorded before
+/// each transaction is connected and once after the last, so that the
+/// filter the connect checks build can read each input's previous script
+/// from the journal (`crate::journalscripts`).  Nothing is recorded
+/// without `stxos`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn check_transactions_and_connect_typed<SP: dcroxide_standalone::SubsidyParams>(
     subsidy_cache: &mut dcroxide_standalone::SubsidyCache<SP>,
@@ -5038,6 +5045,7 @@ pub(crate) fn check_transactions_and_connect_typed<SP: dcroxide_standalone::Subs
     tx_types: &[dcroxide_stake::TxType],
     view: &mut crate::utxoview::UtxoView,
     mut stxos: Option<&mut Vec<crate::chainio::SpentTxOut>>,
+    mut journal_starts: Option<&mut crate::journalscripts::JournalStarts>,
     stake_tree: bool,
     is_treasury_enabled: bool,
     is_auto_revocations_enabled: bool,
@@ -5116,6 +5124,12 @@ pub(crate) fn check_transactions_and_connect_typed<SP: dcroxide_standalone::Subs
             ));
         }
 
+        // Where the transaction's entries will begin in the spend
+        // journal.
+        if let (Some(starts), Some(stxos)) = (journal_starts.as_deref_mut(), stxos.as_deref()) {
+            starts.push(stxos.len());
+        }
+
         // Connect the transaction to the view so the remaining
         // transactions can spend its outputs.  A regular transaction
         // marks its spends of the outputs in the view's
@@ -5142,6 +5156,11 @@ pub(crate) fn check_transactions_and_connect_typed<SP: dcroxide_standalone::Subs
                 is_treasury_enabled,
             );
         }
+    }
+
+    // And where the tree's entries end.
+    if let (Some(starts), Some(stxos)) = (journal_starts, stxos.as_deref()) {
+        starts.push(stxos.len());
     }
 
     if !stake_tree {
@@ -6421,6 +6440,51 @@ impl dcroxide_gcs::blockcf2::PrevScripter for ViewScripts<'_> {
     }
 }
 
+/// The version 2 filter of a block the view has just been connected to
+/// (dcrd `blockcf2.Regular` over that view), handed the type of each
+/// stake transaction, for the connect checks and for the chain's attach
+/// of a block added without full validation.
+///
+/// dcrd looks each previous script up in the view.  Every one of those
+/// outputs was spent by the connect, which appended each, script and all,
+/// to the spend journal as it spent it, so with the journal and where
+/// each transaction's entries begin in it the scripts are read from it by
+/// the input's place, and from the view only for an input it cannot place
+/// (`crate::journalscripts`).  Under debug assertions the filter is built
+/// from the view again and compared.  Without a journal it is built from
+/// the view.
+pub(crate) fn connected_block_filter(
+    block: &MsgBlock,
+    stake_types: &[dcroxide_stake::TxType],
+    view: &crate::utxoview::UtxoView,
+    journal: Option<(
+        &[crate::chainio::SpentTxOut],
+        &crate::journalscripts::BlockJournalStarts,
+    )>,
+) -> Result<dcroxide_gcs::FilterV2, dcroxide_gcs::blockcf2::RegularError> {
+    let view_scripts = ViewScripts(view);
+    let by_view = || dcroxide_gcs::blockcf2::regular_with_types(block, stake_types, &view_scripts);
+    match journal {
+        Some((journal, starts)) => {
+            let scripts = crate::journalscripts::JournalScripts::new(
+                block,
+                journal,
+                &starts.stake,
+                &starts.regular,
+                &view_scripts,
+            );
+            let built = dcroxide_gcs::blockcf2::regular_by_input(block, stake_types, &scripts);
+            debug_assert_eq!(
+                built,
+                by_view(),
+                "the filter built from the spend journal is not the one the view gives"
+            );
+            built
+        }
+        None => by_view(),
+    }
+}
+
 /// Perform the final battery of checks needed to connect the block to
 /// the main chain, connecting the view and producing the spend
 /// journal and header commitment filter (dcrd `checkConnectBlock`).
@@ -6613,6 +6677,14 @@ pub(crate) fn check_connect_block_with_hashes<SP: dcroxide_standalone::SubsidyPa
         dcroxide_standalone::SubsidySplitVariant::Original
     };
 
+    // Where each transaction's entries begin in the spend journal, kept
+    // as the trees connect when there is a journal, for the filter below.
+    let mut journal_starts = if stxos.is_some() {
+        crate::journalscripts::BlockJournalStarts::for_block(block)
+    } else {
+        crate::journalscripts::BlockJournalStarts::default()
+    };
+
     // Connect the stake tree with full checks; the returned fees are
     // carried forward into the regular tree (dcrd 2.2 folded
     // getStakeTreeFees into this return).
@@ -6629,6 +6701,7 @@ pub(crate) fn check_connect_block_with_hashes<SP: dcroxide_standalone::SubsidyPa
         tx_types.stake(),
         view,
         stxos.as_deref_mut(),
+        Some(&mut journal_starts.stake),
         true,
         is_treasury_enabled,
         is_auto_revocations_enabled,
@@ -6699,7 +6772,8 @@ pub(crate) fn check_connect_block_with_hashes<SP: dcroxide_standalone::SubsidyPa
         regular_tx_hashes,
         tx_types.regular(),
         view,
-        stxos,
+        stxos.as_deref_mut(),
+        Some(&mut journal_starts.regular),
         false,
         is_treasury_enabled,
         is_auto_revocations_enabled,
@@ -6737,10 +6811,18 @@ pub(crate) fn check_connect_block_with_hashes<SP: dcroxide_standalone::SubsidyPa
     // (dcrd sets it into the caller's `hdrCommitments`).
     // dcrd returns `ruleError(ErrMissingTxOut, err.Error())`
     // (`validate.go:4575-4578`): for a missing script that is
-    // blockcf2's `PrevScriptError` text, which prints the tree too.
-    let filter =
-        dcroxide_gcs::blockcf2::regular_with_types(block, tx_types.stake(), &ViewScripts(view))
-            .map_err(|e| rule_error(RuleErrorKind::MissingTxOut, format!("{e}")))?;
+    // blockcf2's `PrevScriptError` text, which prints the tree too.  With
+    // a journal the previous scripts are read from it where it can place
+    // them (`connected_block_filter`).
+    let filter = connected_block_filter(
+        block,
+        tx_types.stake(),
+        view,
+        stxos
+            .as_deref()
+            .map(|journal| (journal.as_slice(), &journal_starts)),
+    )
+    .map_err(|e| rule_error(RuleErrorKind::MissingTxOut, format!("{e}")))?;
     let filter_hash = filter.hash();
 
     let hdr_commitments_active =
