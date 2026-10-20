@@ -17,7 +17,7 @@ JSON-RPC/websocket server, the tool commands, the pipe IPC lifecycle,
 and the Windows service wrapper. The deliberate non-ports are small
 and documented in PARITY.md (Go GC tuning, the pprof servers, UPnP,
 the Windows event log, and the wallet-side mixclient). The test suite
-runs 2,567 tests across 444 suites on Linux, most differential against
+runs 2,568 tests across 444 suites on Linux, most differential against
 dcrd itself or replaying sessions generated inside dcrd's own packages.
 
 Since the surface completed, four rounds of work have landed on it. A
@@ -94,15 +94,16 @@ LAN server, each of which validated in full only the blocks after the
 assume-valid block and had dcrd's block at height 1,116,035 (the bench
 ledger, "Where `797a213`'s block thread waits, a deeper read-ahead and a
 rung of four changes").
-Of the commits after `797a213`, one changes the node's code beyond tests
-and comments: it classifies a block's transactions once for every step
+Of the commits after `797a213`, two change the node's code beyond tests
+and comments: one classifies a block's transactions once for every step
 that reads their types, among them checks that apply the consensus
-rules, and changes no rule. In syncs it has been put to blocks only in a
-build made from a worktree that also holds three other changes, R1 of
-that section: in four from the LAN server, each of which validated in
-full only the blocks after the assume-valid block and had dcrd's block
-at height 1,116,035, and in one from the loopback server that ended with
-that same UTXO set and the same block files.
+rules, and changes no rule; the other allocates a block filter's list of
+entries once, and changes no filter's bytes. In syncs they have been put
+to blocks only in a build made from a worktree that also holds two other
+changes, R1 of that section: in four from the LAN server, each of which
+validated in full only the blocks after the assume-valid block and had
+dcrd's block at height 1,116,035, and in one from the loopback server
+that ended with that same UTXO set and the same block files.
 That the rules reject what dcrd's reject rests on the test batteries
 described below, not on a sync, and none of it says the node is safe to
 operate. **Do not expose it to the internet and do not use it with

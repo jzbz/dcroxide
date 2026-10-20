@@ -246,16 +246,13 @@ fn build(
     stake_type: impl Fn(usize, &MsgTx) -> stake::TxType,
     prev_scripts: &impl PrevScripter,
 ) -> Result<FilterV2, RegularError> {
-    // Room for at least one output and one input per regular
-    // transaction and two entries per stake transaction on average
-    // (dcrd's `numEntriesHint`).
-    #[allow(
-        clippy::arithmetic_side_effects,
-        reason = "lengths of in-memory Vec<MsgTx>, each element far larger than 3 bytes, so len * 2 + len < usize::MAX"
-    )]
-    let mut data = Entries(Vec::with_capacity(
-        block.transactions.len() * 2 + block.stransactions.len(),
-    ));
+    // Room for every entry the block can commit ([`entries_bound`]), so
+    // the list is allocated once.  dcrd sizes it by `numEntriesHint`,
+    // two entries per regular transaction and one per stake
+    // transaction, which most blocks outgrow, and the slice is grown as
+    // it fills.  The capacity is not part of the filter.
+    let room = entries_bound(block);
+    let mut data = Entries(Vec::with_capacity(room));
     let mut commitments = CommitmentConverter::new(block.header.fresh_stake);
 
     // Regular tree: all output scripts, plus the previous output
@@ -393,9 +390,31 @@ fn build(
     // scripts; they are never empty.
     let mut entries = data.0;
     entries.extend(commitments.scripts());
+    debug_assert!(
+        entries.len() <= room,
+        "the filter's entries outgrew the room made for them"
+    );
 
     let key = key(&block.header.merkle_root);
     FilterV2::new(B, M, key, &entries).map_err(RegularError::Gcs)
+}
+
+/// An upper bound on the entries a block's filter holds: the number of
+/// outputs and inputs of the transactions of both trees.
+///
+/// Each of them gives the filter at most one entry: an output its script
+/// (a ticket's commitment output the payment script it converts to,
+/// which joins the entries at the end), an input the script of the
+/// output it spends.  Many give none, among them the coinbase's input, a
+/// vote's inputs and its first two outputs, and every script the filter
+/// excludes.
+fn entries_bound(block: &MsgBlock) -> usize {
+    block
+        .transactions
+        .iter()
+        .chain(&block.stransactions)
+        .map(|tx| tx.tx_in.len().saturating_add(tx.tx_out.len()))
+        .fold(0, usize::saturating_add)
 }
 
 /// An error from [`regular`]: either a missing previous script or a
@@ -417,5 +436,57 @@ impl core::fmt::Display for RegularError {
             RegularError::PrevScript(e) => core::fmt::Display::fmt(e, f),
             RegularError::Gcs(e) => core::fmt::Display::fmt(e, f),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use dcroxide_chainhash::Hash;
+    use dcroxide_wire::{BlockHeader, MsgBlock, MsgTx, OutPoint, TxIn, TxOut};
+
+    use super::entries_bound;
+
+    /// A transaction with `ins` inputs and `outs` outputs.
+    fn tx(ins: usize, outs: usize) -> MsgTx {
+        let input = TxIn {
+            previous_out_point: OutPoint {
+                hash: Hash::ZERO,
+                index: 0,
+                tree: 0,
+            },
+            sequence: u32::MAX,
+            value_in: 0,
+            block_height: 0,
+            block_index: 0,
+            signature_script: Vec::new(),
+        };
+        let output = TxOut {
+            value: 0,
+            version: 0,
+            pk_script: Vec::new(),
+        };
+        MsgTx {
+            tx_in: vec![input; ins],
+            tx_out: vec![output; outs],
+            ..MsgTx::default()
+        }
+    }
+
+    /// The bound counts every input and output of both trees: for a
+    /// coinbase of one input and two outputs, a transaction of two and
+    /// one, and in the stake tree one of one and three and one of two
+    /// and three, fifteen.  A block with no transactions has none.
+    #[test]
+    fn the_entries_are_bounded_by_every_input_and_output_of_the_block() {
+        let (header, _) = BlockHeader::from_bytes(&[0u8; 180]).expect("header");
+        let mut block = MsgBlock {
+            header,
+            transactions: vec![tx(1, 2), tx(2, 1)],
+            stransactions: vec![tx(1, 3), tx(2, 3)],
+        };
+        assert_eq!(entries_bound(&block), 15);
+        block.transactions.clear();
+        block.stransactions.clear();
+        assert_eq!(entries_bound(&block), 0);
     }
 }
