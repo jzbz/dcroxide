@@ -765,12 +765,21 @@ pay-to-pubkey-hash output, told by the shape of their signature scripts
 (a signature of the `SigHashAll` type and a public key), are verified
 into the signature cache, where the chain then finds them as it connects
 the block. Once the initial chain sync is done, nothing more is handed
-to them. At most two fewer helpers than the physical cores the process
-may run on do this at once, at least one from two cores, and only while
-no block being connected wants them; the thread that processes blocks
-takes a block back as it reaches it and checks whatever was not reached
-itself. Set `DCROXIDE_PREVERIFY=off` (or a whole number that is zero,
-such as `0`, `00` or `+0`) and restart the node to turn it off, from
+to them. By default at most two fewer helpers than the physical cores
+the process may run on do this at once, plus one for every two logical
+CPUs beyond those cores, counting at most one beyond each core, and at
+least one from two cores. Where the cores are read, that is two fewer
+than the cores without SMT or with one hardware thread of each core
+allowed, and ten with two hardware threads to each of eight cores,
+where the rule before 2026-10-22, two fewer than the cores alone, gave
+six. Where the cores cannot be read, as on Windows and macOS, they are
+taken to be half the logical CPUs, so that sixteen logical CPUs give
+ten there, with or without SMT, where they gave six. The helpers do this
+only while no block being connected wants them; the thread that
+processes blocks takes a block back as it reaches it and checks whatever
+was not reached itself. Set `DCROXIDE_PREVERIFY=off` (or a whole number
+that is zero, such as `0`, `00` or `+0`) and restart the node to turn it
+off, from
 the same binary; the node then logs `Signature pre-verification disabled
 by DCROXIDE_PREVERIFY` at startup. A positive whole number sets the most
 helpers instead, never more than one fewer than the logical CPUs the
@@ -795,8 +804,20 @@ with `DCROXIDE_PREVERIFY=off`, took 7.4 s less with it on, its connect
 checks finding 60.5% of the signatures they looked up in the cache
 ([bench-ledger.md](bench-ledger.md), "Rungs from a block server on the
 LAN, two changes held for their memory, and dcrd v2.1.7", build G and
-the prototype pair). A node that pre-verified also logs one line under
-`SRVR` as it shuts down, after the read-ahead's:
+the prototype pair). The default's count beyond the cores rests on one
+comparison, on 2026-10-19 with the node held to eight cores and their
+SMT siblings, in a build of `797a213`'s code that read the read-ahead's
+depth from a variable, at sixteen frames: at most ten helpers, set with
+`DCROXIDE_PREVERIFY=10`, checked 90.2% and 89.3% of the guessed inputs
+ahead, against 65.5% to 66.2% at six, and the syncs took 5.02 s less by
+the means of two runs and three, about ±2.6 s, for 29.83 s more node CPU
+time ([bench-ledger.md](bench-ledger.md), "Where `797a213`'s block
+thread waits, a deeper read-ahead and a rung of four changes"). No other
+count was run, nor any machine without SMT or with another core count,
+nor ten helpers on the code as committed. Where that processor time is
+better spent on other work, a smaller `DCROXIDE_PREVERIFY` holds fewer.
+A node that pre-verified also logs one line under `SRVR` as it shuts
+down, after the read-ahead's:
 
 ```text
 Signature pre-verification: B blocks with I inputs to guess for on at most W helpers; C inputs checked ahead of the block thread, V verified; K blocks cut short by the block thread or the shutdown; R refused for room
@@ -1366,7 +1387,7 @@ configuration, every name changes.
 | exists-address memtable target (developer-only) | `DCROXIDE_EXISTSADDR_MEMTABLE_KEYS` (keys, default 2,000,000) | — |
 | block download window | `DCROXIDE_BLOCK_WINDOW` (`dcrd`, or a whole number of blocks from 16 to 505; default this port's own window, at most 128 blocks and 3,145,728 bytes) | — |
 | block read-ahead | `DCROXIDE_READ_AHEAD` (unset = on; `off` or `0` = off; anything else warns and stays on) | — |
-| signature pre-verification | `DCROXIDE_PREVERIFY` (unset = on, on at most two helper threads fewer than the physical cores; `off`, or a whole number that is zero, = off; a positive whole number = at most that many helpers, never more than one fewer than the logical CPUs; anything else warns and keeps the default) | — |
+| signature pre-verification | `DCROXIDE_PREVERIFY` (unset = on, on at most two helper threads fewer than the physical cores plus one for every two logical CPUs beyond them, at most one beyond each core; `off`, or a whole number that is zero, = off; a positive whole number = at most that many helpers, never more than one fewer than the logical CPUs; anything else warns and keeps the default) | — |
 
 The chain itself lives under the home directory, not at it: `--datadir`
 defaults to `<home>/data` with the network appended, so on Linux the

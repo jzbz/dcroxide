@@ -80,18 +80,34 @@ pub fn preverify_setting(setting: Option<&str>) -> (PreverifySetting, Option<(Lo
 
 /// The helpers pre-verification holds by default, given the physical
 /// cores the process may run on, if known, and its logical CPUs: two
-/// fewer than the cores, so that the thread that processes blocks and
-/// the reading, index and commit threads keep a core each beside them
-/// rather than share one with a helper, and at least one where there are
-/// two cores or more; none on a machine of one core.  Unknown, the cores
-/// are taken to be half the logical CPUs.
+/// fewer than the cores, which leaves one core to the thread that
+/// processes blocks and one to the reading, index and commit threads,
+/// plus one for every two logical CPUs beyond the cores, counting at
+/// most one beyond each core; at least one where there are two cores or
+/// more; none on a machine of one core.  Unknown, the cores are taken to
+/// be half the logical CPUs.
+///
+/// Where the cores are known, any logical CPU beyond them is a hardware
+/// thread SMT adds, so without SMT, or with one hardware thread of each
+/// core allowed, the count is two fewer than the cores.  Where they are
+/// not, the logical CPUs not taken for cores count as beyond them, at
+/// most one for each, whether or not the machine has SMT: eight logical
+/// CPUs give four helpers and sixteen give ten, where two fewer than the
+/// cores taken would give two and six.  With two hardware threads to
+/// each of eight known cores it is ten, where two fewer than the cores
+/// is six: in syncs on one such machine ten helpers checked about nine
+/// tenths of the inputs guessed for ahead of the thread that processes
+/// blocks, and six about two thirds (PARITY *Signature pre-verification
+/// ahead of the block thread*); no other count and no other machine was
+/// measured.  It is a count, not a placement: where each helper runs is
+/// the kernel's choice.
 pub fn default_helpers(physical_cores: Option<usize>, logical_cpus: usize) -> usize {
     let cores = physical_cores.unwrap_or(logical_cpus / 2).min(logical_cpus);
     if cores < 2 {
-        0
-    } else {
-        cores.saturating_sub(2).max(1)
+        return 0;
     }
+    let beyond = logical_cpus.saturating_sub(cores).min(cores);
+    cores.saturating_sub(2).saturating_add(beyond / 2).max(1)
 }
 
 /// The CPUs a list in the kernel's format names (`0-3,8,10-11`), or
@@ -326,19 +342,51 @@ mod tests {
         }
     }
 
-    /// Two fewer helpers than cores, at least one from two cores, none
-    /// on one, and half the logical CPUs taken for the cores when they
-    /// are not known; never more cores than logical CPUs.
+    /// Two fewer helpers than cores, plus one for every two logical CPUs
+    /// beyond the cores, at most one beyond each core counted; at least
+    /// one from two cores, none on one, and half the logical CPUs taken
+    /// for the cores when they are not known; never more cores than
+    /// logical CPUs.  The rows are machines of each shape; then, for
+    /// every count of cores up to 256, unknown included, and every count
+    /// of logical CPUs up to 256, the default is never under two fewer
+    /// than the cores, is exactly that where no CPU is beyond the cores,
+    /// and never reaches past the pool's width, one fewer than the
+    /// logical CPUs, so that width never has to cap it.
     #[test]
-    fn the_default_stays_two_under_the_cores() {
+    fn the_default_is_two_under_the_cores_plus_half_of_at_most_one_cpu_beyond_each() {
         for (physical, logical, helpers) in [
-            (Some(8), 16, 6),
-            (Some(4), 8, 2),
-            (Some(3), 3, 1),
+            // One core.
+            (Some(1), 1, 0),
+            // No SMT: four, eight and sixteen cores.
+            (Some(4), 4, 2),
+            (Some(8), 8, 6),
+            (Some(16), 16, 14),
+            // Two hardware threads to each of two, four, eight and
+            // sixteen cores; eight is the shape the default was measured
+            // on.
             (Some(2), 4, 1),
+            (Some(4), 8, 4),
+            (Some(8), 16, 10),
+            (Some(16), 32, 22),
+            // Four hardware threads to each of four and eight cores.
+            (Some(4), 16, 4),
+            (Some(8), 32, 10),
+            // Eight cores of two hardware threads and four of one.
+            (Some(12), 20, 14),
+            // Three whole cores of two hardware threads and one thread
+            // of each of two more.
+            (Some(5), 8, 4),
+            // A quota of eight CPUs where sixteen cores are allowed.
+            (Some(16), 8, 6),
+            // The cores not read.
+            (None, 4, 1),
+            (None, 7, 2),
+            (None, 8, 4),
+            (None, 16, 10),
+            // Edges.
+            (Some(3), 3, 1),
             (Some(1), 2, 0),
             (Some(16), 4, 2),
-            (None, 16, 6),
             (None, 3, 0),
             (None, 1, 0),
             (Some(0), 8, 0),
@@ -348,6 +396,28 @@ mod tests {
                 helpers,
                 "{physical:?} cores, {logical} CPUs"
             );
+        }
+        for logical in 1..=256usize {
+            for physical in std::iter::once(None).chain((0..=256).map(Some)) {
+                let helpers = default_helpers(physical, logical);
+                let cores = physical.unwrap_or(logical / 2).min(logical);
+                let two_under = if cores < 2 {
+                    0
+                } else {
+                    cores.saturating_sub(2).max(1)
+                };
+                assert!(
+                    helpers >= two_under,
+                    "{physical:?} cores, {logical} CPUs: {helpers}"
+                );
+                if logical == cores {
+                    assert_eq!(helpers, two_under, "{physical:?} cores, {logical} CPUs");
+                }
+                assert!(
+                    helpers <= logical.saturating_sub(1),
+                    "{physical:?} cores, {logical} CPUs: {helpers}"
+                );
+            }
         }
     }
 
@@ -433,8 +503,8 @@ mod tests {
             Some("Signature pre-verification on at most 15 helper threads by DCROXIDE_PREVERIFY")
         );
         assert_eq!(
-            line(PreverifySetting::Default, Ok(6)).as_deref(),
-            Some("Signature pre-verification on at most 6 helper threads")
+            line(PreverifySetting::Default, Ok(10)).as_deref(),
+            Some("Signature pre-verification on at most 10 helper threads")
         );
         for (setting, reason, why) in [
             (

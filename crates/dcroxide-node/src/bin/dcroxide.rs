@@ -1997,10 +1997,11 @@ fn read_ahead_setting() -> bool {
 /// the block thread*).
 ///
 /// Unset, it is on, on two helper threads fewer than the physical cores
-/// the process may run on.  `off`, or a whole number that is zero, turns
-/// it off, from the same binary, and a positive whole number sets the
-/// most helpers, never more than the script pool holds (one fewer than
-/// the logical CPUs).
+/// the process may run on, plus one for every two logical CPUs beyond
+/// them, at most one beyond each core counted (`default_helpers`).
+/// `off`, or a whole number that is zero, turns it off, from the same
+/// binary, and a positive whole number sets the most helpers, never more
+/// than the script pool holds (one fewer than the logical CPUs).
 /// An environment variable for `DCROXIDE_READ_AHEAD`'s reason: dcrd has
 /// no counterpart, and the generated `-h` output is pinned byte-for-byte
 /// against dcrd's.  Any other value is ignored with a warning, and so is

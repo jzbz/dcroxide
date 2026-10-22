@@ -719,6 +719,35 @@ D2 is unchanged.
 > were states of a worktree and not the tree of a commit, and the series
 > is one of its own.
 
+> **Note, 2026-10-22, on the default number of helpers.** The default
+> now also counts the logical CPUs beyond the physical cores: two fewer
+> helpers than the cores, as above, plus one for every two of those
+> CPUs, counting at most one beyond each core, at least one from two
+> cores, never more than the pool's width. Where the cores are read,
+> that is the count above without SMT or with one hardware thread of
+> each core allowed, and ten with two hardware threads to each of eight
+> cores, where the count above is six. Where the cores cannot be read,
+> as on Windows and macOS, they are still taken to be half the logical
+> CPUs, so the count rises there too, to ten from six for sixteen
+> logical CPUs, with or without SMT. On m3, held to eight cores and
+> their SMT siblings, from a dcrd v2.1.7 node on another machine on the
+> same LAN, one build of `797a213`'s code that read the read-ahead's
+> depth from a variable, at sixteen frames, took 5.02 s less with
+> `DCROXIDE_PREVERIFY=10` than with six by the means of two runs and
+> three, about ±2.6 s, checked 90.2% and 89.3% of the guessed inputs
+> ahead of the block thread against 65.5% to 66.2%, and used 29.83 s
+> more node CPU time ([bench-ledger.md](../bench-ledger.md), "Where
+> `797a213`'s block thread waits, a deeper read-ahead and a rung of four
+> changes"; [PARITY.md](../PARITY.md), *Signature pre-verification ahead
+> of the block thread*). That build was not the tree of a commit, and no
+> other count, no machine without SMT and no other core count was run.
+> Which hardware threads the ten ran on was not recorded, so what a
+> helper on the block thread's SMT sibling costs that thread is still
+> not measured; the block thread was on a processor for 204.5 s and
+> 202.7 s with ten against 207.6 to 207.9 s with six. No thread is added
+> and the pool's width does not change: the count is how many of its
+> helpers may pre-verify at once. D2 is unchanged.
+
 ## Addendum, 2026-10-18 — the reading thread makes the data sanity checks
 
 The addenda of 2026-10-12 and 2026-10-16 record that the `peer-reader`

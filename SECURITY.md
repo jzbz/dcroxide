@@ -208,19 +208,31 @@ evaluating this code.
   thread on a hostile peer's blocks has not been measured either. The
   signatures of a queued block above the height at and below which the
   chain checks no script are also checked while it waits, on the script
-  pool's helper threads, at most two fewer at once than the physical
-  cores: for each input of the one guessed shape, one hash of its
+  pool's helper threads, by default at most two fewer at once than the
+  physical cores plus one for every two logical CPUs beyond them,
+  counting at most one beyond each core. Where the cores are read, that
+  is two fewer than the cores without SMT, as before 2026-10-22, and ten
+  on eight cores with two hardware threads each, where it was six. Where
+  they cannot be read, as on Windows and macOS, the cores are taken to
+  be half the logical CPUs, so that the count rises with or without SMT:
+  to ten from six on sixteen logical CPUs, and to four from two on
+  eight. Each input of the one guessed shape costs one hash of its
   transaction's witness serialization, a byte for each other input, and
   at most one signature verification, whose success leaves an entry in
-  the signature cache. A peer whose block the chain rejects stays
-  connected, as in dcrd, and its later blocks are checked alike, so that
-  work is bounded per block and by the time each block waits, not per
-  peer; what it costs on a hostile peer's blocks has not been measured,
-  and `DCROXIDE_PREVERIFY=off` removes it (PARITY.md, *Signature
-  pre-verification ahead of the block thread*). The memory is at worst
-  about 211 MB held on that connection: seventeen frames of the largest
-  block message, the sixteen queued and the one being handled, at most
-  22,282,716 bytes, and the blocks decoded from them, about 189 MB.
+  the signature cache; the count sets how many of those inputs are
+  checked at once, not what each costs, and the helpers are the pool's,
+  one fewer than the logical CPUs at most, whatever the count. A peer
+  whose block the chain rejects stays connected, as in dcrd, and its
+  later blocks are checked alike, so that work is bounded per block and
+  by the time each block waits, not per peer: more helpers reach more of
+  each block before it is taken, never more than its inputs of that
+  shape. What it costs on a hostile peer's blocks has not been measured,
+  at either count, and `DCROXIDE_PREVERIFY=off` removes it (PARITY.md,
+  *Signature pre-verification ahead of the block thread*). The memory
+  is at worst about 211 MB held on that connection: seventeen frames of
+  the largest block message, the sixteen queued and the one being
+  handled, at most 22,282,716 bytes, and the blocks decoded from them,
+  about 189 MB.
   About 1.3 MB more is held for a moment while one frame is compared
   with its block's serialization, or up to about 1.4 MB while one
   block's trees are built, against about 12.5 MB without the read-ahead.
