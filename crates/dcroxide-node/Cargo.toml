@@ -69,7 +69,7 @@ p521 = { version = "0.14", default-features = false, features = ["ecdsa"] }
 sha1 = { version = "0.11", default-features = false }
 rustls-pki-types = "1"
 ureq = "3"
-webpki-roots = "1"
+webpki-roots = "1.0.10"
 socket2 = "0.6.4"
 
 # Already in the tree via socket2 and getrandom; taken directly for
