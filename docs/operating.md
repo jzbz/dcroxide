@@ -1151,6 +1151,10 @@ for 893.7 to 902.9 s of process CPU time against 877.8 s and 874.6 s
 checks every script, and dcrd v2.1.7"). Neither arm's end state was
 recorded.
 
+Outside the node, on btrfs, the directory it runs in matters too: the
+last paragraphs of this section have what making it without
+copy-on-write saved in a sync, and how to do it.
+
 **Since 2026-10-11 a sync commits less often, and the overlay's default
 ceiling is 300 MiB.** Until then every UTXO cache flush forced a durable
 commit, about 120 of the 133 in a sync, and the overlay's own ceiling of
@@ -1337,32 +1341,85 @@ closed on 2026-08-17 with redb staying. The candidate won on density and
 on write shape and lost on crash safety, so the disk and commit costs
 above are accepted rather than retracted.
 
-**The filesystem under the data directory is part of the commit cost,
-and on m3 what btrfs's copy-on-write, checksums and compression add has
-been measured.** m3's data volume is btrfs with zstd compression over
-an encrypted mapping. A data directory created with the
-no-copy-on-write attribute (`chattr +C` on the empty directory), which
-turns those three off for the files made in it, was run against one
-created as usual three times, one sync each on a quiet machine
-([bench-ledger.md](bench-ledger.md), "Shared commits for UTXO-cache
-flushes, the filesystem's share and a delayed link" and "Eleven
-changes, a background commit not kept and a pool gate"). `7d31abb`, the
-code before the change to commits of 2026-10-11, took 736.8 s against
-775.6 s that day, 5.0% less; a prototype of that change, run that day
-with `DCROXIDE_DB_OVERLAY=300`, the ceiling the change as made has by
-default, took 707.3 s against 724.6 s, 2.4% less; and the change as
-made, `b4a5d2d`, took 714.1 s against 728.5 s on 2026-10-12, 2.0% less.
-The flushes took 144.0 s against
-177.8 s, 86.7 s against 104.8 s and 97.1 s against 107.4 s, and the
-volume took 52.3, 40.4 and 41.6 GB where it took 91.6, 53.4 and
-53.2 GB, for nearly the same bytes passed to write calls. In these
-three pairs the attribute saved less where a sync made fewer commits:
-38.8 s with 133 of them, and 17.3 s and 14.4 s with 52 to 55. This is a
-measurement of one stack and not advice. The encrypted mapping was
-under both directories, what ext4 or xfs would do with the same writes
-was not measured, none of the code after `b4a5d2d` was run this way,
-and a directory made this way gives up the filesystem's own checksums
-of the node's files.
+**On btrfs, give the node a directory without copy-on-write.** The
+filesystem under the data directory is part of what a sync waits for.
+m3's data volume is btrfs with zstd compression over an encrypted
+mapping, and a home directory created there with the no-copy-on-write
+attribute (`chattr +C` on the empty directory), which the files and
+directories made in it take from it, turns off copy-on-write, data
+checksums and compression for the node's files. On 2026-10-22 a build of
+`8bda92e`, from a block server on another machine on the same LAN, took
+232.1 s and 232.8 s in such a directory against 254.8 s and 255.1 s in
+one created as usual, 22.5 s or 8.8% less by the means, 15.8 s of it
+before the assume-valid block, at about the same peak memory: 2,475 and
+2,506 MiB against 2,458 and 2,504 MiB. The volume took 40.4 and 40.7 GB
+where it took 57.0 and 57.9 GB, for 39.3 to 39.5 GB passed to write
+calls in each run. In those runs the thread that processes blocks read
+nothing from storage, and its waits on storage were in its writes, one
+for each block's record in the current block file: in the two runs under
+a sampler it was uninterruptible for 8.6 s against 30.6 s, nearly all of
+it in btrfs's write paths, and it was on a processor for 203.7 to
+204.4 s in all four ([bench-ledger.md](bench-ledger.md), "`8bda92e` in a
+directory without copy-on-write, and block records on fresh pages").
+Transparent huge pages were `always` and the kernel a newer one in that
+session, where the other syncs from the LAN in this guide ran at
+`madvise` on an older kernel, so its walls are compared with each other
+only. Earlier code, one sync each from a block server on the same
+machine on 2026-10-11 and 2026-10-12, gained a smaller share of its
+sync: `7d31abb`, the code before the change to commits of 2026-10-11,
+took 736.8 s against 775.6 s, 38.8 s or 5.0% less; a prototype of that
+change, run with `DCROXIDE_DB_OVERLAY=300`, took 707.3 s against
+724.6 s, 2.4% less; and the change as made, `b4a5d2d`, took 714.1 s
+against 728.5 s, 2.0% less, with the volume taking 52.3, 40.4 and
+41.6 GB where it took 91.6, 53.4 and 53.2 GB (the ledger's "Shared
+commits for UTXO-cache flushes, the filesystem's share and a delayed
+link" and "Eleven changes, a background commit not kept and a pool
+gate").
+
+To set it up, make the home directory, set the attribute while it is
+empty, and start the node with `--appdata` naming it, or do the same to
+`~/.dcroxide` before the first start:
+
+```bash
+mkdir /path/outside/the/repo
+chattr +C /path/outside/the/repo
+lsattr -d /path/outside/the/repo
+```
+
+`lsattr -d` shows a `C` among the directory's flags once it is set. With
+`--datadir` at its default the node then makes `data`, the network's
+directory and every file in them with the attribute; a data directory
+set elsewhere needs the attribute itself, set the same way while it is
+empty. The attribute does not convert a file that already holds data,
+and a move within the same subvolume keeps the files it moves as they
+were, so a chain already synced keeps copy-on-write. To convert one,
+stop the node, copy the home directory's contents into an empty one made
+this way with `cp -a --reflink=never ~/.dcroxide/. /path/to/new/`, check
+that the copied `dcroxide.conf` does not set `datadir`, which would
+still name the old directory, and start the node with
+`--appdata=/path/to/new`.
+
+What it gives up: btrfs no longer checksums or compresses those files.
+Each block record carries its own CRC-32C, checked when a whole block is
+read, as dcrd checks it. The metadata file's pages carry checksums too,
+but redb compares them only when it repairs the file after an unclean
+stop, not when it reads a page, so a page damaged on the drive that is
+still well-formed would be read back as data, where btrfs would have
+failed the read. On a volume that keeps two copies of data, on several
+devices or in the DUP profile, btrfs can no longer tell a damaged copy
+of those files from a good one. A snapshot of the subvolume that holds
+them makes the next write to each part of them that the snapshot shares
+copy once, so snapshots taken while the node syncs would give some of
+the gain back; that was not measured. dcroxide does not set the
+attribute itself, as dcrd does not.
+
+What was not measured: dcrd in such a directory, so the README's
+comparison with dcrd rests on directories created as usual and no figure
+from one made this way is to be set beside dcrd's; a power cut, or any
+unclean stop, in such a directory; a chain converted by copying; how
+much more room the node's files take uncompressed; btrfs without
+compression, and filesystems other than btrfs; another drive, or this
+one without the encrypted mapping; Windows and macOS.
 
 ## Identity: paths, files, and environment
 
@@ -1700,6 +1757,11 @@ Start it against simnet or testnet rather than mainnet while evaluating:
 ```bash
 ./target/release/dcroxide --testnet --appdata=/path/outside/the/repo
 ```
+
+On btrfs, set the no-copy-on-write attribute on that directory while
+it is still empty, before this first start: the storage tuning above
+has the commands, what the attribute saved in a sync and what it gives
+up.
 
 `--norpc` disables the RPC and websocket surfaces entirely, which is the
 right default if you only want a syncing node — it removes the entire

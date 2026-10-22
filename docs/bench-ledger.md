@@ -94,6 +94,7 @@ path) has been measured yet, so this crossover is unconfirmed.
 | 2026-10-19 | m3 | K, the binary of the row above: the code of the three commits that follow the commit that records these syncs, as a state of a worktree | release v2.1.7 (go1.25.4), the binary of the rows above, two runs, and one with `--noexistsaddrindex` | mainnet, genesis to 1,116,035 | The same LAN server and session, at the defaults. K, four runs, two of them those of the row above: 270.7 s, 271.5 s, 272.7 s and 271.8 s, mean 271.68 s — **4,108.0 blk/s** at 3.28–3.33 mean cores, with a peak resident memory of 2,456 to 2,470 MiB. With `--noexistsaddrindex`, two runs: 250.8 s and 249.6 s — 4,449.9 and 4,471.3 blk/s. With `DCROXIDE_DB_SYNC_COMMIT=1`, two runs: 350.2 s and 350.6 s, so the default is 78.7 s or 22.5% less, and peaks lower. dcrd v2.1.7: 3,014.6 s and 3,033.4 s — **370.2 and 367.9 blk/s** at 1.88 mean cores; with the index off, one run, 1,336.3 s — 835.2 blk/s. So K is **11.13x** as fast at the defaults, 11.05x to 11.21x over the eight pairings, and 5.34x with the index off, in one session. One sync of K from the loopback server with `--assumevalid=0`, every block validated in full, ended with the UTXO set and the block files of every full sync from that server since 2026-10-17; its 583.4 s is not a timing, since the server read 19.2 GB from its drive | this file, "One commit thread for the life of the store, a sync that checks every script, and dcrd v2.1.7" |
 | 2026-10-19, evening | m3 | `797a213`, the head of master when the syncs ran, and R1, `797a213` with four changes as a state of a worktree, R1's code that of the sixth commit after the commit that records these syncs but for tests and comments | not run in this session | mainnet, genesis to 1,116,035 | From the LAN server of the rows above, at the defaults, the two alternated. `797a213`: 273.1 s, 270.9 s, 273.2 s and 269.8 s, mean 271.75 s — **4,106.8 blk/s** at 3.30–3.35 mean cores, where K's four runs of that morning had a mean of 271.68 s. R1: 263.1 s, 266.3 s, 265.5 s and 264.9 s, mean 264.95 s — **4,212.2 blk/s** at 3.38–3.40, 6.80 s or 2.5% less, beyond the session's ±2.6 s, at a peak resident memory of 2,460 to 2,470 MiB against 2,465 to 2,500 MiB. One sync of R1 from the loopback server ended with the UTXO set and the block files of every full sync from that server since 2026-10-17 | this file, "Where `797a213`'s block thread waits, a deeper read-ahead and a rung of four changes" |
 | 2026-10-19, evening | m3 | a diagnostic build of `797a213` that reads the read-ahead's depth, four frames in the code, and the index notification buffer, 128, from the environment, not for commit; the depth of sixteen is that of the seventh commit after the commit that records these syncs, which also holds R1's changes and was not run | not run in this session | mainnet, genesis to 1,116,035 | The same LAN server and session, at the defaults but for the setting, two runs of each, alternated. Depth 4: 273.3 s and 272.9 s. Depth 16: 263.4 s and 263.4 s, mean 263.40 s — 4,237.0 blk/s at 3.39–3.40 mean cores, 9.70 s or 3.6% less than depth 4, beyond the queue's ±4.8 s, with 66.2% and 65.5% of the inputs of the guessed shape pre-verified against 51.7% and 52.2%. Depth 32: 267.2 s and 263.5 s, 7.75 s less than depth 4. A buffer of 512 at depth 4: 273.3 s and 270.1 s, 1.40 s less, which is not resolved. In a later queue, depth 16 once more, 264.8 s, and depth 16 with `DCROXIDE_PREVERIFY=10`, at most ten helpers where the default is six: 258.1 s and 259.6 s, 5.02 s under the three runs at depth 16, for 29.83 s more node CPU time | this file, "Where `797a213`'s block thread waits, a deeper read-ahead and a rung of four changes" |
+| 2026-10-22 | m3 | `8bda92e`, the head of master when the syncs ran, in a home directory created as usual and in one created with btrfs's no-copy-on-write attribute (`chattr +C`); and W0b, `8bda92e` with each block record started on a fresh 4 KiB page, a diagnostic build not for commit | not run in this session | mainnet, genesis to 1,116,035 | From the LAN server of the rows above, at the defaults, with transparent huge pages at `always` and kernel 7.3.0 where the LAN rows above ran at `madvise` on an older kernel, so the walls are compared within the session only. As created: 254.8 s and 255.1 s, mean 254.95 s — **4,377.5 blk/s** at 3.69 mean cores. Without copy-on-write: 232.1 s and 232.8 s, mean 232.45 s — **4,801.2 blk/s** at 3.99–4.01, 22.50 s or 8.8% less, with 40.4 and 40.7 GB written at the volume against 57.0 and 57.9 GB, and the block thread uninterruptible for 8.6 s against 30.6 s, nearly all of it in btrfs's write paths, one run of each under a wait sampler. W0b, one run under the sampler: 252.8 s, 2.0 s under its pair, which one run against one does not resolve | this file, "`8bda92e` in a directory without copy-on-write, and block records on fresh pages" |
 
 > **The headline 1.29x predates the fan-out fix, so it is conservative for
 > master.** That figure was measured on `b6d0c63`; `c091b46` (one validation
@@ -6281,3 +6282,188 @@ labelled `r1s-H-1`, `r1s-R1-1`, `r1s-H-2`, `r1s-R1-2`, `r1s-R1-3`,
 per-run samples, flush logs and node logs; the queues' steps and logs;
 the sampler and its change; and the code states and build notes of the
 three builds.
+
+## `8bda92e` in a directory without copy-on-write, and block records on fresh pages (2026-10-22)
+
+"Where `797a213`'s block thread waits, a deeper read-ahead and a rung of
+four changes" above found the block thread's waits on storage in three
+functions of btrfs's buffered-write paths, and took them by elimination
+to be its own writes of each block's record into the current block file.
+`8bda92e`, the head of master when the syncs below ran, holds R1's
+changes, the read-ahead's depth of sixteen frames and a default of more
+pre-verification helpers: ten on the node's eight cores of two hardware
+threads, where the default was six. Between 03:07 and 03:51 on
+2026-10-22, five syncs were run on m3, in two queues and none outside
+them, all from the LAN server of the sections above:
+
+- three under the wait sampler: `8bda92e` in a home directory created as
+  usual (w22-W0), W0b, a diagnostic build described below, in one
+  created the same way (w22-W0b), and `8bda92e` in a home directory
+  created with the no-copy-on-write attribute (w22-W0c);
+- in the second queue, two of `8bda92e` without the sampler, the first
+  in a home directory made that way (w22-nocow-2) and the second in one
+  created as usual (w22-default-2).
+
+**The builds.** `8bda92e` is a release build of that commit's tree, at
+the workspace's release profile with nothing else set, made in a
+worktree at the commit with nothing changed. W0b is a release build of
+`8bda92e` with one change, in no commit and not meant for one: after
+each block record is written, the next starts at the next multiple of
+4,096 bytes in its block file, so that no write touches a page an
+earlier record wrote. It leaves a gap of up to 4,095 bytes after each
+record, which neither dcrd's block files nor this port's have. Neither
+build was made a second time.
+
+**The directories.** The harness gives each run a new, empty home
+directory and passes it as `--appdata`. For w22-W0c and w22-nocow-2 it
+set the no-copy-on-write attribute on that directory (`chattr +C`)
+before the node started, and the node made the data directory, the
+network's directory and every file under them, which took the attribute
+from it. On this volume, btrfs with zstd compression over an encrypted
+mapping, the attribute turns off copy-on-write, data checksums and
+compression for those files. "Written at the volume" is what the
+encrypted mapping took over the run, from the kernel's disk counters, as
+in "Shared commits for UTXO-cache flushes, the filesystem's share and a
+delayed link" above.
+
+**The session.** The syncs are in the harness of the sections above. The
+LAN server was the same live node, dcrd v2.1.7 by its user agent,
+following the network: the starting height it gave each run went from
+1,125,752 to 1,125,757; at the poll that stopped the clock the node was
+355 to 2,168 blocks past block 1,116,035, and its block at that height
+was the frozen chain's in every run. Every run exited 0, none stalled,
+and none was marked disturbed; other userland was 0.17% to 0.39% of the
+machine. The first run of each queue, w22-W0 and w22-nocow-2, followed
+the quiet gate alone, w22-nocow-2 158 s after the first queue ended;
+every other run followed a `sync`, a 300 s idle and the gate. Besides
+QK-0028's three lines at the start, w22-W0c logged an interrupted block
+and w22-nocow-2 an interrupted index update as errors, both at the
+shutdown the harness asks for once the clock has stopped. The flush log
+was on in every run, and every figure is defined as in the sections
+above.
+
+**Transparent huge pages were `always`, and the kernel was 7.3.0**,
+where every LAN section above ran at `madvise` on an older kernel: the
+machine had been restarted on 2026-10-21 into 7.3.0, where the boot
+before it ran 7.2.10, the setting read `always` at 03:06, before the
+first run, and the system journal of that boot shows no write to it.
+These five runs are compared with each other only, and their walls are
+not set beside those of any section above.
+
+| run | started | build | home directory | wait sampler | wall | rate | to block 1,026,597 | after it | node CPU time (user + sys) | block thread | `dbcommit` thread | flush time | passed to write calls | written at the volume | peak RSS |
+|---|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| w22-W0 | 03:07 | `8bda92e` | as created | 200 Hz | 254.8 s | 4,380.0 blk/s | 204.1 s | 50.7 s | 941.1 s (859.4 + 81.7) | 204.4 s | 101.7 s | 123.2 s | 39.3 GB | 57.0 GB | 2,458 MiB |
+| w22-W0b | 03:18 | W0b | as created | 200 Hz | 252.8 s | 4,414.7 blk/s | 205.3 s | 47.5 s | 947.5 s (864.0 + 83.5) | 208.1 s | 100.3 s | 118.9 s | 39.4 GB | 56.3 GB | 2,483 MiB |
+| w22-W0c | 03:29 | `8bda92e` | no copy-on-write | 200 Hz | 232.1 s | 4,808.4 blk/s | 188.4 s | 43.7 s | 926.9 s (856.9 + 70.0) | 203.9 s | 89.8 s | 98.5 s | 39.3 GB | 40.4 GB | 2,475 MiB |
+| w22-nocow-2 | 03:36 | `8bda92e` | no copy-on-write | — | 232.8 s | 4,794.0 blk/s | 188.1 s | 44.7 s | 933.5 s (863.0 + 70.5) | 203.7 s | 90.4 s | 99.6 s | 39.5 GB | 40.7 GB | 2,506 MiB |
+| w22-default-2 | 03:46 | `8bda92e` | as created | — | 255.1 s | 4,374.9 blk/s | 204.0 s | 51.1 s | 941.7 s (860.8 + 80.9) | 204.3 s | 100.1 s | 122.5 s | 39.3 GB | 57.9 GB | 2,504 MiB |
+
+The thread columns are time on a processor, by the same count as in the
+sections above; the flush time is the 52 flushes' inside the clock, on
+`dbcommit`, from the hand-off to the retirement.
+
+**Without copy-on-write (w22-W0c and w22-nocow-2 against w22-W0 and
+w22-default-2).** **232.1 s and 232.8 s, a mean of 232.45 s, against
+254.8 s and 255.1 s, a mean of 254.95 s: 22.50 s or 8.8% less**, 22.7 s
+in the pair under the sampler and 22.3 s in the pair without it, 15.8 s
+of it before the assume-valid block and 6.7 s after. That is two runs
+against two in one session; each arm's two runs were 0.7 s and 0.3 s
+apart.
+
+- **The volume took 40.4 and 40.7 GB against 57.0 and 57.9 GB**, for
+  39.3 to 39.5 GB passed to write calls in every run.
+- **The flushes.** Each run made 52 flushes inside the clock, every one
+  handed over. They took 98.5 s and 99.6 s on `dbcommit` against 123.2 s
+  and 122.5 s, their commits 54.1 s and 55.4 s against 78.5 s and
+  78.2 s, and their row inserts, 30.0 to 30.3 s, and block-file syncs,
+  1.09 to 1.14 s, the same in both. `dbcommit` was on a processor for
+  89.8 s and 90.4 s against 101.7 s and 100.1 s.
+- **The block thread** was on a processor for 203.9 s and 203.7 s
+  against 204.4 s and 204.3 s, so what it gained was time off one. The
+  reader waited for it 91.7 s and 92.7 s in all, against 113.1 s and
+  113.7 s; it waited for the reader 0.48 to 0.54 s in each of the four.
+- **CPU time.** Node CPU time was 926.9 s and 933.5 s against 941.1 s
+  and 941.7 s, the difference in system time: 70.0 s and 70.5 s against
+  81.7 s and 80.9 s. Outside the node the machine's processors were busy
+  for 132.2 s and 122.9 s against 332.2 s and 286.0 s.
+- **Memory** peaked at 2,475 and 2,506 MiB against 2,458 and 2,504 MiB.
+  Neither arm's end state was recorded.
+
+**Where the block thread waits (w22-W0, w22-W0b, w22-W0c).** The harness
+read each thread's I/O counters when the clock stopped, which no run of
+the sections above has. In every run the block thread read 0 bytes from
+storage and made about one write call per block, 1,116,433 in w22-W0,
+dirtying 19.24 GB, so its waits in btrfs's write paths are in those
+writes, which the section of 2026-10-19 could only infer. The three runs
+ran under the sampler of that section at 200 Hz, on the harness's cores,
+using 5.6 to 6.1 s of processor time. On kernel 7.3 the futex wait it
+took for `dbcommit`'s idle wait is named `__futex_wait`, not
+`futex_wait`, so it counted a commit as under way at every sample once
+`dbcommit` existed, all but about the first 3.5 s of each run, and only
+its totals by function are given here; the sampler now matches either
+name.
+
+| block thread | w22-W0 (254.5 s) | w22-W0b (252.5 s) | w22-W0c (231.8 s) |
+|---|---:|---:|---:|
+| running or runnable | 209.7 s (82.4%) | 214.3 s (84.9%) | 209.8 s (90.5%) |
+| uninterruptible, a page under writeback or locked (`folio_wait_bit_common`) | 7.7 s | 4.8 s | 0.0 s |
+| uninterruptible, a write's space reservation (`reserve_bytes`) | 17.8 s | 14.9 s | 0.2 s |
+| uninterruptible, the ordered extents over a range written (`btrfs_start_ordered_extent_nowriteback`) | 4.1 s | 4.5 s | 7.8 s |
+| uninterruptible, elsewhere | 1.0 s | 1.0 s | 0.6 s |
+| asleep on a futex | 10.2 s | 9.5 s | 9.9 s |
+| asleep elsewhere | 4.0 s | 3.6 s | 3.6 s |
+| uninterruptible in all | 30.6 s | 25.1 s | 8.6 s |
+
+| `dbcommit` thread | w22-W0 (251.0 s) | w22-W0b (249.0 s) | w22-W0c (228.3 s) |
+|---|---:|---:|---:|
+| running or runnable | 103.2 s (41.1%) | 101.7 s (40.9%) | 91.9 s (40.3%) |
+| uninterruptible, a page under writeback or locked (`folio_wait_bit_common`) | 1.7 s | 1.5 s | 7.7 s |
+| uninterruptible, a write's space reservation (`reserve_bytes`) | 20.4 s | 17.4 s | 0.3 s |
+| uninterruptible, the ordered extents over a range written (`btrfs_start_ordered_extent_nowriteback`) | 0.1 s | 0.2 s | 0.2 s |
+| uninterruptible, elsewhere | 5.6 s | 5.8 s | 6.0 s |
+| asleep on a futex | 119.1 s | 121.7 s | 121.5 s |
+| asleep elsewhere | 0.8 s | 0.7 s | 0.7 s |
+| uninterruptible in all | 27.9 s | 24.9 s | 14.2 s |
+
+- **As created**, the block thread was uninterruptible for 30.6 s,
+  17.8 s of it reserving space for a write, which on 2026-10-19 it did
+  only while a commit was under way. `dbcommit` was uninterruptible for
+  27.9 s, 20.4 s of it reserving space.
+- **Without copy-on-write** the block thread was uninterruptible for
+  8.6 s, 7.8 s of it on the ordered extents of a range it wrote, and
+  reserved space for 0.2 s. `dbcommit` was uninterruptible for 14.2 s:
+  on pages under writeback 7.7 s, and among the rest throttled for dirty
+  pages (`balance_dirty_pages`) 4.0 s, against 1.5 s as created.
+
+**Records on fresh pages (W0b).** One run under the sampler, against
+w22-W0: 252.8 s against 254.8 s, 2.0 s less, which one run against one
+does not resolve. The block thread was uninterruptible for 25.1 s
+against 30.6 s: on pages under writeback 4.8 s against 7.7 s, reserving
+space 14.9 s against 17.8 s and on ordered extents 4.5 s against 4.1 s.
+It dirtied 21.47 GB in its writes where `8bda92e` dirtied 19.24 GB, for
+nearly the same bytes passed to them.
+
+**What was not measured.**
+
+- `8bda92e` at `madvise` or on the earlier kernel, in either kind of
+  directory, or beside any section above; and dcrd in a directory
+  without copy-on-write, so no comparison with dcrd rests on these runs.
+- Any end state, the data directory's size in either arm, and how much
+  more room the node's files take uncompressed.
+- A directory where only the block files, or only the metadata file,
+  lack copy-on-write.
+- A power cut, or any unclean stop, in a directory without
+  copy-on-write.
+- btrfs without compression, filesystems other than btrfs, this drive
+  without the encrypted mapping, and other drives; Windows and macOS.
+- W0b more than once, without the sampler, or without copy-on-write.
+- The system call of each wait the sampler saw, beyond what the block
+  thread's I/O counters show; the memory after the clock.
+- The flush log's own cost, on in every run, and the sampler's.
+
+Raw: `g1-q1.jsonl`'s rows labelled `w22-W0`, `w22-W0b`, `w22-W0c`,
+`w22-nocow-2` and `w22-default-2`, with each thread's I/O counters; the
+wait-channel counts of the first three; per-run samples, flush logs and
+node logs; the queues' steps and logs; the harness's change that reads
+each thread's I/O counters; the sampler and its later change; and W0b's
+change and both build logs.
