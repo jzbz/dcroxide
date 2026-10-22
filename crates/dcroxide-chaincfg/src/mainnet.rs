@@ -287,10 +287,6 @@ pub fn mainnet_params() -> Params {
             "mainnet-seed-1.decred.org",
             "mainnet-seed-2.decred.org",
             "mainnet-seed.jholdstock.uk",
-            // Upstream since dcrd `b9b64533` (`mainnetparams.go:608` at
-            // the parity pin), so no longer a dcroxide addition.  The
-            // oracle links chaincfg at the pin, so the chaincfg oracle
-            // differential compares it like every other seeder.
             "dcr-seed.jz.bz",
         ],
     }
