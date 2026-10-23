@@ -813,3 +813,25 @@ Entry format:
 - **How found:** a sync from a node on a private address logged the first
   and third lines and not the second, which a dcrd v2.1.6 node syncing over
   loopback logs between them.
+
+## QK-0029 — a KiB of `--logsize` is 1,000 bytes
+
+- **Where:** dcrd `config.go:873-906` (`loadConfig`'s `--logsize` parse)
+  and `log.go:124-137` (`initLogRotator`), over `jrick/logrotate` v1.1.2
+  `rotator.New` (`rotator/rotator.go:66-87`) / dcroxide-node `config.rs`
+  (the same parse), `logging.rs` `init_log_rotator` and `logrotate.rs`
+  `Rotator::new`
+- **What:** dcrd reads `--logsize` in KiB: `k`, `K` and `KiB` take the
+  number as it is, `m`, `M` and `MiB` shift it left by 10 and `g`, `G` and
+  `GiB` by 20, and `initLogRotator`'s comment says the size is in KiB. The
+  rotator it hands the number to multiplies it by 1000
+  (`threshold: 1000 * thresholdKB`), so a KiB of threshold is 1,000 bytes
+  and a MiB 1,024,000: the default `10M` rotates at 10,240,000 bytes,
+  245,760 short of 10 MiB, and `1G` at 1,048,576,000. `0K` is accepted and
+  gives a threshold of zero, which rotates the file after every line.
+- **Why reproduced:** operator-visible parity: for the same `--logsize`
+  the file rotates at the size dcrd's does, so a roll holds as much log.
+- **Pinned by:** `a_kib_of_threshold_is_a_thousand_bytes` and
+  `a_line_reaching_the_threshold_rotates_the_file` in
+  `crates/dcroxide-node/src/logrotate.rs`; the zero threshold by
+  `three_rolls_are_kept_and_the_oldest_deleted` there.

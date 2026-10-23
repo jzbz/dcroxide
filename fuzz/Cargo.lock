@@ -561,6 +561,7 @@ dependencies = [
  "dcroxide-uint256",
  "dcroxide-winsvc",
  "dcroxide-wire",
+ "flate2",
  "getrandom 0.4.3",
  "libc",
  "nix",

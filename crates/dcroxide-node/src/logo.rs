@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: ISC
 //! The dcroxide startup banner.  This is a dcroxide-specific
 //! cosmetic addition — dcrd prints only a version log line at
-//! startup — and it goes to standard output before the logging
-//! subsystem takes over, so it never lands in log files.
+//! startup — and it is written straight to standard output, not
+//! through the logger, so it never lands in log files.
 
 /// The DCROXIDE block-letter logo, 60 columns wide so it fits an
 /// 80-column terminal.

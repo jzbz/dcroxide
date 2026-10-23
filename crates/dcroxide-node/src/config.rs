@@ -43,6 +43,7 @@ use crate::params::NodeParams;
 const DEFAULT_CONFIG_FILENAME: &str = "dcroxide.conf";
 const DEFAULT_DATA_DIRNAME: &str = "data";
 const DEFAULT_LOG_DIRNAME: &str = "logs";
+const DEFAULT_LOG_FILENAME: &str = "dcroxide.log";
 const DEFAULT_LOG_SIZE: &str = "10M";
 const DEFAULT_DB_TYPE: &str = "ffldb";
 const DEFAULT_LOG_LEVEL: &str = "info";
@@ -729,6 +730,16 @@ impl Config {
             warnings: Vec::new(),
             log_warnings: Vec::new(),
         }
+    }
+
+    /// The log file in the network's log directory, `dcroxide.log`
+    /// where dcrd writes `dcrd.log` (dcrd's `filepath.Join(cfg.LogDir,
+    /// defaultLogFilename)`, `config.go:906`).  The load hands it to the
+    /// daemon to open unless `--nofilelogging` is set, which leaves the
+    /// log directory as given
+    /// ([`load_config_from_argv_with_home_refusal`]).
+    pub fn log_file(&self) -> String {
+        filepath_join(&[&self.log_dir, DEFAULT_LOG_FILENAME])
     }
 }
 
@@ -1444,6 +1455,7 @@ pub fn load_config(
             notices,
             &RefCell::new(None),
             None,
+            &mut |_, _| {},
         )
     })
 }
@@ -1465,6 +1477,7 @@ pub fn load_config_from_argv(
             notices,
             &RefCell::new(None),
             None,
+            &mut |_, _| {},
         )
     })
 }
@@ -1493,7 +1506,14 @@ pub fn load_config_from_argv_with_notices(
     notices: &mut dyn FnMut(&str),
     env_refused: &RefCell<Option<String>>,
 ) -> Result<(Config, Vec<String>), String> {
-    load_config_impl(&CliSource::Argv(args), env, notices, env_refused, None)
+    load_config_impl(
+        &CliSource::Argv(args),
+        env,
+        notices,
+        env_refused,
+        None,
+        &mut |_, _| {},
+    )
 }
 
 /// [`load_config_from_argv_with_notices`] where the [`app_data_dir`]
@@ -1508,12 +1528,20 @@ pub fn load_config_from_argv_with_notices(
 /// `--appdata` starts the node, as dcrd's does, and no path given beside
 /// it is taken for one of the defaults the refused home would have
 /// produced ([`REFUSED_DEFAULT_HOME`]).
+///
+/// `init_log_rotator` is called with the log file's path and its
+/// `--logsize` in KiB where dcrd calls `initLogRotator`
+/// (`config.go:904-906`): unless `--nofilelogging` is set, as soon as
+/// `--logsize` parses, ahead of the `--debuglevel=show` exit and every
+/// later check.  dcrd's exits the process when it cannot make the
+/// directory or open the file, so the daemon's does too.
 pub fn load_config_from_argv_with_home_refusal(
     args: &[String],
     env: &ConfigEnv<'_>,
     notices: &mut dyn FnMut(&str),
     env_refused: &RefCell<Option<String>>,
     home_refused: &RefCell<Option<String>>,
+    init_log_rotator: &mut dyn FnMut(&str, i64),
 ) -> Result<(Config, Vec<String>), String> {
     load_config_impl(
         &CliSource::Argv(args),
@@ -1521,6 +1549,7 @@ pub fn load_config_from_argv_with_home_refusal(
         notices,
         env_refused,
         Some(home_refused),
+        init_log_rotator,
     )
 }
 
@@ -1585,6 +1614,7 @@ fn load_config_impl(
     notices: &mut dyn FnMut(&str),
     env_refused: &RefCell<Option<String>>,
     home_refused: Option<&RefCell<Option<String>>>,
+    init_log_rotator: &mut dyn FnMut(&str, i64),
 ) -> Result<(Config, Vec<String>), String> {
     let func_name = "loadConfig";
     // When the default home's lookup was refused
@@ -1980,6 +2010,10 @@ fn load_config_impl(
             _ => return Err(invalid_size()),
         }
         cfg.log_size_kib = logsize;
+
+        // Initialize log rotation
+        // ([`load_config_from_argv_with_home_refusal`]).
+        init_log_rotator(&cfg.log_file(), logsize);
     }
 
     // The special "show" debug level command lists the supported

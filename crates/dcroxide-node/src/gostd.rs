@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: ISC
 //! Faithful ports of the Go standard library behaviors the config
 //! pipeline observes: `time.Duration` parsing and formatting,
-//! `path/filepath.Clean`/`Join`, `os.Expand`, `net.JoinHostPort` /
+//! `path/filepath.Clean`/`Join`/`Split`, `os.Expand`, `net.JoinHostPort` /
 //! `net.SplitHostPort`, `strconv` conversions, and `os.MkdirAll` with
 //! the `*os.PathError` texts its callers print.
 
@@ -355,6 +355,13 @@ pub(crate) fn filepath_join(elems: &[&str]) -> String {
         }
     }
     String::new()
+}
+
+/// Split a path just after its last separator like Go's
+/// `path/filepath.Split` on Unix: the directory keeps the separator,
+/// and either part may be empty.
+pub(crate) fn filepath_split(path: &str) -> (&str, &str) {
+    path.split_at(path.rfind('/').map_or(0, |i| i.saturating_add(1)))
 }
 
 /// Whether `path` is already absolute.  A leading `/` counts on every
@@ -1290,5 +1297,28 @@ mod tests {
                 .to_string(),
             format!("mkdir {file}: not a directory")
         );
+    }
+
+    /// Go's `filepath.Split` on Unix, which dcrd's `initLogRotator`
+    /// takes the log directory from: the directory keeps its trailing
+    /// separator.
+    #[test]
+    fn filepath_split_matches_go() {
+        use super::filepath_split;
+
+        for (path, dir, file) in [
+            (
+                "/home/u/logs/mainnet/dcrd.log",
+                "/home/u/logs/mainnet/",
+                "dcrd.log",
+            ),
+            ("logs/dcrd.log", "logs/", "dcrd.log"),
+            ("dcrd.log", "", "dcrd.log"),
+            ("/dcrd.log", "/", "dcrd.log"),
+            ("/home/u/", "/home/u/", ""),
+            ("", "", ""),
+        ] {
+            assert_eq!(filepath_split(path), (dir, file), "{path}");
+        }
     }
 }

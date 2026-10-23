@@ -1,18 +1,23 @@
 // SPDX-License-Identifier: ISC
 //! The daemon's log line rendering: decred/slog@v1.2.0's exact
 //! header format — `YYYY-MM-DD hh:mm:ss.sss [LVL] TAG: message` in
-//! local time — over a stdout backend, gated by the per-subsystem
-//! levels the configuration's `--debuglevel` grammar parsed
-//! ([`crate::logsubsys::LogLevels`]).  Each line carries the
+//! local time — over standard output and the log file, gated by the
+//! per-subsystem levels the configuration's `--debuglevel` grammar
+//! parsed ([`crate::logsubsys::LogLevels`]).  Each line carries the
 //! subsystem tag its dcrd counterpart logs under (`DCRD` for package
 //! main, `RPCS` for the RPC server, `SRVR` for the server, and so
-//! on).  The rotating file backend (`jrick/logrotate`) remains
-//! unwired; stdout is the only sink.
+//! on).  Once the daemon has opened its log file
+//! ([`init_log_rotator`]), every line goes to the file as well, through
+//! the port of `jrick/logrotate` in `logrotate.rs`, as dcrd's
+//! `logWriter` writes each line to standard output and then to its
+//! rotator (`log.go:32-42`).
 
 use std::io::Write;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Mutex, OnceLock, PoisonError};
 
+use crate::gostd::{filepath_split, go_mkdir_all_owner_only};
+use crate::logrotate::Rotator;
 use crate::logsubsys::{LogLevel, LogLevels, SUBSYSTEM_IDS};
 
 /// Every level in declaration order, so a level's discriminant indexes
@@ -193,15 +198,66 @@ pub fn write_stdout(bytes: &[u8]) {
     let _ = result;
 }
 
+/// The log file, once the daemon has opened it (dcrd's `logRotator`,
+/// `log.go:58-60`).  The daemon alone opens one: addblock logs to
+/// standard output only, as dcrd's `cmd/addblock` does.
+///
+/// Its lock is held across a line's write to standard output and its
+/// write to the file, as slog's backend holds its mutex across
+/// `logWriter`'s two writes (decred/slog v1.2.0 `log.go:305-307`), so
+/// the file has the lines in the order standard output has them.
+static LOG_ROTATOR: Mutex<Option<Rotator>> = Mutex::new(None);
+
+/// How many rolls of the log file are kept (dcrd's `rotator.New(logFile,
+/// logSize, false, 3)`, `log.go:137`).
+const LOG_ROLLS: isize = 3;
+
+/// Open the log file at `log_file`, creating its directory, so that
+/// every later line is written to it after standard output, rotated
+/// once `log_size_kib` thousand bytes have been written to it (dcrd's
+/// `initLogRotator`, `log.go:124-144`).  The directory, everything up
+/// to the file name's last separator, is made as `os.MkdirAll(logDir,
+/// 0700)` makes it: owner-only where it is created, an existing one
+/// left as it is.  The error is the line dcrd writes to standard error
+/// before it exits with status 1.
+pub fn init_log_rotator(log_file: &str, log_size_kib: i64) -> Result<(), String> {
+    let (log_dir, _) = filepath_split(log_file);
+    go_mkdir_all_owner_only(log_dir).map_err(|e| format!("failed to create log directory: {e}"))?;
+    let rotator = Rotator::new(log_file, log_size_kib, LOG_ROLLS)
+        .map_err(|e| format!("failed to create file rotator: {e}"))?;
+    *LOG_ROTATOR.lock().unwrap_or_else(PoisonError::into_inner) = Some(rotator);
+    Ok(())
+}
+
+/// Close the log file, waiting for the rolls being compressed (dcrd's
+/// deferred `logRotator.Close()`, `dcrd.go:54-58`).  A line logged
+/// after it goes to standard output only, as dcrd's write of one to the
+/// closed file fails and is discarded.
+pub fn close_log_rotator() {
+    let rotator = LOG_ROTATOR
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .take();
+    if let Some(mut rotator) = rotator {
+        rotator.close();
+    }
+}
+
 /// Emit a log line for the subsystem at the level when its
-/// configured level allows it.
+/// configured level allows it: to standard output, then to the log
+/// file if one is open.  The rotator's result is discarded, as dcrd's
+/// `logWriter` discards it.
 pub fn log(subsys: &str, level: LogLevel, msg: &str) {
     if !enabled(level, subsystem_level(subsys)) {
         return;
     }
     let mut line = render(&timestamp(), level, subsys, msg);
     line.push('\n');
+    let mut rotator = LOG_ROTATOR.lock().unwrap_or_else(PoisonError::into_inner);
     write_stdout(line.as_bytes());
+    if let Some(rotator) = rotator.as_mut() {
+        let _ = rotator.write(line.as_bytes());
+    }
 }
 
 /// A trace-level line.

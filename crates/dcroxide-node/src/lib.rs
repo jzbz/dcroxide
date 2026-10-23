@@ -7,7 +7,8 @@
 //!   front-end (`flags`), and the `config.go` pipeline behind it
 //!   (`config`) — defaults, config file and command line precedence,
 //!   and the full validation and derivation gauntlet with dcrd's exact
-//!   error strings — plus the logging subsystems and log line format;
+//!   error strings — plus the logging subsystems, the log line format
+//!   and the rotating log file (`logrotate`);
 //! - the peer-to-peer server: `server.go`'s decision core (`server`),
 //!   the threaded runtime over its `Run` and `peerHandler` goroutines
 //!   (`runtime`), the per-peer message loops and served-peer dispatch,
@@ -42,6 +43,7 @@ pub mod limits;
 pub mod listenaddrs;
 pub mod logging;
 pub mod logo;
+mod logrotate;
 pub mod logsubsys;
 pub mod mediantime;
 pub mod mining;

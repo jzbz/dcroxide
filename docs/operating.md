@@ -1433,6 +1433,7 @@ configuration, every name changes.
 | application home directory (macOS) | `~/Library/Application Support/Dcroxide` | `…/Dcrd` |
 | application home directory (Windows) | `%LOCALAPPDATA%\Dcroxide` | `…\Dcrd` |
 | configuration file | `dcroxide.conf` | `dcrd.conf` |
+| log file | `<home>/logs/<network>/dcroxide.log` | `…/dcrd.log` |
 | home directory override | `--appdata`, `DCROXIDE_APPDATA` | `DCRD_APPDATA` |
 | data directory override | `--datadir` | `--datadir` |
 | extra TLS DNS names | `DCROXIDE_ALT_DNSNAMES` | `DCRD_ALT_DNSNAMES` |
@@ -1680,13 +1681,52 @@ and the same help text apart from the two environment annotations, which
 name `DCROXIDE_APPDATA` and `DCROXIDE_ALT_DNSNAMES` where dcrd's name
 `DCRD_APPDATA` and `DCRD_ALT_DNSNAMES`.
 
-There is no log file yet. `--logdir` (default `<home>/logs`), `--logsize`
-and `--nofilelogging` are parsed and validated as dcrd's are, but the
-rotating log file is not wired: standard output is the only sink, so
-capture it — journald under systemd, or a redirect or service wrapper
-elsewhere. Under the Windows service control manager the process has no
-standard handles and every write is discarded, so a daemon run as a
-service keeps no log at all until the log file is wired.
+The daemon logs to standard output and, as dcrd does, to a log file:
+`dcroxide.log` where dcrd writes `dcrd.log`, in `<home>/logs/<network>`,
+or in `<logdir>/<network>` under `--logdir`, the network being
+`mainnet`, `testnet3`, `simnet` or `regnet`. Every log line goes to
+both, in the same order; the configuration warnings are log lines and
+reach the file too. The startup banner, and the blank line written after
+it and after any configuration warnings, are not log lines and go to
+standard output alone. A start appends to the file it finds. The
+directories the daemon creates for the file are owner-only (`0700`), and
+the files are `0644` less the umask.
+
+Once a line brings the file to `--logsize` (default `10M`: a whole
+number and `k`, `K` or `KiB`, `m`, `M` or `MiB`, or `g`, `G` or `GiB`; a
+number without a unit is refused), the file is renamed
+`dcroxide.log.<N>`, N one past the highest roll beside it, a new
+`dcroxide.log` is started, and the roll is gzipped to
+`dcroxide.log.<N>.gz` in the background. The three newest rolls are
+kept: each rotation deletes the compressed rolls from three behind the
+new one downwards, stopping at the first that is not there, and never
+deletes one left uncompressed. A KiB there is 1,000 bytes, as in dcrd's
+rotator, so the default `10M` rotates at 10,240,000 bytes rather than
+10,485,760 (QK-0029 in [QUIRKS.md](QUIRKS.md)). A file already past the
+size when the node starts is rotated after the first line written to it.
+
+The file is opened where dcrd opens it, as soon as `--logsize` has been
+read, ahead of the rest of the configuration's checks, so
+`--debuglevel=show` and a configuration refused later leave an empty log
+file behind. A log directory that cannot be created, or a log file that
+cannot be opened, stops the start there, before anything is logged, with
+`failed to create log directory: ...` or
+`failed to create file rotator: ...` on standard error and status 1. If
+a rotation cannot rename the file, which on Windows another process
+holding it open can cause, the file takes nothing more until a restart,
+as dcrd's does. A file-size limit on the process (`ulimit -f`, systemd's
+`LimitFSIZE=`) below `--logsize` ends the node when the file reaches it,
+where dcrd's goes on and its file takes no more; leave it unset, or
+above `--logsize`.
+
+`--nofilelogging` writes no file and creates no log directory, leaving
+standard output the only sink to capture — journald under systemd, or a
+redirect or service wrapper elsewhere. Under the Windows service control
+manager the process has no standard handles and every write to them is
+discarded, so a daemon run as a service logs to its file alone: under
+`--nofilelogging`, or once a failed rotation has stopped the file, it
+keeps no log at all. Where the port's file departs from dcrd's is in
+[PARITY.md](PARITY.md), *The log file*.
 
 The daemon generates `rpc.cert` and `rpc.key` in the application home
 directory — alongside `dcroxide.conf`, not under `data/` — on first

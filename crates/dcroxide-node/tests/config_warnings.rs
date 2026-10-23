@@ -36,6 +36,8 @@ fn stderr_until(args: &[String], want: &str, wait: std::time::Duration) -> Strin
         .arg("--nolisten")
         .arg("--noseeders")
         .arg(format!("--datadir={}", dir.path().display()))
+        // The home is the default one, so keep the log file out of it.
+        .arg(format!("--logdir={}", dir.path().display()))
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
         .spawn()

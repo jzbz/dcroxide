@@ -68,6 +68,10 @@ rustls = { version = "0.23.45", default-features = false, features = [
 p521 = { version = "0.14", default-features = false, features = ["ecdsa"] }
 sha1 = { version = "0.11", default-features = false }
 rustls-pki-types = "1"
+# Gzips the log file's rolls, as dcrd's rotator does with Go's
+# `compress/gzip` (`logrotate.rs`).  Already in the tree with its
+# default features through ureq's gzip support, so it adds no crate.
+flate2 = "1.1"
 ureq = "3"
 webpki-roots = "1.0.10"
 socket2 = "0.6.4"

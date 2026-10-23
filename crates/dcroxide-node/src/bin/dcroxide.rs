@@ -16,8 +16,9 @@
 //! chain carries a live UTXO cache flushed to the block database on
 //! shutdown; and the JSON-RPC/websocket server binds unless `--norpc`.
 //! Log lines render in slog's exact header format with their dcrd
-//! subsystem tags, gated by `--debuglevel`, to stdout only — the
-//! rotating file backend remains unwired.
+//! subsystem tags, gated by `--debuglevel`, to stdout and, unless
+//! `--nofilelogging` is set, to the rotating log file in the network's
+//! log directory.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -228,12 +229,25 @@ fn real_main() -> ExitCode {
     // config creation, the deprecation and Tor-isolation notices), so
     // they print even when the load fails later.
     let mut notice = |line: &str| eprintln!("{line}");
+    // dcrd's `initLogRotator`, which `loadConfig` calls as soon as
+    // `--logsize` parses: a log directory that cannot be made, or a log
+    // file that cannot be opened, ends the process there with status 1
+    // and why on standard error (`log.go:124-144`), ahead of the
+    // `--debuglevel=show` exit and every later check, and under the
+    // service control manager before the service reports stopped.
+    let mut init_log_rotator = |log_file: &str, log_size_kib: i64| {
+        if let Err(e) = dcroxide_node::logging::init_log_rotator(log_file, log_size_kib) {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+    };
     match dcroxide_node::config::load_config_from_argv_with_home_refusal(
         &args,
         &env,
         &mut notice,
         &env_refused,
         &home_refused,
+        &mut init_log_rotator,
     ) {
         Ok((cfg, _remaining_args)) => run(cfg),
         // Perform a requested service command and exit (dcrd's
@@ -415,12 +429,16 @@ fn shutdown_requested(interrupt: &dcroxide_indexers::Interrupt) -> bool {
     interrupt.load(core::sync::atomic::Ordering::SeqCst)
 }
 
-/// Run the daemon and log `Shutdown complete` however it returns (dcrd's
-/// `defer dcrdLog.Info("Shutdown complete")` at the top of `dcrdMain`,
-/// which runs on the failure returns too).
+/// Run the daemon and log `Shutdown complete` however it returns
+/// (dcrd's `defer dcrdLog.Info("Shutdown complete")` at the top of
+/// `dcrdMain`, which runs on the failure returns too), then close the
+/// log file the configuration load opened, if it opened one (the
+/// `logRotator.Close()` dcrd defers ahead of it, so it runs after the
+/// line, `dcrd.go:54-64`).
 fn run(cfg: Config) -> ExitCode {
     let code = run_node(cfg);
     log_info("Shutdown complete");
+    dcroxide_node::logging::close_log_rotator();
     code
 }
 
@@ -437,8 +455,8 @@ fn run_node(cfg: Config) -> ExitCode {
     // The RPC server's package logger (dcrd's `log.go:96`,
     // `rpcserver.UseLogger(rpcsLog)`).
     dcroxide_rpc::log::use_logger(dcroxide_node::logging::rpcs_log_sink());
-    // The banner shares the log's sink and its tolerance of a stdout
-    // that stopped taking writes.
+    // The banner shares the log's standard-output sink, not its file,
+    // and its tolerance of a stdout that stopped taking writes.
     dcroxide_node::logging::write_stdout(
         logo::startup_banner(version::version_string()).as_bytes(),
     );

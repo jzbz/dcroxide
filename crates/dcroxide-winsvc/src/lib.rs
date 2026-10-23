@@ -13,10 +13,10 @@
 //! and the status transitions mirror dcrd's start-pending → running →
 //! stop-pending → stopped sequence.  The Windows event log half of
 //! dcrd's wrapper (`eventlog.InstallAsEventCreate` and the
-//! start-of-day message) is not ported.  The daemon logs only to
-//! standard output, and a process the SCM starts has no standard
-//! handles, where std discards every write, so until the rotating log
-//! file is wired a daemon run as a service keeps no log at all.
+//! start-of-day message) is not ported.  A process the SCM starts has
+//! no standard handles, where std discards every write, so a daemon run
+//! as a service logs to its log file alone, and under `--nofilelogging`
+//! keeps no log at all.
 //!
 //! It also carries the two Windows pieces of dcrd's process plumbing
 //! that Go's runtime and `os` package give dcrd for free and std does

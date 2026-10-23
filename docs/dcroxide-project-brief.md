@@ -42,7 +42,7 @@ assembles them end to end: config and CLI, the chain engine with full
 consensus validation, mempool and fee estimation, mining and the CPU miner, the
 P2P server with sync, relay, and StakeShuffle mixing message relay, the
 JSON-RPC/websocket server, the tool commands, the pipe IPC lifecycle, and the
-Windows service wrapper. The gate runs 2,575 tests across 444 suites on Linux,
+Windows service wrapper. The gate runs 2,598 tests across 445 suites on Linux,
 most of them differential against dcrd or replaying sessions generated inside dcrd's own
 packages. The parity target moved six times during the port, from
 `release-v2.1.5` to upstream master `452c1a6c` and then through `29f17894`,
@@ -417,14 +417,15 @@ Every task in this project serves one of six compatibility surfaces. They are li
 
 **C5 — Operational artifacts.** `rpc.cert`/`rpc.key` generation compatible with what dcrwallet/dcrctl expect, log file naming/rotation, pprof-style profiling endpoints (`--profile`) with a documented Rust-appropriate equivalent where Go-runtime-specific outputs cannot be replicated, UPnP, proxy/Tor (SOCKS5, onion) support, and `--altdnsnames`.
 
-> **As built:** certificate generation, the proxy/Tor dial path, and
-> `--altdnsnames` are in; the rotating log file is not yet wired (stdout is the
-> only sink), so `--logdir`, `--logsize` and `--nofilelogging` parse and
-> validate but no log file is written. Three items are deliberate non-ports:
-> the profiling flags (`--profile`/`--cpuprofile`/`--memprofile`) validate but
-> serve nothing, `--upnp` parses but maps nothing, and the Windows service ships
-> without the event-log half (under the SCM the process has no standard
-> handles, so a service-run daemon keeps no log until the log file is wired).
+> **As built:** certificate generation, the proxy/Tor dial path,
+> `--altdnsnames` and the rotating log file are in: every log line goes to
+> stdout and to `dcroxide.log` in the network's log directory, rotated and
+> gzipped as dcrd's `dcrd.log` is, unless `--nofilelogging` is set. Three
+> items are deliberate non-ports: the profiling flags
+> (`--profile`/`--cpuprofile`/`--memprofile`) validate but serve nothing,
+> `--upnp` parses but maps nothing, and the Windows service ships without the
+> event-log half (under the SCM the process has no standard handles, so a
+> service-run daemon logs to its log file alone).
 > Go's soft-memory-limit tuning has no Rust analog and is not reproduced.
 > PARITY.md lists each with its reasoning.
 
