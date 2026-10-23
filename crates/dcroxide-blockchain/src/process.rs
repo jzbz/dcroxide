@@ -4555,6 +4555,7 @@ impl Chain {
                     );
                     if let Err(err) = context_result {
                         self.mark_block_failed_on_context_violation(node, &err);
+                        self.drop_unconnectable_candidates(node, &err);
                         return Err(err);
                     }
                 }
@@ -6641,10 +6642,56 @@ impl Chain {
     /// contextual checks failed, which dcrd's `maybeAcceptBlocks` and
     /// `reorganizeChainInternal` do not mark when the failure is
     /// `ErrBadMerkleRoot` (`process.go:367-374`, `chain.go:1209-1215`):
-    /// the header has then not been shown to commit to that data.
+    /// the header has then not been shown to commit to that data.  The
+    /// data is rejected all the same, so its body is dropped from memory
+    /// as a marked block's is.
     fn mark_block_failed_on_context_violation(&mut self, node: NodeId, err: &RuleError) {
-        if err.kind != RuleErrorKind::BadMerkleRoot {
+        if err.kind == RuleErrorKind::BadMerkleRoot {
+            self.forget_rejected_block_body(node);
+        } else {
             self.mark_block_failed_on_rule_violation(node, err);
+        }
+    }
+
+    /// Take a block that the reorganization could not attach because its
+    /// contextual merkle check failed, and every best chain candidate
+    /// that descends from it, out of the best chain candidates, without
+    /// marking any of them.
+    ///
+    /// dcrd leaves such a block a candidate (`chain.go:1209-1215`), and
+    /// while it is the best one `reorganizeChain` is handed it again as
+    /// the next target and stops (`chain.go:1338-1341`): the tip stays
+    /// where the attempt left it until a valid branch with more work
+    /// than the block, or than a branch on it, arrives.  The block
+    /// reaches the attach loop's contextual checks only when it is not
+    /// validated, its merkle check depends on nothing but the block and
+    /// its ancestors, and its hash never enters the recent merkle checks,
+    /// so every reorganization to it or to a descendant attaches it and
+    /// fails here.  Dropping them, as `MarkBlockFailedValidation` would,
+    /// lets [`Self::reorganize_chain`] fall back to the next best
+    /// candidate in the same call, as it does after any failure that
+    /// marks a block.  PARITY.md records the divergence.  Any other
+    /// failure of the check either marks the block, which removes the
+    /// same candidates, or is not a rule violation, and then leaves them
+    /// to be tried again, as in dcrd.
+    ///
+    /// dcrd's candidates always hold at least the current tip, which
+    /// `RemoveLessWorkCandidates` asserts (`blockindex.go:1279-1284`),
+    /// and the unmarked block and the branch on it keep that true there
+    /// by staying candidates.  When the removal takes every candidate,
+    /// the tip, the block's parent and so no descendant of it, is made
+    /// one again, so the next connect does not find the set empty and a
+    /// later sibling of equal work still loses the tie to it.
+    fn drop_unconnectable_candidates(&mut self, node: NodeId, err: &RuleError) {
+        if err.kind != RuleErrorKind::BadMerkleRoot {
+            return;
+        }
+        self.index
+            .remove_best_chain_candidates_from(&self.store, node);
+        if self.index.num_best_chain_candidates() == 0
+            && let Some(tip) = self.best_chain.tip()
+        {
+            self.index.add_best_chain_candidate(tip);
         }
     }
 
@@ -9388,6 +9435,43 @@ mod tests {
         assert_eq!(err.kind, RuleErrorKind::UtxoBackendCorruption);
         assert!(!err.kind.is_rule_violation());
         assert_eq!(err.description, "missing key for block undo data");
+    }
+
+    /// Only a contextual `ErrBadMerkleRoot` takes a block out of the best
+    /// chain candidates without marking it.  A failure of the check that
+    /// is not a rule violation (an unknown agenda, a historical forced
+    /// choice, a backend failure) marks nothing and leaves the block a
+    /// candidate, to be tried again as in dcrd.  The tip stands in for
+    /// the block, with its parent made another candidate so the removal
+    /// leaves one.
+    #[test]
+    fn only_a_contextual_bad_merkle_root_drops_unmarked_candidates() {
+        let params = dcroxide_chaincfg::regnet_params();
+        let mut chain = Chain::new(&params, Hash::ZERO, false);
+        let (blocks, now) = battery_main_chain();
+        for block in &blocks[..4] {
+            let (_, errs) = chain.process_block(block, now, &params);
+            assert!(errs.is_empty(), "{errs:?}");
+        }
+        let tip = chain.best_chain.tip().expect("tip");
+        let parent = chain.store.node(tip).parent.expect("parent");
+        chain.index.add_best_chain_candidate(parent);
+        for kind in [
+            RuleErrorKind::UnknownAgendaID,
+            RuleErrorKind::HistoricalForcedChoice,
+            RuleErrorKind::UtxoBackendCorruption,
+        ] {
+            assert!(!kind.is_rule_violation());
+            chain.drop_unconnectable_candidates(tip, &rule_error(kind, "context check failed"));
+            assert!(chain.index.is_best_chain_candidate(tip), "{kind:?}");
+        }
+
+        chain.drop_unconnectable_candidates(
+            tip,
+            &rule_error(RuleErrorKind::BadMerkleRoot, "context check failed"),
+        );
+        assert!(!chain.index.is_best_chain_candidate(tip));
+        assert!(chain.index.is_best_chain_candidate(parent));
     }
 
     /// Connecting blocks prunes the cached chain tips at most once per

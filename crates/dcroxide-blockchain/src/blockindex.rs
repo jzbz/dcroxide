@@ -867,6 +867,22 @@ impl BlockIndex {
         self.best_chain_candidates.remove(&node);
     }
 
+    /// Remove the node, and every best chain candidate that descends
+    /// from it, from the best chain candidates, leaving every status as
+    /// it is.  These are the candidates
+    /// [`Self::mark_block_failed_validation`] removes (dcrd
+    /// `MarkBlockFailedValidation`, `blockindex.go:1115-1209`); dcrd has
+    /// no form that removes them without marking the blocks.
+    pub fn remove_best_chain_candidates_from(&mut self, store: &NodeStore, node: NodeId) {
+        self.best_chain_candidates
+            .retain(|&n| !store.is_ancestor_of(node, n));
+    }
+
+    /// Whether the node is a best chain candidate.
+    pub fn is_best_chain_candidate(&self, node: NodeId) -> bool {
+        self.best_chain_candidates.contains(&node)
+    }
+
     /// Remove old cached chain tips relative to the passed best node
     /// (dcrd `pruneCachedTips`, sans the time stamp and the interval,
     /// which the engine keeps and `Chain::maybe_prune_cached_tips`
