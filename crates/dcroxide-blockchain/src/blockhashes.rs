@@ -1409,9 +1409,9 @@ mod tests {
     /// Blocks made from one block that fail, or may fail, the checks
     /// that read its hashes, by shape: a tree that no longer has the
     /// root the header names, a tree padded with repeats that still has
-    /// it, in a block of the size its header names, and trees with
-    /// nothing in them.  The header is the block's own unless the shape
-    /// says otherwise.
+    /// it, under the block's own header and in a block of the size its
+    /// header names, and trees with nothing in them.  The header is the
+    /// block's own unless the shape says otherwise.
     fn bad_shapes(block: &MsgBlock) -> Vec<(&'static str, MsgBlock)> {
         let mut shapes = Vec::new();
         let mut add = |shape: &'static str, make: &dyn Fn(&mut MsgBlock) -> bool| {
@@ -1440,29 +1440,45 @@ mod tests {
             alter_last(&mut b.transactions) && alter_last(&mut b.stransactions)
         });
         // A tree with repeats keeps its root, so the header still names
-        // it; the header names the size of the block with the repeats.
-        add(
-            "a regular tree with repeats",
-            &|b| match with_repeated_tail(&b.transactions) {
-                Some(repeated) => {
-                    b.transactions = repeated;
-                    b.header.size = size_of(b);
-                    true
-                }
-                None => false,
-            },
-        );
-        add(
-            "a stake tree with repeats",
-            &|b| match with_repeated_tail(&b.stransactions) {
-                Some(repeated) => {
-                    b.stransactions = repeated;
-                    b.header.size = size_of(b);
-                    true
-                }
-                None => false,
-            },
-        );
+        // it.  Under the block's own header that is a copy of the block
+        // whose size the header does not name; a header that names the
+        // size with the repeats can be no valid block's.
+        for commit_to_size in [false, true] {
+            add(
+                if commit_to_size {
+                    "a regular tree with repeats, of the size the header names"
+                } else {
+                    "a regular tree with repeats"
+                },
+                &|b| match with_repeated_tail(&b.transactions) {
+                    Some(repeated) => {
+                        b.transactions = repeated;
+                        if commit_to_size {
+                            b.header.size = size_of(b);
+                        }
+                        true
+                    }
+                    None => false,
+                },
+            );
+            add(
+                if commit_to_size {
+                    "a stake tree with repeats, of the size the header names"
+                } else {
+                    "a stake tree with repeats"
+                },
+                &|b| match with_repeated_tail(&b.stransactions) {
+                    Some(repeated) => {
+                        b.stransactions = repeated;
+                        if commit_to_size {
+                            b.header.size = size_of(b);
+                        }
+                        true
+                    }
+                    None => false,
+                },
+            );
+        }
         add("no transactions", &|b| {
             b.transactions.clear();
             b.stransactions.clear();
@@ -1587,7 +1603,9 @@ mod tests {
     /// agenda query can give.  The side without roots builds each tree
     /// where dcrd builds it and no other, so a block whose regular root
     /// fails the original commitment has no stake tree built; the side
-    /// with roots builds none.
+    /// with roots builds none.  No block whose header names another size
+    /// than its own has its data commitment proven, the copies with
+    /// repeats under the block's own header among them.
     #[test]
     fn carried_merkle_roots_give_the_verdicts_of_roots_built_by_the_check() {
         let params = dcroxide_chaincfg::regnet_params();
@@ -1609,6 +1627,9 @@ mod tests {
 
         let mut seen: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
         let mut repeats_keep_the_root = 0usize;
+        // Trees with more than one leaf repeated: a repeat at a level
+        // above the leaves.
+        let mut repeats_above_the_leaves = 0usize;
         for (name, block) in fixture_blocks() {
             let mut cases = vec![("the block", block.clone())];
             cases.extend(bad_shapes(&block));
@@ -1635,6 +1656,10 @@ mod tests {
                         "{name}, {shape}"
                     );
                     repeats_keep_the_root += 1;
+                    let leaves = |b: &MsgBlock| b.transactions.len() + b.stransactions.len();
+                    if leaves(&case) - leaves(&block) > 1 {
+                        repeats_above_the_leaves += 1;
+                    }
                 }
 
                 // The merkle check alone, against the check that hashes
@@ -1700,6 +1725,29 @@ mod tests {
                         Err((kind, _)) => kind.kind_name().to_string(),
                     };
                     *seen.entry(format!("{shape}: {verdict}")).or_default() += 1;
+
+                    // A block whose header names another size never has
+                    // its data commitment proven: with the agenda
+                    // decided, the preconditions refuse it for its size
+                    // once its trees pass, where dcrd proves the
+                    // commitment and its sanity checks refuse the block
+                    // (PARITY.md, *The header's size and a proven data
+                    // commitment*).
+                    if case.header.size as usize != case.serialize_size() {
+                        let preconditions = check_block_data_preconditions_with_leaves(
+                            hashed.block(),
+                            hashed.merkle_leaves(),
+                            Some(hashed.merkle_roots()),
+                            || agenda.clone(),
+                        );
+                        assert_ne!(preconditions, Ok(true), "{name}, {shape}, {agenda:?}");
+                        if preconditions.is_err_and(|err| err.kind == RuleErrorKind::WrongBlockSize)
+                        {
+                            *seen
+                                .entry(format!("{shape}: ErrWrongBlockSize, not proven"))
+                                .or_default() += 1;
+                        }
+                    }
                 }
             }
         }
@@ -1707,6 +1755,10 @@ mod tests {
         assert!(
             repeats_keep_the_root >= 100,
             "{repeats_keep_the_root} trees with repeats"
+        );
+        assert!(
+            repeats_above_the_leaves > 0,
+            "no tree has more than one leaf repeated"
         );
         // Every shape reached the check it was made for, on both sides.
         for verdict in [
@@ -1718,8 +1770,12 @@ mod tests {
             "another stake tree: ErrBadMerkleRoot, block merkle root",
             "a stake tree where there was none: ErrBadMerkleRoot, block stake merkle root",
             "both trees are others: ErrBadMerkleRoot, block merkle root",
-            "a regular tree with repeats: ErrDuplicateTx",
-            "a stake tree with repeats: ErrDuplicateTx",
+            "a regular tree with repeats: ErrWrongBlockSize",
+            "a regular tree with repeats: ErrWrongBlockSize, not proven",
+            "a regular tree with repeats, of the size the header names: ErrDuplicateTx",
+            "a stake tree with repeats: ErrWrongBlockSize",
+            "a stake tree with repeats: ErrWrongBlockSize, not proven",
+            "a stake tree with repeats, of the size the header names: ErrDuplicateTx",
             "no transactions: ErrBadMerkleRoot, block merkle root",
             "no regular transactions: ErrBadMerkleRoot, block merkle root",
             "no transactions, as the header says: ErrNoTransactions",

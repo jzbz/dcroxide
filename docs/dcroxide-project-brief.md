@@ -42,7 +42,7 @@ assembles them end to end: config and CLI, the chain engine with full
 consensus validation, mempool and fee estimation, mining and the CPU miner, the
 P2P server with sync, relay, and StakeShuffle mixing message relay, the
 JSON-RPC/websocket server, the tool commands, the pipe IPC lifecycle, and the
-Windows service wrapper. The gate runs 2,606 tests across 446 suites on Linux,
+Windows service wrapper. The gate runs 2,608 tests across 447 suites on Linux,
 most of them differential against dcrd or replaying sessions generated inside dcrd's own
 packages. The parity target moved six times during the port, from
 `release-v2.1.5` to upstream master `452c1a6c` and then through `29f17894`,
@@ -399,6 +399,15 @@ Action item for week 1: contact the dcr-rs author about upstreaming vs. forking;
 Every task in this project serves one of six compatibility surfaces. They are listed in priority order; C1 failures are ship-blockers of the highest severity (a consensus divergence can fork a money network).
 
 **C1 — Consensus (absolute, bug-for-bug).** For every block and transaction ever seen or seeable on any Decred network, dcroxide's accept/reject verdict, resulting chain state (best tip, UTXO set, live-ticket set, treasury balance, agenda threshold states), and all consensus-derived values (subsidies, difficulty, lottery winners, sequence locks) must equal dcrd's exactly. Where dcrd's behavior deviates from written specification, **dcrd's behavior wins** and the deviation is recorded in [QUIRKS.md](QUIRKS.md) with a test pinning it.
+
+> **As built:** one deliberate divergence changes the resulting chain state. A
+> peer can answer a request for a valid block with a copy that keeps its header
+> and repeats the tail of a merkle tree. With the header commitments agenda's
+> state decided, dcrd, by its code as read, marks that header as failed and then
+> refuses the valid block; dcroxide refuses the copy without marking anything
+> and accepts the valid block. No block dcrd accepts is refused. The reasoning
+> is in [PARITY.md](PARITY.md), *The header's size and a proven data
+> commitment*.
 
 **C2 — P2P wire protocol (version 12).** Message framing, per-network magic bytes, version negotiation and services, all message types including the eight mixing messages, inventory/relay semantics, protocol-version gating of features (mixing ≥10, batched cfilters ≥11), misbehavior/ban scoring, and connection policies — such that mixed fleets of dcrd and dcroxide nodes interoperate indefinitely and neither side bans the other.
 

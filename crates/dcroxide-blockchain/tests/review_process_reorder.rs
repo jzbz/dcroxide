@@ -23,7 +23,10 @@
 //! produced by replaying `data/fullblock_vectors.txt` through dcrd's own
 //! `ProcessBlock` at `6f6cf21b`, in both modes, recording for each
 //! rejected block the node status left behind and what processing the
-//! block and its header again returns.
+//! block and its header again returns.  The port keeps them but for one
+//! row, where it refuses a block whose header names another size than
+//! its own before the data commitment counts as proven (PARITY.md, *The
+//! header's size and a proven data commitment*; [`FORCED_NO_STATUSES`]).
 
 // Test-harness arithmetic over bounded values.
 #![allow(clippy::arithmetic_side_effects)]
@@ -33,7 +36,7 @@ use dcroxide_blockchain::agendas::VOTE_ID_HEADER_COMMITMENTS;
 use dcroxide_blockchain::blockindex::BlockStatus;
 use dcroxide_blockchain::chaindb::db_load_block_index;
 use dcroxide_blockchain::process::Chain;
-use dcroxide_blockchain::validate::check_proof_of_work_sanity;
+use dcroxide_blockchain::validate::{check_block_data_sanity, check_proof_of_work_sanity};
 use dcroxide_blockchain::{RuleError, UtxoEntry};
 use dcroxide_chaincfg::{Params, regnet_params, simnet_params};
 use dcroxide_chainhash::Hash;
@@ -365,6 +368,50 @@ fn a_data_sanity_failure_marks_a_header_whose_commitment_is_proven() {
     }
 }
 
+/// Where the port's order departs from dcrd's (PARITY.md, *The header's
+/// size and a proven data commitment*): with the agenda decided, a
+/// block whose header names another size than its own is refused for
+/// it before its data commitment counts as proven, and so is not
+/// marked, even where the data sanity checks, which dcrd makes only
+/// after the commitment is proven, would refuse it for something they
+/// check before the size (`validate.go:884-895`, `:910-914`).  `bsd0`
+/// (a ticket below the stake difficulty) under a header that names a
+/// byte more: the sanity checks, made in dcrd's order, give
+/// `ErrNotEnoughStake`, which by its code is dcrd's verdict and, with
+/// the agenda forced to "no", marks the header there; the port gives
+/// `ErrWrongBlockSize` and leaves the header unmarked, so the block
+/// sent again is refused the same way.  On regnet as shipped nothing is
+/// proven, and the port gives the sanity checks' verdict, as dcrd does.
+/// dcrd was not run on this block.
+#[test]
+fn a_header_that_names_another_size_is_refused_for_it_before_other_data_checks() {
+    let rows = battery();
+    for force_no in [false, true] {
+        let params = regnet(force_no);
+        let (mut chain, now) = replay_rows_until(&rows, &params, "bsd0", true);
+        let mut resized = battery_block(&rows, "bsd0");
+        resized.header.size += 1;
+        grind(&mut resized.header, &params);
+        let hash = resized.header.block_hash();
+        assert_eq!(
+            check_block_data_sanity(&resized, &params).map_err(|err| err.kind),
+            Err(RuleErrorKind::NotEnoughStake)
+        );
+
+        let want = if force_no {
+            "ErrWrongBlockSize"
+        } else {
+            "ErrNotEnoughStake"
+        };
+        let (_, errs) = chain.process_block(&resized, now, &params);
+        assert_eq!(first_kind(&errs), want, "force_no {force_no}");
+        assert_eq!(status_of(&chain, &hash), "0", "force_no {force_no}");
+        let (_, errs) = chain.process_block(&resized, now, &params);
+        assert_eq!(first_kind(&errs), want, "force_no {force_no}: again");
+        assert_eq!(chain.index.best_invalid(), None, "force_no {force_no}");
+    }
+}
+
 /// dcrd `process_test.go:795-806` (`b1bada`): a positional failure of
 /// the data is marked under the same condition.  The battery's `bmf20`
 /// carries an expired transaction.
@@ -496,7 +543,14 @@ const PLAIN_STATUSES: &[&str] = &[
     "bcb14 0 ErrDuplicateTxInputs ok",
 ];
 
-/// [`PLAIN_STATUSES`] with the header commitments agenda forced to "no".
+/// [`PLAIN_STATUSES`] with the header commitments agenda forced to "no",
+/// but for one row where the port diverges from dcrd.  `bmf7`'s header
+/// names another size than its block's.  dcrd proves its data
+/// commitment, refuses it in the sanity checks and marks it, `bmf7 4
+/// ErrKnownInvalidBlock ErrKnownInvalidBlock`; the port refuses it for
+/// its size before the commitment is proven and marks nothing, as it
+/// does with the agenda undecided (PARITY.md, *The header's size and a
+/// proven data commitment*).
 const FORCED_NO_STATUSES: &[&str] = &[
     "bfbbad0 5 ErrDuplicateBlock ErrKnownInvalidBlock",
     "bis1 - ErrInvalidEarlyStakeTx ErrInvalidEarlyStakeTx",
@@ -510,7 +564,7 @@ const FORCED_NO_STATUSES: &[&str] = &[
     "bmf4 - ErrTimeTooNew ErrTimeTooNew",
     "bmf5 0 ErrBadMerkleRoot ok",
     "bmf6 0 ErrBadMerkleRoot ok",
-    "bmf7 4 ErrKnownInvalidBlock ErrKnownInvalidBlock",
+    "bmf7 0 ErrWrongBlockSize ok",
     "bmf13 5 ErrDuplicateBlock ErrKnownInvalidBlock",
     "bmf14 4 ErrKnownInvalidBlock ErrKnownInvalidBlock",
     "bmf20 4 ErrKnownInvalidBlock ErrKnownInvalidBlock",
@@ -525,7 +579,8 @@ const FORCED_NO_STATUSES: &[&str] = &[
 
 /// Every battery block is processed as dcrd's status replay processed
 /// it -- each rejection followed by the block again and then its header
-/// -- and the listed rejections must leave dcrd's outcome.
+/// -- and the listed rejections must leave dcrd's outcome, but for the
+/// row [`FORCED_NO_STATUSES`] names.
 #[test]
 fn battery_rejections_leave_dcrds_statuses() {
     let rows = battery();

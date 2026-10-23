@@ -4796,13 +4796,16 @@ impl Chain {
     /// `checkBlockDataPreconditions`, `validate.go:1954-2049`): the wire
     /// protocol's size limit, then the header's commitment to the
     /// transaction trees with the variant the positional state of the
-    /// header commitments agenda after `prev_node` selects (see
+    /// header commitments agenda after `prev_node` selects, and where
+    /// that state is decided its commitment to the block's size, which
+    /// dcrd leaves to the data sanity checks (see
     /// [`crate::validate::check_block_data_preconditions`]).
     ///
     /// A definitive success records the block in the recent merkle
     /// checks, so the contextual checks need not hash the transaction
-    /// trees again.  Resolving a historical activation anchor caches it
-    /// in the store, as dcrd's positional query does.
+    /// trees again.  A block whose header names another size is not
+    /// recorded.  Resolving a historical activation anchor caches it in
+    /// the store, as dcrd's positional query does.
     pub fn check_block_data_preconditions(
         &mut self,
         block: &MsgBlock,
@@ -5302,6 +5305,13 @@ impl Chain {
         // attributed to the block when these pass and the data
         // commitment has definitively been proven (dcrd
         // `process.go:488-499`).  A failure here never marks the block.
+        // Where the commitment can be proven, these also refuse a block
+        // whose header names another size than the block's, which dcrd
+        // refuses only in the sanity checks below, after proving the
+        // commitment, and so marks: a copy of a valid block with a
+        // repeated merkle tail would have the valid block refused
+        // afterwards (PARITY.md, *The header's size and a proven data
+        // commitment*).
         let parent = self.store.node(node).parent;
         // Hash the block's transactions once.  The merkle roots, the
         // duplicate check and the connect below all read these, and the
@@ -9267,7 +9277,7 @@ mod tests {
     }
 
     /// A block whose header commits to its two regular and one stake
-    /// transaction with the given merkle root variant.
+    /// transaction with the given merkle root variant, and to its size.
     fn committed_block(variant: crate::validate::MerkleRootVariant) -> MsgBlock {
         let tx = |n: u8| MsgTx {
             tx_in: alloc::vec![dcroxide_wire::TxIn {
@@ -9305,6 +9315,7 @@ mod tests {
                 );
             }
         }
+        block.header.size = block.serialize_size() as u32;
         block
     }
 
@@ -9318,6 +9329,13 @@ mod tests {
     /// activation, so it accepts either variant without proving the
     /// commitment -- unless the agenda is forced, as dcrd's process
     /// tests force it to "no" (`process_test.go:223`).
+    ///
+    /// The same block under a header that names another size is proven
+    /// nowhere and recorded nowhere: where the variant would prove it,
+    /// it is refused for its size, which dcrd leaves to the data sanity
+    /// checks (PARITY.md, *The header's size and a proven data
+    /// commitment*); the other variant still fails the merkle check
+    /// first; and regnet still accepts it for now.
     #[test]
     fn data_preconditions_prove_the_commitment_per_network() {
         use crate::validate::MerkleRootVariant::{Dcp0005, Original};
@@ -9364,6 +9382,36 @@ mod tests {
                     chain.recent_merkle_checks.hashes.contains(&hash.0),
                     proven,
                     "{name} {variant:?}: only a proven commitment is recorded"
+                );
+
+                let mut resized = block.clone();
+                resized.header.size += 1;
+                let resized_hash = resized.header.block_hash();
+                let result = chain.check_block_data_preconditions(&resized, genesis, &params);
+                match proven_variant {
+                    Some(proven_by) if proven_by == variant => assert_eq!(
+                        result,
+                        Err(rule_error(
+                            RuleErrorKind::WrongBlockSize,
+                            format!(
+                                "serialized block is not size indicated in header - got {}, \
+                                 expected {}",
+                                resized.header.size,
+                                resized.serialize_size()
+                            ),
+                        )),
+                        "{name} {variant:?}, resized"
+                    ),
+                    Some(_) => assert_eq!(
+                        result.map_err(|err| err.kind),
+                        Err(RuleErrorKind::BadMerkleRoot),
+                        "{name} {variant:?}, resized"
+                    ),
+                    None => assert_eq!(result, Ok(false), "{name} {variant:?}, resized"),
+                }
+                assert!(
+                    !chain.recent_merkle_checks.hashes.contains(&resized_hash.0),
+                    "{name} {variant:?}: a header that names another size is not recorded"
                 );
             }
         }

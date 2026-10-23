@@ -369,3 +369,19 @@ where dcrd takes no server-wide lock at all. Comments in this
 repository are claims, not evidence. (That lock has since been removed:
 the RPC server now carries dcrd's per-field locks, and the handler seams
 take `&self`. See PARITY.md's websocket-delivery note.)
+
+One design flaw shared with dcrd was found by the project's review, and
+the port no longer shares it. A peer asked for a valid block can answer
+with a copy that keeps the block's header and repeats the tail of one
+of its merkle trees, which keeps the trees' roots. With the header
+commitments agenda's state decided, as it is for every mainnet and
+testnet3 block, dcrd counts the copy's data as the header's, refuses the
+copy for its size, marks the header as failed, and then refuses the
+valid block when it arrives. That is dcrd's code as read, with the
+marking itself seen in a replay through dcrd of a block whose header
+names the wrong size; no such copy has been sent to dcrd. The port
+refuses the copy for its size before it counts the data as the
+header's, and marks nothing. A header that an earlier build marked this
+way stays marked until `reconsiderblock` clears it. The divergence and
+its reasoning are in [PARITY.md](docs/PARITY.md), *The header's size
+and a proven data commitment*.

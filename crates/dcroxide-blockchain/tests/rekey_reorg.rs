@@ -141,8 +141,8 @@ fn run_step(chain: &mut Chain, step: &Step, now: i64, params: &Params, who: &str
 
 /// Whether two valid blocks with data share the most work.  Nodes
 /// loaded from the database all start with received order zero
-/// (`blockindex.rs:397`), as dcrd's do, so a restart across such a tie
-/// can change which of them `better_candidate` picks (`:544`): the
+/// (`blockindex.rs:448`), as dcrd's do, so a restart across such a tie
+/// can change which of them `better_candidate` picks (`:595`): the
 /// restarted chain is then right to disagree with the others, and the
 /// restart is skipped.
 fn top_work_tie(chain: &Chain, known: &[Hash]) -> bool {

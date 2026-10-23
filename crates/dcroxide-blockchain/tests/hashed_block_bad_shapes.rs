@@ -11,10 +11,20 @@
 //! That moves no decision: for each shape below the three entries give
 //! the same fork length and the same error with the same text, and leave
 //! the header's index entry, the best header, the tip and the mirror of
-//! recent blocks the same.  The shapes are run under each state the
-//! header commitments agenda can be in when the check asks: decided
-//! inactive, decided active, and not decidable from the block's
-//! position, where both commitments are tried.
+//! recent blocks the same, and the block the shapes are made from, which
+//! arrives after each, is refused as it is on a chain that has seen no
+//! shape.  The shapes are run under each state the header commitments
+//! agenda can be in when the check asks: decided inactive, decided
+//! active, and not decidable from the block's position, where both
+//! commitments are tried.
+//!
+//! Among them are trees with repeats, which keep their roots, under the
+//! header of the block they are made from: refused for their size, and
+//! with the agenda decided refused before the data commitment counts as
+//! proven, so that the header is not marked as having failed validation,
+//! where dcrd marks it (PARITY.md, *The header's size and a proven data
+//! commitment*; `repeated_tail_copies.rs` follows such a copy with the
+//! valid block it was made from).
 //!
 //! The blocks are built on the header of the battery's first block
 //! (`data/fullblock_vectors.txt`), so that the header is accepted in
@@ -36,6 +46,7 @@
 use std::sync::Arc;
 
 use dcroxide_blockchain::agendas::VOTE_ID_HEADER_COMMITMENTS;
+use dcroxide_blockchain::blockindex::BlockStatus;
 use dcroxide_blockchain::process::Chain;
 use dcroxide_blockchain::validate::check_proof_of_work_sanity;
 use dcroxide_blockchain::{HashedBlock, RuleError, RuleErrorKind};
@@ -238,24 +249,33 @@ fn merkle_failure(block: &MsgBlock, agenda: Agenda) -> (RuleErrorKind, String) {
     (RuleErrorKind::BadMerkleRoot, text)
 }
 
-/// One bad block made from the base block, and the one error every
-/// entry must refuse it with.
+/// One bad block made from the base block, the one error every entry
+/// must refuse it with, and whether the refusal marks its header as
+/// having failed validation, which only a refusal after a proven data
+/// commitment does.
 struct Shape {
     name: &'static str,
     block: MsgBlock,
     error: (RuleErrorKind, String),
+    marked: bool,
 }
 
 /// The bad shapes of the base block under one agenda case.
 fn shapes(base: &MsgBlock, agenda: Agenda, params: &Params) -> Vec<Shape> {
     let mut shapes = Vec::new();
+    let decided = agenda != Agenda::Undecided;
 
     // Trees that do not have the roots the header names.
     let mut wrong_trees = |name: &'static str, alter: &dyn Fn(&mut MsgBlock)| {
         let mut block = base.clone();
         alter(&mut block);
         let error = merkle_failure(&block, agenda);
-        shapes.push(Shape { name, block, error });
+        shapes.push(Shape {
+            name,
+            block,
+            error,
+            marked: false,
+        });
     };
     wrong_trees("another regular transaction", &|b| {
         b.transactions[2].lock_time = 12;
@@ -274,10 +294,14 @@ fn shapes(base: &MsgBlock, agenda: Agenda, params: &Params) -> Vec<Shape> {
     wrong_trees("no regular transactions", &|b| b.transactions.clear());
 
     // A tree of three leaves has the root of the same tree with its
-    // last leaf repeated.  In a block whose header names the size with
-    // the repeat, the trees are still the ones the header commits to,
-    // so the merkle check passes and the sanity checks refuse the
-    // repeat.
+    // last leaf repeated, so these pass the merkle check.  Under the
+    // base block's own header, which names the size without the repeat,
+    // they are refused for their size, and with the agenda decided that
+    // refusal comes before the data commitment counts as proven, so the
+    // header is not marked; dcrd proves it and marks the header in its
+    // sanity checks.  In a block whose header names the size with the
+    // repeat, the sanity checks refuse the repeat, and with the agenda
+    // decided mark that header, which can be no valid block's.
     for regular in [true, false] {
         let mut block = base.clone();
         let tree = if regular {
@@ -295,19 +319,37 @@ fn shapes(base: &MsgBlock, agenda: Agenda, params: &Params) -> Vec<Shape> {
             calc_tx_tree_merkle_root(&block.stransactions),
             calc_tx_tree_merkle_root(&base.stransactions)
         );
-        block.header.size = block.serialize_size() as u32;
-        grind(&mut block.header, params);
+        let size = block.serialize_size();
         shapes.push(Shape {
             name: if regular {
                 "a repeated regular transaction"
             } else {
                 "a repeated stake transaction"
             },
+            block: block.clone(),
+            error: (
+                RuleErrorKind::WrongBlockSize,
+                format!(
+                    "serialized block is not size indicated in header - got {}, expected {size}",
+                    base.header.size
+                ),
+            ),
+            marked: false,
+        });
+        block.header.size = size as u32;
+        grind(&mut block.header, params);
+        shapes.push(Shape {
+            name: if regular {
+                "a repeated regular transaction in a block of the size the header names"
+            } else {
+                "a repeated stake transaction in a block of the size the header names"
+            },
             block,
             error: (
                 RuleErrorKind::DuplicateTx,
                 format!("block contains duplicate transaction {}", last.tx_hash()),
             ),
+            marked: decided,
         });
     }
 
@@ -323,20 +365,28 @@ fn shapes(base: &MsgBlock, agenda: Agenda, params: &Params) -> Vec<Shape> {
             RuleErrorKind::NoTransactions,
             "block does not contain any transactions".to_string(),
         ),
+        marked: decided,
     });
 
     shapes
 }
 
 /// Each bad shape is refused with the same error through every entry,
-/// under each agenda case, and leaves the same behind in the index and
-/// in the mirror.
+/// under each agenda case, and leaves the same behind: in the index,
+/// where its header is marked only where the shape says, in the mirror,
+/// and for the base block, which arrives next and is refused as it is
+/// on a chain that has seen no shape.
 #[test]
 fn bad_shapes_are_refused_alike_however_the_block_arrives() {
     let mut refused = 0usize;
     for agenda in [Agenda::Inactive, Agenda::Active, Agenda::Undecided] {
         let params = regnet(agenda);
         let (now, base) = base_block(agenda, &params);
+        let base_hash = base.header.block_hash();
+        let base_shared = Arc::new(base.clone());
+        let base_alone =
+            outcome(&Chain::new(&params, Hash::ZERO, false).process_block(&base, now, &params));
+        assert_eq!(base_alone.1.len(), 1, "{agenda:?}: {base_alone:?}");
         for shape in shapes(&base, agenda, &params) {
             let what = format!("{agenda:?}, {}", shape.name);
             let hash = shape.block.header.block_hash();
@@ -358,7 +408,8 @@ fn bad_shapes_are_refused_alike_however_the_block_arrives() {
             // The header was accepted before the data was refused, and
             // what the refusal left of it is the same.
             let left = kept(&borrowing, &hash);
-            assert!(left.status.is_some(), "{what}: the header is not indexed");
+            let status = BlockStatus(left.status.expect("the header is indexed"));
+            assert_eq!(status.known_validate_failed(), shape.marked, "{what}");
             assert!(!left.have_block, "{what}");
             assert_eq!(kept(&sharing, &hash), left, "{what}: shared");
             assert_eq!(kept(&hashing, &hash), left, "{what}: hashed");
@@ -373,10 +424,24 @@ fn bad_shapes_are_refused_alike_however_the_block_arrives() {
                 "{what}"
             );
 
+            // The base block arrives next.  Where the shape kept its
+            // header, the refusal left that header unmarked, so nothing
+            // it recorded applies to the base block.
+            let base_hashed = HashedBlock::new(Arc::new(base.clone()));
+            let b = borrowing.process_block(&base, now, &params);
+            let s = sharing.process_shared_block(&base_shared, now, &params);
+            let h = hashing.process_hashed_block(&base_hashed, now, &params);
+            assert_eq!(outcome(&b), base_alone, "{what}: the base block");
+            assert_eq!(outcome(&s), outcome(&b), "{what}: the base block, shared");
+            assert_eq!(outcome(&h), outcome(&b), "{what}: the base block, hashed");
+            let left = kept(&borrowing, &base_hash);
+            assert_eq!(kept(&sharing, &base_hash), left, "{what}: shared");
+            assert_eq!(kept(&hashing, &base_hash), left, "{what}: hashed");
+
             refused += 1;
         }
     }
-    assert_eq!(refused, 3 * 8, "three agenda cases of eight shapes");
+    assert_eq!(refused, 3 * 10, "three agenda cases of ten shapes");
 }
 
 /// The base block itself passes the merkle check and the sanity checks

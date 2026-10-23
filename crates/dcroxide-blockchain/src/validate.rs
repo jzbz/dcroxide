@@ -808,16 +808,7 @@ pub(crate) fn check_block_data_sanity_by(
     let serialized_size = block.serialize_size();
     check_block_size_sanity(serialized_size as i64)?;
     let header = &block.header;
-    if header.size != serialized_size as u32 {
-        return Err(rule_error(
-            RuleErrorKind::WrongBlockSize,
-            format!(
-                "serialized block is not size indicated in header - got {}, \
-                 expected {serialized_size}",
-                header.size
-            ),
-        ));
-    }
+    check_block_size_commitment(header, serialized_size)?;
 
     // Perform preliminary sanity checks on each transaction.
     let max_tx_size = params.max_tx_size as u64;
@@ -864,6 +855,30 @@ pub(crate) fn check_block_data_sanity_by(
         }
     }
 
+    Ok(())
+}
+
+/// The block header must commit to the size of the serialized block
+/// (dcrd `checkBlockDataSanity`, `validate.go:910-914`).  The size has
+/// passed [`check_block_size_sanity`], so it fits the header's field.
+/// The data sanity checks make this check, as dcrd's do, and so do the
+/// data preconditions where the agenda state is decided, before they
+/// report the data commitment as proven
+/// ([`check_block_data_preconditions`]).
+fn check_block_size_commitment(
+    header: &dcroxide_wire::BlockHeader,
+    serialized_size: usize,
+) -> Result<(), RuleError> {
+    if header.size != serialized_size as u32 {
+        return Err(rule_error(
+            RuleErrorKind::WrongBlockSize,
+            format!(
+                "serialized block is not size indicated in header - got {}, \
+                 expected {serialized_size}",
+                header.size
+            ),
+        ));
+    }
     Ok(())
 }
 
@@ -2390,15 +2405,44 @@ pub(crate) fn check_merkle_roots_with_leaves(
 /// Perform the checks that must pass before any further validation of
 /// the block data: the serialized block is within the wire protocol's
 /// size limit, and its header commits to its transactions (dcrd
-/// `checkBlockDataPreconditions`, `validate.go:1954-2049`).  The
-/// returned flag is whether the data commitment is definitively known
-/// to be valid.
+/// `checkBlockDataPreconditions`, `validate.go:1954-2049`) and, where
+/// that commitment is proven, to its size.  The returned flag is
+/// whether the data commitment is definitively known to be valid.
 ///
 /// `hdr_cmts_positional` is dcrd's `isAgendaActivePositionalByID`
 /// query for the header commitments agenda from the block's parent
 /// (see [`crate::process::Chain::is_agenda_active_positional_by_id`]).
 /// It runs after the size check, where dcrd makes it, and its error is
 /// returned as is.
+///
+/// Where the agenda state is decided, the header must also commit to
+/// the size of the serialized block before the data commitment is
+/// reported as proven, a check dcrd makes only in the data sanity
+/// checks that follow (`validate.go:910-914`).  A tree level with an
+/// odd number of nodes pairs its last node with itself
+/// (`standalone/merkle.go:56-60`), so repeating the last nodes of such
+/// a level keeps the tree's root, the shape of CVE-2012-2459.  A copy
+/// of a valid block with such a repeat, under the block's own header,
+/// passes dcrd's merkle check, which proves the commitment, and then
+/// fails the sanity checks for its size, which marks the header as
+/// having failed validation (`process.go:496-513`), so that the valid
+/// block is refused as known to be invalid when it arrives; that is
+/// read from dcrd's code, and no such copy has been sent to dcrd.  Here
+/// the copy is refused with the error the sanity checks would give it,
+/// before anything is proven or recorded, and nothing is marked.  dcrd
+/// refuses every block whose header names another size, so this
+/// refuses no block dcrd accepts; a valid block passes it, and short of
+/// breaking the hash every other set of trees with its roots is larger.
+/// What changes is where a block whose header names another size is
+/// refused, here rather than in the sanity checks, and that it no
+/// longer marks its header.  The error is the one the sanity checks
+/// give such a block, but for a block that also fails a check they
+/// make before the size, the proof of stake or the presence of a
+/// regular transaction (`validate.go:884-895`), or for a template the
+/// header's sanity checks (`:4674`, `:973-979`): that block is now
+/// refused for its size instead.  With the agenda undecided nothing is
+/// proven, and the order is dcrd's (PARITY.md, *The header's size and a
+/// proven data commitment*).
 ///
 /// As dcrd explains, these checks present a circular dependency.  They
 /// must come before further validation of the block data, because
@@ -2439,8 +2483,10 @@ pub(crate) fn check_block_data_preconditions_with_leaves(
     // A block must not exceed the maximum allowed block payload when
     // serialized.  This is the quick, context-free check against the
     // wire protocol's limit; the consensus block size, which depends on
-    // the network and on block size votes, is enforced later.
-    check_block_size_sanity(block.serialize_size() as i64)?;
+    // the network and on block size votes, is enforced later.  The size
+    // is that of the block itself, whichever way it arrived.
+    let serialized_size = block.serialize_size();
+    check_block_size_sanity(serialized_size as i64)?;
 
     // Whether the header commitments agenda is active cannot
     // necessarily be determined here, so the state is determined from
@@ -2460,6 +2506,14 @@ pub(crate) fn check_block_data_preconditions_with_leaves(
             MerkleRootVariant::Original
         };
         check_merkle_roots_with_leaves(block, leaves, roots, variant)?;
+
+        // The trees alone do not prove the data is the header's: a tree
+        // with the last nodes of an odd level repeated has the same
+        // root.  The header also commits to the block's size, which no
+        // such copy of a block has, so the commitment is proven only
+        // once that matches too.  dcrd does not check it here (see the
+        // function documentation).
+        check_block_size_commitment(&block.header, serialized_size)?;
         return Ok(true);
     }
 
@@ -7670,7 +7724,8 @@ mod tests {
     }
 
     /// A block of two regular and one stake transaction whose header
-    /// commits to the transaction trees with the given variant.
+    /// commits to the transaction trees with the given variant, and to
+    /// the block's size.
     fn merkle_test_block(variant: MerkleRootVariant) -> MsgBlock {
         let mut block = MsgBlock {
             header: zero_header(),
@@ -7691,6 +7746,7 @@ mod tests {
                 );
             }
         }
+        block.header.size = block.serialize_size() as u32;
         block
     }
 
@@ -7800,9 +7856,10 @@ mod tests {
 
     /// dcrd `checkBlockDataPreconditions` (`validate.go:1954-2049`): the
     /// size check comes before the agenda query, a definitive agenda
-    /// state checks its own variant and proves the commitment, and an
-    /// undetermined one accepts either variant without proving it,
-    /// returning the DCP0005 variant's error when neither matches.
+    /// state checks its own variant and proves the commitment, here only
+    /// once the header also names the block's size, and an undetermined
+    /// one accepts either variant without proving it, returning the
+    /// DCP0005 variant's error when neither matches.
     #[test]
     fn data_preconditions_follow_the_positional_agenda_state() {
         use crate::agendas::AgendaActiveInfo;
@@ -7859,6 +7916,45 @@ mod tests {
         assert_eq!(
             check_block_data_preconditions(&original, || Err(unknown_agenda.clone())),
             Err(unknown_agenda)
+        );
+
+        // Where the state is decided, a header that names another size
+        // than the block's is refused for it once the trees match, with
+        // the error the data sanity checks give it, and the commitment is
+        // not proven; dcrd proves it here and leaves the size to those
+        // checks (PARITY.md, *The header's size and a proven data
+        // commitment*).  The trees are still checked first, and with the
+        // state undecided nothing is proven and the size is still left
+        // to the sanity checks.
+        for (block, info) in [(&original, inactive), (&dcp0005, active)] {
+            let mut resized = block.clone();
+            resized.header.size -= 1;
+            let err = run(&resized, info).expect_err("another size");
+            assert_eq!(
+                err,
+                rule_error(
+                    RuleErrorKind::WrongBlockSize,
+                    format!(
+                        "serialized block is not size indicated in header - got {}, expected {}",
+                        resized.header.size,
+                        resized.serialize_size()
+                    )
+                ),
+                "{info:?}"
+            );
+            assert_eq!(
+                check_block_data_sanity(&resized, &mainnet_params()),
+                Err(err),
+                "{info:?}"
+            );
+            assert_eq!(run(&resized, unknown), Ok(false), "{info:?}");
+        }
+        let mut stale = original.clone();
+        stale.header.size -= 1;
+        stale.header.merkle_root = Hash([0x42; 32]);
+        assert_eq!(
+            run(&stale, inactive).expect_err("stale").kind,
+            RuleErrorKind::BadMerkleRoot
         );
 
         // An oversized block fails before the agenda is even queried.
