@@ -17,7 +17,7 @@ JSON-RPC/websocket server, the tool commands, the pipe IPC lifecycle,
 and the Windows service wrapper. The deliberate non-ports are small
 and documented in PARITY.md (Go GC tuning, the pprof servers, UPnP,
 the Windows event log, and the wallet-side mixclient). The test suite
-runs 2,608 tests across 447 suites on Linux, most differential against
+runs 2,614 tests across 447 suites on Linux, most differential against
 dcrd itself or replaying sessions generated inside dcrd's own packages.
 
 Since the surface completed, four rounds of work have landed on it. A
@@ -94,9 +94,9 @@ LAN server, each of which validated in full only the blocks after the
 assume-valid block and had dcrd's block at height 1,116,035 (the bench
 ledger, "Where `797a213`'s block thread waits, a deeper read-ahead and a
 rung of four changes").
-Of the commits after `797a213`, nine change the node's code beyond
-tests and comments: one classifies a block's transactions once for every
-step that reads their types, among them checks that apply the consensus
+Of the commits after `797a213`, ten change the node's code beyond tests
+and comments: one classifies a block's transactions once for every step
+that reads their types, among them checks that apply the consensus
 rules, and changes no rule; another allocates a block filter's list of
 entries once, and changes no filter's bytes; a third moves a handed-over
 metadata flush's block-file sync onto the commit thread, and reports a
@@ -122,20 +122,26 @@ commitments agenda's state decided, refuses it after and marks the
 header as failed, so that a copy of a valid block with the tail of a
 merkle tree repeated no longer has the valid block refused when it
 arrives, where dcrd refuses it (PARITY.md, *The header's size and a
-proven data commitment*). In syncs the first four have been put to
-blocks only in a build made from a worktree that holds the four of them,
-R1 of that section: in four from the LAN server, each of which validated
-in full only the blocks after the assume-valid block and had dcrd's
-block at height 1,116,035, and in one from the loopback server that
-ended with that same UTXO set and the same block files. The fifth's
+proven data commitment*); the tenth adds again, without the fresh mark,
+an output that a disconnect marked spent when the UTXO cache has no slot
+for it, so that after a restart, or once a flush has evicted the entry,
+a spend before the next flush leaves a tombstone and the flush deletes
+the stored row, as on a node that kept the entry cached, where a
+restarted dcrd keeps the row and accepts a later block spending it,
+which the port then rejects (PARITY.md, *UTXO cache entry for an output
+added again after a disconnect*). In syncs the first four have been put
+to blocks only in a build made from a worktree that holds the four of
+them, R1 of that section: in four from the LAN server, each of which
+validated in full only the blocks after the assume-valid block and had
+dcrd's block at height 1,116,035, and in one from the loopback server
+that ended with that same UTXO set and the same block files. The fifth's
 depth of sixteen frames has been put to blocks only in the diagnostic
 build of that section, `797a213`'s code with the depth read from a
 variable, and not with the other four: in five syncs from the LAN
 server, each of which validated in full only the blocks after the
 assume-valid block and had dcrd's block at height 1,116,035. Two of
 those five ran with `DCROXIDE_PREVERIFY=10`, which on that node is the
-sixth's default; no build of the sixth, the seventh, the eighth or the
-ninth has been synced.
+sixth's default; no build of the sixth to the tenth has been synced.
 That the rules reject what dcrd's reject, but for the valid block the
 ninth accepts after such a copy, rests on the test batteries
 described below, not on a sync, and none of it says the node is safe to

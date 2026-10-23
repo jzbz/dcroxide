@@ -1924,12 +1924,36 @@ impl Chain {
     /// `UtxoCache.Commit` semantics: spent view entries go through
     /// the spend bookkeeping and everything else is added or updated.
     ///
+    /// One deliberate divergence: an unspent entry for an output that a
+    /// disconnect in the view marked spent is added without the fresh
+    /// bit when the cache has no slot for it.  dcrd's `addEntry` marks
+    /// every entry fresh over a missing slot (`utxocache.go:288-289`).
+    /// But the disconnect builds such an output from its transaction
+    /// when the view lacks it, without looking at the cache or the
+    /// backend (`utxoviewpoint.go:444-503`), and the backend holds the
+    /// undone block's row for it whenever that block was flushed with
+    /// the output unspent.  After a restart, or once a flush has
+    /// evicted the entry, the cache has no slot for it.  Two paths add
+    /// such an output again: a block that disapproves its parent and
+    /// reincludes a transaction of it, and the detach of such a block,
+    /// whose redo of the parent adds the parent's copy back.  A fresh
+    /// entry spent before the next flush records no delete
+    /// (`utxocache.go:408-414`), so dcrd keeps the old row, which then
+    /// reads as unspent.  A node that kept the entry cached deletes it.
+    /// Without the fresh bit a spend before the next flush leaves a
+    /// tombstone and the flush deletes the row, so a node that
+    /// restarted reaches the same UTXO set as one that did not.  When
+    /// the backend has no such row, that delete removes nothing.  The
+    /// view, which validation reads, is unaffected.
+    ///
     /// # Panics
     ///
     /// When a zero-confirmation spend in the view is not also marked
     /// spent, or the cache holds an unspent entry for it, with dcrd's
     /// texts (`utxocache.go:594-606`); see [`UtxoView::commit`].
     pub fn commit_view(&mut self, view: &mut UtxoView) {
+        // Taken before the commit, which clears them.
+        let disconnected = view.take_disconnected_outs();
         // dcrd reads its cache map directly here, so an explicit spent
         // marker counts as no entry, as its nil does.
         let cache = &self.utxo_cache.get_mut().0;
@@ -1940,7 +1964,8 @@ impl Chain {
             if entry.is_spent() {
                 self.cache_spend_entry(key);
             } else {
-                self.cache_add_entry(key, entry);
+                let backend_may_hold = disconnected.contains(&UtxoKey(key));
+                self.cache_add_entry(key, entry, backend_may_hold);
             }
         }
     }
@@ -1952,17 +1977,21 @@ impl Chain {
     /// not (`utxocache.go:305-309`) -- a fresh entry over a row the
     /// backend holds would make a later spend drop the entry without
     /// ever deleting that row.
-    fn cache_add_entry(&mut self, key: OutPointKey, mut entry: UtxoEntry) {
+    ///
+    /// `backend_may_hold` says that the backend may hold a row for the
+    /// output even when the cache has no slot for it, as it may for an
+    /// output a disconnect marked spent.  Over a missing slot, such an
+    /// entry is not marked fresh, where dcrd marks it fresh (see
+    /// [`Self::commit_view`]).
+    fn cache_add_entry(&mut self, key: OutPointKey, mut entry: UtxoEntry, backend_may_hold: bool) {
         entry.set_state_bits(entry.state_bits() | crate::utxoentry::UTXO_STATE_MODIFIED);
         let entry_size = utxo_entry_size(&entry);
         let mut total = self.utxo_total_entry_size.get();
         // One descent of the map for the probe and the store alike.
-        let slot = self
-            .utxo_cache
-            .get_mut()
-            .0
-            .entry(UtxoKey(key))
-            .or_insert(None);
+        let (slot, had_slot) = match self.utxo_cache.get_mut().0.entry(UtxoKey(key)) {
+            alloc::collections::btree_map::Entry::Occupied(slot) => (slot.into_mut(), true),
+            alloc::collections::btree_map::Entry::Vacant(slot) => (slot.insert(None), false),
+        };
         match slot {
             Some(existing) => {
                 if existing.is_fresh() {
@@ -1972,9 +2001,25 @@ impl Chain {
                 }
                 total = total.saturating_sub(utxo_entry_size(existing));
             }
-            // Both a missing entry and an explicit spent marker mean
-            // the backend has never seen this output (dcrd's map
-            // lookup returns nil for both).
+            // No slot at all, for an output a disconnect in the view
+            // marked spent, whose undone block may have been flushed:
+            // the entry is not fresh, so a spend before the next flush
+            // deletes whatever row the backend holds.
+            None if !had_slot && backend_may_hold => {
+                entry.set_state_bits(entry.state_bits() & !crate::utxoentry::UTXO_STATE_FRESH);
+            }
+            // An explicit spent marker means the backend has no row: a
+            // lookup found none, or a fresh entry was spent, and the
+            // backend's rows change only at a flush, which drops every
+            // marker (dcrd's map lookup returns nil for a marker and
+            // for a missing slot alike).  A missing slot means the same
+            // for an output no disconnect in the view marked spent.
+            // Either the backend never held a row for it, or an earlier
+            // commit spent it through the cache, as the undo of an
+            // earlier copy of a reincluded transaction or the spend of
+            // an input a disconnect restores, and left a marker or a
+            // tombstone until the flush that deleted its row.  An
+            // earlier copy undone in this view is the case above.
             None => {
                 entry.set_state_bits(entry.state_bits() | crate::utxoentry::UTXO_STATE_FRESH);
             }
@@ -10610,7 +10655,8 @@ mod tests {
                 if entry.is_spent() {
                     reference.cache_spend_entry(key);
                 } else {
-                    reference.cache_add_entry(key, entry);
+                    // No disconnect ran in these views.
+                    reference.cache_add_entry(key, entry, false);
                 }
             }
 
@@ -10648,6 +10694,169 @@ mod tests {
         // Changes applied, entries kept, zero-confirmation spends
         // dropped: the seeds exercised all three.
         assert!(tally.iter().all(|&entries| entries >= 200), "{tally:?}");
+    }
+
+    /// The fresh bit a commit gives an output that a disconnect in the
+    /// view marked spent and a later transaction of the view added
+    /// again.  P = [coinbase, T] is disconnected and T added again, as
+    /// a block that disapproves P and reincludes T does.  Over a
+    /// missing slot the entry is not fresh, whether or not the backend
+    /// holds P's row, so a spend before the next flush deletes that
+    /// row, and a delete of a row the backend lacks changes nothing.
+    /// Over an explicit spent marker or a cached copy the commit
+    /// follows dcrd's `addEntry`, and so does it for an output no
+    /// disconnect touched and for the input the disconnect restored,
+    /// which are fresh over a missing slot.
+    #[test]
+    fn an_output_a_disconnect_marked_spent_is_not_fresh_over_a_missing_slot() {
+        use crate::utxoentry::{UTXO_STATE_MODIFIED, UTXO_STATE_SPENT};
+        use dcroxide_wire::{TxIn, TxOut};
+
+        let params = dcroxide_chaincfg::regnet_params();
+        let mut chain = Chain::new(&params, Hash::ZERO, false);
+        let op_true = |value: i64| TxOut {
+            value,
+            version: 0,
+            pk_script: alloc::vec![0x51],
+        };
+        let spend_of = |previous_out_point: OutPoint, value_in: i64| TxIn {
+            previous_out_point,
+            sequence: u32::MAX,
+            value_in,
+            block_height: 1,
+            block_index: 1,
+            signature_script: Vec::new(),
+        };
+        let x = OutPoint {
+            hash: hash_of(1),
+            index: 0,
+            tree: 0,
+        };
+        let coinbase = MsgTx {
+            tx_in: alloc::vec![spend_of(
+                OutPoint {
+                    hash: Hash::ZERO,
+                    index: u32::MAX,
+                    tree: 0,
+                },
+                0,
+            )],
+            tx_out: alloc::vec![op_true(0)],
+            ..MsgTx::default()
+        };
+        let t = MsgTx {
+            tx_in: alloc::vec![spend_of(x, 4_000)],
+            tx_out: alloc::vec![op_true(1_000); 4],
+            ..MsgTx::default()
+        };
+        // An output of the block that adds T again, which no disconnect
+        // touched.
+        let u = MsgTx {
+            tx_in: alloc::vec![spend_of(OutPoint { index: 1, ..x }, 500)],
+            tx_out: alloc::vec![op_true(500)],
+            ..MsgTx::default()
+        };
+        let (mut header, _) = BlockHeader::from_bytes(&[0u8; 180]).expect("zero header");
+        header.height = 10;
+        let p = MsgBlock {
+            header,
+            transactions: alloc::vec![coinbase, t.clone()],
+            stransactions: Vec::new(),
+        };
+        let t_out = |index: u32| (t.tx_hash().0, index, 0i8);
+        let u_out = (u.tx_hash().0, 0, 0i8);
+        let x_key = (x.hash.0, x.index, x.tree);
+        let row = |height: u32| {
+            UtxoEntry::new(
+                1_000,
+                alloc::vec![0x51],
+                height,
+                1,
+                0,
+                false,
+                false,
+                dcroxide_stake::TxType::Regular,
+                None,
+            )
+        };
+
+        // T:0 and T:2 are P's rows; T:1 and T:3 never reached the
+        // backend.  The cache holds P's T:2, a marker for T:1, and
+        // nothing for T:0, T:3, U:0 or X.
+        chain.utxo_backend.insert(t_out(0), row(10));
+        chain.utxo_backend.insert(t_out(2), row(10));
+        chain.utxo_cache.get_mut().insert(t_out(1), None);
+        chain.utxo_cache.get_mut().insert(t_out(2), Some(row(10)));
+        chain.utxo_total_entry_size.set(utxo_entry_size(&row(10)));
+
+        let mut view = UtxoView::new();
+        let stxo = crate::utxoview::entry_to_spent_tx_out(&UtxoEntry::new(
+            4_000,
+            alloc::vec![0x51],
+            1,
+            1,
+            0,
+            false,
+            false,
+            dcroxide_stake::TxType::Regular,
+            None,
+        ));
+        let hashes = crate::utxoview::collect_tx_hashes(&p.transactions);
+        view.disconnect_transactions(&p, &hashes, &[stxo], false, false)
+            .expect("disconnect P's regular tree");
+        view.add_tx_outs(&t, 11, 1, false);
+        view.add_tx_outs(&u, 11, 2, false);
+        assert_eq!(
+            view.clone().take_disconnected_outs().len(),
+            4,
+            "a copy keeps the record of T's outputs"
+        );
+        chain.commit_view(&mut view);
+        assert!(
+            view.take_disconnected_outs().is_empty(),
+            "the commit clears the record"
+        );
+
+        let fresh = |chain: &Chain, key: OutPointKey| {
+            let cache = chain.utxo_cache.borrow();
+            let entry = cache
+                .get(&key)
+                .and_then(Option::as_ref)
+                .expect("the commit added the entry");
+            assert!(!entry.is_spent(), "{key:?} is unspent");
+            entry.is_fresh()
+        };
+        assert!(!fresh(&chain, t_out(0)), "T:0, no slot, P's row");
+        assert!(fresh(&chain, t_out(1)), "T:1, an explicit spent marker");
+        assert!(!fresh(&chain, t_out(2)), "T:2, P's copy cached");
+        assert!(!fresh(&chain, t_out(3)), "T:3, no slot, no row");
+        assert!(fresh(&chain, u_out), "U:0, which no disconnect touched");
+        assert!(fresh(&chain, x_key), "X, the input the disconnect restored");
+
+        // Spend T's outputs and U's before the next flush.
+        let mut spends = UtxoView::new();
+        for key in [t_out(0), t_out(1), t_out(2), t_out(3), u_out] {
+            let mut entry = row(11);
+            entry.set_state_bits(UTXO_STATE_MODIFIED | UTXO_STATE_SPENT);
+            let outpoint = OutPoint {
+                hash: Hash(key.0),
+                index: key.1,
+                tree: key.2,
+            };
+            spends.insert_entry(&outpoint, entry);
+        }
+        chain.commit_view(&mut spends);
+        chain.flush_utxo_cache(hash_of(9), 11).expect("flush");
+        for key in [t_out(0), t_out(1), t_out(2), t_out(3), u_out] {
+            assert!(
+                !chain.utxo_backend.contains_key(&key),
+                "{key:?} was spent, but the backend still holds its row"
+            );
+        }
+        assert!(
+            chain.utxo_backend.contains_key(&x_key),
+            "the flush wrote the restored X"
+        );
     }
 
     /// A forced flush whose durable database flush fails returns the

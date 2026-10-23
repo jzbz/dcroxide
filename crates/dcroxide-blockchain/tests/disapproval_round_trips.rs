@@ -3,9 +3,9 @@
 //! and reinclude a transaction of it, over a database-backed chain whose
 //! UTXO cache is flushed and whose node is restarted at chosen points.
 //!
-//! Each scenario reaches a commit that spends an output the UTXO cache
-//! already holds spent.  dcrd leaves such an entry as it is since
-//! `9112e4e6` (`internal/blockchain/utxocache.go:340-355` at
+//! The first three scenarios reach a commit that spends an output the
+//! UTXO cache already holds spent.  dcrd leaves such an entry as it is
+//! since `9112e4e6` (`internal/blockchain/utxocache.go:340-355` at
 //! `382ff4dd`): the view holds a single spend of the output, and
 //! double spends are refused when the transactions are validated
 //! against the view.  dcrd's comment names the path, which is reached
@@ -15,7 +15,10 @@
 //! block bypasses the cache only when the view holds none of its
 //! creating transaction's regular outputs when the block's inputs are
 //! fetched (`utxoviewpoint.go:1161-1183`), so the spend of a reincluded
-//! transaction's output goes through the cache like any other.
+//! transaction's output goes through the cache like any other.  The
+//! last two reach a commit that adds a reincluded output again; after a
+//! restart, or once flushes have evicted the output's entry, the cache
+//! has no slot for it while the backend holds a row for it.
 //!
 //! Every scenario checks that each block is accepted, that an output
 //! the chain has spent is absent from the UTXO set afterwards and a
@@ -39,6 +42,29 @@
 //!   X in P's view and P's spend of X meets G's spent cache entry, the
 //!   path `9112e4e6`'s comment names.  The same commit runs again when
 //!   a restart replays G and P.
+//! - P confirms T1 and a flush makes T1's outputs backend rows; N
+//!   disapproves P and reincludes T1 without spending T1:0, and M spends
+//!   T1:0 before the next flush.  The undo of P builds T1's outputs from
+//!   the transaction without looking at the cache or the backend, as
+//!   dcrd's `disconnectTransactions` does (`utxoviewpoint.go:444-503`),
+//!   and N's T1 adds them again.  dcrd's `addEntry` marks an entry fresh
+//!   whenever its cache holds nothing for the output
+//!   (`utxocache.go:276-292`), which after a restart is the case here
+//!   although the backend holds P's row, and the spend of a fresh entry
+//!   records no delete (`:408-414`): a restarted dcrd keeps P's row after
+//!   the flush, where one that kept P's entry cached deletes it.  The
+//!   port does not mark such an entry fresh (`Chain::commit_view`).  The
+//!   scenario runs with a restart after the flush, without one, and with
+//!   flushes that evict P's entries instead of a restart.  The cache
+//!   never evicts an entry at the tip's height, so there Q follows P, and
+//!   N and M outgrow it.
+//! - The same on the disconnect side: N reincludes T1 and is flushed, a
+//!   crash loses the cache, and a branch approving P outgrows N and
+//!   spends T1:0.  Detaching N builds T1's outputs from N's copy of T1,
+//!   and the redo of P adds them again (`utxoviewpoint.go:1064`).  The
+//!   forced flush after every detach writes them before anything can
+//!   spend them, so the scenario turns the flushes off, as dcrd's tests
+//!   do with `disableFlush`, to reach the spend before a flush.
 //!
 //! The harness drives the chain through the entry points production
 //! uses from the block index onward: `maybe_accept_block_data` stores
@@ -66,7 +92,7 @@
 
 use dcroxide_blockchain::blockindex::BlockStatus;
 use dcroxide_blockchain::chaindb::db_fetch_utxo_entry;
-use dcroxide_blockchain::process::Chain;
+use dcroxide_blockchain::process::{Chain, OpenConfig};
 use dcroxide_blockchain::utxoview::{UtxoView, collect_tx_hashes};
 use dcroxide_blockchain::validate::check_transactions_and_connect;
 use dcroxide_blockchain::{RuleError, RuleErrorKind, UtxoEntry};
@@ -587,4 +613,199 @@ fn a_disapproval_reincluding_a_transaction_spends_its_input_again() {
     );
     check(&mut node);
     node.assert_gone(&x, x_height, 0, "X");
+}
+
+/// What the UTXO cache holds of P's entries when N arrives.
+#[derive(Clone, Copy)]
+enum AfterP {
+    /// The entries P's connect left, flushed.
+    Cached,
+    /// Nothing: a crash lost the cache.
+    Restart,
+    /// Nothing: Q follows P, and flushes over a cache at its smallest
+    /// size evict the entries below Q's height.
+    Eviction,
+}
+
+/// P confirms T1 and a flush makes T1:0 and T1:1 backend rows, and then
+/// the cache holds what `after_p` says of them.  N disapproves P and
+/// reincludes T1, and M spends N's T1:0 before the next flush.
+fn reincluded_output_spent_before_the_next_flush(after_p: AfterP) {
+    let mut node = Node::new();
+    let (x, x_height) = fund(&mut node);
+
+    // P = [cbP, T1]; T1 spends X.  The flush makes P's T1 outputs rows.
+    let t1 = tx(
+        vec![input(x, 5 * OUT_VALUE, x_height, 0)],
+        &[OUT_VALUE, OUT_VALUE],
+    );
+    let tip = node.tip();
+    let p = node.block(tip, true, &[], vec![t1.clone()]);
+    node.accept_tip(&p);
+    let p_height = p.header.height;
+    node.utxo_flush();
+    let row = node.backend_row(&op(&t1, 0)).expect("P's T1:0 was flushed");
+    assert_eq!(row.block_height(), i64::from(p_height), "P's copy of T1:0");
+
+    match after_p {
+        AfterP::Cached => {}
+        AfterP::Restart => {
+            node = node.restart();
+            assert_eq!(
+                node.tip(),
+                p.header.block_hash(),
+                "P is the tip after the restart"
+            );
+        }
+        AfterP::Eviction => {
+            // Q = [cbQ] approves P.  Over a cache at its smallest size
+            // each flush raises the eviction height a share of the way
+            // to the tip, and entries below it leave the cache.
+            let q = node.block(p.header.block_hash(), true, &[], Vec::new());
+            node.accept_tip(&q);
+            let cached = |node: &Node| {
+                let cache = node.chain.utxo_cache.borrow();
+                [op(&t1, 0), op(&t1, 1)]
+                    .iter()
+                    .any(|o| cache.get(&(o.hash.0, o.index, o.tree)).is_some())
+            };
+            node.chain.set_utxo_cache_max_bytes(1);
+            for _ in 0..64 {
+                if !cached(&node) {
+                    break;
+                }
+                node.utxo_flush();
+            }
+            // Back to the size the chain was opened with, so that no
+            // flush runs between N and M.
+            let opened = OpenConfig::new(Hash::ZERO, false, 0);
+            node.chain
+                .set_utxo_cache_max_bytes(opened.utxo_cache_max_bytes);
+            assert!(!cached(&node), "the flushes evicted P's T1 outputs");
+            assert!(
+                node.backend_row(&op(&t1, 0)).is_some(),
+                "P's T1:0 is still a row"
+            );
+        }
+    }
+
+    // N = [cbN, T1] disapproves P and reincludes T1.  After the
+    // eviction it ties Q, which stays the tip.
+    let n = node.block(p.header.block_hash(), false, &[], vec![t1.clone()]);
+    node.accept(&n);
+    let n_height = n.header.height;
+
+    // M = [cbM, T4] approves N; T4 spends N's T1:0.  After the eviction
+    // the reorganization detaches Q, flushes, and connects N and M.
+    let t4 = tx(
+        vec![input(op(&t1, 0), OUT_VALUE, n_height, 1)],
+        &[OUT_VALUE],
+    );
+    let m = node.block(n.header.block_hash(), true, &[], vec![t4.clone()]);
+    node.accept_tip(&m);
+
+    assert!(node.unspent(&op(&t4, 0)).is_some(), "M created T4:0");
+    let t1_out1 = node.unspent(&op(&t1, 1)).expect("N re-created T1:1");
+    assert_eq!(
+        t1_out1.block_height(),
+        i64::from(n_height),
+        "N's copy of T1:1"
+    );
+    assert!(node.unspent(&x).is_none(), "N's T1 spent X");
+    node.assert_gone(&op(&t1, 0), n_height, 1, "T1:0");
+    // The block a restarted dcrd accepts names the copy of its stale row.
+    node.assert_spent(&op(&t1, 0), p_height, 1, "P's copy of T1:0");
+    let row = node.backend_row(&op(&t1, 1)).expect("T1:1 is a row");
+    assert_eq!(
+        row.block_height(),
+        i64::from(n_height),
+        "the flush wrote N's copy of T1:1"
+    );
+}
+
+/// The reincluded output's spend deletes P's row when the node restarted
+/// between P's flush and N.
+#[test]
+fn after_a_restart_a_reincluded_output_spent_before_the_next_flush_leaves_the_backend() {
+    reincluded_output_spent_before_the_next_flush(AfterP::Restart);
+}
+
+/// The same with no restart, when flushes have evicted P's entries.
+#[test]
+fn after_an_eviction_a_reincluded_output_spent_before_the_next_flush_leaves_the_backend() {
+    reincluded_output_spent_before_the_next_flush(AfterP::Eviction);
+}
+
+/// The same chain on a node that kept P's entries cached.
+#[test]
+fn a_reincluded_output_spent_before_the_next_flush_leaves_the_backend() {
+    reincluded_output_spent_before_the_next_flush(AfterP::Cached);
+}
+
+/// N reincludes P's T1 and is flushed, so N's T1:0 and T1:1 are backend
+/// rows, and a crash leaves the cache without them.  With the flushes
+/// off, C1 approving P and C2 spending P's T1:0 then outgrow N: detaching
+/// N redoes P's T1 over the outputs N's disconnect built, and the forced
+/// flush that follows a detach does not run before C2 spends T1:0.
+#[test]
+fn after_a_restart_a_detached_reinclusion_spent_before_the_next_flush_leaves_the_backend() {
+    let mut node = Node::new();
+    let (x, x_height) = fund(&mut node);
+
+    // P = [cbP, T1]; T1 spends X.
+    let t1 = tx(
+        vec![input(x, 5 * OUT_VALUE, x_height, 0)],
+        &[OUT_VALUE, OUT_VALUE],
+    );
+    let tip = node.tip();
+    let p = node.block(tip, true, &[], vec![t1.clone()]);
+    node.accept_tip(&p);
+    let p_height = p.header.height;
+
+    // N = [cbN, T1] disapproves P and reincludes T1; the flush makes N's
+    // copies of T1's outputs the rows.
+    let n = node.block(p.header.block_hash(), false, &[], vec![t1.clone()]);
+    node.accept_tip(&n);
+    let n_height = n.header.height;
+    node.utxo_flush();
+    let row = node.backend_row(&op(&t1, 0)).expect("N's T1:0 was flushed");
+    assert_eq!(row.block_height(), i64::from(n_height), "N's copy of T1:0");
+
+    // A crash at N: nothing to replay, and the cache starts empty.
+    let mut node = node.restart();
+    assert_eq!(
+        node.tip(),
+        n.header.block_hash(),
+        "N is the tip after the restart"
+    );
+
+    // C1 = [cbC1] approves P, and C2 = [cbC2, T4] spends P's T1:0.
+    node.chain.utxo_flush_test_hooks.disabled = true;
+    let c1 = node.block(p.header.block_hash(), true, &[], Vec::new());
+    node.accept(&c1);
+    let t4 = tx(
+        vec![input(op(&t1, 0), OUT_VALUE, p_height, 1)],
+        &[OUT_VALUE],
+    );
+    let c2 = node.block(c1.header.block_hash(), true, &[], vec![t4.clone()]);
+    node.accept_tip(&c2);
+    node.chain.utxo_flush_test_hooks.disabled = false;
+
+    assert!(node.unspent(&op(&t4, 0)).is_some(), "C2 created T4:0");
+    let t1_out1 = node.unspent(&op(&t1, 1)).expect("P's T1:1 is back");
+    assert_eq!(
+        t1_out1.block_height(),
+        i64::from(p_height),
+        "P's copy of T1:1"
+    );
+    assert!(node.unspent(&x).is_none(), "P's T1 spent X");
+    node.assert_gone(&op(&t1, 0), p_height, 1, "T1:0");
+    // The block a restarted dcrd accepts names the copy of its stale row.
+    node.assert_spent(&op(&t1, 0), n_height, 1, "N's copy of T1:0");
+    let row = node.backend_row(&op(&t1, 1)).expect("T1:1 is a row");
+    assert_eq!(
+        row.block_height(),
+        i64::from(p_height),
+        "the flush wrote P's copy of T1:1"
+    );
 }

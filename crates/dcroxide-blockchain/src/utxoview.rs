@@ -195,17 +195,33 @@ pub struct UtxoView {
     /// disconnect of that block's regular tree consumes them.  An
     /// empty set holds no allocation.
     zero_conf_outs: BTreeSet<UtxoKey>,
+    /// The outputs a disconnect of a transaction tree has marked spent
+    /// since the view was last committed, whether it found them in the
+    /// view or built them from the transaction.  dcrd builds a missing
+    /// one without looking at its cache or backend
+    /// (`utxoviewpoint.go:444-503`), so the backend may hold a row for
+    /// it that the cache has no slot for, as after a restart.  When a
+    /// later transaction of the view adds one again, the commit must
+    /// not take it for an output the backend has never seen; see
+    /// [`crate::process::Chain::commit_view`].  Only disconnects fill
+    /// it, so the view of a block that approves its parent holds no
+    /// allocation here.  The view's entries and their states are not
+    /// affected.
+    disconnected_outs: BTreeSet<UtxoKey>,
 }
 
 impl Clone for UtxoView {
     /// A copy of the view's entries and best hash (dcrd `clone`,
     /// `utxoviewpoint.go:1287-1300`), without the zero-confirmation
-    /// set, which dcrd's copy does not carry either.
+    /// set, which dcrd's copy does not carry either.  The record of
+    /// the outputs a disconnect marked spent describes the entries, so
+    /// it goes with them.
     fn clone(&self) -> UtxoView {
         UtxoView {
             entries: self.entries.clone(),
             best_hash: self.best_hash,
             zero_conf_outs: BTreeSet::new(),
+            disconnected_outs: self.disconnected_outs.clone(),
         }
     }
 }
@@ -257,6 +273,10 @@ impl UtxoView {
     /// `cache_holds_unspent` answers whether the cache the changes go
     /// to holds an unspent entry for an output, which the commit asks
     /// only of the zero-confirmation spends.
+    ///
+    /// The record of the outputs a disconnect marked spent is cleared;
+    /// a cache that needs it takes it first
+    /// (`take_disconnected_outs`).
     ///
     /// # Panics
     ///
@@ -311,7 +331,15 @@ impl UtxoView {
             }
             updates.push((key.0, entry));
         }
+        self.disconnected_outs = BTreeSet::new();
         updates
+    }
+
+    /// Take the outputs a disconnect of a transaction tree has marked
+    /// spent since the view was last committed, for the commit to the
+    /// UTXO cache that follows.
+    pub(crate) fn take_disconnected_outs(&mut self) -> BTreeSet<UtxoKey> {
+        core::mem::take(&mut self.disconnected_outs)
     }
 
     /// Insert an entry directly; the resolver-driven analogue of
@@ -903,9 +931,11 @@ impl UtxoView {
     /// mirrors dcrd's.  An output of the block in the view's
     /// zero-confirmation set is marked as a zero-confirmation spend,
     /// and disconnecting the regular tree clears the set (dcrd
-    /// `disconnectRegularTransactions`).  `tx_hashes` carries the hash
-    /// of each transaction in the tree being disconnected, computed
-    /// once per block.
+    /// `disconnectRegularTransactions`).  Every output marked spent is
+    /// also recorded for the commit, which dcrd does not do (see
+    /// [`crate::process::Chain::commit_view`]).  `tx_hashes` carries
+    /// the hash of each transaction in the tree being disconnected,
+    /// computed once per block.
     #[allow(clippy::map_entry)]
     pub fn disconnect_transactions(
         &mut self,
@@ -993,6 +1023,7 @@ impl UtxoView {
                 if self.zero_conf_outs.contains(&k) {
                     entry.state |= UTXO_STATE_SPENT_BY_ZERO_CONF;
                 }
+                self.disconnected_outs.insert(k);
             }
 
             // Coinbases, treasurybases, and treasury spends have no
@@ -4406,5 +4437,66 @@ mod tests {
                 block.header.block_hash()
             )
         );
+    }
+
+    /// A disconnect records every output it marks spent, whether it
+    /// builds it or finds it in the view, and not the inputs it
+    /// restores; a connect records nothing, a copy keeps the record and
+    /// a commit clears it.  The block is `[coinbase, A, B]` with B
+    /// spending A:0, connected over the external output and committed.
+    #[test]
+    fn a_disconnect_records_the_outputs_it_marks_spent_until_the_commit() {
+        let (block, a_hash) = zero_conf_block(&[0]);
+        let tx_hashes = crate::blockhashes::BlockTxHashes::compute(&block);
+        let parent = stake_block(Vec::new());
+        let (external, _) = sbss_external();
+        let mut backend = external_backend();
+
+        let mut view = UtxoView::new();
+        let mut stxos = Vec::new();
+        {
+            let resolve = |op: &OutPoint| backend.get(&(op.hash.0, op.index, op.tree)).cloned();
+            view.connect_block_with_lookup(
+                &no_violation,
+                &block,
+                &tx_hashes,
+                &parent,
+                || Ok(Vec::new()),
+                &resolve,
+                Some(&mut stxos),
+                false,
+            )
+            .expect("connect");
+        }
+        assert!(
+            view.disconnected_outs.is_empty(),
+            "a connect records nothing"
+        );
+        commit_to(&mut backend, &mut view);
+        let resolve = |op: &OutPoint| backend.get(&(op.hash.0, op.index, op.tree)).cloned();
+
+        let mut view = UtxoView::new();
+        view.disconnect_block_with_lookup(&no_violation, &block, &parent, &stxos, &resolve, false)
+            .expect("disconnect");
+        let b_hash = tx_hashes.regular()[2];
+        let want: BTreeSet<UtxoKey> = [
+            key(&origin_out(a_hash, 0)),
+            key(&origin_out(a_hash, 1)),
+            key(&origin_out(b_hash, 0)),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(view.disconnected_outs, want, "A's and B's outputs");
+        assert!(
+            !view.disconnected_outs.contains(&key(&external)),
+            "the input the disconnect restored is not recorded"
+        );
+        assert_eq!(
+            view.clone().disconnected_outs,
+            want,
+            "a copy keeps the record"
+        );
+        drop(view.commit(no_cache_entry));
+        assert!(view.disconnected_outs.is_empty(), "the commit clears it");
     }
 }
