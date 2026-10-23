@@ -3,7 +3,7 @@
 //! (RVW-020).
 //!
 //! dcrd flushes the modified block index entries at the end of
-//! `ProcessBlockHeader` (`process.go:267-271`), because a new header
+//! `ProcessBlockHeader` (`process.go:258-262`), because a new header
 //! always adds one. The port did not, and `flush_block_index` had only
 //! three callers: the load path, `connect_block`, and
 //! `disconnect_block`.
@@ -139,7 +139,7 @@ fn accepted_headers_are_flushed_without_waiting_for_a_block() {
             assert!(
                 after > before,
                 "header {} was accepted but its block index row was not committed: dcrd \
-                 flushes the block index after every header (`process.go:267-271`)",
+                 flushes the block index after every header (`process.go:258-262`)",
                 h.height,
             );
             prev = h;
@@ -159,7 +159,7 @@ fn accepted_headers_are_flushed_without_waiting_for_a_block() {
 }
 
 /// The administrative paths flush too (dcrd's
-/// `flushBlockIndexWarnOnly` at `process.go:703`, `:717`, `:767`).
+/// `flushBlockIndexWarnOnly` at `process.go:713`, `:727`, `:777`).
 ///
 /// Marking a side-chain block failed is the cheapest of them to reach:
 /// it takes the early-return branch, so nothing else in the call could

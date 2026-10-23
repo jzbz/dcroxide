@@ -453,7 +453,7 @@ impl RpcChain for NodeRpcChain {
         tspend: &dcroxide_wire::MsgTx,
     ) -> Result<(u32, u32), dcroxide_rpc::server::TSpendCountVotesFailure> {
         // dcrd's `TSpendCountVotes` takes no `chainLock`
-        // (`treasury.go:1090-1102`): capture the voting window under
+        // (`treasury.go:1097-1109`): capture the voting window under
         // the chain mutex, then read and tally its blocks with it
         // released (see `TSpendVoteWindow`).
         let window = {
@@ -10621,7 +10621,7 @@ mod tests {
 
     /// dcrd's `watchedFile` reports a file that no longer exists as
     /// changed *without* refreshing the remembered details
-    /// (`server.go:3626-3628` returns before the refresh at `:3634`), so
+    /// (`server.go:3628-3630` returns before the refresh at `:3634`), so
     /// it keeps reporting changed on every later check instead of
     /// latching. A deleted certificate therefore retries on every
     /// connection until it comes back, rather than going quiet.

@@ -359,8 +359,8 @@ impl Prng {
     /// Go's `Shuffle` takes a swap closure and `ShuffleSlice` supplies
     /// the slice one (`default.go:144-148`); `<[T]>::swap` is that
     /// closure, so the two Go functions collapse into this one.  Go's
-    /// `n < 0` panic (`:215-217`) has no counterpart, because a slice
-    /// length cannot be negative.
+    /// `n < 0` panic (`uniform.go:215-217`) has no counterpart, because
+    /// a slice length cannot be negative.
     pub fn shuffle<T>(&mut self, s: &mut [T]) {
         let len = s.len();
         for i in (1..len).rev() {

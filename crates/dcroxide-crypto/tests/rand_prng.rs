@@ -22,7 +22,7 @@ fn reference(seed: [u8; 32]) -> chacha20::ChaCha20 {
 
 /// Go's zero-value `chacha20.Cipher` is ChaCha20 under an all-zero key
 /// and nonce at counter zero, and `PRNG.seed` XORs the first kernel key
-/// through it (`prng.go:56`, `:71`). `Prng::new` claims to reproduce
+/// through it (`prng.go:56`, `:72`). `Prng::new` claims to reproduce
 /// that; this is the cross-language known-answer vector that makes the
 /// claim falsifiable. A future `chacha20` release that started its
 /// block counter anywhere but zero would fail here rather than silently

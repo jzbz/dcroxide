@@ -61,7 +61,7 @@ impl MessageText {
 }
 
 impl fmt::Display for MessageText {
-    /// dcrd's `MessageError.Error()` (`wire/error.go:266-270`): `Func:
+    /// dcrd's `MessageError.Error()` (`wire/error.go:271-275`): `Func:
     /// Description`, or the description alone when there is no `Func`.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if !self.op.is_empty() {
@@ -304,7 +304,7 @@ impl WireError {
 impl fmt::Display for WireError {
     /// Go's io error texts for the short reads, and dcrd's
     /// `MessageError.Error()` text, `Func: Description`
-    /// (`wire/error.go:266-270`), for every error the transaction,
+    /// (`wire/error.go:271-275`), for every error the transaction,
     /// block and mixing message decoders return, and for `ReadMessage`'s
     /// wrong-network check.  The remaining kinds, which only the other
     /// P2P codecs and the rest of the framing produce, print their kind

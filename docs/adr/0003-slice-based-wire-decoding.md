@@ -28,7 +28,7 @@ codec. Their text is observable through `decoderawtransaction`,
 `sendrawmixmessage`, so every error the transaction, block header, block and
 mixing message decoders return renders dcrd's text exactly. That covers the
 io errors, and dcrd's `MessageError` `Func: Description` for coded errors
-(`wire/error.go:266-270`), including the shared `ReadVarInt`,
+(`wire/error.go:271-275`), including the shared `ReadVarInt`,
 `ReadVarBytes`, `readScript`, `ReadVarString` and `ReadAsciiVarString`
 readers. Kinds whose description varies by check carry a `MessageText`
 holding dcrd's `op` and format string verbatim. Kinds only the other P2P

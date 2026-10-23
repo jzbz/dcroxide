@@ -6,7 +6,7 @@
 //! indexed header, so a header whose body was never stored -- the best
 //! header during initial sync, a side-chain header nobody downloaded --
 //! reaches `tspend_count_votes`.  dcrd's `tSpendCountVotes` returns
-//! `fetchBlockByNode`'s error there (`treasury.go:1026-1030`) and the
+//! `fetchBlockByNode`'s error there (`treasury.go:1033-1037`) and the
 //! handler answers with an internal RPC error; the port `expect`ed the
 //! body and, under `panic = "abort"`, took the whole node down.
 

@@ -1100,7 +1100,7 @@ impl Chain {
     /// its order: "Loading block index..." and the debug "Block index
     /// loaded in ..." around the index load (`chainio.go:1691`,
     /// `:1716`), the debug fork rejection checkpoint and assumed valid
-    /// node lines (`process.go:86`, `chainio.go:1758`), "Deployment
+    /// node lines (`process.go:86`, `chainio.go:1761`), "Deployment
     /// version N loaded" (`:1570`), "UTXO cache initializing (max size: N
     /// MiB)..." and "UTXO cache initialization completed" around the
     /// catch-up replay (`utxocache.go:825`, `:863`, `:1050`), and the
@@ -1265,7 +1265,7 @@ impl Chain {
             // the index load and the deployment version like any other
             // and looks for the fork rejection checkpoint and the
             // assumed valid node in the one-node index
-            // (`chainio.go:1691-1761`, `:1570`).  The index here already
+            // (`chainio.go:1691-1764`, `:1570`).  The index here already
             // holds the genesis node `Chain::new` built, so there is
             // nothing to read back, and the deployment version row
             // written above leaves the update nothing to write.
@@ -1298,7 +1298,7 @@ impl Chain {
 
         // dcrd flushes the block index here when new rules were
         // detected, "since blocks may have been unmarked", before it
-        // advances the deployment version (`chainio.go:1776-1793`).
+        // advances the deployment version (`chainio.go:1779-1796`).
         // The unmarking never marks those nodes modified, though, so
         // that flush writes none of their rows (`blockindex.go:1411`
         // returns on an empty modified set): the cleared statuses live
@@ -1320,7 +1320,7 @@ impl Chain {
 
     /// Find the assumed valid node once the block index is loaded, when
     /// its header is known, and log it at debug (dcrd's lookup near the
-    /// end of the `initChainState` load, `chainio.go:1755-1761`).
+    /// end of the `initChainState` load, `chainio.go:1758-1764`).
     fn load_assume_valid_node(&mut self) {
         if self.assume_valid == Hash::ZERO {
             return;
@@ -1427,7 +1427,7 @@ impl Chain {
     /// Returns the start time of the newly detected deployments, which
     /// the caller needs: a non-zero one is what makes dcrd flush the
     /// block index before advancing the stored deployment version
-    /// (`chainio.go:1776-1793`).
+    /// (`chainio.go:1779-1796`).
     fn load_chain_state(
         &mut self,
         tx: &dcroxide_database::Transaction,
@@ -1709,7 +1709,7 @@ impl Chain {
     /// `updateDeploymentVersion`, `chainio.go:1547-1572`).
     ///
     /// Its own transaction, after the block index flush, in the order
-    /// dcrd's `initChainState` uses (`chainio.go:1776-1793`).  dcrd
+    /// dcrd's `initChainState` uses (`chainio.go:1779-1796`).  dcrd
     /// orders it so the unmarked rows are durable before the version
     /// moves, but the new-rules pass clears those statuses in memory
     /// only (the flush writes none of their rows, QK-0016), so
@@ -8665,7 +8665,7 @@ fn fetch_stored_block(
 /// rest are read from.
 ///
 /// dcrd's exported `TSpendCountVotes` and `CheckTSpendHasVotes` take no
-/// `chainLock` (`treasury.go:1090-1102`, `:1155-1161`):
+/// `chainLock` (`treasury.go:1097-1109`, `:1162-1168`):
 /// `tSpendCountVotes` reads each body through `fetchBlockByNode` under
 /// a database `View` only.  The daemon's RPC and mining seams therefore
 /// capture this under the chain mutex and read and tally the blocks
@@ -8704,7 +8704,7 @@ impl TSpendVoteWindow {
         let mut total_no = 0u32;
         for (height, hash, recent) in &self.blocks {
             // dcrd returns `fetchBlockByNode`'s error here ("Should not
-            // happen", `treasury.go:1026-1030`), and the RPC seam can
+            // happen", `treasury.go:1033-1037`), and the RPC seam can
             // hand over any indexed header, including one whose body
             // was never stored, so a missing body must not panic.
             let fetched;

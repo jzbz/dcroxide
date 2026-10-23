@@ -79,7 +79,7 @@ type Captured = Arc<Mutex<Vec<(LogLevel, String)>>>;
 /// closed underneath it.
 ///
 /// The header is header-only and off the best chain, so `invalidate_block`
-/// takes the early-return branch (dcrd `process.go:700-704`) and nothing
+/// takes the early-return branch (dcrd `process.go:710-714`) and nothing
 /// else in the call could have performed a write.
 fn dead_store_chain(params: &Params) -> (tempfile::TempDir, Chain, Hash, Captured) {
     let dir = tempfile::tempdir().expect("tempdir");

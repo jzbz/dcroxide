@@ -200,7 +200,7 @@ fn the_first_flush_after_a_restart_rewrites_no_block_index_rows() {
 /// inserts it with `addNodeFromDB`, which never marks it modified, so
 /// the flush `initChainState` runs "since blocks may have been
 /// unmarked" finds an empty modified set and writes nothing
-/// (`chainio.go:1494-1502`, `:1776-1786`; `blockindex.go:1411`).  The
+/// (`chainio.go:1494-1502`, `:1779-1789`; `blockindex.go:1411`).  The
 /// stored deployment version then advances, the pass does not run
 /// again, and a second restart reloads the block as failed.  The port
 /// used to mark the node and persist the cleared status (review finding

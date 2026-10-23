@@ -150,7 +150,7 @@ impl TemplateChain for NodeTemplateChain {
 
     fn check_tspend_has_votes(&self, prev_hash: &Hash, tspend: &MsgTx) -> Result<(), String> {
         // dcrd's `CheckTSpendHasVotes` takes no `chainLock`
-        // (`treasury.go:1155-1161`): capture the voting window under
+        // (`treasury.go:1162-1168`): capture the voting window under
         // the chain mutex, then read and tally its blocks with it
         // released (see `TSpendVoteWindow`).
         let window = {

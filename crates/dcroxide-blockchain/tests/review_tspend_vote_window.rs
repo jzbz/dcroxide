@@ -3,7 +3,7 @@
 //! finding B3-p#3).
 //!
 //! dcrd's exported `TSpendCountVotes` and `CheckTSpendHasVotes` take no
-//! `chainLock` (`treasury.go:1090-1102`, `:1155-1161`); the tally reads
+//! `chainLock` (`treasury.go:1097-1109`, `:1162-1168`); the tally reads
 //! each block of the voting window, up to TVI x multiplier of them,
 //! through `fetchBlockByNode` under a database `View` only.  The
 //! daemon's RPC and mining seams ran the whole walk under the chain

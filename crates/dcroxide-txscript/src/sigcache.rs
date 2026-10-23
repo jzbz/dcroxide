@@ -739,7 +739,7 @@ mod tests {
     }
 
     /// OP_CHECKSIGALT consults the cache for its Ed25519 and Schnorr
-    /// suites, which dcrd verifies without one (`opcode.go:2874-2902`):
+    /// suites, which dcrd verifies without one (`opcode.go:2880-2908`):
     /// a valid spend verifies alike cold, warm and uncached and leaves
     /// one entry, and a tampered one over the same signature hash fails
     /// alike, before and after the valid one is cached, and is never

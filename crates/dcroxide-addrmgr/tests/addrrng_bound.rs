@@ -77,7 +77,7 @@ fn two_fresh_managers_do_not_share_a_bucket_key() {
 ///
 /// This is QK-0012's pin. dcrd's `rand.Read` is documented as filling
 /// the buffer and implemented as `XORKeyStream(s, s)`
-/// (`crypto/rand/prng.go:83-84`, `:103`), and its `reset` calls it
+/// (`crypto/rand/prng.go:83-84`, `:105`), and its `reset` calls it
 /// straight into `a.key` (`addrmgr/addrmanager.go:809`, whose comment
 /// still says "fill key"). On the second `reset` of a process that is
 /// exactly a XOR into whatever the partial load left there.

@@ -495,8 +495,9 @@ fn a_bad_upgrade_request_is_refused() {
 /// coerces to "1.0" (`dcrjson/jsonrpc.go:152-154`) -- so the refusal
 /// reads `"jsonrpc":"1.0"` even when the request said 2.0.  Echoing
 /// the request's version back is the natural thing to write and the
-/// wrong bytes.  dcrd's *batch* gate (`:1727`) does pass the version
-/// through, which is why the two paths must not share one rule.
+/// wrong bytes.  dcrd's *batch* gate (`rpcwebsocket.go:1727`) does pass
+/// the version through, which is why the two paths must not share one
+/// rule.
 #[test]
 fn the_limited_user_refusal_answers_in_version_1_0() {
     let (_dir, listener, port, _ntfn, _chain) = serve_ws();
@@ -575,7 +576,7 @@ fn a_batched_request_is_answered_entry_by_entry() {
 /// An empty batch draws dcrd's `Invalid request: empty batch`, and a
 /// batch entry with no `params` array draws its malformed reply -- the
 /// batch arm treats a missing params array as malformed where the
-/// single arm does not (`rpcwebsocket.go:1633`).
+/// single arm does not (`rpcwebsocket.go:1635`).
 #[test]
 fn batch_edge_cases_match_dcrds_arms() {
     let (_dir, listener, port, _ntfn, _chain) = serve_ws();

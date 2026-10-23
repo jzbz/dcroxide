@@ -249,7 +249,7 @@ impl NetByteTotals {
 /// How long a single message write may take before the peer counts as
 /// stalled: a base allowance plus one second per `bytes_per_sec` bytes
 /// of the framed message (dcrd `writeStallTimeout` /
-/// `writeStallBytesPerSec`, applied at `peer/peer.go:1013-1016`).
+/// `writeStallBytesPerSec`, applied at `peer/peer.go:1034-1036`).
 ///
 /// Configurable rather than hard-wired to dcrd's constants so tests can
 /// drive the same arithmetic at millisecond scale; the daemon always
@@ -263,7 +263,7 @@ pub struct WriteStallPolicy {
 }
 
 impl WriteStallPolicy {
-    /// dcrd's constants (`peer/peer.go:84`, `:90`).
+    /// dcrd's constants (`peer/peer.go:90`, `:96`).
     pub fn dcrd() -> WriteStallPolicy {
         WriteStallPolicy {
             base: Duration::from_nanos(dcroxide_peer::WRITE_STALL_TIMEOUT as u64),
@@ -875,7 +875,7 @@ impl<S: Read + Write + SocketTimeout> MsgTransport for WireTransport<S> {
         //
         // `bytes` is the framed message — header plus payload — which is
         // exactly dcrd's `wire.MessageHeaderSize + msg.SerializeSize()`
-        // (`peer/peer.go:1014`).  dcrd's `SerializeSize` is the encoded
+        // (`peer/peer.go:390`).  dcrd's `SerializeSize` is the encoded
         // payload length, asserted against `len(buf.Bytes())` by its own
         // wire tests, so the two sizes agree by construction and no
         // separate size calculation is needed here.
@@ -1050,7 +1050,7 @@ mod tests {
 
     /// The write deadline follows dcrd's formula exactly: a twenty-second
     /// base plus one whole second per 256 KiB of the *framed* message
-    /// (`peer/peer.go:1013-1016`, constants at `:84` and `:90`).
+    /// (`peer/peer.go:1034-1036`, constants at `:90` and `:96`).
     ///
     /// The rows are computed from the constants rather than captured from
     /// dcrd, because the arithmetic is the whole content of the change —

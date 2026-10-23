@@ -653,8 +653,8 @@ pub fn db_put_utxo_set_state(tx: &Transaction, state: &UtxoSetState) -> Result<(
 /// into a silently wrong UTXO set that every descendant inherits.  It
 /// is a laxity local to `FetchState` rather than a storage limit: the
 /// same `Get` returns `nil` only for `leveldb.ErrNotFound`
-/// (`:392-402`), and `dbFetchUtxoEntry` treats a non-nil zero-length
-/// row as an `AssertError` (`:472-477`) — the rule
+/// (`utxobackend.go:392-402`), and `dbFetchUtxoEntry` treats a non-nil
+/// zero-length row as an `AssertError` (`:472-477`) — the rule
 /// [`db_fetch_utxo_entry`] above ports.  Neither implementation writes
 /// a zero-length row (`serialize_utxo_set_state` is a VLQ height plus
 /// a 32-byte hash, 33 bytes minimum), so only corruption or an

@@ -7,7 +7,7 @@
 //! `MaxSize` (`server.go:4005-4009`).  So its open reports the block
 //! index load, the UTXO cache initialization that brackets any catch-up
 //! replay after a crash, and the chain state it arrived at
-//! (`chainio.go:1570-1761`, `utxocache.go:825-1050`,
+//! (`chainio.go:1570-1764`, `utxocache.go:825-1050`,
 //! `chain.go:2254-2305`), and that replay flushes at the configured
 //! size.  The port's daemon installed its sink and applied
 //! `--utxocachemaxsize` only once `Chain::open` had returned: none of
@@ -148,7 +148,7 @@ fn assert_lines(captured: &Captured, want: &[Want]) {
 fn a_fresh_open_and_a_restart_log_dcrds_startup_lines() {
     // Simnet with a hard-coded assumed valid block of genesis, so both
     // opens reach the two debug lines logged once the index knows that
-    // block (`process.go:86`, `chainio.go:1758`).
+    // block (`process.go:86`, `chainio.go:1761`).
     let mut params = simnet_params();
     let genesis = params.genesis_block.header.block_hash();
     params.assume_valid = genesis;
