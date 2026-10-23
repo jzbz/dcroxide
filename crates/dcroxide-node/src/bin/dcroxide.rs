@@ -434,9 +434,14 @@ fn shutdown_requested(interrupt: &dcroxide_indexers::Interrupt) -> bool {
 /// `dcrdMain`, which runs on the failure returns too), then close the
 /// log file the configuration load opened, if it opened one (the
 /// `logRotator.Close()` dcrd defers ahead of it, so it runs after the
-/// line, `dcrd.go:54-64`).
+/// line, `dcrd.go:54-64`).  The profile server manager, which
+/// [`run_node`] starts for `--profile` and hands the RPC server, is
+/// stopped ahead of the line, as dcrd defers `profiler.Stop()` after it
+/// (`dcrd.go:118-119`).
 fn run(cfg: Config) -> ExitCode {
-    let code = run_node(cfg);
+    let profiler = dcroxide_node::profiler::ProfileServer::system();
+    let code = run_node(cfg, &profiler);
+    let _ = dcroxide_rpc::server::RpcProfilerManager::stop(&profiler);
     log_info("Shutdown complete");
     dcroxide_node::logging::close_log_rotator();
     code
@@ -447,8 +452,10 @@ fn run(cfg: Config) -> ExitCode {
 /// the block database, creates the address manager and binds the peer
 /// listeners, loads the chain, starts the RPC server, outbound dialing
 /// and seeding, then idles on the shutdown listener before tearing
-/// everything down.
-fn run_node(cfg: Config) -> ExitCode {
+/// everything down.  `profiler` is the profile server manager, started
+/// here for `--profile` and handed to the RPC server (dcrd's `profiler`,
+/// passed to `newServer`).
+fn run_node(cfg: Config, profiler: &dcroxide_node::profiler::ProfileServer) -> ExitCode {
     // Install the per-subsystem log levels the configuration parsed
     // (dcrd's loadConfig calling parseAndSetDebugLevels).
     dcroxide_node::logging::set_levels(cfg.log_levels.clone());
@@ -494,6 +501,18 @@ fn run_node(cfg: Config) -> ExitCode {
              listening port on your router if you are behind NAT and wish to receive \
              inbound connections",
         );
+    }
+
+    // Enable the profile server if requested, with addresses that are not
+    // loopback allowed (dcrd `dcrdMain`, whose deferred `Stop` is the one
+    // `run` makes).  dcrd logs a refused address and exits; one it would
+    // listen on starts nothing here, the profile server not being ported
+    // (see `profiler::ProfileServer::start_configured`).
+    if !cfg.profile.is_empty()
+        && let Err(e) = profiler.start_configured(&cfg.profile)
+    {
+        log_warn(&format!("unable to start profile server: {e}"));
+        return ExitCode::FAILURE;
     }
 
     // The shared interrupt flag standing in for dcrd's daemon context
@@ -1358,6 +1377,7 @@ fn run_node(cfg: Config) -> ExitCode {
             request_shutdown,
             outbound_channel.control(),
             Arc::clone(&server.mix_pool),
+            profiler.clone(),
         ));
         // Install the websocket notification manager (dcrd's
         // wsNotificationManager) and start its delivery thread over
@@ -2609,6 +2629,7 @@ fn rpc_config(
     request_shutdown: Box<dyn Fn() + Send + Sync>,
     outbound_control: dcroxide_node::outbound::OutboundControl,
     mix_pool: Arc<Mutex<dcroxide_node::mixnode::NodeMixPool>>,
+    profiler: dcroxide_node::profiler::ProfileServer,
 ) -> dcroxide_rpc::server::Config<dcroxide_node::rpcrun::NodeRpcChain> {
     let params = cfg.params.params.clone();
     // The version 2 filter source and the database seam, which looks up
@@ -2684,7 +2705,10 @@ fn rpc_config(
         // getmixpairrequests and getmixmessage read the same shared pool
         // the peers feed (dcrd's `MixPooler: s.mixMsgPool`).
         mix_pooler: Box::new(dcroxide_node::rpcrun::NodeRpcMixPooler::new(mix_pool)),
-        profiler_mgr: Box::new(()),
+        // startprofiler and stopprofiler reach the daemon's manager,
+        // which makes dcrd's address checks and serves nothing (dcrd's
+        // `ProfilerMgr: profiler`).
+        profiler_mgr: Box::new(profiler),
         addr_manager: Box::new(dcroxide_node::rpcrun::NodeRpcAddrManager::new(addr_manager)),
         mining_addrs: cfg.mining_addrs.clone(),
         user_agent_version: version::user_agent_version(),

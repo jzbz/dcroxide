@@ -3526,7 +3526,30 @@ impl dcroxide_rpc::helpers::InterfaceLookup for SystemInterfaces {
     }
 }
 
-/// Go's route netlink reads for [`SystemInterfaces`] and
+/// The interface-name lookup behind the profile server's address
+/// normalization (Go's `net.InterfaceByName` and `Interface.Addrs` in
+/// dcrd's `normalizeAddresses` with `normalizeInterfaceAddrs`, which
+/// `profileServer.Start` calls): a host that names a local network
+/// interface stands for every address that interface has, in the
+/// kernel's order, and for none when it has no address.
+///
+/// On Linux the kernel is asked over route netlink, as for
+/// [`SystemInterfaces`].  Elsewhere no host names an interface, the same
+/// gap as `addnode`'s (recorded in PARITY).
+pub fn system_interface_by_name(name: &str) -> Option<crate::config::IfaceAddrs> {
+    #[cfg(target_os = "linux")]
+    {
+        netlink::interface_by_name(name)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = name;
+        None
+    }
+}
+
+/// Go's route netlink reads for [`SystemInterfaces`],
+/// [`system_interface_by_name`] and
 /// [`system_interface_addrs`] (`syscall.NetlinkRIB`,
 /// `ParseNetlinkMessage`, `ParseNetlinkRouteAttr` and
 /// `net/interface_linux.go`).  Netlink structures are in host byte
@@ -3655,41 +3678,48 @@ mod netlink {
         Some(indexes)
     }
 
-    /// One `RTM_NEWADDR` message's address, as Go's `newAddr` picks it and
-    /// `IPNet.String` renders it, `ip/prefix`.  Like Go, a message that
-    /// carries `IFA_LOCAL` -- every IPv4 one -- skips `IFA_ADDRESS` (the
-    /// peer on a point-to-point link) and takes its first other
-    /// attribute, and one without takes its first attribute.  An
-    /// IPv4-mapped IPv6 address renders as IPv4 with the low 32 bits of
-    /// its mask, as `networkNumberAndMask` trims a 16-byte mask for a
-    /// 4-byte address.  `Some(None)` where Go's `newAddr` returns nil (no
-    /// attribute to take, or a family other than IPv4 and IPv6), and
-    /// `None` for a malformed message.
-    fn new_addr(data: &[u8]) -> Option<Option<String>> {
+    /// One `RTM_NEWADDR` message's address, as Go's `newAddr` picks it.
+    /// Like Go, a message that carries `IFA_LOCAL` -- every IPv4 one --
+    /// skips `IFA_ADDRESS` (the peer on a point-to-point link) and takes
+    /// its first other attribute, and one without takes its first
+    /// attribute.  An IPv6 address keeps its 16 bytes, IPv4-mapped or not.
+    /// `Some(None)` where Go's `newAddr` returns nil (no attribute to take,
+    /// or a family other than IPv4 and IPv6), and `None` for a malformed
+    /// message.
+    fn new_addr_ip(data: &[u8]) -> Option<Option<std::net::IpAddr>> {
         let family = *data.first()?;
-        let prefix_len = *data.get(1)?;
         let attrs = route_attrs(data, IFADDRMSG_LEN)?;
         let point_to_point = attrs.iter().any(|(kind, _)| *kind == IFA_LOCAL);
         let value = attrs
             .iter()
             .find(|(kind, _)| !(point_to_point && *kind == IFA_ADDRESS))
             .map(|(_, value)| *value);
-        let (ip, prefix_len) = match (family, value) {
+        Some(match (family, value) {
             (AF_INET, Some(value)) => {
                 let octets: [u8; 4] = value.get(..4)?.try_into().ok()?;
-                (std::net::Ipv4Addr::from(octets).to_string(), prefix_len)
+                Some(std::net::IpAddr::from(octets))
             }
             (AF_INET6, Some(value)) => {
                 let octets: [u8; 16] = value.get(..16)?.try_into().ok()?;
-                let ip = std::net::Ipv6Addr::from(octets);
-                match ip.to_ipv4_mapped() {
-                    Some(v4) => (v4.to_string(), prefix_len.saturating_sub(96)),
-                    None => (ip.to_string(), prefix_len),
-                }
+                Some(std::net::IpAddr::from(octets))
             }
-            _ => return Some(None),
-        };
-        Some(Some(format!("{ip}/{prefix_len}")))
+            _ => None,
+        })
+    }
+
+    /// One `RTM_NEWADDR` message's address as [`new_addr_ip`] picks it and
+    /// Go's `IPNet.String` renders it, `ip/prefix`.  An IPv4-mapped IPv6
+    /// address renders as IPv4 with the low 32 bits of its mask, as
+    /// `networkNumberAndMask` trims a 16-byte mask for a 4-byte address.
+    fn new_addr(data: &[u8]) -> Option<Option<String>> {
+        let prefix_len = *data.get(1)?;
+        Some(new_addr_ip(data)?.map(|ip| match ip {
+            std::net::IpAddr::V4(v4) => format!("{v4}/{prefix_len}"),
+            std::net::IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+                Some(v4) => format!("{v4}/{}", prefix_len.saturating_sub(96)),
+                None => format!("{v6}/{prefix_len}"),
+            },
+        }))
     }
 
     /// The first address of interface `index` in an `RTM_GETADDR` dump
@@ -3708,6 +3738,26 @@ mod netlink {
             }
         }
         None
+    }
+
+    /// Every address of interface `index` in an `RTM_GETADDR` dump, in the
+    /// kernel's order (Go `Interface.Addrs`: `addrTable` over
+    /// [`new_addr_ip`] for one interface), or `None` for a malformed
+    /// message, where Go's call fails.
+    pub(super) fn iface_addrs(tab: &[u8], index: u32) -> Option<Vec<std::net::IpAddr>> {
+        let mut addrs = Vec::new();
+        for m in messages(tab)? {
+            match m.kind {
+                NLMSG_DONE => break,
+                RTM_NEWADDR if ne_u32(m.data, 4)? == index => {
+                    if let Some(addr) = new_addr_ip(m.data)? {
+                        addrs.push(addr);
+                    }
+                }
+                _ => {}
+            }
+        }
+        Some(addrs)
     }
 
     /// Every address in an `RTM_GETADDR` dump, in the kernel's order (Go
@@ -3801,6 +3851,26 @@ mod netlink {
         let index = link_index(&rib(RTM_GETLINK).ok()?, name)?;
         let addr = first_addr(&rib(RTM_GETADDR).ok()?, index)?;
         Some((index, addr))
+    }
+
+    /// The index and every address of the interface named `name`, or
+    /// `None` when no interface has that name or the link dump cannot be
+    /// had -- every case in which Go's `InterfaceByName` fails.  An
+    /// address dump that cannot be had or parsed leaves the interface
+    /// with no address, as a failed `Interface.Addrs` makes dcrd's
+    /// `normalizeAddresses` add nothing for it.
+    #[cfg(target_os = "linux")]
+    pub(super) fn interface_by_name(name: &str) -> Option<crate::config::IfaceAddrs> {
+        // Go refuses the empty name before asking the kernel.
+        if name.is_empty() {
+            return None;
+        }
+        let index = link_index(&rib(RTM_GETLINK).ok()?, name)?;
+        let addrs = rib(RTM_GETADDR)
+            .ok()
+            .and_then(|tab| iface_addrs(&tab, index))
+            .unwrap_or_default();
+        Some(crate::config::IfaceAddrs { index, addrs })
     }
 
     /// Every address of every interface (Go `net.InterfaceAddrs`), or
@@ -8155,6 +8225,90 @@ mod tests {
         assert_eq!(netlink::link_index(&truncated, "lo"), None);
     }
 
+    /// dcrd's `normalizeAddresses` with `normalizeInterfaceAddrs`, which
+    /// the profile server's `Start` calls, takes every address of a named
+    /// interface in the kernel's dump order (Go `Interface.Addrs`): the
+    /// `IFA_LOCAL` value of an IPv4 address, the first attribute of an
+    /// IPv6 one, an IPv4-mapped address as IPv4, and nothing for an
+    /// interface without an address.  The link-local addresses are zoned
+    /// by the interface's index.
+    #[test]
+    fn netlink_dumps_list_an_interfaces_addresses_as_go_addrs_does() {
+        let done = netlink_msg(netlink::NLMSG_DONE, &[0; 4], &[]);
+        let link_local = [0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 7];
+        let mut mapped = [0u8; 16];
+        mapped[10..].copy_from_slice(&[0xff, 0xff, 192, 0, 2, 7]);
+        let addrs = [
+            netlink_msg(
+                netlink::RTM_NEWADDR,
+                &ifaddrmsg(netlink::AF_INET, 32, 7),
+                &[
+                    (netlink::IFA_ADDRESS, &[10, 0, 0, 2]),
+                    (netlink::IFA_LOCAL, &[10, 0, 0, 1]),
+                ],
+            ),
+            netlink_msg(
+                netlink::RTM_NEWADDR,
+                &ifaddrmsg(netlink::AF_INET, 8, 1),
+                &[(netlink::IFA_LOCAL, &[127, 0, 0, 1])],
+            ),
+            netlink_msg(
+                netlink::RTM_NEWADDR,
+                &ifaddrmsg(netlink::AF_INET6, 64, 7),
+                &[(netlink::IFA_ADDRESS, &link_local)],
+            ),
+            netlink_msg(
+                netlink::RTM_NEWADDR,
+                &ifaddrmsg(netlink::AF_INET6, 128, 7),
+                &[(netlink::IFA_ADDRESS, &mapped)],
+            ),
+            // An address message with no attribute is Go's nil address.
+            netlink_msg(
+                netlink::RTM_NEWADDR,
+                &ifaddrmsg(netlink::AF_INET6, 64, 7),
+                &[],
+            ),
+            done,
+        ]
+        .concat();
+        let ips = netlink::iface_addrs(&addrs, 7).expect("the dump parses");
+        assert_eq!(
+            ips,
+            [
+                "10.0.0.1".parse::<std::net::IpAddr>().expect("IPv4"),
+                "fe80::7".parse().expect("IPv6"),
+                "::ffff:192.0.2.7".parse().expect("IPv6"),
+            ]
+        );
+        assert_eq!(netlink::iface_addrs(&addrs, 3), Some(Vec::new()));
+        let lookup = |name: &str| {
+            (name == "wg0").then(|| crate::config::IfaceAddrs {
+                index: 7,
+                addrs: ips.clone(),
+            })
+        };
+        assert_eq!(
+            crate::config::normalize_addresses(
+                &["wg0:6060".to_string(), "lo:6060".to_string()],
+                "",
+                crate::config::NORMALIZE_INTERFACE_ADDRS,
+                &lookup,
+            ),
+            [
+                "10.0.0.1:6060",
+                "[fe80::7%7]:6060",
+                "192.0.2.7:6060",
+                "lo:6060"
+            ]
+        );
+
+        // A message whose length runs past the buffer is Go's failed
+        // `Addrs`.
+        let mut truncated = addrs;
+        truncated.truncate(truncated.len() - 1);
+        assert_eq!(netlink::iface_addrs(&truncated, 7), None);
+    }
+
     /// The host's interface addresses are Go's `InterfaceAddrs`: every
     /// address of the `RTM_GETADDR` dump in the kernel's order, with its
     /// own prefix, for an interface that is down as for one that is up.
@@ -8278,6 +8432,17 @@ mod tests {
         );
         assert_eq!(SystemInterfaces.interface_addr(""), None);
         assert_eq!(SystemInterfaces.interface_addr("no-such-if0"), None);
+
+        // The profile server's lookup lists every address, the first the
+        // same.
+        let lo = system_interface_by_name("lo").expect("the loopback interface");
+        assert_eq!(lo.index, index);
+        assert_eq!(
+            lo.addrs.first(),
+            Some(&std::net::IpAddr::from([127, 0, 0, 1]))
+        );
+        assert!(system_interface_by_name("").is_none());
+        assert!(system_interface_by_name("no-such-if0").is_none());
     }
 
     /// Go's `pem.Decode` over the malformed shapes a client CA file or

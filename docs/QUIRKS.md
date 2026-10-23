@@ -887,3 +887,42 @@ Entry format:
   `a_skipped_free_transaction_and_its_dependents_are_logged_at_trace` in
   `crates/dcroxide-mining/tests/newtemplate_vectors.rs` (the trailing
   newline); the bundle case is not exercised by a test.
+
+## QK-0032 — an interface with no address leaves the profile server without listeners for good
+
+- **Where:** dcrd `profiler.go:72-157` (`profileServer.Start`) and
+  `internal/rpcserver/rpcserver.go:4514-4544` (`handleStartProfiler`) /
+  dcroxide-node `profiler.rs` `ProfileServer`
+- **What:** `Start` expands a host that names an interface into that
+  interface's addresses (`normalizeAddresses` with
+  `normalizeInterfaceAddrs`). For an interface that has no address the list
+  is empty, so the loopback check and `parseListeners` have nothing to
+  refuse, nothing is bound, and `Start` records an `http.Server` with no
+  listener and returns nil (`profiler.go:137-156`). The handler then finds
+  no listener and answers -32603 `profile server started without active
+  listeners`, which it logs as an RPCS error. Every later `startprofiler`
+  gets the same answer, whatever its address: `Start` returns nil at once
+  while a server is recorded (`profiler.go:77-79`), before any check.
+  `stopprofiler` answers -26 `profile server is not started`, since it reads
+  the listeners and never calls `Stop`, so only the `Stop` that `dcrdMain`
+  defers clears the server, logging `Profiling server stopped` at shutdown
+  (`dcrd.go:118-119`). `--profile` naming such an interface puts the server
+  in the same state from startup, through the start `dcrdMain` makes
+  (`dcrd.go:120-126`). The `ProfilerManager` contract says the listeners
+  tell whether the server is running (`internal/rpcserver/interface.go:49-52`).
+- **Why reproduced:** RPC compatibility. The profile server is not ported,
+  but in this state dcrd binds and serves nothing, so the port can give
+  dcrd's replies: the internal error, the same for every later start, and
+  the line at shutdown. The daemon's manager records the same state, from
+  `startprofiler` or from `--profile`, and the daemon stops it where
+  `dcrdMain`'s deferred `Stop` runs.
+- **Pinned by:** `an_interface_with_no_address_records_a_server_with_no_listener`
+  in `crates/dcroxide-node/tests/profiler_vectors.rs` (the replies through
+  the RPC dispatch) and in `crates/dcroxide-node/src/profiler.rs` (the
+  manager, a clone sharing its state); the state from `--profile` by
+  `the_profile_flag_start_allows_addresses_that_are_not_loopback` there.
+  Nothing pins the daemon's stop at shutdown or its `Profiling server
+  stopped` line: a daemon test would need the host to have an interface
+  with no address.
+- **How found:** reading `Start` while wiring the daemon's manager, then
+  confirmed against dcrd's own `Start` over an interface with no address.

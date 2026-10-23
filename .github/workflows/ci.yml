@@ -176,9 +176,10 @@ jobs:
     # only when someone ran it by hand, and a stale tool surfaced only
     # at the next manual regeneration. fullblockgen is left out: its
     # go.mod asks for a newer Go than the oracle's toolchain here.
-    # chainopsgen, disapprovalgen, mempoolvectors, mixpoolgen and
-    # utxoviewgen are not modules but overlays that compile only inside
-    # a dcrd checkout's packages, so they are left out too.
+    # chainopsgen, disapprovalgen, mempoolvectors, mixpoolgen,
+    # profilergen and utxoviewgen are not modules but overlays that
+    # compile only inside a dcrd checkout's packages, so they are left
+    # out too.
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7

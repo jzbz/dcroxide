@@ -42,7 +42,7 @@ assembles them end to end: config and CLI, the chain engine with full
 consensus validation, mempool and fee estimation, mining and the CPU miner, the
 P2P server with sync, relay, and StakeShuffle mixing message relay, the
 JSON-RPC/websocket server, the tool commands, the pipe IPC lifecycle, and the
-Windows service wrapper. The gate runs 2,661 tests across 451 suites on Linux,
+Windows service wrapper. The gate runs 2,674 tests across 453 suites on Linux,
 most of them differential against dcrd or replaying sessions generated inside dcrd's own
 packages. The parity target moved six times during the port, from
 `release-v2.1.5` to upstream master `452c1a6c` and then through `29f17894`,
@@ -438,10 +438,11 @@ Every task in this project serves one of six compatibility surfaces. They are li
 > stdout and to `dcroxide.log` in the network's log directory, rotated and
 > gzipped as dcrd's `dcrd.log` is, unless `--nofilelogging` is set. Three
 > items are deliberate non-ports: the profiling flags
-> (`--profile`/`--cpuprofile`/`--memprofile`) validate but serve nothing,
-> `--upnp` parses but maps nothing, and the Windows service ships without the
-> event-log half (under the SCM the process has no standard handles, so a
-> service-run daemon logs to its log file alone).
+> (`--profile`/`--cpuprofile`/`--memprofile`) validate but serve nothing
+> (`--profile` and `startprofiler` make dcrd's address checks and start no
+> server), `--upnp` parses but maps nothing, and the Windows service ships
+> without the event-log half (under the SCM the process has no standard
+> handles, so a service-run daemon logs to its log file alone).
 > Go's soft-memory-limit tuning has no Rust analog and is not reproduced.
 > PARITY.md lists each with its reasoning.
 

@@ -17,7 +17,7 @@ JSON-RPC/websocket server, the tool commands, the pipe IPC lifecycle,
 and the Windows service wrapper. The deliberate non-ports are small
 and documented in PARITY.md (Go GC tuning, the pprof servers, UPnP,
 the Windows event log, and the wallet-side mixclient). The test suite
-runs 2,661 tests across 451 suites on Linux, most differential against
+runs 2,674 tests across 453 suites on Linux, most differential against
 dcrd itself or replaying sessions generated inside dcrd's own packages.
 
 Since the surface completed, four rounds of work have landed on it. A
@@ -94,7 +94,7 @@ LAN server, each of which validated in full only the blocks after the
 assume-valid block and had dcrd's block at height 1,116,035 (the bench
 ledger, "Where `797a213`'s block thread waits, a deeper read-ahead and a
 rung of four changes").
-Of the commits after `797a213`, thirteen change the node's code beyond
+Of the commits after `797a213`, fourteen change the node's code beyond
 tests and comments: one classifies a block's transactions once for every
 step that reads their types, among them checks that apply the consensus
 rules, and changes no rule; another allocates a block filter's list of
@@ -136,20 +136,22 @@ twelfth has the RPC listener's TLS handshake choose its key exchange,
 P-521 now among them, and its cipher suite as Go's server does and log a
 refused handshake as dcrd does, and changes no verdict; the thirteenth
 logs the mempool's and the template generator's lines below info as dcrd
-does, and changes no verdict. In syncs the first four have been put to
-blocks only in a build made from a worktree that holds the four of them,
-R1 of that section: in four from the LAN server, each of which validated
+does, and changes no verdict; the fourteenth gives `startprofiler` and
+`--profile` dcrd's address checks and refuses an address dcrd would
+serve, the profile servers not being part of this port, and changes no
+verdict. In syncs the first four have been put to blocks only in a build
+made from a worktree that holds the four of them, R1 of that section: in
+four from the LAN server, each of which validated in full only the
+blocks after the assume-valid block and had dcrd's block at height
+1,116,035, and in one from the loopback server that ended with that same
+UTXO set and the same block files. The fifth's depth of sixteen frames
+has been put to blocks only in the diagnostic build of that section,
+`797a213`'s code with the depth read from a variable, and not with the
+other four: in five syncs from the LAN server, each of which validated
 in full only the blocks after the assume-valid block and had dcrd's
-block at height 1,116,035, and in one from the loopback server that
-ended with that same UTXO set and the same block files. The fifth's
-depth of sixteen frames has been put to blocks only in the diagnostic
-build of that section, `797a213`'s code with the depth read from a
-variable, and not with the other four: in five syncs from the LAN
-server, each of which validated in full only the blocks after the
-assume-valid block and had dcrd's block at height 1,116,035. Two of
-those five ran with `DCROXIDE_PREVERIFY=10`, which on that node is the
-sixth's default; no build of the sixth to the thirteenth has been
-synced.
+block at height 1,116,035. Two of those five ran with
+`DCROXIDE_PREVERIFY=10`, which on that node is the sixth's default; no
+build of the sixth to the fourteenth has been synced.
 That the rules reject what dcrd's reject, but for the valid block the
 ninth accepts after such a copy, rests on the test batteries
 described below, not on a sync, and none of it says the node is safe to
@@ -524,6 +526,11 @@ work). Currently implemented:
   dcrd's own `internal/blockchain` package and dumps the chains
   `tests/disapproval_vectors.rs` replays (Go sources overlaid on a dcrd
   checkout by `run.sh`)
+- `tools/profilergen` — the generator of `profiler_vectors.txt`, run as
+  a test inside a dcrd checkout's package main through
+  `go test -overlay`, so every row is what dcrd's own
+  `profileServer.Start` returned, writing nothing into the checkout
+  (Go + sh)
 
 ## Performance
 
@@ -658,6 +665,8 @@ under dcrd, 17.88 GiB of it block files in each
   reorganization vector generator (Go, overlay sources)
 - `tools/disapprovalgen/` — the disapproval scenario vector generator
   (Go, overlay sources)
+- `tools/profilergen/` — the profile server vector generator, an overlay
+  test for dcrd's package main (Go + sh)
 - `fuzz/` — `cargo-fuzz` targets (nightly toolchain)
 - `docs/adr/` — architecture decision records
 

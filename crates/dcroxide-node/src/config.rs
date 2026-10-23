@@ -320,7 +320,7 @@ pub(crate) fn parse_ip_go(host: &str) -> Option<Vec<u8>> {
 /// IPv4 and 16 for IPv6, with IPv4-mapped forms kept as 16 bytes.
 /// An IPv6 zone follows the first `%`, must be non-empty, and is
 /// dropped the way `netip.PrefixFrom` strips it.
-fn parse_addr_netip(s: &str) -> Option<Vec<u8>> {
+pub(crate) fn parse_addr_netip(s: &str) -> Option<Vec<u8>> {
     if let Some((addr, zone)) = s.split_once('%') {
         // Zones are only valid on IPv6 addresses.
         if zone.is_empty() {

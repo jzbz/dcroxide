@@ -16,8 +16,9 @@
 //!   netsync, mempool, mixing pool and chain notification seams;
 //! - the RPC server's HTTP and websocket serving (`rpcrun`,
 //!   `websocket`, `wsframe`) and its TLS handshake as Go's server
-//!   negotiates it (`rpctls`), the CPU miner and block template glue,
-//!   and the optional indexes;
+//!   negotiates it (`rpctls`), the profile server manager's address
+//!   checks (`profiler`), the CPU miner and block template glue, and
+//!   the optional indexes;
 //! - process plumbing: the pipe IPC protocol and runtime (`ipc`,
 //!   `pipeserve`), process limits (`limits`), the median-adjusted
 //!   network time (`mediantime`), and the `addblock` tool's core.
@@ -55,6 +56,7 @@ pub mod peerconn;
 pub mod peerloop;
 pub mod pipeserve;
 pub mod preverify;
+pub mod profiler;
 pub mod progresslog;
 pub mod readahead;
 pub mod rebroadcast;
