@@ -157,11 +157,25 @@ evaluating this code.
   key-exchange preferences in place (`newTLSConfig`,
   `server.go:3685-3688`), which since Go 1.24 put hybrid X25519MLKEM768
   first, so it negotiates that with Go clients such as dcrctl and
-  dcrwallet. This daemon negotiates plain X25519, because its rustls
-  `ring` provider has no ML-KEM. RPC sessions recorded on a non-local
-  `--rpclisten` are therefore exposed to harvest-now-decrypt-later
-  attacks that dcrd's resist, including the Basic credentials sent with
-  every request. See PARITY.md's open gaps.
+  dcrwallet. This daemon picks among X25519, P-256, P-384 and P-521 as
+  Go's server does, but negotiates plain X25519 with those clients,
+  because its rustls `ring` provider has no ML-KEM. RPC sessions recorded
+  on a non-local `--rpclisten` are therefore exposed to
+  harvest-now-decrypt-later attacks that dcrd's resist, including the
+  Basic credentials sent with every request. The P-521 key exchange,
+  which Decrediton requires, runs on the `p521` crate's arithmetic rather
+  than ring's, and that crate's curve arithmetic has never been
+  independently audited (docs/dependency-ledger.md). See PARITY.md's open
+  gaps.
+- **Any host that can reach the RPC port can drive the TLS handshake
+  error line.** `http: TLS handshake error from <addr>: <err>` is logged
+  at error level for every refused handshake, as dcrd's net/http logs it,
+  so a client that connects and closes, or speaks anything but TLS,
+  drives it at its connection rate. It is not rate-limited, for the
+  reason the authentication-failure warning is not: a filter counting
+  these lines is counting attempts. Nothing bounds it beyond the rate at
+  which connections can be opened. Bind the RPC listeners to trusted
+  interfaces, or rotate logs, if that volume matters.
 - **Descriptor use is several times dcrd's.** The daemon spends several
   descriptors per peer and RPC connection where dcrd spends one, and
   keeps a read handle open for every block file it has touched where

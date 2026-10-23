@@ -15,7 +15,8 @@
 //!   the outbound connection driver, seeding, SOCKS dialing, and the
 //!   netsync, mempool, mixing pool and chain notification seams;
 //! - the RPC server's HTTP and websocket serving (`rpcrun`,
-//!   `websocket`, `wsframe`), the CPU miner and block template glue,
+//!   `websocket`, `wsframe`) and its TLS handshake as Go's server
+//!   negotiates it (`rpctls`), the CPU miner and block template glue,
 //!   and the optional indexes;
 //! - process plumbing: the pipe IPC protocol and runtime (`ipc`,
 //!   `pipeserve`), process limits (`limits`), the median-adjusted
@@ -58,6 +59,7 @@ pub mod progresslog;
 pub mod readahead;
 pub mod rebroadcast;
 pub mod rpcrun;
+mod rpctls;
 pub mod runtime;
 pub mod secretfile;
 pub mod seeding;

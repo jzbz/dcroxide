@@ -1040,6 +1040,376 @@ fn serves_tls_with_a_p521_certificate() {
     listener.shutdown();
 }
 
+/// A client's P-521 key exchange, written for these tests over `p521`'s
+/// arithmetic rather than taken from the listener, so the two ends of
+/// the exchange are separate code.
+#[derive(Debug)]
+struct ClientP521;
+
+/// One [`ClientP521`] exchange in progress.
+struct ClientP521Exchange {
+    secret: p521::SecretKey,
+    share: Vec<u8>,
+}
+
+impl rustls::crypto::SupportedKxGroup for ClientP521 {
+    fn start(&self) -> Result<Box<dyn rustls::crypto::ActiveKeyExchange>, rustls::Error> {
+        use p521::elliptic_curve::Generate;
+        use p521::elliptic_curve::sec1::ToSec1Point;
+        let secret = p521::SecretKey::generate();
+        let share = secret.public_key().to_sec1_point(false).as_bytes().to_vec();
+        Ok(Box::new(ClientP521Exchange { secret, share }))
+    }
+
+    fn name(&self) -> rustls::NamedGroup {
+        rustls::NamedGroup::secp521r1
+    }
+}
+
+impl rustls::crypto::ActiveKeyExchange for ClientP521Exchange {
+    fn complete(
+        self: Box<Self>,
+        peer: &[u8],
+    ) -> Result<rustls::crypto::SharedSecret, rustls::Error> {
+        use p521::elliptic_curve::point::AffineCoordinates;
+        let peer = p521::PublicKey::from_sec1_bytes(peer)
+            .map_err(|_| rustls::Error::General("the server's share is off the curve".into()))?;
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "scalar multiplication of a curve point, which cannot overflow"
+        )]
+        let shared = (peer.to_projective() * *self.secret.to_nonzero_scalar()).to_affine();
+        Ok(rustls::crypto::SharedSecret::from(&shared.x()[..]))
+    }
+
+    fn pub_key(&self) -> &[u8] {
+        &self.share
+    }
+
+    fn group(&self) -> rustls::NamedGroup {
+        rustls::NamedGroup::secp521r1
+    }
+}
+
+/// A key exchange the listener does not implement (x448), which a client
+/// can list ahead of the ones it shares with the server; it is never
+/// completed.
+#[derive(Debug)]
+struct ClientX448;
+
+/// A [`ClientX448`] share: 56 bytes the server never reads.
+struct ClientX448Exchange([u8; 56]);
+
+impl rustls::crypto::SupportedKxGroup for ClientX448 {
+    fn start(&self) -> Result<Box<dyn rustls::crypto::ActiveKeyExchange>, rustls::Error> {
+        Ok(Box::new(ClientX448Exchange([9; 56])))
+    }
+
+    fn name(&self) -> rustls::NamedGroup {
+        rustls::NamedGroup::X448
+    }
+}
+
+impl rustls::crypto::ActiveKeyExchange for ClientX448Exchange {
+    fn complete(
+        self: Box<Self>,
+        _peer: &[u8],
+    ) -> Result<rustls::crypto::SharedSecret, rustls::Error> {
+        Err(rustls::Error::General("x448 is never negotiated".into()))
+    }
+
+    fn pub_key(&self) -> &[u8] {
+        &self.0
+    }
+
+    fn group(&self) -> rustls::NamedGroup {
+        rustls::NamedGroup::X448
+    }
+}
+
+/// What a TLS client got from the listener: the response to
+/// `getblockcount`, and the suite, key exchange and handshake kind the
+/// session settled on.
+struct TlsOutcome {
+    response: String,
+    suite: rustls::CipherSuite,
+    group: rustls::NamedGroup,
+    kind: rustls::HandshakeKind,
+}
+
+/// POST `getblockcount` over TLS `version`, offering exactly the
+/// suites and key exchanges of `provider`, in its order.
+fn tls_getblockcount(
+    port: u16,
+    provider: rustls::crypto::CryptoProvider,
+    version: &'static rustls::SupportedProtocolVersion,
+) -> Result<TlsOutcome, std::io::Error> {
+    let config = rustls::ClientConfig::builder_with_provider(Arc::new(provider))
+        .with_protocol_versions(&[version])
+        .expect("versions")
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(AnyServerCert))
+        .with_no_client_auth();
+    let session = rustls::ClientConnection::new(
+        Arc::new(config),
+        rustls::pki_types::ServerName::try_from("localhost").expect("name"),
+    )
+    .expect("client");
+    let tcp = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+    tcp.set_read_timeout(Some(std::time::Duration::from_secs(10)))
+        .expect("timeout");
+    let mut stream = rustls::StreamOwned::new(session, tcp);
+    let body = r#"{"jsonrpc":"1.0","method":"getblockcount","params":[],"id":1}"#;
+    let request = format!(
+        "POST / HTTP/1.1\r\nHost: localhost\r\nAuthorization: Basic {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        dcroxide_rpc::http::base64_std_encode(b"user:pass"),
+        body.len()
+    );
+    stream.write_all(request.as_bytes())?;
+    let mut response = String::new();
+    stream.read_to_string(&mut response)?;
+    Ok(TlsOutcome {
+        response,
+        suite: stream
+            .conn
+            .negotiated_cipher_suite()
+            .expect("a suite")
+            .suite(),
+        group: stream
+            .conn
+            .negotiated_key_exchange_group()
+            .expect("a key exchange")
+            .name(),
+        kind: stream.conn.handshake_kind().expect("a handshake"),
+    })
+}
+
+/// ring's provider cut to `suites` and `groups`, in the order given.
+fn client_provider(
+    suites: &[rustls::SupportedCipherSuite],
+    groups: &[&'static dyn rustls::crypto::SupportedKxGroup],
+) -> rustls::crypto::CryptoProvider {
+    let mut provider = rustls::crypto::ring::default_provider();
+    provider.cipher_suites = suites.to_vec();
+    provider.kx_groups = groups.to_vec();
+    provider
+}
+
+/// dcrd's Go server offers the P-521 key exchange by default, and
+/// Decrediton pins it (`ecdhCurve: "secp521r1"`), so a client offering
+/// nothing else must be served, over TLS 1.3 and TLS 1.2 alike, as it is
+/// by dcrd.  rustls's ring provider has no P-521 key exchange; the
+/// listener adds one.  A client offering only X25519 is still served
+/// with it.
+#[test]
+fn serves_a_client_offering_only_the_p521_key_exchange() {
+    let (_dir, listener, port, _cert_pem, _key_pem) = serve_tls(dcroxide_certgen::Curve::P256);
+    let suites = rustls::crypto::ring::DEFAULT_CIPHER_SUITES;
+    for version in [&rustls::version::TLS13, &rustls::version::TLS12] {
+        let outcome = tls_getblockcount(port, client_provider(suites, &[&ClientP521]), version)
+            .unwrap_or_else(|e| panic!("{version:?}: a P-521-only client is refused: {e}"));
+        assert!(
+            outcome.response.starts_with("HTTP/1.1 200 OK"),
+            "{version:?}: {}",
+            outcome.response
+        );
+        assert!(
+            outcome.response.contains("\"result\":0"),
+            "{}",
+            outcome.response
+        );
+        assert_eq!(outcome.group, rustls::NamedGroup::secp521r1, "{version:?}");
+        assert_eq!(outcome.kind, rustls::HandshakeKind::Full, "{version:?}");
+
+        let x25519 = [rustls::crypto::ring::kx_group::X25519];
+        let outcome = tls_getblockcount(port, client_provider(suites, &x25519), version)
+            .unwrap_or_else(|e| panic!("{version:?}: an X25519-only client is refused: {e}"));
+        assert!(
+            outcome.response.starts_with("HTTP/1.1 200 OK"),
+            "{}",
+            outcome.response
+        );
+        assert_eq!(outcome.group, rustls::NamedGroup::X25519, "{version:?}");
+    }
+    listener.shutdown();
+}
+
+/// Go picks a TLS 1.3 key exchange in its own order among the groups the
+/// client supports, preferring one the client sent a share for, and asks
+/// for a share with a HelloRetryRequest when there is none
+/// (`crypto/tls/handshake_server_tls13.go:201-246`).  A client that lists
+/// a group the server lacks first, with its only share, and then P-256
+/// and X25519, gets X25519 after a retry, as from dcrd; rustls on its own
+/// would have retried for P-256, the client's first group it supports.
+#[test]
+fn negotiates_the_key_exchange_in_gos_order() {
+    use rustls::crypto::ring::kx_group;
+    let (_dir, listener, port, _cert_pem, _key_pem) = serve_tls(dcroxide_certgen::Curve::P256);
+    let suites = rustls::crypto::ring::DEFAULT_CIPHER_SUITES;
+    let outcome = tls_getblockcount(
+        port,
+        client_provider(
+            suites,
+            &[&ClientX448, kx_group::SECP256R1, kx_group::X25519],
+        ),
+        &rustls::version::TLS13,
+    )
+    .expect("served");
+    assert!(
+        outcome.response.starts_with("HTTP/1.1 200 OK"),
+        "{}",
+        outcome.response
+    );
+    assert_eq!(outcome.group, rustls::NamedGroup::X25519);
+    assert_eq!(
+        outcome.kind,
+        rustls::HandshakeKind::FullWithHelloRetryRequest
+    );
+
+    // With a share for a group Go would take, Go takes it whatever the
+    // order: P-521 here, though X25519 comes first in Go's list.
+    let outcome = tls_getblockcount(
+        port,
+        client_provider(suites, &[&ClientP521, kx_group::X25519]),
+        &rustls::version::TLS13,
+    )
+    .expect("served");
+    assert_eq!(outcome.group, rustls::NamedGroup::secp521r1);
+    assert_eq!(outcome.kind, rustls::HandshakeKind::Full);
+    listener.shutdown();
+}
+
+/// Whether Go would take this machine to have AES-GCM hardware
+/// (`hasAESGCMHardwareSupport`, `crypto/tls/cipher_suites.go:361-369`),
+/// for the one case below whose answer depends on it.
+fn go_aes_gcm_hardware() -> bool {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        std::arch::is_x86_feature_detected!("aes")
+            && std::arch::is_x86_feature_detected!("pclmulqdq")
+            && std::arch::is_x86_feature_detected!("sse4.1")
+            && std::arch::is_x86_feature_detected!("ssse3")
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        std::arch::is_aarch64_feature_detected!("aes")
+            && std::arch::is_aarch64_feature_detected!("pmull")
+    }
+    #[cfg(target_arch = "powerpc64")]
+    {
+        true
+    }
+    #[cfg(not(any(
+        target_arch = "x86",
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        target_arch = "powerpc64"
+    )))]
+    {
+        false
+    }
+}
+
+/// Go picks the cipher suite in its own order, never the client's:
+/// AES-128-GCM, AES-256-GCM, ChaCha20-Poly1305 when the machine has
+/// AES-GCM hardware and the client's first suite is AES-GCM, and
+/// ChaCha20-Poly1305 first otherwise (`crypto/tls/cipher_suites.go:284-336`,
+/// `:385-398`, `defaults.go:98-118`).  OpenSSL lists AES-256-GCM first,
+/// and dcrd answers it with AES-128-GCM where rustls on its own followed
+/// the client.
+#[test]
+fn negotiates_the_cipher_suite_in_gos_order() {
+    use rustls::CipherSuite as Id;
+    use rustls::crypto::ring::cipher_suite::{
+        TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256, TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+        TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256, TLS13_AES_128_GCM_SHA256,
+        TLS13_AES_256_GCM_SHA384, TLS13_CHACHA20_POLY1305_SHA256,
+    };
+    let (_dir, listener, port, _cert_pem, _key_pem) = serve_tls(dcroxide_certgen::Curve::P256);
+    let groups = [rustls::crypto::ring::kx_group::X25519];
+    let (aes_first, chacha_first) = (
+        (
+            Id::TLS13_AES_128_GCM_SHA256,
+            Id::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+        ),
+        (
+            Id::TLS13_CHACHA20_POLY1305_SHA256,
+            Id::TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
+        ),
+    );
+    // The client's first suite is AES-GCM, so the AES order applies where
+    // the hardware is, and the ChaCha20 order where it is not.
+    let hardware_dependent = if go_aes_gcm_hardware() {
+        aes_first
+    } else {
+        chacha_first
+    };
+    for (tls13, tls12, expected) in [
+        // AES-256 first and no ChaCha20: AES-128 in either order.
+        (
+            vec![TLS13_AES_256_GCM_SHA384, TLS13_AES_128_GCM_SHA256],
+            vec![
+                TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+                TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+            ],
+            aes_first,
+        ),
+        // ChaCha20 first: the ChaCha20 order, which takes it.
+        (
+            vec![
+                TLS13_CHACHA20_POLY1305_SHA256,
+                TLS13_AES_256_GCM_SHA384,
+                TLS13_AES_128_GCM_SHA256,
+            ],
+            vec![
+                TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
+                TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+            ],
+            chacha_first,
+        ),
+        // OpenSSL's order.
+        (
+            vec![
+                TLS13_AES_256_GCM_SHA384,
+                TLS13_CHACHA20_POLY1305_SHA256,
+                TLS13_AES_128_GCM_SHA256,
+            ],
+            vec![
+                TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+                TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
+                TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+            ],
+            hardware_dependent,
+        ),
+    ] {
+        let outcome = tls_getblockcount(
+            port,
+            client_provider(&tls13, &groups),
+            &rustls::version::TLS13,
+        )
+        .expect("served over TLS 1.3");
+        assert!(
+            outcome.response.starts_with("HTTP/1.1 200 OK"),
+            "{}",
+            outcome.response
+        );
+        assert_eq!(outcome.suite, expected.0, "TLS 1.3 offering {tls13:?}");
+        let outcome = tls_getblockcount(
+            port,
+            client_provider(&tls12, &groups),
+            &rustls::version::TLS12,
+        )
+        .expect("served over TLS 1.2");
+        assert!(
+            outcome.response.starts_with("HTTP/1.1 200 OK"),
+            "{}",
+            outcome.response
+        );
+        assert_eq!(outcome.suite, expected.1, "TLS 1.2 offering {tls12:?}");
+    }
+    listener.shutdown();
+}
+
 /// A chunked-transfer POST decodes to the same request the
 /// Content-Length path serves (Go's net/http decodes chunked
 /// transparently; the RPC pipeline sees only the body).
@@ -1421,7 +1791,8 @@ fn issue_client_cert(
 }
 
 /// A server configuration over a fresh rpc.cert whose client CA file
-/// holds `clients_pem`.
+/// holds `clients_pem`: the first of the set the listener chooses from,
+/// all of which share the one client verifier.
 fn clientcert_server(clients_pem: &[u8]) -> (tempfile::TempDir, Arc<rustls::ServerConfig>) {
     let dir = tempfile::TempDir::new().expect("tempdir");
     let (cert_pem, key_pem) = dcroxide_node::rpcrun::load_or_generate_cert_pair(
@@ -1431,8 +1802,9 @@ fn clientcert_server(clients_pem: &[u8]) -> (tempfile::TempDir, Arc<rustls::Serv
         dcroxide_certgen::Curve::P256,
     )
     .expect("generate cert pair");
-    let config = dcroxide_node::rpcrun::tls_server_config(&cert_pem, &key_pem, Some(clients_pem))
+    let configs = dcroxide_node::rpcrun::tls_server_config(&cert_pem, &key_pem, Some(clients_pem))
         .expect("clientcert server config");
+    let config = Arc::clone(configs.configs().next().expect("a configuration"));
     (dir, config)
 }
 

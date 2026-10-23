@@ -34,6 +34,10 @@ criticial = "criticial"
 # errors for input cut off inside `true` and `false`.
 tru = "tru"
 fals = "fals"
+# net/http's five-byte prefix of an OPTIONS request, which the RPC
+# listener matches as Go's tlsRecordHeaderLooksLikeHTTP does
+# (net/http/server.go:4277-4283) to answer plaintext HTTP with a 400.
+optio = "optio"
 # A test-case name ported verbatim from dcrd's treasury_test.go:630, so
 # the case can be found on both sides.
 outupt = "outupt"

@@ -36,7 +36,15 @@
 //! `crypto/rand`, not from dcrd's package generator, so routing it
 //! onto the process generator would be the divergence — and it already
 //! returns its error where upstream returns one too, so it cannot
-//! abort. The rest read the kernel once, at startup or in a tool.
+//! abort. `rpctls.rs` reads it once per RPC TLS handshake a client
+//! steers to P-521, for the ephemeral scalar, on the same two grounds:
+//! Go's `crypto/tls` draws that key from its standard-library
+//! `crypto/rand`, and a failed read fails the one handshake. It has a
+//! third: the scalar is the session's whole secret, and the process
+//! generator, which keeps its key for 4 MiB of draws, would let a later
+//! read of the process's memory recover it, where the kernel's
+//! generator erases its key as it goes. The rest read the kernel once,
+//! at startup or in a tool.
 //!
 //! The scope is this crate's own source. Dependencies draw their own
 //! entropy — rustls and ring do so per TLS handshake — and nothing
@@ -171,6 +179,7 @@ fn every_kernel_entropy_read_in_the_daemon_crate_is_accounted_for() {
         ("bin/dcroxide.rs", (1, "one-shot startup: the rand_bytes closure writes the RPC credential file before any listener opens")),
         ("bin/gencerts.rs", (1, "one-shot tool: a standalone binary with no peers; refusing to emit a key beats emitting a weak one")),
         ("rpcrun.rs", (3, "one-shot startup: the self-signed TLS ed25519 seed, EC scalar and certificate serial, generated at boot")),
+        ("rpctls.rs", (1, "per-event but correct, and deliberately not converted: one draw per RPC TLS handshake that negotiates P-521, for the ephemeral ECDHE scalar; Go's crypto/tls draws that key from its standard-library crypto/rand rather than dcrd's package generator, a failure fails only that handshake rather than aborting, and the process generator keeps its ChaCha20 key across draws, so drawing the session's whole secret from it would let a later memory read recover past sessions' keys")),
         ("socks.rs", (1, "per-event but correct, and deliberately not converted: one draw per outbound dial under --torisolation, paced by the node's connect schedule; upstream go-socks draws there from Go's standard-library crypto/rand rather than dcrd's package generator, so moving it onto the process generator would be the divergence, and the surrounding SOCKS exchange is fallible for a dozen other reasons, so the failure is returned rather than aborting")),
     ]
     .into_iter()
@@ -224,9 +233,10 @@ fn every_kernel_entropy_read_in_the_daemon_crate_is_accounted_for() {
 
     // Rebroadcast jitter is the eighth and last: dcrd resets that
     // timer with `rand.Duration(30 * time.Minute)` (`server.go:3345`),
-    // and with it converted no per-event kernel read is left in this
-    // crate.  What remains below is startup and tool draws, plus
-    // `socks.rs`, which returns its error rather than aborting.
+    // and with it converted no per-event kernel read that can abort is
+    // left in this crate.  What remains below is startup and tool
+    // draws, plus `socks.rs` and `rpctls.rs`, which return their errors
+    // rather than aborting.
     assert!(
         !observed.contains_key("rebroadcast.rs"),
         "rebroadcast.rs must not read kernel entropy: the jitter draw \
@@ -320,7 +330,7 @@ fn every_kernel_entropy_read_in_the_daemon_crate_is_accounted_for() {
     );
     assert_eq!(
         (expected.len(), per_event, one_shot),
-        (4, 1, 3),
+        (5, 2, 3),
         "PARITY.md's crypto/rand row quotes these three numbers, all \
          counted by FILE ENTRY rather than by call site: total files, \
          files with a draw an event paces, files that draw only once \

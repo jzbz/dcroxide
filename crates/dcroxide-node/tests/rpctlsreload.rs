@@ -5,9 +5,9 @@
 //!
 //! dcrd hangs `configFileClient` off `tls.Config.GetConfigForClient`, so
 //! the check runs on an arriving connection rather than on a timer. The
-//! port has the same hook because it builds a `rustls::ServerConnection`
-//! per accepted connection, and `config_for_client` stands where dcrd's
-//! callback does.
+//! port has the same hook: its handshake reads the ClientHello before it
+//! chooses a configuration, and `config_for_client` stands there, where
+//! Go calls dcrd's callback.
 //!
 //! Every rotation below changes the SIZE of both files, by generating a
 //! genuinely different pair and then padding each with trailing
@@ -201,15 +201,23 @@ fn a_deleted_certificate_preserves_the_config_and_recovers() {
 ///
 /// `can_cache` is the switch rustls itself consults before offering a
 /// session id at all (`server/tls12.rs:177-178`), so asserting on it
-/// asserts on the thing that decides the behaviour.
+/// asserts on the thing that decides the behaviour.  It holds for every
+/// configuration in the set, whichever one a ClientHello is served by.
 #[test]
 fn stateful_resumption_is_disabled() {
     let (_dir, reloadable) = reloader(Duration::ZERO);
-    let config = reloadable.config_for_client();
-    assert!(
-        !config.session_storage.can_cache(),
-        "a session cache would resume clients dcrd would make handshake again"
+    let configs = reloadable.config_for_client();
+    assert_eq!(
+        configs.configs().count(),
+        10,
+        "two suite orders, five key exchange sets"
     );
+    for config in configs.configs() {
+        assert!(
+            !config.session_storage.can_cache(),
+            "a session cache would resume clients dcrd would make handshake again"
+        );
+    }
 }
 
 /// And a reload does not quietly restore it: every rebuilt configuration
@@ -228,10 +236,12 @@ fn a_reload_does_not_restore_stateful_resumption() {
         !Arc::ptr_eq(&before, &after),
         "the rotation must actually have reloaded, or this proves nothing"
     );
-    assert!(
-        !after.session_storage.can_cache(),
-        "the rebuilt configuration must not resume statefully either"
-    );
+    for config in after.configs() {
+        assert!(
+            !config.session_storage.can_cache(),
+            "the rebuilt configuration must not resume statefully either"
+        );
+    }
 }
 
 /// dcrd accepts `--tlscurve=P-521` and serves TLS with the resulting

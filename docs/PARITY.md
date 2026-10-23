@@ -837,7 +837,7 @@ Status legend:
 |---|---|---|---|
 | `crypto/blake256` | `dcroxide-crypto` | vectors + diff | Vendored from dcr-rs `fd32c1a`; KATs regenerated via oracle; live differential test + incremental-hashing fuzz target |
 | `crypto/ripemd160` | `dcroxide-crypto` | vectors | RustCrypto `ripemd` one-shot digest (dcrd's package is itself the old x/crypto impl); standard Bosselaers reference vectors pinned. Consumed by `txscript` OP_RIPEMD160/OP_HASH160 |
-| `crypto/rand` | `dcroxide-crypto` | semantics | `prng.go`'s byte layer is ported as `dcroxide_crypto::rand::Prng` (`maxCipherRead` :20, `nonce.inc` :26-40, `NewPRNG` :55-63 including the zero-value-cipher mix, `PRNG.seed` :67-81, `PRNG.Read` :85-105 including the mid-buffer split loop), behind a non-default `rand` feature so the no_std job keeps building this crate and the six of its other seven crates that reach it on `x86_64-unknown-none`. `uniform.go`'s reductions are ported too — `PRNG.Uint64` (:54-58), `PRNG.Uint64N` (:102-148, Lemire multiply-shift with dcrd's `lo < n` fast path and `-n % n` threshold, and its power-of-two mask branch, which also takes a zero bound) and `PRNG.Shuffle` (:214-230) — as are the package globals: `lockingPRNG` (`prng.go:111-114`), the `init` that seeds it (`:116-122`), and the `default.go` entry points the peer module's draws go through, `Uint64` (:37-42), `Shuffle` (:136-141) and `ShuffleSlice` (:144-148), plus `IntN` (:109-114) for the mining-address pick and `Duration` (:126-131) for the seeder's backdating and the rebroadcast timer. The globals are ported because dcrd's peer module reaches randomness through nothing else — `rand.Uint64()` for the ping and version nonces (`peer/peer.go:1813`, `:2186`) and `rand.ShuffleSlice` for both addr relays (`:842`, `:873`) — with no per-peer generator anywhere in that file. Go runs `init` before `main`; Rust has no equivalent, so the seeding is lazy behind a `OnceLock` and `dcroxide_crypto::rand::init()` is the explicit hook the daemon calls at startup to put dcrd's one fatal kernel read back there. Porting the global is also what makes the `rand` feature link `std`: a `OnceLock<Mutex<Prng>>` has no `core` form. `semantics` rather than `vectors` because dcrd ships no tests for this package at all — `crypto/rand` carries only `bench_test.go`, with no `Test` functions — so there is nothing to port; it is pinned by behavioural tests plus a cross-language known-answer vector for the zero-value cipher dcrd's first seeding mixes through. dcrd reaches one `rand.PRNG` two ways: most packages through the package global — `addrmgr`, `peer` and `internal/rpcserver` among them — and `internal/connmgr` through an instance of its own. So does this port: `dcroxide_addrmgr::SystemRng` and `dcroxide_connmgr::SystemCsprng` are instances, and the peer environment, the websocket session id, the template generator's address pick and extra nonces, the CPU miner's extra-nonce offset, the seeder's address backdating, the RPC ping nonce with the auth HMAC key beside it, the rebroadcast timer's jitter, and the additional data hedging each P-521 RPC handshake signature all draw from the process-wide generator.  The RPC auth HMAC key is drawn as dcrd draws it, by one `rand.Read` of thirty-two bytes (`internal/rpcserver/rpcserver.go:6234-6235`) rather than through the `rand_u64` config seam, so the generator's lock is taken once where it had been taken four times with room for another thread to interleave.  It is not injected, for the same reason dcrd does not inject it: the stored MACs only ever compare against MACs made under the same key in the same process, so nothing observes it.  The ping nonce keeps its seam, because the handler vectors run through it. Not ported, with the reason for each: `maxCipherDuration` (unobservable, and a clock read on every draw); `uniform.go`'s `Uint32N` and the `is32bit` delegation to it (:61-97, :99, :103-104 — Go's own comment says the 32-bit arithmetic exists "to preserve the exact output sequence observed on 64-bit machines" (:69-71), so the 64-bit `Uint64N` ported here yields the same values on every target); `Shuffle`'s `(n, swap)` callback form (Go needs a swap closure because it cannot name a generic slice-element swap; `<[T]>::swap` is that closure, so `Shuffle` and `ShuffleSlice` collapse into one `shuffle_slice`); the `default.go` entry points no consumer reaches — `Reader`, `Read`, `Uint32`, `Uint32N`, `Uint64N` and the remaining `Int*`/`UintN`/`BigInt`/`Float64` wrappers, each two lines over `Prng` when a consumer appears, with `rand.Duration` for the inventory trickle timeout (`peer/peer.go:1629`) the next one due; and `prng_arc4random.go` (a Go-toolchain fallback). The remaining `getrandom` calls are enumerated site by site, each with the reason it is allowed to stay, by `crates/dcroxide-node/tests/entropy_policy.rs`.  Four file entries remain: `socks.rs` reads once per outbound dial under `--torisolation` and three are one-shot (the RPC credential write in `bin/dcroxide.rs`, `bin/gencerts.rs` a tool, `rpcrun.rs` at boot), and `socks.rs` is already correct, returning the error rather than aborting because its surrounding exchange is fallible for a dozen other reasons anyway. What that does and does not close, stated carefully because four attempts to summarise this set as closed were each wrong: every draw in this crate that an event could pace *and that could abort* now comes from a generator seeded once — the process one for the seams dcrd reaches through its package functions, an instance for the address and connection managers, which dcrd also gives their own. One event-paced kernel read remains and is staying: `socks.rs` draws credentials per outbound dial under `--torisolation`, paced by the node's connect schedule, and upstream's go-socks draws there from Go's standard-library `crypto/rand` rather than dcrd's package generator — so converting it would be the divergence, and it already returns its error rather than aborting. The scope throughout is this crate's own source; dependencies draw their own entropy, rustls and ring per TLS handshake among them. Those counts are asserted by `entropy_policy.rs` rather than only stated here, because restating them in prose across four conversions left one or another of them stale every time. What the conversions cost is worth recording too: the peer environment was estimated at a field on `NodePeerEnv` plus a shape change across eight construction sites and four test doubles, and it turned out to be none of them — dcrd's peer module holds no generator, so porting `globalRand` left `NodePeerEnv` zero-sized and nothing else moved. The two an unauthenticated caller could pace are both gone — the peer environment and the websocket session id draw from the process-wide generator, as dcrd's peer and rpcserver packages do, so a handshake nonce, an over-full addr shuffle and a session id cost no kernel read at all. None is the mempool defect any more; that class is closed (see the divergences table below) |
+| `crypto/rand` | `dcroxide-crypto` | semantics | `prng.go`'s byte layer is ported as `dcroxide_crypto::rand::Prng` (`maxCipherRead` :20, `nonce.inc` :26-40, `NewPRNG` :55-63 including the zero-value-cipher mix, `PRNG.seed` :67-81, `PRNG.Read` :85-105 including the mid-buffer split loop), behind a non-default `rand` feature so the no_std job keeps building this crate and the six of its other seven crates that reach it on `x86_64-unknown-none`. `uniform.go`'s reductions are ported too — `PRNG.Uint64` (:54-58), `PRNG.Uint64N` (:102-148, Lemire multiply-shift with dcrd's `lo < n` fast path and `-n % n` threshold, and its power-of-two mask branch, which also takes a zero bound) and `PRNG.Shuffle` (:214-230) — as are the package globals: `lockingPRNG` (`prng.go:111-114`), the `init` that seeds it (`:116-122`), and the `default.go` entry points the peer module's draws go through, `Uint64` (:37-42), `Shuffle` (:136-141) and `ShuffleSlice` (:144-148), plus `IntN` (:109-114) for the mining-address pick and `Duration` (:126-131) for the seeder's backdating and the rebroadcast timer. The globals are ported because dcrd's peer module reaches randomness through nothing else — `rand.Uint64()` for the ping and version nonces (`peer/peer.go:1813`, `:2186`) and `rand.ShuffleSlice` for both addr relays (`:842`, `:873`) — with no per-peer generator anywhere in that file. Go runs `init` before `main`; Rust has no equivalent, so the seeding is lazy behind a `OnceLock` and `dcroxide_crypto::rand::init()` is the explicit hook the daemon calls at startup to put dcrd's one fatal kernel read back there. Porting the global is also what makes the `rand` feature link `std`: a `OnceLock<Mutex<Prng>>` has no `core` form. `semantics` rather than `vectors` because dcrd ships no tests for this package at all — `crypto/rand` carries only `bench_test.go`, with no `Test` functions — so there is nothing to port; it is pinned by behavioural tests plus a cross-language known-answer vector for the zero-value cipher dcrd's first seeding mixes through. dcrd reaches one `rand.PRNG` two ways: most packages through the package global — `addrmgr`, `peer` and `internal/rpcserver` among them — and `internal/connmgr` through an instance of its own. So does this port: `dcroxide_addrmgr::SystemRng` and `dcroxide_connmgr::SystemCsprng` are instances, and the peer environment, the websocket session id, the template generator's address pick and extra nonces, the CPU miner's extra-nonce offset, the seeder's address backdating, the RPC ping nonce with the auth HMAC key beside it, the rebroadcast timer's jitter, and the additional data hedging each P-521 RPC handshake signature all draw from the process-wide generator.  The RPC auth HMAC key is drawn as dcrd draws it, by one `rand.Read` of thirty-two bytes (`internal/rpcserver/rpcserver.go:6234-6235`) rather than through the `rand_u64` config seam, so the generator's lock is taken once where it had been taken four times with room for another thread to interleave.  It is not injected, for the same reason dcrd does not inject it: the stored MACs only ever compare against MACs made under the same key in the same process, so nothing observes it.  The ping nonce keeps its seam, because the handler vectors run through it. Not ported, with the reason for each: `maxCipherDuration` (unobservable, and a clock read on every draw); `uniform.go`'s `Uint32N` and the `is32bit` delegation to it (:61-97, :99, :103-104 — Go's own comment says the 32-bit arithmetic exists "to preserve the exact output sequence observed on 64-bit machines" (:69-71), so the 64-bit `Uint64N` ported here yields the same values on every target); `Shuffle`'s `(n, swap)` callback form (Go needs a swap closure because it cannot name a generic slice-element swap; `<[T]>::swap` is that closure, so `Shuffle` and `ShuffleSlice` collapse into one `shuffle_slice`); the `default.go` entry points no consumer reaches — `Reader`, `Read`, `Uint32`, `Uint32N`, `Uint64N` and the remaining `Int*`/`UintN`/`BigInt`/`Float64` wrappers, each two lines over `Prng` when a consumer appears, with `rand.Duration` for the inventory trickle timeout (`peer/peer.go:1629`) the next one due; and `prng_arc4random.go` (a Go-toolchain fallback). The remaining `getrandom` calls are enumerated site by site, each with the reason it is allowed to stay, by `crates/dcroxide-node/tests/entropy_policy.rs`.  Five file entries remain: `socks.rs` reads once per outbound dial under `--torisolation`, `rpctls.rs` once per RPC TLS handshake a client steers to P-521, and three are one-shot (the RPC credential write in `bin/dcroxide.rs`, `bin/gencerts.rs` a tool, `rpcrun.rs` at boot), and the two event-paced ones are already correct, returning the error rather than aborting: `socks.rs` because its surrounding exchange is fallible for a dozen other reasons anyway, `rpctls.rs` because a failed draw fails only the handshake it was for. What that does and does not close, stated carefully because four attempts to summarise this set as closed were each wrong: every draw in this crate that an event could pace *and that could abort* now comes from a generator seeded once — the process one for the seams dcrd reaches through its package functions, an instance for the address and connection managers, which dcrd also gives their own. Two event-paced kernel reads remain and are staying. `socks.rs` draws credentials per outbound dial under `--torisolation`, paced by the node's connect schedule, and upstream's go-socks draws there from Go's standard-library `crypto/rand` rather than dcrd's package generator — so converting it would be the divergence, and it already returns its error rather than aborting. `rpctls.rs` draws the ephemeral scalar of each P-521 key exchange, paced by whoever connects to the RPC port, for the same two reasons — Go's `crypto/tls` draws that key from its standard-library `crypto/rand`, and a failed read fails the one handshake — and a third: the scalar is the session's whole secret, and the process generator keeps its ChaCha20 key for up to 4 MiB of draws, so a later read of the process's memory would recover every scalar drawn since it was last keyed, where the kernel's generator erases its key as it goes. The P-521 handshake signature (`rpcrun::P521SigningKey`) stays on the process generator, since RFC 6979 hedges its draw. The scope throughout is this crate's own source; dependencies draw their own entropy, rustls and ring per TLS handshake among them. Those counts are asserted by `entropy_policy.rs` rather than only stated here, because restating them in prose across four conversions left one or another of them stale every time. What the conversions cost is worth recording too: the peer environment was estimated at a field on `NodePeerEnv` plus a shape change across eight construction sites and four test doubles, and it turned out to be none of them — dcrd's peer module holds no generator, so porting `globalRand` left `NodePeerEnv` zero-sized and nothing else moved. The two an unauthenticated caller could pace are both gone — the peer environment and the websocket session id draw from the process-wide generator, as dcrd's peer and rpcserver packages do, so a handshake nonce, an over-full addr shuffle and a session id cost no kernel read at all. None is the mempool defect any more; that class is closed (see the divergences table below) |
 | `chaincfg/chainhash` | `dcroxide-chainhash` | vectors + diff | `hash_test.go` vectors ported (incl. short-string zero-pad quirk); parse/display differential + fuzz target. Not ported: Go-specific plumbing (`SetBytes` pointer API, marshalers) |
 | `dcrec/secp256k1` + `ecdsa` (type 0) | `dcroxide-dcrec` | vectors + diff | dcrd's exact DER + pubkey acceptance (all 25 error kinds, incl. hybrid keys) over libsecp256k1 per ADR-0006; TestSignatureParsing/TestParsePubKey/TestSignatureSerialize ported; differential: parse verdict, kind, values and error text. Pubkey errors print dcrd's `Error()` descriptions with their length, format byte, oddness and coordinates; stdaddr's `failed to parse public key: %v` returns them to RPC clients. RFC6979 sign byte-equality covers hashes >= N too. libsecp256k1 reduces the hash before deriving its nonce and dcrd's `NonceRFC6979` does not, so those hashes are signed on k256 through a port of dcrd's `signRFC6979`. Verify verdicts include high-S. `ecdsa::Error` still displays kind names: no daemon surface prints a DER parse error, because the engine pushes false and verifymessage discards it; 2 fuzz targets. Since ported for the netsync/RPC phases: compact-sig recovery (`RecoverCompact`, behind the `recovery` feature, driving the `verifymessage` handler).  Not ported: `SignCompact` (only wallets sign compact messages); `PrivKeyFromBytes` mod-N reduction (the port rejects out-of-range keys instead — not an observable surface) |
 | `dcrec/secp256k1/schnorr` (type 2) | `dcroxide-dcrec` | vectors + diff | EC-Schnorr-DCRv0 on k256 per ADR-0006; dcrd's `NonceRFC6979` ported exactly (raw-key HMAC variant, extra-data/version/iteration semantics) and pinned by dcrd's own nonce vectors; TestSchnorrSignAndVerify (RFC6979 and explicit-nonce rows) and TestVerifyErrors ported. Differential: sign byte-equality; verify verdicts, including the rejection paths signing never reaches (R at infinity via s = -e*d, zero s, a committed odd R, arbitrary parsed bytes); parse verdict and kind; pubkey parse error text. Verification's R = s*G + e*Q runs as one variable-time GLV/wNAF pass (`mul_by_generator_and_mul_add_vartime`). Every input is public, as with dcrd's `NonConst` operations, and the key is handed to k256 uncompressed. Signing keeps the constant-time `GENERATOR * k`. `schnorr::Error` displays kind names. Its one observable surface, TSPEND's `ParseSignature: %w`, is formatted with dcrd's text in validate.rs; fuzz target. Unreachable-by-construction kinds (`ErrPrivateKeyIsZero`, `ErrPubKeyNotOnCurve`) not represented |
@@ -1925,8 +1925,8 @@ against upstream and the port is faithful.
   changed. The port now has the same subsystem: `ReloadableTlsConfig` in
   `node/src/rpcrun.rs` mirrors `reloadableTLSConfig`, `WatchedFile` mirrors
   `watchedFile`, and `config_for_client` stands exactly where dcrd's callback
-  does, because the port already built a `rustls::ServerConnection` per
-  accepted connection. A rotated certificate is served without a restart, and
+  does, once the ClientHello is in (see the timing paragraph below). A
+  rotated certificate is served without a restart, and
   under `--authtype=clientcert` a removed issuer stops being trusted on the
   first connection after the interval elapses -- which matters because editing
   that bundle is the whole revocation mechanism, neither implementation
@@ -1964,18 +1964,129 @@ against upstream and the port is faithful.
   config's automatically rotated keys when the reloaded one sets none
   (`common.go:1095-1124`). That reasoning was sound and is now moot.
 
-  One bounded difference remains. dcrd's callback runs after the ClientHello,
-  so only a peer that actually speaks TLS advances the five-second clock,
-  while the port chooses the configuration as the connection is accepted and
-  so lets a bare TCP connection consume a check. Under port-scanner noise a
-  rotation can therefore be served up to one interval later than dcrd would
-  serve it -- never more, since the interval bounds both. Closing it means
-  driving the accept path through `rustls::Acceptor` to reach the real
-  ClientHello, which is materially more machinery on the hot path than the
-  bound justifies.
+  The check runs when dcrd's does. Go calls the callback once it has read
+  and parsed the ClientHello (`readClientHello`,
+  `crypto/tls/handshake_server.go:166-176`), so only a peer that actually
+  speaks TLS advances the five-second clock. The port used to choose the
+  configuration as the connection was accepted, so a bare TCP connection
+  consumed a check and, under port-scanner noise, a rotation could be served
+  up to one interval late. The listener now reads the ClientHello through
+  `rustls::server::Acceptor` before it chooses a configuration -- it has to,
+  to pick the cipher suite and key exchange as Go does (next entry) -- and
+  asks `config_for_client` at that point. The one sliver left is a
+  ClientHello that rustls refuses before handing it over, for want of null
+  compression or for a server name rustls finds malformed and Go's parser
+  does not: Go would already have run the callback for it, the port does
+  not. What is cached is now a set of configurations built from the same
+  files, which reload together.
 
   Upstream since `488b8163` (2023-07-10), first carried by a dcrd release in
   2.0.0.
+- **The RPC listener's TLS handshake chooses its key exchange and cipher
+  suite, and reports a refusal, as Go's server does.** dcrd's RPC
+  `tls.Config` sets the certificate, `MinVersion` and the client CAs and
+  nothing else (`newTLSConfig`, `server.go:3685-3699`), so every
+  negotiation choice is Go's default, and dcrd 2.1.7's release binaries are
+  built with Go 1.27. The listener was rustls over the `ring` provider, and
+  side by side with the 2.1.7 binary on loopback it differed three ways. It
+  had no P-521 key exchange, so a client offering only secp521r1 -- curl
+  with `--curves secp521r1`, `openssl s_client -groups P-521` -- got a
+  `handshake_failure` alert where dcrd completed the handshake, and
+  Decrediton 2.1.7 offers nothing else: it pins `ecdhCurve: "secp521r1"`
+  on its requests to a remote daemon. It took the cipher suite in the
+  client's order, so OpenSSL's default offer got TLS_AES_256_GCM_SHA384
+  where dcrd answers TLS_AES_128_GCM_SHA256. And it logged nothing for a
+  refused handshake, where dcrd logs each one.
+
+  *The key exchanges.* `rpctls::P521_KX_GROUP`
+  (`crates/dcroxide-node/src/rpctls.rs`) adds ECDHE over P-521 as a rustls
+  `SupportedKxGroup` on the `p521` crate's arithmetic, which the P-521
+  handshake signer already brings into the build, with no feature added. The
+  ephemeral scalar is drawn as Go's `GenerateKey` draws one, 66 bytes masked
+  to 521 bits and tried until they fall in `[1, n)`, from the kernel (see the
+  `crypto/rand` row for why not the process generator). The peer's share is
+  accepted only as an uncompressed point on the curve, as RFC 8446 and Go's
+  `NewPublicKey` require, and the shared secret is the whole 66-byte
+  x-coordinate. It reproduces the NIST CAVS 14.1 ECC CDH vector that Go's
+  `crypto/ecdh` tests carry. The four groups are offered in Go 1.27's order,
+  X25519, P-256, P-384, P-521 (`curvePreferenceOrder`,
+  `crypto/tls/defaults.go:38-43`), less the hybrid post-quantum groups ahead
+  of them (open entry below).
+
+  *The choices.* Go picks a TLS 1.3 group in its own order among those
+  the client supports, after moving the ones the client sent a key share
+  for to the front, and asks for a share with a HelloRetryRequest when the
+  winner has none (`crypto/tls/handshake_server_tls13.go:201-246`); in TLS
+  1.2 it takes the client's first supported curve (`key_agreement.go:158-163`).
+  It picks the suite in its own order, never the client's: AES-128-GCM,
+  AES-256-GCM, ChaCha20-Poly1305 when the machine has AES-GCM hardware and
+  the first suite in the client's list that Go knows is an AES-GCM one, and
+  ChaCha20-Poly1305 first otherwise (`isAESGCMPreferred`,
+  `cipher_suites.go:385-398`; the lists at `defaults.go:98-118` and
+  `cipher_suites.go:284-336`). rustls picks the group in the client's order
+  and retries for the client's first supported group (`server/hs.rs`
+  `choose_suite_and_kx_group`, `server/tls13.rs:219-246`), and it offers no
+  hook for either choice. So the listener reads each ClientHello through
+  `rustls::server::Acceptor` and then serves it with one of ten
+  configurations built from the same certificate, key and client verifier
+  (`RpcTlsConfigs`): the two suite orders, each with `ignore_client_order`
+  set, times one configuration per key exchange plus one offering all four,
+  for TLS 1.2 and for a ClientHello with no group in common. A
+  configuration offering only Go's group leaves rustls Go's choice,
+  retry included. The key shares and offered versions, which rustls's
+  `ClientHello` does not expose, are read from the raw records. The
+  hardware test is Go's (`hasAESGCMHardwareSupport`,
+  `cipher_suites.go:361-369`): AES, PCLMULQDQ, SSE4.1 and SSSE3 on x86, AES
+  and PMULL on arm64, always on ppc64. Go's s390x test reads CPACF function
+  codes that Rust's feature detection does not name, so an s390x build of
+  the port takes the ChaCha20-first order where dcrd might not. On
+  hardware with AES-GCM, OpenSSL's default offer now gets
+  TLS_AES_128_GCM_SHA256 over TLS 1.3 and
+  TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256 over TLS 1.2; a client listing
+  ChaCha20-Poly1305 first gets it, as from dcrd. Pinned by
+  `serves_a_client_offering_only_the_p521_key_exchange`,
+  `negotiates_the_key_exchange_in_gos_order` and
+  `negotiates_the_cipher_suite_in_gos_order`
+  (`crates/dcroxide-node/tests/rpclisten.rs`), and by the unit tests in
+  `crates/dcroxide-node/src/rpctls.rs`; not yet re-run side by side with
+  the dcrd binary.
+
+  *The refusals.* The handshake now runs to completion before the request
+  head is read, as `conn.serve` runs it (`net/http/server.go:1962-1987`),
+  under the same watchdog deadline as before. A refused handshake is logged
+  as dcrd logs it, `[ERR] RPCS: http: TLS handshake error from <addr>:
+  <err>`: net/http writes the line to the server's `ErrorLog` (`:1985`),
+  which dcrd forwards at error level through the RPCS logger
+  (`logForwarder`, `internal/rpcserver/rpcserver.go:5881-5888`, installed at
+  `:5934`). `<err>` is Go's text wherever the two stacks refuse for the
+  same reason: `EOF` for a close on a record boundary and `unexpected EOF`
+  inside one (`crypto/tls/conn.go:625-637`); `read tcp4 <local>-><remote>:
+  i/o timeout` at the deadline and `read tcp4 ...: read: connection reset
+  by peer` for a reset; `tls: first record does not look like a TLS
+  handshake`, an SSLv2 hello and an oversized first record, refused on the
+  first record's header, with Go's alert where it sends one (`:641-676`);
+  `client sent an HTTP request to an HTTPS server` for plaintext HTTP,
+  which is also answered with net/http's `HTTP/1.0 400 Bad Request` on the
+  bare connection, where the port used to send no HTTP answer
+  (`net/http/server.go:1976-1981`); `remote error: tls: <alert>` under
+  Go's alert names; and Go's own refusals for no suite or no key exchange
+  in common, naming the suite first in TLS 1.3 as Go, which picks it
+  first, does; versions it does not support; a missing client certificate
+  or one signed by an unknown authority; an invalid key share in TLS 1.3
+  and an invalid ClientKeyExchange in TLS 1.2; and a few more
+  (`go_error_text`). Every refusal is logged, unthrottled, as dcrd logs
+  it, like the authentication-failure warning and unlike the shed lines.
+  Two closes are the port's own and are not logged: a connection the
+  pre-authentication pool evicted, whose eviction has its own rate-limited
+  line and which dcrd, having no such pool, would not have closed at all;
+  and one force-closed at shutdown, which dcrd leaves to the process exit.
+  Pinned over a running node by
+  `refused_tls_handshakes_are_logged_as_dcrd_logs_them`
+  (`crates/dcroxide-node/tests/rpctls_handshake_log.rs`), and the two
+  unlogged closes by
+  `eviction_prefers_a_connection_that_has_not_sent_a_request`
+  (`crates/dcroxide-node/src/rpcrun.rs`). The refusals whose text still
+  differs are an open entry below.
 - **`generate 0` cancels an in-flight discrete mining call.** dcrd keeps a
   `generateCancelFn` while discrete mining is active and invokes it on the
   `n == 0` path (`internal/mining/cpuminer/cpuminer.go:159-163`, `:845-851`),
@@ -2441,24 +2552,47 @@ closing it would cost.
   `dcroxide-node`, a manifest change not yet made (review finding GAP06#4).
   The other cases need leaving ring or webpki.
 
-- **The RPC listener's TLS key exchange is classical X25519 where dcrd's is
-  hybrid X25519MLKEM768.** dcrd's `newTLSConfig` sets only `Certificates` and
-  `MinVersion` (`server.go:3685-3688`), so `CurvePreferences` stays nil and
-  Go's default applies: from Go 1.24 it puts X25519MLKEM768 first
-  (`crypto/tls/defaults.go`, unless `GODEBUG=tlsmlkem=0`), and dcrd's `go.mod`
-  requires Go 1.25. Every Go 1.24+ client offers it too, dcrctl and dcrwallet
-  included, so their sessions with dcrd use hybrid post-quantum key exchange.
-  The rustls ring provider offers only X25519, P-256 and P-384
-  (`crypto/ring/mod.rs:177-181`), and ML-KEM exists only under the aws-lc-rs
-  provider, which the build excludes, so the same clients negotiate X25519
-  with the port, visible to them in `ConnectionState.CurveID`. The protocol
-  version and cipher suite are still dcrd's (TLS 1.3, TLS_AES_128_GCM_SHA256).
-  The cost falls where `--rpclisten` is not local: recorded RPC sessions, the
-  Basic credentials every request carries included, lose the
+- **The RPC listener's TLS key exchange is classical where dcrd's is hybrid
+  post-quantum, and its TLS 1.2 offer lacks Go's CBC suites.** dcrd's
+  `newTLSConfig` sets only `Certificates` and `MinVersion`
+  (`server.go:3685-3688`), so `CurvePreferences` and `CipherSuites` stay nil
+  and Go's defaults apply. Go 1.27, which dcrd 2.1.7's release binaries are
+  built with, has three hybrid key exchanges for TLS 1.3 -- X25519MLKEM768,
+  on by default since Go 1.24, and SecP256r1MLKEM768 and SecP384r1MLKEM1024,
+  on since Go 1.26 under the `tlssecpmlkem` setting
+  (`crypto/tls/defaults.go:23-43`) -- and sorts a hybrid the client supports
+  ahead of every other group, even one the client sent a key share for
+  (`handshake_server_tls13.go:201-246`). Which of them a dcrd binary offers
+  is set by its `debug.go`. 2.1.7's has `//go:debug default=go1.25`, which
+  restores Go 1.25's value of every setting changed since, `tlssecpmlkem=0`
+  among them (`internal/godebugs/table.go`), so 2.1.7 offers X25519MLKEM768
+  alone; at `382ff4dd` and on master it has `default=go1.26`, which leaves
+  all three on. Every Go 1.24+ client offers X25519MLKEM768, dcrctl and
+  dcrwallet included, so their sessions with dcrd use hybrid post-quantum
+  key exchange. The port's listener now chooses among the classical groups
+  as Go does, P-521 included (the accepted entry above), but the rustls
+  ring provider has no ML-KEM (`crypto/ring/mod.rs:177-181`), which exists
+  only under the aws-lc-rs provider the build excludes. So the same clients
+  negotiate X25519 with the port, visible to them in
+  `ConnectionState.CurveID`; a client that lists a hybrid without a share
+  for it gets a HelloRetryRequest for the hybrid from dcrd and the
+  classical choice from the port; and a client offering only hybrids that
+  dcrd offers is refused. The protocol version and cipher suite are still
+  dcrd's (TLS 1.3, TLS_AES_128_GCM_SHA256). The cost falls
+  where `--rpclisten` is not local: recorded RPC sessions, the Basic
+  credentials every request carries included, lose the
   harvest-now-decrypt-later protection dcrd gives them. Closing it needs a new
   dependency: a custom `SupportedKxGroup` built from a pure-Rust ML-KEM-768
   crate plus ring's X25519, or the aws-lc-rs provider (review finding
   GAP06#6).
+
+  Go's TLS 1.2 list also keeps four CBC suites after the AEADs,
+  TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA, TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA and
+  their AES-256 forms (`cipher_suites.go:290-292`; `disabledCipherSuites`,
+  `:339-359`, leaves them on), which rustls does not implement. A TLS 1.2
+  client offering only CBC suites is served by dcrd and refused by the port
+  with `handshake_failure`. No client the Decred tools ship is one: every
+  one offers an AES-GCM suite, which both servers prefer.
 
 - **The seeder TLS clients trust the compiled-in `webpki-roots` only.** dcrd's
   seeder client is a bare `http.Transport{DialContext: dialFn}` with a nil
@@ -2835,6 +2969,32 @@ closing it would cost.
   means a log sink on `dcroxide_stake::stakedb::load_best_node` that the chain
   hands the daemon's STKE sink. The UTXO database lines have nothing to report
   in this layout.
+
+- **Some refused RPC TLS handshakes are logged with rustls's description where
+  dcrd logs Go's.** The line is dcrd's (the accepted entry on the listener's
+  TLS handshake), but its `<err>` is Go's text only where the two stacks
+  refuse for the same reason and `rpctls::go_error_text` knows the
+  correspondence. Elsewhere it is rustls's own description of its error. That
+  covers a handshake message out of order, which Go reports as `tls: received
+  unexpected handshake message of type <Go type> when waiting for <Go type>`;
+  a malformed message, which Go reports as `local error: tls: error decoding
+  message` and the port reports that way only when rustls classifies it as
+  `InvalidMessage`; a TLS 1.2 ClientKeyExchange whose point is empty or runs
+  past the message, which Go answers with `illegal_parameter` and reports as
+  `tls: invalid ClientKeyExchange message`, where rustls sends no alert and
+  the port reports `local error: tls: error decoding message` (with bytes
+  after the point the text is Go's, but rustls's alert is `decode_error`); and
+  a client certificate refused for any reason but an unknown issuer, where Go
+  prints x509's error with its times and names. It also covers the refusals
+  dcrd never makes, because it would have served the client: a TLS 1.2 client
+  without `ecdsa_secp521r1_sha512` against a P-521 key (`unexpected error:
+  incompatible signing key`, see the P-521 entry). A CBC-only or hybrid-only
+  client is refused in Go's words for no suite or no key exchange in common,
+  though dcrd would not refuse it at all. Socket errors take Go's Unix
+  wording, `read: connection reset by peer`; on Windows Go names the call
+  `wsarecv` or `wsasend` and keeps the system message's capital, where the
+  port writes `read` or `write` and lower-cases it. Closing the rest is a
+  longer table in `go_error_text`, case by case.
 
 - **The RPC server does not log a websocket client's arrival or departure.**
   dcrd's `internal/rpcserver` logs through a package logger that the daemon
