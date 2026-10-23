@@ -1302,7 +1302,7 @@ impl DbCache {
         sealed: &mut bool,
     ) -> Result<FlushOutcome, Error> {
         let block_sync = Self::sync_blocks(batch, block_store)?;
-        match Self::open(batch, kv, participant, block_sync)? {
+        match Self::open(batch, Some(kv), participant, block_sync)? {
             Opened::Empty(outcome) => Ok(outcome),
             Opened::Tx(job) => {
                 *sealed = job.sealed();
@@ -1390,10 +1390,15 @@ impl DbCache {
     /// holding such a row fails the flush on the capturing thread, as it
     /// did when the rows were written there.
     ///
+    /// `kv` is the store's redb handle, or `None` once a clean close has
+    /// let go of it.  Only a flush with nothing to write can come after
+    /// that, and it ends empty as any other does; one with rows finds the
+    /// store closed.
+    ///
     /// [`FlushParticipant::seal`]: crate::FlushParticipant::seal
     pub(crate) fn open(
         batch: &FlushBatch,
-        kv: &redb::Database,
+        kv: Option<&redb::Database>,
         participant: Option<&Registration>,
         block_sync: crate::FlushPhase,
     ) -> Result<Opened, Error> {
@@ -1440,6 +1445,7 @@ impl DbCache {
                 ),
             ));
         }
+        let kv = kv.ok_or_else(|| db_error(ErrorKind::DbNotOpen, "database is not open"))?;
         let tx = crate::begin_durable_write(kv)?;
         if let Some(registered) = contributing {
             registered.participant.seal();
@@ -3723,7 +3729,7 @@ mod participant_guard_tests {
         let mut sealed = false;
         let result = DbCache::run_flush(
             &batch,
-            &db.inner.kv,
+            &db.inner.kv_handle().expect("open"),
             &db.inner.block_store,
             Some(&registration),
             &mut sealed,

@@ -2085,7 +2085,7 @@ mod tests {
             .expect("fill");
             db.flush().expect("flush to the store");
             let before = backend.reads();
-            let index = BucketIndex::load(&db.inner.kv).expect("load");
+            let index = BucketIndex::load(&db.inner.kv_handle().expect("open")).expect("load");
             let reads = backend.reads() - before;
             assert_eq!(index.get(METADATA_BUCKET_ID, b"rows"), Some([0, 0, 0, 2]));
             reads

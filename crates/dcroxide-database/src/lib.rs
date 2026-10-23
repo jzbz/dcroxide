@@ -276,7 +276,7 @@ impl DbInner {
         cache.set_limits(opts.cache_max_size, opts.cache_flush_interval_secs);
         cache.set_bucket_index(bucketindex::BucketIndex::load(&kv)?);
         Ok(DbInner {
-            kv,
+            kv: Mutex::new(Some(Arc::new(kv))),
             block_store: Mutex::new(block_store),
             closed: AtomicBool::new(false),
             fatal: AtomicBool::new(false),
@@ -376,6 +376,25 @@ impl DbInner {
             .take()
             .map(|r| r.participant)
     }
+
+    /// A clone of the metadata store's redb handle, or `None` once a clean
+    /// close has let go of it ([`DbInner::kv`]).
+    fn kv_handle(&self) -> Option<Arc<redb::Database>> {
+        self.kv.lock().expect("kv slot poisoned").clone()
+    }
+
+    /// [`Self::kv_handle`], refused as dcrd refuses a closed database.
+    fn kv_or_closed(&self) -> Result<Arc<redb::Database>, Error> {
+        self.kv_handle()
+            .ok_or_else(|| db_error(ErrorKind::DbNotOpen, "database is not open"))
+    }
+
+    /// Empty the redb handle's slot, returning what it held, for the
+    /// caller to drop once the slot's lock is released: the drop that
+    /// lets go of the last clone runs redb's close.
+    fn take_kv(&self) -> Option<Arc<redb::Database>> {
+        self.kv.lock().expect("kv slot poisoned").take()
+    }
 }
 
 impl Drop for WriterGuard<'_> {
@@ -415,7 +434,27 @@ pub(crate) fn release_hook() {
 }
 
 pub(crate) struct DbInner {
-    kv: redb::Database,
+    /// The metadata store's redb handle, until a clean close lets go of
+    /// it ([`Database::close`]); `None` from then on.
+    ///
+    /// redb clears the recovery flag that its writable open set in the
+    /// file's header only in the close its handle's drop runs
+    /// (redb-4.3.0 `page_manager.rs:1458-1469`, `db.rs:1963-2028`,
+    /// `page_manager.rs:2466-2486`), and until then the file reads as one
+    /// whose writer did not stop: every open recovers it, and a read-only
+    /// open is refused.  So the handle has to be dropped for a clean close
+    /// to leave a clean file, and the drop of the last [`Database`] clone
+    /// cannot be relied on to do it: the daemon's chain holds a clone in a
+    /// reference cycle that lives to the end of the process.  Each
+    /// transaction holds a clone of the handle from its begin to its end,
+    /// so redb closes once the close and the last of them have let go, on
+    /// whichever thread lets go last.  A flush holds one while it opens
+    /// its write transaction; the close lets go only once no flush is in
+    /// flight, and redb would leave its close to the end of a write
+    /// transaction still open in any case (redb-4.3.0 `db.rs:2012-2028`).
+    /// Asked for once it is `None`, it answers [`ErrorKind::DbNotOpen`].
+    /// The lock is a leaf: nothing else is locked while it is held.
+    kv: Mutex<Option<Arc<redb::Database>>>,
     pub(crate) block_store: Mutex<BlockStore>,
     closed: AtomicBool,
     /// Set when a durable write has failed. Every later write on this
@@ -1510,12 +1549,19 @@ pub(crate) fn flush_locked(
     // either way: no commit hook runs between the capture and the seal,
     // so what the participant sets apart is exactly what the captured
     // commits handed it.
+    //
+    // The store's redb handle opens the transaction.  A clean close lets
+    // go of it only once its own flush has committed, and no writer
+    // begins behind a close, so a flush that finds it gone has nothing to
+    // write: it is a `Database::flush` that lost the writer to the close
+    // (see the comment there), and it ends empty.
+    let kv = inner.kv_handle();
     let may_hand_off = inner.background && kind != FlushKind::Durable;
     let opened = if may_hand_off {
         let plan = DbCache::plan_block_sync(&inner.block_store);
         DbCache::open(
             &batch,
-            &inner.kv,
+            kv.as_deref(),
             registered.as_ref(),
             crate::FlushPhase::default(),
         )
@@ -1523,7 +1569,7 @@ pub(crate) fn flush_locked(
     } else {
         DbCache::sync_blocks(&batch, &inner.block_store)
             .and_then(|block_sync| {
-                DbCache::open(&batch, &inner.kv, registered.as_ref(), block_sync)
+                DbCache::open(&batch, kv.as_deref(), registered.as_ref(), block_sync)
             })
             .map(|opened| (opened, None))
     };
@@ -1580,7 +1626,7 @@ pub(crate) fn flush_locked(
     // in between.  A snapshot that cannot be had is done without: the
     // commit then fails or lands as it would have.
     let snapshot = (deferred && inner.commit_snapshot)
-        .then(|| inner.kv.begin_read().ok())
+        .then(|| kv.as_ref().and_then(|kv| kv.begin_read().ok()))
         .flatten();
     batch.snapshot = snapshot.is_some();
     let mut flight = Flight {
@@ -2247,13 +2293,16 @@ fn finish(
 /// Every flush commits one-phase with no allocator state, so an open
 /// after anything but redb's own `Database::drop` runs a full repair --
 /// "3 full scans" of the file (redb-4.3.0 `db.rs:1473`) -- because only
-/// that drop records the state.  `Database::close` makes it itself,
-/// so a clean close leaves a store that opens without a repair however
-/// long the handle's clones outlive it (redb's own version of this
-/// commit is `ensure_allocator_state_table_and_trim`, `db.rs:1922-1955`,
-/// run from `close_database`, `db.rs:1963`).  Per-commit quick-repair
-/// would cover unclean stops too, at a second fsync on every flush; that
-/// is unmeasured and not done here.
+/// that drop records the state.  `Database::close` makes it itself
+/// before it lets go of redb's handle, so a failure is reported by the
+/// close, which redb's drop cannot do, and a clean close leaves a store
+/// that opens without a full repair even when a transaction still open
+/// keeps the handle, and with it the recovery flag, past the end of the
+/// process.  redb's own version of this commit is
+/// `ensure_allocator_state_table_and_trim` (`db.rs:1922-1955`), which its
+/// drop runs from `close_database` (`db.rs:1963`) before it clears the
+/// flag.  Per-commit quick-repair would cover unclean stops too, at a
+/// second fsync on every flush; that is unmeasured and not done here.
 fn record_allocator_state(kv: &redb::Database) -> Result<(), Error> {
     let mut tx = begin_durable_write(kv)?;
     tx.set_quick_repair(true);
@@ -2739,10 +2788,11 @@ impl Database {
 }
 
 /// What [`Database::begin_seed`] acquires for a new transaction: the store
-/// snapshot, the overlay snapshot, and the bucket index of the commits
-/// that overlay snapshot holds.
+/// snapshot and the redb handle it was taken from, the overlay snapshot,
+/// and the bucket index of the commits that overlay snapshot holds.
 type TxSeed = (
     KvTxSeed,
+    Arc<redb::Database>,
     Arc<crate::dbcache::CacheMap>,
     Arc<bucketindex::BucketIndex>,
 );
@@ -2919,7 +2969,10 @@ impl Database {
     /// so unlike [`Self::raw_stats`] it does not perturb what it measures.
     pub fn bucket_stats(&self) -> Result<Vec<BucketStats>, Error> {
         self.check_open()?;
-        let tx = self.inner.kv.begin_read().map_err(storage_error)?;
+        // Held to the end, past the read transaction, as a transaction
+        // holds it ([`DbInner::kv`]).
+        let kv = self.inner.kv_or_closed()?;
+        let tx = kv.begin_read().map_err(storage_error)?;
         let table = tx.open_table(METADATA_TABLE).map_err(storage_error)?;
 
         // Bucket id -> name, from the `bidx<parent><name>` index rows.
@@ -3016,7 +3069,8 @@ impl Database {
     /// rather than calling this on every commit.
     pub fn raw_stats(&self) -> Result<RawStats, Error> {
         self.check_open()?;
-        let tx = begin_durable_write(&self.inner.kv)?;
+        let kv = self.inner.kv_or_closed()?;
+        let tx = begin_durable_write(&kv)?;
         let stats = {
             let db_stats = tx.stats().map_err(storage_error)?;
             let table = tx.open_table(METADATA_TABLE).map_err(storage_error)?;
@@ -3156,6 +3210,20 @@ impl Database {
                 return Err(e);
             }
         }
+        // The store's redb handle, which the transaction holds to its end
+        // ([`DbInner::kv`]).  A writer past the `closed` check above
+        // always finds it, since the close lets go of it with the writer
+        // semaphore held; a reader that loses a race with the close is
+        // refused, as a begin after the close is.
+        let handle = match self.inner.kv_or_closed() {
+            Ok(handle) => handle,
+            Err(e) => {
+                if writable {
+                    release(&self.inner);
+                }
+                return Err(e);
+            }
+        };
         // The overlay snapshot and the store snapshot are taken under
         // one hold of the cache lock, because a transaction's view is
         // the overlay shadowing the store: `fetch_raw` answers from
@@ -3205,10 +3273,13 @@ impl Database {
                 hook();
             }
         }
-        let kv = match self.inner.kv.begin_read() {
+        let kv = match handle.begin_read() {
             Ok(t) => t,
             Err(e) => {
                 drop(cache);
+                // Let go of the handle before the writer semaphore, as a
+                // transaction does (`Transaction::close`).
+                drop(handle);
                 if writable {
                     release(&self.inner);
                 }
@@ -3221,7 +3292,7 @@ impl Database {
         } else {
             KvTxSeed::Read(kv)
         };
-        Ok((seed, cache_snap, buckets))
+        Ok((seed, handle, cache_snap, buckets))
     }
 
     /// Hold the writer semaphore for the guard's lifetime, waiting out
@@ -3233,7 +3304,9 @@ impl Database {
     /// (`ffldb/db.go:1969-1971`, `:2010-2012`).  A reader here holds its
     /// own overlay layers and redb snapshot, which a flush neither
     /// changes nor frees, so nothing it sees depends on the wait; a
-    /// long-lived reader just does not hold up a flush or a close.
+    /// long-lived reader just does not hold up a flush or a close.  It
+    /// defers redb's own close instead, which comes once the last open
+    /// transaction has ended ([`DbInner::kv`]).
     fn exclusive_writer(&self) -> WriterGuard<'_> {
         self.inner.acquire_writer();
         WriterGuard { db: &self.inner }
@@ -3250,8 +3323,15 @@ impl Database {
         if writable {
             self.inner.check_writable()?;
         }
-        let (seed, cache_snap, buckets) = self.begin_seed(writable)?;
-        Transaction::new(Arc::clone(&self.inner), seed, cache_snap, buckets, false)
+        let (seed, handle, cache_snap, buckets) = self.begin_seed(writable)?;
+        Transaction::new(
+            Arc::clone(&self.inner),
+            seed,
+            handle,
+            cache_snap,
+            buckets,
+            false,
+        )
     }
 
     fn begin_managed(&self, writable: bool) -> Result<Transaction, Error> {
@@ -3259,8 +3339,15 @@ impl Database {
         if writable {
             self.inner.check_writable()?;
         }
-        let (seed, cache_snap, buckets) = self.begin_seed(writable)?;
-        Transaction::new(Arc::clone(&self.inner), seed, cache_snap, buckets, true)
+        let (seed, handle, cache_snap, buckets) = self.begin_seed(writable)?;
+        Transaction::new(
+            Arc::clone(&self.inner),
+            seed,
+            handle,
+            cache_snap,
+            buckets,
+            true,
+        )
     }
 
     /// Invoke the function in a managed read-only transaction (dcrd
@@ -3300,6 +3387,18 @@ impl Database {
     /// The store's commit thread ([`COMMIT_THREAD_NAME`]), when one was
     /// started, is stopped and joined here, latched or not, once the flush
     /// it was writing has ended: none outlives the close.
+    ///
+    /// A close that returns `Ok` lets go of the metadata store's redb
+    /// handle, which closes the file, clearing the recovery flag redb
+    /// keeps in its header while it has the file open for writing, and
+    /// releases redb's lock on it, as dcrd's `Close` closes leveldb
+    /// (`ffldb/dbcache.go:635-639`).  That happens here, or, when a
+    /// transaction begun before the close is still open, as the last such
+    /// transaction ends: each transaction holds the redb handle from its
+    /// begin to its end, and clones of this handle do not hold it.  A
+    /// close that fails, or finds the store latched, leaves
+    /// the handle to the drop of the last clone, as before: the file then
+    /// keeps the flag, and the next open recovers it.
     pub fn close(&self) -> Result<(), Error> {
         if self.inner.closed.swap(true, Ordering::SeqCst) {
             return Err(db_error(ErrorKind::DbNotOpen, "database is not open"));
@@ -3346,16 +3445,25 @@ impl Database {
         closed
     }
 
-    /// The flush and allocator-state commit of [`Self::close`], with the
-    /// writer semaphore held.
+    /// The flush and allocator-state commit of [`Self::close`], and the
+    /// release of redb's handle, with the writer semaphore held.
     fn close_locked(&self) -> Result<(), Error> {
         self.inner.check_writable()?;
         flush_locked(&self.inner, FlushKind::Durable)?;
-        // Then record the allocator state, which redb otherwise does
-        // only when its handle drops -- and this handle's clones can
-        // outlive the close by as long as the threads holding them do.
-        // Without it the next open repairs the whole file.
-        record_allocator_state(&self.inner.kv).map_err(|e| self.inner.mark_fatal(e))?;
+        // Then record the allocator state.  redb's own close records it
+        // too, but it can report no failure, and it runs only once the
+        // last transaction holding the handle has ended -- never, if one
+        // is still open when the process exits.  Without it the next open
+        // would then repair the whole file.
+        let kv = self.inner.kv_or_closed()?;
+        record_allocator_state(&kv).map_err(|e| self.inner.mark_fatal(e))?;
+        drop(kv);
+        // And let go of the handle, so that redb closes the file: here,
+        // unless a transaction begun before the close still holds it.  No
+        // flush is in flight and none can capture anything behind the
+        // close, so redb's close, which makes a commit of its own, has
+        // the store to itself.
+        drop(self.inner.take_kv());
         Ok(())
     }
 
@@ -3643,17 +3751,22 @@ mod already_open_tests {
         };
         assert_eq!(err.kind, ErrorKind::DbExists);
 
-        // `close` flushes and marks the handle closed, mirroring dcrd's
-        // `Close`; the OS lock belongs to the open file, so it is released
-        // when the handle is dropped rather than when close returns.
+        // `close` flushes, marks the handle closed and closes the metadata
+        // file, releasing its lock, as dcrd's `Close` closes leveldb
+        // (`ffldb/dbcache.go:635-639`) -- once no transaction begun
+        // before it is still open, since redb's file stays open under
+        // one.  A clone of the closed handle does not hold the lock.
+        let reader = first.begin(false).expect("begin a reader");
         first.close().expect("close");
-        assert!(
-            Database::open(&opts).is_err(),
-            "the lock belongs to the handle, so closing alone must not release it"
+        assert_eq!(
+            Database::open(&opts).err().map(|e| e.kind),
+            Some(ErrorKind::DbAlreadyOpen),
+            "the file stays open, and locked, under a reader begun before the close"
         );
-        drop(first);
-        let reopened = Database::open(&opts).expect("reopen once the handle is dropped");
+        reader.rollback().expect("end the reader");
+        let reopened = Database::open(&opts).expect("reopen once the last reader has ended");
         reopened.close().expect("close again");
+        drop(first);
     }
 }
 
@@ -6222,13 +6335,20 @@ mod background_commit_tests {
     /// A flush offered to the commit thread after the close has stopped it
     /// commits on the thread that made it, and no thread is started for
     /// it.  No public call gets a flush there: one made after the close
-    /// finds the overlay empty and no participant, and commits nothing.
-    /// Here a row is put into the overlay directly.
+    /// finds the overlay empty and no participant, and commits nothing,
+    /// and once the close has returned the store's redb handle is gone as
+    /// well.  Here the thread is stopped as the close stops it, ahead of
+    /// its own flush, the store is left open, and a row is put into the
+    /// overlay directly.
     #[test]
-    fn a_hand_off_after_the_close_commits_inline() {
+    fn a_hand_off_after_the_close_stopped_the_thread_commits_inline() {
         let rig = Rig::new();
         rig.trip(1);
-        rig.db.close().expect("close");
+        {
+            let _writer = rig.db.exclusive_writer();
+            drain_flight(&rig.db.inner);
+            stop_commit_thread(&rig.db.inner);
+        }
         assert_eq!((slot(&rig.db), started(&rig.db)), (Slot::Stopped, 1));
         rig.forget_observations();
         {

@@ -229,6 +229,11 @@ impl PendingBlock {
 struct TxState {
     /// The underlying key/value transaction; `None` once closed.
     kv: Option<KvTx>,
+    /// The redb handle `kv` was begun on, held until `kv` has been let go
+    /// of, so that a close made while this transaction is open leaves
+    /// redb's file open under it and redb closes the file once the last
+    /// such transaction ends (`DbInner::kv`).  `None` once closed.
+    kv_handle: Option<Arc<redb::Database>>,
     /// The metadata table, opened once for the transaction's life.
     ///
     /// `ReadTransaction::open_table` resolves the table by name through
@@ -312,6 +317,7 @@ impl Transaction {
     pub(crate) fn new(
         db: Arc<DbInner>,
         kv: KvTxSeed,
+        kv_handle: Arc<redb::Database>,
         cache_snap: Arc<crate::dbcache::CacheSnapshot>,
         buckets: Arc<BucketIndex>,
         managed: bool,
@@ -329,6 +335,7 @@ impl Transaction {
             db,
             state: RefCell::new(TxState {
                 kv: Some(kv),
+                kv_handle: Some(kv_handle),
                 table: None,
                 pending_blocks: Vec::new(),
                 pending_index: HashMap::new(),
@@ -1159,7 +1166,16 @@ impl Transaction {
         // oldest live read transaction, so a leaked reader makes the
         // allocator grow the file instead of reusing it.
         state.table = None;
-        if state.kv.take().is_some() && self.writable {
+        let open = state.kv.take().is_some();
+        // Then the redb handle, after the transaction begun on it, and
+        // before a writable transaction releases the writer semaphore:
+        // the close lets go of the store's own clone only with that
+        // semaphore held, so a writer's clone is never the last one, and
+        // redb's close is never left to a thread that has already let the
+        // close go ahead.  A reader's can be the last, and its drop here
+        // then closes redb's file.
+        state.kv_handle = None;
+        if open && self.writable {
             // Release the writer semaphore (dcrd releases its write
             // lock when a writable transaction ends).
             let mut busy = self.db.writer_busy.lock().expect("writer flag poisoned");

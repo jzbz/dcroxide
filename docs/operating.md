@@ -84,7 +84,19 @@ as "Detected unclean shutdown of the metadata store - Repairing..." followed
 by "Metadata store repair N% complete" lines. The repair reads the whole
 metadata file up to three times, so on a mainnet-sized store expect a
 noticeably slower start (not yet measured). A clean shutdown does not need
-it: the node closes its database at exit.
+it: the node closes its database at exit, and since 2026-10-23 that close
+also closes the metadata file, which redb then marks as shut down
+cleanly. Before, the file kept the mark redb sets while it has the file
+open for writing, though the log ended "Shutdown complete". The next
+start ran no repair for it, since the close had already saved what redb
+needs to skip one, but a tool that opens redb files read-only was
+refused with "Database repair aborted" until a writable open had been
+made. After a clean stop such a tool now opens `metadata.redb` directly,
+unless a request from a peer or an RPC client was still reading the store
+as the process exited: the file stays open until the last such read has
+ended, so the mark then stays, and the next start loads the saved state
+without a repair, as before. Open a copy if the node may start meanwhile,
+since the node locks the file while it runs.
 
 The chain then replays the blocks the UTXO set had not yet flushed. As in
 dcrd, that replay runs between the CHAN lines "UTXO cache initializing (max
