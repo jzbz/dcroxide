@@ -10,10 +10,14 @@
 //!   generation the daemon keys its deadlines on;
 //! - a failed tip lookup when a reorg finishes arms the one-second
 //!   failed-generation retry, through the template-update event dcrd's
-//!   `setCurrentTemplate` queues.
+//!   `setCurrentTemplate` queues;
+//! - the vote handler logs dcrd's debug line for each vote it counts
+//!   toward a block it watches.
 
 // Test-harness arithmetic over small counters.
 #![allow(clippy::arithmetic_side_effects)]
+
+use std::sync::{Arc, Mutex};
 
 use dcroxide_blockchain::UtxoEntry;
 use dcroxide_blockchain::utxoview::UtxoView;
@@ -22,6 +26,7 @@ use dcroxide_mining::bg_generator::{
     BgGenerator, BgRegenEvent, BgTemplateState, BgTemplateUpdateReason, handle_regen_event,
     handle_template_update,
 };
+use dcroxide_mining::log::{LogLevel, Logger};
 use dcroxide_mining::{
     BlockTemplate, TemplateBest, TemplateChain, TemplateTxSource, TxMiningView, VoteDesc,
 };
@@ -72,10 +77,11 @@ fn vote(voted_on: &Hash, height: u32) -> MsgTx {
 }
 
 /// A chain that answers the tip facts, and the tip block unless told
-/// to fail the lookup.
+/// to fail the lookup, and hands the handlers its logger if it has one.
 struct Chain {
     tip: TemplateBest,
     tip_block: Option<MsgBlock>,
+    logger: Option<Logger>,
 }
 
 impl Chain {
@@ -198,6 +204,9 @@ impl TemplateChain for Chain {
     fn adjusted_time_unix(&self) -> i64 {
         unreachable!("unused by the regen state machine")
     }
+    fn logger(&self) -> Option<&Logger> {
+        self.logger.as_ref()
+    }
 }
 
 /// A transaction source with a scripted vote count per block.
@@ -293,6 +302,7 @@ fn max_votes_timeout_arms_are_fresh_and_only_arms_restart_it() {
     let mut chain = Chain {
         tip: TemplateBest::default(),
         tip_block: None,
+        logger: None,
     };
     let mut votes = Votes::default();
 
@@ -420,6 +430,7 @@ fn a_failed_tip_lookup_after_a_reorg_arms_the_retry() {
                 ..TemplateBest::default()
             },
             tip_block: None,
+            logger: None,
         };
         let votes = Votes::default();
 
@@ -439,4 +450,106 @@ fn a_failed_tip_lookup_after_a_reorg_arms_the_retry() {
         );
         assert!(g.gen_requests.is_empty(), "the retry builds when it fires");
     }
+}
+
+/// The vote handler logs dcrd's debug line for each vote it counts
+/// toward the tip awaiting its minimum votes, the block the current
+/// template builds on, or a side chain block it watches
+/// (`bgblktmplgenerator.go:1004-1005`, `:1054-1055`, `:1085-1086`), and
+/// nothing above debug.
+#[test]
+fn counted_votes_are_logged_as_dcrd_logs_them() {
+    let lines = Arc::new(Mutex::new(Vec::new()));
+    let level = Arc::new(Mutex::new(LogLevel::Debug));
+    let sink = Arc::clone(&lines);
+    let gate_level = Arc::clone(&level);
+    let logger = Logger::new(
+        Arc::new(move |at| at >= *gate_level.lock().expect("level")),
+        Arc::new(move |at, msg: &str| sink.lock().expect("lines").push((at, msg.to_string()))),
+    );
+    let take = || core::mem::take(&mut *lines.lock().expect("lines"));
+
+    let mut g = BgGenerator::new(TICKETS_PER_BLOCK, 0, true);
+    let mut state = BgTemplateState::new();
+    let mut chain = Chain {
+        tip: TemplateBest::default(),
+        tip_block: None,
+        logger: Some(logger),
+    };
+    let mut votes = Votes::default();
+    let a = block(10, hash(9), 1);
+    let a_hash = a.header.block_hash();
+    chain.set_tip(&a);
+    votes.set(a_hash, 1);
+    handle_regen_event(
+        &mut g,
+        &mut state,
+        &mut chain,
+        &votes,
+        BgRegenEvent::BlockConnected(&a),
+        true,
+        0,
+    );
+    assert!(take().is_empty(), "a connect logs nothing");
+
+    // A vote on the block, told apart from the others by its lock time,
+    // fed to the handler; its hash.
+    fn send(
+        g: &mut BgGenerator,
+        state: &mut BgTemplateState,
+        chain: &mut Chain,
+        votes: &Votes,
+        voted_on: &Hash,
+        nonce: u32,
+    ) -> Hash {
+        let mut vote = vote(voted_on, 10);
+        vote.lock_time = nonce;
+        handle_regen_event(g, state, chain, votes, BgRegenEvent::Vote(&vote), true, 0);
+        vote.tx_hash()
+    }
+
+    // Two votes for the tip, the second locking it in.
+    votes.set(a_hash, 2);
+    let first = send(&mut g, &mut state, &mut chain, &votes, &a_hash, 1);
+    votes.set(a_hash, 3);
+    let second = send(&mut g, &mut state, &mut chain, &votes, &a_hash, 2);
+    // A fourth for the block the next template builds on.
+    votes.set(a_hash, 4);
+    let third = send(&mut g, &mut state, &mut chain, &votes, &a_hash, 3);
+    assert_eq!(
+        take(),
+        [
+            (
+                LogLevel::Debug,
+                format!("Received vote {first} for tip block {a_hash} (2 total)")
+            ),
+            (
+                LogLevel::Debug,
+                format!("Received vote {second} for tip block {a_hash} (3 total)")
+            ),
+            (
+                LogLevel::Debug,
+                format!("Received vote {third} for current template {a_hash} (4 total)")
+            ),
+        ]
+    );
+
+    // A vote for a side chain block being watched, short of the minimum.
+    let side = hash(0x5c);
+    state.awaiting_side_chain_min_votes.insert(side);
+    votes.set(side, 1);
+    let fourth = send(&mut g, &mut state, &mut chain, &votes, &side, 4);
+    assert_eq!(
+        take(),
+        [(
+            LogLevel::Debug,
+            format!("Received vote {fourth} for side chain block {side} (1 total)")
+        )]
+    );
+
+    // Above debug, nothing.
+    *level.lock().expect("level") = LogLevel::Info;
+    votes.set(side, 2);
+    send(&mut g, &mut state, &mut chain, &votes, &side, 5);
+    assert!(take().is_empty());
 }

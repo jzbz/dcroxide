@@ -1021,6 +1021,7 @@ fn continuous_solve(job: ContinuousSolve) {
             &mut update_block_time,
             &mut should_cancel,
             &mut now_micros,
+            Some(&crate::logging::minr_logger()),
         );
         if !solved {
             // Cancelled or an undecodable target; the top-of-loop check
@@ -1115,6 +1116,7 @@ fn solve_and_submit(mut job: SolveJob) {
         &mut update_block_time,
         &mut should_cancel,
         &mut now_micros,
+        Some(&crate::logging::minr_logger()),
     );
     if !solved {
         return;

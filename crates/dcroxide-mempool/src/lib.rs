@@ -8,8 +8,8 @@
 //! voted block and ticket before it is accepted (`a9b79d1b`, `6816d9de`,
 //! `023c42ff`).  It holds the mempool error kinds, the relay policy layer
 //! (`policy.go`) — minimum relay fees, dust outputs, and the
-//! transaction, output script, and input standardness checks — and the
-//! pool itself (`TxPool`, `mempool.go`).
+//! transaction, output script, and input standardness checks — the
+//! pool itself (`TxPool`, `mempool.go`), and its package logger (`log`).
 
 #![cfg_attr(not(test), no_std)]
 #![forbid(unsafe_code)]
@@ -24,6 +24,7 @@
 extern crate alloc;
 
 mod error;
+pub mod log;
 mod policy;
 mod pool;
 

@@ -209,6 +209,24 @@ impl From<RuleError> for PoolError {
     }
 }
 
+impl core::fmt::Display for RuleError {
+    /// The description, as dcrd's `RuleError.Error` returns it.
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(&self.description)
+    }
+}
+
+impl core::fmt::Display for PoolError {
+    /// The text dcrd's `Error` method gives: a rule error's
+    /// description, or the plain error's text.
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            PoolError::Rule(err) => err.fmt(f),
+            PoolError::Other(text) => f.write_str(text),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::ErrorKind;

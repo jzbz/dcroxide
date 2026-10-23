@@ -8,8 +8,9 @@
 //! statistics tracking, the transaction priority queue with Go's exact
 //! heap semantics, the priority calculation, the block template
 //! generation (`NewBlockTemplate`), the background template generator's
-//! regeneration state machine, and the CPU miner's proof-of-work solve
-//! core (`internal/mining/cpuminer`'s `solveBlock`).
+//! regeneration state machine, the CPU miner's proof-of-work solve
+//! core (`internal/mining/cpuminer`'s `solveBlock`), and the package
+//! logger the three log through (`log`).
 
 #![cfg_attr(not(test), no_std)]
 #![forbid(unsafe_code)]
@@ -27,6 +28,7 @@ pub mod bg_generator;
 pub mod cpuminer;
 mod generator;
 mod graph;
+pub mod log;
 mod policy;
 mod pq;
 mod template;

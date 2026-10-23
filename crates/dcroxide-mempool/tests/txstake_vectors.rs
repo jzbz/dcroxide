@@ -36,6 +36,9 @@
 //!   rejections, treasury adds under the fee policy, and standalone
 //!   treasurybase rejection, with a replaced Pi key set.
 //!
+//! Every section also compares the lines the pool logs for each call
+//! with the lines dcrd's pool logged for it (the `log` rows).
+//!
 //! The blocks votes vote on are the harness's mock blocks, whose headers
 //! carry the height the votes claim, and the tickets that may vote on
 //! each are registered as its winners (`b443b0b3`, `023c42ff`).  The file
@@ -49,8 +52,8 @@
 mod common;
 
 use common::{
-    apply_block_row, chain_from_init, error_kind, harness_policy, hash_csv, parse_hash, parse_tx,
-    raw_hex,
+    LogRows, apply_block_row, chain_from_init, error_kind, harness_policy, hash_csv, parse_hash,
+    parse_tx, raw_hex,
 };
 use dcroxide_chaincfg::{Params, mainnet_params};
 use dcroxide_mempool::TxPool;
@@ -92,9 +95,9 @@ fn section<'a>(data: &'a str, name: &str) -> Vec<&'a str> {
 }
 
 /// The per-kind row counts of a replay: process-transaction rows, state
-/// checks, vote hash lists, disapproval checks, tspend hash lists, and
-/// sections.
-type Counts = [usize; 6];
+/// checks, vote hash lists, disapproval checks, tspend hash lists,
+/// sections, and `log` rows.
+type Counts = [usize; 7];
 
 /// Run one section's rows against a fresh pool, adding to the counts.
 fn run_section(params: &Params, lines: &[&str], counts: &mut Counts) {
@@ -108,8 +111,16 @@ fn run_section(params: &Params, lines: &[&str], counts: &mut Counts) {
     // websocket client's `tspendnew`.
     let announced = TSpendRecorder::default();
     pool.set_tspend_receiver(Box::new(announced.clone()));
+    let mut log_rows = LogRows::new();
+    pool.set_logger(log_rows.logger());
 
+    let mut last = lines[0];
     for line in &lines[1..] {
+        if log_rows.take_row(line) {
+            continue;
+        }
+        log_rows.check(last);
+        last = line;
         let f: Vec<&str> = line.split(' ').collect();
         if apply_block_row(&mut pool.chain, &f) {
             continue;
@@ -205,7 +216,9 @@ fn run_section(params: &Params, lines: &[&str], counts: &mut Counts) {
             other => panic!("unknown row tag {other}"),
         }
     }
+    log_rows.check(last);
     counts[5] += 1;
+    counts[6] += log_rows.checked();
 
     // The pool tracks a treasury spend the moment it is added; the
     // announcement fires a few checks earlier, so every tracked hash
@@ -321,7 +334,7 @@ fn txstake_vectors() {
         ]
     );
 
-    let mut counts = [0usize; 6];
+    let mut counts = [0usize; 7];
     for (name, rows) in &sections {
         if *name == "treasury" {
             // The treasury harness replaces the network Pi keys with a
@@ -337,7 +350,7 @@ fn txstake_vectors() {
         }
     }
 
-    assert_eq!(counts, [70, 86, 50, 2, 4, 8], "row counts");
+    assert_eq!(counts, [70, 86, 50, 2, 4, 8, 139], "row counts");
 }
 
 /// Every vote error kind the pool raises is reached by the battery, so

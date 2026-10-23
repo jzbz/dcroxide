@@ -16,6 +16,7 @@ use dcroxide_chainhash::Hash;
 use dcroxide_wire::MsgTx;
 
 use crate::generator::{TemplateBest, TemplateChain, TemplateTxSource};
+use crate::log::{self, LogLevel, Logger, debugf};
 use crate::template::BlockTemplate;
 
 /// The duration that must elapse after a new tip block has been
@@ -501,6 +502,28 @@ pub fn handle_block_accepted(
     state.awaiting_side_chain_min_votes.insert(block_hash);
 }
 
+/// dcrd's debug line for a vote the handler counts toward a block it
+/// watches (`handleVote`, `bgblktmplgenerator.go:1004-1005`, `:1054-1055`,
+/// `:1085-1086`).  The vote is hashed only when the line is wanted, where
+/// dcrd's `dcrutil.Tx` has the hash already.
+fn log_received_vote(
+    logger: Option<&Logger>,
+    vote_tx: &MsgTx,
+    watched: &str,
+    block_hash: &Hash,
+    num_votes: u16,
+) {
+    if log::enabled(logger, LogLevel::Debug) {
+        debugf(
+            logger,
+            format_args!(
+                "Received vote {} for {watched} {block_hash} ({num_votes} total)",
+                vote_tx.tx_hash()
+            ),
+        );
+    }
+}
+
 /// Handle a vote (dcrd `handleVote`).
 pub fn handle_vote(
     g: &mut BgGenerator,
@@ -510,6 +533,10 @@ pub fn handle_vote(
     vote_tx: &MsgTx,
     chain_tip: &TemplateBest,
 ) {
+    // The chain is borrowed mutably below, so the logger is cloned out
+    // of it.
+    let logger = chain.logger().cloned();
+    let logger = logger.as_ref();
     let (voted_on_hash, _) = dcroxide_stake::ssgen_block_voted_on(vote_tx);
 
     // Lock the current tip in once it has the minimum required votes.
@@ -517,6 +544,7 @@ pub fn handle_vote(
         && voted_on_hash == min_votes_hash
     {
         let num_votes = num_votes_for_block(tx_source, &min_votes_hash);
+        log_received_vote(logger, vote_tx, "tip block", &min_votes_hash, num_votes);
         if num_votes >= g.min_votes_required {
             state.stop_regen_timer();
             state.failed_gen_retry_timeout_armed = false;
@@ -552,6 +580,13 @@ pub fn handle_vote(
         }
 
         let num_votes = num_votes_for_block(tx_source, &voted_on_hash);
+        log_received_vote(
+            logger,
+            vote_tx,
+            "current template",
+            &voted_on_hash,
+            num_votes,
+        );
         if num_votes >= g.max_votes_per_block || !state.max_votes_timeout_armed {
             // The template needs a new-parent update the first time
             // it is generated and new-votes updates on subsequent
@@ -579,6 +614,13 @@ pub fn handle_vote(
     // required votes while the current tip could not.
     if state.awaiting_side_chain_min_votes.contains(&voted_on_hash) {
         let num_votes = num_votes_for_block(tx_source, &voted_on_hash);
+        log_received_vote(
+            logger,
+            vote_tx,
+            "side chain block",
+            &voted_on_hash,
+            num_votes,
+        );
         if num_votes >= g.min_votes_required {
             if chain
                 .force_head_reorganization(chain_tip.hash, voted_on_hash)

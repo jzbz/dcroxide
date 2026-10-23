@@ -27,6 +27,7 @@ use dcroxide_txscript::ScriptFlags;
 use dcroxide_txscript::stdaddr::Address;
 use dcroxide_wire::{BlockHeader, MsgBlock, MsgTx, OutPoint};
 
+use crate::log::{self, LogLevel, Logger, debugf, go_float_v, tracef, warnf};
 use crate::pq::{TxPrioItem, TxPriorityQueue, tx_pq_by_stake_and_fee};
 use crate::template::sort_parents_by_votes;
 use crate::template::{
@@ -235,11 +236,14 @@ pub trait TemplateChain {
     /// The current adjusted time as unix seconds (dcrd
     /// `TimeSource.AdjustedTime`).
     fn adjusted_time_unix(&self) -> i64;
-    /// Log a warning where dcrd's mining package calls `log.Warnf`,
-    /// which the daemon routes to the `MINR` subsystem (dcrd `log.go`,
-    /// `mining.UseLogger(minrLog)`).  The generation has no logger of
-    /// its own; the default discards the message.
-    fn log_warn(&self, _msg: &str) {}
+    /// The package logger the template generation and the background
+    /// generator's vote handler log through, in place of dcrd's mining
+    /// package `log`, which the daemon points at its `MINR` subsystem
+    /// logger (`log.go:92`, `mining.UseLogger(minrLog)`).  The default
+    /// is dcrd's `slog.Disabled`: nothing is logged.
+    fn logger(&self) -> Option<&Logger> {
+        None
+    }
 }
 
 /// The transaction source surface the template generation consumes
@@ -308,6 +312,40 @@ pub fn spend_transaction(
         dcroxide_wire::NULL_BLOCK_INDEX,
         is_treasury_enabled,
     );
+}
+
+/// Log at trace each transaction skipped along with a skipped one
+/// because it depends on it (dcrd `logSkippedDeps`).
+///
+/// dcrd hands it the children of the queue item being considered, which
+/// it collects as the item is popped (`deps := miningView.children(...)`,
+/// `mining.go:1558`), and the transaction the line names as skipped,
+/// which is that item except where a transaction of its ancestor bundle
+/// fails, when it names the bundled transaction against the item's
+/// children all the same (`mining.go:1758`, `:1767`).  Nothing changes
+/// the view between the pop and the skip, so the children are read here,
+/// and only when trace is on.  dcrd's format ends in a newline that slog
+/// follows with its own, so each line is followed by an empty one
+/// (QK-0031).  The children of one item come in Go's map order there and
+/// in hash order here.
+fn log_skipped_deps(
+    logger: Option<&Logger>,
+    mining_view: &TxMiningView,
+    item_hash: &Hash,
+    skipped_hash: &Hash,
+) {
+    if !log::enabled(logger, LogLevel::Trace) {
+        return;
+    }
+    for dep in mining_view.children(item_hash) {
+        tracef(
+            logger,
+            format_args!(
+                "Skipping tx {} since it depends on {skipped_hash}\n",
+                dep.tx_hash
+            ),
+        );
+    }
 }
 
 /// The block template generator (dcrd `BlkTmplGenerator`).
@@ -387,9 +425,10 @@ impl<'p, C: TemplateChain, S: TemplateTxSource> BlkTmplGenerator<'p, C, S> {
         let view = match self.chain.fetch_utxo_view(stx, stx_hash, tree, tree_valid) {
             Ok(view) => view,
             Err(e) => {
-                self.chain.log_warn(&format!(
-                    "Unable to fetch transaction store for stx {stx_hash}: {e}"
-                ));
+                warnf(
+                    self.chain.logger(),
+                    format_args!("Unable to fetch transaction store for stx {stx_hash}: {e}"),
+                );
                 return false;
             }
         };
@@ -558,6 +597,11 @@ impl<'p, C: TemplateChain, S: TemplateTxSource> BlkTmplGenerator<'p, C, S> {
             }));
         }
 
+        debugf(
+            self.chain.logger(),
+            format_args!("Not enough voters on top block to generate new block template"),
+        );
+
         Ok(None)
     }
 
@@ -692,6 +736,15 @@ impl<'p, C: TemplateChain, S: TemplateTxSource> BlkTmplGenerator<'p, C, S> {
             prio_item_map.insert(revocation_tx_hash.0, prio_item);
         }
 
+        debugf(
+            self.chain.logger(),
+            format_args!(
+                "Generated {} automatic revocations for the new block (num missed this \
+                 block: {missed_count}, num expired this block: {expired_count})",
+                revoke_tickets.len()
+            ),
+        );
+
         Ok(())
     }
 
@@ -706,6 +759,10 @@ impl<'p, C: TemplateChain, S: TemplateTxSource> BlkTmplGenerator<'p, C, S> {
         nonces: &ExtraNonces,
     ) -> Result<Option<BlockTemplate>, String> {
         let script_flags = self.chain.standard_verify_flags()?;
+        // The chain is borrowed mutably below, so the logger is cloned
+        // out of it for the build.
+        let logger = self.chain.logger().cloned();
+        let logger = logger.as_ref();
         // Taken once and deliberately never refreshed, as in dcrd
         // (`mining.go:1200`): after the eligible-parents loop below
         // reorganizes to a sibling tip only `prev_hash` moves, and the
@@ -757,6 +814,13 @@ impl<'p, C: TemplateChain, S: TemplateTxSource> BlkTmplGenerator<'p, C, S> {
                 self.params,
             );
             if eligible_parents.is_empty() {
+                debugf(
+                    logger,
+                    format_args!(
+                        "Too few voters found on any HEAD block, recycling a parent block to \
+                         mine on"
+                    ),
+                );
                 return self.handle_too_few_voters(
                     next_block_height,
                     pay_to_address,
@@ -766,17 +830,26 @@ impl<'p, C: TemplateChain, S: TemplateTxSource> BlkTmplGenerator<'p, C, S> {
                 );
             }
 
+            debugf(
+                logger,
+                format_args!(
+                    "Found eligible parent {} with enough votes to build block on, proceeding \
+                     to create a new block template",
+                    eligible_parents[0]
+                ),
+            );
+
             // Force a reorganization to the parent with the most
             // votes if needed.
             for new_head in &eligible_parents {
                 if *new_head == prev_hash {
                     break;
                 }
-                if self
-                    .chain
-                    .force_head_reorganization(prev_hash, *new_head)
-                    .is_err()
-                {
+                if let Err(e) = self.chain.force_head_reorganization(prev_hash, *new_head) {
+                    debugf(
+                        logger,
+                        format_args!("failed to reorganize to new parent: {e}"),
+                    );
                     continue;
                 }
 
@@ -811,7 +884,19 @@ impl<'p, C: TemplateChain, S: TemplateTxSource> BlkTmplGenerator<'p, C, S> {
         let mut tx_sig_op_counts_map: BTreeMap<[u8; 32], i64> = BTreeMap::new();
         tx_fees.push(-1); // Updated once known.
 
+        debugf(
+            logger,
+            format_args!(
+                "Considering {} transactions for inclusion to new block",
+                source_txns.len()
+            ),
+        );
         let known_disapproved = self.tx_source.is_reg_tx_tree_known_disapproved(&prev_hash);
+
+        // The number of source transactions that depend on another
+        // from the source (dcrd `totalDescendantTxns`, which only the
+        // trace line after the loop reads).
+        let mut total_descendant_txns = 0usize;
         let mut prio_item_map: BTreeMap<[u8; 32], TxPrioItem> = BTreeMap::new();
 
         'mempool_loop: for tx_desc in &source_txns {
@@ -820,12 +905,14 @@ impl<'p, C: TemplateChain, S: TemplateTxSource> BlkTmplGenerator<'p, C, S> {
             let tx = &tx_desc.tx;
             let tx_hash = tx_desc.tx_hash;
             if dcroxide_standalone::is_coin_base_tx(tx, is_treasury_enabled) {
+                tracef(logger, format_args!("Skipping coinbase tx {tx_hash}"));
                 continue;
             }
             if !self
                 .chain
                 .is_finalized_transaction(tx, next_block_height, best.median_time_unix)
             {
+                tracef(logger, format_args!("Skipping non-finalized tx {tx_hash}"));
                 continue;
             }
 
@@ -837,6 +924,13 @@ impl<'p, C: TemplateChain, S: TemplateTxSource> BlkTmplGenerator<'p, C, S> {
                     reason = "next_block_height is best.height + 1 >= 1"
                 )]
                 if !(block_hash == prev_hash && i64::from(block_height) == next_block_height - 1) {
+                    tracef(
+                        logger,
+                        format_args!(
+                            "Skipping ssgen tx {tx_hash} because it does not vote on the \
+                             correct block"
+                        ),
+                    );
                     continue;
                 }
             }
@@ -851,8 +945,10 @@ impl<'p, C: TemplateChain, S: TemplateTxSource> BlkTmplGenerator<'p, C, S> {
                 {
                     Ok(utxos) => utxos,
                     Err(e) => {
-                        self.chain
-                            .log_warn(&format!("Unable to fetch utxo view for tx {tx_hash}: {e}"));
+                        warnf(
+                            logger,
+                            format_args!("Unable to fetch utxo view for tx {tx_hash}: {e}"),
+                        );
                         continue;
                     }
                 };
@@ -868,6 +964,14 @@ impl<'p, C: TemplateChain, S: TemplateTxSource> BlkTmplGenerator<'p, C, S> {
                 if (entry.is_none() || entry.is_some_and(|e| e.is_spent()))
                     && !self.tx_source.have_transaction(&origin_hash)
                 {
+                    tracef(
+                        logger,
+                        format_args!(
+                            "Skipping tx {tx_hash} because it references unspent output {} \
+                             which is not available",
+                            tx_in.previous_out_point
+                        ),
+                    );
                     continue 'mempool_loop;
                 }
             }
@@ -910,10 +1014,26 @@ impl<'p, C: TemplateChain, S: TemplateTxSource> BlkTmplGenerator<'p, C, S> {
                 );
             }
 
+            #[allow(
+                clippy::arithmetic_side_effects,
+                reason = "counts the entries of source_txns, at most its length"
+            )]
+            if has_parents {
+                total_descendant_txns += 1;
+            }
+
             // Merge the referenced outputs from the input transactions
             // into the block utxo view to avoid a second lookup.
             merge_utxo_view(&mut block_utxos, &utxos);
         }
+
+        tracef(
+            logger,
+            format_args!(
+                "Priority queue len {}, dependers len {total_descendant_txns}",
+                priority_queue.len()
+            ),
+        );
 
         let mut block_size = BLOCK_HEADER_OVERHEAD;
         let mut block_sig_ops: i64 = 0;
@@ -988,6 +1108,13 @@ impl<'p, C: TemplateChain, S: TemplateTxSource> BlkTmplGenerator<'p, C, S> {
                 // window, without enough votes, or overspending.
                 if is_tspend {
                     if !is_tvi {
+                        tracef(
+                            logger,
+                            format_args!(
+                                "Skipping tspend {tx_hash} because block is not on a TVI: \
+                                 {next_block_height}"
+                            ),
+                        );
                         continue;
                     }
                     let exp = tx.expiry;
@@ -997,13 +1124,35 @@ impl<'p, C: TemplateChain, S: TemplateTxSource> BlkTmplGenerator<'p, C, S> {
                         self.params.treasury_vote_interval,
                         self.params.treasury_vote_interval_multiplier,
                     ) {
+                        tracef(
+                            logger,
+                            format_args!(
+                                "Skipping treasury spend {tx_hash} at height \
+                                 {next_block_height} because it has an expiry of {exp} that \
+                                 is outside of the voting window"
+                            ),
+                        );
                         continue;
                     }
-                    if self.chain.check_tspend_has_votes(&prev_hash, tx).is_err() {
+                    if let Err(e) = self.chain.check_tspend_has_votes(&prev_hash, tx) {
+                        tracef(
+                            logger,
+                            format_args!(
+                                "Skipping tspend {tx_hash} because it doesn't have enough \
+                                 votes: height {next_block_height} reason '{e}'"
+                            ),
+                        );
                         continue;
                     }
                     let tspend_amount = tx.tx_in[0].value_in;
                     if max_treasury_spend.wrapping_sub(tspend_amount) < 0 {
+                        tracef(
+                            logger,
+                            format_args!(
+                                "Skipping tspend {tx_hash} because it spends more than \
+                                 allowed: treasury {max_treasury_spend} tspend {tspend_amount}"
+                            ),
+                        );
                         continue;
                     }
                     max_treasury_spend = max_treasury_spend.wrapping_sub(tspend_amount);
@@ -1012,9 +1161,25 @@ impl<'p, C: TemplateChain, S: TemplateTxSource> BlkTmplGenerator<'p, C, S> {
                 // Enforce the per-block treasury add and ticket
                 // count limits and the ticket price.
                 if is_tadd && num_tadds >= MAX_TADDS_PER_BLOCK {
+                    tracef(
+                        logger,
+                        format_args!(
+                            "Skipping tadd {tx_hash} because it would exceed the max number \
+                             of tadds allowed in a block"
+                        ),
+                    );
+                    log_skipped_deps(logger, &mining_view, &tx_hash, &tx_hash);
                     continue;
                 }
                 if is_sstx && num_sstx >= usize::from(self.params.max_fresh_stake_per_block) {
+                    tracef(
+                        logger,
+                        format_args!(
+                            "Skipping sstx {tx_hash} because it would exceed the max number \
+                             of sstx allowed in a block"
+                        ),
+                    );
+                    log_skipped_deps(logger, &mining_view, &tx_hash, &tx_hash);
                     continue;
                 }
                 if is_sstx && tx.tx_out[0].value < best.next_stake_diff {
@@ -1076,6 +1241,15 @@ impl<'p, C: TemplateChain, S: TemplateTxSource> BlkTmplGenerator<'p, C, S> {
                 if block_plus_tx_size < block_size
                     || block_plus_tx_size >= self.policy.block_max_size
                 {
+                    tracef(
+                        logger,
+                        format_args!(
+                            "Skipping tx {tx_hash} (size {tx_size}) because it would exceed the \
+                             max block size; cur block size {block_size}, cur num tx {}",
+                            block_txns.len()
+                        ),
+                    );
+                    log_skipped_deps(logger, &mining_view, &tx_hash, &tx_hash);
                     mining_view.reject(&tx_hash);
                     continue;
                 }
@@ -1096,6 +1270,14 @@ impl<'p, C: TemplateChain, S: TemplateTxSource> BlkTmplGenerator<'p, C, S> {
                 if block_sig_ops + num_sig_ops_bundle < block_sig_ops
                     || block_sig_ops + num_sig_ops_bundle > MAX_SIG_OPS_PER_BLOCK
                 {
+                    tracef(
+                        logger,
+                        format_args!(
+                            "Skipping tx {tx_hash} because it would exceed the maximum sigops \
+                             per block"
+                        ),
+                    );
+                    log_skipped_deps(logger, &mining_view, &tx_hash, &tx_hash);
                     mining_view.reject(&tx_hash);
                     continue;
                 }
@@ -1116,6 +1298,14 @@ impl<'p, C: TemplateChain, S: TemplateTxSource> BlkTmplGenerator<'p, C, S> {
                 if prio_item.fee_per_kb < self.policy.tx_min_free_fee as f64
                     && tx_desc.tree != dcroxide_wire::TX_TREE_STAKE
                 {
+                    tracef(
+                        logger,
+                        format_args!(
+                            "Skipping tx {tx_hash} with feePerKB {:.2} < TxMinFreeFee {} ",
+                            prio_item.fee_per_kb, self.policy.tx_min_free_fee
+                        ),
+                    );
+                    log_skipped_deps(logger, &mining_view, &tx_hash, &tx_hash);
                     mining_view.reject(&tx_hash);
                     continue;
                 }
@@ -1124,33 +1314,41 @@ impl<'p, C: TemplateChain, S: TemplateTxSource> BlkTmplGenerator<'p, C, S> {
                 let mut tx_bundle = ancestors;
                 tx_bundle.push(tx_desc.clone());
                 for bundled_tx in &tx_bundle {
-                    if self
-                        .chain
-                        .check_transaction_inputs(
-                            &bundled_tx.tx,
-                            next_block_height,
-                            &block_utxos,
-                            false,
-                            &best_header,
-                            is_treasury_enabled,
-                            is_auto_revocations_enabled,
-                            subsidy_split_variant,
-                        )
-                        .is_err()
-                    {
+                    if let Err(e) = self.chain.check_transaction_inputs(
+                        &bundled_tx.tx,
+                        next_block_height,
+                        &block_utxos,
+                        false,
+                        &best_header,
+                        is_treasury_enabled,
+                        is_auto_revocations_enabled,
+                        subsidy_split_variant,
+                    ) {
+                        tracef(
+                            logger,
+                            format_args!(
+                                "Skipping tx {} due to error in CheckTransactionInputs: {e}",
+                                bundled_tx.tx_hash
+                            ),
+                        );
+                        log_skipped_deps(logger, &mining_view, &tx_hash, &bundled_tx.tx_hash);
                         mining_view.reject(&bundled_tx.tx_hash);
                         continue 'next_priority_queue_item;
                     }
-                    if self
-                        .chain
-                        .validate_transaction_scripts(
-                            &bundled_tx.tx,
-                            &block_utxos,
-                            script_flags,
-                            is_auto_revocations_enabled,
-                        )
-                        .is_err()
-                    {
+                    if let Err(e) = self.chain.validate_transaction_scripts(
+                        &bundled_tx.tx,
+                        &block_utxos,
+                        script_flags,
+                        is_auto_revocations_enabled,
+                    ) {
+                        tracef(
+                            logger,
+                            format_args!(
+                                "Skipping tx {} due to error in ValidateTransactionScripts: {e}",
+                                bundled_tx.tx_hash
+                            ),
+                        );
+                        log_skipped_deps(logger, &mining_view, &tx_hash, &bundled_tx.tx_hash);
                         mining_view.reject(&bundled_tx.tx_hash);
                         continue 'next_priority_queue_item;
                     }
@@ -1214,6 +1412,18 @@ impl<'p, C: TemplateChain, S: TemplateTxSource> BlkTmplGenerator<'p, C, S> {
                     template_txn_map.insert(bundled_tx_hash.0);
                     tx_fees_map.insert(bundled_tx_hash.0, bundled_tx_desc.fee);
                     tx_sig_op_counts_map.insert(bundled_tx_hash.0, bundled_tx_sig_ops);
+
+                    if log::enabled(logger, LogLevel::Trace)
+                        && let Some(bundled_prio_item) = prio_item_map.get(&bundled_tx_hash.0)
+                    {
+                        tracef(
+                            logger,
+                            format_args!(
+                                "Adding tx {bundled_tx_hash} (priority {:.2}, feePerKB {:.2})",
+                                bundled_prio_item.priority, bundled_prio_item.fee_per_kb
+                            ),
+                        );
+                    }
 
                     // Remove from the mining view and promote children
                     // with no remaining dependencies.
@@ -1384,8 +1594,13 @@ impl<'p, C: TemplateChain, S: TemplateTxSource> BlkTmplGenerator<'p, C, S> {
             }
         }
 
-        self.chain
-            .check_ticket_exhaustion(&best.hash, fresh_stake as u8)?;
+        if let Err(e) = self
+            .chain
+            .check_ticket_exhaustion(&best.hash, fresh_stake as u8)
+        {
+            debugf(logger, format_args!("{e}"));
+            return Err(e);
+        }
 
         // Revocations.
         let mut revocations = 0usize;
@@ -1423,20 +1638,30 @@ impl<'p, C: TemplateChain, S: TemplateTxSource> BlkTmplGenerator<'p, C, S> {
         if is_treasury_enabled {
             for tx_desc in &block_txns {
                 let tx = &tx_desc.tx;
-                if tx_desc.tree == dcroxide_wire::TX_TREE_STAKE
-                    && (dcroxide_stake::is_tadd(tx) || dcroxide_stake::is_tspend(tx))
-                {
-                    let mut tx_copy = tx.clone();
-                    if self.maybe_insert_stake_tx(
-                        &mut tx_copy,
-                        &tx_desc.tx_hash,
-                        tx_desc.tree,
-                        !known_disapproved,
-                        is_treasury_enabled,
-                    ) {
-                        block_txns_stake.push(tx_copy);
-                        block_txns_stake_hashes.push(tx_desc.tx_hash);
-                    }
+                if tx_desc.tree != dcroxide_wire::TX_TREE_STAKE {
+                    continue;
+                }
+                let kind = if dcroxide_stake::is_tadd(tx) {
+                    "TADD"
+                } else if dcroxide_stake::is_tspend(tx) {
+                    "TSPEND"
+                } else {
+                    continue;
+                };
+                let mut tx_copy = tx.clone();
+                if self.maybe_insert_stake_tx(
+                    &mut tx_copy,
+                    &tx_desc.tx_hash,
+                    tx_desc.tree,
+                    !known_disapproved,
+                    is_treasury_enabled,
+                ) {
+                    block_txns_stake.push(tx_copy);
+                    block_txns_stake_hashes.push(tx_desc.tx_hash);
+                    tracef(
+                        logger,
+                        format_args!("maybeInsertStakeTx {kind} {} ", tx_desc.tx_hash),
+                    );
                 }
             }
         }
@@ -1454,15 +1679,21 @@ impl<'p, C: TemplateChain, S: TemplateTxSource> BlkTmplGenerator<'p, C, S> {
             subsidy_split_variant,
         );
         let coinbase_hash = coinbase_tx.tx_hash();
-        let num_coinbase_sig_ops = i64::from(self.chain.count_total_sig_ops(
+        let num_coinbase_sig_ops = match self.chain.count_total_sig_ops(
             &coinbase_tx,
             true,
             false,
             &block_utxos,
             is_treasury_enabled,
-        )?);
+        ) {
+            Ok(n) => i64::from(n),
+            Err(e) => {
+                debugf(logger, format_args!("{e}"));
+                return Err(e);
+            }
+        };
         block_size = block_size.wrapping_add(coinbase_tx.serialize_size() as u32);
-        // Only consumed by dcrd's final debug log.
+        // Only consumed by the final debug line.
         #[allow(
             clippy::arithmetic_side_effects,
             reason = "block_sig_ops sums the uint32 sigop counts of this template's \
@@ -1471,7 +1702,6 @@ impl<'p, C: TemplateChain, S: TemplateTxSource> BlkTmplGenerator<'p, C, S> {
         {
             block_sig_ops += num_coinbase_sig_ops;
         }
-        let _ = block_sig_ops;
         tx_fees_map.insert(coinbase_hash.0, 0);
         tx_sig_op_counts_map.insert(coinbase_hash.0, num_coinbase_sig_ops);
         if let Some(tb_hash) = treasury_base_hash {
@@ -1496,6 +1726,11 @@ impl<'p, C: TemplateChain, S: TemplateTxSource> BlkTmplGenerator<'p, C, S> {
             if tx_desc.tree == dcroxide_wire::TX_TREE_REGULAR {
                 block_txns_regular.push(tx_desc.tx.clone());
                 block_txns_regular_hashes.push(tx_desc.tx_hash);
+            } else if tx_desc.tree != dcroxide_wire::TX_TREE_STAKE {
+                tracef(
+                    logger,
+                    format_args!("Error adding tx {} to block; invalid tree", tx_desc.tx_hash),
+                );
             }
         }
 
@@ -1562,8 +1797,6 @@ impl<'p, C: TemplateChain, S: TemplateTxSource> BlkTmplGenerator<'p, C, S> {
             block_txns_regular_hashes[0] = coinbase_tx.tx_hash();
             tx_fees[0] = total_fees.wrapping_neg();
         }
-        let _ = block_size;
-
         let ts = self.median_adjusted_time();
         let req_difficulty = self.chain.calc_next_required_difficulty(&prev_hash, ts)?;
 
@@ -1574,9 +1807,12 @@ impl<'p, C: TemplateChain, S: TemplateTxSource> BlkTmplGenerator<'p, C, S> {
         )]
         let minimum_votes_required = usize::from(self.params.tickets_per_block / 2 + 1);
         if next_block_height >= stake_validation_height && voters < minimum_votes_required {
-            self.chain.log_warn(
-                "incongruent number of voters in mempool vs mempool.voters; not enough voters \
-                 found",
+            warnf(
+                logger,
+                format_args!(
+                    "incongruent number of voters in mempool vs mempool.voters; not enough \
+                     voters found"
+                ),
             );
             return self.handle_too_few_voters(
                 next_block_height,
@@ -1718,6 +1954,32 @@ impl<'p, C: TemplateChain, S: TemplateTxSource> BlkTmplGenerator<'p, C, S> {
                      template: {e}"
                 )
             })?;
+
+        if log::enabled(logger, LogLevel::Debug) {
+            // dcrd counts the treasury adds and spends as it appends the
+            // stake tree to the block (`mining.go:2293-2305`).
+            let total_treasury_ops = msg_block
+                .stransactions
+                .iter()
+                .filter(|stx| {
+                    is_treasury_enabled
+                        && (dcroxide_stake::is_tadd(stx) || dcroxide_stake::is_tspend(stx))
+                })
+                .count();
+            debugf(
+                logger,
+                format_args!(
+                    "Created new block template ({} transactions, {} stake transactions, \
+                     {total_treasury_ops} treasury transactions, {total_fees} in fees, \
+                     {block_sig_ops} signature operations, {block_size} bytes, target \
+                     difficulty {:064x}, stake difficulty {})",
+                    msg_block.transactions.len(),
+                    msg_block.stransactions.len(),
+                    dcroxide_standalone::compact_to_big(msg_block.header.bits),
+                    go_float_v(msg_block.header.sbits as f64 / 1e8),
+                ),
+            );
+        }
 
         Ok(Some(BlockTemplate {
             block: msg_block,

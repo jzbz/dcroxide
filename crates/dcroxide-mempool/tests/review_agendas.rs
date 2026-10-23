@@ -4,7 +4,8 @@
 //! the steps of `TestRevocationsWithAutoRevocationsEnabled`,
 //! `TestSubsidySplitSemantics` and `TestSubsidySplitR2Semantics`
 //! (`internal/mempool/mempool_test.go:3486`, `:3728`, `:3832`) and
-//! recording every chain mutation, pool call and resulting pool state
+//! recording every chain mutation, pool call and resulting pool state,
+//! and the lines the pool logged for each call
 //! (`data/review_agenda_vectors.txt`, written by `tools/mempoolvectors`).
 //! The two vote sections vote on a mock block whose header carries the
 //! height the votes claim, with the ticket registered as one of its
@@ -33,7 +34,9 @@
 
 mod common;
 
-use common::{apply_block_row, chain_from_init, error_kind, harness_policy, hash_csv, parse_tx};
+use common::{
+    LogRows, apply_block_row, chain_from_init, error_kind, harness_policy, hash_csv, parse_tx,
+};
 use dcroxide_chaincfg::mainnet_params;
 use dcroxide_mempool::TxPool;
 
@@ -44,6 +47,8 @@ struct Counts {
     pt: usize,
     state: usize,
     toggles: usize,
+    /// The `log` rows compared.
+    logs: usize,
 }
 
 fn run_section(lines: &[&str]) -> Counts {
@@ -52,9 +57,17 @@ fn run_section(lines: &[&str]) -> Counts {
     let chain = chain_from_init(&init);
     let policy = harness_policy(params.coinbase_maturity);
     let mut pool = TxPool::new(chain, policy, &params);
+    let mut log_rows = LogRows::new();
+    pool.set_logger(log_rows.logger());
     let mut counts = Counts::default();
 
+    let mut last = lines[0];
     for line in &lines[1..] {
+        if log_rows.take_row(line) {
+            continue;
+        }
+        log_rows.check(last);
+        last = line;
         let f: Vec<&str> = line.split(' ').collect();
         if apply_block_row(&mut pool.chain, &f) {
             continue;
@@ -118,6 +131,8 @@ fn run_section(lines: &[&str]) -> Counts {
             other => panic!("unknown row tag {other}"),
         }
     }
+    log_rows.check(last);
+    counts.logs = log_rows.checked();
     counts
 }
 
@@ -151,7 +166,8 @@ fn revocations_follow_dcrd_with_auto_revocations_active() {
         Counts {
             pt: 5,
             state: 6,
-            toggles: 1
+            toggles: 1,
+            logs: 6,
         }
     );
 }
@@ -165,7 +181,8 @@ fn votes_follow_dcrd_across_the_subsidy_split_agenda() {
         Counts {
             pt: 4,
             state: 5,
-            toggles: 4
+            toggles: 4,
+            logs: 6,
         }
     );
 }
@@ -179,7 +196,8 @@ fn votes_follow_dcrd_across_the_subsidy_split_r2_agenda() {
         Counts {
             pt: 4,
             state: 5,
-            toggles: 4
+            toggles: 4,
+            logs: 6,
         }
     );
 }

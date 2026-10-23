@@ -59,6 +59,23 @@
 //	tsh <tspend hashes>                TSpendHashes
 //	have <hash> <bool>                 HaveTransaction
 //	spent <hash> <index> <tree> <bool> IsSpent
+//	chainspend <hash> <index> <tree>   the fake chain's entry marked spent
+//	log <level> <text>                 a line the pool logged
+//
+// The pool logs through the package logger at trace, the lowest level, as
+// the daemon's `TXMP` logger does under `--debuglevel=TXMP=trace`, and each
+// line it logs is a `log` row after the row of the call that logged it:
+// the level as slog abbreviates it (`TRC`, `DBG`) and the text as slog
+// formats it, to the end of the row.  A call's lines are in the order the
+// pool logged them, but for those it logs while ranging over a Go map, whose
+// order changes from run to run, which are sorted: the lines of a `prune` or
+// `pruneexp` call, whose walks over the pool, the stage pool and the vote
+// tracker log, are sorted whole, and each run of consecutive `Removing orphan
+// transaction` lines, the one line the walks over the orphans log (the
+// expiry scan, the cascade into an orphan's redeemers, and the removal of a
+// peer's orphans and of the orphans an accepted transaction double spends),
+// is sorted.  No session gives an output more than one orphan redeeming it,
+// where the order processOrphans tries them in would vary as well.
 //
 // Hashes are hex in internal byte order and transactions and headers hex of
 // their serialization.  Lists are comma-separated, `-` when empty: the hashes
@@ -93,6 +110,7 @@ import (
 	"github.com/decred/dcrd/txscript/v4/sign"
 	"github.com/decred/dcrd/txscript/v4/stdscript"
 	"github.com/decred/dcrd/wire"
+	"github.com/decred/slog"
 )
 
 // The median times the sessions run at: the ones the files were first dumped
@@ -112,6 +130,21 @@ var vdTSpendNonces = [15]uint64{
 	6408511562634217274, 365676131171835342, 7122534323979371974,
 	1171828243539116311, 6159988815291292413, 1547981397033169910,
 }
+
+// vdLogLines collects the lines the pool logs, each a whole slog write,
+// until the next row is written and flushes them as `log` rows.
+type vdLogLines struct {
+	lines []string
+}
+
+func (l *vdLogLines) Write(p []byte) (int, error) {
+	l.lines = append(l.lines, string(p))
+	return len(p), nil
+}
+
+// vdLog is the writer behind the package logger while the vectors are
+// dumped.
+var vdLog vdLogLines
 
 // vdDump records one section of rows over a harness built for it.
 type vdDump struct {
@@ -230,6 +263,53 @@ func vdNewSection(t *testing.T, out *strings.Builder, name string, params *chain
 func (d *vdDump) row(fields ...string) {
 	d.out.WriteString(strings.Join(fields, " "))
 	d.out.WriteByte('\n')
+	d.logRows(fields[0])
+}
+
+// vdOrphanRemoval is the `log` row the pool's walks over its orphans write
+// for each orphan they remove.
+const vdOrphanRemoval = "log TRC Removing orphan transaction "
+
+// logRows writes a `log` row for each line the pool has logged since the
+// last row, which is the row of the call that logged them, with the lines
+// logged while ranging over a Go map sorted (see the comment at the top).
+// slog's backend writes each line whole, as the bracketed level, the
+// subsystem tag, a colon and space, the text and a newline (the backend runs
+// without the date and time).
+func (d *vdDump) logRows(call string) {
+	const tagged = "[TRC] TXMP: "
+	rows := make([]string, 0, len(vdLog.lines))
+	for _, line := range vdLog.lines {
+		if len(line) < len(tagged) || line[0] != '[' || line[4:len(tagged)] != "] TXMP: " ||
+			!strings.HasSuffix(line, "\n") {
+
+			d.t.Fatalf("unexpected log write %q", line)
+		}
+		text := strings.TrimSuffix(line[len(tagged):], "\n")
+		if strings.Contains(text, "\n") {
+			d.t.Fatalf("a logged line spans rows: %q", line)
+		}
+		rows = append(rows, "log "+line[1:4]+" "+text)
+	}
+	vdLog.lines = nil
+	if call == "prune" || call == "pruneexp" {
+		sort.Strings(rows)
+	} else {
+		for start := 0; start < len(rows); {
+			end := start + 1
+			if strings.HasPrefix(rows[start], vdOrphanRemoval) {
+				for end < len(rows) && strings.HasPrefix(rows[end], vdOrphanRemoval) {
+					end++
+				}
+				sort.Strings(rows[start:end])
+			}
+			start = end
+		}
+	}
+	for _, row := range rows {
+		d.out.WriteString(row)
+		d.out.WriteByte('\n')
+	}
 }
 
 func (d *vdDump) must(tx *dcrutil.Tx, err error) *dcrutil.Tx {
@@ -266,6 +346,17 @@ func (d *vdDump) winner(block, ticket *chainhash.Hash) {
 func (d *vdDump) utxo(tx *dcrutil.Tx, height int64, blockIndex uint32) {
 	d.harness.AddFakeUTXO(tx, height, blockIndex)
 	d.row("utxo", vdTx(d.t, tx), fmt.Sprint(height), fmt.Sprint(blockIndex))
+}
+
+// chainSpend marks the fake chain's entry for the output spent, as the view
+// of a block spending it holds it.
+func (d *vdDump) chainSpend(op wire.OutPoint) {
+	entry := d.harness.chain.utxos.LookupEntry(op)
+	if entry == nil {
+		d.t.Fatalf("the fake chain has no entry for %v", op)
+	}
+	entry.Spend()
+	d.row("chainspend", vdHash(&op.Hash), fmt.Sprint(op.Index), fmt.Sprint(op.Tree))
 }
 
 func (d *vdDump) utxoTime(tx *dcrutil.Tx, index uint32) {
@@ -319,7 +410,22 @@ func (d *vdDump) tspendMined(tx *dcrutil.Tx) {
 
 // Pool calls.  Each that can change the pool is followed by a `state` row.
 
+// vdFresh is the transaction as the pool receives it from a peer or the RPC
+// server, in a wrapper that hashes the transaction it carries.  A session
+// that changes a transaction after wrapping it (the auto revocation section
+// lowers an output's value) leaves the wrapper's cached hash stale, and the
+// pool would log that hash for the transaction.
+func vdFresh(tx *dcrutil.Tx) *dcrutil.Tx {
+	if *tx.Hash() == tx.MsgTx().TxHash() {
+		return tx
+	}
+	fresh := dcrutil.NewTx(tx.MsgTx())
+	fresh.SetTree(tx.Tree())
+	return fresh
+}
+
 func (d *vdDump) pt(tx *dcrutil.Tx, allowOrphan, allowHighFees bool, tag Tag) {
+	tx = vdFresh(tx)
 	accepted, err := d.harness.txPool.ProcessTransaction(tx, allowOrphan,
 		allowHighFees, tag)
 	fields := []string{"pt", vdTx(d.t, tx), fmt.Sprint(allowOrphan),
@@ -333,6 +439,7 @@ func (d *vdDump) pt(tx *dcrutil.Tx, allowOrphan, allowHighFees bool, tag Tag) {
 }
 
 func (d *vdDump) mat(tx *dcrutil.Tx, isNew bool) {
+	tx = vdFresh(tx)
 	missing, err := d.harness.txPool.MaybeAcceptTransaction(tx, isNew)
 	fields := []string{"mat", vdTx(d.t, tx), fmt.Sprint(isNew)}
 	switch {
@@ -352,6 +459,11 @@ func (d *vdDump) mat(tx *dcrutil.Tx, isNew bool) {
 }
 
 func (d *vdDump) mats(txns []*dcrutil.Tx) {
+	fresh := make([]*dcrutil.Tx, 0, len(txns))
+	for _, tx := range txns {
+		fresh = append(fresh, vdFresh(tx))
+	}
+	txns = fresh
 	err := d.harness.txPool.MaybeAcceptTransactions(txns)
 	hexes := make([]string, 0, len(txns))
 	for _, tx := range txns {
@@ -370,23 +482,27 @@ func (d *vdDump) mats(txns []*dcrutil.Tx) {
 }
 
 func (d *vdDump) mad(tx *dcrutil.Tx, isTreasuryEnabled bool) {
+	tx = vdFresh(tx)
 	accepted := d.harness.txPool.MaybeAcceptDependents(tx, isTreasuryEnabled)
 	d.row("mad", vdTx(d.t, tx), fmt.Sprint(isTreasuryEnabled), vdTxList(accepted))
 	d.state()
 }
 
 func (d *vdDump) rmtx(tx *dcrutil.Tx, removeRedeemers bool) {
+	tx = vdFresh(tx)
 	d.harness.txPool.RemoveTransaction(tx, removeRedeemers)
 	d.row("rmtx", vdTx(d.t, tx), fmt.Sprint(removeRedeemers))
 }
 
 func (d *vdDump) rmds(tx *dcrutil.Tx) {
+	tx = vdFresh(tx)
 	d.harness.txPool.RemoveDoubleSpends(tx)
 	d.row("rmds", vdTx(d.t, tx))
 	d.state()
 }
 
 func (d *vdDump) rmorph(tx *dcrutil.Tx) {
+	tx = vdFresh(tx)
 	d.harness.txPool.RemoveOrphan(tx)
 	d.row("rmorph", vdTx(d.t, tx))
 	d.state()
@@ -481,7 +597,8 @@ func (d *vdDump) voteBits(bits uint16) func(*wire.MsgTx) {
 // vdExportTxPool is the transaction pool session: chained acceptance,
 // orphans and their policy, duplicates and double spends, the fee policy,
 // sequence locks, expiry, ticket staging and the stake difficulty, batch
-// acceptance and removals.
+// acceptance and removals, an input the chain holds spent, and a ticket moved
+// to the stage pool.
 
 func vdExportTxPool(t *testing.T) string {
 	// This file holds a single session, without a `net` row.
@@ -600,6 +717,22 @@ func vdExportTxPool(t *testing.T) string {
 	// Removal with redeemers.
 	d.rmtx(chain5[1], true)
 	d.state()
+
+	// A transaction spending an output the chain holds spent is an orphan,
+	// and a ticket in the pool whose input's transaction comes back to the
+	// pool, as after the block that mined it is disconnected, moves to the
+	// stage pool.
+	back := d.must(h.CreateCoinbaseTx(1, 2))
+	d.utxo(back, 1, 0)
+	spentTx := d.must(h.CreateTx(d.spend(back, 0)))
+	d.utxo(spentTx, 200, 0)
+	d.chainSpend(d.spend(spentTx, 0).outPoint)
+	d.pt(d.must(h.CreateTx(d.spend(spentTx, 0))), true, false, 0)
+	returned := d.must(h.CreateTx(d.spend(back, 1)))
+	d.utxo(returned, 200, 0)
+	d.pt(d.must(h.CreateTicketPurchaseFromTx(returned, 1e8)), true, false, 0)
+	d.chainSpend(d.spend(returned, 0).outPoint)
+	d.mat(returned, false)
 	return out.String()
 }
 
@@ -1206,6 +1339,11 @@ func TestExportMempoolVectors(t *testing.T) {
 	if dir == "" {
 		t.Skip("MEMPOOL_VECTORS_DIR is not set")
 	}
+	backend := slog.NewBackend(&vdLog, slog.WithFlags(slog.Lnodatetime))
+	logger := backend.Logger("TXMP")
+	logger.SetLevel(slog.LevelTrace)
+	UseLogger(logger)
+	defer UseLogger(slog.Disabled)
 	files := []struct {
 		name string
 		gen  func(*testing.T) string

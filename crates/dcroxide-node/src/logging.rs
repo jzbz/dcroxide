@@ -14,7 +14,7 @@
 
 use std::io::Write;
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::{Mutex, OnceLock, PoisonError};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use crate::gostd::{filepath_split, go_mkdir_all_owner_only};
 use crate::logrotate::Rotator;
@@ -94,15 +94,21 @@ pub fn parse_and_set_debug_levels(debug_level: &str) -> Result<(), String> {
     result
 }
 
-/// The configured level for a subsystem; unknown tags — such as the
-/// tool binaries' `MAIN` — and an uninstalled configuration read as
-/// slog's default `Info`.
-pub(crate) fn subsystem_level(subsys: &str) -> LogLevel {
+/// The slot holding a subsystem's level; `None` for a tag the daemon
+/// keeps no level for, such as the tool binaries' `MAIN`.
+fn level_slot(subsys: &str) -> Option<&'static AtomicU8> {
     SUBSYSTEM_IDS
         .iter()
         .zip(&LEVELS)
         .find(|(id, _)| **id == subsys)
-        .map_or(LogLevel::Info, |(_, slot)| decode_level(slot))
+        .map(|(_, slot)| slot)
+}
+
+/// The configured level for a subsystem; unknown tags — such as the
+/// tool binaries' `MAIN` — and an uninstalled configuration read as
+/// slog's default `Info`.
+pub(crate) fn subsystem_level(subsys: &str) -> LogLevel {
+    level_slot(subsys).map_or(LogLevel::Info, decode_level)
 }
 
 /// Whether a message at the level passes the subsystem's configured
@@ -251,6 +257,12 @@ pub fn log(subsys: &str, level: LogLevel, msg: &str) {
     if !enabled(level, subsystem_level(subsys)) {
         return;
     }
+    write_line(subsys, level, msg);
+}
+
+/// Write a line whose level has passed the subsystem's, as [`log`]
+/// writes it.
+fn write_line(subsys: &str, level: LogLevel, msg: &str) {
     let mut line = render(&timestamp(), level, subsys, msg);
     line.push('\n');
     let mut rotator = LOG_ROTATOR.lock().unwrap_or_else(PoisonError::into_inner);
@@ -320,6 +332,48 @@ pub fn bcdb_log_sink() -> dcroxide_database::LogSink {
 /// `cmd/addblock/addblock.go:78` does.
 pub fn indx_log_sink() -> dcroxide_database::LogSink {
     subsystem_log_sink("INDX")
+}
+
+/// A package logger for the mining and mempool crates
+/// (`dcroxide_mining::log::Logger`) rendered under the subsystem tag, as
+/// a dcrd subsystem logger handed to a package's `UseLogger` is.  Its
+/// gate reads the subsystem's level slot, found once here, so a line
+/// whose level is off costs an atomic load and is never formatted, the
+/// check slog's print methods make before they format.
+fn package_logger(subsys: &'static str) -> dcroxide_mining::log::Logger {
+    use dcroxide_mining::log::LogLevel as PkgLevel;
+    fn level(level: PkgLevel) -> LogLevel {
+        match level {
+            PkgLevel::Trace => LogLevel::Trace,
+            PkgLevel::Debug => LogLevel::Debug,
+            PkgLevel::Info => LogLevel::Info,
+            PkgLevel::Warn => LogLevel::Warn,
+            PkgLevel::Error => LogLevel::Error,
+        }
+    }
+    let slot = level_slot(subsys);
+    dcroxide_mining::log::Logger::new(
+        Arc::new(move |at: PkgLevel| enabled(level(at), slot.map_or(LogLevel::Info, decode_level))),
+        Arc::new(move |at: PkgLevel, msg: &str| write_line(subsys, level(at), msg)),
+    )
+}
+
+/// The mempool's package logger, rendered under `TXMP`.  The daemon's
+/// pool logs through it ([`crate::txmempool::new_shared_tx_pool`]), as
+/// dcrd's `log.go:91` installs `mempool.UseLogger(txmpLog)`.
+pub fn txmp_logger() -> dcroxide_mining::log::Logger {
+    static LOGGER: OnceLock<dcroxide_mining::log::Logger> = OnceLock::new();
+    LOGGER.get_or_init(|| package_logger("TXMP")).clone()
+}
+
+/// The mining packages' logger, rendered under `MINR`: the template
+/// generation and the background generator log through it
+/// ([`crate::mining::NodeTemplateChain`]), and so does the CPU miner's
+/// solve core, as dcrd's `log.go:92` and `:94` install it for both
+/// (`mining.UseLogger(minrLog)`, `cpuminer.UseLogger(minrLog)`).
+pub fn minr_logger() -> dcroxide_mining::log::Logger {
+    static LOGGER: OnceLock<dcroxide_mining::log::Logger> = OnceLock::new();
+    LOGGER.get_or_init(|| package_logger("MINR")).clone()
 }
 
 /// The RPC server's package log sink, rendered under `RPCS`: the

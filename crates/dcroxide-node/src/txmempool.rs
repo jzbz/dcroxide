@@ -472,11 +472,11 @@ pub fn new_shared_tx_pool(
         allow_old_votes,
         enable_ancestor_tracking,
     );
-    Arc::new(Mutex::new(TxPool::new(
-        NodePoolChain::new(chain, params.clone()),
-        policy,
-        params,
-    )))
+    let mut pool = TxPool::new(NodePoolChain::new(chain, params.clone()), policy, params);
+    // dcrd's pool logs to `TXMP` from init (`log.go:91`,
+    // `mempool.UseLogger(txmpLog)`).
+    pool.set_logger(crate::logging::txmp_logger());
+    Arc::new(Mutex::new(pool))
 }
 
 /// The netsync adapter over the shared pool (dcrd hands netsync the

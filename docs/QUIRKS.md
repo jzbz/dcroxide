@@ -835,3 +835,55 @@ Entry format:
   `a_line_reaching_the_threshold_rotates_the_file` in
   `crates/dcroxide-node/src/logrotate.rs`; the zero threshold by
   `three_rolls_are_kept_and_the_oldest_deleted` there.
+
+## QK-0030 — three of the mempool's log lines name the wrong transaction or none
+
+- **Where:** dcrd `internal/mempool/mempool.go` `removeTransaction`
+  (`:897-902`), `RemoveDoubleSpends` (`:963-970`) and
+  `ProcessTransaction` (`:2360-2414`) / dcroxide-mempool `pool.rs`
+  `TxPool::remove_transaction`, `remove_double_spends` and
+  `process_transaction_accepted` with `log_process_failure`
+- **What:** removing a transaction whose output a staged ticket spends
+  logs `Removing staged transaction <hash>` at trace with the outpoint's
+  hash, which is the transaction being removed, not the staged ticket the
+  line reports removing.  `RemoveDoubleSpends` logs `Removing double spend
+  transaction <hash> from stage pool` at debug with the hash of the
+  transaction it was handed, a connected block's, not the staged one it
+  removes.  `ProcessTransaction` logs a failure at trace from a deferred
+  function that reads the function's `err` variable, but refuses an orphan
+  when orphans are not allowed with `return nil, txRuleError(...)`, which
+  leaves `err` nil, so that refusal is never logged, though the RPC
+  server's `sendrawtransaction` refuses every orphan that way; nor is a
+  failed agenda lookup, which returns before the function is deferred.
+  The failures of the acceptance and of adding the orphan are logged.
+- **Why reproduced:** operator-visible log parity: under
+  `--debuglevel=TXMP=trace` the same transactions produce the same lines,
+  misattributions included.
+- **Pinned by:** `a_staged_redeemer_removal_names_the_spent_transaction`
+  and `a_staged_double_spend_removal_names_the_spending_transaction` in
+  `crates/dcroxide-mempool/src/pool.rs`; the refusals of an orphan in
+  `crates/dcroxide-mempool/tests/data/txpool_vectors.txt` and
+  `txstake_vectors.txt`, after which dcrd's pool logged only the trace
+  line for the unknown input (the `log` rows, compared by
+  `txpool_vectors` and `txstake_vectors`).
+
+## QK-0031 — a skipped template transaction's dependents are logged with an empty line each
+
+- **Where:** dcrd `internal/mining/mining.go` `logSkippedDeps`
+  (`:718-729`) and its callers in `NewBlockTemplate` (`:1558`, `:1614`
+  to `:1767`) / dcroxide-mining `generator.rs` `log_skipped_deps`
+- **What:** when the template build skips a queue item, each transaction
+  depending on it is logged at trace as `Skipping tx <dependent> since it
+  depends on <item>`.  The format string ends in `\n` and slog's `Tracef`
+  appends a newline of its own, so every such line is followed by an
+  empty one.  The dependents are the item's children, collected when the
+  item is popped; where a transaction of the item's ancestor bundle fails
+  its input or script check, the line names that bundled transaction as
+  the one depended on, while the transactions listed are still the
+  item's children.
+- **Why reproduced:** operator-visible log parity under
+  `--debuglevel=MINR=trace`.
+- **Pinned by:**
+  `a_skipped_free_transaction_and_its_dependents_are_logged_at_trace` in
+  `crates/dcroxide-mining/tests/newtemplate_vectors.rs` (the trailing
+  newline); the bundle case is not exercised by a test.

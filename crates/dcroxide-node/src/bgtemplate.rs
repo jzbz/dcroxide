@@ -561,7 +561,17 @@ fn build_template(ctx: &BuildCtx) -> (Option<dcroxide_mining::BlockTemplate>, Op
     );
     match builder.new_block_template(pay_addr, &nonces) {
         Ok(template) => (template, None),
-        Err(e) => (None, Some(e)),
+        Err(e) => {
+            // Logged before the cancellation check, as dcrd's goroutine
+            // logs it (`bgblktmplgenerator.go:729-733`), through the
+            // mining packages' logger, so the line is formatted only
+            // when MINR is at trace.
+            dcroxide_mining::log::tracef(
+                Some(&crate::logging::minr_logger()),
+                format_args!("NewBlockTemplate: {e}"),
+            );
+            (None, Some(e))
+        }
     }
 }
 

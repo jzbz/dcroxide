@@ -142,6 +142,7 @@ fn the_generator_gate_reads_the_median_adjusted_time() {
             &mut |_| {},
             &mut || false,
             &mut || 0,
+            None,
         ),
         "the regnet proof of work solves"
     );

@@ -34,6 +34,7 @@ use dcroxide_wire::{BlockHeader, MsgTx, OutPoint};
 use crate::error::{
     ErrorKind, PoolError, RuleError, chain_rule_error, tx_rule_error, wrap_tx_rule_error,
 };
+use crate::log::{Logger, debugf, pick_noun, tracef};
 use crate::policy::calc_min_required_tx_relay_fee;
 use crate::{check_inputs_standard, check_transaction_standard};
 use dcroxide_mining::TxMiningView;
@@ -440,7 +441,7 @@ struct VoteTracker {
 impl VoteTracker {
     /// Track the vote for the block it votes on, unless a vote by the
     /// same ticket is already tracked for that block (dcrd `AddVote`).
-    fn add_vote(&mut self, vote: &MsgTx, vote_hash: &Hash) {
+    fn add_vote(&mut self, vote: &MsgTx, vote_hash: &Hash, logger: Option<&Logger>) {
         let (voted_hash, voted_height) = dcroxide_stake::ssgen_block_voted_on(vote);
         let ticket_hash = vote.tx_in[1].previous_out_point.hash;
 
@@ -468,6 +469,15 @@ impl VoteTracker {
             ticket_hash,
             approves_parent,
         });
+
+        let approves = if approves_parent { "yes" } else { "no" };
+        debugf(
+            logger,
+            format_args!(
+                "Accepted {approves} vote {vote_hash} for block hash {voted_hash} (height \
+                 {voted_height})"
+            ),
+        );
     }
 
     /// The metadata tracked for the block, empty when none is.
@@ -479,14 +489,29 @@ impl VoteTracker {
 
     /// Drop the metadata of every block whose first vote claims a height
     /// more than [`HEIGHT_DIFF_TO_PRUNE_VOTES`] below the given height
-    /// (dcrd `PruneOldVotes`).
+    /// (dcrd `PruneOldVotes`), logging each block's at debug as dcrd
+    /// does; dcrd ranges over a Go map, so its lines come in no set
+    /// order, and these in hash order.
     #[allow(
         clippy::arithmetic_side_effects,
         reason = "block_height is a u32 claimed height widened to i64, so adding 10 cannot overflow"
     )]
-    fn prune_old_votes(&mut self, height: i64) {
-        self.votes
-            .retain(|_, tracked| tracked.block_height + HEIGHT_DIFF_TO_PRUNE_VOTES >= height);
+    fn prune_old_votes(&mut self, height: i64, logger: Option<&Logger>) {
+        self.votes.retain(|block_hash, tracked| {
+            let keep = tracked.block_height + HEIGHT_DIFF_TO_PRUNE_VOTES >= height;
+            if !keep {
+                debugf(
+                    logger,
+                    format_args!(
+                        "Pruning {} tracked votes for block {} (height {})",
+                        tracked.votes.len(),
+                        Hash(*block_hash),
+                        tracked.block_height
+                    ),
+                );
+            }
+            keep
+        });
     }
 }
 
@@ -527,6 +552,9 @@ pub struct TxPool<C: PoolChain> {
     /// it creates, in place of the chain's best height (see
     /// [`TxPool::with_event_height`]).
     event_height: Option<i64>,
+    /// The package logger (see [`TxPool::set_logger`]); `None` logs
+    /// nothing, dcrd's `slog.Disabled` default.
+    logger: Option<Logger>,
 }
 
 impl<C: PoolChain> TxPool<C> {
@@ -563,7 +591,16 @@ impl<C: PoolChain> TxPool<C> {
             fee_estimator: None,
             mixpool_probe: None,
             event_height: None,
+            logger: None,
         }
+    }
+
+    /// Install the package logger the pool logs through (dcrd
+    /// `mempool.UseLogger`, which the daemon calls with its `TXMP` logger
+    /// at init, `log.go:91`).  Until one is installed the pool logs
+    /// nothing, as dcrd's `slog.Disabled` package default does.
+    pub fn set_logger(&mut self, logger: Logger) {
+        self.logger = Some(logger);
     }
 
     /// Run `f` with the descriptors of the transactions the pool accepts
@@ -796,6 +833,11 @@ impl<C: PoolChain> TxPool<C> {
     fn unlink_orphan(&mut self, tx_hash: &Hash) -> Option<OrphanTx> {
         let otx = self.orphans.get(&tx_hash.0).cloned()?;
 
+        tracef(
+            self.logger.as_ref(),
+            format_args!("Removing orphan transaction {tx_hash}"),
+        );
+
         // Remove the reference from the previous orphan index.
         for tx_in in &otx.tx.tx_in {
             let key = out_key(&tx_in.previous_out_point);
@@ -894,6 +936,7 @@ impl<C: PoolChain> TxPool<C> {
             reason = "now_mono_nanos counts nanoseconds from a process-wide origin, so it stays below i64::MAX - ORPHAN_EXPIRE_SCAN_INTERVAL_NANOS for about 292 years of uptime"
         )]
         if now > self.next_expire_scan_mono {
+            let orig_num_orphans = self.orphans.len();
             let expired: Vec<Hash> = self
                 .orphans
                 .values()
@@ -909,6 +952,18 @@ impl<C: PoolChain> TxPool<C> {
             // Set next expiration scan to occur after the scan
             // interval.
             self.next_expire_scan_mono = now + ORPHAN_EXPIRE_SCAN_INTERVAL_NANOS;
+
+            let num_orphans = self.orphans.len();
+            let num_expired = orig_num_orphans.saturating_sub(num_orphans);
+            if num_expired > 0 {
+                debugf(
+                    self.logger.as_ref(),
+                    format_args!(
+                        "Expired {num_expired} {} (remaining: {num_orphans})",
+                        pick_noun(num_expired as u64, "orphan", "orphans")
+                    ),
+                );
+            }
         }
 
         // Nothing to do if adding another orphan will not cause the
@@ -990,6 +1045,14 @@ impl<C: PoolChain> TxPool<C> {
                 .or_default()
                 .insert(tx_hash.0, tx.clone());
         }
+
+        debugf(
+            self.logger.as_ref(),
+            format_args!(
+                "Stored orphan transaction {tx_hash} (total: {})",
+                self.orphans.len()
+            ),
+        );
     }
 
     /// Potentially add an orphan to the orphan pool (dcrd
@@ -1171,6 +1234,13 @@ impl<C: PoolChain> TxPool<C> {
                 continue;
             }
             if let Some(redeemer) = self.staged_outpoints.get(&key).cloned() {
+                // dcrd names the outpoint's hash here, the transaction
+                // whose output the staged one spends, not the staged one
+                // it removes (QK-0030).
+                tracef(
+                    self.logger.as_ref(),
+                    format_args!("Removing staged transaction {frame_hash}"),
+                );
                 self.remove_staged_transaction(&redeemer);
             }
         }
@@ -1182,6 +1252,11 @@ impl<C: PoolChain> TxPool<C> {
     fn remove_pool_transaction(&mut self, tx_hash: &Hash, update_descendant_stats: bool) {
         // Remove the transaction if needed.
         if let Some(tx_desc) = self.pool.remove(&tx_hash.0) {
+            tracef(
+                self.logger.as_ref(),
+                format_args!("Removing transaction {tx_hash}"),
+            );
+
             // Mark the referenced outpoints as unspent by the pool.
             for tx_in in &tx_desc.tx.tx_in {
                 self.outpoints.remove(&out_key(&tx_in.previous_out_point));
@@ -1219,6 +1294,12 @@ impl<C: PoolChain> TxPool<C> {
             if let Some(redeemer) = self.staged_outpoints.get(&key).cloned()
                 && redeemer.tx_hash != *tx_hash
             {
+                // dcrd names the passed transaction here, not the staged
+                // one it removes (QK-0030).
+                debugf(
+                    self.logger.as_ref(),
+                    format_args!("Removing double spend transaction {tx_hash} from stage pool"),
+                );
                 self.remove_staged_transaction(&redeemer);
             }
         }
@@ -1580,6 +1661,14 @@ impl<C: PoolChain> TxPool<C> {
         is_treasury_enabled: bool,
     ) -> Result<(), PoolError> {
         if tx_desc.tx_type == TxType::SStx && !self.has_mempool_input(&tx_desc.tx) {
+            tracef(
+                self.logger.as_ref(),
+                format_args!(
+                    "Removing ticket {} with no mempool dependencies from stage pool",
+                    tx_desc.tx_hash
+                ),
+            );
+
             // Remove the dependent transaction and attempt to add it
             // to the main pool.  In the event of an error, the
             // transaction will be discarded.
@@ -1606,7 +1695,14 @@ impl<C: PoolChain> TxPool<C> {
         let mut accepted = Vec::new();
         for redeemer in Self::collect_redeemers(&self.staged_outpoints, tx, tx_hash) {
             let redeemer_hash = redeemer.tx_hash;
-            let _ = self.maybe_unstage_transaction(redeemer, is_treasury_enabled);
+            if let Err(err) = self.maybe_unstage_transaction(redeemer, is_treasury_enabled) {
+                debugf(
+                    self.logger.as_ref(),
+                    format_args!(
+                        "Failed to add previously staged ticket {redeemer_hash} to pool: {err}"
+                    ),
+                );
+            }
             if self.is_transaction_in_pool(&redeemer_hash) {
                 accepted.push(redeemer_hash);
             }
@@ -1921,12 +2017,28 @@ impl<C: PoolChain> TxPool<C> {
                 continue;
             }
 
-            match utxo_view
-                .lookup_entry(&tx_in.previous_out_point)
-                .filter(|e| !e.is_spent())
-            {
+            match utxo_view.lookup_entry(&tx_in.previous_out_point) {
                 None => {
                     missing_parents.push(tx_in.previous_out_point);
+                    tracef(
+                        self.logger.as_ref(),
+                        format_args!(
+                            "Transaction {tx_hash} uses unknown input {} and will be \
+                             considered an orphan",
+                            tx_in.previous_out_point
+                        ),
+                    );
+                }
+                Some(entry) if entry.is_spent() => {
+                    missing_parents.push(tx_in.previous_out_point);
+                    tracef(
+                        self.logger.as_ref(),
+                        format_args!(
+                            "Transaction {tx_hash} uses spent input {} and will be \
+                             considered an orphan",
+                            tx_in.previous_out_point
+                        ),
+                    );
                 }
                 Some(entry) => {
                     // Check the fraud proof data.  If anything does not
@@ -2129,6 +2241,18 @@ impl<C: PoolChain> TxPool<C> {
             if let Some(receiver) = &mut self.tspend_receiver {
                 receiver.tspend_received(&tx);
             }
+
+            tracef(
+                self.logger.as_ref(),
+                format_args!(
+                    "TSpend allowed in mempool: nbh {next_block_height} expiry {} tvi {} tvim \
+                     {} tspends {}",
+                    tx.expiry,
+                    self.params.treasury_vote_interval,
+                    self.params.treasury_vote_interval_multiplier,
+                    self.tspends.len()
+                ),
+            );
         }
 
         let tx_desc = Arc::new(TxDesc {
@@ -2147,6 +2271,10 @@ impl<C: PoolChain> TxPool<C> {
         // been approved by stakeholders, so tickets with mempool
         // inputs are placed in a separate stage pool.
         if tx_type == TxType::SStx && self.has_mempool_input(&tx_desc.tx) {
+            debugf(
+                self.logger.as_ref(),
+                format_args!("Adding ticket {tx_hash} with mempool dependency to stage pool"),
+            );
             self.stage_transaction(tx_desc);
             return Ok(Vec::new());
         }
@@ -2160,21 +2288,36 @@ impl<C: PoolChain> TxPool<C> {
         if !is_new && tx_type == TxType::Regular {
             for redeemer in Self::collect_redeemers(&self.outpoints, tx, &tx_hash) {
                 if redeemer.tx_type == TxType::SStx {
-                    self.remove_transaction(&redeemer.tx, &redeemer.tx_hash, true);
+                    let redeemer_hash = redeemer.tx_hash;
+                    self.remove_transaction(&redeemer.tx, &redeemer_hash, true);
                     self.stage_transaction(redeemer);
+                    debugf(
+                        self.logger.as_ref(),
+                        format_args!(
+                            "Moved ticket {redeemer_hash} dependent on {tx_hash} into stage pool"
+                        ),
+                    );
                 }
             }
         }
 
         // Keep track of votes separately.
         if is_vote {
-            self.vote_track.add_vote(tx, &tx_hash);
+            self.vote_track.add_vote(tx, &tx_hash, self.logger.as_ref());
         }
 
         // Keep track of tspends separately.
         if is_tspend {
             self.tspends.insert(tx_hash.0);
         }
+
+        debugf(
+            self.logger.as_ref(),
+            format_args!(
+                "Accepted transaction {tx_hash} (pool size: {})",
+                self.pool.len()
+            ),
+        );
 
         Ok(Vec::new())
     }
@@ -2566,14 +2709,9 @@ impl<C: PoolChain> TxPool<C> {
         let tx_hash = tx.tx_hash();
 
         // Potentially accept the transaction to the memory pool.
-        let missing_parents = self.maybe_accept_transaction(
-            tx,
-            &tx_hash,
-            true,
-            allow_high_fees,
-            true,
-            check_tx_flags,
-        )?;
+        let missing_parents = self
+            .maybe_accept_transaction(tx, &tx_hash, true, allow_high_fees, true, check_tx_flags)
+            .inspect_err(|err| self.log_process_failure(&tx_hash, err))?;
 
         if missing_parents.is_empty() {
             // Accept any orphan transactions that depend on this
@@ -2607,8 +2745,26 @@ impl<C: PoolChain> TxPool<C> {
         }
 
         // Potentially add the orphan transaction to the orphan pool.
-        self.maybe_add_orphan(tx, &tx_hash, tag)?;
+        if let Err(err) = self.maybe_add_orphan(tx, &tx_hash, tag) {
+            let err = PoolError::from(err);
+            self.log_process_failure(&tx_hash, &err);
+            return Err(err);
+        }
         Ok(Vec::new())
+    }
+
+    /// The trace line dcrd's `ProcessTransaction` defers for a failure
+    /// (`mempool.go:2371-2375`).  The deferred function reads the
+    /// function's `err` variable, which holds the errors of the
+    /// acceptance and of adding the orphan; the agenda lookup fails
+    /// before the function is deferred, and the refusal of an orphan
+    /// when orphans are not allowed is returned without passing through
+    /// the variable, so neither is logged (QK-0030).
+    fn log_process_failure(&self, tx_hash: &Hash, err: &PoolError) {
+        tracef(
+            self.logger.as_ref(),
+            format_args!("Failed to process transaction {tx_hash}: {err}"),
+        );
     }
 
     /// Prune tickets, votes, and revocations that can no longer be
@@ -2652,10 +2808,24 @@ impl<C: PoolChain> TxPool<C> {
         for tx_desc in staged_descs {
             let tx_type = tx_desc.tx_type;
             if tx_type == TxType::SStx && tx_desc.tx.tx_out[0].value < required_stake_difficulty {
+                debugf(
+                    self.logger.as_ref(),
+                    format_args!(
+                        "Pruning ticket {} with insufficient stake difficulty from stage pool",
+                        tx_desc.tx_hash
+                    ),
+                );
                 self.remove_staged_transaction(&tx_desc);
                 continue;
             }
             if tx_type == TxType::SStx && tx_desc.height + HEIGHT_DIFF_TO_PRUNE_TICKET < height {
+                debugf(
+                    self.logger.as_ref(),
+                    format_args!(
+                        "Pruning old ticket {} added at height {} from stage pool",
+                        tx_desc.tx_hash, tx_desc.height
+                    ),
+                );
                 self.remove_staged_transaction(&tx_desc);
                 continue;
             }
@@ -2672,7 +2842,8 @@ impl<C: PoolChain> TxPool<C> {
         // outlive its metadata, and while it does, a second vote by its
         // ticket on the same block passes `check_vote_double_spend`, up to
         // the five-vote cap, as in dcrd.
-        self.vote_track.prune_old_votes(height);
+        self.vote_track
+            .prune_old_votes(height, self.logger.as_ref());
     }
 
     /// Prune stake transactions that are no longer deemed relevant for
@@ -2708,9 +2879,22 @@ impl<C: PoolChain> TxPool<C> {
         )]
         let next_block_height = height + 1;
 
+        // dcrd ranges over the map it removes from, which never yields
+        // an entry removed before the range reaches it (the Go spec's
+        // `for` statements), so one an earlier expiry took along as a
+        // redeemer is neither logged nor removed again.
         let pool_descs: Vec<Arc<TxDesc>> = self.pool.values().cloned().collect();
         for tx_desc in pool_descs {
-            if is_expired_tx(&tx_desc.tx, next_block_height) {
+            if is_expired_tx(&tx_desc.tx, next_block_height)
+                && self.is_transaction_in_pool(&tx_desc.tx_hash)
+            {
+                debugf(
+                    self.logger.as_ref(),
+                    format_args!(
+                        "Pruning expired transaction {} from the mempool",
+                        tx_desc.tx_hash
+                    ),
+                );
                 self.remove_transaction(&tx_desc.tx, &tx_desc.tx_hash, true);
             }
         }
@@ -2718,6 +2902,13 @@ impl<C: PoolChain> TxPool<C> {
         let staged_descs: Vec<Arc<TxDesc>> = self.staged.values().cloned().collect();
         for tx_desc in staged_descs {
             if is_expired_tx(&tx_desc.tx, next_block_height) {
+                debugf(
+                    self.logger.as_ref(),
+                    format_args!(
+                        "Pruning expired transaction {} from the stage pool",
+                        tx_desc.tx_hash
+                    ),
+                );
                 self.remove_staged_transaction(&tx_desc);
             }
         }
@@ -2944,8 +3135,12 @@ mod removal_cascade_tests {
     const SEED_HASH: Hash = Hash([7u8; 32]);
 
     /// A chain backend answering only the wall-clock question the
-    /// removal paths ask.
+    /// removal paths ask, and the tip and the refused utxo view an
+    /// unstaging meets.
     struct StubChain;
+
+    /// The error the stub's utxo view fetch returns.
+    const STUB_VIEW_ERR: &str = "no utxo view";
 
     impl PoolChain for StubChain {
         fn next_stake_difficulty(&self) -> Result<i64, String> {
@@ -2958,10 +3153,10 @@ mod removal_cascade_tests {
             _tree: i8,
             _tree_valid: bool,
         ) -> Result<UtxoView, String> {
-            unimplemented!()
+            Err(String::from(STUB_VIEW_ERR))
         }
         fn best_hash(&self) -> Hash {
-            unimplemented!()
+            Hash::ZERO
         }
         fn best_height(&self) -> i64 {
             unimplemented!()
@@ -3225,6 +3420,281 @@ mod removal_cascade_tests {
         assert!(pool.is_transaction_in_pool(&hashes[0]));
         assert!(!pool.is_transaction_in_pool(&hashes[1]));
         assert!(pool.is_transaction_in_pool(&hashes[2]));
+    }
+
+    /// A ticket purchase spending the given outpoint, staged as one with
+    /// a mempool input is, accepted at `height`.
+    fn stage_ticket(pool: &mut TxPool<StubChain>, prev: OutPoint, height: i64) -> Hash {
+        let tx = linked_tx(prev, 0);
+        let tx_hash = tx.tx_hash();
+        pool.stage_transaction(Arc::new(TxDesc {
+            tx,
+            tx_hash,
+            tree: dcroxide_wire::TX_TREE_STAKE,
+            tx_type: TxType::SStx,
+            added_unix: 0,
+            height,
+            fee: 0,
+            total_sig_ops: 0,
+            tx_size: 200,
+        }));
+        tx_hash
+    }
+
+    /// Removing a transaction a staged ticket spends logs at trace the
+    /// staged removal and then its own, the first naming the outpoint's
+    /// transaction, which is the one being removed, rather than the
+    /// staged ticket (`mempool.go:897-908`, QK-0030).  Neither shows at
+    /// debug.
+    #[test]
+    fn a_staged_redeemer_removal_names_the_spent_transaction() {
+        use crate::log::{Capture, LogLevel};
+
+        for (level, logged) in [(LogLevel::Trace, true), (LogLevel::Debug, false)] {
+            let capture = Capture::at(level);
+            let mut pool = new_pool();
+            pool.set_logger(capture.logger.clone());
+            let hashes = fill_chain(&mut pool, 1, 0);
+            let ticket = stage_ticket(
+                &mut pool,
+                OutPoint {
+                    hash: hashes[0],
+                    index: 0,
+                    tree: TX_TREE_REGULAR,
+                },
+                1,
+            );
+            let head = pool.pool.get(&hashes[0].0).cloned().expect("in pool");
+            pool.remove_transaction(&head.tx, &head.tx_hash, true);
+            assert!(!pool.is_transaction_staged(&ticket));
+            let want = if logged {
+                vec![
+                    (
+                        LogLevel::Trace,
+                        format!("Removing staged transaction {}", hashes[0]),
+                    ),
+                    (
+                        LogLevel::Trace,
+                        format!("Removing transaction {}", hashes[0]),
+                    ),
+                ]
+            } else {
+                Vec::new()
+            };
+            assert_eq!(capture.take(), want, "{level:?}");
+        }
+    }
+
+    /// A connected block's transaction double spending a staged ticket
+    /// logs the staged removal at debug, naming the block's transaction
+    /// rather than the staged ticket it removes (`mempool.go:963-970`,
+    /// QK-0030).
+    #[test]
+    fn a_staged_double_spend_removal_names_the_spending_transaction() {
+        use crate::log::{Capture, LogLevel};
+
+        let capture = Capture::at(LogLevel::Debug);
+        let mut pool = new_pool();
+        pool.set_logger(capture.logger.clone());
+        let seed = OutPoint {
+            hash: SEED_HASH,
+            index: 0,
+            tree: TX_TREE_REGULAR,
+        };
+        let ticket = stage_ticket(&mut pool, seed, 1);
+        let conflict = linked_tx(seed, 9);
+        let conflict_hash = conflict.tx_hash();
+        pool.remove_double_spends(&conflict, &conflict_hash);
+        assert!(!pool.is_transaction_staged(&ticket));
+        assert_eq!(
+            capture.take(),
+            [(
+                LogLevel::Debug,
+                format!("Removing double spend transaction {conflict_hash} from stage pool")
+            )]
+        );
+    }
+
+    /// A staged ticket whose mempool input was mined is taken out of the
+    /// stage pool with dcrd's trace line, and, when its inputs cannot be
+    /// fetched, dropped with the debug line `MaybeAcceptDependents` logs
+    /// for the error (`mempool.go:1345-1346`, `:1378-1379`).  Neither
+    /// shows at info.
+    #[test]
+    fn a_failed_unstaging_is_logged_as_dcrd_logs_it() {
+        use crate::log::{Capture, LogLevel};
+
+        for level in [LogLevel::Trace, LogLevel::Debug, LogLevel::Info] {
+            let capture = Capture::at(level);
+            let mut pool = new_pool();
+            pool.set_logger(capture.logger.clone());
+            let mined = linked_tx(
+                OutPoint {
+                    hash: SEED_HASH,
+                    index: 0,
+                    tree: TX_TREE_REGULAR,
+                },
+                0,
+            );
+            let mined_hash = mined.tx_hash();
+            let ticket = stage_ticket(
+                &mut pool,
+                OutPoint {
+                    hash: mined_hash,
+                    index: 0,
+                    tree: TX_TREE_REGULAR,
+                },
+                1,
+            );
+            let accepted = pool.maybe_accept_dependents(&mined, &mined_hash, false);
+            assert!(accepted.is_empty(), "{level:?}");
+            assert!(!pool.is_transaction_staged(&ticket), "{level:?}");
+            let removing = (
+                LogLevel::Trace,
+                format!("Removing ticket {ticket} with no mempool dependencies from stage pool"),
+            );
+            let failed = (
+                LogLevel::Debug,
+                format!("Failed to add previously staged ticket {ticket} to pool: {STUB_VIEW_ERR}"),
+            );
+            let want = match level {
+                LogLevel::Trace => vec![removing, failed],
+                LogLevel::Debug => vec![failed],
+                _ => Vec::new(),
+            };
+            assert_eq!(capture.take(), want, "{level:?}");
+        }
+    }
+
+    /// The stake pruning logs each ticket it takes from the stage pool at
+    /// debug, for its price or its age (`mempool.go:2244-2257`), and the
+    /// expiry pruning each transaction it takes from either pool
+    /// (`mempool.go:2302-2316`).  A transaction an earlier expiry took
+    /// along as a redeemer is not logged again, as dcrd's range over the
+    /// pool never reaches an entry removed before it.
+    #[test]
+    fn the_prunes_log_dcrds_lines() {
+        use crate::log::{Capture, LogLevel};
+
+        let capture = Capture::at(LogLevel::Debug);
+        let mut pool = new_pool();
+        pool.set_logger(capture.logger.clone());
+        let outpoint = |index: u32| OutPoint {
+            hash: Hash([0x33; 32]),
+            index,
+            tree: TX_TREE_REGULAR,
+        };
+        let sorted = |mut lines: Vec<(LogLevel, String)>| {
+            lines.sort();
+            lines
+        };
+
+        // linked_tx's ticket output is 900,000 atoms: under a price of
+        // 1,000,000, both go for their price, the old one too, since the
+        // price is checked first.
+        let recent = stage_ticket(&mut pool, outpoint(1), 400);
+        let old = stage_ticket(&mut pool, outpoint(2), 10);
+        pool.prune_stake_tx_internal(1_000_000, 400, false);
+        assert_eq!(
+            sorted(capture.take()),
+            sorted(vec![
+                (
+                    LogLevel::Debug,
+                    format!(
+                        "Pruning ticket {recent} with insufficient stake difficulty from stage \
+                         pool"
+                    )
+                ),
+                (
+                    LogLevel::Debug,
+                    format!(
+                        "Pruning ticket {old} with insufficient stake difficulty from stage pool"
+                    )
+                ),
+            ])
+        );
+
+        // At its price, a ticket staged more than 288 blocks ago goes for
+        // its age, and a recent one stays.
+        let recent = stage_ticket(&mut pool, outpoint(3), 400);
+        let old = stage_ticket(&mut pool, outpoint(4), 10);
+        pool.prune_stake_tx_internal(900_000, 400, false);
+        assert!(pool.is_transaction_staged(&recent));
+        assert_eq!(
+            capture.take(),
+            [(
+                LogLevel::Debug,
+                format!("Pruning old ticket {old} added at height 10 from stage pool")
+            )]
+        );
+
+        // Two expiring transactions, the second spending the first, and
+        // an expiring staged ticket.  The pool is walked in hash order:
+        // the child is logged only when it comes first, before its
+        // parent's removal takes it along.
+        let head = linked_tx(
+            OutPoint {
+                hash: SEED_HASH,
+                index: 0,
+                tree: TX_TREE_REGULAR,
+            },
+            12,
+        );
+        let head_hash = head.tx_hash();
+        let child = linked_tx(
+            OutPoint {
+                hash: head_hash,
+                index: 0,
+                tree: TX_TREE_REGULAR,
+            },
+            12,
+        );
+        let child_hash = child.tx_hash();
+        for (tx, tx_hash) in [(head, head_hash), (child, child_hash)] {
+            pool.add_transaction(Arc::new(TxDesc {
+                tx,
+                tx_hash,
+                tree: TX_TREE_REGULAR,
+                tx_type: TxType::Regular,
+                added_unix: 0,
+                height: 1,
+                fee: 100_000,
+                total_sig_ops: 1,
+                tx_size: 200,
+            }));
+        }
+        let mut staged = linked_tx(outpoint(5), 12);
+        staged.tx_out[0].value = 1;
+        let staged_hash = staged.tx_hash();
+        pool.stage_transaction(Arc::new(TxDesc {
+            tx: staged,
+            tx_hash: staged_hash,
+            tree: dcroxide_wire::TX_TREE_STAKE,
+            tx_type: TxType::SStx,
+            added_unix: 0,
+            height: 1,
+            fee: 0,
+            total_sig_ops: 0,
+            tx_size: 200,
+        }));
+        pool.prune_expired_tx(11);
+        assert_eq!(pool.count(), 0);
+        let mut want = Vec::new();
+        if child_hash.0 < head_hash.0 {
+            want.push((
+                LogLevel::Debug,
+                format!("Pruning expired transaction {child_hash} from the mempool"),
+            ));
+        }
+        want.push((
+            LogLevel::Debug,
+            format!("Pruning expired transaction {head_hash} from the mempool"),
+        ));
+        want.push((
+            LogLevel::Debug,
+            format!("Pruning expired transaction {staged_hash} from the stage pool"),
+        ));
+        assert_eq!(capture.take(), want);
     }
 
     /// The tag every orphan of the orphan cascade tests is filed under,
@@ -3589,6 +4059,68 @@ mod orphan_eviction_tests {
         assert!(!pool.orphans.contains_key(&first.0), "16 minutes old");
         assert!(!pool.orphans.contains_key(&second.0), "16 minutes old");
         assert!(pool.orphans.contains_key(&third.0));
+    }
+
+    /// The expiry scan logs at debug how many orphans it took and how
+    /// many are left, the noun following dcrd's `pickNoun`
+    /// (`mempool.go:566-572`), ahead of the line for the orphan whose
+    /// admission ran the scan (`mempool.go:622-623`); each orphan
+    /// removed is logged at trace (`mempool.go:482`).
+    #[test]
+    fn the_expiry_scan_logs_dcrds_lines() {
+        use crate::log::{Capture, LogLevel};
+
+        const SECOND: i64 = 1_000_000_000;
+        let capture = Capture::at(LogLevel::Trace);
+        let mut pool = pool_capped_at(10, 0);
+        pool.set_logger(capture.logger.clone());
+        let first = orphan_with_hash(&mut pool, 1);
+        let second = orphan_with_hash(&mut pool, 2);
+        assert_eq!(
+            capture.take(),
+            [
+                (
+                    LogLevel::Debug,
+                    format!("Stored orphan transaction {first} (total: 1)")
+                ),
+                (
+                    LogLevel::Debug,
+                    format!("Stored orphan transaction {second} (total: 2)")
+                ),
+            ]
+        );
+
+        pool.chain.mono.set(16 * 60 * SECOND);
+        let third = orphan_with_hash(&mut pool, 3);
+        assert_eq!(
+            capture.take(),
+            [
+                (
+                    LogLevel::Trace,
+                    format!("Removing orphan transaction {first}")
+                ),
+                (
+                    LogLevel::Trace,
+                    format!("Removing orphan transaction {second}")
+                ),
+                (
+                    LogLevel::Debug,
+                    "Expired 2 orphans (remaining: 0)".to_string()
+                ),
+                (
+                    LogLevel::Debug,
+                    format!("Stored orphan transaction {third} (total: 1)")
+                ),
+            ]
+        );
+
+        // One orphan expiring at the next scan takes the singular.
+        pool.chain.mono.set(32 * 60 * SECOND);
+        orphan_with_hash(&mut pool, 4);
+        assert!(capture.take().contains(&(
+            LogLevel::Debug,
+            "Expired 1 orphan (remaining: 0)".to_string()
+        )));
     }
 
     /// Eviction stays reachable at a pool size the reduction does not
@@ -4192,7 +4724,7 @@ mod vote_tracker_tests {
             total_sig_ops: 0,
             tx_size: vote.serialize_size() as i64,
         }));
-        pool.vote_track.add_vote(vote, &tx_hash);
+        pool.vote_track.add_vote(vote, &tx_hash, None);
         tx_hash
     }
 
@@ -4211,8 +4743,8 @@ mod vote_tracker_tests {
         ] {
             let mut tracker = VoteTracker::default();
             let tracked = test_vote(block.0, BLOCK_HEIGHT, [0x71; 32], 0x0001);
-            tracker.add_vote(&tracked, &tracked.tx_hash());
-            tracker.prune_old_votes(prune_height);
+            tracker.add_vote(&tracked, &tracked.tx_hash(), None);
+            tracker.prune_old_votes(prune_height, None);
             assert_eq!(
                 tracker.votes_on(&block).is_empty(),
                 want_pruned,
@@ -4232,9 +4764,9 @@ mod vote_tracker_tests {
         let first = test_vote(block.0, BLOCK_HEIGHT, [0x71; 32], 0x0001);
         let again = test_vote(block.0, BLOCK_HEIGHT, [0x71; 32], 0x0000);
         let later = test_vote(block.0, BLOCK_HEIGHT + 100, [0x72; 32], 0x0001);
-        tracker.add_vote(&first, &first.tx_hash());
-        tracker.add_vote(&again, &again.tx_hash());
-        tracker.add_vote(&later, &later.tx_hash());
+        tracker.add_vote(&first, &first.tx_hash(), None);
+        tracker.add_vote(&again, &again.tx_hash(), None);
+        tracker.add_vote(&later, &later.tx_hash(), None);
         let hashes: Vec<Hash> = tracker
             .votes_on(&block)
             .iter()
@@ -4242,7 +4774,10 @@ mod vote_tracker_tests {
             .collect();
         assert_eq!(hashes, vec![first.tx_hash(), later.tx_hash()]);
 
-        tracker.prune_old_votes(i64::from(BLOCK_HEIGHT) + HEIGHT_DIFF_TO_PRUNE_VOTES + 1);
+        tracker.prune_old_votes(
+            i64::from(BLOCK_HEIGHT) + HEIGHT_DIFF_TO_PRUNE_VOTES + 1,
+            None,
+        );
         assert!(tracker.votes_on(&block).is_empty());
     }
 

@@ -19,6 +19,7 @@ use dcroxide_blockchain::process::Chain;
 use dcroxide_blockchain::utxoview::UtxoView;
 use dcroxide_chaincfg::Params;
 use dcroxide_chainhash::Hash;
+use dcroxide_mining::log::Logger;
 use dcroxide_mining::{TemplateBest, TemplateChain, TemplateTxSource, TxMiningView, VoteDesc};
 use dcroxide_standalone::{SubsidyCache, SubsidySplitVariant};
 use dcroxide_txscript::ScriptFlags;
@@ -43,6 +44,8 @@ pub struct NodeTemplateChain {
     /// (dcrd `disapprovedView`), so one template build disconnects the
     /// tip's regular tree once rather than once per transaction.
     disapproved_view: DisapprovedViewCache,
+    /// The `MINR` logger the generation logs through.
+    logger: Logger,
 }
 
 impl NodeTemplateChain {
@@ -54,6 +57,7 @@ impl NodeTemplateChain {
             params,
             subsidy_cache,
             disapproved_view: DisapprovedViewCache::default(),
+            logger: crate::logging::minr_logger(),
         }
     }
 
@@ -337,10 +341,10 @@ impl TemplateChain for NodeTemplateChain {
         adjusted_time_unix()
     }
 
-    /// The generator's warnings go to `MINR`, the logger dcrd hands its
-    /// mining package (`log.go`, `mining.UseLogger(minrLog)`).
-    fn log_warn(&self, msg: &str) {
-        crate::logging::warn("MINR", msg);
+    /// The generation logs to `MINR`, the logger dcrd hands its mining
+    /// package (`log.go:92`, `mining.UseLogger(minrLog)`).
+    fn logger(&self) -> Option<&Logger> {
+        Some(&self.logger)
     }
 }
 

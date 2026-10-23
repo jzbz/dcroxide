@@ -17,6 +17,8 @@ use dcroxide_chainhash::{Hash, hash_h};
 use dcroxide_standalone::{Sign, compact_to_big};
 use dcroxide_wire::{BlockHeader, MAX_BLOCK_HEADER_PAYLOAD};
 
+use crate::log::{Logger, errorf};
+
 /// The maximum nonce searched before advancing the extra nonce (dcrd
 /// `maxNonce = ^uint32(0)`).
 const MAX_NONCE: u32 = u32::MAX;
@@ -43,6 +45,25 @@ fn hash_at_or_below(hash: &Hash, target_be: &[u8; 32]) -> bool {
         }
     }
     true
+}
+
+/// The sign and overflow flags dcrd's `DiffBitsToUint256` reports for
+/// compact difficulty bits (`internal/staging/primitives/pow.go:45-87`):
+/// a zero mantissa is neither, whatever the sign bit; otherwise the sign
+/// bit alone makes the target negative, even where the exponent shifts
+/// the whole mantissa out, and an exponent above 32 overflows a uint256
+/// once the mantissa needs more bits than the shifts leave.
+fn diff_bits_flags(bits: u32) -> (bool, bool) {
+    let mantissa = bits & 0x007f_ffff;
+    let is_sign_bit_set = bits & 0x0080_0000 != 0;
+    let exponent = bits >> 24;
+    if mantissa == 0 {
+        return (false, false);
+    }
+    let overflows = exponent >= 35
+        || (exponent >= 34 && mantissa > 0xff)
+        || (exponent >= 33 && mantissa > 0xffff);
+    (is_sign_bit_set, overflows)
 }
 
 /// The hashing speed statistics the solve loop accumulates (dcrd
@@ -88,6 +109,9 @@ fn accumulate(stats: &SpeedStats, hashes_completed: &mut u64, start: &mut u64, n
 ///   `ctx.Done` select).
 /// - `now_micros`: a monotonic microsecond clock for the speed stats
 ///   (the core is `no_std`, so the clock is injected).
+/// - `logger`: the package logger, the daemon's `MINR` one (dcrd's
+///   `cpuminer.UseLogger(minrLog)`, `log.go:94`), for the error line an
+///   undecodable target logs.
 #[allow(clippy::too_many_arguments)]
 pub fn solve_block(
     header: &mut BlockHeader,
@@ -97,13 +121,28 @@ pub fn solve_block(
     update_block_time: &mut dyn FnMut(&mut BlockHeader),
     should_cancel: &mut dyn FnMut() -> bool,
     now_micros: &mut dyn FnMut() -> u64,
+    logger: Option<&Logger>,
 ) -> bool {
-    // Decode the target difficulty once.  dcrd bails out when the bits
-    // are negative or overflow a uint256 (`DiffBitsToUint256`'s isNeg /
-    // overflows); the overflow case is unreachable for a real
-    // (at-or-below the pow limit) template, but is guarded to match
+    // Decode the target difficulty once.  dcrd bails out with an error
+    // line when the bits are negative or overflow a uint256
+    // (`cpuminer.go:276-281`); the overflow case is unreachable for a
+    // real (at-or-below the pow limit) template, but is guarded to match
     // dcrd exactly — a target needing more than 256 bits would
     // otherwise be trivially "solved" by any hash on the first nonce.
+    let (is_negative, overflows) = diff_bits_flags(header.bits);
+    if is_negative || overflows {
+        errorf(
+            logger,
+            format_args!(
+                "Unable to convert diff bits {:08x} to uint256 (negative: {is_negative}, \
+                 overflows: {overflows})",
+                header.bits
+            ),
+        );
+        return false;
+    }
+    // Neither flag leaves a negative target or one over 256 bits; the
+    // check keeps the copy below in bounds regardless.
     let target = compact_to_big(header.bits);
     if target.sign() == Sign::Minus || target.bits() > 256 {
         return false;
@@ -251,6 +290,7 @@ mod tests {
                     clock += 1;
                     clock
                 },
+                None,
             );
             assert!(solved, "the easy target must be solved (blake3={blake3})");
 
@@ -290,8 +330,92 @@ mod tests {
             &mut |_| {},
             &mut || false,
             &mut || 0,
+            None,
         );
         assert!(!solved, "an overflowing target is not solvable");
+    }
+
+    /// Bits `DiffBitsToUint256` refuses are logged at error with dcrd's
+    /// text and flags (`cpuminer.go:276-281`) before the solve gives up,
+    /// the sign bit counting even where the exponent shifts the whole
+    /// mantissa out; bits it accepts log nothing.
+    #[test]
+    fn an_undecodable_target_logs_dcrds_error_line() {
+        use crate::log::LogLevel;
+        use std::sync::{Arc, Mutex};
+
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&lines);
+        let logger = Logger::new(
+            Arc::new(|level| level >= LogLevel::Error),
+            Arc::new(move |level, msg: &str| {
+                sink.lock().expect("lines").push((level, msg.to_string()));
+            }),
+        );
+        for (bits, want) in [
+            (
+                0x227f_ffff,
+                "Unable to convert diff bits 227fffff to uint256 (negative: false, overflows: \
+                 true)",
+            ),
+            (
+                0x1d80_0001,
+                "Unable to convert diff bits 1d800001 to uint256 (negative: true, overflows: \
+                 false)",
+            ),
+            (
+                0x0180_0001,
+                "Unable to convert diff bits 01800001 to uint256 (negative: true, overflows: \
+                 false)",
+            ),
+            (
+                0x23ff_ffff,
+                "Unable to convert diff bits 23ffffff to uint256 (negative: true, overflows: \
+                 true)",
+            ),
+        ] {
+            let mut header = easy_header();
+            header.bits = bits;
+            let mut checks = 0u32;
+            let solved = solve_block(
+                &mut header,
+                &SpeedStats::default(),
+                false,
+                0,
+                &mut |_| {},
+                &mut || {
+                    checks += 1;
+                    true
+                },
+                &mut || 0,
+                Some(&logger),
+            );
+            assert!(!solved, "{bits:08x}");
+            assert_eq!(checks, 0, "{bits:08x} is refused before any hashing");
+            assert_eq!(
+                lines.lock().expect("lines").drain(..).collect::<Vec<_>>(),
+                [(LogLevel::Error, want.to_string())],
+                "{bits:08x}"
+            );
+        }
+
+        // A zero mantissa is neither negative nor overflowing, whatever
+        // the sign bit says, and the easy target decodes: no line.
+        for bits in [0x0180_0000, easy_header().bits] {
+            let mut header = easy_header();
+            header.bits = bits;
+            solve_block(
+                &mut header,
+                &SpeedStats::default(),
+                false,
+                0,
+                &mut |_| {},
+                &mut || true,
+                &mut || 0,
+                Some(&logger),
+            );
+            assert!(lines.lock().expect("lines").is_empty(), "{bits:08x}");
+        }
     }
 
     /// A cancel that fires drops out of the solve with `false`.  The
@@ -316,6 +440,7 @@ mod tests {
                 true
             },
             &mut || 0,
+            None,
         );
         assert!(!solved, "a cancelled solve returns false");
         assert_eq!(checks, 1, "cancel is checked once, at the first interval");
@@ -346,6 +471,7 @@ mod tests {
                 checks >= 2
             },
             &mut || 0,
+            None,
         );
         // The first interval: cancel checked (continues), block time
         // updated.  The second interval: cancel checked (returns) before
@@ -378,6 +504,7 @@ mod tests {
                 &mut |h| h.timestamp += 1,
                 &mut || false,
                 &mut || 0,
+                None,
             );
             assert!(solved, "blake3={blake3}");
             assert_eq!(header.nonce, want_nonce, "blake3={blake3}");

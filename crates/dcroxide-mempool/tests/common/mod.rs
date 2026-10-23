@@ -1,14 +1,17 @@
 // SPDX-License-Identifier: ISC
-//! Shared helpers for the pool vector replays: the parsing utilities
-//! and the mirror of dcrd's mempool test `fakeChain`.
+//! Shared helpers for the pool vector replays: the parsing utilities,
+//! the mirror of dcrd's mempool test `fakeChain`, and the check of the
+//! pool's log lines against the `log` rows.
 
 #![allow(dead_code)]
 
 use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 
 use dcroxide_blockchain::sequencelock::SequenceLock;
 use dcroxide_blockchain::utxoview::UtxoView;
 use dcroxide_chainhash::Hash;
+use dcroxide_mempool::log::{LogLevel, Logger};
 use dcroxide_mempool::{BASE_STANDARD_VERIFY_FLAGS, Policy, PoolChain, PoolError, UNMINED_HEIGHT};
 use dcroxide_testutil::unhex;
 use dcroxide_txscript::ScriptFlags;
@@ -37,6 +40,106 @@ pub fn hash_csv(hashes: &[Hash]) -> String {
         .map(|h| raw_hex(&h.0))
         .collect::<Vec<_>>()
         .join(",")
+}
+
+/// The pool's log lines against the `log` rows `tools/mempoolvectors`
+/// writes after each pool call: the lines dcrd's pool logged for the
+/// call through a trace-level logger, as slog abbreviates the level and
+/// formats the text, in the order it logged them but for the lines it
+/// logs while ranging over a Go map, which are sorted ([`map_sorted`]).
+/// The port's pool logs through [`LogRows::logger`], which keeps each
+/// line as its row would read, and [`LogRows::check`] compares the two,
+/// the port's sorted alike, before the next call runs.
+pub struct LogRows {
+    logged: Arc<Mutex<Vec<String>>>,
+    expected: Vec<String>,
+    checked: usize,
+}
+
+impl LogRows {
+    pub fn new() -> LogRows {
+        LogRows {
+            logged: Arc::new(Mutex::new(Vec::new())),
+            expected: Vec::new(),
+            checked: 0,
+        }
+    }
+
+    /// A logger at trace, the lowest level, keeping every line.
+    pub fn logger(&self) -> Logger {
+        let logged = Arc::clone(&self.logged);
+        Logger::new(
+            Arc::new(|_| true),
+            Arc::new(move |level, msg: &str| {
+                let tag = match level {
+                    LogLevel::Trace => "TRC",
+                    LogLevel::Debug => "DBG",
+                    LogLevel::Info => "INF",
+                    LogLevel::Warn => "WRN",
+                    LogLevel::Error => "ERR",
+                };
+                logged
+                    .lock()
+                    .expect("log lines")
+                    .push(format!("log {tag} {msg}"));
+            }),
+        )
+    }
+
+    /// Keep the row for the next check if it is a `log` row.
+    pub fn take_row(&mut self, line: &str) -> bool {
+        if !line.starts_with("log ") {
+            return false;
+        }
+        self.expected.push(line.to_string());
+        true
+    }
+
+    /// Compare the `log` rows kept since the last check with the lines
+    /// the pool logged since then; `after` is the row of the call that
+    /// logged them.
+    pub fn check(&mut self, after: &str) {
+        let call = after.split(' ').next().unwrap_or_default();
+        let logged = map_sorted(
+            call,
+            std::mem::take(&mut *self.logged.lock().expect("log lines")),
+        );
+        let expected = std::mem::take(&mut self.expected);
+        let shown: String = after.chars().take(120).collect();
+        assert_eq!(logged, expected, "the lines logged after {shown}");
+        self.checked += expected.len();
+    }
+
+    /// How many `log` rows the checks have compared.
+    pub fn checked(&self) -> usize {
+        self.checked
+    }
+}
+
+/// The row of the line the pool's walks over its orphans log for each
+/// orphan they remove.
+const ORPHAN_REMOVAL: &str = "log TRC Removing orphan transaction ";
+
+/// A call's lines with those logged while ranging over a Go map sorted,
+/// as `tools/mempoolvectors` writes them, since dcrd's order there
+/// changes from run to run and the port's is fixed: the lines of a
+/// `prune` or `pruneexp` call, whose walks over the pool, the stage pool
+/// and the vote tracker log (`mempool.go:2215`, `:2242`, `:2301`,
+/// `:2310`, `:389`), whole, and each run of consecutive `Removing orphan
+/// transaction` lines, the one line the walks over the orphans log
+/// (`:509`, `:536`, `:556`, `:664`).  The rest keep the order they were
+/// logged in.
+pub fn map_sorted(call: &str, mut lines: Vec<String>) -> Vec<String> {
+    if call == "prune" || call == "pruneexp" {
+        lines.sort();
+        return lines;
+    }
+    for run in
+        lines.chunk_by_mut(|a, b| a.starts_with(ORPHAN_REMOVAL) && b.starts_with(ORPHAN_REMOVAL))
+    {
+        run.sort();
+    }
+    lines
 }
 
 pub fn parse_tx(s: &str) -> MsgTx {

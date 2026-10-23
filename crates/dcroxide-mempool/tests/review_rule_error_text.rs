@@ -126,8 +126,9 @@ fn outpoint_descriptions_render_as_dcrd_outpoint_strings() {
             "prune" => {
                 pool.prune_stake_tx(f[1].parse().expect("sdiff"), f[2].parse().expect("height"));
             }
-            // Read-only checks the vector replay already makes.
-            "state" | "vhb" | "disap" | "tsh" => {}
+            // Read-only checks, and the pool's log lines, which the
+            // vector replay already makes.
+            "state" | "vhb" | "disap" | "tsh" | "log" => {}
             other => panic!("unknown row tag {other}"),
         }
     }
@@ -253,7 +254,7 @@ fn vote_rejection_descriptions_are_dcrds() {
             "prune" => {
                 pool.prune_stake_tx(f[1].parse().expect("sdiff"), f[2].parse().expect("height"));
             }
-            "state" | "vhb" | "disap" => {}
+            "state" | "vhb" | "disap" | "log" => {}
             other => panic!("unknown row tag {other}"),
         }
     }

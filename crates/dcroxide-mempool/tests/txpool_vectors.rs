@@ -8,10 +8,13 @@
 //! fee policy in both directions, block- and time-based sequence
 //! locks, expiry with pruning, ticket staging with unstaging on
 //! parent confirmation, stake difficulty gates and pruning, batch
-//! acceptance through the transient pool, and double spend removal —
-//! comparing every verdict, accepted-transaction list, and the full
-//! pool/orphan/stage/tspend state after every operation.  The file is
-//! written by `tools/mempoolvectors`, run inside dcrd's
+//! acceptance through the transient pool, double spend removal, an
+//! input the chain holds spent, and a pool ticket moved to the stage
+//! pool when its input's transaction returns to the pool — comparing
+//! every verdict, accepted-transaction list, and the full
+//! pool/orphan/stage/tspend state after every operation, and the lines
+//! the pool logs for each operation against dcrd's (`log` rows).  The
+//! file is written by `tools/mempoolvectors`, run inside dcrd's
 //! `internal/mempool`.
 
 // Test-harness arithmetic over bounded lengths.
@@ -20,7 +23,7 @@
 mod common;
 
 use common::{
-    chain_from_init, error_kind, harness_policy, hash_csv, parse_hash, parse_tx, raw_hex,
+    LogRows, chain_from_init, error_kind, harness_policy, hash_csv, parse_hash, parse_tx, raw_hex,
 };
 use dcroxide_chaincfg::mainnet_params;
 use dcroxide_mempool::TxPool;
@@ -38,9 +41,17 @@ fn txpool_vectors() {
     let chain = chain_from_init(&init);
     let policy = harness_policy(params.coinbase_maturity);
     let mut pool = TxPool::new(chain, policy, &params);
+    let mut log_rows = LogRows::new();
+    pool.set_logger(log_rows.logger());
     let mut counts = [0usize; 8];
 
+    let mut last = "init";
     for line in lines {
+        if log_rows.take_row(line) {
+            continue;
+        }
+        log_rows.check(last);
+        last = line;
         let f: Vec<&str> = line.split(' ').collect();
         match f[0] {
             "utxo" => {
@@ -65,6 +76,20 @@ fn txpool_vectors() {
             }
             "setsdiff" => {
                 pool.chain.next_stake_diff = f[1].parse().expect("sdiff");
+            }
+            "chainspend" => {
+                // chainspend <hash> <idx> <tree>: the fake chain's entry
+                // marked spent.
+                let outpoint = dcroxide_wire::OutPoint {
+                    hash: parse_hash(f[1]),
+                    index: f[2].parse().expect("idx"),
+                    tree: f[3].parse().expect("tree"),
+                };
+                pool.chain
+                    .utxos
+                    .lookup_entry_mut(&outpoint)
+                    .expect("the fake chain's entry")
+                    .spend();
             }
             "pt" => {
                 // pt <txhex> <alloworphan> <allowhighfees> <tag>
@@ -182,8 +207,13 @@ fn txpool_vectors() {
             other => panic!("unknown row tag {other}"),
         }
     }
-    assert_eq!(counts, [29, 1, 2, 1, 1, 40, 1, 1], "row counts");
+    log_rows.check(last);
+    assert_eq!(counts, [31, 2, 2, 1, 1, 43, 1, 1], "row counts");
+    assert_eq!(log_rows.checked(), LOG_ROWS, "log rows");
 }
+
+/// The `log` rows in `data/txpool_vectors.txt`.
+const LOG_ROWS: usize = 70;
 
 /// The exists-address hook fires for every transaction added to the
 /// pool (dcrd `addTransaction` calling `AddUnconfirmedTx` when the
