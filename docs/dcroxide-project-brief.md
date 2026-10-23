@@ -65,9 +65,16 @@ exit criteria have not been demonstrated, and those are listed here too:
   an unmodified `dcrctl` command sweep, `dcrwallet` in RPC mode, and Decrediton
   including the IPC lifecycle; M4's acceptance column adds the Go `dcrdtest`
   harness pointed at the dcroxide binary. Nothing in the repo records any of
-  those being executed. The same applies to the Phase 8 per-block state
-  comparator: the mainnet and testnet syncs validated to a matching tip, which
-  is weaker than comparing chain state at every height.
+  those being executed.
+- **Phase 8's per-block state comparator has been run on mainnet only.** On
+  2026-10-23 the data directory of a mainnet sync of `b49145e` was compared,
+  at every height from genesis to block 1,116,035, with the one dcrd 2.2.0-pre
+  at `b9634e01` wrote for the same chain: the blocks and every other record
+  both stores keep for a block at each height, and the chain, stake and UTXO
+  state at the tip. Nothing differed ([docs/bench-ledger.md](bench-ledger.md),
+  "Per-block comparison with dcrd, genesis to block 1,116,035"). Testnet has
+  been synced to a matching tip only, which is weaker than comparing the
+  stored records at every height, as on mainnet.
 - **Phase 0 — the CI gates are partly wired.** `.github/workflows/ci.yml` runs
   rustfmt and `clippy -D warnings`, `cargo test --workspace` on all three OSes
   with the oracle required (`DCROXIDE_REQUIRE_ORACLE=1`), `cargo-deny` over
@@ -777,9 +784,20 @@ pins this policy asks for.
 **Where these stand:** the implementation behind M0–M4 is in the tree and M5 is
 underway; the status block near the top records what Phase 15 has covered. The
 demo/acceptance column is the honest measure and it is not fully satisfied —
-M2's per-block comparator, M3's mixed-fleet soak and live wallet mixes, and all
-four of M4's ecosystem sweeps have not been run. Read the acceptance column, not
-the phase list, when judging readiness.
+M3's mixed-fleet soak and live wallet mixes, and all four of M4's ecosystem
+sweeps, have not been run. M2's per-block comparator was run once, on
+2026-10-23: the data directory a mainnet sync of `b49145e` left, from genesis
+to block 1,116,035, against the one dcrd 2.2.0-pre at `b9634e01` wrote for the
+same chain. The blocks and every other record both stores keep for a block,
+the filters among them, were equal at every height, and the UTXO set, the
+ticket sets, the chain and stake state and the exists-address set were equal
+at the tip ([docs/bench-ledger.md](bench-ledger.md), "Per-block comparison
+with dcrd, genesis to block 1,116,035"). It compares stored records, not chain
+state recomputed at each height, and leaves the transaction index out, since
+dcrd's store has none; the dcrd that wrote that store is 70 commits behind the
+parity pin, commits that change no row format but do change behaviour; and the
+sync, at the defaults, validated in full only the blocks after the assume-valid
+block. Read the acceptance column, not the phase list, when judging readiness.
 
 Sizing guidance (not a promise): M1 and M2 are each on the order of several engineer-months for a strong systems-Rust developer already fluent in Bitcoin-family internals; P4 and P8 dominate. Calendar estimates should be produced by the developer after Phase 0/1, when the oracle rig gives real porting-velocity data.
 

@@ -6467,3 +6467,351 @@ wait-channel counts of the first three; per-run samples, flush logs and
 node logs; the queues' steps and logs; the harness's change that reads
 each thread's I/O counters; the sampler and its later change; and W0b's
 change and both build logs.
+
+## Per-block comparison with dcrd, genesis to block 1,116,035 (2026-10-23)
+
+The project brief's milestone M2 asks for a per-block comparator against
+a synced dcrd. Until this section, syncs were checked against dcrd at
+the tip only: at most the block at 1,116,035, the UTXO set by
+`gettxoutsetinfo` and a hash of the block files. Between 02:12 and 03:01
+on 2026-10-23, on m3, `b49145e`, the head of master then, synced mainnet
+from genesis to 1,116,035 from the loopback dcrd v2.1.6 block server of
+the sections above, and the data directory it left was read offline
+beside the one dcrd wrote for the same chain, the frozen chain whose
+copy that server serves. The blocks and every other record both stores
+keep for a block were compared at every height, and what both keep once,
+at the tip. Between 03:05 and 03:23 a verification read the records of
+66 heights again through each store's own interface, decoded some of
+them by hand and rechecked the rest of the work. **Nothing differs**, at
+any height or at the tip.
+
+**The builds.** `b49145e` is a release build of that commit's tree, at
+the workspace's release profile with nothing else set, made with rustc
+1.98.1 from a checkout at the commit with nothing changed. Its node code
+is that of `8bda92e`, the section above: `b49145e` changes only
+documents. The frozen chain was written by dcrd 2.2.0-pre at `b9634e01`,
+the port's parity pin before `6f6cf21b`, built with Go 1.27.1, with the
+exists-address index on and no transaction index, over four starts on
+2026-09-26 and 2026-09-27, the last ending in a clean shutdown. At the
+second start it logged an unclean shutdown, repaired its block database
+and resumed at 688,974. Each store was read by a program outside the
+tree. dcrd's reader was built offline with Go 1.27.1 in an export of
+`b9634e01` to which were added the reader's command, a command that
+makes the spot checks' changes through ffldb, and one file in
+`internal/blockchain` that exports wrappers over the package's
+unexported decoders; the verification later added a command of its own.
+dcroxide's is a crate of its own, built offline against the crates of
+an export of `b49145e` with the workspace's lock file and toolchain. A
+first build of it took the crates from a working tree that gained three
+commits during the job; its per-height file was byte-identical to the
+rebuild's, and every figure here is the rebuild's. The verification
+found each export equal to its commit's tree in every file it holds, but
+for what was added.
+
+**The session.** The sync was one step of the harness's queue, run
+without the quiet gate: it was not to be timed, and builds of other work
+ran during it, which the harness counted as 24 cargo and 4 rustc
+processes, with other userland at 19.1% of the machine, so the run was
+marked disturbed. The server's data, 26.0 GB, was read into the page
+cache in 14.5 s, and the server still read 18.8 GB from its drive. The
+node reached block 1,116,035 in 315.2 s, which is not a timing, with
+964.1 s of CPU time (893.4 + 70.7) and a peak resident memory of
+2,457 MiB, and exited 0 after a shutdown of 0.3 s. It ended on the
+server's tip, `8752fdc9…`, with the UTXO set of every full sync from
+that server since 2026-10-17 (`gettxoutsetinfo`: 760,741 transactions,
+1,850,903 outputs, a total amount of 1,672,716,060,550,750 atoms and the
+serialized hash `eb7f88de…`) and block files hashing to
+`33b7ac837a45c74f` over 36 files and 19,202,596,910 B, as in the full
+syncs from that server recorded above. The frozen chain's listing, 3,514
+entries, was the same at the end of the verification as before the job,
+and that of the data directory the sync left the same as just after the
+sync.
+
+**Reading the stores offline.** Each reader read a reflink copy of its
+store, and both refused the originals' paths:
+
+- dcrd's metadata and UTXO databases were opened with goleveldb's
+  read-only option and its block files read-only. ffldb's
+  `database.Open`, which recovers and reconciles on open, was not used,
+  and the copy's listing was unchanged after a dump.
+- dcroxide's `metadata.redb` was opened with redb's `ReadOnlyDatabase`,
+  after one writable open of the copy (the last finding below), and its
+  block files read-only. Its exists-address set was read through
+  `dcroxide_indexers::stored_keys`, which needs `Database::open`, on a
+  second copy, deleted afterwards.
+
+Both metadata keyspaces have ffldb's raw layout, each key behind its
+bucket's id, and the ids differ between the stores, so each reader
+walked the keyspace itself and matched buckets by name. The main chain
+was taken from `chainstate`, back to genesis through `blockidxv3` by
+each header's previous block, every row's header hashing to its key.
+Every row of both keyspaces was walked once, for an inventory and the
+tip, and the records of each height were read by point lookups, so that
+an absent row and an empty one stay distinct. The keys differ by design,
+height first since [ADR-0010](adr/0010-height-first-block-keys.md) where
+dcrd keys by hash or little-endian height, and the values were compared
+byte for byte.
+
+**The digests.** For each height and kind, a digest: BLAKE-256 over the
+kind's name, whether the row is present, its length and its bytes. For
+each height, R is BLAKE-256 over the height, the block's hash and the
+ten kind digests, and C is BLAKE-256 over the C of the height before and
+R, from genesis on, so that equal C at the tip says every height agrees
+and the per-height lines place a difference. Each reader wrote one line
+per height, with 64 bits of each kind digest and R and C in full. At the
+tip each bucket compared was digested over its rows in key order, with
+its row count.
+
+**What each side checked of itself.** A replay of the ticket undo data
+from height 0, applied as dcrd's `WriteConnectedBestNode` applies it,
+matched the header's pool size at every height with no replay error, and
+its live, missed and revoked sets at the tip equalled the buckets. A
+block has a treasurybase exactly when it has a `treasury` row; the first
+header-commitment leaf is the filter's hash in every block that has one;
+every treasury spend's `tspend` row lists its block; no block failed to
+read or decode; every bucket and root key is compared or excluded by
+name; no per-block bucket holds a row off the main chain; and the rows
+read make up each bucket's row count, with no extra row. All of it held
+on both sides.
+
+**Held heights.** The comparator was built to report a difference at
+805,360 heights, 72.16%, by height and kind alone, without its values:
+777,181 whose block spends an output created in the block before,
+110,409 whose block spends one created in it, 82,230 of them both, and
+none that repeats a transaction within a tree. That limits what a
+difference would have shown, not what was compared, and none arose.
+
+**The result.** At every height from 0 to 1,116,035, 1,116,036 in all,
+no kind differs and R is equal, and C ends at
+`79440a5ec300d9a476bde5f9ad206f3eab5ed3304b3242681e8b10e538bf9f36` on
+both sides. At the tip no compared record and no row count differs, and
+neither side has an extra row.
+
+| kind | what is compared at each height | heights with the row on both sides | heights that differ |
+|---|---|---:|---:|
+| BLK | the serialized block from the block files, with the record's checksum, network and length and the index row's header checked | 1,116,036 | 0 |
+| BIDX | the `blockidxv3` value: header, status and vote information | 1,116,036 | 0 |
+| SJ | the `spendjournalv3` value | 1,116,035 (none at genesis) | 0 |
+| SJD | the spend journal decoded against the block by each side's own decoder | 1,116,035 | 0 |
+| GCS | the `gcsfilters` value | 1,116,036 | 0 |
+| HCMT | the `hdrcmts` value | 684,548 (from 431,488) | 0 |
+| TRSY | the `treasury` value | 563,588 (from 552,448) | 0 |
+| TSPD | the `tspend` rows of the block's treasury spends | 43 | 0 |
+| UNDO | the `stakeblockundo` value | 1,116,036 | 0 |
+| NEWT | the `ticketsinblock` value | 1,116,036 | 0 |
+
+| compared at block 1,116,035 | rows | result |
+|---|---:|---|
+| the UTXO set, dcrd's UTXO database against `utxosetv3`, row by row, and `utxosetstate` | 1,850,903 | equal |
+| the live, missed and revoked ticket buckets | 40,760, 0 and 99,106 | equal |
+| `tspend`: the row count, and the rows no main-chain treasury spend reaches | 43, none unreached | equal (the 43 compared per block as TSPD) |
+| the exists-address set, dcrd's layout 2 rows against layout 3 through `stored_keys` | 67,960,843 keys | equal, BLAKE-256 `8b676bdb…` |
+| `chainstate`, `stakechainstate` and `deploymentver` (11) | — | equal |
+| the exists-address index's `idxtips` row | — | both `8752fdc9…` at 1,116,035 |
+| `dbinfo`'s compression, block index and spend journal versions (1, 3 and 3), and `stakedbinfo`'s version (1) | — | equal |
+
+The exists-address set's count and digest are those that "Exists-address
+index layout 3" above gives for dcroxide's index at 1,116,035, now from
+dcrd's index as well. Excluded by name, as different by design or not
+chain data: `dbinfo`'s version, 14 against 15 (ADR-0010), and its
+creation time; `stakedbinfo`'s date; `idxtips`' version, 2 against 3
+([ADR-0011](adr/0011-exists-address-layout-3-and-the-flush-participant.md));
+`ffldb-writeloc`, the block files' write cursor; the bucket-index rows
+and `bidx-cbid`, since buckets are matched by name; dcrd's four UTXO
+database information rows, which dcroxide does not keep; and layout 3's
+M, J and R rows, 1, 29,142 and 338,820, whose key set is compared
+through `stored_keys` instead.
+
+**The spot checks.** Each tested that a difference would be reported:
+
+- **A bit flipped in each kind.** A reader option that flips one bit of
+  a record after reading it was set at one height for each of the ten
+  kinds, outside the held heights, on dcrd's side and then on
+  dcroxide's. Each time the comparator named exactly those ten heights
+  and kinds, R differed at exactly those heights, and C from the first
+  of them on, at all 57 later lines of dcrd's run and all 37 of
+  dcroxide's.
+- **Ten tip digests**, the UTXO set and `utxosetstate`, the three ticket
+  buckets, the unreached `tspend` rows, `chainstate`, `stakechainstate`,
+  `deploymentver` and the exists-address set, on one side or the other
+  (the exists-address set on both), and the `blockidxv3` row count on
+  each, changed the same way: each was reported, and nothing else. The
+  `idxtips` row and the `dbinfo` and `stakedbinfo` versions were not
+  changed, so their comparisons were not exercised.
+- **Rows changed through each store's interface**, on reflink copies
+  deleted afterwards. On dcrd's, through ffldb's `Put` and `Delete`: one
+  bit of the spend journal row at 900,039, the `hdrcmts` row at 900,041
+  deleted, and a spend journal row added under a made-up hash, reported
+  as SJ and SJD at 900,039, HCMT absent against present at 900,041, and
+  one extra row. On dcroxide's, through a write transaction its close
+  flushed: one bit of the `gcsfilters` row at 900,042, reported as GCS
+  there, which that side's header-commitment check also counted, and a
+  `gcsfilters` row added under a made-up hash at the existing height
+  900,044, reported as one extra row with R at 900,044 unchanged.
+- **Determinism.** A pilot over heights 0 to 10,000, 431,478 to 431,498
+  (the first `hdrcmts` row is at 431,488), 552,438 to 552,458 (the first
+  `treasury` row at 552,448), 688,974 to 689,245 (where dcrd's writer
+  resumed) and 1,106,036 to 1,116,035, dumped twice with the final
+  readers, gave identical files, and each side's full dump was identical
+  to its first full run. The two readers printed byte-identical decoded
+  spend journals for 900,000.
+
+**The verification.**
+
+- **The two per-height files**, decompressed, are byte-identical over
+  1,116,036 lines, and not trivially so: the BLK, BIDX and GCS digests
+  are all distinct; a spend journal is empty only at the 481 blocks that
+  hold nothing but a coinbase, a new-ticket row at the 350,767 blocks
+  whose block 256 below bought no tickets, and an undo row at 863
+  heights; the 256 repeated `treasury` digests are those of the first
+  256 treasury blocks, each with a balance of 0 and the same
+  treasurybase; and no digest of a read or decode error occurs.
+- **Through each store's own interface**, on reflink copies deleted
+  afterwards: dcrd's with ffldb's `database.Open`, `Bucket.Get`,
+  `Cursor.Seek` and `FetchBlock`, and dcroxide's with `Database::open`,
+  `Bucket::get`, `Cursor::seek` and `fetch_block`, on a copy of the data
+  directory as the sync left it, so that the reader's writable open is
+  covered too. At 66 heights, 26 chosen ones and the heights one and 256
+  below each, the rows and the blocks were equal on both sides, and
+  every kind digest and R of both per-height files, recomputed from them
+  with a separate BLAKE-256, matched.
+- **Decoded by hand, at the 26**, among them genesis, the first
+  stake-validation block, the first revocation and a block with 255,
+  both edges of the header commitments' and the treasury's activation,
+  the first and last treasury spends, the assume-valid block and the
+  blocks either side of it, an automatic revocation and the tip. A
+  separate decoder checked each block's hash, height, link to the block
+  before and merkle roots, split before DCP0005 and combined from it on,
+  and its stake transactions against the header's counts; the block
+  index entry's header and each vote's version and bits; the spend
+  journal, whose decoded digest it reproduced on both sides, and 1,563
+  spent outputs against the outputs they spend in 555 earlier blocks, by
+  script, script version, amount, flags and ticket minimal outputs,
+  where a corrupted script decompression, as a control, failed 1,275 of
+  them; the filter's BLAKE-256 as the only commitment leaf and the
+  header's stake root from 431,488 on; the `treasury` row's values
+  against the block's treasurybase, treasury adds and treasury spends,
+  and its balance as that of the block before plus the values of the
+  block 256 below; each `tspend` row listing its block, all 43 at
+  heights that are multiples of 288; the new tickets as those mined 256
+  blocks below, in block order; and the undo data's maturing, spent and
+  revoked tickets and its missed count, five less the votes. It also
+  recomputed the held heights, and checked C at heights 0 to 3 and at
+  the tip.
+- **The UTXO set.** The 246 unspent outputs of the last two blocks are
+  in both dumps, each with the right height, index, flags, amount,
+  script and minimal outputs.
+
+**The figures.** Each reader ran eight workers; its wall includes the
+walk of every row, 16.5 s for dcrd's and 30.7 s for dcroxide's.
+
+| step | wall | CPU time (user + sys) | peak RSS |
+|---|---:|---:|---:|
+| the sync of `b49145e`, disturbed, not a timing | 315.2 s | 964.1 s (893.4 + 70.7) | 2,457 MiB |
+| dcrd's reader, every height | 99.8 s | 390.2 s (344.3 + 46.0) | 3,217 MiB |
+| dcroxide's reader, every height | 61.9 s | 220.2 s (193.5 + 26.7) | 2,786 MiB |
+| dcroxide's exists-address pass | 15.0 s | 14.8 s (11.7 + 3.1) | 3,788 MiB |
+| the comparison | 3.7 s | — | — |
+| the spot checks | 264.9 s | 385.5 s (295.7 + 89.8) | — |
+
+| what | apparent size |
+|---|---:|
+| dcroxide's network directory after the sync | 29,982,145,960 B |
+| of it, the block files | 19,202,596,910 B |
+| of it, `metadata.redb` | 10,779,545,600 B |
+| dcrd's network directory, the frozen chain | 25,968,840,626 B |
+| dcrd's per-height file, gzipped, 1,116,036 lines | 202,034,593 B |
+| dcroxide's per-height file, gzipped, the same lines | 212,394,800 B |
+| dcrd's UTXO dump, gzipped | 73,314,877 B |
+| dcroxide's UTXO dump, gzipped | 92,761,207 B |
+
+The two per-height files differ in size only by their compressors:
+decompressed, they are byte-identical.
+
+**What the result rests on.**
+
+- **Which kinds carry weight of their own.** SJD's amounts, heights and
+  indexes come from the block's inputs (`decodeSpentTxOut` takes them
+  from the `TxIn`), so over identical spend journal bytes it shows only
+  that the two decoders agree. The blocks, and the headers in the block
+  index entries, were all but certain to match, since dcroxide stored
+  the blocks it was served. The weight rests on the spend journals, the
+  ticket undo data and new tickets, the `treasury` and `tspend` rows,
+  the filters and header commitments, the block index entries' status
+  and votes, and the state at the tip.
+- **What the spot checks prove.** Rows were changed in the stores only
+  for SJ, SJD and HCMT on dcrd's side and GCS on dcroxide's, with one
+  extra row on each. The other six kinds were tested only by the flipped
+  bit, which a reader applies after its read, so for them the spot
+  checks prove the comparator, not the readers' lookups; the reads
+  through each store's interface cover those lookups, at 66 heights.
+- **The writer is not the pin.** `b9634e01..382ff4dd` is 70 commits.
+  None of `chainio.go`, `utxoio.go`, `compress.go`, `treasury.go`,
+  `headercmt.go`, the ticket database, `gcs` or `database` changes a row
+  format between them; the 70 commits do change behaviour: 748 lines of
+  `utxoviewpoint.go` and 456 of `validate.go` by git's count, with
+  `thresholdstate.go` and `agendas.go`. The result is equality with what
+  `b9634e01` wrote, not with what dcrd at the pin would write. The
+  writer also repaired its block database after an unclean shutdown and
+  resumed at 688,974, a window the pilot covered and in which nothing
+  differs; dcroxide's sync stopped cleanly.
+- **Two gaps in the tooling, moot here.** dcrd's fee estimator database,
+  `feesdb`, is in neither inventory. The comparator leaves a
+  disagreement between the sides over which heights are held out of its
+  exit status, and exits 0 when the exists-address set is not compared;
+  in this run there is no such disagreement, and the set was compared.
+
+**A clean stop leaves the metadata file marked for recovery.** This is
+outside the comparison. The node logged "Gracefully shutting down the
+block database..." and "Shutdown complete" and exited 0, yet the god
+byte of the `metadata.redb` it left was 0b111, redb's recovery-required
+bit set beside the two-phase-commit and primary-slot bits. redb 4.3.0's
+`ReadOnlyDatabase` refuses such a file ("Database repair aborted"), so
+dcroxide's reader opened its copy writable once. That open took 0.02 s,
+so no full repair ran; it rewrote the file's header and modification
+time, leaving 1.27 MiB of the copy no longer shared with the original.
+Once it had closed, the copy's god byte was 0b100, the recovery-required
+bit clear and the primary-slot bit flipped, as a commit flips it (redb's
+close commits its allocator state), and every later open of the copy was
+read-only. So the node's next start after such a stop begins with redb's
+recovery, and the store cannot be opened read-only until a writable open
+has closed it. It is recorded here as found; no change to the node is
+part of this section. The commit before the one that adds this section
+makes the block database's close close the file, so that a clean stop
+leaves the bit clear, as its tests check; no build of it was run here.
+
+**What was not measured.**
+
+- Testnet, or any network but mainnet.
+- Chain state at each height. The UTXO set, the ticket buckets and the
+  chain and stake state were compared at the tip only, since neither
+  store keeps them per height; every change to them is in the blocks,
+  spend journals, undo data and new tickets compared at each height, and
+  the pool size was checked at each height within each side. Cumulative
+  transaction and subsidy counts, and agenda states, which neither store
+  keeps, were not compared.
+- The exists-address index beyond its final key set: neither layout
+  stores a height.
+- The transaction index: absent from the frozen chain, and off by
+  default in dcroxide.
+- Any row a reorganization writes: the server serves one chain, and
+  neither store holds a row off it.
+- The addresses dcrd's index takes from its mempool at connect: both
+  mempools were empty over loopback.
+- A store that dcrd wrote at the parity pin, or without an unclean
+  shutdown; a second sync of dcroxide; a sync with `--assumevalid=0`,
+  where this one validated in full only the blocks after the
+  assume-valid block.
+- Any code after `b49145e`.
+- A start of the node after the clean stop, and how long redb's recovery
+  takes in it.
+- Storage other than m3's NVMe drive under btrfs; Windows and macOS.
+
+Raw: `per-block.jsonl`'s row labelled `pb-keep-1`, with the node's log;
+the queue's step and log; the build notes of `b49145e`'s binary; both
+readers' per-height files, tip and meta files and UTXO dumps, the
+exists-address pass's output, the UTXO comparison and the comparator's
+output; the spot checks' record and log, with the pilot's dumps; the
+verification's reads through each store's interface, its decoder and its
+record; the listings of the frozen chain and of the data directory the
+sync left; and the readers' sources and build logs.
