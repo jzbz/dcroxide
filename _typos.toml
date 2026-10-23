@@ -37,6 +37,9 @@ fals = "fals"
 # A test-case name ported verbatim from dcrd's treasury_test.go:630, so
 # the case can be found on both sides.
 outupt = "outupt"
+# A block of dcrd's fullblocktests battery (generate.go's "bse0"), named
+# as dcrd names it in tests that replay the battery.
+bse = "bse"
 # Decred domain terms and dcrd identifiers.
 asert = "asert" # the ASERT difficulty algorithm (DCP-0011)
 indx = "indx" # dcrd's INDX log subsystem tag
