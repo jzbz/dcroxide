@@ -61,11 +61,46 @@ exit criteria have not been demonstrated, and those are listed here too:
   `ping`'s broadcast and the mixing RPCs' seams were only wired in the
   2026-09-23 review. The typed Rust client the plan lists as its own
   deliverable is not started; the ledger's `rpcclient` row still reads "—".
-- **Ecosystem acceptance has not been run.** The Phase 13/14 exit criteria name
-  an unmodified `dcrctl` command sweep, `dcrwallet` in RPC mode, and Decrediton
-  including the IPC lifecycle; M4's acceptance column adds the Go `dcrdtest`
-  harness pointed at the dcroxide binary. Nothing in the repo records any of
-  those being executed.
+- **Ecosystem acceptance has been run once, on x86_64 Linux.** The Phase 13/14
+  exit criteria name an unmodified `dcrctl` command sweep, `dcrwallet` in RPC
+  mode, and Decrediton including the IPC lifecycle; M4's acceptance column adds
+  the Go `dcrdtest` harness pointed at the dcroxide binary. On 2026-10-23, with
+  the dcrd 2.1.7 release binaries, unmodified, as the reference and every node
+  on loopback: `dcrctl` 2.1.7 sent 2,731 calls, covering 1,287 argument sets
+  over all 77 chain-server commands, their `help` and four wallet-only command
+  names, to dcrd and to `b49145e` on a simnet chain dcrd built to height 341,
+  and every reply that differed followed dcrd master's source at the parity pin,
+  `382ff4dd`, came from the unported profile server or the missing inventory
+  trickle delay below, or matched a second dcrd given the same role and history;
+  two `dcrwallet` 2.1.7 wallets in RPC mode made transfers, bought tickets and
+  voted on simnet to height 519 with `b49145e` as their node, passing every step
+  they passed with dcrd; and dcrd's own `TestRpcServer` and `TestTreasury`, from
+  dcrd master at `3360ae4d`, pointed through the `dcrdtest` harness at a dcrd
+  built from that tree, the 2.1.7 binary and `b49145e`, passed against all
+  three. Decrediton 2.1.7, in remote-daemon mode, connected over loopback
+  straight to `58bd107`, which had synced mainnet from a dcrd node on the LAN,
+  made a wallet that never held funds, and showed the node's height, ticket
+  price and peer count. The checks of `b49145e` found nine differences from
+  2.1.7. Later commits fixed six: no P-521 key exchange, refused handshakes not
+  logged and a TLS 1.3 suite order other than Go's, all in the RPC listener; the
+  mempool's and template generator's missing lines below info; the missing log
+  file; and `startprofiler`'s internal error and skipped address checks, the
+  profile server itself staying unported. Three remain: inventory sent without
+  dcrd's trickle delay, as PARITY.md records; the `addnode`/`node` behavior,
+  reported versions and `debuglevel` subsystems of dcrd master, which the port
+  follows; and some startup and shutdown log lines, with the retry schedule for
+  an unreachable `--connect` peer, which probably follows dcrd master's backoff
+  but has not been analysed. Not run: Decrediton's IPC lifecycle; config, IPC
+  and service parity on Windows and macOS; testnet; RPC authentication by TLS
+  client certificate (`--authtype=clientcert`); `dcrwallet`'s mixing and the mix
+  messages; fee estimates, since dcroxide gave none on simnet, and dust
+  rejection, since simnet relays non-standard transactions; in the sweep, a
+  solved `getwork`, large `generate` counts, `startprofiler` off loopback, a
+  negative `setgenerate`, `addnode`/`node` with host names, `node disconnect` of
+  a live dcrd peer, a pending ticket purchase and a nonzero `gethashespersec`;
+  the sweep, the wallet run and the harness on any build after `b49145e`, the
+  RPC listener's rewrite in `58bd107` among them; and Decrediton on any build
+  after `58bd107`.
 - **Phase 8's per-block state comparator has been run on mainnet only.** On
   2026-10-23 the data directory of a mainnet sync of `b49145e` was compared,
   at every height from genesis to block 1,116,035, with the one dcrd 2.2.0-pre
@@ -785,8 +820,9 @@ pins this policy asks for.
 **Where these stand:** the implementation behind M0–M4 is in the tree and M5 is
 underway; the status block near the top records what Phase 15 has covered. The
 demo/acceptance column is the honest measure and it is not fully satisfied —
-M3's mixed-fleet soak and live wallet mixes, and all four of M4's ecosystem
-sweeps, have not been run. M2's per-block comparator was run once, on
+M3's mixed-fleet soak and live wallet mixes have not been run, and M4's four
+ecosystem checks have been run once, on Linux and without Decrediton's IPC
+lifecycle, as the status block records. M2's per-block comparator ran once, on
 2026-10-23: the data directory a mainnet sync of `b49145e` left, from genesis
 to block 1,116,035, against the one dcrd 2.2.0-pre at `b9634e01` wrote for the
 same chain. The blocks and every other record both stores keep for a block,

@@ -139,19 +139,31 @@ logs the mempool's and the template generator's lines below info as dcrd
 does, and changes no verdict; the fourteenth gives `startprofiler` and
 `--profile` dcrd's address checks and refuses an address dcrd would
 serve, the profile servers not being part of this port, and changes no
-verdict. In syncs the first four have been put to blocks only in a build
+verdict. In syncs the first four were initially put to blocks in a build
 made from a worktree that holds the four of them, R1 of that section: in
-four from the LAN server, each of which validated in full only the
-blocks after the assume-valid block and had dcrd's block at height
+four from the LAN server, each of which had dcrd's block at height
 1,116,035, and in one from the loopback server that ended with that same
 UTXO set and the same block files. The fifth's depth of sixteen frames
-has been put to blocks only in the diagnostic build of that section,
+was first put to blocks in the diagnostic build of that section,
 `797a213`'s code with the depth read from a variable, and not with the
-other four: in five syncs from the LAN server, each of which validated
-in full only the blocks after the assume-valid block and had dcrd's
-block at height 1,116,035. Two of those five ran with
-`DCROXIDE_PREVERIFY=10`, which on that node is the sixth's default; no
-build of the sixth to the fourteenth has been synced.
+other four: in five syncs from the LAN server, each of which had dcrd's
+block at height 1,116,035, two of them with `DCROXIDE_PREVERIFY=10`,
+which on that node is the sixth's default. A release build of `8bda92e`,
+which holds the first six, then synced four times from the LAN server
+on 2026-10-22, each with dcrd's block at that height (the bench ledger,
+"`8bda92e` in a directory without copy-on-write, and block records on
+fresh pages"); one of `b49145e`, whose node code is `8bda92e`'s, synced
+from the loopback server on 2026-10-23, and the blocks and every other
+record both stores keep for a block were equal at every height from
+genesis to 1,116,035 in the data directory it left and the one dcrd
+wrote for the same chain (the ledger, "Per-block comparison with dcrd,
+genesis to block 1,116,035"); and one of `58bd107`, which holds the
+first twelve, synced mainnet once from the LAN server to block
+1,126,076, as the node of the Decrediton run the project brief records,
+outside the bench harness, so not as a timing, and was not compared
+with dcrd at its end. Each sync in the three sentences before this one
+validated in full only the blocks after the assume-valid block. No
+build of the thirteenth or the fourteenth has been synced.
 That the rules reject what dcrd's reject, but for the valid block the
 ninth accepts after such a copy, rests on the test batteries
 described below, not on a sync, and none of it says the node is safe to

@@ -223,9 +223,9 @@ pub(crate) mod tests {
     use dcroxide_testutil::{SplitMix64, unhex};
 
     /// dcrd's `bitWriter` as the port wrote it before the word at a
-    /// time writer: a bit at a time into the last byte.  The reference
-    /// the writer above is compared against, here and by the filter
-    /// build's test in the crate root.
+    /// time writer: a bit at a time into the last byte, and whole bytes
+    /// once an n-bit write reaches a byte boundary.  The reference the
+    /// writer above is compared against, here and in the crate root.
     pub(crate) struct SingleBitWriter {
         pub(crate) bytes: Vec<u8>,
         /// Mask of the next bit to write in the final byte; zero when

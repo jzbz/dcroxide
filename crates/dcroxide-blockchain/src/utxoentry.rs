@@ -51,8 +51,8 @@ pub fn is_ticket_submission_output(tx_type: u8, tx_out_idx: u32) -> bool {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UtxoEntry {
     pub(crate) amount: i64,
-    /// The script, held in place when it is short, as the standard
-    /// payment scripts are (see [`PkScript`]).
+    /// The script, held in place when it is short, as pay-to-pubkey-hash
+    /// and pay-to-script-hash scripts are (see [`PkScript`]).
     pub(crate) pk_script: PkScript,
     /// The serialized minimal outputs of the ticket purchase, kept when
     /// this entry is a ticket submission output (dcrd
@@ -251,7 +251,7 @@ mod tests {
     }
 
     /// The vector forms [`UtxoEntry::new`] takes land as the same
-    /// bytes, and a standard script is held in place.
+    /// bytes, and a pay-to-pubkey-hash script is held in place.
     #[test]
     fn new_keeps_the_bytes_it_is_given() {
         let script = [&[0x76, 0xa9, 0x14][..], &[0x5a; 20], &[0x88, 0xac]].concat();

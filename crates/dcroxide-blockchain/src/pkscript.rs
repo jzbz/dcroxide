@@ -2,15 +2,15 @@
 //! The public key script of a UTXO entry and of a spent output, held
 //! in place when it is short.
 //!
-//! The standard payment scripts are short, 23 to 26 bytes:
-//! pay-to-pubkey-hash takes 25 bytes, pay-to-script-hash 23, and the
+//! Pay-to-pubkey-hash and pay-to-script-hash scripts are short, 23 to
+//! 26 bytes: the first takes 25 bytes, the second 23, and the
 //! stake-tagged forms of either one byte more.  Held as a `Vec<u8>`,
 //! a script is a heap allocation when its output is created, another
 //! for every copy of the entry (out of the UTXO cache into a block's
 //! view, into the spend journal), and a free for each of them.
 //! [`PkScript`] keeps a script of up to [`PkScript::INLINE_CAPACITY`]
 //! bytes inside itself and puts only a longer one on the heap, so
-//! those copies of a standard script are plain byte copies.
+//! those copies of a short script are plain byte copies.
 //!
 //! Which form holds a script is visible only to the crate's tests: a
 //! [`PkScript`] reads, compares and prints as the script's bytes, and

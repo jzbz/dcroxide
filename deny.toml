@@ -49,7 +49,7 @@ reason = "ring 0.17 pins windows-sys 0.52; ctrlc, socket2 0.6 and windows-servic
 
 [[bans.skip]]
 crate = "syn:2"
-reason = "the ecosystem is mid-migration to syn 3: serde_derive, displaydoc, zerovec-derive and wasm-bindgen-macro-support are on 3, while curve25519-dalek-derive, synstructure, windows-implement, windows-interface, yoke-derive and zerofrom-derive still pin 2 -- both majors are present until the laggards move, and neither side is ours to choose"
+reason = "the ecosystem is mid-migration to syn 3: serde_derive and wasm-bindgen-macro-support are on 3, while curve25519-dalek-derive, windows-implement, windows-interface and zerocopy-derive still pin 2 -- both majors are present until the laggards move, and neither side is this workspace's to choose"
 
 [sources]
 unknown-registry = "deny"

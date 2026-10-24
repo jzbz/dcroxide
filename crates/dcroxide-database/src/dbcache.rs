@@ -31,9 +31,9 @@
 //! Because a sealed layer is immutable, a key rewritten while a reader
 //! held a snapshot is stored once per layer it was written into, until
 //! a merge collapses the copies.  The size accounting counts those
-//! copies — see [`DbCache::total_size`] — so the flush threshold sees
-//! the memory the overlay really holds rather than the size of its
-//! logical contents.
+//! copies — see [`DbCache::total_size`] — so the size the flush gates on
+//! includes every copy, each at dcrd's node size, which is less than the
+//! memory an entry takes (see [`NODE_FIELDS_SIZE`]).
 //!
 //! Lookups walk the layers newest to oldest and stop at the first
 //! layer holding the key, whether it holds a value or a pending

@@ -659,8 +659,8 @@ mod tests {
     }
 
     /// The serialized filter as the port built it before the word at a
-    /// time writer: the same values and entry count, coded a bit at a
-    /// time by dcrd's `bitWriter`.
+    /// time writer: the same values and entry count, coded by dcrd's
+    /// `bitWriter` as the port had it, each quotient a bit at a time.
     #[allow(
         clippy::arithmetic_side_effects,
         reason = "the values are sorted, so v >= prev; b <= 32, so 1 << b >= 1; and the remainder is the low bits of the delta"

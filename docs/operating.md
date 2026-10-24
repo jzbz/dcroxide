@@ -528,13 +528,17 @@ anything over loopback; both are of later code than the 12.1 minutes
 above. No whole sync has been run through
 the default window over a delayed link, or over a real one with a
 longer round trip than a LAN's: the only whole syncs over a real link,
-on 2026-10-18 and 2026-10-19, took their blocks from a node on another
-machine on the same LAN ([bench-ledger.md](bench-ledger.md), "Rungs from
-a block server on the LAN, two changes held for their memory, and dcrd
-v2.1.7" and "One commit thread for the life of the store, a sync that
-checks every script, and dcrd v2.1.7"). So there is no sync time to
-budget from for a longer round trip, and the 72 minutes and 3.6 hours
-above are not its figures.
+on 2026-10-18, 2026-10-19, 2026-10-22 and 2026-10-23, took their blocks
+from a node on another machine on the same LAN
+([bench-ledger.md](bench-ledger.md), "Rungs from a block server on the
+LAN, two changes held for their memory, and dcrd v2.1.7", "One commit
+thread for the life of the store, a sync that checks every script, and
+dcrd v2.1.7", "Where `797a213`'s block thread waits, a deeper read-ahead
+and a rung of four changes" and "`8bda92e` in a directory without
+copy-on-write, and block records on fresh pages"; [the project
+brief](dcroxide-project-brief.md) for the Decrediton check's sync of
+2026-10-23). So there is no sync time to budget from for a longer round
+trip, and the 72 minutes and 3.6 hours above are not its figures.
 
 The wider window can cost a node its sync peer where dcrd's would not,
 in two cases. Neither has been measured; both are read from the code. A
@@ -825,11 +829,17 @@ ahead, against 65.5% to 66.2% at six, and the syncs took 5.02 s less by
 the means of two runs and three, about ±2.6 s, for 29.83 s more node CPU
 time ([bench-ledger.md](bench-ledger.md), "Where `797a213`'s block
 thread waits, a deeper read-ahead and a rung of four changes"). No other
-count was run, nor any machine without SMT or with another core count,
-nor ten helpers on the code as committed. Where that processor time is
-better spent on other work, a smaller `DCROXIDE_PREVERIFY` holds fewer.
-A node that pre-verified also logs one line under `SRVR` as it shuts
-down, after the read-ahead's:
+count was compared, nor any machine without SMT or with another core
+count. Where that processor time is better spent on other work, a
+smaller `DCROXIDE_PREVERIFY` holds fewer. Ten helpers on the code as
+committed have run, at `8bda92e`'s default with the node held to eight
+cores and their SMT siblings, in four of the benchmark harness's syncs
+of 2026-10-22, those of `8bda92e`, and in its sync of `b49145e` on
+2026-10-23 ([bench-ledger.md](bench-ledger.md), "`8bda92e` in a
+directory without copy-on-write, and block records on fresh pages" and
+"Per-block comparison with dcrd, genesis to block 1,116,035"), never
+beside six. A node that pre-verified also logs one line under `SRVR` as
+it shuts down, after the read-ahead's:
 
 ```text
 Signature pre-verification: B blocks with I inputs to guess for on at most W helpers; C inputs checked ahead of the block thread, V verified; K blocks cut short by the block thread or the shutdown; R refused for room
@@ -1846,7 +1856,8 @@ records every deliberate divergence from dcrd and the known remaining
 gaps. Bug-for-bug reproductions of dcrd behavior — the ones that look
 like defects and are not — are catalogued in [QUIRKS.md](QUIRKS.md).
 
-There is no per-RPC-method status ledger yet. It is planned alongside
-the ecosystem-acceptance work (the `dcrdtest` harness, a `dcrctl`
-sweep, dcrwallet integration), none of which has been run; the project
-brief tracks that as unmet.
+There is no per-RPC-method status ledger yet. The ecosystem-acceptance
+checks it was planned alongside (the `dcrdtest` harness, a `dcrctl`
+sweep and dcrwallet in RPC mode) have been run once, on Linux, and
+Decrediton with them; [the project brief](dcroxide-project-brief.md)
+records what they covered and what they left out.

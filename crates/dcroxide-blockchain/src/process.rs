@@ -3876,13 +3876,13 @@ impl Chain {
             "provided stxos do not match the outputs the block spends"
         );
 
-        // Whether this connect drops the parent's stake node when it
-        // ends (dcrd `connectBlock`, `chain.go:783-796`), decided before
-        // the block's own stake node is made: when it does, that node is
-        // made of the parent's in place.  The end of the connect drops
-        // the parent's by this same answer, which nothing in between can
-        // change: only accepting a header and marking a block invalid
-        // move the best header, and neither happens in a connect.
+        // Whether this connect drops the parent's stake node when it ends
+        // (dcrd `connectBlock`, `chain.go:783-796`), decided before the
+        // block's own stake node is made: when it does, that node is made
+        // of the parent's in place.  The connect's end drops the parent's
+        // by this answer, which nothing in between can change: the best
+        // header moves only on a header's acceptance, a block marked
+        // invalid or reconsidered, or the load at startup, never in a connect.
         let prunes_parent = self.connect_prunes_parent(node);
         let (stake_node, parent_restore) = if prunes_parent {
             self.fetch_stake_node_taking_parent(node, params)
