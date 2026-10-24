@@ -2807,25 +2807,6 @@ fn go_oid_ok(content: &[u8]) -> bool {
     true
 }
 
-/// Advance `chosen`, a strictly increasing choice of indexes below `n`,
-/// to the next such choice in lexicographic order; false after the
-/// last.
-// Index arithmetic bounded by `n`, which is at least `chosen.len()`.
-#[allow(clippy::arithmetic_side_effects)]
-fn next_choice(chosen: &mut [usize], n: usize) -> bool {
-    let k = chosen.len();
-    for i in (0..k).rev() {
-        if chosen[i] < n - k + i {
-            chosen[i] += 1;
-            for j in i + 1..k {
-                chosen[j] = chosen[j - 1] + 1;
-            }
-            return true;
-        }
-    }
-    false
-}
-
 impl CertFacts {
     /// Read the facts from a DER certificate, or `None` where Go's
     /// `ParseCertificate` (`crypto/x509/parser.go`) fails on what this
@@ -3019,14 +3000,18 @@ struct ClientCa {
 ///   extended key usage.  webpki refuses such a certificate when it is
 ///   a CA, which is exactly what dcrd's `gencerts` and `certgen`
 ///   produce, so the simplest clientcert setup would otherwise fail.
-/// - Any other certificate is chain-verified by webpki, over only the
-///   pool certificates Go would accept at the end of the chain: those
-///   `isValid(rootCertificate)` passes now, whose own extended key
-///   usage `checkChainForKeyUsage` admits, and whose path length
-///   constraint the chain's intermediates stay within.  webpki's trust
-///   anchors carry no validity window or extensions, so an expired,
-///   not yet valid, unhandled-critical, server-only or `pathlen:0` root
-///   used to anchor chains dcrd refuses.
+/// - Any other certificate is chain-verified by webpki in one search,
+///   as Go's `buildChains` is one search, within webpki's one budget of
+///   100 signature checks and 200,000 path-building steps.  It runs over
+///   only the pool certificates Go would accept at the end of the chain:
+///   those `isValid(rootCertificate)` passes now and whose own extended
+///   key usage `checkChainForKeyUsage` admits.  Each path the search
+///   builds is held to its root's path length constraint in webpki's
+///   path callback, and each certificate on it to Go's extended key
+///   usage rule ([`GoClientAuthUsage`]).  webpki's trust anchors carry
+///   no validity window or extensions, so an expired, not yet valid,
+///   unhandled-critical, server-only or `pathlen:0` root used to anchor
+///   chains dcrd refuses.
 ///
 /// The root hints and the handshake signature checks are webpki's over
 /// the whole pool.
@@ -3034,16 +3019,105 @@ struct ClientCa {
 struct GoClientCertVerifier {
     cas: Vec<ClientCa>,
     all: Arc<dyn rustls::server::danger::ClientCertVerifier>,
+    /// The signature algorithms chains are verified with: the ring
+    /// provider's, which [`build_server_config`] installs and the
+    /// verifier over the whole pool uses.
+    sig_algs: &'static [&'static dyn rustls::pki_types::SignatureVerificationAlgorithm],
 }
 
-/// The most intermediate choices [`GoClientCertVerifier`] verifies
-/// for one client chain under path-length-constrained roots.  Go
-/// bounds its own chain search at `maxChainSignatureChecks` (100,
-/// `crypto/x509/verify.go`); this bounds the choices at the same
-/// number, so a client holding a chain to such a root cannot make one
-/// handshake verify combinatorially many paths by sending many
-/// intermediates.
-const MAX_CLIENT_CHAIN_CHOICES: usize = 100;
+/// Go's extended key usage rule for one certificate of a client chain
+/// (`checkChainForKeyUsage` asked for `ExtKeyUsageClientAuth`,
+/// `crypto/x509/verify.go`): no extended key usage, or one listing
+/// `clientAuth` or `anyExtendedKeyUsage`.  webpki's
+/// `KeyUsage::client_auth` refuses `anyExtendedKeyUsage`; a refusal here
+/// is the error webpki's rule returns, so it reads the same.  Every
+/// entry is read before the rule is applied, as Go's parser reads the
+/// whole list, so an entry that is not an object identifier refuses the
+/// certificate wherever it stands; an identifier's own encoding is not
+/// checked against Go's reader.
+struct GoClientAuthUsage;
+
+impl webpki::ExtendedKeyUsageValidator for GoClientAuthUsage {
+    fn validate(&self, usages: webpki::KeyPurposeIdIter<'_, '_>) -> Result<(), webpki::Error> {
+        // id-kp-clientAuth and anyExtendedKeyUsage, as DER OID contents.
+        const CLIENT_AUTH: webpki::KeyPurposeId<'static> =
+            webpki::KeyPurposeId::new(&[0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x02]);
+        const ANY: webpki::KeyPurposeId<'static> =
+            webpki::KeyPurposeId::new(&[0x55, 0x1d, 0x25, 0x00]);
+        let mut present = Vec::new();
+        let mut admitted = false;
+        for usage in usages {
+            let usage = usage?;
+            admitted |= usage == CLIENT_AUTH || usage == ANY;
+            present.push(usage.to_decoded_oid());
+        }
+        if admitted || present.is_empty() {
+            return Ok(());
+        }
+        Err(webpki::Error::RequiredEkuNotFoundContext(
+            webpki::RequiredEkuNotFoundContext {
+                required: webpki::KeyUsage::client_auth(),
+                present,
+            },
+        ))
+    }
+}
+
+/// A webpki error as rustls's client verifier reports it (rustls
+/// `webpki/mod.rs` `pki_error`), so a chain [`GoClientCertVerifier`]
+/// refuses fails with the error rustls's own verifier gives, and the
+/// handshake is refused and logged the same (`rpctls::go_error_text`).
+/// The revocation and name errors are left to the last arm: no
+/// revocation list or name is checked.
+fn go_pki_error(error: webpki::Error) -> rustls::Error {
+    use rustls::{CertificateError, ExtendedKeyPurpose};
+    use webpki::Error::*;
+    let purpose = |values: Vec<usize>| match values.as_slice() {
+        webpki::KeyUsage::CLIENT_AUTH_REPR => ExtendedKeyPurpose::ClientAuth,
+        webpki::KeyUsage::SERVER_AUTH_REPR => ExtendedKeyPurpose::ServerAuth,
+        _ => ExtendedKeyPurpose::Other(values),
+    };
+    match error {
+        BadDer | BadDerTime | TrailingData(_) => CertificateError::BadEncoding.into(),
+        CertNotValidYet { time, not_before } => {
+            CertificateError::NotValidYetContext { time, not_before }.into()
+        }
+        CertExpired { time, not_after } => {
+            CertificateError::ExpiredContext { time, not_after }.into()
+        }
+        InvalidCertValidity => CertificateError::Expired.into(),
+        UnknownIssuer => CertificateError::UnknownIssuer.into(),
+        InvalidSignatureForPublicKey => CertificateError::BadSignature.into(),
+        #[allow(deprecated)]
+        UnsupportedSignatureAlgorithm | UnsupportedSignatureAlgorithmForPublicKey => {
+            CertificateError::UnsupportedSignatureAlgorithm.into()
+        }
+        UnsupportedSignatureAlgorithmContext(cx) => {
+            CertificateError::UnsupportedSignatureAlgorithmContext {
+                signature_algorithm_id: cx.signature_algorithm_id,
+                supported_algorithms: cx.supported_algorithms,
+            }
+            .into()
+        }
+        UnsupportedSignatureAlgorithmForPublicKeyContext(cx) => {
+            CertificateError::UnsupportedSignatureAlgorithmForPublicKeyContext {
+                signature_algorithm_id: cx.signature_algorithm_id,
+                public_key_algorithm_id: cx.public_key_algorithm_id,
+            }
+            .into()
+        }
+        #[allow(deprecated)]
+        RequiredEkuNotFound => CertificateError::InvalidPurpose.into(),
+        RequiredEkuNotFoundContext(webpki::RequiredEkuNotFoundContext { required, present }) => {
+            CertificateError::InvalidPurposeContext {
+                required: purpose(required.oid_values().collect()),
+                presented: present.into_iter().map(purpose).collect(),
+            }
+            .into()
+        }
+        _ => CertificateError::Other(rustls::OtherError(Arc::new(error))).into(),
+    }
+}
 
 impl GoClientCertVerifier {
     /// Load the pool from the `--clientcafile` contents as Go's
@@ -3089,7 +3163,13 @@ impl GoClientCertVerifier {
             return Err(NO_CLIENT_CAS.to_string());
         }
         let all = Self::webpki_over(cas.iter().map(|ca| ca.anchor.clone()).collect())?;
-        Ok(GoClientCertVerifier { cas, all })
+        Ok(GoClientCertVerifier {
+            cas,
+            all,
+            sig_algs: rustls::crypto::ring::default_provider()
+                .signature_verification_algorithms
+                .all,
+        })
     }
 
     /// webpki's client verifier over the given anchors.
@@ -3143,81 +3223,61 @@ impl rustls::server::danger::ClientCertVerifier for GoClientCertVerifier {
             return Ok(rustls::server::danger::ClientCertVerified::assertion());
         }
 
-        // Otherwise only the roots Go would accept at the end of a chain
-        // may anchor one: `isValid(rootCertificate)` in `buildChains`
+        // Otherwise one chain search, over the roots Go would accept at
+        // the end of a chain: `isValid(rootCertificate)` in `buildChains`
         // (validity, critical extensions, and `MaxPathLen` against the
         // chain's intermediates), and the root's own extended key usage
-        // in `checkChainForKeyUsage`.  Usually that is every root, with
-        // room for every intermediate sent, and the verifier over the
-        // whole pool answers.
-        let usable = |ca: &&ClientCa| ca.facts.valid_at(now_secs).is_ok() && ca.facts.client_auth;
-        let sent = intermediates.len();
-        let path_limit = |ca: &ClientCa| {
-            ca.facts.max_path_len.map_or(sent, |limit| {
-                usize::try_from(limit).map_or(sent, |l| l.min(sent))
-            })
-        };
-        if self
+        // in `checkChainForKeyUsage`.  webpki's anchors keep none of
+        // this, so the roots are chosen here, and each path webpki
+        // builds is held to its root's path length constraint in the
+        // callback.  A path refused there sends webpki on to the next
+        // within the same search and the same budgets, where the code
+        // this replaced made a whole search, with budgets of its own,
+        // for each of up to 100 choices of the intermediates sent.
+        // webpki counts its 100 signature checks over each path it
+        // verifies at an anchor, where Go counts one for each candidate
+        // issuer, so refused paths that share intermediates Go counts
+        // once spend it sooner than Go's.  A chain the constraint refuses
+        // fails with webpki's own error for it, which is logged as Go's
+        // `TooManyIntermediates`, unless another path the search tried
+        // failed in a way webpki ranks higher, on a signature, a validity
+        // window or a usage (PARITY.md, the clientcert entry).
+        let usable: Vec<&ClientCa> = self
             .cas
             .iter()
-            .all(|ca| usable(&ca) && path_limit(ca) == sent)
-        {
-            return self.all.verify_client_cert(end_entity, intermediates, now);
-        }
-
-        // The usable roots, grouped by how many intermediates a chain to
-        // them may hold.  webpki may build its path through any of the
-        // intermediates it is given, so a group whose limit is below the
-        // number sent verifies over every choice of that many: a chain
-        // within the limit exists exactly when one of those choices
-        // verifies.
-        let mut groups: Vec<(usize, Vec<rustls::pki_types::TrustAnchor<'static>>)> = Vec::new();
-        for ca in self.cas.iter().filter(usable) {
-            let limit = path_limit(ca);
-            match groups.iter_mut().find(|(l, _)| *l == limit) {
-                Some((_, roots)) => roots.push(ca.anchor.clone()),
-                None => groups.push((limit, vec![ca.anchor.clone()])),
-            }
-        }
-        groups.sort_by_key(|(limit, _)| std::cmp::Reverse(*limit));
-        let mut first_err = None;
-        let mut choices_left = MAX_CLIENT_CHAIN_CHOICES;
-        'groups: for (limit, roots) in groups {
-            let verifier = Self::webpki_over(roots).map_err(rustls::Error::General)?;
-            // Every intermediate first.  A path through a choice of them
-            // is a path through all of them, so when no chain reaches
-            // these roots at all no choice is tried, and only a client
-            // holding a real chain to a constrained root reaches the
-            // choices.
-            match verifier.verify_client_cert(end_entity, intermediates, now) {
-                Ok(verified) if limit == sent => return Ok(verified),
-                Ok(_) => {}
-                Err(e) => {
-                    first_err.get_or_insert(e);
-                    continue;
+            .filter(|ca| ca.facts.valid_at(now_secs).is_ok() && ca.facts.client_auth)
+            .collect();
+        let anchors: Vec<rustls::pki_types::TrustAnchor<'_>> =
+            usable.iter().map(|ca| ca.anchor.clone()).collect();
+        let within_path_len = |path: &webpki::VerifiedPath<'_>| {
+            let held = path.intermediate_certificates().count();
+            // webpki hands back the anchor from the slice it was given;
+            // any other is refused rather than left unconstrained.
+            let Some(i) = anchors
+                .iter()
+                .position(|anchor| std::ptr::eq(anchor, path.anchor()))
+            else {
+                return Err(webpki::Error::UnknownIssuer);
+            };
+            match usable[i].facts.max_path_len {
+                Some(limit) if u64::try_from(held).unwrap_or(u64::MAX) > limit => {
+                    Err(webpki::Error::PathLenConstraintViolated)
                 }
+                _ => Ok(()),
             }
-            let mut chosen: Vec<usize> = (0..limit).collect();
-            loop {
-                let Some(left) = choices_left.checked_sub(1) else {
-                    break 'groups;
-                };
-                choices_left = left;
-                let subset: Vec<_> = chosen.iter().map(|&i| intermediates[i].clone()).collect();
-                match verifier.verify_client_cert(end_entity, &subset, now) {
-                    Ok(verified) => return Ok(verified),
-                    Err(e) => {
-                        first_err.get_or_insert(e);
-                    }
-                }
-                if !next_choice(&mut chosen, sent) {
-                    break;
-                }
-            }
-        }
-        Err(first_err.unwrap_or(rustls::Error::InvalidCertificate(
-            rustls::CertificateError::UnknownIssuer,
-        )))
+        };
+        let cert = webpki::EndEntityCert::try_from(end_entity).map_err(go_pki_error)?;
+        cert.verify_for_usage(
+            self.sig_algs,
+            &anchors,
+            intermediates,
+            now,
+            GoClientAuthUsage,
+            None,
+            Some(&within_path_len),
+        )
+        .map(|_| rustls::server::danger::ClientCertVerified::assertion())
+        .map_err(go_pki_error)
     }
 
     fn verify_tls12_signature(
@@ -9250,33 +9310,299 @@ mod tests {
         ));
     }
 
-    /// Every choice of `k` indexes below `n`, in order, once each.
+    /// A chained certificate is held to Go's extended key usage rule
+    /// (review finding GAP06#4): a leaf, or an intermediate, listing
+    /// `anyExtendedKeyUsage` authenticates, as `checkChainForKeyUsage`
+    /// lets it, where webpki's `KeyUsage::client_auth` refused it, and a
+    /// list naming `clientAuth` anywhere authenticates as before.  A leaf
+    /// or intermediate listing neither, a list with an entry that is not
+    /// an object identifier, wherever it stands, and a certificate no
+    /// pool certificate signs are refused, with the errors rustls's own
+    /// client verifier gives.
     #[test]
-    fn next_choice_walks_every_choice() {
-        for (n, k, want) in [
-            (3, 0, vec![vec![]]),
-            (3, 3, vec![vec![0, 1, 2]]),
-            (3, 1, vec![vec![0], vec![1], vec![2]]),
-            (
-                4,
-                2,
-                vec![
-                    vec![0, 1],
-                    vec![0, 2],
-                    vec![0, 3],
-                    vec![1, 2],
-                    vec![1, 3],
-                    vec![2, 3],
-                ],
+    fn a_chained_certificate_takes_gos_extended_key_usage_rule() {
+        use dcroxide_certgen::gentool::generate_key;
+        use rustls::pki_types::CertificateDer;
+        use rustls::server::danger::ClientCertVerifier;
+        const BASIC_CONSTRAINTS: &[u8] = &[0x55, 0x1d, 0x13];
+        const KEY_USAGE: &[u8] = &[0x55, 0x1d, 0x0f];
+        const EKU: &[u8] = &[0x55, 0x1d, 0x25];
+        const ANY: &[u8] = &[0x55, 0x1d, 0x25, 0x00];
+        const SERVER_AUTH: &[u8] = &[0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x01];
+        const CLIENT_AUTH: &[u8] = &[0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x02];
+        const CODE_SIGNING: &[u8] = &[0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x03];
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let now = rustls::pki_types::UnixTime::since_unix_epoch(Duration::from_secs(1_790_000_000));
+        let key = || generate_key("P-256").expect("key");
+        let (root_key, int_key, leaf_key, stranger_key) = (key(), key(), key(), key());
+        let authority = vec![
+            der_extension(
+                BASIC_CONSTRAINTS,
+                true,
+                &der_tlv(0x30, &der_tlv(0x01, &[0xff])),
             ),
+            der_extension(KEY_USAGE, true, &der_tlv(0x03, &[0x02, 0x84])),
+        ];
+        // An extended key usage of the given DER elements, each an
+        // object identifier unless built otherwise.
+        let eku_of =
+            |elements: &[Vec<u8>]| der_extension(EKU, false, &der_tlv(0x30, &elements.concat()));
+        let eku = |usages: &[&[u8]]| {
+            eku_of(
+                &usages
+                    .iter()
+                    .map(|usage| der_tlv(0x06, usage))
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let signing = der_extension(KEY_USAGE, true, &der_tlv(0x03, &[0x07, 0x80]));
+
+        let root = signed_p256_certificate(1, "root", &root_key, "root", &root_key, &authority);
+        let ours = GoClientCertVerifier::from_pem(&certificate_pem(&root)).expect("verifier");
+        let mut roots = rustls::RootCertStore::empty();
+        roots
+            .add(CertificateDer::from(root.as_slice()))
+            .expect("the root");
+        let theirs = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots))
+            .build()
+            .expect("webpki's verifier");
+        let check = |verifier: &dyn ClientCertVerifier, leaf: &[u8], sent: &[&[u8]]| {
+            let sent: Vec<_> = sent.iter().map(|der| CertificateDer::from(*der)).collect();
+            verifier
+                .verify_client_cert(&CertificateDer::from(leaf), &sent, now)
+                .map(|_| ())
+        };
+        let intermediate = |extensions: &[Vec<u8>]| {
+            signed_p256_certificate(2, "int", &int_key, "root", &root_key, extensions)
+        };
+        let leaf_with = |usage: Vec<u8>| {
+            signed_p256_certificate(
+                3,
+                "leaf",
+                &leaf_key,
+                "int",
+                &int_key,
+                &[signing.clone(), usage],
+            )
+        };
+        let leaf = |usages: &[&[u8]]| leaf_with(eku(usages));
+        let plain = intermediate(&authority);
+
+        let any_leaf = leaf(&[ANY]);
+        assert!(
+            check(&*theirs, &any_leaf, &[&plain]).is_err(),
+            "webpki's rule refuses anyExtendedKeyUsage on the leaf"
+        );
+        check(&ours, &any_leaf, &[&plain]).expect("Go's rule admits it on the leaf");
+
+        let any_intermediate = intermediate(&[authority.clone(), vec![eku(&[ANY])]].concat());
+        let client_leaf = leaf(&[CLIENT_AUTH]);
+        assert!(
+            check(&*theirs, &client_leaf, &[&any_intermediate]).is_err(),
+            "webpki's rule refuses anyExtendedKeyUsage on an intermediate"
+        );
+        check(&ours, &client_leaf, &[&any_intermediate])
+            .expect("Go's rule admits it on an intermediate");
+        check(&ours, &client_leaf, &[&plain]).expect("clientAuth");
+
+        // The whole list counts: `clientAuth` or `anyExtendedKeyUsage`
+        // after another usage still admits.
+        let server_then_client = leaf(&[SERVER_AUTH, CLIENT_AUTH]);
+        check(&*theirs, &server_then_client, &[&plain]).expect("webpki: clientAuth second");
+        check(&ours, &server_then_client, &[&plain]).expect("Go: clientAuth second");
+        check(&ours, &leaf(&[SERVER_AUTH, ANY]), &[&plain]).expect("Go: any second");
+
+        let server_leaf = leaf(&[SERVER_AUTH]);
+        let not_an_oid = leaf_with(eku_of(&[der_tlv(0x06, ANY), der_tlv(0x02, &[0x01])]));
+        let neither_intermediate =
+            intermediate(&[authority.clone(), vec![eku(&[SERVER_AUTH, CODE_SIGNING])]].concat());
+        let stranger = signed_p256_certificate(
+            4,
+            "stranger",
+            &stranger_key,
+            "nobody",
+            &stranger_key,
+            std::slice::from_ref(&signing),
+        );
+        for (refused, sent) in [
+            (&server_leaf, vec![plain.as_slice()]),
+            (&not_an_oid, vec![plain.as_slice()]),
+            (&client_leaf, vec![neither_intermediate.as_slice()]),
+            (&stranger, vec![]),
         ] {
-            let mut chosen: Vec<usize> = (0..k).collect();
-            let mut got = vec![chosen.clone()];
-            while next_choice(&mut chosen, n) {
-                got.push(chosen.clone());
-            }
-            assert_eq!(got, want, "{n} choose {k}");
+            let want = check(&*theirs, refused, &sent).expect_err("refused by webpki");
+            assert_eq!(check(&ours, refused, &sent), Err(want));
         }
+    }
+
+    /// A client chain is one search, held to its root's path length
+    /// constraint within that search, as Go's `buildChains` holds it: a
+    /// chain through one intermediate under a `pathlen:1` root is found
+    /// among 120 unrelated intermediates sent before it; a longer path
+    /// the constraint refuses sends the search on to a shorter one; a
+    /// chain through two is refused under that root with the error
+    /// logged as Go's `TooManyIntermediates`, and accepted under a
+    /// `pathlen:2` root of the same name and key; and each pooled root
+    /// is held to its own constraint, an unusable one lending none and a
+    /// refusal at one sending the search on to the next.  The verifier
+    /// this replaced made a whole webpki search for each choice of one
+    /// intermediate, up to 100 choices, and refused the first chain when
+    /// they ran out.
+    #[test]
+    fn a_chain_within_the_path_length_is_found_in_one_search() {
+        use dcroxide_certgen::gentool::generate_key;
+        use rustls::pki_types::CertificateDer;
+        use rustls::server::danger::ClientCertVerifier;
+        const BASIC_CONSTRAINTS: &[u8] = &[0x55, 0x1d, 0x13];
+        const KEY_USAGE: &[u8] = &[0x55, 0x1d, 0x0f];
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let now = rustls::pki_types::UnixTime::since_unix_epoch(Duration::from_secs(1_790_000_000));
+        let key = || generate_key("P-256").expect("key");
+        let (root_key, int_key, inner_key, leaf_key, decoy_key, mid_key) =
+            (key(), key(), key(), key(), key(), key());
+        let authority = |path_len: Option<u8>| {
+            let mut constraints = der_tlv(0x01, &[0xff]);
+            if let Some(path_len) = path_len {
+                constraints.extend(der_tlv(0x02, &[path_len]));
+            }
+            vec![
+                der_extension(BASIC_CONSTRAINTS, true, &der_tlv(0x30, &constraints)),
+                der_extension(KEY_USAGE, true, &der_tlv(0x03, &[0x02, 0x84])),
+            ]
+        };
+        let signing = [der_extension(
+            KEY_USAGE,
+            true,
+            &der_tlv(0x03, &[0x07, 0x80]),
+        )];
+        let verify = |path_len: u8, leaf: &[u8], sent: &[&[u8]]| {
+            let root = signed_p256_certificate(
+                1,
+                "root",
+                &root_key,
+                "root",
+                &root_key,
+                &authority(Some(path_len)),
+            );
+            let verifier =
+                GoClientCertVerifier::from_pem(&certificate_pem(&root)).expect("verifier");
+            let sent: Vec<_> = sent.iter().map(|der| CertificateDer::from(*der)).collect();
+            verifier
+                .verify_client_cert(&CertificateDer::from(leaf), &sent, now)
+                .map(|_| ())
+        };
+
+        let int = signed_p256_certificate(2, "int", &int_key, "root", &root_key, &authority(None));
+        let leaf = signed_p256_certificate(3, "leaf", &leaf_key, "int", &int_key, &signing);
+        // Serials stay below 0x80, which the helper would encode as a
+        // negative INTEGER that Go's parser refuses.
+        let decoys: Vec<Vec<u8>> = (0..120u8)
+            .map(|i| {
+                signed_p256_certificate(
+                    6 + i,
+                    &format!("decoy {i}"),
+                    &decoy_key,
+                    "root",
+                    &root_key,
+                    &authority(None),
+                )
+            })
+            .collect();
+        let mut sent: Vec<&[u8]> = decoys.iter().map(Vec::as_slice).collect();
+        sent.push(&int);
+        verify(1, &leaf, &sent).expect("the chain is found among the decoys");
+
+        let inner =
+            signed_p256_certificate(4, "inner", &inner_key, "int", &int_key, &authority(None));
+        let deep_leaf =
+            signed_p256_certificate(5, "deep", &leaf_key, "inner", &inner_key, &signing);
+        let too_many = |err: &rustls::Error| {
+            matches!(
+                err,
+                rustls::Error::InvalidCertificate(rustls::CertificateError::Other(other))
+                    if other.0.downcast_ref::<webpki::Error>()
+                        == Some(&webpki::Error::PathLenConstraintViolated)
+            )
+        };
+        let err = verify(1, &deep_leaf, &[&inner, &int]).expect_err("two under pathlen:1");
+        assert!(too_many(&err), "{err:?}");
+        verify(2, &deep_leaf, &[&inner, &int]).expect("two intermediates under pathlen:2");
+
+        // `int` again, under a `mid` the root signs: the path through it
+        // holds two intermediates, which pathlen:1 refuses, and the
+        // search goes on to the `int` the root signs itself.
+        let mid =
+            signed_p256_certificate(126, "mid", &mid_key, "root", &root_key, &authority(None));
+        let long_int =
+            signed_p256_certificate(127, "int", &int_key, "mid", &mid_key, &authority(None));
+        verify(1, &leaf, &[&long_int, &mid, &int]).expect("the shorter path after the longer");
+        let err = verify(0, &leaf, &[&long_int, &mid, &int]).expect_err("pathlen:0");
+        assert!(too_many(&err), "{err:?}");
+
+        // Each pooled root is held to its own constraint: an expired
+        // root of the same name and key listed first anchors nothing,
+        // and the `pathlen:0` one after it refuses the chain an
+        // unconstrained one accepts.
+        let expired = signed_p256_certificate_until(
+            1,
+            "root",
+            &root_key,
+            "root",
+            &root_key,
+            der_tlv(0x17, b"200101000000Z"),
+            &authority(None),
+        );
+        let pooled = |path_len: Option<u8>, leaf: &[u8], sent: &[&[u8]]| {
+            let root = signed_p256_certificate(
+                1,
+                "root",
+                &root_key,
+                "root",
+                &root_key,
+                &authority(path_len),
+            );
+            let pem = [certificate_pem(&expired), certificate_pem(&root)].concat();
+            let verifier = GoClientCertVerifier::from_pem(&pem).expect("verifier");
+            let sent: Vec<_> = sent.iter().map(|der| CertificateDer::from(*der)).collect();
+            verifier
+                .verify_client_cert(&CertificateDer::from(leaf), &sent, now)
+                .map(|_| ())
+        };
+        let err = pooled(Some(0), &leaf, &[&int]).expect_err("the second root's pathlen:0");
+        assert!(too_many(&err), "{err:?}");
+        pooled(None, &leaf, &[&int]).expect("an unconstrained second root");
+
+        // Two usable roots of one name.  With another key and no
+        // constraint listed first, the `pathlen:0` root that signed the
+        // chain still refuses it; with the same key and no constraint
+        // listed after a `pathlen:0` one, the chain verifies through the
+        // second once the first refuses it.
+        let two = |first: Vec<u8>, second: Vec<u8>| {
+            let pem = [certificate_pem(&first), certificate_pem(&second)].concat();
+            let verifier = GoClientCertVerifier::from_pem(&pem).expect("verifier");
+            verifier
+                .verify_client_cert(
+                    &CertificateDer::from(leaf.as_slice()),
+                    &[CertificateDer::from(int.as_slice())],
+                    now,
+                )
+                .map(|_| ())
+        };
+        let root_with = |key: &dcroxide_certgen::gentool::ToolKeyPair, path_len: Option<u8>| {
+            signed_p256_certificate(1, "root", key, "root", key, &authority(path_len))
+        };
+        // The refusal reports the failed signature at the first root,
+        // which webpki ranks above the constraint's error, where Go would
+        // report the constraint.
+        assert_eq!(
+            two(root_with(&mid_key, None), root_with(&root_key, Some(0))),
+            Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::BadSignature
+            )),
+            "the signing root's pathlen:0, after another root of its name"
+        );
+        two(root_with(&root_key, Some(0)), root_with(&root_key, None))
+            .expect("the unconstrained twin after the pathlen:0 root");
     }
 
     /// The client CA file loads as Go's `AppendCertsFromPEM` loads it

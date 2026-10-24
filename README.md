@@ -17,7 +17,7 @@ JSON-RPC/websocket server, the tool commands, the pipe IPC lifecycle,
 and the Windows service wrapper. The deliberate non-ports are small
 and documented in PARITY.md (Go GC tuning, the pprof servers, UPnP,
 the Windows event log, and the wallet-side mixclient). The test suite
-runs 2,675 tests across 453 suites on Linux, most differential against
+runs 2,676 tests across 453 suites on Linux, most differential against
 dcrd itself or replaying sessions generated inside dcrd's own packages.
 
 Since the surface completed, four rounds of work have landed on it. A
@@ -94,7 +94,7 @@ LAN server, each of which validated in full only the blocks after the
 assume-valid block and had dcrd's block at height 1,116,035 (the bench
 ledger, "Where `797a213`'s block thread waits, a deeper read-ahead and a
 rung of four changes").
-Of the commits after `797a213`, fifteen change the node's code beyond
+Of the commits after `797a213`, sixteen change the node's code beyond
 tests and comments: one classifies a block's transactions once for every
 step that reads their types, among them checks that apply the consensus
 rules, and changes no rule; another allocates a block filter's list of
@@ -143,32 +143,41 @@ verdict; the fifteenth copies the committed filters a getcfilterv2 or
 getcfsv2 request takes from the chain's recent window after releasing
 the chain lock, where it copied them under it, as dcrd's
 `LocateCFiltersV2` copies its filters after releasing its chain lock,
-and changes no verdict. In syncs the first four were initially put to
-blocks in a build made from a worktree that holds the four of them, R1
-of that section: in four from the LAN server, each of which had dcrd's
-block at height 1,116,035, and in one from the loopback server that
-ended with that same UTXO set and the same block files. The fifth's
-depth of sixteen frames was first put to blocks in the diagnostic
-build of that section, `797a213`'s code with the depth read from a
-variable, and not with the other four: in five syncs from the LAN
-server, each of which had dcrd's block at height 1,116,035, two of
-them with `DCROXIDE_PREVERIFY=10`, which on that node is the sixth's
-default. A release build of `8bda92e`, which holds the first six, then
-synced four times from the LAN server on 2026-10-22, each with dcrd's
-block at that height (the bench ledger, "`8bda92e` in a directory
-without copy-on-write, and block records on fresh pages"); one of
-`b49145e`, whose node code is `8bda92e`'s, synced from the loopback
-server on 2026-10-23, and the blocks and every other record both
-stores keep for a block were equal at every height from genesis to
-1,116,035 in the data directory it left and the one dcrd wrote for the
-same chain (the ledger, "Per-block comparison with dcrd, genesis to
-block 1,116,035"); and one of `58bd107`, which holds the first twelve,
+and changes no verdict; the sixteenth checks an RPC client
+certificate's chain in one webpki search, held to each root's path
+length constraint within it, where it searched all of the
+intermediates sent and then up to 100 choices of them, each on its
+own, and admits a chained certificate whose extended key usage
+includes anyExtendedKeyUsage, as dcrd does, but now refuses, under a
+path length constraint, a chain whose alternative issuers spend
+webpki's budget of signature checks before Go's would be spent
+(PARITY.md, the clientcert entry), and changes no verdict. In syncs
+the first four were initially put to blocks in a build made from a
+worktree that holds the four of them, R1 of that section: in four
+from the LAN server, each of which had dcrd's block at height
+1,116,035, and in one from the loopback server that ended with that
+same UTXO set and the same block files. The fifth's depth of sixteen
+frames was first put to blocks in the diagnostic build of that
+section, `797a213`'s code with the depth read from a variable, and
+not with the other four: in five syncs from the LAN server, each of
+which had dcrd's block at height 1,116,035, two of them with
+`DCROXIDE_PREVERIFY=10`, which on that node is the sixth's default. A
+release build of `8bda92e`, which holds the first six, then synced
+four times from the LAN server on 2026-10-22, each with dcrd's block
+at that height (the bench ledger, "`8bda92e` in a directory without
+copy-on-write, and block records on fresh pages"); one of `b49145e`,
+whose node code is `8bda92e`'s, synced from the loopback server on
+2026-10-23, and the blocks and every other record both stores keep
+for a block were equal at every height from genesis to 1,116,035 in
+the data directory it left and the one dcrd wrote for the same chain
+(the ledger, "Per-block comparison with dcrd, genesis to block
+1,116,035"); and one of `58bd107`, which holds the first twelve,
 synced mainnet once from the LAN server to block 1,126,076, as the
 node of the Decrediton run the project brief records, outside the
 bench harness, so not as a timing, and was not compared with dcrd at
-its end. Each sync in the three sentences before this one validated in
-full only the blocks after the assume-valid block. No build of the
-thirteenth to the fifteenth has been synced.
+its end. Each sync in the three sentences before this one validated
+in full only the blocks after the assume-valid block. No build of the
+thirteenth to the sixteenth has been synced.
 That the rules reject what dcrd's reject, but for the valid block the
 ninth accepts after such a copy, rests on the test batteries
 described below, not on a sync, and none of it says the node is safe to

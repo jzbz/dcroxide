@@ -595,6 +595,7 @@ dependencies = [
  "rustix",
  "rustls",
  "rustls-pki-types",
+ "rustls-webpki",
  "sha1",
  "socket2",
  "tempfile",

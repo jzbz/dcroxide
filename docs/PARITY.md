@@ -2563,8 +2563,9 @@ closing it would cost.
   `--authtype=clientcert`; it is recorded with the other client certificates
   webpki and ring refuse in the next entry.
 
-- **Under `--authtype=clientcert` a few client certificates dcrd accepts get
-  no handshake, because webpki and ring still verify them.** The client chain
+- **Under `--authtype=clientcert` webpki and ring still decide part of a
+  client chain: a few certificates dcrd accepts get no handshake, and some
+  chains dcrd refuses verify.** The client chain
   is decided by `GoClientCertVerifier` (`build_server_config` in `rpcrun.rs`),
   which follows Go's `x509.Certificate.Verify` for
   `RequireAndVerifyClientCert` wherever webpki would decide otherwise. A
@@ -2594,11 +2595,65 @@ closing it would cost.
   contents of other extensions. A certificate malformed only there stays in
   the pool where dcrd skips it, and only the operator can place one there.
 
-  webpki and ring still decide the rest: `GoClientCertVerifier` hands every
-  chain it anchors and every handshake signature to a `WebPkiClientVerifier`
-  (`GoClientCertVerifier::webpki_over`), so five kinds of client certificate
-  that dcrd accepts are refused, each failing closed. A P-521 client key is
-  refused because the handshake signature is checked with the provider's
+  webpki and ring still decide the rest. `GoClientCertVerifier` builds each
+  chain it anchors with webpki's `EndEntityCert::verify_for_usage`, called
+  directly, for which `rustls-webpki` is a direct dependency of
+  `dcroxide-node`: one search over the roots Go would accept, with each path
+  the search builds held to its root's `pathLenConstraint` in webpki's path
+  callback and each certificate on it to Go's extended key usage rule
+  (`GoClientAuthUsage`), so a chained leaf or intermediate whose extended key
+  usage includes anyExtendedKeyUsage authenticates, as Go's
+  `checkChainForKeyUsage` lets it (`verify.go:1011-1015`; review finding
+  GAP06#4). A chain the constraint refuses fails with webpki's error for it,
+  which the RPC log reports as Go's `x509: too many intermediates for path
+  length constraint`, unless another path the search tried failed in a way
+  webpki ranks higher, on a signature, a validity window or a usage, whose
+  error is reported instead, where Go reports the constraint's. The alert
+  rustls sends with it is `certificate_unknown`, where Go sends
+  `bad_certificate`.
+
+  The search keeps webpki's budgets, 100 signature checks, 200,000
+  path-building steps and 250,000 name constraint comparisons, where Go 1.27's
+  keeps only its 100 signature checks, and the two count signature checks
+  differently: webpki counts them over each whole path it verifies at a root,
+  where Go counts one for each candidate issuer, whether or not it leads to a
+  root. So a client can spend webpki's budget before Go's. Under a `pathlen:1`
+  root, take a leaf whose issuer is sent twice under one key: first as a
+  certificate issued by alternative intermediates that share one name and key
+  and that the root signs, then as a certificate the root signs directly. With
+  that first copy and 33 alternatives sent ahead of the second, the chain is
+  refused, where by Go's count up to 48 would still verify. With an
+  unconstrained pool that was so before this change as well, the verifier then
+  being one webpki search too. And a client can spend Go's budget before
+  webpki's: certificates that match an issuer's name but lead to no root cost
+  Go a check each and webpki none, so a chain dcrd refuses at its limit, with
+  `x509: signature check attempts limit reached while verifying certificate
+  chain`, can still verify here. webpki's signature check limit is logged with
+  that text, with the `certificate_unknown` alert where Go sends
+  `bad_certificate`; its path-building limit is logged with rustls's text.
+
+  Go also checks a chain's certificate policies (`policiesValid`, `verify.go`)
+  and the port does not. webpki skips the four policy extensions, certificate
+  policies, policy mappings, policy constraints and inhibit any policy, when
+  they are not critical, so a chain dcrd refuses for its policies can verify
+  here: one with a non-critical policy constraints extension on a presented
+  intermediate requiring an explicit policy that no certificate carries, say.
+  When they are critical, webpki refuses them
+  (`UnsupportedCriticalExtension`), where Go processes them. Go treats a
+  critical subject alternative name with no DNS, email, IP or URI name, and a
+  critical name constraints extension with a subtree of another form, as an
+  unhandled critical extension and refuses the certificate; the pool's
+  certificates are held to that, but webpki takes both extensions as
+  understood on the certificates a client presents, so a chain dcrd refuses
+  for one can verify here. And the certificates a client presents are parsed
+  by webpki, not by a port of Go's `ParseCertificate`, so one Go refuses to
+  parse, such as one with a negative serial number or with an extended key
+  usage identifier Go's reader refuses, can still verify.
+
+  Every handshake signature goes to a `WebPkiClientVerifier`
+  (`GoClientCertVerifier::webpki_over`), and client certificates of these
+  kinds that dcrd accepts are refused, each failing closed. A P-521 client key
+  is refused because the handshake signature is checked with the provider's
   verification algorithms (`webpki/client_verifier.rs:274-295`), and ring's
   stop at P-384 (`crypto/ring/mod.rs:109-112`). So is any chain whose issuer
   signs with ecdsa-with-SHA512, which ring cannot verify, including a P-256
@@ -2607,18 +2662,18 @@ closing it would cost.
   below 2048 bits: ring accepts only `RSA_*_2048_8192`, where Go 1.24 and
   later accept 1024 bits and up. So is an X.509 v1 client certificate, pooled
   or chained: webpki parses only v3 end entities (`cert.rs` `version3`), and
-  the handshake signature check parses the certificate the same way. And so is
-  a chained leaf or intermediate whose extended key usage is only
-  anyExtendedKeyUsage: webpki's `KeyUsage::client_auth()` accepts only the
-  clientAuth OID or an absent extension, whereas Go's `checkChainForKeyUsage`
-  lets anyExtendedKeyUsage satisfy it (`verify.go:1011-1015`); a pooled leaf
-  carrying it is accepted.
-
-  The last case is fixable with a custom `ExtendedKeyUsageValidator` passed to
-  webpki's `EndEntityCert::verify_for_usage`. rustls does not expose that
-  path, so the fix needs `rustls-webpki` as a direct dependency of
-  `dcroxide-node`, a manifest change not yet made (review finding GAP06#4).
-  The other cases need leaving ring or webpki.
+  the handshake signature check parses the certificate the same way. So is a
+  chained leaf whose basic constraints mark it a CA: webpki refuses a CA as an
+  end entity (`CaUsedAsEndEntity`), where Go's `isValid` asks the CA flag only
+  of the intermediates; a pooled one is accepted. So is a chain of more than
+  six intermediates, which webpki's path building refuses
+  (`MAX_SUB_CA_COUNT`), where Go's search has no such limit. And so is a
+  chained leaf or intermediate whose extended key usage extension is present
+  but lists nothing: webpki refuses it (`EmptyEkuExtension`, `verify_cert.rs`
+  `check_eku`) before the usage rule is asked, where Go's
+  `parseExtKeyUsageExtension` reads it as no extended key usage and accepts
+  it; a pooled leaf carrying it is accepted. These cases need leaving ring or
+  webpki.
 
 - **The RPC listener's TLS key exchange is classical where dcrd's is hybrid
   post-quantum, and its TLS 1.2 offer lacks Go's CBC suites.** dcrd's
@@ -3052,10 +3107,11 @@ closing it would cost.
   `tls: invalid ClientKeyExchange message`, where rustls sends no alert and
   the port reports `local error: tls: error decoding message` (with bytes
   after the point the text is Go's, but rustls's alert is `decode_error`); and
-  a client certificate refused for any reason but an unknown issuer, where Go
-  prints x509's error with its times and names. It also covers the refusals
-  dcrd never makes, because it would have served the client: a TLS 1.2 client
-  without `ecdsa_secp521r1_sha512` against a P-521 key (`unexpected error:
+  a client certificate refused for any reason but an unknown issuer, a path
+  length constraint or the signature check limit, where Go prints x509's error
+  with its times and names. It also covers the refusals dcrd never makes,
+  because it would have served the client: a TLS 1.2 client without
+  `ecdsa_secp521r1_sha512` against a P-521 key (`unexpected error:
   incompatible signing key`, see the P-521 entry). A CBC-only or hybrid-only
   client is refused in Go's words for no suite or no key exchange in common,
   though dcrd would not refuse it at all. Socket errors take Go's Unix

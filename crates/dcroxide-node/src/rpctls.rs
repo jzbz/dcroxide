@@ -1122,6 +1122,28 @@ fn go_error_text(err: &rustls::Error, hello: Option<&HelloFacts>) -> String {
             "tls: failed to verify certificate: x509: certificate signed by unknown authority"
                 .to_string()
         }
+        // webpki's refusal of a path past a path length constraint, an
+        // intermediate's own or the root's (`GoClientCertVerifier`'s
+        // path callback): Go's `TooManyIntermediates`.
+        Error::InvalidCertificate(CertificateError::Other(other))
+            if other.0.downcast_ref::<webpki::Error>()
+                == Some(&webpki::Error::PathLenConstraintViolated) =>
+        {
+            "tls: failed to verify certificate: x509: too many intermediates for path length \
+             constraint"
+                .to_string()
+        }
+        // webpki's limit on the signature checks of one chain search: Go's
+        // `errSignatureLimit`, though the two count their checks
+        // differently (PARITY.md, the clientcert entry).
+        Error::InvalidCertificate(CertificateError::Other(other))
+            if other.0.downcast_ref::<webpki::Error>()
+                == Some(&webpki::Error::MaximumSignatureChecksExceeded) =>
+        {
+            "tls: failed to verify certificate: x509: signature check attempts limit reached \
+             while verifying certificate chain"
+                .to_string()
+        }
         // Go answers a record that fails to decrypt with `bad_record_mac`
         // and a message that fails to parse with `decode_error`, and
         // reports the alert it sent.
@@ -1599,6 +1621,20 @@ mod tests {
                 Error::NoCertificatesPresented,
                 Some(&tls13),
                 "tls: client didn't provide a certificate",
+            ),
+            (
+                Error::InvalidCertificate(rustls::CertificateError::Other(rustls::OtherError(
+                    std::sync::Arc::new(webpki::Error::PathLenConstraintViolated),
+                ))),
+                Some(&tls13),
+                "tls: failed to verify certificate: x509: too many intermediates for path length constraint",
+            ),
+            (
+                Error::InvalidCertificate(rustls::CertificateError::Other(rustls::OtherError(
+                    std::sync::Arc::new(webpki::Error::MaximumSignatureChecksExceeded),
+                ))),
+                Some(&tls13),
+                "tls: failed to verify certificate: x509: signature check attempts limit reached while verifying certificate chain",
             ),
         ] {
             assert_eq!(go_error_text(&err, hello), expected, "{err:?}");
