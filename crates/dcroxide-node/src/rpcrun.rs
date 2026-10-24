@@ -3033,8 +3033,9 @@ struct GoClientCertVerifier {
 /// is the error webpki's rule returns, so it reads the same.  Every
 /// entry is read before the rule is applied, as Go's parser reads the
 /// whole list, so an entry that is not an object identifier refuses the
-/// certificate wherever it stands; an identifier's own encoding is not
-/// checked against Go's reader.
+/// certificate wherever it stands; an identifier's own encoding has
+/// been checked against Go's reader before the search, by
+/// [`CertFacts::parse`].
 struct GoClientAuthUsage;
 
 impl webpki::ExtendedKeyUsageValidator for GoClientAuthUsage {
@@ -3203,6 +3204,26 @@ impl rustls::server::danger::ClientCertVerifier for GoClientCertVerifier {
     ) -> Result<rustls::server::danger::ClientCertVerified, rustls::Error> {
         let now_secs = i64::try_from(now.as_secs()).unwrap_or(i64::MAX);
 
+        // Go parses every certificate the client sends before it checks
+        // any (`processCertsFromClient`), and a certificate
+        // `ParseCertificate` refuses ends the handshake, used or not.
+        // Each is read here as the pool's certificates are, which covers
+        // that parse as far as [`CertFacts::parse`] goes, and gives the
+        // facts Go's `isValid` reads below.
+        let Some(leaf_facts) = CertFacts::parse(end_entity.as_ref()) else {
+            return Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::BadEncoding,
+            ));
+        };
+        if intermediates
+            .iter()
+            .any(|cert| CertFacts::parse(cert.as_ref()).is_none())
+        {
+            return Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::BadEncoding,
+            ));
+        }
+
         // A certificate in the pool is its own chain: Go checks it with
         // `isValid(leafCertificate)` and the key usage walk over `[c]`,
         // and nothing else.
@@ -3242,6 +3263,24 @@ impl rustls::server::danger::ClientCertVerifier for GoClientCertVerifier {
         // `TooManyIntermediates`, unless another path the search tried
         // failed in a way webpki ranks higher, on a signature, a validity
         // window or a usage (PARITY.md, the clientcert entry).
+        //
+        // Go's `isValid` refuses a leaf, and passes over an intermediate,
+        // that carries an unhandled critical extension, which webpki
+        // takes as understood when it is a subject alternative name or
+        // name constraints extension of a form Go does not handle
+        // ([`CertFacts::parse`]): the leaf is refused here, before the
+        // search, as Go refuses it before its own, and a path through
+        // such an intermediate is refused in the callback.  A search that
+        // fails on such a refusal is reported as Go reports it.  webpki's
+        // own refusal of a critical extension it does not support is the
+        // same error, raised also while it parses a sent certificate no
+        // path uses, where Go reports no issuer, so it keeps rustls's
+        // error unless the callback refused a path too.
+        if leaf_facts.unhandled_critical {
+            return Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::UnhandledCriticalExtension,
+            ));
+        }
         let usable: Vec<&ClientCa> = self
             .cas
             .iter()
@@ -3249,7 +3288,14 @@ impl rustls::server::danger::ClientCertVerifier for GoClientCertVerifier {
             .collect();
         let anchors: Vec<rustls::pki_types::TrustAnchor<'_>> =
             usable.iter().map(|ca| ca.anchor.clone()).collect();
+        let refused_unhandled = std::cell::Cell::new(false);
         let within_path_len = |path: &webpki::VerifiedPath<'_>| {
+            if path.intermediate_certificates().any(|cert| {
+                CertFacts::parse(cert.der().as_ref()).is_none_or(|facts| facts.unhandled_critical)
+            }) {
+                refused_unhandled.set(true);
+                return Err(webpki::Error::UnsupportedCriticalExtension);
+            }
             let held = path.intermediate_certificates().count();
             // webpki hands back the anchor from the slice it was given;
             // any other is refused rather than left unconstrained.
@@ -3277,7 +3323,14 @@ impl rustls::server::danger::ClientCertVerifier for GoClientCertVerifier {
             Some(&within_path_len),
         )
         .map(|_| rustls::server::danger::ClientCertVerified::assertion())
-        .map_err(go_pki_error)
+        .map_err(|err| match err {
+            webpki::Error::UnsupportedCriticalExtension if refused_unhandled.get() => {
+                rustls::Error::InvalidCertificate(
+                    rustls::CertificateError::UnhandledCriticalExtension,
+                )
+            }
+            err => go_pki_error(err),
+        })
     }
 
     fn verify_tls12_signature(
@@ -9603,6 +9656,136 @@ mod tests {
         );
         two(root_with(&root_key, Some(0)), root_with(&root_key, None))
             .expect("the unconstrained twin after the pathlen:0 root");
+    }
+
+    /// Every certificate a client presents is held to Go's
+    /// `ParseCertificate`, as far as [`CertFacts::parse`] reads it, and to
+    /// the unhandled critical extension rule of Go's `isValid`, where
+    /// webpki takes a critical subject alternative name or name
+    /// constraints extension of a form Go does not handle as understood.
+    /// A leaf whose critical subject alternative name names only a
+    /// registered identifier is refused, one naming a DNS name is not; a
+    /// path through an intermediate whose critical name constraints hold
+    /// a registered identifier subtree is passed over for another, and
+    /// refused when it is the only one; and a certificate Go's parser
+    /// refuses, here one carrying an extension twice, ends the handshake
+    /// even when no path uses it.  rustls's own client verifier accepts
+    /// each of the refused chains.
+    #[test]
+    fn a_presented_certificate_takes_gos_unhandled_critical_rule() {
+        use dcroxide_certgen::gentool::generate_key;
+        use rustls::pki_types::CertificateDer;
+        use rustls::server::danger::ClientCertVerifier;
+        const BASIC_CONSTRAINTS: &[u8] = &[0x55, 0x1d, 0x13];
+        const KEY_USAGE: &[u8] = &[0x55, 0x1d, 0x0f];
+        const SAN: &[u8] = &[0x55, 0x1d, 0x11];
+        const NAME_CONSTRAINTS: &[u8] = &[0x55, 0x1d, 0x1e];
+        // A registeredID GeneralName, 1.2.3, and a dNSName.
+        let registered = der_tlv(0x88, &[0x2a, 0x03]);
+        let dns = der_tlv(0x82, b"client.example");
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let now = rustls::pki_types::UnixTime::since_unix_epoch(Duration::from_secs(1_790_000_000));
+        let key = || generate_key("P-256").expect("key");
+        let (root_key, int_key, leaf_key) = (key(), key(), key());
+        let authority = vec![
+            der_extension(
+                BASIC_CONSTRAINTS,
+                true,
+                &der_tlv(0x30, &der_tlv(0x01, &[0xff])),
+            ),
+            der_extension(KEY_USAGE, true, &der_tlv(0x03, &[0x02, 0x84])),
+        ];
+        let signing = der_extension(KEY_USAGE, true, &der_tlv(0x03, &[0x07, 0x80]));
+
+        let root = signed_p256_certificate(1, "root", &root_key, "root", &root_key, &authority);
+        let ours = GoClientCertVerifier::from_pem(&certificate_pem(&root)).expect("verifier");
+        let mut roots = rustls::RootCertStore::empty();
+        roots
+            .add(CertificateDer::from(root.as_slice()))
+            .expect("the root");
+        let theirs = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots))
+            .build()
+            .expect("webpki's verifier");
+        let check = |verifier: &dyn ClientCertVerifier, leaf: &[u8], sent: &[&[u8]]| {
+            let sent: Vec<_> = sent.iter().map(|der| CertificateDer::from(*der)).collect();
+            verifier
+                .verify_client_cert(&CertificateDer::from(leaf), &sent, now)
+                .map(|_| ())
+        };
+        let unhandled = Err(rustls::Error::InvalidCertificate(
+            rustls::CertificateError::UnhandledCriticalExtension,
+        ));
+        let unparsed = Err(rustls::Error::InvalidCertificate(
+            rustls::CertificateError::BadEncoding,
+        ));
+
+        // A leaf the root signs, by the critical subject alternative
+        // name it carries.
+        let named = |serial: u8, name: &[u8]| {
+            let san = der_extension(SAN, true, &der_tlv(0x30, name));
+            signed_p256_certificate(
+                serial,
+                "leaf",
+                &leaf_key,
+                "root",
+                &root_key,
+                &[signing.clone(), san],
+            )
+        };
+        let registered_leaf = named(2, &registered);
+        check(&*theirs, &registered_leaf, &[]).expect("webpki takes the name as understood");
+        assert_eq!(check(&ours, &registered_leaf, &[]), unhandled);
+        check(&ours, &named(3, &dns), &[]).expect("a DNS name Go handles");
+
+        // An intermediate whose critical name constraints permit only a
+        // registered identifier subtree, beside one without them.
+        let constrained = {
+            let subtree = der_tlv(0x30, &registered);
+            let constraints = der_extension(
+                NAME_CONSTRAINTS,
+                true,
+                &der_tlv(0x30, &der_tlv(0xa0, &subtree)),
+            );
+            let extensions = [authority.clone(), vec![constraints]].concat();
+            signed_p256_certificate(4, "int", &int_key, "root", &root_key, &extensions)
+        };
+        let plain = signed_p256_certificate(5, "int", &int_key, "root", &root_key, &authority);
+        let leaf = signed_p256_certificate(
+            6,
+            "leaf",
+            &leaf_key,
+            "int",
+            &int_key,
+            std::slice::from_ref(&signing),
+        );
+        check(&*theirs, &leaf, &[&constrained]).expect("webpki takes the subtree as understood");
+        assert_eq!(check(&ours, &leaf, &[&constrained]), unhandled);
+        check(&ours, &leaf, &[&constrained, &plain]).expect("the path without it");
+
+        // An extension twice, which Go's parser refuses: on the leaf, and
+        // on an intermediate sent beside the path, which no path uses.
+        let twice = der_extension(&[0x2a, 0x03, 0x04], false, &[0x05, 0x00]);
+        let doubled_leaf = signed_p256_certificate(
+            7,
+            "leaf",
+            &leaf_key,
+            "int",
+            &int_key,
+            &[signing.clone(), twice.clone(), twice.clone()],
+        );
+        let doubled_spare = signed_p256_certificate(
+            8,
+            "spare",
+            &int_key,
+            "root",
+            &root_key,
+            &[authority.clone(), vec![twice.clone(), twice]].concat(),
+        );
+        check(&*theirs, &doubled_leaf, &[&plain]).expect("webpki ignores the repeated extension");
+        assert_eq!(check(&ours, &doubled_leaf, &[&plain]), unparsed);
+        check(&*theirs, &leaf, &[&plain, &doubled_spare])
+            .expect("webpki builds no path through the spare");
+        assert_eq!(check(&ours, &leaf, &[&plain, &doubled_spare]), unparsed);
     }
 
     /// The client CA file loads as Go's `AppendCertsFromPEM` loads it

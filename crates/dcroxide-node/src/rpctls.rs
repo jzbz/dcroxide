@@ -1122,6 +1122,11 @@ fn go_error_text(err: &rustls::Error, hello: Option<&HelloFacts>) -> String {
             "tls: failed to verify certificate: x509: certificate signed by unknown authority"
                 .to_string()
         }
+        // A certificate with a critical extension Go does not handle, as
+        // Go's `isValid` refuses it (`GoClientCertVerifier`).
+        Error::InvalidCertificate(CertificateError::UnhandledCriticalExtension) => {
+            "tls: failed to verify certificate: x509: unhandled critical extension".to_string()
+        }
         // webpki's refusal of a path past a path length constraint, an
         // intermediate's own or the root's (`GoClientCertVerifier`'s
         // path callback): Go's `TooManyIntermediates`.
@@ -1628,6 +1633,11 @@ mod tests {
                 ))),
                 Some(&tls13),
                 "tls: failed to verify certificate: x509: too many intermediates for path length constraint",
+            ),
+            (
+                Error::InvalidCertificate(rustls::CertificateError::UnhandledCriticalExtension),
+                Some(&tls13),
+                "tls: failed to verify certificate: x509: unhandled critical extension",
             ),
             (
                 Error::InvalidCertificate(rustls::CertificateError::Other(rustls::OtherError(

@@ -2642,13 +2642,31 @@ closing it would cost.
   (`UnsupportedCriticalExtension`), where Go processes them. Go treats a
   critical subject alternative name with no DNS, email, IP or URI name, and a
   critical name constraints extension with a subtree of another form, as an
-  unhandled critical extension and refuses the certificate; the pool's
-  certificates are held to that, but webpki takes both extensions as
-  understood on the certificates a client presents, so a chain dcrd refuses
-  for one can verify here. And the certificates a client presents are parsed
-  by webpki, not by a port of Go's `ParseCertificate`, so one Go refuses to
-  parse, such as one with a negative serial number or with an extended key
-  usage identifier Go's reader refuses, can still verify.
+  unhandled critical extension, which webpki takes as understood;
+  `GoClientCertVerifier` holds the certificates a client presents to it, as it
+  holds the pool's, through `CertFacts::parse`. A leaf carrying one is refused
+  before the search, as Go's `isValid(leafCertificate)` refuses it before its
+  own, and logged as Go's `x509: unhandled critical extension`. A path through
+  an intermediate carrying one is refused in the path callback, so the search
+  goes on without it as Go's does. Which error a refused chain is then logged
+  with follows webpki's ranking of the errors its search met, keeping the
+  earlier of two that rank alike, where Go reports the error of the last
+  candidate whose signature checked; they agree when that intermediate is the
+  only path, and can differ when several paths fail. An intermediate on the
+  path that carries a critical extension webpki does not support is refused by
+  webpki itself, logged in rustls's words with `certificate_unknown`, where Go
+  logs `x509: unhandled critical extension` with `bad_certificate`. Every
+  certificate a client presents goes through that reader first, and the
+  handshake is refused if one fails, used or not, as Go's
+  `processCertsFromClient` refuses it when `ParseCertificate` fails; Go logs
+  `tls: failed to parse client certificate: ...` with a `decode_error` alert,
+  where the port reports rustls's bad encoding with `bad_certificate`. The
+  reader covers the version, the validity times, the extension list and the
+  extensions whose facts it keeps, but not the names inside a subject
+  alternative name or name constraints extension beyond their forms, nor Go's
+  other parse checks, so a certificate Go refuses to parse only for those,
+  such as one with a negative serial number or an IP address of five bytes in
+  its subject alternative name, can still verify.
 
   Every handshake signature goes to a `WebPkiClientVerifier`
   (`GoClientCertVerifier::webpki_over`), and client certificates of these
@@ -3108,17 +3126,18 @@ closing it would cost.
   the port reports `local error: tls: error decoding message` (with bytes
   after the point the text is Go's, but rustls's alert is `decode_error`); and
   a client certificate refused for any reason but an unknown issuer, a path
-  length constraint or the signature check limit, where Go prints x509's error
-  with its times and names. It also covers the refusals dcrd never makes,
-  because it would have served the client: a TLS 1.2 client without
-  `ecdsa_secp521r1_sha512` against a P-521 key (`unexpected error:
-  incompatible signing key`, see the P-521 entry). A CBC-only or hybrid-only
-  client is refused in Go's words for no suite or no key exchange in common,
-  though dcrd would not refuse it at all. Socket errors take Go's Unix
-  wording, `read: connection reset by peer`; on Windows Go names the call
-  `wsarecv` or `wsasend` and keeps the system message's capital, where the
-  port writes `read` or `write` and lower-cases it. Closing the rest is a
-  longer table in `go_error_text`, case by case.
+  length constraint, an unhandled critical extension on the leaf or of a
+  subject alternative name or name constraints form, or the signature check
+  limit, where Go prints x509's error with its times and names. It also covers
+  the refusals dcrd never makes, because it would have served the client: a
+  TLS 1.2 client without `ecdsa_secp521r1_sha512` against a P-521 key
+  (`unexpected error: incompatible signing key`, see the P-521 entry). A
+  CBC-only or hybrid-only client is refused in Go's words for no suite or no
+  key exchange in common, though dcrd would not refuse it at all. Socket
+  errors take Go's Unix wording, `read: connection reset by peer`; on Windows
+  Go names the call `wsarecv` or `wsasend` and keeps the system message's
+  capital, where the port writes `read` or `write` and lower-cases it. Closing
+  the rest is a longer table in `go_error_text`, case by case.
 
 - **The RPC server does not log a websocket client's arrival or departure.**
   dcrd's `internal/rpcserver` logs through a package logger that the daemon
