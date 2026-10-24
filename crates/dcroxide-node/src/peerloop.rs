@@ -524,10 +524,12 @@ where
                 // not draining its socket, which is reported and the
                 // pong dropped: hanging up here would let a burst of
                 // relay announcements to a momentarily slow but honest
-                // peer cost it its connection, and the peer's own ping
-                // timeout, the writer's write deadline and the stall
-                // detector already bound a peer that has truly stopped
-                // reading.
+                // peer cost it its connection.  A peer that has truly
+                // stopped reading parks the writer in a write, where the
+                // write deadline (dcrd's write-stall bound) ends the
+                // connection, and the stall detector bounds one that
+                // owes this node data.  Neither this port nor dcrd has a
+                // ping timeout.
                 if let Some(reply) = reply {
                     let command = reply.command();
                     match outbound.queue_message(*reply) {

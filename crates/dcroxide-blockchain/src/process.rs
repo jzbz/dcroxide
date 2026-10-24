@@ -255,6 +255,10 @@ type AcceptedHashes = (
     Arc<BlockTxTypes>,
 );
 
+/// A committed filter as the chain's recent window shares it
+/// ([`Chain::filters`]).
+pub type SharedFilter = Arc<FilterV2>;
+
 /// The growing chain state: the block tree arena and index together
 /// with the chain state and configuration (the subset of dcrd's
 /// `BlockChain` struct this port reads).  dcrd's locks are not
@@ -349,8 +353,9 @@ pub struct Chain {
     /// spending inputs' fraud proofs on load.
     pub spend_journal: BTreeMap<[u8; 32], Vec<u8>>,
     /// The version 2 GCS filters by block hash; like dcrd, filters
-    /// are intentionally not removed on disconnect.
-    pub filters: BTreeMap<[u8; 32], FilterV2>,
+    /// are intentionally not removed on disconnect.  Shared, so a
+    /// reader holding the chain lock takes a filter without copying it.
+    pub filters: BTreeMap<[u8; 32], SharedFilter>,
     /// The header commitment merkle tree leaves by block hash.
     pub header_commitments: BTreeMap<[u8; 32], Vec<Hash>>,
     /// The best chain state snapshot.
@@ -891,7 +896,10 @@ impl Chain {
             if let Ok(genesis_filter) =
                 dcroxide_gcs::blockcf2::regular(&params.genesis_block, &NoScripts)
             {
-                filters.insert(params.genesis_block.header.block_hash().0, genesis_filter);
+                filters.insert(
+                    params.genesis_block.header.block_hash().0,
+                    Arc::new(genesis_filter),
+                );
             }
         }
 
@@ -1249,16 +1257,19 @@ impl Chain {
                 .map_err(chain_db_to_db_error)?;
                 Ok(())
             })?;
-            chain.filters.insert(genesis_hash.0, {
-                struct NoScripts;
-                impl dcroxide_gcs::blockcf2::PrevScripter for NoScripts {
-                    fn prev_script(&self, _out: &OutPoint) -> Option<(u16, &[u8])> {
-                        None
+            chain.filters.insert(
+                genesis_hash.0,
+                Arc::new({
+                    struct NoScripts;
+                    impl dcroxide_gcs::blockcf2::PrevScripter for NoScripts {
+                        fn prev_script(&self, _out: &OutPoint) -> Option<(u16, &[u8])> {
+                            None
+                        }
                     }
-                }
-                dcroxide_gcs::blockcf2::regular(&params.genesis_block, &NoScripts)
-                    .expect("genesis filter")
-            });
+                    dcroxide_gcs::blockcf2::regular(&params.genesis_block, &NoScripts)
+                        .expect("genesis filter")
+                }),
+            );
             chain.db = Some(db);
             // dcrd's `initChainState` goes on to load the state
             // `createChainState` has just written, so a fresh start logs
@@ -1617,7 +1628,7 @@ impl Chain {
                 self.spend_journal.insert(hash.0, journal);
             }
             if let Some(filter) = crate::chaindb::db_fetch_gcs_filter(tx, &hash, height)? {
-                self.filters.insert(hash.0, filter);
+                self.filters.insert(hash.0, Arc::new(filter));
             }
             let commitments = crate::chaindb::db_fetch_header_commitments(tx, &hash, height)?;
             if !commitments.is_empty() {
@@ -4017,7 +4028,7 @@ impl Chain {
             crate::chainio::serialize_spend_journal_entry(&stxos).unwrap_or_default();
         self.spend_journal.insert(node_hash.0, serialized_journal);
         self.write_stake_db_rows(node);
-        self.filters.insert(node_hash.0, filter);
+        self.filters.insert(node_hash.0, Arc::new(filter));
         self.header_commitments
             .insert(node_hash.0, hdr_commitment_leaves);
         // The treasury account and spend rows when the agenda is active
@@ -4381,7 +4392,7 @@ impl Chain {
             None => block.header.block_hash(),
         };
         if let Some(filter) = self.filters.get(&block_hash.0) {
-            return Ok(filter.clone());
+            return Ok(FilterV2::clone(filter));
         }
         let built = match tx_types {
             Some(tx_types) => {
@@ -6426,7 +6437,7 @@ impl Chain {
         height: u32,
     ) -> Result<Option<FilterV2>, crate::chaindb::ChainDbError> {
         if let Some(filter) = self.filters.get(&hash.0) {
-            return Ok(Some(filter.clone()));
+            return Ok(Some(FilterV2::clone(filter)));
         }
         let Some(db) = self.db.as_ref() else {
             return Ok(None);

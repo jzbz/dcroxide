@@ -1699,21 +1699,26 @@ impl BlockRead {
 
 /// Committed filters resolved under the chain lock (the index half of
 /// dcrd `BlockChain.LocateCFiltersV2` and `FilterByBlockHash`), with the
-/// database reads left for after the lock is released.  The getcfilterv2
-/// and getcfsv2 handlers and the getcfilterv2 RPC (`rpcrun.rs`
-/// `NodeRpcFiltererV2`) go through it.
+/// database reads and the copies of the filters' bytes left for after
+/// the lock is released.  The getcfilterv2 and getcfsv2 handlers and the
+/// getcfilterv2 RPC (`rpcrun.rs` `NodeRpcFiltererV2`) go through it.
 ///
-/// dcrd walks the index under `chainLock.RLock`, releases it, and only
-/// then reads the filters and header commitments in one `db.View`.  The
-/// port's chain lock is exclusive, so reading up to
-/// [`dcroxide_wire::MAX_CFILTERS_V2_PER_BATCH`] filters from the database
-/// under it would hold off block processing and every other chain user
-/// for an 88-byte request.  Filters and commitments are immutable per
-/// block hash once stored, so the reads after the lock is released return
-/// what [`Chain::locate_cfilters_v2`] and [`Chain::filter_by_block_hash`]
-/// would have, their errors included: a failed read, or a filter or
-/// commitments row that does not decode, is the database error dcrd
-/// returns, never a missing filter or a proof over no leaves.
+/// dcrd's `LocateCFiltersV2` walks the index under `chainLock.RLock`,
+/// releases it, and only then reads the filters and header commitments
+/// in one `db.View` and copies them into its reply; `FilterByBlockHash`
+/// takes no chain lock at all.  The port's chain lock is exclusive, so
+/// reading or copying up to [`dcroxide_wire::MAX_CFILTERS_V2_PER_BATCH`]
+/// filters under it would hold off block processing and every other
+/// chain user for an 88-byte request: under the lock it takes only a
+/// shared reference to each filter the chain's recent window holds, and
+/// a clone of the commitment leaves it holds, one hash a block once the
+/// header commitments agenda is active.  Filters and commitments are
+/// immutable per block hash once stored, so the reads after the lock is
+/// released return what [`Chain::locate_cfilters_v2`] and
+/// [`Chain::filter_by_block_hash`] would have, their errors included: a
+/// failed read, or a filter or commitments row that does not decode, is
+/// the database error dcrd returns, never a missing filter or a proof
+/// over no leaves.
 pub(crate) struct FilterReads {
     db: Option<Database>,
     /// Whether the stored filters are served as stored, without being
@@ -1752,8 +1757,9 @@ struct FilterRead {
     hash: Hash,
     /// The block's height, which keys its rows in the database.
     height: u32,
-    /// The serialized filter, when the window held it.
-    filter: Option<Vec<u8>>,
+    /// The filter: the window's own, when it held it, or the bytes read
+    /// from the database.
+    filter: Option<FilterBytes>,
     /// The header commitment leaves, when the window held them.
     leaves: Option<Vec<Hash>>,
 }
@@ -1783,7 +1789,7 @@ impl FilterRead {
             let Some(filter) = filter else {
                 return Err(no_filter(&self.hash));
             };
-            self.filter = Some(filter);
+            self.filter = Some(FilterBytes::Read(filter));
         }
         if self.leaves.is_none() {
             self.leaves =
@@ -1793,14 +1799,35 @@ impl FilterRead {
     }
 }
 
+/// A block's filter as [`FilterReads`] holds it until the reply is made.
+enum FilterBytes {
+    /// The chain's recent window's own filter, shared, so taking it
+    /// under the chain lock copies nothing.
+    Window(dcroxide_blockchain::process::SharedFilter),
+    /// The serialized filter read from the database.
+    Read(Vec<u8>),
+}
+
+impl FilterBytes {
+    /// The serialized filter, copied out of the window's filter where
+    /// it is shared.
+    fn into_vec(self) -> Vec<u8> {
+        match self {
+            FilterBytes::Window(filter) => filter.bytes().to_vec(),
+            FilterBytes::Read(bytes) => bytes,
+        }
+    }
+}
+
 /// dcrd's `ErrNoFilter` for a block, with its text.
 fn no_filter(hash: &Hash) -> FilterFetchError {
     FilterFetchError::NoFilter(format!("no filter available for block {hash}"))
 }
 
 impl FilterReads {
-    /// The recent-window copies for the given blocks (each hash with its
-    /// height), taken under the chain lock.
+    /// What the recent window holds for the given blocks (each hash with
+    /// its height), taken under the chain lock: a shared reference to
+    /// each filter and a clone of each block's commitment leaves.
     fn from_window(
         chain: &Chain,
         blocks: impl IntoIterator<Item = (Hash, u32)>,
@@ -1814,7 +1841,7 @@ impl FilterReads {
                 filter: chain
                     .filters
                     .get(&hash.0)
-                    .map(|filter| filter.bytes().to_vec()),
+                    .map(|filter| FilterBytes::Window(Arc::clone(filter))),
                 leaves: chain.header_commitments.get(&hash.0).cloned(),
             })
             .collect();
@@ -1872,10 +1899,11 @@ impl FilterReads {
     }
 
     /// The filters with their header commitment inclusion proofs, reading
-    /// what the window did not hold in one database view with no chain
-    /// lock held, block by block in order as dcrd's `db.View` does: the
-    /// first missing filter is [`FilterFetchError::NoFilter`], and the
-    /// first failed read or undecodable row is [`FilterFetchError::Db`].
+    /// what the window did not hold in one database view, and copying
+    /// what it did, with no chain lock held, block by block in order as
+    /// dcrd's `db.View` does: the first missing filter is
+    /// [`FilterFetchError::NoFilter`], and the first failed read or
+    /// undecodable row is [`FilterFetchError::Db`].
     /// Without a database, a filter the window did not hold is missing
     /// and absent commitments prove against no leaves, as the chain's
     /// own lookups answer.
@@ -1904,7 +1932,7 @@ impl FilterReads {
         blocks
             .into_iter()
             .map(|read| {
-                let data = read.filter.ok_or_else(|| no_filter(&read.hash))?;
+                let data = read.filter.ok_or_else(|| no_filter(&read.hash))?.into_vec();
                 let leaves = read.leaves.unwrap_or_default();
                 Ok(MsgCFilterV2 {
                     block_hash: read.hash,
@@ -3224,8 +3252,10 @@ impl ServerPeerHandler {
     /// silently ignoring requests for unknown blocks or missing
     /// filters (dcrd `serverPeer.OnGetCFilterV2`).
     fn on_get_cfilter_v2(&self, block_hash: Hash, outbound: &OutboundQueue) {
-        // The chain lock covers the index lookup only; the database
-        // reads run after it is released ([`FilterReads`]).
+        // The chain lock covers the index lookup and what the chain's
+        // recent window holds for the block, a shared reference to its
+        // filter and a clone of its commitment leaves; the copy and the
+        // database reads run after it is released ([`FilterReads`]).
         let located = {
             let chain = self.ctx.chain.lock().expect("chain mutex poisoned");
             FilterReads::locate_block(&chain, &block_hash)
@@ -3247,8 +3277,10 @@ impl ServerPeerHandler {
     /// silently ignoring invalid ranges (dcrd
     /// `serverPeer.OnGetCFiltersV2`).
     fn on_get_cfilters_v2(&self, start_hash: Hash, end_hash: Hash, outbound: &OutboundQueue) {
-        // The chain lock covers the range walk only; the up to 100
-        // filter and commitment reads run after it is released, as
+        // The chain lock covers the range walk and what the chain's
+        // recent window holds for the range, shared references to its
+        // filters and clones of their commitment leaves; the up to 100
+        // filter copies and database reads run after it is released, as
         // dcrd's `LocateCFiltersV2` releases its `chainLock` before its
         // `db.View` ([`FilterReads`]).
         let located = {
@@ -5304,6 +5336,55 @@ mod tests {
                 "getcfsv2 from {start} to {end}"
             );
         }
+    }
+
+    /// A getcfsv2 range the chain's recent window holds takes each of
+    /// its filters under the chain lock as a shared reference, which the
+    /// strong counts show, and copies the bytes in `fetch`, which holds
+    /// no chain lock, as dcrd's `LocateCFiltersV2` copies its filters
+    /// into the reply after releasing its `chainLock`.  The port copied
+    /// up to 100 filters with its exclusive chain mutex held, which block
+    /// processing waits on.
+    #[test]
+    fn a_range_in_the_window_copies_its_filters_after_the_chain_lock() {
+        let (_dir, chain, hashes) = database_battery_chain(40);
+        assert!(hashes.len() > 2, "a range of more than one block");
+        let tip = hashes.last().expect("a tip");
+        let (range, want) = {
+            let chain = chain.lock().expect("chain mutex");
+            assert!(
+                hashes
+                    .iter()
+                    .all(|hash| chain.filters.contains_key(&hash.0)),
+                "the window holds every filter of the range"
+            );
+            let want = chain
+                .locate_cfilters_v2(&hashes[0], tip)
+                .expect("the range")
+                .cfilters;
+            let range = FilterReads::locate_range(&chain, &hashes[0], tip).expect("a valid range");
+            for hash in &hashes {
+                assert_eq!(
+                    Arc::strong_count(&chain.filters[&hash.0]),
+                    2,
+                    "block {hash}: its filter is taken without a copy"
+                );
+            }
+            (range, want)
+        };
+
+        // The reply is made with no chain lock held, and keeps no
+        // reference to the window.
+        let served = range.fetch();
+        let chain = chain.lock().expect("chain mutex");
+        for hash in &hashes {
+            assert_eq!(
+                Arc::strong_count(&chain.filters[&hash.0]),
+                1,
+                "block {hash}: the reply holds no reference to the window"
+            );
+        }
+        assert_eq!(served, Ok(want), "the range serves what the chain does");
     }
 
     /// Overwrite a block's row in a chain database bucket, as a disk

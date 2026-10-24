@@ -12,8 +12,10 @@
 //! un-orphaned messages as well (`reconsider_orphans`), and the expiry
 //! latch that keeps the newest height and is drained on the daemon's
 //! epoch ticker ([`Pool::expire_messages_in_background`]).  `receive`
-//! collects what is currently accepted (matching dcrd's
-//! pre-cancelled-context path, which is also what the observer uses).
+//! collects what is currently accepted, as dcrd's `Receive` does with a
+//! pre-cancelled context, the path dcrd's own observer reads the pool
+//! through; this port's observer reads only the senders' identities,
+//! through `session_senders`.
 //! The wall and monotonic clocks are injectable so expiration behavior
 //! is fully deterministic under test.
 
@@ -1223,8 +1225,10 @@ impl<B: MixBlockChain> Pool<B> {
     /// Collect the messages currently accepted for a session (dcrd
     /// `Receive`, which additionally blocks until all expected
     /// messages arrive; this synchronous port matches dcrd's
-    /// pre-cancelled-context behavior of returning immediately, which
-    /// is also what the misbehavior observer uses).
+    /// pre-cancelled-context behavior of returning immediately, the
+    /// path dcrd's misbehavior observer takes).  This port's observer
+    /// reads the senders through `session_senders` instead, and nothing
+    /// in the daemon calls this.
     pub fn receive(&self, r: &mut Received) -> Result<(), PoolError> {
         let ses = self
             .sessions

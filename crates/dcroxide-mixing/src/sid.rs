@@ -32,9 +32,18 @@ fn xor(a: &mut [u8], b: &[u8]) {
 /// Perform an in-place sort of prs, moving each pair request to its
 /// original unmixed position in the protocol, and return the session
 /// ID (dcrd `SortPRsForSession`).
+///
+/// # Panics
+///
+/// If a pair request does not encode, which none decoded from the wire
+/// can fail to do (see `MsgMixPairReq::mix_hash`).
 pub fn sort_prs_for_session(prs: &mut [MsgMixPairReq], epoch: u64) -> [u8; 32] {
-    // Lexicographical sort PRs to derive the sid.  Every message here
-    // is well formed, so the identity hashes are available.
+    // Lexicographical sort PRs to derive the sid.  The identity hashes
+    // need each pair request to encode, which every one decoded from
+    // the wire does, its decoder having made each check the encoder
+    // makes; dcrd reads the hash `WriteHash` recorded, which cannot
+    // fail.  Only tests call this: dcrd's non-test callers are all in
+    // the wallet-side `mixclient`, which is not ported.
     prs.sort_by(|a, b| {
         let a = a.mix_hash().expect("pair request hash");
         let b = b.mix_hash().expect("pair request hash");
