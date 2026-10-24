@@ -2630,19 +2630,64 @@ closing it would cost.
   `x509: signature check attempts limit reached while verifying certificate
   chain`, can still verify here. webpki's signature check limit is logged with
   that text, with the `certificate_unknown` alert where Go sends
-  `bad_certificate`; its path-building limit is logged with rustls's text.
+  `bad_certificate`, and its path-building limit with rustls's text, unless
+  the search refused a path for its policies first (below).
 
-  Go also checks a chain's certificate policies (`policiesValid`, `verify.go`)
-  and the port does not. webpki skips the four policy extensions, certificate
-  policies, policy mappings, policy constraints and inhibit any policy, when
-  they are not critical, so a chain dcrd refuses for its policies can verify
-  here: one with a non-critical policy constraints extension on a presented
-  intermediate requiring an explicit policy that no certificate carries, say.
-  When they are critical, webpki refuses them
-  (`UnsupportedCriticalExtension`), where Go processes them. Go treats a
-  critical subject alternative name with no DNS, email, IP or URI name, and a
-  critical name constraints extension with a subtree of another form, as an
-  unhandled critical extension, which webpki takes as understood;
+  Each path is also held to Go's policy validation, a port of `policiesValid`
+  (`verify.go`: RFC 5280's policy processing, as RFC 9618 replaces parts of it)
+  run with the options Go's TLS server uses under dcrd's `tls.Config`, no
+  initial policy set and none of the initial require or inhibit flags. A chain
+  then fails it only when a certificate's policy constraints require an
+  explicit policy and none is left valid, or when a certificate's mapping names
+  anyPolicy, on either side. `CertFacts::parse` reads the four policy
+  extensions, certificate policies, policy mappings, policy constraints and
+  inhibit any policy, by Go's rules, and takes a length, there as everywhere it
+  reads, only in the fewest octets, as cryptobyte does; so a certificate Go's
+  parser refuses for one of them, such as one listing a policy twice or giving
+  a length in more octets than it needs, is refused too. The port replays Go's
+  own `TestPoliciesValid` table, with its options, over Go's vectors
+  (`tests/data/x509-policy`). A path the validation refuses sends the search on
+  to another, as Go drops a chain and keeps the rest. A path holding a
+  certificate that Go's `alreadyInChain` takes for its root is refused before
+  that, and not counted: Go passes over such a root before checking its
+  signature, so a client that sends a copy of its root behind an intermediate
+  makes no second chain to Go, where webpki, which keeps that rule for the
+  intermediates it adds but not for the anchor, builds one, and the copy, held
+  to the policy rules as an intermediate, could pass a chain Go refuses: a copy
+  without a policies extension empties the policy graph before an
+  intermediate's mapping of anyPolicy is read. webpki's rule for the
+  intermediates compares the subject and key only, where Go's also compares the
+  subject alternative names, so a path through an intermediate that shares a
+  name and key with a certificate below it, but not its alternative names, is
+  not built, where Go builds it. The search runs over one copy of each
+  certificate the client sent, and the pool holds one copy of each certificate
+  the client CA file lists, as Go's pools keep one (`addCertFunc`), so the
+  CertificateRequest's certificate authorities name each certificate's subject
+  once, as Go's `ClientCAs.Subjects()` does. When the callback has refused a
+  path for its policies and the search fails, the refusal is logged as Go's
+  `x509: no valid chains built: N candidate chains with invalid policies`, even
+  when a budget then ran out. Go drops its signature limit once its search has
+  built a chain, but the limit also charges candidates that lead to no root,
+  which webpki never verifies, so Go's can run out before it builds one, and Go
+  then logs the limit; webpki's other two budgets Go does not keep, and its
+  search would go on, to count more chains or to find one it accepts. The alert
+  is `certificate_unknown` where Go sends `bad_certificate`. N counts the paths
+  refused, which are, as far as both searches reach, the chains Go's search
+  builds, but for those webpki refuses during its search, before the callback,
+  for their key usage or a name constraint, both of which Go checks only after
+  the policies. So a chain that fails the policies and one of those is a policy
+  failure to Go and never reaches the policy check here: when every chain that
+  fails the policies fails the key usage too, the port logs rustls's usage
+  error, with `unsupported_certificate`, where Go logs the invalid policies; Go
+  also names in the same error the chains it dropped for their key usage alone;
+  and when a chain that passes the policies and the key usage breaks a name
+  constraint, Go reports that, `x509: a root or intermediate certificate is not
+  authorized to sign for this name: ...`, where the port logs the invalid
+  policies of the others. When the four policy extensions are critical, webpki
+  refuses them (`UnsupportedCriticalExtension`), where Go processes them. Go
+  treats a critical subject alternative name with no DNS, email, IP or URI
+  name, and a critical name constraints extension with a subtree of another
+  form, as an unhandled critical extension, which webpki takes as understood;
   `GoClientCertVerifier` holds the certificates a client presents to it, as it
   holds the pool's, through `CertFacts::parse`. A leaf carrying one is refused
   before the search, as Go's `isValid(leafCertificate)` refuses it before its
@@ -2664,9 +2709,9 @@ closing it would cost.
   reader covers the version, the validity times, the extension list and the
   extensions whose facts it keeps, but not the names inside a subject
   alternative name or name constraints extension beyond their forms, nor Go's
-  other parse checks, so a certificate Go refuses to parse only for those,
-  such as one with a negative serial number or an IP address of five bytes in
-  its subject alternative name, can still verify.
+  other parse checks, so a certificate Go refuses to parse only for those, such
+  as one with a negative serial number or an IP address of five bytes in its
+  subject alternative name, can still verify.
 
   Every handshake signature goes to a `WebPkiClientVerifier`
   (`GoClientCertVerifier::webpki_over`), and client certificates of these
@@ -3127,17 +3172,17 @@ closing it would cost.
   after the point the text is Go's, but rustls's alert is `decode_error`); and
   a client certificate refused for any reason but an unknown issuer, a path
   length constraint, an unhandled critical extension on the leaf or of a
-  subject alternative name or name constraints form, or the signature check
-  limit, where Go prints x509's error with its times and names. It also covers
-  the refusals dcrd never makes, because it would have served the client: a
-  TLS 1.2 client without `ecdsa_secp521r1_sha512` against a P-521 key
-  (`unexpected error: incompatible signing key`, see the P-521 entry). A
-  CBC-only or hybrid-only client is refused in Go's words for no suite or no
-  key exchange in common, though dcrd would not refuse it at all. Socket
-  errors take Go's Unix wording, `read: connection reset by peer`; on Windows
-  Go names the call `wsarecv` or `wsasend` and keeps the system message's
-  capital, where the port writes `read` or `write` and lower-cases it. Closing
-  the rest is a longer table in `go_error_text`, case by case.
+  subject alternative name or name constraints form, invalid policies, or the
+  signature check limit, where Go prints x509's error with its times and
+  names. It also covers the refusals dcrd never makes, because it would have
+  served the client: a TLS 1.2 client without `ecdsa_secp521r1_sha512` against
+  a P-521 key (`unexpected error: incompatible signing key`, see the P-521
+  entry). A CBC-only or hybrid-only client is refused in Go's words for no
+  suite or no key exchange in common, though dcrd would not refuse it at all.
+  Socket errors take Go's Unix wording, `read: connection reset by peer`; on
+  Windows Go names the call `wsarecv` or `wsasend` and keeps the system
+  message's capital, where the port writes `read` or `write` and lower-cases
+  it. Closing the rest is a longer table in `go_error_text`, case by case.
 
 - **The RPC server does not log a websocket client's arrival or departure.**
   dcrd's `internal/rpcserver` logs through a package logger that the daemon

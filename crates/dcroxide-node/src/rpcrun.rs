@@ -2590,8 +2590,9 @@ fn with_client_cas_path(err: String, path: Option<&Path>) -> String {
 }
 
 /// A minimal DER reader over the certificate fields Go's client
-/// verification reads: low-tag-number, definite-length elements only,
-/// which is every shape Go's own parser accepts.
+/// verification reads: low-tag-number elements of a definite length
+/// written in the fewest octets, which is every shape cryptobyte, and so
+/// Go's own parser, accepts.
 struct DerReader<'a> {
     data: &'a [u8],
 }
@@ -2609,7 +2610,9 @@ impl<'a> DerReader<'a> {
         self.data.first().copied()
     }
 
-    /// The next element's tag and content.
+    /// The next element's tag and content.  A long-form length must
+    /// need its form and open with a nonzero octet, as cryptobyte's
+    /// `readASN1` requires (`vendor/golang.org/x/crypto/cryptobyte/asn1.go`).
     // A length of at most four bytes, checked against the input.
     #[allow(clippy::arithmetic_side_effects)]
     fn read(&mut self) -> Option<(u8, &'a [u8])> {
@@ -2622,14 +2625,18 @@ impl<'a> DerReader<'a> {
             usize::from(first)
         } else {
             let n = usize::from(first & 0x7f);
-            if n == 0 || n > 4 || rest.len() < n {
+            if n == 0 || n > 4 || rest.len() < n || rest[0] == 0 {
                 return None;
             }
             let (len_bytes, tail) = rest.split_at(n);
             rest = tail;
-            len_bytes
+            let len = len_bytes
                 .iter()
-                .fold(0usize, |len, &b| (len << 8) | usize::from(b))
+                .fold(0usize, |len, &b| (len << 8) | usize::from(b));
+            if len < 0x80 {
+                return None;
+            }
+            len
         };
         if rest.len() < len {
             return None;
@@ -2751,6 +2758,97 @@ struct CertFacts {
     max_path_len: Option<u64>,
 }
 
+/// The facts Go's `policiesValid` (`crypto/x509/verify.go`) reads from
+/// one certificate of a client chain, as `processExtensions` parses the
+/// four policy extensions whatever their critical flag says: the policy
+/// identifiers, as DER object identifier contents, in order; the policy
+/// mappings, issuer domain then subject domain; the policy constraints'
+/// two values and inhibit any policy's, `None` where absent; and whether
+/// the certificate is self-issued, its issuer and subject names equal.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct PolicyFacts {
+    policies: Vec<Vec<u8>>,
+    mappings: Vec<(Vec<u8>, Vec<u8>)>,
+    require_explicit_policy: Option<i64>,
+    inhibit_policy_mapping: Option<i64>,
+    inhibit_any_policy: Option<i64>,
+    self_issued: bool,
+}
+
+/// What Go's `alreadyInChain` (`crypto/x509/verify.go`) compares to
+/// keep a certificate off a chain that holds its like: the subject and
+/// the subject public key info, as DER contents, and the value of the
+/// subject alternative name extension where there is one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ChainIdentity<'a> {
+    subject: &'a [u8],
+    spki: &'a [u8],
+    san: Option<&'a [u8]>,
+}
+
+impl ChainIdentity<'_> {
+    /// Go's `alreadyInChain(candidate, chain)`: a certificate of `chain`
+    /// has the candidate's subject and key, and either neither carries a
+    /// subject alternative name or both carry the same one; the first
+    /// with the subject and key whose name only one of the two carries
+    /// ends the walk with `false`, as Go's loop returns there.
+    fn already_in(&self, chain: &[ChainIdentity<'_>]) -> bool {
+        for cert in chain {
+            if cert.subject != self.subject || cert.spki != self.spki {
+                continue;
+            }
+            match (self.san, cert.san) {
+                (None, None) => return true,
+                (None, Some(_)) | (Some(_), None) => return false,
+                (Some(ours), Some(theirs)) if ours == theirs => return true,
+                (Some(_), Some(_)) => {}
+            }
+        }
+        false
+    }
+}
+
+/// An INTEGER's content as cryptobyte's `ReadASN1Int64WithTag` and
+/// `ReadASN1Integer` read it into an `int64`: at least one octet,
+/// minimally encoded (`checkASN1Integer`), and no more than eight
+/// (`asn1Signed`).
+// Shifts over at most eight bytes.
+#[allow(clippy::arithmetic_side_effects)]
+fn go_asn1_int64(content: &[u8]) -> Option<i64> {
+    match content {
+        [] => return None,
+        [0x00, next, ..] if next & 0x80 == 0 => return None,
+        [0xff, next, ..] if next & 0x80 != 0 => return None,
+        _ if content.len() > 8 => return None,
+        _ => {}
+    }
+    let negative = content[0] & 0x80 != 0;
+    let start = if negative { -1i64 } else { 0 };
+    Some(
+        content
+            .iter()
+            .fold(start, |value, &b| (value << 8) | i64::from(b)),
+    )
+}
+
+/// Whether `der` is an object identifier Go's `newOIDFromDER`
+/// (`crypto/x509/oid.go`) accepts, as `parseCertificatePoliciesExtension`
+/// requires of each policy: not empty, ending a subidentifier, and no
+/// subidentifier opening with 0x80.
+fn go_new_oid_from_der(der: &[u8]) -> bool {
+    if der.last().is_none_or(|last| last & 0x80 != 0) {
+        return false;
+    }
+    let mut start = true;
+    for &b in der {
+        if start && b == 0x80 {
+            return false;
+        }
+        start = b & 0x80 == 0;
+    }
+    true
+}
+
 /// A basic constraints `pathLenConstraint` as Go 1.27's
 /// `parseBasicConstraintsExtension` reads it, through cryptobyte's
 /// `ReadASN1Integer` into a `uint`: a minimally encoded, non-negative
@@ -2817,9 +2915,23 @@ impl CertFacts {
     /// are kept.  Go's other checks (the serial number, names, public
     /// key, signature, and the contents of other extensions) are not
     /// ported, so `Some` does not promise Go parses the certificate.
+    /// The four policy extensions are among those read, with Go's rules,
+    /// though only [`CertFacts::parse_all`] keeps what they say.
+    fn parse(der: &[u8]) -> Option<CertFacts> {
+        Self::parse_all(der).map(|(facts, _, _)| facts)
+    }
+
+    /// [`CertFacts::parse`], with the policy facts Go's `policiesValid`
+    /// reads and what Go's `alreadyInChain` compares.
     // The version is at most 2 before the increment.
     #[allow(clippy::arithmetic_side_effects)]
-    fn parse(der: &[u8]) -> Option<CertFacts> {
+    fn parse_all(der: &[u8]) -> Option<(CertFacts, PolicyFacts, ChainIdentity<'_>)> {
+        // The certificate policies, policy mappings, policy constraints
+        // and inhibit any policy extensions, as DER OID contents.
+        const POLICIES: &[u8] = &[0x55, 0x1d, 0x20];
+        const POLICY_MAPPINGS: &[u8] = &[0x55, 0x1d, 0x21];
+        const POLICY_CONSTRAINTS: &[u8] = &[0x55, 0x1d, 0x24];
+        const INHIBIT_ANY_POLICY: &[u8] = &[0x55, 0x1d, 0x36];
         // id-ce-basicConstraints, id-ce-extKeyUsage,
         // anyExtendedKeyUsage, id-kp-clientAuth and
         // id-pe-authorityInfoAccess, as DER OID contents.
@@ -2844,14 +2956,14 @@ impl CertFacts {
         };
         tbs.read_tag(0x02)?; // serialNumber
         tbs.read_tag(0x30)?; // signature
-        tbs.read_tag(0x30)?; // issuer
+        let issuer = tbs.read_tag(0x30)?;
         let mut validity = DerReader::new(tbs.read_tag(0x30)?);
         let (tag, content) = validity.read()?;
         let not_before = parse_asn1_time(tag, content)?;
         let (tag, content) = validity.read()?;
         let not_after = parse_asn1_time(tag, content)?;
-        tbs.read_tag(0x30)?; // subject
-        tbs.read_tag(0x30)?; // subjectPublicKeyInfo
+        let subject = tbs.read_tag(0x30)?;
+        let spki = tbs.read_tag(0x30)?;
 
         let mut facts = CertFacts {
             not_before,
@@ -2860,10 +2972,19 @@ impl CertFacts {
             client_auth: true,
             max_path_len: None,
         };
+        let mut policies = PolicyFacts {
+            self_issued: issuer == subject,
+            ..PolicyFacts::default()
+        };
+        let mut identity = ChainIdentity {
+            subject,
+            spki,
+            san: None,
+        };
         // Go reads the unique identifiers from v2 on and the extensions
         // only from a v3 certificate.
         if version < 2 {
-            return Some(facts);
+            return Some((facts, policies, identity));
         }
         for unique_id in [0x81, 0x82] {
             if tbs.peek_tag() == Some(unique_id) {
@@ -2871,7 +2992,7 @@ impl CertFacts {
             }
         }
         if version < 3 || tbs.peek_tag() != Some(0xa3) {
-            return Some(facts);
+            return Some((facts, policies, identity));
         }
         let mut extensions = DerReader::new(DerReader::new(tbs.read()?.1).read_tag(0x30)?);
         let mut seen: Vec<&[u8]> = Vec::new();
@@ -2906,6 +3027,7 @@ impl CertFacts {
                     // A subject alternative name counts as handled only
                     // when Go collected a name from it.
                     17 => {
+                        identity.san = Some(value);
                         let mut names = DerReader::new(DerReader::new(value).read_tag(0x30)?);
                         let mut any_known = false;
                         while !names.is_empty() {
@@ -2958,9 +3080,58 @@ impl CertFacts {
                     facts.max_path_len = Some(der_path_len(constraints.read_tag(0x02)?)?);
                 }
             }
+            // `processExtensions` for the policy extensions, each read
+            // as far as Go reads it, trailing bytes left unread as Go
+            // leaves them.
+            if oid == POLICIES {
+                // `parseCertificatePoliciesExtension`: each policy's
+                // identifier, its qualifiers unread, none twice.
+                let mut infos = DerReader::new(DerReader::new(value).read_tag(0x30)?);
+                while !infos.is_empty() {
+                    let mut info = DerReader::new(infos.read_tag(0x30)?);
+                    let policy = info.read_tag(0x06)?;
+                    if policies
+                        .policies
+                        .iter()
+                        .any(|seen| seen.as_slice() == policy)
+                        || !go_new_oid_from_der(policy)
+                    {
+                        return None;
+                    }
+                    policies.policies.push(policy.to_vec());
+                }
+            }
+            if oid == POLICY_MAPPINGS {
+                let mut mappings = DerReader::new(DerReader::new(value).read_tag(0x30)?);
+                while !mappings.is_empty() {
+                    let mut mapping = DerReader::new(mappings.read_tag(0x30)?);
+                    let issuer_domain = mapping.read_tag(0x06)?;
+                    let subject_domain = mapping.read_tag(0x06)?;
+                    policies
+                        .mappings
+                        .push((issuer_domain.to_vec(), subject_domain.to_vec()));
+                }
+            }
+            if oid == POLICY_CONSTRAINTS {
+                // requireExplicitPolicy [0] and inhibitPolicyMapping [1],
+                // each an implicitly tagged INTEGER.
+                let mut constraints = DerReader::new(DerReader::new(value).read_tag(0x30)?);
+                if constraints.peek_tag() == Some(0x80) {
+                    policies.require_explicit_policy =
+                        Some(go_asn1_int64(constraints.read_tag(0x80)?)?);
+                }
+                if constraints.peek_tag() == Some(0x81) {
+                    policies.inhibit_policy_mapping =
+                        Some(go_asn1_int64(constraints.read_tag(0x81)?)?);
+                }
+            }
+            if oid == INHIBIT_ANY_POLICY {
+                policies.inhibit_any_policy =
+                    Some(go_asn1_int64(DerReader::new(value).read_tag(0x02)?)?);
+            }
             facts.unhandled_critical |= critical && unhandled;
         }
-        Some(facts)
+        Some((facts, policies, identity))
     }
 
     /// Go's `isValid` for this certificate at `now` (`verify.go`
@@ -3007,8 +3178,13 @@ struct ClientCa {
 ///   those `isValid(rootCertificate)` passes now and whose own extended
 ///   key usage `checkChainForKeyUsage` admits.  Each path the search
 ///   builds is held to its root's path length constraint in webpki's
-///   path callback, and each certificate on it to Go's extended key
-///   usage rule ([`GoClientAuthUsage`]).  webpki's trust anchors carry
+///   path callback, each certificate on it to Go's extended key usage
+///   rule ([`GoClientAuthUsage`]), and the path to Go's policy
+///   validation ([`go_policies_valid`]); a path holding a certificate
+///   Go's `alreadyInChain` takes for its root, a copy of the root the
+///   client sent, say, is refused, as Go builds no such chain.
+///   The search runs over one copy of each certificate sent, as Go's
+///   pool of intermediates keeps one.  webpki's trust anchors carry
 ///   no validity window or extensions, so an expired, not yet valid,
 ///   unhandled-critical, server-only or `pathlen:0` root used to anchor
 ///   chains dcrd refuses.
@@ -3063,6 +3239,369 @@ impl webpki::ExtendedKeyUsageValidator for GoClientAuthUsage {
         ))
     }
 }
+
+/// anyPolicy, 2.5.29.32.0, as DER object identifier contents.
+const ANY_POLICY: &[u8] = &[0x55, 0x1d, 0x20, 0x00];
+
+/// A node of Go's valid policy graph (`policyGraphNode`): its valid
+/// policy, the policies it expects of a child, and its edges, by index
+/// into [`PolicyGraph::nodes`].
+#[derive(Debug)]
+struct PolicyNode {
+    valid: Vec<u8>,
+    expected: Vec<Vec<u8>>,
+    parents: std::collections::BTreeSet<usize>,
+    children: std::collections::BTreeSet<usize>,
+}
+
+/// Go's valid policy graph (`policyGraph`, RFC 9618): the nodes, each
+/// stratum's nodes by valid policy, and the previous stratum's nodes by
+/// the policies they expect.  The maps keep their entries in order where
+/// Go's iterate in any, and nothing the graph answers depends on it.
+#[derive(Debug)]
+struct PolicyGraph {
+    nodes: Vec<PolicyNode>,
+    strata: Vec<std::collections::BTreeMap<Vec<u8>, usize>>,
+    parent_index: std::collections::BTreeMap<Vec<u8>, Vec<usize>>,
+    depth: usize,
+}
+
+impl PolicyGraph {
+    /// `newPolicyGraph`: the anyPolicy root, alone in stratum zero.
+    fn new() -> PolicyGraph {
+        PolicyGraph {
+            nodes: vec![PolicyNode {
+                valid: ANY_POLICY.to_vec(),
+                expected: vec![ANY_POLICY.to_vec()],
+                parents: std::collections::BTreeSet::new(),
+                children: std::collections::BTreeSet::new(),
+            }],
+            strata: vec![std::collections::BTreeMap::from([(ANY_POLICY.to_vec(), 0)])],
+            parent_index: std::collections::BTreeMap::new(),
+            depth: 0,
+        }
+    }
+
+    /// `newPolicyGraphNode`: a node for `valid`, expecting it, linked
+    /// under `parents`; [`PolicyGraph::insert`] places it.
+    fn new_node(&mut self, valid: Vec<u8>, parents: &[usize]) -> usize {
+        let id = self.nodes.len();
+        for &parent in parents {
+            self.nodes[parent].children.insert(id);
+        }
+        self.nodes.push(PolicyNode {
+            expected: vec![valid.clone()],
+            valid,
+            parents: parents.iter().copied().collect(),
+            children: std::collections::BTreeSet::new(),
+        });
+        id
+    }
+
+    fn insert(&mut self, id: usize) {
+        let key = self.nodes[id].valid.clone();
+        self.strata[self.depth].insert(key, id);
+    }
+
+    fn parents_with_expected(&self, expected: &[u8]) -> Vec<usize> {
+        if self.depth == 0 {
+            return Vec::new();
+        }
+        self.parent_index.get(expected).cloned().unwrap_or_default()
+    }
+
+    fn parent_with_any_policy(&self) -> Option<usize> {
+        let below = self.depth.checked_sub(1)?;
+        self.strata[below].get(ANY_POLICY).copied()
+    }
+
+    fn parents(&self) -> Vec<usize> {
+        match self.depth.checked_sub(1) {
+            Some(below) => self.strata[below].values().copied().collect(),
+            None => Vec::new(),
+        }
+    }
+
+    fn leaf_with_policy(&self, policy: &[u8]) -> Option<usize> {
+        self.strata[self.depth].get(policy).copied()
+    }
+
+    fn delete_leaf(&mut self, policy: &[u8]) {
+        let Some(id) = self.strata[self.depth].remove(policy) else {
+            return;
+        };
+        for parent in std::mem::take(&mut self.nodes[id].parents) {
+            self.nodes[parent].children.remove(&id);
+        }
+        for child in std::mem::take(&mut self.nodes[id].children) {
+            self.nodes[child].parents.remove(&id);
+        }
+    }
+
+    /// The nodes other than anyPolicy whose one parent is anyPolicy, in
+    /// every stratum.
+    fn valid_policy_nodes(&self) -> Vec<usize> {
+        let mut valid = Vec::new();
+        for stratum in self.strata.iter().rev() {
+            for &id in stratum.values() {
+                let node = &self.nodes[id];
+                if node.valid == ANY_POLICY {
+                    continue;
+                }
+                if node.parents.len() == 1
+                    && node
+                        .parents
+                        .iter()
+                        .all(|&parent| self.nodes[parent].valid == ANY_POLICY)
+                {
+                    valid.push(id);
+                }
+            }
+        }
+        valid
+    }
+
+    /// Remove every childless node in the strata between the root's and
+    /// the leaves', from the stratum next to the leaves toward the root,
+    /// each stratum's childless nodes taken together.  A node's removal
+    /// can leave childless its parents in the stratum nearer the root,
+    /// taken next, and, where 6.1.4 (b) (2) put the node under its own
+    /// stratum's anyPolicy node, that anyPolicy node, which Go's pass
+    /// removes or keeps as its map's order falls.  Kept, it has no child,
+    /// and the anyPolicy nodes nearer the root that it keeps in turn have
+    /// none but anyPolicy nodes, all of which `valid_policy_nodes` skips,
+    /// so it finds the same nodes either way.
+    fn prune(&mut self) {
+        for i in (1..self.depth).rev() {
+            let childless: Vec<usize> = self.strata[i]
+                .values()
+                .copied()
+                .filter(|&id| self.nodes[id].children.is_empty())
+                .collect();
+            for id in childless {
+                for parent in std::mem::take(&mut self.nodes[id].parents) {
+                    self.nodes[parent].children.remove(&id);
+                }
+                let key = self.nodes[id].valid.clone();
+                self.strata[i].remove(&key);
+            }
+        }
+    }
+
+    // The depth is at most the chain's length.
+    #[allow(clippy::arithmetic_side_effects)]
+    fn incr_depth(&mut self) {
+        let mut index: std::collections::BTreeMap<Vec<u8>, Vec<usize>> =
+            std::collections::BTreeMap::new();
+        for &id in self.strata[self.depth].values() {
+            for expected in &self.nodes[id].expected {
+                index.entry(expected.clone()).or_default().push(id);
+            }
+        }
+        self.parent_index = index;
+        self.depth += 1;
+        self.strata.push(std::collections::BTreeMap::new());
+    }
+}
+
+/// The options Go's `policiesValid` reads from `VerifyOptions`: the
+/// initial policy set, as DER object identifier contents, empty for any
+/// policy, and the three initial flags.  Go's TLS server verifies a
+/// client chain under dcrd's `tls.Config` with all of them at their zero
+/// values, [`PolicyOptions::default`]; the others are for the vectors
+/// Go's own tests check `policiesValid` with.
+#[derive(Debug, Clone, Default)]
+struct PolicyOptions {
+    policies: Vec<Vec<u8>>,
+    require_explicit_policy: bool,
+    inhibit_policy_mapping: bool,
+    inhibit_any_policy: bool,
+}
+
+/// Go's `policiesValid` (`crypto/x509/verify.go`: RFC 5280's policy
+/// processing, as RFC 9618 replaces parts of it) over a client chain,
+/// the leaf first and the trust anchor left out.  The step numbers are
+/// RFC 5280's, as Go's comments give them.
+// Counters bounded by the chain's length, plus one.
+#[allow(clippy::arithmetic_side_effects)]
+fn go_policies_valid(chain: &[&PolicyFacts], opts: &PolicyOptions) -> bool {
+    // A chain of the trust anchor alone.
+    if chain.is_empty() {
+        return true;
+    }
+    // n is the length of the chain minus the trust anchor.
+    let n = i64::try_from(chain.len()).unwrap_or(i64::MAX - 1);
+    let initial = |inhibited: bool| if inhibited { 0 } else { n + 1 };
+    let mut graph = Some(PolicyGraph::new());
+    let mut inhibit_any_policy = initial(opts.inhibit_any_policy);
+    let mut explicit_policy = initial(opts.require_explicit_policy);
+    let mut policy_mapping = initial(opts.inhibit_policy_mapping);
+    // No initial policy set stands for anyPolicy.
+    let mut initial_policies: std::collections::BTreeSet<Vec<u8>> =
+        opts.policies.iter().cloned().collect();
+    if initial_policies.is_empty() {
+        initial_policies.insert(ANY_POLICY.to_vec());
+    }
+    for (i, cert) in chain.iter().enumerate().rev() {
+        // 6.1.3 (e)
+        if cert.policies.is_empty() {
+            graph = None;
+        }
+        // 6.1.3 (f)
+        if explicit_policy == 0 && graph.is_none() {
+            return false;
+        }
+        if let Some(pg) = graph.as_mut() {
+            pg.incr_depth();
+            // 6.1.3 (d) (1)
+            for policy in &cert.policies {
+                if policy.as_slice() == ANY_POLICY {
+                    continue;
+                }
+                let mut parents = pg.parents_with_expected(policy);
+                if parents.is_empty()
+                    && let Some(any) = pg.parent_with_any_policy()
+                {
+                    parents = vec![any];
+                }
+                if !parents.is_empty() {
+                    let node = pg.new_node(policy.clone(), &parents);
+                    pg.insert(node);
+                }
+            }
+            // 6.1.3 (d) (2)
+            if cert
+                .policies
+                .iter()
+                .any(|policy| policy.as_slice() == ANY_POLICY)
+                && (inhibit_any_policy > 0 || (i > 0 && cert.self_issued))
+            {
+                let mut missing: std::collections::BTreeMap<Vec<u8>, Vec<usize>> =
+                    std::collections::BTreeMap::new();
+                for parent in pg.parents() {
+                    for expected in &pg.nodes[parent].expected {
+                        if pg.leaf_with_policy(expected).is_none() {
+                            missing.entry(expected.clone()).or_default().push(parent);
+                        }
+                    }
+                }
+                for (policy, parents) in missing {
+                    let node = pg.new_node(policy, &parents);
+                    pg.insert(node);
+                }
+            }
+            // 6.1.3 (d) (3)
+            pg.prune();
+            // 6.1.4 (b)
+            if i != 0 && !cert.mappings.is_empty() {
+                let mut mappings: std::collections::BTreeMap<Vec<u8>, Vec<Vec<u8>>> =
+                    std::collections::BTreeMap::new();
+                for (issuer, subject) in &cert.mappings {
+                    if policy_mapping > 0 {
+                        if issuer.as_slice() == ANY_POLICY || subject.as_slice() == ANY_POLICY {
+                            // An invalid mapping.
+                            return false;
+                        }
+                        mappings
+                            .entry(issuer.clone())
+                            .or_default()
+                            .push(subject.clone());
+                    } else {
+                        pg.delete_leaf(issuer);
+                    }
+                }
+                pg.prune();
+                for (issuer, subjects) in mappings {
+                    if let Some(matching) = pg.leaf_with_policy(&issuer) {
+                        pg.nodes[matching].expected = subjects;
+                    } else if let Some(any) = pg.leaf_with_policy(ANY_POLICY) {
+                        let node = pg.new_node(issuer, &[any]);
+                        pg.nodes[node].expected = subjects;
+                        pg.insert(node);
+                    }
+                }
+            }
+        }
+        if i != 0 {
+            // 6.1.4 (h)
+            if !cert.self_issued {
+                for counter in [
+                    &mut explicit_policy,
+                    &mut policy_mapping,
+                    &mut inhibit_any_policy,
+                ] {
+                    if *counter > 0 {
+                        *counter -= 1;
+                    }
+                }
+            }
+            // 6.1.4 (i) and (j): a value present and not negative that
+            // is below the counter lowers it.
+            for (counter, value) in [
+                (&mut explicit_policy, cert.require_explicit_policy),
+                (&mut policy_mapping, cert.inhibit_policy_mapping),
+                (&mut inhibit_any_policy, cert.inhibit_any_policy),
+            ] {
+                if let Some(value) = value
+                    && value >= 0
+                    && value < *counter
+                {
+                    *counter = value;
+                }
+            }
+        }
+    }
+    // 6.1.5 (a)
+    if explicit_policy > 0 {
+        explicit_policy -= 1;
+    }
+    // 6.1.5 (b)
+    if chain
+        .first()
+        .is_some_and(|leaf| leaf.require_explicit_policy == Some(0))
+    {
+        explicit_policy = 0;
+    }
+    // 6.1.5 (g) (1) to (4): the authority-constrained policy set, the
+    // valid policies and anyPolicy if it is a leaf.
+    let mut authority = std::collections::BTreeSet::new();
+    if let Some(pg) = &graph {
+        for id in pg.valid_policy_nodes() {
+            authority.insert(pg.nodes[id].valid.clone());
+        }
+        if let Some(any) = pg.leaf_with_policy(ANY_POLICY) {
+            authority.insert(pg.nodes[any].valid.clone());
+        }
+    }
+    // 6.1.5 (g) (5) and (6): intersected with the initial policy set
+    // unless that is anyPolicy alone.
+    let mut user = authority.clone();
+    if initial_policies.len() != 1 || !initial_policies.contains(ANY_POLICY) {
+        user.retain(|policy| initial_policies.contains(policy));
+        if authority.contains(ANY_POLICY) {
+            user.extend(initial_policies);
+        }
+    }
+    !(explicit_policy == 0 && user.is_empty())
+}
+
+/// Go's error when every chain its search built fails `policiesValid`
+/// (`Verify`, `crypto/x509/verify.go`: `NoValidChains` with this
+/// detail), carried to the RPC log (`rpctls::go_error_text`).
+#[derive(Debug)]
+pub(crate) struct InvalidPolicies(pub(crate) usize);
+
+impl std::fmt::Display for InvalidPolicies {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "x509: no valid chains built: {} candidate chains with invalid policies",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for InvalidPolicies {}
 
 /// A webpki error as rustls's client verifier reports it (rustls
 /// `webpki/mod.rs` `pki_error`), so a chain [`GoClientCertVerifier`]
@@ -3127,16 +3666,21 @@ impl GoClientCertVerifier {
     /// certificate parses, skipping everything else, and failing only
     /// when nothing was added.  webpki's anchor parser and
     /// [`CertFacts::parse`] together stand in for Go's
-    /// `ParseCertificate`: a certificate either refuses is skipped.
+    /// `ParseCertificate`: a certificate either refuses is skipped.  A
+    /// certificate already added is not added again, as `addCertFunc`
+    /// keeps one copy of each.
     fn from_pem(cas_pem: &[u8]) -> Result<GoClientCertVerifier, String> {
-        let mut cas = Vec::new();
+        let mut cas: Vec<ClientCa> = Vec::new();
         let mut rest = cas_pem;
         while !rest.is_empty() {
             let Some((block, next)) = go_pem_decode(rest) else {
                 break;
             };
             rest = next;
-            if block.block_type != b"CERTIFICATE" || block.has_headers {
+            if block.block_type != b"CERTIFICATE"
+                || block.has_headers
+                || cas.iter().any(|ca| ca.der == block.bytes)
+            {
                 continue;
             }
             let mut one = rustls::RootCertStore::empty();
@@ -3210,7 +3754,9 @@ impl rustls::server::danger::ClientCertVerifier for GoClientCertVerifier {
         // Each is read here as the pool's certificates are, which covers
         // that parse as far as [`CertFacts::parse`] goes, and gives the
         // facts Go's `isValid` reads below.
-        let Some(leaf_facts) = CertFacts::parse(end_entity.as_ref()) else {
+        let Some((leaf_facts, leaf_policies, leaf_identity)) =
+            CertFacts::parse_all(end_entity.as_ref())
+        else {
             return Err(rustls::Error::InvalidCertificate(
                 rustls::CertificateError::BadEncoding,
             ));
@@ -3288,15 +3834,38 @@ impl rustls::server::danger::ClientCertVerifier for GoClientCertVerifier {
             .collect();
         let anchors: Vec<rustls::pki_types::TrustAnchor<'_>> =
             usable.iter().map(|ca| ca.anchor.clone()).collect();
+        // The pool parsed each of these when it was loaded.
+        let roots: Vec<Option<ChainIdentity<'_>>> = usable
+            .iter()
+            .map(|ca| CertFacts::parse_all(&ca.der).map(|(_, _, identity)| identity))
+            .collect();
+        // Go adds the sent certificates to a pool of intermediates
+        // (`processCertsFromClient`), which keeps one copy of each, so a
+        // certificate sent twice makes no second chain.
+        let mut sent: Vec<rustls::pki_types::CertificateDer<'_>> = Vec::new();
+        for cert in intermediates {
+            if !sent.iter().any(|seen| seen.as_ref() == cert.as_ref()) {
+                sent.push(cert.clone());
+            }
+        }
         let refused_unhandled = std::cell::Cell::new(false);
+        let refused_policies = std::cell::Cell::new(0usize);
         let within_path_len = |path: &webpki::VerifiedPath<'_>| {
-            if path.intermediate_certificates().any(|cert| {
-                CertFacts::parse(cert.der().as_ref()).is_none_or(|facts| facts.unhandled_critical)
-            }) {
+            let ders: Vec<rustls::pki_types::CertificateDer<'_>> = path
+                .intermediate_certificates()
+                .map(|cert| cert.der())
+                .collect();
+            let parsed: Option<Vec<(CertFacts, PolicyFacts, ChainIdentity<'_>)>> = ders
+                .iter()
+                .map(|der| CertFacts::parse_all(der.as_ref()))
+                .collect();
+            let Some(parsed) = parsed
+                .filter(|parsed| parsed.iter().all(|(facts, _, _)| !facts.unhandled_critical))
+            else {
                 refused_unhandled.set(true);
                 return Err(webpki::Error::UnsupportedCriticalExtension);
-            }
-            let held = path.intermediate_certificates().count();
+            };
+            let held = parsed.len();
             // webpki hands back the anchor from the slice it was given;
             // any other is refused rather than left unconstrained.
             let Some(i) = anchors
@@ -3305,18 +3874,41 @@ impl rustls::server::danger::ClientCertVerifier for GoClientCertVerifier {
             else {
                 return Err(webpki::Error::UnknownIssuer);
             };
-            match usable[i].facts.max_path_len {
-                Some(limit) if u64::try_from(held).unwrap_or(u64::MAX) > limit => {
-                    Err(webpki::Error::PathLenConstraintViolated)
-                }
-                _ => Ok(()),
+            // Go passes over a root already on the chain before it checks
+            // the root's signature (`alreadyInChain` in `buildChains`), so
+            // a path that reaches the root through a copy of it the client
+            // sent is no chain to Go.  webpki keeps that rule for the
+            // intermediates it adds, not for the anchor; the copy would
+            // otherwise be held to the policy rules as an intermediate,
+            // and one without a policies extension would pass a path whose
+            // mapping Go refuses on the chain that ends at the root itself.
+            let chain: Vec<ChainIdentity<'_>> = std::iter::once(leaf_identity)
+                .chain(parsed.iter().map(|&(_, _, identity)| identity))
+                .collect();
+            if roots[i].is_none_or(|root| root.already_in(&chain)) {
+                return Err(webpki::Error::UnknownIssuer);
             }
+            if let Some(limit) = usable[i].facts.max_path_len
+                && u64::try_from(held).unwrap_or(u64::MAX) > limit
+            {
+                return Err(webpki::Error::PathLenConstraintViolated);
+            }
+            // Go's `Verify` drops each chain its search built that
+            // `policiesValid` refuses, and keeps the rest.
+            let chain: Vec<&PolicyFacts> = std::iter::once(&leaf_policies)
+                .chain(parsed.iter().map(|(_, policies, _)| policies))
+                .collect();
+            if !go_policies_valid(&chain, &PolicyOptions::default()) {
+                refused_policies.set(refused_policies.get().saturating_add(1));
+                return Err(webpki::Error::UnknownIssuer);
+            }
+            Ok(())
         };
         let cert = webpki::EndEntityCert::try_from(end_entity).map_err(go_pki_error)?;
         cert.verify_for_usage(
             self.sig_algs,
             &anchors,
-            intermediates,
+            &sent,
             now,
             GoClientAuthUsage,
             None,
@@ -3324,6 +3916,27 @@ impl rustls::server::danger::ClientCertVerifier for GoClientCertVerifier {
         )
         .map(|_| rustls::server::danger::ClientCertVerified::assertion())
         .map_err(|err| match err {
+            // Once Go's search has built a chain it drops its signature
+            // limit (`buildChains`) and the errors of the candidates that
+            // made none, and `Verify` reports what dropped every chain it
+            // built: `NoValidChains` when that was `policiesValid`.  A
+            // chain is built here when the callback sees it.  Go's limit
+            // also charges candidates that lead to no root, which webpki
+            // never verifies, so Go's can run out before it builds a
+            // chain; webpki's other two budgets have no Go counterpart,
+            // and Go's search would go on.  Go reports instead the name
+            // constraint broken by a chain that passed the policies and
+            // the key usage, which webpki refuses during its search
+            // (PARITY.md, the clientcert entry).
+            _ if refused_policies.get() > 0 => {
+                rustls::Error::InvalidCertificate(rustls::CertificateError::Other(
+                    rustls::OtherError(Arc::new(InvalidPolicies(refused_policies.get()))),
+                ))
+            }
+            // A budget that ran out ended the search before it was done.
+            webpki::Error::MaximumSignatureChecksExceeded
+            | webpki::Error::MaximumPathBuildCallsExceeded
+            | webpki::Error::MaximumNameConstraintComparisonsExceeded => go_pki_error(err),
             webpki::Error::UnsupportedCriticalExtension if refused_unhandled.get() => {
                 rustls::Error::InvalidCertificate(
                     rustls::CertificateError::UnhandledCriticalExtension,
@@ -9786,6 +10399,813 @@ mod tests {
         check(&*theirs, &leaf, &[&plain, &doubled_spare])
             .expect("webpki builds no path through the spare");
         assert_eq!(check(&ours, &leaf, &[&plain, &doubled_spare]), unparsed);
+    }
+
+    /// One of Go's certificate policy vectors (`tests/data/x509-policy`),
+    /// as DER.
+    fn policy_vector(name: &str) -> Vec<u8> {
+        let path = format!(
+            "{}/tests/data/x509-policy/{name}.pem",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let pem = std::fs::read(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
+        go_pem_decode(&pem).expect("a PEM block").0.bytes
+    }
+
+    /// An object identifier's DER contents from its arcs.
+    // Base-128 digits of each arc.
+    #[allow(clippy::arithmetic_side_effects)]
+    fn oid_contents(arcs: &[u64]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for value in std::iter::once(arcs[0] * 40 + arcs[1]).chain(arcs[2..].iter().copied()) {
+            let mut digits = vec![(value & 0x7f) as u8];
+            let mut rest = value >> 7;
+            while rest > 0 {
+                digits.push(((rest & 0x7f) as u8) | 0x80);
+                rest >>= 7;
+            }
+            digits.reverse();
+            out.extend(digits);
+        }
+        out
+    }
+
+    /// `go_policies_valid` answers every case of Go's `TestPoliciesValid`
+    /// (`crypto/x509/verify_test.go`, BoringSSL's before it) over the
+    /// same certificates, read by `CertFacts::parse_all`: the
+    /// chain with its trust anchor left out, the initial policy set and
+    /// the three initial flags.
+    #[test]
+    fn go_policies_valid_matches_gos_vectors() {
+        let test_oid = |n: u64| oid_contents(&[1, 2, 840, 113554, 4, 1, 72585, 2, n]);
+        let facts = |name: &str| {
+            CertFacts::parse_all(&policy_vector(name))
+                .unwrap_or_else(|| panic!("{name} parses"))
+                .1
+        };
+        // (chain without the trust anchor, initial policies,
+        // requireExplicitPolicy, inhibitPolicyMapping, inhibitAnyPolicy,
+        // valid)
+        type Case = (Vec<&'static str>, Vec<u64>, bool, bool, bool, bool);
+        let mut cases: Vec<Case> = vec![
+            // The chain is good for oid1 and oid2, but not oid3.
+            (
+                vec!["policy_leaf", "policy_intermediate"],
+                vec![],
+                true,
+                false,
+                false,
+                true,
+            ),
+            (
+                vec!["policy_leaf", "policy_intermediate"],
+                vec![1],
+                true,
+                false,
+                false,
+                true,
+            ),
+            (
+                vec!["policy_leaf", "policy_intermediate"],
+                vec![2],
+                true,
+                false,
+                false,
+                true,
+            ),
+            (
+                vec!["policy_leaf", "policy_intermediate"],
+                vec![3],
+                true,
+                false,
+                false,
+                false,
+            ),
+            (
+                vec!["policy_leaf", "policy_intermediate"],
+                vec![1, 2],
+                true,
+                false,
+                false,
+                true,
+            ),
+            (
+                vec!["policy_leaf", "policy_intermediate"],
+                vec![1, 3],
+                true,
+                false,
+                false,
+                true,
+            ),
+            // Without requireExplicitPolicy no valid policy is required.
+            (
+                vec!["policy_leaf", "policy_intermediate"],
+                vec![1],
+                false,
+                false,
+                false,
+                true,
+            ),
+            (
+                vec!["policy_leaf", "policy_intermediate"],
+                vec![3],
+                false,
+                false,
+                false,
+                true,
+            ),
+            // A CA's policy constraints can require an explicit policy.
+            (
+                vec!["policy_leaf", "policy_intermediate_require"],
+                vec![1],
+                false,
+                false,
+                false,
+                true,
+            ),
+            (
+                vec!["policy_leaf", "policy_intermediate_require"],
+                vec![3],
+                false,
+                false,
+                false,
+                false,
+            ),
+            (
+                vec!["policy_leaf_none", "policy_intermediate_require"],
+                vec![],
+                true,
+                false,
+                false,
+                false,
+            ),
+            // So can a leaf's.
+            (
+                vec!["policy_leaf_require", "policy_intermediate"],
+                vec![],
+                false,
+                false,
+                false,
+                true,
+            ),
+            (
+                vec!["policy_leaf_require", "policy_intermediate"],
+                vec![1],
+                false,
+                false,
+                false,
+                true,
+            ),
+            (
+                vec!["policy_leaf_require", "policy_intermediate"],
+                vec![3],
+                false,
+                false,
+                false,
+                false,
+            ),
+            // requireExplicitPolicy counts certificates to skip.
+            (
+                vec!["policy_leaf", "policy_intermediate_require1"],
+                vec![3],
+                false,
+                false,
+                false,
+                false,
+            ),
+            (
+                vec!["policy_leaf", "policy_intermediate_require2"],
+                vec![3],
+                false,
+                false,
+                false,
+                true,
+            ),
+            (
+                vec!["policy_leaf_require1", "policy_intermediate"],
+                vec![3],
+                false,
+                false,
+                false,
+                true,
+            ),
+            // The more constrained value wins.
+            (
+                vec!["policy_leaf_require1", "policy_intermediate_require1"],
+                vec![3],
+                false,
+                false,
+                false,
+                false,
+            ),
+            (
+                vec!["policy_leaf_require", "policy_intermediate_require2"],
+                vec![3],
+                false,
+                false,
+                false,
+                false,
+            ),
+            // A CA requiring an explicit policy and naming none.
+            (
+                vec!["policy_leaf", "policy_intermediate_require_no_policies"],
+                vec![1],
+                false,
+                false,
+                false,
+                false,
+            ),
+            // anyPolicy on the leaf, the intermediate, and both.
+            (
+                vec!["policy_leaf_any", "policy_intermediate"],
+                vec![1],
+                true,
+                false,
+                false,
+                true,
+            ),
+            (
+                vec!["policy_leaf_any", "policy_intermediate"],
+                vec![3],
+                true,
+                false,
+                false,
+                false,
+            ),
+            (
+                vec!["policy_leaf", "policy_intermediate_any"],
+                vec![1],
+                true,
+                false,
+                false,
+                true,
+            ),
+            (
+                vec!["policy_leaf", "policy_intermediate_any"],
+                vec![3],
+                true,
+                false,
+                false,
+                false,
+            ),
+            (
+                vec!["policy_leaf_any", "policy_intermediate_any"],
+                vec![1],
+                true,
+                false,
+                false,
+                true,
+            ),
+            (
+                vec!["policy_leaf_any", "policy_intermediate_any"],
+                vec![3],
+                true,
+                false,
+                false,
+                true,
+            ),
+            // The trust anchor alone.
+            (vec![], vec![1], true, false, false, true),
+            // Many mappings, of which only oid3's are accepted.
+            (
+                vec!["policy_leaf_oid1", "policy_intermediate_mapped_oid3"],
+                vec![3],
+                true,
+                false,
+                false,
+                true,
+            ),
+            (
+                vec!["policy_leaf_oid4", "policy_intermediate_mapped_oid3"],
+                vec![4],
+                true,
+                false,
+                false,
+                false,
+            ),
+            // Mapping inhibited by the caller, and by a certificate.
+            (
+                vec!["policy_leaf_oid1", "policy_intermediate_mapped_oid3"],
+                vec![3],
+                true,
+                true,
+                false,
+                false,
+            ),
+            (
+                vec![
+                    "policy_leaf_oid1",
+                    "policy_intermediate_mapped_oid3",
+                    "policy_root_cross_inhibit_mapping",
+                ],
+                vec![3],
+                true,
+                false,
+                false,
+                false,
+            ),
+        ];
+        for use_any in [false, true] {
+            let mapped = if use_any {
+                "policy_intermediate_mapped_any"
+            } else {
+                "policy_intermediate_mapped"
+            };
+            cases.extend([
+                (
+                    vec!["policy_leaf", mapped],
+                    vec![3],
+                    true,
+                    false,
+                    false,
+                    true,
+                ),
+                (
+                    vec!["policy_leaf_oid1", mapped],
+                    vec![3],
+                    true,
+                    false,
+                    false,
+                    true,
+                ),
+                (
+                    vec!["policy_leaf_oid2", mapped],
+                    vec![3],
+                    true,
+                    false,
+                    false,
+                    true,
+                ),
+                (
+                    vec!["policy_leaf_oid3", mapped],
+                    vec![3],
+                    true,
+                    false,
+                    false,
+                    use_any,
+                ),
+                (
+                    vec!["policy_leaf_oid1", mapped],
+                    vec![1],
+                    true,
+                    false,
+                    false,
+                    !use_any,
+                ),
+                (
+                    vec!["policy_leaf_oid4", mapped],
+                    vec![4],
+                    true,
+                    false,
+                    false,
+                    true,
+                ),
+                (
+                    vec!["policy_leaf_oid4", mapped],
+                    vec![5],
+                    true,
+                    false,
+                    false,
+                    true,
+                ),
+                (
+                    vec!["policy_leaf_oid5", mapped],
+                    vec![4],
+                    true,
+                    false,
+                    false,
+                    true,
+                ),
+                (
+                    vec!["policy_leaf_oid5", mapped],
+                    vec![5],
+                    true,
+                    false,
+                    false,
+                    true,
+                ),
+                (
+                    vec!["policy_leaf_oid4", mapped],
+                    vec![4, 5],
+                    true,
+                    false,
+                    false,
+                    true,
+                ),
+            ]);
+        }
+        assert_eq!(
+            cases.len(),
+            51,
+            "every case of Go's table, the mapped ten twice"
+        );
+        for (i, (chain, policies, require, inhibit_mapping, inhibit_any, valid)) in
+            cases.into_iter().enumerate()
+        {
+            let chain_facts: Vec<PolicyFacts> = chain.iter().map(|name| facts(name)).collect();
+            let chain_refs: Vec<&PolicyFacts> = chain_facts.iter().collect();
+            let opts = PolicyOptions {
+                policies: policies.iter().map(|&n| test_oid(n)).collect(),
+                require_explicit_policy: require,
+                inhibit_policy_mapping: inhibit_mapping,
+                inhibit_any_policy: inhibit_any,
+            };
+            assert_eq!(
+                go_policies_valid(&chain_refs, &opts),
+                valid,
+                "case {i}: {chain:?}, policies {policies:?}, require {require}"
+            );
+        }
+    }
+
+    /// The policy vectors Go's parser refuses, the two `TestParsePolicies`
+    /// reads and the three intermediates no Go test reads, each listing a
+    /// policy twice or carrying a certificate policies value that is not
+    /// a SEQUENCE, are refused here, and so the pool skips them and a
+    /// client presenting one gets no handshake.  Six of the others, the
+    /// root among them, parse here, and the vectors the table's chains
+    /// use parse in `go_policies_valid_matches_gos_vectors`.
+    #[test]
+    fn policies_go_refuses_to_parse_are_refused() {
+        for name in [
+            "policy_leaf_duplicate",
+            "policy_leaf_invalid",
+            "policy_intermediate_duplicate",
+            "policy_intermediate_invalid",
+            "policy_intermediate_require_duplicate",
+        ] {
+            assert!(CertFacts::parse(&policy_vector(name)).is_none(), "{name}");
+        }
+        for name in [
+            "policy_root",
+            "policy_intermediate",
+            "policy_intermediate_mapped",
+            "policy_intermediate_require",
+            "policy_leaf",
+            "policy_leaf_any",
+        ] {
+            assert!(CertFacts::parse(&policy_vector(name)).is_some(), "{name}");
+        }
+    }
+
+    /// The four policy extensions are read as Go's `processExtensions`
+    /// reads them through cryptobyte (`crypto/x509/parser.go`): a length
+    /// in more octets than it needs, a policy identifier
+    /// `newOIDFromDER` refuses, a policy listed twice, and an integer
+    /// `checkASN1Integer` or `asn1Signed` refuses each fail the parse,
+    /// while qualifiers, trailing bytes, a constructed element where an
+    /// implicit integer may stand, and mapped identifiers of any shape
+    /// are taken as Go takes them.
+    #[test]
+    fn policy_extensions_are_read_by_gos_rules() {
+        const POLICIES: &[u8] = &[0x55, 0x1d, 0x20];
+        const POLICY_MAPPINGS: &[u8] = &[0x55, 0x1d, 0x21];
+        const POLICY_CONSTRAINTS: &[u8] = &[0x55, 0x1d, 0x24];
+        const INHIBIT_ANY_POLICY: &[u8] = &[0x55, 0x1d, 0x36];
+        let read = |oid: &[u8], value: &[u8]| {
+            CertFacts::parse_all(&der_certificate(
+                Some(2),
+                &[der_extension(oid, false, value)],
+            ))
+            .map(|(_, policies, _)| policies)
+        };
+        // Twenty policies of seven octets each, 140 in all, so the
+        // SEQUENCE needs a long-form length.
+        let many: Vec<u8> = (0..20u8)
+            .flat_map(|n| der_tlv(0x30, &der_tlv(0x06, &[0x2a, 0x03, n])))
+            .collect();
+        let refused: &[(&[u8], Vec<u8>)] = &[
+            (
+                POLICIES,
+                vec![0x30, 0x81, 0x05, 0x30, 0x03, 0x06, 0x01, 0x2a],
+            ),
+            (POLICIES, [&[0x30, 0x82, 0x00, 0x8c][..], &many].concat()),
+            (POLICIES, vec![0x30, 0x04, 0x30, 0x02, 0x06, 0x00]),
+            (
+                POLICIES,
+                vec![0x30, 0x06, 0x30, 0x04, 0x06, 0x02, 0x2a, 0x80],
+            ),
+            (
+                POLICIES,
+                vec![0x30, 0x06, 0x30, 0x04, 0x06, 0x02, 0x80, 0x01],
+            ),
+            (
+                POLICIES,
+                vec![0x30, 0x07, 0x30, 0x05, 0x06, 0x03, 0x2a, 0x80, 0x01],
+            ),
+            (
+                POLICIES,
+                vec![
+                    0x30, 0x0a, 0x30, 0x03, 0x06, 0x01, 0x2a, 0x30, 0x03, 0x06, 0x01, 0x2a,
+                ],
+            ),
+            (POLICIES, b"INVALID".to_vec()),
+            (
+                POLICY_MAPPINGS,
+                vec![
+                    0x30, 0x81, 0x08, 0x30, 0x06, 0x06, 0x01, 0x2a, 0x06, 0x01, 0x2b,
+                ],
+            ),
+            (
+                POLICY_MAPPINGS,
+                vec![0x30, 0x05, 0x30, 0x03, 0x06, 0x01, 0x2a],
+            ),
+            (POLICY_CONSTRAINTS, vec![0x30, 0x02, 0x80, 0x00]),
+            (POLICY_CONSTRAINTS, vec![0x30, 0x04, 0x80, 0x02, 0x00, 0x01]),
+            (POLICY_CONSTRAINTS, vec![0x30, 0x04, 0x80, 0x02, 0xff, 0x80]),
+            (POLICY_CONSTRAINTS, vec![0x30, 0x04, 0x80, 0x81, 0x01, 0x00]),
+            (
+                POLICY_CONSTRAINTS,
+                [&[0x30, 0x0b, 0x81, 0x09, 0x01][..], &[0; 8]].concat(),
+            ),
+            (INHIBIT_ANY_POLICY, vec![0x02, 0x00]),
+            (INHIBIT_ANY_POLICY, vec![0x02, 0x81, 0x01, 0x00]),
+            (INHIBIT_ANY_POLICY, vec![0x04, 0x01, 0x00]),
+        ];
+        for (oid, value) in refused {
+            assert_eq!(read(oid, value), None, "{oid:02x?} {value:02x?}");
+        }
+
+        let facts = |policies: Vec<Vec<u8>>| PolicyFacts {
+            policies,
+            self_issued: true,
+            ..PolicyFacts::default()
+        };
+        // A subidentifier of 2^32 - 1, which `newOIDFromDER` takes though
+        // cryptobyte's `ReadASN1ObjectIdentifier` would not.
+        let wide = vec![0x2a, 0x8f, 0xff, 0xff, 0xff, 0x7f];
+        assert_eq!(
+            read(
+                POLICIES,
+                &der_tlv(0x30, &der_tlv(0x30, &der_tlv(0x06, &wide)))
+            ),
+            Some(facts(vec![wide]))
+        );
+        // A qualifier after the identifier, and bytes after the SEQUENCE.
+        let qualified = der_tlv(
+            0x30,
+            &[der_tlv(0x06, &[0x2a]), der_tlv(0x30, &[0x05, 0x00])].concat(),
+        );
+        assert_eq!(
+            read(
+                POLICIES,
+                &[der_tlv(0x30, &qualified), vec![0xff, 0xff]].concat()
+            ),
+            Some(facts(vec![vec![0x2a]]))
+        );
+        assert_eq!(
+            read(POLICIES, &[&[0x30, 0x81, 0x8c][..], &many].concat()),
+            Some(facts((0..20u8).map(|n| vec![0x2a, 0x03, n]).collect()))
+        );
+        assert_eq!(
+            read(
+                POLICY_MAPPINGS,
+                &[0x30, 0x06, 0x30, 0x04, 0x06, 0x00, 0x06, 0x00]
+            ),
+            Some(PolicyFacts {
+                mappings: vec![(vec![], vec![])],
+                ..facts(vec![])
+            })
+        );
+        assert_eq!(
+            read(
+                POLICY_CONSTRAINTS,
+                &[0x30, 0x06, 0x80, 0x01, 0xff, 0x81, 0x01, 0x7f]
+            ),
+            Some(PolicyFacts {
+                require_explicit_policy: Some(-1),
+                inhibit_policy_mapping: Some(127),
+                ..facts(vec![])
+            })
+        );
+        // A constructed [0] is not the implicit INTEGER, and stops the
+        // read of [1] behind it, as cryptobyte's `PeekASN1Tag` does.
+        assert_eq!(
+            read(
+                POLICY_CONSTRAINTS,
+                &[0x30, 0x08, 0xa0, 0x03, 0x02, 0x01, 0x00, 0x81, 0x01, 0x00]
+            ),
+            Some(facts(vec![]))
+        );
+        assert_eq!(
+            read(
+                INHIBIT_ANY_POLICY,
+                &[0x02, 0x08, 0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]
+            ),
+            Some(PolicyFacts {
+                inhibit_any_policy: Some(i64::MAX),
+                ..facts(vec![])
+            })
+        );
+        assert_eq!(
+            read(INHIBIT_ANY_POLICY, &[0x02, 0x01, 0x80]),
+            Some(PolicyFacts {
+                inhibit_any_policy: Some(-128),
+                ..facts(vec![])
+            })
+        );
+    }
+
+    /// Go's `alreadyInChain`: the subject and key must match, and the
+    /// subject alternative names must both be absent or both be equal,
+    /// the walk ending at the first match of subject and key that has a
+    /// name on one side only.
+    #[test]
+    fn chain_identity_follows_gos_already_in_chain() {
+        let id = |subject: &'static [u8], spki: &'static [u8], san: Option<&'static [u8]>| {
+            ChainIdentity { subject, spki, san }
+        };
+        let root = id(b"root", b"key", None);
+        let chain = [id(b"leaf", b"other", None), id(b"root", b"key", None)];
+        assert!(root.already_in(&chain));
+        assert!(!root.already_in(&chain[..1]));
+        assert!(!id(b"root", b"key2", None).already_in(&chain));
+        assert!(!id(b"root2", b"key", None).already_in(&chain));
+        assert!(!id(b"root", b"key", Some(b"a")).already_in(&chain));
+        let named = [id(b"root", b"key", Some(b"a"))];
+        assert!(id(b"root", b"key", Some(b"a")).already_in(&named));
+        assert!(!id(b"root", b"key", Some(b"b")).already_in(&named));
+        assert!(!root.already_in(&named));
+        // Go returns at the first certificate with the subject and key
+        // when only one of the two carries a name, and walks on past one
+        // whose name differs.
+        let both = [id(b"root", b"key", Some(b"a")), id(b"root", b"key", None)];
+        assert!(!root.already_in(&both));
+        let renamed = [
+            id(b"root", b"key", Some(b"b")),
+            id(b"root", b"key", Some(b"a")),
+        ];
+        assert!(id(b"root", b"key", Some(b"a")).already_in(&renamed));
+    }
+
+    /// A client chain is held to Go's policy validation, with the options
+    /// dcrd's TLS server leaves Go's: an intermediate whose policy
+    /// constraints require an explicit policy refuses a leaf that names
+    /// none, or names one the intermediate does not, and accepts one
+    /// naming its policy; an intermediate mapping anyPolicy refuses the
+    /// chain; a refused path sends the search on to another; and the
+    /// refusal is logged as Go's `NoValidChains`.  rustls's own client
+    /// verifier accepts the refused chains it is shown.  The chains
+    /// counted are those Go builds: none through a copy of the root the
+    /// client sent, which would otherwise pass the anyPolicy mapping, and
+    /// one for a certificate sent twice or a root the pool lists twice.
+    /// Once a chain has been refused for its policies, a signature
+    /// budget that then runs out leaves the refusal logged as Go logs it.
+    #[test]
+    fn a_client_chain_takes_gos_policy_validation() {
+        use dcroxide_certgen::gentool::generate_key;
+        use rustls::pki_types::CertificateDer;
+        use rustls::server::danger::ClientCertVerifier;
+        const BASIC_CONSTRAINTS: &[u8] = &[0x55, 0x1d, 0x13];
+        const KEY_USAGE: &[u8] = &[0x55, 0x1d, 0x0f];
+        const POLICIES: &[u8] = &[0x55, 0x1d, 0x20];
+        const POLICY_MAPPINGS: &[u8] = &[0x55, 0x1d, 0x21];
+        const POLICY_CONSTRAINTS: &[u8] = &[0x55, 0x1d, 0x24];
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let now = rustls::pki_types::UnixTime::since_unix_epoch(Duration::from_secs(1_790_000_000));
+        let key = || generate_key("P-256").expect("key");
+        let (root_key, int_key, leaf_key) = (key(), key(), key());
+        let (one, two) = (oid_contents(&[1, 2, 3, 1]), oid_contents(&[1, 2, 3, 2]));
+        let policies = |oids: &[&[u8]]| {
+            let infos: Vec<u8> = oids
+                .iter()
+                .flat_map(|oid| der_tlv(0x30, &der_tlv(0x06, oid)))
+                .collect();
+            der_extension(POLICIES, false, &der_tlv(0x30, &infos))
+        };
+        // requireExplicitPolicy 0.
+        let require = der_extension(
+            POLICY_CONSTRAINTS,
+            false,
+            &der_tlv(0x30, &der_tlv(0x80, &[0])),
+        );
+        let authority = vec![
+            der_extension(
+                BASIC_CONSTRAINTS,
+                true,
+                &der_tlv(0x30, &der_tlv(0x01, &[0xff])),
+            ),
+            der_extension(KEY_USAGE, true, &der_tlv(0x03, &[0x02, 0x84])),
+        ];
+        let signing = der_extension(KEY_USAGE, true, &der_tlv(0x03, &[0x07, 0x80]));
+
+        let root = signed_p256_certificate(1, "root", &root_key, "root", &root_key, &authority);
+        let ours = GoClientCertVerifier::from_pem(&certificate_pem(&root)).expect("verifier");
+        let mut roots = rustls::RootCertStore::empty();
+        roots
+            .add(CertificateDer::from(root.as_slice()))
+            .expect("the root");
+        let theirs = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots))
+            .build()
+            .expect("webpki's verifier");
+        let check = |verifier: &dyn ClientCertVerifier, leaf: &[u8], sent: &[&[u8]]| {
+            let sent: Vec<_> = sent.iter().map(|der| CertificateDer::from(*der)).collect();
+            verifier
+                .verify_client_cert(&CertificateDer::from(leaf), &sent, now)
+                .map(|_| ())
+        };
+        let intermediate = |serial: u8, extensions: Vec<Vec<u8>>| {
+            let extensions = [authority.clone(), extensions].concat();
+            signed_p256_certificate(serial, "int", &int_key, "root", &root_key, &extensions)
+        };
+        let leaf = |serial: u8, extensions: Vec<Vec<u8>>| {
+            let extensions = [vec![signing.clone()], extensions].concat();
+            signed_p256_certificate(serial, "leaf", &leaf_key, "int", &int_key, &extensions)
+        };
+        let invalid = |err: rustls::Error, chains: usize| {
+            let text = crate::rpctls::go_error_text_for_tests(&err);
+            assert_eq!(
+                text,
+                format!(
+                    "tls: failed to verify certificate: x509: no valid chains built: {chains} \
+                     candidate chains with invalid policies"
+                ),
+                "{err:?}"
+            );
+        };
+
+        let requiring = intermediate(2, vec![require.clone(), policies(&[&one])]);
+        let no_policy = leaf(3, vec![]);
+        let named_one = leaf(4, vec![policies(&[&one])]);
+        let named_two = leaf(5, vec![policies(&[&two])]);
+        for refused in [&no_policy, &named_two] {
+            check(&*theirs, refused, &[&requiring]).expect("webpki checks no policy");
+            invalid(
+                check(&ours, refused, &[&requiring]).expect_err("no explicit policy"),
+                1,
+            );
+        }
+        check(&ours, &named_one, &[&requiring]).expect("the required policy");
+        check(
+            &ours,
+            &no_policy,
+            &[&intermediate(6, vec![policies(&[&one])])],
+        )
+        .expect("no policy required");
+
+        // An intermediate's mapping of anyPolicy is invalid while policy
+        // mapping is not inhibited and the policy graph is not empty.
+        let any_mapping = {
+            let mapping = der_tlv(
+                0x30,
+                &[der_tlv(0x06, ANY_POLICY), der_tlv(0x06, &one)].concat(),
+            );
+            der_extension(POLICY_MAPPINGS, false, &der_tlv(0x30, &mapping))
+        };
+        let mapping_any = intermediate(7, vec![policies(&[&one]), any_mapping]);
+        check(&*theirs, &named_one, &[&mapping_any]).expect("webpki reads no mapping");
+        invalid(
+            check(&ours, &named_one, &[&mapping_any]).expect_err("anyPolicy mapped"),
+            1,
+        );
+
+        // The path through the requiring intermediate is refused and the
+        // search goes on through one that requires nothing.
+        let plain = intermediate(8, vec![]);
+        check(&ours, &no_policy, &[&requiring, &plain]).expect("the other path");
+
+        // A copy of the root sent behind the intermediate is a second
+        // path to webpki, and none to Go.  The copy carries no policies
+        // extension, so as an intermediate it would empty the policy
+        // graph before the mapping was read and pass the path.
+        check(&*theirs, &named_one, &[&mapping_any, &root]).expect("webpki reads no mapping");
+        invalid(
+            check(&ours, &named_one, &[&mapping_any, &root]).expect_err("no path past the root"),
+            1,
+        );
+        invalid(
+            check(&ours, &no_policy, &[&requiring, &root]).expect_err("no explicit policy"),
+            1,
+        );
+        // A certificate sent twice, and a root listed twice, make one
+        // chain each, as Go's pools keep one copy.
+        invalid(
+            check(&ours, &no_policy, &[&requiring, &requiring]).expect_err("sent twice"),
+            1,
+        );
+        let doubled = GoClientCertVerifier::from_pem(
+            &[certificate_pem(&root), certificate_pem(&root)].concat(),
+        )
+        .expect("verifier");
+        assert_eq!(doubled.cas.len(), 1);
+        invalid(
+            check(&doubled, &no_policy, &[&requiring]).expect_err("listed twice"),
+            1,
+        );
+
+        // Fifty-one intermediates of one name and key, each requiring a
+        // policy the leaf does not name: each chain costs Go two
+        // signature checks and webpki two, so both build fifty and stop
+        // on the fifty-first, and Go, having built chains, drops its
+        // signature limit and reports the fifty it refused.
+        let requiring_many: Vec<Vec<u8>> = (10..61u8)
+            .map(|serial| intermediate(serial, vec![require.clone(), policies(&[&one])]))
+            .collect();
+        let sent: Vec<&[u8]> = requiring_many.iter().map(Vec::as_slice).collect();
+        invalid(
+            check(&ours, &no_policy, &sent).expect_err("the budget ran out"),
+            50,
+        );
     }
 
     /// The client CA file loads as Go's `AppendCertsFromPEM` loads it

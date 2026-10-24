@@ -17,7 +17,7 @@ JSON-RPC/websocket server, the tool commands, the pipe IPC lifecycle,
 and the Windows service wrapper. The deliberate non-ports are small
 and documented in PARITY.md (Go GC tuning, the pprof servers, UPnP,
 the Windows event log, and the wallet-side mixclient). The test suite
-runs 2,677 tests across 453 suites on Linux, most differential against
+runs 2,682 tests across 453 suites on Linux, most differential against
 dcrd itself or replaying sessions generated inside dcrd's own packages.
 
 Since the surface completed, four rounds of work have landed on it. A
@@ -94,7 +94,7 @@ LAN server, each of which validated in full only the blocks after the
 assume-valid block and had dcrd's block at height 1,116,035 (the bench
 ledger, "Where `797a213`'s block thread waits, a deeper read-ahead and a
 rung of four changes").
-Of the commits after `797a213`, seventeen change the node's code beyond
+Of the commits after `797a213`, eighteen change the node's code beyond
 tests and comments: one classifies a block's transactions once for every
 step that reads their types, among them checks that apply the consensus
 rules, and changes no rule; another allocates a block filter's list of
@@ -158,6 +158,14 @@ pool's certificates already met, so a leaf or intermediate dcrd
 refuses for a critical subject alternative name or name constraints
 extension of a form Go does not handle, or for a fault Go's parser
 refuses as far as the port reads it, is refused, where it verified,
+and changes no verdict; the eighteenth holds an RPC client's chain to
+Go's certificate policy validation, so a chain dcrd refuses for its
+policies, one with an intermediate whose non-critical policy constraints
+require an explicit policy none of its certificates names, say, is
+refused, where it verified, as is a certificate the client sends with a
+length written in more octets than it needs where the port reads it, in
+a policy extension, say, which Go's parser refuses and which the client
+CA pool now skips as dcrd's does,
 and changes no verdict. In syncs the first four were initially put to
 blocks in a build made from a worktree that holds the four of them, R1
 of that section: in four from the LAN server, each of which had dcrd's
@@ -183,7 +191,7 @@ node of the Decrediton run the project brief records, outside the
 bench harness, so not as a timing, and was not compared with dcrd at
 its end. Each sync in the three sentences before this one validated in
 full only the blocks after the assume-valid block. No build of the
-thirteenth to the seventeenth has been synced.
+thirteenth to the eighteenth has been synced.
 That the rules reject what dcrd's reject, but for the valid block the
 ninth accepts after such a copy, rests on the test batteries
 described below, not on a sync, and none of it says the node is safe to

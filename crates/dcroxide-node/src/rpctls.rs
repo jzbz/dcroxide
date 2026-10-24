@@ -1039,6 +1039,13 @@ fn go_hex_list(values: &[u16]) -> String {
     format!("[{}]", items.join(" "))
 }
 
+/// [`go_error_text`] for a refusal that does not depend on the
+/// ClientHello, for the client certificate verifier's tests.
+#[cfg(test)]
+pub(crate) fn go_error_text_for_tests(err: &rustls::Error) -> String {
+    go_error_text(err, None)
+}
+
 /// Go's error text for a handshake rustls refused, as far as the two
 /// refusals correspond (`crypto/tls/handshake_server.go`,
 /// `handshake_server_tls13.go`, `conn.go`); rustls's own description
@@ -1121,6 +1128,16 @@ fn go_error_text(err: &rustls::Error, hello: Option<&HelloFacts>) -> String {
         Error::InvalidCertificate(CertificateError::UnknownIssuer) => {
             "tls: failed to verify certificate: x509: certificate signed by unknown authority"
                 .to_string()
+        }
+        // Every chain the search completed failed Go's policy
+        // validation (`GoClientCertVerifier`).
+        Error::InvalidCertificate(CertificateError::Other(other))
+            if other
+                .0
+                .downcast_ref::<crate::rpcrun::InvalidPolicies>()
+                .is_some() =>
+        {
+            format!("tls: failed to verify certificate: {}", other.0)
         }
         // A certificate with a critical extension Go does not handle, as
         // Go's `isValid` refuses it (`GoClientCertVerifier`).
@@ -1633,6 +1650,13 @@ mod tests {
                 ))),
                 Some(&tls13),
                 "tls: failed to verify certificate: x509: too many intermediates for path length constraint",
+            ),
+            (
+                Error::InvalidCertificate(rustls::CertificateError::Other(rustls::OtherError(
+                    std::sync::Arc::new(crate::rpcrun::InvalidPolicies(2)),
+                ))),
+                Some(&tls13),
+                "tls: failed to verify certificate: x509: no valid chains built: 2 candidate chains with invalid policies",
             ),
             (
                 Error::InvalidCertificate(rustls::CertificateError::UnhandledCriticalExtension),
