@@ -95,6 +95,7 @@ path) has been measured yet, so this crossover is unconfirmed.
 | 2026-10-19, evening | m3 | `797a213`, the head of master when the syncs ran, and R1, `797a213` with four changes as a state of a worktree, R1's code that of the sixth commit after the commit that records these syncs but for tests and comments | not run in this session | mainnet, genesis to 1,116,035 | From the LAN server of the rows above, at the defaults, the two alternated. `797a213`: 273.1 s, 270.9 s, 273.2 s and 269.8 s, mean 271.75 s — **4,106.8 blk/s** at 3.30–3.35 mean cores, where K's four runs of that morning had a mean of 271.68 s. R1: 263.1 s, 266.3 s, 265.5 s and 264.9 s, mean 264.95 s — **4,212.2 blk/s** at 3.38–3.40, 6.80 s or 2.5% less, beyond the session's ±2.6 s, at a peak resident memory of 2,460 to 2,470 MiB against 2,465 to 2,500 MiB. One sync of R1 from the loopback server ended with the UTXO set and the block files of every full sync from that server since 2026-10-17 | this file, "Where `797a213`'s block thread waits, a deeper read-ahead and a rung of four changes" |
 | 2026-10-19, evening | m3 | a diagnostic build of `797a213` that reads the read-ahead's depth, four frames in the code, and the index notification buffer, 128, from the environment, not for commit; the depth of sixteen is that of the seventh commit after the commit that records these syncs, which also holds R1's changes and was not run | not run in this session | mainnet, genesis to 1,116,035 | The same LAN server and session, at the defaults but for the setting, two runs of each, alternated. Depth 4: 273.3 s and 272.9 s. Depth 16: 263.4 s and 263.4 s, mean 263.40 s — 4,237.0 blk/s at 3.39–3.40 mean cores, 9.70 s or 3.6% less than depth 4, beyond the queue's ±4.8 s, with 66.2% and 65.5% of the inputs of the guessed shape pre-verified against 51.7% and 52.2%. Depth 32: 267.2 s and 263.5 s, 7.75 s less than depth 4. A buffer of 512 at depth 4: 273.3 s and 270.1 s, 1.40 s less, which is not resolved. In a later queue, depth 16 once more, 264.8 s, and depth 16 with `DCROXIDE_PREVERIFY=10`, at most ten helpers where the default is six: 258.1 s and 259.6 s, 5.02 s under the three runs at depth 16, for 29.83 s more node CPU time | this file, "Where `797a213`'s block thread waits, a deeper read-ahead and a rung of four changes" |
 | 2026-10-22 | m3 | `8bda92e`, the head of master when the syncs ran, in a home directory created as usual and in one created with btrfs's no-copy-on-write attribute (`chattr +C`); and W0b, `8bda92e` with each block record started on a fresh 4 KiB page, a diagnostic build not for commit | not run in this session | mainnet, genesis to 1,116,035 | From the LAN server of the rows above, at the defaults, with transparent huge pages at `always` and kernel 7.3.0 where the LAN rows above ran at `madvise` on an older kernel, so the walls are compared within the session only. As created: 254.8 s and 255.1 s, mean 254.95 s — **4,377.5 blk/s** at 3.69 mean cores. Without copy-on-write: 232.1 s and 232.8 s, mean 232.45 s — **4,801.2 blk/s** at 3.99–4.01, 22.50 s or 8.8% less, with 40.4 and 40.7 GB written at the volume against 57.0 and 57.9 GB, and the block thread uninterruptible for 8.6 s against 30.6 s, nearly all of it in btrfs's write paths, one run of each under a wait sampler. W0b, one run under the sampler: 252.8 s, 2.0 s under its pair, which one run against one does not resolve | this file, "`8bda92e` in a directory without copy-on-write, and block records on fresh pages" |
+| 2026-10-24 | m3 | `f37d763`, the head of master when the syncs ran, which holds the eighteen commits after `797a213` that change the node's code, against `797a213` | not run in this session | mainnet, genesis to 1,116,035 | From the LAN server of the rows above, at the defaults, with transparent huge pages at `always` and kernel 7.3.0, as on 2026-10-22 but in a later package release of it, so the walls are compared within the session only. `f37d763`: 254.9 s, 252.8 s, 252.0 s and 253.2 s, mean 253.23 s — **4,407.3 blk/s** at 3.65–3.68 mean cores, with a peak resident memory of 2,465 to 2,507 MiB. `797a213`, run second and fourth of the six: 270.3 s and 268.8 s, mean 269.55 s — 4,140.4 blk/s at 3.34–3.36 mean cores. `f37d763` took **16.33 s or 6.1% less**, and less in each of the eight pairings. From the loopback dcrd v2.1.6 server `f37d763` ended on the UTXO set and block files of every full sync from it since 2026-10-17, at the defaults and with `--assumevalid=0`, which took 491.7 s from a server that read nothing from its drive, in another session than the 583.4 s of 2026-10-19 | this file, "`f37d763` against `797a213`, its end state and a sync that checks every script" |
 
 > **The headline 1.29x predates the fan-out fix, so it is conservative for
 > master.** That figure was measured on `b6d0c63`; `c091b46` (one validation
@@ -6815,3 +6816,189 @@ output; the spot checks' record and log, with the pilot's dumps; the
 verification's reads through each store's interface, its decoder and its
 record; the listings of the frozen chain and of the data directory the
 sync left; and the readers' sources and build logs.
+
+## `f37d763` against `797a213`, its end state and a sync that checks every script (2026-10-24)
+
+The README counts eighteen commits after `797a213` that change the
+node's code, and no build holding the thirteenth to the eighteenth had
+been synced. `f37d763`, the head of master when the syncs below ran,
+holds all eighteen: the six of `8bda92e`, which "`8bda92e` in a
+directory without copy-on-write, and block records on fresh pages" above
+put to blocks, and the twelve after them, which write the daemon's log
+file, take a block whose contextual merkle check fails out of the best
+chain candidates, refuse a block whose header names another size before
+counting its data as the header's, add an output again without the fresh
+mark when the UTXO cache has no slot for it, close the metadata file
+with the block database, change the RPC server's TLS handshake, log the
+mempool's and the template generator's lines below info, give
+`startprofiler` and `--profile` dcrd's address checks, copy the filters
+a peer or an RPC client asks for after releasing the chain lock, and
+change the RPC server's checks of a client's certificates. Between 05:23
+and 07:10 on 2026-10-24, ten syncs were run on m3, in one queue and none
+outside it:
+
+- six from the LAN server of the sections above, in the order `f37d763`,
+  `797a213`, `f37d763`, `797a213`, `f37d763`, `f37d763`: four of
+  `f37d763` (x24-H-1 to x24-H-4) and two of `797a213` (x24-K-1 and
+  x24-K-2);
+- one from the same server of a build of `f37d763` with frame pointers,
+  under the profiler (x24-H-profile);
+- three of `f37d763` from the loopback dcrd v2.1.6 server, for the end
+  state that the LAN runs do not record: two at the defaults
+  (x24-H-loopback, marked disturbed, and the queue's repeat of it,
+  x24-H-loopback-again1) and one with `--assumevalid=0`
+  (x24-H-fullval-loopback).
+
+**The builds.** `f37d763` and `797a213` are release builds of those
+commits' trees, at the workspace's release profile with nothing else
+set, `f37d763`'s made in a checkout at the commit and `797a213`'s in a
+worktree at its commit, with nothing changed in either. The binary of
+`797a213` that the evening of 2026-10-19 ran was not kept, so this one
+is another build of the same tree. The profiled build is `f37d763`'s
+tree built with frame pointers (`-C force-frame-pointers=yes`) and
+nothing else changed. Each was built once, with rustc 1.98.1.
+
+**The session.** The syncs are in the harness of the sections above. The
+LAN server was the same live node, dcrd v2.1.7 by its user agent,
+following the network: the starting height it gave each run went from
+1,126,308 to 1,126,323; at the poll that stopped the clock the node was
+617 to 1,289 blocks past block 1,116,035, and 2,298 in the profiled run,
+and its block at that height was the frozen chain's in every run. The
+loopback server ran over a reflink copy of the frozen chain, whose 26.0
+GB were read into the page cache before each of its runs; it read 11.9
+GB from its drive during x24-H-loopback, whose wall is therefore not a
+timing, and nothing during the other two. Every run exited 0 and none
+stalled. x24-H-loopback was marked disturbed, other userland having used
+0.51% of the machine against the limit of 0.5%, and the queue ran it
+again at its end; other userland was 0.22% to 0.26% of the machine in
+every other run. The first run followed the quiet gate alone; every
+other run followed a `sync`, a 300 s idle and the gate. Besides
+QK-0028's three lines at the start, six of the seven LAN runs, all but
+x24-K-2, logged one or two interrupted block or index updates as errors,
+at the shutdown the harness asks for once the clock has stopped. The
+flush log was on in every run, and every figure is defined as in the
+sections above; the read-ahead's and the pre-verifier's lines at
+shutdown count to the shutdown, past the clock.
+
+**Transparent huge pages were `always`, and the kernel was 7.3.0**, as
+in the section of 2026-10-22 though in a later package release, where
+the LAN sections before that one ran at `madvise` on an older kernel:
+the machine had been restarted on 2026-10-23 into that release, the
+setting read `always` after the queue, and the system journal of that
+boot shows no write to it. These ten runs are compared with each other
+only.
+
+| run | started | build | server | setting | wall | rate | to block 1,026,597 | after it | node CPU time (user + sys) | mean cores | block thread | script pool, 15 threads | `dbcommit` thread | flush time | written at the volume | peak RSS |
+|---|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| x24-H-loopback | 05:23 | `f37d763` | loopback | defaults (marked disturbed) | 253.8 s | 4,397.3 blk/s | 204.0 s | 49.8 s | 921.3 s (853.1 + 68.2) | 3.63 | 199.7 s | 420.9 s | 97.4 s | 116.5 s | 53.6 GB | 2,463 MiB |
+| x24-H-1 | 05:34 | `f37d763` | LAN | defaults | 254.9 s | 4,378.3 blk/s | 205.8 s | 49.1 s | 930.4 s (855.2 + 75.2) | 3.65 | 200.3 s | 424.4 s | 99.3 s | 116.3 s | 54.6 GB | 2,472 MiB |
+| x24-K-1 | 05:44 | `797a213` | LAN | defaults | 270.3 s | 4,128.9 blk/s | 212.8 s | 57.5 s | 902.4 s (829.6 + 72.8) | 3.34 | 210.6 s | 395.3 s | 94.3 s | 113.6 s | 53.4 GB | 2,458 MiB |
+| x24-H-2 | 05:55 | `f37d763` | LAN | defaults | 252.8 s | 4,414.7 blk/s | 203.5 s | 49.3 s | 923.0 s (850.9 + 72.1) | 3.65 | 198.8 s | 421.1 s | 97.0 s | 115.7 s | 54.0 GB | 2,507 MiB |
+| x24-K-2 | 06:06 | `797a213` | LAN | defaults | 268.8 s | 4,151.9 blk/s | 211.8 s | 57.0 s | 903.8 s (831.2 + 72.6) | 3.36 | 210.6 s | 396.4 s | 94.1 s | 112.7 s | 52.8 GB | 2,463 MiB |
+| x24-H-3 | 06:17 | `f37d763` | LAN | defaults | 252.0 s | 4,428.7 blk/s | 202.4 s | 49.6 s | 927.1 s (854.7 + 72.4) | 3.68 | 198.8 s | 425.0 s | 96.6 s | 115.4 s | 53.9 GB | 2,465 MiB |
+| x24-H-4 | 06:28 | `f37d763` | LAN | defaults | 253.2 s | 4,407.7 blk/s | 202.3 s | 50.9 s | 924.4 s (851.8 + 72.6) | 3.65 | 198.9 s | 422.6 s | 96.5 s | 115.0 s | 53.6 GB | 2,486 MiB |
+| x24-H-fullval-loopback | 06:39 | `f37d763` | loopback | `--assumevalid=0` | 491.7 s | 2,269.7 blk/s | 442.0 s | 49.7 s | 4,702.1 s (4,586.4 + 115.7) | 9.56 | 355.0 s | 3,959.1 s | 112.7 s | 127.3 s | 53.1 GB | 2,392 MiB |
+| x24-H-profile | 06:53 | `f37d763` with frame pointers | LAN | defaults, under `perf` (not a clean timing) | 257.0 s | 4,342.5 blk/s | 209.6 s | 47.4 s | 954.8 s (872.5 + 82.3) | 3.71 | 203.9 s | 435.9 s | 98.3 s | 115.9 s | 52.8 GB | 2,476 MiB |
+| x24-H-loopback-again1 | 07:05 | `f37d763` | loopback | defaults | 254.0 s | 4,393.8 blk/s | 204.8 s | 49.2 s | 915.6 s (846.3 + 69.3) | 3.60 | 198.1 s | 418.3 s | 97.9 s | 117.3 s | 54.3 GB | 2,501 MiB |
+
+The thread columns are time on a processor, by the same count as in the
+sections above; the script pool's is the sum over its fifteen threads,
+and the flush time is the 52 flushes' inside the clock, on `dbcommit`,
+from the hand-off to the retirement.
+
+**`f37d763` against `797a213` (x24-H-1 to x24-H-4 against x24-K-1 and
+x24-K-2).** **254.9 s, 252.8 s, 252.0 s and 253.2 s, a mean of 253.23 s,
+against 270.3 s and 268.8 s, a mean of 269.55 s: 16.33 s or 6.1% less**,
+and less in each of the eight pairings, by 13.9 s to 18.3 s; 8.8 s of it
+before the assume-valid block and 7.5 s after. That is four runs against
+two in one session, which went `f37d763`, `797a213`, `f37d763`,
+`797a213`, `f37d763`, `f37d763`; `f37d763`'s four spread over 2.9 s and
+`797a213`'s two over 1.5 s.
+
+- **The block thread** was on a processor for 198.8 s to 200.3 s against
+  210.6 s in both, 11.43 s less by the means. It waited for the reader
+  0.49 s to 0.58 s against 3.65 s and 3.68 s, with up to 16 items queued
+  against 4, and the reader waited for it 112.7 s to 115.4 s against
+  132.9 s and 134.5 s.
+- **Pre-verification** checked 87.06% to 87.76% of the inputs to guess
+  for ahead of the block thread, on up to ten helpers, against 51.49%
+  and 51.81% on up to six, and 8.7% to 9.4% of the blocks its line
+  counts, every block after the assume-valid block, were cut short
+  against 25.6% and 25.8%.
+- **The flushes.** Each run made 52 flushes inside the clock, every one
+  handed over. Their foreground time was 0.02 s to 0.03 s in every run
+  of `f37d763` against 2.61 s and 2.64 s, the third of the eighteen
+  commits having moved the block-file sync onto `dbcommit`. `dbcommit`
+  was on a processor for 96.5 s to 99.3 s against 94.1 s and 94.3 s, and
+  the flushes took 115.0 s to 116.3 s on it against 112.7 s and 113.6 s.
+  The index queue was full for 3.75 s to 3.82 s against 3.70 s and 3.75
+  s.
+- **CPU time.** Node CPU time was 923.0 s to 930.4 s against 902.4 s and
+  903.8 s, 23.1 s more by the means, at 3.65 to 3.68 mean cores against
+  3.34 and 3.36; the script pool's threads were on a processor for 421.1
+  s to 425.0 s against 395.3 s and 396.4 s.
+- **Memory** peaked at 2,465 to 2,507 MiB against 2,458 and 2,463 MiB.
+- **Bytes.** 39.3 to 39.5 GB were passed to write calls in each of the
+  six, and the volume took 53.6 to 54.6 GB against 52.8 and 53.4 GB.
+
+**The end state, and every block validated in full (x24-H-loopback,
+x24-H-loopback-again1, x24-H-fullval-loopback).** Each ended on the
+server's tip, `8752fdc9…`, and in each `gettxoutsetinfo` reported the
+UTXO set of every full sync from the loopback server since 2026-10-17:
+760,741 transactions, 1,850,903 outputs, a total amount of
+1,672,716,060,550,750 atoms and the serialized hash
+`eb7f88de7b69f98676ce78072c0f90cc2667b875df0b26637dffcf9da5b3c30c`. The
+block files hashed to `33b7ac837a45c74f` over 36 files and
+19,202,596,910 B in all three. The exists-address index and the rest of
+the metadata store were not compared. The run with `--assumevalid=0`
+logged that assume-valid was disabled and took 491.7 s, 442.0 s of it to
+block 1,026,597, with 4,702.1 s of CPU time at 9.56 mean cores, while
+the server read nothing from its drive. Pre-verification checked 90.78%
+of its 82,821,730 inputs to guess for ahead of the block thread, which
+was on a processor for 355.0 s and waited for the reader 0.003 s; the
+node peaked at 2,392 MiB. The only other sync with `--assumevalid=0`
+this ledger records, K's of 2026-10-19, ran at `madvise` on the older
+kernel, and the two are not compared.
+
+**The profiled run.** x24-H-profile ran the build with frame pointers
+under two `perf` recorders on the harness's four cores, apart from the
+node's, as p19-K-profile did on 2026-10-19: a flat one at 499 Hz,
+459,451 samples, and a call-graph one at 199 Hz unwinding by frame
+pointer, 184,639 samples, both of user space only. It took 257.0 s, 3.8
+s or 1.5% over the mean of `f37d763`'s four runs, which is not a timing
+of either build. Of the user-space cycles the flat recorder sampled, the
+block thread had 21.8%, the reader 14.8%, the index 8.2%, `dbcommit`
+6.1% and each of the script pool's fifteen threads 3.2% to 3.3%. What
+else the profile shows is not set out here.
+
+**What was not measured.**
+
+- dcrd in this session, so no comparison with dcrd rests on these runs;
+  the README's rests on the runs of 2026-10-19.
+- `f37d763` or `797a213` at `madvise` or on the earlier kernel, or
+  beside any section above.
+- The trees between `797a213` and `f37d763`, so what each of the
+  eighteen commits does on its own is not measured here.
+- `797a213`'s end state in this session; any end state in the LAN runs;
+  the exists-address index and the rest of the metadata store in the
+  three loopback checks.
+- A second sync of `f37d763` with `--assumevalid=0`, and dcrd with
+  `--assumevalid=0`.
+- The build with frame pointers without the profiler.
+- What the twelfth to the eighteenth commits change, but for being in
+  the binary: the node ran without TLS on its RPC listener (`--notls`),
+  with no client certificate, no `--profile` and no inbound peers, at
+  the default log level, so no handshake, certificate check, profiler
+  address check, served filter or line below info of the mempool or the
+  template generator was exercised.
+- A power cut, or any unclean stop.
+- Storage other than m3's NVMe drive under btrfs; Windows and macOS.
+- The flush log's own cost, on in every run.
+
+Raw: `runs-lan.jsonl`'s rows labelled `x24-H-1` to `x24-H-4`, `x24-K-1`
+and `x24-K-2`, `verify.jsonl`'s labelled `x24-H-loopback`,
+`x24-H-loopback-again1` and `x24-H-fullval-loopback`, and
+`perf-x24.jsonl`'s `x24-H-profile`, with each thread's counters and I/O
+counters; per-run samples, flush logs and node logs; the queue's steps
+and log; the profiled run's two `perf` recordings; and the three builds'
+notes and logs.

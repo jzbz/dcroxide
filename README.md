@@ -190,8 +190,15 @@ synced mainnet once from the LAN server to block 1,126,076, as the
 node of the Decrediton run the project brief records, outside the
 bench harness, so not as a timing, and was not compared with dcrd at
 its end. Each sync in the three sentences before this one validated in
-full only the blocks after the assume-valid block. No build of the
-thirteenth to the eighteenth has been synced.
+full only the blocks after the assume-valid block. A release build of
+`f37d763`, which holds all eighteen, synced on 2026-10-24 four times
+from the LAN server, each with dcrd's block at height 1,116,035, and
+three times from the loopback server, each ending with the UTXO set that
+dcrd's syncs of 2026-10-17 ended with and the same block files; all but
+one of the seven validated in full only the blocks after the
+assume-valid block, and that one, with `--assumevalid=0`, validated
+every block in full (the ledger, "`f37d763` against `797a213`, its end
+state and a sync that checks every script").
 That the rules reject what dcrd's reject, but for the valid block the
 ninth accepts after such a copy, rests on the test batteries
 described below, not on a sync, and none of it says the node is safe to
