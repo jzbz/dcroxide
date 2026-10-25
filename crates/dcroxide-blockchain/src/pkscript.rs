@@ -202,7 +202,7 @@ mod tests {
     /// The script forms the module documentation names fit in place,
     /// and the type is 32 bytes on 64-bit targets.
     #[test]
-    fn the_standard_scripts_fit_in_place() {
+    fn p2pkh_and_p2sh_scripts_fit_in_place() {
         // Pay-to-pubkey-hash and its stake-tagged form, and the same
         // for pay-to-script-hash.
         let p2pkh = [&[0x76, 0xa9, 0x14][..], &[0x11; 20], &[0x88, 0xac]].concat();
