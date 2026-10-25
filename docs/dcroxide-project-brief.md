@@ -137,7 +137,9 @@ What Phase 15 has covered so far:
   validation, and on 2026-10-10 every block up to 1,116,035 at `337779d`. On
   2026-10-19 one sync of a build of the code of `797a213` with
   `--assumevalid=0` validated every block up to 1,116,035 in full and ended
-  with the UTXO set and the block files of the default syncs.
+  with the UTXO set and the block files of the default syncs. On 2026-10-24 one
+  sync of `f37d763`'s build, the binary of the syncs of 2026-10-25, did the
+  same with `--assumevalid=0`.
 - **Performance campaign.** Storage-commit policy, the release build profile,
   script-engine allocation, parallel script validation, per-block hash
   memoization, a `SigCache` port, and a batch of smaller allocation fixes.
@@ -344,8 +346,22 @@ What Phase 15 has covered so far:
   the same build from the loopback server, at the defaults and with
   `--assumevalid=0`, every block validated in full, ended with the block
   files and the UTXO set of every full sync from that server since
-  2026-10-17. The [bench ledger](bench-ledger.md) has every run,
-  and the README's Performance section the summary.
+  2026-10-17. The [bench ledger](bench-ledger.md) has every run.
+- **On 2026-10-25 a build of `dfa77fe`, the head of master when the
+  syncs ran, whose node code is that of `f37d763`, took a mean of 251.58
+  s over four syncs against dcrd v2.1.7's 2,997.7 s and 2,972.5 s,
+  11.87x in one session**, from the same LAN server, with transparent
+  huge pages at `always` where the runs of 2026-10-19 had `madvise`, so
+  the two sessions are not set beside each other. With the
+  exists-address index off, 230.5 s and 231.0 s against one dcrd run of
+  1,325.3 s, 5.74x. Its peak resident memory, read when the clock
+  stopped with the node still syncing, was 2,462 to 2,496 MiB against
+  dcrd's 1,854 and 1,855 MiB. The LAN runs record no end state; on
+  2026-10-24 three syncs of the same binary from the loopback server,
+  two at the defaults and one with `--assumevalid=0`, ended with the
+  block files and the UTXO set of every full sync from that server since
+  2026-10-17. The [bench ledger](bench-ledger.md) has every run, and the
+  README's Performance section the summary.
 - **The daemon's default download window is now its own, not dcrd's,
   and was measured on 2026-10-12 in short runs only** (PARITY.md,
   *Block download window*). It keeps up to 128 blocks requested from
@@ -371,13 +387,13 @@ What Phase 15 has covered so far:
   one run each does not settle as a cost or as nothing. Not measured: a
   whole sync over a delayed link or a real one with a longer round trip
   than a LAN's (whole syncs from a node on another machine on the same
-  LAN ran on 2026-10-18 and 2026-10-19), a sync over a link held to a
-  set rate, or one with a reader made to stop for 20 s or more. The last
-  two are where the wider window can cost sync peers, which is read from
-  the code and from a model over header sizes, not from a run: the
-  public-network starts ran over whatever links their peers had, at
-  rates that were not recorded, and the longest flush of the loopback
-  sync took 3.5 s.
+  LAN ran on 2026-10-18, 2026-10-19, 2026-10-22, 2026-10-23, 2026-10-24
+  and 2026-10-25), a sync over a link held to a set rate, or one with a
+  reader made to stop for 20 s or more. The last two are where the wider
+  window can cost sync peers, which is read from the code and from a
+  model over header sizes, not from a run: the public-network starts ran
+  over whatever links their peers had, at rates that were not recorded,
+  and the longest flush of the loopback sync took 3.5 s.
 - **Security-blocker campaign.** The release blockers, highs, and mediums from
   an audit of the ported surface: RPC authentication and admission, peer
   message-path bounds (stall deadlines, getdata, queue and write limits),
@@ -397,7 +413,7 @@ Named open items, tracked and not fixed:
   copy-out rebuild packs *worse*, 58.29%, on a larger live tree, 10.92 GiB
   against 9.79. The 1.536 GiB of intra-page slack in `spendjournalv3` is real
   and unreachable inside this engine.
-- The node was flush-bound under fast ingest as measured in 2026-08 (the 48%-of-wall stall figure above, 90–98% of it inside a metadata-flush window). With the height-first block keys and the exists-address index's own layout, metadata flushes took 15–16% of a from-genesis sync on another machine in 2026-10 ([docs/bench-ledger.md](bench-ledger.md), "Daemon against daemon, each from the other"). In the nine syncs of 2026-10-12 listed above with the eleven commits they took 104.3–111.4 s whichever code ran, so their share grew as the rest shrank: 14.7% of the 728.5 s run and 21.3% of each of the two runs with the read-ahead on. On 2026-10-17, with the commit on a thread of its own, the four default syncs of `88c46c3` had a flush under way for a median of 110.2 s, 27.8% of the wall, of which the flushes held the threads that sync for 47.1 s, 11.9%. On 2026-10-19, from a block server on the LAN, the flushes of a build of the code of `797a213`, which writes their rows on that thread too, were in the foreground on the threads that sync for 2.5 to 2.8 s of each default sync.
+- The node was flush-bound under fast ingest as measured in 2026-08 (the 48%-of-wall stall figure above, 90–98% of it inside a metadata-flush window). With the height-first block keys and the exists-address index's own layout, metadata flushes took 15–16% of a from-genesis sync on another machine in 2026-10 ([docs/bench-ledger.md](bench-ledger.md), "Daemon against daemon, each from the other"). In the nine syncs of 2026-10-12 listed above with the eleven commits they took 104.3–111.4 s whichever code ran, so their share grew as the rest shrank: 14.7% of the 728.5 s run and 21.3% of each of the two runs with the read-ahead on. On 2026-10-17, with the commit on a thread of its own, the four default syncs of `88c46c3` had a flush under way for a median of 110.2 s, 27.8% of the wall, of which the flushes held the threads that sync for 47.1 s, 11.9%. On 2026-10-19, from a block server on the LAN, the flushes of a build of the code of `797a213`, which writes their rows on that thread too, were in the foreground on the threads that sync for 2.5 to 2.8 s of each default sync. On 2026-10-25, from the same server at another huge-page setting, the flushes of a build of `dfa77fe`, whose commit thread has also synced a handed-over flush's block files since `aa157d1`, were in the foreground for 0.02 to 0.03 s of each default sync.
 
 **The node is still pre-alpha. Do not expose it to the internet and do not use
 it with funds.**

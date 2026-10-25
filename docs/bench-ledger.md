@@ -96,6 +96,7 @@ path) has been measured yet, so this crossover is unconfirmed.
 | 2026-10-19, evening | m3 | a diagnostic build of `797a213` that reads the read-ahead's depth, four frames in the code, and the index notification buffer, 128, from the environment, not for commit; the depth of sixteen is that of the seventh commit after the commit that records these syncs, which also holds R1's changes and was not run | not run in this session | mainnet, genesis to 1,116,035 | The same LAN server and session, at the defaults but for the setting, two runs of each, alternated. Depth 4: 273.3 s and 272.9 s. Depth 16: 263.4 s and 263.4 s, mean 263.40 s — 4,237.0 blk/s at 3.39–3.40 mean cores, 9.70 s or 3.6% less than depth 4, beyond the queue's ±4.8 s, with 66.2% and 65.5% of the inputs of the guessed shape pre-verified against 51.7% and 52.2%. Depth 32: 267.2 s and 263.5 s, 7.75 s less than depth 4. A buffer of 512 at depth 4: 273.3 s and 270.1 s, 1.40 s less, which is not resolved. In a later queue, depth 16 once more, 264.8 s, and depth 16 with `DCROXIDE_PREVERIFY=10`, at most ten helpers where the default is six: 258.1 s and 259.6 s, 5.02 s under the three runs at depth 16, for 29.83 s more node CPU time | this file, "Where `797a213`'s block thread waits, a deeper read-ahead and a rung of four changes" |
 | 2026-10-22 | m3 | `8bda92e`, the head of master when the syncs ran, in a home directory created as usual and in one created with btrfs's no-copy-on-write attribute (`chattr +C`); and W0b, `8bda92e` with each block record started on a fresh 4 KiB page, a diagnostic build not for commit | not run in this session | mainnet, genesis to 1,116,035 | From the LAN server of the rows above, at the defaults, with transparent huge pages at `always` and kernel 7.3.0 where the LAN rows above ran at `madvise` on an older kernel, so the walls are compared within the session only. As created: 254.8 s and 255.1 s, mean 254.95 s — **4,377.5 blk/s** at 3.69 mean cores. Without copy-on-write: 232.1 s and 232.8 s, mean 232.45 s — **4,801.2 blk/s** at 3.99–4.01, 22.50 s or 8.8% less, with 40.4 and 40.7 GB written at the volume against 57.0 and 57.9 GB, and the block thread uninterruptible for 8.6 s against 30.6 s, nearly all of it in btrfs's write paths, one run of each under a wait sampler. W0b, one run under the sampler: 252.8 s, 2.0 s under its pair, which one run against one does not resolve | this file, "`8bda92e` in a directory without copy-on-write, and block records on fresh pages" |
 | 2026-10-24 | m3 | `f37d763`, the head of master when the syncs ran, which holds the eighteen commits after `797a213` that change the node's code, against `797a213` | not run in this session | mainnet, genesis to 1,116,035 | From the LAN server of the rows above, at the defaults, with transparent huge pages at `always` and kernel 7.3.0, as on 2026-10-22 but in a later package release of it, so the walls are compared within the session only. `f37d763`: 254.9 s, 252.8 s, 252.0 s and 253.2 s, mean 253.23 s — **4,407.3 blk/s** at 3.65–3.68 mean cores, with a peak resident memory of 2,465 to 2,507 MiB. `797a213`, run second and fourth of the six: 270.3 s and 268.8 s, mean 269.55 s — 4,140.4 blk/s at 3.34–3.36 mean cores. `f37d763` took **16.33 s or 6.1% less**, and less in each of the eight pairings. From the loopback dcrd v2.1.6 server `f37d763` ended on the UTXO set and block files of every full sync from it since 2026-10-17, at the defaults and with `--assumevalid=0`, which took 491.7 s from a server that read nothing from its drive, in another session than the 583.4 s of 2026-10-19 | this file, "`f37d763` against `797a213`, its end state and a sync that checks every script" |
+| 2026-10-25 | m3 | `dfa77fe`, the head of master when the syncs ran, whose node code is `f37d763`'s and whose binary is the one of the row above | release v2.1.7 (go1.25.4), the binary of the 2026-10-19 rows, two runs, and one with `--noexistsaddrindex` | mainnet, genesis to 1,116,035 | From the LAN server of the rows above, at the defaults, with transparent huge pages at `always` and kernel 7.3.0 as in the row above, where the 2026-10-19 rows ran at `madvise`, so the walls are compared within the session only. `dfa77fe`, four runs: 251.2 s, 253.1 s, 252.4 s and 249.6 s, mean 251.58 s — **4,436.2 blk/s** at 3.66–3.72 mean cores, with a peak resident memory of 2,462 to 2,496 MiB. dcrd v2.1.7: 2,997.7 s and 2,972.5 s, mean 2,985.1 s — **372.3 and 375.5 blk/s** at 1.88 and 1.87 mean cores, peaking at 1,854 and 1,855 MiB; with the index off, one run, 1,325.3 s — 842.1 blk/s. So `dfa77fe` is **11.87x** as fast at the defaults, 11.74x to 12.01x over the eight pairings, and 5.74x with the index off (230.5 s and 231.0 s against one dcrd run of 1,325.3 s) | this file, "`dfa77fe` against dcrd v2.1.7, with the exists-address index on and off" |
 
 > **The headline 1.29x predates the fan-out fix, so it is conservative for
 > master.** That figure was measured on `b6d0c63`; `c091b46` (one validation
@@ -130,11 +131,16 @@ path) has been measured yet, so this crossover is unconfirmed.
 > Performance section reported this comparison instead, and later ones
 > after it. From 2026-10-17 it reported only the comparison of that day,
 > and the text it carried until then is in "README Performance text
-> retired on 2026-10-17" below. Since 2026-10-19 it reports the syncs of
+> retired on 2026-10-17" below. From 2026-10-19 it reported the syncs of
 > that morning from a block server on the LAN, with those of 2026-10-17
 > in one bullet; the text it replaced is in git history, and its figures
 > in "`88c46c3`, the background commit as committed, dcrd v2.1.7 and
-> two preloaded allocators" below.
+> two preloaded allocators" below. Since 2026-10-25 it reports that
+> day's syncs of `dfa77fe` from the same server, with those of
+> 2026-10-19 in one bullet and the end state from the loopback syncs of
+> 2026-10-24; the text it replaced is in git history, and its figures in
+> "One commit thread for the life of the store, a sync that checks every
+> script, and dcrd v2.1.7" below.
 
 **Open arm, unmeasured: the maturing-ticket ancestor read.** Every connect
 past stake-enabled height lists the ticket purchases in the block
@@ -7002,3 +7008,114 @@ and `x24-K-2`, `verify.jsonl`'s labelled `x24-H-loopback`,
 counters; per-run samples, flush logs and node logs; the queue's steps
 and log; the profiled run's two `perf` recordings; and the three builds'
 notes and logs.
+
+## `dfa77fe` against dcrd v2.1.7, with the exists-address index on and off (2026-10-25)
+
+The README's Performance section gave the syncs of 2026-10-19 from the
+LAN server, run with transparent huge pages at `madvise` on an older
+kernel; since a restart on 2026-10-21 into kernel 7.3.0 the setting has
+been the kernel's default, `always` (the sections of 2026-10-22 and
+2026-10-24 above ran at it), and "`f37d763` against `797a213`, its end
+state and a sync that checks every script" above ran no dcrd. To give
+the section figures of the head of master and dcrd from one session at
+the machine's current setting, nine syncs were run on m3 between 05:07
+and 08:25 on 2026-10-25, in one queue and none outside it, all from the
+LAN server of the sections above:
+
+- four of `dfa77fe`, the head of master when the syncs ran, at the
+  defaults (x25-H-1 to x25-H-4), and two with `--noexistsaddrindex`
+  (x25-H-noindex-1 and x25-H-noindex-2);
+- two of dcrd v2.1.7 at the defaults (x25-dcrd-1 and x25-dcrd-2), and
+  one with `--noexistsaddrindex` (x25-dcrd-noindex).
+
+They went `dfa77fe`, dcrd, `dfa77fe`, `dfa77fe` without the index, dcrd
+without it, `dfa77fe`, `dfa77fe` without the index, dcrd, `dfa77fe`.
+
+**The builds.** `dfa77fe` changes nothing in the node's code after
+`f37d763`. Its release build, at the workspace's release profile with
+nothing else set, in a checkout at the commit with nothing changed,
+found nothing to recompile, and its binary is byte for byte the build of
+`f37d763` that the section above ran (sha256 `7e45064e…`). dcrd is the
+v2.1.7 binary of the sections of 2026-10-18 and 2026-10-19 (sha256
+`83ed2983…`).
+
+**The session.** The syncs are in the harness of the sections above. The
+LAN server was the same live node, dcrd v2.1.7 by its user agent,
+following the network: the starting height it gave each run went from
+1,126,620 to 1,126,655; at the poll that stopped the clock `dfa77fe` was
+37 to 2,111 blocks past block 1,116,035 and dcrd 40 to 79, and the
+syncing node's block at that height was the frozen chain's in every run.
+Every run exited 0, none stalled, and none was marked disturbed; other
+userland was 0.10% to 0.25% of the machine. The first run followed the
+quiet gate alone; every other run followed a `sync`, a 300 s idle and
+the gate. Both daemons logged QK-0028's three lines at the start, and
+seven of the nine runs, all but x25-H-noindex-1 and x25-dcrd-2, logged
+one or two interrupted block or index updates as errors at the shutdown
+the harness asks for once the clock has stopped. The flush log was on in
+every run of `dfa77fe`, and every figure is defined as in the sections
+above.
+
+**Transparent huge pages were `always`, and the kernel was 7.3.0**, in
+the boot of the section above: the setting read `always` after the
+queue, and the system journal of that boot shows no write to it. The
+runs of 2026-10-19 whose figures the README gave until now were at
+`madvise` on an older kernel. The setting and the kernel may change
+either daemon's speed, by amounts these runs do not measure, so these
+nine are set beside no run at `madvise`.
+
+| run | started | build | setting | wall | rate | to block 1,026,597 | after it | node CPU time (user + sys) | block thread | index thread | reader thread | `dbcommit` thread | peak RSS | received, highest 10 s |
+|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| x25-H-1 | 05:07 | `dfa77fe` | defaults | 251.2 s | 4,442.8 blk/s | 202.3 s | 48.9 s | 934.9 s (862.0 + 72.9) | 200.8 s | 73.1 s | 132.8 s | 96.3 s | 2,496 MiB | 103.3 MB/s |
+| x25-dcrd-1 | 05:18 | dcrd v2.1.7 | defaults | 2,997.7 s | 372.3 blk/s | 2,117.1 s | 880.6 s | 5,632.4 s (4,506.5 + 1,125.9) | — | — | — | — | 1,854 MiB | 16.0 MB/s |
+| x25-H-2 | 06:14 | `dfa77fe` | defaults | 253.1 s | 4,409.5 blk/s | 204.8 s | 48.3 s | 927.0 s (854.4 + 72.6) | 198.8 s | 72.8 s | 132.3 s | 96.5 s | 2,462 MiB | 102.0 MB/s |
+| x25-H-noindex-1 | 06:25 | `dfa77fe` | `--noexistsaddrindex` | 230.5 s | 4,841.8 blk/s | 186.9 s | 43.6 s | 809.7 s (758.0 + 51.7) | 198.9 s | — | 132.2 s | 59.9 s | 2,276 MiB | 116.6 MB/s |
+| x25-dcrd-noindex | 06:35 | dcrd v2.1.7 | `--noexistsaddrindex` | 1,325.3 s | 842.1 blk/s | 687.5 s | 637.8 s | 2,724.9 s (2,508.2 + 216.7) | — | — | — | — | 1,850 MiB | 38.5 MB/s |
+| x25-H-3 | 07:03 | `dfa77fe` | defaults | 252.4 s | 4,421.7 blk/s | 202.6 s | 49.8 s | 923.8 s (852.0 + 71.8) | 199.9 s | 72.7 s | 132.2 s | 95.8 s | 2,463 MiB | 104.9 MB/s |
+| x25-H-noindex-2 | 07:14 | `dfa77fe` | `--noexistsaddrindex` | 231.0 s | 4,831.3 blk/s | 186.9 s | 44.1 s | 814.4 s (760.7 + 53.7) | 198.6 s | — | 130.8 s | 61.5 s | 2,281 MiB | 114.0 MB/s |
+| x25-dcrd-2 | 07:24 | dcrd v2.1.7 | defaults | 2,972.5 s | 375.5 blk/s | 2,100.4 s | 872.1 s | 5,569.9 s (4,452.1 + 1,117.8) | — | — | — | — | 1,855 MiB | 15.6 MB/s |
+| x25-H-4 | 08:20 | `dfa77fe` | defaults | 249.6 s | 4,471.3 blk/s | 201.1 s | 48.5 s | 924.2 s (852.7 + 71.5) | 198.4 s | 72.6 s | 131.6 s | 95.1 s | 2,470 MiB | 102.9 MB/s |
+
+The thread columns are time on a processor, by the same count as in the
+sections above; dcrd's threads are not counted that way.
+
+**`dfa77fe` against dcrd v2.1.7.** **251.2 s, 253.1 s, 252.4 s and 249.6
+s, a mean of 251.58 s, against 2,997.7 s and 2,972.5 s, a mean of
+2,985.1 s: 11.87x**, 11.74x to 12.01x over the eight pairings. To the
+assume-valid block `dfa77fe` took a mean of 202.71 s against 2,108.75 s,
+10.4x, and the 89,438 blocks after it 48.86 s against 876.35 s, 17.9x.
+With the index off, 230.5 s and 231.0 s against one dcrd run of 1,325.3
+s, 5.74x (5.75x and 5.74x). The index costs `dfa77fe` 20.8 s, 8.3% of
+its default mean, and dcrd 1,659.8 s, 55.6% of its mean. dcrd used
+5,632.4 s and 5,569.9 s of CPU time, 6.0x `dfa77fe`'s mean of 927.48 s,
+and peaked at 1,854 and 1,855 MiB; `dfa77fe` peaked at 2,462 to 2,496
+MiB, 1.33x to 1.35x that.
+
+- **`dfa77fe`'s runs.** Each default run made 52 flushes inside the
+  clock and each run with the index off 38, all of them handed over,
+  with 0.02 to 0.03 s of foreground time at the defaults. In all six the
+  block thread's time was 198.4 to 200.8 s and the reader thread's 130.8
+  to 132.8 s. At the defaults the index thread's was 72.6 to 73.1 s and
+  `dbcommit`'s 95.1 to 96.5 s; with the index off `dbcommit`'s was 59.9
+  s and 61.5 s.
+- **This session and the last.** The same binary took 252.0 to 254.9 s,
+  a mean of 253.23 s, in the section above, a day earlier in the same
+  boot and at the same setting: 1.65 s more than here, which four runs
+  against four in two sessions do not resolve. dcrd's runs of
+  2026-10-19, at the other setting, are not set beside these.
+
+**What was not measured.**
+
+- Any end state; the section above has the same binary's.
+- Either daemon at `madvise` in this session, so how much of either's
+  change since 2026-10-19 the setting made.
+- `DCROXIDE_DB_SYNC_COMMIT=1`, a profile, or a sync with
+  `--assumevalid=0` in this session.
+- A link with a longer round trip; storage other than m3's NVMe drive
+  under btrfs; Windows and macOS.
+- The flush log's own cost, on in every run of `dfa77fe`.
+
+Raw: `runs-lan.jsonl`'s rows labelled `x25-H-1` to `x25-H-4`,
+`x25-H-noindex-1`, `x25-H-noindex-2`, `x25-dcrd-1`, `x25-dcrd-2` and
+`x25-dcrd-noindex`, with each thread's counters; per-run samples, flush
+logs and node logs; the queue's steps and log; and the build's notes and
+log.

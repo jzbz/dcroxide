@@ -1250,7 +1250,14 @@ against upstream and the port is faithful.
   against 3,014.6 s and 3,033.4 s for dcrd v2.1.7, 11.13x in one
   session, its flushes in the foreground on the threads that sync for
   2.5 to 2.8 s of each (the same ledger, "One commit thread for the life
-  of the store, a sync that checks every script, and dcrd v2.1.7"). So
+  of the store, a sync that checks every script, and dcrd v2.1.7"). On
+  2026-10-25, from the same server and with transparent huge pages at
+  `always` where those runs had `madvise`, a build of `dfa77fe`, whose
+  node code is that of `f37d763`, took a mean of 251.58 s over four
+  default syncs against 2,997.7 s and 2,972.5 s for dcrd v2.1.7, 11.87x
+  in one session, its flushes in the foreground on the threads that sync
+  for 0.02 to 0.03 s of each (the same ledger, "`dfa77fe` against dcrd
+  v2.1.7, with the exists-address index on and off"). So
   the rest of this passage explains the gap as it was measured on m1 in
   2026-08. It has not been re-measured there, and on m3 the node is not
   flush-bound.) A task-state decomposition on 2026-08-15 measured the
