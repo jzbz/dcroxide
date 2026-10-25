@@ -134,3 +134,18 @@ moves left their other exporters as scratch code. The five are
 `tools/chainopsgen` and `tools/disapprovalgen`, each an overlay that runs
 inside a dcrd checkout's own package and writes its committed files back byte
 for byte when run at the pin.
+
+## Addendum, 2026-10-25 — pin, oracle and battery generator at `3360ae4d`, toward the unreleased v2.2
+
+The parity target is now dcrd v2.2, which upstream has not yet released, so
+the pin follows master until v2.2 is tagged, moving at upstream milestones
+and on the owner's word. It moved to master `3360ae4d`, one commit past
+`382ff4dd`, which changes only `internal/rpcserver` in dcrd's root module, and
+`tools/oracle/go.mod` and `tools/fullblockgen/go.mod` moved with it, as
+`the_dcrd_pin_matches_ci_and_the_oracle` requires. The split was checked again
+rather than carried forward: no module was tagged after `382ff4dd` and no
+linked module's directory changed, so every pseudo-pinned module moved to the
+new commit, nine in the oracle and seven in `fullblockgen`, and each one's
+files, as the module proxy serves them, are byte-identical at both commits. No
+exporter was run again: none runs in `internal/rpcserver`, and no vector file
+changed.

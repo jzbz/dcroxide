@@ -961,7 +961,7 @@ pub fn serve_websocket<S: Read + Write + Send>(
         return;
     }
     // The origin check sits between the version and the key, and dcrd
-    // supplies its own (`rpcserver.go:5972-6007`).
+    // supplies its own (`rpcserver.go:5976-6011`).
     if !crate::rpcrun::check_origin(head) {
         let _ = write_handshake_error(&mut stream, "403 Forbidden", "Forbidden");
         return;
@@ -980,7 +980,7 @@ pub fn serve_websocket<S: Read + Write + Send>(
     // handshake -- "client sent data before handshake is complete"
     // (`gorilla/websocket@v1.5.1 server.go:186-191`) -- which dcrd
     // surfaces only as a log line, never as a response
-    // (`rpcserver.go:6009-6015`).  Without this the declared bytes are
+    // (`rpcserver.go:6013-6019`).  Without this the declared bytes are
     // read as the first RFC 6455 frames, so a proxy that forwarded them
     // as a `Content-Length` body and this server disagree about where
     // the request ended.
@@ -1141,7 +1141,7 @@ fn serve_ws_reads<S: Read + Write>(
 ) {
     // The connection's read limit, gorilla's `readLimit`: set at the
     // upgrade from whether the client arrived authenticated
-    // (`rpcserver.go:6036-6040`), and raised after that only by the
+    // (`rpcserver.go:6040-6044`), and raised after that only by the
     // single-request authenticate arm (`rpcwebsocket.go:1496-1497`).  It
     // is not the authenticated flag -- dcrd's batch arm authenticates a
     // client without raising it, so one that authenticated in a batch
@@ -1196,9 +1196,9 @@ fn serve_ws_reads<S: Read + Write>(
         // websocket-only table, and getwork is not in that table
         // (`rpcwebsocket.go:1807-1819`).
         //
-        // That context is the UPGRADE request's (`rpcserver.go:6041`
+        // That context is the UPGRADE request's (`rpcserver.go:6045`
         // passing `r.Context()`), which descends from the server's
-        // through `BaseContext` (`rpcserver.go:5921-5927`), so shutdown
+        // through `BaseContext` (`rpcserver.go:5925-5931`), so shutdown
         // cancels it.
         //
         // dcrd also reaches it on a client hangup, but only where it
@@ -1858,7 +1858,7 @@ fn valid_ws_key(key: &str) -> bool {
 /// status text as the message -- so text/plain, the sniffing opt-out,
 /// and the trailing newline `Fprintln` adds.  The reason gorilla builds
 /// goes into the error it returns to the caller, never into the
-/// response, and dcrd only logs it (`rpcserver.go:6010-6015`).
+/// response, and dcrd only logs it (`rpcserver.go:6014-6019`).
 fn write_handshake_error<S: Write>(
     stream: &mut S,
     status: &str,

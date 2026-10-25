@@ -16,9 +16,9 @@
 //!   first hybrid, behind the `tlssecpmlkem` setting, and 2.1.7 keeps them
 //!   off: its `debug.go` sets `//go:debug default=go1.25`, which restores
 //!   Go 1.25's value of every setting changed since, `tlssecpmlkem=0`
-//!   among them (`internal/godebugs/table.go`).  At `382ff4dd`, the parity
-//!   target, and on master, `debug.go` sets `default=go1.26`, so a build
-//!   of either offers all three hybrids.
+//!   among them (`internal/godebugs/table.go`).  At `3360ae4d`, the parity
+//!   pin, as on master, `debug.go` sets `default=go1.26`, so a build
+//!   there offers all three hybrids.
 //! * In TLS 1.3 it takes the first of those the client supports, after
 //!   moving the groups the client sent a key share for ahead of the rest
 //!   and the hybrids ahead of everything, and asks for a key share with a

@@ -5233,8 +5233,8 @@ impl Drop for PreAuthSlot {
 /// `http: TLS handshake error from %s: %v` to the server's `ErrorLog`
 /// (`net/http/server.go:1985`), which dcrd points at a writer that logs
 /// each line at error level through the RPC server's logger, its trailing
-/// newline trimmed (`logForwarder`, `internal/rpcserver/rpcserver.go:5881-5888`,
-/// installed at `:5934`), and that logger is RPCS (`log.go:96`).
+/// newline trimmed (`logForwarder`, `internal/rpcserver/rpcserver.go:5885-5892`,
+/// installed at `:5938`), and that logger is RPCS (`log.go:96`).
 ///
 /// Every refusal is logged, unthrottled, as dcrd logs it, like the
 /// authentication-failure warning and unlike the shed lines: a filter
@@ -5414,7 +5414,7 @@ const TLS_CLOSE_NOTIFY_TIMEOUT: Duration = Duration::from_secs(5);
 ///
 /// dcrd's every close of an RPC connection goes through `tls.Conn` --
 /// `conn.serve`'s own close, the hijacked JSON-RPC connection's `defer
-/// conn.Close()` (`rpcserver.go:5714`), and the websocket's -- while
+/// conn.Close()` (`rpcserver.go:5718`), and the websocket's -- while
 /// rustls's `StreamOwned` has no `Drop` and so ends every session in a
 /// bare FIN.  A client that frames a reply by the close (every answer
 /// Go's connection loop writes, and the hijacked JSON-RPC reply) then
@@ -5773,7 +5773,7 @@ enum ChunkedBody {
 enum ChunkError {
     /// The framing broke one of Go's rules.  The text is Go's own
     /// error, which dcrd answers as `400 error reading JSON message:
-    /// <err>` (`rpcserver.go:5678-5686`).
+    /// <err>` (`rpcserver.go:5682-5690`).
     Malformed(String),
     /// The stream failed, closed, or ran out the deadline.
     Io,
@@ -6503,7 +6503,7 @@ fn read_head_byte<S: Read + SocketTimeout>(
 }
 
 /// Where a request target sends the connection.  dcrd registers two
-/// patterns and nothing else (`rpcserver.go:5936`, `:5961`), so this is
+/// patterns and nothing else (`rpcserver.go:5940`, `:5965`), so this is
 /// the whole of its mux.
 enum Route {
     /// The `/ws` pattern.
@@ -7407,7 +7407,7 @@ fn read_http_head<S: Read + SocketTimeout>(
         if name.eq_ignore_ascii_case("authorization") {
             // Go's header map keeps every occurrence in arrival
             // order and dcrd authenticates against `authhdr[0]`
-            // (`rpcserver.go:5525-5536`), so a duplicate header
+            // (`rpcserver.go:5529-5540`), so a duplicate header
             // never displaces the first.  Overwriting here would
             // hand the decision to whichever copy arrived last --
             // behind a reverse proxy that injects its own
@@ -7452,7 +7452,7 @@ fn read_http_head<S: Read + SocketTimeout>(
             head.sec_websocket_version.push(value.to_string());
         } else if name.eq_ignore_ascii_case("origin") {
             // dcrd's `CheckOrigin` reads `r.Header["Origin"][0]`
-            // (`rpcserver.go:5975-5982`), so a decoy first copy is
+            // (`rpcserver.go:5979-5986`), so a decoy first copy is
             // the one that decides -- taking the last would let a
             // cross-origin page slip a permitted value in behind
             // it and open a websocket dcrd answers 403 to.
@@ -7710,7 +7710,7 @@ fn is_token_octet(b: u8) -> bool {
 }
 
 /// Whether a websocket upgrade's `Origin` header is allowed: dcrd's
-/// `CheckOrigin` (`rpcserver.go:5973-6007`), which parses the first
+/// `CheckOrigin` (`rpcserver.go:5977-6011`), which parses the first
 /// `Origin` copy with `url.Parse`.
 ///
 /// Only a *missing* header is allowed outright (dcrctl and other
@@ -7791,7 +7791,7 @@ fn host_without_port(host_port: &[u8]) -> &[u8] {
     host
 }
 
-/// dcrd's `equalASCIIFold` (`rpcserver.go:5890-5913`): rune by rune as
+/// dcrd's `equalASCIIFold` (`rpcserver.go:5894-5917`): rune by rune as
 /// `utf8.DecodeRuneInString` decodes them -- each invalid byte its own
 /// U+FFFD, which [`dcroxide_dcrjson::gojson::coerce_utf8`] reproduces --
 /// equal when the runes match after folding ASCII upper case.
@@ -7891,7 +7891,7 @@ fn serve_rpc_connection<S: Read + Write + SocketTimeout + Send>(
     }
 
     // dcrd's mux sends `/ws` to the websocket handler and everything
-    // else to the JSON-RPC handler (`rpcserver.go:5936`, `:5961`), so
+    // else to the JSON-RPC handler (`rpcserver.go:5940`, `:5965`), so
     // the path alone decides here too.  A `/ws` request that is not a
     // valid upgrade is gorilla's to refuse -- it must not fall through
     // to the RPC endpoint, which would answer a different status for
@@ -8120,7 +8120,7 @@ fn serve_rpc_connection<S: Read + Write + SocketTimeout + Send>(
             match read {
                 Ok(body) => body,
                 // dcrd answers a body `io.ReadAll` could not read with the
-                // reader's own error (`rpcserver.go:5678-5686`).
+                // reader's own error (`rpcserver.go:5682-5690`).
                 Err(Some(err)) => {
                     let _ = write_handler_error(
                         &mut stream,
@@ -8143,7 +8143,7 @@ fn serve_rpc_connection<S: Read + Write + SocketTimeout + Send>(
     watchdog.disarm();
 
     // dcrd hands the body to `json.Unmarshal` as it arrived
-    // (`rpcserver.go:5742`, `:5765`), so invalid UTF-8 inside a string is
+    // (`rpcserver.go:5746`, `:5769`), so invalid UTF-8 inside a string is
     // served, and a stray byte elsewhere is Go's syntax error, answered
     // as either arm answers one: "1.0" for a single request, "2.0" for a
     // body starting `[`.
@@ -8288,7 +8288,7 @@ fn client_hung_up(sock: Option<&TcpStream>) -> bool {
 /// (`server.go:3868`), and `jsonRPCRead` hijacks the connection -- which
 /// ends `net/http`'s own background read -- and watches it with a
 /// goroutine of its own that reads one byte *through* TLS
-/// (`rpcserver.go:5705-5727`), so a `close_notify` surfaces as `io.EOF`
+/// (`rpcserver.go:5709-5731`), so a `close_notify` surfaces as `io.EOF`
 /// and cancels the request's context.  That goroutine returns without
 /// cancelling on the first byte it does read, so once a client has sent
 /// a byte past its request dcrd no longer notices it hang up; this probe
@@ -8516,11 +8516,11 @@ impl RequestCancelWatch {
 }
 
 /// Write the JSON-RPC reply the way dcrd writes it, by hand on the
-/// hijacked connection (`rpcserver.go:5858`): `httpStatusLine`'s status
+/// hijacked connection (`rpcserver.go:5862`): `httpStatusLine`'s status
 /// line, which mirrors the request's protocol so an HTTP/1.0 request is
-/// answered `HTTP/1.0 200 OK` (`:5316-5348`), then the handler's header
+/// answered `HTTP/1.0 200 OK` (`:5320-5352`), then the handler's header
 /// map written by `Header.Write` -- the `Connection` and `Content-Type`
-/// the `/` handler set (`:5937-5938`), in its sorted order -- and the
+/// the `/` handler set (`:5941-5942`), in its sorted order -- and the
 /// body.  Nothing else: no `Date` and no `Content-Length`, since no
 /// `ResponseWriter` is involved, so the body runs to the close.  It is
 /// the one response that carries dcrd's `application/json`; error
@@ -8613,7 +8613,7 @@ fn write_unauthorized<S: Write>(
     version: (u32, u32),
 ) -> std::io::Result<()> {
     // dcrd adds the challenge and then answers through `http.Error`
-    // (`jsonAuthFail`, `rpcserver.go:5874-5877`), so the body, the
+    // (`jsonAuthFail`, `rpcserver.go:5878-5881`), so the body, the
     // content type, and the sniffing opt-out are that helper's.
     write_handler_error_with(
         stream,
@@ -8729,7 +8729,7 @@ fn write_protocol_error<S: Write>(stream: &mut S, status: &str, body: &str) -> s
 /// by its `Fprintln`.  The `Content-Length` is there because the
 /// response writer buffers a body this small and fills it in, and
 /// `Connection: close` because dcrd's handlers set it on every reply
-/// (`rpcserver.go:5937`).  The status line mirrors the request's
+/// (`rpcserver.go:5941`).  The status line mirrors the request's
 /// protocol, and a HEAD gets the same `Content-Length` but no body: the
 /// writer measures what the handler wrote and then eats it
 /// (`server.go:377-384`, `:1382`).
@@ -12980,7 +12980,7 @@ mod tests {
     /// without unread data pending -- the pipelined-request case, which
     /// dcrd does NOT treat as a hangup: the goroutine watching its
     /// hijacked connection cancels only when its one-byte read fails, and
-    /// a byte arriving ends the watch instead (`rpcserver.go:5722-5727`).
+    /// a byte arriving ends the watch instead (`rpcserver.go:5726-5731`).
     #[test]
     #[cfg(any(unix, windows))]
     fn a_live_connection_is_not_reported_gone() {

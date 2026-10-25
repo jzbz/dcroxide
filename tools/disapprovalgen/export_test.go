@@ -50,7 +50,9 @@ import (
 )
 
 // exportNow is block one's timestamp and the chain's adjusted time: the time
-// of the parity pin's commit, 2026-10-13 22:36:39 UTC.
+// of 382ff4dd's commit, the parity pin when the file was generated,
+// 2026-10-13 22:36:39 UTC.  It stays fixed when the pin moves, so the clock
+// adds no difference of its own at a later pin.
 var exportNow = time.Unix(1791930999, 0)
 
 // exportTimeSource is a MedianTimeSource fixed at exportNow.

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: ISC
 //! Daemon assembly, ported from dcrd's package main and the internal
-//! packages it wires together, at the parity pin, master `382ff4dd`:
+//! packages it wires together, at the parity pin, master `3360ae4d`:
 //!
 //! - configuration: the network parameter groupings with their RPC
 //!   ports (`params`), the go-flags v1.6.1 command line and INI

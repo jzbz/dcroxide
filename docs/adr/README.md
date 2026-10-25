@@ -6,7 +6,7 @@ than rewriting what was decided. Use [template.md](template.md).
 
 ## Index
 
-- [ADR-0001](0001-oracle-driven-differential-testing.md) — Oracle rig: Go shim over line-JSON, pinned to dcrd `release-v2.1.5` *(Accepted; addendum 2026-07-26 — re-pinned to master `452c1a6c`; addenda 2026-08-20 through 2026-10-16 — the target's five later moves, the oracle with it from `036b7090` on; both now at master `382ff4dd`)*
+- [ADR-0001](0001-oracle-driven-differential-testing.md) — Oracle rig: Go shim over line-JSON, pinned to dcrd `release-v2.1.5` *(Accepted; addendum 2026-07-26 — re-pinned to master `452c1a6c`; addenda 2026-08-20 through 2026-10-25 — the pin's six later moves, the oracle with it from `036b7090` on; both now at master `3360ae4d`, toward the unreleased v2.2)*
 - [ADR-0002](0002-vendor-blake256-from-dcr-rs.md) — Vendor BLAKE-256 from dcr-rs *(Accepted)*
 - [ADR-0003](0003-slice-based-wire-decoding.md) — Slice-based wire decoding with consumed-length semantics *(Accepted; addendum 2026-07-26 — framing bounds per message type)*
 - [ADR-0004](0004-storage-backend.md) — D1: dcrd's database semantics over `redb`, flat block files, fresh-sync C6 stance *(Accepted; amended 2026-07-26, then dated addenda through 2026-08-15 including one retraction and several corrections — the status block and the "Findings as of" section at the top carry the current state. Its revisit gate was **satisfied and closed 2026-08-17: the engine stays redb**. Now on redb 4.3.0; the move from 2.x to 4 changed the on-disk format. Addendum 2026-10-08 — height-first keys moved to ADR-0010, for write shape, not size, and the payload comparison qualified by their four key bytes. Addendum 2026-10-10 — a later sync comparison on another machine, against dcrd release v2.1.6: dcroxide 2.71x as fast, its metadata flushes 15–16% of wall time (68% on the 2026-08 machine), its data directory 1.15x dcrd's; the 1.29x and ~48% of 2026-08 are not re-measured and the decision is unchanged. Addendum 2026-10-10 (second) — later that day on the same machine: dcrd at the parity commit `6f6cf21b` took 0.9% longer than v2.1.6 (dcroxide 2.73x as fast); with the exists-address index off, one run each, dcroxide was 1.42x as fast, the index being 80% of the difference at the defaults; of lever (c)'s two ceilings, `--utxocachemaxsize=1200` came 3.7% under the default time and `DCROXIDE_DB_OVERLAY=800` no faster, one run each. Addendum 2026-10-11 — a UTXO cache flush that only the size limit tripped no longer forces a commit, and the overlay's default ceiling is 300 MiB: three default syncs on m3 took a median of 728.7 s with 54 flushes where the code before took 775.6 s with 133, at 450–650 MiB more peak memory with the exists-address index on; what an unclean stop during catch-up loses grew to about 120 s of processing. Addendum 2026-10-12 — on a data directory without copy-on-write the code of that change, `b4a5d2d`, took 714.1 s against 728.5 s, one run each, 2.0% less where the code before it had 5.0%; a reduced background commit, built in a scratch tree only, was 28.3 s and 30.5 s faster than its control in one pair of syncs on each of two builds, one run against one run, at 981 and 748 MiB more peak memory, and was not adopted; the decision is unchanged. Addendum 2026-10-16 — the background commit in the form with a read snapshot, on a build that does what `8fc9160` does, took 389.55 s against 429.45 s, four runs each, 9.3% less, faster in every pairing, at 27 s more process CPU time and about 256 MiB more peak memory to the tip; only m3's storage was measured; kept, on by default in the daemon; the decision is unchanged.)*
@@ -31,12 +31,15 @@ than rewriting what was decided. Use [template.md](template.md).
   gates final ratification, and each carries a dated addendum recording what
   shipped: D4 diverged from its draft, D3 did not. Ratifying them, or
   superseding them, is the project owner's call.
-- **D5** — Upstream tracking cadence. The port has followed dcrd master twice
-  (`release-v2.1.5` → `452c1a6c` → `29f17894`, version 2.2.0-pre); the
-  standing cadence is still undecided. The mechanical half is no longer
-  manual: `tools/pinbump` resolves an upstream delta to the crates that
-  port it through PARITY.md's table, so a bump starts from a review list.
-  What remains undecided is how often to look, not how to look.
+- **D5** — Upstream tracking cadence. The pin has moved seven times, from
+  `release-v2.1.5` through `452c1a6c`, `29f17894`, `036b7090`, `b9634e01`,
+  `6f6cf21b` and `382ff4dd` to master `3360ae4d` (version 2.2.0-pre). On
+  2026-10-25 the owner made dcrd v2.2 the target and set the cadence until
+  it is released: the pin moves at upstream milestones and on the owner's
+  word. The cadence once v2.2 lands is still undecided. The mechanical half
+  is no longer manual: `tools/pinbump` resolves an upstream delta to the
+  crates that port it through PARITY.md's table, so a bump starts from a
+  review list.
 - **D6** — dcr-rs relationship (upstream vs. fork) — partially covered by ADR-0002
 - **D7** — MSRV, platform tiers, release signing/reproducibility (MSRV
   currently the pinned toolchain itself, 1.98.1, via workspace

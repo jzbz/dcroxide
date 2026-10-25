@@ -2,7 +2,7 @@
 
 **A full Rust re-implementation of the Decred full-node daemon (`dcrd`), built as a drop-in replacement.**
 
-Prepared for the implementing developer/team. Parity target: **dcrd master `382ff4dd`** (version `2.2.0-pre`) — moved up six times, from the `release-v2.1.5` tag this plan was originally written against and then through `452c1a6c`, `29f17894`, `036b7090`, `b9634e01` and `6f6cf21b`; see the status block below. Wire protocol version **12**, JSON-RPC API version **8.3.0**.
+Prepared for the implementing developer/team. Parity target: **dcrd v2.2**, which upstream has not yet released, so the pin follows dcrd master until v2.2 is tagged: now **`3360ae4d`** (version `2.2.0-pre`) — moved up seven times, from the `release-v2.1.5` tag this plan was originally written against and then through `452c1a6c`, `29f17894`, `036b7090`, `b9634e01`, `6f6cf21b` and `382ff4dd`; see the status block below. Wire protocol version **12**, JSON-RPC API version **8.3.0**.
 
 ---
 
@@ -44,13 +44,14 @@ P2P server with sync, relay, and StakeShuffle mixing message relay, the
 JSON-RPC/websocket server, the tool commands, the pipe IPC lifecycle, and the
 Windows service wrapper. The gate runs 2,682 tests across 453 suites on Linux,
 most of them differential against dcrd or replaying sessions generated inside dcrd's own
-packages. The parity target moved six times during the port, from
+packages. The parity pin moved seven times during the port, from
 `release-v2.1.5` to upstream master `452c1a6c` and then through `29f17894`,
-`036b7090`, `b9634e01` and `6f6cf21b` to `382ff4dd` (2.2.0-pre); the oracle
-rig was re-pinned for the first move, kept at `452c1a6c` for the second, since
-nothing in that delta changes what the exporters emit, and has moved with the
-target since, so it now links `382ff4dd` (see PARITY.md and
-`tools/oracle/go.mod`).
+`036b7090`, `b9634e01`, `6f6cf21b` and `382ff4dd` to `3360ae4d` (2.2.0-pre); the
+target is now dcrd v2.2, which upstream has not yet released, so the pin follows
+master until v2.2 is tagged. The oracle rig was re-pinned for the first move,
+kept at `452c1a6c` for the second, since nothing in that delta changes what the
+exporters emit, and has moved with the pin since, so it now links `3360ae4d`
+(see PARITY.md and `tools/oracle/go.mod`).
 
 Work from earlier phases that is genuinely still outstanding. "Complete" above
 means the implementation work of those phases is done; several of their written
@@ -69,22 +70,22 @@ exit criteria have not been demonstrated, and those are listed here too:
   on loopback: `dcrctl` 2.1.7 sent 2,731 calls, covering 1,287 argument sets
   over all 77 chain-server commands, their `help` and four wallet-only command
   names, to dcrd and to `b49145e` on a simnet chain dcrd built to height 341,
-  and every reply that differed followed dcrd master's source at the parity pin,
-  `382ff4dd`, came from the unported profile server or the missing inventory
-  trickle delay below, or matched a second dcrd given the same role and history;
-  two `dcrwallet` 2.1.7 wallets in RPC mode made transfers, bought tickets and
-  voted on simnet to height 519 with `b49145e` as their node, passing every step
-  they passed with dcrd; and dcrd's own `TestRpcServer` and `TestTreasury`, from
-  dcrd master at `3360ae4d`, pointed through the `dcrdtest` harness at a dcrd
-  built from that tree, the 2.1.7 binary and `b49145e`, passed against all
-  three. Decrediton 2.1.7, in remote-daemon mode, connected over loopback
-  straight to `58bd107`, which had synced mainnet from a dcrd node on the LAN,
-  made a wallet that never held funds, and showed the node's height, ticket
-  price and peer count. The checks of `b49145e` found nine differences from
-  2.1.7. Later commits fixed six: no P-521 key exchange, refused handshakes not
-  logged and a TLS 1.3 suite order other than Go's, all in the RPC listener; the
-  mempool's and template generator's missing lines below info; the missing log
-  file; and `startprofiler`'s internal error and skipped address checks, the
+  and every reply that differed followed dcrd master's source at the parity pin
+  then, `382ff4dd`, came from the unported profile server or the missing
+  inventory trickle delay below, or matched a second dcrd given the same role
+  and history; two `dcrwallet` 2.1.7 wallets in RPC mode made transfers, bought
+  tickets and voted on simnet to height 519 with `b49145e` as their node,
+  passing every step they passed with dcrd; and dcrd's own `TestRpcServer` and
+  `TestTreasury`, from dcrd master at `3360ae4d`, pointed through the `dcrdtest`
+  harness at a dcrd built from that tree, the 2.1.7 binary and `b49145e`, passed
+  against all three. Decrediton 2.1.7, in remote-daemon mode, connected over
+  loopback straight to `58bd107`, which had synced mainnet from a dcrd node on
+  the LAN, made a wallet that never held funds, and showed the node's height,
+  ticket price and peer count. The checks of `b49145e` found nine differences
+  from 2.1.7. Later commits fixed six: no P-521 key exchange, refused handshakes
+  not logged and a TLS 1.3 suite order other than Go's, all in the RPC listener;
+  the mempool's and template generator's missing lines below info; the missing
+  log file; and `startprofiler`'s internal error and skipped address checks, the
   profile server itself staying unported. Three remain: inventory sent without
   dcrd's trickle delay, as PARITY.md records; the `addnode`/`node` behavior,
   reported versions and `debuglevel` subsystems of dcrd master, which the port
@@ -425,7 +426,7 @@ it with funds.**
 | Item | Fact |
 |---|---|
 | Reference implementation | [decred/dcrd](https://github.com/decred/dcrd), Go, ISC license, in production since Feb 2016, ~7,300 commits |
-| Parity target | Planned as the `release-v2.1.5` tag (Apr 2026), tracking upstream releases thereafter. It did move: the target is now master `382ff4dd` (2.2.0-pre), reached via `452c1a6c`, `29f17894`, `036b7090`, `b9634e01` and `6f6cf21b` |
+| Parity target | Planned as the `release-v2.1.5` tag (Apr 2026), tracking upstream releases thereafter. It did move: the target is now dcrd v2.2, not yet released, so the pin follows master, now `3360ae4d` (2.2.0-pre), reached via `452c1a6c`, `29f17894`, `036b7090`, `b9634e01`, `6f6cf21b` and `382ff4dd` |
 | Implementation size | ~168,000 lines of non-test Go; ~134,000 lines of Go tests |
 | Protocol facts | P2P wire protocol 12 (mixing added at v10, batched cfilters at v11); JSON-RPC API semver 8.3.0; mainnet ports 9108 (p2p) / 9109 (RPC) |
 | RPC surface | 77 HTTP methods + 17 websocket methods, spec in `docs/json_rpc_api.mediawiki` |
@@ -523,7 +524,7 @@ Every task in this project serves one of six compatibility surfaces. They are li
 4. **Memory safety as a feature.** `#![forbid(unsafe_code)]` in all dcroxide crates; `unsafe` allowed only inside vetted third-party dependencies, tracked via `cargo-deny`/`cargo-vet`/`cargo-audit` in CI. This is a headline advantage of the project — protect it. One audited exception exists: `dcroxide-winsvc` denies rather than forbids `unsafe_code`, for the `windows-service` entry macro's shim and for the Windows console control handler and pipe-handle adoption that std does not wrap, each unsafe block allowed individually with a `SAFETY` comment ([ADR-0008](adr/0008-clippy-lint-policy.md)'s 2026-09-25 addendum).
 5. **Consensus code is boring code.** No cleverness in validation paths: explicit integer widths, checked arithmetic mirroring dcrd's `checkedmath`, no floating point anywhere near consensus, deterministic iteration orders, and exhaustive error enums mapped 1:1 to dcrd's error kinds (RPC and reject messages leak error identity — parity matters).
 6. **DoS posture parity.** dcrd's limits (message sizes, orphan pools, ban scores, per-peer rate limits, mixpool limits, APBF sizing) are consensus-adjacent: divergence lets an attacker partition mixed networks. Port limits verbatim; test them.
-7. **Pin, then track.** All parity claims reference one pinned upstream commit — `release-v2.1.5` when this plan was written, master `382ff4dd` now. A standing "upstream watch" task reviews every dcrd release/merged consensus PR and files parity issues. A `PARITY.md` ledger maps each dcrd package to its dcroxide crate and status.
+7. **Pin, then track.** All parity claims reference one pinned upstream commit — `release-v2.1.5` when this plan was written, now master `3360ae4d`: the target is dcrd v2.2, which upstream has not yet released, and the pin follows master until v2.2 is tagged. A standing "upstream watch" task reviews every dcrd release/merged consensus PR and files parity issues. A `PARITY.md` ledger maps each dcrd package to its dcroxide crate and status.
 
 ---
 
@@ -785,13 +786,15 @@ pins this policy asks for.
 >   dumped from inside dcrd's own packages rather than captured from a running
 >   node.
 > - **D5** (upstream tracking cadence) and **D7** (MSRV, platform tiers,
->   release signing and reproducibility) have no ADR. Facts on the ground:
->   the parity target did move to master `452c1a6c` and on through `29f17894`,
->   `036b7090`, `b9634e01` and `6f6cf21b` to `382ff4dd`,
->   MSRV is the pinned toolchain itself, 1.98.1, through the workspace
->   `rust-version`, with no separate CI job, and CI tests on Linux, macOS, and
->   Windows. Release signing
->   and reproducible builds are neither decided nor built.
+>   release signing and reproducibility) have no ADR. Facts on the ground: the
+>   parity pin did move to master `452c1a6c` and on through `29f17894`,
+>   `036b7090`, `b9634e01`, `6f6cf21b` and `382ff4dd` to `3360ae4d`; on
+>   2026-10-25 the owner made dcrd v2.2 the target and set the cadence until
+>   it is released, that the pin moves at upstream milestones and on the
+>   owner's word, while D5's question for after v2.2 lands stays open; MSRV is
+>   the pinned toolchain itself, 1.98.1, through the workspace `rust-version`,
+>   with no separate CI job, and CI tests on Linux, macOS, and Windows.
+>   Release signing and reproducible builds are neither decided nor built.
 > - **D6** is partially covered by
 >   [ADR-0002](adr/0002-vendor-blake256-from-dcr-rs.md): dcr-rs is
 >   vendored at a pinned commit with attribution.
@@ -847,10 +850,11 @@ ticket sets, the chain and stake state and the exists-address set were equal
 at the tip ([docs/bench-ledger.md](bench-ledger.md), "Per-block comparison
 with dcrd, genesis to block 1,116,035"). It compares stored records, not chain
 state recomputed at each height, and leaves the transaction index out, since
-dcrd's store has none; the dcrd that wrote that store is 70 commits behind the
-parity pin, commits that change no row format but do change behaviour; and the
-sync, at the defaults, validated in full only the blocks after the assume-valid
-block. Read the acceptance column, not the phase list, when judging readiness.
+dcrd's store has none; the dcrd that wrote that store is 70 commits behind
+`382ff4dd`, the parity pin then, and 71 behind `3360ae4d`, commits that change
+no row format but do change behaviour; and the sync, at the defaults, validated
+in full only the blocks after the assume-valid block. Read the acceptance
+column, not the phase list, when judging readiness.
 
 Sizing guidance (not a promise): M1 and M2 are each on the order of several engineer-months for a strong systems-Rust developer already fluent in Bitcoin-family internals; P4 and P8 dominate. Calendar estimates should be produced by the developer after Phase 0/1, when the oracle rig gives real porting-velocity data.
 

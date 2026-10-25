@@ -4,12 +4,12 @@
 // mempool test harness (`newPoolHarness` and its fake chain): the scripted
 // sessions are run against dcrd's real `TxPool`, and every chain mutation,
 // pool call and resulting pool state is written as one row, so the
-// expectations in the files are dcrd's at the parity target, not this
+// expectations in the files are dcrd's at the parity pin, not this
 // project's reading of them.
 //
 // It is an overlay, not a module: it belongs to dcrd's `internal/mempool`
 // package and uses the harness that package's tests define.  To regenerate,
-// copy it into `internal/mempool` of a dcrd checkout at the parity target and
+// copy it into `internal/mempool` of a dcrd checkout at the parity pin and
 // run, from the checkout's root,
 //
 //	MEMPOOL_VECTORS_DIR=<dir> go test -run TestExportMempoolVectors ./internal/mempool/
@@ -23,7 +23,7 @@
 // median time is fixed to the one the files have carried since they were
 // first dumped, and the treasury spends' uniqueness nonce, which dcrd's
 // `createTSpend` draws from math/rand, is replaced by the nonces those files
-// carry.  So a run at an unchanged parity target reproduces the files byte for
+// carry.  So a run at an unchanged parity pin reproduces the files byte for
 // byte, and a run after a move shows exactly what the move changed.
 //
 // The stake and agenda files are sections, each opened by a `net <name>` row
@@ -114,7 +114,7 @@ import (
 )
 
 // The median times the sessions run at: the ones the files were first dumped
-// with, kept so a regeneration changes only what the parity target changes.
+// with, kept so a regeneration changes only what moving the pin changes.
 const (
 	vdTxPoolMedianTime = 1783313288
 	vdStakeMedianTime  = 1783314311

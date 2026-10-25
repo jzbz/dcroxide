@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: ISC
 //! Differential test: the full canonical parameter dump of all four
 //! networks, byte for byte, against the identical dump emitted by dcrd's
-//! own `chaincfg` (`chaincfg/v3` at the parity pin, master `382ff4dd`,
+//! own `chaincfg` (`chaincfg/v3` at the parity pin, master `3360ae4d`,
 //! as `tools/oracle/go.mod` pins it) through the
 //! oracle. This covers every `Params` field including the serialized
 //! genesis block, the complete deployment/vote/choice definitions, and a

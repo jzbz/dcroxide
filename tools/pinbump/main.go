@@ -3,7 +3,7 @@
 // Command pinbump reports which dcroxide crates a dcrd parity-pin bump
 // touches.
 //
-// Moving the parity target means reading the upstream delta and deciding
+// Moving the parity pin means reading the upstream delta and deciding
 // which parts of this port need re-reading. Done by hand that is a whole-diff
 // review whose completeness rests on one person's memory of what maps where.
 // PARITY.md already carries the mapping — one row per dcrd package, naming

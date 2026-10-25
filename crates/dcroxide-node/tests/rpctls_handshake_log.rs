@@ -6,7 +6,7 @@
 //! failed handshake as `http: TLS handshake error from <addr>: <err>`
 //! (`net/http/server.go:1985`) to the server's `ErrorLog`, which dcrd
 //! forwards to the RPCS logger at error level (`logForwarder`,
-//! `internal/rpcserver/rpcserver.go:5881-5888`).  The port logged nothing
+//! `internal/rpcserver/rpcserver.go:5885-5892`).  The port logged nothing
 //! for any of them.  The `<err>` is Go's own text for each failure here:
 //! a client that closes without a word, one that speaks plain HTTP (which
 //! net/http also answers with a 400), one that rejects the certificate,

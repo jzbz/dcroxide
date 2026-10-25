@@ -14,9 +14,10 @@
 //! - getrawmempool reports the pool's cached transaction hash;
 //! - getrawtransaction's deserialization failure carries Go's error
 //!   text, not a Rust Debug rendering;
-//! - the two recorded divergences stay what PARITY.md says they are:
-//!   sendrawtransaction reads an explicit null `allowhighfees` as false,
-//!   and submitblock hands on only the block, not trailing bytes.
+//! - sendrawtransaction reads an explicit null `allowhighfees` as false,
+//!   as dcrd has since `3360ae4d`, and the recorded divergence for
+//!   submitblock stays what PARITY.md says: it hands on only the block,
+//!   not trailing bytes.
 
 use std::sync::Mutex;
 
@@ -529,12 +530,12 @@ fn getrawtransaction_deserialize_failure_carries_gos_text() {
 }
 
 // ---------------------------------------------------------------------
-// Recorded divergences.
+// A former divergence, and a recorded one.
 // ---------------------------------------------------------------------
 
-/// dcrd dereferences the nil `AllowHighFees` an explicit null leaves
-/// and panics; the port reads it as false and processes the
-/// transaction (PARITY.md, deliberate divergences).
+/// An explicit null leaves `AllowHighFees` nil, which the port reads as
+/// false, processing the transaction; dcrd dereferenced the nil and
+/// panicked until `3360ae4d`, which reads it as false too.
 #[test]
 fn sendrawtransaction_null_allowhighfees_reads_as_false() {
     let sync: &'static MockSync = Box::leak(Box::default());

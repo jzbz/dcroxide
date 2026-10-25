@@ -2827,12 +2827,10 @@ pub fn handle_send_raw_transaction<C: RpcChain>(
     let c = fields(cmd);
     let hex_tx = s(&c[0]);
     // An explicit JSON null leaves `AllowHighFees` nil (defaults fill
-    // only absent trailing params), and dcrd's first statement,
-    // `allowHighFees := *c.AllowHighFees`, dereferences it: a panic that
-    // net/http recovers by dropping the connection and that kills dcrd
-    // outright on the websocket path.  The port reads nil as false and
-    // processes the transaction instead (PARITY.md, deliberate
-    // divergences).
+    // only absent trailing params), which dcrd has read as false
+    // (`rpcserver.go:4403-4406`) since `3360ae4d`; before it, dcrd
+    // dereferenced the nil and panicked.  The port has always read it as
+    // false and processed the transaction.
     let allow_high_fees = opt_bool(&c[1]).unwrap_or(false);
 
     // Deserialize and send off to tx relay.

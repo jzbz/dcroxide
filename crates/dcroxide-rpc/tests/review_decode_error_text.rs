@@ -4,9 +4,9 @@
 //!
 //! dcrd's handlers print the wire error's own text: `decoderawtransaction`
 //! and `sendrawtransaction` answer `rpcDeserializationError("Could not
-//! decode Tx: %v", err)` (`rpcserver.go:1418`, `:4415`), `submitblock`
+//! decode Tx: %v", err)` (`rpcserver.go:1418`, `:4419`), `submitblock`
 //! answers `rpcInternalErr(err, "Block decode")`, which returns
-//! `err.Error()` alone (`rpcserver.go:414-421`, `:4586`),
+//! `err.Error()` alone (`rpcserver.go:414-421`, `:4590`),
 //! `getrawtransaction` does the same for a stored transaction that does
 //! not decode (`rpcserver.go:3036-3039`), and `sendrawmixmessage` answers
 //! `rpcDeserializationError("Could not decode mix message: %v", err)`

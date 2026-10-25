@@ -245,7 +245,7 @@ fn every_kernel_entropy_read_in_the_daemon_crate_is_accounted_for() {
 
     // The RPC rand_u64 closure is the seventh converted, taking the
     // auth HMAC key with it: dcrd draws both from the package global
-    // (`internal/rpcserver/rpcserver.go:4269`, `:6234-6235`).  The
+    // (`internal/rpcserver/rpcserver.go:4269`, `:6238-6239`).  The
     // file keeps one read, the startup credential write, which is why
     // it is still listed above rather than asserted absent.
     //

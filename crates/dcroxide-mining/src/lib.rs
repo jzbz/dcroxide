@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: ISC
 //! Block template mining support, ported from dcrd's
-//! `internal/mining` package at the parity pin, master `382ff4dd` (the
+//! `internal/mining` package at the parity pin, master `3360ae4d` (the
 //! package's one change since the 2.2 campaign target `452c1a6c`,
 //! `6444f057`, rewords two `TxSource` doc comments, which
 //! `TemplateTxSource`'s docs need not follow): the transaction

@@ -1346,7 +1346,7 @@ impl<C: RpcChain> Server<C> {
 
         // The auth HMAC key, drawn the way dcrd draws it: one
         // `rand.Read` of thirty-two bytes from the package generator
-        // (`internal/rpcserver/rpcserver.go:6234-6235`).  Not taken
+        // (`internal/rpcserver/rpcserver.go:6238-6239`).  Not taken
         // through `cfg.rand_u64` -- dcrd does not inject this one, and
         // assembling it from four `u64` draws took the generator's
         // lock four times where dcrd takes it once, leaving room for

@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: ISC
 //! The transaction memory pool, ported from dcrd's `internal/mempool`
-//! package at the parity pin, master `382ff4dd`, whose changes since the
-//! previous pin `6f6cf21b` are carried: the refusal of spends of outputs
-//! controlled by a misbehaving mixing peer (`3c8a1734`), vote metadata
-//! kept in a tracker and pruned ten blocks past the block voted on
-//! (`6444f057`, `d54099ad`), and the checks of a vote's claimed height,
-//! voted block and ticket before it is accepted (`a9b79d1b`, `6816d9de`,
-//! `023c42ff`).  It holds the mempool error kinds, the relay policy layer
-//! (`policy.go`) — minimum relay fees, dust outputs, and the
-//! transaction, output script, and input standardness checks — the
-//! pool itself (`TxPool`, `mempool.go`), and its package logger (`log`).
+//! package at the parity pin, master `3360ae4d`, whose changes since
+//! `6f6cf21b`, the pin before `382ff4dd`, are carried: the refusal of
+//! spends of outputs controlled by a misbehaving mixing peer
+//! (`3c8a1734`), vote metadata kept in a tracker and pruned ten blocks
+//! past the block voted on (`6444f057`, `d54099ad`), and the checks of
+//! a vote's claimed height, voted block and ticket before it is
+//! accepted (`a9b79d1b`, `6816d9de`, `023c42ff`).  It holds the mempool
+//! error kinds, the relay policy layer (`policy.go`) — minimum relay
+//! fees, dust outputs, and the transaction, output script, and input
+//! standardness checks — the pool itself (`TxPool`, `mempool.go`), and
+//! its package logger (`log`).
 
 #![cfg_attr(not(test), no_std)]
 #![forbid(unsafe_code)]

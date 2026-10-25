@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: ISC
 //! The application version constants and helpers (dcrd
-//! `internal/version` at master `382ff4dd`, where the development
+//! `internal/version` at master `3360ae4d`, where the development
 //! branch pins `Version = "2.2.0-pre"`).  Only the pieces the
 //! handlers read at runtime are ported; the semver parsing that
 //! dcrd's package `init` performs on the constant is frozen into the

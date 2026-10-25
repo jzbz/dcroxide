@@ -1,13 +1,14 @@
 # Quirks ledger
 
-dcrd's behavior at the pinned upstream (master `382ff4dd`, version `2.2.0-pre`)
-is the specification — including where it deviates from written documentation
-(DCPs, `docs/`). Every intentional reproduction of such a deviation is recorded
-here, with a test pinning it so it cannot silently regress; where that test has
-since been lost the entry says so. The parity target moved from the
-`release-v2.1.5` tag to master during the dcrd 2.2 campaign, and QK-0001 through
-QK-0008 were written against the tag; where upstream has changed in that window
-the entry keeps its number and records the change rather than being deleted.
+dcrd's behavior at the pinned upstream (master `3360ae4d`, version `2.2.0-pre`,
+on the way to the unreleased v2.2) is the specification — including where it
+deviates from written documentation (DCPs, `docs/`). Every intentional
+reproduction of such a deviation is recorded here, with a test pinning it so it
+cannot silently regress; where that test has since been lost the entry says so.
+The parity target moved from the `release-v2.1.5` tag to master during the dcrd
+2.2 campaign, and QK-0001 through QK-0008 were written against the tag; where
+upstream has changed in that window the entry keeps its number and records the
+change rather than being deleted.
 
 Entry format:
 
@@ -891,7 +892,7 @@ Entry format:
 ## QK-0032 — an interface with no address leaves the profile server without listeners for good
 
 - **Where:** dcrd `profiler.go:72-157` (`profileServer.Start`) and
-  `internal/rpcserver/rpcserver.go:4514-4544` (`handleStartProfiler`) /
+  `internal/rpcserver/rpcserver.go:4518-4548` (`handleStartProfiler`) /
   dcroxide-node `profiler.rs` `ProfileServer`
 - **What:** `Start` expands a host that names an interface into that
   interface's addresses (`normalizeAddresses` with

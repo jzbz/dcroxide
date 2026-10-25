@@ -1925,7 +1925,7 @@ fn clientcert_getblockcount(
 /// GAP06#7).  dcrd's listener requires and verifies a client
 /// certificate (`tls.RequireAndVerifyClientCert`, `server.go:3694`), and
 /// with no credentials set `checkAuth` grants admin to every request
-/// (`rpcserver.go:5519-5523`), so the completed handshake is the whole
+/// (`rpcserver.go:5523-5527`), so the completed handshake is the whole
 /// authentication: a leaf the bundle's authority issued and a
 /// `gencerts` certificate the bundle lists are served with no
 /// `Authorization` header, while a client with no certificate, or one
@@ -2481,7 +2481,7 @@ fn the_pre_auth_budget_is_shared_across_listen_addresses() {
 
 /// Two `Authorization` headers on one request: dcrd's header map keeps
 /// every occurrence in arrival order and it authenticates against
-/// `authhdr[0]` (`rpcserver.go:5525-5536`), so the first one decides.
+/// `authhdr[0]` (`rpcserver.go:5529-5540`), so the first one decides.
 /// The concrete case is a reverse proxy that injects its own header:
 /// with last-wins the client's copy overrides the proxy's, which is the
 /// opposite of dcrd's answer in both directions.
@@ -2525,7 +2525,7 @@ fn the_first_authorization_header_decides() {
 /// The 401 must reach a client that declared a body and never sent it,
 /// without waiting out the handshake deadline.  dcrd answers straight
 /// away: its `/` handler sets `Connection: close`
-/// (`rpcserver.go:5937`), so Go flushes the response in
+/// (`rpcserver.go:5941`), so Go flushes the response in
 /// `finishRequest` and only then closes the body, and `body.Close`
 /// reads nothing at all when the request was closing
 /// (`net/http/transfer.go:996-998`).  Draining first instead means the
@@ -2714,7 +2714,7 @@ fn the_host_header_is_required_and_singular() {
     listener.shutdown();
 }
 
-/// dcrd registers no method check on `/` (`rpcserver.go:5936-5958`), so
+/// dcrd registers no method check on `/` (`rpcserver.go:5940-5962`), so
 /// a GET is authenticated and dispatched like any other request rather
 /// than being turned away with a 405 dcrd never sends.
 #[test]
@@ -2804,7 +2804,7 @@ fn the_date_header_follows_who_wrote_the_response() {
         "the asterisk 200 carries a date"
     );
 
-    // Written by hand on the hijacked connection (`rpcserver.go:5858`).
+    // Written by hand on the hijacked connection (`rpcserver.go:5862`).
     assert!(
         !dated(&format!(
             "POST / HTTP/1.1\r\nHost: localhost\r\nAuthorization: Basic {auth}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -3009,7 +3009,7 @@ fn upgrade_tokens_are_read_across_every_copy() {
 /// hijacked reader and closes outright on any byte that arrived with
 /// the handshake -- "client sent data before handshake is complete"
 /// (`gorilla/websocket@v1.5.1 server.go:186-191`) -- which dcrd
-/// surfaces only as a log line (`rpcserver.go:6010-6015`).  Without the
+/// surfaces only as a log line (`rpcserver.go:6014-6019`).  Without the
 /// check those bytes are read as the first RFC 6455 frames, so a proxy
 /// that forwarded them as a `Content-Length` body and this server
 /// disagree about where the request ended.
@@ -3068,7 +3068,7 @@ fn send_raw(port: u16, request: &str) -> String {
 
 /// Duplicate `Content-Length` headers follow Go's `fixLength`
 /// (`net/http/transfer.go`), which dcrd's RPC server runs because it
-/// serves over a real `http.Server` (`rpcserver.go:5918`): copies that
+/// serves over a real `http.Server` (`rpcserver.go:5922`): copies that
 /// disagree are 400 before routing, copies that agree are deduplicated
 /// and the request is served.  A last-wins reader answers 200 to the
 /// first case, which is the CL.CL smuggling shape.

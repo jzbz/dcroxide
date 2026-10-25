@@ -3,11 +3,12 @@
 A from-scratch Rust implementation of the Decred full-node daemon, built as a
 drop-in replacement for [dcrd](https://github.com/decred/dcrd).
 
-Parity target: **dcrd master `382ff4dd`** (version 2.2.0-pre) — wire protocol
-12, JSON-RPC API 8.3.0. dcrd's behavior at that commit is the specification; see
-[QUIRKS.md](docs/QUIRKS.md) for deliberate bug-for-bug reproductions and
-[PARITY.md](docs/PARITY.md) for per-package status. The full plan lives in
-[dcroxide-project-brief.md](docs/dcroxide-project-brief.md).
+Parity target: **dcrd v2.2**, which upstream has not yet released: until it is
+tagged, the pin follows dcrd master, now **`3360ae4d`** (version 2.2.0-pre) —
+wire protocol 12, JSON-RPC API 8.3.0. dcrd's behavior at the pinned commit is
+the specification; see [QUIRKS.md](docs/QUIRKS.md) for deliberate bug-for-bug
+reproductions and [PARITY.md](docs/PARITY.md) for per-package status. The full
+plan lives in [dcroxide-project-brief.md](docs/dcroxide-project-brief.md).
 
 **Status: pre-alpha — the dcrd surface is ported end to end.** Every
 dcrd package has a Rust counterpart and the threaded daemon assembles
@@ -534,7 +535,7 @@ work). Currently implemented:
   interval, so an optimization is measured on the same blocks before
   and after
 - `tools/oracle` — Go shim linking dcrd's own packages (pinned to the
-  parity target, master `382ff4dd`: each dcrd module at that commit's
+  parity pin, master `3360ae4d`: each dcrd module at that commit's
   pseudo-version or at a tag whose source is byte-identical to it, as the
   header of `tools/oracle/go.mod` records) as a test oracle over
   line-delimited JSON

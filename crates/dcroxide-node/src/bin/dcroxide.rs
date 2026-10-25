@@ -2677,7 +2677,7 @@ fn rpc_config(
         // functions for both draws this closure serves -- the ping
         // nonce in `handlePing` (`internal/rpcserver/rpcserver.go:42`,
         // `:4269`) and the auth HMAC key at server construction
-        // (`:6234-6235`).  The nonce is drawn per request, so an
+        // (`:6238-6239`).  The nonce is drawn per request, so an
         // authenticated client sets its rate, and under
         // `panic = "abort"` a failed read there would be an outage.
         rand_u64: Box::new(dcroxide_crypto::rand::uint64),

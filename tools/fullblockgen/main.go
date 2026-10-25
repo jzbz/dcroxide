@@ -9,10 +9,10 @@
 // hundreds of specifically invalid variants and their expected rejection
 // kinds. Running the generator inside dcrd's package is what makes the dump an
 // oracle rather than a transcription: the expectations are dcrd's, at the
-// pinned parity target, not this project's reading of them.
+// parity pin, not this project's reading of them.
 //
-// The module is pinned to the parity target in go.mod. Regenerate whenever the
-// target moves across a commit that touches `blockchain/fullblocktests` —
+// The module is pinned to the parity pin in go.mod. Regenerate whenever the
+// pin moves across a commit that touches `blockchain/fullblocktests` —
 // `a38c0195` did, changing two instances from ErrImmatureSpend to
 // ErrMissingTxOut once stake transactions were explicitly barred from spending
 // same-block outputs. The move from `b9634e01` to `6f6cf21b` did too:

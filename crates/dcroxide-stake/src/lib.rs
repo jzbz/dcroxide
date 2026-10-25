@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: ISC
 //! Decred stake transaction primitives and ticket state, mirroring dcrd's
-//! `blockchain/stake` package at the parity pin, master `382ff4dd`: stake
+//! `blockchain/stake` package at the parity pin, master `3360ae4d`: stake
 //! transaction classification and format rule checks (tickets, votes,
 //! revocations, and the treasury transactions),
 //! commitment/vote-bits/block-reference extraction, reward calculation,
