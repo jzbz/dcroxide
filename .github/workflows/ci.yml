@@ -44,6 +44,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
+      # fuzz/ is a workspace of its own, and the fuzz jobs' `cargo fuzz
+      # run` adds a package its lock lacks without failing. Resolving it
+      # here with `--locked` fails instead; dcroxide-testutil's
+      # the_fuzz_lock_matches_the_workspace_lock holds the packages the
+      # lock has to the workspace lock's versions.
+      - run: cargo metadata --locked --format-version 1 --manifest-path fuzz/Cargo.toml > /dev/null
 
   lint-latest:
     name: clippy on latest stable (advisory)
@@ -137,17 +143,19 @@ jobs:
     # with each crate's own cfg (aes 0.9's `aes_backend`, polyval 0.7's
     # `polyval_backend`, chacha20 0.10's `chacha20_backend`, poly1305
     # 0.9's `poly1305_backend`, sha2 0.11's `sha2_backend`, and
-    # curve25519-dalek 5's `curve25519_dalek_backend` for the key exchange
-    # and signatures the crate takes on later) and runs the crate's tests,
-    # Wycheproof's vectors among them, on them (ADR-0015 T10).
+    # curve25519-dalek 5's `curve25519_dalek_backend` for the signatures
+    # the crate takes on later, where Ed25519 verification's double-base
+    # multiplication is what it switches; X25519's ladder and base-point
+    # table are the same portable code on every backend) and runs the
+    # crate's tests, Wycheproof's vectors among them, on them (ADR-0015
+    # T10).
     steps:
       - uses: actions/checkout@v7
       - run: rustup toolchain install
       # The workflow-wide DCROXIDE_REQUIRE_ORACLE turns a missing oracle
-      # into a failure, so the reference Go is installed as in the test
-      # job, ready for the tests that check the crate's verdicts against
-      # Go's, which the later steps of ADR-0015's plan add; the crate has
-      # none yet.
+      # into a failure, and the crate's key exchange verdicts are checked
+      # against Go's through the oracle, under it on the reference Go
+      # alone, so the reference Go is installed as in the test job.
       - uses: actions/setup-go@v7
         with:
           go-version: ${{ env.GO_VERSION }}

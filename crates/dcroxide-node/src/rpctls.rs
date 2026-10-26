@@ -37,11 +37,13 @@
 //!
 //! rustls with the `ring` provider offers only X25519, P-256 and P-384,
 //! and it picks the group, and by default the suite, in the client's
-//! order.  The port closes most of that gap in three parts.
-//! [`P521_KX_GROUP`] adds P-521 over the `p521` crate.  A certificate pair
-//! is served by [`RpcTlsConfigs`], a set of rustls configurations, one for
-//! each cipher-suite order and TLS 1.3 key exchange Go can settle on, all
-//! with `ignore_client_order` set.  And [`handshake`] reads the ClientHello
+//! order.  The port closes most of that gap in three parts.  P-521 comes
+//! from `dcroxide-tlscrypto`, the in-tree provider ADR-0015 moves the
+//! node's TLS to, whose group takes a peer's share and draws its
+//! ephemeral key as Go's `crypto/ecdh` does.  A certificate pair is served
+//! by [`RpcTlsConfigs`], a set of rustls configurations, one for each
+//! cipher-suite order and TLS 1.3 key exchange Go can settle on, all with
+//! `ignore_client_order` set.  And [`handshake`] reads the ClientHello
 //! through `rustls::server::Acceptor` before it picks one of them, so the
 //! configuration a connection gets leaves rustls only Go's choice to
 //! make.  The ClientHello's key shares and offered versions, which
@@ -63,10 +65,8 @@ use std::net::{SocketAddr, TcpStream};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use rustls::crypto::{
-    ActiveKeyExchange, CryptoProvider, GetRandomFailed, SharedSecret, SupportedKxGroup,
-};
-use rustls::{NamedGroup, ServerConfig, SupportedCipherSuite};
+use rustls::crypto::{CryptoProvider, SupportedKxGroup};
+use rustls::{ServerConfig, SupportedCipherSuite};
 
 /// The IANA code of X25519 (RFC 8446 §4.2.7).
 const X25519_ID: u16 = 0x001d;
@@ -85,147 +85,23 @@ const SECP521R1_ID: u16 = 0x0019;
 const RPC_KX_GROUP_IDS: [u16; 4] = [X25519_ID, SECP256R1_ID, SECP384R1_ID, SECP521R1_ID];
 
 /// The key exchanges the RPC server offers, in the order of
-/// [`RPC_KX_GROUP_IDS`]: ring's three and [`P521_KX_GROUP`].
+/// [`RPC_KX_GROUP_IDS`]: ring's three, and P-521 from `dcroxide-tlscrypto`,
+/// which Go's server offers by default (`defaultCurvePreferences`,
+/// `crypto/tls/defaults.go:21-35`) and ring's provider does not
+/// (`rustls-0.23.46/src/crypto/ring/mod.rs:180-181`).
+///
+/// Without P-521 a client that offers nothing else gets a
+/// `handshake_failure` alert where dcrd completes the handshake, and
+/// Decrediton is such a client: it pins `ecdhCurve: "secp521r1"` on its
+/// requests to a remote daemon.
 fn rpc_kx_groups() -> [&'static dyn SupportedKxGroup; 4] {
     use rustls::crypto::ring::kx_group;
     [
         kx_group::X25519,
         kx_group::SECP256R1,
         kx_group::SECP384R1,
-        P521_KX_GROUP,
+        dcroxide_tlscrypto::kx_group::SECP521R1,
     ]
-}
-
-/// ECDHE over P-521 (secp521r1), which Go's server offers by default
-/// (`defaultCurvePreferences`, `crypto/tls/defaults.go:21-35`) and rustls's
-/// `ring` provider does not (`rustls/src/crypto/ring/mod.rs:177-181`).
-///
-/// Without it a client that offers nothing else gets a `handshake_failure`
-/// alert where dcrd completes the handshake, and Decrediton is such a
-/// client: it pins `ecdhCurve: "secp521r1"` on its requests to a remote
-/// daemon.
-pub(crate) static P521_KX_GROUP: &dyn SupportedKxGroup = &P521KxGroup;
-
-/// The [`SupportedKxGroup`] behind [`P521_KX_GROUP`].
-#[derive(Debug)]
-struct P521KxGroup;
-
-impl SupportedKxGroup for P521KxGroup {
-    fn start(&self) -> Result<Box<dyn ActiveKeyExchange>, rustls::Error> {
-        Ok(Box::new(P521KeyExchange::new(p521_ephemeral_secret()?)))
-    }
-
-    fn ffdhe_group(&self) -> Option<rustls::ffdhe_groups::FfdheGroup<'static>> {
-        None
-    }
-
-    fn name(&self) -> NamedGroup {
-        NamedGroup::secp521r1
-    }
-}
-
-/// An uncompressed SEC 1 P-521 point: the `0x04` tag and two 66-byte
-/// coordinates, the only encoding TLS 1.3 allows a key share
-/// (RFC 8446 §4.2.8.2) and the only one Go accepts.
-const P521_UNCOMPRESSED_POINT_LEN: usize = 133;
-
-/// A fresh P-521 ephemeral key, drawn as Go draws one: 66 bytes with the
-/// seven bits above the order's top bit cleared, tried until they are a
-/// scalar in `[1, n)` (`GenerateKey`,
-/// `crypto/internal/fips140/ecdh/ecdh.go`, which `crypto/tls` reaches
-/// through `crypto/ecdh` with `config.rand()`).
-///
-/// The bytes come from the kernel, through the `getrandom` crate, where
-/// Go's come from its standard library's `crypto/rand`, and not from the
-/// process-wide generator the handshake signer draws from.  The signer can
-/// take that generator because RFC 6979 hedges it, while this scalar is the
-/// session's whole secret: the generator keeps its ChaCha20 key for up to
-/// 4 MiB of draws, so a later read of the process's memory would recover
-/// every scalar drawn since it was last keyed, where the kernel's
-/// generator erases its key as it goes.  A failed read fails this
-/// handshake, as a failed read fails ring's own groups, and cannot abort
-/// the process.  `tests/entropy_policy.rs` lists the call.
-fn p521_ephemeral_secret() -> Result<p521::SecretKey, rustls::Error> {
-    use p521::elliptic_curve::zeroize::Zeroize;
-    loop {
-        let mut bytes = p521::FieldBytes::default();
-        getrandom::fill(bytes.as_mut_slice()).map_err(|_| GetRandomFailed)?;
-        // The order is just under 2^521, so this rarely draws again.
-        if let Some(top) = bytes.first_mut() {
-            *top &= 0x01;
-        }
-        let secret = p521::SecretKey::from_bytes(&bytes);
-        bytes.as_mut_slice().zeroize();
-        if let Ok(secret) = secret {
-            return Ok(secret);
-        }
-    }
-}
-
-/// One P-521 key exchange in progress: the ephemeral secret and its
-/// public key as the key share carries it.
-struct P521KeyExchange {
-    /// The ephemeral scalar, zeroed when the exchange is dropped.
-    secret: p521::SecretKey,
-    /// The uncompressed SEC 1 encoding of the public point.
-    pub_key: Vec<u8>,
-}
-
-impl P521KeyExchange {
-    /// The exchange for an ephemeral secret.
-    fn new(secret: p521::SecretKey) -> P521KeyExchange {
-        use p521::elliptic_curve::sec1::ToSec1Point;
-        let pub_key = secret.public_key().to_sec1_point(false).as_bytes().to_vec();
-        P521KeyExchange { secret, pub_key }
-    }
-
-    /// The shared secret with the peer's key share: the x-coordinate of
-    /// the product, all 66 bytes, as RFC 8446 §7.4.2 and Go's
-    /// `crypto/ecdh` take it.
-    ///
-    /// The share must be an uncompressed point on the curve, which is what
-    /// Go's `NewPublicKey` enforces (`crypto/internal/fips140/ecdh`); the
-    /// compressed form and the identity are refused, as RFC 8446 requires.
-    /// A refusal is rustls's `InvalidKeyShare`, which it answers with an
-    /// `illegal_parameter` alert, as Go answers its own.
-    fn shared_secret(&self, peer: &[u8]) -> Result<SharedSecret, rustls::Error> {
-        use p521::elliptic_curve::group::Group;
-        use p521::elliptic_curve::point::AffineCoordinates;
-        let invalid = || rustls::Error::from(rustls::PeerMisbehaved::InvalidKeyShare);
-        if peer.len() != P521_UNCOMPRESSED_POINT_LEN || peer.first() != Some(&0x04) {
-            return Err(invalid());
-        }
-        let peer = p521::PublicKey::from_sec1_bytes(peer).map_err(|_| invalid())?;
-        #[allow(
-            clippy::arithmetic_side_effects,
-            reason = "scalar multiplication of a curve point, which cannot overflow"
-        )]
-        let product = peer.to_projective() * *self.secret.to_nonzero_scalar();
-        // A point of the prime-order group times a non-zero scalar below the
-        // order is never the identity; checked anyway, as Go checks it.
-        if bool::from(product.is_identity()) {
-            return Err(invalid());
-        }
-        Ok(SharedSecret::from(&product.to_affine().x()[..]))
-    }
-}
-
-impl ActiveKeyExchange for P521KeyExchange {
-    fn complete(self: Box<Self>, peer_pub_key: &[u8]) -> Result<SharedSecret, rustls::Error> {
-        self.shared_secret(peer_pub_key)
-    }
-
-    fn pub_key(&self) -> &[u8] {
-        &self.pub_key
-    }
-
-    fn ffdhe_group(&self) -> Option<rustls::ffdhe_groups::FfdheGroup<'static>> {
-        None
-    }
-
-    fn group(&self) -> NamedGroup {
-        NamedGroup::secp521r1
-    }
 }
 
 /// Every TLS 1.0-1.2 cipher suite Go implements, disabled ones included:
@@ -1183,90 +1059,6 @@ fn go_error_text(err: &rustls::Error, hello: Option<&HelloFacts>) -> String {
 #[allow(clippy::arithmetic_side_effects)]
 mod tests {
     use super::*;
-    use dcroxide_testutil::unhex;
-
-    /// The P-521 vector Go's `crypto/ecdh` tests against
-    /// (`crypto/ecdh/ecdh_test.go`), from NIST's CAVS 14.1 ECC CDH
-    /// Primitive (SP 800-56A) set, with the two leading zero bytes the
-    /// published field elements carry removed, as Go removes them.
-    const CAVS_PRIVATE: &str = "017eecc07ab4b329068fba65e56a1f8890aa935e57134ae0ffcce802735151f4eac6564f6ee9974c5e6887a1fefee5743ae2241bfeb95d5ce31ddcb6f9edb4d6fc47";
-    const CAVS_PUBLIC: &str = "0400602f9d0cf9e526b29e22381c203c48a886c2b0673033366314f1ffbcba240ba42f4ef38a76174635f91e6b4ed34275eb01c8467d05ca80315bf1a7bbd945f550a501b7c85f26f5d4b2d7355cf6b02117659943762b6d1db5ab4f1dbc44ce7b2946eb6c7de342962893fd387d1b73d7a8672d1f236961170b7eb3579953ee5cdc88cd2d";
-    const CAVS_PEER: &str = "0400685a48e86c79f0f0875f7bc18d25eb5fc8c0b07e5da4f4370f3a9490340854334b1e1b87fa395464c60626124a4e70d0f785601d37c09870ebf176666877a2046d01ba52c56fc8776d9e8f5db4f0cc27636d0b741bbe05400697942e80b739884a83bde99e0f6716939e632bc8986fa18dccd443a348b6c3e522497955a4f3c302f676";
-    const CAVS_SHARED: &str = "005fc70477c3e63bc3954bd0df3ea0d1f41ee21746ed95fc5e1fdf90930d5e136672d72cc770742d1711c3c3a4c334a0ad9759436a4d3c5bf6e74b9578fac148c831";
-
-    fn cavs_exchange() -> P521KeyExchange {
-        P521KeyExchange::new(
-            p521::SecretKey::from_slice(&unhex(CAVS_PRIVATE)).expect("the vector's private key"),
-        )
-    }
-
-    /// The key share and the shared secret match the NIST vector.
-    #[test]
-    fn p521_key_exchange_matches_the_nist_cdh_vector() {
-        let exchange = cavs_exchange();
-        assert_eq!(exchange.pub_key, unhex(CAVS_PUBLIC), "the key share");
-        assert_eq!(exchange.pub_key.len(), P521_UNCOMPRESSED_POINT_LEN);
-        let shared = Box::new(exchange)
-            .complete(&unhex(CAVS_PEER))
-            .expect("the vector's peer key is valid");
-        assert_eq!(shared.secret_bytes(), unhex(CAVS_SHARED).as_slice());
-    }
-
-    /// Two fresh exchanges agree with each other, and each fresh key share
-    /// is an uncompressed point on the curve.
-    #[test]
-    fn fresh_p521_exchanges_agree() {
-        let ours = P521_KX_GROUP.start().expect("start ours");
-        let theirs = P521_KX_GROUP.start().expect("start theirs");
-        assert_eq!(ours.group(), NamedGroup::secp521r1);
-        for share in [ours.pub_key(), theirs.pub_key()] {
-            assert_eq!(share.len(), P521_UNCOMPRESSED_POINT_LEN);
-            assert_eq!(share.first(), Some(&0x04));
-            p521::PublicKey::from_sec1_bytes(share).expect("on the curve");
-        }
-        assert_ne!(ours.pub_key(), theirs.pub_key(), "fresh ephemeral keys");
-        let (ours_pub, theirs_pub) = (ours.pub_key().to_vec(), theirs.pub_key().to_vec());
-        let a = ours.complete(&theirs_pub).expect("ours completes");
-        let b = theirs.complete(&ours_pub).expect("theirs completes");
-        assert_eq!(a.secret_bytes(), b.secret_bytes());
-        assert_eq!(a.secret_bytes().len(), 66, "the whole x-coordinate");
-    }
-
-    /// The compressed form, an off-curve point, a short share and the
-    /// identity's encoding are all refused as invalid key shares.
-    #[test]
-    fn p521_key_exchange_refuses_invalid_shares() {
-        use p521::elliptic_curve::sec1::ToSec1Point;
-        let peer = p521::PublicKey::from_sec1_bytes(&unhex(CAVS_PEER)).expect("valid peer");
-        let compressed = peer.to_sec1_point(true).as_bytes().to_vec();
-        let mut off_curve = unhex(CAVS_PEER);
-        if let Some(last) = off_curve.last_mut() {
-            *last ^= 1;
-        }
-        let short = unhex(CAVS_PEER)
-            .get(..P521_UNCOMPRESSED_POINT_LEN - 1)
-            .expect("shorter")
-            .to_vec();
-        for (label, share) in [
-            ("compressed", compressed),
-            ("off the curve", off_curve),
-            ("short", short),
-            ("identity", vec![0x00]),
-            ("empty", Vec::new()),
-        ] {
-            let err = Box::new(cavs_exchange())
-                .complete(&share)
-                .err()
-                .unwrap_or_else(|| panic!("{label}: refused"));
-            assert!(
-                matches!(
-                    err,
-                    rustls::Error::PeerMisbehaved(rustls::PeerMisbehaved::InvalidKeyShare)
-                ),
-                "{label}: {err:?}"
-            );
-        }
-    }
 
     /// The implementations follow the codes the choice indexes.
     #[test]
@@ -1446,7 +1238,7 @@ mod tests {
         for fragment in [16384, 64] {
             let both = client_hello(
                 rustls::DEFAULT_VERSIONS,
-                vec![P521_KX_GROUP, kx_group::X25519],
+                vec![dcroxide_tlscrypto::kx_group::SECP521R1, kx_group::X25519],
                 fragment,
             );
             let facts = HelloFacts::parse(&both).expect("parses");

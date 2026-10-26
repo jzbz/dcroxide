@@ -173,6 +173,14 @@
 //	                     certificate under RequireAndVerifyClientCert;
 //	                     {"result": "ok"} or {"result": "refused: <error>"},
 //	                     each with "go_version": runtime.Version()
+//	ecdh               → data is JSON {"curve": "X25519"|"P-256"|"P-384"|
+//	                     "P-521", "private": hex, "public": hex}; the key
+//	                     agreement crypto/tls makes with a peer's key share:
+//	                     the private key through crypto/ecdh's
+//	                     NewPrivateKey, the share through NewPublicKey, then
+//	                     ECDH; {"result": "<hex shared secret>"} or
+//	                     {"result": "refused: <error>"}, each with
+//	                     "go_version": runtime.Version()
 //	build_info         → takes no data; {"go_version": runtime.Version(),
 //	                      "modules": {"<module path>": "<version>"}} for the
 //	                     secp256k1/v4 and edwards/v2 modules linked in
@@ -181,6 +189,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"crypto/ecdh"
 	"crypto/x509"
 	"encoding/binary"
 	"encoding/hex"
@@ -1546,6 +1555,56 @@ func handle(req request) response {
 			return response{Result: "refused: " + err.Error(), GoVersion: runtime.Version()}
 		}
 		return response{Result: "ok", GoVersion: runtime.Version()}
+
+	case "ecdh":
+		// crypto/tls's agreement with a peer's key share
+		// (crypto/tls/key_schedule.go:127-141): the share through the
+		// curve's NewPublicKey, then ECDH with the local key, here a
+		// given one rather than a generated one.  A private key Go
+		// refuses is an error in the request; a share it refuses, or an
+		// agreement, is the verdict, with the Go that gave it.
+		var in struct {
+			Curve   string `json:"curve"`
+			Private string `json:"private"`
+			Public  string `json:"public"`
+		}
+		if err := json.Unmarshal(data, &in); err != nil {
+			return errResp("ecdh: %v", err)
+		}
+		var curve ecdh.Curve
+		switch in.Curve {
+		case "X25519":
+			curve = ecdh.X25519()
+		case "P-256":
+			curve = ecdh.P256()
+		case "P-384":
+			curve = ecdh.P384()
+		case "P-521":
+			curve = ecdh.P521()
+		default:
+			return errResp("ecdh: unknown curve %q", in.Curve)
+		}
+		private, err := hex.DecodeString(in.Private)
+		if err != nil {
+			return errResp("ecdh: private: %v", err)
+		}
+		public, err := hex.DecodeString(in.Public)
+		if err != nil {
+			return errResp("ecdh: public: %v", err)
+		}
+		key, err := curve.NewPrivateKey(private)
+		if err != nil {
+			return errResp("ecdh: private: %v", err)
+		}
+		peer, err := curve.NewPublicKey(public)
+		if err != nil {
+			return response{Result: "refused: " + err.Error(), GoVersion: runtime.Version()}
+		}
+		secret, err := key.ECDH(peer)
+		if err != nil {
+			return response{Result: "refused: " + err.Error(), GoVersion: runtime.Version()}
+		}
+		return response{Result: hex.EncodeToString(secret), GoVersion: runtime.Version()}
 
 	case "build_info":
 		// What a recorded comparison ran against: the toolchain, and the

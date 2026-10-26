@@ -20,6 +20,15 @@ aes_gcm_test.json             213177   985e5ecc172e181eaf49e89508b9470dcf478002e
                                        223f53cad33d78013ed635d94889836c036e1d58
 chacha20_poly1305_test.json   241127   fe61d25f90e1bde4461d00eafe61049e5f29bd999f36b766df9cda90906ad53d
                                        1ad9ff254d1f26f0812a27135fe95769f34adba5
+ecdh_secp256r1_ecpoint_test.json
+                              200088   648f16d077caf2400d02331ca51f44744c72c799830c8d0595d0b18b6dd9f886
+                                       e4a2458f3e1825a7d0dd3e5c838c1bc1535e9227
+ecdh_secp384r1_ecpoint_test.json
+                              549253   ffa7835fe1de359dff762c8f1272b98acebd5578e2f855d969051ff956c6dca3
+                                       737e3b4f705b6d600c36aecfc7a5b9712f5095b4
+ecdh_secp521r1_ecpoint_test.json
+                              553688   87aba8739c96de2bde8c75b60ffea09d0493192c4d9543d1d969e5e998931f35
+                                       8c82dd4c2a5abb58a3b79629f5ea2e389122d5b0
 hkdf_sha256_test.json          92505   bb2b462a38b251cb52a2aede706d6d4b62b26864f4e80c95497507ddb07c5f1e
                                        5486a4d9d12c0b6f08c2dcc9edf10266a5ca806d
 hkdf_sha384_test.json         116155   69ff6ea3657bb9c1b8cdffbbb4e7832353d08fd15c0d9997b03f7a6b180e3678
@@ -28,7 +37,9 @@ hmac_sha256_test.json          69111   2d201cfa61d1bf95e6f5d07d96634b4a348b31e8e
                                        19181195d1bfa01ded2ca5620f0aedd0e50dc31f
 hmac_sha384_test.json          78567   28b9776e979dd755d852ca471043ea6cedce8b15f7a28abdf6ea9efd982b43c0
                                        3ba4fbac6744df6ef62c6d0a205cc7466a8a7cbc
+x25519_test.json              253890   35c3f5231cf25cc640b524d403461deee9e49441d5d915a3a25b2c8ff5adbe7d
+                                       1ffa8e68f2c11a321376cda748a48ed0d85f5beb
 LICENSE                        11357   58d1e17ffe5109a7ae296caafcadfdbe6a7d176f0bc4ab01e12a689b0499d8bd
                                        7a4a3ea2424c09fbe48d455aed1eaa94d9124835
 
-Compressed, the six vector files are 232,655 bytes, from 810,642.
+Compressed, the ten vector files are 619,155 bytes, from 2,367,561.

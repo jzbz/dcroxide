@@ -8,6 +8,7 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"io"
 	"os"
@@ -632,6 +633,74 @@ func TestBuildInfo(t *testing.T) {
 	}
 	if !reflect.DeepEqual(resp.Modules, want) {
 		t.Errorf("modules: got %v, want %v", resp.Modules, want)
+	}
+}
+
+// ecdhRequest is an ecdh request's data: its JSON, as the Rust tests send it.
+func ecdhRequest(t *testing.T, curve, private, public string) []byte {
+	t.Helper()
+	data, err := json.Marshal(map[string]string{
+		"curve": curve, "private": private, "public": public,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return data
+}
+
+// TestECDH checks ecdh against RFC 7748's X25519 example, the NIST CAVS
+// P-521 vector crypto/ecdh's own tests carry and twice the generator on
+// P-256 and P-384, so that each curve name answers on its own curve; that a
+// share Go refuses comes back as a verdict with the Go that gave it; and
+// that a request Go cannot run, an unknown curve or a private key of the
+// wrong length, is an error.
+func TestECDH(t *testing.T) {
+	const (
+		alice  = "77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a"
+		bobPub = "de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f"
+		shared = "4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742"
+
+		cavsPrivate = "017eecc07ab4b329068fba65e56a1f8890aa935e57134ae0ffcce802735151f4eac6564f6ee9974c5e6887a1fefee5743ae2241bfeb95d5ce31ddcb6f9edb4d6fc47"
+		cavsPeer    = "0400685a48e86c79f0f0875f7bc18d25eb5fc8c0b07e5da4f4370f3a9490340854334b1e1b87fa395464c60626124a4e70d0f785601d37c09870ebf176666877a2046d01ba52c56fc8776d9e8f5db4f0cc27636d0b741bbe05400697942e80b739884a83bde99e0f6716939e632bc8986fa18dccd443a348b6c3e522497955a4f3c302f676"
+		cavsShared  = "005fc70477c3e63bc3954bd0df3ea0d1f41ee21746ed95fc5e1fdf90930d5e136672d72cc770742d1711c3c3a4c334a0ad9759436a4d3c5bf6e74b9578fac148c831"
+	)
+	zeros := strings.Repeat("00", 32)
+	p256Peer := "046b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296" +
+		"4fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5"
+	p384Peer := "04aa87ca22be8b05378eb1c71ef320ad746e1d3b628ba79b9859f741e082542a38" +
+		"5502f25dbf55296c3a545e3872760ab73617de4a96262c6f5d9e98bf9292dc29f8f41d" +
+		"bd289a147ce9da3113b5f0b8c00a60b1ce1d7e819d7a431d7c90ea0e5f"
+	for name, tc := range map[string]struct {
+		curve, private, public, want string
+	}{
+		"X25519, RFC 7748 6.1": {"X25519", alice, bobPub, shared},
+		"P-521, CAVS 14.1":     {"P-521", cavsPrivate, cavsPeer, cavsShared},
+		"X25519, small order": {"X25519", alice, zeros,
+			"refused: crypto/ecdh: bad X25519 remote ECDH input: low order point"},
+		"P-256, compressed": {"P-256", zeros[2:] + "01", "03" + p256Peer[2:66],
+			"refused: crypto/ecdh: invalid public key"},
+		"P-256, twice the generator": {"P-256", zeros[2:] + "02", p256Peer,
+			"7cf27b188d034f7e8a52380304b51ac3c08969e277f21b35a60b48fc47669978"},
+		"P-384, twice the generator": {"P-384", strings.Repeat("00", 47) + "02", p384Peer,
+			"08d999057ba3d2d969260045c55b97f089025959a6f434d6" +
+				"51d207d19fb96e9e4fe0e86ebe0e64f85b96a9c75295df61"},
+	} {
+		resp := call("ecdh", ecdhRequest(t, tc.curve, tc.private, tc.public))
+		if resp.Error != "" || resp.Result != tc.want || resp.GoVersion != runtime.Version() {
+			t.Errorf("%s: got %+v, want result %q from %s", name, resp, tc.want,
+				runtime.Version())
+		}
+	}
+	for name, data := range map[string][]byte{
+		"unknown curve":       ecdhRequest(t, "P-224", alice, bobPub),
+		"short private key":   ecdhRequest(t, "X25519", alice[2:], bobPub),
+		"private key not hex": ecdhRequest(t, "X25519", "zz", bobPub),
+		"not JSON":            []byte("X25519"),
+	} {
+		resp := call("ecdh", data)
+		if resp.Error == "" || resp.Result != "" {
+			t.Errorf("%s: got %+v, want an error", name, resp)
+		}
 	}
 }
 

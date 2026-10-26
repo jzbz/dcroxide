@@ -199,6 +199,24 @@ pub fn go_available() -> bool {
 /// before a change to `tools/oracle` answers for the old source.
 pub const ORACLE_BIN_VAR: &str = "DCROXIDE_ORACLE_BIN";
 
+/// The Go CI takes the oracle's verdicts from, as `runtime.Version()`
+/// names it: the reference Go of ADR-0001's 2026-10-26 addendum, which
+/// `ci.yml`'s `GO_VERSION` installs.
+pub const REFERENCE_GO: &str = "go1.26.2";
+
+/// Under `DCROXIDE_REQUIRE_ORACLE`, as in CI, panic unless `go_version`, the
+/// `go_version` an oracle response reports, is [`REFERENCE_GO`]: a test
+/// that holds the port to the oracle's verdicts then holds it to the
+/// reference Go's.  Without it any Go is taken, so a local run compares
+/// with the Go it has.
+pub fn require_reference_go(go_version: &str) {
+    assert!(
+        env::var_os("DCROXIDE_REQUIRE_ORACLE").is_none() || go_version == REFERENCE_GO,
+        "DCROXIDE_REQUIRE_ORACLE is set but the oracle runs {go_version:?}, not the \
+         reference Go, {REFERENCE_GO}"
+    );
+}
+
 /// Skip-or-fail policy shared by all differential tests: without an oracle
 /// the test skips (returns None), unless `DCROXIDE_REQUIRE_ORACLE` is set
 /// (as in CI), in which case a missing oracle panics so that differential
@@ -754,6 +772,8 @@ pub fn pseudo_version_commit(version: &str) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::{BTreeMap, BTreeSet};
+
     use super::*;
 
     /// The dcrd modules a `go.mod` pins by pseudo-version, each with the
@@ -1224,6 +1244,78 @@ mod tests {
                 panic!("tools/{tool}/go.mod: {why}");
             }
         }
+    }
+
+    /// The versions a `Cargo.lock` holds of each package, by name; a name
+    /// holds several where the build takes several majors.
+    fn locked_versions(path: &Path) -> BTreeMap<String, BTreeSet<String>> {
+        let text = std::fs::read_to_string(path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        let quoted = |line: &str, key: &str| {
+            line.strip_prefix(key)?
+                .strip_prefix(" = \"")?
+                .strip_suffix('"')
+                .map(str::to_owned)
+        };
+        let mut locked: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        for package in text.split("[[package]]").skip(1) {
+            let name = package.lines().find_map(|line| quoted(line, "name"));
+            let version = package.lines().find_map(|line| quoted(line, "version"));
+            let (Some(name), Some(version)) = (name, version) else {
+                panic!("{}: a package without a name and version", path.display());
+            };
+            locked.entry(name).or_default().insert(version);
+        }
+        locked
+    }
+
+    /// `fuzz/` is a workspace of its own, outside the root one, so its lock
+    /// moves only when something re-resolves it there, and a bump of the
+    /// root lock can leave the fuzz build on versions the node no longer
+    /// ships.  Every package both locks hold must be locked at the same
+    /// versions in each.  The fuzz build links the node, so the two share
+    /// most of the tree.  A package the fuzz lock lacks altogether is not
+    /// caught here: cargo adds it, at the newest version it can, the next
+    /// time the fuzz build resolves, which the fuzz jobs' `cargo fuzz run`
+    /// does without failing; the lint job's `cargo metadata --locked
+    /// --manifest-path fuzz/Cargo.toml` is what fails on it.
+    #[test]
+    fn the_fuzz_lock_matches_the_workspace_lock() {
+        let workspace = locked_versions(&repo_root().join("Cargo.lock"));
+        let fuzz = locked_versions(&repo_root().join("fuzz").join("Cargo.lock"));
+        let mut shared = 0usize;
+        for (name, versions) in &fuzz {
+            let Some(locked) = workspace.get(name) else {
+                continue;
+            };
+            assert_eq!(
+                versions, locked,
+                "{name}: fuzz/Cargo.lock locks {versions:?} where Cargo.lock locks \
+                 {locked:?}; move it with `cargo update --manifest-path fuzz/Cargo.toml \
+                 -p {name} --precise <version>`"
+            );
+            shared = shared.saturating_add(1);
+        }
+        assert!(
+            shared > 100,
+            "only {shared} packages are in both locks; the fuzz build links the node"
+        );
+    }
+
+    /// [`REFERENCE_GO`] is the release CI installs for every job that runs
+    /// the oracle, so a test that requires it there finds it.
+    #[test]
+    fn the_reference_go_is_the_one_ci_installs() {
+        let ci_path = repo_root().join(".github").join("workflows").join("ci.yml");
+        let ci = std::fs::read_to_string(&ci_path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", ci_path.display()));
+        let ci_go = ci
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("GO_VERSION:"))
+            .expect("ci.yml sets GO_VERSION")
+            .trim()
+            .trim_matches('"');
+        assert_eq!(format!("go{ci_go}"), REFERENCE_GO);
     }
 
     /// A child that writes far more than a pipe buffer holds, on both

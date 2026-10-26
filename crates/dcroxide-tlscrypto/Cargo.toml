@@ -24,6 +24,21 @@ poly1305 = { version = "0.9.1", default-features = false, features = ["zeroize"]
 # `digest`'s, which `hmac`'s turns on as well (`src/hmac.rs`).
 sha2 = { version = "0.11", default-features = false, features = ["zeroize"] }
 hmac = { version = "0.13", default-features = false, features = ["zeroize"] }
+# Key exchange (ADR-0015 T1): X25519 on `curve25519-dalek`'s Montgomery
+# ladder, and P-256, P-384 and P-521 on the curve arithmetic alone.  No
+# `ecdh` feature: it pulls `hkdf`, and the exchange is one scalar
+# multiplication.  `precomputed-tables` speeds the multiplication by the
+# generator that makes each ephemeral public key (`std` is what the table
+# is built under).
+p256 = { version = "0.14", default-features = false, features = ["std", "precomputed-tables"] }
+p384 = { version = "0.14", default-features = false, features = ["std", "precomputed-tables"] }
+p521 = { version = "0.14", default-features = false, features = ["std", "precomputed-tables"] }
+curve25519-dalek = "5"
+# X25519's all-zero check, made in constant time.
+subtle = "2.6"
+# The kernel read behind every random byte the provider draws: the
+# handshake randoms and the ephemeral keys (`src/rand.rs`).
+getrandom = "0.4"
 rustls = { version = "0.23.46", default-features = false, features = ["std", "tls12"] }
 zeroize = "1.9"
 

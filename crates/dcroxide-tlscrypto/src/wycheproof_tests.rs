@@ -1,32 +1,42 @@
 // SPDX-License-Identifier: ISC
-//! Wycheproof's vectors for the crate's record protection, HMAC and HKDF
-//! (ADR-0015 T10), run through the crate's own code: the AEADs the suites
-//! instantiate, through the `seal` and `open` every record goes through;
-//! HMAC as rustls asks for a tag; and HKDF as rustls builds it on that
-//! HMAC.  The files, their commit and their hashes are in
-//! `tests/data/wycheproof/SOURCE`.
+//! Wycheproof's vectors for the crate's record protection, HMAC, HKDF and
+//! key exchange (ADR-0015 T10), run through the crate's own code: the
+//! AEADs the suites instantiate, through the `seal` and `open` every
+//! record goes through; HMAC as rustls asks for a tag; HKDF as rustls
+//! builds it on that HMAC; and each key exchange group's `complete`, from
+//! the case's private key.  The files, their commit and their hashes are
+//! in `tests/data/wycheproof/SOURCE`.
 //!
 //! A unit-test module rather than an integration test, because the AEADs
-//! are reached through crate-private functions.  The harness checks each
-//! file's `algorithm` and `schema` before it reads the groups, and counts
-//! what it runs and what it skips against fixed totals, so a truncated or
-//! replaced file fails rather than passing on fewer cases.  A `valid` case
-//! must succeed with Wycheproof's answer and an `invalid` one must fail.
-//! None of these six files has an `acceptable` case; one appearing fails
-//! the test until a policy for it is written down here.
+//! and a key exchange with a fixed private key are reached through
+//! crate-private functions.  The harness checks each file's `algorithm`
+//! and `schema` before it reads the groups, and counts what it runs and
+//! what it skips against fixed totals, so a truncated or replaced file
+//! fails rather than passing on fewer cases.  A `valid` case must succeed
+//! with Wycheproof's answer and an `invalid` one must fail.  Only the key
+//! exchange files have `acceptable` cases, and each is decided by its
+//! flags under [`ACCEPTABLE_KX`], which gives the reason for each verdict;
+//! a case none of its entries covers fails the test until one is written
+//! down, and any `acceptable` case in the other files fails it too.
+//! Every key exchange case, whatever its result, is also held to Go's
+//! `crypto/ecdh` through the oracle, which is how the table is checked
+//! against Go: where there is no oracle that comparison is skipped, unless
+//! `DCROXIDE_REQUIRE_ORACLE` is set, as in CI, where it also requires the
+//! reference Go.
 
 use std::io::Read;
 
 use aes_gcm::{Aes128Gcm, Aes256Gcm};
 use chacha20poly1305::ChaCha20Poly1305;
-use dcroxide_testutil::unhex;
-use rustls::Error;
+use dcroxide_testutil::{Oracle, hex, unhex};
 use rustls::crypto::hmac::Hmac;
 use rustls::crypto::tls13::{Hkdf, OutputLengthError};
+use rustls::{Error, NamedGroup, PeerMisbehaved};
 use serde_json::Value;
 
 use crate::aead::{self, RecordAead};
 use crate::hmac::{HKDF_SHA256, HKDF_SHA384, HMAC_SHA256, HMAC_SHA384};
+use crate::kx::exchange_with;
 
 /// The parsed vector file `name`, from `tests/data/wycheproof`.
 fn load(name: &str) -> Value {
@@ -97,6 +107,8 @@ struct Tally {
     valid: usize,
     /// Invalid cases run.
     invalid: usize,
+    /// Acceptable cases run, each as its policy decides.
+    acceptable: usize,
     /// Cases in groups of a shape no suite uses, not run.
     skipped: usize,
 }
@@ -110,6 +122,11 @@ impl Tally {
         }
     }
 
+    /// Count an acceptable case that was run.
+    fn ran_acceptable(&mut self) {
+        self.acceptable = self.acceptable.saturating_add(1);
+    }
+
     /// Count a group's cases as skipped.
     fn skip(&mut self, group: &Value) {
         self.skipped = self.skipped.saturating_add(cases(group).len());
@@ -119,6 +136,7 @@ impl Tally {
     fn total(&self) -> usize {
         self.valid
             .saturating_add(self.invalid)
+            .saturating_add(self.acceptable)
             .saturating_add(self.skipped)
     }
 }
@@ -227,6 +245,7 @@ fn aes_gcm_answers_wycheproof() {
     let expected = Tally {
         valid: 79,
         invalid: 54,
+        acceptable: 0,
         skipped: 183,
     };
     run_file(
@@ -257,6 +276,7 @@ fn chacha20_poly1305_answers_wycheproof() {
     let expected = Tally {
         valid: 256,
         invalid: 60,
+        acceptable: 0,
         skipped: 9,
     };
     run_file(
@@ -283,6 +303,7 @@ fn hmac_answers_wycheproof(file: &str, algorithm: &str, hmac: &dyn Hmac) {
     let expected = Tally {
         valid: 66,
         invalid: 108,
+        acceptable: 0,
         skipped: 0,
     };
     run_file(
@@ -331,6 +352,7 @@ fn hkdf_answers_wycheproof(file: &str, algorithm: &str, hkdf: &dyn Hkdf, valid: 
     let expected = Tally {
         valid,
         invalid: 3,
+        acceptable: 0,
         skipped: 0,
     };
     run_file(
@@ -377,4 +399,277 @@ fn hkdf_sha256_answers_wycheproof() {
 #[test]
 fn hkdf_sha384_answers_wycheproof() {
     hkdf_answers_wycheproof("hkdf_sha384_test.json", "HKDF-SHA-384", &HKDF_SHA384, 80);
+}
+
+/// What the provider must do with an `acceptable` key exchange case: the
+/// verdict of the first entry whose flag the case carries, for the reason
+/// the entry gives.  The order matters only for an X25519 share of small
+/// order that is also on the twist or written at or above p, which the
+/// first entry refuses.
+const ACCEPTABLE_KX: [(&str, Expect, &str); 4] = [
+    (
+        "ZeroSharedSecret",
+        Expect::Invalid,
+        "an X25519 share of small order gives an all-zero secret, which Go and \
+         ring refuse (`crypto/ecdh/x25519.go:85-87`, \
+         `ring-0.17.14/src/ec/curve25519/x25519.rs:158-162`)",
+    ),
+    (
+        "CompressedPoint",
+        Expect::Invalid,
+        "a TLS key share is an uncompressed point (RFC 8446 §4.2.8.2), and Go \
+         refuses every other form (`crypto/ecdh/nist.go:120-125`)",
+    ),
+    (
+        "Twist",
+        Expect::Valid,
+        "X25519 takes a u-coordinate on the twist, as it takes any 32 bytes \
+         (RFC 7748 §5, `crypto/ecdh/x25519.go:69-80`)",
+    ),
+    (
+        "NonCanonicalPublic",
+        Expect::Valid,
+        "X25519 reduces a u-coordinate at or above p, as RFC 7748 §5 and Go \
+         read it",
+    ),
+];
+
+/// What a key exchange case expects, and why: Wycheproof's own word for a
+/// valid or invalid case, and for an acceptable one the verdict
+/// [`ACCEPTABLE_KX`] gives it.
+fn kx_expect(case: &Value) -> (Expect, &'static str) {
+    match text(case, "result") {
+        "valid" => (Expect::Valid, "valid"),
+        "invalid" => (Expect::Invalid, "invalid"),
+        "acceptable" => {
+            let flags = case["flags"]
+                .as_array()
+                .unwrap_or_else(|| panic!("no flags in {case}"));
+            ACCEPTABLE_KX
+                .iter()
+                .find(|(flag, ..)| flags.iter().any(|f| f == flag))
+                .map(|&(_, expect, why)| (expect, why))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "tcId {}: no policy for an acceptable case flagged {flags:?}",
+                        number(case, "tcId")
+                    )
+                })
+        }
+        other => panic!(
+            "tcId {}: no policy for a result of {other:?}",
+            number(case, "tcId")
+        ),
+    }
+}
+
+/// A key exchange vector file and what the harness needs to run it.
+struct KxFile {
+    /// The file's name.
+    name: &'static str,
+    /// The group its cases are run on.
+    group: NamedGroup,
+    /// The curve as the file's groups name it.
+    curve: &'static str,
+    /// The curve as the oracle's `ecdh` command names it.
+    go_curve: &'static str,
+    /// The length of a private key: a NIST curve's field, or X25519's 32.
+    private_len: usize,
+}
+
+/// The four key exchange files.
+const KX_FILES: [KxFile; 4] = [
+    KxFile {
+        name: "x25519_test.json",
+        group: NamedGroup::X25519,
+        curve: "curve25519",
+        go_curve: "X25519",
+        private_len: 32,
+    },
+    KxFile {
+        name: "ecdh_secp256r1_ecpoint_test.json",
+        group: NamedGroup::secp256r1,
+        curve: "secp256r1",
+        go_curve: "P-256",
+        private_len: 32,
+    },
+    KxFile {
+        name: "ecdh_secp384r1_ecpoint_test.json",
+        group: NamedGroup::secp384r1,
+        curve: "secp384r1",
+        go_curve: "P-384",
+        private_len: 48,
+    },
+    KxFile {
+        name: "ecdh_secp521r1_ecpoint_test.json",
+        group: NamedGroup::secp521r1,
+        curve: "secp521r1",
+        go_curve: "P-521",
+        private_len: 66,
+    },
+];
+
+impl KxFile {
+    /// A case's private key at the length the group takes.  X25519's is
+    /// its 32 bytes as they stand.  Wycheproof writes a NIST key as ASN.1
+    /// writes the integer, with a leading zero byte when its top bit is
+    /// set and without the leading zeros a smaller value has, so it is cut
+    /// to its digits and padded back to the field's length.
+    fn private(&self, case: &Value) -> Vec<u8> {
+        let private = bytes(case, "private");
+        if self.group == NamedGroup::X25519 {
+            return private;
+        }
+        let start = private
+            .iter()
+            .position(|&b| b != 0)
+            .unwrap_or(private.len());
+        let digits = &private[start..];
+        let pad = self
+            .private_len
+            .checked_sub(digits.len())
+            .unwrap_or_else(|| {
+                panic!(
+                    "{} tcId {}: a private key longer than the field",
+                    self.name,
+                    number(case, "tcId")
+                )
+            });
+        [vec![0; pad], digits.to_vec()].concat()
+    }
+
+    /// The group's answer to a case: the secret its exchange from the
+    /// case's private key agrees with the case's public key, or the error
+    /// it refuses the public key with.
+    fn ours(&self, case: &Value) -> Result<Vec<u8>, Error> {
+        exchange_with(self.group, &self.private(case))
+            .unwrap_or_else(|| {
+                panic!(
+                    "{} tcId {}: a private key the group takes",
+                    self.name,
+                    number(case, "tcId")
+                )
+            })
+            .complete(&bytes(case, "public"))
+            .map(|shared| shared.secret_bytes().to_vec())
+    }
+
+    /// Go's answer to a case, through the oracle's `ecdh`: the secret, or
+    /// `None` where Go refuses the public key.
+    fn go(&self, oracle: &mut Oracle, case: &Value) -> Option<Vec<u8>> {
+        let request = serde_json::json!({
+            "curve": self.go_curve,
+            "private": hex(&self.private(case)),
+            "public": text(case, "public"),
+        });
+        let response = oracle.call("ecdh", request.to_string().as_bytes());
+        dcroxide_testutil::require_reference_go(
+            response["go_version"].as_str().unwrap_or_default(),
+        );
+        match response["result"].as_str() {
+            Some(refused) if refused.starts_with("refused: ") => None,
+            Some(secret) => Some(unhex(secret)),
+            None => panic!(
+                "{} tcId {}: the oracle answered {response}",
+                self.name,
+                number(case, "tcId")
+            ),
+        }
+    }
+}
+
+/// Run a key exchange file: a valid case, and an acceptable one its
+/// policy accepts, must agree Wycheproof's secret; an invalid one, and an
+/// acceptable one its policy refuses, must be refused as an invalid key
+/// share; and every case must get Go's answer, the same secret or a
+/// refusal, where there is an oracle.
+fn kx_answers_wycheproof(file: &KxFile, algorithm: &str, schema: &str, expected: Tally) {
+    let mut oracle = dcroxide_testutil::oracle_or_skip();
+    run_file(file.name, algorithm, schema, expected, |group, tally| {
+        assert_eq!(text(group, "curve"), file.curve, "{}", file.name);
+        for case in cases(group) {
+            let id = number(case, "tcId");
+            let (expect, why) = kx_expect(case);
+            let ours = file.ours(case);
+            if let Some(oracle) = oracle.as_mut() {
+                assert_eq!(
+                    ours.as_ref().ok(),
+                    file.go(oracle, case).as_ref(),
+                    "{} tcId {id}: Go's answer",
+                    file.name
+                );
+            }
+            match expect {
+                Expect::Valid => {
+                    assert_eq!(
+                        ours,
+                        Ok(bytes(case, "shared")),
+                        "{} tcId {id}: {why}",
+                        file.name
+                    );
+                }
+                Expect::Invalid => assert_eq!(
+                    ours,
+                    Err(Error::PeerMisbehaved(PeerMisbehaved::InvalidKeyShare)),
+                    "{} tcId {id}: {why}",
+                    file.name
+                ),
+            }
+            if text(case, "result") == "acceptable" {
+                tally.ran_acceptable();
+            } else {
+                tally.ran(expect);
+            }
+        }
+    });
+}
+
+#[test]
+fn x25519_answers_wycheproof() {
+    // The acceptable cases are the shares of small order, refused, and the
+    // twist's and the non-canonical u-coordinates, taken.
+    let expected = Tally {
+        valid: 264,
+        invalid: 0,
+        acceptable: 254,
+        skipped: 0,
+    };
+    kx_answers_wycheproof(&KX_FILES[0], "XDH", "xdh_comp_schema_v1.json", expected);
+}
+
+#[test]
+fn p256_ecdh_answers_wycheproof() {
+    // The one acceptable case is a compressed share, refused.
+    let expected = Tally {
+        valid: 330,
+        invalid: 24,
+        acceptable: 1,
+        skipped: 0,
+    };
+    let schema = "ecdh_ecpoint_test_schema_v1.json";
+    kx_answers_wycheproof(&KX_FILES[1], "ECDH", schema, expected);
+}
+
+#[test]
+fn p384_ecdh_answers_wycheproof() {
+    let expected = Tally {
+        valid: 771,
+        invalid: 18,
+        acceptable: 1,
+        skipped: 0,
+    };
+    let schema = "ecdh_ecpoint_test_schema_v1.json";
+    kx_answers_wycheproof(&KX_FILES[2], "ECDH", schema, expected);
+}
+
+#[test]
+fn p521_ecdh_answers_wycheproof() {
+    let expected = Tally {
+        valid: 632,
+        invalid: 28,
+        acceptable: 1,
+        skipped: 0,
+    };
+    let schema = "ecdh_ecpoint_test_schema_v1.json";
+    kx_answers_wycheproof(&KX_FILES[3], "ECDH", schema, expected);
 }

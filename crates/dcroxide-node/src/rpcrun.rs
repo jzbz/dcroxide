@@ -2228,10 +2228,10 @@ pub fn reloadable_tls_config(
 /// keeps off the kernel (see `tests/entropy_policy.rs`); the global
 /// generator cannot fail once seeded, and the RFC 6979 derivation the
 /// draw is mixed into keeps the nonce safe should it be weak.  The P-521
-/// key exchange in the same handshake draws from the kernel instead, for
-/// the reason `crate::rpctls` gives: its scalar has no such hedge.  The
-/// generator produces keystream by XOR, so every buffer is zeroed before
-/// the draw.
+/// key exchange in the same handshake draws from the kernel instead, in
+/// `dcroxide-tlscrypto`, for the reason that crate's `src/rand.rs` gives:
+/// its scalar has no such hedge.  The generator produces keystream by XOR,
+/// so every buffer is zeroed before the draw.
 struct ProcessRng;
 
 impl p521::ecdsa::signature::rand_core::TryRng for ProcessRng {
@@ -16331,7 +16331,9 @@ mod tests {
         // Every group the set offers, P-521 among them, so the client can
         // complete a handshake with each configuration.
         let mut provider = rustls::crypto::ring::default_provider();
-        provider.kx_groups.push(crate::rpctls::P521_KX_GROUP);
+        provider
+            .kx_groups
+            .push(dcroxide_tlscrypto::kx_group::SECP521R1);
         let provider = Arc::new(provider);
 
         for config in configs.configs() {

@@ -9,10 +9,20 @@
 //! other; and a full handshake in memory runs for each suite with this
 //! crate's suite on one side and ring's on the other, both ways, carrying
 //! application data each way and, in TLS 1.3, across a key update, after
-//! which both ends hand out the same traffic secrets.  Key exchange, the
-//! keys and certificate verification are ring's on both sides, since the
-//! crate has none of its own yet, so the handshakes run the two key
-//! schedules and record layers against each other.
+//! which both ends hand out the same traffic secrets.  The keys and
+//! certificate verification are ring's on both sides, since the crate has
+//! none of its own yet, so those handshakes run the two key schedules and
+//! record layers against each other.
+//!
+//! For the key exchange groups ring has, X25519, P-256 and P-384: the
+//! default list is ring's; each group takes and refuses the shares ring's
+//! takes and refuses, the generated ones of `kx_shares` and every public
+//! key of Wycheproof's files for the group; each agrees ring's secret with
+//! ring's key share and ring agrees its with the group's; and a handshake
+//! in each TLS version negotiates the group with this crate's on one side
+//! and ring's on the other, both ways.  P-521, which ring lacks, runs the
+//! same handshakes with this crate's group on both sides, and is held to
+//! Go's verdicts instead (`tests/go_differential.rs`).
 //!
 //! The ring half of this file goes at the switch, with the dev-dependency
 //! that selects ring.
@@ -20,7 +30,9 @@
 // Test-harness arithmetic over bounded lengths.
 #![allow(clippy::arithmetic_side_effects)]
 
-use std::io::Write;
+mod kx_shares;
+
+use std::io::{Read, Write};
 use std::sync::Arc;
 
 use dcroxide_testutil::unhex;
@@ -31,11 +43,11 @@ use rustls::crypto::cipher::{
 };
 use rustls::crypto::hash::Hash;
 use rustls::crypto::tls13::OkmBlock;
-use rustls::crypto::{CryptoProvider, ring};
+use rustls::crypto::{CryptoProvider, SupportedKxGroup, ring};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
 use rustls::{
     ClientConfig, ClientConnection, ConnectionCommon, ConnectionTrafficSecrets, ContentType,
-    ProtocolVersion, RootCertStore, ServerConfig, ServerConnection, SignatureScheme,
+    NamedGroup, ProtocolVersion, RootCertStore, ServerConfig, ServerConnection, SignatureScheme,
     SupportedCipherSuite,
 };
 
@@ -525,25 +537,33 @@ fn server_pair(suite: SupportedCipherSuite) -> (CertificateDer<'static>, Private
     )
 }
 
-/// Ring's provider offering `suite` alone.
-fn offering(suite: SupportedCipherSuite) -> Arc<CryptoProvider> {
+/// Ring's provider offering `suite` alone and the key exchange groups
+/// `groups`.
+fn offering(
+    suite: SupportedCipherSuite,
+    groups: &[&'static dyn SupportedKxGroup],
+) -> Arc<CryptoProvider> {
     Arc::new(CryptoProvider {
         cipher_suites: vec![suite],
+        kx_groups: groups.to_vec(),
         ..ring::default_provider()
     })
 }
 
-/// A server offering `server_suite` and a client offering `client_suite`,
-/// both of the same version, the client trusting the server's certificate
+/// One end of a handshake: the suite it offers and its key exchange
+/// groups.
+type End<'a> = (SupportedCipherSuite, &'a [&'static dyn SupportedKxGroup]);
+
+/// A server and a client offering what their ends give, both of the
+/// server suite's version, the client trusting the server's certificate
 /// and checking it with ring's verifier, and both able to hand out their
 /// traffic secrets.
-fn configs(
-    server_suite: SupportedCipherSuite,
-    client_suite: SupportedCipherSuite,
-) -> (Arc<ServerConfig>, Arc<ClientConfig>) {
+fn configs(server_end: End<'_>, client_end: End<'_>) -> (Arc<ServerConfig>, Arc<ClientConfig>) {
+    let (server_suite, server_groups) = server_end;
+    let (client_suite, client_groups) = client_end;
     let version = server_suite.version();
     let (cert, key) = server_pair(server_suite);
-    let mut server = ServerConfig::builder_with_provider(offering(server_suite))
+    let mut server = ServerConfig::builder_with_provider(offering(server_suite, server_groups))
         .with_protocol_versions(&[version])
         .expect("the server's version")
         .with_no_client_auth()
@@ -559,7 +579,7 @@ fn configs(
     )
     .build()
     .expect("the verifier");
-    let mut client = ClientConfig::builder_with_provider(offering(client_suite))
+    let mut client = ClientConfig::builder_with_provider(offering(client_suite, client_groups))
         .with_protocol_versions(&[version])
         .expect("the client's version")
         .with_webpki_verifier(verifier)
@@ -636,13 +656,26 @@ fn named(secrets: &ConnectionTrafficSecrets) -> (&'static str, Vec<u8>, Vec<u8>)
 }
 
 /// Run a handshake between `server_suite` and `client_suite`, which share
-/// a name, then application data each way, a key update in TLS 1.3 and
-/// more data under the new keys, and check that the two ends hand out the
-/// same traffic secrets for each direction.
+/// a name, with ring's key exchange groups on both sides, then
+/// application data each way, a key update in TLS 1.3 and more data under
+/// the new keys, and check that the two ends hand out the same traffic
+/// secrets for each direction.
 fn handshake(server_suite: SupportedCipherSuite, client_suite: SupportedCipherSuite, what: &str) {
+    handshake_between(
+        (server_suite, ring::ALL_KX_GROUPS),
+        (client_suite, ring::ALL_KX_GROUPS),
+        what,
+    );
+}
+
+/// [`handshake`] between two ends, which may differ in their key exchange
+/// groups: the group the two ends agree on, which must be the same at
+/// both.
+fn handshake_between(server_end: End<'_>, client_end: End<'_>, what: &str) -> NamedGroup {
+    let server_suite = server_end.0;
     let name = server_suite.suite();
     let what = format!("{name:?}, {what}");
-    let (server_config, client_config) = configs(server_suite, client_suite);
+    let (server_config, client_config) = configs(server_end, client_end);
     let server_name = ServerName::try_from("localhost").expect("the server name");
     let mut client = ClientConnection::new(client_config, server_name).expect("the client");
     let mut server = ServerConnection::new(server_config).expect("the server");
@@ -665,6 +698,14 @@ fn handshake(server_suite: SupportedCipherSuite, client_suite: SupportedCipherSu
         Some(server_suite.version().version),
         "{what}"
     );
+    let group = |kx: Option<&'static dyn SupportedKxGroup>| kx.map(|kx| kx.name());
+    let agreed = group(client.negotiated_key_exchange_group());
+    assert_eq!(
+        agreed,
+        group(server.negotiated_key_exchange_group()),
+        "{what}: the key exchange group"
+    );
+    let agreed = agreed.unwrap_or_else(|| panic!("{what}: no key exchange group"));
 
     exchange(&mut client, &mut server, &what);
     if server_suite.version().version == ProtocolVersion::TLSv1_3 {
@@ -704,6 +745,7 @@ fn handshake(server_suite: SupportedCipherSuite, client_suite: SupportedCipherSu
         "{what}: secrets named {}",
         client_tx.0
     );
+    agreed
 }
 
 /// For each of the nine suites, a handshake with application data, and in
@@ -716,5 +758,165 @@ fn each_suite_handshakes_with_rings_both_ways() {
         handshake(ours, rings, "this crate serving, ring dialing");
         handshake(rings, ours, "ring serving, this crate dialing");
         handshake(ours, ours, "this crate on both sides");
+    }
+}
+
+/// The default key exchange groups are ring's, in ring's order, and the
+/// full list adds P-521 after them.
+#[test]
+fn the_group_lists_are_rings() {
+    let names = |groups: &[&dyn SupportedKxGroup]| {
+        groups.iter().map(|group| group.name()).collect::<Vec<_>>()
+    };
+    let rings = names(ring::ALL_KX_GROUPS);
+    assert_eq!(names(dcroxide_tlscrypto::DEFAULT_KX_GROUPS), rings);
+    assert_eq!(names(&ring::default_provider().kx_groups), rings);
+    assert_eq!(
+        names(dcroxide_tlscrypto::ALL_KX_GROUPS),
+        [rings, vec![NamedGroup::secp521r1]].concat()
+    );
+}
+
+/// One of this crate's groups, ring's of the same name, and the
+/// Wycheproof file for the group.
+type GroupPair = (
+    &'static dyn SupportedKxGroup,
+    &'static dyn SupportedKxGroup,
+    &'static str,
+);
+
+/// This crate's three groups that ring has, each beside ring's.
+fn group_pairs() -> [GroupPair; 3] {
+    use dcroxide_tlscrypto::kx_group as ours;
+    use ring::kx_group as rings;
+    [
+        (ours::X25519, rings::X25519, "x25519_test.json"),
+        (
+            ours::SECP256R1,
+            rings::SECP256R1,
+            "ecdh_secp256r1_ecpoint_test.json",
+        ),
+        (
+            ours::SECP384R1,
+            rings::SECP384R1,
+            "ecdh_secp384r1_ecpoint_test.json",
+        ),
+    ]
+}
+
+/// The public keys of a Wycheproof key exchange file, each labelled by
+/// its case.
+fn wycheproof_shares(file: &str) -> Vec<(String, Vec<u8>)> {
+    let path = format!(
+        "{}/tests/data/wycheproof/{file}.gz",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let mut json = String::new();
+    flate2::read::GzDecoder::new(std::fs::File::open(&path).expect("the file"))
+        .read_to_string(&mut json)
+        .expect("the file decompressed");
+    let vectors: serde_json::Value = serde_json::from_str(&json).expect("JSON");
+    vectors["testGroups"]
+        .as_array()
+        .expect("testGroups")
+        .iter()
+        .flat_map(|group| group["tests"].as_array().expect("tests"))
+        .map(|case| {
+            (
+                format!("{file} tcId {}", case["tcId"]),
+                unhex(case["public"].as_str().expect("a public key")),
+            )
+        })
+        .collect()
+}
+
+/// Whether `group`, from a fresh key, takes `share`; a refusal must be an
+/// invalid key share.
+fn takes(group: &dyn SupportedKxGroup, share: &[u8], label: &str) -> bool {
+    match group.start().expect("started").complete(share) {
+        Ok(_) => true,
+        Err(err) => {
+            assert_eq!(
+                err,
+                rustls::Error::PeerMisbehaved(rustls::PeerMisbehaved::InvalidKeyShare),
+                "{:?}, {label}",
+                group.name()
+            );
+            false
+        }
+    }
+}
+
+/// Each group takes exactly the shares ring's takes: whether a share is
+/// taken depends on the share alone, never on the key drawn, since an
+/// X25519 share of small order zeroes every clamped key's secret and a
+/// NIST curve's checks read only the share.  Both answers are counted, so
+/// a run in which every share went one way fails.
+#[test]
+fn each_group_takes_the_shares_ring_takes() {
+    for (ours, rings, file) in group_pairs() {
+        let name = ours.name();
+        let mut shares = kx_shares::shares(name);
+        shares.extend(wycheproof_shares(file));
+        let (mut taken, mut refused) = (0, 0);
+        for (label, share) in &shares {
+            let verdict = takes(ours, share, label);
+            assert_eq!(verdict, takes(rings, share, label), "{name:?}, {label}");
+            if verdict {
+                taken += 1;
+            } else {
+                refused += 1;
+            }
+        }
+        assert!(
+            taken > 100 && refused > 100,
+            "{name:?}: {taken} taken, {refused} refused"
+        );
+    }
+}
+
+/// Each group agrees ring's secret: this crate's exchange completed with
+/// ring's key share gives what ring's completed with this crate's gives.
+#[test]
+fn each_group_agrees_rings_secret() {
+    for (ours, rings, _) in group_pairs() {
+        for _ in 0..16 {
+            let (o, r) = (ours.start().expect("ours"), rings.start().expect("ring's"));
+            let (o_pub, r_pub) = (o.pub_key().to_vec(), r.pub_key().to_vec());
+            let ours_agreed = o.complete(&r_pub).expect("ours completes");
+            let rings_agreed = r.complete(&o_pub).expect("ring's completes");
+            assert_eq!(
+                ours_agreed.secret_bytes(),
+                rings_agreed.secret_bytes(),
+                "{:?}",
+                ours.name()
+            );
+        }
+    }
+}
+
+/// A handshake in each TLS version negotiates each group with this
+/// crate's on one side and ring's on the other, both ways, and P-521 with
+/// this crate's on both sides, the suites ring's throughout.
+#[test]
+fn each_group_handshakes_with_rings_both_ways() {
+    let suites = [
+        ring::cipher_suite::TLS13_AES_128_GCM_SHA256,
+        ring::cipher_suite::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+    ];
+    for suite in suites {
+        for (ours, rings, _) in group_pairs() {
+            let name = ours.name();
+            let (ours, rings) = (&[ours][..], &[rings][..]);
+            let agreed =
+                handshake_between((suite, ours), (suite, rings), "this crate's group serving");
+            assert_eq!(agreed, name);
+            let agreed =
+                handshake_between((suite, rings), (suite, ours), "this crate's group dialing");
+            assert_eq!(agreed, name);
+        }
+        let p521 = &[dcroxide_tlscrypto::kx_group::SECP521R1][..];
+        let agreed = handshake_between((suite, p521), (suite, p521), "P-521 on both sides");
+        assert_eq!(agreed, NamedGroup::secp521r1);
     }
 }

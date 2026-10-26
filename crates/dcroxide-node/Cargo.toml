@@ -51,6 +51,10 @@ dcroxide-peer = { path = "../dcroxide-peer" }
 dcroxide-rpc = { path = "../dcroxide-rpc" }
 dcroxide-txscript = { path = "../dcroxide-txscript" }
 dcroxide-wire = { path = "../dcroxide-wire" }
+# The in-tree rustls crypto provider (ADR-0015).  Until the switch hands it
+# everything, the RPC server takes only its P-521 key exchange, beside
+# ring's three groups (`rpctls::rpc_kx_groups`).
+dcroxide-tlscrypto = { path = "../dcroxide-tlscrypto" }
 # Only the ring provider is used (see rpcrun::tls_server_config).
 # Default features would also pull aws-lc-rs, compiling a 68 MB
 # C/assembly crypto library into a workspace that otherwise forbids

@@ -1,11 +1,12 @@
 # ADR-0015 — TLS crypto provider: an in-tree provider on RustCrypto
 
 - **Status:** Accepted 2026-10-26. Step 1 is under way:
-  `dcroxide-tlscrypto` holds the nine cipher suites' record protection,
-  and the node does not use it yet. `ring` stays the node's TLS provider
-  until the in-tree provider passes the Go interop matrix: every cipher
-  suite, key exchange group, key type and TLS version, plus client
-  certificates. Then `ring` goes in one change.
+  `dcroxide-tlscrypto` holds the nine cipher suites' record protection
+  and the four key exchange groups, and the node takes only its P-521
+  group, which `ring` lacks. `ring` stays the node's TLS provider for
+  everything else until the in-tree provider passes the Go interop
+  matrix: every cipher suite, key exchange group, key type and TLS
+  version, plus client certificates. Then `ring` goes in one change.
 - **Date:** 2026-10-26
 
 ## Context

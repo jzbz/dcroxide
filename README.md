@@ -486,9 +486,13 @@ work). Currently implemented:
   `ring` (no dcrd counterpart; ADR-0015), built in steps beside it: so
   far the nine cipher suites' record protection over RustCrypto's
   `aes-gcm` and `chacha20poly1305`, with their transcript hashes, HMAC,
-  HKDF and TLS 1.2 PRF, pinned by Wycheproof's vectors on hardware and
-  portable backends and by in-memory handshakes against ring's suites of
-  the same names, both ways; the node does not use it yet
+  HKDF and TLS 1.2 PRF, and the X25519, P-256, P-384 and P-521 key
+  exchanges over `curve25519-dalek` and RustCrypto's curve crates, with
+  Go's rules for a peer's share and ephemeral keys from the kernel,
+  pinned by Wycheproof's vectors on hardware and portable backends, by
+  in-memory handshakes against ring's suites and groups of the same
+  names, both ways, and by Go's `crypto/ecdh` through the oracle; the
+  node takes only its P-521 key exchange so far
 - `dcroxide-ratelimit` — dcrd 2.2's `internal/ratelimit` token bucket:
   a bucket seeded with `burst` tokens refilling at a fixed rate,
   reproducing dcrd's `f64` operations in dcrd's order — including
