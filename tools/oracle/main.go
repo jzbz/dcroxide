@@ -143,17 +143,25 @@
 //	                     {"result": "<hex of the canonical params dump>"}
 //	                     (line format defined by dumpParams below, mirrored
 //	                     byte-for-byte by dcroxide's Params::dump)
+//	x509_verify_client → data is JSON {"roots": [hex DER], "leaf": hex DER,
+//	                     "intermediates": [hex DER], "time": unix seconds};
+//	                     the leaf verified as crypto/tls verifies a client
+//	                     certificate under RequireAndVerifyClientCert;
+//	                     {"result": "ok"} or {"result": "refused: <error>"},
+//	                     each with "go_version": runtime.Version()
 package main
 
 import (
 	"bufio"
 	"bytes"
+	"crypto/x509"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -198,6 +206,7 @@ type response struct {
 	FullHash    string `json:"full_hash,omitempty"`
 	BlockHash   string `json:"block_hash,omitempty"`
 	Reencoded   string `json:"reencoded,omitempty"`
+	GoVersion   string `json:"go_version,omitempty"`
 }
 
 func errResp(format string, args ...any) response {
@@ -1357,6 +1366,57 @@ func handle(req request) response {
 			return errResp("chaincfg_dump: %v", err)
 		}
 		return response{Result: hex.EncodeToString([]byte(dump))}
+
+	case "x509_verify_client":
+		// crypto/tls's processCertsFromClient: the roots in one pool,
+		// every certificate sent after the leaf in another, client
+		// authentication as the key usage, at the given time.  A root Go
+		// cannot parse is skipped, as AppendCertsFromPEM skips it.  The
+		// Go version goes with the verdict because x509's chain search
+		// is the toolchain's, not dcrd's.
+		var in struct {
+			Roots         []string `json:"roots"`
+			Leaf          string   `json:"leaf"`
+			Intermediates []string `json:"intermediates"`
+			Time          int64    `json:"time"`
+		}
+		if err := json.Unmarshal(data, &in); err != nil {
+			return errResp("x509_verify_client: %v", err)
+		}
+		parse := func(h string) (*x509.Certificate, error) {
+			der, err := hex.DecodeString(h)
+			if err != nil {
+				return nil, err
+			}
+			return x509.ParseCertificate(der)
+		}
+		roots := x509.NewCertPool()
+		for _, h := range in.Roots {
+			if cert, err := parse(h); err == nil {
+				roots.AddCert(cert)
+			}
+		}
+		leaf, err := parse(in.Leaf)
+		if err != nil {
+			return errResp("x509_verify_client: leaf: %v", err)
+		}
+		opts := x509.VerifyOptions{
+			Roots:         roots,
+			CurrentTime:   time.Unix(in.Time, 0),
+			Intermediates: x509.NewCertPool(),
+			KeyUsages:     []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+		}
+		for _, h := range in.Intermediates {
+			cert, err := parse(h)
+			if err != nil {
+				return errResp("x509_verify_client: intermediate: %v", err)
+			}
+			opts.Intermediates.AddCert(cert)
+		}
+		if _, err := leaf.Verify(opts); err != nil {
+			return response{Result: "refused: " + err.Error(), GoVersion: runtime.Version()}
+		}
+		return response{Result: "ok", GoVersion: runtime.Version()}
 
 	default:
 		return errResp("unknown cmd: %s", req.Cmd)

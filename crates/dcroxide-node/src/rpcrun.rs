@@ -2653,6 +2653,74 @@ impl<'a> DerReader<'a> {
             _ => None,
         }
     }
+
+    /// [`DerReader::read_tag`], with the whole element as well.
+    // The element is the prefix of the input the read consumed.
+    #[allow(clippy::arithmetic_side_effects)]
+    fn read_raw(&mut self, want: u8) -> Option<(u8, &'a [u8], &'a [u8])> {
+        let before = self.data;
+        let content = self.read_tag(want)?;
+        Some((want, content, &before[..before.len() - self.data.len()]))
+    }
+}
+
+/// Whether `content` is an AlgorithmIdentifier's contents Go's `parseAI`
+/// (`crypto/x509/parser.go`) reads: an OBJECT IDENTIFIER cryptobyte
+/// reads ("x509: malformed OID"), then, if anything follows, one
+/// well-formed element ("x509: malformed parameters"), after which
+/// nothing is read.
+fn go_parse_ai(content: &[u8]) -> bool {
+    let mut ai = DerReader::new(content);
+    if !ai.read_tag(0x06).is_some_and(go_oid_ok) {
+        return false;
+    }
+    ai.is_empty() || ai.read().is_some()
+}
+
+/// A BIT STRING's content as cryptobyte's `ReadASN1BitString` reads it:
+/// the count of unused bits, at most seven and none in an empty string,
+/// which must all be zero, then the octets.
+// A shift of at most seven.
+#[allow(clippy::arithmetic_side_effects)]
+fn go_bit_string(content: &[u8]) -> Option<(u8, &[u8])> {
+    let (&unused, bytes) = content.split_first()?;
+    if unused > 7
+        || (bytes.is_empty() && unused != 0)
+        || bytes
+            .last()
+            .is_some_and(|last| last & ((1u8 << unused) - 1) != 0)
+    {
+        return None;
+    }
+    Some((unused, bytes))
+}
+
+/// A subject public key info's algorithm identifier contents and key
+/// bits, when its algorithm is one Go 1.27's `x509` gives a key
+/// (`getPublicKeyAlgorithmFromOID`: RSA, DSA, ECDSA, Ed25519 and the
+/// three ML-DSA parameter sets) and the key bits leave no bit unused;
+/// `None` otherwise, which for an algorithm Go does not know is Go's nil
+/// `PublicKey`.
+fn go_public_key(spki: &[u8]) -> Option<(&[u8], &[u8])> {
+    const KNOWN: [&[u8]; 7] = [
+        RSA_ENCRYPTION,
+        &[0x2a, 0x86, 0x48, 0xce, 0x38, 0x04, 0x01],
+        &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01],
+        &[0x2b, 0x65, 0x70],
+        &[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x03, 0x11],
+        &[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x03, 0x12],
+        &[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x03, 0x13],
+    ];
+    let mut spki = DerReader::new(spki);
+    let algorithm = spki.read_tag(0x30)?;
+    let oid = DerReader::new(algorithm).read_tag(0x06)?;
+    if !KNOWN.contains(&oid) {
+        return None;
+    }
+    match go_bit_string(spki.read_tag(0x03)?)? {
+        (0, key) => Some((algorithm, key)),
+        _ => None,
+    }
 }
 
 /// Unix seconds from a proleptic Gregorian civil date and time.
@@ -2756,6 +2824,39 @@ struct CertFacts {
     /// `pathLenConstraint`: the most intermediates a chain below this
     /// certificate may hold.
     max_path_len: Option<u64>,
+    /// Go's `Version`: 1, 2 or 3.
+    version: u8,
+    /// Go's `BasicConstraintsValid`: the certificate carries basic
+    /// constraints.
+    basic_constraints: bool,
+    /// Go's `IsCA`: the basic constraints assert cA.
+    is_ca: bool,
+    /// Go's `KeyUsage`: the first nine bits of the key usage extension,
+    /// as `parseKeyUsageExtension` keeps them, and zero without one.
+    key_usage: u16,
+}
+
+/// What Go's `buildChains` reads from a certificate to find and check
+/// the certificates that may have issued it (`crypto/x509/verify.go`,
+/// `cert_pool.go`): the issuer and subject names its pools index and
+/// compare, as DER contents; the subject and authority key identifiers
+/// that order the candidates, empty where absent, as Go's nil and empty
+/// slices compare equal; the signed `TBSCertificate`, whole, with its
+/// signature algorithm's contents and its signature, `None` when the
+/// signature's last octet carries unused bits; and the certificate's
+/// own key, as its algorithm identifier's contents and its key bits,
+/// `None` where Go's parser leaves `PublicKey` nil, an algorithm it does
+/// not know, or where this reader cannot read the key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ChainLinks<'a> {
+    issuer: &'a [u8],
+    subject: &'a [u8],
+    subject_key_id: &'a [u8],
+    authority_key_id: &'a [u8],
+    tbs: &'a [u8],
+    signature_algorithm: &'a [u8],
+    signature: Option<&'a [u8]>,
+    key: Option<(&'a [u8], &'a [u8])>,
 }
 
 /// The facts Go's `policiesValid` (`crypto/x509/verify.go`) reads from
@@ -2908,13 +3009,17 @@ fn go_oid_ok(content: &[u8]) -> bool {
 impl CertFacts {
     /// Read the facts from a DER certificate, or `None` where Go's
     /// `ParseCertificate` (`crypto/x509/parser.go`) fails on what this
-    /// reads: the version, the validity times, the extension list
-    /// (`parseExtension` and no OID twice), the critical marking
-    /// `processExtensions` refuses on the key identifiers and the
-    /// authority information access, and the extensions whose facts
-    /// are kept.  Go's other checks (the serial number, names, public
-    /// key, signature, and the contents of other extensions) are not
-    /// ported, so `Some` does not promise Go parses the certificate.
+    /// reads: nothing after the certificate, the version (its [0] holding
+    /// the INTEGER alone), inner and outer signature algorithms that are
+    /// the same and read as `parseAI` reads them, the validity times,
+    /// the signature's BIT STRING, the extension list (`parseExtension`
+    /// and no OID twice), the critical marking `processExtensions`
+    /// refuses on the key identifiers and the authority information
+    /// access, and the extensions whose facts are kept, the key
+    /// identifiers and the key usage among them.  Go's other checks (the
+    /// serial number, names, public key, and the contents of other
+    /// extensions) are not ported, so `Some` does not promise Go parses
+    /// the certificate.
     /// The four policy extensions are among those read, with Go's rules,
     /// though only [`CertFacts::parse_all`] keeps what they say.
     fn parse(der: &[u8]) -> Option<CertFacts> {
@@ -2923,9 +3028,18 @@ impl CertFacts {
 
     /// [`CertFacts::parse`], with the policy facts Go's `policiesValid`
     /// reads and what Go's `alreadyInChain` compares.
-    // The version is at most 2 before the increment.
-    #[allow(clippy::arithmetic_side_effects)]
     fn parse_all(der: &[u8]) -> Option<(CertFacts, PolicyFacts, ChainIdentity<'_>)> {
+        Self::parse_full(der).map(|(facts, policies, identity, _)| (facts, policies, identity))
+    }
+
+    /// [`CertFacts::parse_all`], with what Go's `buildChains` reads to
+    /// place the certificate in a chain ([`ChainLinks`]).
+    // The version is at most 2 before the increment, and a bit index is
+    // below nine.
+    #[allow(clippy::arithmetic_side_effects)]
+    fn parse_full(
+        der: &[u8],
+    ) -> Option<(CertFacts, PolicyFacts, ChainIdentity<'_>, ChainLinks<'_>)> {
         // The certificate policies, policy mappings, policy constraints
         // and inhibit any policy extensions, as DER OID contents.
         const POLICIES: &[u8] = &[0x55, 0x1d, 0x20];
@@ -2944,10 +3058,41 @@ impl CertFacts {
         // uniformResourceIdentifier and iPAddress.
         let known_name = |tag: u8| matches!(tag, 0x81 | 0x82 | 0x86 | 0x87);
 
-        let certificate = DerReader::new(der).read_tag(0x30)?;
-        let mut tbs = DerReader::new(DerReader::new(certificate).read_tag(0x30)?);
+        // id-ce-subjectKeyIdentifier, id-ce-keyUsage and
+        // id-ce-authorityKeyIdentifier, as DER OID contents.
+        const SUBJECT_KEY_ID: &[u8] = &[0x55, 0x1d, 0x0e];
+        const KEY_USAGE: &[u8] = &[0x55, 0x1d, 0x0f];
+        const AUTHORITY_KEY_ID: &[u8] = &[0x55, 0x1d, 0x23];
+
+        // `ParseCertificate`: the certificate and nothing after it
+        // ("x509: trailing data"), then the TBSCertificate, the
+        // signature algorithm, which must equal the one the
+        // TBSCertificate names ("x509: inner and outer signature
+        // algorithm identifiers don't match") and read as `parseAI`
+        // reads it, and the signature, a BIT STRING cryptobyte's
+        // `ReadASN1BitString` reads.
+        let mut whole = DerReader::new(der);
+        let certificate = whole.read_tag(0x30)?;
+        if !whole.is_empty() {
+            return None;
+        }
+        let mut outer = DerReader::new(certificate);
+        let (_, tbs_content, tbs_element) = outer.read_raw(0x30)?;
+        let (_, signature_algorithm, outer_algorithm) = outer.read_raw(0x30)?;
+        let signature = go_bit_string(outer.read_tag(0x03)?)?;
+        if !go_parse_ai(signature_algorithm) {
+            return None;
+        }
+        let mut tbs = DerReader::new(tbs_content);
+        // `ReadOptionalASN1Integer`: the [0] holds the INTEGER and
+        // nothing after it ("x509: malformed version").
         let version = if tbs.peek_tag() == Some(0xa0) {
-            match DerReader::new(tbs.read()?.1).read_tag(0x02)? {
+            let mut wrapped = DerReader::new(tbs.read()?.1);
+            let value = wrapped.read_tag(0x02)?;
+            if !wrapped.is_empty() {
+                return None;
+            }
+            match value {
                 [v @ 0..=2] => v + 1,
                 _ => return None,
             }
@@ -2955,7 +3100,9 @@ impl CertFacts {
             1
         };
         tbs.read_tag(0x02)?; // serialNumber
-        tbs.read_tag(0x30)?; // signature
+        if tbs.read_raw(0x30)?.2 != outer_algorithm {
+            return None;
+        }
         let issuer = tbs.read_tag(0x30)?;
         let mut validity = DerReader::new(tbs.read_tag(0x30)?);
         let (tag, content) = validity.read()?;
@@ -2971,6 +3118,20 @@ impl CertFacts {
             unhandled_critical: false,
             client_auth: true,
             max_path_len: None,
+            version,
+            basic_constraints: false,
+            is_ca: false,
+            key_usage: 0,
+        };
+        let mut links = ChainLinks {
+            issuer,
+            subject,
+            subject_key_id: &[],
+            authority_key_id: &[],
+            tbs: tbs_element,
+            signature_algorithm,
+            signature: (signature.0 == 0).then_some(signature.1),
+            key: go_public_key(spki),
         };
         let mut policies = PolicyFacts {
             self_issued: issuer == subject,
@@ -2984,7 +3145,7 @@ impl CertFacts {
         // Go reads the unique identifiers from v2 on and the extensions
         // only from a v3 certificate.
         if version < 2 {
-            return Some((facts, policies, identity));
+            return Some((facts, policies, identity, links));
         }
         for unique_id in [0x81, 0x82] {
             if tbs.peek_tag() == Some(unique_id) {
@@ -2992,7 +3153,7 @@ impl CertFacts {
             }
         }
         if version < 3 || tbs.peek_tag() != Some(0xa3) {
-            return Some((facts, policies, identity));
+            return Some((facts, policies, identity, links));
         }
         let mut extensions = DerReader::new(DerReader::new(tbs.read()?.1).read_tag(0x30)?);
         let mut seen: Vec<&[u8]> = Vec::new();
@@ -3071,13 +3232,41 @@ impl CertFacts {
                 // An optional cA boolean, then the optional
                 // pathLenConstraint (`parseBasicConstraintsExtension`).
                 let mut constraints = DerReader::new(DerReader::new(value).read_tag(0x30)?);
-                if constraints.peek_tag() == Some(0x01)
-                    && !matches!(constraints.read_tag(0x01)?, [0x00] | [0xff])
-                {
-                    return None;
+                facts.basic_constraints = true;
+                if constraints.peek_tag() == Some(0x01) {
+                    facts.is_ca = match constraints.read_tag(0x01)? {
+                        [0x00] => false,
+                        [0xff] => true,
+                        _ => return None,
+                    };
                 }
                 if constraints.peek_tag() == Some(0x02) {
                     facts.max_path_len = Some(der_path_len(constraints.read_tag(0x02)?)?);
+                }
+            }
+            // The key identifiers (`processExtensions`): the subject's an
+            // OCTET STRING, the authority's a SEQUENCE whose optional [0]
+            // is the identifier Go keeps.
+            if oid == SUBJECT_KEY_ID {
+                links.subject_key_id = DerReader::new(value).read_tag(0x04)?;
+            }
+            if oid == AUTHORITY_KEY_ID {
+                let mut akid = DerReader::new(DerReader::new(value).read_tag(0x30)?);
+                if akid.peek_tag() == Some(0x80) {
+                    links.authority_key_id = akid.read_tag(0x80)?;
+                }
+            }
+            // `parseKeyUsageExtension`: a BIT STRING, of which the first
+            // nine bits are kept.
+            if oid == KEY_USAGE {
+                let (_, bits) = go_bit_string(DerReader::new(value).read_tag(0x03)?)?;
+                for i in 0..9usize {
+                    if bits
+                        .get(i / 8)
+                        .is_some_and(|byte| byte & (0x80 >> (i % 8)) != 0)
+                    {
+                        facts.key_usage |= 1 << i;
+                    }
                 }
             }
             // `processExtensions` for the policy extensions, each read
@@ -3131,7 +3320,7 @@ impl CertFacts {
             }
             facts.unhandled_critical |= critical && unhandled;
         }
-        Some((facts, policies, identity))
+        Some((facts, policies, identity, links))
     }
 
     /// Go's `isValid` for this certificate at `now` (`verify.go`
@@ -3150,6 +3339,264 @@ impl CertFacts {
         }
         Ok(())
     }
+}
+
+/// The most signature checks one of Go's chain searches makes (Go's
+/// `maxChainSignatureChecks`, `crypto/x509/verify.go`).
+const MAX_CHAIN_SIGNATURE_CHECKS: usize = 100;
+
+/// Go's `KeyUsageCertSign`, bit 5 of `KeyUsage`.
+const KEY_USAGE_CERT_SIGN: u16 = 1 << 5;
+
+/// A certificate Go's chain search can place, a pool certificate or one
+/// the client sent, with what the search reads from it.
+struct ChainCandidate<'a> {
+    der: &'a [u8],
+    facts: CertFacts,
+    identity: ChainIdentity<'a>,
+    links: ChainLinks<'a>,
+}
+
+impl<'a> ChainCandidate<'a> {
+    /// The candidate for a certificate [`CertFacts::parse_full`] reads.
+    fn parse(der: &'a [u8]) -> Option<ChainCandidate<'a>> {
+        let (facts, _, identity, links) = CertFacts::parse_full(der)?;
+        Some(ChainCandidate {
+            der,
+            facts,
+            identity,
+            links,
+        })
+    }
+}
+
+/// How Go's `buildChains` ended for a client certificate.
+#[derive(Debug, PartialEq, Eq)]
+enum GoChains<'a> {
+    /// The chains it built, each as the DER of its certificates from the
+    /// leaf's issuer to the root.
+    Built(Vec<Vec<&'a [u8]>>),
+    /// Its signature check budget ran out before it built one
+    /// (`errSignatureLimit`).
+    SignatureLimit,
+}
+
+/// Go 1.27's `buildChains` for `leaf` (`crypto/x509/verify.go`), over
+/// the `--clientcafile` pool and the pool of certificates the client
+/// sent, each deduplicated and in the order it was filled, as Go's
+/// `CertPool.AddCert` leaves them, at `now`.
+///
+/// It looks for the leaf's issuer among the roots and then among the
+/// sent certificates, in the order `findPotentialParents` gives (those
+/// named as the issuer, the ones whose subject key identifier matches
+/// the child's authority key identifier first, then those where only
+/// one of the two is present, then the rest), and goes into each
+/// intermediate it accepts before the next candidate.  Each candidate
+/// costs one of the 100 signature checks before anything else is asked
+/// of it, so one passed over for its missing key, or because
+/// `alreadyInChain` finds its like on the chain, costs one too; then it
+/// must pass `CheckSignatureFrom` (a version 3 parent must carry basic
+/// constraints, which must assert cA, a parent's key usage, when it has
+/// one, must include certificate signing, and the parent's key must
+/// verify the child's signature) and `isValid` (no unhandled critical
+/// extension, the validity window, basic constraints asserting cA for an
+/// intermediate, and its path length constraint over the intermediates
+/// below it).  The search ends when the budget runs out, keeping the
+/// chains built by then.
+///
+/// The signature is verified with `sig_algs`, the ring provider's
+/// algorithms webpki uses, by the first one naming both the child's
+/// signature algorithm and the parent's key algorithm, as webpki picks
+/// it, after the RSA public exponent limit Go's verification applies and
+/// ring's does not (`go_rsa_exponent_fits`).  Go verifies some
+/// signatures those cannot, among them RSA keys of 1024 to 2047 bits or
+/// over 8192, P-224 and P-521 keys, ECDSA with SHA-512, ML-DSA, a
+/// signature algorithm identifier Go matches by its OID alone, and a
+/// signature BIT STRING with unused bits, which Go right-aligns; such a
+/// candidate is taken here as failing its signature check, where Go
+/// would go on through it.
+fn go_build_chains<'a>(
+    leaf: &ChainCandidate<'a>,
+    roots: &[ChainCandidate<'a>],
+    sent: &[ChainCandidate<'a>],
+    now: i64,
+    sig_algs: &[&'static dyn rustls::pki_types::SignatureVerificationAlgorithm],
+) -> GoChains<'a> {
+    let mut search = ChainSearch {
+        roots,
+        sent,
+        now,
+        sig_algs,
+        checks: 0,
+        chains: Vec::new(),
+    };
+    let mut chain = vec![leaf];
+    let finished = search.build(&mut chain);
+    if !finished && search.chains.is_empty() {
+        return GoChains::SignatureLimit;
+    }
+    GoChains::Built(search.chains)
+}
+
+/// The state of one [`go_build_chains`] search.
+struct ChainSearch<'s, 'a> {
+    roots: &'s [ChainCandidate<'a>],
+    sent: &'s [ChainCandidate<'a>],
+    now: i64,
+    sig_algs: &'s [&'static dyn rustls::pki_types::SignatureVerificationAlgorithm],
+    /// The signature checks spent, Go's `sigChecks`.
+    checks: usize,
+    chains: Vec<Vec<&'a [u8]>>,
+}
+
+impl<'s, 'a> ChainSearch<'s, 'a> {
+    /// `buildChains` for the last certificate of `chain`, which runs
+    /// from the leaf; `false` once the budget has run out, which ends
+    /// the search at every level, as Go's `errSignatureLimit` breaks
+    /// each level's loop.
+    // `chain` holds the leaf, so its length is at least one.
+    #[allow(clippy::arithmetic_side_effects)]
+    fn build(&mut self, chain: &mut Vec<&'s ChainCandidate<'a>>) -> bool {
+        let child = chain[chain.len() - 1];
+        for (is_root, pool) in [(true, self.roots), (false, self.sent)] {
+            for candidate in potential_parents(pool, child) {
+                self.checks += 1;
+                if self.checks > MAX_CHAIN_SIGNATURE_CHECKS {
+                    return false;
+                }
+                let identities: Vec<ChainIdentity<'a>> =
+                    chain.iter().map(|cert| cert.identity).collect();
+                if candidate.links.key.is_none()
+                    || candidate.identity.already_in(&identities)
+                    || !check_signature_from(child, candidate, self.sig_algs)
+                    || !go_is_valid(candidate, is_root, chain.len(), self.now)
+                {
+                    continue;
+                }
+                if is_root {
+                    let mut built: Vec<&'a [u8]> = chain[1..].iter().map(|cert| cert.der).collect();
+                    built.push(candidate.der);
+                    self.chains.push(built);
+                } else {
+                    chain.push(candidate);
+                    let finished = self.build(chain);
+                    chain.pop();
+                    if !finished {
+                        return false;
+                    }
+                }
+            }
+        }
+        true
+    }
+}
+
+/// Go's `CertPool.findPotentialParents` for `child`: the certificates
+/// of `pool` named as its issuer, in the pool's order, those whose
+/// subject key identifier equals the child's authority key identifier
+/// first (two empty ones are equal, as Go's nil and empty slices are),
+/// then those where only one of the two is present, then the rest.
+fn potential_parents<'s, 'a>(
+    pool: &'s [ChainCandidate<'a>],
+    child: &ChainCandidate<'a>,
+) -> Vec<&'s ChainCandidate<'a>> {
+    let named = || {
+        pool.iter()
+            .filter(|c| c.links.subject == child.links.issuer)
+    };
+    let akid = child.links.authority_key_id;
+    let matching = named().filter(|c| c.links.subject_key_id == akid);
+    let one = named().filter(|c| {
+        c.links.subject_key_id != akid && (c.links.subject_key_id.is_empty() != akid.is_empty())
+    });
+    let mismatch = named().filter(|c| {
+        c.links.subject_key_id != akid && c.links.subject_key_id.is_empty() == akid.is_empty()
+    });
+    matching.chain(one).chain(mismatch).collect()
+}
+
+/// Go's `CheckSignatureFrom(parent)` for `child` (`crypto/x509/x509.go`),
+/// with the signature verified as [`go_build_chains`] says.
+fn check_signature_from(
+    child: &ChainCandidate<'_>,
+    parent: &ChainCandidate<'_>,
+    sig_algs: &[&'static dyn rustls::pki_types::SignatureVerificationAlgorithm],
+) -> bool {
+    let facts = &parent.facts;
+    if (facts.version == 3 && !facts.basic_constraints)
+        || (facts.basic_constraints && !facts.is_ca)
+        || (facts.key_usage != 0 && facts.key_usage & KEY_USAGE_CERT_SIGN == 0)
+    {
+        return false;
+    }
+    let (Some((key_algorithm, key)), Some(signature)) = (parent.links.key, child.links.signature)
+    else {
+        return false;
+    };
+    // Go's RSA verification refuses a public exponent above 2^31 - 1
+    // ("crypto/rsa: public exponent too large"), where ring takes one up
+    // to 2^33 - 1.
+    if DerReader::new(key_algorithm).read_tag(0x06) == Some(RSA_ENCRYPTION)
+        && !go_rsa_exponent_fits(key)
+    {
+        return false;
+    }
+    sig_algs
+        .iter()
+        .find(|alg| {
+            alg.signature_alg_id().as_ref() == child.links.signature_algorithm
+                && alg.public_key_alg_id().as_ref() == key_algorithm
+        })
+        .is_some_and(|alg| {
+            alg.verify_signature(key, child.links.tbs, signature)
+                .is_ok()
+        })
+}
+
+/// rsaEncryption, as DER object identifier contents.
+const RSA_ENCRYPTION: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01];
+
+/// Whether an RSA public key's exponent is one Go's RSA verification
+/// takes, at most 2^31 - 1 (`crypto/internal/fips140/rsa`
+/// `checkPublicKey`); a key that does not read as `RSAPublicKey` is
+/// refused too.  The exponent's other limits, odd and at least 3, are
+/// ring's as well.
+// Shifts over at most eight bytes.
+#[allow(clippy::arithmetic_side_effects)]
+fn go_rsa_exponent_fits(key: &[u8]) -> bool {
+    let Some(mut fields) = DerReader::new(key).read_tag(0x30).map(DerReader::new) else {
+        return false;
+    };
+    let (Some(_modulus), Some(exponent)) = (fields.read_tag(0x02), fields.read_tag(0x02)) else {
+        return false;
+    };
+    let digits = exponent.strip_prefix(&[0x00]).unwrap_or(exponent);
+    digits.len() <= 4
+        && exponent.first().is_some_and(|first| first & 0x80 == 0)
+        && digits
+            .iter()
+            .fold(0u64, |value, &b| (value << 8) | u64::from(b))
+            <= 0x7fff_ffff
+}
+
+/// Go 1.27's `isValid` for a root or intermediate `candidate` placed
+/// above a chain of `chain_len` certificates (`crypto/x509/verify.go`);
+/// the name check it opens with holds for every candidate
+/// [`potential_parents`] gives.
+// `chain_len` counts the leaf, so it is at least one.
+#[allow(clippy::arithmetic_side_effects)]
+fn go_is_valid(candidate: &ChainCandidate<'_>, is_root: bool, chain_len: usize, now: i64) -> bool {
+    let facts = &candidate.facts;
+    if facts.valid_at(now).is_err() {
+        return false;
+    }
+    if !is_root && !(facts.basic_constraints && facts.is_ca) {
+        return false;
+    }
+    let intermediates = u64::try_from(chain_len - 1).unwrap_or(u64::MAX);
+    facts
+        .max_path_len
+        .is_none_or(|max_path_len| intermediates <= max_path_len)
 }
 
 /// One certificate `--clientcafile` added to the pool.
@@ -3188,6 +3635,17 @@ struct ClientCa {
 ///   no validity window or extensions, so an expired, not yet valid,
 ///   unhandled-critical, server-only or `pathlen:0` root used to anchor
 ///   chains dcrd refuses.
+/// - Before that search, Go's own is replayed ([`go_build_chains`]),
+///   with its budget of 100 signature checks charged for every
+///   candidate it considers.  A replay whose budget runs out before it
+///   builds a chain refuses the client with Go's error, where webpki,
+///   which verifies no candidate that leads to no root, would go on.
+///   Otherwise webpki searches only over the chains the replay built and
+///   accepts only a path that is one of them; and a root Go's
+///   `CheckSignatureFrom` lets sign nothing, a version 3 root without
+///   basic constraints, one whose basic constraints do not assert cA, or
+///   one whose key usage leaves out certificate signing, anchors
+///   nothing, though webpki's anchors check none of it.
 ///
 /// The root hints and the handshake signature checks are webpki's over
 /// the whole pool.
@@ -3804,7 +4262,9 @@ impl rustls::server::danger::ClientCertVerifier for GoClientCertVerifier {
         // webpki counts its 100 signature checks over each path it
         // verifies at an anchor, where Go counts one for each candidate
         // issuer, so refused paths that share intermediates Go counts
-        // once spend it sooner than Go's.  A chain the constraint refuses
+        // once spend it sooner than Go's; the other way round, Go's
+        // budget is held by replaying Go's own search first (below).  A
+        // chain the constraint refuses
         // fails with webpki's own error for it, which is logged as Go's
         // `TooManyIntermediates`, unless another path the search tried
         // failed in a way webpki ranks higher, on a signature, a validity
@@ -3827,18 +4287,6 @@ impl rustls::server::danger::ClientCertVerifier for GoClientCertVerifier {
                 rustls::CertificateError::UnhandledCriticalExtension,
             ));
         }
-        let usable: Vec<&ClientCa> = self
-            .cas
-            .iter()
-            .filter(|ca| ca.facts.valid_at(now_secs).is_ok() && ca.facts.client_auth)
-            .collect();
-        let anchors: Vec<rustls::pki_types::TrustAnchor<'_>> =
-            usable.iter().map(|ca| ca.anchor.clone()).collect();
-        // The pool parsed each of these when it was loaded.
-        let roots: Vec<Option<ChainIdentity<'_>>> = usable
-            .iter()
-            .map(|ca| CertFacts::parse_all(&ca.der).map(|(_, _, identity)| identity))
-            .collect();
         // Go adds the sent certificates to a pool of intermediates
         // (`processCertsFromClient`), which keeps one copy of each, so a
         // certificate sent twice makes no second chain.
@@ -3848,6 +4296,88 @@ impl rustls::server::danger::ClientCertVerifier for GoClientCertVerifier {
                 sent.push(cert.clone());
             }
         }
+        // Go's own search, replayed ([`go_build_chains`]), decides which
+        // chains there are, and webpki's search below then accepts only
+        // a path that is one of them.  Go's budget charges every
+        // candidate it considers, where webpki's counts the signatures of
+        // the paths it verifies at an anchor, so candidates named as an
+        // issuer that lead to no root, which webpki never verifies, can
+        // spend Go's before it builds a chain, and Go then refuses what
+        // webpki alone would accept.  Go checks the leaf's own validity
+        // before it searches (`isValid(leafCertificate)` in `Verify`);
+        // for a leaf outside its window webpki's search fails on that,
+        // so the replay is not run for it.
+        let allowed = if leaf_facts.valid_at(now_secs).is_ok() {
+            let leaf = ChainCandidate::parse(end_entity.as_ref());
+            let pool: Vec<ChainCandidate<'_>> = self
+                .cas
+                .iter()
+                .filter_map(|ca| ChainCandidate::parse(&ca.der))
+                .collect();
+            let sent_candidates: Vec<ChainCandidate<'_>> = sent
+                .iter()
+                .filter_map(|cert| ChainCandidate::parse(cert.as_ref()))
+                .collect();
+            match leaf.map(|leaf| {
+                go_build_chains(&leaf, &pool, &sent_candidates, now_secs, self.sig_algs)
+            }) {
+                Some(GoChains::SignatureLimit) => {
+                    return Err(go_pki_error(webpki::Error::MaximumSignatureChecksExceeded));
+                }
+                Some(GoChains::Built(chains)) => Some(chains),
+                None => Some(Vec::new()),
+            }
+        } else {
+            None
+        };
+        // When the replay built chains, webpki searches only over them:
+        // the sent certificates on one, and the roots that end one.  A
+        // path webpki builds and the callback then refuses still spends
+        // webpki's budget, and webpki tries the sent certificates in the
+        // order sent where Go puts the key identifiers' matches first, so
+        // paths Go never builds, through certificates the pool's roots
+        // did sign or through forged ones, could spend it before webpki
+        // reached a chain Go built.  With no chain built webpki searches
+        // everything, for the error it ranks.
+        let built = allowed.as_ref().filter(|chains| !chains.is_empty());
+        let chain_ends: Option<Vec<&[u8]>> = built.map(|chains| {
+            chains
+                .iter()
+                .filter_map(|chain| chain.last().copied())
+                .collect()
+        });
+        let chain_below: Option<Vec<&[u8]>> = built.map(|chains| {
+            chains
+                .iter()
+                .flat_map(|chain| chain.split_last().map_or(&[][..], |(_, below)| below))
+                .copied()
+                .collect()
+        });
+        let usable: Vec<&ClientCa> = self
+            .cas
+            .iter()
+            .filter(|ca| ca.facts.valid_at(now_secs).is_ok() && ca.facts.client_auth)
+            .filter(|ca| {
+                chain_ends
+                    .as_ref()
+                    .is_none_or(|ends| ends.contains(&ca.der.as_slice()))
+            })
+            .collect();
+        let searched: Vec<rustls::pki_types::CertificateDer<'_>> = match &chain_below {
+            Some(below) => sent
+                .iter()
+                .filter(|cert| below.contains(&cert.as_ref()))
+                .cloned()
+                .collect(),
+            None => sent.clone(),
+        };
+        let anchors: Vec<rustls::pki_types::TrustAnchor<'_>> =
+            usable.iter().map(|ca| ca.anchor.clone()).collect();
+        // The pool parsed each of these when it was loaded.
+        let roots: Vec<Option<ChainIdentity<'_>>> = usable
+            .iter()
+            .map(|ca| CertFacts::parse_all(&ca.der).map(|(_, _, identity)| identity))
+            .collect();
         let refused_unhandled = std::cell::Cell::new(false);
         let refused_policies = std::cell::Cell::new(0usize);
         let within_path_len = |path: &webpki::VerifiedPath<'_>| {
@@ -3893,6 +4423,21 @@ impl rustls::server::danger::ClientCertVerifier for GoClientCertVerifier {
             {
                 return Err(webpki::Error::PathLenConstraintViolated);
             }
+            // A path that is no chain Go's search built is none to Go:
+            // it lies past the point where Go's budget ran out, or runs
+            // through a certificate Go passes over.  This comes before the
+            // policies, so a path Go never built is not counted among the
+            // chains they dropped.
+            if let Some(allowed) = &allowed {
+                let path: Vec<&[u8]> = ders
+                    .iter()
+                    .map(|der| der.as_ref())
+                    .chain(std::iter::once(usable[i].der.as_slice()))
+                    .collect();
+                if !allowed.contains(&path) {
+                    return Err(webpki::Error::UnknownIssuer);
+                }
+            }
             // Go's `Verify` drops each chain its search built that
             // `policiesValid` refuses, and keeps the rest.
             let chain: Vec<&PolicyFacts> = std::iter::once(&leaf_policies)
@@ -3908,7 +4453,7 @@ impl rustls::server::danger::ClientCertVerifier for GoClientCertVerifier {
         cert.verify_for_usage(
             self.sig_algs,
             &anchors,
-            &sent,
+            &searched,
             now,
             GoClientAuthUsage,
             None,
@@ -3920,11 +4465,12 @@ impl rustls::server::danger::ClientCertVerifier for GoClientCertVerifier {
             // limit (`buildChains`) and the errors of the candidates that
             // made none, and `Verify` reports what dropped every chain it
             // built: `NoValidChains` when that was `policiesValid`.  A
-            // chain is built here when the callback sees it.  Go's limit
-            // also charges candidates that lead to no root, which webpki
-            // never verifies, so Go's can run out before it builds a
-            // chain; webpki's other two budgets have no Go counterpart,
-            // and Go's search would go on.  Go reports instead the name
+            // chain is built here when the callback sees it.  A search in
+            // which Go's budget runs out before it builds a chain is
+            // refused above, by the replay; webpki's budgets can still run
+            // out before Go's, and webpki's other two have no Go
+            // counterpart, where Go's search would go on.  Go reports
+            // instead the name
             // constraint broken by a chain that passed the policies and
             // the key usage, which webpki refuses during its search
             // (PARITY.md, the clientcert entry).
@@ -3932,6 +4478,15 @@ impl rustls::server::danger::ClientCertVerifier for GoClientCertVerifier {
                 rustls::Error::InvalidCertificate(rustls::CertificateError::Other(
                     rustls::OtherError(Arc::new(InvalidPolicies(refused_policies.get()))),
                 ))
+            }
+            // Go's search ended without a chain and without running out,
+            // so a budget webpki ran out of is not Go's reason.
+            webpki::Error::MaximumSignatureChecksExceeded
+            | webpki::Error::MaximumPathBuildCallsExceeded
+            | webpki::Error::MaximumNameConstraintComparisonsExceeded
+                if allowed.as_ref().is_some_and(Vec::is_empty) =>
+            {
+                go_pki_error(webpki::Error::UnknownIssuer)
             }
             // A budget that ran out ended the search before it was done.
             webpki::Error::MaximumSignatureChecksExceeded
@@ -9341,12 +9896,17 @@ mod tests {
         not_after: Vec<u8>,
         extensions: &[Vec<u8>],
     ) -> Vec<u8> {
+        // ecdsa-with-SHA256, an identifier Go's `parseAI` reads.
+        let algorithm = der_tlv(
+            0x30,
+            &der_tlv(0x06, &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x02]),
+        );
         let mut tbs = Vec::new();
         if let Some(version) = version {
             tbs.extend(der_tlv(0xa0, &der_tlv(0x02, &[version])));
         }
         tbs.extend(der_tlv(0x02, &[1]));
-        tbs.extend(der_tlv(0x30, &[]));
+        tbs.extend(algorithm.clone());
         tbs.extend(der_tlv(0x30, &[]));
         tbs.extend(der_tlv(
             0x30,
@@ -9359,7 +9919,7 @@ mod tests {
         }
         der_tlv(
             0x30,
-            &[der_tlv(0x30, &tbs), der_tlv(0x30, &[]), der_tlv(0x03, &[0])].concat(),
+            &[der_tlv(0x30, &tbs), algorithm, der_tlv(0x03, &[0])].concat(),
         )
     }
 
@@ -9401,6 +9961,10 @@ mod tests {
                 unhandled_critical: false,
                 client_auth: true,
                 max_path_len: None,
+                version: 3,
+                basic_constraints: false,
+                is_ca: false,
+                key_usage: 0,
             }
         );
 
@@ -9765,16 +10329,9 @@ mod tests {
         not_after: Vec<u8>,
         extensions: &[Vec<u8>],
     ) -> Vec<u8> {
-        // ecdsa-with-SHA256, id-ecPublicKey, prime256v1 and commonName.
-        const ECDSA_SHA256: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x02];
+        // id-ecPublicKey and prime256v1.
         const EC_PUBLIC_KEY: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01];
         const P256: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07];
-        const COMMON_NAME: &[u8] = &[0x55, 0x04, 0x03];
-        let name = |cn: &str| {
-            let attribute = [der_tlv(0x06, COMMON_NAME), der_tlv(0x0c, cn.as_bytes())].concat();
-            der_tlv(0x30, &der_tlv(0x31, &der_tlv(0x30, &attribute)))
-        };
-        let algorithm = der_tlv(0x30, &der_tlv(0x06, ECDSA_SHA256));
         let spki = der_tlv(
             0x30,
             &[
@@ -9786,6 +10343,30 @@ mod tests {
             ]
             .concat(),
         );
+        signed_certificate_with_spki(
+            serial, subject, spki, issuer, issuer_key, not_after, extensions,
+        )
+    }
+
+    /// A certificate for the subject public key info `spki`, signed with
+    /// ECDSA P-256 by `issuer_key`.
+    fn signed_certificate_with_spki(
+        serial: u8,
+        subject: &str,
+        spki: Vec<u8>,
+        issuer: &str,
+        issuer_key: &dcroxide_certgen::gentool::ToolKeyPair,
+        not_after: Vec<u8>,
+        extensions: &[Vec<u8>],
+    ) -> Vec<u8> {
+        // ecdsa-with-SHA256 and commonName.
+        const ECDSA_SHA256: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x02];
+        const COMMON_NAME: &[u8] = &[0x55, 0x04, 0x03];
+        let name = |cn: &str| {
+            let attribute = [der_tlv(0x06, COMMON_NAME), der_tlv(0x0c, cn.as_bytes())].concat();
+            der_tlv(0x30, &der_tlv(0x31, &der_tlv(0x30, &attribute)))
+        };
+        let algorithm = der_tlv(0x30, &der_tlv(0x06, ECDSA_SHA256));
         let validity = [der_tlv(0x17, b"240101000000Z"), not_after].concat();
         let tbs = der_tlv(
             0x30,
@@ -10269,6 +10850,1191 @@ mod tests {
         );
         two(root_with(&root_key, Some(0)), root_with(&root_key, None))
             .expect("the unconstrained twin after the pathlen:0 root");
+    }
+
+    /// The parts of a certificate for [`chain_facts_follow_gos_parser`],
+    /// starting from one Go's `ParseCertificate` accepts.
+    #[derive(Clone)]
+    struct CertParts {
+        /// The contents of the version's [0], absent for version 1.
+        version: Option<Vec<u8>>,
+        inner: Vec<u8>,
+        outer: Vec<u8>,
+        spki: Vec<u8>,
+        signature: Vec<u8>,
+        trailing: Vec<u8>,
+        extensions: Vec<Vec<u8>>,
+    }
+
+    impl CertParts {
+        fn base(public_key: &[u8]) -> CertParts {
+            let ecdsa_sha256 = der_tlv(0x06, &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x02]);
+            let ec_p256 = [
+                der_tlv(0x06, &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01]),
+                der_tlv(0x06, &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07]),
+            ]
+            .concat();
+            CertParts {
+                version: Some(der_tlv(0x02, &[2])),
+                inner: ecdsa_sha256.clone(),
+                outer: ecdsa_sha256,
+                spki: der_tlv(
+                    0x30,
+                    &[
+                        der_tlv(0x30, &ec_p256),
+                        der_tlv(0x03, &[&[0u8][..], public_key].concat()),
+                    ]
+                    .concat(),
+                ),
+                signature: vec![0, 1, 2],
+                trailing: Vec::new(),
+                extensions: Vec::new(),
+            }
+        }
+
+        fn der(&self) -> Vec<u8> {
+            let name = der_tlv(0x30, &[]);
+            let mut tbs = self
+                .version
+                .as_ref()
+                .map(|v| der_tlv(0xa0, v))
+                .unwrap_or_default();
+            tbs.extend(der_tlv(0x02, &[1]));
+            tbs.extend(der_tlv(0x30, &self.inner));
+            tbs.extend(name.clone());
+            tbs.extend(der_tlv(
+                0x30,
+                &[
+                    der_tlv(0x17, b"240101000000Z"),
+                    der_tlv(0x18, b"20500101000000Z"),
+                ]
+                .concat(),
+            ));
+            tbs.extend(name);
+            tbs.extend(self.spki.clone());
+            if !self.extensions.is_empty() {
+                tbs.extend(der_tlv(0xa3, &der_tlv(0x30, &self.extensions.concat())));
+            }
+            let mut der = der_tlv(
+                0x30,
+                &[
+                    der_tlv(0x30, &tbs),
+                    der_tlv(0x30, &self.outer),
+                    der_tlv(0x03, &self.signature),
+                ]
+                .concat(),
+            );
+            der.extend_from_slice(&self.trailing);
+            der
+        }
+    }
+
+    /// Whether Go's `ParseCertificate` accepts `der`, through the oracle's
+    /// `x509_verify_client`, which parses the leaf first; `None` without
+    /// an oracle.
+    fn go_parses(oracle: &mut Option<dcroxide_testutil::Oracle>, der: &[u8]) -> Option<bool> {
+        let hex: String = der.iter().map(|b| format!("{b:02x}")).collect();
+        let request = format!(r#"{{"roots":[],"leaf":"{hex}","intermediates":[],"time":0}}"#);
+        let response = oracle
+            .as_mut()?
+            .call("x509_verify_client", request.as_bytes());
+        Some(
+            !response["error"]
+                .as_str()
+                .is_some_and(|err| err.starts_with("x509_verify_client: leaf: ")),
+        )
+    }
+
+    /// What the chain search reads, read as Go's parser reads it: the
+    /// version, basic constraints, cA and key usage bits; the key
+    /// identifiers, the signed `TBSCertificate`, its signature algorithm
+    /// and signature, and the key of an algorithm Go knows.  A
+    /// certificate Go's `ParseCertificate` refuses on any of them is
+    /// refused: trailing data, a version's [0] holding more than the
+    /// INTEGER, inner and outer signature algorithms that differ or that
+    /// `parseAI` does not read, a signature or key usage BIT STRING
+    /// cryptobyte does not read, and a key identifier of the wrong form.
+    /// Each case starts from a certificate Go parses, and where the
+    /// oracle runs, Go's own verdict on each is compared.
+    #[test]
+    fn chain_facts_follow_gos_parser() {
+        const BASIC_CONSTRAINTS: &[u8] = &[0x55, 0x1d, 0x13];
+        const KEY_USAGE: &[u8] = &[0x55, 0x1d, 0x0f];
+        const SKI: &[u8] = &[0x55, 0x1d, 0x0e];
+        const AKI: &[u8] = &[0x55, 0x1d, 0x23];
+        let mut oracle = dcroxide_testutil::oracle_or_skip();
+        let key = dcroxide_certgen::gentool::generate_key("P-256").expect("key");
+        let base = CertParts::base(&key.public_bytes());
+        let with = |change: &dyn Fn(&mut CertParts)| {
+            let mut parts = base.clone();
+            change(&mut parts);
+            parts.der()
+        };
+        let mut agrees = |label: &str, der: &[u8], parses: bool| {
+            assert_eq!(CertFacts::parse(der).is_some(), parses, "{label}");
+            if let Some(go) = go_parses(&mut oracle, der) {
+                assert_eq!(go, parses, "{label}: Go's verdict");
+            }
+        };
+
+        agrees("the base certificate", &base.der(), true);
+        let ca = with(&|c| {
+            c.extensions = vec![
+                der_extension(
+                    BASIC_CONSTRAINTS,
+                    true,
+                    &der_tlv(0x30, &der_tlv(0x01, &[0xff])),
+                ),
+                der_extension(KEY_USAGE, true, &der_tlv(0x03, &[0x02, 0x84])),
+                der_extension(SKI, false, &der_tlv(0x04, &[7; 4])),
+                der_extension(AKI, false, &der_tlv(0x30, &der_tlv(0x80, &[8; 4]))),
+            ]
+        });
+        agrees("a CA certificate", &ca, true);
+        let (facts, _, _, links) = CertFacts::parse_full(&ca).expect("a CA certificate");
+        assert_eq!(
+            (facts.version, facts.basic_constraints, facts.is_ca),
+            (3, true, true)
+        );
+        assert_eq!(
+            facts.key_usage,
+            1 | KEY_USAGE_CERT_SIGN,
+            "digitalSignature and keyCertSign"
+        );
+        assert_eq!(
+            (links.subject_key_id, links.authority_key_id),
+            (&[7u8; 4][..], &[8u8; 4][..])
+        );
+        assert_eq!(links.signature, Some(&[1u8, 2][..]));
+        assert_eq!(links.signature_algorithm, base.inner.as_slice());
+        let ec_p256 = [
+            der_tlv(0x06, &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01]),
+            der_tlv(0x06, &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07]),
+        ]
+        .concat();
+        let public_key = key.public_bytes();
+        assert_eq!(
+            links.key,
+            Some((ec_p256.as_slice(), &public_key[..])),
+            "the P-256 key and its algorithm identifier"
+        );
+
+        let end_entity = with(&|c| {
+            c.extensions = vec![
+                der_extension(BASIC_CONSTRAINTS, true, &der_tlv(0x30, &[])),
+                der_extension(KEY_USAGE, true, &der_tlv(0x03, &[0x07, 0x00, 0x80])),
+                der_extension(AKI, false, &der_tlv(0x30, &der_tlv(0x82, &[1]))),
+            ]
+        });
+        agrees("an end entity", &end_entity, true);
+        let (facts, _, _, links) = CertFacts::parse_full(&end_entity).expect("an end entity");
+        assert_eq!((facts.basic_constraints, facts.is_ca), (true, false));
+        assert_eq!(facts.key_usage, 1 << 8, "decipherOnly, the ninth bit");
+        assert!(
+            links.subject_key_id.is_empty() && links.authority_key_id.is_empty(),
+            "no identifier, and an authority without [0]"
+        );
+        let version_1 = with(&|c| c.version = None);
+        agrees("version 1", &version_1, true);
+        assert_eq!(
+            CertFacts::parse(&version_1).map(|f| (f.version, f.basic_constraints)),
+            Some((1, false))
+        );
+        // A key usage bit past the ninth is dropped, as Go drops it.
+        let bit_9 = with(&|c| {
+            c.extensions = vec![der_extension(
+                KEY_USAGE,
+                true,
+                &der_tlv(0x03, &[0x06, 0x00, 0x40]),
+            )]
+        });
+        agrees("bit 9 of the key usage", &bit_9, true);
+        assert_eq!(CertFacts::parse(&bit_9).map(|f| f.key_usage), Some(0));
+        // A signature whose last octet carries unused bits, all zero,
+        // parses; Go right-aligns it, and the chain search verifies
+        // nothing with it (webpki refuses it too).
+        let unused = with(&|c| c.signature = vec![2, 0x04]);
+        agrees("a signature with unused bits", &unused, true);
+        assert_eq!(
+            CertFacts::parse_full(&unused).map(|(_, _, _, l)| l.signature),
+            Some(None)
+        );
+        // Bytes after the subject key identifier, and after an algorithm
+        // identifier's parameters, are not read, as Go reads none.
+        agrees(
+            "bytes after the subject key identifier",
+            &with(&|c| {
+                c.extensions = vec![der_extension(
+                    SKI,
+                    false,
+                    &[der_tlv(0x04, &[1]), vec![0]].concat(),
+                )]
+            }),
+            true,
+        );
+        let with_params = [base.inner.clone(), der_tlv(0x05, &[]), vec![0x05, 0x00]].concat();
+        agrees(
+            "bytes after the parameters",
+            &with(&|c| {
+                c.inner = with_params.clone();
+                c.outer = with_params.clone();
+            }),
+            true,
+        );
+
+        agrees("trailing data", &with(&|c| c.trailing = vec![0]), false);
+        agrees(
+            "a version holding more than its INTEGER",
+            &with(&|c| c.version = Some([der_tlv(0x02, &[2]), der_tlv(0x05, &[])].concat())),
+            false,
+        );
+        agrees(
+            "an outer algorithm that differs",
+            &with(&|c| c.outer = der_tlv(0x06, &[0x2a, 0x03])),
+            false,
+        );
+        for (label, ai) in [
+            ("an empty algorithm identifier", Vec::new()),
+            (
+                "an algorithm identifier opening with no OID",
+                der_tlv(0x05, &[]),
+            ),
+            ("a malformed OID", der_tlv(0x06, &[0x80, 0x01])),
+            (
+                "malformed parameters",
+                [base.inner.clone(), vec![0x05, 0x05]].concat(),
+            ),
+        ] {
+            agrees(
+                label,
+                &with(&|c| {
+                    c.inner = ai.clone();
+                    c.outer = ai.clone();
+                }),
+                false,
+            );
+        }
+        for bits in [&[][..], &[8, 0], &[1], &[1, 0x01]] {
+            agrees(
+                &format!("signature {bits:02x?}"),
+                &with(&|c| c.signature = bits.to_vec()),
+                false,
+            );
+            agrees(
+                &format!("key usage {bits:02x?}"),
+                &with(&|c| {
+                    c.extensions = vec![der_extension(KEY_USAGE, true, &der_tlv(0x03, bits))]
+                }),
+                false,
+            );
+        }
+        agrees(
+            "a subject key identifier that is no OCTET STRING",
+            &with(&|c| c.extensions = vec![der_extension(SKI, false, &der_tlv(0x30, &[]))]),
+            false,
+        );
+        for value in [der_tlv(0x04, &[1]), der_tlv(0x30, &[0x80, 0x05, 0x01])] {
+            agrees(
+                &format!("authority key identifier {value:02x?}"),
+                &with(&|c| c.extensions = vec![der_extension(AKI, false, &value)]),
+                false,
+            );
+        }
+
+        // The key of every algorithm Go 1.27 gives one, and none for an
+        // algorithm it does not know or for key bits with unused bits.
+        // These keys are not well formed, so Go is not asked.
+        for (label, oid, known) in [
+            (
+                "RSA",
+                &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01][..],
+                true,
+            ),
+            ("DSA", &[0x2a, 0x86, 0x48, 0xce, 0x38, 0x04, 0x01], true),
+            ("ECDSA", &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01], true),
+            ("Ed25519", &[0x2b, 0x65, 0x70], true),
+            (
+                "ML-DSA-44",
+                &[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x03, 0x11],
+                true,
+            ),
+            (
+                "ML-DSA-65",
+                &[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x03, 0x12],
+                true,
+            ),
+            (
+                "ML-DSA-87",
+                &[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x03, 0x13],
+                true,
+            ),
+            (
+                "X25519, which Go 1.27 leaves without a key",
+                &[0x2b, 0x65, 0x6e],
+                false,
+            ),
+        ] {
+            let algorithm = der_tlv(0x06, oid);
+            let spki = |bits: &[u8]| {
+                der_tlv(
+                    0x30,
+                    &[der_tlv(0x30, &algorithm), der_tlv(0x03, bits)].concat(),
+                )
+            };
+            assert_eq!(
+                go_public_key(
+                    DerReader::new(&spki(&[0, 9, 9]))
+                        .read_tag(0x30)
+                        .expect("spki")
+                ),
+                known.then_some((algorithm.as_slice(), &[9u8, 9][..])),
+                "{label}"
+            );
+            assert_eq!(
+                go_public_key(
+                    DerReader::new(&spki(&[1, 9, 8]))
+                        .read_tag(0x30)
+                        .expect("spki")
+                ),
+                None,
+                "{label} with an unused bit"
+            );
+        }
+    }
+
+    /// rsaEncryption and sha256WithRSAEncryption identifiers' contents,
+    /// each with its NULL parameters.
+    const RSA_AI: &[u8] = &[
+        0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01, 0x05, 0x00,
+    ];
+    const SHA256_RSA_AI: &[u8] = &[
+        0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0b, 0x05, 0x00,
+    ];
+
+    /// An RSA algorithm that takes every signature, so that only the
+    /// checks around it decide.
+    #[derive(Debug)]
+    struct EveryRsaSignature;
+
+    impl rustls::pki_types::SignatureVerificationAlgorithm for EveryRsaSignature {
+        fn verify_signature(
+            &self,
+            _public_key: &[u8],
+            _message: &[u8],
+            _signature: &[u8],
+        ) -> Result<(), rustls::pki_types::InvalidSignature> {
+            Ok(())
+        }
+        fn public_key_alg_id(&self) -> rustls::pki_types::AlgorithmIdentifier {
+            rustls::pki_types::AlgorithmIdentifier::from_slice(RSA_AI)
+        }
+        fn signature_alg_id(&self) -> rustls::pki_types::AlgorithmIdentifier {
+            rustls::pki_types::AlgorithmIdentifier::from_slice(SHA256_RSA_AI)
+        }
+    }
+
+    /// The replay's signature check refuses an RSA parent whose public
+    /// exponent Go's RSA verification refuses, above 2^31 - 1, though
+    /// ring would take it: with an algorithm that takes every signature,
+    /// a CA with exponent 65537 or 2^31 - 1 signs and one with 2^31 + 1
+    /// or 2^32 + 1 does not.
+    #[test]
+    fn an_rsa_parent_past_gos_exponent_limit_signs_nothing() {
+        const BASIC_CONSTRAINTS: &[u8] = &[0x55, 0x1d, 0x13];
+        let key = dcroxide_certgen::gentool::generate_key("P-256").expect("key");
+        let ca = vec![der_extension(
+            BASIC_CONSTRAINTS,
+            true,
+            &der_tlv(0x30, &der_tlv(0x01, &[0xff])),
+        )];
+        let mut child = CertParts::base(&key.public_bytes());
+        child.inner = SHA256_RSA_AI.to_vec();
+        child.outer = SHA256_RSA_AI.to_vec();
+        let child_der = child.der();
+        let child = ChainCandidate::parse(&child_der).expect("the child");
+        let algorithms: [&'static dyn rustls::pki_types::SignatureVerificationAlgorithm; 1] =
+            [&EveryRsaSignature];
+        for (exponent, signs) in [
+            (&[0x01, 0x00, 0x01][..], true),
+            (&[0x7f, 0xff, 0xff, 0xff], true),
+            (&[0x00, 0x80, 0x00, 0x00, 0x01], false),
+            (&[0x01, 0x00, 0x00, 0x00, 0x01], false),
+        ] {
+            let rsa_key = der_tlv(
+                0x30,
+                &[der_tlv(0x02, &[0x00, 0xc1, 0x05]), der_tlv(0x02, exponent)].concat(),
+            );
+            let mut parent = CertParts::base(&key.public_bytes());
+            parent.spki = der_tlv(
+                0x30,
+                &[
+                    der_tlv(0x30, RSA_AI),
+                    der_tlv(0x03, &[&[0u8][..], &rsa_key].concat()),
+                ]
+                .concat(),
+            );
+            parent.extensions = ca.clone();
+            let parent_der = parent.der();
+            let parent = ChainCandidate::parse(&parent_der).expect("the parent");
+            assert_eq!(
+                check_signature_from(&child, &parent, &algorithms),
+                signs,
+                "exponent {exponent:02x?}"
+            );
+        }
+    }
+
+    /// The exponent rule itself.
+    #[test]
+    fn an_rsa_exponent_past_gos_limit_signs_nothing() {
+        let key = |exponent: &[u8]| {
+            der_tlv(
+                0x30,
+                &[der_tlv(0x02, &[0x00, 0xc1, 0x05]), der_tlv(0x02, exponent)].concat(),
+            )
+        };
+        assert!(go_rsa_exponent_fits(&key(&[0x01, 0x00, 0x01])), "65537");
+        assert!(
+            go_rsa_exponent_fits(&key(&[0x7f, 0xff, 0xff, 0xff])),
+            "2^31 - 1"
+        );
+        assert!(
+            !go_rsa_exponent_fits(&key(&[0x00, 0x80, 0x00, 0x00, 0x01])),
+            "2^31 + 1"
+        );
+        assert!(
+            !go_rsa_exponent_fits(&key(&[0x01, 0x00, 0x00, 0x00, 0x01])),
+            "2^32 + 1"
+        );
+        assert!(!go_rsa_exponent_fits(&key(&[0xff])), "a negative exponent");
+        assert!(!go_rsa_exponent_fits(&der_tlv(0x30, &[])), "no fields");
+    }
+
+    /// Go's verdict on a client chain from the oracle's
+    /// `x509_verify_client`.
+    struct GoVerdict {
+        /// `"ok"`, or the text of Go's refusal.
+        verdict: String,
+        /// Whether that Go charges a candidate before `alreadyInChain`
+        /// and the missing-key check, as the verifier does.  Of the
+        /// toolchains checked, go1.24.13, go1.25.4 and go1.26.0 charge
+        /// after them, and go1.25.14, go1.26.2 and later and go1.27 first;
+        /// go1.26.1 and the 1.25 point release between were not checked,
+        /// and count as charging after.
+        charges_first: bool,
+    }
+
+    /// Go's verdict on a client chain, `None` without an oracle.  A Go
+    /// version that cannot be read fails the test under
+    /// `DCROXIDE_REQUIRE_ORACLE`, and is otherwise taken as no oracle.
+    fn go_client_verdict(
+        oracle: &mut Option<dcroxide_testutil::Oracle>,
+        roots: &[&[u8]],
+        leaf: &[u8],
+        sent: &[&[u8]],
+        now: u64,
+    ) -> Option<GoVerdict> {
+        let hex = |der: &[u8]| der.iter().map(|b| format!("{b:02x}")).collect::<String>();
+        let list = |ders: &[&[u8]]| {
+            ders.iter()
+                .map(|der| format!("\"{}\"", hex(der)))
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        let request = format!(
+            r#"{{"roots":[{}],"leaf":"{}","intermediates":[{}],"time":{now}}}"#,
+            list(roots),
+            hex(leaf),
+            list(sent)
+        );
+        let response = oracle
+            .as_mut()?
+            .call("x509_verify_client", request.as_bytes());
+        let result = response["result"]
+            .as_str()
+            .unwrap_or_else(|| panic!("the oracle's x509_verify_client answered {response}"));
+        let version = response["go_version"].as_str().unwrap_or_default();
+        let Some((minor, patch)) = go_version_numbers(version) else {
+            assert!(
+                std::env::var_os("DCROXIDE_REQUIRE_ORACLE").is_none(),
+                "the oracle's Go version {version:?} cannot be read"
+            );
+            return None;
+        };
+        Some(GoVerdict {
+            verdict: result
+                .strip_prefix("refused: ")
+                .unwrap_or(result)
+                .to_string(),
+            charges_first: minor >= 27
+                || (minor == 26 && patch >= 2)
+                || (minor == 25 && patch >= 14),
+        })
+    }
+
+    /// The minor and patch numbers of a `runtime.Version()` string, from
+    /// its first word that opens `go1.`: `go1.27.1-X:nodwarf5` gives
+    /// (27, 1), and a development build's `devel go1.28-abcdef ...` gives
+    /// (28, 0).
+    fn go_version_numbers(version: &str) -> Option<(u32, u32)> {
+        let word = version
+            .split_whitespace()
+            .find_map(|w| w.strip_prefix("go1."))?;
+        let mut numbers = word.split(|c: char| !c.is_ascii_digit());
+        let minor = numbers.next()?.parse().ok()?;
+        let patch = if word[word
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(word.len())..]
+            .starts_with('.')
+        {
+            numbers.next()?.parse().ok()?
+        } else {
+            0
+        };
+        Some((minor, patch))
+    }
+
+    /// The oracle's Go version strings read as their release numbers.
+    #[test]
+    fn go_version_strings_read_as_numbers() {
+        for (version, want) in [
+            ("go1.27.1", Some((27, 1))),
+            ("go1.27.1-X:nodwarf5", Some((27, 1))),
+            ("go1.27.1-foo X:bar", Some((27, 1))),
+            ("go1.26", Some((26, 0))),
+            (
+                "devel go1.28-abcdef Mon Oct 26 00:00:00 2026 +0000",
+                Some((28, 0)),
+            ),
+            ("go1.25.14", Some((25, 14))),
+            ("weekly", None),
+            ("", None),
+        ] {
+            assert_eq!(go_version_numbers(version), want, "{version:?}");
+        }
+    }
+
+    /// Go's chain search is replayed before webpki's, and its budget of
+    /// 100 signature checks charges every candidate it considers
+    /// (Go 1.27's `buildChains`): certificates named as the leaf's issuer
+    /// that lead to no root cost Go a check each and webpki none, so 98 of
+    /// them sent ahead of the real intermediate leave room for the chain,
+    /// the intermediate's check being the 99th and the root's the 100th,
+    /// and 99 do not, where webpki alone accepted both.  The candidates
+    /// go in Go's order: those whose subject key identifier matches the
+    /// child's authority key identifier first, then those where only one
+    /// of the two is present, then the rest; so the same flood is no
+    /// obstacle to an intermediate whose identifier matches and the
+    /// whole obstacle to one that comes after the matching decoys.  Each
+    /// verdict is Go 1.27's, and Go's own where the oracle runs 1.26 or
+    /// later.
+    #[test]
+    fn gos_signature_budget_charges_every_candidate() {
+        use dcroxide_certgen::gentool::generate_key;
+        use rustls::pki_types::CertificateDer;
+        use rustls::server::danger::ClientCertVerifier;
+        const BASIC_CONSTRAINTS: &[u8] = &[0x55, 0x1d, 0x13];
+        const KEY_USAGE: &[u8] = &[0x55, 0x1d, 0x0f];
+        const SKI: &[u8] = &[0x55, 0x1d, 0x0e];
+        const AKI: &[u8] = &[0x55, 0x1d, 0x23];
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let secs = 1_790_000_000u64;
+        let now = rustls::pki_types::UnixTime::since_unix_epoch(Duration::from_secs(secs));
+        let mut oracle = dcroxide_testutil::oracle_or_skip();
+        let key = || generate_key("P-256").expect("key");
+        let (root_key, int_key, leaf_key, decoy_key) = (key(), key(), key(), key());
+        let ca = || {
+            vec![
+                der_extension(
+                    BASIC_CONSTRAINTS,
+                    true,
+                    &der_tlv(0x30, &der_tlv(0x01, &[0xff])),
+                ),
+                der_extension(KEY_USAGE, true, &der_tlv(0x03, &[0x02, 0x84])),
+            ]
+        };
+        let ski = |id: u8| der_extension(SKI, false, &der_tlv(0x04, &[id; 20]));
+        let aki = |id: u8| der_extension(AKI, false, &der_tlv(0x30, &der_tlv(0x80, &[id; 20])));
+        let root = signed_p256_certificate(1, "root", &root_key, "root", &root_key, &ca());
+        let verify = |leaf: &[u8], sent: &[&[u8]]| {
+            let verifier =
+                GoClientCertVerifier::from_pem(&certificate_pem(&root)).expect("verifier");
+            let sent_ders: Vec<_> = sent.iter().map(|der| CertificateDer::from(*der)).collect();
+            verifier
+                .verify_client_cert(&CertificateDer::from(leaf), &sent_ders, now)
+                .map(|_| ())
+        };
+        let mut check = |label: &str, leaf: &[u8], sent: &[&[u8]], go_accepts: bool| {
+            let got = verify(leaf, sent);
+            assert_eq!(got.is_ok(), go_accepts, "{label}: {got:?}");
+            if let Err(err) = &got
+                && label.ends_with("limit")
+            {
+                assert!(
+                    crate::rpctls::go_error_text_for_tests(err).ends_with(
+                        "x509: signature check attempts limit reached while verifying certificate chain"
+                    ),
+                    "{label}: {err:?}"
+                );
+            }
+            if let Some(GoVerdict { verdict, .. }) =
+                go_client_verdict(&mut oracle, &[&root], leaf, sent, secs)
+            {
+                assert_eq!(verdict == "ok", go_accepts, "{label}: Go says {verdict}");
+                if label.ends_with("limit") {
+                    assert_eq!(
+                        verdict,
+                        "x509: signature check attempts limit reached while verifying certificate chain",
+                        "{label}"
+                    );
+                }
+            }
+        };
+
+        // Decoys named `int`, under a key of their own and issued by a
+        // name no pool certificate holds.  Serials stay below 0x80.
+        let decoys = |extensions: &dyn Fn() -> Vec<Vec<u8>>| -> Vec<Vec<u8>> {
+            (0..120u8)
+                .map(|i| {
+                    signed_p256_certificate(
+                        6 + i,
+                        "int",
+                        &decoy_key,
+                        "nowhere",
+                        &decoy_key,
+                        &extensions(),
+                    )
+                })
+                .collect()
+        };
+        let plain = decoys(&ca);
+        let int = signed_p256_certificate(2, "int", &int_key, "root", &root_key, &ca());
+        let leaf = signed_p256_certificate(3, "leaf", &leaf_key, "int", &int_key, &[]);
+        let ahead = |decoys: &[Vec<u8>], n: usize, int: &[u8]| -> Vec<Vec<u8>> {
+            let mut sent: Vec<Vec<u8>> = decoys[..n].to_vec();
+            sent.push(int.to_vec());
+            sent
+        };
+        let refs = |sent: &[Vec<u8>]| -> Vec<Vec<u8>> { sent.to_vec() };
+        for (n, accepts) in [(98, true), (99, false)] {
+            let sent = refs(&ahead(&plain, n, &int));
+            let sent: Vec<&[u8]> = sent.iter().map(Vec::as_slice).collect();
+            let label = if accepts {
+                format!("{n} decoys")
+            } else {
+                format!("{n} decoys: limit")
+            };
+            check(&label, &leaf, &sent, accepts);
+        }
+
+        // Key identifiers reorder the candidates.  The leaf names key 7 as
+        // its authority's; an intermediate with that subject key
+        // identifier goes before 120 decoys with another, or none.
+        let leaf7 = signed_p256_certificate(4, "leaf", &leaf_key, "int", &int_key, &[aki(7)]);
+        let int7 = signed_p256_certificate(
+            2,
+            "int",
+            &int_key,
+            "root",
+            &root_key,
+            &[ca(), vec![ski(7)]].concat(),
+        );
+        for (label, extensions) in [
+            (
+                "mismatched decoys",
+                &(|| [ca(), vec![ski(8)]].concat()) as &dyn Fn() -> Vec<Vec<u8>>,
+            ),
+            ("decoys without an identifier", &ca),
+        ] {
+            let sent = ahead(&decoys(extensions), 120, &int7);
+            let sent: Vec<&[u8]> = sent.iter().map(Vec::as_slice).collect();
+            check(label, &leaf7, &sent, true);
+        }
+        // Decoys whose identifier matches go first, and the intermediate
+        // without one after them.
+        let matching = decoys(&|| [ca(), vec![ski(7)]].concat());
+        for (n, accepts) in [(98, true), (99, false)] {
+            let sent = ahead(&matching, n, &int);
+            let sent: Vec<&[u8]> = sent.iter().map(Vec::as_slice).collect();
+            let label = if accepts {
+                format!("{n} matching decoys")
+            } else {
+                format!("{n} matching decoys: limit")
+            };
+            check(&label, &leaf7, &sent, accepts);
+        }
+    }
+
+    /// More of how Go's candidate order and checks shape its budget,
+    /// each verdict Go 1.27's and, where the oracle runs, Go's own:
+    /// - the one-identifier group goes before the mismatched one, and two
+    ///   absent identifiers count as matching, so 99 decoys behind
+    ///   either do not keep the chain from its first two checks;
+    /// - the roots are searched before the sent certificates, so 100
+    ///   decoys sent under the root's name cost nothing;
+    /// - a candidate `isValid` refuses for its path length is not gone
+    ///   into, so the subtree behind it costs nothing;
+    /// - a candidate whose key algorithm Go does not know is charged
+    ///   (from the Go releases that charge first), so 99 of them ahead
+    ///   of the intermediate run the budget out, and 98 do not;
+    /// - a certificate sent many times is one candidate;
+    /// - intermediates the root signed whose key usage leaves out
+    ///   certificate signing fail `CheckSignatureFrom`, and 50 of them
+    ///   ahead of the right one stay within Go's budget; webpki, which
+    ///   ignores key usage, would spend its own on their paths, so its
+    ///   search runs over the chains Go built only;
+    /// - forged copies of the intermediate sent ahead of it, which webpki
+    ///   would try in the order sent, come after it in Go's order when
+    ///   its identifier matches the leaf's.
+    /// - an expired leaf is refused for its validity before any search,
+    ///   however many decoys follow it.
+    #[test]
+    fn gos_candidate_order_and_checks_shape_its_budget() {
+        use dcroxide_certgen::gentool::generate_key;
+        use rustls::pki_types::CertificateDer;
+        use rustls::server::danger::ClientCertVerifier;
+        const BASIC_CONSTRAINTS: &[u8] = &[0x55, 0x1d, 0x13];
+        const KEY_USAGE: &[u8] = &[0x55, 0x1d, 0x0f];
+        const SKI: &[u8] = &[0x55, 0x1d, 0x0e];
+        const AKI: &[u8] = &[0x55, 0x1d, 0x23];
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let secs = 1_790_000_000u64;
+        let now = rustls::pki_types::UnixTime::since_unix_epoch(Duration::from_secs(secs));
+        let mut oracle = dcroxide_testutil::oracle_or_skip();
+        let key = || generate_key("P-256").expect("key");
+        let (root_key, int_key, leaf_key, decoy_key, x_key, forger) =
+            (key(), key(), key(), key(), key(), key());
+        let constraints = |path_len: Option<u8>| {
+            let mut content = der_tlv(0x01, &[0xff]);
+            if let Some(path_len) = path_len {
+                content.extend(der_tlv(0x02, &[path_len]));
+            }
+            der_extension(BASIC_CONSTRAINTS, true, &der_tlv(0x30, &content))
+        };
+        let ca = || {
+            vec![
+                constraints(None),
+                der_extension(KEY_USAGE, true, &der_tlv(0x03, &[0x02, 0x84])),
+            ]
+        };
+        let ski = |id: u8| der_extension(SKI, false, &der_tlv(0x04, &[id; 20]));
+        let aki = |id: u8| der_extension(AKI, false, &der_tlv(0x30, &der_tlv(0x80, &[id; 20])));
+        let root = signed_p256_certificate(1, "root", &root_key, "root", &root_key, &ca());
+        let mut check = |label: &str,
+                         leaf: &[u8],
+                         sent: &[&[u8]],
+                         go_accepts: bool,
+                         needs_charge_first: bool| {
+            let verifier =
+                GoClientCertVerifier::from_pem(&certificate_pem(&root)).expect("verifier");
+            let ders: Vec<_> = sent.iter().map(|der| CertificateDer::from(*der)).collect();
+            let got = verifier
+                .verify_client_cert(&CertificateDer::from(leaf), &ders, now)
+                .map(|_| ());
+            assert_eq!(got.is_ok(), go_accepts, "{label}: {got:?}");
+            if let Some(go) = go_client_verdict(&mut oracle, &[&root], leaf, sent, secs)
+                && (go.charges_first || !needs_charge_first)
+            {
+                assert_eq!(
+                    go.verdict == "ok",
+                    go_accepts,
+                    "{label}: Go says {}",
+                    go.verdict
+                );
+            }
+            got
+        };
+        let decoys = |n: u8, name: &str, extensions: &dyn Fn() -> Vec<Vec<u8>>| -> Vec<Vec<u8>> {
+            (0..n)
+                .map(|i| {
+                    signed_p256_certificate(
+                        10 + i,
+                        name,
+                        &decoy_key,
+                        "nowhere",
+                        &decoy_key,
+                        &extensions(),
+                    )
+                })
+                .collect()
+        };
+        let refs = |certs: &[Vec<u8>]| -> Vec<Vec<u8>> { certs.to_vec() };
+        let int = signed_p256_certificate(2, "int", &int_key, "root", &root_key, &ca());
+        let leaf = signed_p256_certificate(3, "leaf", &leaf_key, "int", &int_key, &[]);
+        let leaf7 = signed_p256_certificate(4, "leaf", &leaf_key, "int", &int_key, &[aki(7)]);
+        let mismatched = decoys(99, "int", &|| [ca(), vec![ski(8)]].concat());
+
+        let mut sent = refs(&mismatched);
+        sent.push(int.clone());
+        let sent: Vec<&[u8]> = sent.iter().map(Vec::as_slice).collect();
+        let _ = check(
+            "one identifier before a mismatch",
+            &leaf7,
+            &sent,
+            true,
+            false,
+        );
+        let _ = check("two absent identifiers match", &leaf, &sent, true, false);
+
+        let by_root = signed_p256_certificate(5, "leaf", &leaf_key, "root", &root_key, &[]);
+        let root_named = decoys(100, "root", &ca);
+        let sent: Vec<&[u8]> = root_named.iter().map(Vec::as_slice).collect();
+        let _ = check(
+            "roots before the sent certificates",
+            &by_root,
+            &sent,
+            true,
+            false,
+        );
+
+        // leaf <- a <- x, where the x the client sends first allows no
+        // intermediate below it and the second leads to the root.
+        let a = signed_p256_certificate(6, "a", &int_key, "x", &x_key, &ca());
+        let leaf_a = signed_p256_certificate(7, "leaf", &leaf_key, "a", &int_key, &[]);
+        let x_bad = signed_p256_certificate(
+            8,
+            "x",
+            &x_key,
+            "y",
+            &x_key,
+            &[constraints(Some(0)), ca()[1].clone()],
+        );
+        let x_good = signed_p256_certificate(9, "x", &x_key, "root", &root_key, &ca());
+        let y_named = decoys(97, "y", &ca);
+        let mut sent: Vec<&[u8]> = vec![&a, &x_bad];
+        sent.extend(y_named.iter().map(Vec::as_slice));
+        sent.push(&x_good);
+        let _ = check(
+            "a candidate isValid refuses is not gone into",
+            &leaf_a,
+            &sent,
+            true,
+            false,
+        );
+
+        // Decoys under X25519, a key algorithm Go 1.27 leaves without a key.
+        let x25519 = |i: u8| {
+            der_tlv(
+                0x30,
+                &[
+                    der_tlv(0x30, &der_tlv(0x06, &[0x2b, 0x65, 0x6e])),
+                    der_tlv(0x03, &[&[0u8][..], &[i; 32]].concat()),
+                ]
+                .concat(),
+            )
+        };
+        let keyless: Vec<Vec<u8>> = (0..99u8)
+            .map(|i| {
+                signed_certificate_with_spki(
+                    10 + i,
+                    "int",
+                    x25519(i),
+                    "nowhere",
+                    &decoy_key,
+                    der_tlv(0x17, b"491231235959Z"),
+                    &ca(),
+                )
+            })
+            .collect();
+        for (n, accepts) in [(98usize, true), (99, false)] {
+            let mut sent: Vec<&[u8]> = keyless[..n].iter().map(Vec::as_slice).collect();
+            sent.push(&int);
+            let _ = check(&format!("{n} keyless decoys"), &leaf, &sent, accepts, true);
+        }
+
+        let one = decoys(1, "int", &ca);
+        let mut sent: Vec<&[u8]> = vec![&one[0]; 99];
+        sent.push(&int);
+        let _ = check("a decoy sent 99 times", &leaf, &sent, true, false);
+
+        // Intermediates the root signed, under int's name and key, whose
+        // key usage is digital signature only.
+        let sign_only: Vec<Vec<u8>> = (0..50u8)
+            .map(|i| {
+                signed_p256_certificate(
+                    20 + i,
+                    "int",
+                    &int_key,
+                    "root",
+                    &root_key,
+                    &[
+                        constraints(None),
+                        der_extension(KEY_USAGE, true, &der_tlv(0x03, &[0x07, 0x80])),
+                    ],
+                )
+            })
+            .collect();
+        let mut sent: Vec<&[u8]> = sign_only.iter().map(Vec::as_slice).collect();
+        sent.push(&int);
+        let _ = check(
+            "50 intermediates that may not sign",
+            &leaf,
+            &sent,
+            true,
+            false,
+        );
+
+        // Forged copies of int, signed by a key of the client's own, ahead
+        // of the int whose identifier matches the leaf's.
+        let forged: Vec<Vec<u8>> = (0..99u8)
+            .map(|i| signed_p256_certificate(20 + i, "int", &int_key, "root", &forger, &ca()))
+            .collect();
+        let int7 = signed_p256_certificate(
+            2,
+            "int",
+            &int_key,
+            "root",
+            &root_key,
+            &[ca(), vec![ski(7)]].concat(),
+        );
+        let mut sent: Vec<&[u8]> = forged.iter().map(Vec::as_slice).collect();
+        sent.push(&int7);
+        let _ = check("99 forged copies ahead", &leaf7, &sent, true, false);
+
+        let expired = signed_p256_certificate_until(
+            9,
+            "leaf",
+            &leaf_key,
+            "int",
+            &int_key,
+            der_tlv(0x17, b"250101000000Z"),
+            &[],
+        );
+        let flood = decoys(100, "int", &ca);
+        let mut sent: Vec<&[u8]> = flood.iter().map(Vec::as_slice).collect();
+        sent.push(&int);
+        let err = check("an expired leaf", &expired, &sent, false, false).expect_err("expired");
+        assert!(
+            matches!(
+                err,
+                rustls::Error::InvalidCertificate(
+                    rustls::CertificateError::Expired
+                        | rustls::CertificateError::ExpiredContext { .. }
+                )
+            ),
+            "refused for its validity, not the budget: {err:?}"
+        );
+        if let Some(go) = go_client_verdict(&mut oracle, &[&root], &expired, &sent, secs) {
+            assert!(
+                go.verdict
+                    .starts_with("x509: certificate has expired or is not yet valid"),
+                "{}",
+                go.verdict
+            );
+        }
+    }
+
+    /// A candidate Go's `alreadyInChain` passes over still costs a
+    /// signature check (Go 1.26 on; 1.24 counted it only after).  The
+    /// leaf's issuer `a` and a `b` sign each other, and a second `a`
+    /// under the same key leads to the root.  Go goes into the first `a`,
+    /// then `b`, where both `a`s are already on the chain, then back to
+    /// the decoys and the second `a`: with `d` decoys named `a` sent
+    /// between `b` and the second `a`, the chain costs 6 + 2d checks, so
+    /// 47 leave room and 48 do not, where 1.24's count would have
+    /// allowed 48 and webpki alone accepted both.
+    #[test]
+    fn a_candidate_already_on_the_chain_costs_a_check() {
+        use dcroxide_certgen::gentool::generate_key;
+        use rustls::pki_types::CertificateDer;
+        use rustls::server::danger::ClientCertVerifier;
+        const BASIC_CONSTRAINTS: &[u8] = &[0x55, 0x1d, 0x13];
+        const KEY_USAGE: &[u8] = &[0x55, 0x1d, 0x0f];
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let secs = 1_790_000_000u64;
+        let now = rustls::pki_types::UnixTime::since_unix_epoch(Duration::from_secs(secs));
+        let mut oracle = dcroxide_testutil::oracle_or_skip();
+        let key = || generate_key("P-256").expect("key");
+        let (root_key, a_key, b_key, leaf_key, decoy_key) = (key(), key(), key(), key(), key());
+        let ca = || {
+            vec![
+                der_extension(
+                    BASIC_CONSTRAINTS,
+                    true,
+                    &der_tlv(0x30, &der_tlv(0x01, &[0xff])),
+                ),
+                der_extension(KEY_USAGE, true, &der_tlv(0x03, &[0x02, 0x84])),
+            ]
+        };
+        let root = signed_p256_certificate(1, "root", &root_key, "root", &root_key, &ca());
+        let a = signed_p256_certificate(2, "a", &a_key, "b", &b_key, &ca());
+        let b = signed_p256_certificate(3, "b", &b_key, "a", &a_key, &ca());
+        let a2 = signed_p256_certificate(4, "a", &a_key, "root", &root_key, &ca());
+        let leaf = signed_p256_certificate(5, "leaf", &leaf_key, "a", &a_key, &[]);
+        let decoys: Vec<Vec<u8>> = (0..48u8)
+            .map(|i| signed_p256_certificate(10 + i, "a", &decoy_key, "nowhere", &decoy_key, &ca()))
+            .collect();
+        for (d, go_accepts) in [(47usize, true), (48, false)] {
+            let mut sent: Vec<&[u8]> = vec![&a, &b];
+            sent.extend(decoys[..d].iter().map(Vec::as_slice));
+            sent.push(&a2);
+            let verifier =
+                GoClientCertVerifier::from_pem(&certificate_pem(&root)).expect("verifier");
+            let ders: Vec<_> = sent.iter().map(|der| CertificateDer::from(*der)).collect();
+            let got = verifier
+                .verify_client_cert(&CertificateDer::from(leaf.as_slice()), &ders, now)
+                .map(|_| ());
+            assert_eq!(got.is_ok(), go_accepts, "{d} decoys: {got:?}");
+            if let Some(go) = go_client_verdict(&mut oracle, &[&root], &leaf, &sent, secs) {
+                // A Go that charges a candidate only after `alreadyInChain`
+                // counts 4 + 2d checks, and accepts both.
+                let go_should = if go.charges_first {
+                    go_accepts
+                } else {
+                    d <= 48
+                };
+                assert_eq!(
+                    go.verdict == "ok",
+                    go_should,
+                    "{d} decoys: Go says {}",
+                    go.verdict
+                );
+            }
+        }
+    }
+
+    /// webpki's search accepts only a path that is a chain Go's search
+    /// built.  An intermediate whose extended key usage admits only server
+    /// authentication makes Go's first chain, which its key usage check
+    /// then drops; past 97 decoys the second intermediate, which admits
+    /// client authentication, lies beyond Go's budget and makes no chain,
+    /// so Go refuses where webpki alone found the second path.  With 96
+    /// the second chain fits, and both accept.
+    #[test]
+    fn webpki_accepts_only_a_chain_gos_search_built() {
+        use dcroxide_certgen::gentool::generate_key;
+        use rustls::pki_types::CertificateDer;
+        use rustls::server::danger::ClientCertVerifier;
+        const BASIC_CONSTRAINTS: &[u8] = &[0x55, 0x1d, 0x13];
+        const KEY_USAGE: &[u8] = &[0x55, 0x1d, 0x0f];
+        const EKU: &[u8] = &[0x55, 0x1d, 0x25];
+        const SERVER_AUTH: &[u8] = &[0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x01];
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let secs = 1_790_000_000u64;
+        let now = rustls::pki_types::UnixTime::since_unix_epoch(Duration::from_secs(secs));
+        let mut oracle = dcroxide_testutil::oracle_or_skip();
+        let key = || generate_key("P-256").expect("key");
+        let (root_key, int_key, leaf_key, decoy_key) = (key(), key(), key(), key());
+        let ca = || {
+            vec![
+                der_extension(
+                    BASIC_CONSTRAINTS,
+                    true,
+                    &der_tlv(0x30, &der_tlv(0x01, &[0xff])),
+                ),
+                der_extension(KEY_USAGE, true, &der_tlv(0x03, &[0x02, 0x84])),
+            ]
+        };
+        let root = signed_p256_certificate(1, "root", &root_key, "root", &root_key, &ca());
+        let server_only = signed_p256_certificate(
+            2,
+            "int",
+            &int_key,
+            "root",
+            &root_key,
+            &[
+                ca(),
+                vec![der_extension(
+                    EKU,
+                    false,
+                    &der_tlv(0x30, &der_tlv(0x06, SERVER_AUTH)),
+                )],
+            ]
+            .concat(),
+        );
+        let any_use = signed_p256_certificate(3, "int", &int_key, "root", &root_key, &ca());
+        let leaf = signed_p256_certificate(4, "leaf", &leaf_key, "int", &int_key, &[]);
+        let decoys: Vec<Vec<u8>> = (0..97u8)
+            .map(|i| {
+                signed_p256_certificate(10 + i, "int", &decoy_key, "nowhere", &decoy_key, &ca())
+            })
+            .collect();
+        for (d, go_accepts) in [(96usize, true), (97, false)] {
+            let mut sent: Vec<&[u8]> = vec![&server_only];
+            sent.extend(decoys[..d].iter().map(Vec::as_slice));
+            sent.push(&any_use);
+            let verifier =
+                GoClientCertVerifier::from_pem(&certificate_pem(&root)).expect("verifier");
+            let ders: Vec<_> = sent.iter().map(|der| CertificateDer::from(*der)).collect();
+            let got = verifier
+                .verify_client_cert(&CertificateDer::from(leaf.as_slice()), &ders, now)
+                .map(|_| ());
+            assert_eq!(got.is_ok(), go_accepts, "{d} decoys: {got:?}");
+            if let Some(GoVerdict { verdict, .. }) =
+                go_client_verdict(&mut oracle, &[&root], &leaf, &sent, secs)
+            {
+                assert_eq!(verdict == "ok", go_accepts, "{d} decoys: Go says {verdict}");
+            }
+        }
+    }
+
+    /// A root signs a chain only when Go's `CheckSignatureFrom` lets it:
+    /// a version 3 root without basic constraints, one whose basic
+    /// constraints do not assert cA, and one whose key usage leaves out
+    /// certificate signing sign nothing to Go, though webpki's trust
+    /// anchors check none of it and accepted each.
+    #[test]
+    fn a_root_signs_only_as_gos_check_signature_from_allows() {
+        use dcroxide_certgen::gentool::generate_key;
+        use rustls::pki_types::CertificateDer;
+        use rustls::server::danger::ClientCertVerifier;
+        const BASIC_CONSTRAINTS: &[u8] = &[0x55, 0x1d, 0x13];
+        const KEY_USAGE: &[u8] = &[0x55, 0x1d, 0x0f];
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let secs = 1_790_000_000u64;
+        let now = rustls::pki_types::UnixTime::since_unix_epoch(Duration::from_secs(secs));
+        let mut oracle = dcroxide_testutil::oracle_or_skip();
+        let key = || generate_key("P-256").expect("key");
+        let (root_key, leaf_key) = (key(), key());
+        let constraints = |ca: bool| {
+            der_extension(
+                BASIC_CONSTRAINTS,
+                true,
+                &der_tlv(
+                    0x30,
+                    &if ca {
+                        der_tlv(0x01, &[0xff])
+                    } else {
+                        Vec::new()
+                    },
+                ),
+            )
+        };
+        let usage = |bits: &[u8]| der_extension(KEY_USAGE, true, &der_tlv(0x03, bits));
+        let leaf = signed_p256_certificate(9, "leaf", &leaf_key, "root", &root_key, &[]);
+        for (label, extensions, go_accepts) in [
+            (
+                "a CA root",
+                vec![constraints(true), usage(&[0x02, 0x84])],
+                true,
+            ),
+            ("a CA root without key usage", vec![constraints(true)], true),
+            ("no basic constraints", vec![usage(&[0x02, 0x84])], false),
+            (
+                "cA not asserted",
+                vec![constraints(false), usage(&[0x02, 0x84])],
+                false,
+            ),
+            (
+                "no certificate signing",
+                vec![constraints(true), usage(&[0x07, 0x80])],
+                false,
+            ),
+        ] {
+            let root =
+                signed_p256_certificate(1, "root", &root_key, "root", &root_key, &extensions);
+            let verifier =
+                GoClientCertVerifier::from_pem(&certificate_pem(&root)).expect("verifier");
+            let got = verifier
+                .verify_client_cert(&CertificateDer::from(leaf.as_slice()), &[], now)
+                .map(|_| ());
+            assert_eq!(got.is_ok(), go_accepts, "{label}: {got:?}");
+            if let Some(GoVerdict { verdict, .. }) =
+                go_client_verdict(&mut oracle, &[&root], &leaf, &[], secs)
+            {
+                assert_eq!(verdict == "ok", go_accepts, "{label}: Go says {verdict}");
+            }
+        }
     }
 
     /// Every certificate a client presents is held to Go's
