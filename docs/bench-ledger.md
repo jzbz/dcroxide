@@ -7119,3 +7119,113 @@ Raw: `runs-lan.jsonl`'s rows labelled `x25-H-1` to `x25-H-4`,
 `x25-dcrd-noindex`, with each thread's counters; per-run samples, flush
 logs and node logs; the queue's steps and log; and the build's notes and
 log.
+
+## ECDSA verification on libsecp256k1 and on k256 (2026-10-26)
+
+ADR-0006's addendum of 2026-10-26 moves dcroxide-dcrec's ECDSA from
+libsecp256k1 to `k256` behind a differential soak and a speed
+measurement, and its plan names a microbenchmark that can run before any
+port, to show early how far apart the two backends are. It ran on m3
+between 07:06 and 07:12 on 2026-10-26.
+
+**The program.** An out-of-tree program, not in the tree, built with
+rustc 1.98.1 at the workspace's release profile (thin LTO, one codegen
+unit, `panic = "abort"`, overflow checks off), offline, against
+`dcroxide-dcrec` and `dcroxide-crypto` as at `7965354` and the
+`secp256k1` 0.33.1 and `k256` 0.14.0 of `Cargo.lock`. It draws 32,768
+cases from a fixed seed: a key, a hash and an honest ECDSA signature
+over it, made with `k256`'s arithmetic and not with dcroxide's signer,
+in a low-S, a high-S and an invalid form (one bit of the hash flipped),
+with the key's two encodings, the signature's DER form, its compact
+recoverable form, and an EC-Schnorr-DCRv0 signature over the same hash,
+the one input made with dcroxide-dcrec's own signer. Each operation has
+arms: libsecp256k1 called directly, dcroxide-dcrec as the node calls it
+today, and `k256` used as the port would use it. The `k256` verify arms
+follow dcrd's verification steps as far as `u1·G + u2·Q` and then bring
+the sum back to affine coordinates, one field inversion, where dcrd
+compares `r·Z²` with the sum's Jacobian x and inverts nothing; `k256`
+does not expose a point's projective coordinates. Every arm's answer to
+every case was folded into a digest, and the arms of each operation gave
+the same digest in every run. Each process ran its arms in turn three
+times, on one thread and then on sixteen threads splitting the cases;
+three processes ran one after another: the default build, a build with
+`k256`'s `precomputed-tables` feature, and the default build again.
+
+**Single-thread time per operation**: the least over every round of the
+three processes, and for verification over its low-S, high-S and invalid
+cases too, which gave the same figures within 0.3%; the split arm's
+figure without the tables comes from the two default processes and with
+them from the second. Across the processes each least figure moved by
+under 1%, but for the uncompressed key's parse, printed to the
+nanosecond, which moved by 1 ns. The ratio is `k256`'s over
+dcroxide-dcrec's, which the port replaces:
+
+| operation | libsecp256k1 | dcroxide-dcrec today | `k256` | ratio |
+|---|---|---|---|---|
+| ECDSA verify, combined pass, `batch_normalize_vartime` | 22.1 µs | 22.1 µs | 45.0 µs | 2.04x |
+| the same, `to_affine` | | | 46.1 µs | 2.08x |
+| the same, `u1·G` and `u2·Q` apart, without the tables | | | 60.6 µs | 2.74x |
+| the same, apart, with the tables | | | 47.6 µs | 2.15x |
+| the same, constant-time `lincomb` and `to_affine` | | | 55.1 µs | 2.49x |
+| key parse, DER parse and verify, as `OP_CHECKSIG` | | 25.0 µs | 50.7 µs | 2.03x |
+| parse of a compressed key | 2.83 µs | 2.83 µs | 4.60 µs | 1.63x |
+| parse of an uncompressed key | 68 ns | 74 ns | 52 ns | 0.70x |
+| EC-Schnorr-DCRv0 verify, already on `k256` | | 42.7 µs | 42.6 µs | 1.00x |
+| compact recovery (`verifymessage`) | 25.7 µs | 25.7 µs | 50.7 µs | 1.97x |
+| RFC6979 signing | | 32.3 µs | 40.8 µs | 1.26x |
+
+The combined pass is `mul_by_generator_and_mul_add_vartime`, one GLV/wNAF
+pass over both points, as dcroxide's Schnorr verify already runs. The
+Schnorr row's `k256` arm holds the key as a `k256` point, where the
+node's reserializes it through libsecp256k1 first; the node's arm took 9
+to 100 ns longer in the three processes, too little to separate from the
+noise. On sixteen threads, unpinned, the figures were noisier: the
+per-thread time of every arm but the key parses was 10% to 41% higher
+than on one thread, the compressed key's parse 16% to 55% higher, and
+the uncompressed key's, a matter of tens of nanoseconds, from 32% lower
+to 128% higher; the combined pass's ratios to libsecp256k1 ranged from
+1.6x to 2.1x, and the other `k256` verify arms' from 1.7x to 2.8x, the
+lowest where libsecp256k1's own sixteen-thread time was its highest.
+
+**What it shows.**
+
+- One ECDSA verification on `k256` costs about twice what it does on
+  libsecp256k1, and the ratio does not depend on whether the signature
+  is low-S, high-S or invalid.
+- `k256`'s precomputed tables reach only `mul_by_generator` and
+  `mul_by_generator_vartime`. The first, timed on a single call each,
+  fell from 33 µs to 15 µs, and its first call, which fills the tables,
+  took 173 µs; the second forms the split arm's `u1·G`, which is how that
+  arm fell from 60.6 µs to 47.6 µs. With the tables the split arm was
+  still slower than the combined pass without them, so the tables buy
+  verification nothing.
+- `batch_normalize_vartime` on the one point is about 1 µs faster than
+  `to_affine`, which uses a constant-time inversion; constant-time
+  `lincomb` is 9 µs slower than the combined variable-time pass with the
+  same `to_affine`. Every input to verification is public.
+
+**What it does not show.** The cost to a sync. As an estimate only:
+the run with `--assumevalid=0` in "`f37d763` against `797a213`, its end
+state and a sync that checks every script" above gave the pre-verifier
+82,821,730 inputs. At one `OP_CHECKSIG` each, the 25.7 µs more of the
+table's `OP_CHECKSIG` row, the key's parse included, would add about
+2,100 s of CPU time to the 4,702.1 s that run used, or 2,300 s to 2,500
+s at that row's sixteen-thread figures; the verification alone, 22.9 µs
+more, about 1,900 s. How much of that reaches the wall clock depends on
+how much verification sits on the path the block thread waits on, which
+only a sync of each build measures. Nor does it show what a verify that
+skips the inversion, as dcrd's does, would cost on `k256`. The
+comparison was not run on any other machine or at any other thread
+count.
+
+Machine state: transparent huge pages at `always`, the `powersave`
+governor under `amd_pstate` in active mode, a load average of 1.49
+before the first process and 2.3 to 2.7 between and after them, the
+latter including the program's own sixteen threads; nothing else ran a
+build or a benchmark.
+
+Raw: `1-default.txt`, `2-tables.txt` and `3-default.txt`, the three
+processes' outputs, with their `.err` files; `state.txt`, the machine
+state before and after each; `build.txt`, the toolchain line, the two
+binaries' digests and the CPU's name; and the program's `main.rs`,
+`Cargo.toml`, `Cargo.lock` and `run.sh`.
