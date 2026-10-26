@@ -2607,8 +2607,14 @@ closing it would cost.
   the path a modern client actually takes. It was reachable by any client
   that offers resumption, which is third-party tooling rather than dcrctl or
   dcrwallet. Pinned end to end in `serves_tls_with_a_generated_certificate`,
-  which reconnects on the same client config and requires a full handshake;
-  with the default store restored, that second connection reports `Resumed`.
+  which reconnects on the same client config, in TLS1.3 and again in
+  TLS1.2, and requires a full handshake each time. With the default store
+  restored, the TLS1.2 reconnection reports `Resumed`, from the session id
+  the store kept; the TLS1.3 one does only once rustls's default of two
+  TLS1.3 tickets is restored as well, since `disable_stateful_resumption`
+  also sets `send_tls13_tickets` to zero and a TLS1.3 client is then given
+  no ticket to present. `stateful_resumption_is_disabled` in
+  `rpctlsreload.rs` pins the store itself.
 
 - **Over TLS1.2 a P-521 RPC key signs with SHA-512 where dcrd signs with the
   client's first ECDSA hash, and a client that never offers

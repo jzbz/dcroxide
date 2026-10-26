@@ -4634,7 +4634,8 @@ fn build_server_config(
 }
 
 /// Turn off stateful session resumption, which Go's server does not have
-/// and rustls enables by default.
+/// and rustls enables by default, and the TLS1.3 tickets that would have
+/// keyed it.
 fn disable_stateful_resumption(config: &mut rustls::ServerConfig) {
     // Go resumes only from tickets: TLS1.2's `checkForResumption` reads
     // `clientHello.sessionTicket` and nothing else
@@ -4668,6 +4669,25 @@ fn disable_stateful_resumption(config: &mut rustls::ServerConfig) {
     // and the completed handshake is itself the authentication. See
     // PARITY.
     config.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
+    // With nowhere to store a ticket, rustls would still prepare
+    // `send_tls13_tickets` of them (two by default,
+    // `server/builder.rs:123`) after every TLS1.3 handshake whose client
+    // offers `psk_dhe_ke`. A rustls client offers it whenever it offers
+    // TLS1.3 (`client/hs.rs:321-327`). A Go client offers it only when its
+    // `tls.Config` has a `ClientSessionCache`
+    // (`crypto/tls/handshake_client.go:352-356`, `:364-368`), which dcrd's
+    // `rpcclient` does not set (`infrastructure.go:1234-1237`,
+    // `:1265-1267`, v8.1.0); for a client that offers none, rustls
+    // prepares no ticket already (`server/tls13.rs:341-349`). Each ticket
+    // draws a 32-byte nonce, a four-byte `age_add` and a 32-byte id from
+    // the provider's random source and derives a resumption secret
+    // (`server/tls13.rs:1328-1358`, called at `:1420-1422`), only for
+    // `NoServerSessionStorage::put` to refuse it
+    // (`server/handy.rs:13-15`) and nothing to be sent. A count of zero
+    // skips that work and leaves the wire as it was. `max_tls13_tickets`
+    // stays at its default of zero, so a client's `ticket_request`
+    // cannot raise the count again (`server/tls13.rs:355-368`).
+    config.send_tls13_tickets = 0;
 }
 
 /// Build the rustls server configurations from the PEM certificate
@@ -16110,6 +16130,49 @@ mod tests {
         }
     }
 
+    /// A client's verifier that accepts any server certificate and
+    /// handshake signature, for the tests about what a session does once
+    /// it is up rather than how the server is authenticated.
+    #[derive(Debug)]
+    struct AnyCertificate;
+
+    impl rustls::client::danger::ServerCertVerifier for AnyCertificate {
+        fn verify_server_cert(
+            &self,
+            _end_entity: &rustls::pki_types::CertificateDer<'_>,
+            _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+            _server_name: &rustls::pki_types::ServerName<'_>,
+            _ocsp_response: &[u8],
+            _now: rustls::pki_types::UnixTime,
+        ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+            Ok(rustls::client::danger::ServerCertVerified::assertion())
+        }
+
+        fn verify_tls12_signature(
+            &self,
+            _message: &[u8],
+            _cert: &rustls::pki_types::CertificateDer<'_>,
+            _dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        }
+
+        fn verify_tls13_signature(
+            &self,
+            _message: &[u8],
+            _cert: &rustls::pki_types::CertificateDer<'_>,
+            _dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        }
+
+        fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+            rustls::crypto::ring::default_provider()
+                .signature_verification_algorithms
+                .supported_schemes()
+        }
+    }
+
     /// A TLS session ends in a `close_notify`, as Go's `tls.Conn.Close`
     /// ends it, so a reply framed by the close reads as complete.  It
     /// ended in a bare FIN, which rustls, like OpenSSL, reports as a
@@ -16117,48 +16180,7 @@ mod tests {
     #[test]
     #[cfg(any(unix, windows))]
     fn a_tls_session_ends_with_close_notify() {
-        use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
-
-        #[derive(Debug)]
-        struct AnyCertificate;
-        impl rustls::client::danger::ServerCertVerifier for AnyCertificate {
-            fn verify_server_cert(
-                &self,
-                _end_entity: &CertificateDer<'_>,
-                _intermediates: &[CertificateDer<'_>],
-                _server_name: &ServerName<'_>,
-                _ocsp_response: &[u8],
-                _now: UnixTime,
-            ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-                Ok(rustls::client::danger::ServerCertVerified::assertion())
-            }
-
-            fn verify_tls12_signature(
-                &self,
-                _message: &[u8],
-                _cert: &CertificateDer<'_>,
-                _dss: &rustls::DigitallySignedStruct,
-            ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error>
-            {
-                Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-            }
-
-            fn verify_tls13_signature(
-                &self,
-                _message: &[u8],
-                _cert: &CertificateDer<'_>,
-                _dss: &rustls::DigitallySignedStruct,
-            ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error>
-            {
-                Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-            }
-
-            fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-                rustls::crypto::ring::default_provider()
-                    .signature_verification_algorithms
-                    .supported_schemes()
-            }
-        }
+        use rustls::pki_types::ServerName;
 
         let dir = tempfile::tempdir().expect("temp dir");
         let (cert, key) = load_or_generate_cert_pair(
@@ -16208,5 +16230,142 @@ mod tests {
             "{:?}",
             String::from_utf8_lossy(&reply)
         );
+    }
+
+    /// The RPC server prepares no TLS1.3 ticket: every configuration in
+    /// the set has `send_tls13_tickets` at zero, and `max_tls13_tickets`
+    /// at zero beside it, so no `ticket_request` raises the count.
+    ///
+    /// The wire is what it was at rustls's default of two, since the
+    /// tickets `NoServerSessionStorage` refused were never sent. Against
+    /// each configuration, in TLS1.3 and TLS1.2 and at either count, a
+    /// handshake in memory completes, the server answers the client's
+    /// Finished with the same number of bytes (none in TLS1.3; its own
+    /// ChangeCipherSpec and Finished in TLS1.2), application data
+    /// crosses both ways, and the client has received no ticket.
+    #[test]
+    fn the_rpc_server_prepares_no_tls13_tickets() {
+        use rustls::pki_types::ServerName;
+
+        /// Move every record `from` has to send into `to` and process
+        /// them, returning how many bytes crossed.
+        fn transfer<A, B>(
+            from: &mut rustls::ConnectionCommon<A>,
+            to: &mut rustls::ConnectionCommon<B>,
+        ) -> usize {
+            let mut wire = Vec::new();
+            while from.wants_write() {
+                from.write_tls(&mut wire).expect("write the records");
+            }
+            let mut rest = wire.as_slice();
+            while !rest.is_empty() {
+                to.read_tls(&mut rest).expect("read the records");
+                to.process_new_packets().expect("process the records");
+            }
+            wire.len()
+        }
+
+        /// Run a handshake between fresh connections over the two
+        /// configurations, send application data each way, and return
+        /// the length of the server's answer to the client's Finished.
+        fn answer_to_finished(
+            server_config: &Arc<rustls::ServerConfig>,
+            client_config: &Arc<rustls::ClientConfig>,
+        ) -> usize {
+            let name = ServerName::try_from("localhost").expect("server name");
+            let mut client =
+                rustls::ClientConnection::new(Arc::clone(client_config), name).expect("client");
+            let mut server =
+                rustls::ServerConnection::new(Arc::clone(server_config)).expect("server");
+            // One round per client flight: two in a handshake, three
+            // with a HelloRetryRequest.
+            for _ in 0..3 {
+                transfer(&mut client, &mut server);
+                if !server.is_handshaking() {
+                    break;
+                }
+                transfer(&mut server, &mut client);
+            }
+            assert!(
+                !server.is_handshaking(),
+                "the server has read the client's Finished"
+            );
+            let answer = transfer(&mut server, &mut client);
+            assert!(!client.is_handshaking(), "the client has finished too");
+
+            client
+                .writer()
+                .write_all(b"ping")
+                .expect("the client writes");
+            transfer(&mut client, &mut server);
+            let mut ping = [0u8; 4];
+            server
+                .reader()
+                .read_exact(&mut ping)
+                .expect("the server reads");
+            assert_eq!(&ping, b"ping");
+            server
+                .writer()
+                .write_all(b"pong")
+                .expect("the server writes");
+            transfer(&mut server, &mut client);
+            let mut pong = [0u8; 4];
+            client
+                .reader()
+                .read_exact(&mut pong)
+                .expect("the client reads");
+            assert_eq!(&pong, b"pong");
+            assert_eq!(client.tls13_tickets_received(), 0, "no ticket arrived");
+            answer
+        }
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (cert, key) = load_or_generate_cert_pair(
+            &dir.path().join("rpc.cert"),
+            &dir.path().join("rpc.key"),
+            &[],
+            Curve::P256,
+        )
+        .expect("a cert pair");
+        let configs = tls_server_config(&cert, &key, None).expect("server config");
+        // Every group the set offers, P-521 among them, so the client can
+        // complete a handshake with each configuration.
+        let mut provider = rustls::crypto::ring::default_provider();
+        provider.kx_groups.push(crate::rpctls::P521_KX_GROUP);
+        let provider = Arc::new(provider);
+
+        for config in configs.configs() {
+            assert_eq!(config.send_tls13_tickets, 0, "no ticket is prepared");
+            assert_eq!(
+                config.max_tls13_tickets, 0,
+                "and no ticket_request asks for one"
+            );
+            let mut rustls_default = rustls::ServerConfig::clone(config);
+            rustls_default.send_tls13_tickets = 2;
+            let rustls_default = Arc::new(rustls_default);
+            for version in [&rustls::version::TLS13, &rustls::version::TLS12] {
+                let client_config = Arc::new(
+                    rustls::ClientConfig::builder_with_provider(Arc::clone(&provider))
+                        .with_protocol_versions(&[version])
+                        .expect("the version")
+                        .dangerous()
+                        .with_custom_certificate_verifier(Arc::new(AnyCertificate))
+                        .with_no_client_auth(),
+                );
+                let answer = answer_to_finished(config, &client_config);
+                assert_eq!(
+                    answer,
+                    answer_to_finished(&rustls_default, &client_config),
+                    "{:?}: the same answer at rustls's default count",
+                    version.version
+                );
+                assert_eq!(
+                    answer == 0,
+                    version.version == rustls::ProtocolVersion::TLSv1_3,
+                    "{:?}: {answer} bytes after the client's Finished",
+                    version.version
+                );
+            }
+        }
     }
 }

@@ -761,16 +761,8 @@ fn serves_tls_with_a_generated_certificate() {
         .expect("parse cert")
         .as_ref()
         .to_vec();
-    let client_config = Arc::new(
-        rustls::ClientConfig::builder()
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(PinnedCert(pinned_der)))
-            .with_no_client_auth(),
-    );
-    let name = rustls::pki_types::ServerName::try_from("localhost").expect("name");
-    let session = rustls::ClientConnection::new(Arc::clone(&client_config), name).expect("client");
-    let tcp = TcpStream::connect(("127.0.0.1", port)).expect("connect");
-    let mut tls_stream = rustls::StreamOwned::new(session, tcp);
+    let verifier: Arc<dyn rustls::client::danger::ServerCertVerifier> =
+        Arc::new(PinnedCert(pinned_der));
 
     let body = r#"{"jsonrpc":"1.0","method":"getblockcount","params":[],"id":1}"#;
     let request = format!(
@@ -778,11 +770,21 @@ fn serves_tls_with_a_generated_certificate() {
         dcroxide_rpc::http::base64_std_encode(b"user:pass"),
         body.len()
     );
-    tls_stream.write_all(request.as_bytes()).expect("write");
-    let mut response = String::new();
-    let _ = tls_stream.read_to_string(&mut response);
-    assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
-    assert!(response.contains("\"result\":0"), "{response}");
+    // One query over a new connection from `client_config`, returning the
+    // client's side of it once the server has answered.
+    let query = |client_config: &Arc<rustls::ClientConfig>| {
+        let name = rustls::pki_types::ServerName::try_from("localhost").expect("name");
+        let session =
+            rustls::ClientConnection::new(Arc::clone(client_config), name).expect("client");
+        let tcp = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        let mut tls_stream = rustls::StreamOwned::new(session, tcp);
+        tls_stream.write_all(request.as_bytes()).expect("write");
+        let mut response = String::new();
+        let _ = tls_stream.read_to_string(&mut response);
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+        assert!(response.contains("\"result\":0"), "{response}");
+        tls_stream.conn
+    };
 
     // A second connection over the SAME client config -- which keeps
     // rustls's default in-memory client session store, so it will offer
@@ -794,25 +796,40 @@ fn serves_tls_with_a_generated_certificate() {
     // (`crypto/tls/handshake_server_tls13.go:362-381`). rustls does no
     // such re-verification, and with no ticketer configured its TLS1.3
     // "ticket" is a 32-byte key into `session_storage` with a 24 hour
-    // lifetime (`server/tls13.rs:1330-1338`), which an ordinary Go client
-    // would store and present again. Disabling the store is what keeps a
+    // lifetime (`server/tls13.rs:1330-1338`), which a client with a
+    // session cache would store and present again; in TLS1.2 it resumes
+    // from the client's session id in that same store
+    // (`server/tls12.rs:146-153`). Disabling the store is what keeps a
     // client the daemon would now reject from resuming its way back in.
-    let session = rustls::ClientConnection::new(
-        Arc::clone(&client_config),
-        rustls::pki_types::ServerName::try_from("localhost").expect("name"),
-    )
-    .expect("second client");
-    let tcp = TcpStream::connect(("127.0.0.1", port)).expect("reconnect");
-    let mut second = rustls::StreamOwned::new(session, tcp);
-    second.write_all(request.as_bytes()).expect("write");
-    let mut response = String::new();
-    let _ = second.read_to_string(&mut response);
-    assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
-    assert_eq!(
-        second.conn.handshake_kind(),
-        Some(rustls::HandshakeKind::Full),
-        "the second connection must not have resumed"
-    );
+    // In TLS1.3 the ticket count of zero keeps it out as well, since no
+    // ticket is then sent at all, so the check runs again over TLS1.2,
+    // where the store is the only guard.
+    let versions = [
+        (
+            rustls::ProtocolVersion::TLSv1_3,
+            rustls::ClientConfig::builder(),
+        ),
+        (
+            rustls::ProtocolVersion::TLSv1_2,
+            rustls::ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS12]),
+        ),
+    ];
+    for (version, builder) in versions {
+        let client_config = Arc::new(
+            builder
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::clone(&verifier))
+                .with_no_client_auth(),
+        );
+        let first = query(&client_config);
+        assert_eq!(first.protocol_version(), Some(version));
+        let second = query(&client_config);
+        assert_eq!(
+            second.handshake_kind(),
+            Some(rustls::HandshakeKind::Full),
+            "{version:?}: the second connection must not have resumed"
+        );
+    }
 
     listener.shutdown();
 }
