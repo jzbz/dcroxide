@@ -647,6 +647,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "dcroxide-sigdiff"
+version = "0.1.0"
+dependencies = [
+ "dcroxide-crypto",
+ "dcroxide-dcrec",
+ "dcroxide-testutil",
+ "k256",
+ "serde_json",
+]
+
+[[package]]
 name = "dcroxide-stake"
 version = "0.1.0"
 dependencies = [

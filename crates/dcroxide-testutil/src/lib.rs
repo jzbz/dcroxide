@@ -35,9 +35,11 @@ pub fn hex(b: &[u8]) -> String {
 }
 
 /// Append the lowercase hex of `b` to `out`, two digits a byte looked up in
-/// [`HEX_DIGITS`], with one reservation up front rather than an allocation
-/// per byte.
-fn push_hex(out: &mut String, b: &[u8]) {
+/// a 16-entry table, with one reservation up front rather than an allocation
+/// per byte.  A caller that builds many lines into one reused `String`, as a
+/// client keeping requests in flight does, encodes each without a `String`
+/// of its own.
+pub fn push_hex(out: &mut String, b: &[u8]) {
     out.reserve(b.len().saturating_mul(2));
     for &byte in b {
         out.push(char::from(HEX_DIGITS[usize::from(byte >> 4)]));
@@ -163,8 +165,11 @@ impl SplitMix64 {
 }
 
 /// Parse a seed as [`SplitMix64::from_entropy`] prints it: hex, with or
-/// without the `0x` prefix.
-fn parse_seed(value: &str) -> Option<u64> {
+/// without the `0x` prefix, surrounding whitespace ignored.  `None` for
+/// anything else, including an empty string and a value wider than 64 bits,
+/// so a tool reading a seed from its command line takes the same values
+/// [`SEED_VAR`] does.
+pub fn parse_seed(value: &str) -> Option<u64> {
     let value = value.trim();
     let digits = value
         .strip_prefix("0x")
@@ -204,8 +209,18 @@ pub const ORACLE_BIN_VAR: &str = "DCROXIDE_ORACLE_BIN";
 /// is missing when that variable names anything but an absolute path to a
 /// file, or when it is unset and no Go toolchain is found.
 pub fn oracle_or_skip() -> Option<Oracle> {
+    oracle_bin_or_skip().map(|bin| Oracle::spawn_bin(&bin))
+}
+
+/// The oracle binary [`oracle_or_skip`] would spawn, under the same
+/// skip-or-fail policy, for a test that runs the oracle itself (several at
+/// once, with requests in flight) rather than through [`Oracle`]: `None`
+/// where that would skip, a panic where it would fail, and otherwise the
+/// path, after building `tools/oracle` once in this process when
+/// [`ORACLE_BIN_VAR`] names no binary.
+pub fn oracle_bin_or_skip() -> Option<PathBuf> {
     match choose_oracle(env::var_os(ORACLE_BIN_VAR).as_deref(), go_available) {
-        Ok(source) => Some(Oracle::spawn_from(source)),
+        Ok(source) => Some(source.path()),
         Err(why) => {
             assert!(
                 env::var_os("DCROXIDE_REQUIRE_ORACLE").is_none(),
@@ -215,6 +230,14 @@ pub fn oracle_or_skip() -> Option<Oracle> {
             None
         }
     }
+}
+
+/// The oracle binary, as [`oracle_bin_or_skip`] chooses it, for a caller
+/// that cannot run without one: where that would skip, this panics.
+pub fn oracle_bin() -> PathBuf {
+    choose_oracle(env::var_os(ORACLE_BIN_VAR).as_deref(), go_available)
+        .unwrap_or_else(|why| panic!("cannot spawn the oracle: {why}"))
+        .path()
 }
 
 /// Where the oracle binary comes from.
@@ -367,14 +390,11 @@ impl Oracle {
     /// Spawn the oracle [`oracle_or_skip`] would, building it if needed;
     /// where that would skip, this panics.
     pub fn spawn() -> Self {
-        let source = choose_oracle(env::var_os(ORACLE_BIN_VAR).as_deref(), go_available)
-            .unwrap_or_else(|why| panic!("cannot spawn the oracle: {why}"));
-        Oracle::spawn_from(source)
+        Oracle::spawn_bin(&oracle_bin())
     }
 
-    fn spawn_from(source: OracleSource) -> Self {
-        let bin = source.path();
-        let mut child = Command::new(&bin)
+    fn spawn_bin(bin: &Path) -> Self {
+        let mut child = Command::new(bin)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()
@@ -644,11 +664,18 @@ fn free_port() -> u16 {
 pub struct TempDir(PathBuf);
 
 impl TempDir {
-    fn new(prefix: &str) -> TempDir {
+    /// Create a fresh directory under the system's temporary directory,
+    /// named for `prefix`, this process, a count of the directories it has
+    /// made and the time, so neither two threads of one test process (on a
+    /// clock too coarse to tell their calls apart) nor two processes share
+    /// one.  Panics if it cannot be created.
+    pub fn new(prefix: &str) -> TempDir {
+        static MADE: AtomicUsize = AtomicUsize::new(0);
         let mut base = env::temp_dir();
         let unique = format!(
-            "{prefix}-{}-{}",
+            "{prefix}-{}-{}-{}",
             std::process::id(),
+            MADE.fetch_add(1, Ordering::Relaxed),
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .expect("clock after epoch")
@@ -707,14 +734,30 @@ pub fn dcrd_available() -> bool {
     true
 }
 
+/// The 12-hex commit a Go pseudo-version names, or `None` for a plain tag
+/// (`v5.0.3`) or anything else.  A pseudo-version ends
+/// `<14-digit timestamp>-<12-hex commit>`, the timestamp following a `-`
+/// (`v0.0.0-…`) or a `.` (`v1.2.4-0.…`, `v1.2.3-pre.0.…`).  It is the rule
+/// this crate's pin test applies to the `go.mod` files of the Go tools,
+/// shared with tools that check the versions a built oracle reports.
+pub fn pseudo_version_commit(version: &str) -> Option<&str> {
+    let (rest, commit) = version.rsplit_once('-')?;
+    let (sep, stamp) = rest
+        .get(rest.len().checked_sub(15)?..)?
+        .split_at_checked(1)?;
+    let pseudo = commit.len() == 12
+        && commit.bytes().all(|b| b.is_ascii_hexdigit())
+        && (sep == "-" || sep == ".")
+        && stamp.bytes().all(|b| b.is_ascii_digit());
+    pseudo.then_some(commit)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     /// The dcrd modules a `go.mod` pins by pseudo-version, each with the
-    /// 12-hex commit its version names.  A pseudo-version ends
-    /// `<14-digit timestamp>-<12-hex commit>`, the timestamp following a
-    /// `-` (`v0.0.0-…`) or a `.` (`v1.2.4-0.…`, `v1.2.3-pre.0.…`).
+    /// 12-hex commit its version names ([`pseudo_version_commit`]).
     fn dcrd_pseudo_pins(gomod: &str) -> Vec<(&str, &str)> {
         gomod
             .lines()
@@ -728,15 +771,31 @@ mod tests {
                 {
                     return None;
                 }
-                let (rest, commit) = version.rsplit_once('-')?;
-                let (sep, stamp) = rest.get(rest.len().checked_sub(15)?..)?.split_at(1);
-                let pseudo = commit.len() == 12
-                    && commit.bytes().all(|b| b.is_ascii_hexdigit())
-                    && (sep == "-" || sep == ".")
-                    && stamp.bytes().all(|b| b.is_ascii_digit());
-                pseudo.then_some((module, commit))
+                Some((module, pseudo_version_commit(version)?))
             })
             .collect()
+    }
+
+    /// The commit of each pseudo-version form Go writes, and none for tags.
+    #[test]
+    fn pseudo_version_commit_known_answers() {
+        for (version, want) in [
+            ("v4.4.2-0.20261019113547-3360ae4dbef8", Some("3360ae4dbef8")),
+            ("v0.0.0-20170116200512-5312a6153412", Some("5312a6153412")),
+            (
+                "v1.2.3-pre.0.20260927225945-6f6cf21bd26d",
+                Some("6f6cf21bd26d"),
+            ),
+            ("v5.0.3", None),
+            ("v1.0.6", None),
+            ("v1.0.0-rc1", None),
+            ("v1.0.0-20170116200512-5312a615341", None),
+            ("v1.0.0-2017011620051x-5312a6153412", None),
+            ("x\u{e9}0000000000000-5312a6153412", None),
+            ("", None),
+        ] {
+            assert_eq!(pseudo_version_commit(version), want, "{version:?}");
+        }
     }
 
     /// Whether a Go tool (the oracle, or the full block battery generator)
@@ -1044,6 +1103,77 @@ mod tests {
             .expect("chosen once already")
             .path();
         let (ok, text) = run("run", &bin, true);
+        assert!(ok, "{text}");
+    }
+
+    /// `oracle_bin_or_skip` applies `oracle_or_skip`'s policy, in a child
+    /// with no Go on `PATH`: a named binary that is missing skips, or fails
+    /// under `DCROXIDE_REQUIRE_ORACLE`, and a named binary that exists comes
+    /// back as named, with nothing built.
+    #[test]
+    fn the_oracle_bin_follows_the_skip_policy() {
+        const CHILD: &str = "DCROXIDE_TESTUTIL_ORACLE_BIN_PATH_CHILD";
+        match env::var(CHILD).as_deref() {
+            Ok("skip") => {
+                assert_eq!(oracle_bin_or_skip(), None);
+                return;
+            }
+            Ok("named") => {
+                let named = env::var_os(ORACLE_BIN_VAR).expect("the parent names a binary");
+                assert_eq!(oracle_bin_or_skip(), Some(PathBuf::from(&named)));
+                assert_eq!(oracle_bin(), PathBuf::from(named));
+                assert_eq!(ORACLE_BUILDS.load(Ordering::Relaxed), 0);
+                return;
+            }
+            Ok("require") => {
+                // Panics: the binary is missing and DCROXIDE_REQUIRE_ORACLE is set.
+                let _ = oracle_bin_or_skip();
+                return;
+            }
+            _ => {}
+        }
+
+        let exe = env::current_exe().expect("test binary path");
+        let empty = TempDir::new("no-go-bin");
+        let run = |mode: &str, bin: &Path, require: bool| {
+            let mut cmd = Command::new(&exe);
+            cmd.args([
+                "--exact",
+                "tests::the_oracle_bin_follows_the_skip_policy",
+                "--nocapture",
+            ])
+            .env(CHILD, mode)
+            .env(ORACLE_BIN_VAR, bin)
+            .env("PATH", empty.path());
+            if require {
+                cmd.env("DCROXIDE_REQUIRE_ORACLE", "1");
+            } else {
+                cmd.env_remove("DCROXIDE_REQUIRE_ORACLE");
+            }
+            let out = cmd.output().expect("run the child");
+            let text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            (out.status.success(), text)
+        };
+
+        let absent = empty.path().join("dcrd-oracle");
+        let (ok, text) = run("skip", &absent, false);
+        assert!(ok, "{text}");
+        assert!(
+            text.contains("skipping: DCROXIDE_ORACLE_BIN names"),
+            "{text}"
+        );
+        let (ok, text) = run("require", &absent, true);
+        assert!(!ok, "{text}");
+        assert!(
+            text.contains("DCROXIDE_REQUIRE_ORACLE is set but DCROXIDE_ORACLE_BIN names"),
+            "{text}"
+        );
+        // Any existing file will do: the path is handed back, not run.
+        let (ok, text) = run("named", &exe, true);
         assert!(ok, "{text}");
     }
 

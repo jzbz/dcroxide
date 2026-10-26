@@ -526,6 +526,13 @@ work). Currently implemented:
   test, or fails it when `DCROXIDE_REQUIRE_ORACLE` is set), a
   deterministic SplitMix64 PRNG that prints its seed so a failure
   reproduces, and hex helpers; a dev-dependency only, never published
+- `dcroxide-sigdiff` — the signature differential soak (no dcrd
+  counterpart): generators for named input classes of ECDSA verification,
+  signing and DER parsing and of public key parsing, built with their own
+  curve arithmetic rather than the code under test, a pipelined client for
+  `tools/oracle`, and the `sigsoak` binary that runs the classes against
+  dcrd's own code at recorded volume and replays any case from its seed;
+  development only, never published
 - `dcroxide-bench` — the block replay harness (no dcrd counterpart):
   `export` writes the main chain of a stopped data directory to a
   bootstrap-format corpus, and `replay` drives that corpus back

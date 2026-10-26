@@ -7,7 +7,7 @@
   measurement; see the 2026-10-26 addendum
 - **Date:** 2026-07-03 (proposed), 2026-07-26 (addendum: the split held),
   2026-10-26 (addendum: ECDSA and key handling to move to `k256`; a superseding
-  ADR pending)
+  ADR pending; second addendum: how the soak is run and compared)
 
 ## Context
 
@@ -379,3 +379,44 @@ then this ADR and its addenda describe the code in the tree. The soak passing
 is also one of the conditions the project owner set the same day for publishing
 any binary (D7, [ADR-0014](0014-release-engineering.md)), and its sign-off
 falls under the project brief's §7 gates as amended that day.
+
+## Addendum, 2026-10-26 (second) — how the soak is run and compared
+
+The soak's tool, `dcroxide-sigdiff` with its `sigsoak` binary, was designed the
+same day, and the design left five questions on the wording of the plan the
+project owner had approved. The owner accepted the recommended answer to each:
+
+1. **What the freeze covers.** The plan held the soak's code frozen from the
+   baseline soak on libsecp256k1 to the gate soak on `k256`, or the baseline
+   run again. The freeze covers the modules that build inputs, model dcrd's
+   answers and judge them, whose source a fingerprint built into `sigsoak`
+   covers (`crates/dcroxide-sigdiff/src/fingerprint.rs`). `src/ours.rs`, the
+   one module that calls `dcroxide-dcrec` and the one the port's steps edit,
+   and the plumbing that runs and records cases may change between the two
+   soaks. `sigsoak compare` refuses two runs whose fingerprints differ.
+2. **What a canary may trip.** Each deliberately broken model, a canary, has a
+   primary class, where it must be caught within 10^4 cases, and a footprint of
+   classes it may also trip, declared in code; tripping a class outside its
+   footprint fails the run. The plan's "in no other class" cannot hold for the
+   canaries whose break necessarily shows in a neighbouring class.
+3. **The floors over the window.** If the calibration minute shows the floors
+   need more than the 1-3 hour window, the window stretches and the floors
+   stay.
+4. **Ed25519 error text.** A case where dcroxide's Ed25519 error text differs
+   from dcrd's while the verdicts agree is a disagreement, and blocks the gate.
+5. **A pin move between the soaks.** The gate soak may run at a later pin than
+   the baseline only if the move leaves dcrd's `dcrec/secp256k1/v4` and
+   `dcrec/edwards/v2` source unchanged; otherwise the baseline is run again at
+   the new pin. `sigsoak compare` refuses runs at different pins unless told,
+   with `--allow-pin-change`, that this rule allows it.
+
+Three further points of the design, which change nothing approved, follow its
+recommendations: recovery error kinds are compared from the port step that
+makes `recover_compact` report them; `dcroxide-sigdiff` has no build script;
+and the port's ECDSA verification reports which of dcrd's steps decided it, as
+EC-Schnorr-DCRv0's `verify_detailed` does, so that the soak checks each
+constructed case's branch against dcroxide's own answer.
+
+The microbenchmark the plan names ran the same day, before any port (bench
+ledger, "ECDSA verification on libsecp256k1 and on k256 (2026-10-26)"): one
+ECDSA verification costs about twice as much on `k256` as on libsecp256k1.

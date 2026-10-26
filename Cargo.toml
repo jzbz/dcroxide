@@ -26,6 +26,7 @@ members = [
     "crates/dcroxide-ratelimit",
     "crates/dcroxide-rpc",
     "crates/dcroxide-rpctypes",
+    "crates/dcroxide-sigdiff",
     "crates/dcroxide-stake",
     "crates/dcroxide-standalone",
     "crates/dcroxide-testutil",
@@ -110,6 +111,24 @@ overflow-checks = false
 [profile.dist]
 inherits = "release"
 strip = "debuginfo"
+
+# The profile the signature soak runs under (dcroxide-sigdiff's sigsoak):
+# release's code generation, so the soak exercises the arithmetic the node
+# ships, but panics unwind, so that a panic in the code under test is recorded
+# with the case that caused it instead of ending the run.  Nothing ships from
+# it.
+#
+#   cargo run --locked --profile soak -p dcroxide-sigdiff --bin sigsoak -- run ...
+#   # -> <target-dir>/soak/sigsoak
+[profile.soak]
+inherits = "release"
+panic = "unwind"
+
+# The soak's overflow-checks leg: the same, with arithmetic overflow panicking,
+# to catch code that is only right because release wraps.
+[profile.soak-checked]
+inherits = "soak"
+overflow-checks = true
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
