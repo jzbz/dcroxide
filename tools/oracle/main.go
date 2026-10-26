@@ -20,9 +20,19 @@
 // the_dcrd_pin_matches_ci_and_the_oracle checks the pseudo-versions against
 // the harness pin. Do not bump them independently of a parity-pin move.
 //
-// Protocol: one JSON object per line in, one per line out. Every command
-// takes a single "data" argument holding hex-encoded bytes; responses carry
-// {"error": "..."} on failure or command-specific fields on success:
+// Protocol: one JSON object per line in, one per line out, in order. Every
+// command takes a single "data" argument holding hex-encoded bytes. A request
+// may also carry an "id", an unsigned 64-bit integer that its response echoes,
+// so a client keeping several requests in flight can check that each answer
+// is the one it expects; a request without an id gets a response without one.
+// A line that does not decode as a request, or is longer than 64 MiB, is
+// answered in its place with an error carrying no id, and the line after it
+// is served as usual. Responses are written out whenever the input holds no
+// further complete request, so a client that sends one request and waits has
+// its answer at once, and one that sends many gets theirs in few writes. A
+// request that panics ends the process, as it always has, once the answers
+// ahead of it are written out. Responses carry {"error": "..."} on failure or
+// command-specific fields on success:
 //
 //	blake256           → {"result": "<hex 32-byte digest>"}
 //	newhashfromstr     → data is the hex of the string bytes;
@@ -33,10 +43,24 @@
 //	blockheader_decode → {"block_hash": ..., "reencoded": "<hex>"}
 //	ecdsa_parse_der    → {"result": "<hex 64-byte R||S>"} or
 //	                     {"error": ..., "kind": "ErrSig..."}
-//	ecdsa_sign         → data is 32-byte privkey || 32-byte hash;
-//	                     {"result": "<hex DER signature>"}
+//	ecdsa_sign         → data is 32-byte privkey, nonzero mod N ||
+//	                     32-byte hash; {"result": "<hex DER signature>"}
 //	ecdsa_verify       → data is 33-byte compressed pubkey || 32-byte hash ||
 //	                     DER signature; {"result": "true"|"false"}
+//	ecdsa_verify_raw   → data is key_len(1) || key || 32-byte hash ||
+//	                     32-byte r || 32-byte s, the key in any format
+//	                     ParsePubKey takes; {"result": "true"|"false"} or
+//	                     {"error": ..., "kind": "ErrPubKey..."|
+//	                      "ErrSigRTooBig"|"ErrSigSTooBig"}
+//	ecdsa_sign_compact → data is compressed(1: 0 or 1) || 32-byte privkey,
+//	                     nonzero mod N || 32-byte hash; {"result": "<hex
+//	                     65-byte compact signature>"}
+//	ecdsa_recover_compact → data is 32-byte hash || compact signature;
+//	                     {"result": "<hex pubkey, compressed if the
+//	                      signature says so>",
+//	                      "was_compressed": "true"|"false"} or
+//	                     {"error": ..., "kind": "ErrSig..."|
+//	                      "ErrPointNotOnCurve"}
 //	pubkey_parse       → {"result": "<hex uncompressed>",
 //	                      "compressed": "<hex compressed>"} or
 //	                     {"error": ..., "kind": "ErrPubKey..."}
@@ -149,6 +173,9 @@
 //	                     certificate under RequireAndVerifyClientCert;
 //	                     {"result": "ok"} or {"result": "refused: <error>"},
 //	                     each with "go_version": runtime.Version()
+//	build_info         → takes no data; {"go_version": runtime.Version(),
+//	                      "modules": {"<module path>": "<version>"}} for the
+//	                     secp256k1/v4 and edwards/v2 modules linked in
 package main
 
 import (
@@ -160,8 +187,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"runtime"
+	"runtime/debug"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -192,22 +222,39 @@ import (
 )
 
 type request struct {
-	Cmd  string `json:"cmd"`
-	Data string `json:"data,omitempty"`
+	ID   *uint64 `json:"id,omitempty"`
+	Cmd  string  `json:"cmd"`
+	Data string  `json:"data,omitempty"`
 }
 
 type response struct {
-	Result      string `json:"result,omitempty"`
-	Error       string `json:"error,omitempty"`
-	Kind        string `json:"kind,omitempty"`
-	Compressed  string `json:"compressed,omitempty"`
-	TxID        string `json:"txid,omitempty"`
-	WitnessHash string `json:"witness_hash,omitempty"`
-	FullHash    string `json:"full_hash,omitempty"`
-	BlockHash   string `json:"block_hash,omitempty"`
-	Reencoded   string `json:"reencoded,omitempty"`
-	GoVersion   string `json:"go_version,omitempty"`
+	ID            *uint64           `json:"id,omitempty"`
+	Result        string            `json:"result,omitempty"`
+	Error         string            `json:"error,omitempty"`
+	Kind          string            `json:"kind,omitempty"`
+	Compressed    string            `json:"compressed,omitempty"`
+	WasCompressed string            `json:"was_compressed,omitempty"`
+	TxID          string            `json:"txid,omitempty"`
+	WitnessHash   string            `json:"witness_hash,omitempty"`
+	FullHash      string            `json:"full_hash,omitempty"`
+	BlockHash     string            `json:"block_hash,omitempty"`
+	Reencoded     string            `json:"reencoded,omitempty"`
+	GoVersion     string            `json:"go_version,omitempty"`
+	Modules       map[string]string `json:"modules,omitempty"`
 }
+
+// buildInfoModules are the modules build_info reports: the signature code
+// the differential tests compare against.
+var buildInfoModules = []string{
+	"github.com/decred/dcrd/dcrec/secp256k1/v4",
+	"github.com/decred/dcrd/dcrec/edwards/v2",
+}
+
+// maxLineBytes caps one request line, newline excluded. A full block travels
+// hex-encoded in well under it.
+const maxLineBytes = 64 << 20
+
+var errLineTooLong = fmt.Errorf("line exceeds %d bytes", maxLineBytes)
 
 func errResp(format string, args ...any) response {
 	return response{Error: fmt.Sprintf(format, args...)}
@@ -329,7 +376,14 @@ func handle(req request) response {
 			return errResp("ecdsa_sign: want 64 bytes (privkey || hash), got %d",
 				len(data))
 		}
+		// A key that reduces to zero mod N is refused: signRFC6979 never
+		// returns for it when the hash reduces to zero as well, since every
+		// nonce then gives s = 0, and over any other hash it signs for a
+		// public key at the point at infinity.
 		privKey := secp256k1.PrivKeyFromBytes(data[:32])
+		if privKey.Key.IsZero() {
+			return errResp("ecdsa_sign: private key is zero mod N")
+		}
 		sig := ecdsa.Sign(privKey, data[32:])
 		return response{Result: hex.EncodeToString(sig.Serialize())}
 
@@ -350,6 +404,81 @@ func handle(req request) response {
 			return response{Result: "true"}
 		}
 		return response{Result: "false"}
+
+	case "ecdsa_verify_raw":
+		// data: key_len(1) || key || hash(32) || r(32) || s(32).  The key
+		// takes any format ParsePubKey does, so uncompressed and hybrid
+		// keys reach Verify too.  r and s reach it as NewSignature takes
+		// them, zero included, so Verify's own range check is what
+		// rejects a zero.  dcrd has no verify taking r and s as bytes, so
+		// a value at or above N is reported under the kinds
+		// ParseDERSignature and RecoverCompact give it, r checked first,
+		// rather than reduced or folded into false.
+		if len(data) < 1 || len(data) != 1+int(data[0])+32+64 {
+			return errResp("ecdsa_verify_raw: want key_len(1) || key || "+
+				"96 bytes, got %d bytes", len(data))
+		}
+		keyLen := int(data[0])
+		pubKey, err := secp256k1.ParsePubKey(data[1 : 1+keyLen])
+		if err != nil {
+			return errKindResp(err)
+		}
+		rest := data[1+keyLen:]
+		var r, s secp256k1.ModNScalar
+		if overflow := r.SetByteSlice(rest[32:64]); overflow {
+			return errKindResp(ecdsa.Error{Err: ecdsa.ErrSigRTooBig,
+				Description: "invalid signature: R >= group order"})
+		}
+		if overflow := s.SetByteSlice(rest[64:96]); overflow {
+			return errKindResp(ecdsa.Error{Err: ecdsa.ErrSigSTooBig,
+				Description: "invalid signature: S >= group order"})
+		}
+		if ecdsa.NewSignature(&r, &s).Verify(rest[:32], pubKey) {
+			return response{Result: "true"}
+		}
+		return response{Result: "false"}
+
+	case "ecdsa_sign_compact":
+		// data: compressed(1) || privkey(32) || hash(32).  PrivKeyFromBytes
+		// reduces the key mod N, as for ecdsa_sign, where the port rejects
+		// a key outside [1, N-1], so callers keep keys in that range.  A
+		// key that reduces to zero is refused for ecdsa_sign's reason.
+		if len(data) != 1+32+32 {
+			return errResp("ecdsa_sign_compact: want 65 bytes "+
+				"(compressed || privkey || hash), got %d", len(data))
+		}
+		if data[0] > 1 {
+			return errResp("ecdsa_sign_compact: compressed flag %d is not "+
+				"0 or 1", data[0])
+		}
+		privKey := secp256k1.PrivKeyFromBytes(data[1:33])
+		if privKey.Key.IsZero() {
+			return errResp("ecdsa_sign_compact: private key is zero mod N")
+		}
+		sig := ecdsa.SignCompact(privKey, data[33:], data[0] == 1)
+		return response{Result: hex.EncodeToString(sig)}
+
+	case "ecdsa_recover_compact":
+		// data: hash(32) || compact signature of any length, so a wrong
+		// length reaches RecoverCompact's own check.  The key is
+		// serialized as dcrd's verifymessage serializes it before
+		// hashing it into an address.
+		if len(data) < 32 {
+			return errResp("ecdsa_recover_compact: want >= 32 bytes "+
+				"(hash || sig), got %d", len(data))
+		}
+		pubKey, wasCompressed, err := ecdsa.RecoverCompact(data[32:], data[:32])
+		if err != nil {
+			return errKindResp(err)
+		}
+		serialized := pubKey.SerializeUncompressed()
+		if wasCompressed {
+			serialized = pubKey.SerializeCompressed()
+		}
+		return response{
+			Result:        hex.EncodeToString(serialized),
+			WasCompressed: strconv.FormatBool(wasCompressed),
+		}
 
 	case "pubkey_parse":
 		pubKey, err := secp256k1.ParsePubKey(data)
@@ -1418,6 +1547,35 @@ func handle(req request) response {
 		}
 		return response{Result: "ok", GoVersion: runtime.Version()}
 
+	case "build_info":
+		// What a recorded comparison ran against: the toolchain, and the
+		// signature modules as the build resolved them.  A replaced module
+		// reads "<version> => <replacement path> [<replacement version>]".
+		info, ok := debug.ReadBuildInfo()
+		if !ok {
+			return errResp("build_info: no build information in the binary")
+		}
+		modules := make(map[string]string, len(buildInfoModules))
+		for _, dep := range info.Deps {
+			if !slices.Contains(buildInfoModules, dep.Path) {
+				continue
+			}
+			version := dep.Version
+			if r := dep.Replace; r != nil {
+				version += " => " + r.Path
+				if r.Version != "" {
+					version += " " + r.Version
+				}
+			}
+			modules[dep.Path] = version
+		}
+		for _, path := range buildInfoModules {
+			if modules[path] == "" {
+				return errResp("build_info: no version for %s", path)
+			}
+		}
+		return response{GoVersion: runtime.Version(), Modules: modules}
+
 	default:
 		return errResp("unknown cmd: %s", req.Cmd)
 	}
@@ -1646,36 +1804,108 @@ func dumpParams(p *chaincfg.Params) (string, error) {
 	return w.String(), nil
 }
 
-func main() {
-	in := bufio.NewScanner(os.Stdin)
-	// Allow large inputs (full blocks later): 64 MiB line limit.
-	in.Buffer(make([]byte, 0, 64*1024), 64*1024*1024)
-	out := bufio.NewWriter(os.Stdout)
-	enc := json.NewEncoder(out)
+// handleLine answers one request line, echoing its id.
+func handleLine(line []byte) response {
+	var req request
+	if err := json.Unmarshal(line, &req); err != nil {
+		return errResp("bad request: %v", err)
+	}
+	resp := handle(req)
+	resp.ID = req.ID
+	return resp
+}
 
-	for in.Scan() {
-		line := in.Bytes()
-		if len(bytes.TrimSpace(line)) == 0 {
-			continue
+// readLine returns the next line from in without its newline, or io.EOF once
+// in is exhausted; a last line with no newline is returned before the io.EOF.
+// A line that fits in in's buffer comes back as a slice of it, valid until the
+// next read. A line longer than maxLineBytes is read through its newline and
+// discarded, and reported as errLineTooLong, so the line after it can still be
+// served.
+func readLine(in *bufio.Reader) ([]byte, error) {
+	var line []byte
+	n := 0
+	for {
+		chunk, err := in.ReadSlice('\n')
+		if err == nil {
+			chunk = chunk[:len(chunk)-1]
+			if n == 0 {
+				return chunk, nil
+			}
 		}
-		var req request
-		var resp response
-		if err := json.Unmarshal(line, &req); err != nil {
-			resp = errResp("bad request: %v", err)
+		n += len(chunk)
+		if n <= maxLineBytes {
+			line = append(line, chunk...)
 		} else {
-			resp = handle(req)
+			line = nil
 		}
-		if err := enc.Encode(&resp); err != nil {
-			fmt.Fprintf(os.Stderr, "dcrd-oracle: write: %v\n", err)
-			os.Exit(1)
-		}
-		if err := out.Flush(); err != nil {
-			fmt.Fprintf(os.Stderr, "dcrd-oracle: flush: %v\n", err)
-			os.Exit(1)
+		switch {
+		case errors.Is(err, bufio.ErrBufferFull):
+			continue
+		case err == nil, errors.Is(err, io.EOF) && n > 0:
+			if n > maxLineBytes {
+				return nil, errLineTooLong
+			}
+			return line, nil
+		default:
+			return nil, err
 		}
 	}
-	if err := in.Err(); err != nil {
-		fmt.Fprintf(os.Stderr, "dcrd-oracle: read: %v\n", err)
+}
+
+// lineBuffered reports whether in already holds a complete line, so that the
+// next readLine returns without waiting on the input.
+func lineBuffered(in *bufio.Reader) bool {
+	buffered, _ := in.Peek(in.Buffered())
+	return bytes.IndexByte(buffered, '\n') >= 0
+}
+
+// serve answers each request line read from in with answer, as main does with
+// handleLine, writing the responses to out, until in is exhausted. out is
+// flushed before any read that could wait on the input, so no client waits on
+// an answer still sitting in out, and answers to requests that arrived
+// together go out together. A request that never returns holds back the
+// answers to those that arrived with it.
+func serve(in *bufio.Reader, out *bufio.Writer, answer func(line []byte) response) error {
+	// Answers already given reach the client whatever ends serving,
+	// including a request that panics: nothing recovers the panic, so this
+	// runs as it unwinds, before the process dies.
+	defer out.Flush()
+
+	enc := json.NewEncoder(out)
+	for {
+		if out.Buffered() > 0 && !lineBuffered(in) {
+			if err := out.Flush(); err != nil {
+				return fmt.Errorf("flush: %w", err)
+			}
+		}
+		line, err := readLine(in)
+		var resp response
+		switch {
+		case errors.Is(err, io.EOF):
+			if err := out.Flush(); err != nil {
+				return fmt.Errorf("flush: %w", err)
+			}
+			return nil
+		case errors.Is(err, errLineTooLong):
+			resp = errResp("bad request: %v", err)
+		case err != nil:
+			return fmt.Errorf("read: %w", err)
+		case len(bytes.TrimSpace(line)) == 0:
+			continue
+		default:
+			resp = answer(line)
+		}
+		if err := enc.Encode(&resp); err != nil {
+			return fmt.Errorf("write: %w", err)
+		}
+	}
+}
+
+func main() {
+	in := bufio.NewReaderSize(os.Stdin, 1<<20)
+	out := bufio.NewWriterSize(os.Stdout, 1<<20)
+	if err := serve(in, out, handleLine); err != nil {
+		fmt.Fprintf(os.Stderr, "dcrd-oracle: %v\n", err)
 		os.Exit(1)
 	}
 }

@@ -748,6 +748,14 @@ with another release answers as that release does.
 instead, so a run cannot silently pass with the differential coverage
 skipped — CI sets it.
 
+`DCROXIDE_ORACLE_BIN` can name a prebuilt oracle instead: the absolute
+path of a `dcrd-oracle` built from this checkout's `tools/oracle` with
+`go build -o`. Every test process then runs that binary rather than
+building its own, and no Go toolchain is needed. The binary is taken as
+found, so one built before a change to `tools/oracle` answers for the
+old source. A name that is not an absolute path to a file skips the
+oracle tests, or fails them under `DCROXIDE_REQUIRE_ORACLE`.
+
 Every randomized differential prints the seed it drew
 (`<label>: seed 0x…`). To replay a failure without editing the test, set
 `DCROXIDE_TEST_SEED` to that value and run the failing test by name.

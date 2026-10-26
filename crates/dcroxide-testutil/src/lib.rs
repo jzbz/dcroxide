@@ -15,6 +15,7 @@ pub mod gate;
 pub mod powerloss;
 
 use std::env;
+use std::ffi::OsStr;
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
@@ -23,9 +24,25 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+/// Lowercase hex digits, indexed by the value of a nibble.
+const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
+
 /// Encode bytes as lowercase hex.
 pub fn hex(b: &[u8]) -> String {
-    b.iter().map(|x| format!("{x:02x}")).collect()
+    let mut out = String::new();
+    push_hex(&mut out, b);
+    out
+}
+
+/// Append the lowercase hex of `b` to `out`, two digits a byte looked up in
+/// [`HEX_DIGITS`], with one reservation up front rather than an allocation
+/// per byte.
+fn push_hex(out: &mut String, b: &[u8]) {
+    out.reserve(b.len().saturating_mul(2));
+    for &byte in b {
+        out.push(char::from(HEX_DIGITS[usize::from(byte >> 4)]));
+        out.push(char::from(HEX_DIGITS[usize::from(byte & 0x0f)]));
+    }
 }
 
 /// Decode a lowercase/uppercase hex string; panics on invalid input (tests).
@@ -111,6 +128,38 @@ impl SplitMix64 {
         self.fill(&mut v);
         v
     }
+
+    /// The sub-seed of stream `label`, number `index`, under `master`, so
+    /// one printed master seed reproduces many independent streams: one for
+    /// each class of input, say, and one for each case within a class.  For
+    /// more than one index, nest the calls:
+    /// `derive(derive(master, "worker", w), "case", i)`.
+    ///
+    /// A state starting at `master` absorbs, in turn, the label's UTF-8
+    /// bytes as little-endian words of eight (the last one zero-padded), the
+    /// label's length in bytes, and `index`.  Each word is xored into the
+    /// state, which is then replaced by the output of one SplitMix64 step
+    /// from it.  Nothing but wrapping `u64` arithmetic and an explicit byte
+    /// order goes in, so a sub-seed is the same on every platform.  Every
+    /// step is a bijection of the state: with the label and index fixed,
+    /// distinct masters give distinct sub-seeds, and with the master and
+    /// label fixed, so do distinct indices.  The length keeps a label apart
+    /// from the same label with NUL bytes appended, which pads to the same
+    /// words.
+    ///
+    /// Recorded seeds replay only while this construction stays as it is;
+    /// a known-answer test pins it.
+    pub fn derive(master: u64, label: &str, index: u64) -> u64 {
+        let absorb = |state: u64, word: u64| SplitMix64(state ^ word).next_u64();
+        let mut state = master;
+        for chunk in label.as_bytes().chunks(8) {
+            let mut word = [0u8; 8];
+            word[..chunk.len()].copy_from_slice(chunk);
+            state = absorb(state, u64::from_le_bytes(word));
+        }
+        state = absorb(state, label.len() as u64);
+        absorb(state, index)
+    }
 }
 
 /// Parse a seed as [`SplitMix64::from_entropy`] prints it: hex, with or
@@ -135,22 +184,78 @@ pub fn go_available() -> bool {
         .is_ok_and(|o| o.status.success())
 }
 
-/// Skip-or-fail policy shared by all differential tests: without a Go
-/// toolchain the test skips (returns None), unless `DCROXIDE_REQUIRE_ORACLE`
-/// is set (as in CI), in which case a missing toolchain panics so that
-/// differential coverage can never silently vanish from CI.
+/// Names a prebuilt `dcrd-oracle` to run in place of building `tools/oracle`
+/// in every test process: an absolute path (each test binary runs in its own
+/// crate's directory, where a relative one would name a different file) to a
+/// binary built from this checkout's `tools/oracle` with `go build -o`.
+/// Every test process, and every job that runs them, can share one build
+/// this way, and a run with it set needs no Go toolchain.  Unset or empty,
+/// the oracle is built as usual.  The binary is taken as found: one built
+/// before a change to `tools/oracle` answers for the old source.
+pub const ORACLE_BIN_VAR: &str = "DCROXIDE_ORACLE_BIN";
+
+/// Skip-or-fail policy shared by all differential tests: without an oracle
+/// the test skips (returns None), unless `DCROXIDE_REQUIRE_ORACLE` is set
+/// (as in CI), in which case a missing oracle panics so that differential
+/// coverage can never silently vanish from CI.
+///
+/// The oracle is the binary [`ORACLE_BIN_VAR`] (`DCROXIDE_ORACLE_BIN`)
+/// names, or else `tools/oracle` built with the Go toolchain on `PATH`.  It
+/// is missing when that variable names anything but an absolute path to a
+/// file, or when it is unset and no Go toolchain is found.
 pub fn oracle_or_skip() -> Option<Oracle> {
-    if !go_available() {
-        assert!(
-            env::var_os("DCROXIDE_REQUIRE_ORACLE").is_none(),
-            "DCROXIDE_REQUIRE_ORACLE is set but no Go toolchain was found"
-        );
-        eprintln!(
-            "skipping: Go toolchain not found (set DCROXIDE_REQUIRE_ORACLE to make this an error)"
-        );
-        return None;
+    match choose_oracle(env::var_os(ORACLE_BIN_VAR).as_deref(), go_available) {
+        Ok(source) => Some(Oracle::spawn_from(source)),
+        Err(why) => {
+            assert!(
+                env::var_os("DCROXIDE_REQUIRE_ORACLE").is_none(),
+                "DCROXIDE_REQUIRE_ORACLE is set but {why}"
+            );
+            eprintln!("skipping: {why} (set DCROXIDE_REQUIRE_ORACLE to make this an error)");
+            None
+        }
     }
-    Some(Oracle::spawn())
+}
+
+/// Where the oracle binary comes from.
+#[derive(Debug, PartialEq, Eq)]
+enum OracleSource {
+    /// The prebuilt binary [`ORACLE_BIN_VAR`] names.
+    Prebuilt(PathBuf),
+    /// `tools/oracle`, built by [`build_oracle`].
+    Build,
+}
+
+impl OracleSource {
+    /// The binary's path, building it first if it comes from source.
+    fn path(self) -> PathBuf {
+        match self {
+            OracleSource::Prebuilt(path) => path,
+            OracleSource::Build => build_oracle(),
+        }
+    }
+}
+
+/// Choose the oracle given the value of [`ORACLE_BIN_VAR`], or say why there
+/// is none.  `go_available` is asked only when no binary is named: a
+/// prebuilt oracle needs no Go toolchain.
+fn choose_oracle(
+    named: Option<&OsStr>,
+    go_available: impl FnOnce() -> bool,
+) -> Result<OracleSource, String> {
+    match named.filter(|value| !value.is_empty()).map(Path::new) {
+        Some(path) if !path.is_absolute() => Err(format!(
+            "{ORACLE_BIN_VAR} names {}, which is not an absolute path",
+            path.display()
+        )),
+        Some(path) if !path.is_file() => Err(format!(
+            "{ORACLE_BIN_VAR} names {}, which is not a file",
+            path.display()
+        )),
+        Some(path) => Ok(OracleSource::Prebuilt(path.to_path_buf())),
+        None if go_available() => Ok(OracleSource::Build),
+        None => Err("no Go toolchain was found".to_owned()),
+    }
 }
 
 fn repo_root() -> &'static Path {
@@ -238,38 +343,67 @@ fn build_oracle_uncached() -> PathBuf {
     bin
 }
 
+/// Append an oracle request line, newline included: `{"cmd":…,"data":…}`
+/// with `data` hex-encoded.  `cmd` is one of the oracle's command names and
+/// goes in unescaped.
+fn push_request(line: &mut String, cmd: &str, data: &[u8]) {
+    line.push_str(r#"{"cmd":""#);
+    line.push_str(cmd);
+    line.push_str(r#"","data":""#);
+    push_hex(line, data);
+    line.push_str("\"}\n");
+}
+
 /// A running `dcrd-oracle` subprocess speaking line-delimited JSON.
 pub struct Oracle {
     child: Child,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
+    /// The line being written or read, kept across calls for its capacity.
+    line: String,
 }
 
 impl Oracle {
-    /// Build (if needed) and spawn the oracle.
+    /// Spawn the oracle [`oracle_or_skip`] would, building it if needed;
+    /// where that would skip, this panics.
     pub fn spawn() -> Self {
-        let bin = build_oracle();
+        let source = choose_oracle(env::var_os(ORACLE_BIN_VAR).as_deref(), go_available)
+            .unwrap_or_else(|why| panic!("cannot spawn the oracle: {why}"));
+        Oracle::spawn_from(source)
+    }
+
+    fn spawn_from(source: OracleSource) -> Self {
+        let bin = source.path();
         let mut child = Command::new(&bin)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()
-            .expect("spawn dcrd-oracle");
+            .unwrap_or_else(|e| panic!("spawn {}: {e}", bin.display()));
         let stdin = child.stdin.take().expect("oracle stdin");
         let stdout = BufReader::new(child.stdout.take().expect("oracle stdout"));
         Oracle {
             child,
             stdin,
             stdout,
+            line: String::new(),
         }
     }
 
     /// Issue a command whose sole argument is `data` (hex-encoded bytes) and
     /// return the raw JSON response object.
     pub fn call(&mut self, cmd: &str, data: &[u8]) -> serde_json::Value {
-        writeln!(self.stdin, r#"{{"cmd":"{cmd}","data":"{}"}}"#, hex(data)).expect("write request");
-        let mut line = String::new();
-        self.stdout.read_line(&mut line).expect("read response");
-        serde_json::from_str(&line).expect("parse oracle response")
+        // One write for the whole line: `ChildStdin` is unbuffered, so
+        // formatting straight into it costs a write(2) a piece.
+        self.line.clear();
+        push_request(&mut self.line, cmd, data);
+        self.stdin
+            .write_all(self.line.as_bytes())
+            .expect("write request");
+        self.line.clear();
+        self.stdout
+            .read_line(&mut self.line)
+            .expect("read response");
+        serde_json::from_str(&self.line).expect("parse oracle response")
     }
 
     /// Like [`Self::call`], but panics on an error response and returns the
@@ -720,6 +854,199 @@ mod tests {
         assert!(!run("not-a-seed").status.success());
     }
 
+    /// A sub-seed depends on the master, the label and the index and on
+    /// nothing else: the known answers come from a model of the documented
+    /// construction written apart from this one, and none of the labels
+    /// below, nor any index, lands on another's sub-seed.
+    #[test]
+    fn derive_is_deterministic_and_tells_labels_and_indices_apart() {
+        const MASTER: u64 = 0x0123_4567_89ab_cdef;
+        for (master, label, index, want) in [
+            (0, "", 0, 0xa706_dd2f_4d19_7e6f),
+            (MASTER, "", 0, 0x021c_88d0_a3fd_73b6),
+            (MASTER, "EV-xGEN-true", 7, 0xd694_e2f7_b11c_6b18),
+            (MASTER, "a", 0, 0xacc5_f4af_4882_c14e),
+            (MASTER, "a\0", 0, 0xdf1e_052c_6e59_7851),
+            (u64::MAX, "class/éè", u64::MAX, 0x2c3f_7fc3_15d6_16a1),
+        ] {
+            assert_eq!(
+                SplitMix64::derive(master, label, index),
+                want,
+                "derive({master:#x}, {label:?}, {index})"
+            );
+        }
+
+        // Prefixes, NUL padding, word boundaries and near-identical names.
+        let labels = [
+            "",
+            "\0",
+            "a",
+            "a\0",
+            "b",
+            "ab",
+            "ba",
+            "abcdefgh",
+            "abcdefgh\0",
+            "abcdefghi",
+            "EV-xGEN-true",
+            "EV-xGEN-false",
+        ];
+        let mut seen = std::collections::HashSet::new();
+        for label in labels {
+            for index in 0..512 {
+                let seed = SplitMix64::derive(MASTER, label, index);
+                assert!(seen.insert(seed), "{label:?} {index} repeats a sub-seed");
+                assert_ne!(seed, MASTER, "{label:?} {index} returns the master");
+            }
+        }
+        for bit in 0..64 {
+            assert_ne!(
+                SplitMix64::derive(MASTER ^ (1 << bit), "a", 0),
+                SplitMix64::derive(MASTER, "a", 0),
+                "flipping master bit {bit} changes nothing"
+            );
+        }
+    }
+
+    /// The table-driven encoder writes what `{:02x}` does, for every byte.
+    #[test]
+    fn hex_encodes_every_byte_as_format_does() {
+        let all: Vec<u8> = (0..=u8::MAX).collect();
+        let want: String = all.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(hex(&all), want);
+        assert_eq!(hex(&[]), "");
+        assert_eq!(unhex(&hex(&all)), all);
+    }
+
+    /// A request is the line the oracle has always read, built whole for
+    /// its one write.
+    #[test]
+    fn a_request_is_one_json_line() {
+        let mut line = String::new();
+        push_request(&mut line, "ecdsa_verify", &[0x00, 0xab, 0xff]);
+        assert_eq!(line, "{\"cmd\":\"ecdsa_verify\",\"data\":\"00abff\"}\n");
+        let parsed: serde_json::Value = serde_json::from_str(&line).expect("valid JSON");
+        assert_eq!(parsed["cmd"], "ecdsa_verify");
+        line.clear();
+        push_request(&mut line, "blake256", &[]);
+        assert_eq!(line, "{\"cmd\":\"blake256\",\"data\":\"\"}\n");
+    }
+
+    /// `DCROXIDE_ORACLE_BIN` names the binary to run, and Go is asked about
+    /// only when it names none: an absolute path to a file is taken as it
+    /// is, and anything else it names is a reason to skip.
+    #[test]
+    fn the_oracle_is_chosen_from_dcroxide_oracle_bin() {
+        let no_go = || -> bool { panic!("Go was asked about although a binary was named") };
+        let exe = env::current_exe().expect("test binary path");
+        assert_eq!(
+            choose_oracle(Some(exe.as_os_str()), no_go),
+            Ok(OracleSource::Prebuilt(exe.clone()))
+        );
+
+        let dir = TempDir::new("oracle-bin");
+        let absent = dir.path().join("dcrd-oracle");
+        for missing in [absent.as_path(), dir.path()] {
+            let err = choose_oracle(Some(missing.as_os_str()), no_go).expect_err("not a file");
+            assert_eq!(
+                err,
+                format!(
+                    "DCROXIDE_ORACLE_BIN names {}, which is not a file",
+                    missing.display()
+                )
+            );
+        }
+        let err = choose_oracle(Some(OsStr::new("dcrd-oracle")), no_go).expect_err("relative");
+        assert_eq!(
+            err,
+            "DCROXIDE_ORACLE_BIN names dcrd-oracle, which is not an absolute path"
+        );
+
+        // Unset or empty, the oracle is built, given Go.
+        for named in [None, Some(OsStr::new(""))] {
+            assert_eq!(choose_oracle(named, || true), Ok(OracleSource::Build));
+            assert_eq!(
+                choose_oracle(named, || false),
+                Err("no Go toolchain was found".to_owned())
+            );
+        }
+    }
+
+    /// End to end, in a child with no Go on `PATH`: a named binary that is
+    /// missing skips, or fails under `DCROXIDE_REQUIRE_ORACLE`, and a named
+    /// oracle runs without one being built.
+    #[test]
+    fn a_named_oracle_runs_without_go() {
+        const CHILD: &str = "DCROXIDE_TESTUTIL_ORACLE_BIN_CHILD";
+        match env::var(CHILD).as_deref() {
+            Ok("skip") => {
+                assert!(oracle_or_skip().is_none());
+                return;
+            }
+            Ok("run") => {
+                let mut oracle = oracle_or_skip().expect("the named oracle");
+                assert_eq!(
+                    oracle.call_ok("blake256", b""),
+                    "716f6e863f744b9ac22c97ec7b76ea5f5908bc5b2f67c61510bfc4751384ea7a"
+                );
+                assert_eq!(ORACLE_BUILDS.load(Ordering::Relaxed), 0);
+                return;
+            }
+            _ => {}
+        }
+
+        let exe = env::current_exe().expect("test binary path");
+        // An empty directory as `PATH`: no Go toolchain is found there.
+        let empty = TempDir::new("no-go");
+        let run = |mode: &str, bin: &Path, require: bool| {
+            let mut cmd = Command::new(&exe);
+            cmd.args([
+                "--exact",
+                "tests::a_named_oracle_runs_without_go",
+                "--nocapture",
+            ])
+            .env(CHILD, mode)
+            .env(ORACLE_BIN_VAR, bin)
+            .env("PATH", empty.path());
+            if require {
+                cmd.env("DCROXIDE_REQUIRE_ORACLE", "1");
+            } else {
+                cmd.env_remove("DCROXIDE_REQUIRE_ORACLE");
+            }
+            let out = cmd.output().expect("run the child");
+            let text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            (out.status.success(), text)
+        };
+
+        let absent = empty.path().join("dcrd-oracle");
+        let (ok, text) = run("skip", &absent, false);
+        assert!(ok, "{text}");
+        assert!(
+            text.contains("skipping: DCROXIDE_ORACLE_BIN names"),
+            "{text}"
+        );
+        let (ok, text) = run("skip", &absent, true);
+        assert!(!ok, "{text}");
+        assert!(
+            text.contains("DCROXIDE_REQUIRE_ORACLE is set but DCROXIDE_ORACLE_BIN names"),
+            "{text}"
+        );
+
+        let Some(oracle) = oracle_or_skip() else {
+            return;
+        };
+        drop(oracle);
+        let bin = choose_oracle(env::var_os(ORACLE_BIN_VAR).as_deref(), || true)
+            .expect("chosen once already")
+            .path();
+        let (ok, text) = run("run", &bin, true);
+        assert!(ok, "{text}");
+    }
+
     /// The pin the interop harness enforces is the commit CI builds dcrd
     /// from and the commit the oracle and the full block battery generator
     /// link: the harness once required `29f17894` while everything else had
@@ -802,7 +1129,8 @@ mod tests {
         assert!(log_tail(&log).contains("last 65536 bytes"));
     }
 
-    /// Spawning the oracle repeatedly builds it once per process.
+    /// Spawning the oracle repeatedly builds it once per process, and one
+    /// that `DCROXIDE_ORACLE_BIN` names, never.
     #[test]
     fn the_oracle_is_built_once_per_process() {
         let Some(first) = oracle_or_skip() else {
@@ -810,6 +1138,12 @@ mod tests {
         };
         let second = Oracle::spawn();
         drop((first, second));
+        if let Ok(OracleSource::Prebuilt(_)) =
+            choose_oracle(env::var_os(ORACLE_BIN_VAR).as_deref(), || true)
+        {
+            assert_eq!(ORACLE_BUILDS.load(Ordering::Relaxed), 0);
+            return;
+        }
         assert_eq!(build_oracle(), build_oracle());
         assert_eq!(
             ORACLE_BUILDS.load(Ordering::Relaxed),
