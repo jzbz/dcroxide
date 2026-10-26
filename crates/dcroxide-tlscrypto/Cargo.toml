@@ -1,0 +1,39 @@
+[package]
+name = "dcroxide-tlscrypto"
+description = "The rustls crypto provider ADR-0015 moves the node's TLS to: RustCrypto primitives, in-tree RSA verification, and Go's key and point rules"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# Record protection (ADR-0015 T1).  No `alloc` or `getrandom`: the provider
+# encrypts in place and draws nothing through these crates.
+aes-gcm = { version = "0.11.1", default-features = false, features = ["aes", "zeroize"] }
+chacha20poly1305 = { version = "0.11.0", default-features = false, features = ["zeroize"] }
+# Taken for its `zeroize` alone, which `chacha20poly1305`'s does not turn
+# on: it wipes each record's Poly1305 state, keyed with that record's
+# one-time key, once the tag is made or checked
+# (`poly1305-0.9.1/src/lib.rs:122-130`).
+poly1305 = { version = "0.9.1", default-features = false, features = ["zeroize"] }
+# The transcript hash, and HMAC, which HKDF and the TLS 1.2 PRF run on.
+# `zeroize` on both: a keyed HMAC holds two SHA-2 states and a block
+# buffer, which `sha2`'s feature wipes on drop, the buffer through
+# `digest`'s, which `hmac`'s turns on as well (`src/hmac.rs`).
+sha2 = { version = "0.11", default-features = false, features = ["zeroize"] }
+hmac = { version = "0.13", default-features = false, features = ["zeroize"] }
+rustls = { version = "0.23.46", default-features = false, features = ["std", "tls12"] }
+zeroize = "1.9"
+
+[dev-dependencies]
+dcroxide-testutil = { path = "../dcroxide-testutil" }
+serde_json = "1"
+flate2 = "1.1"
+# Step 1 only: the parity tests run ring's provider beside this one.
+# Removed by the switch, which leaves nothing in the build selecting ring.
+rustls = { version = "0.23.46", default-features = false, features = ["std", "tls12", "ring"] }
+
+[lints]
+workspace = true

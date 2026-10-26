@@ -482,6 +482,13 @@ work). Currently implemented:
   shape: Ed25519 pairs pin byte for byte and ECDSA pairs pin their
   to-be-signed bytes and keys, from a scripted session mirroring
   dcrd's template construction
+- `dcroxide-tlscrypto` — the rustls crypto provider that is to replace
+  `ring` (no dcrd counterpart; ADR-0015), built in steps beside it: so
+  far the nine cipher suites' record protection over RustCrypto's
+  `aes-gcm` and `chacha20poly1305`, with their transcript hashes, HMAC,
+  HKDF and TLS 1.2 PRF, pinned by Wycheproof's vectors on hardware and
+  portable backends and by in-memory handshakes against ring's suites of
+  the same names, both ways; the node does not use it yet
 - `dcroxide-ratelimit` — dcrd 2.2's `internal/ratelimit` token bucket:
   a bucket seeded with `burst` tokens refilling at a fixed rate,
   reproducing dcrd's `f64` operations in dcrd's order — including

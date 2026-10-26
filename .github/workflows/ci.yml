@@ -123,6 +123,63 @@ jobs:
         env:
           CARGO_PROFILE_DEV_DEBUG_ASSERTIONS: "false"
 
+  tls-soft-backends:
+    name: TLS provider (software backends, no ring)
+    runs-on: ubuntu-latest
+    # dcroxide-tlscrypto's record protection runs on aes, polyval, chacha20
+    # and poly1305, and its transcript hash, HMAC, HKDF and PRF on sha2,
+    # each of which picks a hardware backend at run time (AES-NI or the
+    # ARMv8 AES instructions, CLMUL or PMULL, SSE2 or AVX2, SHA-NI, AVX2 or
+    # the ARMv8 SHA-2 and SHA-3 instructions) and falls back to portable
+    # code without one. The runners have the hardware, so every other job
+    # tests only those backends, and a processor without it would be the
+    # first to run the portable ones. This job forces the portable ones
+    # with each crate's own cfg (aes 0.9's `aes_backend`, polyval 0.7's
+    # `polyval_backend`, chacha20 0.10's `chacha20_backend`, poly1305
+    # 0.9's `poly1305_backend`, sha2 0.11's `sha2_backend`, and
+    # curve25519-dalek 5's `curve25519_dalek_backend` for the key exchange
+    # and signatures the crate takes on later) and runs the crate's tests,
+    # Wycheproof's vectors among them, on them (ADR-0015 T10).
+    steps:
+      - uses: actions/checkout@v7
+      - run: rustup toolchain install
+      # The workflow-wide DCROXIDE_REQUIRE_ORACLE turns a missing oracle
+      # into a failure, so the reference Go is installed as in the test
+      # job, ready for the tests that check the crate's verdicts against
+      # Go's, which the later steps of ADR-0015's plan add; the crate has
+      # none yet.
+      - uses: actions/setup-go@v7
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: tools/oracle/go.sum
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p dcroxide-tlscrypto
+        env:
+          RUSTFLAGS: >-
+            --cfg aes_backend="soft"
+            --cfg polyval_backend="soft"
+            --cfg chacha20_backend="soft"
+            --cfg poly1305_backend="soft"
+            --cfg sha2_backend="soft"
+            --cfg curve25519_dalek_backend="serial"
+      # The library on its own, which builds no dev-dependency. Under the
+      # workspace's resolver 3, with only this package selected, rustls's
+      # `ring` feature is off, since only the crate's ring parity tests ask
+      # for it, so a `rustls::crypto::ring` outside the tests fails here
+      # rather than first at the switch that removes ring (ADR-0015).
+      - name: Build the library without ring
+        run: |
+          set -o pipefail
+          cargo check -p dcroxide-tlscrypto --lib
+          # `grep -c` exits 1 when it counts nothing, which is the pass
+          # here, so its status is dropped and the count is what is
+          # checked; a failing `cargo tree` still fails the step.
+          ring=$(cargo tree -p dcroxide-tlscrypto -e normal --prefix none -f '{p}' | { grep -c '^ring ' || true; })
+          if [ "$ring" -ne 0 ]; then
+            echo "the dcroxide-tlscrypto library reaches ring" >&2
+            exit 1
+          fi
+
   dcrd-interop:
     name: dcrd interop (live socket)
     runs-on: ubuntu-latest

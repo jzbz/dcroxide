@@ -30,6 +30,7 @@ members = [
     "crates/dcroxide-stake",
     "crates/dcroxide-standalone",
     "crates/dcroxide-testutil",
+    "crates/dcroxide-tlscrypto",
     "crates/dcroxide-txscript",
     "crates/dcroxide-uint256",
     "crates/dcroxide-winsvc",

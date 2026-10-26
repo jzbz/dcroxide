@@ -1,0 +1,34 @@
+Wycheproof test vectors
+
+Repository:  https://github.com/C2SP/wycheproof
+Commit:      d17cc89fa5c8f4f4d378b5385ebf75da5d0926c9 (2026-10-23)
+Directory:   testvectors_v1/
+Fetched:     2026-10-26, from raw.githubusercontent.com at that commit; each
+             file's git blob hash and size matched the repository's listing
+             at the commit.
+Licence:     Apache License 2.0, the repository's LICENSE, copied unchanged
+             beside this file.
+
+Each vector file is the fetched file compressed with `gzip -9n` (GNU gzip
+1.15), which stores no name or time, so the same input gives the same bytes.
+The hashes and sizes below are of each file as fetched, before compression.
+src/wycheproof_tests.rs reads them; ADR-0015 (T10) and
+docs/dependency-ledger.md say why they are here.
+
+file                          bytes    SHA-256 / git blob
+aes_gcm_test.json             213177   985e5ecc172e181eaf49e89508b9470dcf478002eb7e8559c707eb42dc97dfe7
+                                       223f53cad33d78013ed635d94889836c036e1d58
+chacha20_poly1305_test.json   241127   fe61d25f90e1bde4461d00eafe61049e5f29bd999f36b766df9cda90906ad53d
+                                       1ad9ff254d1f26f0812a27135fe95769f34adba5
+hkdf_sha256_test.json          92505   bb2b462a38b251cb52a2aede706d6d4b62b26864f4e80c95497507ddb07c5f1e
+                                       5486a4d9d12c0b6f08c2dcc9edf10266a5ca806d
+hkdf_sha384_test.json         116155   69ff6ea3657bb9c1b8cdffbbb4e7832353d08fd15c0d9997b03f7a6b180e3678
+                                       9e623ead3bf5320e1149123ecdc326d1228a4d08
+hmac_sha256_test.json          69111   2d201cfa61d1bf95e6f5d07d96634b4a348b31e8eaa277ad7c8d09677b7a743f
+                                       19181195d1bfa01ded2ca5620f0aedd0e50dc31f
+hmac_sha384_test.json          78567   28b9776e979dd755d852ca471043ea6cedce8b15f7a28abdf6ea9efd982b43c0
+                                       3ba4fbac6744df6ef62c6d0a205cc7466a8a7cbc
+LICENSE                        11357   58d1e17ffe5109a7ae296caafcadfdbe6a7d176f0bc4ab01e12a689b0499d8bd
+                                       7a4a3ea2424c09fbe48d455aed1eaa94d9124835
+
+Compressed, the six vector files are 232,655 bytes, from 810,642.
