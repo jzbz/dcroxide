@@ -19,31 +19,34 @@
 //! side by side, and [`digest`] reduces each class to a digest that depends
 //! on the inputs, dcrd's answers and whether the two agreed, never on
 //! dcroxide's own answer.  The `sigsoak` binary drives it all and writes the
-//! record of a run ([`record`], [`manifest`]).
+//! record of a run ([`record`], [`manifest`]).  The canaries ([`canary`])
+//! stand deliberately broken models in for dcroxide, to show that the
+//! classes fail where an implementation gets dcrd's branches wrong.
 //!
 //! # Independence
 //!
 //! Generators, models, the class registry and their arithmetic build every
-//! input with this crate's own `k256` arithmetic, never with the code under
-//! test, so a change to that code cannot change what it is tested on.  Only
-//! `src/ours.rs` names the code under test, and only `src/run.rs` (and the
-//! canaries, which stand in for it) call into `ours`;
-//! `tests/independence.rs` holds every file under `src/` to that.
+//! input with this crate's own `k256` and `curve25519-dalek` arithmetic,
+//! never with the code under test, so a change to that code cannot change
+//! what it is tested on.  Only `src/ours.rs` names the code under test, and
+//! only `src/run.rs` (and the canaries, which stand in for it) call into
+//! `ours`; `tests/independence.rs` holds every file under `src/` to that.
 //!
 //! # The freeze
 //!
 //! Between the baseline soak and the gate soak, the files
 //! [`fingerprint::FROZEN`] lists do not change: everything that decides a
 //! case's inputs, dcrd's normalized answer, the comparison, the status and
-//! the digest.  [`fingerprint::fingerprint`] is a digest of exactly those
-//! files as they were compiled into the binary, so two runs whose
-//! fingerprints differ are refused as a comparison.  The adapter
+//! the digest, and the canaries.  [`fingerprint::fingerprint`] is a digest
+//! of exactly those files as they were compiled into the binary, so two
+//! runs whose fingerprints differ are refused as a comparison.  The adapter
 //! (`src/ours.rs`) and the plumbing ([`fingerprint::PLUMBING`]) may change,
 //! since none of them can change an input, an answer as compared, a status
 //! or a digest.
 
 pub mod answer;
 pub mod arith;
+pub mod canary;
 pub mod class;
 pub mod cmd;
 pub mod compare;

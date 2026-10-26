@@ -5,7 +5,8 @@
 //! Every file under `src/` is in exactly one of three lists:
 //!
 //! - [`FROZEN`]: everything that decides a case's inputs, dcrd's
-//!   normalized answer, the comparison, the status and the digest leaf.
+//!   normalized answer, the comparison, the status and the digest leaf, and
+//!   the canaries that stand in for dcroxide.
 //!   These do not change between the baseline soak and the gate soak, and
 //!   [`fingerprint`] is a digest of them.
 //! - [`ADAPTER`]: `src/ours.rs`, which reaches the code under test and
@@ -46,6 +47,7 @@ macro_rules! sources {
 pub static FROZEN: &[Source] = sources![
     "src/answer.rs",
     "src/arith.rs",
+    "src/canary.rs",
     "src/class.rs",
     "src/cmd.rs",
     "src/compare.rs",
@@ -53,11 +55,16 @@ pub static FROZEN: &[Source] = sources![
     "src/entropy.rs",
     "src/gen/der.rs",
     "src/gen/ecdsa.rs",
+    "src/gen/ed25519.rs",
     "src/gen/kwrap_points.rs",
     "src/gen/mod.rs",
     "src/gen/pubkey.rs",
+    "src/gen/recover.rs",
+    "src/gen/schnorr.rs",
     "src/model/ecdsa.rs",
+    "src/model/ed25519.rs",
     "src/model/mod.rs",
+    "src/model/schnorr.rs",
     "src/reply.rs",
 ];
 
@@ -203,6 +210,7 @@ mod tests {
         let top_level = [
             "src/answer.rs",
             "src/arith.rs",
+            "src/canary.rs",
             "src/class.rs",
             "src/cmd.rs",
             "src/compare.rs",

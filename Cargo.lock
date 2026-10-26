@@ -712,11 +712,13 @@ dependencies = [
 name = "dcroxide-sigdiff"
 version = "0.1.0"
 dependencies = [
+ "curve25519-dalek",
  "dcroxide-crypto",
  "dcroxide-dcrec",
  "dcroxide-testutil",
  "k256",
  "serde_json",
+ "sha2",
 ]
 
 [[package]]

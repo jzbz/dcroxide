@@ -14,7 +14,7 @@ use dcroxide_testutil::SplitMix64;
 
 use crate::cmd::{Cmd, Request};
 use crate::entropy::Entropy;
-use crate::r#gen::{der, ecdsa, pubkey};
+use crate::r#gen::{der, ecdsa, ed25519, pubkey, recover, schnorr};
 use crate::model::EcdsaBranch;
 
 /// The signature family a class tests.  A selection of every class of a
@@ -225,7 +225,7 @@ pub enum Intent {
     /// dcrd rejects with this error kind, and dcroxide rejects.
     RejectKind(&'static str),
     /// dcrd rejects with an error that has no kind (Schnorr key parsing's
-    /// own errors), and dcroxide rejects.
+    /// own errors, and every Ed25519 error), and dcroxide rejects.
     RejectPlain,
     /// The ECDSA model ends in this step, and dcrd's verdict is the one it
     /// implies (as is dcroxide's step, when it reports one).
@@ -284,7 +284,9 @@ impl core::fmt::Debug for ClassSpec {
 }
 
 /// Every class, in the order `sigsoak list` prints them: ECDSA
-/// verification and signing, DER parsing, public key parsing.
+/// verification and signing, DER parsing, public key parsing, compact
+/// recovery, EC-Schnorr-DCRv0 signing, parsing and verification, and
+/// Ed25519 signing, key parsing, signature parsing and verification.
 pub static CLASSES: &[ClassSpec] = &[
     ecdsa::EV_HONEST,
     ecdsa::EV_HIGH_S,
@@ -307,6 +309,7 @@ pub static CLASSES: &[ClassSpec] = &[
     ecdsa::ES_RANDOM,
     ecdsa::ES_HASH_GEN,
     ecdsa::ES_BOUNDARY,
+    ecdsa::ES_COMPACT,
     der::DER_VALID,
     der::DER_MUTATE,
     der::DER_STRUCTURED,
@@ -323,6 +326,50 @@ pub static CLASSES: &[ClassSpec] = &[
     pubkey::K_SMALL_X,
     pubkey::K_FORMAT,
     pubkey::K_LENGTH,
+    recover::ER_HONEST,
+    recover::ER_FLIP_PARITY,
+    recover::ER_HIGH_S,
+    recover::ER_OVERFLOW_VALID,
+    recover::ER_OVERFLOW_PRIME,
+    recover::ER_NOT_ON_CURVE,
+    recover::ER_INFINITY,
+    recover::ER_DOUBLE,
+    recover::ER_HEADER,
+    recover::ER_LENGTH,
+    recover::ER_RANGE,
+    recover::ER_HASH,
+    schnorr::SS_RANDOM,
+    schnorr::SS_HASH_GEN,
+    schnorr::SS_BOUNDARY,
+    schnorr::SP_RANDOM,
+    schnorr::SP_R_RANGE,
+    schnorr::SV_HONEST,
+    schnorr::SV_TAMPER,
+    schnorr::SV_RANDOM,
+    schnorr::SV_HASH_GEN,
+    schnorr::SV_ZERO_S,
+    schnorr::SV_INFINITY,
+    schnorr::SV_ODD_R,
+    schnorr::SV_R_GEN_TRUE,
+    schnorr::SV_R_GEN_ODD,
+    schnorr::SV_UNEQUAL_R,
+    schnorr::SV_DOUBLE,
+    ed25519::DS_RANDOM,
+    ed25519::DK_CANONICAL,
+    ed25519::DK_RANDOM,
+    ed25519::DK_SMALL,
+    ed25519::DK_LENGTH,
+    ed25519::DG_EDGES,
+    ed25519::DG_RANDOM,
+    ed25519::DV_HONEST,
+    ed25519::DV_TAMPER,
+    ed25519::DV_S_PLUS_L,
+    ed25519::DV_TOP_BITS,
+    ed25519::DV_RANDOM,
+    ed25519::DV_TORSION,
+    ed25519::DV_TORSION_SWEEP,
+    ed25519::DV_TORSION_NONCANON,
+    ed25519::DV_ZERO_S_SMALL_R,
 ];
 
 /// The class named `name`.
@@ -492,8 +539,8 @@ mod tests {
         assert_ne!(generate(random, 1, 3), generate(random, 1, 6));
     }
 
-    /// The A5 classes, with the tier and family their names give, the floor
-    /// of their tier, and a mix that matches their intents.
+    /// The classes, with the tier and family their names give, the floor of
+    /// their tier, and a mix that matches their intents.
     #[test]
     fn the_classes_are_the_designs() {
         let names: Vec<&str> = CLASSES.iter().map(|c| c.name).collect();
@@ -521,6 +568,7 @@ mod tests {
                 "ES-random",
                 "ES-hashGEN",
                 "ES-boundary",
+                "ES-compact",
                 "DER-valid",
                 "DER-mutate",
                 "DER-structured",
@@ -537,8 +585,53 @@ mod tests {
                 "K-smallX",
                 "K-format",
                 "K-length",
+                "ER-honest",
+                "ER-flipParity",
+                "ER-highS",
+                "ER-overflowValid",
+                "ER-overflowPrime",
+                "ER-notOnCurve",
+                "ER-infinity",
+                "ER-double",
+                "ER-header",
+                "ER-length",
+                "ER-range",
+                "ER-hash",
+                "SS-random",
+                "SS-hashGEN",
+                "SS-boundary",
+                "SP-random",
+                "SP-rRange",
+                "SV-honest",
+                "SV-tamper",
+                "SV-random",
+                "SV-hashGEN",
+                "SV-zeroS",
+                "SV-infinity",
+                "SV-oddR",
+                "SV-rGEN-true",
+                "SV-rGEN-odd",
+                "SV-unequalR",
+                "SV-double",
+                "DS-random",
+                "DK-canonical",
+                "DK-random",
+                "DK-small",
+                "DK-length",
+                "DG-edges",
+                "DG-random",
+                "DV-honest",
+                "DV-tamper",
+                "DV-SplusL",
+                "DV-topBits",
+                "DV-random",
+                "DV-torsion",
+                "DV-torsionSweep",
+                "DV-torsionNoncanon",
+                "DV-zeroS-smallR",
             ]
         );
+        assert_eq!(names.len(), 82, "the 82 classes");
         let tier_b = [
             "EV-xGEN-true",
             "EV-xGEN-false",
@@ -551,18 +644,35 @@ mod tests {
             "ES-random",
             "ES-hashGEN",
             "ES-boundary",
+            "ES-compact",
+            "SS-random",
+            "SS-hashGEN",
+            "SS-boundary",
+            "SV-infinity",
+            "SV-oddR",
+            "SV-rGEN-true",
+            "SV-rGEN-odd",
+            "SV-unequalR",
+            "SV-double",
+            "DS-random",
+            "DV-torsionSweep",
+            "DV-torsionNoncanon",
+            "DV-zeroS-smallR",
         ];
         for class in CLASSES {
             let family = match class.name.split('-').next() {
                 Some("EV" | "ES") => Family::Ecdsa,
                 Some("DER") => Family::Der,
                 Some("K") => Family::Pubkey,
+                Some("ER") => Family::Recover,
+                Some("SS" | "SP" | "SV") => Family::Schnorr,
+                Some("DS" | "DK" | "DG" | "DV") => Family::Ed25519,
                 other => panic!("{}: prefix {other:?}", class.name),
             };
             assert_eq!(class.family, family, "{}", class.name);
             let tier = if class.size.finite().is_some() {
                 Tier::Finite
-            } else if tier_b.contains(&class.name) {
+            } else if tier_b.contains(&class.name) || class.family == Family::Recover {
                 Tier::B
             } else {
                 Tier::A
@@ -590,6 +700,7 @@ mod tests {
                                         | Intent::Branch(
                                             EcdsaBranch::Step8Accept | EcdsaBranch::Step10Accept
                                         )
+                                        | Intent::Schnorr(Ok(()))
                                 ),
                                 "{} case {index}: {first:?}",
                                 class.name
@@ -599,7 +710,8 @@ mod tests {
                                 !matches!(
                                     first,
                                     Intent::Accept | Intent::AcceptValue(_) | Intent::Any
-                                ) && !matches!(first, Intent::Branch(b) if b.accepts()),
+                                ) && !matches!(first, Intent::Branch(b) if b.accepts())
+                                    && *first != Intent::Schnorr(Ok(())),
                                 "{} case {index}: {first:?}",
                                 class.name
                             );
@@ -648,7 +760,11 @@ mod tests {
             vec!["K-wrap", "K-length"],
             "registry order, not list order"
         );
-        assert_eq!(names("*length,K-l*").expect("overlap").len(), 1);
+        assert_eq!(names("K-*length,K-l*").expect("overlap").len(), 1);
+        assert_eq!(
+            names("*length").expect("pattern"),
+            vec!["K-length", "ER-length", "DK-length"]
+        );
         assert!(names("K-nothing").is_err());
         assert!(names("K-*,").is_err());
 

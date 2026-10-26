@@ -710,6 +710,38 @@ mod tests {
         assert_eq!(categories(&r), [Category::Intent], "both accept");
     }
 
+    /// Every Ed25519 command's rejections carry no kind and have their text
+    /// compared: a text that differs while both sides reject is a
+    /// disagreement, as ADR-0006's second 2026-10-26 addendum decides.
+    #[test]
+    fn ed25519_texts_are_compared() {
+        let text = "point not on curve";
+        let theirs = reply(&format!("{{\"error\":\"{text}\"}}"));
+        for request in [
+            cmd::ed25519_pubkey_parse(&[2; 32]),
+            cmd::ed25519_parse(&[2; 64]),
+            cmd::ed25519_verify(&[2; 32], &[0; 64], b"m"),
+        ] {
+            let run = |ours_text: &str| {
+                compare(
+                    &case(vec![request.clone()], vec![Intent::RejectPlain]),
+                    &[ours(Answer::Reject {
+                        kind: Kind::Plain,
+                        text: Some(ours_text.to_owned()),
+                    })],
+                    std::slice::from_ref(&theirs),
+                    &ModelView::default(),
+                )
+            };
+            let r = run(text);
+            assert_eq!(r.status, Status::Agree, "{:?}", request.cmd);
+            assert_eq!(r.kind_compared, [true], "{:?}", request.cmd);
+            let r = run("pubkey string is empty");
+            assert_eq!(categories(&r), [Category::Text], "{:?}", request.cmd);
+            assert_eq!(r.status, Status::Disagree, "{:?}", request.cmd);
+        }
+    }
+
     /// A branch intent needs the model's branch, dcrd's verdict for it,
     /// the doubling the generator tagged, and dcroxide's step when it
     /// reports one.

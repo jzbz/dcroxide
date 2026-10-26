@@ -29,9 +29,10 @@ use crate::class::{Case, ClassSpec, Consistency, Family, Intent, Mix, Size, Tag,
 use crate::cmd::{self, Cmd, Request};
 use crate::entropy::Entropy;
 use crate::r#gen::{
-    ALL_ACCEPTED, DECOMPRESS_TRIES, Draw, FLOOR_A, FLOOR_B, MIX_MIN_N, NONE_ACCEPTED, PR_CASES,
-    Presentation, SCALAR_TRIES, base_mul, be, decompress, digit, finite, flip_bit, n_minus,
-    present, presentation, reduce, scalar, scalar_bytes, single, stratum, x_of,
+    ALL_ACCEPTED, AT_OR_ABOVE_N, BOUNDARY_KEYS, DECOMPRESS_TRIES, Draw, FLAGS, FLOOR_A, FLOOR_B,
+    MIX_MIN_N, NONE_ACCEPTED, PR_CASES, Presentation, SCALAR_TRIES, at_or_above_n, base_mul, be,
+    boundary_key, decompress, digit, finite, flip_bit, n_minus, present, presentation, reduce,
+    scalar, scalar_bytes, single, solve_key, stratum, x_of,
 };
 use crate::model::EcdsaBranch;
 
@@ -43,6 +44,9 @@ const VERIFY_RAW: &[Cmd] = &[Cmd::EcdsaVerifyRaw];
 
 /// The signing command.
 const SIGN: &[Cmd] = &[Cmd::EcdsaSign];
+
+/// The compact signing command.
+const SIGN_COMPACT: &[Cmd] = &[Cmd::EcdsaSignCompact];
 
 /// A verify case's inputs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -105,33 +109,6 @@ fn signed(d: &mut Draw, key: &Scalar, sign_h: [u8; 32], verify_h: [u8; 32]) -> V
         h: verify_h,
         r: sig.r,
         s: sig.s,
-    }
-}
-
-/// The key Q for which u1·G + u2·Q is the point `x`, with u1 = e/s and
-/// u2 = r/s: Q = r⁻¹·(s·X − e·G).  `None` when Q would be the point at
-/// infinity.
-#[allow(
-    clippy::arithmetic_side_effects,
-    reason = "k256 scalar and point operations only: modular group arithmetic, no integer operator here"
-)]
-fn solve_key(r: &Scalar, s: &Scalar, e: &Scalar, x: &AffinePoint) -> Option<AffinePoint> {
-    let r_inv = Option::<Scalar>::from(r.invert())?;
-    finite(&((ProjectivePoint::from(*x) * s - ProjectivePoint::GENERATOR * e) * r_inv))
-}
-
-/// The labels of the values at or above N that EV-hashGEN, EV-range and
-/// ES-hashGEN take.
-const AT_OR_ABOVE_N: [&str; 4] = ["N", "N+1", "max", "random"];
-
-/// Value `k` of [`AT_OR_ABOVE_N`]: N, N + 1, 2^256 − 1, or uniform in
-/// [N, 2^256).
-fn at_or_above_n(d: &mut Draw, k: usize) -> [u8; 32] {
-    match k {
-        0 => N,
-        1 => arith::add_be(&N, &be(1)).0,
-        2 => [0xff; 32],
-        _ => arith::add_be(&N, &d.uniform_below(&TWO_256_MINUS_N)).0,
     }
 }
 
@@ -688,9 +665,6 @@ fn es_hash_gen(e: &mut dyn Entropy, i: u64) -> Case {
     ))
 }
 
-/// ES-boundary's private keys.
-const SIGN_KEYS: [&str; 6] = ["1", "2", "N-1", "N-2", "N/2", "N/2+1"];
-
 /// ES-boundary's hashes.
 const SIGN_HASHES: [&str; 4] = ["0", "1", "leading-zeros", "random"];
 
@@ -698,14 +672,7 @@ fn es_boundary(e: &mut dyn Entropy, i: u64) -> Case {
     let mut d = Draw::new(e);
     let k = stratum(i, 6);
     let which = digit(i, 6, 4);
-    let key = match k {
-        0 => be(1),
-        1 => be(2),
-        2 => n_minus(1),
-        3 => n_minus(2),
-        4 => HALF_N,
-        _ => arith::add_be(&HALF_N, &be(1)).0,
-    };
+    let key = boundary_key(k);
     let h = match which {
         0 => [0; 32],
         1 => be(1),
@@ -718,8 +685,20 @@ fn es_boundary(e: &mut dyn Entropy, i: u64) -> Case {
         _ => d.bytes32(),
     };
     d.finish(single(
-        format!("d={}/h={}", SIGN_KEYS[k], SIGN_HASHES[which]),
+        format!("d={}/h={}", BOUNDARY_KEYS[k], SIGN_HASHES[which]),
         cmd::ecdsa_sign(&key, &h),
+        Intent::Accept,
+    ))
+}
+
+fn es_compact(e: &mut dyn Entropy, i: u64) -> Case {
+    let mut d = Draw::new(e);
+    let flag = stratum(i, 2);
+    let key = scalar_bytes(&d.key());
+    let h = d.bytes32();
+    d.finish(single(
+        FLAGS[flag],
+        cmd::ecdsa_sign_compact(flag == 1, &key, &h),
         Intent::Accept,
     ))
 }
@@ -1081,6 +1060,23 @@ pub const ES_BOUNDARY: ClassSpec = ClassSpec {
           bytes then random, and random ((i / 6) % 4)",
 };
 
+/// ES-compact.
+pub const ES_COMPACT: ClassSpec = ClassSpec {
+    name: "ES-compact",
+    family: Family::Ecdsa,
+    commands: SIGN_COMPACT,
+    size: Size::Stratified {
+        strata: 2,
+        floor: FLOOR_B,
+    },
+    tier: Tier::B,
+    generator: es_compact,
+    mix: ALL_ACCEPTED,
+    pr_cases: PR_CASES,
+    doc: "RFC6979 compact signing of a random hash by a random key, for the uncompressed and \
+          compressed key (i % 2), compared byte for byte, recovery header included",
+};
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1091,7 +1087,7 @@ mod tests {
     use std::collections::BTreeSet;
 
     /// Every EV and ES class.
-    const CLASSES: [&ClassSpec; 21] = [
+    const CLASSES: [&ClassSpec; 22] = [
         &EV_HONEST,
         &EV_HIGH_S,
         &EV_TAMPER,
@@ -1113,6 +1109,7 @@ mod tests {
         &ES_RANDOM,
         &ES_HASH_GEN,
         &ES_BOUNDARY,
+        &ES_COMPACT,
     ];
 
     /// One verify request decoded: Q, h, r, s.
@@ -1327,7 +1324,7 @@ mod tests {
     /// labels says that all of them came up), and every command it lists.
     #[test]
     fn per_pr_counts_cover_every_variant() {
-        let all_labels: [(&ClassSpec, usize); 21] = [
+        let all_labels: [(&ClassSpec, usize); 22] = [
             (&EV_HONEST, 4),
             (&EV_HIGH_S, 4),
             (&EV_TAMPER, 16),
@@ -1349,6 +1346,7 @@ mod tests {
             (&ES_RANDOM, 1),
             (&ES_HASH_GEN, 4),
             (&ES_BOUNDARY, 24),
+            (&ES_COMPACT, 2),
         ];
         for (class, labels) in all_labels {
             let mut variants = BTreeSet::new();
@@ -1385,6 +1383,17 @@ mod tests {
         for (i, case) in cases(&ES_HASH_GEN, 8) {
             let h: [u8; 32] = case.requests[0].data[32..].try_into().expect("hash");
             assert!(h >= N, "case {i}: a hash at or above N");
+        }
+        for (i, case) in cases(&ES_COMPACT, 48) {
+            let data = &case.requests[0].data;
+            assert_eq!(data.len(), 65);
+            assert_eq!(data[0], u8::from(stratum(i, 2) == 1), "case {i}: the flag");
+            assert_eq!(case.variant, FLAGS[stratum(i, 2)]);
+            let key: [u8; 32] = data[1..33].try_into().expect("key");
+            assert!(
+                scalar(&key).is_some_and(|k| !bool::from(k.is_zero())),
+                "ES-compact {i}"
+            );
         }
     }
 }

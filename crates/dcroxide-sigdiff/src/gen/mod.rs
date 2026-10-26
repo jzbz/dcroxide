@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: ISC
 //! The generators, and the helpers they share: drawing values with bounded
 //! retries, keys and honest signatures on this crate's own `k256`
-//! arithmetic, the four ECDSA key presentations, minimal DER, and the
-//! integer index arithmetic that picks a case's stratum and presentation.
+//! arithmetic, the key a signature solves for, the four ECDSA key
+//! presentations, minimal DER, the boundary values several families take,
+//! and the integer index arithmetic that picks a case's stratum and
+//! presentation.
 //!
 //! Nothing here calls the code under test.  Honest signatures take a
 //! random nonce from the entropy, never RFC6979 and never dcroxide's
@@ -18,8 +20,11 @@
 
 pub mod der;
 pub mod ecdsa;
+pub mod ed25519;
 pub mod kwrap_points;
 pub mod pubkey;
+pub mod recover;
+pub mod schnorr;
 
 use std::borrow::Cow;
 
@@ -31,7 +36,7 @@ use k256::elliptic_curve::scalar::IsHigh;
 use k256::elliptic_curve::subtle::Choice;
 use k256::{AffinePoint, FieldBytes, ProjectivePoint, Scalar};
 
-use crate::arith::{self, HALF_N, N};
+use crate::arith::{self, HALF_N, N, TWO_256_MINUS_N};
 use crate::class::{Case, Consistency, Intent, Mix, Tag, Tags};
 use crate::cmd::{self, Request};
 use crate::entropy::Entropy;
@@ -135,7 +140,11 @@ impl<'a> Draw<'a> {
     }
 
     /// The first value `attempt` returns within `tries` attempts, or
-    /// `fallback()` with the draw marked as fallen back.
+    /// `fallback()` with the draw marked as fallen back.  Once the draw has
+    /// fallen back, the case is a fallback whatever it draws next, so a
+    /// failed attempt ends the retry: a retry around a construction whose
+    /// own retry ran out (an exhausted stream) makes one attempt, not
+    /// `tries` of them.
     pub fn retry<T>(
         &mut self,
         tries: u32,
@@ -145,6 +154,9 @@ impl<'a> Draw<'a> {
         for _ in 0..tries {
             if let Some(value) = attempt(self) {
                 return value;
+            }
+            if self.fell_back {
+                break;
             }
         }
         self.fell_back = true;
@@ -540,6 +552,53 @@ pub fn n_minus(k: u64) -> [u8; 32] {
     arith::sub_be(&N, &be(k)).0
 }
 
+/// The key Q for which u1·G + u2·Q is the point `x`, with u1 = e/s and
+/// u2 = r/s: Q = r⁻¹·(s·X − e·G).  It is also the key compact recovery
+/// returns for (r, s), hash e and the point X the header names.  `None`
+/// when Q would be the point at infinity.
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "k256 scalar and point operations only: modular group arithmetic, no integer operator here"
+)]
+pub fn solve_key(r: &Scalar, s: &Scalar, e: &Scalar, x: &AffinePoint) -> Option<AffinePoint> {
+    let r_inv = Option::<Scalar>::from(r.invert())?;
+    finite(&((ProjectivePoint::from(*x) * s - ProjectivePoint::GENERATOR * e) * r_inv))
+}
+
+/// The labels of the values at or above N that the hash and range classes
+/// take.
+pub const AT_OR_ABOVE_N: [&str; 4] = ["N", "N+1", "max", "random"];
+
+/// Value `k` of [`AT_OR_ABOVE_N`]: N, N + 1, 2^256 − 1, or uniform in
+/// [N, 2^256).
+pub fn at_or_above_n(d: &mut Draw, k: usize) -> [u8; 32] {
+    match k {
+        0 => N,
+        1 => arith::add_be(&N, &be(1)).0,
+        2 => [0xff; 32],
+        _ => arith::add_be(&N, &d.uniform_below(&TWO_256_MINUS_N)).0,
+    }
+}
+
+/// The signing classes' boundary private keys, as labels.
+pub const BOUNDARY_KEYS: [&str; 6] = ["1", "2", "N-1", "N-2", "N/2", "N/2+1"];
+
+/// Boundary key `k` of [`BOUNDARY_KEYS`]: 1, 2, N − 1, N − 2, ⌊N/2⌋ or
+/// ⌊N/2⌋ + 1.
+pub fn boundary_key(k: usize) -> [u8; 32] {
+    match k {
+        0 => be(1),
+        1 => be(2),
+        2 => n_minus(1),
+        3 => n_minus(2),
+        4 => HALF_N,
+        _ => arith::add_be(&HALF_N, &be(1)).0,
+    }
+}
+
+/// The labels of a compact signature's compressed flag, false then true.
+pub const FLAGS: [&str; 2] = ["uncompressed", "compressed"];
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -660,5 +719,50 @@ mod tests {
         assert_eq!(case.variant, "fallback");
         assert_eq!(case.intents, [Intent::Any]);
         assert!(case.tags.has(Tag::Fallback));
+    }
+
+    /// A retry around a construction whose own retry ran out makes one
+    /// attempt and falls back, so an exhausted stream costs the inner
+    /// retry's tries once rather than once per outer try; after that,
+    /// every retry stops at its first miss and still returns what an
+    /// attempt finds.
+    #[test]
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "counters of at most 64 times 256 attempts in u32"
+    )]
+    fn a_retry_stops_once_the_case_fell_back() {
+        let mut zeros = ByteEntropy::new(&[]);
+        let mut d = Draw::new(&mut zeros);
+        let (mut outer, mut inner) = (0u32, 0u32);
+        let value = d.retry(
+            SCALAR_TRIES,
+            || "fallback",
+            |d| {
+                outer += 1;
+                d.retry(
+                    DECOMPRESS_TRIES,
+                    || (),
+                    |_| {
+                        inner += 1;
+                        None
+                    },
+                );
+                None
+            },
+        );
+        assert_eq!((value, outer, inner), ("fallback", 1, DECOMPRESS_TRIES));
+        assert!(d.fell_back());
+        let mut tries = 0u32;
+        let missed = d.retry(
+            SCALAR_TRIES,
+            || 0,
+            |_| {
+                tries += 1;
+                None
+            },
+        );
+        assert_eq!((missed, tries), (0, 1));
+        assert_eq!(d.retry(SCALAR_TRIES, || 0, |_| Some(7)), 7);
     }
 }

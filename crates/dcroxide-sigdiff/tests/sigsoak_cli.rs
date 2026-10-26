@@ -3,11 +3,14 @@
 //! every file of its record, a replayed case's leaf is the one its run's
 //! digest implies, `compare` passes equal runs and fails each kind of
 //! difference, a run that completes nothing fails, and `--out` is refused
-//! inside the repository or when it holds files.
+//! inside the repository or when it holds files.  A canary run writes its
+//! record beside a run's, each disagreement it records replays with its
+//! canary, and `list` ends quietly when its reader goes away.
 
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
+use dcroxide_sigdiff::canary::{CANARIES, CANARY_BOUND};
 use dcroxide_sigdiff::class::{CLASSES, Family};
 use dcroxide_sigdiff::digest::class_digest;
 use dcroxide_testutil::{TempDir, hex, oracle_bin_or_skip, unhex};
@@ -248,16 +251,204 @@ fn run_replay_and_compare() {
     assert_eq!(code, 2, "a run's directory holds files:\n{text}");
 }
 
+/// The canary run of two canaries, one of each kind: the model baseline
+/// over the recovery classes and both canaries pass and leave their
+/// record; a run may then share the directory, and a second canary run
+/// may not; a disagreement's replay line replays with its canary.
+#[test]
+fn canary_run_and_replay() {
+    let Some(oracle) = oracle_bin_or_skip() else {
+        return;
+    };
+    let oracle = oracle.display().to_string();
+    let dir = TempDir::new("sigsoak-canary");
+    let leg = dir.path().join("leg");
+    let leg_arg = leg.display().to_string();
+    let seed = "0x0123456789abcdef";
+    let canary = |extra: &[&str]| {
+        let mut args = vec![
+            "canary",
+            "--out",
+            &leg_arg,
+            "--seed",
+            seed,
+            "--canary",
+            "C9,recover-accepts-infinity",
+            "--cases",
+            "32",
+            "--workers",
+            "2",
+            "--oracle",
+            &oracle,
+        ];
+        args.extend(extra);
+        sigsoak(&args)
+    };
+    let (code, text) = canary(&[]);
+    assert_eq!(code, 0, "{text}");
+    assert!(text.contains("canary run: passed"), "{text}");
+    let record = leg.join("canary");
+    let tsv = std::fs::read_to_string(record.join("summary.tsv")).expect("summary.tsv");
+    let rows: Vec<Vec<&str>> = tsv
+        .lines()
+        .skip(1)
+        .map(|l| l.split('\t').collect())
+        .collect();
+    assert_eq!(rows.len(), 3, "{tsv}");
+    assert_eq!(rows[0][1], "model-baseline", "{tsv}");
+    assert_eq!((rows[1][0], rows[1][2]), ("C9", "ES-hashGEN"), "{tsv}");
+    assert_eq!((rows[2][0], rows[2][2]), ("C14", "ER-infinity"), "{tsv}");
+    for row in &rows {
+        assert_eq!(row[7], "pass", "{tsv}");
+    }
+    let manifest: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(record.join("manifest.json")).expect("read"))
+            .expect("JSON");
+    assert_eq!(manifest["command"], "canary");
+    assert_eq!(manifest["status"], "passed");
+    assert_eq!(manifest["pin"]["consistent"], true);
+    assert_eq!(
+        manifest["mode"],
+        serde_json::json!({ "kind": "cases", "cases": 32 })
+    );
+    // --cases sets the baseline's and the other classes' volume; a
+    // primary runs to the canary bound whatever it says.
+    let part_cases = |part: &str| {
+        let text = std::fs::read_to_string(record.join(part).join("manifest.json")).expect("read");
+        let part: serde_json::Value = serde_json::from_str(&text).expect("JSON");
+        part["mode"]["cases"].as_u64().expect("a count")
+    };
+    assert_eq!(part_cases("model-baseline"), 32);
+    assert_eq!(part_cases("recover-accepts-infinity/primary"), CANARY_BOUND);
+    assert_eq!(part_cases("recover-accepts-infinity/others"), 32);
+    let baseline: Vec<&str> = manifest["baseline_classes"]
+        .as_array()
+        .expect("a list")
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .collect();
+    let recover: Vec<&str> = CLASSES
+        .iter()
+        .filter(|c| c.family == Family::Recover)
+        .map(|c| c.name)
+        .collect();
+    assert_eq!(baseline, recover, "C14 breaks only the recovery model");
+    for part in [
+        "model-baseline",
+        "ecdsa-sign-reduced-hash/primary",
+        "ecdsa-sign-reduced-hash/others",
+        "recover-accepts-infinity/primary",
+        "recover-accepts-infinity/others",
+    ] {
+        for file in [
+            "manifest.json",
+            "summary.txt",
+            "digests.tsv",
+            "disagreements.jsonl",
+        ] {
+            assert!(record.join(part).join(file).is_file(), "{part}/{file}");
+        }
+    }
+
+    // The first disagreement C14 recorded replays with C14 in dcroxide's
+    // place, and disagrees again; without it, dcroxide agrees.
+    let lines = std::fs::read_to_string(
+        record.join("recover-accepts-infinity/primary/disagreements.jsonl"),
+    )
+    .expect("read");
+    let first: serde_json::Value =
+        serde_json::from_str(lines.lines().next().expect("C14 disagreed")).expect("JSON");
+    assert_eq!(first["canary"], "recover-accepts-infinity");
+    let replay = first["replay"].as_str().expect("a replay line");
+    assert!(
+        replay.ends_with("--canary recover-accepts-infinity"),
+        "{replay}"
+    );
+    let mut args: Vec<&str> = replay.split(' ').skip(1).collect();
+    args.extend(["--oracle", &oracle]);
+    let (code, text) = sigsoak(&args);
+    assert_eq!(code, 1, "{text}");
+    assert!(
+        text.contains("canary recover-accepts-infinity answers in dcroxide's place"),
+        "{text}"
+    );
+    let without: Vec<&str> = args
+        .iter()
+        .copied()
+        .filter(|a| *a != "--canary" && *a != "recover-accepts-infinity")
+        .collect();
+    let (code, text) = sigsoak(&without);
+    assert_eq!(code, 0, "{text}");
+    let mut unknown = without.clone();
+    unknown.extend(["--canary", "C99"]);
+    let (code, text) = sigsoak(&unknown);
+    assert_eq!(code, 2, "{text}");
+
+    // A run may write beside a canary run; another canary run may not.
+    let (code, text) = sigsoak(&[
+        "run",
+        "--out",
+        &leg_arg,
+        "--seed",
+        seed,
+        "--classes",
+        "K-length",
+        "--cases",
+        "1",
+        "--oracle",
+        &oracle,
+        "--progress-every",
+        "1h",
+    ]);
+    assert_eq!(code, 0, "{text}");
+    let (code, text) = canary(&[]);
+    assert_eq!(code, 2, "{text}");
+    assert!(text.contains("is not empty"), "{text}");
+}
+
+/// `list` writes to a reader that has gone away without a panic, and exits
+/// 0: the pipe's read end is closed before the binary starts.
+#[test]
+fn list_ends_quietly_on_a_closed_pipe() {
+    for args in [vec!["list"], vec!["list", "--canaries"]] {
+        let (reader, writer) = std::io::pipe().expect("a pipe");
+        drop(reader);
+        let out = Command::new(env!("CARGO_BIN_EXE_sigsoak"))
+            .args(&args)
+            .stdout(writer)
+            .stderr(Stdio::piped())
+            .output()
+            .expect("run sigsoak");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(0), "{args:?}: {stderr}");
+        assert_eq!(stderr, "", "{args:?}");
+    }
+}
+
 /// Usage errors exit 2, with the help; `help` and `list` exit 0.
 #[test]
 fn usage() {
     let (code, text) = sigsoak(&["help"]);
     assert_eq!(code, 0);
     assert!(text.contains("sigsoak run --out DIR"), "{text}");
+    assert!(text.contains("sigsoak canary --out DIR"), "{text}");
     let (code, text) = sigsoak(&["list"]);
     assert_eq!(code, 0);
     for class in CLASSES {
         assert!(text.contains(class.name), "{text}");
+    }
+    let (code, text) = sigsoak(&["list", "--canaries"]);
+    assert_eq!(code, 0);
+    assert!(text.contains("model-baseline"), "{text}");
+    for canary in CANARIES {
+        assert!(
+            text.contains(&format!("{}\t{}\t", canary.id, canary.name)),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!("primary {}", canary.primary)),
+            "{text}"
+        );
     }
     for args in [
         vec![],
@@ -278,7 +469,12 @@ fn usage() {
         ],
         vec!["replay", "--seed", "zz", "--class", "x", "--case", "0"],
         vec!["compare", "one"],
-        vec!["list", "--canaries"],
+        vec!["list", "--classes"],
+        vec!["list", "--canaries=yes"],
+        vec!["canary"],
+        vec!["canary", "--out", "/nowhere", "--canary", "C99"],
+        vec!["canary", "--out", "/nowhere", "--cases", "0"],
+        vec!["canary", "--out", "/nowhere", "--floors"],
     ] {
         let (code, text) = sigsoak(&args);
         assert_eq!(code, 2, "{args:?}:\n{text}");

@@ -12,14 +12,19 @@ repository.workspace = true
 [dependencies]
 # The code under test.  src/ours.rs is the only module that names it.
 dcroxide-dcrec = { path = "../dcroxide-dcrec" }
-# BLAKE-256: the soak's digests and the generator fingerprint.
+# BLAKE-256: the EC-Schnorr-DCRv0 challenge the generators compute, the
+# soak's digests and the generator fingerprint.
 dcroxide-crypto = { path = "../dcroxide-crypto" }
 # SplitMix64 and its derive, the oracle binary and its skip policy, the
 # parity pin and its pseudo-version rule, hex.
 dcroxide-testutil = { path = "../dcroxide-testutil" }
-# The generators' and models' own arithmetic, at the version and features
-# dcroxide-dcrec takes, so the workspace builds no second copy or feature set.
+# The generators' and models' own arithmetic, at the versions and features
+# dcroxide-dcrec takes, so the workspace builds no second copy or feature set:
+# secp256k1 on k256, Ed25519 on curve25519-dalek with SHA-512 for its
+# challenge.
 k256 = { version = "0.14", default-features = false, features = ["arithmetic"] }
+curve25519-dalek = "5"
+sha2 = { version = "0.11", default-features = false }
 serde_json = "1"
 
 # The fake oracle in this test is the test binary itself, run as a child

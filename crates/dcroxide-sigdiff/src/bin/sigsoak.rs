@@ -2,22 +2,29 @@
 //! `sigsoak`: the signature differential soak's command line.  See `HELP`.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use dcroxide_sigdiff::canary::{CANARIES, MODEL_BASELINE, select_canaries};
 use dcroxide_sigdiff::class::{CLASSES, ClassSpec, Family, select_classes};
-use dcroxide_sigdiff::cmd::Request;
+use dcroxide_sigdiff::cmd::{Cmd, Request};
 use dcroxide_sigdiff::fingerprint::{fingerprint, source_differences};
 use dcroxide_sigdiff::manifest::{
-    CARGO_LOCK, LOCKED_CRATES, SCHEMA, check_pin, crate_dir, git_state, lock_versions, oracle_json,
-    platform, profile_name, repo_root, rustc_vv, unix_now, utc,
+    CARGO_LOCK, LOCKED_CRATES, PinCheck, SCHEMA, check_pin, crate_dir, git_state, lock_versions,
+    oracle_json, platform, profile_name, repo_root, rustc_vv, unix_now, utc,
 };
 use dcroxide_sigdiff::pipe::{OraclePipe, Payload, PipeConfig, PipeFailure};
-use dcroxide_sigdiff::record::{OutUse, append_ledger, out_dir_problem};
+use dcroxide_sigdiff::record::{
+    OutUse, append_ledger, out_dir_problem, write_canary_record, write_json,
+};
 use dcroxide_sigdiff::reply::Reply;
-use dcroxide_sigdiff::run::{self, Mode, RunConfig, RunStatus, class_targets, default_workers};
+use dcroxide_sigdiff::run::{
+    self, CanaryVolume, Mode, RunConfig, RunStatus, baseline_classes, class_targets,
+    default_workers,
+};
 use dcroxide_testutil::{DCRD_PARITY_COMMIT, hex, parse_seed};
 use serde_json::{Value, json};
 
@@ -36,21 +43,34 @@ usage:
       aside).  --floors runs each class's floor (times --scale), --cases N
       runs N cases of each sampled class, --budget runs until the deadline
       with the floors as weights; finite classes always run whole.
-  sigsoak replay --seed HEX --class NAME --case N [--oracle PATH]
+  sigsoak canary --out DIR [--seed HEX] [--canary LIST|all] [--cases N]
+              [--workers N] [--oracle PATH]
+      Stand deliberately broken models in for dcroxide and show that the
+      classes catch them: first the models with no break over N cases of
+      every class of the selected model canaries' commands, which must
+      agree with dcrd; then each canary over its primary class until it
+      first disagrees, which must happen within 10000 cases, and over N
+      cases of every other class of its commands, where it may disagree
+      only within its footprint.  N defaults to 10000.  Writes
+      DIR/canary/, which must hold nothing yet.
+  sigsoak replay --seed HEX --class NAME --case N [--canary NAME]
+              [--oracle PATH]
       Regenerate one case, answer it on both sides and print everything:
       requests, intents, both answers, the comparison and the digest leaf.
+      --canary stands a canary (or model-baseline) in for dcroxide.
   sigsoak compare [--replay] [--exploratory] [--allow-subset]
               [--allow-fingerprint-change] [--allow-pin-change] DIR_A DIR_B
       Hold two runs' digests against each other; a class either run
       completed no case of compares nothing and fails.  --replay: DIR_B is
       a shorter run with DIR_A's seed, compared at DIR_A's checkpoints.
-  sigsoak list
-      Print every class.
+  sigsoak list [--canaries]
+      Print every class, or every canary with its primary and footprint.
   sigsoak help
       Print this.
 
 LIST is comma-separated class names or patterns with * (EV-*,K-wrap); the
-default is every class.  DUR is <n>s, <n>m or <n>h.  --oracle defaults to
+default is every class.  A canary LIST takes names, ids (C1 to C18) or
+patterns the same way.  DUR is <n>s, <n>m or <n>h.  --oracle defaults to
 DCROXIDE_ORACLE_BIN, or tools/oracle built with the Go toolchain on PATH.
 --ledger appends one line per run to FILE.
 
@@ -77,13 +97,14 @@ fn config(message: impl Into<String>) -> Refusal {
 }
 
 /// Flags that take no value.
-const BOOL_FLAGS: [&str; 6] = [
+const BOOL_FLAGS: [&str; 7] = [
     "floors",
     "replay",
     "exploratory",
     "allow-subset",
     "allow-fingerprint-change",
     "allow-pin-change",
+    "canaries",
 ];
 
 /// A parsed command line: `--name value` or `--name=value` flags, each at
@@ -269,6 +290,129 @@ fn selection(chosen: &[&'static ClassSpec]) -> Value {
     }
 }
 
+/// What `run` and `canary` establish before they start.
+struct Preflight {
+    /// The repository root, canonical.
+    root: PathBuf,
+    /// `--out`, absolute.
+    out: PathBuf,
+    /// How the binary's embedded source differs from the checkout's.
+    source_differs: Vec<String>,
+    /// The oracle binary.
+    oracle: PathBuf,
+    /// Its `build_info`.
+    build_info: Reply,
+    /// Its pin check, which passed.
+    pin: PinCheck,
+    /// Whether the binary computes with overflow checks.
+    overflow: bool,
+}
+
+/// The checks `run` and `canary` make before they start, each a refusal
+/// (exit 2): a build whose panics unwind, a repository root that
+/// resolves, an `out` outside it that `usage` may write into, and an
+/// oracle that keeps the pin rule.  A binary built from another tree is
+/// only warned about.  Installs the panic hook last.
+fn preflight(args: &Args, out: &str, usage: OutUse) -> Result<Preflight, Refusal> {
+    if cfg!(panic = "abort") {
+        return Err(config(
+            "built with panic = \"abort\": build with --profile soak (or soak-checked), whose \
+             panics unwind, so a panic in the code under test is recorded with its case",
+        ));
+    }
+    let root = repo_root().map_err(config)?;
+    let cwd = std::env::current_dir().map_err(|e| config(format!("no current directory: {e}")))?;
+    let out = PathBuf::from(out);
+    if let Some(problem) = out_dir_problem(&out, &cwd, &root, usage) {
+        return Err(config(format!("--out: {problem}")));
+    }
+    let out = if out.is_absolute() {
+        out
+    } else {
+        cwd.join(out)
+    };
+    let source_differs = source_differences(&crate_dir(&root));
+    if !source_differs.is_empty() {
+        eprintln!(
+            "sigsoak: warning: this binary was not built from the checkout at {} ({}); the run \
+             is not gate-eligible",
+            root.display(),
+            source_differs.join(", ")
+        );
+    }
+    let oracle = oracle_path(args)?;
+    let build_info = oracle_build_info(&oracle)?;
+    let pin = check_pin(&build_info);
+    if !pin.consistent() {
+        return Err(config(format!(
+            "the oracle {} links another specification: {}",
+            oracle.display(),
+            pin.problems().join("; ")
+        )));
+    }
+    let overflow = overflow_checks();
+    install_panic_hook();
+    Ok(Preflight {
+        root,
+        out,
+        source_differs,
+        oracle,
+        build_info,
+        pin,
+        overflow,
+    })
+}
+
+/// The manifest fields `run` and `canary` share, with status `running`.
+fn base_manifest(
+    command: &str,
+    raw: &[String],
+    master: u64,
+    pre: &Preflight,
+    git: &Value,
+    gomaxprocs: u32,
+    start: u64,
+) -> Value {
+    json!({
+        "schema": SCHEMA,
+        "command": command,
+        "args": raw,
+        "tool": {
+            "crate_version": env!("CARGO_PKG_VERSION"),
+            "generator_fingerprint": hex(&fingerprint()),
+            "source_matches_checkout": pre.source_differs.is_empty(),
+            "source_differs": pre.source_differs,
+        },
+        "master_seed": format!("{master:#018x}"),
+        "start": { "unix": start, "utc": utc(start) },
+        "end": null,
+        "status": "running",
+        "git": git,
+        "pin": pre.pin.to_json(),
+        "oracle": oracle_json(&pre.oracle, &pre.build_info, gomaxprocs),
+        "lock": lock_versions(CARGO_LOCK, &LOCKED_CRATES),
+        "rust": {
+            "rustc_vv": rustc_vv(&pre.root),
+            "profile": profile_name(),
+            "debug_assertions": cfg!(debug_assertions),
+            "overflow_checks": pre.overflow,
+            "panic": if cfg!(panic = "unwind") { "unwind" } else { "abort" },
+            "RUSTFLAGS": std::env::var("RUSTFLAGS").ok(),
+            "RUSTUP_TOOLCHAIN": std::env::var("RUSTUP_TOOLCHAIN").ok(),
+        },
+        "platform": platform(),
+    })
+}
+
+/// A run's exit code: 0 passed, 1 failed, 3 aborted.
+fn exit_code(status: RunStatus) -> ExitCode {
+    match status {
+        RunStatus::Passed => ExitCode::SUCCESS,
+        RunStatus::Failed => ExitCode::from(1),
+        RunStatus::Aborted => ExitCode::from(3),
+    }
+}
+
 const RUN_FLAGS: &[&str] = &[
     "out",
     "floors",
@@ -287,7 +431,7 @@ const RUN_FLAGS: &[&str] = &[
 ];
 
 fn cmd_run(args: &Args, raw: &[String]) -> Outcome {
-    let out = PathBuf::from(args.require("out")?);
+    let out = args.require("out")?;
     let floors = args.flag("floors")?;
     let scale: Option<f64> = args.number("scale")?;
     let cases: Option<u64> = args.number("cases")?;
@@ -323,56 +467,19 @@ fn cmd_run(args: &Args, raw: &[String]) -> Outcome {
         .duration("progress-every")?
         .unwrap_or(Duration::from_secs(60));
 
-    if cfg!(panic = "abort") {
-        return Err(config(
-            "built with panic = \"abort\": build with --profile soak (or soak-checked), whose \
-             panics unwind, so a panic in the code under test is recorded with its case",
-        ));
-    }
-    let root = repo_root().map_err(config)?;
-    let cwd = std::env::current_dir().map_err(|e| config(format!("no current directory: {e}")))?;
-    if let Some(problem) = out_dir_problem(&out, &cwd, &root, OutUse::Run) {
-        return Err(config(format!("--out: {problem}")));
-    }
-    let out = if out.is_absolute() {
-        out
-    } else {
-        cwd.join(out)
-    };
-    let source_differs = source_differences(&crate_dir(&root));
-    if !source_differs.is_empty() {
-        eprintln!(
-            "sigsoak: warning: this binary was not built from the checkout at {} ({}); the run \
-             is not gate-eligible",
-            root.display(),
-            source_differs.join(", ")
-        );
-    }
-    let oracle = oracle_path(args)?;
-    let build_info = oracle_build_info(&oracle)?;
-    let pin = check_pin(&build_info);
-    if !pin.consistent() {
-        return Err(config(format!(
-            "the oracle {} links another specification: {}",
-            oracle.display(),
-            pin.problems().join("; ")
-        )));
-    }
-    let overflow = overflow_checks();
-    install_panic_hook();
-
+    let pre = preflight(args, out, OutUse::Run)?;
+    let out = pre.out.clone();
     println!("sigsoak: master seed {master:#018x}");
-    let git = git_state(&root);
-    let profile = profile_name();
+    let git = git_state(&pre.root);
     let selection = selection(&classes);
-    let gate_eligible = matches!(profile.as_deref(), Some("soak" | "soak-checked"))
-        && source_differs.is_empty()
+    let gate_eligible = matches!(profile_name().as_deref(), Some("soak" | "soak-checked"))
+        && pre.source_differs.is_empty()
         && git["dirty"] == json!(false)
-        && pin.consistent()
+        && pre.pin.consistent()
         && mode == Mode::Floors { scale: 1.0 }
         && selection != json!("partial");
     let start = unix_now();
-    let mut cfg = RunConfig::new(master, classes.clone(), mode, oracle.clone());
+    let mut cfg = RunConfig::new(master, classes.clone(), mode, pre.oracle.clone());
     cfg.workers = workers;
     cfg.window = window;
     cfg.flush_every = flush_every;
@@ -385,50 +492,24 @@ fn cmd_run(args: &Args, raw: &[String]) -> Outcome {
         .zip(class_targets(&classes, mode))
         .map(|(c, target)| json!({ "name": c.name, "target": target }))
         .collect();
-    cfg.manifest = Some(json!({
-        "schema": SCHEMA,
-        "command": "run",
-        "args": raw,
-        "tool": {
-            "crate_version": env!("CARGO_PKG_VERSION"),
-            "generator_fingerprint": hex(&fingerprint()),
-            "source_matches_checkout": source_differs.is_empty(),
-            "source_differs": source_differs,
-        },
-        "master_seed": format!("{master:#018x}"),
-        "mode": mode.to_json(),
-        "classes": targets,
-        "selection": selection,
-        "canary": null,
-        "workers": workers,
-        "window": window,
-        "flush_every": flush_every,
-        "hang_timeout_s": hang_timeout.as_secs(),
-        "start": { "unix": start, "utc": utc(start) },
-        "end": null,
-        "status": "running",
-        "gate_eligible": gate_eligible,
-        "git": git,
-        "pin": pin.to_json(),
-        "oracle": oracle_json(&oracle, &build_info, cfg.gomaxprocs),
-        "lock": lock_versions(CARGO_LOCK, &LOCKED_CRATES),
-        "rust": {
-            "rustc_vv": rustc_vv(&root),
-            "profile": profile,
-            "debug_assertions": cfg!(debug_assertions),
-            "overflow_checks": overflow,
-            "panic": if cfg!(panic = "unwind") { "unwind" } else { "abort" },
-            "RUSTFLAGS": std::env::var("RUSTFLAGS").ok(),
-            "RUSTUP_TOOLCHAIN": std::env::var("RUSTUP_TOOLCHAIN").ok(),
-        },
-        "platform": platform(),
-    }));
+    let mut manifest = base_manifest("run", raw, master, &pre, &git, cfg.gomaxprocs, start);
+    manifest["mode"] = mode.to_json();
+    manifest["classes"] = json!(targets);
+    manifest["selection"] = selection;
+    manifest["canary"] = Value::Null;
+    manifest["workers"] = json!(workers);
+    manifest["window"] = json!(window);
+    manifest["flush_every"] = json!(flush_every);
+    manifest["hang_timeout_s"] = json!(hang_timeout.as_secs());
+    manifest["gate_eligible"] = json!(gate_eligible);
+    cfg.manifest = Some(manifest);
 
     let summary = run::run(&cfg).map_err(config)?;
     eprint!("{}", summary.render());
     eprintln!("sigsoak: {} ({})", summary.status.name(), out.display());
     if let Some(ledger) = args.get("ledger") {
-        let modules: Vec<String> = pin
+        let modules: Vec<String> = pre
+            .pin
             .modules
             .iter()
             .map(|m| m.built.clone().unwrap_or_default())
@@ -448,11 +529,60 @@ fn cmd_run(args: &Args, raw: &[String]) -> Outcome {
             eprintln!("sigsoak: could not append to the ledger {ledger}: {e}");
         }
     }
-    Ok(match summary.status {
-        RunStatus::Passed => ExitCode::SUCCESS,
-        RunStatus::Failed => ExitCode::from(1),
-        RunStatus::Aborted => ExitCode::from(3),
-    })
+    Ok(exit_code(summary.status))
+}
+
+const CANARY_FLAGS: &[&str] = &["out", "seed", "canary", "cases", "workers", "oracle"];
+
+fn cmd_canary(args: &Args, raw: &[String]) -> Outcome {
+    let out = args.require("out")?;
+    let canaries = select_canaries(args.get("canary").unwrap_or("all")).map_err(usage)?;
+    let cases: u64 = args.number("cases")?.unwrap_or(10_000);
+    let workers = args.number("workers")?.unwrap_or_else(default_workers);
+    if cases == 0 || workers == 0 {
+        return Err(usage("--cases and --workers are at least 1"));
+    }
+    let master = master_seed(args)?;
+
+    let pre = preflight(args, out, OutUse::Canary)?;
+    let dir = pre.out.join("canary");
+    println!("sigsoak: master seed {master:#018x}");
+    let git = git_state(&pre.root);
+    let start = unix_now();
+    let mut base = RunConfig::new(master, Vec::new(), Mode::Cases(cases), pre.oracle.clone());
+    base.workers = workers;
+    base.progress_every = Some(Duration::from_secs(60));
+    base.out = Some(dir.clone());
+    let mut manifest = base_manifest("canary", raw, master, &pre, &git, base.gomaxprocs, start);
+    manifest["mode"] = base.mode.to_json();
+    manifest["canary"] = json!(canaries.iter().map(|c| c.name).collect::<Vec<_>>());
+    manifest["baseline_classes"] = json!(
+        baseline_classes(&canaries)
+            .iter()
+            .map(|c| c.name)
+            .collect::<Vec<_>>()
+    );
+    manifest["workers"] = json!(workers);
+    manifest["window"] = json!(base.window);
+    manifest["flush_every"] = json!(base.flush_every);
+    manifest["hang_timeout_s"] = json!(base.hang_timeout.as_secs());
+    manifest["gate_eligible"] = json!(false);
+    let manifest_path = dir.join("manifest.json");
+    std::fs::create_dir_all(&dir)
+        .and_then(|()| write_json(&manifest_path, &manifest))
+        .map_err(|e| config(format!("cannot write {}: {e}", manifest_path.display())))?;
+    base.manifest = Some(manifest.clone());
+
+    let report = run::canary_run(&base, &canaries, CanaryVolume::Soak { cases }).map_err(config)?;
+    let status = report.status();
+    manifest["status"] = json!(status.name());
+    manifest["end"] = json!({ "unix": unix_now(), "utc": utc(unix_now()) });
+    write_canary_record(&dir, &report)
+        .and_then(|()| write_json(&manifest_path, &manifest))
+        .map_err(|e| config(format!("cannot write the canary record: {e}")))?;
+    eprint!("{}", report.render());
+    eprintln!("sigsoak: canary run {} ({})", status.name(), dir.display());
+    Ok(exit_code(status))
 }
 
 fn cmd_replay(args: &Args) -> Outcome {
@@ -465,19 +595,30 @@ fn cmd_replay(args: &Args) -> Outcome {
         .ok_or_else(|| usage("--case is required"))?;
     let oracle = oracle_path(args)?;
     install_panic_hook();
-    let report = run::replay(seed, class, index, None, &oracle).map_err(config)?;
+    let report = run::replay(seed, class, index, args.get("canary"), &oracle).map_err(config)?;
     println!(
         "class {} case {} under master seed {seed:#018x}",
         report.class, report.index
     );
     println!("case seed {:#018x}", report.case_seed);
     println!("variant {}", report.case.variant);
+    if let Some(canary) = &report.canary {
+        println!(
+            "canary {} answers in dcroxide's place on {}",
+            canary.name,
+            command_names(canary.commands)
+        );
+    }
     for (j, request) in report.case.requests.iter().enumerate() {
         println!("request {j}: {} {}", request.cmd.name(), hex(&request.data));
         println!("  intent: {:?}", report.case.intents[j]);
+        let who = match &report.canary {
+            Some(canary) if canary.covers(request.cmd) => canary.name,
+            _ => "ours",
+        };
         match &report.ours[j] {
-            Ok(o) => println!("  ours: {} ({:?})", o.answer.describe(), o.detail),
-            Err(message) => println!("  ours: panic: {message}"),
+            Ok(o) => println!("  {who}: {} ({:?})", o.answer.describe(), o.detail),
+            Err(message) => println!("  {who}: panic: {message}"),
         }
         match report.replies.get(j) {
             Some(reply) => println!("  oracle: {}", reply.raw),
@@ -724,7 +865,32 @@ fn cmd_compare(args: &Args) -> Outcome {
     }
 }
 
-fn cmd_list() -> Outcome {
+/// Commands' names, comma-separated.
+fn command_names(commands: &[Cmd]) -> String {
+    commands
+        .iter()
+        .map(|c| c.name())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// `list`: every class, or every canary.  A reader that goes away early
+/// (`sigsoak list | head`) ends the listing quietly.
+fn cmd_list(args: &Args) -> Outcome {
+    let mut out = io::stdout().lock();
+    let written = if args.flag("canaries")? {
+        list_canaries(&mut out)
+    } else {
+        list_classes(&mut out)
+    };
+    match written {
+        Ok(()) => Ok(ExitCode::SUCCESS),
+        Err(e) if e.kind() == io::ErrorKind::BrokenPipe => Ok(ExitCode::SUCCESS),
+        Err(e) => Err(config(format!("cannot write the list: {e}"))),
+    }
+}
+
+fn list_classes(out: &mut impl Write) -> io::Result<()> {
     for class in CLASSES {
         let size = match class.size {
             dcroxide_sigdiff::class::Size::Sampled { floor } => format!("sampled, floor {floor}"),
@@ -733,18 +899,46 @@ fn cmd_list() -> Outcome {
             }
             dcroxide_sigdiff::class::Size::Finite { size } => format!("finite, {size}"),
         };
-        let commands: Vec<&str> = class.commands.iter().map(|c| c.name()).collect();
-        println!(
+        writeln!(
+            out,
             "{}\t{}\t{:?}\t{size}\tper-PR {}\t{}\n    {}",
             class.name,
             class.family.name(),
             class.tier,
             class.pr_cases,
-            commands.join(","),
+            command_names(class.commands),
             class.doc
-        );
+        )?;
     }
-    Ok(ExitCode::SUCCESS)
+    out.flush()
+}
+
+fn list_canaries(out: &mut impl Write) -> io::Result<()> {
+    writeln!(
+        out,
+        "-\t{}\tmodel\t{}\n    every model with no break; must agree with dcrd on every \
+         class of the selected model canaries' commands",
+        MODEL_BASELINE.name,
+        command_names(MODEL_BASELINE.commands)
+    )?;
+    for canary in CANARIES {
+        let footprint = if canary.footprint.is_empty() {
+            "none".to_owned()
+        } else {
+            canary.footprint.join(",")
+        };
+        writeln!(
+            out,
+            "{}\t{}\t{}\t{}\tprimary {}\tfootprint {footprint}\n    {}",
+            canary.id,
+            canary.name,
+            canary.kind(),
+            command_names(canary.commands),
+            canary.primary,
+            canary.doc
+        )?;
+    }
+    out.flush()
 }
 
 /// Notes each panic's place for the record of the case it hit, and prints
@@ -770,7 +964,8 @@ fn main() -> ExitCode {
     };
     let result = match cmd.as_str() {
         "run" => Args::parse(rest, RUN_FLAGS, false).and_then(|a| cmd_run(&a, &raw)),
-        "replay" => Args::parse(rest, &["seed", "class", "case", "oracle"], false)
+        "canary" => Args::parse(rest, CANARY_FLAGS, false).and_then(|a| cmd_canary(&a, &raw)),
+        "replay" => Args::parse(rest, &["seed", "class", "case", "canary", "oracle"], false)
             .and_then(|a| cmd_replay(&a)),
         "compare" => Args::parse(
             rest,
@@ -784,7 +979,7 @@ fn main() -> ExitCode {
             true,
         )
         .and_then(|a| cmd_compare(&a)),
-        "list" => Args::parse(rest, &[], false).and_then(|_| cmd_list()),
+        "list" => Args::parse(rest, &["canaries"], false).and_then(|a| cmd_list(&a)),
         "help" | "--help" | "-h" => {
             print!("{HELP}");
             Ok(ExitCode::SUCCESS)

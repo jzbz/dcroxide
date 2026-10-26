@@ -13,6 +13,9 @@
 //! <out>/disagreements.jsonl  one JSON object per disagreement; empty means none
 //! <out>/events.jsonl         oracle faults and restarts, including unreproduced ones
 //! <out>/oracle-w<k>.stderr   each worker's oracle stderr, every spawn appended
+//! <out>/canary/              the canary run (sigsoak canary): manifest.json,
+//!                            summary.tsv, summary.txt, and the record of each
+//!                            part in model-baseline/ and <canary>/{primary,others}/
 //! ```
 
 use std::borrow::Cow;
@@ -30,7 +33,7 @@ use serde_json::Value;
 use crate::answer::{Answer, Kind, OursAnswer};
 use crate::class::{Case, ClassSpec, Family, Mix, Tag};
 use crate::cmd::Cmd;
-use crate::compare::CaseResult;
+use crate::compare::{CaseResult, Status};
 use crate::digest::ClassDigest;
 
 /// At most this many disagreement lines are written per run; counting goes
@@ -38,8 +41,10 @@ use crate::digest::ClassDigest;
 pub const MAX_DISAGREEMENT_LINES: u64 = 10_000;
 
 /// The kinds every run that selects their family must see dcrd return at
-/// least 10^4 times (the kind-coverage criterion): the 19 DER kinds and the
-/// 6 public key kinds.
+/// least 10^4 times (the kind-coverage criterion): the 19 DER kinds, the 6
+/// public key kinds, the 8 compact recovery kinds and the 4 Schnorr
+/// signature parse kinds.  Recovery kinds are seen on dcrd's side; they are
+/// compared with dcroxide's once dcroxide reports them.
 pub const REACHABLE_KINDS: &[(Family, Cmd, &str)] = &[
     (Family::Der, Cmd::EcdsaParseDer, "ErrSigTooShort"),
     (Family::Der, Cmd::EcdsaParseDer, "ErrSigTooLong"),
@@ -70,17 +75,64 @@ pub const REACHABLE_KINDS: &[(Family, Cmd, &str)] = &[
         Cmd::PubkeyParse,
         "ErrPubKeyMismatchedOddness",
     ),
+    (
+        Family::Recover,
+        Cmd::EcdsaRecoverCompact,
+        "ErrSigInvalidLen",
+    ),
+    (
+        Family::Recover,
+        Cmd::EcdsaRecoverCompact,
+        "ErrSigInvalidRecoveryCode",
+    ),
+    (Family::Recover, Cmd::EcdsaRecoverCompact, "ErrSigRTooBig"),
+    (Family::Recover, Cmd::EcdsaRecoverCompact, "ErrSigRIsZero"),
+    (Family::Recover, Cmd::EcdsaRecoverCompact, "ErrSigSTooBig"),
+    (Family::Recover, Cmd::EcdsaRecoverCompact, "ErrSigSIsZero"),
+    (
+        Family::Recover,
+        Cmd::EcdsaRecoverCompact,
+        "ErrSigOverflowsPrime",
+    ),
+    (
+        Family::Recover,
+        Cmd::EcdsaRecoverCompact,
+        "ErrPointNotOnCurve",
+    ),
+    (Family::Schnorr, Cmd::SchnorrParse, "ErrSigTooShort"),
+    (Family::Schnorr, Cmd::SchnorrParse, "ErrSigTooLong"),
+    (Family::Schnorr, Cmd::SchnorrParse, "ErrSigRTooBig"),
+    (Family::Schnorr, Cmd::SchnorrParse, "ErrSigSTooBig"),
 ];
 
 /// The kinds and reasons no input through the oracle can reach, and the one
-/// excluded by design, as the summary lists them.
-pub const UNREACHABLE: &[&str] = &[
-    "ErrInvalidHashLen (Schnorr): every oracle Schnorr command takes a 32-byte hash",
-    "ErrSchnorrHashValue (Schnorr): needs BLAKE-256 at or above N, odds about 2^-128",
-    "ErrPubKeyNotOnCurve in Schnorr verify: a parsed key is on the curve",
-    "Ed25519 \"pubkey Y parameter is >= to P\": decoding reduces y",
-    "Ed25519 ParseDERSignature: no oracle command reaches it",
-    "excluded by design: ErrPrivateKeyIsZero (signing keys stay in [1, N-1])",
+/// excluded by design, each with the family it belongs to: the summary
+/// lists those of the families a run selected.
+pub const UNREACHABLE: &[(Family, &str)] = &[
+    (
+        Family::Schnorr,
+        "ErrInvalidHashLen (Schnorr): every oracle Schnorr command takes a 32-byte hash",
+    ),
+    (
+        Family::Schnorr,
+        "ErrSchnorrHashValue (Schnorr): needs BLAKE-256 at or above N, odds about 2^-128",
+    ),
+    (
+        Family::Schnorr,
+        "ErrPubKeyNotOnCurve in Schnorr verify: a parsed key is on the curve",
+    ),
+    (
+        Family::Ed25519,
+        "Ed25519 \"pubkey Y parameter is >= to P\": decoding reduces y",
+    ),
+    (
+        Family::Ed25519,
+        "Ed25519 ParseDERSignature: no oracle command reaches it",
+    ),
+    (
+        Family::Schnorr,
+        "excluded by design: ErrPrivateKeyIsZero in Schnorr signing (signing keys stay in [1, N-1])",
+    ),
 ];
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -134,6 +186,8 @@ pub struct ClassTotals {
     pub doubled: u64,
     /// Of those, cases tagged [`Tag::FormsDiffer`].
     pub forms_differ: u64,
+    /// The lowest index of a case that disagreed (status 1).
+    pub first_disagree: Option<u64>,
     /// The class's digest.
     pub digest: ClassDigest,
 }
@@ -175,6 +229,9 @@ impl Totals {
         totals.completed = totals.completed.saturating_add(1);
         let status = &mut totals.statuses[usize::from(result.status.code())];
         *status = status.saturating_add(1);
+        if result.status == Status::Disagree {
+            totals.first_disagree = Some(totals.first_disagree.map_or(index, |i| i.min(index)));
+        }
         totals.requests = totals
             .requests
             .saturating_add(u64::try_from(case.requests.len()).unwrap_or(u64::MAX));
@@ -256,6 +313,10 @@ impl Totals {
             mine.accepted = mine.accepted.saturating_add(theirs.accepted);
             mine.doubled = mine.doubled.saturating_add(theirs.doubled);
             mine.forms_differ = mine.forms_differ.saturating_add(theirs.forms_differ);
+            mine.first_disagree = match (mine.first_disagree, theirs.first_disagree) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            };
             mine.digest.merge(&theirs.digest);
         }
     }
@@ -637,6 +698,22 @@ impl Recorder {
     }
 }
 
+/// Writes the canary run's own files into `dir` (`<out>/canary`):
+/// `summary.tsv`, one row per canary and one for the model baseline, and
+/// `summary.txt`.  Each part of the run keeps its own record in a
+/// subdirectory, written as it ran.
+pub fn write_canary_record(dir: &Path, report: &crate::run::CanaryReport) -> io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    write_atomically(&dir.join("summary.tsv"), report.summary_tsv().as_bytes())?;
+    write_atomically(&dir.join("summary.txt"), report.render().as_bytes())
+}
+
+/// Writes `value` as pretty JSON to `path`, whole or not at all.
+pub fn write_json(path: &Path, value: &Value) -> io::Result<()> {
+    let text = serde_json::to_string_pretty(value).map_err(io::Error::other)?;
+    write_atomically(path, text.as_bytes())
+}
+
 /// Writes `bytes` to a temporary file beside `path` and renames it into
 /// place, so a reader never sees half a file.
 fn write_atomically(path: &Path, bytes: &[u8]) -> io::Result<()> {
@@ -775,6 +852,43 @@ mod tests {
             .map(|m| m.pass)
             .collect();
         assert_eq!(passes, [Some(false), Some(false), None]);
+    }
+
+    /// A class's first disagreement is the lowest index that disagreed,
+    /// whatever order cases complete in and shares merge in; other
+    /// statuses do not count.
+    #[test]
+    fn the_first_disagreement_is_the_lowest_index() {
+        let case = Case {
+            variant: Cow::Borrowed("v"),
+            requests: vec![crate::cmd::ecdsa_parse_der(&[])],
+            intents: vec![crate::class::Intent::Any],
+            consistency: crate::class::Consistency::None,
+            tags: crate::class::Tags::NONE,
+        };
+        let result = |status| CaseResult {
+            status,
+            failures: Vec::new(),
+            theirs: vec![None],
+            kind_compared: vec![false],
+        };
+        let ours = [Err("x".to_owned())];
+        let mut a = Totals::new(1);
+        let mut b = Totals::new(1);
+        a.record(0, 9, &case, &ours, &result(Status::Disagree), &[0; 32]);
+        a.record(0, 1, &case, &ours, &result(Status::OracleFailure), &[0; 32]);
+        a.record(0, 0, &case, &ours, &result(Status::Agree), &[0; 32]);
+        assert_eq!(a.classes[0].first_disagree, Some(9));
+        b.record(0, 4, &case, &ours, &result(Status::Disagree), &[0; 32]);
+        b.record(0, 7, &case, &ours, &result(Status::Disagree), &[0; 32]);
+        assert_eq!(b.classes[0].first_disagree, Some(4));
+        let mut none = Totals::new(1);
+        none.record(0, 2, &case, &ours, &result(Status::OursPanicked), &[0; 32]);
+        assert_eq!(none.classes[0].first_disagree, None);
+        none.merge(a);
+        assert_eq!(none.classes[0].first_disagree, Some(9));
+        none.merge(b);
+        assert_eq!(none.classes[0].first_disagree, Some(4));
     }
 
     #[test]

@@ -27,10 +27,13 @@
 //!
 //! dcroxide's answer is computed under `catch_unwind` before the case is
 //! submitted, so a panic in the code under test is a disagreement of
-//! category `ours-panicked` with dcrd's answer still recorded.  A case
-//! dcroxide does not finish within the hang timeout cannot be stopped from
-//! outside: the monitor records it as `ours-hung`, writes the summary as
-//! `aborted` and ends the process with exit code 3.
+//! category `ours-panicked` with dcrd's answer still recorded.  A run may
+//! stand a canary in for dcroxide on the canary's commands
+//! ([`RunConfig::canary`]); the canary run ([`canary_run`]) does so for the
+//! model baseline and each canary in turn.  A case dcroxide does not finish
+//! within the hang timeout cannot be stopped from outside: the monitor
+//! records it as `ours-hung`, writes the summary as `aborted` and ends the
+//! process with exit code 3.
 
 use std::any::Any;
 use std::borrow::Cow;
@@ -50,6 +53,7 @@ use dcroxide_testutil::{SplitMix64, hex, oracle_bin_or_skip};
 use serde_json::{Value, json};
 
 use crate::answer::OursAnswer;
+use crate::canary::{CANARY_BOUND, Canary, MODEL_BASELINE, Rule, StandIn, find_stand_in};
 use crate::class::{Case, ClassSpec, Family, find_class, generate};
 use crate::cmd::Request;
 use crate::compare::{CaseResult, Category, Status, compare};
@@ -163,13 +167,16 @@ pub struct RunConfig {
     pub kind_coverage: bool,
     /// The command a disagreement record's replay line starts with.
     pub replay_program: String,
+    /// What answers in dcroxide's place on the commands it covers: a
+    /// canary or the model baseline; `None` for dcroxide itself.
+    pub canary: Option<StandIn>,
 }
 
 impl RunConfig {
     /// A run of `classes` under `master` in `mode` against `oracle`, with
     /// the defaults: [`default_workers`] workers, window 512, flush batch
     /// 64, hang timeout 120 s, no progress, `GOMAXPROCS=2`, no output, 3
-    /// faults per worker.
+    /// faults per worker, dcroxide answering.
     pub fn new(
         master: u64,
         classes: Vec<&'static ClassSpec>,
@@ -194,6 +201,7 @@ impl RunConfig {
             max_faults: 3,
             kind_coverage: false,
             replay_program: "sigsoak".to_owned(),
+            canary: None,
         }
     }
 }
@@ -246,6 +254,9 @@ pub struct ClassSummary {
     pub fallbacks: u64,
     /// Whether a finite class ran every element.
     pub whole: bool,
+    /// The lowest index of a case that disagreed (status 1); with every
+    /// completed index below the count, the class's first.
+    pub first_disagree: Option<u64>,
     /// Its digest.
     pub digest: ClassDigest,
 }
@@ -320,6 +331,8 @@ pub struct Summary {
     pub build_info: Option<Reply>,
     /// Why the run stopped early.
     pub abort_reason: Option<String>,
+    /// What answered in dcroxide's place, if anything.
+    pub canary: Option<StandIn>,
 }
 
 impl Summary {
@@ -359,6 +372,15 @@ impl Summary {
             let _ = writeln!(s, "aborted: {reason}");
         }
         let _ = writeln!(s, "master seed: {:#018x}", self.master);
+        if let Some(canary) = &self.canary {
+            let commands: Vec<&str> = canary.commands.iter().map(|c| c.name()).collect();
+            let _ = writeln!(
+                s,
+                "canary: {} answered in dcroxide's place on {}",
+                canary.name,
+                commands.join(", ")
+            );
+        }
         let _ = writeln!(s, "mode: {}", self.mode.to_json());
         let _ = writeln!(
             s,
@@ -447,9 +469,19 @@ impl Summary {
                 );
             }
         }
-        s.push_str("\nunreachable through the oracle:\n");
-        for line in UNREACHABLE {
-            let _ = writeln!(s, "  {line}");
+        // Only the families the run selected.
+        let unreachable: Vec<&str> = UNREACHABLE
+            .iter()
+            .filter(|(family, _)| self.classes.iter().any(|c| c.family == *family))
+            .map(|&(_, line)| line)
+            .collect();
+        if unreachable.is_empty() {
+            s.push_str("\nunreachable through the oracle: nothing in the families run\n");
+        } else {
+            s.push_str("\nunreachable through the oracle:\n");
+            for line in unreachable {
+                let _ = writeln!(s, "  {line}");
+            }
         }
         s
     }
@@ -580,6 +612,7 @@ struct Shared {
     stop_on_disagreement: bool,
     kind_coverage: bool,
     replay_program: String,
+    canary: Option<StandIn>,
     cases: AtomicU64,
     requests: AtomicU64,
     disagreements: AtomicU64,
@@ -675,8 +708,12 @@ impl Shared {
     }
 
     fn replay_line(&self, class: &str, index: u64) -> String {
+        let canary = self
+            .canary
+            .map(|c| format!(" --canary {}", c.name))
+            .unwrap_or_default();
         format!(
-            "{} replay --seed {:#018x} --class {class} --case {index}",
+            "{} replay --seed {:#018x} --class {class} --case {index}{canary}",
             self.replay_program, self.master
         )
     }
@@ -760,6 +797,7 @@ impl Shared {
             "worker": worker,
             "category": category.name(),
             "status": result.status.code(),
+            "canary": self.canary.map(|c| c.name),
             "request": first.and_then(|f| f.request),
             "detail": first.map(|f| f.detail.clone()),
             "failures": result.failures.iter().map(|f| json!({
@@ -812,13 +850,15 @@ impl Payload for Probe {
     }
 }
 
-/// dcroxide's answers to `case`, each under `catch_unwind`.
-fn ours_answers(case: &Case) -> Vec<Result<OursAnswer, String>> {
+/// dcroxide's answers to `case`, each under `catch_unwind`: `canary`'s
+/// on the commands it covers, when one stands in.
+fn ours_answers(case: &Case, canary: Option<StandIn>) -> Vec<Result<OursAnswer, String>> {
     case.requests
         .iter()
         .map(|r| {
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                ours::answer(r.cmd, &r.data)
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match canary {
+                Some(canary) if canary.covers(r.cmd) => canary.answer(r.cmd, &r.data),
+                _ => ours::answer(r.cmd, &r.data),
             }))
             .map_err(|payload| panic_message(payload.as_ref()))
         })
@@ -898,7 +938,7 @@ impl Worker {
             .store(self.shared.now_ms().saturating_add(1), Ordering::SeqCst);
         let case = generate(plan.spec, self.shared.master, index);
         slot.phase.store(ANSWERING, Ordering::SeqCst);
-        let ours = ours_answers(&case);
+        let ours = ours_answers(&case, self.shared.canary);
         let model = model::view(&case);
         slot.busy_since.store(0, Ordering::SeqCst);
         slot.phase.store(IDLE, Ordering::SeqCst);
@@ -1340,6 +1380,7 @@ pub fn run(cfg: &RunConfig) -> Result<Summary, String> {
         stop_on_disagreement: cfg.stop_on_disagreement,
         kind_coverage: cfg.kind_coverage,
         replay_program: cfg.replay_program.clone(),
+        canary: cfg.canary,
         cases: AtomicU64::new(0),
         requests: AtomicU64::new(0),
         disagreements: AtomicU64::new(0),
@@ -1433,6 +1474,7 @@ fn summarize(shared: &Shared) -> Summary {
                 .size
                 .finite()
                 .is_some_and(|size| plan.stride == 1 && t.completed == size),
+            first_disagree: t.first_disagree,
             digest: t.digest.clone(),
         })
         .collect();
@@ -1571,6 +1613,7 @@ fn summarize(shared: &Shared) -> Summary {
         faults_not_reproduced: shared.not_reproduced.load(Ordering::SeqCst),
         build_info: shared.build_info.get().cloned(),
         abort_reason,
+        canary: shared.canary,
         totals,
     }
 }
@@ -1600,11 +1643,14 @@ pub struct ReplayReport {
     pub result: CaseResult,
     /// The case's digest leaf.
     pub leaf: [u8; 32],
+    /// What answered in dcroxide's place, if anything.
+    pub canary: Option<StandIn>,
 }
 
 /// Regenerates case `index` of `class` under `seed`, answers it on both
-/// sides with a fresh oracle, and compares.  `canary` names a broken model
-/// to stand in for dcroxide; none exists yet, so naming one is an error.
+/// sides with a fresh oracle, and compares.  `canary` names a canary (by
+/// name or id) or the model baseline to stand in for dcroxide on the
+/// commands it covers.
 pub fn replay(
     seed: u64,
     class: &str,
@@ -1612,11 +1658,12 @@ pub fn replay(
     canary: Option<&str>,
     oracle: &Path,
 ) -> Result<ReplayReport, String> {
-    if let Some(name) = canary {
-        return Err(format!(
-            "no canary {name}: the canaries are not in this build"
-        ));
-    }
+    let canary = canary
+        .map(|name| {
+            find_stand_in(name)
+                .ok_or_else(|| format!("no canary {name} (sigsoak list --canaries prints them)"))
+        })
+        .transpose()?;
     let spec =
         find_class(class).ok_or_else(|| format!("no class {class} (sigsoak list prints them)"))?;
     if let Some(size) = spec.size.finite()
@@ -1625,7 +1672,7 @@ pub fn replay(
         return Err(format!("{class} has {size} cases; {index} is past its end"));
     }
     let case = generate(spec, seed, index);
-    let ours = ours_answers(&case);
+    let ours = ours_answers(&case, canary);
     let model = model::view(&case);
     let replies: Arc<Mutex<Option<Vec<Reply>>>> = Arc::new(Mutex::new(None));
     let slot = Arc::clone(&replies);
@@ -1688,33 +1735,471 @@ pub fn replay(
         fault,
         result,
         leaf,
+        canary,
     })
 }
 
 /// The variable that overrides every class's per-PR case count.
 pub const CASES_VAR: &str = "DCROXIDE_SIGDIFF_CASES";
 
-/// Runs class `name` as the per-PR tests do: one worker, window 64, flush
-/// batch 16, hang timeout 60 s, its `pr_cases` cases (or
-/// `DCROXIDE_SIGDIFF_CASES`), a master seed printed for replay (and taken
-/// from `DCROXIDE_TEST_SEED` when set), and no output files.  `None` when
-/// the oracle is unavailable and the policy says skip.  Panics on an
-/// unknown class or a run that cannot start.
+/// The configuration the per-PR tests run under: one worker, window 64,
+/// flush batch 16, hang timeout 60 s, a master seed printed for replay
+/// under `label` (and taken from `DCROXIDE_TEST_SEED` when set), no output
+/// files, dcroxide answering; no class yet, each at its per-PR count.
+/// `None` when the oracle is unavailable and the policy says skip.
+pub fn test_config(label: &str) -> Option<RunConfig> {
+    let oracle = oracle_bin_or_skip()?;
+    let master = SplitMix64::from_entropy(&format!("sigdiff {label}")).0;
+    let mut cfg = RunConfig::new(master, Vec::new(), Mode::PerPr { cases: None }, oracle);
+    cfg.workers = 1;
+    cfg.window = 64;
+    cfg.flush_every = 16;
+    cfg.hang_timeout = Duration::from_secs(60);
+    Some(cfg)
+}
+
+/// Runs class `name` as the per-PR tests do ([`test_config`]), at its
+/// `pr_cases` cases (or `DCROXIDE_SIGDIFF_CASES`).  `None` when the oracle
+/// is unavailable and the policy says skip.  Panics on an unknown class or
+/// a run that cannot start.
 pub fn run_class_for_test(name: &str) -> Option<Summary> {
     let spec = find_class(name).unwrap_or_else(|| panic!("no class {name}"));
-    let oracle = oracle_bin_or_skip()?;
+    let mut cfg = test_config(name)?;
     let cases = std::env::var(CASES_VAR).ok().map(|v| {
         v.trim()
             .parse::<u64>()
             .unwrap_or_else(|_| panic!("{CASES_VAR}={v:?} is not a count"))
     });
-    let master = SplitMix64::from_entropy(&format!("sigdiff {name}")).0;
-    let mut cfg = RunConfig::new(master, vec![spec], Mode::PerPr { cases }, oracle);
-    cfg.workers = 1;
-    cfg.window = 64;
-    cfg.flush_every = 16;
-    cfg.hang_timeout = Duration::from_secs(60);
+    cfg.classes = vec![spec];
+    cfg.mode = Mode::PerPr { cases };
     Some(run(&cfg).unwrap_or_else(|e| panic!("{name}: {e}")))
+}
+
+/// How many cases each part of a canary run takes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CanaryVolume {
+    /// The soak's canary run: `cases` of every class the model baseline
+    /// covers, at most [`CANARY_BOUND`] of each primary, whatever `cases`
+    /// is, and `cases` of every other class of a canary's commands; finite
+    /// classes whole.
+    Soak {
+        /// Cases per class.
+        cases: u64,
+    },
+    /// The per-PR test's: 16 cases of every class the model baseline
+    /// covers, each canary's per-PR count of its primary, and 4 cases of
+    /// every other class of its commands; finite classes of at most 128
+    /// elements whole, as in every per-PR run.
+    PerPr,
+}
+
+impl CanaryVolume {
+    fn baseline(self) -> Mode {
+        match self {
+            CanaryVolume::Soak { cases } => Mode::Cases(cases),
+            CanaryVolume::PerPr => Mode::PerPr { cases: Some(16) },
+        }
+    }
+
+    fn primary(self, canary: &Canary) -> Mode {
+        match self {
+            CanaryVolume::Soak { .. } => Mode::Cases(CANARY_BOUND),
+            CanaryVolume::PerPr => Mode::PerPr {
+                cases: Some(canary.primary_pr_cases()),
+            },
+        }
+    }
+
+    fn others(self) -> Mode {
+        match self {
+            CanaryVolume::Soak { cases } => Mode::Cases(cases),
+            CanaryVolume::PerPr => Mode::PerPr { cases: Some(4) },
+        }
+    }
+}
+
+/// What one canary did in a canary run.
+#[derive(Debug, Clone)]
+pub struct CanaryOutcome {
+    /// The canary.
+    pub canary: &'static Canary,
+    /// Cases of its primary completed.
+    pub primary_cases: u64,
+    /// The lowest index of its primary at which it disagreed with dcrd;
+    /// the primary's completed cases are a prefix, so it is the first,
+    /// whatever the worker count.  `None` when it never did.
+    pub first_index: Option<u64>,
+    /// Every class it disagreed with dcrd in, with how many cases, its
+    /// primary first.
+    pub fired: Vec<(&'static str, u64)>,
+    /// Of those, the classes outside its primary and footprint.
+    pub unexpected: Vec<(&'static str, u64)>,
+    /// The first disagreement kept of each unexpected class.
+    pub notes: Vec<String>,
+    /// Anything else that went wrong: a case that panicked, an oracle
+    /// failure, a class that completed nothing, a part that stopped early.
+    pub problems: Vec<String>,
+    /// Whether a part of it stopped early.
+    pub aborted: bool,
+}
+
+impl CanaryOutcome {
+    /// Whether it fired in its primary at an index below [`CANARY_BOUND`],
+    /// nowhere outside its footprint, and nothing else went wrong.
+    pub fn pass(&self) -> bool {
+        self.first_index.is_some_and(|i| i < CANARY_BOUND)
+            && self.unexpected.is_empty()
+            && self.problems.is_empty()
+    }
+}
+
+/// What a canary run found.
+#[derive(Debug, Clone)]
+pub struct CanaryReport {
+    /// The master seed.
+    pub master: u64,
+    /// The model baseline's run; `None` when no canary selected breaks a
+    /// model.
+    pub baseline: Option<Summary>,
+    /// Each canary's outcome, in registry order.
+    pub outcomes: Vec<CanaryOutcome>,
+}
+
+impl CanaryReport {
+    /// Whether the model baseline agreed with dcrd everywhere, held every
+    /// intent and mix, and ran to the end (or did not run).
+    pub fn baseline_pass(&self) -> bool {
+        self.baseline
+            .as_ref()
+            .is_none_or(|s| s.status == RunStatus::Passed)
+    }
+
+    /// Whether the baseline passed and every canary passed.
+    pub fn pass(&self) -> bool {
+        self.baseline_pass() && self.outcomes.iter().all(CanaryOutcome::pass)
+    }
+
+    /// Whether any part stopped early.
+    pub fn aborted(&self) -> bool {
+        self.baseline
+            .as_ref()
+            .is_some_and(|s| s.status == RunStatus::Aborted)
+            || self.outcomes.iter().any(|o| o.aborted)
+    }
+
+    /// `passed`, `failed` or `aborted`.
+    pub fn status(&self) -> RunStatus {
+        if self.aborted() {
+            RunStatus::Aborted
+        } else if self.pass() {
+            RunStatus::Passed
+        } else {
+            RunStatus::Failed
+        }
+    }
+
+    /// `summary.tsv`: per canary its primary, the first index it was
+    /// caught at, the classes it fired in and those outside its footprint,
+    /// with counts, and whether it passed; the model baseline first, with
+    /// the classes it disagreed in.
+    pub fn summary_tsv(&self) -> String {
+        let verdict = |pass: bool| if pass { "pass" } else { "fail" };
+        let mut s = String::from(
+            "id\tcanary\tprimary\tfirst_index\tprimary_cases\tfired\tunexpected\tpass\tproblems\n",
+        );
+        if let Some(baseline) = &self.baseline {
+            let fired: Vec<(&str, u64)> = baseline
+                .classes
+                .iter()
+                .filter(|c| c.statuses[1..].iter().any(|&n| n > 0))
+                .map(|c| (c.name, c.statuses[1..].iter().sum()))
+                .collect();
+            let _ = writeln!(
+                s,
+                "-\t{}\t-\t-\t-\t{}\t{}\t{}\t{}",
+                MODEL_BASELINE.name,
+                classes(&fired),
+                classes(&fired),
+                verdict(self.baseline_pass()),
+                baseline.problems().join("; ")
+            );
+        }
+        for o in &self.outcomes {
+            let _ = writeln!(
+                s,
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                o.canary.id,
+                o.canary.name,
+                o.canary.primary,
+                o.first_index
+                    .map_or_else(|| "-".to_owned(), |i| i.to_string()),
+                o.primary_cases,
+                classes(&o.fired),
+                classes(&o.unexpected),
+                verdict(o.pass()),
+                o.problems.join("; ")
+            );
+        }
+        s
+    }
+
+    /// The report for a reader: the baseline's verdict, then one line per
+    /// canary, then whatever failed.
+    pub fn render(&self) -> String {
+        let mut s = String::new();
+        let _ = writeln!(s, "canary run: {}", self.status().name());
+        let _ = writeln!(s, "master seed: {:#018x}", self.master);
+        match &self.baseline {
+            Some(b) => {
+                let _ = writeln!(
+                    s,
+                    "{}: {} ({} cases of {} classes, {} disagreements)",
+                    MODEL_BASELINE.name,
+                    if self.baseline_pass() { "pass" } else { "FAIL" },
+                    b.cases,
+                    b.classes.len(),
+                    b.disagreements
+                );
+                for problem in b.problems() {
+                    let _ = writeln!(s, "  {problem}");
+                }
+            }
+            None => {
+                let _ = writeln!(s, "{}: not run", MODEL_BASELINE.name);
+            }
+        }
+        for o in &self.outcomes {
+            let caught = match o.first_index {
+                None => format!(
+                    "never caught in {} cases of {}",
+                    o.primary_cases, o.canary.primary
+                ),
+                Some(i) if i >= CANARY_BOUND => format!(
+                    "caught at {} case {i}, not within {} cases",
+                    o.canary.primary,
+                    thousands(CANARY_BOUND)
+                ),
+                Some(i) => format!("caught at {} case {i}", o.canary.primary),
+            };
+            let _ = writeln!(
+                s,
+                "{} {}: {} ({caught}; fired in {})",
+                o.canary.id,
+                o.canary.name,
+                if o.pass() { "pass" } else { "FAIL" },
+                classes(&o.fired)
+            );
+            for (class, n) in &o.unexpected {
+                let _ = writeln!(s, "  outside its footprint: {class}, {n} cases");
+            }
+            for line in o.notes.iter().chain(&o.problems) {
+                let _ = writeln!(s, "  {line}");
+            }
+        }
+        s
+    }
+}
+
+/// Classes with counts, `name:n` comma-separated, or `none`.
+fn classes(list: &[(&str, u64)]) -> String {
+    if list.is_empty() {
+        return "none".to_owned();
+    }
+    list.iter()
+        .map(|(class, n)| format!("{class}:{n}"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// The classes the model baseline runs for `canaries`: every class that
+/// sends a command one of the model canaries among them answers, in
+/// registry order.
+pub fn baseline_classes(canaries: &[&'static Canary]) -> Vec<&'static ClassSpec> {
+    MODEL_BASELINE
+        .classes()
+        .into_iter()
+        .filter(|class| {
+            canaries.iter().any(|canary| {
+                matches!(canary.rule, Rule::Model(_))
+                    && class
+                        .commands
+                        .iter()
+                        .any(|&cmd| canary.stand_in().covers(cmd))
+            })
+        })
+        .collect()
+}
+
+/// `base` with `canary` standing in for dcroxide on `classes` in `mode`,
+/// its record (if any) in the `part` subdirectory of `base.out`, its
+/// manifest `base`'s with the part, the stand-in, the mode and the
+/// classes.
+fn canary_part(
+    base: &RunConfig,
+    canary: StandIn,
+    classes: Vec<&'static ClassSpec>,
+    mode: Mode,
+    part: &str,
+    stop_on_disagreement: bool,
+) -> RunConfig {
+    let mut cfg = base.clone();
+    cfg.manifest = base.manifest.as_ref().map(|manifest| {
+        let mut manifest = manifest.clone();
+        manifest["part"] = json!(part);
+        manifest["canary"] = json!(canary.name);
+        manifest["mode"] = mode.to_json();
+        manifest["classes"] = json!(
+            classes
+                .iter()
+                .zip(class_targets(&classes, mode))
+                .map(|(c, target)| json!({ "name": c.name, "target": target }))
+                .collect::<Vec<_>>()
+        );
+        manifest
+    });
+    cfg.canary = Some(canary);
+    cfg.classes = classes;
+    cfg.mode = mode;
+    cfg.out = base.out.as_ref().map(|out| out.join(part));
+    cfg.stop_on_disagreement = stop_on_disagreement;
+    cfg.kind_coverage = false;
+    cfg
+}
+
+/// Runs the model baseline over `classes` as `volume` says: every model,
+/// with no break, in dcroxide's place.  It must agree with dcrd everywhere
+/// ([`CanaryReport::baseline_pass`]).
+pub fn baseline_check(
+    base: &RunConfig,
+    classes: Vec<&'static ClassSpec>,
+    volume: CanaryVolume,
+) -> Result<Summary, String> {
+    run(&canary_part(
+        base,
+        MODEL_BASELINE,
+        classes,
+        volume.baseline(),
+        MODEL_BASELINE.name,
+        false,
+    ))
+}
+
+/// Runs `canary` as the canary run does: its primary until the first
+/// disagreement, under the stop condition, then every other class of its
+/// commands, each as `volume` says; and finds where it fired.
+pub fn canary_check(
+    base: &RunConfig,
+    canary: &'static Canary,
+    volume: CanaryVolume,
+) -> Result<CanaryOutcome, String> {
+    let stand_in = canary.stand_in();
+    let primary = run(&canary_part(
+        base,
+        stand_in,
+        vec![canary.primary_class()],
+        volume.primary(canary),
+        &format!("{}/primary", canary.name),
+        true,
+    ))?;
+    let others = canary.others();
+    let others = if others.is_empty() {
+        None
+    } else {
+        Some(run(&canary_part(
+            base,
+            stand_in,
+            others,
+            volume.others(),
+            &format!("{}/others", canary.name),
+            false,
+        ))?)
+    };
+    let mut outcome = CanaryOutcome {
+        canary,
+        primary_cases: 0,
+        first_index: None,
+        fired: Vec::new(),
+        unexpected: Vec::new(),
+        notes: Vec::new(),
+        problems: Vec::new(),
+        aborted: false,
+    };
+    for (part, summary) in [("primary", Some(&primary)), ("others", others.as_ref())] {
+        let Some(summary) = summary else {
+            continue;
+        };
+        if let Some(reason) = &summary.abort_reason {
+            outcome.aborted = true;
+            outcome
+                .problems
+                .push(format!("{part}: stopped early: {reason}"));
+        }
+        for class in &summary.classes {
+            let [_, disagreed, oracle, panicked] = class.statuses;
+            if disagreed > 0 {
+                outcome.fired.push((class.name, disagreed));
+                if !canary.may_fire_in(class.name) {
+                    outcome.unexpected.push((class.name, disagreed));
+                    outcome.notes.extend(
+                        summary
+                            .notes
+                            .iter()
+                            .filter(|n| n.class == class.name)
+                            .take(1)
+                            .map(|n| {
+                                format!("{} case {}: {}", n.class, n.index, n.failures.join("; "))
+                            }),
+                    );
+                }
+            }
+            if oracle > 0 {
+                outcome.problems.push(format!(
+                    "{}: the oracle failed on {oracle} cases",
+                    class.name
+                ));
+            }
+            if panicked > 0 {
+                outcome
+                    .problems
+                    .push(format!("{}: {panicked} cases panicked", class.name));
+            }
+            if class.completed == 0 {
+                outcome
+                    .problems
+                    .push(format!("{}: no case completed", class.name));
+            }
+        }
+    }
+    let primary = primary.class(canary.primary).expect("the primary ran");
+    outcome.primary_cases = primary.completed;
+    outcome.first_index = primary.first_disagree;
+    Ok(outcome)
+}
+
+/// The canary run: the model baseline over the classes of the model
+/// canaries among `canaries` ([`baseline_classes`]), then each canary in
+/// turn ([`canary_check`]), each part with its own record under
+/// `base.out` when there is one.
+pub fn canary_run(
+    base: &RunConfig,
+    canaries: &[&'static Canary],
+    volume: CanaryVolume,
+) -> Result<CanaryReport, String> {
+    let classes = baseline_classes(canaries);
+    let baseline = if classes.is_empty() {
+        None
+    } else {
+        Some(baseline_check(base, classes, volume)?)
+    };
+    let outcomes = canaries
+        .iter()
+        .map(|&canary| canary_check(base, canary, volume))
+        .collect::<Result<Vec<_>, String>>()?;
+    Ok(CanaryReport {
+        master: base.master,
+        baseline,
+        outcomes,
+    })
 }
 
 #[cfg(test)]
@@ -1797,6 +2282,7 @@ mod tests {
             stop_on_disagreement: false,
             kind_coverage: false,
             replay_program: "sigsoak".to_owned(),
+            canary: None,
             cases: AtomicU64::new(0),
             requests: AtomicU64::new(0),
             disagreements: AtomicU64::new(0),
@@ -1960,6 +2446,152 @@ mod tests {
             summary.criteria[0].detail,
             "no case completed, so nothing was compared"
         );
+    }
+
+    /// summary.txt lists the unreachable kinds of the families a run
+    /// selected, and no others.
+    #[test]
+    fn the_unreachable_list_follows_the_families() {
+        static SCHNORR: ClassSpec = ClassSpec {
+            name: "T-schnorr",
+            family: Family::Schnorr,
+            ..SAMPLED
+        };
+        let render = |classes: &[&'static ClassSpec]| {
+            summarize(&shared_for(classes, Mode::Budget(Duration::ZERO))).render()
+        };
+        let der = render(&[&SAMPLED]);
+        assert!(
+            der.contains("unreachable through the oracle: nothing in the families run"),
+            "{der}"
+        );
+        assert!(!der.contains("ErrInvalidHashLen"), "{der}");
+        let schnorr = render(&[&SAMPLED, &SCHNORR]);
+        for (family, line) in UNREACHABLE {
+            assert_eq!(
+                schnorr.contains(line),
+                *family == Family::Schnorr,
+                "{line}:\n{schnorr}"
+            );
+        }
+    }
+
+    /// A canary passes when it fired in its primary within the bound,
+    /// nowhere outside its footprint, and nothing else went wrong; the
+    /// report passes when every canary and the baseline do, and its table
+    /// says so per row.  The soak's primary runs to the bound whatever its
+    /// volume.
+    #[test]
+    fn canary_reports_decide_by_primary_and_footprint() {
+        let canary = crate::canary::find_canary("C5").expect("C5");
+        let outcome = CanaryOutcome {
+            canary,
+            primary_cases: 48,
+            first_index: Some(0),
+            fired: vec![("K-wrap", 48), ("K-XTooBig", 3)],
+            unexpected: Vec::new(),
+            notes: Vec::new(),
+            problems: Vec::new(),
+            aborted: false,
+        };
+        assert!(outcome.pass());
+        let mut report = CanaryReport {
+            master: 7,
+            baseline: None,
+            outcomes: vec![outcome.clone()],
+        };
+        assert!(report.pass());
+        assert_eq!(report.status(), RunStatus::Passed);
+        let tsv = report.summary_tsv();
+        let row = tsv.lines().nth(1).expect("a row");
+        assert_eq!(
+            row,
+            "C5\tpubkey-reduce-mod-p\tK-wrap\t0\t48\tK-wrap:48,K-XTooBig:3\tnone\tpass\t"
+        );
+        assert!(report.render().contains("caught at K-wrap case 0"));
+
+        let mut never = outcome.clone();
+        never.first_index = None;
+        assert!(!never.pass());
+        // Caught, but not within the bound: too late, whatever the volume
+        // the primary ran at.
+        let mut late = outcome.clone();
+        late.first_index = Some(CANARY_BOUND.saturating_sub(1));
+        assert!(late.pass());
+        late.first_index = Some(CANARY_BOUND);
+        assert!(!late.pass());
+        let rendered = CanaryReport {
+            master: 7,
+            baseline: None,
+            outcomes: vec![late],
+        }
+        .render();
+        assert!(
+            rendered.contains("FAIL (caught at K-wrap case 10000, not within 10,000 cases;"),
+            "{rendered}"
+        );
+        for cases in [1, 10_000, 50_000] {
+            let volume = CanaryVolume::Soak { cases };
+            assert_eq!(volume.primary(canary), Mode::Cases(CANARY_BOUND));
+            assert_eq!(volume.baseline(), Mode::Cases(cases));
+            assert_eq!(volume.others(), Mode::Cases(cases));
+        }
+        let mut wide = outcome.clone();
+        wide.unexpected = vec![("K-valid", 1)];
+        assert!(!wide.pass());
+        let mut broken = outcome;
+        broken.problems = vec!["K-wrap: 1 cases panicked".to_owned()];
+        broken.aborted = true;
+        assert!(!broken.pass());
+        report.outcomes.push(wide);
+        assert!(!report.pass());
+        assert_eq!(report.status(), RunStatus::Failed);
+        assert!(
+            report
+                .render()
+                .contains("outside its footprint: K-valid, 1 cases")
+        );
+        report.outcomes.push(broken);
+        assert_eq!(report.status(), RunStatus::Aborted);
+
+        // A baseline that disagreed fails the report on its own.
+        let mut summary = summarize(&shared_for(&[&SAMPLED], Mode::Cases(1)));
+        summary.status = RunStatus::Failed;
+        let report = CanaryReport {
+            master: 7,
+            baseline: Some(summary),
+            outcomes: Vec::new(),
+        };
+        assert!(!report.baseline_pass() && !report.pass());
+        assert!(report.summary_tsv().contains("\tmodel-baseline\t"));
+    }
+
+    /// The baseline runs the classes of the selected model canaries'
+    /// commands, and none for a wrapper alone, even one on a model
+    /// command.
+    #[test]
+    fn the_baseline_follows_the_model_canaries() {
+        let names = |ids: &[&str]| -> Vec<&'static str> {
+            let canaries: Vec<&'static Canary> = ids
+                .iter()
+                .map(|id| crate::canary::find_canary(id).expect("a canary"))
+                .collect();
+            baseline_classes(&canaries).iter().map(|c| c.name).collect()
+        };
+        let family = |prefix: &str| -> Vec<&'static str> {
+            crate::class::CLASSES
+                .iter()
+                .filter(|c| c.name.starts_with(prefix))
+                .map(|c| c.name)
+                .collect()
+        };
+        assert!(names(&["C2", "C4", "C5", "C6", "C9"]).is_empty());
+        assert_eq!(names(&["C1"]), family("EV-"));
+        assert_eq!(names(&["C9", "C14"]), family("ER-"));
+        assert_eq!(names(&["C6", "C18"]), family("SV-"));
+        assert_eq!(names(&["C2", "C16"]), family("DV-"));
+        let all: Vec<&'static Canary> = crate::canary::CANARIES.iter().collect();
+        assert_eq!(baseline_classes(&all).len(), MODEL_BASELINE.classes().len());
     }
 
     #[test]
