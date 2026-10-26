@@ -738,9 +738,15 @@ and 24.18 GiB under dcrd, 17.88 GiB of it block files in each
 ## Development
 
 Rust 1.98.1 and a Go toolchain (for the oracle-backed differential
-tests; without Go those tests skip). `DCROXIDE_REQUIRE_ORACLE=1` turns a
-missing toolchain into a failure instead, so a run cannot silently pass
-with the differential coverage skipped — CI sets it.
+tests; without Go those tests skip). Go 1.26.2 is the reference: the
+release dcrd's release image builds the parity pin with, and the one CI
+runs (`GO_VERSION` in `.github/workflows/ci.yml`; ADR-0001's 2026-10-26
+addendum on the reference Go). The oracle builds with Go 1.24 or later,
+but where an answer comes from Go's standard library, an oracle built
+with another release answers as that release does.
+`DCROXIDE_REQUIRE_ORACLE=1` turns a missing toolchain into a failure
+instead, so a run cannot silently pass with the differential coverage
+skipped — CI sets it.
 
 Every randomized differential prints the seed it drew
 (`<label>: seed 0x…`). To replay a failure without editing the test, set

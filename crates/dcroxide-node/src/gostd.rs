@@ -1080,7 +1080,8 @@ mod tests {
 
     /// `ParseDuration` quotes its errors with the time package's own
     /// `quote`, not `strconv.Quote`, and wraps its uint64 sum as Go does
-    /// (outputs from a Go 1.27 run).
+    /// (outputs from a Go 1.27 run, and the same from go1.26.2, the
+    /// reference Go).
     #[test]
     fn duration_errors_and_wrap_match_go() {
         for (input, want) in [
@@ -1114,7 +1115,7 @@ mod tests {
     /// `net.JoinHostPort` brackets for a colon only, and
     /// `net.SplitHostPort` scans the whole address for stray brackets
     /// after its bracket switch, with Go's text for each (outputs from a
-    /// Go 1.27 run).
+    /// Go 1.27 run, and the same from go1.26.2, the reference Go).
     #[test]
     fn host_port_edges_match_go() {
         assert_eq!(join_host_port("host%zone", "9108"), "host%zone:9108");
@@ -1148,7 +1149,8 @@ mod tests {
     /// `strconv.ParseInt` and `ParseUint` in Go's order: the first digit
     /// that overflows is a range error even when an invalid byte or a
     /// misplaced underscore follows, and the underscores are checked
-    /// last (outputs from a Go 1.27 run).
+    /// last (outputs from a Go 1.27 run, and the same from go1.26.2, the
+    /// reference Go).
     #[test]
     fn integer_parsing_matches_go() {
         let int_cases: [(&str, Result<i64, &str>); 18] = [
@@ -1191,7 +1193,8 @@ mod tests {
     }
 
     /// `strconv.ParseFloat`: underscores, hex floats and `ErrRange` on
-    /// overflow, and no sign before `NaN` (outputs from a Go 1.27 run).
+    /// overflow, and no sign before `NaN` (outputs from a Go 1.27 run, and
+    /// the same from go1.26.2, the reference Go).
     #[test]
     fn float_parsing_matches_go() {
         let cases: [(&str, Result<f64, &str>); 12] = [
@@ -1219,7 +1222,8 @@ mod tests {
 
     /// `strconv.Unquote` of a double-quoted value: `\U`, byte escapes
     /// that spell UTF-8, and hex digits that are only hex digits
-    /// (outputs from a Go 1.27 run).
+    /// (outputs from a Go 1.27 run, and the same from go1.26.2, the
+    /// reference Go).
     #[test]
     fn unquote_matches_go() {
         for (input, want) in [

@@ -2064,7 +2064,7 @@ mod tests {
             chain_params: params.clone(),
             subsidy_cache: Mutex::new(dcroxide_standalone::SubsidyCache::new(params.clone())),
             min_relay_tx_fee: 10000,
-            max_protocol_version: dcroxide_wire::PROTOCOL_VERSION,
+            max_protocol_version: crate::server::MAX_PROTOCOL_VERSION,
             sync_mgr: Box::new(crate::rpcrun::NodeRpcSyncManager::new(
                 sync_manager,
                 Arc::clone(&tx_pool),

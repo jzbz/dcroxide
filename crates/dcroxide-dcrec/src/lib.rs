@@ -9,8 +9,11 @@
 //! three: **type 0 (ECDSA-secp256k1)**, **type 1 (Ed25519)**, and **type 2
 //! (EC-Schnorr-DCRv0)**.
 //!
-//! Per ADR-0006, elliptic-curve arithmetic comes from the audited
-//! libsecp256k1 C library (via the `secp256k1` bindings crate); everything
+//! Per ADR-0006, ECDSA runs on the audited libsecp256k1 C library (via the
+//! `secp256k1` bindings crate), which also holds every secp256k1 key and
+//! checks that a parsed key is on the curve; EC-Schnorr-DCRv0, and ECDSA
+//! signing of a hash at or above the group order, run on `k256`'s
+//! arithmetic, and Ed25519 on `curve25519-dalek`'s.  Everything
 //! dcrd-behavior-specific — DER signature acceptance, public key format
 //! acceptance, low-S serialization, error identities — is implemented here
 //! and differential-tested against dcrd's own code via `tools/oracle`.

@@ -409,7 +409,8 @@ mod tests {
     /// `strconv.IsPrint` holds and never escapes it.  The port rendered
     /// the character with Rust's char `Debug`, which quotes control
     /// characters and escapes `'` and `\`.  Expected texts from Go 1.27's
-    /// `hex.InvalidByteError(b).Error()`.
+    /// `hex.InvalidByteError(b).Error()`, which go1.26.2, the reference Go,
+    /// writes alike.
     #[test]
     fn hex_invalid_byte_text_matches_go() {
         for (b, want) in [
@@ -455,7 +456,8 @@ mod tests {
     /// the host and appends the default port.
     #[test]
     fn split_host_port_rejects_stray_brackets_after_the_host() {
-        // Every one of these is an error from Go 1.27's SplitHostPort.
+        // Every one of these is an error from Go's SplitHostPort, in
+        // go1.26.2, the reference, as in 1.27.
         for bad in [
             "[a[b]:1",
             "[a]:1]",

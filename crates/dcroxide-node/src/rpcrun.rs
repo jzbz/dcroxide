@@ -2950,11 +2950,11 @@ fn go_new_oid_from_der(der: &[u8]) -> bool {
     true
 }
 
-/// A basic constraints `pathLenConstraint` as Go 1.27's
-/// `parseBasicConstraintsExtension` reads it, through cryptobyte's
-/// `ReadASN1Integer` into a `uint`: a minimally encoded, non-negative
-/// integer no larger than `math.MaxInt`.  `None` is Go's
-/// `x509: invalid basic constraints`.
+/// A basic constraints `pathLenConstraint` as Go's
+/// `parseBasicConstraintsExtension` reads it (the same in 1.26.2 and
+/// 1.27.1), through cryptobyte's `ReadASN1Integer` into a `uint`: a
+/// minimally encoded, non-negative integer no larger than `math.MaxInt`.
+/// `None` is Go's `x509: invalid basic constraints`.
 // Byte shifts over at most eight bytes.
 #[allow(clippy::arithmetic_side_effects)]
 fn der_path_len(content: &[u8]) -> Option<u64> {
@@ -3381,10 +3381,10 @@ enum GoChains<'a> {
     SignatureLimit,
 }
 
-/// Go 1.27's `buildChains` for `leaf` (`crypto/x509/verify.go`), over
-/// the `--clientcafile` pool and the pool of certificates the client
-/// sent, each deduplicated and in the order it was filled, as Go's
-/// `CertPool.AddCert` leaves them, at `now`.
+/// Go's `buildChains` for `leaf` (`crypto/x509/verify.go`, the same text
+/// in 1.26.2 and 1.27.1), over the `--clientcafile` pool and the pool of
+/// certificates the client sent, each deduplicated and in the order it
+/// was filled, as Go's `CertPool.AddCert` leaves them, at `now`.
 ///
 /// It looks for the leaf's issuer among the roots and then among the
 /// sent certificates, in the order `findPotentialParents` gives (those
@@ -3410,11 +3410,13 @@ enum GoChains<'a> {
 /// it, after the RSA public exponent limit Go's verification applies and
 /// ring's does not (`go_rsa_exponent_fits`).  Go verifies some
 /// signatures those cannot, among them RSA keys of 1024 to 2047 bits or
-/// over 8192, P-224 and P-521 keys, ECDSA with SHA-512, ML-DSA, a
-/// signature algorithm identifier Go matches by its OID alone, and a
-/// signature BIT STRING with unused bits, which Go right-aligns; such a
-/// candidate is taken here as failing its signature check, where Go
-/// would go on through it.
+/// over 8192, P-224 and P-521 keys, ECDSA with SHA-512, ML-DSA (from
+/// Go 1.27: 1.26.2, the reference Go, leaves an ML-DSA key nil and
+/// passes the candidate over, at the same one check), a signature
+/// algorithm identifier Go matches by its OID alone, and a signature BIT
+/// STRING with unused bits, which Go right-aligns; such a candidate is
+/// taken here as failing its signature check, where Go would go on
+/// through it.
 fn go_build_chains<'a>(
     leaf: &ChainCandidate<'a>,
     roots: &[ChainCandidate<'a>],
@@ -3579,10 +3581,10 @@ fn go_rsa_exponent_fits(key: &[u8]) -> bool {
             <= 0x7fff_ffff
 }
 
-/// Go 1.27's `isValid` for a root or intermediate `candidate` placed
-/// above a chain of `chain_len` certificates (`crypto/x509/verify.go`);
-/// the name check it opens with holds for every candidate
-/// [`potential_parents`] gives.
+/// Go's `isValid` for a root or intermediate `candidate` placed above a
+/// chain of `chain_len` certificates (`crypto/x509/verify.go`, the same
+/// text in 1.26.2 and 1.27.1); the name check it opens with holds for
+/// every candidate [`potential_parents`] gives.
 // `chain_len` counts the leaf, so it is at least one.
 #[allow(clippy::arithmetic_side_effects)]
 fn go_is_valid(candidate: &ChainCandidate<'_>, is_root: bool, chain_len: usize, now: i64) -> bool {
@@ -7357,9 +7359,9 @@ struct GoUrl {
     query: Option<String>,
 }
 
-/// `net/url`'s `parse` (`url.go:432-510`, Go 1.27).  `via_request`
-/// is its `viaRequest`: `ParseRequestURI` allows only an absolute URL
-/// or a rooted path, `Parse` any reference.
+/// `net/url`'s `parse` (`url.go:431-509` in Go 1.26.2, the same text in
+/// 1.27.1).  `via_request` is its `viaRequest`: `ParseRequestURI` allows
+/// only an absolute URL or a rooted path, `Parse` any reference.
 fn go_url_parse(raw: &str, via_request: bool) -> Option<GoUrl> {
     // `stringContainsCTLByte`: any ASCII control byte, DEL included.
     if raw.bytes().any(|b| b < 0x20 || b == 0x7f) {
@@ -7489,12 +7491,12 @@ fn go_parse_authority(scheme: &str, authority: &str) -> Option<Vec<u8>> {
     Some(host)
 }
 
-/// `parseHost` (`url.go:549-658`, Go 1.27): an IP literal in brackets
-/// must hold an IPv6 address, a port must be digits, and the escapes a
-/// host may use are only those of non-ASCII bytes (and `%25`).  With
-/// more than one colon outside brackets, http and https take the port
-/// from the first (the `urlstrictcolons` default) and every other
-/// scheme from the last.
+/// `parseHost` (`url.go:548-639` in Go 1.26.2, the same text in 1.27.1):
+/// an IP literal in brackets must hold an IPv6 address, a port must be
+/// digits, and the escapes a host may use are only those of non-ASCII
+/// bytes (and `%25`).  With more than one colon outside brackets, http
+/// and https take the port from the first (the `urlstrictcolons`
+/// default) and every other scheme from the last.
 fn go_parse_host(scheme: &str, host: &str) -> Option<Vec<u8>> {
     match host.rfind('[') {
         Some(open) if open > 0 => None,
@@ -9727,9 +9729,10 @@ mod tests {
     }
 
     /// Go's `pem.Decode` over the malformed shapes a client CA file or
-    /// rpc.cert can hold, with the blocks Go 1.27 returns for each
-    /// (review finding GAP06#3): each entry is the input and the
-    /// `type|has headers|hex bytes` of every block decoded in turn.
+    /// rpc.cert can hold, with the blocks Go 1.27 returns for each, as
+    /// go1.26.2, the reference Go, returns them too (review finding
+    /// GAP06#3): each entry is the input and, for every block decoded in
+    /// turn, its `type|has headers|hex bytes`.
     #[test]
     fn go_pem_decode_matches_go() {
         let good = "-----BEGIN CERTIFICATE-----\nAQID\n-----END CERTIFICATE-----\n";
@@ -9829,9 +9832,10 @@ mod tests {
 
     /// cryptobyte's UTCTime and GeneralizedTime readers, as Go's
     /// certificate parser reads the validity window.  Every row is Go
-    /// 1.27's `ParseCertificate` over a certificate with that notAfter:
-    /// a fraction of a second is refused in either form, and a zone
-    /// hour of 24 is accepted.
+    /// 1.27's `ParseCertificate` over a certificate with that notAfter,
+    /// whose time readers 1.26.2, the reference Go, shares: a fraction of
+    /// a second is refused in either form, and a zone hour of 24 is
+    /// accepted.
     #[test]
     fn asn1_times_parse_as_go_reads_them() {
         let cases: [(u8, &str, Option<i64>); 21] = [
@@ -10021,9 +10025,9 @@ mod tests {
             );
         }
 
-        // The basic constraints' path length, read as Go 1.27 reads it:
-        // absent is no constraint, and a negative or non-minimal integer
-        // fails the parse.
+        // The basic constraints' path length, read as Go reads it (the
+        // same in 1.26.2 and 1.27.1): absent is no constraint, and a
+        // negative or non-minimal integer fails the parse.
         const BASIC_CONSTRAINTS: &[u8] = &[0x55, 0x1d, 0x13];
         let constraints = |content: &[u8]| {
             CertFacts::parse(&der_certificate(
@@ -10064,7 +10068,8 @@ mod tests {
         }
 
         // What Go's parser refuses outright, so that the client CA file
-        // skips it, each checked against Go 1.27's `ParseCertificate`: a
+        // skips it, each checked against Go 1.27's `ParseCertificate`,
+        // whose code for these 1.26.2, the reference Go, shares: a
         // fractional validity time, a key identifier or authority
         // information access marked critical, an extension twice, a
         // critical flag or cA boolean that is not a DER BOOLEAN, and an
@@ -11415,19 +11420,20 @@ mod tests {
     }
 
     /// Go's chain search is replayed before webpki's, and its budget of
-    /// 100 signature checks charges every candidate it considers
-    /// (Go 1.27's `buildChains`): certificates named as the leaf's issuer
-    /// that lead to no root cost Go a check each and webpki none, so 98 of
-    /// them sent ahead of the real intermediate leave room for the chain,
-    /// the intermediate's check being the 99th and the root's the 100th,
-    /// and 99 do not, where webpki alone accepted both.  The candidates
-    /// go in Go's order: those whose subject key identifier matches the
-    /// child's authority key identifier first, then those where only one
-    /// of the two is present, then the rest; so the same flood is no
-    /// obstacle to an intermediate whose identifier matches and the
-    /// whole obstacle to one that comes after the matching decoys.  Each
-    /// verdict is Go 1.27's, and Go's own where the oracle runs 1.26 or
-    /// later.
+    /// 100 signature checks charges every candidate it considers (Go's
+    /// `buildChains`, the same in 1.26.2 and 1.27.1): certificates named
+    /// as the leaf's issuer that lead to no root cost Go a check each and
+    /// webpki none, so 98 of them sent ahead of the real intermediate
+    /// leave room for the chain, the intermediate's check being the 99th
+    /// and the root's the 100th, and 99 do not, where webpki alone
+    /// accepted both.  The candidates go in Go's order: those whose
+    /// subject key identifier matches the child's authority key
+    /// identifier first, then those where only one of the two is present,
+    /// then the rest; so the same flood is no obstacle to an intermediate
+    /// whose identifier matches and the whole obstacle to one that comes
+    /// after the matching decoys.  Each verdict is the reference Go's,
+    /// 1.26.2's, as it is 1.27's, and is compared with the oracle's Go,
+    /// of whatever release, where it runs.
     #[test]
     fn gos_signature_budget_charges_every_candidate() {
         use dcroxide_certgen::gentool::generate_key;
@@ -11565,8 +11571,9 @@ mod tests {
         }
     }
 
-    /// More of how Go's candidate order and checks shape its budget,
-    /// each verdict Go 1.27's and, where the oracle runs, Go's own:
+    /// More of how Go's candidate order and checks shape its budget, each
+    /// verdict the reference Go's, 1.26.2's, as it is 1.27's, and, where
+    /// the oracle runs, Go's own:
     /// - the one-identifier group goes before the mismatched one, and two
     ///   absent identifiers count as matching, so 99 decoys behind
     ///   either do not keep the chain from its first two checks;
@@ -11712,7 +11719,8 @@ mod tests {
             false,
         );
 
-        // Decoys under X25519, a key algorithm Go 1.27 leaves without a key.
+        // Decoys under X25519, a key algorithm Go leaves without a key,
+        // in 1.26.2 as in 1.27.
         let x25519 = |i: u8| {
             der_tlv(
                 0x30,
@@ -11825,14 +11833,15 @@ mod tests {
     }
 
     /// A candidate Go's `alreadyInChain` passes over still costs a
-    /// signature check (Go 1.26 on; 1.24 counted it only after).  The
-    /// leaf's issuer `a` and a `b` sign each other, and a second `a`
-    /// under the same key leads to the root.  Go goes into the first `a`,
-    /// then `b`, where both `a`s are already on the chain, then back to
-    /// the decoys and the second `a`: with `d` decoys named `a` sent
-    /// between `b` and the second `a`, the chain costs 6 + 2d checks, so
-    /// 47 leave room and 48 do not, where 1.24's count would have
-    /// allowed 48 and webpki alone accepted both.
+    /// signature check (go1.26.2, the reference, and 1.27; go1.24.13,
+    /// go1.25.4 and go1.26.0 counted it only after).  The leaf's issuer
+    /// `a` and a `b` sign each other, and a second `a` under the same key
+    /// leads to the root.  Go goes into the first `a`, then `b`, where
+    /// both `a`s are already on the chain, then back to the decoys and
+    /// the second `a`: with `d` decoys named `a` sent between `b` and the
+    /// second `a`, the chain costs 6 + 2d checks, so 47 leave room and 48
+    /// do not, where 1.24's count would have allowed 48 and webpki alone
+    /// accepted both.
     #[test]
     fn a_candidate_already_on_the_chain_costs_a_check() {
         use dcroxide_certgen::gentool::generate_key;
@@ -13319,10 +13328,13 @@ mod tests {
     /// `tests/data/muxroute.tsv` was generated by driving raw request
     /// lines at a stock `http.Server` carrying dcrd's two registrations
     /// and recording what came back -- handler, redirect target, or
-    /// refusal.  It is 4,016 targets built by combining separators,
-    /// dot segments, encoded separators and dots, non-ASCII bytes, and
-    /// the characters that force a path to be re-escaped, which is the
-    /// combination the escaped-path rule turns on.
+    /// refusal.  It is 3,836 targets built by combining separators, dot
+    /// segments, encoded separators and dots, non-ASCII bytes, and the
+    /// characters that force a path to be re-escaped, which is the
+    /// combination the escaped-path rule turns on.  The server was Go
+    /// 1.27's; against go1.26.2, the reference Go, 1,634 of the rows, all
+    /// redirects, come out differently, its redirect escaping the cleaned
+    /// path again (PARITY.md's RPC mux row).
     ///
     /// This is the only check that covers the request-target parser
     /// itself rather than the routing decision on top of it.
@@ -14836,12 +14848,14 @@ mod tests {
         }
     }
 
-    /// The chunked decoder refuses what Go's refuses, with Go's text,
-    /// and accepts what it accepts.  Every row is a real server's
-    /// answer: Go 1.27's `net/http` behind dcrd's handler shape, which
-    /// answers a failed read `400 error reading JSON message: <err>`.
-    /// The decoder took a bare-LF size line, trimmed any whitespace, and
-    /// parsed the size with `from_str_radix`, which takes a `+`.
+    /// The chunked decoder refuses what Go's refuses, with Go's text, and
+    /// accepts what it accepts.  Every row is a real server's answer: Go
+    /// 1.27's `net/http` behind dcrd's handler shape, which answers a
+    /// failed read `400 error reading JSON message: <err>`.  Against
+    /// go1.26.2, the reference Go, every row agrees but four, whose
+    /// malformed MIME header line it writes unquoted.  The decoder took a
+    /// bare-LF size line, trimmed any whitespace, and parsed the size
+    /// with `from_str_radix`, which takes a `+`.
     #[test]
     fn chunked_framing_follows_gos_reader() {
         let ok = |body: &[u8]| Ok(body.to_vec());
@@ -15364,12 +15378,13 @@ mod tests {
         assert!(matches!(route(&head), Route::Asterisk));
     }
 
-    /// Request targets through `url.ParseRequestURI` and the mux, and
-    /// the host an absolute-form or CONNECT target names, each row a
-    /// real server's answer (Go 1.27, dcrd's two patterns, the handler
-    /// echoing `URL.Host`).  The port had no control-byte check, found
-    /// a scheme by searching for `://` and never validated the
-    /// authority, and read every CONNECT target as a bare authority.
+    /// Request targets through `url.ParseRequestURI` and the mux, and the
+    /// host an absolute-form or CONNECT target names, each row a real
+    /// server's answer (Go 1.27, as go1.26.2, the reference Go, answers
+    /// each too; dcrd's two patterns, the handler echoing `URL.Host`).
+    /// The port had no control-byte check, found a scheme by searching
+    /// for `://` and never validated the authority, and read every
+    /// CONNECT target as a bare authority.
     #[test]
     fn request_targets_parse_as_gos_request_uri() {
         let cases: &[(&str, &str, &str, &str)] = &[

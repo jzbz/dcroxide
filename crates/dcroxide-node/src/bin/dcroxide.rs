@@ -2650,7 +2650,7 @@ fn rpc_config(
         chain_params: params.clone(),
         subsidy_cache: std::sync::Mutex::new(dcroxide_standalone::SubsidyCache::new(params)),
         min_relay_tx_fee: cfg.min_relay_tx_fee_atoms,
-        max_protocol_version: dcroxide_wire::PROTOCOL_VERSION,
+        max_protocol_version: dcroxide_node::server::MAX_PROTOCOL_VERSION,
         // The mixing pool behind sendrawmixmessage (dcrd's
         // `AcceptMixMessage` adaptor over `s.mixMsgPool`).
         sync_mgr: Box::new(

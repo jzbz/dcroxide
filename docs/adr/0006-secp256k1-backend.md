@@ -1,7 +1,13 @@
 # ADR-0006 — D3: secp256k1 backend split
 
-- **Status:** Proposed (draft for decision D3)
-- **Date:** 2026-07-03 (proposed), 2026-07-26 (addendum: the split held)
+- **Status:** Proposed (draft for decision D3) — on 2026-10-26 the project
+  owner decided that ECDSA and secp256k1 key handling move to `k256` under
+  ADR-0012 and that Ed25519 stays on `curve25519-dalek`; a new ADR is to
+  supersede this one after the port, its differential soak and its speed
+  measurement; see the 2026-10-26 addendum
+- **Date:** 2026-07-03 (proposed), 2026-07-26 (addendum: the split held),
+  2026-10-26 (addendum: ECDSA and key handling to move to `k256`; a superseding
+  ADR pending)
 
 ## Context
 
@@ -81,3 +87,295 @@ verification forms, oracle rows for all eight small-order points and their
 (`ed25519_random_torsion_keys_verify_as_agl_does`). Extending the fuzz target
 waits on a decision to add those two dependencies to `fuzz/Cargo.toml`.
 Ratifying D3 remains the project owner's call.
+
+## Addendum, 2026-10-26 — ECDSA to move to `k256`; a superseding ADR pending
+
+On 2026-10-26 the project owner decided D3, and the split this ADR proposed is
+not to be ratified. Under [ADR-0012](0012-pure-rust.md)'s rule that what ships,
+and what `cargo test` builds, is Rust, ECDSA (type 0) and secp256k1 key
+handling are to move from the `secp256k1` bindings to `k256`, which already
+carries EC-Schnorr-DCRv0 (type 2): key parsing, verification, signing and
+compact recovery all go. Ed25519 (type 1) stays on `curve25519-dalek`, which is
+Rust already. The bindings' `secp256k1-sys`, ~67k lines of vendored C
+([dependency-ledger.md](../dependency-ledger.md)), is the one crate in
+`dcroxide-dcrec`'s build that compiles C, the only crate under which
+`cargo tree -p dcroxide-dcrec -i cc` finds `cc`, and it leaves with them.
+`ring`, the TLS provider, compiles C as well; its replacement, a separate part
+of the same rule, is [ADR-0015](0015-tls-crypto-provider.md)'s. Most of dcrd's
+acceptance rules sit in dcroxide's own layer in front of the arithmetic, where
+this ADR put them, and stay there. Two checks are libsecp256k1's today and are
+to move to `k256` with the rest: that a parsed key is on the curve, or
+decompresses, and that a compact signature's r and s are in range. The move is
+meant to change no verdict, and the soak below is what has to show that.
+
+The same day the project owner accepted the recommended answers to twelve
+questions that a plan for the port, made by reading dcrd's code against
+`k256`'s, had left open. Each is recorded below where it applies. Line numbers
+in dcrd's code below are in its `dcrec/secp256k1` module at the parity pin,
+`3360ae4d`, as the oracle pins it.
+
+**What the tree holds today.** The decision is not built: the code is still the
+split the 2026-07-26 addendum describes, with two facts that addendum did not
+record.
+
+- **`k256` already signs some ECDSA.** Since `9857639` (2026-09-24),
+  `ecdsa::sign` hands a hash at or above the group order N to
+  `sign_rfc6979_unreduced_hash`, a port of dcrd's `signRFC6979` on `k256`
+  (`crates/dcroxide-dcrec/src/secp256k1/ecdsa.rs`), because libsecp256k1
+  reduces the hash mod N before it derives its RFC6979 nonce and dcrd's
+  `NonceRFC6979` takes the hash as it is. Below N, libsecp256k1 still signs.
+  PARITY.md's `dcrec/secp256k1` row records this, and the text above does not.
+  It is signing only, and changes nothing dcroxide accepts.
+- **libsecp256k1 holds every secp256k1 key.** `PublicKey` and `PrivateKey`
+  (`crates/dcroxide-dcrec/src/secp256k1.rs`) wrap the bindings' key types, and
+  `PublicKey::parse` hands each key, Schnorr keys included, to
+  `libsecp256k1::PublicKey::from_slice` once dcroxide's own format checks pass.
+  Schnorr verification gets the point into `k256` by serializing it
+  uncompressed and parsing it again (`as_k256_point`). Compact recovery,
+  `recover_compact`, runs on libsecp256k1 too; its one caller is the
+  `verifymessage` RPC (`crates/dcroxide-rpc/src/handlers.rs`), not a consensus
+  path.
+
+**The gate was not met, and its timing has lapsed.** This ADR wanted all three
+verify paths differential-fuzzed to high volume "before the chain engine
+consumes them". The chain engine has called all three since it was built, and
+the soak was never run. What exists is what the 2026-07-26 addendum lists:
+oracle batteries of fixed iteration counts, seeded afresh on each run unless
+`DCROXIDE_TEST_SEED` is set, with no running total kept, and dcrec fuzz targets
+that check dcroxide only against itself. Two syncs with `--assumevalid=0`, on
+2026-10-19 and 2026-10-24, validated every block of mainnet's chain to
+1,116,035 in full (README.md), so the builds synced accepted every signature in
+that history; what dcroxide rejects rests on the batteries, as README.md says.
+Two input classes the random batteries did not generate were found outside
+them:
+
+- torsion-carrying Ed25519 keys, a consensus divergence live from `5bf83a6`
+  (2026-07-04) until `e57120d` (2026-08-19) and found by the 2026-08 security
+  review. The fix's commit message calls the differential "blind to this by
+  construction", since every key it drew was torsion-free; oracle rows for the
+  class landed in `9b343c4` (2026-09-23);
+- ECDSA signing of a hash at or above N, fixed in `9857639`: a valid signature
+  that differed from dcrd's, which the header of
+  `crates/dcroxide-dcrec/tests/review_ecdsa_sign_unreduced.rs` says the
+  random-hash differential never saw, at odds of about 2^-128.
+
+Inference: more runs over the same input shapes would have found neither;
+naming the classes would have. The oracle has gaps the 2026-07-26 addendum did
+not list: it has no command for compact signing or recovery, and its
+`ecdsa_verify` takes 33-byte keys only (`tools/oracle/main.go`).
+
+**What the port has to keep.** The reading behind the plan found three things
+this ADR and its first addendum do not say.
+
+- **Verification accepts any S.** dcrd's `Signature.Verify` refuses only an r
+  or s of zero (`ecdsa/signature.go:229-231`), and `Signature::verify` reaches
+  the same verdict by negating a high S before libsecp256k1 sees it. Refusing a
+  high S in verification would not split the chain: `OP_CHECKSIG` and
+  `OP_CHECKMULTISIG` refuse an S above half the group order before they verify
+  (`check_signature_encoding`,
+  `crates/dcroxide-txscript/src/consensus.rs:224-242`, called at
+  `opcodes.rs:1567` and `:1769`). It would change what `Signature::verify`
+  answers its other callers, dcrec's public API and `merge_multi_sig` in
+  txscript's `sign.rs` (`:451-473`) among them. So dcrd's rule is kept, and the
+  port does not verify with `k256`'s ECDSA verifier from `ecdsa` 0.17, which
+  refuses a high S because `k256` sets `NORMALIZE_S` (`k256` 0.14.0
+  `src/ecdsa.rs:104-106`, `ecdsa` 0.17.0 `src/hazmat.rs:142-144`); it follows
+  dcrd's algorithm instead.
+- **Three branches an attacker can reach in consensus.** A script can take its
+  public key from the spending input's signature script, which the signature
+  hash does not commit to: it commits to the script of the input being signed
+  and to empty scripts for the others
+  (`crates/dcroxide-txscript/src/sighash.rs:294-319`). A pay-to-script-hash
+  redeem script that is only `OP_CHECKSIG` is one such script. Whoever spends
+  such an output knows the hash before choosing the key, and can solve for a
+  key that sends verification down a branch an honest signature reaches with
+  negligible odds:
+  - dcrd's r + N branch, which accepts a signature whose sum has the x
+    coordinate r + N, below the field prime (`ecdsa/signature.go:281-293`). A
+    verifier that compares that x with r as bytes, or skips the branch, refuses
+    a block dcrd accepts, and the chain splits;
+  - a sum at the point at infinity, which dcrd refuses (`:260-265`);
+  - point doubling: dcrd's addition doubles when its two points are equal
+    (`curve.go:229-234`, `:459-464`), in ECDSA's u1·G + u2·Q
+    (`ecdsa/signature.go:254-258`) and in Schnorr's s·G + e·Q
+    (`schnorr/signature.go:196-198`). `k256`'s complete formulas handle it
+    today; addition formulas that are not complete, the kind speed work might
+    bring in, would not.
+
+  libsecp256k1 takes the r + N branch too, so these classes pin behaviour the
+  port must keep. Syncing mainnet is no evidence for any of them. Each is to
+  get a constructed input class in the soak, a witness vector that dcrd's code
+  generates and that is committed so that it runs without Go, and a canary, a
+  deliberately broken implementation that the class must catch.
+- **Untrusted key bytes go only through dcroxide's own checks.** `k256`'s SEC1
+  decoding refuses hybrid keys, which dcrd accepts, and accepts a 33-byte
+  compact form tagged 0x05, which dcrd refuses, and its point decoder accepts
+  the one-byte identity as well (`sec1` 0.8.1 `src/point.rs:527-535`; `k256`
+  0.14.0 `src/arithmetic/affine.rs:328-336`). So no key bytes from a script or
+  an RPC request reach `from_sec1_bytes`: the length, format byte, coordinate
+  range and hybrid parity checks of `PublicKey::parse` run first, as they do
+  today, and `k256` then checks the point, or decompresses it, from its
+  coordinates, so that dcrd's error kinds do not collapse into one.
+
+**The soak, re-specified.** The gate on the port is oracle-backed differential
+fuzzing of all three signature types: fuzz targets that hand each input to
+dcroxide and, through `tools/oracle`, to dcrd's own code, and compare verdicts,
+the keys and signatures produced, and error kinds where dcrd exposes them.
+libFuzzer and the Go oracle are test tooling that never ships, the two
+exceptions ADR-0012 names. dcrd's code is the only reference: the fuzz crate
+gets no libsecp256k1 of its own. The targets aim at named input classes, not at
+volume alone:
+
+- **Ed25519 torsion keys:** the eight small-order points and `a*B + T`
+  composites, at every residue of k mod 8, through key parsing and
+  verification. Building them in a fuzz target needs `curve25519-dalek` and
+  `sha2` in `fuzz/Cargo.toml`, as the 2026-07-26 addendum says, so the soak
+  takes the decision that addendum left waiting; `fuzz/Cargo.lock` already
+  resolves both at the versions `dcroxide-dcrec` uses.
+- **Hashes at or above N,** for ECDSA signing, verification and recovery, built
+  rather than drawn, since a random digest lands there with odds of about
+  2^-128.
+- **Key encodings:** compressed, uncompressed and hybrid secp256k1 keys, valid
+  and malformed (a coordinate at or above the field prime, a point off the
+  curve, an x with no point on it, a hybrid prefix whose parity does not match
+  y), through key parsing, the Schnorr key parse among it, and through ECDSA
+  verification.
+- **The three branches above:** the r + N branch, accepting and refusing, a sum
+  at infinity and a doubled sum in ECDSA verification, a doubled sum in Schnorr
+  verification, and the same cases in compact recovery, whose r, s and header
+  byte a `verifymessage` caller supplies.
+- **High-S** ECDSA signatures, which dcrd verifies and which
+  `Signature::verify` today normalizes before libsecp256k1 sees them: a class
+  for dcrec's API and the multisig merge, since scripts refuse them first.
+- **Recovery codes:** compact recovery over every header byte, the eight valid
+  ones from 27 to 34 and those outside them, with r and s at the edges of their
+  range.
+
+dcrd's fixed vectors that dcrec does not port yet are to join its tests, which
+run without Go: the ECDSA `TestSignAndVerify`, `TestVerifyFailures`,
+`TestSignAndRecoverCompact` and `TestRecoverCompactErrors`
+(`ecdsa/signature_test.go`), and the Ed25519 `TestGolden` of dcrd's
+`dcrec/edwards`. Its 784,207-byte fixture, `testdata/sign.input.gz`, a
+selection of the test cases in the Ed25519 reference's `sign.input` as dcrd's
+test says, is to be committed gzipped, as dcrd keeps it, with where it came
+from recorded in the dependency ledger.
+
+**Volume, baseline and order.** The project owner accepted these floors: 10^7
+cases for each parse and verification class, 10^6 for each signing, recovery
+and constructed class, and every case of a class that has finitely many, such
+as the 256 header bytes of compact recovery; the gate soak runs for one to
+three hours. The tooling lands first and runs against libsecp256k1, before any
+commit of the port, as a baseline: a divergence there is a parity bug in
+today's code, to be fixed before the port. The gate soak then runs on the
+ported code. If the parity pin moves while D3 is under way, the gate soak runs
+against the pin current when it runs, and records it. The baseline soak and the
+gate soak each start only on the project owner's word. A result records the
+inputs each target ran, by class where the target can count them, the commit,
+the pin, the seeds or corpus, the canaries caught, and every divergence, each
+of which is a stop-ship bug whose minimized input becomes a permanent
+regression test (the project brief's §7, Layer 4). The existing batteries keep
+running in CI.
+
+The project owner's decision asks for the signature code to be checked against
+dcrd's before it is trusted. This record reads that as the gate soak passing on
+the ported code before the port merges.
+
+**The speed measurement.** Signature checks are a large share of full
+validation: in the one profile the bench ledger records over fully validated
+blocks, secp256k1 took about 38% of the user-space cycles on all threads and
+BLAKE-256 compression 48.4% (docs/bench-ledger.md, "Five changes on the
+block-processing thread (2026-10-11)"). That profile is of `74168e8`, a build
+from before BLAKE-256's rounds were written out (`5590b07`) and before
+signatures were pre-verified ahead of the block thread (ADR-0005's second
+addendum of 2026-10-17), and it does not separate libsecp256k1 from `k256`.
+`k256`'s ECDSA speed has not been measured here. Two measurements are to be
+made, each timed run on the project owner's word:
+
+- a microbenchmark of the two verifiers, outside the workspace, which can run
+  before the port and shows early whether stage 2 (below) will be needed.
+  `k256`'s `precomputed-tables` feature, off since the Schnorr code reads no
+  basepoint table (the dependency ledger's `k256` row), is tried there as one
+  arm. Its table serves only `mul_by_generator` and `mul_by_generator_vartime`,
+  not the combined pass (`mul_by_generator_and_mul_add_vartime`) that dcrd's
+  algorithm calls for (`k256` 0.14.0 `src/arithmetic/mul.rs:180-232`,
+  `:303-310`), so it is expected to buy verification nothing (inference).
+  Without `std` or `critical-section` the table does not build (`primeorder`
+  0.14.0 `src/tables/basepoint.rs:5-6`), and `dcroxide-dcrec`'s no_std check
+  builds with neither. The feature stays off unless the arm shows a gain;
+- syncs that validate in full, with `--assumevalid=0`, of the build before the
+  port and the build with it, interleaved on one machine in one session, since
+  the bench ledger reads seconds only against a baseline run in the same
+  session; and default syncs of both builds, which check no script before the
+  assume-valid block (docs/operating.md) and so show the change only after it.
+
+**The bar.** The project owner set it in two parts on 2026-10-26: the port
+merges only if the slowdown is small or optimized away, and speed work beyond
+the port (stage 2) is done if full validation is more than 10% slower, or if
+the default sync moves beyond the run-to-run noise of one session. This record
+reads the two together as the bar the port has to clear to merge: syncs with
+`--assumevalid=0` that take no more than 10% longer with the port than without
+it, and default syncs that do not move beyond the run-to-run noise of the
+session that measures them. A port outside the bar gets stage 2 first, and a
+slowdown that stage 2 cannot bring inside the bar goes back to the project
+owner, whose call it then is; that, too, is this record's reading. The
+superseding ADR waits for the full-validation comparison.
+
+**Stage 2.** The first route is static tables inside `dcroxide-dcrec`, built on
+the public `wnaf` crate, which `k256` already brings into the build. An
+estimate, not a measurement, puts what that wins back at about 10%: `k256`'s
+field type is not public (`src/lib.rs:38`, `:58`), so its additions stay its
+own complete projective ones. A change to `k256` itself would be a pull request
+to another project, and is made only on the project owner's word. Either way,
+the doubling and infinity witnesses above guard the result. A `k256`-only
+signature benchmark is to be added to `dcroxide-bench` as well, and kept, to
+catch later slowdowns. The escape hatch in the Consequences above, moving
+Schnorr onto the bindings, closes with this decision.
+
+**What is pending, and what gates the superseding ADR.** None of the work is in
+the tree as of this addendum. In order:
+
+1. The differential tooling, which depends on none of the TLS work and can
+   start first: the oracle commands the soak lacks (verification taking a key
+   in any of dcrd's formats, compact signing, and compact recovery returning
+   dcrd's error kinds), the soak's targets and classes with their witness
+   vectors and canaries, and dcrd's fixed vectors above, run against
+   libsecp256k1 for the baseline soak.
+2. The port, in five steps: verification on `k256`, by dcrd's algorithm;
+   signing of every hash on `k256`; `PublicKey` and `PrivateKey` on `k256`,
+   with the curve check and decompression that `PublicKey::parse` leaves to
+   libsecp256k1 today; `recover_compact` on `k256`, with the `secp256k1`
+   dependency, and `secp256k1-sys` with it, removed; and the text that names
+   the backend. Within them:
+   - dcrd's `SignCompact` (`ecdsa/signature.go:771-786`), about 40 lines,
+     ported as a public function, so that the oracle can check the recovery
+     code byte for byte;
+   - `recover_compact` reporting dcrd's error kinds, checked in dcrd's order,
+     as new variants of the `ecdsa::Error` that DER parsing returns, since
+     dcrd's ECDSA package has one error type for both; four of
+     `RecoverCompact`'s eight kinds are DER's already (`:858-990`);
+   - the temporary copies of a private key that signing makes zeroed, as dcrd
+     zeroes its own (`:700-713`), with `zeroize` as a direct dependency. It is
+     pure Rust and already in `dcroxide-dcrec`'s build under `k256` and
+     `curve25519-dalek`; its wipe barrier, an empty `asm!` (`zeroize` 1.9.0
+     `src/barrier.rs:69`), is one of the inline-assembly barriers ADR-0012
+     allows, each named in the dependency ledger;
+   - the crate's `std` feature, which today selects only libsecp256k1's
+     per-thread context and which no dependent names, removed, with the second
+     `dcroxide-dcrec` test run in CI that exists for it, and the no_std job's
+     notes on `secp256k1-sys` rewritten;
+   - the `k256`-only benchmark in `dcroxide-bench`;
+   - the crate docs and manifest, the dependency ledger, PARITY.md's `dcrec`
+     rows, the brief's §8 "As built" paragraph and README.md's `dcroxide-dcrec`
+     entry brought in line.
+3. The gate soak on the ported code, to its floors, with every divergence it
+   finds fixed; and the speed measurement, with stage 2 if the bar calls for
+   it.
+
+The port merges once the gate soak has passed on it and it is inside the bar
+(this record's readings, above). A new ADR, which takes the next free number
+when it is written, then records the soak, the measurement and the pin the gate
+soak ran against, and supersedes this one, whose status then names it. Until
+then this ADR and its addenda describe the code in the tree. The soak passing
+is also one of the conditions the project owner set the same day for publishing
+any binary (D7, [ADR-0014](0014-release-engineering.md)), and its sign-off
+falls under the project brief's §7 gates as amended that day.

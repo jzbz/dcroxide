@@ -23,6 +23,13 @@ env:
   # (`cfg(target_os = "linux")`), so this has no effect on the macOS and
   # Windows matrix entries.
   DCROXIDE_REQUIRE_FAULT_INJECTION: "1"
+  # The reference Go: the release dcrd's contrib/docker/Dockerfile builds
+  # the parity pin with, to the patch (ADR-0001's 2026-10-26 addendum on
+  # the reference Go).
+  # Every setup-go step below takes it from here, so the oracle, the tool
+  # modules and the interop daemon are built with one toolchain, and a pin
+  # bump that moves the Dockerfile's release moves this line.
+  GO_VERSION: "1.26.2"
 
 jobs:
   lint:
@@ -74,7 +81,7 @@ jobs:
       - run: rustup toolchain install
       - uses: actions/setup-go@v7
         with:
-          go-version: "1.24"
+          go-version: ${{ env.GO_VERSION }}
           cache-dependency-path: tools/oracle/go.sum
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace
@@ -100,7 +107,7 @@ jobs:
       - run: rustup toolchain install
       - uses: actions/setup-go@v7
         with:
-          go-version: "1.24"
+          go-version: ${{ env.GO_VERSION }}
           cache-dependency-path: tools/oracle/go.sum
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace
@@ -127,9 +134,6 @@ jobs:
     # it per OS, and a per-OS matrix would triple the dcrd build for coverage
     # the unit suites already give on those platforms.
     env:
-      # dcrd at the parity pin requires Go 1.25; the oracle job pins 1.24.
-      # These are separate toolchains on purpose — the oracle's version is
-      # chosen for the module graph it links, not for building the daemon.
       # The same commit as DCRD_PARITY_COMMIT in dcroxide-testutil, which
       # refuses any other stamped revision; its unit tests fail when the
       # two drift apart.
@@ -139,15 +143,24 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - run: rustup toolchain install
+      # dcrd is built with GO_VERSION, the reference Go, rather than an
+      # older Go its `go 1.25.0` line also admits: its debug.go sets
+      # `//go:debug default=go1.26` behind `//go:build go1.26`, so a 1.25
+      # build has neither those settings nor Go 1.26's two added hybrid TLS
+      # key exchanges. The build flags stay `go build`'s defaults, not the
+      # release image's (ADR-0001's 2026-10-26 addendum on the reference
+      # Go).
       - uses: actions/setup-go@v7
         with:
-          go-version: "1.25"
+          go-version: ${{ env.GO_VERSION }}
       - name: Cache the dcrd binary
         id: dcrd-cache
         uses: actions/cache@v6
         with:
           path: ~/dcrd-bin
-          key: dcrd-${{ env.DCRD_COMMIT }}-${{ runner.os }}
+          # The Go release is part of the key: a binary built with another
+          # one is a different daemon.
+          key: dcrd-${{ env.DCRD_COMMIT }}-go${{ env.GO_VERSION }}-${{ runner.os }}
       # Built from a clone at the pinned commit, never a release download: a
       # release is a different specification. The clone (rather than a
       # worktree) is what lets Go stamp the VCS revision into --version,
@@ -174,8 +187,9 @@ jobs:
     # tools/pinbump's main_test.go, which pins the bump review list
     # keeping upstream `_test.go` changes and both sides of a move, ran
     # only when someone ran it by hand, and a stale tool surfaced only
-    # at the next manual regeneration. fullblockgen is left out: its
-    # go.mod asks for a newer Go than the oracle's toolchain here.
+    # at the next manual regeneration. fullblockgen is left out until its
+    # go.mod's `go 1.27.0`, newer than GO_VERSION, comes down (ADR-0001's
+    # 2026-10-26 addendum on the reference Go).
     # chainopsgen, disapprovalgen, mempoolvectors, mixpoolgen,
     # profilergen and utxoviewgen are not modules but overlays that
     # compile only inside a dcrd checkout's packages, so they are left
@@ -184,7 +198,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
         with:
-          go-version: "1.24"
+          go-version: ${{ env.GO_VERSION }}
           cache-dependency-path: tools/oracle/go.sum
       - name: Vet and test the tool modules
         run: |

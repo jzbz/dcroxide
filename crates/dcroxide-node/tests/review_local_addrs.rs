@@ -108,4 +108,13 @@ fn external_ips_are_listed_as_local_addresses() {
         response.contains(r#""localaddresses":[{"address":"1.2.3.4","port":18555,"score":0}]"#),
         "{response}"
     );
+    // The daemon reports its server's maximum protocol version, as dcrd
+    // reports `maxProtocolVersion`.
+    assert!(
+        response.contains(&format!(
+            r#""protocolversion":{}"#,
+            dcroxide_node::server::MAX_PROTOCOL_VERSION
+        )),
+        "{response}"
+    );
 }

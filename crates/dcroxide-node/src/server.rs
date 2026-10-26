@@ -94,10 +94,10 @@ pub fn netsync_max_outbound_peers(max_peers: i64) -> u64 {
 const GO_MAX_ALLOC: i64 = 1 << 48;
 
 /// `unsafe.Sizeof(hchan{})` rounded to `maxAlign` (`runtime/chan.go`).
-/// Measured as 104 under go1.27.  The limit below is the same integer
-/// for any value in `[104, 136]`, which spans the plausible range and
-/// covers both toolchains CI pins (`ci.yml:74` 1.24, `:106` 1.25), so
-/// the constant does not track the Go release.
+/// Measured as 104 under go1.27; go1.26.2, the reference Go that CI
+/// runs, declares `hchan`, `waitq` and `mutex` the same.  The limit
+/// below is the same integer for any value in `[104, 136]`, which spans
+/// the plausible range, so the constant does not track the Go release.
 const GO_HCHAN_SIZE: i64 = 104;
 
 /// `unsafe.Sizeof(relayMsg{})`, measured in the pin; `broadcastMsg` is
@@ -770,6 +770,15 @@ pub fn natf_supported(pver: u32) -> fn(NetAddressType) -> bool {
     }
     is_supported_net_address_type_v2
 }
+
+/// The highest protocol version the server supports (dcrd
+/// `maxProtocolVersion`, `server.go:79-80`): the version every peer is
+/// offered (`server.go:2264`) and the one `getinfo` and `getnetworkinfo`
+/// report (`server.go:4372`).  It is the server's own choice, kept apart
+/// from wire's latest version and the peer package's default, as dcrd
+/// keeps them: in dcrd 2.1.7 the wire module's `ProtocolVersion` was
+/// already 12 while the server stayed at 11.
+pub const MAX_PROTOCOL_VERSION: u32 = dcroxide_wire::ADDR_V2_VERSION;
 
 /// The maximum number of known addresses to track per peer (dcrd
 /// `maxKnownAddrsPerPeer`).

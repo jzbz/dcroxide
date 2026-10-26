@@ -1862,10 +1862,10 @@ Default ports are dcrd's, unchanged: mainnet 9108 (P2P) and 9109 (RPC).
 
 ## Running it
 
-Build from source. Binaries are not published, and the release process —
-signing, platform tiers, reproducibility — is an open decision (D7 in
-[the ADR index](adr/README.md)); it is a hard gate before anything ships
-as a binary.
+Build from source. Binaries are not published. The release process —
+signing, platform tiers, reproducibility — is set by
+[ADR-0014](adr/0014-release-engineering.md), which publishes no binary
+until its four conditions hold; none of its machinery is built yet.
 
 ```bash
 cargo build --release
@@ -1873,8 +1873,8 @@ cargo build --release
 
 The release profile is deliberate: one codegen unit, thin LTO, line
 tables kept for profiling, and the `panic = "abort"` discussed above.
-The toolchain is pinned in `rust-toolchain.toml` so artifacts are
-reproducible from the same source.
+The toolchain is pinned in `rust-toolchain.toml`; that alone does not
+make a build reproducible (ADR-0014).
 
 Start it against simnet or testnet rather than mainnet while evaluating:
 

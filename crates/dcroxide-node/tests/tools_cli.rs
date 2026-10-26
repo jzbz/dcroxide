@@ -223,7 +223,8 @@ fn gencerts_authority_issues_a_working_tls_chain() {
     use std::sync::Arc;
 
     // The tests pick the ring provider explicitly (the daemon installs
-    // it at startup).
+    // it only when it builds a TLS RPC listener, in
+    // `build_server_config`).
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     let dir = scratch("gencerts");

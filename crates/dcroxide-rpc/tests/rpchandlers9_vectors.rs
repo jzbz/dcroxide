@@ -475,7 +475,8 @@ fn mining_network_mix_handler_slice_matches_dcrd() {
             chain_params: params.clone(),
             subsidy_cache: std::sync::Mutex::new(SubsidyCache::new(params)),
             min_relay_tx_fee: 10000,
-            max_protocol_version: dcroxide_wire::PROTOCOL_VERSION,
+            // dcrd's server reports `maxProtocolVersion`, AddrV2Version.
+            max_protocol_version: dcroxide_wire::ADDR_V2_VERSION,
             sync_mgr: Box::new(MockSyncMgr9 {
                 accept: err_or(mock[13]),
             }),

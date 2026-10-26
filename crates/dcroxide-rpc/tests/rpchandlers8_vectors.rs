@@ -29,7 +29,7 @@ use dcroxide_rpctypes::chainsvrresults as results;
 use dcroxide_rpctypes::{method, register_all};
 use dcroxide_stake::{MinimalOutput, TxType};
 use dcroxide_standalone::SubsidyCache;
-use dcroxide_wire::{BlockHeader, MsgBlock, PROTOCOL_VERSION};
+use dcroxide_wire::{ADDR_V2_VERSION, BlockHeader, MsgBlock};
 
 const VECTORS: &str = include_str!("data/rpchandlers8_vectors.txt");
 
@@ -382,7 +382,8 @@ fn fee_and_node_info_handler_slice_matches_dcrd() {
             chain_params: params.clone(),
             subsidy_cache: std::sync::Mutex::new(SubsidyCache::new(params.clone())),
             min_relay_tx_fee: 10000,
-            max_protocol_version: PROTOCOL_VERSION,
+            // dcrd's server reports `maxProtocolVersion`, AddrV2Version.
+            max_protocol_version: ADDR_V2_VERSION,
             sync_mgr: Box::new(()),
             conn_mgr: Box::new(MockConnMgr8),
             client_cert_auth: false,

@@ -218,8 +218,9 @@ impl PeerTemplate {
     /// configuration-driven fields from the parsed config: the network,
     /// `IdleTimeout` from `--peeridletimeout`, `DisableRelayTx` from
     /// `--blocksonly` and `Proxy` from `--proxy`.  The services are
-    /// dcrd's `defaultServices`, the protocol version the package
-    /// maximum (dcrd's `maxProtocolVersion`), and the ping interval
+    /// dcrd's `defaultServices`, the protocol version the server's
+    /// maximum, [`crate::server::MAX_PROTOCOL_VERSION`] (dcrd's
+    /// `maxProtocolVersion`), and the ping interval
     /// dcrd's constant, which `--peeridletimeout` does not move.
     ///
     /// Here rather than in the binary so a test can check the wiring:
@@ -232,8 +233,9 @@ impl PeerTemplate {
     ) -> PeerTemplate {
         PeerTemplate {
             net: cfg.params.params.net,
-            // 0 selects the package's maximum protocol version.
-            protocol_version: 0,
+            // The server's maximum, as dcrd's `newPeerConfig` passes
+            // `maxProtocolVersion` (`server.go:2264`).
+            protocol_version: crate::server::MAX_PROTOCOL_VERSION,
             services: ServiceFlag::NODE_NETWORK,
             user_agent_name: user_agent_name.to_string(),
             user_agent_version: crate::version::user_agent_version(),
@@ -1426,6 +1428,10 @@ mod tests {
     fn the_daemon_template_carries_the_config_into_the_version() {
         let mut cfg = crate::config::Config::defaults("/nonexistent/dcroxide-home");
         let defaults = PeerTemplate::from_config(&cfg, "dcroxide", None);
+        assert_eq!(
+            defaults.protocol_version,
+            crate::server::MAX_PROTOCOL_VERSION
+        );
         assert!(!defaults.disable_relay_tx);
         assert_eq!(defaults.proxy, "");
         assert_eq!(defaults.idle_timeout, Duration::from_secs(120));

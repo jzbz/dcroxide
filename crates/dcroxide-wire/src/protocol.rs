@@ -9,9 +9,10 @@ use core::fmt;
 pub const INITIAL_PROTOCOL_VERSION: u32 = 1;
 
 /// The latest protocol version this crate implements (dcrd
-/// `ProtocolVersion` at the dcrd master 2.2 pre-release parity
-/// target): the addrv2 version, negotiated since the strict-verack
-/// handshake and the daemon's addrv2 handlers landed.
+/// `ProtocolVersion`), the addrv2 version.  The version a server offers
+/// its peers and reports over RPC is the server's own choice, which
+/// dcrd keeps in `server.go`'s `maxProtocolVersion`
+/// (`dcroxide_node::server::MAX_PROTOCOL_VERSION`).
 pub const PROTOCOL_VERSION: u32 = 12;
 
 /// The protocol version which adds the `addrv2` message and retires

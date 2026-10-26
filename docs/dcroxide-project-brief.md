@@ -525,7 +525,7 @@ Every task in this project serves one of six compatibility surfaces. They are li
 4. **Memory safety as a feature.** `#![forbid(unsafe_code)]` in all dcroxide crates; `unsafe` allowed only inside vetted third-party dependencies, tracked via `cargo-deny`/`cargo-vet`/`cargo-audit` in CI. This is a headline advantage of the project — protect it. One audited exception exists: `dcroxide-winsvc` denies rather than forbids `unsafe_code`, for the `windows-service` entry macro's shim and for the Windows console control handler and pipe-handle adoption that std does not wrap, each unsafe block allowed individually with a `SAFETY` comment ([ADR-0008](adr/0008-clippy-lint-policy.md)'s 2026-09-25 addendum).
 5. **Consensus code is boring code.** No cleverness in validation paths: explicit integer widths, checked arithmetic mirroring dcrd's `checkedmath`, no floating point anywhere near consensus, deterministic iteration orders, and exhaustive error enums mapped 1:1 to dcrd's error kinds (RPC and reject messages leak error identity — parity matters).
 6. **DoS posture parity.** dcrd's limits (message sizes, orphan pools, ban scores, per-peer rate limits, mixpool limits, APBF sizing) are consensus-adjacent: divergence lets an attacker partition mixed networks. Port limits verbatim; test them.
-7. **Pin, then track.** All parity claims reference one pinned upstream commit — `release-v2.1.5` when this plan was written, now master `3360ae4d`: the target is dcrd v2.2, which upstream has not yet released, and the pin follows master until v2.2 is tagged. A standing "upstream watch" task reviews every dcrd release/merged consensus PR and files parity issues. A `PARITY.md` ledger maps each dcrd package to its dcroxide crate and status.
+7. **Pin, then track.** All parity claims reference one pinned upstream commit — `release-v2.1.5` when this plan was written, now master `3360ae4d`: the target is dcrd v2.2, which upstream has not yet released, and the pin follows master until v2.2 is tagged, then dcrd's release tags ([ADR-0013](adr/0013-upstream-tracking-release-tags.md)). A standing "upstream watch" task reviews every dcrd release/merged consensus PR and files parity issues. ADR-0013 makes the watch the project owner's, with nothing scheduling it; from the v2.2 tag on, each release is reviewed as a pin move, and master's consensus and policy commits are read ahead into dated notes, not ported until a release carries them. A `PARITY.md` ledger maps each dcrd package to its dcroxide crate and status.
 
 ---
 
@@ -715,7 +715,25 @@ Coverage percentage alone is a vanity metric for consensus software; a line can 
 
 **Layer 7 — Performance & robustness.** Criterion benches with regression thresholds; macro benchmarks vs. dcrd on identical hardware; adversarial peer/RPC load tests; crash-consistency (power-cut simulation) on the storage layer; resource-ceiling tests against the published minimum specs (2 GB RAM class hardware).
 
-**Gates:** consensus-tagged crates (`txscript`, `stake`, `standalone`, `blockchain`, `gcs`, `dcrec`, `wire`, `mixing` validation paths) require: 100% of ported vectors passing, differential fuzz soak sign-off, mutation-testing review, and two-reviewer sign-off on every PR. Workspace line coverage is reported and ratcheted (never decreases); a target ≥90% overall is expected to fall out naturally rather than be chased.
+**Gates:** consensus-tagged crates (`txscript`, `stake`, `standalone`,
+`blockchain`, `gcs`, `dcrec`, `wire`, `mixing` validation paths) require: 100%
+of ported vectors passing; differential coverage against dcrd, through
+`tools/oracle` or vectors dumped inside dcrd's own packages, in a CI that fails
+rather than skips when the oracle is missing (`DCROXIDE_REQUIRE_ORACLE`);
+differential fuzz soak sign-off, by the project owner; mutation-testing review;
+and, for every change, an adversarial automated review whose findings are fixed
+or recorded (`PARITY.md`, `SECURITY.md`), and the project owner's signature on
+its commit. The last two replace the two-reviewer sign-off on every PR that
+this plan first asked for, which a project with one maintainer
+([docs/dependency-ledger.md](dependency-ledger.md), "What is deliberately not
+here") cannot meet; the external review of Phase 15 is still to come. Not all
+of this is in place. The soak has not been run for `dcrec`
+([ADR-0006](adr/0006-secp256k1-backend.md)'s 2026-10-26 addendum), none of the
+17 targets under `fuzz/fuzz_targets/` calls the oracle, and `cargo-mutants` is
+not wired up (the Phase 0 item in the list of outstanding work above).
+Workspace line coverage is to be reported and ratcheted (never decreases) once
+`cargo-llvm-cov` is wired up, which it is not yet; a target ≥90% overall is
+expected to fall out naturally rather than be chased.
 
 ---
 
@@ -748,7 +766,7 @@ Not needed by the daemon (avoid scope creep): CBOR/airgap bits of dcr-rs, BIP39,
 There is no async runtime: `tokio` is not in the dependency graph and the daemon
 is OS-threaded throughout. There is no HTTP or websocket framework either —
 `hyper` and `tokio-tungstenite` were not adopted, and the RPC listener speaks
-HTTP/1.1 and RFC 6455 directly over `rustls` (ring provider only, which keeps rustls' default `aws-lc-rs` provider out of the build; `ring` itself is still ~151k lines of C and assembly and `secp256k1-sys` another ~59k, so the workspace's `forbid(unsafe_code)` covers its own crates and not its dependencies). The RPC crates
+HTTP/1.1 and RFC 6455 directly over `rustls` (ring provider only, which keeps rustls' default `aws-lc-rs` provider out of the build; `ring` itself is still ~151k lines of C and assembly and `secp256k1-sys` another ~67k, so the workspace's `forbid(unsafe_code)` covers its own crates and not its dependencies). The RPC crates
 declare no serde dependency at all: dcrd's `dcrjson` is reflection-driven, so
 the port carries a runtime Go type model with `encoding/json` reimplemented over
 it, Go float formatting and all (ADR-0007). `certgen` is a direct port of dcrd's
@@ -777,28 +795,61 @@ pins this policy asks for.
 >   tokio in the dependency graph and the node is OS-threaded throughout,
 >   which is the ADR's own documented fallback. Its addenda record what
 >   shipped and the evidence behind ratification.
-> - **D3** — [ADR-0006](adr/0006-secp256k1-backend.md), still *Proposed*.
->   The split held: libsecp256k1 bindings for ECDSA, `k256` for
->   Schnorr-DCRv0, curve25519-dalek for Ed25519.
-> - **D4** — [ADR-0007](adr/0007-json-emission-strategy.md), still
->   *Proposed*. Both halves were built but neither in the proposed shape: the
->   emission layer uses no serde at all (a runtime Go type model with a
->   reimplementation of `encoding/json` over it), and the regression corpus is
->   dumped from inside dcrd's own packages rather than captured from a running
->   node.
-> - **D5** (upstream tracking cadence) and **D7** (MSRV, platform tiers,
->   release signing and reproducibility) have no ADR. Facts on the ground: the
->   parity pin did move to master `452c1a6c` and on through `29f17894`,
->   `036b7090`, `b9634e01`, `6f6cf21b` and `382ff4dd` to `3360ae4d`; on
->   2026-10-25 the owner made dcrd v2.2 the target and set the cadence until
->   it is released, that the pin moves at upstream milestones and on the
->   owner's word, while D5's question for after v2.2 lands stays open; MSRV is
->   the pinned toolchain itself, 1.98.1, through the workspace `rust-version`,
->   with no separate CI job, and CI tests on Linux, macOS, and Windows.
->   Release signing and reproducible builds are neither decided nor built.
-> - **D6** is partially covered by
->   [ADR-0002](adr/0002-vendor-blake256-from-dcr-rs.md): dcr-rs is
->   vendored at a pinned commit with attribution.
+> - **D3** — [ADR-0006](adr/0006-secp256k1-backend.md), still *Proposed*, and
+>   to be superseded. The split it proposed is what is built: libsecp256k1
+>   bindings for ECDSA and for every secp256k1 key, `k256` for Schnorr-DCRv0
+>   and, since 2026-09-24, for ECDSA signing of a hash at or above the group
+>   order, curve25519-dalek for Ed25519. On 2026-10-26 the project owner
+>   decided that, under [ADR-0012](adr/0012-pure-rust.md)'s pure-Rust rule,
+>   ECDSA and secp256k1 key handling move to `k256`, and that Ed25519 stays on
+>   curve25519-dalek. The port is not in the tree. The owner asked for an
+>   oracle-backed differential fuzz soak of all three signature types, over
+>   named input classes and to floors the owner accepted, and for the port to
+>   merge only if its slowdown is small or optimized away, with further speed
+>   work if full validation is more than 10% slower or a default sync moves
+>   beyond one session's run-to-run noise. ADR-0006's 2026-10-26 addendum
+>   reads these together as the bar to merge: the soak passed on the ported
+>   code, and syncs within those two bounds, after speed work where they are
+>   not. A new ADR then supersedes ADR-0006. None of this has been done.
+> - **D4** — [ADR-0007](adr/0007-json-emission-strategy.md), *Accepted*
+>   (ratified 2026-10-26 as shipped). Both halves were built but neither in
+>   the proposed shape: the emission layer uses no serde at all (a runtime Go
+>   type model with a reimplementation of `encoding/json` over it), and the
+>   regression corpus is dumped from inside dcrd's own packages rather than
+>   captured from a running node. A kept Go float generator is pending, and
+>   ADR-0001's 2026-10-26 addendum on frozen batteries governs rebuilding the
+>   corpus's exporters.
+> - **D5** — [ADR-0013](adr/0013-upstream-tracking-release-tags.md),
+>   *Accepted* 2026-10-26, effective when dcrd tags v2.2.0. The parity pin
+>   moved to master `452c1a6c` and on through `29f17894`, `036b7090`,
+>   `b9634e01`, `6f6cf21b` and `382ff4dd` to `3360ae4d`, and on 2026-10-25
+>   the project owner made dcrd v2.2 the target, the pin following master
+>   until it is tagged, at upstream milestones and on the project owner's
+>   word. From the tag on, the pin follows dcrd's release tags, and master
+>   is read ahead into notes rather than ported; that the tags are those of
+>   the newest release line, on one dcroxide branch, is ADR-0013's reading.
+>   What the first tag move needs is not built yet.
+> - **D6** — closed on 2026-10-26 by the addendum to
+>   [ADR-0002](adr/0002-vendor-blake256-from-dcr-rs.md). BLAKE-256 is the
+>   one import from dcr-rs, taken once at `fd32c1a` with attribution and
+>   owned here; the address, base58, transaction serialization and sighash
+>   code was ported from Decred's Go code instead, so where §2.1, §5 and
+>   §6 Phase 1 credit dcr-rs with it they describe the plan, not the
+>   outcome. Neither repository tracks the other or owes it changes; a fix
+>   that changes a digest, found in either copy, is checked against the
+>   other, and a later import from dcr-rs needs a decision of its own.
+> - **D7** — [ADR-0014](adr/0014-release-engineering.md), *Accepted*
+>   2026-10-26 as policy, with nothing built yet. The recommendation below
+>   was narrowed for binaries: none is published until the pure-Rust rule
+>   is met, the D3 signature soak has passed, the pin is at a dcrd v2.2
+>   release tag and a reproduction prototype has passed, and then only for
+>   x86_64 Linux, while CI keeps testing Linux, macOS and Windows and the
+>   other targets build from source until each passes a named bar. MSRV
+>   stays the pinned toolchain itself, 1.98.1, through the workspace
+>   `rust-version`. A release is an SSH-signed tag and a PGP-signed
+>   `SHA256SUMS`, signed only after an off-GitHub rebuild matches CI's
+>   bytes, with GitHub artifact attestations beside it, and stale binaries
+>   get no expiry.
 >
 > The original list follows unchanged.
 
@@ -821,7 +872,14 @@ pins this policy asks for.
 - **R5 — Lottery/PRNG exactness.** `Hash256PRNG` winner selection must match bit-for-bit at every height; a single off-by-one invalidates vote validation. Full-history winner comparison is part of the Phase 8 comparator.
 - **R6 — DoS-behavior mismatch.** Divergent limits/ban logic lets attackers partition dcroxide from dcrd peers. Port limits verbatim; adversarial interop suite in Phase 11.
 - **R7 — Moving upstream target.** 2.2 (and future consensus agendas) will land mid-project. Mitigation: D5 process, pinned-tag parity claims, agenda-aware design (threshold state machine is data-driven from chaincfg).
-- **R8 — Team/bus factor & review scarcity.** Consensus-grade Rust reviewers are rare. Two-reviewer rule on consensus crates, early engagement with Decred developers (they are receptive to alternative implementations; the mixing and blockchain modules were designed for reuse), and the external review in Phase 15.
+- **R8 — Team/bus factor & review scarcity.** Consensus-grade Rust
+  reviewers are rare. §7's gates in place of the two-reviewer rule this
+  plan first set on consensus crates, which one maintainer cannot meet
+  (an adversarial automated review of every change, the differential and
+  oracle tests, and the project owner's signature on every commit), early
+  engagement with Decred developers (they are receptive to alternative
+  implementations; the mixing and blockchain modules were designed for
+  reuse), and the external review in Phase 15.
 - **R9 — Underestimation.** dcrd is 168k LOC of battle-hardened Go with a decade of edge cases. The milestone structure below is designed so partial completion still yields shippable value (libraries → tools → archival node → full node), and progress is measured by acceptance suites, not vibes.
 
 ---
@@ -863,7 +921,17 @@ Sizing guidance (not a promise): M1 and M2 are each on the order of several engi
 
 ## 12. Working agreements — definition of done for every task
 
-A task/PR is done when: (1) implementation matches the pinned dcrd tag with any quirk documented; (2) dcrd's corresponding tests are ported or regenerated and passing; (3) new parsers/state machines have fuzz + property targets wired into CI; (4) consensus-tagged code has differential coverage and two approving reviews; (5) `PARITY.md` and (if applicable) `QUIRKS.md`/ADRs are updated; (6) public items are documented (`#![deny(missing_docs)]` on library crates); (7) benchmarks exist for hot paths with thresholds recorded.
+A task/PR is done when: (1) implementation matches the pinned dcrd tag with
+any quirk documented; (2) dcrd's corresponding tests are ported or
+regenerated and passing; (3) new parsers/state machines have fuzz +
+property targets wired into CI; (4) consensus-tagged code has differential
+coverage against dcrd, has been through an adversarial automated review
+whose findings are fixed or recorded, and lands in a commit the project
+owner signs, which together replace the two approving reviews this
+agreement first asked for, since the project has one maintainer (§7's
+gates); (5) `PARITY.md` and (if applicable) `QUIRKS.md`/ADRs are updated;
+(6) public items are documented (`#![deny(missing_docs)]` on library
+crates); (7) benchmarks exist for hot paths with thresholds recorded.
 
 Suggested first sprint for the developer: Phase 0 rig + D1–D4 ADR drafts + vendor dcr-rs with regenerated vectors + the wire `MsgTx`/header codecs under differential fuzz. That sequence produces immediate, measurable parity signal and forces the big decisions while they're still cheap.
 

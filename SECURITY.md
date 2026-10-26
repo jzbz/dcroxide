@@ -280,6 +280,13 @@ evaluating this code.
   checksum to the address dispatch); the chain database's stored-row
   decoders; `chainhash` parsing; DER signature parsing; public-key
   parsing; the Schnorr and Ed25519 suites; `uint256`; and BLAKE-256.
+  None of the targets asks dcrd for an answer. The four signature
+  targets check dcroxide only against itself, that parsing and signing
+  do not panic, that what it signs verifies and that what it serializes
+  parses back. For signatures the comparison with dcrd rests on the
+  oracle batteries of the test suite
+  ([ADR-0006](docs/adr/0006-secp256k1-backend.md)'s addenda), which run
+  a fixed number of cases each, and on its ported vectors.
   Stateless parsers still unfuzzed: the config-file and command-line
   parser, which takes the operator's input rather than a peer's, GCS
   filter decoding, and the ticket, index and address-manager stores.
