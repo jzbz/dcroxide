@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: ISC
 //! The daemon's logging subsystem registry and the `--debuglevel`
-//! grammar (dcrd `log.go` / `config.go`): the nineteen subsystem
+//! grammar (dcrd `log.go` / `config.go`): the eighteen subsystem
 //! identifiers, slog's level names, and
 //! `parseAndSetDebugLevels` with dcrd's exact error texts.
 

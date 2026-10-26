@@ -913,6 +913,10 @@ fn run_node(cfg: Config, profiler: &dcroxide_node::profiler::ProfileServer) -> E
         Arc::clone(&tx_pool),
         ntfn.clone(),
     );
+    // Run every peer's inventory trickle timer, which sends the
+    // inventory relayed to the peer in batches (dcrd's per-peer
+    // `queueHandler`).
+    let inv_trickler = dcroxide_node::dispatch::start_inv_trickler(server.sync_peers.clone());
 
     // Track user-submitted transactions and periodically rebroadcast
     // them until they make it into a block (dcrd `server.Run`
@@ -1608,6 +1612,7 @@ fn run_node(cfg: Config, profiler: &dcroxide_node::profiler::ProfileServer) -> E
     }
     connector.shutdown();
     stall_timer.shutdown();
+    inv_trickler.shutdown();
     if let Some(rebroadcaster) = rebroadcaster {
         rebroadcaster.shutdown();
     }

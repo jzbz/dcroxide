@@ -28,8 +28,8 @@
 //! `Uint64` (`default.go:37-42`) and `ShuffleSlice` (`:144-148`) over
 //! `Shuffle` (`:136-141`) for the peer module, `IntN` (`:109-114`)
 //! for the mining package's address pick, `Duration` (`:126-131`) for
-//! the seeder's address backdating and the rebroadcast timer, and
-//! `Read` (`:22-26`) for the RPC server's auth HMAC key.
+//! the seeder's backdating, the rebroadcast timer and the inventory
+//! trickle, and `Read` (`:22-26`) for the RPC server's auth HMAC key.
 //!
 //! The globals are ported because dcrd's peer module reaches
 //! randomness through nothing else: `rand.Uint64()` for the ping and
@@ -61,9 +61,9 @@
 //!   `Int*`/`UintN`/`BigInt`/`Float64` wrappers.  Each is two lines
 //!   over [`Prng`] when a consumer appears -- which is how `IntN`
 //!   arrived with the mining-address pick and `Duration` with the
-//!   seeder's backdating.  `peer/peer.go:1629`'s inventory trickle
-//!   timeout is a further `rand.Duration` caller whose port is not
-//!   yet wired.
+//!   seeder's backdating; the rebroadcast timer and the inventory
+//!   trickle period (`peer/peer.go:1628-1631`) have since drawn on
+//!   it too.
 //! * The OpenBSD `arc4random` build variant
 //!   (`crypto/rand/prng_arc4random.go`), a Go-toolchain fallback.
 //!

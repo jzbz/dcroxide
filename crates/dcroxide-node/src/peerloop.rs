@@ -28,8 +28,8 @@
 //! loop, the timers, the getdata server and
 //! `getpeerinfo` therefore keep going while a handler runs, as dcrd's
 //! `outHandler` keeps writing (pings included) while `inHandler`
-//! blocks.  dcrd's separate inventory trickle queue (`QueueInventory`)
-//! is not ported: each announcement is its own message.  The idle read
+//! blocks.  dcrd's inventory trickle queue (`QueueInventory`) is kept
+//! with the relay state in `dispatch`, not on this queue.  The idle read
 //! deadline is applied through the transport's absolute per-message
 //! read budget (dcrd's `SetReadDeadline` before each read); a read
 //! timeout ends the loop exactly like dcrd's idle disconnect.
@@ -593,9 +593,9 @@ pub(crate) fn mix_message_hash(msg: &Message) -> Option<dcroxide_chainhash::Hash
 /// through clones of this handle; a single output loop drains the
 /// receiver and does the actual writing, so all writes to the
 /// connection are serialized on one thread.  This is the plain message
-/// queue: dcrd's separate inventory trickle queue (`QueueInventory`) is
-/// not ported, and the getdata server's `maxPendingSend` pacing lives
-/// with that server in `dispatch`.
+/// queue: dcrd's inventory trickle queue (`QueueInventory`) lives with
+/// the relay state in `dispatch`, and the getdata server's
+/// `maxPendingSend` pacing with that server.
 #[derive(Clone)]
 pub struct OutboundQueue {
     sender: mpsc::SyncSender<QueuedMessage>,

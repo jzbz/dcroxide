@@ -215,13 +215,22 @@ struct SyncPeerHandles {
 }
 
 /// The per-peer relay state (dcrd's `serverPeer` fields the relay
-/// reads): the handshake facts, the last announced block, and the
-/// known-inventory set that both dedups our announcements and
-/// prevents echoing inventory the peer itself announced.
+/// reads, and the inventory half of the peer's `queueHandler`): the
+/// handshake facts, the last announced block, the known-inventory set
+/// that both dedups our announcements and prevents echoing inventory
+/// the peer itself announced, and the trickle queue with its timer.
 pub struct RelayPeerState {
     facts: crate::server::RelayPeerFacts,
     announced_block: Option<Hash>,
     known_inventory: dcroxide_containers::lru::Set<InvVect>,
+    /// Inventory waiting for the peer's next trickle, in the order it
+    /// was queued (dcrd `queueHandler`'s `invSendQueue`, fed by
+    /// `QueueInventory`).  [`flush_trickle`] drains it.
+    inv_send_queue: Vec<InvVect>,
+    /// When the peer's trickle timer next fires (dcrd's `trickleTimer`),
+    /// or `None` until the trickle thread first sees the peer and arms
+    /// it ([`SyncPeers::trickle_tick`]).
+    next_trickle: Option<Instant>,
 }
 
 impl RelayPeerState {
@@ -241,6 +250,8 @@ impl RelayPeerState {
                 dcroxide_peer::MAX_KNOWN_INVENTORY,
                 dcroxide_peer::MAX_KNOWN_INVENTORY_TTL,
             ),
+            inv_send_queue: Vec::new(),
+            next_trickle: None,
         }
     }
 }
@@ -555,51 +566,79 @@ impl SyncPeers {
         })
     }
 
-    /// Drop the inventory the peer already knows, returning what remains
-    /// to send (dcrd `QueueInventory`'s contains-check).  An unregistered
-    /// peer keeps the whole list.
+    /// Queue inventory for the peer's next trickle (dcrd `QueueInventory`
+    /// for each vector, as `OnMemPool` calls it): what the peer already
+    /// knows is dropped, the rest waits in the trickle queue for
+    /// [`flush_trickle`].  An unregistered peer takes nothing.
     ///
-    /// Marking is deliberately *not* done here: dcrd marks each vector as
-    /// it batches it into the inv message it then queues, and the only
-    /// way that queueing fails is past the 40 MiB `maxQueuedOutputBytes`,
-    /// which disconnects the peer, so a surviving peer's marks always
-    /// accompany a send (`queueHandler`'s trickle timer).  The port's
-    /// queue refuses a message and keeps the peer, so the caller marks
-    /// with [`SyncPeers::mark_known`] only after the enqueue succeeds —
-    /// otherwise the peer is permanently convinced it knows inventory it
-    /// was never sent.
-    pub(crate) fn filter_known(&self, id: i32, invs: Vec<InvVect>) -> Vec<InvVect> {
-        let registry = self.inner.lock().expect("sync peers mutex poisoned");
-        let Some(handles) = registry.get(&id) else {
-            return invs;
-        };
-        // `contains` refreshes the LRU recency, so the guard is mutable
-        // even though nothing is inserted here.
-        let mut relay = handles.relay.lock().expect("relay state poisoned");
-        invs.into_iter()
-            .filter(|inv| !relay.known_inventory.contains(inv))
-            .collect()
-    }
-
-    /// Record inventory as known to the peer, after it has really been
-    /// queued for sending (dcrd `AddKnownInventory`).
-    pub(crate) fn mark_known(&self, id: i32, invs: &[InvVect]) {
+    /// Nothing is marked known here.  dcrd marks a vector only as its
+    /// trickle batches it into an inv message, and so does the port's
+    /// flush, after the message is queued.
+    pub(crate) fn queue_inventory(&self, id: i32, invs: Vec<InvVect>) {
         let registry = self.inner.lock().expect("sync peers mutex poisoned");
         let Some(handles) = registry.get(&id) else {
             return;
         };
         let mut relay = handles.relay.lock().expect("relay state poisoned");
-        for inv in invs {
-            relay.known_inventory.put(*inv);
+        let RelayPeerState {
+            known_inventory,
+            inv_send_queue,
+            ..
+        } = &mut *relay;
+        // `contains` refreshes the LRU recency, as dcrd's does.
+        inv_send_queue.extend(
+            invs.into_iter()
+                .filter(|inv| !known_inventory.contains(inv)),
+        );
+    }
+
+    /// One pass of the trickle thread at `now`: every registered peer
+    /// whose trickle timer is due has its trickle queue flushed
+    /// ([`flush_trickle`]) and its timer re-armed with a fresh random
+    /// period from `timeout`, and a peer the pass sees for the first
+    /// time has its timer armed.  Returns the earliest deadline still
+    /// set, `None` with no peer registered.
+    ///
+    /// dcrd gives each peer a `trickleTimer` of its own, in the peer's
+    /// `queueHandler`, armed when the handler starts and reset after
+    /// every fire, whether or not anything was queued; the deadline
+    /// each peer's relay state keeps is that timer, run by one thread
+    /// for every peer.  dcrd's fire sends nothing while the peer is
+    /// disconnecting.  Here a disconnecting peer's socket is already
+    /// shut, so a batch queued before the peer leaves the registry is
+    /// never written, and the queue refuses batches once the peer's
+    /// output loop has ended.
+    pub(crate) fn trickle_tick(
+        &self,
+        now: Instant,
+        timeout: &mut dyn FnMut() -> Duration,
+    ) -> Option<Instant> {
+        let registry = self.inner.lock().expect("sync peers mutex poisoned");
+        let mut earliest: Option<Instant> = None;
+        for handles in registry.values() {
+            let mut relay = handles.relay.lock().expect("relay state poisoned");
+            match relay.next_trickle {
+                Some(at) if now < at => {}
+                Some(_) => {
+                    flush_trickle(&mut relay, &handles.outbound);
+                    relay.next_trickle = now.checked_add(timeout());
+                }
+                None => relay.next_trickle = now.checked_add(timeout()),
+            }
+            if let Some(at) = relay.next_trickle {
+                earliest = Some(earliest.map_or(at, |e| e.min(at)));
+            }
         }
+        earliest
     }
 
     /// Relay inventory to every registered peer that should receive it
     /// (dcrd `RelayInventory` driving `handleRelayPeerInvMsg`); the
-    /// known-inventory set dedups repeated announcements.  dcrd's
-    /// trickle queue batches non-immediate inventory over a short
-    /// random window; the plain per-peer queue sends each announcement
-    /// as its own message.
+    /// known-inventory set dedups repeated announcements.  Inventory
+    /// that is not immediate waits in each peer's trickle queue for the
+    /// peer's next trickle (`flush_trickle`), and immediate inventory
+    /// is queued at once as its own message, as dcrd's `QueueInventory`
+    /// and `QueueInventoryImmediate` do.
     /// Returns whether at least one peer was eligible to receive the
     /// advertisement — i.e. a connected peer with the required services
     /// and, for a transaction, relaying enabled.  A transaction relay's
@@ -645,6 +684,8 @@ impl SyncPeers {
                 facts,
                 announced_block,
                 known_inventory,
+                inv_send_queue,
+                ..
             } = &mut *relay;
             let outcome = crate::server::handle_relay_peer_inv(announced_block, facts, msg);
             // dcrd records the transaction as recently advertised for
@@ -682,8 +723,20 @@ impl SyncPeers {
                         }
                     }
                 }
-                crate::server::RelayPeerAction::QueueInventory
-                | crate::server::RelayPeerAction::QueueInventoryImmediate => {
+                crate::server::RelayPeerAction::QueueInventory => {
+                    let inv = InvVect {
+                        inv_type: msg.inv_type,
+                        hash: msg.inv_hash,
+                    };
+                    // dcrd `QueueInventory`: inventory the peer is known
+                    // to have is ignored, and the rest waits for the
+                    // peer's next trickle, which checks again before
+                    // sending ([`flush_trickle`]).
+                    if !known_inventory.contains(&inv) {
+                        inv_send_queue.push(inv);
+                    }
+                }
+                crate::server::RelayPeerAction::QueueInventoryImmediate => {
                     let inv = InvVect {
                         inv_type: msg.inv_type,
                         hash: msg.inv_hash,
@@ -692,16 +745,15 @@ impl SyncPeers {
                         continue;
                     }
                     // Record the item as known to the peer only once it
-                    // is really on its way.  dcrd marks it as it batches
-                    // the inv into a message it then queues, and a
-                    // failed queueing there disconnects the peer (past
-                    // the 40 MiB `maxQueuedOutputBytes`), so for any
-                    // peer still connected marking and queueing are one
-                    // step (`queueHandler`'s trickle timer calling
-                    // `AddKnownInventory` per vector).  Marking first
-                    // here would permanently convince this peer it knows
-                    // an item it was never told about, and the
-                    // announcement would never be retried.
+                    // is really on its way.  dcrd's
+                    // `QueueInventoryImmediate` marks it and then queues
+                    // the message, and a failed queueing there
+                    // disconnects the peer (past the 40 MiB
+                    // `maxQueuedOutputBytes`), so for any peer still
+                    // connected marking and queueing are one step.
+                    // Marking first here would permanently convince this
+                    // peer it knows an item it was never told about, and
+                    // the announcement would never be retried.
                     if handles.outbound.try_queue(Message::Inv(MsgInv {
                         inv_list: vec![inv],
                     })) {
@@ -730,6 +782,17 @@ impl SyncPeers {
             .lock()
             .expect("sync peers mutex poisoned")
             .remove(&id);
+    }
+
+    /// Fire every registered peer's trickle timer now, whatever its
+    /// deadline: one pass of the trickle thread once every timer is due.
+    #[cfg(test)]
+    pub(crate) fn fire_trickles(&self) {
+        let now = Instant::now();
+        for handles in self.inner.lock().expect("registry").values() {
+            handles.relay.lock().expect("relay").next_trickle = Some(now);
+        }
+        self.trickle_tick(now, &mut || Duration::from_millis(100));
     }
 
     /// The persistent (permanent) peers, for `getaddednodeinfo` (dcrd's
@@ -935,11 +998,12 @@ impl SyncPeers {
                                 // PARITY.md keeps the drop deliberately.
                                 // Severing the connection at this depth
                                 // punishes an honest peer for transient
-                                // congestion — post-sync, relay emits one
-                                // inv message per item per peer, so a
+                                // congestion — post-sync, relay queues inv
+                                // messages for every peer on each trickle
+                                // and one per block announcement, so a
                                 // peer on a slow link can accumulate the
-                                // whole queue purely while we are pushing
-                                // it a block it asked for, and the next
+                                // whole queue while we are pushing it a
+                                // block it asked for, and the next
                                 // sync request would kill it.  A peer
                                 // whose socket never drains is torn down
                                 // by the output loop's per-message write
@@ -1159,6 +1223,140 @@ pub fn start_stall_timer(
     StallTimer {
         sender,
         stall: Arc::clone(&peers_stall),
+        thread: Some(thread),
+    }
+}
+
+/// A peer's trickle timer firing (dcrd `queueHandler` on
+/// `trickleTimer.C`, `peer/peer.go:1661-1707`): the trickle queue is
+/// drained into inv messages of at most `maxInvTrickleSize` (1000)
+/// vectors, in the order the vectors were queued, skipping inventory
+/// the peer has come to know since it was queued.
+///
+/// dcrd marks each vector known as it batches it, and a refused
+/// queueing there disconnects the peer (past the 40 MiB
+/// `maxQueuedOutputBytes`).  The port's queue refuses a message and
+/// keeps the peer, so a batch is marked only once it is queued, as
+/// every other announcement here is.  A refused batch ends the firing,
+/// and what was not yet sent is dropped unmarked: the queue is full, so
+/// the rest would be refused too, and unmarked vectors are announced
+/// again by a later relay, rebroadcast or mempool request.  Marking
+/// after queueing leaves a vector queued twice unseen by the known set
+/// within one firing, so the firing also skips a vector it has already
+/// placed.  That is stricter than dcrd: its marking as it batches
+/// catches a repeat only while the first copy is still among the 1000
+/// vectors the known set keeps, and its check sees the evictions that
+/// its own marks in the same message made, so it can send a repeat, or
+/// a vector the peer announced, that the port skips.
+pub(crate) fn flush_trickle(relay: &mut RelayPeerState, outbound: &OutboundQueue) {
+    let queued = std::mem::take(&mut relay.inv_send_queue);
+    if queued.is_empty() {
+        return;
+    }
+    let mut placed: HashSet<InvVect> = HashSet::with_capacity(queued.len());
+    let mut batch: Vec<InvVect> =
+        Vec::with_capacity(queued.len().min(dcroxide_peer::MAX_INV_TRICKLE_SIZE));
+    for inv in queued {
+        if relay.known_inventory.contains(&inv) || !placed.insert(inv) {
+            continue;
+        }
+        batch.push(inv);
+        if batch.len() >= dcroxide_peer::MAX_INV_TRICKLE_SIZE
+            && !send_trickle_batch(relay, outbound, &mut batch)
+        {
+            return;
+        }
+    }
+    if !batch.is_empty() {
+        send_trickle_batch(relay, outbound, &mut batch);
+    }
+}
+
+/// Queue one trickle batch as an inv message and mark its vectors known
+/// to the peer, emptying `batch`; returns `false`, marking nothing, if
+/// the queue refused it.
+fn send_trickle_batch(
+    relay: &mut RelayPeerState,
+    outbound: &OutboundQueue,
+    batch: &mut Vec<InvVect>,
+) -> bool {
+    if !outbound.try_queue(Message::Inv(MsgInv {
+        inv_list: batch.clone(),
+    })) {
+        return false;
+    }
+    for inv in batch.drain(..) {
+        relay.known_inventory.put(inv);
+    }
+    true
+}
+
+/// A trickle period: dcrd's `trickleTimeout`, a uniform draw from
+/// `minInvTrickleTimeout` (100 ms) up to `maxInvTrickleTimeout`
+/// (500 ms) (`peer/peer.go:1628-1631`).
+fn trickle_timeout() -> Duration {
+    let span = dcroxide_peer::MAX_INV_TRICKLE_TIMEOUT - dcroxide_peer::MIN_INV_TRICKLE_TIMEOUT;
+    let nanos = dcroxide_peer::MIN_INV_TRICKLE_TIMEOUT
+        .saturating_add(dcroxide_crypto::rand::duration(span));
+    Duration::from_nanos(u64::try_from(nanos).expect("a trickle period is positive"))
+}
+
+/// The running inventory trickle thread; dropping it (or calling
+/// [`InvTrickler::shutdown`]) stops the thread.
+pub struct InvTrickler {
+    /// The thread's only stop signal; dropping it ends the thread's wait.
+    stop: Option<mpsc::Sender<()>>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl InvTrickler {
+    /// Stop the trickle thread and wait for it to finish.
+    pub fn shutdown(mut self) {
+        self.stop_thread();
+    }
+
+    fn stop_thread(&mut self) {
+        self.stop = None;
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+impl Drop for InvTrickler {
+    fn drop(&mut self) {
+        self.stop_thread();
+    }
+}
+
+/// Start the inventory trickle thread over the registry: it runs every
+/// registered peer's trickle timer (`SyncPeers::trickle_tick`),
+/// waking for whichever deadline is due next.  dcrd runs one timer per
+/// peer, in the peer's `queueHandler` goroutine; goroutines cost
+/// nothing, while each thread here counts against the process's thread
+/// limit, so one thread serves every peer.
+pub fn start_inv_trickler(peers: SyncPeers) -> InvTrickler {
+    let (stop, stopped) = mpsc::channel::<()>();
+    let thread = thread::spawn(move || {
+        // A peer registered while the thread waits is armed on the next
+        // pass, so no wait is longer than the shortest period.
+        let longest_wait = Duration::from_nanos(dcroxide_peer::MIN_INV_TRICKLE_TIMEOUT as u64);
+        loop {
+            let now = Instant::now();
+            let wait = peers
+                .trickle_tick(now, &mut trickle_timeout)
+                .map_or(longest_wait, |at| {
+                    at.saturating_duration_since(now).min(longest_wait)
+                });
+            match stopped.recv_timeout(wait) {
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                // Stop requested, or the handle dropped.
+                Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => return,
+            }
+        }
+    });
+    InvTrickler {
+        stop: Some(stop),
         thread: Some(thread),
     }
 }
@@ -1509,6 +1707,32 @@ impl GetDataWorker {
     /// The peer's cumulative sent bytes, or `None` without a handle.
     fn peer_bytes_sent(&self) -> Option<u64> {
         peer_bytes_sent(self.peer_handle.as_ref())
+    }
+}
+
+/// Answer a mempool request with the pool's inventory (dcrd `OnMemPool`
+/// queueing each transaction through `QueueInventory`): for a
+/// registered peer, what it knows is dropped and the rest goes out on
+/// its next trickle.  A handler that never registered has no relay
+/// state to queue on, so the batches the trickle would send are queued
+/// at once.
+fn reply_mem_pool(
+    sync_peers: &SyncPeers,
+    sync_peer_id: Option<i32>,
+    invs: Vec<InvVect>,
+    outbound: &OutboundQueue,
+) {
+    match sync_peer_id {
+        Some(id) => sync_peers.queue_inventory(id, invs),
+        None => {
+            for chunk in mem_pool_inv_batches(&invs) {
+                if !outbound.try_queue(Message::Inv(MsgInv {
+                    inv_list: chunk.to_vec(),
+                })) {
+                    break;
+                }
+            }
+        }
     }
 }
 
@@ -2816,42 +3040,7 @@ impl ServerPeerHandler {
                         ServeSignal::Disconnect(BAN_SCORE_EXCEEDED.into())
                     }
                     crate::server::OnMemPoolOutcome::Inventory(invs) => {
-                        // Drop inventory the peer already knows, matching
-                        // dcrd `OnMemPool` queuing each tx through
-                        // `QueueInventory` (which filters against the
-                        // peer's known-inventory set) rather than sending
-                        // the raw pool contents.
-                        let invs = match self.sync_peer_id {
-                            Some(id) => self.ctx.sync_peers.filter_known(id, invs),
-                            None => invs,
-                        };
-                        // dcrd queues each vector through its trickle
-                        // queue, which flushes an inv every
-                        // `maxInvTrickleSize` (1000) entries
-                        // (`peer/peer.go:1685`); the batches are queued
-                        // here at once rather than on the next trickle
-                        // tick.
-                        for chunk in mem_pool_inv_batches(&invs) {
-                            if chunk.is_empty() {
-                                continue;
-                            }
-                            // Each batch is marked known only once it is
-                            // queued (dcrd marks per vector as it fills
-                            // the inv message it then queues).  A full
-                            // queue stops the fan-out: the remaining
-                            // chunks would be refused too, and leaving
-                            // them unmarked means a later mempool
-                            // request, or ordinary relay, still
-                            // announces them.
-                            if !outbound.try_queue(Message::Inv(MsgInv {
-                                inv_list: chunk.to_vec(),
-                            })) {
-                                break;
-                            }
-                            if let Some(id) = self.sync_peer_id {
-                                self.ctx.sync_peers.mark_known(id, chunk);
-                            }
-                        }
+                        reply_mem_pool(&self.ctx.sync_peers, self.sync_peer_id, invs, outbound);
                         ServeSignal::Continue
                     }
                 }
@@ -3835,7 +4024,7 @@ mod tests {
         }
 
         // An unregistered peer is a silent no-op, as `mark_known_inventory`
-        // and `mark_known` already are.
+        // and `queue_inventory` already are.
         peers.mark_known_inventory_batch(9, [tx_inv(0xb1)]);
         assert!(
             !peers.is_known_inventory(9, &tx_inv(0xb1)),
@@ -3909,8 +4098,9 @@ mod tests {
     }
 
     /// The fan-out relays a transaction announcement to relay-enabled
-    /// peers only, dedups repeats through the known-inventory set, and
-    /// never echoes inventory a peer already knows.
+    /// peers only, on each peer's next trickle, dedups repeats through
+    /// the known-inventory set, and never echoes inventory a peer
+    /// already knows.
     #[test]
     fn relays_tx_inventory_with_dedup_and_relay_preference() {
         let peers = SyncPeers::new();
@@ -3948,6 +4138,11 @@ mod tests {
             peers.relay_inventory(&tx_relay_msg(&inv)),
             "a relay-enabled peer marks the tx advertised"
         );
+        assert!(
+            rx_a.try_recv().is_err(),
+            "the inv waits for the peer's next trickle"
+        );
+        peers.fire_trickles();
         match rx_a.try_recv().expect("peer 1 receives the inv") {
             Message::Inv(msg) => assert_eq!(msg.inv_list, vec![inv]),
             other => panic!("expected inv, got {other:?}"),
@@ -3960,6 +4155,7 @@ mod tests {
             peers.relay_inventory(&tx_relay_msg(&inv)),
             "the tx is still advertised even when the queue dedups it"
         );
+        peers.fire_trickles();
         assert!(rx_a.try_recv().is_err(), "repeat announcements dedup");
 
         // Inventory the peer announced itself is never echoed back, yet
@@ -3970,6 +4166,7 @@ mod tests {
             peers.relay_inventory(&tx_relay_msg(&echoed)),
             "a known inventory still counts as advertised"
         );
+        peers.fire_trickles();
         assert!(rx_a.try_recv().is_err(), "announced inventory not echoed");
     }
 
@@ -4615,10 +4812,10 @@ mod tests {
         );
     }
 
-    /// A mempool reply goes out in dcrd's trickle batches of at most
-    /// `maxInvTrickleSize` (1000) vectors, in pool order: 2,500
-    /// transactions are three inv messages of 1000, 1000 and 500, where
-    /// the wire limit would have sent one of 2,500.
+    /// An unregistered handler's mempool reply is split into dcrd's
+    /// trickle batches of at most `maxInvTrickleSize` (1000) vectors, in
+    /// pool order: 2,500 transactions are three inv messages of 1000,
+    /// 1000 and 500, where the wire limit would have sent one of 2,500.
     #[test]
     fn mem_pool_replies_batch_at_the_trickle_size() {
         let invs: Vec<InvVect> = (0..2500u32)
@@ -4644,16 +4841,185 @@ mod tests {
         );
     }
 
-    /// `filter_known` must not mark: the mempool inv fan-out filters
-    /// first, then queues each batch, then marks only the batches the
-    /// queue accepted.  If filtering marked as well, a batch refused by
-    /// a full queue would leave the peer recorded as knowing
-    /// transactions it was never sent, and they would never be
-    /// announced to it again.
+    /// Register one relaying peer and return the receiving end of its
+    /// outbound queue.
+    fn register_trickle_peer(peers: &SyncPeers, id: i32) -> crate::peerloop::OutboundReceiver {
+        let (queue, rx) = crate::peerloop::OutboundQueue::channel();
+        peers.register(
+            id,
+            queue,
+            None,
+            Arc::new(Mutex::new(RelayPeerState::new(relay_facts(false)))),
+            test_peer_handle(),
+            None,
+            false,
+            None,
+            None,
+            None,
+        );
+        rx
+    }
+
+    /// The inv messages waiting in a peer's outbound queue, in order.
+    fn queued_invs(rx: &crate::peerloop::OutboundReceiver) -> Vec<Vec<InvVect>> {
+        let mut invs = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            match msg {
+                Message::Inv(inv) => invs.push(inv.inv_list),
+                other => panic!("expected inv, got {other:?}"),
+            }
+        }
+        invs
+    }
+
+    /// `n` distinct transaction vectors, numbered from zero.
+    fn numbered_tx_invs(n: u32) -> Vec<InvVect> {
+        (0..n)
+            .map(|i| {
+                let mut hash = [0u8; 32];
+                hash[..4].copy_from_slice(&i.to_le_bytes());
+                InvVect {
+                    inv_type: InvType::TX,
+                    hash: Hash(hash),
+                }
+            })
+            .collect()
+    }
+
+    /// A block header for the announcement tests.
+    fn trickle_test_header() -> dcroxide_wire::BlockHeader {
+        dcroxide_wire::BlockHeader {
+            version: 1,
+            prev_block: Hash([0; 32]),
+            merkle_root: Hash([1; 32]),
+            stake_root: Hash([2; 32]),
+            vote_bits: 0,
+            final_state: [0; 6],
+            voters: 0,
+            fresh_stake: 0,
+            revocations: 0,
+            pool_size: 0,
+            bits: 0,
+            sbits: 0,
+            height: 1,
+            size: 0,
+            timestamp: 0,
+            nonce: 0,
+            extra_data: [0; 32],
+            stake_version: 0,
+        }
+    }
+
+    /// A registered peer's trickle queue, as it stands.
+    fn trickle_queue(peers: &SyncPeers, id: i32) -> Vec<InvVect> {
+        let registry = peers.inner.lock().expect("registry");
+        let relay = registry[&id].relay.lock().expect("relay");
+        relay.inv_send_queue.clone()
+    }
+
+    /// When a registered peer's trickle timer next fires.
+    fn next_trickle(peers: &SyncPeers, id: i32) -> Option<Instant> {
+        let registry = peers.inner.lock().expect("registry");
+        let relay = registry[&id].relay.lock().expect("relay");
+        relay.next_trickle
+    }
+
+    /// Queued inventory waits for the peer's trickle timer, which the
+    /// trickle thread arms on its first pass over the peer and which
+    /// fires no earlier than its deadline (dcrd's `trickleTimer`).  The
+    /// firing sends the queue in inv messages of at most
+    /// `maxInvTrickleSize` vectors, in the order they were queued, marks
+    /// each vector known, and re-arms the timer with a fresh period
+    /// whether or not anything was queued.
     #[test]
-    fn filter_known_leaves_marking_to_the_caller() {
+    fn trickled_inventory_waits_for_the_timer_and_goes_out_in_batches() {
         let peers = SyncPeers::new();
-        let (queue, _rx) = crate::peerloop::OutboundQueue::channel();
+        let rx = register_trickle_peer(&peers, 1);
+        let ms = Duration::from_millis;
+        let t0 = Instant::now();
+
+        let invs = numbered_tx_invs(2500);
+        peers.queue_inventory(1, invs.clone());
+        assert_eq!(
+            peers.trickle_tick(t0, &mut || ms(100)),
+            Some(t0 + ms(100)),
+            "the first pass arms the timer"
+        );
+        assert!(queued_invs(&rx).is_empty(), "arming sends nothing");
+        assert_eq!(
+            peers.trickle_tick(t0 + ms(99), &mut || ms(300)),
+            Some(t0 + ms(100)),
+            "a pass before the deadline leaves the timer alone"
+        );
+        assert!(queued_invs(&rx).is_empty(), "nothing goes out early");
+
+        assert_eq!(
+            peers.trickle_tick(t0 + ms(100), &mut || ms(300)),
+            Some(t0 + ms(400)),
+            "the firing re-arms the timer with a fresh period"
+        );
+        let sent = queued_invs(&rx);
+        assert_eq!(
+            sent.iter().map(Vec::len).collect::<Vec<_>>(),
+            vec![1000, 1000, 500]
+        );
+        assert_eq!(sent.concat(), invs, "every vector, once, in order");
+        // Each sent vector is marked known; the set keeps the most recent
+        // `MAX_KNOWN_INVENTORY` (1000), as dcrd's does.
+        assert!(
+            invs[1500..]
+                .iter()
+                .all(|inv| peers.is_known_inventory(1, inv)),
+            "the sent vectors are marked known"
+        );
+
+        // An empty queue still re-arms the timer when it fires.
+        assert_eq!(
+            peers.trickle_tick(t0 + ms(400), &mut || ms(200)),
+            Some(t0 + ms(600))
+        );
+        assert!(queued_invs(&rx).is_empty());
+        assert_eq!(
+            SyncPeers::new().trickle_tick(t0, &mut || ms(100)),
+            None,
+            "no peer, no deadline"
+        );
+    }
+
+    /// The firing skips what the peer came to know while the vector
+    /// waited (dcrd checks the known set again before sending), and a
+    /// vector queued twice goes out once.  What the peer already knew
+    /// is not queued at all.
+    #[test]
+    fn the_trickle_skips_inventory_the_peer_came_to_know() {
+        let peers = SyncPeers::new();
+        let rx = register_trickle_peer(&peers, 1);
+        let (a, b, c, d) = (tx_inv(0x31), tx_inv(0x32), tx_inv(0x33), tx_inv(0x34));
+        peers.mark_known_inventory(1, d);
+        peers.queue_inventory(1, vec![a, b, a, d]);
+        assert_eq!(trickle_queue(&peers, 1), vec![a, b, a], "d is never queued");
+        assert!(peers.relay_inventory(&tx_relay_msg(&c)));
+        assert!(peers.relay_inventory(&tx_relay_msg(&d)));
+        assert_eq!(
+            trickle_queue(&peers, 1),
+            vec![a, b, a, c],
+            "a relay of known inventory is not queued either"
+        );
+        // The peer announces `b` to us before our trickle fires.
+        peers.mark_known_inventory(1, b);
+        peers.fire_trickles();
+        assert_eq!(queued_invs(&rx), vec![vec![a, c]]);
+    }
+
+    /// A batch the full outbound queue refuses ends the firing and is
+    /// dropped unmarked, with the rest of the trickle queue: nothing is
+    /// recorded as known that the peer was never sent, so a later relay
+    /// still announces it.
+    #[test]
+    fn a_refused_trickle_batch_is_dropped_unmarked() {
+        let peers = SyncPeers::new();
+        let (queue, rx) = crate::peerloop::OutboundQueue::channel();
+        fill_queue(&queue);
         peers.register(
             1,
             queue,
@@ -4666,24 +5032,179 @@ mod tests {
             None,
             None,
         );
+        let invs = numbered_tx_invs(1500);
+        peers.queue_inventory(1, invs.clone());
+        peers.fire_trickles();
+        assert!(
+            invs.iter().all(|inv| !peers.is_known_inventory(1, inv)),
+            "no refused vector may be recorded as known"
+        );
+        for _ in 0..crate::peerloop::MAX_OUTBOUND_QUEUE_DEPTH {
+            assert_eq!(rx.try_recv().expect("filler"), Message::GetAddr);
+        }
+        peers.fire_trickles();
+        assert!(
+            queued_invs(&rx).is_empty(),
+            "the refused firing dropped the rest of the queue"
+        );
+        peers.queue_inventory(1, invs[..1].to_vec());
+        peers.fire_trickles();
+        assert_eq!(queued_invs(&rx), vec![invs[..1].to_vec()]);
+    }
 
-        let inv = tx_inv(0x21);
-        assert_eq!(peers.filter_known(1, vec![inv]), vec![inv]);
+    /// Block announcements are immediate (dcrd `RelayBlockAnnouncement`
+    /// relays with `immediate` set): they bypass the trickle queue and
+    /// are queued at once as their own message.
+    #[test]
+    fn block_announcements_skip_the_trickle() {
+        let peers = SyncPeers::new();
+        let rx = register_trickle_peer(&peers, 1);
+        let header = trickle_test_header();
+        peers.relay_block_announcement(&header, dcroxide_wire::ServiceFlag(0));
+        assert_eq!(
+            queued_invs(&rx),
+            vec![vec![InvVect {
+                inv_type: InvType::BLOCK,
+                hash: header.block_hash(),
+            }]]
+        );
+    }
+
+    /// A registered peer's mempool reply waits for its trickle and drops
+    /// what the peer knows, as dcrd's `OnMemPool` queues each transaction
+    /// through `QueueInventory`; nothing goes straight to the handler's
+    /// queue.  A handler that never registered gets the batches at once.
+    #[test]
+    fn mem_pool_replies_take_a_registered_peers_trickle() {
+        let peers = SyncPeers::new();
+        let rx = register_trickle_peer(&peers, 1);
+        let (handler_queue, handler_rx) = crate::peerloop::OutboundQueue::channel();
+        let (a, b) = (tx_inv(0x51), tx_inv(0x52));
+        peers.mark_known_inventory(1, b);
+        reply_mem_pool(&peers, Some(1), vec![a, b], &handler_queue);
+        assert!(
+            queued_invs(&rx).is_empty(),
+            "the reply waits for the trickle"
+        );
+        assert!(handler_rx.try_recv().is_err(), "nothing is sent at once");
+        peers.fire_trickles();
+        assert_eq!(queued_invs(&rx), vec![vec![a]]);
+
+        reply_mem_pool(&peers, None, numbered_tx_invs(1500), &handler_queue);
+        assert_eq!(
+            queued_invs(&handler_rx)
+                .iter()
+                .map(Vec::len)
+                .collect::<Vec<_>>(),
+            vec![1000, 500]
+        );
+    }
+
+    /// An immediate block announcement the full queue refuses is not
+    /// recorded as known, and its announced-block marker is put back, so
+    /// the second announcement pass delivers it once the peer drains.
+    /// dcrd marks the block and queues it in one step for any peer still
+    /// connected (`QueueInventoryImmediate`), so marking first here would
+    /// keep the block from the peer for good.
+    #[test]
+    fn a_refused_block_announcement_is_announced_again() {
+        let peers = SyncPeers::new();
+        let (queue, rx) = crate::peerloop::OutboundQueue::channel();
+        fill_queue(&queue);
+        peers.register(
+            1,
+            queue,
+            None,
+            Arc::new(Mutex::new(RelayPeerState::new(relay_facts(false)))),
+            test_peer_handle(),
+            None,
+            false,
+            None,
+            None,
+            None,
+        );
+        let header = trickle_test_header();
+        let inv = InvVect {
+            inv_type: InvType::BLOCK,
+            hash: header.block_hash(),
+        };
+        peers.relay_block_announcement(&header, dcroxide_wire::ServiceFlag(0));
         assert!(
             !peers.is_known_inventory(1, &inv),
-            "filtering must not record the inventory as known"
+            "a refused announcement must not be recorded as known"
         );
-        // Filtering again still yields it, which is what makes a retry
-        // after a refused enqueue possible.
-        assert_eq!(peers.filter_known(1, vec![inv]), vec![inv]);
-
-        // Marking is the caller's step, taken once the batch is queued.
-        peers.mark_known(1, &[inv]);
+        for _ in 0..crate::peerloop::MAX_OUTBOUND_QUEUE_DEPTH {
+            assert_eq!(rx.try_recv().expect("filler"), Message::GetAddr);
+        }
+        peers.relay_block_announcement(&header, dcroxide_wire::ServiceFlag(0));
+        assert_eq!(queued_invs(&rx), vec![vec![inv]]);
         assert!(peers.is_known_inventory(1, &inv));
+    }
+
+    /// A trickle period is a uniform draw from dcrd's 100 ms up to 500 ms
+    /// (`peer/peer.go:1628-1631`).
+    #[test]
+    fn trickle_periods_fall_in_dcrds_window() {
+        let ms = Duration::from_millis;
+        let draws: Vec<Duration> = (0..4096).map(|_| trickle_timeout()).collect();
         assert!(
-            peers.filter_known(1, vec![inv]).is_empty(),
-            "a marked item is filtered out of later fan-outs"
+            draws.iter().all(|d| (ms(100)..ms(500)).contains(d)),
+            "every period lies in [100 ms, 500 ms)"
         );
+        assert!(draws.iter().any(|d| *d < ms(300)));
+        assert!(draws.iter().any(|d| *d >= ms(300)));
+    }
+
+    /// A pass returns the earliest deadline over every registered peer,
+    /// and fires only the peers that are due.
+    #[test]
+    fn a_trickle_pass_fires_only_due_peers_and_returns_the_earliest_deadline() {
+        let peers = SyncPeers::new();
+        let rx1 = register_trickle_peer(&peers, 1);
+        let rx2 = register_trickle_peer(&peers, 2);
+        let ms = Duration::from_millis;
+        let t0 = Instant::now();
+        let mut periods = [ms(100), ms(300)].into_iter();
+        assert_eq!(
+            peers.trickle_tick(t0, &mut || periods.next().expect("one period each")),
+            Some(t0 + ms(100))
+        );
+        let (early, late) = if next_trickle(&peers, 1) == Some(t0 + ms(100)) {
+            (&rx1, &rx2)
+        } else {
+            (&rx2, &rx1)
+        };
+        peers.queue_inventory(1, vec![tx_inv(0x61)]);
+        peers.queue_inventory(2, vec![tx_inv(0x62)]);
+        assert_eq!(
+            peers.trickle_tick(t0 + ms(100), &mut || ms(400)),
+            Some(t0 + ms(300)),
+            "the late peer's deadline is now the earliest"
+        );
+        assert_eq!(queued_invs(early).len(), 1, "the due peer fires");
+        assert!(queued_invs(late).is_empty(), "the other waits");
+    }
+
+    /// The trickle thread sends a relayed inventory no sooner than the
+    /// shortest trickle period after it starts, and stops when shut down
+    /// (the ten-second wait only guards against a hang).
+    #[test]
+    fn the_trickle_thread_sends_relayed_inventory_and_stops() {
+        let peers = SyncPeers::new();
+        let rx = register_trickle_peer(&peers, 1);
+        let started = Instant::now();
+        let trickler = start_inv_trickler(peers.clone());
+        let inv = tx_inv(0x41);
+        assert!(peers.relay_inventory(&tx_relay_msg(&inv)));
+        match rx.recv_timeout(Duration::from_secs(10)) {
+            Ok(Message::Inv(msg)) => assert_eq!(msg.inv_list, vec![inv]),
+            other => panic!("expected the trickled inv, got {other:?}"),
+        }
+        assert!(
+            started.elapsed() >= Duration::from_millis(100),
+            "the inv must wait at least the shortest trickle period"
+        );
+        trickler.shutdown();
     }
 
     /// An announcement that could not be queued must not leave the peer
@@ -4719,6 +5240,7 @@ mod tests {
             peers.relay_inventory(&tx_relay_msg(&inv)),
             "the peer clears the relay gate"
         );
+        peers.fire_trickles();
         assert!(
             !peers.is_known_inventory(1, &inv),
             "an announcement that was never sent must not be recorded as known"
@@ -4734,6 +5256,7 @@ mod tests {
 
         // The retry reaches it, and only now is the item recorded.
         assert!(peers.relay_inventory(&tx_relay_msg(&inv)));
+        peers.fire_trickles();
         match rx
             .try_recv()
             .expect("the retried announcement is delivered")
@@ -4751,8 +5274,8 @@ mod tests {
     /// is left connected.
     ///
     /// Disconnecting here looked like the recovery path, but it severs
-    /// honest peers. Post-sync, relay emits one inv message per item per
-    /// peer, so a peer on a slow link fills the queue purely while we are
+    /// honest peers. Post-sync, relay queues inv messages for every peer
+    /// on each trickle, so a peer on a slow link fills the queue while we are
     /// pushing it a block it asked for, and the next sync request would
     /// kill it.
     ///

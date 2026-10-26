@@ -71,9 +71,9 @@ exit criteria have not been demonstrated, and those are listed here too:
   over all 77 chain-server commands, their `help` and four wallet-only command
   names, to dcrd and to `b49145e` on a simnet chain dcrd built to height 341,
   and every reply that differed followed dcrd master's source at the parity pin
-  then, `382ff4dd`, came from the unported profile server or the missing
-  inventory trickle delay below, or matched a second dcrd given the same role
-  and history; two `dcrwallet` 2.1.7 wallets in RPC mode made transfers, bought
+  then, `382ff4dd`, came from the unported profile server or the inventory
+  trickle delay then missing, or matched a second dcrd given the same role and
+  history; two `dcrwallet` 2.1.7 wallets in RPC mode made transfers, bought
   tickets and voted on simnet to height 519 with `b49145e` as their node,
   passing every step they passed with dcrd; and dcrd's own `TestRpcServer` and
   `TestTreasury`, from dcrd master at `3360ae4d`, pointed through the `dcrdtest`
@@ -82,17 +82,18 @@ exit criteria have not been demonstrated, and those are listed here too:
   loopback straight to `58bd107`, which had synced mainnet from a dcrd node on
   the LAN, made a wallet that never held funds, and showed the node's height,
   ticket price and peer count. The checks of `b49145e` found nine differences
-  from 2.1.7. Later commits fixed six: no P-521 key exchange, refused handshakes
-  not logged and a TLS 1.3 suite order other than Go's, all in the RPC listener;
-  the mempool's and template generator's missing lines below info; the missing
-  log file; and `startprofiler`'s internal error and skipped address checks, the
-  profile server itself staying unported. Three remain: inventory sent without
-  dcrd's trickle delay, as PARITY.md records; the `addnode`/`node` behavior,
-  reported versions and `debuglevel` subsystems of dcrd master, which the port
-  follows; and some startup and shutdown log lines, with the retry schedule for
-  an unreachable `--connect` peer, which probably follows dcrd master's backoff
-  but has not been analysed. Not run: Decrediton's IPC lifecycle; config, IPC
-  and service parity on Windows and macOS; testnet; RPC authentication by TLS
+  from 2.1.7. Later commits fixed seven: no P-521 key exchange, refused
+  handshakes not logged and a TLS 1.3 suite order other than Go's, all in the
+  RPC listener; the mempool's and template generator's missing lines below
+  info; the missing log file; `startprofiler`'s internal error and skipped
+  address checks, the profile server itself staying unported; and inventory
+  sent without dcrd's trickle delay. Two remain: the `addnode`/`node` behavior,
+  reported versions and `debuglevel` subsystems, which follow dcrd master, as
+  PARITY.md records; and some startup and shutdown log lines, not compared with
+  master, beside the retry schedule for an unreachable `--connect` peer, which
+  follows master's backoff, as PARITY.md also records. Not run: Decrediton's
+  IPC lifecycle; config, IPC and service parity on Windows and macOS; testnet;
+  RPC authentication by TLS
   client certificate (`--authtype=clientcert`); `dcrwallet`'s mixing and the mix
   messages; fee estimates, since dcroxide gave none on simnet, and dust
   rejection, since simnet relays non-standard transactions; in the sweep, a

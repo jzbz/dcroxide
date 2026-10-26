@@ -1321,9 +1321,9 @@ impl dcroxide_rpc::server::RpcConnManager for NodeRpcConnManager {
     }
 
     /// Add the address as a new persistent or one-try outbound peer
-    /// (dcrd `rpcConnManager.Connect`): the driver's event loop runs the
-    /// duplicate, resolution, and max-peers checks and dials after
-    /// replying.
+    /// (dcrd 2.2's `rpcConnManager.Connect`): the address resolves here,
+    /// a persistent peer is registered and dialed after the reply, and a
+    /// one-try peer is dialed before it, the reply carrying the outcome.
     fn connect(&self, addr: &str, permanent: bool) -> Result<(), String> {
         let outbound = self
             .outbound
@@ -1359,11 +1359,11 @@ impl dcroxide_rpc::server::RpcConnManager for NodeRpcConnManager {
         }
     }
 
-    /// Remove the persistent peer with the given address (dcrd
+    /// Remove the persistent peer with the given address (dcrd 2.2's
     /// `rpcConnManager.RemoveByAddr`): when no connected persistent peer
-    /// matches, fall back to cancelling a pending connection request for
-    /// the resolved address — an added peer that is still dialing or
-    /// awaiting a retry.
+    /// matches, fall back to removing the connection manager's persistent
+    /// entry for the address as given, unresolved — an added peer that
+    /// is still dialing or awaiting a retry.
     fn remove_by_addr(&self, addr: &str) -> Result<(), String> {
         match self.sync_peers.remove_persistent_by_addr(addr) {
             Some(conn_req_id) => {
@@ -12028,7 +12028,7 @@ mod tests {
             crate::runtime::ConnectedPeers::new(),
             Arc::new(crate::transport::NetByteTotals::new()),
         )
-        .with_peer_registry(sync_peers);
+        .with_peer_registry(sync_peers.clone());
 
         let pr = dcroxide_wire::MsgMixPairReq {
             signature: [0u8; 64],
@@ -12049,6 +12049,9 @@ mod tests {
             .mix_hash()
             .expect("hash");
         manager.relay_mix_messages(&[dcroxide_wire::Message::MixPairReq(pr)]);
+        // The inventory waits for the peer's next trickle.
+        assert!(rx.try_recv().is_err());
+        sync_peers.fire_trickles();
 
         let sent = rx.try_recv().expect("the inventory is queued to the peer");
         assert!(
