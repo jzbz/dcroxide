@@ -543,8 +543,9 @@ work). Currently implemented:
   curve arithmetic rather than the code under test, a pipelined client for
   `tools/oracle`, and the `sigsoak` binary that runs the classes against
   dcrd's own code at recorded volume, replays any case from its seed and
-  runs deliberately broken models to show the classes can fail;
-  development only, never published
+  runs deliberately broken models to show the classes can fail, and emits
+  the witness vectors `dcroxide-dcrec` keeps; development only, never
+  published
 - `dcroxide-bench` — the block replay harness (no dcrd counterpart):
   `export` writes the main chain of a stopped data directory to a
   bootstrap-format corpus, and `replay` drives that corpus back

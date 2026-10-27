@@ -5,7 +5,9 @@
 //! difference, a run that completes nothing fails, and `--out` is refused
 //! inside the repository or when it holds files.  A canary run writes its
 //! record beside a run's, each disagreement it records replays with its
-//! canary, and `list` ends quietly when its reader goes away.
+//! canary, `emit-corpus` writes the witness file `dcroxide-dcrec` keeps,
+//! a copy of the binary records its own build wherever it lies, and `list`
+//! ends quietly when its reader goes away.
 
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -13,6 +15,7 @@ use std::process::{Command, Stdio};
 use dcroxide_sigdiff::canary::{CANARIES, CANARY_BOUND};
 use dcroxide_sigdiff::class::{CLASSES, Family};
 use dcroxide_sigdiff::digest::class_digest;
+use dcroxide_sigdiff::witness::{FILE_NAME, vector_lines};
 use dcroxide_testutil::{TempDir, hex, oracle_bin_or_skip, unhex};
 
 /// Runs sigsoak; its exit code and everything it printed.
@@ -120,6 +123,14 @@ fn run_replay_and_compare() {
     assert_eq!(
         manifest["gate_eligible"], false,
         "a test build is not gate-eligible"
+    );
+    // The soak profile check is recorded beside the build's facts: a
+    // profile, or why the build is none.
+    let rust = &manifest["rust"];
+    assert_ne!(
+        rust["soak_profile"].is_null(),
+        rust["profile_problem"].is_null(),
+        "{rust}"
     );
     assert_eq!(manifest["tool"]["source_matches_checkout"], true);
     assert!(manifest["end"]["utc"].is_string());
@@ -406,6 +417,113 @@ fn canary_run_and_replay() {
     assert!(text.contains("is not empty"), "{text}");
 }
 
+/// `emit-corpus` at the default seed writes the witness file with the
+/// committed file's vector lines, and refuses a directory that holds it
+/// or lies inside the repository.
+#[test]
+fn emit_corpus_writes_the_witness_file() {
+    let Some(oracle) = oracle_bin_or_skip() else {
+        return;
+    };
+    let oracle = oracle.display().to_string();
+    let dir = TempDir::new("sigsoak-emit");
+    let out = dir.path().join("emit").display().to_string();
+    let (code, text) = sigsoak(&["emit-corpus", "--out", &out, "--oracle", &oracle]);
+    assert_eq!(code, 0, "{text}");
+    assert!(
+        text.contains("sigsoak: master seed 0x7769746e65737331"),
+        "{text}"
+    );
+    for count in ["  EV-xGEN-true: 4 lines\n", "  SV-rGEN-true: 1 line\n"] {
+        assert!(text.contains(count), "{count:?} in:\n{text}");
+    }
+    let written = std::fs::read_to_string(Path::new(&out).join(FILE_NAME)).expect("the file");
+    let committed = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../dcroxide-dcrec/tests/data/sigdiff_witness_vectors.txt"
+    ));
+    assert_eq!(
+        vector_lines(&written).collect::<Vec<_>>(),
+        vector_lines(committed).collect::<Vec<_>>()
+    );
+    assert!(written.starts_with("# Witness vectors"), "{written}");
+
+    let (code, text) = sigsoak(&["emit-corpus", "--out", &out, "--oracle", &oracle]);
+    assert_eq!(code, 2, "the directory holds the file:\n{text}");
+    assert!(text.contains("is not empty"), "{text}");
+    let inside = Path::new(env!("CARGO_MANIFEST_DIR")).join("sigsoak-emit-out");
+    let inside_arg = inside.display().to_string();
+    let (code, text) = sigsoak(&["emit-corpus", "--out", &inside_arg, "--oracle", &oracle]);
+    assert_eq!(code, 2, "{text}");
+    assert!(text.contains("inside the repository"), "{text}");
+    assert!(!inside.exists());
+}
+
+/// Whether this test binary computes with overflow checks, probed as
+/// sigsoak probes its own: the same profile builds both.
+fn overflow_checks() -> bool {
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "the overflow is the probe: it panics exactly when overflow checks are on"
+    )]
+    let checked =
+        std::panic::catch_unwind(|| std::hint::black_box(u8::MAX) + std::hint::black_box(1u8))
+            .is_err();
+    checked
+}
+
+/// The binary copied into a directory named `soak` records that name and,
+/// beside it, its own debug assertions, overflow checks and panic
+/// strategy, which a copy keeps; it is the soak profile only if those are
+/// soak's, so a test build there is refused for its debug assertions.
+#[test]
+fn a_copied_binary_records_its_own_build() {
+    let Some(oracle) = oracle_bin_or_skip() else {
+        return;
+    };
+    let dir = TempDir::new("sigsoak-copied");
+    let built = Path::new(env!("CARGO_BIN_EXE_sigsoak"));
+    let soak = dir.path().join("soak");
+    std::fs::create_dir(&soak).expect("create soak/");
+    let copy = soak.join(built.file_name().expect("a file name"));
+    std::fs::copy(built, &copy).expect("copy sigsoak");
+    let out = dir.path().join("out");
+    let run = Command::new(&copy)
+        .args(["run", "--out"])
+        .arg(&out)
+        .args(["--cases", "1", "--classes", "K-valid", "--workers", "1"])
+        .args(["--seed", "0x0123456789abcdef", "--progress-every", "1h"])
+        .arg("--oracle")
+        .arg(&oracle)
+        .output()
+        .expect("run the copy");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(run.status.code(), Some(0), "{text}");
+    let manifest: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(out.join("manifest.json")).expect("read"))
+            .expect("JSON");
+    let rust = &manifest["rust"];
+    assert_eq!(rust["profile"], "soak", "{rust}");
+    let overflow = overflow_checks();
+    assert_eq!(rust["overflow_checks"], overflow, "{rust}");
+    assert_eq!(rust["debug_assertions"], cfg!(debug_assertions), "{rust}");
+    assert_eq!(rust["panic"], "unwind", "{rust}");
+    if !cfg!(debug_assertions) && !overflow {
+        assert_eq!(rust["soak_profile"], "soak", "{rust}");
+    } else {
+        assert!(rust["soak_profile"].is_null(), "{rust}");
+    }
+    if cfg!(debug_assertions) {
+        let problem = rust["profile_problem"].as_str().unwrap_or_default();
+        assert!(problem.contains("debug assertions are on"), "{rust}");
+    }
+    assert_eq!(manifest["gate_eligible"], false);
+}
+
 /// `list` writes to a reader that has gone away without a panic, and exits
 /// 0: the pipe's read end is closed before the binary starts.
 #[test]
@@ -432,6 +550,7 @@ fn usage() {
     assert_eq!(code, 0);
     assert!(text.contains("sigsoak run --out DIR"), "{text}");
     assert!(text.contains("sigsoak canary --out DIR"), "{text}");
+    assert!(text.contains("sigsoak emit-corpus --out DIR"), "{text}");
     let (code, text) = sigsoak(&["list"]);
     assert_eq!(code, 0);
     for class in CLASSES {
@@ -475,6 +594,9 @@ fn usage() {
         vec!["canary", "--out", "/nowhere", "--canary", "C99"],
         vec!["canary", "--out", "/nowhere", "--cases", "0"],
         vec!["canary", "--out", "/nowhere", "--floors"],
+        vec!["emit-corpus"],
+        vec!["emit-corpus", "--out", "/nowhere", "--seed", "zz"],
+        vec!["emit-corpus", "--out", "/nowhere", "--cases", "1"],
     ] {
         let (code, text) = sigsoak(&args);
         assert_eq!(code, 2, "{args:?}:\n{text}");

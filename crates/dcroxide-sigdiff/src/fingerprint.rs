@@ -80,6 +80,7 @@ pub static PLUMBING: &[Source] = sources![
     "src/pipe.rs",
     "src/record.rs",
     "src/run.rs",
+    "src/witness.rs",
 ];
 
 /// Every embedded file, frozen, adapter and plumbing.

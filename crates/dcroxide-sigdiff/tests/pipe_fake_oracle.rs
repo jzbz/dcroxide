@@ -28,7 +28,7 @@ use std::time::{Duration, Instant};
 use dcroxide_sigdiff::answer::{Answer, Kind};
 use dcroxide_sigdiff::arith::add_be;
 use dcroxide_sigdiff::class::{
-    Case, ClassSpec, Consistency, Family, Intent, Size, Tags, Tier, generate,
+    Case, ClassSpec, Consistency, Family, Intent, Size, Tags, Tier, find_class, generate,
 };
 use dcroxide_sigdiff::cmd::{self, Cmd, Request};
 use dcroxide_sigdiff::compare::{Category, Status};
@@ -37,6 +37,7 @@ use dcroxide_sigdiff::entropy::Entropy;
 use dcroxide_sigdiff::manifest::{ORACLE_GO_MOD, SIGNATURE_MODULES, go_mod_version};
 use dcroxide_sigdiff::pipe::{OraclePipe, Payload, PipeConfig, PipeFailure};
 use dcroxide_sigdiff::run::{Mode, RunConfig, RunStatus, Summary, run};
+use dcroxide_sigdiff::witness::{EmitFailure, WITNESS_CLASSES, WITNESS_SEED, emit};
 use dcroxide_testutil::{SplitMix64, TempDir, unhex};
 
 /// The first argument that makes this binary the fake oracle.
@@ -118,6 +119,10 @@ fn main() {
         (
             "the_harness_reads_libtest_options",
             the_harness_reads_libtest_options,
+        ),
+        (
+            "emit_refuses_cases_and_keeps_them_past_an_oracle_failure",
+            emit_refuses_cases_and_keeps_them_past_an_oracle_failure,
         ),
     ];
     let options = Options::parse(&args[1..]);
@@ -1109,6 +1114,70 @@ fn a_deadline_and_a_stop_leave_a_prefix() {
         summary.classes[0].digest.total(),
         expected_sum(&T_DRAWN, n, &[(1_000, Some(lie), Status::Disagree)])
     );
+}
+
+/// `emit-corpus`'s refusals.  The fake answers no verify command, so
+/// dcroxide's answers disagree with it on every case: every witness class
+/// is tried and each has its problems from case 0, and no lines come back.
+/// With the fake also dying on SV-rGEN-true's first case, the emission
+/// ends there as an oracle failure that keeps the problems of the classes
+/// before it.
+fn emit_refuses_cases_and_keeps_them_past_an_oracle_failure() {
+    let of_class = |problems: &[String], class: &str| {
+        problems
+            .iter()
+            .filter(|p| p.starts_with(&format!("{class} case ")))
+            .count()
+    };
+    let failure = within(Duration::from_secs(600), "the emission", || {
+        emit(WITNESS_SEED, &fake_config(&["echo"]))
+    })
+    .expect_err("no lines");
+    assert_eq!(failure.exit_code(), 1, "{failure}");
+    let EmitFailure::Cases(problems) = &failure else {
+        panic!("{failure}");
+    };
+    assert!(
+        problems[0].starts_with("EV-xGEN-true case 0 (raw-compressed): verdict: "),
+        "{}",
+        problems[0]
+    );
+    for witness in WITNESS_CLASSES {
+        let first = format!("{} case 0 (", witness.name);
+        assert!(
+            problems.iter().any(|p| p.starts_with(&first)),
+            "{}",
+            witness.name
+        );
+    }
+
+    let culprit = find_class("SV-rGEN-true").expect("registered");
+    let data = &generate(culprit, WITNESS_SEED, 0).requests[0].data;
+    let fatal = format!("fatal-at={}", number(data));
+    let failure = within(Duration::from_secs(600), "the emission", move || {
+        emit(WITNESS_SEED, &fake_config(&[&fatal]))
+    })
+    .expect_err("no lines");
+    assert_eq!(failure.exit_code(), 3, "{failure}");
+    let EmitFailure::Oracle { why, problems } = &failure else {
+        panic!("{failure}");
+    };
+    assert!(
+        why.starts_with("SV-rGEN-true: the oracle failed with "),
+        "{why}"
+    );
+    let before = WITNESS_CLASSES
+        .iter()
+        .position(|w| w.name == culprit.name)
+        .expect("a witness class");
+    for (k, witness) in WITNESS_CLASSES.iter().enumerate() {
+        assert_eq!(
+            of_class(problems, witness.name) > 0,
+            k < before,
+            "{}",
+            witness.name
+        );
+    }
 }
 
 /// The options a workspace run passes on reach the harness as libtest

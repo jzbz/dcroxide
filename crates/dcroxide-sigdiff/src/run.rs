@@ -34,6 +34,9 @@
 //! within the hang timeout cannot be stopped from outside: the monitor
 //! records it as `ours-hung`, writes the summary as `aborted` and ends the
 //! process with exit code 3.
+//!
+//! [`answer_cases`] runs a few cases of one class the same way, through
+//! one oracle, for the witness vectors.
 
 use std::any::Any;
 use std::borrow::Cow;
@@ -1681,20 +1684,9 @@ pub fn replay(
         flush_every: 1,
         ..PipeConfig::new(oracle.to_path_buf())
     };
-    let mut pipe = OraclePipe::spawn(&cfg, move |_: Probe, r: Vec<Reply>| {
+    let mut pipe = spawn_pinned(&cfg, move |_: Probe, r: Vec<Reply>| {
         *lock(&slot) = Some(r);
-    })
-    .map_err(|f| match f {
-        PipeFailure::Spawn(e) => format!("the oracle did not start: {e}"),
-        PipeFailure::Oracle { fault, .. } => format!("the oracle failed at start: {fault}"),
     })?;
-    let pin = check_pin(pipe.build_info());
-    if !pin.consistent() {
-        return Err(format!(
-            "the oracle's pin check failed: {}",
-            pin.problems().join("; ")
-        ));
-    }
     let failure = match pipe.submit(Probe(case.requests.clone())) {
         Ok(()) => pipe.finish().err(),
         Err(failure) => Some(failure),
@@ -1737,6 +1729,98 @@ pub fn replay(
         leaf,
         canary,
     })
+}
+
+/// One case run as a run's worker runs it, with the oracle's replies.
+#[derive(Debug, Clone)]
+pub struct AnsweredCase {
+    /// The case index.
+    pub index: u64,
+    /// The case.
+    pub case: Case,
+    /// The oracle's reply to each request.
+    pub replies: Vec<Reply>,
+    /// dcroxide's answers held against the replies and the intents.
+    pub result: CaseResult,
+}
+
+/// A fresh oracle run as `cfg` says, its pin check passed, calling
+/// `on_case` as [`OraclePipe::spawn`] does: replay's and
+/// [`answer_cases`]'s start, each failure as text.
+fn spawn_pinned<T: Payload>(
+    cfg: &PipeConfig,
+    on_case: impl FnMut(T, Vec<Reply>) + Send + 'static,
+) -> Result<OraclePipe<T>, String> {
+    let pipe = OraclePipe::spawn(cfg, on_case).map_err(|f| match f {
+        PipeFailure::Spawn(e) => format!("the oracle did not start: {e}"),
+        PipeFailure::Oracle { fault, .. } => format!("the oracle failed at start: {fault}"),
+    })?;
+    let pin = check_pin(pipe.build_info());
+    if !pin.consistent() {
+        return Err(format!(
+            "the oracle's pin check failed: {}",
+            pin.problems().join("; ")
+        ));
+    }
+    Ok(pipe)
+}
+
+/// Cases `indices` of `class` under `master`, in index order, each run as
+/// a run's worker runs it: generated, answered by dcroxide (each request
+/// under `catch_unwind`) and by the models, sent to one fresh oracle run
+/// as `pipe` says, and compared.  An oracle that does not start, links
+/// another specification or fails on a case is an error that names the
+/// class, and nothing is isolated: this answers a few cases for a record,
+/// not a soak.
+pub fn answer_cases(
+    class: &'static ClassSpec,
+    master: u64,
+    indices: Range<u64>,
+    pipe: &PipeConfig,
+) -> Result<Vec<AnsweredCase>, String> {
+    let answered: Arc<Mutex<Vec<AnsweredCase>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&answered);
+    let mut pipe = spawn_pinned(pipe, move |work: Work, replies: Vec<Reply>| {
+        let result = compare(&work.case, &work.ours, &replies, &work.model);
+        lock(&sink).push(AnsweredCase {
+            index: work.index,
+            case: work.case,
+            replies,
+            result,
+        });
+    })
+    .map_err(|e| format!("{}: {e}", class.name))?;
+    let failed = |failure: PipeFailure<Work>| match failure {
+        PipeFailure::Spawn(e) => format!("{}: the oracle did not start: {e}", class.name),
+        PipeFailure::Oracle { fault, unanswered } => format!(
+            "{}: the oracle failed with {} cases unanswered{}: {fault}",
+            class.name,
+            unanswered.len(),
+            unanswered
+                .first()
+                .map(|w| format!(" from case {}", w.index))
+                .unwrap_or_default()
+        ),
+    };
+    for index in indices {
+        let case = generate(class, master, index);
+        let ours = ours_answers(&case, None);
+        let model = model::view(&case);
+        // A worker's `class` numbers the class among a run's; here there is
+        // one.
+        pipe.submit(Work {
+            class: 0,
+            index,
+            case,
+            ours,
+            model,
+        })
+        .map_err(failed)?;
+    }
+    pipe.finish().map_err(failed)?;
+    let mut answered = std::mem::take(&mut *lock(&answered));
+    answered.sort_by_key(|a| a.index);
+    Ok(answered)
 }
 
 /// The variable that overrides every class's per-PR case count.

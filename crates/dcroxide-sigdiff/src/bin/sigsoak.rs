@@ -13,8 +13,8 @@ use dcroxide_sigdiff::class::{CLASSES, ClassSpec, Family, select_classes};
 use dcroxide_sigdiff::cmd::{Cmd, Request};
 use dcroxide_sigdiff::fingerprint::{fingerprint, source_differences};
 use dcroxide_sigdiff::manifest::{
-    CARGO_LOCK, LOCKED_CRATES, PinCheck, SCHEMA, check_pin, crate_dir, git_state, lock_versions,
-    oracle_json, platform, profile_name, repo_root, rustc_vv, unix_now, utc,
+    Build, CARGO_LOCK, LOCKED_CRATES, PinCheck, SCHEMA, check_pin, crate_dir, gate_eligible,
+    git_state, lock_versions, oracle_json, platform, repo_root, rustc_vv, unix_now, utc,
 };
 use dcroxide_sigdiff::pipe::{OraclePipe, Payload, PipeConfig, PipeFailure};
 use dcroxide_sigdiff::record::{
@@ -25,6 +25,7 @@ use dcroxide_sigdiff::run::{
     self, CanaryVolume, Mode, RunConfig, RunStatus, baseline_classes, class_targets,
     default_workers,
 };
+use dcroxide_sigdiff::witness::{self, FILE_NAME, WITNESS_CLASSES, WITNESS_SEED};
 use dcroxide_testutil::{DCRD_PARITY_COMMIT, hex, parse_seed};
 use serde_json::{Value, json};
 
@@ -65,6 +66,14 @@ usage:
       a shorter run with DIR_A's seed, compared at DIR_A's checkpoints.
   sigsoak list [--canaries]
       Print every class, or every canary with its primary and footprint.
+  sigsoak emit-corpus --out DIR [--seed HEX] [--oracle PATH]
+      Write DIR/sigdiff_witness_vectors.txt, the witness vectors
+      dcroxide-dcrec keeps: for each witness class, from case 0 under the
+      seed (default 0x7769746e65737331), the first case of each variant
+      group (a variant's first /-separated part) and each dcrd verdict,
+      with dcrd's answer.  Every case must agree with dcrd and get the
+      answer it was built for, and each class must fill its lines within
+      4096 cases.  DIR must lie outside the repository and hold nothing.
   sigsoak help
       Print this.
 
@@ -75,7 +84,8 @@ DCROXIDE_ORACLE_BIN, or tools/oracle built with the Go toolchain on PATH.
 --ledger appends one line per run to FILE.
 
 exit codes: 0 pass; 1 a criterion or comparison failed; 2 usage or
-configuration error; 3 aborted (dcroxide hung, or oracle faults exhausted).
+configuration error; 3 aborted (dcroxide hung, oracle faults exhausted, or
+the oracle failed during emit-corpus).
 ";
 
 /// Why a command did not run.
@@ -290,7 +300,7 @@ fn selection(chosen: &[&'static ClassSpec]) -> Value {
     }
 }
 
-/// What `run` and `canary` establish before they start.
+/// What `run`, `canary` and `emit-corpus` establish before they start.
 struct Preflight {
     /// The repository root, canonical.
     root: PathBuf,
@@ -304,15 +314,16 @@ struct Preflight {
     build_info: Reply,
     /// Its pin check, which passed.
     pin: PinCheck,
-    /// Whether the binary computes with overflow checks.
-    overflow: bool,
+    /// How the binary was built.
+    build: Build,
 }
 
-/// The checks `run` and `canary` make before they start, each a refusal
-/// (exit 2): a build whose panics unwind, a repository root that
-/// resolves, an `out` outside it that `usage` may write into, and an
+/// The checks `run`, `canary` and `emit-corpus` make before they start,
+/// each a refusal (exit 2): a build whose panics unwind, a repository root
+/// that resolves, an `out` outside it that `usage` may write into, and an
 /// oracle that keeps the pin rule.  A binary built from another tree is
-/// only warned about.  Installs the panic hook last.
+/// only warned about.  Probes the build's overflow checks and installs the
+/// panic hook last.
 fn preflight(args: &Args, out: &str, usage: OutUse) -> Result<Preflight, Refusal> {
     if cfg!(panic = "abort") {
         return Err(config(
@@ -333,9 +344,13 @@ fn preflight(args: &Args, out: &str, usage: OutUse) -> Result<Preflight, Refusal
     };
     let source_differs = source_differences(&crate_dir(&root));
     if !source_differs.is_empty() {
+        let consequence = match usage {
+            OutUse::Run | OutUse::Canary => "the run is not gate-eligible",
+            OutUse::EmitCorpus => "the witness file may not match this checkout's generators",
+        };
         eprintln!(
-            "sigsoak: warning: this binary was not built from the checkout at {} ({}); the run \
-             is not gate-eligible",
+            "sigsoak: warning: this binary was not built from the checkout at {} ({}); \
+             {consequence}",
             root.display(),
             source_differs.join(", ")
         );
@@ -350,7 +365,7 @@ fn preflight(args: &Args, out: &str, usage: OutUse) -> Result<Preflight, Refusal
             pin.problems().join("; ")
         )));
     }
-    let overflow = overflow_checks();
+    let build = Build::current(Some(overflow_checks()));
     install_panic_hook();
     Ok(Preflight {
         root,
@@ -359,7 +374,7 @@ fn preflight(args: &Args, out: &str, usage: OutUse) -> Result<Preflight, Refusal
         oracle,
         build_info,
         pin,
-        overflow,
+        build,
     })
 }
 
@@ -373,6 +388,13 @@ fn base_manifest(
     gomaxprocs: u32,
     start: u64,
 ) -> Value {
+    let mut rust = pre.build.to_json();
+    rust.insert("rustc_vv".into(), json!(rustc_vv(&pre.root)));
+    rust.insert("RUSTFLAGS".into(), json!(std::env::var("RUSTFLAGS").ok()));
+    rust.insert(
+        "RUSTUP_TOOLCHAIN".into(),
+        json!(std::env::var("RUSTUP_TOOLCHAIN").ok()),
+    );
     json!({
         "schema": SCHEMA,
         "command": command,
@@ -391,15 +413,7 @@ fn base_manifest(
         "pin": pre.pin.to_json(),
         "oracle": oracle_json(&pre.oracle, &pre.build_info, gomaxprocs),
         "lock": lock_versions(CARGO_LOCK, &LOCKED_CRATES),
-        "rust": {
-            "rustc_vv": rustc_vv(&pre.root),
-            "profile": profile_name(),
-            "debug_assertions": cfg!(debug_assertions),
-            "overflow_checks": pre.overflow,
-            "panic": if cfg!(panic = "unwind") { "unwind" } else { "abort" },
-            "RUSTFLAGS": std::env::var("RUSTFLAGS").ok(),
-            "RUSTUP_TOOLCHAIN": std::env::var("RUSTUP_TOOLCHAIN").ok(),
-        },
+        "rust": rust,
         "platform": platform(),
     })
 }
@@ -472,12 +486,19 @@ fn cmd_run(args: &Args, raw: &[String]) -> Outcome {
     println!("sigsoak: master seed {master:#018x}");
     let git = git_state(&pre.root);
     let selection = selection(&classes);
-    let gate_eligible = matches!(profile_name().as_deref(), Some("soak" | "soak-checked"))
-        && pre.source_differs.is_empty()
-        && git["dirty"] == json!(false)
-        && pre.pin.consistent()
-        && mode == Mode::Floors { scale: 1.0 }
-        && selection != json!("partial");
+    if mode == (Mode::Floors { scale: 1.0 })
+        && let Err(problem) = pre.build.soak_profile()
+    {
+        eprintln!("sigsoak: warning: the run is not gate-eligible: {problem}");
+    }
+    let eligible = gate_eligible(
+        &pre.build,
+        &pre.source_differs,
+        &git,
+        &pre.pin,
+        mode,
+        &selection,
+    );
     let start = unix_now();
     let mut cfg = RunConfig::new(master, classes.clone(), mode, pre.oracle.clone());
     cfg.workers = workers;
@@ -486,7 +507,7 @@ fn cmd_run(args: &Args, raw: &[String]) -> Outcome {
     cfg.hang_timeout = hang_timeout;
     cfg.progress_every = Some(progress_every);
     cfg.out = Some(out.clone());
-    cfg.kind_coverage = gate_eligible;
+    cfg.kind_coverage = eligible;
     let targets: Vec<Value> = classes
         .iter()
         .zip(class_targets(&classes, mode))
@@ -501,7 +522,7 @@ fn cmd_run(args: &Args, raw: &[String]) -> Outcome {
     manifest["window"] = json!(window);
     manifest["flush_every"] = json!(flush_every);
     manifest["hang_timeout_s"] = json!(hang_timeout.as_secs());
-    manifest["gate_eligible"] = json!(gate_eligible);
+    manifest["gate_eligible"] = json!(eligible);
     cfg.manifest = Some(manifest);
 
     let summary = run::run(&cfg).map_err(config)?;
@@ -583,6 +604,39 @@ fn cmd_canary(args: &Args, raw: &[String]) -> Outcome {
     eprint!("{}", report.render());
     eprintln!("sigsoak: canary run {} ({})", status.name(), dir.display());
     Ok(exit_code(status))
+}
+
+const EMIT_FLAGS: &[&str] = &["out", "seed", "oracle"];
+
+fn cmd_emit_corpus(args: &Args) -> Outcome {
+    let out = args.require("out")?;
+    let master = match args.get("seed") {
+        Some(v) => parse_seed(v).ok_or_else(|| usage(format!("--seed {v:?} is not a hex seed")))?,
+        None => WITNESS_SEED,
+    };
+    let pre = preflight(args, out, OutUse::EmitCorpus)?;
+    println!("sigsoak: master seed {master:#018x}");
+    let lines = match witness::emit(master, &PipeConfig::new(pre.oracle.clone())) {
+        Ok(lines) => lines,
+        Err(failure) => {
+            eprintln!("sigsoak: no witness file:\n{failure}");
+            return Ok(ExitCode::from(failure.exit_code()));
+        }
+    };
+    let path = pre.out.join(FILE_NAME);
+    std::fs::create_dir_all(&pre.out)
+        .and_then(|()| std::fs::write(&path, witness::file(master, &lines)))
+        .map_err(|e| config(format!("cannot write {}: {e}", path.display())))?;
+    for class in WITNESS_CLASSES {
+        let n = lines.iter().filter(|l| l.class == class.name).count();
+        eprintln!(
+            "  {}: {n} line{}",
+            class.name,
+            if n == 1 { "" } else { "s" }
+        );
+    }
+    eprintln!("sigsoak: wrote {} lines to {}", lines.len(), path.display());
+    Ok(ExitCode::SUCCESS)
 }
 
 fn cmd_replay(args: &Args) -> Outcome {
@@ -980,6 +1034,7 @@ fn main() -> ExitCode {
         )
         .and_then(|a| cmd_compare(&a)),
         "list" => Args::parse(rest, &["canaries"], false).and_then(|a| cmd_list(&a)),
+        "emit-corpus" => Args::parse(rest, EMIT_FLAGS, false).and_then(|a| cmd_emit_corpus(&a)),
         "help" | "--help" | "-h" => {
             print!("{HELP}");
             Ok(ExitCode::SUCCESS)

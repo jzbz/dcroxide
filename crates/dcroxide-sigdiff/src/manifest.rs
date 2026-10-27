@@ -21,6 +21,7 @@ use dcroxide_testutil::{DCRD_PARITY_COMMIT, hex, pseudo_version_commit};
 use serde_json::{Value, json};
 
 use crate::reply::Reply;
+use crate::run::Mode;
 
 /// The manifest's schema name.
 pub const SCHEMA: &str = "dcroxide-sigsoak/1";
@@ -253,9 +254,10 @@ pub fn rustc_vv(root: &Path) -> Option<String> {
         .then(|| String::from_utf8_lossy(&out.stdout).trim().to_owned())
 }
 
-/// The profile the running binary was built with: the name of the
-/// directory holding it (`<target-dir>/soak/sigsoak`), or of the one above
-/// for a test binary in `deps/`.
+/// The name of the directory holding the running binary
+/// (`<target-dir>/soak/sigsoak`), or of the one above for a test binary in
+/// `deps/`: the profile it was built with while it stays where cargo put
+/// it, and whatever directory it was copied to otherwise.
 pub fn profile_name() -> Option<String> {
     let exe = std::env::current_exe().ok()?;
     let mut dir = exe.parent()?;
@@ -263,6 +265,122 @@ pub fn profile_name() -> Option<String> {
         dir = dir.parent()?;
     }
     Some(dir.file_name()?.to_string_lossy().into_owned())
+}
+
+/// How the running binary was built, as far as it can tell without a
+/// build script: the name of its directory, which a copy elsewhere loses,
+/// and three facts compiled into its code, which hold wherever it is
+/// copied.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Build {
+    /// [`profile_name`].
+    pub dir: Option<String>,
+    /// `cfg!(debug_assertions)`.
+    pub debug_assertions: bool,
+    /// Whether arithmetic overflow panics, as probed at run time; `None`
+    /// when it could not be probed (a build whose panics abort, where the
+    /// probe would end the process).
+    pub overflow_checks: Option<bool>,
+    /// `cfg!(panic = "unwind")`.
+    pub panic_unwind: bool,
+}
+
+impl Build {
+    /// This binary, with `overflow_checks` as its caller probed it.
+    pub fn current(overflow_checks: Option<bool>) -> Build {
+        Build {
+            dir: profile_name(),
+            debug_assertions: cfg!(debug_assertions),
+            overflow_checks,
+            panic_unwind: cfg!(panic = "unwind"),
+        }
+    }
+
+    /// The soak profile this binary is: `soak` or `soak-checked` when its
+    /// directory has that name and its code has that profile's facts (no
+    /// debug assertions, overflow checks off for `soak` and on for
+    /// `soak-checked`, panics that unwind); otherwise why not.  A soak
+    /// binary copied elsewhere and a dev binary copied into `soak/` are
+    /// both refused.
+    pub fn soak_profile(&self) -> Result<&'static str, String> {
+        let (profile, overflow) = match self.dir.as_deref() {
+            Some("soak") => ("soak", false),
+            Some("soak-checked") => ("soak-checked", true),
+            Some(other) => {
+                return Err(format!(
+                    "the binary lies in {other}/, not in a soak or soak-checked profile directory"
+                ));
+            }
+            None => return Err("the binary's directory has no name".to_owned()),
+        };
+        let mut problems = Vec::new();
+        if self.debug_assertions {
+            problems.push("debug assertions are on".to_owned());
+        }
+        match self.overflow_checks {
+            Some(on) if on == overflow => {}
+            Some(on) => problems.push(format!(
+                "overflow checks are {}",
+                if on { "on" } else { "off" }
+            )),
+            None => problems.push("overflow checks were not probed".to_owned()),
+        }
+        if !self.panic_unwind {
+            problems.push("panics abort".to_owned());
+        }
+        if problems.is_empty() {
+            Ok(profile)
+        } else {
+            Err(format!(
+                "the binary lies in {profile}/, but {}, which {profile} does not build",
+                problems.join(", ")
+            ))
+        }
+    }
+
+    /// The manifest's `rust` fields this describes: `profile` (the
+    /// directory's name), `debug_assertions`, `overflow_checks`, `panic`,
+    /// and `soak_profile` with `profile_problem`, what [`Self::soak_profile`]
+    /// found.
+    pub fn to_json(&self) -> serde_json::Map<String, Value> {
+        let (soak_profile, problem) = match self.soak_profile() {
+            Ok(profile) => (Some(profile), None),
+            Err(problem) => (None, Some(problem)),
+        };
+        let mut out = serde_json::Map::new();
+        out.insert("profile".into(), json!(self.dir));
+        out.insert("debug_assertions".into(), json!(self.debug_assertions));
+        out.insert("overflow_checks".into(), json!(self.overflow_checks));
+        out.insert(
+            "panic".into(),
+            json!(if self.panic_unwind { "unwind" } else { "abort" }),
+        );
+        out.insert("soak_profile".into(), json!(soak_profile));
+        out.insert("profile_problem".into(), json!(problem));
+        out
+    }
+}
+
+/// Whether a run is gate-eligible: the binary is a soak profile
+/// ([`Build::soak_profile`]) built from the checkout (`source_differs`
+/// empty), the tree is clean (`git`'s `dirty` is false, which it is not
+/// when git cannot tell), the oracle keeps the pin rule, the mode is
+/// `--floors` at scale 1, and the selection is every class or whole
+/// families (not `"partial"`).
+pub fn gate_eligible(
+    build: &Build,
+    source_differs: &[String],
+    git: &Value,
+    pin: &PinCheck,
+    mode: Mode,
+    selection: &Value,
+) -> bool {
+    build.soak_profile().is_ok()
+        && source_differs.is_empty()
+        && git["dirty"] == json!(false)
+        && pin.consistent()
+        && mode == (Mode::Floors { scale: 1.0 })
+        && *selection != json!("partial")
 }
 
 /// The Ed25519 backend `curve25519-dalek` picks, inferred as it decides:
@@ -497,5 +615,160 @@ mod tests {
         assert!(crate_dir(&root).join("Cargo.toml").is_file());
         assert!(profile_name().is_some());
         assert!(["serial", "fiat", "avx2", "avx512ifma"].contains(&dalek_backend()));
+    }
+
+    fn build(dir: &str, debug_assertions: bool, overflow_checks: bool, unwind: bool) -> Build {
+        Build {
+            dir: Some(dir.to_owned()),
+            debug_assertions,
+            overflow_checks: Some(overflow_checks),
+            panic_unwind: unwind,
+        }
+    }
+
+    /// A soak profile takes both its directory's name and its code's
+    /// facts: the two soak builds where cargo puts them pass, and each
+    /// fact or name that differs refuses the build, naming it.
+    #[test]
+    fn a_soak_profile_needs_its_directory_and_its_facts() {
+        assert_eq!(build("soak", false, false, true).soak_profile(), Ok("soak"));
+        assert_eq!(
+            build("soak-checked", false, true, true).soak_profile(),
+            Ok("soak-checked")
+        );
+        for (b, why) in [
+            // A soak binary copied elsewhere.
+            (build("bin", false, false, true), "lies in bin/"),
+            (build("release", false, false, true), "lies in release/"),
+            // A dev or test binary copied into soak/.
+            (build("soak", true, true, true), "debug assertions are on"),
+            // Debug assertions with overflow checks off, as CI's
+            // test-wrapping job builds.
+            (build("soak", true, false, true), "debug assertions are on"),
+            // Each soak profile with the other's overflow checks.
+            (build("soak", false, true, true), "overflow checks are on"),
+            (
+                build("soak-checked", false, false, true),
+                "overflow checks are off",
+            ),
+            // A release binary copied into soak/: its panics abort.
+            (build("soak", false, false, false), "panics abort"),
+        ] {
+            let problem = b.soak_profile().expect_err("refused");
+            assert!(problem.contains(why), "{b:?}: {problem}");
+        }
+        let unprobed = Build {
+            overflow_checks: None,
+            ..build("soak", false, false, true)
+        };
+        assert!(
+            unprobed
+                .soak_profile()
+                .is_err_and(|p| p.contains("not probed"))
+        );
+        let nameless = Build {
+            dir: None,
+            ..build("soak", false, false, true)
+        };
+        assert!(nameless.soak_profile().is_err());
+        let all_wrong = build("soak-checked", true, false, false)
+            .soak_profile()
+            .expect_err("refused");
+        assert!(
+            all_wrong.contains("debug assertions are on, overflow checks are off, panics abort"),
+            "{all_wrong}"
+        );
+    }
+
+    /// Gate eligibility takes each of its conditions: with every other one
+    /// met, a build that is no soak profile, a binary from another tree, a
+    /// dirty tree or one git could not read, an oracle off the pin, another
+    /// mode or scale, and a partial selection each refuse it.
+    #[test]
+    fn gate_eligibility_takes_every_condition() {
+        let soak = build("soak", false, false, true);
+        let clean = json!({ "head": "c1b6244", "dirty": false });
+        let pinned = check_pin(&info(
+            go_mod_version(ORACLE_GO_MOD, SIGNATURE_MODULES[0]).expect("required"),
+            go_mod_version(ORACLE_GO_MOD, SIGNATURE_MODULES[1]).expect("required"),
+        ));
+        let floors = Mode::Floors { scale: 1.0 };
+        let all = json!("all");
+        let eligible = |b: &Build| gate_eligible(b, &[], &clean, &pinned, floors, &all);
+        assert!(eligible(&soak));
+        assert!(eligible(&build("soak-checked", false, true, true)));
+        let ed25519 = json!(["ed25519"]);
+        assert!(gate_eligible(&soak, &[], &clean, &pinned, floors, &ed25519));
+
+        for b in [
+            build("bin", false, false, true),
+            build("soak", true, false, true),
+            build("soak", false, true, true),
+            build("soak-checked", false, false, true),
+            build("soak", false, false, false),
+            Build {
+                overflow_checks: None,
+                ..soak.clone()
+            },
+        ] {
+            assert!(!eligible(&b), "{b:?}");
+        }
+        let differs = ["src/run.rs".to_owned()];
+        assert!(!gate_eligible(
+            &soak, &differs, &clean, &pinned, floors, &all
+        ));
+        for git in [
+            json!({ "head": "c1b6244", "dirty": true }),
+            json!({ "head": null, "dirty": null }),
+        ] {
+            assert!(
+                !gate_eligible(&soak, &[], &git, &pinned, floors, &all),
+                "{git}"
+            );
+        }
+        let off_pin = check_pin(&info("v4.4.1", EDW));
+        assert!(!off_pin.consistent());
+        assert!(!gate_eligible(&soak, &[], &clean, &off_pin, floors, &all));
+        for mode in [
+            Mode::Floors { scale: 0.5 },
+            Mode::Cases(300),
+            Mode::Budget(std::time::Duration::from_secs(60)),
+        ] {
+            assert!(
+                !gate_eligible(&soak, &[], &clean, &pinned, mode, &all),
+                "{mode:?}"
+            );
+        }
+        let partial = json!("partial");
+        assert!(!gate_eligible(
+            &soak,
+            &[],
+            &clean,
+            &pinned,
+            floors,
+            &partial
+        ));
+    }
+
+    /// The record names the directory and every fact beside what they
+    /// make of the build, and this test binary reports its own build's
+    /// facts.
+    #[test]
+    fn the_build_is_recorded_with_its_facts() {
+        let json = build("soak", false, false, true).to_json();
+        assert_eq!(json["profile"], "soak");
+        assert_eq!(json["soak_profile"], "soak");
+        assert_eq!(json["profile_problem"], Value::Null);
+        assert_eq!(json["panic"], "unwind");
+        let json = build("bin", false, false, true).to_json();
+        assert_eq!(json["profile"], "bin");
+        assert_eq!(json["soak_profile"], Value::Null);
+        assert!(json["profile_problem"].is_string());
+
+        let current = Build::current(Some(true));
+        assert_eq!(current.dir, profile_name());
+        assert_eq!(current.debug_assertions, cfg!(debug_assertions));
+        assert_eq!(current.panic_unwind, cfg!(panic = "unwind"));
+        assert_eq!(current.overflow_checks, Some(true));
     }
 }

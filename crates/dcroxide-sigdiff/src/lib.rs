@@ -21,7 +21,10 @@
 //! dcroxide's own answer.  The `sigsoak` binary drives it all and writes the
 //! record of a run ([`record`], [`manifest`]).  The canaries ([`canary`])
 //! stand deliberately broken models in for dcroxide, to show that the
-//! classes fail where an implementation gets dcrd's branches wrong.
+//! classes fail where an implementation gets dcrd's branches wrong, and
+//! [`witness`] picks the witness vectors `dcroxide-dcrec` keeps: cases of
+//! the constructed classes, with dcrd's answers, that its own Go-free test
+//! answers and re-derives.
 //!
 //! # Independence
 //!
@@ -63,3 +66,4 @@ pub mod pipe;
 pub mod record;
 pub mod reply;
 pub mod run;
+pub mod witness;
