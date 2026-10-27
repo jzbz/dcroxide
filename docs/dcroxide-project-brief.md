@@ -118,7 +118,7 @@ exit criteria have not been demonstrated, and those are listed here too:
   licenses/advisories/sources/bans, a
   60-second-per-target fuzz smoke — all of those on every push to `master`
   and every pull request — and a nightly
-  10-minute-per-target run over the 17 fuzz targets. Not wired: coverage
+  10-minute-per-target run over the 19 fuzz targets. Not wired: coverage
   reporting (`cargo-llvm-cov`), `cargo-vet`, `cargo-mutants`, and any sanitizer
   coverage beyond the AddressSanitizer `cargo fuzz` builds in by default. [docs/dependency-ledger.md](dependency-ledger.md) records a decision per load-bearing crate — vendored, reviewed@V, accepted, or declined — while stating outright that it is not a review; a full manual audit and a version freeze are still Phase 15 items.
 - Three further ledger rows sit at "—" for reasons that are not debt:
@@ -729,7 +729,7 @@ this plan first asked for, which a project with one maintainer
 here") cannot meet; the external review of Phase 15 is still to come. Not all
 of this is in place. The soak has not been run for `dcrec`
 ([ADR-0006](adr/0006-secp256k1-backend.md)'s 2026-10-26 addendum), none of the
-17 targets under `fuzz/fuzz_targets/` calls the oracle, and `cargo-mutants` is
+19 targets under `fuzz/fuzz_targets/` calls the oracle, and `cargo-mutants` is
 not wired up (the Phase 0 item in the list of outstanding work above).
 Workspace line coverage is to be reported and ratcheted (never decreases) once
 `cargo-llvm-cov` is wired up, which it is not yet; a target ≥90% overall is

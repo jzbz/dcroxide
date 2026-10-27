@@ -2,12 +2,14 @@
 
 - **Status:** Accepted 2026-10-26. Step 1 is under way:
   `dcroxide-tlscrypto` holds the nine cipher suites' record protection,
-  the four key exchange groups and the signing keys, and the node takes
-  only its P-521 group and its P-521 signer, which `ring` lacks. `ring`
-  stays the node's TLS provider for everything else until the in-tree
-  provider passes the Go interop matrix: every cipher suite, key
-  exchange group, key type and TLS version, plus client certificates.
-  Then `ring` goes in one change.
+  the four key exchange groups, the signing keys and ring's fourteen
+  verification algorithms, RSA among them verified in tree (T5), put
+  together in its `default_provider`; the node takes only its P-521
+  group and its P-521 signer, which `ring` lacks. `ring` stays the
+  node's TLS provider for everything else until the in-tree provider
+  passes the Go interop matrix: every cipher suite, key exchange group,
+  key type and TLS version, plus client certificates. Then `ring` goes
+  in one change.
 - **Date:** 2026-10-26
 
 ## Context
@@ -87,7 +89,7 @@ node asks for `ureq = "3"` with its default features
 only when both switches change; either alone brings it back. `fuzz/`,
 outside the workspace with a lock of its own, takes the node's whole tree
 through `dcroxide-node` (`fuzz/Cargo.toml:21-24`) and locks `ring` too
-(`fuzz/Cargo.lock:1390`).
+(`fuzz/Cargo.lock:1392`).
 
 ### The process default
 
@@ -282,7 +284,7 @@ was not taken: the line of it built on the RustCrypto generation in the
 lock was a prerelease when the research read it, its stable 0.9 line is
 built on the generation before (`digest` 0.10,
 `rsa-0.9.10/Cargo.toml:108-109`, where the lock has 0.11.3,
-`Cargo.lock:837-838`), and it carries RUSTSEC-2023-0071, the
+`Cargo.lock:838-839`), and it carries RUSTSEC-2023-0071, the
 timing advisory `gencerts` already cites (`gentool.rs:12-15`). That
 advisory concerns private-key operations, which verification does not
 run; this is the research's reading, and the advisory was not re-read for
@@ -332,9 +334,9 @@ and ends the reliance on ureq's unstable provider API.
 - **The Go interop matrix**, through the oracle: every cipher suite, key
   exchange group, key type and TLS version, plus client certificates,
   against the reference Go. "Through the oracle" is the research's means;
-  the approved text says "against Go". The oracle has no TLS command
-  today, its one X.509 command being `x509_verify_client`
-  (`tools/oracle/main.go:1526`).
+  the approved text says "against Go". When this was accepted the oracle
+  had no TLS command, its one X.509 command being `x509_verify_client`
+  (`tools/oracle/main.go:1550`).
 - **A constant-time check on the signing and key-exchange paths.** Its
   method is not set here.
 
@@ -346,7 +348,7 @@ and ends the reliance on ureq's unstable provider API.
   under rustls can offer them. Every client the Decred tools ship offers
   an AES-GCM suite (`PARITY.md:2994-2995`).
 - **rustls 0.24 is unreleased.** The provider is written against 0.23,
-  the line the node is on (0.23.46, `Cargo.lock:1526-1527`), and is ported
+  the line the node is on (0.23.46, `Cargo.lock:1527-1528`), and is ported
   to 0.24 when that is stable. The research read 0.24.0-dev.2 as
   reshaping `CryptoProvider`, separate TLS 1.2 and TLS 1.3 suite lists
   among the changes, and estimated a modest port; it also found that

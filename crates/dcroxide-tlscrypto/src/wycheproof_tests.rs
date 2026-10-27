@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: ISC
-//! Wycheproof's vectors for the crate's record protection, HMAC, HKDF and
-//! key exchange (ADR-0015 T10), run through the crate's own code: the
-//! AEADs the suites instantiate, through the `seal` and `open` every
-//! record goes through; HMAC as rustls asks for a tag; HKDF as rustls
-//! builds it on that HMAC; and each key exchange group's `complete`, from
-//! the case's private key.  The files, their commit and their hashes are
-//! in `tests/data/wycheproof/SOURCE`.
+//! Wycheproof's vectors for the crate's record protection, HMAC, HKDF, key
+//! exchange and signature verification (ADR-0015 T10), run through the
+//! crate's own code: the AEADs the suites instantiate, through the `seal`
+//! and `open` every record goes through; HMAC as rustls asks for a tag;
+//! HKDF as rustls builds it on that HMAC; each key exchange group's
+//! `complete`, from the case's private key; and the verification
+//! algorithms of `SUPPORTED_SIG_ALGS`, on the key as a certificate's
+//! SubjectPublicKeyInfo carries it.  The files, their commit and their
+//! hashes are in `tests/data/wycheproof/SOURCE`.
 //!
 //! A unit-test module rather than an integration test, because the AEADs
 //! and a key exchange with a fixed private key are reached through
@@ -13,16 +15,19 @@
 //! and `schema` before it reads the groups, and counts what it runs and
 //! what it skips against fixed totals, so a truncated or replaced file
 //! fails rather than passing on fewer cases.  A `valid` case must succeed
-//! with Wycheproof's answer and an `invalid` one must fail.  Only the key
-//! exchange files have `acceptable` cases, and each is decided by its
-//! flags under [`ACCEPTABLE_KX`], which gives the reason for each verdict;
-//! a case none of its entries covers fails the test until one is written
-//! down, and any `acceptable` case in the other files fails it too.
-//! Every key exchange case, whatever its result, is also held to Go's
-//! `crypto/ecdh` through the oracle, which is how the table is checked
-//! against Go: where there is no oracle that comparison is skipped, unless
-//! `DCROXIDE_REQUIRE_ORACLE` is set, as in CI, where it also requires the
-//! reference Go.
+//! with Wycheproof's answer and an `invalid` one must fail.  The key
+//! exchange and signature files have `acceptable` cases, and each is
+//! decided by its flags under [`ACCEPTABLE_KX`] or [`ACCEPTABLE_SIG`],
+//! which give the reason for each verdict; a case none of their entries
+//! covers fails the test until one is written down, and any `acceptable`
+//! case in the other files fails it too.  A PSS group whose parameters
+//! TLS does not sign with is run as must-refuse, valid cases and all
+//! ([`pss_policy`]).  Every key exchange and signature case, whatever its
+//! result, is also held to Go through the oracle, `crypto/ecdh` for the
+//! one and `crypto/x509`'s signature check for the other, which is how
+//! the tables are checked against Go: where there is no oracle that
+//! comparison is skipped, unless `DCROXIDE_REQUIRE_ORACLE` is set, as in
+//! CI, where it also requires the reference Go.
 
 use std::io::Read;
 
@@ -31,12 +36,14 @@ use chacha20poly1305::ChaCha20Poly1305;
 use dcroxide_testutil::{Oracle, hex, unhex};
 use rustls::crypto::hmac::Hmac;
 use rustls::crypto::tls13::{Hkdf, OutputLengthError};
+use rustls::pki_types::SignatureVerificationAlgorithm;
 use rustls::{Error, NamedGroup, PeerMisbehaved};
 use serde_json::Value;
 
 use crate::aead::{self, RecordAead};
 use crate::hmac::{HKDF_SHA256, HKDF_SHA384, HMAC_SHA256, HMAC_SHA384};
 use crate::kx::exchange_with;
+use crate::verify;
 
 /// The parsed vector file `name`, from `tests/data/wycheproof`.
 fn load(name: &str) -> Value {
@@ -672,4 +679,335 @@ fn p521_ecdh_answers_wycheproof() {
     };
     let schema = "ecdh_ecpoint_test_schema_v1.json";
     kx_answers_wycheproof(&KX_FILES[3], "ECDH", schema, expected);
+}
+
+/// What the provider must do with an `acceptable` signature case: the
+/// verdict of the first entry whose flag the case carries, for the reason
+/// the entry gives.
+const ACCEPTABLE_SIG: [(&str, Expect, &str); 3] = [
+    (
+        "MissingNull",
+        Expect::Invalid,
+        "the DigestInfo of PKCS#1 v1.5 carries NULL parameters, and ring and Go \
+         build the whole encoding with them and compare it \
+         (`ring-0.17.14/src/rsa/padding/pkcs1.rs:51-93`, \
+         `crypto/internal/fips140/rsa/pkcs1v15.go:120-126`)",
+    ),
+    (
+        "SmallOrderPublicKey",
+        Expect::Valid,
+        "Go and ring take a key of small order, checking no order, and these \
+         signatures meet the cofactorless equation they check as well as the \
+         cofactored one (`crypto/internal/fips140/ed25519/ed25519.go:290-327`)",
+    ),
+    (
+        "MixedOrderPublicKey",
+        Expect::Valid,
+        "Go and ring take a key with a torsion component, checking no \
+         subgroup, and these signatures meet the cofactorless equation",
+    ),
+];
+
+/// What a signature case expects, and why: Wycheproof's own word for a
+/// valid or invalid case, `refused` in place of a valid case's verdict
+/// where the group's parameters are not TLS's, and for an acceptable one
+/// what [`ACCEPTABLE_SIG`] gives it.
+fn sig_expect(case: &Value, refused: Option<&'static str>) -> (Expect, &'static str) {
+    match (text(case, "result"), refused) {
+        ("valid", None) => (Expect::Valid, "valid"),
+        ("valid", Some(why)) => (Expect::Invalid, why),
+        ("invalid", _) => (Expect::Invalid, "invalid"),
+        ("acceptable", _) => {
+            let flags = case["flags"]
+                .as_array()
+                .unwrap_or_else(|| panic!("no flags in {case}"));
+            ACCEPTABLE_SIG
+                .iter()
+                .find(|(flag, ..)| flags.iter().any(|f| f == flag))
+                .map(|&(_, expect, why)| (expect, why))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "tcId {}: no policy for an acceptable case flagged {flags:?}",
+                        number(case, "tcId")
+                    )
+                })
+        }
+        (other, _) => panic!(
+            "tcId {}: no policy for a result of {other:?}",
+            number(case, "tcId")
+        ),
+    }
+}
+
+/// How a group of a signature file is run: the algorithm, its name as Go's
+/// `x509.SignatureAlgorithm` gives it, and the reason a valid case must
+/// still be refused, when the group's parameters are not TLS's.
+type SigGroup = (
+    &'static dyn SignatureVerificationAlgorithm,
+    &'static str,
+    Option<&'static str>,
+);
+
+/// Go's verdict on a signature case, through the oracle's `sig_verify`:
+/// the group's SubjectPublicKeyInfo, as Wycheproof gives it, checked as Go
+/// checks a certificate's signature under `x509_alg`.
+fn go_verifies(oracle: &mut Oracle, spki: &str, x509_alg: &str, case: &Value) -> bool {
+    let request = serde_json::json!({
+        "spki": spki,
+        "x509_alg": x509_alg,
+        "message": text(case, "msg"),
+        "signature": text(case, "sig"),
+    });
+    let response = oracle.call("sig_verify", request.to_string().as_bytes());
+    dcroxide_testutil::require_reference_go(response["go_version"].as_str().unwrap_or_default());
+    match response["result"].as_str() {
+        Some("ok") => true,
+        Some(refused) if refused.starts_with("refused: ") => false,
+        _ => panic!(
+            "tcId {}: the oracle answered {response}",
+            number(case, "tcId")
+        ),
+    }
+}
+
+/// Run a signature file: each case of each group `run` picks, on the key
+/// `key` takes from the group, must get its expected verdict, and Go's,
+/// where there is an oracle; the groups `run` passes over are counted as
+/// skipped.
+fn sig_answers_wycheproof(
+    file: &str,
+    algorithm: &str,
+    schema: &str,
+    expected: Tally,
+    run: impl Fn(&Value) -> Option<SigGroup>,
+    key: impl Fn(&Value) -> Vec<u8>,
+) {
+    let mut oracle = dcroxide_testutil::oracle_or_skip();
+    run_file(file, algorithm, schema, expected, |group, tally| {
+        let Some((algorithm, x509_alg, refused)) = run(group) else {
+            tally.skip(group);
+            return;
+        };
+        let public_key = key(group);
+        for case in cases(group) {
+            let id = number(case, "tcId");
+            let (expect, why) = sig_expect(case, refused);
+            let ours = algorithm
+                .verify_signature(&public_key, &bytes(case, "msg"), &bytes(case, "sig"))
+                .is_ok();
+            if let Some(oracle) = oracle.as_mut() {
+                let spki = text(group, "publicKeyDer");
+                assert_eq!(
+                    ours,
+                    go_verifies(oracle, spki, x509_alg, case),
+                    "{file} tcId {id}: Go's verdict"
+                );
+            }
+            assert_eq!(ours, expect == Expect::Valid, "{file} tcId {id}: {why}");
+            if text(case, "result") == "acceptable" {
+                tally.ran_acceptable();
+            } else {
+                tally.ran(expect);
+            }
+        }
+    });
+}
+
+/// The uncompressed point of an ECDSA group's key.
+fn ecdsa_key(group: &Value) -> Vec<u8> {
+    bytes(&group["publicKey"], "uncompressed")
+}
+
+/// The `RSAPublicKey` of an RSA group's key.
+fn rsa_key(group: &Value) -> Vec<u8> {
+    bytes(group, "publicKeyAsn")
+}
+
+/// Run an ECDSA file, whose groups are all on `curve` with `sha`, under
+/// `run`'s algorithm.
+fn ecdsa_answers_wycheproof(file: &str, curve: &str, sha: &str, run: SigGroup, expected: Tally) {
+    sig_answers_wycheproof(
+        file,
+        "ECDSA",
+        "ecdsa_verify_schema_v1.json",
+        expected,
+        |group| {
+            assert_eq!(text(&group["publicKey"], "curve"), curve, "{file}");
+            assert_eq!(text(group, "sha"), sha, "{file}");
+            Some(run)
+        },
+        ecdsa_key,
+    );
+}
+
+#[test]
+fn ecdsa_p256_sha256_answers_wycheproof() {
+    let expected = Tally {
+        valid: 174,
+        invalid: 310,
+        acceptable: 0,
+        skipped: 0,
+    };
+    let run = (verify::ECDSA_P256_SHA256, "ECDSA-SHA256", None);
+    let file = "ecdsa_secp256r1_sha256_test.json";
+    ecdsa_answers_wycheproof(file, "secp256r1", "SHA-256", run, expected);
+}
+
+#[test]
+fn ecdsa_p384_sha256_answers_wycheproof() {
+    let expected = Tally {
+        valid: 162,
+        invalid: 310,
+        acceptable: 0,
+        skipped: 0,
+    };
+    let run = (verify::ECDSA_P384_SHA256, "ECDSA-SHA256", None);
+    let file = "ecdsa_secp384r1_sha256_test.json";
+    ecdsa_answers_wycheproof(file, "secp384r1", "SHA-256", run, expected);
+}
+
+#[test]
+fn ecdsa_p384_sha384_answers_wycheproof() {
+    let expected = Tally {
+        valid: 194,
+        invalid: 310,
+        acceptable: 0,
+        skipped: 0,
+    };
+    let run = (verify::ECDSA_P384_SHA384, "ECDSA-SHA384", None);
+    let file = "ecdsa_secp384r1_sha384_test.json";
+    ecdsa_answers_wycheproof(file, "secp384r1", "SHA-384", run, expected);
+}
+
+#[test]
+fn ed25519_answers_wycheproof() {
+    // The acceptable cases are keys of small order and keys with a torsion
+    // component, all taken.
+    let expected = Tally {
+        valid: 117,
+        invalid: 64,
+        acceptable: 29,
+        skipped: 0,
+    };
+    sig_answers_wycheproof(
+        "ed25519_test.json",
+        "EDDSA",
+        "eddsa_verify_schema_v1.json",
+        expected,
+        |group| {
+            assert_eq!(text(&group["publicKey"], "curve"), "edwards25519");
+            Some((verify::ED25519, "Ed25519", None))
+        },
+        |group| bytes(&group["publicKey"], "pk"),
+    );
+}
+
+/// The PKCS#1 v1.5 algorithm of a hash as Wycheproof names it, with Go's
+/// name for it.
+fn pkcs1_for(sha: &str) -> (&'static dyn SignatureVerificationAlgorithm, &'static str) {
+    match sha {
+        "SHA-256" => (verify::RSA_PKCS1_2048_8192_SHA256, "SHA256-RSA"),
+        "SHA-384" => (verify::RSA_PKCS1_2048_8192_SHA384, "SHA384-RSA"),
+        "SHA-512" => (verify::RSA_PKCS1_2048_8192_SHA512, "SHA512-RSA"),
+        other => panic!("no PKCS#1 v1.5 algorithm for {other}"),
+    }
+}
+
+#[test]
+fn rsa_pkcs1_answers_wycheproof() {
+    // Each file's one acceptable case is a DigestInfo missing its NULL,
+    // refused.
+    for (file, sha, valid, invalid) in [
+        ("rsa_signature_2048_sha256_test.json", "SHA-256", 9, 249),
+        ("rsa_signature_2048_sha384_test.json", "SHA-384", 7, 250),
+        ("rsa_signature_2048_sha512_test.json", "SHA-512", 8, 250),
+        ("rsa_signature_3072_sha256_test.json", "SHA-256", 8, 250),
+        ("rsa_signature_3072_sha384_test.json", "SHA-384", 7, 251),
+        ("rsa_signature_3072_sha512_test.json", "SHA-512", 8, 251),
+        ("rsa_signature_4096_sha384_test.json", "SHA-384", 7, 251),
+        ("rsa_signature_4096_sha512_test.json", "SHA-512", 7, 251),
+    ] {
+        let expected = Tally {
+            valid,
+            invalid,
+            acceptable: 1,
+            skipped: 0,
+        };
+        sig_answers_wycheproof(
+            file,
+            "RSASSA-PKCS1-v1_5",
+            "rsassa_pkcs1_verify_schema_v1.json",
+            expected,
+            |group| {
+                assert_eq!(text(group, "sha"), sha, "{file}");
+                let (algorithm, go) = pkcs1_for(sha);
+                Some((algorithm, go, None))
+            },
+            rsa_key,
+        );
+    }
+}
+
+/// How a PSS group runs: under the PSS algorithm of its hash, when the
+/// provider has one, and as must-refuse when its MGF1 hash or salt length
+/// is not what TLS signs with (RFC 8446 §4.2.3: the message's hash, and a
+/// salt the hash's length), which ring and Go's `crypto/tls` alike
+/// require; `None`, to be skipped, for a hash no algorithm takes.
+fn pss_policy(group: &Value) -> Option<SigGroup> {
+    let (algorithm, go, len): (&'static dyn SignatureVerificationAlgorithm, _, _) =
+        match text(group, "sha") {
+            "SHA-256" => (
+                verify::RSA_PSS_2048_8192_SHA256_LEGACY_KEY,
+                "SHA256-RSAPSS",
+                32,
+            ),
+            "SHA-384" => (
+                verify::RSA_PSS_2048_8192_SHA384_LEGACY_KEY,
+                "SHA384-RSAPSS",
+                48,
+            ),
+            "SHA-512" => (
+                verify::RSA_PSS_2048_8192_SHA512_LEGACY_KEY,
+                "SHA512-RSAPSS",
+                64,
+            ),
+            _ => return None,
+        };
+    assert_eq!(text(group, "mgf"), "MGF1");
+    let tls = text(group, "mgfSha") == text(group, "sha") && number(group, "sLen") == len;
+    let refused = (!tls).then_some(
+        "TLS signs with MGF1 over the message's hash and a salt the hash's length, \
+         and ring and Go's crypto/tls take nothing else",
+    );
+    Some((algorithm, go, refused))
+}
+
+#[test]
+fn rsa_pss_answers_wycheproof() {
+    for (file, valid, invalid, skipped) in [
+        ("rsa_pss_2048_sha256_mgf1_32_test.json", 63, 45, 0),
+        ("rsa_pss_3072_sha256_mgf1_32_test.json", 63, 45, 0),
+        ("rsa_pss_4096_sha256_mgf1_32_test.json", 63, 45, 0),
+        ("rsa_pss_4096_sha512_mgf1_64_test.json", 132, 47, 0),
+        // Every case is valid for its parameters: the three groups of a
+        // hash TLS signs PSS with, its MGF1 and its salt length run as
+        // valid, the 87 others of those hashes as must-refuse, and the 60
+        // of SHA-1 and SHA-224 are skipped.
+        ("rsa_pss_misc_test.json", 3, 87, 60),
+    ] {
+        let expected = Tally {
+            valid,
+            invalid,
+            acceptable: 0,
+            skipped,
+        };
+        sig_answers_wycheproof(
+            file,
+            "RSASSA-PSS",
+            "rsassa_pss_verify_schema_v1.json",
+            expected,
+            pss_policy,
+            rsa_key,
+        );
+    }
 }

@@ -770,6 +770,160 @@ pub fn pseudo_version_commit(version: &str) -> Option<&str> {
     pseudo.then_some(commit)
 }
 
+/// The RSA keys of the test-key fixture, `data/rsa-test-keys.json`, each a
+/// name with its modulus length in bits and its public exponent: moduli
+/// of 1024, 2040, 2041, 2048, 3072, 4096, 8192 and 8193 bits with
+/// e = 65537, and 2048-bit moduli with e = 3, 2^31 - 1, 2^31 + 1,
+/// 2^33 - 1 and 2^33 + 1.  They sit at the edges of ring's RSA limits and
+/// Go's, which `dcroxide-tlscrypto` holds its RSA verification to
+/// (ADR-0015 T5), and serve as RSA keys in its other tests, since Go's key
+/// generation is slow at these lengths and, from Go 1.26, never makes the
+/// same key twice.
+///
+/// Test-only keys, made once by the oracle's `rsa_keygen` through the
+/// ignored `regenerate_rsa_test_keys` below, and kept as hex components
+/// rather than PEM, so no private-key block sits in the tree.  They sign
+/// nothing outside the tests and must never be used as real keys.
+///
+/// `dcroxide-tlscrypto`'s signature parity corpus names these keys and
+/// records signatures under them, with ring's verdicts, so new keys make
+/// its recorded RSA verdicts wrong: the corpus has to be made again with
+/// them, which only a tree that still has ring can do.  Once ring is gone
+/// the fixture's keys stay as they are, and a key is added by appending
+/// `rsa_keygen`'s answer for it and its entry here.
+pub const RSA_TEST_KEYS: &[(&str, u64, u64)] = &[
+    ("rsa1024", 1024, 65537),
+    ("rsa2040", 2040, 65537),
+    ("rsa2041", 2041, 65537),
+    ("rsa2048", 2048, 65537),
+    ("rsa3072", 3072, 65537),
+    ("rsa4096", 4096, 65537),
+    ("rsa8192", 8192, 65537),
+    ("rsa8193", 8193, 65537),
+    ("rsa2048-e3", 2048, 3),
+    ("rsa2048-e2147483647", 2048, (1 << 31) - 1),
+    ("rsa2048-e2147483649", 2048, (1 << 31) + 1),
+    ("rsa2048-e8589934591", 2048, (1 << 33) - 1),
+    ("rsa2048-e8589934593", 2048, (1 << 33) + 1),
+];
+
+/// A key of the RSA test-key fixture ([`RSA_TEST_KEYS`]): each component
+/// big-endian, without leading zeros.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RsaTestKey {
+    /// The key's name in the fixture.
+    pub name: String,
+    /// The modulus's length in bits.
+    pub bits: u64,
+    /// The modulus.
+    pub n: Vec<u8>,
+    /// The public exponent.
+    pub e: Vec<u8>,
+    /// The private exponent.
+    pub d: Vec<u8>,
+    /// The first prime.
+    pub p: Vec<u8>,
+    /// The second prime.
+    pub q: Vec<u8>,
+}
+
+impl RsaTestKey {
+    /// The key's `RSAPublicKey` (RFC 8017 §A.1.1), as a SubjectPublicKeyInfo
+    /// carries it: a SEQUENCE of the modulus and the exponent as INTEGERs,
+    /// each with the sign byte DER needs, in lengths of the fewest bytes.
+    pub fn rsa_public_key(&self) -> Vec<u8> {
+        der_element(0x30, &[der_integer(&self.n), der_integer(&self.e)].concat())
+    }
+
+    /// The key's components as the oracle takes an RSA key: an object of
+    /// `n`, `e`, `d`, `p` and `q` in hex.
+    pub fn oracle_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "n": hex(&self.n),
+            "e": hex(&self.e),
+            "d": hex(&self.d),
+            "p": hex(&self.p),
+            "q": hex(&self.q),
+        })
+    }
+}
+
+/// A DER INTEGER of the unsigned big-endian `value`: a zero byte ahead of
+/// a top bit that is set.
+fn der_integer(value: &[u8]) -> Vec<u8> {
+    let mut content = Vec::with_capacity(value.len().saturating_add(1));
+    if value.first().is_none_or(|first| first & 0x80 != 0) {
+        content.push(0);
+    }
+    content.extend_from_slice(value);
+    der_element(0x02, &content)
+}
+
+/// A DER element: `tag`, its content's length in the fewest bytes, and
+/// `content`.
+fn der_element(tag: u8, content: &[u8]) -> Vec<u8> {
+    let len = content.len().to_be_bytes();
+    let digits = &len[len.iter().position(|&b| b != 0).unwrap_or(len.len())..];
+    let mut out = vec![tag];
+    match digits {
+        [] => out.push(0),
+        [short] if *short < 0x80 => out.push(*short),
+        _ => {
+            out.push(0x80 | u8::try_from(digits.len()).expect("at most eight length bytes"));
+            out.extend_from_slice(digits);
+        }
+    }
+    out.extend_from_slice(content);
+    out
+}
+
+/// Where the RSA test-key fixture lives.
+fn rsa_test_keys_path() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("data")
+        .join("rsa-test-keys.json")
+}
+
+/// The RSA test key `name` ([`RSA_TEST_KEYS`]); panics on a name the
+/// fixture lacks.  The fixture is read once per process.
+pub fn rsa_test_key(name: &str) -> RsaTestKey {
+    static KEYS: OnceLock<Vec<RsaTestKey>> = OnceLock::new();
+    KEYS.get_or_init(|| {
+        let path = rsa_test_keys_path();
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        let fixture: serde_json::Value =
+            serde_json::from_str(&text).unwrap_or_else(|e| panic!("parse {}: {e}", path.display()));
+        fixture["keys"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{}: no keys", path.display()))
+            .iter()
+            .map(|key| {
+                let field = |name: &str| {
+                    key[name]
+                        .as_str()
+                        .unwrap_or_else(|| panic!("{}: a key without {name}", path.display()))
+                };
+                RsaTestKey {
+                    name: field("name").to_owned(),
+                    bits: key["bits"]
+                        .as_u64()
+                        .unwrap_or_else(|| panic!("{}: a key without its bits", path.display())),
+                    n: unhex(field("n")),
+                    e: unhex(field("e")),
+                    d: unhex(field("d")),
+                    p: unhex(field("p")),
+                    q: unhex(field("q")),
+                }
+            })
+            .collect()
+    })
+    .iter()
+    .find(|key| key.name == name)
+    .unwrap_or_else(|| panic!("no RSA test key named {name:?}"))
+    .clone()
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
@@ -1372,5 +1526,111 @@ mod tests {
             1,
             "every spawn after the first must reuse the built binary"
         );
+    }
+
+    /// Writes the RSA test-key fixture, `data/rsa-test-keys.json`: each key
+    /// of [`RSA_TEST_KEYS`] from the oracle's `rsa_keygen`, under the
+    /// reference Go.  Ignored, since the fixture is made once and committed
+    /// (the 8192-bit keys take Go a while, and no two runs make the same
+    /// keys); run it alone, with
+    /// `cargo test -p dcroxide-testutil --lib -- --ignored regenerate_rsa_test_keys`,
+    /// and every test that takes its keys from the fixture sees new ones.
+    /// The signature parity corpus, which records signatures under the old
+    /// ones, must then be made again with `dcroxide-tlscrypto`'s
+    /// `regenerate_parity_corpus` while ring is in the tree; once ring is
+    /// gone, keys are only appended ([`RSA_TEST_KEYS`]).
+    #[test]
+    #[ignore = "regenerates the committed RSA test-key fixture"]
+    fn regenerate_rsa_test_keys() {
+        let mut oracle = Oracle::spawn();
+        let mut keys = Vec::new();
+        for &(name, bits, e) in RSA_TEST_KEYS {
+            let request = serde_json::json!({ "bits": bits, "e": e });
+            let response = oracle.call("rsa_keygen", request.to_string().as_bytes());
+            let go_version = response["go_version"].as_str().unwrap_or_default();
+            assert_eq!(
+                go_version, REFERENCE_GO,
+                "the fixture is the reference Go's"
+            );
+            let detail = &response["detail"];
+            assert!(detail.is_object(), "{name}: the oracle answered {response}");
+            let mut key = serde_json::json!({ "name": name, "bits": bits });
+            for component in ["n", "e", "d", "p", "q"] {
+                key[component] = detail[component].clone();
+            }
+            keys.push(key);
+        }
+        let fixture = serde_json::json!({
+            "about": "Test-only RSA keys for dcroxide's tests, never real keys: made once by \
+                      the oracle's rsa_keygen under the reference Go through \
+                      dcroxide-testutil's regenerate_rsa_test_keys, and read through \
+                      dcroxide_testutil::rsa_test_key. Each component is big-endian hex.",
+            "go_version": REFERENCE_GO,
+            "keys": keys,
+        });
+        let mut text = serde_json::to_string_pretty(&fixture).expect("serialize the fixture");
+        text.push('\n');
+        let path = rsa_test_keys_path();
+        std::fs::create_dir_all(path.parent().expect("data/")).expect("create data/");
+        std::fs::write(&path, text).unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
+    }
+
+    /// The fixture holds every key of [`RSA_TEST_KEYS`] in order, each with
+    /// its name, a modulus of its bit length, its exponent, a private
+    /// exponent and primes about half its length, and no two share a
+    /// modulus; and a key's `RSAPublicKey` is its two INTEGERs, the sign
+    /// byte where DER needs one.  (That the values make an RSA key, n = pq
+    /// and d inverting e, `dcroxide-tlscrypto`'s RSA tests check, where
+    /// there is big-integer arithmetic.)
+    #[test]
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "bit and byte counts of keys at most 8193 bits long"
+    )]
+    fn the_rsa_test_keys_are_what_they_say() {
+        let bits_of = |value: &[u8]| {
+            let first = value.first().copied().unwrap_or(0);
+            u64::try_from(value.len()).expect("a length") * 8 - u64::from(first.leading_zeros())
+        };
+        let mut moduli = BTreeSet::new();
+        for &(name, bits, e) in RSA_TEST_KEYS {
+            let key = rsa_test_key(name);
+            assert_eq!(key.name, name);
+            assert_eq!(key.bits, bits, "{name}");
+            assert_eq!(bits_of(&key.n), bits, "{name}: the modulus");
+            assert_eq!(
+                key.n.last().map(|b| b & 1),
+                Some(1),
+                "{name}: an odd modulus"
+            );
+            let mut exponent = [0u8; 8];
+            exponent[8 - key.e.len()..].copy_from_slice(&key.e);
+            assert_eq!(u64::from_be_bytes(exponent), e, "{name}: the exponent");
+            for (component, value) in [("d", &key.d), ("p", &key.p), ("q", &key.q)] {
+                assert_ne!(
+                    value.first(),
+                    Some(&0),
+                    "{name}: {component} without leading zeros"
+                );
+            }
+            assert!(bits_of(&key.d) <= bits, "{name}: d below n");
+            assert_eq!(
+                bits_of(&key.p) + bits_of(&key.q),
+                bits,
+                "{name}: two halves"
+            );
+            assert!(moduli.insert(key.n.clone()), "{name}: a modulus of its own");
+        }
+        let key = rsa_test_key("rsa2048-e3");
+        let public = key.rsa_public_key();
+        assert_eq!(
+            &public[..9],
+            &[0x30, 0x82, 0x01, 0x08, 0x02, 0x82, 0x01, 0x01, 0x00]
+        );
+        assert!(public.ends_with(&[0x02, 0x01, 0x03]));
+        assert_eq!(der_element(0x04, &[0; 0x80])[..3], [0x04, 0x81, 0x80]);
+        assert_eq!(der_integer(&[0x7f]), [0x02, 0x01, 0x7f]);
+        assert_eq!(der_integer(&[0x80]), [0x02, 0x02, 0x00, 0x80]);
+        assert_eq!(key.oracle_json()["e"], "03");
     }
 }

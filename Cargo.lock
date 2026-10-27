@@ -768,6 +768,7 @@ dependencies = [
  "flate2",
  "getrandom 0.4.3",
  "hmac",
+ "num-bigint",
  "p256",
  "p384",
  "p521",

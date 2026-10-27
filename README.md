@@ -483,20 +483,25 @@ work). Currently implemented:
   to-be-signed bytes and keys, from a scripted session mirroring
   dcrd's template construction
 - `dcroxide-tlscrypto` — the rustls crypto provider that is to replace
-  `ring` (no dcrd counterpart; ADR-0015), built in steps beside it: so
-  far the nine cipher suites' record protection over RustCrypto's
-  `aes-gcm` and `chacha20poly1305`, with their transcript hashes, HMAC,
-  HKDF and TLS 1.2 PRF, and the X25519, P-256, P-384 and P-521 key
-  exchanges over `curve25519-dalek` and RustCrypto's curve crates, with
-  Go's rules for a peer's share and ephemeral keys from the kernel, and
-  the ECDSA (P-256, P-384, P-521, hedged RFC 6979) and Ed25519 signing
-  keys, loaded by Go's `tls.X509KeyPair` rules with RSA keys refused,
-  pinned by Wycheproof's vectors on hardware and portable backends, by
-  RFC 6979's and RFC 8032's known answers, by in-memory handshakes
-  against ring's suites and groups, both ways, and against ring's
-  verifier on the provider's keys, and by Go's `crypto/ecdh`,
-  `tls.X509KeyPair` and `ed25519.Sign` through the oracle; the node
-  takes only its P-521 key exchange and its P-521 signer so far
+  `ring` (no dcrd counterpart; ADR-0015), built beside it and now whole
+  at today's feature level: the nine cipher suites' record protection
+  over RustCrypto's `aes-gcm` and `chacha20poly1305`, with their
+  transcript hashes, HMAC, HKDF and TLS 1.2 PRF; the X25519, P-256,
+  P-384 and P-521 key exchanges over `curve25519-dalek` and RustCrypto's
+  curve crates, with Go's rules for a peer's share and ephemeral keys
+  from the kernel; the ECDSA (P-256, P-384, P-521, hedged RFC 6979) and
+  Ed25519 signing keys, loaded by Go's `tls.X509KeyPair` rules with RSA
+  keys refused; and ring's fourteen verification algorithms, ECDSA,
+  Ed25519 by Go's rules and RSA PKCS#1 v1.5 and PSS verified in tree on
+  `num-bigint`, within ring's limits; pinned by Wycheproof's vectors on
+  hardware and portable backends, by RFC 6979's and RFC 8032's known
+  answers, by in-memory handshakes against ring's provider, both ways,
+  by a corpus of signatures on which every verdict is ring's, recorded
+  for after ring leaves, and Go's but on RSA keys outside either's
+  limits and keys with bytes after their values, where ring differs
+  from Go today, and by Go's `crypto/ecdh`, `tls.X509KeyPair`,
+  `ed25519.Sign` and signature checks through the oracle; the node takes
+  only its P-521 key exchange and its P-521 signer so far
 - `dcroxide-ratelimit` — dcrd 2.2's `internal/ratelimit` token bucket:
   a bucket seeded with `burst` tokens refilling at a fixed rate,
   reproducing dcrd's `f64` operations in dcrd's order — including

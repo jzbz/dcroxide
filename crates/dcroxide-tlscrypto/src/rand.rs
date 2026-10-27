@@ -52,16 +52,9 @@ fn checked_fill<E>(
     read(buf).map_err(|_| GetRandomFailed)
 }
 
-/// The provider's `SecureRandom`: each call one [`kernel_fill`].
+/// The provider's `SecureRandom`, which [`crate::default_provider`] takes:
+/// each call one [`kernel_fill`].
 #[derive(Debug)]
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the provider value takes it once verification is in as well \
-                  (ADR-0015, step 1); until then only its tests do"
-    )
-)]
 pub(crate) struct KernelRandom;
 
 impl SecureRandom for KernelRandom {

@@ -15,6 +15,8 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/asn1"
 	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
@@ -840,8 +842,8 @@ func sigSignRequest(t *testing.T, key []byte, scheme, message string) []byte {
 }
 
 // TestSigSign checks sig_sign's Ed25519 signatures against RFC 8032's first
-// two tests, and that a scheme it does not take, a key of another type and
-// requests it cannot read are errors.
+// two tests, and that a scheme it does not take, a scheme or a key of
+// another type and requests it cannot read are errors.
 func TestSigSign(t *testing.T) {
 	for name, tc := range map[string]struct{ seed, message, want string }{
 		"RFC 8032 test 1": {
@@ -866,13 +868,351 @@ func TestSigSign(t *testing.T) {
 		t.Fatal(err)
 	}
 	for name, data := range map[string][]byte{
-		"unknown scheme":        sigSignRequest(t, edKey, "ECDSAWithP256AndSHA256", ""),
-		"a key of another type": sigSignRequest(t, pkcs8(t, ecKey), "Ed25519", ""),
-		"a key Go refuses":      sigSignRequest(t, []byte("not a key"), "Ed25519", ""),
-		"message not hex":       sigSignRequest(t, edKey, "Ed25519", "zz"),
-		"not JSON":              []byte("Ed25519"),
+		"unknown scheme":           sigSignRequest(t, edKey, "PKCS1WithSHA1", ""),
+		"a scheme of another type": sigSignRequest(t, edKey, "ECDSAWithP256AndSHA256", ""),
+		"a key of another type":    sigSignRequest(t, pkcs8(t, ecKey), "Ed25519", ""),
+		"a key Go refuses":         sigSignRequest(t, []byte("not a key"), "Ed25519", ""),
+		"message not hex":          sigSignRequest(t, edKey, "Ed25519", "zz"),
+		"not JSON":                 []byte("Ed25519"),
 	} {
 		resp := call("sig_sign", data)
+		if resp.Error == "" || resp.Result != "" {
+			t.Errorf("%s: got %+v, want an error", name, resp)
+		}
+	}
+}
+
+// jsonRequest is a request's data: fields as JSON.
+func jsonRequest(t *testing.T, fields map[string]any) []byte {
+	t.Helper()
+	data, err := json.Marshal(fields)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return data
+}
+
+// testRSAKey is an RSA key from rsaKeygen, with its components as
+// sig_sign takes them.
+func testRSAKey(t *testing.T, bits int, e uint64) (rsaComponents, rsaValues) {
+	t.Helper()
+	c, err := rsaKeygen(bits, e)
+	if err != nil {
+		t.Fatal(err)
+	}
+	v, err := c.values()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return c, v
+}
+
+// raised is sig raised to e mod n, as many bytes as the modulus: the
+// encoding a signature carries.
+func raised(v rsaValues, sig []byte) []byte {
+	m := new(big.Int).Exp(new(big.Int).SetBytes(sig), v.e, v.n)
+	return m.FillBytes(make([]byte, (v.n.BitLen()+7)/8))
+}
+
+// TestRSAKeygen checks rsa_keygen's keys: exactly the length asked for, an
+// odd one included, n = pq with both factors prime, the exponent asked for
+// and d its inverse mod lcm(p - 1, q - 1), and a key crypto/rsa takes
+// unless its exponent is one crypto/rsa refuses; and that requests it
+// cannot meet are errors.
+func TestRSAKeygen(t *testing.T) {
+	one := big.NewInt(1)
+	for _, tc := range []struct {
+		bits int
+		e    uint64
+	}{{1024, 65537}, {1025, 3}, {1024, 1<<31 + 1}} {
+		resp := call("rsa_keygen", jsonRequest(t, map[string]any{"bits": tc.bits, "e": tc.e}))
+		if resp.Error != "" || resp.Result != "" || resp.GoVersion != runtime.Version() {
+			t.Fatalf("%d bits, e %d: got %+v", tc.bits, tc.e, resp)
+		}
+		var c rsaComponents
+		if err := json.Unmarshal(resp.Detail, &c); err != nil {
+			t.Fatal(err)
+		}
+		v, err := c.values()
+		if err != nil {
+			t.Fatal(err)
+		}
+		pm1, qm1 := new(big.Int).Sub(v.p, one), new(big.Int).Sub(v.q, one)
+		lcm := new(big.Int).Mul(pm1, qm1)
+		lcm.Div(lcm, new(big.Int).GCD(nil, nil, pm1, qm1))
+		de := new(big.Int).Mul(v.d, v.e)
+		switch {
+		case v.n.BitLen() != tc.bits:
+			t.Errorf("%d bits, e %d: a modulus of %d bits", tc.bits, tc.e, v.n.BitLen())
+		case new(big.Int).Mul(v.p, v.q).Cmp(v.n) != 0:
+			t.Errorf("%d bits, e %d: n is not pq", tc.bits, tc.e)
+		case !v.p.ProbablyPrime(20) || !v.q.ProbablyPrime(20):
+			t.Errorf("%d bits, e %d: a factor is not prime", tc.bits, tc.e)
+		case !v.e.IsUint64() || v.e.Uint64() != tc.e:
+			t.Errorf("%d bits, e %d: e is %v", tc.bits, tc.e, v.e)
+		case de.Mod(de, lcm).Cmp(one) != 0:
+			t.Errorf("%d bits, e %d: d is not e's inverse", tc.bits, tc.e)
+		}
+		_, err = c.privateKey()
+		if takes := tc.e <= 1<<31-1; (err == nil) != takes {
+			t.Errorf("%d bits, e %d: crypto/rsa says %v", tc.bits, tc.e, err)
+		}
+	}
+	for name, data := range map[string][]byte{
+		"63 bits":    jsonRequest(t, map[string]any{"bits": 63, "e": 3}),
+		"16385 bits": jsonRequest(t, map[string]any{"bits": 16385, "e": 3}),
+		"e even":     jsonRequest(t, map[string]any{"bits": 1024, "e": 65536}),
+		"e 1":        jsonRequest(t, map[string]any{"bits": 1024, "e": 1}),
+		"not JSON":   []byte("1024"),
+	} {
+		resp := call("rsa_keygen", data)
+		if resp.Error == "" || len(resp.Detail) != 0 {
+			t.Errorf("%s: got %+v, want an error", name, resp)
+		}
+	}
+}
+
+// TestSigSignRSA checks sig_sign's RSA signatures. Through crypto/rsa,
+// PKCS#1 v1.5 signatures crypto/rsa verifies, which the raw signer makes
+// byte for byte, and PSS signatures it verifies, as it verifies the raw
+// signer's, under a scheme and an x509 algorithm alike; an exponent
+// crypto/rsa refuses is refused without raw and signed with it, its PKCS#1
+// v1.5 encoding the one a key of the same length and another exponent
+// carries; the raw signer's other encodings and salt lengths are what they
+// say; and requests it cannot meet are errors.
+func TestSigSignRSA(t *testing.T) {
+	small, smallValues := testRSAKey(t, 2048, 65537)
+	big31, big31Values := testRSAKey(t, 2048, 1<<31+1)
+	priv, err := small.privateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	message := []byte("a TLS 1.3 CertificateVerify's content")
+	sign := func(fields map[string]any) []byte {
+		t.Helper()
+		fields["message"] = hex.EncodeToString(message)
+		resp := call("sig_sign", jsonRequest(t, fields))
+		if resp.Error != "" || resp.GoVersion != runtime.Version() {
+			t.Fatalf("%v: got %+v", fields, resp)
+		}
+		return hexToBytes(resp.Result)
+	}
+	for _, tc := range []struct {
+		scheme, x509Alg string
+		hash            crypto.Hash
+		pss             bool
+	}{
+		{"PKCS1WithSHA256", "SHA256-RSA", crypto.SHA256, false},
+		{"PKCS1WithSHA384", "SHA384-RSA", crypto.SHA384, false},
+		{"PKCS1WithSHA512", "SHA512-RSA", crypto.SHA512, false},
+		{"PSSWithSHA256", "SHA256-RSAPSS", crypto.SHA256, true},
+		{"PSSWithSHA384", "SHA384-RSAPSS", crypto.SHA384, true},
+		{"PSSWithSHA512", "SHA512-RSAPSS", crypto.SHA512, true},
+	} {
+		digest := digestOf(tc.hash, message)
+		verify := func(sig []byte, saltLen int) error {
+			if tc.pss {
+				return rsa.VerifyPSS(&priv.PublicKey, tc.hash, digest, sig,
+					&rsa.PSSOptions{SaltLength: saltLen})
+			}
+			return rsa.VerifyPKCS1v15(&priv.PublicKey, tc.hash, digest, sig)
+		}
+		bySchemeName := sign(map[string]any{"rsa": small, "scheme": tc.scheme})
+		byX509Name := sign(map[string]any{"rsa": small, "x509_alg": tc.x509Alg})
+		rawSig := sign(map[string]any{"rsa": small, "scheme": tc.scheme, "raw": true})
+		for name, sig := range map[string][]byte{
+			"crypto/rsa, by scheme": bySchemeName, "crypto/rsa, by x509 name": byX509Name,
+			"raw": rawSig,
+		} {
+			if err := verify(sig, rsa.PSSSaltLengthEqualsHash); err != nil {
+				t.Errorf("%s, %s: %v", tc.scheme, name, err)
+			}
+		}
+		if !tc.pss && (!bytes.Equal(rawSig, bySchemeName) || !bytes.Equal(rawSig, byX509Name)) {
+			t.Errorf("%s: the raw signature is not crypto/rsa's", tc.scheme)
+		}
+		big31Sig := sign(map[string]any{"rsa": big31, "scheme": tc.scheme, "raw": true})
+		switch big31Encoded := raised(big31Values, big31Sig); {
+		case tc.pss:
+			// The same encoding steps, checked through crypto/rsa's verifier
+			// on the small key above; here the trailer and the top bit.
+			if big31Encoded[len(big31Encoded)-1] != 0xbc || big31Encoded[0]&0x80 != 0 {
+				t.Errorf("%s: e = 2^31 + 1 encodes %x", tc.scheme, big31Encoded)
+			}
+		case !bytes.Equal(big31Encoded, raised(smallValues, rawSig)):
+			t.Errorf("%s: e = 2^31 + 1 carries another encoding", tc.scheme)
+		}
+		if tc.pss {
+			for _, saltLen := range []int{0, tc.hash.Size() - 1, tc.hash.Size() + 1} {
+				sig := sign(map[string]any{"rsa": small, "scheme": tc.scheme, "raw": true,
+					"salt_len": saltLen})
+				if verify(sig, rsa.PSSSaltLengthEqualsHash) == nil || verify(sig, saltLen) != nil {
+					t.Errorf("%s: a salt of %d is not one", tc.scheme, saltLen)
+				}
+			}
+			continue
+		}
+		prefix := pkcs1Prefixes[tc.hash]
+		noNull := raised(smallValues, sign(map[string]any{"rsa": small, "scheme": tc.scheme,
+			"raw": true, "encoding": "no_null"}))
+		wantTail := append(append([]byte{0x00, 0x30, prefix[1] - 2, 0x30, prefix[3] - 2},
+			prefix[4:15]...), append(prefix[17:], digest...)...)
+		if !bytes.HasPrefix(noNull, []byte{0x00, 0x01, 0xff}) || !bytes.HasSuffix(noNull, wantTail) {
+			t.Errorf("%s: no_null encodes %x", tc.scheme, noNull)
+		}
+		short := raised(smallValues, sign(map[string]any{"rsa": small, "scheme": tc.scheme,
+			"raw": true, "encoding": "short_padding"}))
+		if !bytes.HasPrefix(short, []byte{0x00, 0x00, 0x01, 0xff}) ||
+			!bytes.HasSuffix(short, append(append([]byte{0x00}, prefix...), digest...)) {
+			t.Errorf("%s: short_padding encodes %x", tc.scheme, short)
+		}
+	}
+	edKey := pkcs8(t, ed25519.NewKeyFromSeed(make([]byte, ed25519.SeedSize)))
+	for name, fields := range map[string]map[string]any{
+		"e = 2^31 + 1 through crypto/rsa": {"rsa": big31, "scheme": "PKCS1WithSHA256"},
+		"raw with a PKCS#8 key": {"key_pkcs8": hex.EncodeToString(edKey),
+			"scheme": "PKCS1WithSHA256", "raw": true},
+		"raw on an ECDSA scheme": {"rsa": small, "scheme": "ECDSAWithP256AndSHA256",
+			"raw": true},
+		"raw on Ed25519": {"rsa": small, "x509_alg": "Ed25519", "raw": true},
+		"an encoding without raw": {"rsa": small, "scheme": "PKCS1WithSHA256",
+			"encoding": "no_null"},
+		"a salt length without raw": {"rsa": small, "scheme": "PSSWithSHA256", "salt_len": 0},
+		"an unknown encoding": {"rsa": small, "scheme": "PKCS1WithSHA256", "raw": true,
+			"encoding": "short"},
+		"an encoding for PSS": {"rsa": small, "scheme": "PSSWithSHA256", "raw": true,
+			"encoding": "no_null"},
+		"too long a salt": {"rsa": small, "scheme": "PSSWithSHA512", "raw": true,
+			"salt_len": 191},
+		"both keys": {"rsa": small, "key_pkcs8": hex.EncodeToString(edKey),
+			"scheme": "PKCS1WithSHA256"},
+		"neither key": {"scheme": "PKCS1WithSHA256"},
+		"a scheme and an x509 name": {"rsa": small, "scheme": "PKCS1WithSHA256",
+			"x509_alg": "SHA256-RSA"},
+		"components not hex": {"rsa": map[string]string{"n": "zz", "e": "03", "d": "01",
+			"p": "01", "q": "01"}, "scheme": "PKCS1WithSHA256", "raw": true},
+	} {
+		fields["message"] = ""
+		resp := call("sig_sign", jsonRequest(t, fields))
+		if resp.Error == "" || resp.Result != "" {
+			t.Errorf("%s: got %+v, want an error", name, resp)
+		}
+	}
+}
+
+// TestSigVerify checks sig_verify on a signature of each key type, through
+// an x509 algorithm and a TLS scheme alike: taken when it is the key's,
+// and refused, with Go's text, when a byte of it or of the message
+// changes, when the algorithm names another key type, and when the key is
+// one x509.ParsePKIXPublicKey refuses; and that requests it cannot read
+// are errors.
+func TestSigVerify(t *testing.T) {
+	ecKey, err := stdecdsa.GenerateKey(elliptic.P384(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, edKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rsaComponents, _ := testRSAKey(t, 2048, 65537)
+	rsaKey, err := rsaComponents.privateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	message := []byte("a certificate's TBSCertificate")
+	verify := func(fields map[string]any) string {
+		t.Helper()
+		resp := call("sig_verify", jsonRequest(t, fields))
+		if resp.Error != "" || resp.GoVersion != runtime.Version() {
+			t.Fatalf("%v: got %+v", fields, resp)
+		}
+		return resp.Result
+	}
+	for _, tc := range []struct {
+		key                       crypto.Signer
+		x509Alg, scheme, mismatch string
+	}{
+		{ecKey, "ECDSA-SHA384", "ECDSAWithP384AndSHA384", "SHA384-RSA"},
+		{ecKey, "ECDSA-SHA256", "ECDSAWithP256AndSHA256", "Ed25519"},
+		{edKey, "Ed25519", "Ed25519", "ECDSA-SHA256"},
+		{rsaKey, "SHA256-RSA", "PKCS1WithSHA256", "ECDSA-SHA256"},
+		{rsaKey, "SHA512-RSAPSS", "PSSWithSHA512", "Ed25519"},
+	} {
+		alg, err := lookupSigAlgorithm("", tc.x509Alg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		sig, err := signWith(tc.key, alg, message)
+		if err != nil {
+			t.Fatal(err)
+		}
+		spki, err := x509.MarshalPKIXPublicKey(tc.key.Public())
+		if err != nil {
+			t.Fatal(err)
+		}
+		flipped := append([]byte{}, sig...)
+		flipped[len(flipped)/2] ^= 0x10
+		for _, path := range []map[string]any{{"x509_alg": tc.x509Alg}, {"tls_scheme": tc.scheme}} {
+			fields := func(message, sig []byte) map[string]any {
+				f := map[string]any{"spki": hex.EncodeToString(spki),
+					"message": hex.EncodeToString(message), "signature": hex.EncodeToString(sig)}
+				for k, v := range path {
+					f[k] = v
+				}
+				return f
+			}
+			if got := verify(fields(message, sig)); got != "ok" {
+				t.Errorf("%s, %v: got %q", tc.x509Alg, path, got)
+			}
+			for name, got := range map[string]string{
+				"a byte of the signature": verify(fields(message, flipped)),
+				"another message":         verify(fields([]byte("another"), sig)),
+			} {
+				if !strings.HasPrefix(got, "refused: ") {
+					t.Errorf("%s, %v, %s: got %q", tc.x509Alg, path, name, got)
+				}
+			}
+		}
+		mismatched := verify(map[string]any{"spki": hex.EncodeToString(spki),
+			"x509_alg": tc.mismatch, "message": hex.EncodeToString(message),
+			"signature": hex.EncodeToString(sig)})
+		if !strings.HasPrefix(mismatched, "refused: x509: signature algorithm specifies") {
+			t.Errorf("%s under %s: got %q", tc.x509Alg, tc.mismatch, mismatched)
+		}
+	}
+	// An RSA key whose SubjectPublicKeyInfo lacks the NULL parameters, which
+	// x509.ParsePKIXPublicKey refuses (crypto/x509/parser.go:254-258).
+	spki, err := x509.MarshalPKIXPublicKey(&rsaKey.PublicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var info struct {
+		Algorithm pkix.AlgorithmIdentifier
+		PublicKey asn1.BitString
+	}
+	if _, err := asn1.Unmarshal(spki, &info); err != nil {
+		t.Fatal(err)
+	}
+	info.Algorithm.Parameters = asn1.RawValue{}
+	noNull, err := asn1.Marshal(info)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := verify(map[string]any{"spki": hex.EncodeToString(noNull),
+		"tls_scheme": "PKCS1WithSHA256", "message": "", "signature": "00"})
+	if got != "refused: x509: RSA key missing NULL parameters" {
+		t.Errorf("an RSA key without NULL parameters: got %q", got)
+	}
+	for name, data := range map[string][]byte{
+		"both names": jsonRequest(t, map[string]any{"spki": "", "x509_alg": "Ed25519",
+			"tls_scheme": "Ed25519"}),
+		"neither name":    jsonRequest(t, map[string]any{"spki": ""}),
+		"an unknown name": jsonRequest(t, map[string]any{"spki": "", "x509_alg": "MD5-RSA"}),
+		"spki not hex":    jsonRequest(t, map[string]any{"spki": "zz", "x509_alg": "Ed25519"}),
+		"not JSON":        []byte("Ed25519"),
+	} {
+		resp := call("sig_verify", data)
 		if resp.Error == "" || resp.Result != "" {
 			t.Errorf("%s: got %+v, want an error", name, resp)
 		}

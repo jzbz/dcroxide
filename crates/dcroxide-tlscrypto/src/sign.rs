@@ -465,6 +465,69 @@ impl Signer for Ed25519Signer {
     }
 }
 
+/// The body of the `tlscrypto_key_parse` fuzz target, not part of the API:
+/// [`load_der`] on `der`, which must not panic and must agree with
+/// [`key_algorithm`].  A key it loads is of the type that names, signs
+/// `der` with that type's scheme, and, for the types this provider
+/// verifies, P-256, P-384 and Ed25519, gives a signature the provider's
+/// own verifier takes under the key's public key; a key it refuses as RSA
+/// is RSA, and any other it refuses has no type.  Returns whether the key
+/// loaded.
+#[doc(hidden)]
+pub fn fuzz_key_parse(der: &[u8]) -> bool {
+    use rustls::pki_types::SignatureVerificationAlgorithm;
+    let algorithm = key_algorithm(der);
+    let key = match load_der(der) {
+        Ok(key) => key,
+        Err(Error::General(text)) => {
+            let rsa = text == RSA_KEY_REFUSED;
+            assert_eq!(rsa, algorithm == Some(KeyAlgorithm::Rsa), "{text}");
+            assert!(rsa || algorithm.is_none(), "{text}, yet {algorithm:?}");
+            return false;
+        }
+        Err(other) => panic!("load_der refused with {other:?}"),
+    };
+    let (scheme, verify, public_len): (_, Option<&dyn SignatureVerificationAlgorithm>, _) =
+        match algorithm {
+            Some(KeyAlgorithm::EcdsaP256) => (
+                SignatureScheme::ECDSA_NISTP256_SHA256,
+                Some(crate::verify::ECDSA_P256_SHA256),
+                65,
+            ),
+            Some(KeyAlgorithm::EcdsaP384) => (
+                SignatureScheme::ECDSA_NISTP384_SHA384,
+                Some(crate::verify::ECDSA_P384_SHA384),
+                97,
+            ),
+            Some(KeyAlgorithm::EcdsaP521) => (SignatureScheme::ECDSA_NISTP521_SHA512, None, 133),
+            Some(KeyAlgorithm::Ed25519) => {
+                (SignatureScheme::ED25519, Some(crate::verify::ED25519), 32)
+            }
+            other => panic!("load_der loaded a key key_algorithm reads as {other:?}"),
+        };
+    let signature = key
+        .choose_scheme(&[scheme])
+        .expect("the key's own scheme")
+        .sign(der)
+        .expect("signed");
+    let spki = key.public_key().expect("a loaded key's public key");
+    let spki = spki.as_ref();
+    // The SubjectPublicKeyInfo ends with the key, the content of its BIT
+    // STRING after the unused-bits byte.
+    let public = spki
+        .len()
+        .checked_sub(public_len)
+        .and_then(|start| spki.get(start..))
+        .expect("a SubjectPublicKeyInfo longer than its key");
+    if let Some(verify) = verify {
+        assert!(
+            verify.verify_signature(public, der, &signature).is_ok(),
+            "{scheme:?}: the key's own signature"
+        );
+    }
+    true
+}
+
 #[cfg(test)]
 // Test-harness arithmetic over bounded lengths.
 #[allow(clippy::arithmetic_side_effects)]
@@ -885,6 +948,56 @@ mod tests {
         );
         for other in [p224, x25519, b"not a key".to_vec()] {
             assert_eq!(key_algorithm(&other), None, "{other:02x?}");
+        }
+    }
+
+    /// The fuzz target's body loads and signs with each key type, its
+    /// signature verified by the provider's own verifier but for P-521's,
+    /// refuses an RSA key as RSA, and over every truncation of each key, a
+    /// bit flipped in every byte, and inputs from a fixed generator, never
+    /// panics.
+    #[test]
+    fn the_fuzz_body_agrees_with_key_algorithm() {
+        let mut p521 = [7; 66];
+        p521[0] = 1;
+        let keys = [
+            sec1_key(P256_OID, &[7; 32]),
+            sec1_key(P384_OID, &[7; 48]),
+            sec1_key(P521_OID, &p521),
+            ed25519_key(&[7; 32]),
+        ];
+        for key in &keys {
+            assert!(fuzz_key_parse(key), "{key:02x?}");
+        }
+        let int = |content: &[u8]| tlv(0x02, content);
+        let rsa = tlv(
+            0x30,
+            &[
+                int(&[0]),
+                int(&[0x00, 0xc5]),
+                int(&[3]),
+                int(&[5]),
+                int(&[7]),
+                int(&[11]),
+            ]
+            .concat(),
+        );
+        assert!(!fuzz_key_parse(&rsa));
+        let mut loaded = 0;
+        for key in keys.iter().chain([&rsa]) {
+            for len in 0..key.len() {
+                loaded += usize::from(fuzz_key_parse(&key[..len]));
+            }
+            for at in 0..key.len() {
+                let mut flipped = key.clone();
+                flipped[at] ^= 0x01;
+                loaded += usize::from(fuzz_key_parse(&flipped));
+            }
+        }
+        assert!(loaded > 4, "{loaded} mutated keys loaded");
+        let mut rng = dcroxide_testutil::SplitMix64(0x4b65_7950_6172_7365);
+        for _ in 0..2000 {
+            assert!(!fuzz_key_parse(&rng.bytes(200)));
         }
     }
 

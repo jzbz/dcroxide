@@ -25,6 +25,7 @@ dcroxide-node = { path = "../crates/dcroxide-node" }
 dcroxide-rpc = { path = "../crates/dcroxide-rpc" }
 dcroxide-rpctypes = { path = "../crates/dcroxide-rpctypes" }
 dcroxide-stake = { path = "../crates/dcroxide-stake" }
+dcroxide-tlscrypto = { path = "../crates/dcroxide-tlscrypto" }
 dcroxide-txscript = { path = "../crates/dcroxide-txscript" }
 dcroxide-uint256 = { path = "../crates/dcroxide-uint256" }
 dcroxide-wire = { path = "../crates/dcroxide-wire" }
@@ -146,6 +147,20 @@ bench = false
 [[bin]]
 name = "http_head_parse"
 path = "fuzz_targets/http_head_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tlscrypto_verify"
+path = "fuzz_targets/tlscrypto_verify.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tlscrypto_key_parse"
+path = "fuzz_targets/tlscrypto_key_parse.rs"
 test = false
 doc = false
 bench = false

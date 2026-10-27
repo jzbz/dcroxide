@@ -261,7 +261,7 @@ evaluating this code.
   connection is then read as dcrd reads, and no frame is kept. Details
   are in PARITY.md, *Reading ahead of the block handler*.
 - **Fuzzing reaches the stateless parsers, not the state machines.**
-  Seventeen `cargo-fuzz` targets run for 60 seconds apiece on every push
+  Nineteen `cargo-fuzz` targets run for 60 seconds apiece on every push
   to `master` and every pull request, and for ten minutes apiece
   nightly: wire framing, decoded at every protocol version a peer can
   negotiate (9 through 12); the `tx` and `blockheader` decoders, with
@@ -279,14 +279,24 @@ evaluating this code.
   that check-encodes a chosen address ID and payload gets past the
   checksum to the address dispatch); the chain database's stored-row
   decoders; `chainhash` parsing; DER signature parsing; public-key
-  parsing; the Schnorr and Ed25519 suites; `uint256`; and BLAKE-256.
-  None of the targets asks dcrd for an answer. The four signature
-  targets check dcroxide only against itself, that parsing and signing
-  do not panic, that what it signs verifies and that what it serializes
-  parses back. For signatures the comparison with dcrd rests on the
-  oracle batteries of the test suite
+  parsing; the Schnorr and Ed25519 suites; `uint256`; BLAKE-256; and,
+  in `dcroxide-tlscrypto`, the TLS provider that is to replace `ring`
+  ([ADR-0015](docs/adr/0015-tls-crypto-provider.md)), its signature
+  verification, which a peer's certificate chain and handshake
+  signature will reach before anything of theirs is trusted once the
+  provider replaces ring's (the fourteen algorithms, the in-tree RSA
+  among them), and its parsing of the RPC key (the port of Go's
+  `parsePrivateKey`), which the node already runs on every `rpc.key`.
+  None of the targets asks dcrd or Go for an answer. The four
+  signature targets and the two TLS ones check dcroxide only against
+  itself, that parsing, signing and verifying do not panic, that what
+  it signs verifies and that what it serializes parses back. For
+  signatures the comparison with dcrd rests on the oracle batteries of
+  the test suite
   ([ADR-0006](docs/adr/0006-secp256k1-backend.md)'s addenda), which run
-  a fixed number of cases each, and on its ported vectors.
+  a fixed number of cases each, and on its ported vectors; for the TLS
+  provider the comparison with ring and Go rests on its parity corpus,
+  its Wycheproof vectors and its Go differential.
   Stateless parsers still unfuzzed: the config-file and command-line
   parser, which takes the operator's input rather than a peer's, GCS
   filter decoding, and the ticket, index and address-manager stores.

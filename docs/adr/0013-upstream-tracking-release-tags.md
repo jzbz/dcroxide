@@ -95,8 +95,8 @@ other (`docs/PARITY.md:2307-2362`).
 things built for a master pin, whatever rule follows it:
 
 - The consistency test reads the `go.mod` header text after "dcrd master
-  commit " (`crates/dcroxide-testutil/src/lib.rs:1231-1237`) and fails when
-  no dcrd module is pinned by pseudo-version (`:839-842`). At a tag every
+  commit " (`crates/dcroxide-testutil/src/lib.rs:1385-1391`) and fails when
+  no dcrd module is pinned by pseudo-version (`:993-996`). At a tag every
   module would be pinned by tag.
 - The interop harness would refuse CI's own build. dcrd's note for
   maintainers sets the build metadata `release.local` on a release branch
@@ -191,11 +191,11 @@ v2.2.0 and on each part below, which lands with that move or before it.
 
 - **The consistency test's tag shape.**
   `the_dcrd_pin_matches_ci_and_the_oracle`
-  (`crates/dcroxide-testutil/src/lib.rs:1200-1247`) has to read a header
+  (`crates/dcroxide-testutil/src/lib.rs:1354-1401`) has to read a header
   that names the tag and its commit in place of "dcrd master commit "
-  (`:1231-1237`), and the rule that at least one dcrd module is pinned by
-  pseudo-version (`:839-842`) has to go. It already refuses a `replace`
-  of a dcrd module (`:831-838`). Inference: at a tag it also refuses any
+  (`:1385-1391`), and the rule that at least one dcrd module is pinned by
+  pseudo-version (`:993-996`) has to go. It already refuses a `replace`
+  of a dcrd module (`:985-992`). Inference: at a tag it also refuses any
   pseudo-version, and whether each module sits at the tag's required
   version needs dcrd's `go.mod` at the tag, which the repository does not
   hold, so that half is checked at the move unless a CI job with a dcrd

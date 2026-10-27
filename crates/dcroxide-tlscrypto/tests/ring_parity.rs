@@ -10,9 +10,9 @@
 //! crate's suite on one side and ring's on the other, both ways, carrying
 //! application data each way and, in TLS 1.3, across a key update, after
 //! which both ends hand out the same traffic secrets.  The keys and
-//! certificate verification are ring's on both sides, since the crate has
-//! none of its own yet, so those handshakes run the two key schedules and
-//! record layers against each other.
+//! certificate verification are ring's on both sides there, so those
+//! handshakes run the two key schedules and record layers against each
+//! other alone; the whole provider meets ring's further down.
 //!
 //! For the key exchange groups ring has, X25519, P-256 and P-384: the
 //! default list is ring's; each group takes and refuses the shares ring's
@@ -26,26 +26,39 @@
 //!
 //! For the signing keys: each key the provider signs with loads with
 //! ring's public key, algorithm and choice of scheme, ring verifies its
-//! signatures and the provider's verifier-to-be verifies ring's, two of
-//! its ECDSA signatures of one message differ, as two of ring's do, and
+//! signatures and the provider's verifier verifies ring's, two of its
+//! ECDSA signatures of one message differ, as two of ring's do, and
 //! Ed25519 signatures are ring's byte for byte; every key of `key_corpus`
 //! ring loads, under its PEM label, the provider loads as the same key,
 //! but an RSA key, which it refuses (ADR-0015, T6); and a handshake in
 //! each TLS version with ring's client completes against a server whose
 //! key and certificate the provider loaded and signed, on P-256, P-384 and
-//! Ed25519.  P-521, which ring cannot load or verify, has its signatures
-//! held to `ecdsa`'s verifier, here and in the node's `tests/rpclisten.rs`
-//! over a real handshake, and its loading to Go
-//! (`tests/go_differential.rs`).
+//! Ed25519.  P-521, which ring cannot load or verify, and which the
+//! provider does not verify either until Go's client-certificate set
+//! (ADR-0015, T4), has its signatures held to `ecdsa`'s verifier, here and
+//! in the node's `tests/rpclisten.rs` over a real handshake, and its
+//! loading to Go (`tests/go_differential.rs`).
+//!
+//! For verification: the provider's fourteen algorithms carry ring's
+//! identifiers in ring's order, with ring's mapping to signature schemes,
+//! and `default_provider` is ring's in every list; each algorithm gives
+//! ring's verdict, and the verdict recorded from ring, on every case of the
+//! parity corpus (`sig_corpus`), which `regenerate_parity_corpus` makes;
+//! and handshakes in each TLS version run between the provider whole and
+//! ring's provider, both ways, on ECDSA, Ed25519 and RSA certificates, with
+//! a client certificate, each side verifying the other's chain and
+//! handshake signature.
 //!
 //! The ring half of this file goes at the switch, with the dev-dependency
-//! that selects ring.
+//! that selects ring; the corpus's recorded verdicts stay.
 
 // Test-harness arithmetic over bounded lengths.
 #![allow(clippy::arithmetic_side_effects)]
 
 mod key_corpus;
 mod kx_shares;
+mod sig_corpus;
+mod sig_corpus_gen;
 
 use std::io::{Read, Write};
 use std::sync::Arc;
@@ -60,6 +73,7 @@ use rustls::crypto::hash::Hash;
 use rustls::crypto::tls13::OkmBlock;
 use rustls::crypto::{CryptoProvider, SupportedKxGroup, ring};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
+use rustls::server::WebPkiClientVerifier;
 use rustls::{
     ClientConfig, ClientConnection, ConnectionCommon, ConnectionTrafficSecrets, ContentType,
     NamedGroup, ProtocolVersion, RootCertStore, ServerConfig, ServerConnection, SignatureScheme,
@@ -864,26 +878,24 @@ fn messages() -> [Vec<u8>; 4] {
 }
 
 /// Whether `signature` is a DER signature of `message` by `public` under
-/// the ECDSA `scheme`, by `ecdsa`'s verifier, on which the provider's own
-/// will run.
+/// the ECDSA `scheme`: by the provider's own verifier for P-256 and P-384,
+/// and for P-521, which it does not verify, by `ecdsa`'s, on which its
+/// own runs.
 fn ecdsa_verifies(
     scheme: SignatureScheme,
     public: &[u8],
     message: &[u8],
     signature: &[u8],
 ) -> bool {
+    use dcroxide_tlscrypto::verify;
     use p256::ecdsa::signature::Verifier;
     match scheme {
-        SignatureScheme::ECDSA_NISTP256_SHA256 => {
-            let key = p256::ecdsa::VerifyingKey::from_sec1_bytes(public).expect("a point");
-            p256::ecdsa::DerSignature::from_bytes(signature)
-                .is_ok_and(|signature| key.verify(message, &signature).is_ok())
-        }
-        SignatureScheme::ECDSA_NISTP384_SHA384 => {
-            let key = p384::ecdsa::VerifyingKey::from_sec1_bytes(public).expect("a point");
-            p384::ecdsa::DerSignature::from_bytes(signature)
-                .is_ok_and(|signature| key.verify(message, &signature).is_ok())
-        }
+        SignatureScheme::ECDSA_NISTP256_SHA256 => verify::ECDSA_P256_SHA256
+            .verify_signature(public, message, signature)
+            .is_ok(),
+        SignatureScheme::ECDSA_NISTP384_SHA384 => verify::ECDSA_P384_SHA384
+            .verify_signature(public, message, signature)
+            .is_ok(),
         SignatureScheme::ECDSA_NISTP521_SHA512 => {
             let key = p521::ecdsa::VerifyingKey::from_sec1_bytes(public).expect("a point");
             p521::ecdsa::DerSignature::from_bytes(signature)
@@ -896,13 +908,12 @@ fn ecdsa_verifies(
 /// Each key the provider signs with loads as ring's loader loads it from
 /// the same PKCS#8, with the same public key, algorithm and choice of
 /// scheme from each list a peer might offer; ring's verification
-/// algorithm for the scheme verifies the provider's signatures, `ecdsa`'s
-/// verifier, on which the provider's own will run, verifies ring's ECDSA
-/// signatures, and the two Ed25519 signatures are equal.  Two of the
-/// provider's ECDSA signatures of one message, each hedged with a fresh
-/// draw, differ as two of ring's do, and both verify, the P-521 key's
-/// among them, which ring cannot load; two Ed25519 signatures of one
-/// message are the same.
+/// algorithm for the scheme verifies the provider's signatures, the
+/// provider's verifies ring's ECDSA signatures, and the two Ed25519
+/// signatures are equal.  Two of the provider's ECDSA signatures of one
+/// message, each hedged with a fresh draw, differ as two of ring's do,
+/// and both verify, the P-521 key's among them, which ring cannot load;
+/// two Ed25519 signatures of one message are the same.
 #[test]
 fn each_signing_key_signs_as_rings() {
     use rustls::pki_types::PrivatePkcs8KeyDer;
@@ -1086,8 +1097,9 @@ fn the_provider_loads_every_key_ring_loads() {
 }
 
 /// A self-signed certificate for `key`, with `P256_CERT`'s names, validity
-/// and extensions, signed by `key` with `scheme` under the signature
-/// algorithm `algorithm`.
+/// and extensions, but for an extended key usage of both server and client
+/// authentication (`either_end`), signed by `key` with `scheme` under the
+/// signature algorithm `algorithm`.
 fn self_signed(
     key: &dyn rustls::sign::SigningKey,
     scheme: SignatureScheme,
@@ -1098,16 +1110,31 @@ fn self_signed(
     assert_eq!(tbs.len(), 8, "version to extensions");
     let algorithm = key_corpus::seq(&[&key_corpus::tlv(0x06, algorithm)]);
     let spki = key.public_key().expect("a public key");
-    let tbs = key_corpus::seq(&[
-        tbs[0],
-        tbs[1],
-        &algorithm,
-        tbs[3],
-        tbs[4],
-        tbs[5],
-        spki.as_ref(),
-        tbs[7],
-    ]);
+    signed_by(
+        &[
+            tbs[0],
+            tbs[1],
+            &algorithm,
+            tbs[3],
+            tbs[4],
+            tbs[5],
+            spki.as_ref(),
+            &either_end(tbs[7]),
+        ],
+        key,
+        scheme,
+    )
+}
+
+/// The certificate whose TBSCertificate holds `fields`, version to
+/// extensions, signed by `key` with `scheme` under the signature algorithm
+/// the third of them names.
+fn signed_by(
+    fields: &[&[u8]; 8],
+    key: &dyn rustls::sign::SigningKey,
+    scheme: SignatureScheme,
+) -> CertificateDer<'static> {
+    let tbs = key_corpus::seq(fields);
     let signature = key
         .choose_scheme(&[scheme])
         .expect("the scheme")
@@ -1115,9 +1142,38 @@ fn self_signed(
         .expect("signed");
     CertificateDer::from(key_corpus::seq(&[
         &tbs,
-        &algorithm,
+        fields[2],
         &key_corpus::tlv(0x03, &[&[0][..], &signature].concat()),
     ]))
+}
+
+/// A TBSCertificate's `extensions` with their one extended key usage made
+/// both server and client authentication.
+fn either_end(extensions: &[u8]) -> Vec<u8> {
+    const EXTENDED_KEY_USAGE: &[u8] = &[0x55, 0x1d, 0x25];
+    const SERVER_AUTH: &[u8] = &[0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x01];
+    const CLIENT_AUTH: &[u8] = &[0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x02];
+    let mut replaced = 0;
+    let extensions: Vec<Vec<u8>> = key_corpus::elements(key_corpus::elements(extensions)[0])
+        .into_iter()
+        .map(|extension| {
+            if key_corpus::elements(extension)[0] != key_corpus::tlv(0x06, EXTENDED_KEY_USAGE) {
+                return extension.to_vec();
+            }
+            replaced += 1;
+            let usage = key_corpus::seq(&[
+                &key_corpus::tlv(0x06, SERVER_AUTH),
+                &key_corpus::tlv(0x06, CLIENT_AUTH),
+            ]);
+            key_corpus::seq(&[
+                &key_corpus::tlv(0x06, EXTENDED_KEY_USAGE),
+                &key_corpus::tlv(0x04, &usage),
+            ])
+        })
+        .collect();
+    assert_eq!(replaced, 1, "one extended key usage");
+    let extensions: Vec<&[u8]> = extensions.iter().map(Vec::as_slice).collect();
+    key_corpus::tlv(0xa3, &key_corpus::seq(&extensions))
 }
 
 /// A handshake in each TLS version, and application data each way,
@@ -1198,5 +1254,458 @@ fn handshakes_complete_on_the_providers_keys() {
         completed.len(),
         6,
         "three keys in each TLS version: {completed:#?}"
+    );
+}
+
+/// The identifiers of each algorithm of a list.
+fn identifiers(
+    algorithms: &[&dyn rustls::pki_types::SignatureVerificationAlgorithm],
+) -> Vec<(Vec<u8>, Vec<u8>)> {
+    algorithms
+        .iter()
+        .map(|algorithm| {
+            (
+                algorithm.public_key_alg_id().as_ref().to_vec(),
+                algorithm.signature_alg_id().as_ref().to_vec(),
+            )
+        })
+        .collect()
+}
+
+/// The verification set is ring's: the fourteen algorithms with ring's
+/// identifiers in ring's order, and the mapping's schemes in ring's order,
+/// each with ring's algorithms by their identifiers, the first of each
+/// being the one TLS 1.3 tries.
+#[test]
+fn the_verification_set_is_rings() {
+    let ours = dcroxide_tlscrypto::SUPPORTED_SIG_ALGS;
+    let rings = ring::default_provider().signature_verification_algorithms;
+    assert_eq!(identifiers(ours.all), identifiers(rings.all));
+    assert_eq!(ours.supported_schemes(), rings.supported_schemes());
+    for ((scheme, algorithms), (_, ring_algorithms)) in ours.mapping.iter().zip(rings.mapping) {
+        assert_eq!(
+            identifiers(algorithms),
+            identifiers(ring_algorithms),
+            "{scheme:?}"
+        );
+    }
+    assert_eq!(ours.mapping.len(), 9);
+    for (index, (name, _)) in sig_corpus::ALGORITHMS.iter().enumerate() {
+        assert_eq!(format!("{:?}", ours.all[index]), *name, "at {index}");
+    }
+}
+
+/// `default_provider` is ring's in every list, the suites, the groups and
+/// the verification set, each this crate's own, with this crate's key
+/// loader and random numbers.
+#[test]
+fn the_provider_value_is_rings_in_every_list() {
+    let ours = dcroxide_tlscrypto::default_provider();
+    let rings = ring::default_provider();
+    let suites = |provider: &CryptoProvider| {
+        provider
+            .cipher_suites
+            .iter()
+            .map(|suite| suite.suite())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(suites(&ours), suites(&rings));
+    assert!(
+        ours.cipher_suites
+            .iter()
+            .zip(dcroxide_tlscrypto::DEFAULT_CIPHER_SUITES)
+            .all(|(a, b)| a.suite() == b.suite()),
+        "this crate's suites"
+    );
+    let groups = |provider: &CryptoProvider| {
+        provider
+            .kx_groups
+            .iter()
+            .map(|group| group.name())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(groups(&ours), groups(&rings));
+    assert_eq!(
+        identifiers(ours.signature_verification_algorithms.all),
+        identifiers(rings.signature_verification_algorithms.all)
+    );
+    let mut random = [0u8; 32];
+    ours.secure_random.fill(&mut random).expect("random bytes");
+    assert_ne!(random, [0; 32]);
+    assert_eq!(format!("{:?}", ours.secure_random), "KernelRandom");
+    assert_eq!(format!("{:?}", ours.key_provider), "KeyLoader");
+    assert!(!ours.fips(), "nothing here claims FIPS validation");
+    let rsa = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(unhex(key_corpus::RSA2048_KEY)));
+    match ours.key_provider.load_private_key(rsa) {
+        Err(rustls::Error::General(text)) => {
+            assert_eq!(text, dcroxide_tlscrypto::sign::RSA_KEY_REFUSED)
+        }
+        other => panic!("an RSA key: {other:?}"),
+    }
+}
+
+/// What the provider makes of a class of the corpus.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Verdicts {
+    /// Every case taken.
+    Taken,
+    /// Every case refused.
+    Refused,
+    /// Some cases each way.
+    Both,
+}
+
+/// Each generated class of the corpus with what the provider, and ring,
+/// make of it: the valid signatures, the other signature of the same r,
+/// and an exponent Go refuses taken; the identity's encodings among
+/// Ed25519's keys and R values, the messages whose challenge is a
+/// multiple of a small-order key's order, and the PKCS#1 v1.5 signatures
+/// under the identifiers without NULL, taken among refusals; everything
+/// else refused, a key outside ring's bounds included.
+const CLASS_VERDICTS: [(&str, Verdicts); 37] = [
+    ("ecdsa-valid", Verdicts::Taken),
+    ("ecdsa-high-s", Verdicts::Taken),
+    ("ecdsa-other-algorithm", Verdicts::Refused),
+    ("ecdsa-flip-key", Verdicts::Refused),
+    ("ecdsa-flip-message", Verdicts::Refused),
+    ("ecdsa-flip-signature", Verdicts::Refused),
+    ("ecdsa-der", Verdicts::Refused),
+    ("ecdsa-range", Verdicts::Refused),
+    ("ecdsa-point-form", Verdicts::Refused),
+    ("ed25519-valid", Verdicts::Taken),
+    ("ed25519-flip-key", Verdicts::Refused),
+    ("ed25519-flip-message", Verdicts::Refused),
+    ("ed25519-flip-signature", Verdicts::Refused),
+    ("ed25519-s-range", Verdicts::Refused),
+    ("ed25519-length", Verdicts::Refused),
+    ("ed25519-key-encoding", Verdicts::Both),
+    ("ed25519-r-encoding", Verdicts::Both),
+    ("ed25519-key-hash", Verdicts::Both),
+    ("rsa-valid", Verdicts::Taken),
+    ("rsa-exponent-above-go", Verdicts::Taken),
+    ("rsa-modulus-1024", Verdicts::Refused),
+    ("rsa-modulus-2040", Verdicts::Refused),
+    ("rsa-modulus-8193", Verdicts::Refused),
+    ("rsa-exponent-above-ring", Verdicts::Refused),
+    ("rsa-exponent-refused", Verdicts::Refused),
+    ("rsa-other-algorithm", Verdicts::Both),
+    ("rsa-flip-key", Verdicts::Refused),
+    ("rsa-flip-message", Verdicts::Refused),
+    ("rsa-flip-signature", Verdicts::Refused),
+    ("rsa-key-der", Verdicts::Refused),
+    ("rsa-key-trailing-data", Verdicts::Refused),
+    ("rsa-signature-range", Verdicts::Refused),
+    ("rsa-pkcs1-encoding", Verdicts::Refused),
+    ("rsa-pss-salt", Verdicts::Refused),
+    ("wycheproof", Verdicts::Both),
+    // Not classes of their own but checked the same way: every case of the
+    // corpus, and its generated ones.
+    ("all", Verdicts::Both),
+    ("generated", Verdicts::Both),
+];
+
+/// Every case of the parity corpus gets ring's verdict from the provider:
+/// the verdict ring gives now and the one recorded from it.  And it gets
+/// Go's recorded verdict, but in the classes of `GO_DIFFERS`, each of
+/// which has a case where Go's differs.  Each class goes the way
+/// `CLASS_VERDICTS` says.  The header is the corpus's own: its
+/// algorithms, the count of each class and of the Wycheproof cases, and
+/// its compressed size, both within the generator's bounds; and the
+/// Wycheproof cases are 4,335, every case of the 17 files but the 60 of
+/// PSS over SHA-1 and SHA-224 (`sig_corpus::cases` holds each file to it).
+#[test]
+fn the_verifiers_give_rings_verdicts_on_the_corpus() {
+    use std::collections::BTreeMap;
+    let header = sig_corpus::read();
+    let names: Vec<&str> = sig_corpus::ALGORITHMS
+        .iter()
+        .map(|(name, _)| *name)
+        .collect();
+    assert_eq!(header["algorithms"], serde_json::json!(names));
+    assert_eq!(header["ring"], "0.17.14");
+    let path = format!("{}/{}", env!("CARGO_MANIFEST_DIR"), sig_corpus::PATH);
+    let size = std::fs::metadata(&path).expect("the corpus").len();
+    assert_eq!(header["compressed_bytes"].as_u64(), Some(size));
+    assert!(size <= sig_corpus_gen::MAX_BYTES as u64, "{size} bytes");
+    let rings = ring::default_provider().signature_verification_algorithms;
+    let cases = sig_corpus::cases();
+    assert!(
+        cases.len() <= sig_corpus_gen::MAX_CASES,
+        "{} cases",
+        cases.len()
+    );
+    let mut classes: BTreeMap<String, (usize, usize)> = BTreeMap::new();
+    let mut go_differs: BTreeMap<&str, usize> = BTreeMap::new();
+    for case in &cases {
+        let verify = |algorithm: &dyn rustls::pki_types::SignatureVerificationAlgorithm| {
+            algorithm
+                .verify_signature(&case.key, &case.message, &case.signature)
+                .is_ok()
+        };
+        let ours = verify(sig_corpus::ours(case.algorithm));
+        assert_eq!(
+            ours,
+            verify(rings.all[case.algorithm]),
+            "{}: ring's verdict",
+            case.label
+        );
+        assert_eq!(ours, case.ring, "{}: ring's recorded verdict", case.label);
+        match sig_corpus::GO_DIFFERS
+            .iter()
+            .find(|(class, _)| *class == case.class)
+        {
+            Some((class, _)) => {
+                *go_differs.entry(class).or_default() += usize::from(ours != case.go)
+            }
+            None => assert_eq!(ours, case.go, "{}: Go's recorded verdict", case.label),
+        }
+        let generated = (case.class != "wycheproof").then_some("generated");
+        for class in [Some(case.class.as_str()), Some("all"), generated]
+            .into_iter()
+            .flatten()
+        {
+            let counts = classes.entry(class.to_owned()).or_default();
+            if ours {
+                counts.0 += 1;
+            } else {
+                counts.1 += 1;
+            }
+        }
+    }
+    for (class, _) in sig_corpus::GO_DIFFERS {
+        assert!(
+            go_differs.get(class).is_some_and(|&differs| differs > 0),
+            "{class}: a case where Go's verdict differs, or no need for its entry"
+        );
+    }
+    let observed: BTreeMap<String, Verdicts> = classes
+        .iter()
+        .map(|(class, &(taken, refused))| {
+            let verdicts = match (taken, refused) {
+                (_, 0) => Verdicts::Taken,
+                (0, _) => Verdicts::Refused,
+                _ => Verdicts::Both,
+            };
+            (class.clone(), verdicts)
+        })
+        .collect();
+    let expected: BTreeMap<String, Verdicts> = CLASS_VERDICTS
+        .iter()
+        .map(|&(class, verdicts)| (class.to_owned(), verdicts))
+        .collect();
+    assert_eq!(observed, expected, "what the provider makes of each class");
+    let recorded: BTreeMap<String, usize> =
+        serde_json::from_value(header["classes"].clone()).expect("the classes");
+    let counted: BTreeMap<String, usize> = classes
+        .iter()
+        .filter(|(class, _)| !matches!(class.as_str(), "wycheproof" | "all" | "generated"))
+        .map(|(class, (taken, refused))| (class.clone(), taken + refused))
+        .collect();
+    assert_eq!(counted, recorded, "the count of each class");
+    let wycheproof = classes["wycheproof"];
+    assert_eq!(
+        header["wycheproof_cases"].as_u64(),
+        u64::try_from(wycheproof.0 + wycheproof.1).ok()
+    );
+    assert_eq!(
+        wycheproof.0 + wycheproof.1,
+        1460 + 210 + 2072 + 593,
+        "Wycheproof's ECDSA, Ed25519, PKCS#1 v1.5 and PSS cases"
+    );
+}
+
+/// Make the parity corpus again, with ring's verdicts from ring's provider
+/// and Go's through the oracle.  Ignored: the corpus is made once and
+/// committed, and ring's column cannot be made again once the switch
+/// removes ring.  Run it alone, under the reference Go, with
+/// `cargo test -p dcroxide-tlscrypto --test ring_parity -- --ignored regenerate_parity_corpus`.
+#[test]
+#[ignore = "regenerates the committed parity corpus"]
+fn regenerate_parity_corpus() {
+    let mut oracle = dcroxide_testutil::Oracle::spawn();
+    let rings = ring::default_provider().signature_verification_algorithms;
+    let ring_verdict = |algorithm: usize, key: &[u8], message: &[u8], signature: &[u8]| {
+        rings.all[algorithm]
+            .verify_signature(key, message, signature)
+            .is_ok()
+    };
+    sig_corpus_gen::regenerate(&mut oracle, &ring_verdict);
+}
+
+/// The provider's whole `default_provider` when `ours`, else ring's, for
+/// one end of a handshake.
+fn provider_of(ours: bool) -> Arc<CryptoProvider> {
+    Arc::new(if ours {
+        dcroxide_tlscrypto::default_provider()
+    } else {
+        ring::default_provider()
+    })
+}
+
+/// A certificate chain of one certificate and its key, for one end of a
+/// handshake.
+type Identity = (CertificateDer<'static>, PrivateKeyDer<'static>);
+
+/// The certificate `template`, a self-signed one, made again for either end
+/// of a handshake (`either_end`) and signed again by `key`, its own, with
+/// `scheme`.
+fn for_either_end(
+    template: &[u8],
+    key: &dyn rustls::sign::SigningKey,
+    scheme: SignatureScheme,
+) -> CertificateDer<'static> {
+    let tbs = key_corpus::elements(key_corpus::elements(template)[0]);
+    assert_eq!(tbs.len(), 8, "version to extensions");
+    signed_by(
+        &[
+            tbs[0],
+            tbs[1],
+            tbs[2],
+            tbs[3],
+            tbs[4],
+            tbs[5],
+            tbs[6],
+            &either_end(tbs[7]),
+        ],
+        key,
+        scheme,
+    )
+}
+
+/// A handshake in `version`, and application data each way, between a
+/// server on the provider or ring's, serving `server`, and a client on the
+/// provider or ring's, presenting `client` when the server asks for a
+/// certificate, which it does.  Each end trusts the other's certificate
+/// and verifies its chain and handshake signature with its own algorithms:
+/// the server offers its own schemes in its CertificateRequest.
+fn handshake_with_keys(
+    version: &'static rustls::SupportedProtocolVersion,
+    (server_ours, client_ours): (bool, bool),
+    server: &Identity,
+    client: &Identity,
+    what: &str,
+) {
+    let trusting = |cert: &CertificateDer<'static>| {
+        let mut roots = RootCertStore::empty();
+        roots.add(cert.clone()).expect("the certificate as a root");
+        Arc::new(roots)
+    };
+    let client_verifier =
+        WebPkiClientVerifier::builder_with_provider(trusting(&client.0), provider_of(server_ours))
+            .build()
+            .expect("the client verifier");
+    let server_config = ServerConfig::builder_with_provider(provider_of(server_ours))
+        .with_protocol_versions(&[version])
+        .expect("the server's version")
+        .with_client_cert_verifier(client_verifier)
+        .with_single_cert(vec![server.0.clone()], server.1.clone_key())
+        .unwrap_or_else(|e| panic!("{what}: the server's key: {e}"));
+    let server_verifier =
+        WebPkiServerVerifier::builder_with_provider(trusting(&server.0), provider_of(client_ours))
+            .build()
+            .expect("the server verifier");
+    let client_config = ClientConfig::builder_with_provider(provider_of(client_ours))
+        .with_protocol_versions(&[version])
+        .expect("the client's version")
+        .with_webpki_verifier(server_verifier)
+        .with_client_auth_cert(vec![client.0.clone()], client.1.clone_key())
+        .unwrap_or_else(|e| panic!("{what}: the client's key: {e}"));
+    let server_name = ServerName::try_from("localhost").expect("the server name");
+    let mut client_end =
+        ClientConnection::new(Arc::new(client_config), server_name).expect("the client");
+    let mut server_end = ServerConnection::new(Arc::new(server_config)).expect("the server");
+    for _ in 0..2 {
+        deliver(&mut client_end, &mut server_end);
+        deliver(&mut server_end, &mut client_end);
+    }
+    assert!(
+        !client_end.is_handshaking() && !server_end.is_handshaking(),
+        "{what}: the handshake completes"
+    );
+    assert_eq!(
+        client_end.protocol_version(),
+        Some(version.version),
+        "{what}"
+    );
+    assert_eq!(
+        client_end.peer_certificates(),
+        Some(&[server.0.clone()][..]),
+        "{what}: the server's certificate"
+    );
+    assert_eq!(
+        server_end.peer_certificates(),
+        Some(&[client.0.clone()][..]),
+        "{what}: the client's certificate"
+    );
+    exchange(&mut client_end, &mut server_end, what);
+}
+
+/// Handshakes in each TLS version between the provider whole and ring's
+/// provider, both ways, and the provider on both ends, the client
+/// presenting a certificate: on the P-256, P-384 and Ed25519 keys the
+/// provider loads, each end with the same key and certificate, the
+/// certificate signed by the provider; and on an RSA-2048 key, which the
+/// provider neither serves nor presents (ADR-0015, T6) but verifies, ring
+/// serving it to the provider's client or presenting it to the provider's
+/// server, the provider's end on the P-256 key.  Each end verifies the
+/// other's chain and handshake signature with its own algorithms.
+#[test]
+fn handshakes_run_on_the_whole_provider_against_rings() {
+    let mut identities = Vec::new();
+    for base in key_corpus::base_keys() {
+        let (scheme, algorithm): (_, &[u8]) = match base.name {
+            "P-256 (Go's)" => (
+                SignatureScheme::ECDSA_NISTP256_SHA256,
+                &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x02],
+            ),
+            "P-384" => (
+                SignatureScheme::ECDSA_NISTP384_SHA384,
+                &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x03],
+            ),
+            "Ed25519" => (SignatureScheme::ED25519, &[0x2b, 0x65, 0x70]),
+            _ => continue,
+        };
+        let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(base.pkcs8.clone()));
+        let signing = dcroxide_tlscrypto::sign::KEY_PROVIDER
+            .load_private_key(key.clone_key())
+            .expect("the key");
+        let cert = self_signed(&*signing, scheme, algorithm);
+        identities.push((base.name, (cert, key)));
+    }
+    assert_eq!(identities.len(), 3, "the three keys");
+    let mut completed = 0;
+    for (name, identity) in &identities {
+        for version in [&rustls::version::TLS13, &rustls::version::TLS12] {
+            for ends in [(true, false), (false, true), (true, true)] {
+                let what = format!("{name}, {:?}, {ends:?}", version.version);
+                handshake_with_keys(version, ends, identity, identity, &what);
+                completed += 1;
+            }
+        }
+    }
+    let rsa_key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(unhex(key_corpus::RSA2048_KEY)));
+    let rsa_signing = ring::sign::any_supported_type(&rsa_key).expect("ring's RSA key");
+    let rsa = (
+        for_either_end(
+            &unhex(key_corpus::RSA2048_CERT),
+            &*rsa_signing,
+            SignatureScheme::RSA_PKCS1_SHA256,
+        ),
+        rsa_key,
+    );
+    let (_, p256) = identities
+        .iter()
+        .find(|(name, _)| *name == "P-256 (Go's)")
+        .expect("the P-256 key");
+    for version in [&rustls::version::TLS13, &rustls::version::TLS12] {
+        let what = format!("RSA-2048 served, {:?}", version.version);
+        handshake_with_keys(version, (false, true), &rsa, p256, &what);
+        let what = format!("RSA-2048 presented, {:?}", version.version);
+        handshake_with_keys(version, (true, false), p256, &rsa, &what);
+        completed += 2;
+    }
+    assert_eq!(
+        completed, 22,
+        "three keys, both versions, three pairings; RSA both versions, both ways"
     );
 }

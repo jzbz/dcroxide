@@ -38,7 +38,7 @@ compiler, is a build dependency of exactly four crates in the lock, as
 `pkg-config`, `vcpkg` or `bindgen`, and no workspace crate has a build
 script.
 
-- **`secp256k1-sys` 0.14.1** (`Cargo.lock:1603`): ~67k lines of vendored
+- **`secp256k1-sys` 0.14.1** (`Cargo.lock:1604`): ~67k lines of vendored
   libsecp256k1 C (`docs/dependency-ledger.md:43`), under `secp256k1`
   0.33.1, which `dcroxide-dcrec` takes as `libsecp256k1`
   (`crates/dcroxide-dcrec/Cargo.toml:33`). It runs ECDSA verification
@@ -49,12 +49,12 @@ script.
   signature types 0 and 2. `k256` 0.14.0 sits beside it (`Cargo.toml:38`)
   for EC-Schnorr-DCRv0 and for ECDSA signing of a hash at or above the
   order (`ecdsa.rs:388-437`).
-- **`ring` 0.17.14** (`Cargo.lock:1481`): ~151k lines of C and assembly
+- **`ring` 0.17.14** (`Cargo.lock:1482`): ~151k lines of C and assembly
   (`dependency-ledger.md:51`), the crypto provider of `rustls` 0.23.46.
   `dcroxide-node` selects rustls's `ring` feature
   (`crates/dcroxide-node/Cargo.toml:59-69`), `ureq` 3.4.2 selects it
   through its default `rustls` feature, and `rustls-webpki` 0.103.16
-  depends on it (`Cargo.lock:1550-1558`). It runs the RPC and websocket
+  depends on it (`Cargo.lock:1551-1559`). It runs the RPC and websocket
   TLS listener, the RPC client-certificate verifier
   (`rpcrun::GoClientCertVerifier`, which hands `rustls-webpki` ring's
   signature algorithms) and both TLS clients of the HTTPS seeder
@@ -187,7 +187,7 @@ C that cgo links into the oracle included:
   builds and runs (`.github/workflows/ci.yml:191-245`).
 - **cargo-fuzz's libFuzzer**, which has no pure-Rust drop-in. `fuzz/` is
   outside the workspace (the root `Cargo.toml:39`) with its own lock, and
-  `libfuzzer-sys` 0.4.13 (`fuzz/Cargo.lock:1085-1086`) compiles libFuzzer's
+  `libfuzzer-sys` 0.4.13 (`fuzz/Cargo.lock:1087-1088`) compiles libFuzzer's
   C++ with `cc` under its default `link_libfuzzer` feature
   (`build.rs:24-38`, `:43-44`).
 

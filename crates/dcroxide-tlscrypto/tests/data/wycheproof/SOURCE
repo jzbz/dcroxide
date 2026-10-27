@@ -29,6 +29,17 @@ ecdh_secp384r1_ecpoint_test.json
 ecdh_secp521r1_ecpoint_test.json
                               553688   87aba8739c96de2bde8c75b60ffea09d0493192c4d9543d1d969e5e998931f35
                                        8c82dd4c2a5abb58a3b79629f5ea2e389122d5b0
+ecdsa_secp256r1_sha256_test.json
+                              327156   182db4f3e230f6f9fa9f800d2a614dede30284b8e8438bbfe1171905402e9332
+                                       19c951dbd3b6e33ed5e28d9bbbeea30e5f0350d3
+ecdsa_secp384r1_sha256_test.json
+                              361096   660c948e5433279ecdf966e8a1386b69ecec618efc1ff00269e85aa9dc84f0a6
+                                       32891e5ffb7342fd6183c7c68cff2aac753f4ae2
+ecdsa_secp384r1_sha384_test.json
+                              375442   8a5b3ae1760975143414811f13588c24d951d9d8c904195087ba327591dfe9cc
+                                       19df1b5614d68af884d9d197b0d123cc5d22807d
+ed25519_test.json             172628   ea80ffebac085e21cb9d3e903e7fa2b448d96702da5b31f061d0b83b430b74b3
+                                       3f991dd56496129e3a99b6b486408ef8f3df6945
 hkdf_sha256_test.json          92505   bb2b462a38b251cb52a2aede706d6d4b62b26864f4e80c95497507ddb07c5f1e
                                        5486a4d9d12c0b6f08c2dcc9edf10266a5ca806d
 hkdf_sha384_test.json         116155   69ff6ea3657bb9c1b8cdffbbb4e7832353d08fd15c0d9997b03f7a6b180e3678
@@ -37,9 +48,47 @@ hmac_sha256_test.json          69111   2d201cfa61d1bf95e6f5d07d96634b4a348b31e8e
                                        19181195d1bfa01ded2ca5620f0aedd0e50dc31f
 hmac_sha384_test.json          78567   28b9776e979dd755d852ca471043ea6cedce8b15f7a28abdf6ea9efd982b43c0
                                        3ba4fbac6744df6ef62c6d0a205cc7466a8a7cbc
+rsa_pss_2048_sha256_mgf1_32_test.json
+                               85280   7f6efafc160f4816b96cbf1c12188a31051d7e3f001e27505d9edb5f2a0e325c
+                                       bdb7694c4b44e8f0a3569bc2a9c56c33e9d24cec
+rsa_pss_3072_sha256_mgf1_32_test.json
+                              113786   cca48433e6d1accb57f65b3396c4f4dd93c776467101c3f0948e74c283fd4749
+                                       ae66ed7a7b1b8ff8ab1bbe277a034af49f8823bc
+rsa_pss_4096_sha256_mgf1_32_test.json
+                              142295   e627cbf5139a01e0a446c4fe15911f6268224fdd3ef4a1eb714b3942b5686410
+                                       bc269c8ad5be25bc45a60a214ead990e27db44ff
+rsa_pss_4096_sha512_mgf1_64_test.json
+                              232338   c93ceaa56a190c9fd4707441c5c6a75839f108202d88aec891697f9623042547
+                                       7c6b44626473f71f6ac94694a9edc3d253976b93
+rsa_pss_misc_test.json        496116   1fac515f67fea8ccbf44ea08fde2de00cd76169f774a54ce2994c9963c31e84f
+                                       8e4d8b2ae4a91851f0c73c508203e9f734747402
+rsa_signature_2048_sha256_test.json
+                              211075   94a917b01ff50fb874cfc05bf29b4af44868d944a6558201cf18380da93fb393
+                                       26f8d2c5b5c50bcba47653ee54d7b81e97f2ea0a
+rsa_signature_2048_sha384_test.json
+                              203297   c571c105d261c0ff588a2888a529f152563fb3b77894b7620d4e4f8f934f2c1d
+                                       4f46227342d74e456ddb91fb0f0ff99f4dfecbc1
+rsa_signature_2048_sha512_test.json
+                              207663   16ea24b039905d054bdb6004f5fd179374e150b7b6d73a7ba654b6d00eab12ef
+                                       83f0083b48ad67a5faee5e2d68ac534496a2210f
+rsa_signature_3072_sha256_test.json
+                              275722   0f5f18cabfaad3e2792e82f7e9882f8999049b456714de924b8a5e202f61ca43
+                                       eadbe046ce232284e522b0bab426fd98669f2f1e
+rsa_signature_3072_sha384_test.json
+                              270950   73499ee649d8fb703b3f0f455fa36f7682fde677c590a736958ebce05ab27dae
+                                       78fc1d1dbea93d36e1c98bfae728795a1a9eaa9c
+rsa_signature_3072_sha512_test.json
+                              276682   09aa3336fdb7be216180ce944ca7b2a052e1de38c210435c19506327d4a36ebd
+                                       a07b4380dc9cce6264d8f6bbbeb7e6d59a4cd2c2
+rsa_signature_4096_sha384_test.json
+                              337859   bc26f16b9fc9a90628864d3d1111ef48a4bd00b9d4870bfab88ff326e309e073
+                                       492e3321c99dfcb71564038c4ae33c984f84d113
+rsa_signature_4096_sha512_test.json
+                              337859   9d6e67b1eb0d7040db411835238efd20e9302399a258bdff82de3f38e0f2855a
+                                       5dcb85df9bd300c0f573bcad7070c4998073ceb5
 x25519_test.json              253890   35c3f5231cf25cc640b524d403461deee9e49441d5d915a3a25b2c8ff5adbe7d
                                        1ffa8e68f2c11a321376cda748a48ed0d85f5beb
 LICENSE                        11357   58d1e17ffe5109a7ae296caafcadfdbe6a7d176f0bc4ab01e12a689b0499d8bd
                                        7a4a3ea2424c09fbe48d455aed1eaa94d9124835
 
-Compressed, the ten vector files are 619,155 bytes, from 2,367,561.
+Compressed, the 27 vector files are 2,034,370 bytes, from 6,794,805.

@@ -16,6 +16,17 @@
 //! which is deterministic, signs as Go's `ed25519.Sign` signs, byte for
 //! byte.
 //!
+//! For verification: each of the fourteen algorithms gives Go's verdict,
+//! through the oracle's `sig_verify`, on every generated case of the
+//! parity corpus (`sig_corpus`), as Go checks a certificate's signature and
+//! as its `crypto/tls` checks a handshake's under each signature scheme
+//! the algorithm serves, and Go's verdict is still the one the corpus
+//! recorded; but in the classes `sig_corpus::GO_DIFFERS` lists, RSA keys
+//! outside ring's bounds and Go's and an `RSAPublicKey` with bytes after
+//! its values, where ring differs from Go today (`GO_DIFFERS` says how
+//! much of that PARITY.md records).  Wycheproof's cases, which the corpus
+//! holds too, are held to Go case by case in the crate's unit tests.
+//!
 //! Without an oracle the tests skip, unless `DCROXIDE_REQUIRE_ORACLE` is
 //! set, as in CI, where they also require the reference Go.
 
@@ -24,6 +35,7 @@
 
 mod key_corpus;
 mod kx_shares;
+mod sig_corpus;
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -410,4 +422,117 @@ fn ed25519_signs_as_go_signs() {
             );
         }
     }
+}
+
+/// Go's `tls.SignatureScheme` name for each scheme of the provider's
+/// mapping.
+fn go_scheme(scheme: rustls::SignatureScheme) -> &'static str {
+    use rustls::SignatureScheme as S;
+    match scheme {
+        S::ECDSA_NISTP256_SHA256 => "ECDSAWithP256AndSHA256",
+        S::ECDSA_NISTP384_SHA384 => "ECDSAWithP384AndSHA384",
+        S::ED25519 => "Ed25519",
+        S::RSA_PKCS1_SHA256 => "PKCS1WithSHA256",
+        S::RSA_PKCS1_SHA384 => "PKCS1WithSHA384",
+        S::RSA_PKCS1_SHA512 => "PKCS1WithSHA512",
+        S::RSA_PSS_SHA256 => "PSSWithSHA256",
+        S::RSA_PSS_SHA384 => "PSSWithSHA384",
+        S::RSA_PSS_SHA512 => "PSSWithSHA512",
+        other => panic!("no scheme of the mapping: {other:?}"),
+    }
+}
+
+/// Go's verdict on a case as its `crypto/tls` checks a handshake signature
+/// under `scheme`, through the oracle's `sig_verify`.
+fn go_verifies_handshake(
+    oracle: &mut Oracle,
+    scheme: rustls::SignatureScheme,
+    case: &sig_corpus::Case,
+) -> bool {
+    let request = serde_json::json!({
+        "spki": hex(&sig_corpus::spki(case.algorithm, &case.key)),
+        "tls_scheme": go_scheme(scheme),
+        "message": hex(&case.message),
+        "signature": hex(&case.signature),
+    });
+    let response = oracle.call("sig_verify", request.to_string().as_bytes());
+    dcroxide_testutil::require_reference_go(response["go_version"].as_str().unwrap_or_default());
+    match response["result"].as_str() {
+        Some("ok") => true,
+        Some(refused) if refused.starts_with("refused: ") => false,
+        _ => panic!("{}: the oracle answered {response}", case.label),
+    }
+}
+
+/// Each algorithm gives Go's verdict on every generated case of the parity
+/// corpus: Go's as it checks a certificate's signature, which is still the
+/// verdict the corpus recorded, and Go's as its `crypto/tls` checks a
+/// handshake signature under each scheme the provider's mapping serves the
+/// algorithm under; but in the classes of `GO_DIFFERS`, each of which has
+/// a case where Go's verdict differs, so that an entry no longer needed
+/// shows.  The provider gives the recorded Go verdict on Wycheproof's
+/// cases too.  The count of cases Go takes is pinned, so that a corpus
+/// gone wrong cannot pass on agreement alone.
+#[test]
+fn signatures_verify_as_go_verifies_them() {
+    let Some(mut oracle) = dcroxide_testutil::oracle_or_skip() else {
+        return;
+    };
+    let mapping = dcroxide_tlscrypto::SUPPORTED_SIG_ALGS.mapping;
+    let mut differs: BTreeMap<&str, usize> = BTreeMap::new();
+    let (mut taken, mut generated, mut handshakes) = (0, 0, 0);
+    for case in sig_corpus::cases() {
+        let ours = sig_corpus::ours(case.algorithm)
+            .verify_signature(&case.key, &case.message, &case.signature)
+            .is_ok();
+        // Where Go differs, it differs from ring, whose verdict the
+        // provider gives (`tests/ring_parity.rs` holds every case to it).
+        assert_eq!(ours, case.ring, "{}: ring's recorded verdict", case.label);
+        let allowed = sig_corpus::GO_DIFFERS
+            .iter()
+            .find(|(class, _)| *class == case.class)
+            .map(|(class, _)| *class);
+        let label = &case.label;
+        if case.class != "wycheproof" {
+            let go = sig_corpus::go_verifies(
+                &mut oracle,
+                case.algorithm,
+                &case.key,
+                &case.message,
+                &case.signature,
+            );
+            assert_eq!(go, case.go, "{label}: Go's verdict, as recorded");
+            let name = sig_corpus::ALGORITHMS[case.algorithm].0;
+            for (scheme, algorithms) in mapping {
+                if algorithms
+                    .iter()
+                    .any(|algorithm| format!("{algorithm:?}") == name)
+                {
+                    let handshake = go_verifies_handshake(&mut oracle, *scheme, &case);
+                    assert_eq!(handshake, go, "{label}: Go's verdict under {scheme:?}");
+                    handshakes += 1;
+                }
+            }
+            generated += 1;
+            taken += usize::from(go);
+        }
+        match allowed {
+            Some(class) => *differs.entry(class).or_default() += usize::from(ours != case.go),
+            None => assert_eq!(ours, case.go, "{label}: Go's verdict"),
+        }
+    }
+    for (class, _) in sig_corpus::GO_DIFFERS {
+        assert!(
+            differs.get(class).is_some_and(|&count| count > 0),
+            "{class}: no case where Go's verdict differs"
+        );
+    }
+    assert_eq!(
+        (generated, taken),
+        (1087, 187),
+        "generated cases, and those Go takes"
+    );
+    // Every generated case but those of the three algorithms the mapping
+    // does not list, PKCS#1 v1.5 under the identifiers without NULL.
+    assert_eq!(handshakes, 929, "handshake verdicts asked of Go");
 }

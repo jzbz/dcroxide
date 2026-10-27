@@ -18,29 +18,35 @@ chacha20poly1305 = { version = "0.11.0", default-features = false, features = ["
 # one-time key, once the tag is made or checked
 # (`poly1305-0.9.1/src/lib.rs:122-130`).
 poly1305 = { version = "0.9.1", default-features = false, features = ["zeroize"] }
-# The transcript hash, and HMAC, which HKDF and the TLS 1.2 PRF run on.
-# `zeroize` on both: a keyed HMAC holds two SHA-2 states and a block
-# buffer, which `sha2`'s feature wipes on drop, the buffer through
-# `digest`'s, which `hmac`'s turns on as well (`src/hmac.rs`).
+# The transcript hash, the digests signatures are made over, and HMAC,
+# which HKDF and the TLS 1.2 PRF run on.  `zeroize` on both: a keyed HMAC
+# holds two SHA-2 states and a block buffer, which `sha2`'s feature wipes
+# on drop, the buffer through `digest`'s, which `hmac`'s turns on as well
+# (`src/hmac.rs`).
 sha2 = { version = "0.11", default-features = false, features = ["zeroize"] }
 hmac = { version = "0.13", default-features = false, features = ["zeroize"] }
-# Key exchange and handshake signatures (ADR-0015 T1): X25519 and Ed25519
-# on `curve25519-dalek`, and P-256, P-384 and P-521 on the curve crates,
-# whose `ecdsa` feature gives each curve its signing key and its hash.  No
-# `ecdh` feature: it pulls `hkdf`, and the exchange is one scalar
-# multiplication.  `precomputed-tables` speeds the multiplication by the
-# generator that makes each ephemeral public key and each signature (`std`
-# is what the table is built under).
+# Key exchange, handshake signatures and verification (ADR-0015 T1):
+# X25519 and Ed25519 on `curve25519-dalek`, and P-256, P-384 and P-521 on
+# the curve crates, whose `ecdsa` feature gives each curve its signing and
+# verifying keys and its hash.  No `ecdh` feature: it pulls `hkdf`, and the
+# exchange is one scalar multiplication.  `precomputed-tables` speeds the
+# multiplication by the generator that makes each ephemeral public key and
+# each signature (`std` is what the table is built under).
 p256 = { version = "0.14", default-features = false, features = ["ecdsa", "std", "precomputed-tables"] }
 p384 = { version = "0.14", default-features = false, features = ["ecdsa", "std", "precomputed-tables"] }
 p521 = { version = "0.14", default-features = false, features = ["ecdsa", "std", "precomputed-tables"] }
 # The generic types the signer is written over and its hedged RFC 6979
-# (`SigningKey<C>`, `hazmat`, the DER signature); the curve crates export
-# only per-curve aliases.  Locked at 0.17.0 already, with these features.
+# (`SigningKey<C>`, `hazmat`, the DER signature), and the verifier's
+# prehash trait; the curve crates export only per-curve aliases.  Locked
+# at 0.17.0 already, with these features.
 ecdsa = { version = "0.17", default-features = false, features = ["algorithm", "der"] }
 curve25519-dalek = "5"
 # X25519's all-zero check, made in constant time.
 subtle = "2.6"
+# RSA verification, public-key arithmetic alone (ADR-0015 T5, `src/rsa.rs`):
+# `modpow` on public values.  Locked at 0.5.1 already, for the standalone
+# difficulty math.
+num-bigint = { version = "0.5.1", default-features = false }
 # The kernel read behind every random byte the provider draws but one:
 # the handshake randoms and the ephemeral keys (`src/rand.rs`).
 getrandom = "0.4"

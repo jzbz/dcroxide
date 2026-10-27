@@ -143,19 +143,19 @@ jobs:
     # with each crate's own cfg (aes 0.9's `aes_backend`, polyval 0.7's
     # `polyval_backend`, chacha20 0.10's `chacha20_backend`, poly1305
     # 0.9's `poly1305_backend`, sha2 0.11's `sha2_backend`, and
-    # curve25519-dalek 5's `curve25519_dalek_backend` for the signatures
-    # the crate takes on later, where Ed25519 verification's double-base
-    # multiplication is what it switches; X25519's ladder and base-point
-    # table are the same portable code on every backend) and runs the
-    # crate's tests, Wycheproof's vectors among them, on them (ADR-0015
-    # T10).
+    # curve25519-dalek 5's `curve25519_dalek_backend`, which switches
+    # Ed25519 verification's double-base multiplication alone: X25519's
+    # ladder and the base-point table of Ed25519 signing are the same
+    # portable code on every backend) and runs the crate's tests,
+    # Wycheproof's vectors and the signature parity corpus among them, on
+    # them (ADR-0015 T10).
     steps:
       - uses: actions/checkout@v7
       - run: rustup toolchain install
       # The workflow-wide DCROXIDE_REQUIRE_ORACLE turns a missing oracle
-      # into a failure, and the crate's key exchange verdicts are checked
-      # against Go's through the oracle, under it on the reference Go
-      # alone, so the reference Go is installed as in the test job.
+      # into a failure, and the crate's key exchange and signature verdicts
+      # are checked against Go's through the oracle, under it on the
+      # reference Go alone, so the reference Go is installed as in the test job.
       - uses: actions/setup-go@v7
         with:
           go-version: ${{ env.GO_VERSION }}
