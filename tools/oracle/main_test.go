@@ -7,10 +7,20 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"crypto"
+	"crypto/ecdh"
+	stdecdsa "crypto/ecdsa"
+	"crypto/ed25519"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"io"
+	"math/big"
 	"os"
 	"reflect"
 	"runtime"
@@ -698,6 +708,171 @@ func TestECDH(t *testing.T) {
 		"not JSON":            []byte("X25519"),
 	} {
 		resp := call("ecdh", data)
+		if resp.Error == "" || resp.Result != "" {
+			t.Errorf("%s: got %+v, want an error", name, resp)
+		}
+	}
+}
+
+// keyPairRequest is an x509_key_pair request's data: a self-signed
+// certificate for cert's public key and key's PEM block under keyType, as
+// JSON.
+func keyPairRequest(t *testing.T, cert crypto.Signer, key []byte, keyType string) []byte {
+	t.Helper()
+	template := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		NotBefore:    time.Unix(1767225600, 0),
+		NotAfter:     time.Unix(4102444800, 0),
+	}
+	der, err := x509.CreateCertificate(rand.Reader, template, template, cert.Public(), cert)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := json.Marshal(map[string]string{
+		"cert_pem": string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})),
+		"key_pem":  string(pem.EncodeToMemory(&pem.Block{Type: keyType, Bytes: key})),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return data
+}
+
+// pkcs8 is key in PKCS#8.
+func pkcs8(t *testing.T, key any) []byte {
+	t.Helper()
+	der, err := x509.MarshalPKCS8PrivateKey(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return der
+}
+
+// TestX509KeyPair checks x509_key_pair on a pair of each key type Go loads,
+// the EC keys in both their forms and RSA in PKCS#1, with the type each
+// reads as, P-224 among them; that a key for another certificate, one of
+// another type, a PKCS#8 X25519 key and bytes no parser reads come back as
+// Go's refusals; and that a request that is not JSON is an error.
+func TestX509KeyPair(t *testing.T) {
+	type pair struct {
+		cert crypto.Signer
+		key  []byte
+		kind string
+	}
+	pairs := map[string]pair{}
+	for _, curve := range []elliptic.Curve{elliptic.P224(), elliptic.P256(), elliptic.P384(), elliptic.P521()} {
+		key, err := stdecdsa.GenerateKey(curve, rand.Reader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		sec1, err := x509.MarshalECPrivateKey(key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		name := curve.Params().Name
+		pairs[name+", PKCS#8"] = pair{key, pkcs8(t, key), "PRIVATE KEY"}
+		pairs[name+", SEC 1"] = pair{key, sec1, "EC PRIVATE KEY"}
+	}
+	_, edKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pairs["Ed25519"] = pair{edKey, pkcs8(t, edKey), "PRIVATE KEY"}
+	rsaKey, err := rsa.GenerateKey(rand.Reader, 1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pairs["RSA"] = pair{rsaKey, x509.MarshalPKCS1PrivateKey(rsaKey), "RSA PRIVATE KEY"}
+	want := map[string]string{
+		"P-224, PKCS#8": "ok ECDSA P-224", "P-224, SEC 1": "ok ECDSA P-224",
+		"P-256, PKCS#8": "ok ECDSA P-256", "P-256, SEC 1": "ok ECDSA P-256",
+		"P-384, PKCS#8": "ok ECDSA P-384", "P-384, SEC 1": "ok ECDSA P-384",
+		"P-521, PKCS#8": "ok ECDSA P-521", "P-521, SEC 1": "ok ECDSA P-521",
+		"Ed25519": "ok Ed25519", "RSA": "ok RSA 1024",
+	}
+	for name, p := range pairs {
+		resp := call("x509_key_pair", keyPairRequest(t, p.cert, p.key, p.kind))
+		if resp.Error != "" || resp.Result != want[name] || resp.GoVersion != runtime.Version() {
+			t.Errorf("%s: got %+v, want result %q from %s", name, resp, want[name],
+				runtime.Version())
+		}
+	}
+
+	x25519, err := ecdh.X25519().GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p256, p384 := pairs["P-256, PKCS#8"], pairs["P-384, PKCS#8"]
+	for name, tc := range map[string]struct {
+		data []byte
+		want string
+	}{
+		"another certificate's key": {keyPairRequest(t, p256.cert, p384.key, "PRIVATE KEY"),
+			"refused: tls: private key does not match public key"},
+		"a key of another type": {keyPairRequest(t, edKey, p256.key, "PRIVATE KEY"),
+			"refused: tls: private key type does not match public key type"},
+		"X25519": {keyPairRequest(t, p256.cert, pkcs8(t, x25519), "PRIVATE KEY"),
+			"refused: tls: found unknown private key type in PKCS#8 wrapping"},
+		"not a key": {keyPairRequest(t, p256.cert, []byte("not a key"), "PRIVATE KEY"),
+			"refused: tls: failed to parse private key"},
+	} {
+		resp := call("x509_key_pair", tc.data)
+		if resp.Error != "" || resp.Result != tc.want || resp.GoVersion != runtime.Version() {
+			t.Errorf("%s: got %+v, want result %q from %s", name, resp, tc.want,
+				runtime.Version())
+		}
+	}
+	if resp := call("x509_key_pair", []byte("not JSON")); resp.Error == "" || resp.Result != "" {
+		t.Errorf("not JSON: got %+v, want an error", resp)
+	}
+}
+
+// sigSignRequest is a sig_sign request's data, as JSON.
+func sigSignRequest(t *testing.T, key []byte, scheme, message string) []byte {
+	t.Helper()
+	data, err := json.Marshal(map[string]string{
+		"key_pkcs8": hex.EncodeToString(key), "scheme": scheme, "message": message,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return data
+}
+
+// TestSigSign checks sig_sign's Ed25519 signatures against RFC 8032's first
+// two tests, and that a scheme it does not take, a key of another type and
+// requests it cannot read are errors.
+func TestSigSign(t *testing.T) {
+	for name, tc := range map[string]struct{ seed, message, want string }{
+		"RFC 8032 test 1": {
+			"9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60", "",
+			"e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e065224901555fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b",
+		},
+		"RFC 8032 test 2": {
+			"4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb", "72",
+			"92a009a9f0d4cab8720e820b5f642540a2b27b5416503f8fb3762223ebdb69da085ac1e43e15996e458f3613d0f11d8c387b2eaeb4302aeeb00d291612bb0c00",
+		},
+	} {
+		key := pkcs8(t, ed25519.NewKeyFromSeed(hexToBytes(tc.seed)))
+		resp := call("sig_sign", sigSignRequest(t, key, "Ed25519", tc.message))
+		if resp.Error != "" || resp.Result != tc.want || resp.GoVersion != runtime.Version() {
+			t.Errorf("%s: got %+v, want result %q from %s", name, resp, tc.want,
+				runtime.Version())
+		}
+	}
+	edKey := pkcs8(t, ed25519.NewKeyFromSeed(make([]byte, ed25519.SeedSize)))
+	ecKey, err := stdecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, data := range map[string][]byte{
+		"unknown scheme":        sigSignRequest(t, edKey, "ECDSAWithP256AndSHA256", ""),
+		"a key of another type": sigSignRequest(t, pkcs8(t, ecKey), "Ed25519", ""),
+		"a key Go refuses":      sigSignRequest(t, []byte("not a key"), "Ed25519", ""),
+		"message not hex":       sigSignRequest(t, edKey, "Ed25519", "zz"),
+		"not JSON":              []byte("Ed25519"),
+	} {
+		resp := call("sig_sign", data)
 		if resp.Error == "" || resp.Result != "" {
 			t.Errorf("%s: got %+v, want an error", name, resp)
 		}

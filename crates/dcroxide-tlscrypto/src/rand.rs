@@ -18,8 +18,20 @@
 //!
 //! A failed read is rustls's `GetRandomFailed`, which fails the one
 //! handshake that asked, as a failed read fails ring's, and cannot abort
-//! the process.  `tests/entropy_policy.rs` holds the crate to this one
-//! read.
+//! the process.
+//!
+//! One draw goes to the process-wide generator of `dcroxide_crypto::rand`
+//! instead, through [`ProcessRng`]: the additional data an ECDSA
+//! handshake signature mixes into its RFC 6979 nonce.  RFC 6979 derives
+//! the nonce from the key and the message, so the signature is safe
+//! should that draw be weak, and the draw only makes two signatures of
+//! the same transcript differ, as Go's and ring's hedged nonces do.  A
+//! handshake is paced by a peer, and that generator, seeded once at
+//! startup, cannot fail after it, where a kernel read can (the node's
+//! `tests/entropy_policy.rs` gives the reasons for its draws).
+//!
+//! `tests/entropy_policy.rs` holds the crate to the one kernel read and
+//! the one draw from the process generator, and each to its place.
 
 use rustls::crypto::{GetRandomFailed, SecureRandom};
 
@@ -46,7 +58,7 @@ fn checked_fill<E>(
     not(test),
     expect(
         dead_code,
-        reason = "the provider value takes it once signing and verification are in \
+        reason = "the provider value takes it once verification is in as well \
                   (ADR-0015, step 1); until then only its tests do"
     )
 )]
@@ -55,6 +67,24 @@ pub(crate) struct KernelRandom;
 impl SecureRandom for KernelRandom {
     fn fill(&self, buf: &mut [u8]) -> Result<(), GetRandomFailed> {
         kernel_fill(buf)
+    }
+}
+
+/// The process-wide generator ([`dcroxide_crypto::rand`]) as the source
+/// of an ECDSA signature's hedge, which `sign.rs` draws for each
+/// handshake it signs.
+///
+/// The generator produces keystream by XOR, so the buffer is zeroed
+/// before the draw.  It cannot fail once seeded, which the daemon does at
+/// startup (`dcroxide_crypto::rand::init`), so the draw has no error.
+#[derive(Debug)]
+pub(crate) struct ProcessRng;
+
+impl ProcessRng {
+    /// Fill `buf` from the process-wide generator.
+    pub(crate) fn fill(&self, buf: &mut [u8]) {
+        buf.fill(0);
+        dcroxide_crypto::rand::read(buf);
     }
 }
 
@@ -96,6 +126,31 @@ mod tests {
         KernelRandom.fill(&mut first).expect("the first read");
         kernel_fill(&mut second).expect("the second read");
         assert_ne!(first, second, "fresh bytes each read");
+    }
+
+    /// Every length an ECDSA hedge takes, the three curves' field
+    /// lengths, is written in full by the process generator, as the
+    /// kernel reads are above, and two draws differ.
+    #[test]
+    fn each_process_draw_fills_its_buffer() {
+        for len in [32, 48, 66] {
+            let mut written = vec![0u8; len];
+            for _ in 0..64 {
+                let mut buf = vec![0xa5; len];
+                ProcessRng.fill(&mut buf);
+                for (seen, byte) in written.iter_mut().zip(&buf) {
+                    *seen |= byte;
+                }
+            }
+            assert!(
+                written.iter().all(|&byte| byte == 0xff),
+                "a draw of {len} left bits unwritten: {written:02x?}"
+            );
+        }
+        let (mut first, mut second) = ([0; 32], [0; 32]);
+        ProcessRng.fill(&mut first);
+        ProcessRng.fill(&mut second);
+        assert_ne!(first, second, "fresh bytes each draw");
     }
 
     /// A read that fails is `GetRandomFailed`, for the handshake to fail

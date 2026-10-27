@@ -24,12 +24,27 @@
 //! same handshakes with this crate's group on both sides, and is held to
 //! Go's verdicts instead (`tests/go_differential.rs`).
 //!
+//! For the signing keys: each key the provider signs with loads with
+//! ring's public key, algorithm and choice of scheme, ring verifies its
+//! signatures and the provider's verifier-to-be verifies ring's, two of
+//! its ECDSA signatures of one message differ, as two of ring's do, and
+//! Ed25519 signatures are ring's byte for byte; every key of `key_corpus`
+//! ring loads, under its PEM label, the provider loads as the same key,
+//! but an RSA key, which it refuses (ADR-0015, T6); and a handshake in
+//! each TLS version with ring's client completes against a server whose
+//! key and certificate the provider loaded and signed, on P-256, P-384 and
+//! Ed25519.  P-521, which ring cannot load or verify, has its signatures
+//! held to `ecdsa`'s verifier, here and in the node's `tests/rpclisten.rs`
+//! over a real handshake, and its loading to Go
+//! (`tests/go_differential.rs`).
+//!
 //! The ring half of this file goes at the switch, with the dev-dependency
 //! that selects ring.
 
 // Test-harness arithmetic over bounded lengths.
 #![allow(clippy::arithmetic_side_effects)]
 
+mod key_corpus;
 mod kx_shares;
 
 use std::io::{Read, Write};
@@ -420,105 +435,6 @@ fn records_are_rings_byte_for_byte() {
     assert_eq!(checked, 6, "two TLS 1.3 and four TLS 1.2 suites");
 }
 
-/// The P-256 server certificate the ECDSA and TLS 1.3 handshakes use:
-/// self-signed for `localhost`, valid from 2026 to 9999, made once with
-/// Go 1.26.2's `crypto/x509` for these tests.
-const P256_CERT: &str = "\
-    3082018b30820130a003020102020101300a06082a8648ce3d04030230273125\
-    30230603550403131c6463726f786964652d746c7363727970746f2074657374\
-    20503235363020170d3236303130313030303030305a180f3939393931323331\
-    3233353935395a3027312530230603550403131c6463726f786964652d746c73\
-    63727970746f207465737420503235363059301306072a8648ce3d020106082a\
-    8648ce3d030107034200048906089259a44192a029477117b3dac5d142059a7e\
-    39acd172143cf3db9a710f109ca52ad1203cf22f4cff10adbbdbdff10962e551\
-    b12d03684ed5adea1b7762a34b3049300e0603551d0f0101ff04040302078030\
-    130603551d25040c300a06082b06010505070301300c0603551d130101ff0402\
-    300030140603551d11040d300b82096c6f63616c686f7374300a06082a8648ce\
-    3d0403020349003046022100af5fad70b55d476e25af5234969c03d0dea48f62\
-    6cda45b1c1a55dfe6503afd302210099190288504f5f42c6d989ba7a92540dab\
-    d3c171a4775957d51d8ed3f5f942bc";
-
-/// [`P256_CERT`]'s key, in PKCS#8.  A test key, made for these tests
-/// alone.
-const P256_KEY: &str = "\
-    308187020100301306072a8648ce3d020106082a8648ce3d030107046d306b02\
-    01010420a9868ed882e56ef01d5ce5f867e19593cc5316442917c9e07010bc34\
-    166428d4a144034200048906089259a44192a029477117b3dac5d142059a7e39\
-    acd172143cf3db9a710f109ca52ad1203cf22f4cff10adbbdbdff10962e551b1\
-    2d03684ed5adea1b7762";
-
-/// The RSA-2048 server certificate the ECDHE-RSA handshakes use, made as
-/// [`P256_CERT`] was.
-const RSA2048_CERT: &str = "\
-    3082031c30820204a003020102020102300d06092a864886f70d01010b050030\
-    2a312830260603550403131f6463726f786964652d746c7363727970746f2074\
-    65737420525341323034383020170d3236303130313030303030305a180f3939\
-    3939313233313233353935395a302a312830260603550403131f6463726f7869\
-    64652d746c7363727970746f2074657374205253413230343830820122300d06\
-    092a864886f70d01010105000382010f003082010a0282010100b7b8234bf9ad\
-    5bb312abcbdd1f1ca7bec6617ca729d87afec32a0b31c42173039c63a5c0b244\
-    a112e288bc0440fc18f7ab143c59fac686f9305ee8a65fabf0d22e8a7f0348bd\
-    6bce194c764b222133e727da007053d453d380d1e530a8fdba10d774286fe763\
-    efa2781d80265cdbcca625ee787a796c0b971c09e4002d3ec53f918e658d20fb\
-    7a2ef20a7fc139bc2b46265492a369d078a2418bc40b2ba3449efead2e7bf827\
-    294c204e6dcd2489230ff8a962f1684b9e7d45cd0be8035a705636bda9a94cd5\
-    13ddbda70bd0f86370cf7921ceee327078b997c9cba7e407dfc6ccca7b6a8336\
-    1053a3f896f5b8b875b44ca761c8250577999979039d02a4980f0203010001a3\
-    4b3049300e0603551d0f0101ff04040302078030130603551d25040c300a0608\
-    2b06010505070301300c0603551d130101ff0402300030140603551d11040d30\
-    0b82096c6f63616c686f7374300d06092a864886f70d01010b05000382010100\
-    8c7060eba7d740206fd6815ca7e74fc15daa2cb6728f7b2dda86e0e45fbe433d\
-    e4eb0d4688b0b7cf8b9597f2c8d8447287938bbe74657e79eb072ae362dce9e8\
-    ca624fcfb7046d108e47022f17553257816f9e6358d92dc91cbbc64cda1df3d8\
-    8748ceda309aaac1da2c38a92a27a00022abd1d52ff09f0f0db640b4bc8522d9\
-    905c4e167e9241834a56795974e56fb7584ffaf8422bf442b99986bedbf8e7e4\
-    374ff76ed1aefdc375a8fa009711092bf833ab0b3f68689240e184b15c7a673e\
-    a27e025eb09e94a85bf212b3c419ebba045a1e3ea3caa82407a308e5f6b90274\
-    51e1b396ef221476bbb94121d79cbc2599889bb9e40bab6819884e427c776ca1";
-
-/// [`RSA2048_CERT`]'s key, in PKCS#8.  A test key, made for these tests
-/// alone; ring signs with it, which this crate will not (ADR-0015 T6).
-const RSA2048_KEY: &str = "\
-    308204be020100300d06092a864886f70d0101010500048204a8308204a40201\
-    000282010100b7b8234bf9ad5bb312abcbdd1f1ca7bec6617ca729d87afec32a\
-    0b31c42173039c63a5c0b244a112e288bc0440fc18f7ab143c59fac686f9305e\
-    e8a65fabf0d22e8a7f0348bd6bce194c764b222133e727da007053d453d380d1\
-    e530a8fdba10d774286fe763efa2781d80265cdbcca625ee787a796c0b971c09\
-    e4002d3ec53f918e658d20fb7a2ef20a7fc139bc2b46265492a369d078a2418b\
-    c40b2ba3449efead2e7bf827294c204e6dcd2489230ff8a962f1684b9e7d45cd\
-    0be8035a705636bda9a94cd513ddbda70bd0f86370cf7921ceee327078b997c9\
-    cba7e407dfc6ccca7b6a83361053a3f896f5b8b875b44ca761c8250577999979\
-    039d02a4980f02030100010282010018df67229c14ea509e25d5732f091eca11\
-    eaea336a28e8234c4cdee31d488cb25fc93b36e6c0ffdaf7571d0d53b6f85d0a\
-    33b27aaec6e89dc7fcb1715a368463659afe831ffa9fce7157b6bede9f5c2589\
-    71ac3ede3a90216c53fe66ce1a3bc7429973f80d28572dc9d144a397a2c7b174\
-    2535a3c4833f8bca675464e9bb3bd2454d9ce65c85134829252c3ae0c4ee0089\
-    5e0e0c72ee75f097cb0abf528dbb68ff6260ae24d2810356e868d815813ab808\
-    cb54f67093af2d04e8e22e8f791dbf2fb4deba3a5e23e60b6cdcd58a73974356\
-    7d2922aae7817edba35115e1b0460bd66f3b84083714e5219c45609422c4ffcb\
-    ee71bd4d2bd6fc8ba301c914dbe3e102818100d19990501ce2e033b94c1c828e\
-    8c2d6c7f292d5b4e335658c5cfd383fcbf72b810f5556de3de302b9dc82aaa10\
-    d949d9858c55a72d2d4c9b8ab47514f84c6f8a7572d3c02ce3598cb4feadc4b5\
-    5e4f8c24b6597be1666e207ba4e0b6ff81e16134a52186e8fa33cc3d7e821556\
-    ad1132bdce8be2377176816b5c1bdde8e93dd902818100e063df1177198cbb2c\
-    f8c8c4269611bc47ab5d48d9578424e2fabeedf022421451dada991621d59f9e\
-    2252e543b2c4096f3046590e24a7c3f3d2bbf6d497184fccf279ea7a65752e24\
-    40cc4fa4cc428d2947c001bb7b358f0e4549ed85ff64e5c35ff1543b558bf755\
-    827086c7db00b79ec934f722ec315331d694437a260c270281804dcf0d24c064\
-    74c89ecc23755007b7c1243f9c07de32eea60be107eb62838bc9caf9d859f012\
-    869d5a78796622d5173639fe8bb980eae51a84d652f492ec8527c84bf551cd18\
-    252137fba77473c3ec11e17b142309dce59b076b80c44e7bdfb81f3c02033c2f\
-    cdd4cf2b4c8d315d141a5b1df70de679277e09e5eaae698d54990281810084ef\
-    65f608e32016bbbbdfe5251efefed64ed583150fddffa460fcc025e585d457f2\
-    1a535b634c15b62f8b80bbacaaab142e3b5f031c002ffcc13a0e2f401c6d1a74\
-    047a3f6ce01127f52395838267630db3ae32d88953df9e8aba1377b1286b5e65\
-    f6a8fa45e217f396c56773fb70df57b8c8222994585c7b482eaa13317b3d0281\
-    8100cb97dbc1905c837fb6c70c4eba98a3011cc32de1710a961884fee46e9709\
-    3de1961819c891a95e26113035ef8a89ed3037f427ad18abbbd02a0ba19af7c2\
-    c3427ae614a388dc3d217c68558ca8bc1b08511fe125b3985a15938ed8afea67\
-    edfc87a9858eeeee90a9637434d721ed30bdec6b4ae66e17246717d0c4431d62\
-    8465";
-
 /// The server certificate and key for `suite`: RSA for an ECDHE-RSA suite,
 /// P-256 for the rest.
 fn server_pair(suite: SupportedCipherSuite) -> (CertificateDer<'static>, PrivateKeyDer<'static>) {
@@ -527,9 +443,9 @@ fn server_pair(suite: SupportedCipherSuite) -> (CertificateDer<'static>, Private
         SupportedCipherSuite::Tls13(_) => false,
     };
     let (cert, key) = if rsa {
-        (RSA2048_CERT, RSA2048_KEY)
+        (key_corpus::RSA2048_CERT, key_corpus::RSA2048_KEY)
     } else {
-        (P256_CERT, P256_KEY)
+        (key_corpus::P256_CERT, key_corpus::P256_KEY)
     };
     (
         CertificateDer::from(unhex(cert)),
@@ -919,4 +835,368 @@ fn each_group_handshakes_with_rings_both_ways() {
         let agreed = handshake_between((suite, p521), (suite, p521), "P-521 on both sides");
         assert_eq!(agreed, NamedGroup::secp521r1);
     }
+}
+
+/// Every signature scheme a TLS peer may offer for the keys here.
+const SCHEMES: [SignatureScheme; 6] = [
+    SignatureScheme::ECDSA_NISTP256_SHA256,
+    SignatureScheme::ECDSA_NISTP384_SHA384,
+    SignatureScheme::ECDSA_NISTP521_SHA512,
+    SignatureScheme::ED25519,
+    SignatureScheme::RSA_PSS_SHA256,
+    SignatureScheme::RSA_PKCS1_SHA256,
+];
+
+/// The public key a SubjectPublicKeyInfo's BIT STRING holds.
+fn public_key_bits(spki: &[u8]) -> Vec<u8> {
+    key_corpus::content(key_corpus::elements(spki)[1])[1..].to_vec()
+}
+
+/// The messages each key signs here: empty, short, a SHA-512 block, and
+/// the length of a TLS 1.3 CertificateVerify's content.
+fn messages() -> [Vec<u8>; 4] {
+    [
+        Vec::new(),
+        b"m".to_vec(),
+        (0..128).map(|i| i as u8).collect(),
+        (0..130).map(|i| (i * 7) as u8).collect(),
+    ]
+}
+
+/// Whether `signature` is a DER signature of `message` by `public` under
+/// the ECDSA `scheme`, by `ecdsa`'s verifier, on which the provider's own
+/// will run.
+fn ecdsa_verifies(
+    scheme: SignatureScheme,
+    public: &[u8],
+    message: &[u8],
+    signature: &[u8],
+) -> bool {
+    use p256::ecdsa::signature::Verifier;
+    match scheme {
+        SignatureScheme::ECDSA_NISTP256_SHA256 => {
+            let key = p256::ecdsa::VerifyingKey::from_sec1_bytes(public).expect("a point");
+            p256::ecdsa::DerSignature::from_bytes(signature)
+                .is_ok_and(|signature| key.verify(message, &signature).is_ok())
+        }
+        SignatureScheme::ECDSA_NISTP384_SHA384 => {
+            let key = p384::ecdsa::VerifyingKey::from_sec1_bytes(public).expect("a point");
+            p384::ecdsa::DerSignature::from_bytes(signature)
+                .is_ok_and(|signature| key.verify(message, &signature).is_ok())
+        }
+        SignatureScheme::ECDSA_NISTP521_SHA512 => {
+            let key = p521::ecdsa::VerifyingKey::from_sec1_bytes(public).expect("a point");
+            p521::ecdsa::DerSignature::from_bytes(signature)
+                .is_ok_and(|signature| key.verify(message, &signature).is_ok())
+        }
+        other => panic!("not an ECDSA scheme: {other:?}"),
+    }
+}
+
+/// Each key the provider signs with loads as ring's loader loads it from
+/// the same PKCS#8, with the same public key, algorithm and choice of
+/// scheme from each list a peer might offer; ring's verification
+/// algorithm for the scheme verifies the provider's signatures, `ecdsa`'s
+/// verifier, on which the provider's own will run, verifies ring's ECDSA
+/// signatures, and the two Ed25519 signatures are equal.  Two of the
+/// provider's ECDSA signatures of one message, each hedged with a fresh
+/// draw, differ as two of ring's do, and both verify, the P-521 key's
+/// among them, which ring cannot load; two Ed25519 signatures of one
+/// message are the same.
+#[test]
+fn each_signing_key_signs_as_rings() {
+    use rustls::pki_types::PrivatePkcs8KeyDer;
+
+    let algorithms = ring::default_provider().signature_verification_algorithms;
+    let scheme = |key: &dyn rustls::sign::SigningKey, offered: &[SignatureScheme]| {
+        key.choose_scheme(offered).map(|signer| signer.scheme())
+    };
+    let twice = |key: &dyn rustls::sign::SigningKey, scheme: SignatureScheme, message: &[u8]| {
+        let signer = key.choose_scheme(&[scheme]).expect("the scheme");
+        [
+            signer.sign(message).expect("signed"),
+            signer.sign(message).expect("signed"),
+        ]
+    };
+    let (mut signed, mut ring_refused) = (Vec::new(), Vec::new());
+    for base in key_corpus::base_keys() {
+        let name = base.name;
+        let der = || PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(base.pkcs8.clone()));
+        let ours = dcroxide_tlscrypto::sign::KEY_PROVIDER
+            .load_private_key(der())
+            .expect("the provider loads its own key");
+        let spki = ours.public_key().expect("a public key");
+        assert_eq!(spki.as_ref(), &base.spki[..], "{name}");
+        let public = public_key_bits(spki.as_ref());
+        let chosen = scheme(&*ours, &SCHEMES).expect("a scheme");
+        let message = &messages()[3];
+        let [first, second] = twice(&*ours, chosen, message);
+        if chosen == SignatureScheme::ED25519 {
+            assert_eq!(first, second, "{name}: Ed25519 signs deterministically");
+        } else {
+            assert_ne!(first, second, "{name}: each signature hedged afresh");
+            for signature in [&first, &second] {
+                assert!(
+                    ecdsa_verifies(chosen, &public, message, signature),
+                    "{name}"
+                );
+            }
+        }
+        let rings = ring::default_provider()
+            .key_provider
+            .load_private_key(der());
+        if name == "P-521" {
+            assert!(rings.is_err(), "ring has no P-521 signer");
+            ring_refused.push(name);
+            continue;
+        }
+        let rings = rings.expect("ring loads the key");
+        assert_eq!(
+            rings.public_key().map(|spki| spki.as_ref().to_vec()),
+            Some(base.spki.clone()),
+            "{name}"
+        );
+        assert_eq!(ours.algorithm(), rings.algorithm(), "{name}");
+        let mut lists: Vec<Vec<SignatureScheme>> = vec![SCHEMES.to_vec(), Vec::new()];
+        lists.extend(SCHEMES.iter().map(|scheme| vec![*scheme]));
+        for offered in &lists {
+            assert_eq!(
+                scheme(&*ours, offered),
+                scheme(&*rings, offered),
+                "{name}, {offered:?}"
+            );
+        }
+        let [ring_first, ring_second] = twice(&*rings, chosen, message);
+        assert_eq!(
+            ring_first == ring_second,
+            first == second,
+            "{name}: ring's two signatures of one message"
+        );
+        let verify = algorithms
+            .mapping
+            .iter()
+            .find(|(scheme, _)| *scheme == chosen)
+            .map(|(_, algorithms)| algorithms[0])
+            .expect("ring verifies the scheme");
+        for message in messages() {
+            let sign = |key: &dyn rustls::sign::SigningKey| {
+                key.choose_scheme(&[chosen])
+                    .expect("the scheme")
+                    .sign(&message)
+                    .expect("signed")
+            };
+            let (our_signature, ring_signature) = (sign(&*ours), sign(&*rings));
+            assert!(
+                verify
+                    .verify_signature(&public, &message, &our_signature)
+                    .is_ok(),
+                "{name}: ring verifies the provider's signature"
+            );
+            let ring_verified = match chosen {
+                SignatureScheme::ED25519 => our_signature == ring_signature,
+                _ => ecdsa_verifies(chosen, &public, &message, &ring_signature),
+            };
+            assert!(
+                ring_verified,
+                "{name}: ring's signature, {} bytes signed",
+                message.len()
+            );
+        }
+        signed.push(name);
+    }
+    assert_eq!(
+        (signed, ring_refused),
+        (vec!["P-256 (Go's)", "P-384", "Ed25519"], vec!["P-521"]),
+        "the keys signed both ways, and the one ring cannot load"
+    );
+}
+
+/// The keys of the corpus ring loads and Go refuses, as the provider does:
+/// SEC 1 keys that name no curve.  rustls hands ring a SEC 1 key wrapped
+/// in a PKCS#8 prefix that names P-256, then one that names P-384
+/// (`rustls-0.23.46/src/crypto/ring/sign.rs:228`, `:245-286`), so the
+/// curve comes from the prefix, where Go finds none
+/// (`crypto/x509/sec1.go:102-110`).  ring needs the public key besides,
+/// so the same keys without one load in neither.
+const RING_ONLY: &[&str] = &[
+    "P-256 (Go's), SEC 1, no curve",
+    "P-256, SEC 1, no curve",
+    "P-384, SEC 1, no curve",
+];
+
+/// Every key of the corpus that ring's loader loads, handed to it as the
+/// node's PEM reader hands it today (by label: `PRIVATE KEY` as PKCS#8,
+/// `EC PRIVATE KEY` as SEC 1, `RSA PRIVATE KEY` as PKCS#1, other labels not
+/// at all), the provider loads too, as the same key, matching the
+/// certificate of the key it was mutated from; but an RSA key, which the
+/// provider refuses with its own text (ADR-0015, T6), and the keys of
+/// [`RING_ONLY`], which it refuses with Go's.  Otherwise the provider
+/// loads more than ring does, as Go does, which `tests/go_differential.rs`
+/// holds it to.
+#[test]
+fn the_provider_loads_every_key_ring_loads() {
+    use rustls::pki_types::{PrivatePkcs1KeyDer, PrivatePkcs8KeyDer, PrivateSec1KeyDer};
+
+    let (mut loaded, mut rsa, mut ring_only) = (0, 0, Vec::new());
+    for case in key_corpus::cases() {
+        let label = &case.label;
+        let der = match case.pem_label {
+            "PRIVATE KEY" => PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(case.der.clone())),
+            "EC PRIVATE KEY" => PrivateKeyDer::Sec1(PrivateSec1KeyDer::from(case.der.clone())),
+            "RSA PRIVATE KEY" => PrivateKeyDer::Pkcs1(PrivatePkcs1KeyDer::from(case.der.clone())),
+            _ => continue,
+        };
+        let Ok(rings) = ring::default_provider()
+            .key_provider
+            .load_private_key(der.clone_key())
+        else {
+            continue;
+        };
+        match dcroxide_tlscrypto::sign::KEY_PROVIDER.load_private_key(der) {
+            Ok(ours) => {
+                loaded += 1;
+                assert_eq!(
+                    ours.public_key().map(|spki| spki.as_ref().to_vec()),
+                    rings.public_key().map(|spki| spki.as_ref().to_vec()),
+                    "{label}"
+                );
+                let certified =
+                    rustls::sign::CertifiedKey::new(vec![CertificateDer::from(case.cert)], ours);
+                assert!(certified.keys_match().is_ok(), "{label}");
+            }
+            Err(rustls::Error::General(text))
+                if text == dcroxide_tlscrypto::sign::RSA_KEY_REFUSED =>
+            {
+                assert_eq!(
+                    rings.algorithm(),
+                    rustls::SignatureAlgorithm::RSA,
+                    "{label}"
+                );
+                rsa += 1;
+            }
+            Err(rustls::Error::General(text)) => {
+                assert_eq!(text, "tls: failed to parse private key", "{label}");
+                ring_only.push(label.clone());
+            }
+            Err(other) => panic!("{label}: {other:?}"),
+        }
+    }
+    assert_eq!(ring_only, RING_ONLY, "the keys ring loads and Go refuses");
+    assert!(loaded >= 17 && rsa >= 3, "{loaded} loaded, {rsa} RSA");
+}
+
+/// A self-signed certificate for `key`, with `P256_CERT`'s names, validity
+/// and extensions, signed by `key` with `scheme` under the signature
+/// algorithm `algorithm`.
+fn self_signed(
+    key: &dyn rustls::sign::SigningKey,
+    scheme: SignatureScheme,
+    algorithm: &[u8],
+) -> CertificateDer<'static> {
+    let template = unhex(key_corpus::P256_CERT);
+    let tbs = key_corpus::elements(key_corpus::elements(&template)[0]);
+    assert_eq!(tbs.len(), 8, "version to extensions");
+    let algorithm = key_corpus::seq(&[&key_corpus::tlv(0x06, algorithm)]);
+    let spki = key.public_key().expect("a public key");
+    let tbs = key_corpus::seq(&[
+        tbs[0],
+        tbs[1],
+        &algorithm,
+        tbs[3],
+        tbs[4],
+        tbs[5],
+        spki.as_ref(),
+        tbs[7],
+    ]);
+    let signature = key
+        .choose_scheme(&[scheme])
+        .expect("the scheme")
+        .sign(&tbs)
+        .expect("signed");
+    CertificateDer::from(key_corpus::seq(&[
+        &tbs,
+        &algorithm,
+        &key_corpus::tlv(0x03, &[&[0][..], &signature].concat()),
+    ]))
+}
+
+/// A handshake in each TLS version, and application data each way,
+/// between ring's client, which verifies the server's certificate and its
+/// handshake signature with ring, and a server on ring's suites and key
+/// exchange whose key and certificate the provider loaded and signed: on
+/// the Go-made P-256 key, the P-384 key and the Ed25519 key.
+#[test]
+fn handshakes_complete_on_the_providers_keys() {
+    use rustls::pki_types::PrivatePkcs8KeyDer;
+
+    let mut completed = Vec::new();
+    for base in key_corpus::base_keys() {
+        let (scheme, algorithm): (_, &[u8]) = match base.name {
+            "P-256 (Go's)" => (
+                SignatureScheme::ECDSA_NISTP256_SHA256,
+                &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x02],
+            ),
+            "P-384" => (
+                SignatureScheme::ECDSA_NISTP384_SHA384,
+                &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x03],
+            ),
+            "Ed25519" => (SignatureScheme::ED25519, &[0x2b, 0x65, 0x70]),
+            _ => continue,
+        };
+        let der = || PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(base.pkcs8.clone()));
+        let key = dcroxide_tlscrypto::sign::KEY_PROVIDER
+            .load_private_key(der())
+            .expect("the key");
+        let cert = self_signed(&*key, scheme, algorithm);
+        for suite in [
+            ring::cipher_suite::TLS13_AES_128_GCM_SHA256,
+            ring::cipher_suite::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+        ] {
+            let what = format!("{}, {:?}", base.name, suite.suite());
+            let version = suite.version();
+            let server_provider = Arc::new(CryptoProvider {
+                cipher_suites: vec![suite],
+                key_provider: dcroxide_tlscrypto::sign::KEY_PROVIDER,
+                ..ring::default_provider()
+            });
+            let server = ServerConfig::builder_with_provider(server_provider)
+                .with_protocol_versions(&[version])
+                .expect("the server's version")
+                .with_no_client_auth()
+                .with_single_cert(vec![cert.clone()], der())
+                .expect("the provider's key and its certificate");
+            let mut roots = RootCertStore::empty();
+            roots.add(cert.clone()).expect("the certificate as a root");
+            let verifier = WebPkiServerVerifier::builder_with_provider(
+                Arc::new(roots),
+                Arc::new(ring::default_provider()),
+            )
+            .build()
+            .expect("the verifier");
+            let client = ClientConfig::builder_with_provider(offering(suite, ring::ALL_KX_GROUPS))
+                .with_protocol_versions(&[version])
+                .expect("the client's version")
+                .with_webpki_verifier(verifier)
+                .with_no_client_auth();
+            let server_name = ServerName::try_from("localhost").expect("the server name");
+            let mut client =
+                ClientConnection::new(Arc::new(client), server_name).expect("the client");
+            let mut server = ServerConnection::new(Arc::new(server)).expect("the server");
+            for _ in 0..2 {
+                deliver(&mut client, &mut server);
+                deliver(&mut server, &mut client);
+            }
+            assert!(
+                !client.is_handshaking() && !server.is_handshaking(),
+                "{what}: the handshake completes"
+            );
+            exchange(&mut client, &mut server, &what);
+            completed.push(what);
+        }
+    }
+    assert_eq!(
+        completed.len(),
+        6,
+        "three keys in each TLS version: {completed:#?}"
+    );
 }

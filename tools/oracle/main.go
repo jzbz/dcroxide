@@ -181,6 +181,20 @@
 //	                     ECDH; {"result": "<hex shared secret>"} or
 //	                     {"result": "refused: <error>"}, each with
 //	                     "go_version": runtime.Version()
+//	x509_key_pair      → data is JSON {"cert_pem": string, "key_pem":
+//	                     string}; the pair loaded as crypto/tls's
+//	                     X509KeyPair loads a certificate and its key;
+//	                     {"result": "ok <key type>"}, the type "ECDSA
+//	                     <curve name>", "Ed25519" or "RSA <modulus bits>",
+//	                     or {"result": "refused: <error>"}, each with
+//	                     "go_version": runtime.Version()
+//	sig_sign           → data is JSON {"key_pkcs8": hex, "scheme": name,
+//	                     "message": hex}; the signature crypto/tls makes
+//	                     with the key for the TLS signature scheme of that
+//	                     name (tls.SignatureScheme's String), so far
+//	                     "Ed25519" alone: ed25519.Sign over the message;
+//	                     {"result": "<hex signature>"} with
+//	                     "go_version": runtime.Version()
 //	build_info         → takes no data; {"go_version": runtime.Version(),
 //	                      "modules": {"<module path>": "<version>"}} for the
 //	                     secp256k1/v4 and edwards/v2 modules linked in
@@ -190,6 +204,10 @@ import (
 	"bufio"
 	"bytes"
 	"crypto/ecdh"
+	stdecdsa "crypto/ecdsa"
+	"crypto/ed25519"
+	"crypto/rsa"
+	"crypto/tls"
 	"crypto/x509"
 	"encoding/binary"
 	"encoding/hex"
@@ -1605,6 +1623,78 @@ func handle(req request) response {
 			return response{Result: "refused: " + err.Error(), GoVersion: runtime.Version()}
 		}
 		return response{Result: hex.EncodeToString(secret), GoVersion: runtime.Version()}
+
+	case "x509_key_pair":
+		// crypto/tls's X509KeyPair, which dcrd loads rpc.cert and rpc.key
+		// with (tls.LoadX509KeyPair): the certificate's blocks, the first
+		// key block, the key as parsePrivateKey reads it, and the key
+		// checked against the certificate.  The key's type goes with the
+		// verdict, so that a key read as another type than the caller's
+		// shows.
+		var in struct {
+			CertPEM string `json:"cert_pem"`
+			KeyPEM  string `json:"key_pem"`
+		}
+		if err := json.Unmarshal(data, &in); err != nil {
+			return errResp("x509_key_pair: %v", err)
+		}
+		pair, err := tls.X509KeyPair([]byte(in.CertPEM), []byte(in.KeyPEM))
+		if err != nil {
+			return response{Result: "refused: " + err.Error(), GoVersion: runtime.Version()}
+		}
+		var kind string
+		switch key := pair.PrivateKey.(type) {
+		case *stdecdsa.PrivateKey:
+			kind = "ECDSA " + key.Curve.Params().Name
+		case ed25519.PrivateKey:
+			kind = "Ed25519"
+		case *rsa.PrivateKey:
+			kind = fmt.Sprintf("RSA %d", key.N.BitLen())
+		default:
+			return errResp("x509_key_pair: a key of type %T", key)
+		}
+		return response{Result: "ok " + kind, GoVersion: runtime.Version()}
+
+	case "sig_sign":
+		// The signature crypto/tls makes for a handshake with a key and a
+		// TLS signature scheme: for Ed25519, the key signs the message
+		// itself, unhashed (directSigning, crypto/tls/auth.go:146), which
+		// is ed25519.Sign and deterministic, so a caller can compare its
+		// own signature byte for byte.  A key Go refuses, or a scheme not
+		// taken here, is an error in the request.
+		var in struct {
+			KeyPKCS8 string `json:"key_pkcs8"`
+			Scheme   string `json:"scheme"`
+			Message  string `json:"message"`
+		}
+		if err := json.Unmarshal(data, &in); err != nil {
+			return errResp("sig_sign: %v", err)
+		}
+		der, err := hex.DecodeString(in.KeyPKCS8)
+		if err != nil {
+			return errResp("sig_sign: key_pkcs8: %v", err)
+		}
+		message, err := hex.DecodeString(in.Message)
+		if err != nil {
+			return errResp("sig_sign: message: %v", err)
+		}
+		key, err := x509.ParsePKCS8PrivateKey(der)
+		if err != nil {
+			return errResp("sig_sign: key_pkcs8: %v", err)
+		}
+		switch in.Scheme {
+		case tls.Ed25519.String():
+			priv, ok := key.(ed25519.PrivateKey)
+			if !ok {
+				return errResp("sig_sign: a key of type %T for %s", key, in.Scheme)
+			}
+			return response{
+				Result:    hex.EncodeToString(ed25519.Sign(priv, message)),
+				GoVersion: runtime.Version(),
+			}
+		default:
+			return errResp("sig_sign: unknown scheme %q", in.Scheme)
+		}
 
 	case "build_info":
 		// What a recorded comparison ran against: the toolchain, and the

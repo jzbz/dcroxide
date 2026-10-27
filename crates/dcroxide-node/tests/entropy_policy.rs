@@ -44,8 +44,8 @@
 //!
 //! The scope is this crate's own source. Dependencies draw their own
 //! entropy — rustls and ring do so per TLS handshake, and
-//! `dcroxide-tlscrypto` for every handshake that negotiates P-521 — and
-//! nothing here says otherwise.
+//! `dcroxide-tlscrypto` for every handshake that negotiates P-521 or is
+//! signed with a P-521 key — and nothing here says otherwise.
 //!
 //! What these tests pin is the mechanism: no kernel read on the
 //! peer-paced path, a stream that is seeded once from the OS, and an

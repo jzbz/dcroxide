@@ -52,8 +52,9 @@ dcroxide-rpc = { path = "../dcroxide-rpc" }
 dcroxide-txscript = { path = "../dcroxide-txscript" }
 dcroxide-wire = { path = "../dcroxide-wire" }
 # The in-tree rustls crypto provider (ADR-0015).  Until the switch hands it
-# everything, the RPC server takes only its P-521 key exchange, beside
-# ring's three groups (`rpctls::rpc_kx_groups`).
+# everything, the RPC server takes only the P-521 that ring lacks: its key
+# exchange, beside ring's three groups (`rpctls::rpc_kx_groups`), and its
+# signer for a P-521 RPC key (`rpcrun::build_server_config`).
 dcroxide-tlscrypto = { path = "../dcroxide-tlscrypto" }
 # Only the ring provider is used (see rpcrun::tls_server_config).
 # Default features would also pull aws-lc-rs, compiling a 68 MB
@@ -66,10 +67,6 @@ rustls = { version = "0.23.45", default-features = false, features = [
     "tls12",
     "logging",
 ] }
-# Signs RPC TLS handshakes for a P-521 key, which rustls's ring provider
-# cannot (see `rpcrun::P521SigningKey`).  The same version as
-# `dcroxide-certgen`'s, whose key parser hands this crate the key.
-p521 = { version = "0.14", default-features = false, features = ["ecdsa"] }
 sha1 = { version = "0.11", default-features = false }
 rustls-pki-types = "1"
 # The webpki rustls verifies certificates with, called directly by the
@@ -128,6 +125,11 @@ dcroxide-testutil = { path = "../dcroxide-testutil" }
 # The same crate as above, with its counter of hashed headers for the
 # test that a block's hash travels with it from its reader to the chain.
 dcroxide-wire = { path = "../dcroxide-wire", features = ["count-header-hashes"] }
+# A TLS client's side of P-521 in `tests/rpclisten.rs`: it verifies the
+# server's P-521 handshake signatures and runs a P-521 key exchange
+# against it.  The server's side is `dcroxide-tlscrypto`'s.  The same
+# version as that crate's and `dcroxide-certgen`'s.
+p521 = { version = "0.14", default-features = false, features = ["ecdsa"] }
 tempfile = "3"
 
 [lints]

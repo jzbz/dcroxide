@@ -295,36 +295,54 @@ fn a_p521_key_for_another_certificate_is_refused() {
     );
 }
 
-/// A SEC1 private key rewritten by `edit`, as PEM: the P-521 pair the port
-/// generates, its `ECPrivateKey` bytes changed before re-encoding.
-fn p521_pair_with_edited_key(edit: impl Fn(&[u8]) -> Vec<u8>) -> (Vec<u8>, Vec<u8>) {
+/// The pair the port generates on `curve`: the certificate's PEM, and the
+/// DER of the SEC 1 key it writes under `EC PRIVATE KEY`.
+fn generated_pair(curve: Curve) -> (Vec<u8>, Vec<u8>) {
     use rustls::pki_types::pem::PemObject;
     let dir = tempfile::tempdir().expect("temp dir");
     let (cert_pem, key_pem) = load_or_generate_cert_pair(
         &dir.path().join("rpc.cert"),
         &dir.path().join("rpc.key"),
         &[],
-        Curve::P521,
+        curve,
     )
-    .expect("generate a P-521 pair");
+    .expect("generate a pair");
     let key = rustls::pki_types::PrivateKeyDer::from_pem_slice(&key_pem).expect("parse key");
-    let der = key.secret_der();
-    // SEQUENCE (long form, one length byte), INTEGER 1, OCTET STRING of 66.
-    assert_eq!(&der[..2], &[0x30, 0x81], "a long-form SEQUENCE");
-    assert_eq!(
-        &der[3..8],
-        &[0x02, 0x01, 0x01, 0x04, 0x42],
-        "version 1, a 66-byte scalar"
-    );
-    let edited = edit(der);
-    let b64 = dcroxide_rpc::http::base64_std_encode(&edited);
-    let mut pem = String::from("-----BEGIN EC PRIVATE KEY-----\n");
+    (cert_pem, key.secret_der().to_vec())
+}
+
+/// `der` as a PEM block of type `label`.
+fn pem(label: &str, der: &[u8]) -> Vec<u8> {
+    let b64 = dcroxide_rpc::http::base64_std_encode(der);
+    let mut pem = format!("-----BEGIN {label}-----\n");
     for line in b64.as_bytes().chunks(64) {
         pem.push_str(std::str::from_utf8(line).expect("base64 is ASCII"));
         pem.push('\n');
     }
-    pem.push_str("-----END EC PRIVATE KEY-----\n");
-    (cert_pem, pem.into_bytes())
+    pem.push_str(&format!("-----END {label}-----\n"));
+    pem.into_bytes()
+}
+
+/// The pair the port generates on `curve`, its SEC 1 key rewritten by
+/// `edit` before it is re-encoded as an `EC PRIVATE KEY` block.
+fn pair_with_edited_key(curve: Curve, edit: impl Fn(&[u8]) -> Vec<u8>) -> (Vec<u8>, Vec<u8>) {
+    let (cert_pem, der) = generated_pair(curve);
+    (cert_pem, pem("EC PRIVATE KEY", &edit(&der)))
+}
+
+/// A SEC1 private key rewritten by `edit`, as PEM: the P-521 pair the port
+/// generates, its `ECPrivateKey` bytes changed before re-encoding.
+fn p521_pair_with_edited_key(edit: impl Fn(&[u8]) -> Vec<u8>) -> (Vec<u8>, Vec<u8>) {
+    pair_with_edited_key(Curve::P521, |der| {
+        // SEQUENCE (long form, one length byte), INTEGER 1, OCTET STRING of 66.
+        assert_eq!(&der[..2], &[0x30, 0x81], "a long-form SEQUENCE");
+        assert_eq!(
+            &der[3..8],
+            &[0x02, 0x01, 0x01, 0x04, 0x42],
+            "version 1, a 66-byte scalar"
+        );
+        edit(der)
+    })
 }
 
 /// Go drops zero padding in front of a private scalar
@@ -360,6 +378,112 @@ fn a_p521_key_with_an_unknown_version_is_refused_as_in_dcrd() {
         err.contains("unable to build the RPC TLS configuration"),
         "got: {err}"
     );
+}
+
+/// The fields of a SEC 1 key the port generated: the length of its
+/// SEQUENCE's header, and where each field starts, every header in the
+/// short or the one-byte long form.
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "offsets into a key of under 256 bytes the port generated"
+)]
+fn sec1_fields(der: &[u8]) -> (usize, Vec<usize>) {
+    let header = |at: usize| match der[at + 1] {
+        0x81 => (3, usize::from(der[at + 2])),
+        len => (2, usize::from(len)),
+    };
+    let mut fields = Vec::new();
+    let mut at = header(0).0;
+    while at < der.len() {
+        fields.push(at);
+        let (size, len) = header(at);
+        at += size + len;
+    }
+    (header(0).0, fields)
+}
+
+/// A DER element of `tag` holding `content`, under 256 bytes, its length
+/// in the short or the one-byte long form.
+fn tlv(tag: u8, content: &[u8]) -> Vec<u8> {
+    let mut out = vec![tag];
+    match u8::try_from(content.len()).expect("a short key") {
+        len @ 0..0x80 => out.push(len),
+        len => out.extend([0x81, len]),
+    }
+    out.extend_from_slice(content);
+    out
+}
+
+/// A SEC 1 key the port generated, without the `[1]` public key that
+/// ends it.
+fn without_public_key(der: &[u8]) -> Vec<u8> {
+    let (start, fields) = sec1_fields(der);
+    assert_eq!(fields.len(), 4, "version, scalar, curve and public key");
+    let public = fields[3];
+    assert_eq!(der[public], 0xa1, "the public key last");
+    tlv(0x30, &der[start..public])
+}
+
+/// A SEC 1 key the port generated on `curve`, in PKCS#8: version 0, the
+/// `id-ecPublicKey` algorithm with the curve's OID, and the key, which
+/// names its curve inside too, as Go and ring read either way.
+fn as_pkcs8(curve: Curve, sec1: &[u8]) -> Vec<u8> {
+    let named: &[u8] = match curve {
+        Curve::P256 => &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07],
+        Curve::P521 => &[0x2b, 0x81, 0x04, 0x00, 0x23],
+    };
+    let ec_public_key = [0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01];
+    let algorithm = tlv(
+        0x30,
+        &[tlv(0x06, &ec_public_key), tlv(0x06, named)].concat(),
+    );
+    tlv(
+        0x30,
+        &[tlv(0x02, &[0]), algorithm, tlv(0x04, sec1)].concat(),
+    )
+}
+
+/// Until ADR-0015's switch only a P-521 key reaches `dcroxide-tlscrypto`'s
+/// loader, which reads it by Go's `tls.X509KeyPair` rules; every other key
+/// keeps ring's.  A SEC 1 key without its public key, which Go loads, since
+/// it never reads that key (`crypto/x509/sec1.go:87-130`), and ring
+/// refuses, since it requires one, builds a configuration on P-521, as in
+/// dcrd, and not yet on P-256.
+#[test]
+fn until_the_switch_only_a_p521_key_is_read_by_gos_rules() {
+    for (curve, builds) in [(Curve::P521, true), (Curve::P256, false)] {
+        let (cert_pem, key_pem) = pair_with_edited_key(curve, without_public_key);
+        let built = dcroxide_node::rpcrun::tls_server_config(&cert_pem, &key_pem, None);
+        assert_eq!(built.is_ok(), builds, "{curve:?}: {:?}", built.err());
+    }
+}
+
+/// The RPC server routes a key by what its DER reads as by Go's rules,
+/// not by the PEM label the reader took it under, which Go ignores
+/// (`crypto/tls/tls.go:366-383`), so a P-521 pair builds with its SEC 1
+/// key under `EC PRIVATE KEY` or `RSA PRIVATE KEY` and with its PKCS#8
+/// form under `PRIVATE KEY`, as in dcrd.  A P-256 key still takes ring's
+/// loader, which reads the DER as the label names it, and until the switch
+/// is refused under `RSA PRIVATE KEY`.
+#[test]
+fn a_p521_key_builds_under_each_label_the_reader_takes() {
+    for (curve, under_rsa_label) in [(Curve::P521, true), (Curve::P256, false)] {
+        let (cert_pem, sec1) = generated_pair(curve);
+        let pkcs8 = as_pkcs8(curve, &sec1);
+        for (label, der, builds) in [
+            ("EC PRIVATE KEY", &sec1, true),
+            ("RSA PRIVATE KEY", &sec1, under_rsa_label),
+            ("PRIVATE KEY", &pkcs8, true),
+        ] {
+            let built = dcroxide_node::rpcrun::tls_server_config(&cert_pem, &pem(label, der), None);
+            assert_eq!(
+                built.is_ok(),
+                builds,
+                "{curve:?} under {label}: {:?}",
+                built.err()
+            );
+        }
+    }
 }
 
 /// And P-256, the default, is unaffected.

@@ -52,7 +52,7 @@ script.
 - **`ring` 0.17.14** (`Cargo.lock:1348`): ~151k lines of C and assembly
   (`dependency-ledger.md:46`), the crypto provider of `rustls` 0.23.46.
   `dcroxide-node` selects rustls's `ring` feature
-  (`crates/dcroxide-node/Cargo.toml:54-64`), `ureq` 3.4.2 selects it
+  (`crates/dcroxide-node/Cargo.toml:59-69`), `ureq` 3.4.2 selects it
   through its default `rustls` feature, and `rustls-webpki` 0.103.16
   depends on it (`Cargo.lock:1417-1425`). It runs the RPC and websocket
   TLS listener, the RPC client-certificate verifier
@@ -86,7 +86,7 @@ makes a skip of either a failure (`.github/workflows/ci.yml:16-25`).
 **Inline assembly in Rust crates.** Crates already in the node's build
 carry `asm!`, which rustc assembles itself, with no C toolchain: the
 system calls of `rustix` 1.1.5, which `dcroxide-node` takes on Unix
-(`crates/dcroxide-node/Cargo.toml:101`) and whose build script picks its
+(`crates/dcroxide-node/Cargo.toml:102`) and whose build script picks its
 Linux backend there (`build.rs:101-122`); the optimization barrier of
 `zeroize` 1.9.0 (`src/barrier.rs:69`); the constant-time moves of `cmov`
 0.5.4; and a few more, which the dependency ledger lists.

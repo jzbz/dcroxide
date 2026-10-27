@@ -11,23 +11,28 @@
 //! (ADR-0015, "T1").  Each part keeps ring's choices: the same suites in
 //! the same order, the same limits, the same verdicts.
 //!
-//! So far it holds record protection and key exchange.  Record protection
-//! is the nine cipher suites the node serves and the seeders dial with,
-//! TLS 1.3's AES-128-GCM, AES-256-GCM and ChaCha20-Poly1305 and TLS 1.2's
-//! ECDHE-ECDSA and ECDHE-RSA with each of the three, on `aes-gcm` and
-//! `chacha20poly1305`, with their transcript hashes, HKDF and PRF on
-//! `sha2` and `hmac`.  Key exchange is ring's three groups, X25519, P-256
-//! and P-384, and P-521, which ring lacks and Go's server offers, on
-//! `curve25519-dalek` and the `p256`, `p384` and `p521` crates, each with
-//! Go's rules for the peer's share and its ephemeral key drawn from the
-//! kernel (`kx`, `rand`).  The suites and groups are items of their own
-//! under the names of rustls's ring provider
+//! So far it holds record protection, key exchange and the signing keys.
+//! Record protection is the nine cipher suites the node serves and the
+//! seeders dial with, TLS 1.3's AES-128-GCM, AES-256-GCM and
+//! ChaCha20-Poly1305 and TLS 1.2's ECDHE-ECDSA and ECDHE-RSA with each of
+//! the three, on `aes-gcm` and `chacha20poly1305`, with their transcript
+//! hashes, HKDF and PRF on `sha2` and `hmac`.  Key exchange is ring's
+//! three groups, X25519, P-256 and P-384, and P-521, which ring lacks and
+//! Go's server offers, on `curve25519-dalek` and the `p256`, `p384` and
+//! `p521` crates, each with Go's rules for the peer's share and its
+//! ephemeral key drawn from the kernel (`kx`, `rand`).  The suites and
+//! groups are items of their own under the names of rustls's ring provider
 //! (`rustls-0.23.46/src/crypto/ring/mod.rs:65-103`, `:172-181`), so the
 //! node can build both of Go's suite orders from them, and its per-group
-//! configurations, as it does from ring's.  The node takes P-521 from here
-//! already; signing, verification and the rest of key exchange and
-//! randomness are still ring's, and an item from here runs beside them in
-//! any `CryptoProvider` that lists it.
+//! configurations, as it does from ring's.  The signing keys are ECDSA on
+//! the three NIST curves, hedged RFC 6979 on the curve crates, and Ed25519
+//! on `curve25519-dalek`, read from an `rpc.key` by Go's `tls.X509KeyPair`
+//! rules and refusing RSA keys ([`sign`]).
+//!
+//! The node takes P-521 from here already, its key exchange and its
+//! signing key, both of which ring lacks; verification and the rest of
+//! signing, key exchange and randomness are still ring's, and an item
+//! from here runs beside them in any `CryptoProvider` that lists it.
 //!
 //! Every function a peer's record or key share reaches computes on lengths
 //! with `checked_*` or compares them first, and fails the record or the
@@ -35,10 +40,13 @@
 //! build aborts on a panic and wraps on overflow.
 
 mod aead;
+mod der;
 mod hash;
 mod hmac;
+mod keys;
 mod kx;
 mod rand;
+pub mod sign;
 mod tls12;
 mod tls13;
 #[cfg(test)]

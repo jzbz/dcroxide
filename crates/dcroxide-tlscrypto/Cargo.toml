@@ -24,21 +24,29 @@ poly1305 = { version = "0.9.1", default-features = false, features = ["zeroize"]
 # `digest`'s, which `hmac`'s turns on as well (`src/hmac.rs`).
 sha2 = { version = "0.11", default-features = false, features = ["zeroize"] }
 hmac = { version = "0.13", default-features = false, features = ["zeroize"] }
-# Key exchange (ADR-0015 T1): X25519 on `curve25519-dalek`'s Montgomery
-# ladder, and P-256, P-384 and P-521 on the curve arithmetic alone.  No
+# Key exchange and handshake signatures (ADR-0015 T1): X25519 and Ed25519
+# on `curve25519-dalek`, and P-256, P-384 and P-521 on the curve crates,
+# whose `ecdsa` feature gives each curve its signing key and its hash.  No
 # `ecdh` feature: it pulls `hkdf`, and the exchange is one scalar
 # multiplication.  `precomputed-tables` speeds the multiplication by the
-# generator that makes each ephemeral public key (`std` is what the table
-# is built under).
-p256 = { version = "0.14", default-features = false, features = ["std", "precomputed-tables"] }
-p384 = { version = "0.14", default-features = false, features = ["std", "precomputed-tables"] }
-p521 = { version = "0.14", default-features = false, features = ["std", "precomputed-tables"] }
+# generator that makes each ephemeral public key and each signature (`std`
+# is what the table is built under).
+p256 = { version = "0.14", default-features = false, features = ["ecdsa", "std", "precomputed-tables"] }
+p384 = { version = "0.14", default-features = false, features = ["ecdsa", "std", "precomputed-tables"] }
+p521 = { version = "0.14", default-features = false, features = ["ecdsa", "std", "precomputed-tables"] }
+# The generic types the signer is written over and its hedged RFC 6979
+# (`SigningKey<C>`, `hazmat`, the DER signature); the curve crates export
+# only per-curve aliases.  Locked at 0.17.0 already, with these features.
+ecdsa = { version = "0.17", default-features = false, features = ["algorithm", "der"] }
 curve25519-dalek = "5"
 # X25519's all-zero check, made in constant time.
 subtle = "2.6"
-# The kernel read behind every random byte the provider draws: the
-# handshake randoms and the ephemeral keys (`src/rand.rs`).
+# The kernel read behind every random byte the provider draws but one:
+# the handshake randoms and the ephemeral keys (`src/rand.rs`).
 getrandom = "0.4"
+# The process-wide generator, for that one: the hedge each ECDSA handshake
+# signature mixes into its RFC 6979 nonce (`src/rand.rs`).
+dcroxide-crypto = { path = "../dcroxide-crypto", features = ["rand"] }
 rustls = { version = "0.23.46", default-features = false, features = ["std", "tls12"] }
 zeroize = "1.9"
 
