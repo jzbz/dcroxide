@@ -48,7 +48,7 @@ or matched a second dcrd in the same role
 PARITY.md keep master's behaviour where 2.1.7 differs: `addnode` and
 `node`, protocol version 12 against 11 and `debuglevel`'s subsystems in
 one, and the retry backoff for an unreachable `--connect` peer in the
-other (`docs/PARITY.md:2304-2359`).
+other (`docs/PARITY.md:2307-2362`).
 
 **How dcrd releases**, read from its repository as fetched on 2026-10-25:
 
@@ -95,8 +95,8 @@ other (`docs/PARITY.md:2304-2359`).
 things built for a master pin, whatever rule follows it:
 
 - The consistency test reads the `go.mod` header text after "dcrd master
-  commit " (`crates/dcroxide-testutil/src/lib.rs:754-760`) and fails when
-  no dcrd module is pinned by pseudo-version (`:626-629`). At a tag every
+  commit " (`crates/dcroxide-testutil/src/lib.rs:1231-1237`) and fails when
+  no dcrd module is pinned by pseudo-version (`:839-842`). At a tag every
   module would be pinned by tag.
 - The interop harness would refuse CI's own build. dcrd's note for
   maintainers sets the build metadata `release.local` on a release branch
@@ -107,8 +107,8 @@ things built for a master pin, whatever rule follows it:
   metadata is empty (`:161-177`). The harness's `assert_dcrd_revision`
   takes eight or more characters after a `+` for a stamped revision, and
   any revision but the pin's for a different specification
-  (`crates/dcroxide-testutil/src/lib.rs:458-500`, the check at
-  `:484-492`), so `release.local` is refused. Inference: the v2.2 tags
+  (`crates/dcroxide-testutil/src/lib.rs:630-672`, the check at
+  `:656-664`), so `release.local` is refused. Inference: the v2.2 tags
   follow the same documented process.
 - Nested modules. `tools/pinbump` lists the files a tree diff between the
   two refs changes (`tools/pinbump/main.go:166`), and the port's citations
@@ -191,25 +191,25 @@ v2.2.0 and on each part below, which lands with that move or before it.
 
 - **The consistency test's tag shape.**
   `the_dcrd_pin_matches_ci_and_the_oracle`
-  (`crates/dcroxide-testutil/src/lib.rs:723-770`) has to read a header
+  (`crates/dcroxide-testutil/src/lib.rs:1200-1247`) has to read a header
   that names the tag and its commit in place of "dcrd master commit "
-  (`:754-760`), and the rule that at least one dcrd module is pinned by
-  pseudo-version (`:626-629`) has to go. It already refuses a `replace`
-  of a dcrd module (`:618-625`). Inference: at a tag it also refuses any
+  (`:1231-1237`), and the rule that at least one dcrd module is pinned by
+  pseudo-version (`:839-842`) has to go. It already refuses a `replace`
+  of a dcrd module (`:831-838`). Inference: at a tag it also refuses any
   pseudo-version, and whether each module sits at the tag's required
   version needs dcrd's `go.mod` at the tag, which the repository does not
   hold, so that half is checked at the move unless a CI job with a dcrd
   clone takes it on.
 - **The harness's revision check.** `assert_dcrd_revision`
-  (`crates/dcroxide-testutil/src/lib.rs:458-500`) has to accept a dcrd that
+  (`crates/dcroxide-testutil/src/lib.rs:630-672`) has to accept a dcrd that
   CI built from the tag's commit. Two ways are open, neither chosen
   (inference): read the revision from the binary's Go build information,
   which `-buildvcs=true` records whatever the version string says; or
   build with the linker override `version.go` documents (`:51-54` at
   `release-v2.1.7`) set to the bare `X.Y.Z`, so that `init` stamps the
   revision as it does on master. `DCRD_COMMIT` becomes the tag's commit
-  (`.github/workflows/ci.yml:140`), and the comment that a release "is a
-  different specification" (`:164-167`) changes with it.
+  (`.github/workflows/ci.yml:205`), and the comment that a release "is a
+  different specification" (`:229-232`) changes with it.
 - **ADR-0001's original rule for the oracle and `fullblockgen`.** Every
   dcrd module in `tools/oracle/go.mod` and `tools/fullblockgen/go.mod`
   sits at exactly the version the tag's `go.mod` requires, as ADR-0001's
@@ -297,8 +297,8 @@ not PARITY.md's range sections, which record what the port claims.
   that a newer one supersedes before its move lands is pinned on the way
   or skipped; whether a scheduled CI job runs `tools/pinbump` against
   dcrd's newest tag and master (CI already clones dcrd for the interop
-  job, `.github/workflows/ci.yml:171`, and its one scheduled job is the
-  nightly fuzz, `:7-9`, `:321-323`); and the harness and build-metadata
+  job, `.github/workflows/ci.yml:236`, and its one scheduled job is the
+  nightly fuzz, `:7-9`, `:386-388`); and the harness and build-metadata
   choices above.
 
 ## Alternatives

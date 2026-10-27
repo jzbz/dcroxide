@@ -24,9 +24,9 @@ Cuprate-style expiry or a recorded refusal".
 `ci.yml`. Of the release engineering, only `[profile.dist]` and
 `panic = "abort"` exist (the brief's status block, "Release engineering,
 partial"). `dist` inherits `release` and sets `strip = "debuginfo"`, and is
-"the profile release artifacts are cut from" (`Cargo.toml:93-112`). The
+"the profile release artifacts are cut from" (`Cargo.toml:95-114`). The
 toolchain is pinned at 1.98.1 (`rust-toolchain.toml:17-19`), and the
-workspace `rust-version` names the same release (`Cargo.toml:43-48`). That
+workspace `rust-version` names the same release (`Cargo.toml:45-50`). That
 has held since `d2bcb31` (2026-09-15), which also removed the `msrv` CI
 job, since with the floor on the pinned release it repeated the lint
 build. Before it the workspace kept an older floor, checked by that job:
@@ -40,17 +40,17 @@ so that rule as written can block a bump indefinitely.
 
 **Where the evidence is.** CI runs `cargo test --workspace` on four
 runners: `ubuntu-latest`, `ubuntu-24.04-arm`, `macos-latest` (taken to be
-arm64, not checked here) and `windows-latest` (`ci.yml:65-92`). The
+arm64, not checked here) and `windows-latest` (`ci.yml:71-98`). The
 fault-injection tests in that run are Linux-only, so they run on the two
 Linux legs (`:16-25`). Everything else runs on x86_64 Linux only: rustfmt
 and clippy, the suites with overflow checks off as the release profile
-computes (`:94-124`), the live dcrd interop test (`:126-180`), the no_std
+computes (`:100-130`), the live dcrd interop test (`:191-245`), the no_std
 check, docs, deny and fuzzing. No job builds the workspace's `release` or
 `dist` profile on any target, so the configuration that ships (thin LTO,
 `codegen-units = 1`, `panic = "abort"`) has never been compiled in CI.
 Every timed sync ran on x86_64 machines (m1 to m3,
 `docs/bench-ledger.md:28-30`), none on Windows or macOS
-(`README.md:694-695`), and none on aarch64 of any OS. Ecosystem acceptance
+(`README.md:718-719`), and none on aarch64 of any OS. Ecosystem acceptance
 has been run once, on x86_64 Linux, without Decrediton's IPC lifecycle or
 config, IPC and service parity on Windows and macOS (the brief's status
 block), so the exit criterion that Decrediton launches, supervises and
@@ -205,8 +205,8 @@ signing, Apple's or Windows', is not decided here.
   add to the signatures and the rebuild and replace neither.
 - **Not decided here:** whether the release workflow uses only GitHub-owned
   actions, each pinned to a full commit SHA, and restores no cache, where
-  `ci.yml` pins by tag and uses third-party actions (`ci.yml:44`, `:59`,
-  `:214`, `:238`); and where the two fingerprints, the SSH key's for tags
+  `ci.yml` pins by tag and uses third-party actions (`ci.yml:44`, `:65`,
+  `:279`, `:303`); and where the two fingerprints, the SSH key's for tags
   and the OpenPGP key's for `SHA256SUMS`, are published with the
   verification steps, `SECURITY.md` and the README being candidates.
 
@@ -252,7 +252,7 @@ This supersedes the D7 entry's sentence that the pinned toolchain and
 `codegen-units = 1` "already make reproducible-artifact verification
 attainable". The pin is necessary and not sufficient: host paths, the C
 toolchain, the linker and the C library are inputs too. Inference:
-`codegen-units = 1` is there for speed (`Cargo.toml:52-53`) and is not
+`codegen-units = 1` is there for speed (`Cargo.toml:54-55`) and is not
 needed for deterministic output.
 
 ### 5. Stale binaries: no expiry
@@ -306,7 +306,7 @@ recorded divergence in PARITY.md.
   addition, which needs an ADR (brief §8), and under the pure-Rust rule it
   could not be one built from C.
 - **The release's version identity.** A tag such as `v0.1.0`, the
-  workspace version (`Cargo.toml:40`), would not match what the binary
+  workspace version (`Cargo.toml:42`), would not match what the binary
   prints, `2.2.0-pre`, or the `dcroxide:2.2.0(pre)` its user agent carries
   (`user_agent_version`, `crates/dcroxide-node/src/version.rs:55-58`, with
   the pre-release as its comment). dcrd's release branches set the build
@@ -334,10 +334,10 @@ recorded divergence in PARITY.md.
   distribution whose packaged rustc lags the pin cannot build the node
   with it.
 - Each promotion needs a sync timed on that architecture and OS, and none
-  has been timed on aarch64, Windows or macOS (`README.md:694-695`,
+  has been timed on aarch64, Windows or macOS (`README.md:718-719`,
   `docs/bench-ledger.md:28-30`): it needs such a machine, or a CI runner
   with room for a mainnet data directory, a median of 27.93 GiB after the
-  syncs of 2026-10-17 (`README.md:706-708`). Runner disk sizes were not
+  syncs of 2026-10-17 (`README.md:730-732`). Runner disk sizes were not
   checked.
 - Each release costs an LTO build per target off GitHub and two signatures
   by hand, and checking both the tag and the binaries takes two keys.

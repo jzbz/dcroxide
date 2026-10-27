@@ -411,14 +411,14 @@ which is `oldest_live_read.next()` when a read transaction is live and the
 committing transaction's own id otherwise (`transactions.rs:1936-1940`,
 `2129-2160`, `2200-2262`). The only steady-state writer to the metadata
 store is `DbCache::run_flush`. It is reached from `Transaction::commit_internal`
-(`transaction.rs:671`), where the committing transaction's read snapshot
+(`transaction.rs:1296`), where the committing transaction's read snapshot
 sits at the last committed id `R` and the flush's own write lands at `R+1`.
 `free_until` is therefore `R+1` whether or not that reader exists: the
 transaction that triggers its own flush pins nothing.
 
 The second path is closed by locking rather than arithmetic.
 `Database::begin` takes the cache mutex and holds it across `begin_read()`
-(`lib.rs:1143-1155`, in `begin_seed`). It no longer holds it across the flush:
+(`lib.rs:3261-3289`, in `begin_seed`). It no longer holds it across the flush:
 since `d5aa17f` (2026-08-16) `flush_locked` takes the cache lock only to
 `begin_flush` and `finish_flush`, releasing it across `DbCache::run_flush` and
 redb's commit (`lib.rs:400-421`), so a *new* reader can now come into existence
