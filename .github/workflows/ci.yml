@@ -343,6 +343,12 @@ jobs:
   fuzz-smoke:
     name: fuzz smoke (60s per target)
     runs-on: ubuntu-latest
+    # Provisional, about twice what a cold run is estimated to take: a
+    # minute of fuzzing per target and a build that runs cold about once a
+    # day as the nightly toolchain moves, none of it measured yet. The run
+    # step writes each target's wall time to the job summary; the limit is
+    # to be set from those, at twice the longest run seen.
+    timeout-minutes: 120
     env:
       # cargo-fuzz needs nightly, and rust-toolchain.toml at the repo root
       # applies inside fuzz/ as well — without this the pin would win and
@@ -354,7 +360,29 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: fuzz
+      # The oracle, for the fuzz targets that ask dcrd's own code through
+      # tools/oracle and stop rather than fuzz without it, as every test in
+      # this workflow fails rather than skips under DCROXIDE_REQUIRE_ORACLE.
+      # It is built once, with the reference Go, and named to the targets by
+      # DCROXIDE_ORACLE_BIN.
+      - uses: actions/setup-go@v7
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: tools/oracle/go.sum
+      - name: Build the oracle
+        working-directory: tools/oracle
+        run: |
+          go build -o "$RUNNER_TEMP/dcrd-oracle" .
+          echo "DCROXIDE_ORACLE_BIN=$RUNNER_TEMP/dcrd-oracle" >> "$GITHUB_ENV"
       - run: cargo install cargo-fuzz --locked
+      # The corpus nightly-fuzz keeps, restored and never saved from here:
+      # every target starts from what the nightly runs found.
+      - name: Restore the nightly corpus
+        uses: actions/cache/restore@v6
+        with:
+          path: fuzz/corpus
+          key: fuzz-corpus-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: fuzz-corpus-
       - name: Run every fuzz target briefly
         run: |
           # The list is taken by a plain assignment so a failing `cargo
@@ -369,14 +397,52 @@ jobs:
             echo "cargo fuzz list gave $listed targets; fuzz/Cargo.toml declares $declared" >&2
             exit 1
           fi
+          # Every target runs even after one fails, so one crash does not
+          # hide the rest. -timeout bounds one input, which libFuzzer
+          # otherwise allows 20 minutes, so an input that hangs, waiting on
+          # an oracle that stopped answering or otherwise, becomes a timeout
+          # with the input saved. Each target's wall time, its build or
+          # link included, goes to the job summary.
+          failed=""
+          {
+            echo "| target | seconds |"
+            echo "|---|---|"
+          } >> "$GITHUB_STEP_SUMMARY"
           for t in $targets; do
-            cargo fuzz run "$t" -- -max_total_time=60
+            start=$SECONDS
+            if ! cargo fuzz run "$t" -- -max_total_time=60 -timeout=60; then
+              failed="$failed $t"
+              # libFuzzer names corpus files and reproducers by the input's
+              # SHA-1, so a reproducer named for a file of the restored
+              # corpus holds an input the nightly runs kept, which may fail
+              # on master as well. A slow unit, written there too, is an
+              # input that passed and no reproducer.
+              for f in fuzz/artifacts/"$t"/*; do
+                case "${f##*/}" in slow-unit-*) continue ;; esac
+                [ -e "$f" ] || continue
+                if [ -e "fuzz/corpus/$t/${f##*-}" ]; then
+                  echo "$f: an input of the restored nightly corpus; it may fail on master too" >&2
+                else
+                  echo "$f: an input this run made" >&2
+                fi
+              done
+            fi
+            # An oracle that hangs is still running when libFuzzer ends the
+            # target on its timeout, and must not keep a CPU from the
+            # targets after it.
+            pkill -KILL -x dcrd-oracle || true
+            echo "| $t | $((SECONDS - start)) |" >> "$GITHUB_STEP_SUMMARY"
           done
+          if [ -n "$failed" ]; then
+            echo "fuzz targets that failed:$failed" >&2
+            exit 1
+          fi
       # Without this a crash is only ever a red X: the input that caused
       # it lives in fuzz/artifacts on a runner that is about to be
-      # destroyed, so nobody can reproduce or minimize it.
+      # destroyed, so nobody can reproduce or minimize it. A job the
+      # timeout cancels keeps what earlier targets wrote, too.
       - name: Upload crash artifacts
-        if: failure()
+        if: failure() || cancelled()
         uses: actions/upload-artifact@v7
         with:
           name: fuzz-artifacts-smoke
@@ -387,13 +453,35 @@ jobs:
     name: nightly fuzz (10m per target)
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
+    # The run step starts a target only while twelve minutes remain of the
+    # 295 minutes it gives itself, which leaves the steps around it the
+    # rest.
+    timeout-minutes: 330
     env:
       # See fuzz-smoke: the root pin reaches into fuzz/ and must be overridden.
       RUSTUP_TOOLCHAIN: nightly
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@nightly
+      # See fuzz-smoke.
+      - uses: actions/setup-go@v7
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: tools/oracle/go.sum
+      - name: Build the oracle
+        working-directory: tools/oracle
+        run: |
+          go build -o "$RUNNER_TEMP/dcrd-oracle" .
+          echo "DCROXIDE_ORACLE_BIN=$RUNNER_TEMP/dcrd-oracle" >> "$GITHUB_ENV"
       - run: cargo install cargo-fuzz --locked
+      # Each night starts from the corpus the last one saved, so coverage
+      # accumulates instead of every run starting cold.
+      - name: Restore the corpus
+        uses: actions/cache/restore@v6
+        with:
+          path: fuzz/corpus
+          key: fuzz-corpus-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: fuzz-corpus-
       - name: Run every fuzz target for 10 minutes
         run: |
           # See the smoke job: an empty or short list must fail the step.
@@ -404,13 +492,71 @@ jobs:
             echo "cargo fuzz list gave $listed targets; fuzz/Cargo.toml declares $declared" >&2
             exit 1
           fi
+          # libFuzzer counts -max_total_time from its start but checks it
+          # only once it has run the corpus it was given, so a target takes
+          # its ten minutes or that pass, whichever is longer, plus its
+          # build and its exit. The step gives itself 295 minutes and starts
+          # a target only while twelve of them remain; the targets that do
+          # not fit are listed and fail the job, the sign that it needs
+          # splitting into a matrix. As in the smoke job every target that
+          # fits runs, and each one's wall time and corpus size go to the
+          # job summary.
+          deadline=$((SECONDS + 295 * 60))
+          failed=""
+          skipped=""
+          {
+            echo "| target | seconds | corpus files |"
+            echo "|---|---|---|"
+          } >> "$GITHUB_STEP_SUMMARY"
           for t in $targets; do
-            cargo fuzz run "$t" -- -max_total_time=600
+            if [ $((SECONDS + 720)) -gt "$deadline" ]; then
+              skipped="$skipped $t"
+              continue
+            fi
+            corpus="$GITHUB_WORKSPACE/fuzz/corpus/$t"
+            mkdir -p "$corpus"
+            start=$SECONDS
+            if ! cargo fuzz run "$t" "$corpus" -- -max_total_time=600 -timeout=60; then
+              failed="$failed $t"
+              # See the smoke job; libFuzzer keeps only inputs that pass.
+              for f in fuzz/artifacts/"$t"/*; do
+                case "${f##*/}" in slow-unit-*) continue ;; esac
+                [ -e "$f" ] || continue
+                if [ -e "$corpus/${f##*-}" ]; then
+                  echo "$f: an input of the restored corpus, which passed on the night that kept it" >&2
+                else
+                  echo "$f: an input this run made" >&2
+                fi
+              done
+            fi
+            # See the smoke job.
+            pkill -KILL -x dcrd-oracle || true
+            files=$(find "$corpus" -type f | wc -l)
+            echo "| $t | $((SECONDS - start)) | $files |" >> "$GITHUB_STEP_SUMMARY"
           done
+          if [ -n "$skipped" ]; then
+            echo "not run, for want of time:$skipped; nightly-fuzz needs a matrix" >&2
+          fi
+          if [ -n "$failed" ]; then
+            echo "fuzz targets that failed:$failed" >&2
+          fi
+          if [ -n "$failed$skipped" ]; then
+            exit 1
+          fi
+      # A cache key is never overwritten, so each night (and each re-run of
+      # one) saves under its own and the next restores the newest by
+      # prefix. It saves after a failure too: libFuzzer writes a failing
+      # input to fuzz/artifacts, never into the corpus.
+      - name: Save the corpus
+        if: always() && hashFiles('fuzz/corpus/**') != ''
+        uses: actions/cache/save@v6
+        with:
+          path: fuzz/corpus
+          key: fuzz-corpus-${{ github.run_id }}-${{ github.run_attempt }}
       # See the smoke job: a nightly crash is the one most likely to be
       # noticed hours later, so the reproducer has to outlive the runner.
       - name: Upload crash artifacts
-        if: failure()
+        if: failure() || cancelled()
         uses: actions/upload-artifact@v7
         with:
           name: fuzz-artifacts-nightly

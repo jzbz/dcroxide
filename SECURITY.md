@@ -308,11 +308,13 @@ evaluating this code.
   and the port writes a plain operator fails them even though the
   release build wraps; that is the point, since such a site makes
   debug and test builds disagree with the shipped binary. No corpus is
-  committed (`fuzz/corpus` is ignored), so every run starts cold and
-  has to rediscover structure inside its budget. Those jobs are also
-  the only sanitized build in CI, since `cargo fuzz` defaults to
-  AddressSanitizer; neither the test suite nor a running node is run
-  under a sanitizer.
+  committed (`fuzz/corpus` is ignored); the nightly job keeps one in
+  CI's cache, which the next night and the 60-second runs start from,
+  so a target starts cold, and has to rediscover structure inside its
+  budget, only before a night has kept its corpus or after the cache has
+  expired. Those jobs are also the only sanitized build in CI, since
+  `cargo fuzz` defaults to AddressSanitizer; neither the test suite nor
+  a running node is run under a sanitizer.
 - **The Windows build runs unsafe code of the project's own.** Every
   workspace crate forbids `unsafe_code` except `dcroxide-winsvc`, which
   denies it and holds the one audited exception: three Windows-only unsafe

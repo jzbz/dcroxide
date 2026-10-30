@@ -298,7 +298,7 @@ not PARITY.md's range sections, which record what the port claims.
   or skipped; whether a scheduled CI job runs `tools/pinbump` against
   dcrd's newest tag and master (CI already clones dcrd for the interop
   job, `.github/workflows/ci.yml:236`, and its one scheduled job is the
-  nightly fuzz, `:7-9`, `:386-388`); and the harness and build-metadata
+  nightly fuzz, `:7-9`, `:452-454`); and the harness and build-metadata
   choices above.
 
 ## Alternatives
