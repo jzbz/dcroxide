@@ -402,14 +402,15 @@ fn ed25519_verify_torsion_keys_match_dcrd_oracle() {
 }
 
 /// A sweep over random torsion-carrying keys, the key class
-/// `fuzz/fuzz_targets/dcrec_ed25519.rs` cannot build (that crate has no
-/// group arithmetic to add a torsion point with).  For a key
-/// `A = a*B + T`, any of the eight small-order `T` and random `a`, zero
-/// included, an honest signature `(r*B, r + k*a)` over a random message
-/// satisfies agl's `s*B - k*A = R - k*T`, so `verify_raw` must accept it
-/// exactly when `k*T` is the identity; the scalar-negation form instead
-/// accepts exactly when `(L-k)*T` is, and the two verdicts must be seen
-/// to differ.
+/// `fuzz/fuzz_targets/dcrec_ed25519.rs` cannot build (it signs only with
+/// keys from a seed; `dcrec_ed25519_model` builds them through the
+/// signature soak's classes).  For a key `A = a*B + T`, any of the eight
+/// small-order `T` and random `a`, zero included, an honest signature
+/// `(r*B, r + k*a)` over a random message satisfies agl's
+/// `s*B - k*A = R - k*T`, so `verify_raw` must accept it exactly when
+/// `k*T` is the identity; the scalar-negation form instead accepts
+/// exactly when `(L-k)*T` is, and the two verdicts must be seen to
+/// differ.
 #[test]
 fn ed25519_random_torsion_keys_verify_as_agl_does() {
     let mut rng = SplitMix64::from_entropy("ed25519 torsion key sweep");

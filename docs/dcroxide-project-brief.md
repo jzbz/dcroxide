@@ -113,12 +113,15 @@ exit criteria have not been demonstrated, and those are listed here too:
   been synced to a matching tip only, which is weaker than comparing the
   stored records at every height, as on mainnet.
 - **Phase 0 — the CI gates are partly wired.** `.github/workflows/ci.yml` runs
-  rustfmt and `clippy -D warnings`, `cargo test --workspace` on all three OSes
-  with the oracle required (`DCROXIDE_REQUIRE_ORACLE=1`), `cargo-deny` over
+  rustfmt and `clippy -D warnings`, `cargo test --workspace` on all four
+  runners (x86_64 and arm64 Linux, macOS, Windows) with the oracle required
+  (`DCROXIDE_REQUIRE_ORACLE=1`), `cargo-deny` over
   licenses/advisories/sources/bans, a
   60-second-per-target fuzz smoke — all of those on every push to `master`
   and every pull request — and a nightly
-  10-minute-per-target run over the 19 fuzz targets. Not wired: coverage
+  10-minute-per-target run over the 25 fuzz targets, five of which ask dcrd's
+  own code through the oracle and one of which checks against a model of
+  dcrd's Ed25519, from a corpus kept between nights. Not wired: coverage
   reporting (`cargo-llvm-cov`), `cargo-vet`, `cargo-mutants`, and any sanitizer
   coverage beyond the AddressSanitizer `cargo fuzz` builds in by default. [docs/dependency-ledger.md](dependency-ledger.md) records a decision per load-bearing crate — vendored, reviewed@V, accepted, or declined — while stating outright that it is not a review; a full manual audit and a version freeze are still Phase 15 items.
 - Three further ledger rows sit at "—" for reasons that are not debt:
@@ -728,9 +731,9 @@ this plan first asked for, which a project with one maintainer
 ([docs/dependency-ledger.md](dependency-ledger.md), "What is deliberately not
 here") cannot meet; the external review of Phase 15 is still to come. Not all
 of this is in place. The soak has not been run for `dcrec`
-([ADR-0006](adr/0006-secp256k1-backend.md)'s 2026-10-26 addendum), none of the
-19 targets under `fuzz/fuzz_targets/` calls the oracle, and `cargo-mutants` is
-not wired up (the Phase 0 item in the list of outstanding work above).
+([ADR-0006](adr/0006-secp256k1-backend.md)'s 2026-10-26 addendum), though five
+fuzz targets compare it with dcrd in CI, and `cargo-mutants` is not wired up
+(the Phase 0 item in the list of outstanding work above).
 Workspace line coverage is to be reported and ratcheted (never decreases) once
 `cargo-llvm-cov` is wired up, which it is not yet; a target ≥90% overall is
 expected to fall out naturally rather than be chased.

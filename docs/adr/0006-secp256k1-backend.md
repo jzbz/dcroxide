@@ -7,7 +7,8 @@
   measurement; see the 2026-10-26 addendum
 - **Date:** 2026-07-03 (proposed), 2026-07-26 (addendum: the split held),
   2026-10-26 (addendum: ECDSA and key handling to move to `k256`; a superseding
-  ADR pending; second addendum: how the soak is run and compared)
+  ADR pending; second addendum: how the soak is run and compared), 2026-10-27
+  (addendum: the oracle-backed fuzz targets)
 
 ## Context
 
@@ -420,3 +421,49 @@ constructed case's branch against dcroxide's own answer.
 The microbenchmark the plan names ran the same day, before any port (bench
 ledger, "ECDSA verification on libsecp256k1 and on k256 (2026-10-26)"): one
 ECDSA verification costs about twice as much on `k256` as on libsecp256k1.
+
+## Addendum, 2026-10-27 — the oracle-backed fuzz targets
+
+The fuzz crate gains six signature targets, which read their inputs through the
+soak's tool, `dcroxide-sigdiff` (`crates/dcroxide-sigdiff/src/fuzz.rs`). Five
+of them, `dcrec_diff_ecdsa` (the ECDSA and DER classes), `dcrec_diff_recover`,
+`dcrec_diff_pubkey`, `dcrec_diff_schnorr` and `dcrec_diff_ed25519`, take an
+input's first byte as one of the soak's input classes, the next eight as the
+case index and the rest as the class generator's entropy, so that the fuzzer
+steers the constructions the soak draws from its seed; together they reach all
+82 classes. Every request of the case is answered by `dcroxide-dcrec` and,
+through one `tools/oracle` per fuzz process whose pin is checked before the
+target fuzzes, by dcrd's own code, and the soak's own comparison holds the two
+answers side by side. The intents a generator attaches to a case are first
+rebased on the soak's models, since a stream the fuzzer chooses can make a
+construction miss the branch it was built for while both sides agree; the four
+torsion classes keep the Accept or Reject their generators compute from the
+signature they built. Any failure the comparison reports, and an oracle that
+fails on an input, ends the target with the case, every request and both
+answers, and `sigsoak fuzz-replay` replays the input without libFuzzer. The
+entry is plumbing in the soak's fingerprint lists: no soak run, digest or
+witness passes through it, and the generator fingerprint did not move. The
+targets run in CI's 60-second and ten-minute fuzz jobs, the nightly one also
+reading inputs from `sigsoak fuzz-seeds` that regenerate each class's per-PR
+cases. That is regression evidence on the code in the tree, not the soak that
+gates the port.
+
+The sixth, `dcrec_ed25519_model`, reads the Ed25519 classes' inputs the same
+way and needs no oracle: it holds `dcroxide-dcrec`'s Ed25519 key parsing,
+signature parsing and verification to the soak's Go-free model of dcrd's
+parsing and of agl's verification, and requires every signature dcrec makes to
+verify under the model. Its classes build what `dcrec_ed25519`, which signs
+only with keys from a seed, cannot reach: the eight small-order points and
+`a*B + T` keys at every residue of k mod 8, their non-canonical encodings, and
+zero-S signatures with a small-order R. The model decodes points with the same
+`curve25519-dalek` decompression as dcrec, so only `dcrec_diff_ed25519` holds
+that decoding to dcrd, and the model's own parsing has unit-test evidence only.
+`dcrec_ed25519` keeps its four properties, unchanged. The decision the
+2026-07-26 addendum left waiting is taken through the `dcroxide-sigdiff` path
+dependency rather than direct `curve25519-dalek` and `sha2` lines in
+`fuzz/Cargo.toml`: both are still reached, through sigdiff, at the versions
+`dcroxide-dcrec` uses, and `fuzz/Cargo.lock` gains only the two path crates,
+`dcroxide-sigdiff` and `dcroxide-testutil`. The fuzz crate still takes no
+libsecp256k1 reference: libsecp256k1 reaches it only through `dcroxide-dcrec`,
+as the code under test, and the references are dcrd, through the oracle, and
+the soak's models.

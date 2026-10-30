@@ -787,6 +787,17 @@ found, so one built before a change to `tools/oracle` answers for the
 old source. A name that is not an absolute path to a file skips the
 oracle tests, or fails them under `DCROXIDE_REQUIRE_ORACLE`.
 
+The five `dcrec_diff_*` fuzz targets ask dcrd's own code through the
+oracle on every input. They find it as the differential tests do, but
+stop rather than skip without one. Any fuzz target replays a crash
+input on the pinned toolchain, without cargo-fuzz, when its own binary
+runs on the file: `cargo run --manifest-path fuzz/Cargo.toml --bin
+<target> -- fuzz/artifacts/<target>/crash-…` (this builds libFuzzer, so
+it needs a C++ compiler). For the six signature targets, `cargo run -p
+dcroxide-sigdiff --bin sigsoak -- fuzz-replay --target <target> FILE`
+also decodes the input and prints the case, both answers and the
+comparison.
+
 Every randomized differential prints the seed it drew
 (`<label>: seed 0x…`). To replay a failure without editing the test, set
 `DCROXIDE_TEST_SEED` to that value and run the failing test by name.

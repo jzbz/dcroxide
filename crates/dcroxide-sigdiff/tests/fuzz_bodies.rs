@@ -3,17 +3,20 @@
 //! without libFuzzer: every class's seed inputs and fuzz-shaped inputs
 //! agree with dcrd through the oracle and, for the Ed25519 classes, with
 //! the Go-free model; every canary standing in for dcroxide trips its
-//! primary's target with a side-by-side difference; and the process oracle
+//! primary's target with a side-by-side difference; the process oracle
 //! keeps an input, rejects one that reaches no class and goes on after a
-//! finding.  Each test prints the master seed it drew
-//! (`DCROXIDE_TEST_SEED` replays it).
+//! finding; and each target's binary under `fuzz/` reads its own table.
+//! Each test that draws a master seed prints it (`DCROXIDE_TEST_SEED`
+//! replays it).
 
 use dcroxide_sigdiff::canary::{CANARIES, find_canary};
 use dcroxide_sigdiff::class::{CLASSES, ClassSpec};
 use dcroxide_sigdiff::compare::Category;
 use dcroxide_sigdiff::fuzz::{
-    self, Checked, FuzzOracle, Report, Target, check, check_ed25519_model, seed_indices, seed_input,
+    self, Checked, ED25519_MODEL_TARGET, FuzzOracle, Report, Target, check, check_ed25519_model,
+    seed_indices, seed_input,
 };
+use dcroxide_sigdiff::manifest::repo_root;
 use dcroxide_sigdiff::run::{Mode, class_indices, ours_answerer};
 use dcroxide_testutil::{SplitMix64, oracle_bin_or_skip, oracle_or_skip};
 
@@ -260,5 +263,47 @@ fn fuzz_one_keeps_rejects_and_panics() {
     assert!(
         fuzz::fuzz_one(Target::Ecdsa, &input, &ours),
         "answered after the finding"
+    );
+}
+
+/// Each signature target's binary under `fuzz/` is wired to its own
+/// table: `fuzz/Cargo.toml` builds it from the file of its name, an
+/// oracle-backed target's file starts the process oracle and makes one
+/// call of `fuzz_one`, with its own `Target`, and the model target's
+/// passes its inputs to `fuzz_ed25519_model`.  Nothing in `cargo test`
+/// builds those binaries, and one that read another target's table of the
+/// same size would agree with dcrd on every seed input.
+#[test]
+fn each_target_binary_reads_its_own_table() {
+    let fuzz = repo_root().expect("the repository root").join("fuzz");
+    let manifest = std::fs::read_to_string(fuzz.join("Cargo.toml")).expect("read fuzz/Cargo.toml");
+    let source = |name: &str| {
+        let bin = format!("name = \"{name}\"\npath = \"fuzz_targets/{name}.rs\"\n");
+        assert!(
+            manifest.contains(&bin),
+            "fuzz/Cargo.toml builds {name} from fuzz_targets/{name}.rs"
+        );
+        std::fs::read_to_string(fuzz.join("fuzz_targets").join(format!("{name}.rs")))
+            .unwrap_or_else(|e| panic!("{name}: {e}"))
+    };
+    for target in Target::ALL {
+        let text = source(target.name());
+        let call = format!("fuzz::fuzz_one(Target::{target:?}, data, ");
+        let calls = text.matches("fuzz_one(").count();
+        assert!(
+            calls == 1 && text.contains(&call),
+            "{}: one call of fuzz_one, {call:?}",
+            target.name()
+        );
+        assert!(
+            text.contains("init: fuzz::init_oracle_target(),"),
+            "{}: the oracle starts in init",
+            target.name()
+        );
+    }
+    let model = source(ED25519_MODEL_TARGET);
+    assert!(
+        model.contains("fuzz::fuzz_ed25519_model(data, ") && !model.contains("fuzz_one("),
+        "{ED25519_MODEL_TARGET}: its inputs go to fuzz_ed25519_model"
     );
 }

@@ -401,16 +401,23 @@ jobs:
           # hide the rest. -timeout bounds one input, which libFuzzer
           # otherwise allows 20 minutes, so an input that hangs, waiting on
           # an oracle that stopped answering or otherwise, becomes a timeout
-          # with the input saved. Each target's wall time, its build or
-          # link included, goes to the job summary.
+          # with the input saved. The signature targets read a class, a
+          # case index and then entropy, so -len_control=0 has them mutate
+          # at full length from the start rather than grow inputs from a
+          # few bytes. Each target's wall time, its build or link included,
+          # goes to the job summary.
           failed=""
           {
             echo "| target | seconds |"
             echo "|---|---|"
           } >> "$GITHUB_STEP_SUMMARY"
           for t in $targets; do
+            args=(-max_total_time=60 -timeout=60)
+            case "$t" in
+              dcrec_diff_* | dcrec_ed25519_model) args+=(-len_control=0) ;;
+            esac
             start=$SECONDS
-            if ! cargo fuzz run "$t" -- -max_total_time=60 -timeout=60; then
+            if ! cargo fuzz run "$t" -- "${args[@]}"; then
               failed="$failed $t"
               # libFuzzer names corpus files and reproducers by the input's
               # SHA-1, so a reproducer named for a file of the restored
@@ -482,6 +489,17 @@ jobs:
           path: fuzz/corpus
           key: fuzz-corpus-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: fuzz-corpus-
+      # Inputs that regenerate the per-PR cases of every signature class,
+      # read beside the corpus by the targets that decode them, so that
+      # even a cold corpus starts from each class's constructions. sigsoak
+      # builds on rust-toolchain.toml's pin, as in the test jobs, not on
+      # the job's nightly, and a failure here costs the night its seeds,
+      # never its fuzzing.
+      - name: Write the signature classes' seed inputs
+        continue-on-error: true
+        run: |
+          env -u RUSTUP_TOOLCHAIN rustup toolchain install
+          env -u RUSTUP_TOOLCHAIN cargo run --locked -p dcroxide-sigdiff --bin sigsoak -- fuzz-seeds --out "$RUNNER_TEMP/fuzz-seeds"
       - name: Run every fuzz target for 10 minutes
         run: |
           # See the smoke job: an empty or short list must fail the step.
@@ -515,15 +533,36 @@ jobs:
             fi
             corpus="$GITHUB_WORKSPACE/fuzz/corpus/$t"
             mkdir -p "$corpus"
+            # A signature target also reads the seed inputs written above.
+            # libFuzzer writes what it finds only to the first directory,
+            # the kept corpus, so the seeds themselves never enter the cache.
+            seeds="$RUNNER_TEMP/fuzz-seeds/$t"
+            dirs=("$corpus")
+            if [ -d "$seeds" ]; then
+              dirs+=("$seeds")
+            fi
+            # See the smoke job for -len_control=0.
+            args=(-max_total_time=600 -timeout=60)
+            case "$t" in
+              dcrec_diff_* | dcrec_ed25519_model) args+=(-len_control=0) ;;
+            esac
             start=$SECONDS
-            if ! cargo fuzz run "$t" "$corpus" -- -max_total_time=600 -timeout=60; then
+            if ! cargo fuzz run "$t" "${dirs[@]}" -- "${args[@]}"; then
               failed="$failed $t"
-              # See the smoke job; libFuzzer keeps only inputs that pass.
+              # See the smoke job; libFuzzer keeps only inputs that pass. A
+              # seed input's reproducer is named by its seed file, which
+              # gives the class and the case index.
               for f in fuzz/artifacts/"$t"/*; do
                 case "${f##*/}" in slow-unit-*) continue ;; esac
                 [ -e "$f" ] || continue
+                seed=""
+                if [ -d "$seeds" ]; then
+                  seed=$(sha1sum "$seeds"/* | awk -v h="${f##*-}" '$1 == h { print $2 }')
+                fi
                 if [ -e "$corpus/${f##*-}" ]; then
                   echo "$f: an input of the restored corpus, which passed on the night that kept it" >&2
+                elif [ -n "$seed" ]; then
+                  echo "$f: the seed input ${seed##*/}" >&2
                 else
                   echo "$f: an input this run made" >&2
                 fi

@@ -89,7 +89,7 @@ node asks for `ureq = "3"` with its default features
 only when both switches change; either alone brings it back. `fuzz/`,
 outside the workspace with a lock of its own, takes the node's whole tree
 through `dcroxide-node` (`fuzz/Cargo.toml:21-24`) and locks `ring` too
-(`fuzz/Cargo.lock:1392`).
+(`fuzz/Cargo.lock:1414`).
 
 ### The process default
 

@@ -506,6 +506,7 @@ dependencies = [
  "dcroxide-node",
  "dcroxide-rpc",
  "dcroxide-rpctypes",
+ "dcroxide-sigdiff",
  "dcroxide-stake",
  "dcroxide-tlscrypto",
  "dcroxide-txscript",
@@ -679,6 +680,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "dcroxide-sigdiff"
+version = "0.1.0"
+dependencies = [
+ "curve25519-dalek",
+ "dcroxide-crypto",
+ "dcroxide-dcrec",
+ "dcroxide-testutil",
+ "k256",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "dcroxide-stake"
 version = "0.1.0"
 dependencies = [
@@ -696,6 +710,14 @@ dependencies = [
  "dcroxide-chainhash",
  "dcroxide-wire",
  "num-bigint",
+]
+
+[[package]]
+name = "dcroxide-testutil"
+version = "0.1.0"
+dependencies = [
+ "redb",
+ "serde_json",
 ]
 
 [[package]]

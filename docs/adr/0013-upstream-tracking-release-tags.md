@@ -13,11 +13,11 @@ The project brief left D5 open as "Upstream tracking cadence once 2.2
 lands upstream: parity branch policy, how consensus PRs are mirrored, who
 owns the watch" (§9, D5 in its original list). The rules around it were
 already set: code at the pinned upstream commit is the specification
-(principle 1, `docs/dcroxide-project-brief.md:522`, and R2 in §10); all
+(principle 1, `docs/dcroxide-project-brief.md:525`, and R2 in §10); all
 parity claims reference one pin, and a standing "upstream watch" reviews
-dcrd's releases and merged consensus changes (principle 7, `:528`), a
+dcrd's releases and merged consensus changes (principle 7, `:531`), a
 watch nothing had defined: no ADR, schedule or CI job. The plan expected
-the pin to track "upstream releases thereafter" (`:430`), with
+the pin to track "upstream releases thereafter" (`:433`), with
 "pinned-tag parity claims" (R7, §10) and work that "matches the pinned
 dcrd tag" (§12's definition of done).
 
@@ -137,7 +137,7 @@ things built for a master pin, whatever rule follows it:
    `dcrec`, `wire`, and `mixing`'s validation paths), to `chaincfg`, which
    defines the agendas, and to the policy crates, `mempool`, `mining` and
    `mixing`'s pool, which carry the limits principle 6 names
-   (`docs/dcroxide-project-brief.md:527`).
+   (`docs/dcroxide-project-brief.md:530`).
 4. **One dcroxide branch.** master carries the one pin. No second line is
    kept, neither a release branch beside master nor an early-port branch
    for a master agenda; one would need a decision of the project owner's.
@@ -247,7 +247,7 @@ v2.2.0 and on each part below, which lands with that move or before it.
   paragraph, its *Oracle pin* paragraph and the paragraph on the Go
   release dcrd's `contrib/docker/Dockerfile` builds with; the brief's
   target statements (`docs/dcroxide-project-brief.md:5`, `:47-54`,
-  `:430`, `:528`, as its rule for corrections allows, `:34-37`) and its
+  `:433`, `:531`, as its rule for corrections allows, `:34-37`) and its
   §9 entry for D5; and the ADR index's line for ADR-0001 and its D5
   entry.
 
@@ -298,7 +298,7 @@ not PARITY.md's range sections, which record what the port claims.
   or skipped; whether a scheduled CI job runs `tools/pinbump` against
   dcrd's newest tag and master (CI already clones dcrd for the interop
   job, `.github/workflows/ci.yml:236`, and its one scheduled job is the
-  nightly fuzz, `:7-9`, `:452-454`); and the harness and build-metadata
+  nightly fuzz, `:7-9`, `:459-461`); and the harness and build-metadata
   choices above.
 
 ## Alternatives
@@ -307,7 +307,7 @@ not PARITY.md's range sections, which record what the port claims.
   Rejected: between waypoints the port would claim parity with code no
   release ships, for cycles that have run 11 and 18 months between `.0`
   tags; acceptance against release binaries would keep its adjudication
-  step; and the brief's `:430`, R7 and definition of done say otherwise.
+  step; and the brief's `:433`, R7 and definition of done say otherwise.
   It keeps small, prompt moves and master's head start on fixes, which
   this decision gives up.
 - **Two lines, mirroring dcrd's**: dcroxide master on dcrd master, and a

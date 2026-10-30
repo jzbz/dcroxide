@@ -85,7 +85,7 @@ entry. Ratifying D4 remains the project owner's call.
 The design the 2026-07-26 addendum describes is the accepted decision for D4,
 ratified by the project owner on 2026-10-26. The project brief framed D4 as a
 custom serializer against canonicalized comparison with documented deltas
-(`docs/dcroxide-project-brief.md:859`). The answer is a custom serializer,
+(`docs/dcroxide-project-brief.md:862`). The answer is a custom serializer,
 compared on raw bytes:
 
 - **No serde.** `dcroxide-dcrjson` depends only on `dcroxide-chainhash`,

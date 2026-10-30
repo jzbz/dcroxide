@@ -24,6 +24,12 @@ dcroxide-dcrjson = { path = "../crates/dcroxide-dcrjson" }
 dcroxide-node = { path = "../crates/dcroxide-node" }
 dcroxide-rpc = { path = "../crates/dcroxide-rpc" }
 dcroxide-rpctypes = { path = "../crates/dcroxide-rpctypes" }
+# The signature input classes, the entry the dcrec_diff_* targets and
+# dcrec_ed25519_model share, and the Go-free model of dcrd's Ed25519 that
+# dcrec_ed25519_model checks against.  k256, curve25519-dalek, sha2 and
+# serde_json are already locked here at the workspace lock's versions; the
+# two path crates, dcroxide-sigdiff and dcroxide-testutil, join the lock.
+dcroxide-sigdiff = { path = "../crates/dcroxide-sigdiff" }
 dcroxide-stake = { path = "../crates/dcroxide-stake" }
 dcroxide-tlscrypto = { path = "../crates/dcroxide-tlscrypto" }
 dcroxide-txscript = { path = "../crates/dcroxide-txscript" }
@@ -68,6 +74,48 @@ bench = false
 [[bin]]
 name = "dcrec_pubkey_parse"
 path = "fuzz_targets/dcrec_pubkey_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dcrec_diff_ecdsa"
+path = "fuzz_targets/dcrec_diff_ecdsa.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dcrec_diff_recover"
+path = "fuzz_targets/dcrec_diff_recover.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dcrec_diff_pubkey"
+path = "fuzz_targets/dcrec_diff_pubkey.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dcrec_diff_schnorr"
+path = "fuzz_targets/dcrec_diff_schnorr.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dcrec_diff_ed25519"
+path = "fuzz_targets/dcrec_diff_ed25519.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dcrec_ed25519_model"
+path = "fuzz_targets/dcrec_ed25519_model.rs"
 test = false
 doc = false
 bench = false
