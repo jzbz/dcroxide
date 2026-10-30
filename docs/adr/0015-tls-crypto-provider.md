@@ -8,9 +8,10 @@
   group and its P-521 signer, which `ring` lacks. `ring` stays the
   node's TLS provider for everything else until the in-tree provider
   passes the Go interop matrix: every cipher suite, key exchange group,
-  key type and TLS version, plus client certificates. Then `ring` goes
-  in one change.
-- **Date:** 2026-10-26
+  key type and TLS version, plus client certificates, which is in the
+  tree (addendum of 2026-10-30). Then `ring` goes in one change.
+- **Date:** 2026-10-26 (accepted), 2026-10-30 (addendum: the Go interop
+  matrix)
 
 ## Context
 
@@ -61,19 +62,22 @@ itself written in Rust with no C, and forbids `unsafe`
    (`:4045-4047`), which takes the process default provider
    (`rustls-0.23.46/src/webpki/client_verifier.rs:274-279`).
 3. **Both clients of the HTTPS seeder.** Without a proxy, `UreqTransport`
-   (`src/seeding.rs:25`) goes through `ureq` 3.4.2, which picks a
+   (`src/seeding.rs:78`) goes through `ureq` 3.4.2, which picks a
    provider when it first builds its configuration: the one its
    `TlsConfig` names, else the process default, else ring when its
    `_ring` feature is on, else a panic
    (`ureq-3.4.2/src/tls/rustls.rs:137-160`). Under `--proxy`,
-   `ProxySeederTransport` (`seeding.rs:93`) runs rustls itself over a
+   `ProxySeederTransport` (`seeding.rs:165`) runs rustls itself over a
    configuration built on ring's provider (`seeder_tls_config`,
-   `:151-167`). Both check the seeder's chain with the provider's
+   `:251-267`). Both check the seeder's chain with the provider's
    verification algorithms (`rustls-0.23.46/src/client/builder.rs:51-61`).
 
-`rustls::crypto::ring` is named 46 times in seven files of `dcroxide-node`,
-seven of those uses outside tests (`rpctls.rs:98`, `:180`, `:292`;
-`rpcrun.rs:4035`, `:4421`, `:4480`; `seeding.rs:158`).
+`rustls::crypto::ring` was named 46 times in seven files of
+`dcroxide-node` when this was accepted, and is named 47 times in eight
+since the matrix's addendum, whose `tests/tls_interop.rs` names it once,
+in a regeneration the switch deletes. Seven of those uses are outside
+tests (`rpctls.rs:98`, `:180`, `:292`; `rpcrun.rs:4035`, `:4421`,
+`:4480`; `seeding.rs:72`).
 
 ### How `ring` arrives
 
@@ -82,8 +86,9 @@ reaches it only through rustls's `crypto::ring` module. It arrives
 through two feature switches. `dcroxide-node` turns on rustls's
 `ring` feature (`crates/dcroxide-node/Cargo.toml:64-69`), which turns on
 `rustls-webpki`'s as well (`rustls-0.23.46/Cargo.toml:88-91`). And the
-node asks for `ureq = "3"` with its default features
-(`crates/dcroxide-node/Cargo.toml:82`), whose `rustls` feature turns on
+node asks for `ureq` with its default features, `"3"` when this was
+accepted and `"=3.4.2"` since the matrix's addendum
+(`crates/dcroxide-node/Cargo.toml:86`), whose `rustls` feature turns on
 `_ring`, that is `rustls?/ring` (`ureq-3.4.2/Cargo.toml:63`, `:74-77`,
 `:101-105`). Cargo unifies features across the build, so `ring` leaves
 only when both switches change; either alone brings it back. `fuzz/`,
@@ -284,7 +289,7 @@ was not taken: the line of it built on the RustCrypto generation in the
 lock was a prerelease when the research read it, its stable 0.9 line is
 built on the generation before (`digest` 0.10,
 `rsa-0.9.10/Cargo.toml:108-109`, where the lock has 0.11.3,
-`Cargo.lock:838-839`), and it carries RUSTSEC-2023-0071, the
+`Cargo.lock:839-840`), and it carries RUSTSEC-2023-0071, the
 timing advisory `gencerts` already cites (`gentool.rs:12-15`). That
 advisory concerns private-key operations, which verification does not
 run; this is the research's reading, and the advisory was not re-read for
@@ -295,15 +300,20 @@ is stable.
 
 An RSA `rpc.key` is refused at startup with a clear message, and
 PARITY.md records the divergence; neither is done yet. dcrd accepts such
-a key and ring signs with one today. The only pure-Rust RSA signer is
-the `rsa` crate, and its advisory is about the private-key operations a
-signer runs, which is why `gencerts` already refuses RSA
-(`gentool.rs:12-15`). This record reads the refusal as landing with the
-switch, the change that takes away the only signer of an RSA key; until
-then ring serves one as it does now. A certificate rotation loads the key
-through the same function (`rpcrun.rs:2154`), and this record reads "at
-startup" as naming where the daemon stops, not as limiting the check: a
-rotated-in RSA key meets the same refusal.
+a key. ring signs with one of 2048 to 4096 bits with an exponent of at
+least 65537 today (`ring-0.17.14/src/rsa/keypair.rs:268-285`), and the
+listener already refuses any other at startup, in ring's words for a key
+none of its signers loads, a narrower divergence PARITY.md records since
+the matrix's addendum; for those keys the switch changes only the
+refusal's text. The only pure-Rust RSA signer is the `rsa` crate, and
+its advisory is about the private-key operations a signer runs, which is
+why `gencerts` already refuses RSA (`gentool.rs:12-15`). This record
+reads the refusal as landing with the switch, the change that takes away
+the only signer of an RSA key; until then ring serves the keys it loads
+as it does now. A certificate rotation loads the key through the same
+function (`rpcrun.rs:2154`), and this record reads "at startup" as
+naming where the daemon stops, not as limiting the check: a rotated-in
+RSA key meets the same refusal.
 
 ### T7 — the seeder's HTTPS clients
 
@@ -314,14 +324,15 @@ that a run under `--norpc` or `--notls`, which installs no process
 default, never reaches ureq's panic. ureq says that call is not guaranteed
 for semver (`mod.rs:246-254`).
 While the node relies on it, ureq is pinned to an exact version, where
-the manifest asks for `"3"` today; this record takes the pin from the
-research's condition on keeping ureq, since the approved text names only
-the unstable API.
+the manifest asked for `"3"` when this was accepted (the matrix's
+addendum pins it); this record takes the pin from the research's
+condition on keeping ureq, since the approved text names only the
+unstable API.
 
 Afterwards one small in-tree client replaces both seeder clients. It
 closes the redirect gap PARITY.md records on the proxy path, whose client
 follows no redirects and decodes no chunked transfer encoding
-(`PARITY.md:940`; `seeding.rs:86-92`), drops `ureq` and `ureq-proto`,
+(`PARITY.md:940`; `seeding.rs:158-164`), drops `ureq` and `ureq-proto`,
 and ends the reliance on ureq's unstable provider API.
 
 ### T10 — assurance for the new cryptography
@@ -336,7 +347,7 @@ and ends the reliance on ureq's unstable provider API.
   against the reference Go. "Through the oracle" is the research's means;
   the approved text says "against Go". When this was accepted the oracle
   had no TLS command, its one X.509 command being `x509_verify_client`
-  (`tools/oracle/main.go:1550`).
+  (`tools/oracle/main.go:1594`).
 - **A constant-time check on the signing and key-exchange paths.** Its
   method is not set here.
 
@@ -348,7 +359,7 @@ and ends the reliance on ureq's unstable provider API.
   under rustls can offer them. Every client the Decred tools ship offers
   an AES-GCM suite (`PARITY.md:2994-2995`).
 - **rustls 0.24 is unreleased.** The provider is written against 0.23,
-  the line the node is on (0.23.46, `Cargo.lock:1527-1528`), and is ported
+  the line the node is on (0.23.46, `Cargo.lock:1528-1529`), and is ported
   to 0.24 when that is stable. The research read 0.24.0-dev.2 as
   reshaping `CryptoProvider`, separate TLS 1.2 and TLS 1.3 suite lists
   among the changes, and estimated a modest port; it also found that
@@ -395,10 +406,13 @@ and ends the reliance on ureq's unstable provider API.
   (`rustls-0.23.46/src/client/builder.rs:51-61`), so T4 widens what their
   chains may use too; that this moves seeding nearer Go's client is an
   inference, not checked.
-- **An operator with an RSA `rpc.key`**, which dcrd and the port accept
-  today, has to replace it after the switch; `gencerts` writes none.
+- **An operator with an RSA `rpc.key`** of 2048 to 4096 bits with an
+  exponent of at least 65537, which dcrd and the port accept today, has
+  to replace it after the switch; one outside those bounds, which dcrd
+  serves, the port refuses already (T6). `gencerts` writes none.
 - **Tests change with the switch:** 39 of the 46 uses of ring's provider
-  are in tests, and one asserts that ring has no P-521 verification
+  were in tests when this was accepted, and 40 of the 47 are since the
+  matrix's addendum; one asserts that ring has no P-521 verification
   (`crates/dcroxide-node/tests/rpclisten.rs:1023-1026`), a premise T4
   removes.
 - **Binaries wait on it.** Meeting ADR-0012's rule, which takes `ring`
@@ -442,3 +456,160 @@ As the research read them on 2026-10-26:
   provider.
 - **Dropping `ureq` in the switch itself.** A larger switch; T7 keeps
   ureq through it and replaces both clients afterwards.
+
+## Addendum, 2026-10-30 — the Go interop matrix
+
+The matrix T10 names, the one the switch waits on, is in the tree. This
+records what it holds and what each cell asserts. It records no result:
+CI first runs it once the change that adds it is pushed, and the
+switch's addendum cites those runs, with each system's times.
+
+- **The oracle's TLS commands.** `tls_pki` makes certificates with Go's
+  `x509.CreateCertificate`, each with the key, issuer, signature
+  algorithm, basic constraints, extended key usages, names and validity
+  asked for, generating EC and Ed25519 keys and taking RSA keys from the
+  test-key fixture, never generating one. `tls_dial` makes one
+  connection with Go's `crypto/tls` client, configured as asked, and one
+  HTTP request over it. `tls_listen` starts a Go server on 127.0.0.1 that
+  serves one connection in the background, and `tls_listen_result` gives
+  what it saw, its peer's certificates, the chains Go verified them to
+  and the first ClientHello among it. The answers come in a new `detail`
+  field, the connections' with the version, cipher suite and key exchange
+  by Go's names and whether there was a HelloRetryRequest. Go dials and
+  listens on loopback alone, with one deadline over every accept,
+  handshake, read and write. Each command refuses a field it does not
+  name, since a misspelled one would leave Go's default in its place, the
+  baseline the cells compare with; a TLS 1.3 suite name, which
+  `crypto/tls` does not configure; and a client certificate without an
+  HTTP request, since a TLS 1.3 server refuses one only after the
+  client's handshake is done. The commands read `ConnectionState.CurveID`
+  and `ConnectionState.HelloRetryRequest`, which Go 1.25 and 1.26 added,
+  where the module's line stays `go 1.24.0` for the other commands'
+  GODEBUG defaults, so they live in `tools/oracle/tls.go`, built by Go
+  1.26 or later, and `tls_old.go` answers them with an error under an
+  older Go. Their tests run each against the others, and every way a
+  request can be refused. The interop tests start the oracle with
+  `GODEBUG=tlssecpmlkem=1,tlssha1=0,x509sha256skid=1,cryptocustomrand=0`
+  (`DCRD_TLS_GODEBUG`): dcrd's values at the parity pin for the four
+  crypto, `crypto/tls` and `crypto/x509` settings among the eight where
+  its `default=go1.26` differs from that line, so Go's default client and
+  server are dcrd's, the three hybrids first. The oracle's own TLS tests
+  use the same string, which a test holds equal.
+- **The harness both matrices share,** `dcroxide-testutil`'s
+  `tls_interop` module, on its new `oracle_or_skip_with_env`: the oracle
+  under that GODEBUG, skipped, or failed under `DCROXIDE_REQUIRE_ORACLE`,
+  where its Go is older than 1.26; certificates from `tls_pki`; Go's
+  report of what a connection negotiated; and the client-certificate
+  cells with each one's verdict today, so that T4 changes them in one
+  place. A refusal is held to Go's words for it only when the oracle runs
+  the reference Go, go1.26.2; under another Go only to its being a
+  refusal, so that a newer toolchain still tests interop.
+- **The provider's matrix,** `crates/dcroxide-tlscrypto/tests/go_interop.rs`:
+  rustls configurations built from `default_provider` alone, cut to the
+  suites, groups or signature schemes of a cell. Go's client against the
+  provider's server, 155 handshakes: TLS 1.3's three suites, forced on
+  the server, and TLS 1.2's three ECDHE-ECDSA suites, each by the four
+  groups by the server keys P-256, P-384, P-521 and Ed25519; a
+  HelloRetryRequest; client keys P-256, P-384, Ed25519 and RSA-2048, each
+  a self-signed leaf and under a P-256, P-384, RSA-4096 (SHA256-RSA and
+  SHA256-RSAPSS) and Ed25519 CA, in each version; and refused, a P-521
+  client key, an issuer signing with ECDSA-SHA512, an RSA-1024 client
+  key, ECDHE-RSA suites against an ECDSA key, a CBC suite and no group in
+  common. The provider's client against Go's server, 181 handshakes:
+  TLS 1.3's suites by the groups by the server keys P-256, P-384, Ed25519
+  and RSA-2048, -3072 and -4096, and TLS 1.2's ECDSA and RSA suites by the
+  groups by the keys of their kind; each RSA signature scheme alone in
+  each version that has it; an RSA-4096 root over an RSA-2048
+  intermediate over a P-256 leaf, the seeders' shape, under four
+  signature algorithms, a P-384 root over a P-256 leaf and an Ed25519
+  chain; refused, a P-521 server key, a P-521 root and RSA-1024 and
+  RSA-8193 intermediates; and the provider's client certificates on
+  P-256, P-384, P-521 and Ed25519 keys. A completed cell asserts that
+  both ends report one version, suite, group and HelloRetryRequest, the
+  cell's version and, where it names them, its suite, group and
+  HelloRetryRequest, and an HTTP request answered over it; a refused
+  cell, the refusing end's rustls error and Go's refusal. Each refused
+  cell's rustls error was checked once against ring's, in a local run of
+  the matrix with ring's provider put in for this one while ring is in
+  the tree, which gave the same error in every refused cell it can run,
+  all but those whose keys are P-521. The rustls end of a failed
+  connection closes it only once its peer has, so that its alert is not
+  lost to a reset. The refusals are today's feature level (the provider
+  verifies no P-521 or SHA-512 ECDSA and no RSA key outside 2048 to 8192
+  bits), and T4 turns the client-certificate ones into completed cells.
+- **The node's matrix,** `crates/dcroxide-node/tests/tls_interop.rs`:
+  production code alone, `start_rpc_listener` over `reloadable_tls_config`
+  and both seeder transports, so the same file runs on ring's provider
+  and on this one. Go's client against the RPC listener, 213 handshakes:
+  server keys P-256 and P-521 from certgen, P-384 and Ed25519 from
+  gencerts and RSA-2048 from the fixture, by fourteen client profiles
+  (Go's default, TLS 1.2, each group alone in each version, each TLS 1.2
+  suite of the key's kind alone, and a SecP384r1MLKEM1024 share with
+  P-256 and no P-384), each a `getblockcount` answered 200 and compared
+  with Go's server holding the same pair: one cut to the listener's
+  classical groups agrees on every cell, and one on Go's default list on
+  every cell but those of the two profiles where it takes a hybrid, which
+  the test asserts as PARITY's classical key exchange entry records; and
+  the fixture's RSA-1024, RSA-8192 and e = 3 keys, which ring's signer
+  does not load, each refused by the listener at startup in ring's words
+  and served by Go's server, as dcrd serves them, which PARITY's RSA
+  `rpc.key` entry records. Under
+  `--authtype=clientcert`, 108 handshakes: the shared client certificates
+  through `GoClientCertVerifier` and Go's server alike, in each version;
+  the 48 accepted cells accepted by both, and the three refused today
+  refused by the listener in its handshake, each with the alert Go's
+  client reports for it and no HTTP answer, where the reference Go's
+  server accepts them, as PARITY's client-certificate entry records; the
+  listener's count asserted, and under the reference Go, Go's server's.
+  The seeder transports against Go's HTTPS server, 73 handshakes: P-256,
+  P-384 and Ed25519 keys and the seeders' RSA chain, in each version,
+  under each group alone, P-521 refused since the seeders offer ring's
+  three, with the addresses read through `seed_addrs`; in each version,
+  the daemon's own constructors, which trust `webpki-roots`, and the test
+  constructors given a root that did not issue the chain, each refusing
+  the chain as an unknown issuer; and for ureq, whose client dials a
+  name where the proxy's needs a proxy to, a seeder named `localhost`.
+  Each ClientHello Go's server saw equals
+  `tests/data/seeder-client-hello.json`, recorded from a run on ring's
+  provider to a seeder named by its address: suites, groups, signature
+  schemes and versions in order and extensions as a set, since rustls
+  orders them at random, with the server_name extension added for the
+  seeder named `localhost`. So the daemon's constructors' provider
+  hand-off is compared, though no local chain gets through it. Its
+  regeneration holds what it records to ring's provider's lists, so the
+  switch, which takes ring out, deletes it. In TLS 1.3 Go's server sees a
+  seeder's refusal as the connection's end with no alert: rustls makes
+  one write after a failed handshake, and both transports' connections
+  write one buffer a call, so the middlebox-compatibility ChangeCipherSpec
+  queued ahead of the alert goes and the alert does not. The RSA-2048
+  `rpc.key` is served today; T6 refuses it at the switch, which flips
+  that cell, `RSA_RPC_KEY_SERVED`, and no other, pins T6's refusal text
+  in its branch, which also has Go's server serve the pair, puts the same
+  text in place of ring's words for the three keys refused today
+  (`RSA_KEY_REFUSAL`), and must reproduce the recorded ClientHello. Where
+  the node refuses Go's end, off Linux a reset passes for the alert,
+  since a system that throws away what it has received when a reset
+  arrives would show Go the reset.
+- **The seeders' provider hand-off.** Each seeder transport now makes its
+  TLS client in one private constructor that takes its roots, `new`, the
+  daemon's, passing `webpki-roots`, and `with_root_certs`, the matrix's,
+  passing a test chain's root, so the matrix runs the hand-off the daemon
+  runs; each kind of roots is turned into each client's form in one
+  place, and a unit test holds each constructor to its roots alone and
+  both to one provider's lists. Both hand rustls ring's provider
+  explicitly from one function, `seeder_crypto_provider`: `UreqTransport`
+  through T7's `unversioned_rustls_crypto_provider`, with ureq now pinned
+  at `=3.4.2` as T7 asks while the node relies on that call,
+  `ProxySeederTransport` through `ClientConfig::builder_with_provider`,
+  as before. ureq's fallback (Context, item 3) chose ring's provider for
+  `UreqTransport` already, so the daemon's seeders run as they did; the
+  switch changes that one function.
+
+Each matrix prints its handshakes and wall time to the test log, which
+the switch's addendum reads from CI. The checks every cell rests on, a
+completed cell held to what it negotiated, the listener held to both Go
+servers and a ClientHello held to its description, have tests of their
+own that run without the oracle. What gates the switch: both matrices
+green in CI's `test` job on the four systems and in `test-wrapping`, the
+provider's again on the portable backends of `tls-soft-backends`, and the
+oracle's Go tests in `go-tools`.

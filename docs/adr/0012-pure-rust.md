@@ -38,7 +38,7 @@ compiler, is a build dependency of exactly four crates in the lock, as
 `pkg-config`, `vcpkg` or `bindgen`, and no workspace crate has a build
 script.
 
-- **`secp256k1-sys` 0.14.1** (`Cargo.lock:1604`): ~67k lines of vendored
+- **`secp256k1-sys` 0.14.1** (`Cargo.lock:1605`): ~67k lines of vendored
   libsecp256k1 C (`docs/dependency-ledger.md:43`), under `secp256k1`
   0.33.1, which `dcroxide-dcrec` takes as `libsecp256k1`
   (`crates/dcroxide-dcrec/Cargo.toml:33`). It runs ECDSA verification
@@ -49,12 +49,12 @@ script.
   signature types 0 and 2. `k256` 0.14.0 sits beside it (`Cargo.toml:38`)
   for EC-Schnorr-DCRv0 and for ECDSA signing of a hash at or above the
   order (`ecdsa.rs:388-437`).
-- **`ring` 0.17.14** (`Cargo.lock:1482`): ~151k lines of C and assembly
+- **`ring` 0.17.14** (`Cargo.lock:1483`): ~151k lines of C and assembly
   (`dependency-ledger.md:51`), the crypto provider of `rustls` 0.23.46.
   `dcroxide-node` selects rustls's `ring` feature
   (`crates/dcroxide-node/Cargo.toml:59-69`), `ureq` 3.4.2 selects it
   through its default `rustls` feature, and `rustls-webpki` 0.103.16
-  depends on it (`Cargo.lock:1551-1559`). It runs the RPC and websocket
+  depends on it (`Cargo.lock:1552-1560`). It runs the RPC and websocket
   TLS listener, the RPC client-certificate verifier
   (`rpcrun::GoClientCertVerifier`, which hands `rustls-webpki` ring's
   signature algorithms) and both TLS clients of the HTTPS seeder
@@ -86,7 +86,7 @@ makes a skip of either a failure (`.github/workflows/ci.yml:26-35`).
 **Inline assembly in Rust crates.** Crates already in the node's build
 carry `asm!`, which rustc assembles itself, with no C toolchain: the
 system calls of `rustix` 1.1.5, which `dcroxide-node` takes on Unix
-(`crates/dcroxide-node/Cargo.toml:102`) and whose build script picks its
+(`crates/dcroxide-node/Cargo.toml:106`) and whose build script picks its
 Linux backend there (`build.rs:101-122`); the optimization barrier of
 `zeroize` 1.9.0 (`src/barrier.rs:69`); the constant-time moves of `cmov`
 0.5.4; and a few more, which the dependency ledger lists.
@@ -177,7 +177,7 @@ C that cgo links into the oracle included:
 
 - **The oracle**, the Go program that runs dcrd's own code to answer the
   differential tests. Tests build it with `go build`
-  (`crates/dcroxide-testutil/src/lib.rs:340-366`), and where a C compiler
+  (`crates/dcroxide-testutil/src/lib.rs:349-375`), and where a C compiler
   is present Go enables cgo and links C from its own runtime and resolver
   into it: an oracle the test suite built on an x86_64 Linux desktop
   records `CGO_ENABLED=1` and needs `libresolv.so.2`. This record reads

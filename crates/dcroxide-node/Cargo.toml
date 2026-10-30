@@ -79,7 +79,11 @@ rustls-webpki = { version = "0.103.16", default-features = false, features = ["s
 # `compress/gzip` (`logrotate.rs`).  Already in the tree with its
 # default features through ureq's gzip support, so it adds no crate.
 flate2 = "1.1"
-ureq = "3"
+# Exact: the seeder transport hands ureq its rustls provider through
+# `TlsConfigBuilder::unversioned_rustls_crypto_provider`, which ureq does
+# not keep across its minor versions (`ureq-3.4.2/src/tls/mod.rs:246-254`),
+# so ADR-0015's T7 pins it while the node relies on that call.
+ureq = "=3.4.2"
 webpki-roots = "1.0.10"
 socket2 = "0.6.4"
 
@@ -130,6 +134,9 @@ dcroxide-wire = { path = "../dcroxide-wire", features = ["count-header-hashes"] 
 # against it.  The server's side is `dcroxide-tlscrypto`'s.  The same
 # version as that crate's and `dcroxide-certgen`'s.
 p521 = { version = "0.14", default-features = false, features = ["ecdsa"] }
+# The JSON the oracle's TLS commands take and answer with, in
+# `tests/tls_interop.rs`; the version `dcroxide-testutil` locks already.
+serde_json = "1"
 tempfile = "3"
 
 [lints]

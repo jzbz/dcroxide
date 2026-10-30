@@ -5,14 +5,16 @@
 //! packages at the parity pin, master `3360ae4d`; its `go.mod` records how
 //! each module is pinned) plus a deterministic PRNG and hex helpers, so every
 //! crate's differential tests share one implementation, the power-loss
-//! storage rig the crash suites cut power under ([`powerloss`]), and the
-//! gate that holds a metadata commit running on a thread of its own
-//! ([`gate`]).
+//! storage rig the crash suites cut power under ([`powerloss`]), the gate
+//! that holds a metadata commit running on a thread of its own
+//! ([`gate`]), and the TLS interop tests' harness around the oracle's TLS
+//! commands ([`tls_interop`]).
 //!
 //! This crate is a dev-dependency only and is never published.
 
 pub mod gate;
 pub mod powerloss;
+pub mod tls_interop;
 
 use std::env;
 use std::ffi::OsStr;
@@ -227,7 +229,14 @@ pub fn require_reference_go(go_version: &str) {
 /// is missing when that variable names anything but an absolute path to a
 /// file, or when it is unset and no Go toolchain is found.
 pub fn oracle_or_skip() -> Option<Oracle> {
-    oracle_bin_or_skip().map(|bin| Oracle::spawn_at(&bin))
+    oracle_or_skip_with_env(&[])
+}
+
+/// [`oracle_or_skip`] with `env` added to the oracle's environment, which
+/// is otherwise this process's: [`tls_interop::DCRD_TLS_GODEBUG`] as
+/// `GODEBUG`, say, for the TLS interop tests.
+pub fn oracle_or_skip_with_env(env: &[(&str, &str)]) -> Option<Oracle> {
+    oracle_bin_or_skip().map(|bin| Oracle::spawn_at_with_env(&bin, env))
 }
 
 /// The oracle binary [`oracle_or_skip`] would spawn, under the same
@@ -408,13 +417,24 @@ impl Oracle {
     /// Spawn the oracle [`oracle_or_skip`] would, building it if needed;
     /// where that would skip, this panics.
     pub fn spawn() -> Self {
-        Oracle::spawn_at(&oracle_bin())
+        Oracle::spawn_with_env(&[])
+    }
+
+    /// [`Oracle::spawn`] with `env` added to the oracle's environment, as
+    /// [`oracle_or_skip_with_env`] adds it.
+    pub fn spawn_with_env(env: &[(&str, &str)]) -> Self {
+        Oracle::spawn_at_with_env(&oracle_bin(), env)
     }
 
     /// Spawn the oracle binary at `bin`.  Panics, naming it, when it cannot
     /// be spawned.
     pub fn spawn_at(bin: &Path) -> Self {
-        Oracle::from_command(&mut Command::new(bin))
+        Oracle::spawn_at_with_env(bin, &[])
+    }
+
+    /// Spawn the oracle binary at `bin` with `env` added to its environment.
+    fn spawn_at_with_env(bin: &Path, env: &[(&str, &str)]) -> Self {
+        Oracle::from_command(Command::new(bin).envs(env.iter().copied()))
     }
 
     /// Spawn `cmd` as the oracle, its stdin and stdout piped and its stderr

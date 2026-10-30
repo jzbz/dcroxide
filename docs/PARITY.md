@@ -3015,6 +3015,37 @@ closing it would cost.
   GAP06#5). Separately, the direct `ureq` path follows up to ten redirects as
   Go's client does, while the proxied path follows none (see the daemon row).
 
+- **The RPC listener refuses an RSA `rpc.key` that ring cannot sign with, one
+  outside 2048 to 4096 bits or with an exponent under 65537, where dcrd
+  serves it.** dcrd loads the pair with `tls.LoadX509KeyPair`
+  (`server.go:3680`) and serves any RSA key Go's `crypto/rsa` takes: 1024 bits
+  and up, a smaller key being refused under the default `rsa1024min` setting
+  (`crypto/rsa/rsa.go:280-293`), with an odd exponent from 3 to 2^31 - 1
+  (`crypto/internal/fips140/rsa/rsa.go:343-362`). Go's own client, which
+  dcrctl and dcrwallet use, takes a server key of up to 8192 bits
+  (`crypto/tls/handshake_client.go:1085-1112`). Until ADR-0015's switch the
+  port hands every key but a P-521 one to rustls's ring loader
+  (`CertifiedKey::from_der` on ring's provider, `rpcrun.rs:4480`), whose RSA
+  signer takes a modulus of 2048 to 4096 bits and an exponent of at least
+  65537 (`ring-0.17.14/src/rsa/keypair.rs:268-285`,
+  `ring-0.17.14/src/rsa.rs:35`) and which refuses every other key with
+  "failed to parse private key as RSA, ECDSA, or EdDSA"
+  (`rustls-0.23.46/src/crypto/ring/sign.rs:21-40`). So an RSA-1024, RSA-8192
+  or e = 3 key that dcrd serves stops the port at startup, with an error
+  carrying those words, and a certificate rotation to one keeps the
+  configuration already served, with a warning (`rpcrun.rs:2085-2098`), where
+  dcrd takes the new pair. `gencerts` and certgen write no RSA key, so only a
+  pair made elsewhere reaches this. The node's Go interop matrix pins it:
+  `go_clients_handshake_with_the_rpc_listener`
+  (`crates/dcroxide-node/tests/tls_interop.rs`) has the listener refuse the
+  test-key fixture's RSA-1024, RSA-8192 and e = 3 keys in ring's words while
+  Go's server, under dcrd's GODEBUG, serves each to Go's client. ADR-0015's
+  T6 refuses every RSA key at the switch, the in-tree provider having no RSA
+  signer, so the switch widens this entry to every RSA key and, for the keys
+  it lists now, changes only the refusal's text. Closing it would take an
+  RSA signer, which ADR-0015 declines for the reasons under its T5 and T6,
+  the `rsa` crate's timing advisory among them.
+
 - **A `--maxpeers` inside the host-dependent band exhausts memory in dcrd
   and not the port.** `newServer` builds its relay and broadcast queues as
   `make(chan relayMsg, cfg.MaxPeers)` and `make(chan broadcastMsg,

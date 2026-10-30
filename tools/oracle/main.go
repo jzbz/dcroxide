@@ -216,6 +216,50 @@
 //	                     that public exponent; {"detail": {"n", "e", "d",
 //	                     "p", "q": hex}} with "go_version":
 //	                     runtime.Version()
+//	tls_pki            → data is JSON {"certs": [{"name", "key": "P-256" |
+//	                     "P-384" | "P-521" | "Ed25519" | "rsa": {"n",
+//	                     "e", "d", "p", "q": hex}, "issuer": name,
+//	                     "sig_alg": x509 name, "ca": bool, "eku":
+//	                     ["server_auth" | "client_auth" | "any"], "dns":
+//	                     [name], "ip": [address], "not_before",
+//	                     "not_after": unix seconds}]}; each certificate
+//	                     made by x509.CreateCertificate, in order, over
+//	                     a key generated here or, for RSA, the caller's;
+//	                     {"detail": {name: {"cert", "key_pkcs8": hex,
+//	                     "cert_pem", "key_pem": PEM}}} with "go_version":
+//	                     runtime.Version()
+//	tls_dial           → data is JSON {"addr": loopback host:port,
+//	                     "server_name", "roots": [hex DER], "min_version",
+//	                     "max_version": tls.VersionName, "cipher_suites":
+//	                     [tls.CipherSuiteName of TLS 1.2 or earlier],
+//	                     "curve_preferences": [CurveID name],
+//	                     "client_cert": {"chain": [hex DER], "key_pkcs8":
+//	                     hex}, only with "request": {"method", "path",
+//	                     "headers": {name: value}, "body"}, "timeout_ms"};
+//	                     one connection by crypto/tls's client, and one
+//	                     HTTP request over it, "ok" true only if both
+//	                     succeed; {"detail": {"ok", "error", "version",
+//	                     "cipher_suite", "curve_id", "hello_retry_request",
+//	                     "did_resume", "http_status", "http_body"}} with
+//	                     "go_version": runtime.Version()
+//	tls_listen         → data is JSON {"chain": [hex DER], "key_pkcs8":
+//	                     hex, "min_version", "max_version",
+//	                     "cipher_suites", "curve_preferences" as tls_dial
+//	                     takes them, "client_auth": tls.ClientAuthType
+//	                     name, "client_cas": [hex DER], "response_body",
+//	                     "timeout_ms"}; a crypto/tls server on loopback
+//	                     that serves one connection in the background;
+//	                     {"result": "<host:port>", "detail": {"id"}} with
+//	                     "go_version": runtime.Version()
+//	tls_listen_result  → data is JSON {"id"}; once that server is done,
+//	                     {"detail": {"ok", "error", "version",
+//	                     "cipher_suite", "curve_id", "hello_retry_request",
+//	                     "peer_certificates", "verified_chains",
+//	                     "client_hello": {"cipher_suites",
+//	                     "supported_curves", "signature_schemes",
+//	                     "supported_versions", "extensions"}}} with
+//	                     "go_version": runtime.Version(); each of the four
+//	                     TLS commands refuses a field it does not name
 //	build_info         → takes no data; {"go_version": runtime.Version(),
 //	                      "modules": {"<module path>": "<version>"}} for the
 //	                     secp256k1/v4 and edwards/v2 modules linked in
@@ -1843,6 +1887,26 @@ func handle(req request) response {
 			return errResp("rsa_keygen: %v", err)
 		}
 		return response{Detail: detail, GoVersion: runtime.Version()}
+
+	case "tls_pki":
+		// Certificates for the TLS interop tests, each made by
+		// x509.CreateCertificate as the caller describes it.
+		return tlsPKI(data)
+
+	case "tls_dial":
+		// One connection by crypto/tls's client to a server under test,
+		// and what it negotiated.
+		return tlsDial(data)
+
+	case "tls_listen":
+		// A crypto/tls server for a client under test, serving one
+		// connection in the background while later requests are
+		// answered.
+		return tlsListen(data)
+
+	case "tls_listen_result":
+		// What that server saw, once its connection is done.
+		return tlsListenResult(data)
 
 	case "build_info":
 		// What a recorded comparison ran against: the toolchain, and the

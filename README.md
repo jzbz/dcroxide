@@ -499,9 +499,12 @@ work). Currently implemented:
   by a corpus of signatures on which every verdict is ring's, recorded
   for after ring leaves, and Go's but on RSA keys outside either's
   limits and keys with bytes after their values, where ring differs
-  from Go today, and by Go's `crypto/ecdh`, `tls.X509KeyPair`,
-  `ed25519.Sign` and signature checks through the oracle; the node takes
-  only its P-521 key exchange and its P-521 signer so far
+  from Go today, by Go's `crypto/ecdh`, `tls.X509KeyPair`,
+  `ed25519.Sign` and signature checks through the oracle, and by the Go
+  interop matrix, Go's `crypto/tls` client and server against the
+  provider's every suite, group, key type and version, and client
+  certificates; the node takes only its P-521 key exchange and its P-521
+  signer so far
 - `dcroxide-ratelimit` — dcrd 2.2's `internal/ratelimit` token bucket:
   a bucket seeded with `burst` tokens refilling at a fixed rate,
   reproducing dcrd's `f64` operations in dcrd's order — including
@@ -543,7 +546,8 @@ work). Currently implemented:
 - `dcroxide-testutil` — the differential-test harness every crate
   shares (no dcrd counterpart): the line-delimited JSON transport to
   `tools/oracle`, the toolchain gate (a missing Go toolchain skips the
-  test, or fails it when `DCROXIDE_REQUIRE_ORACLE` is set), a
+  test, or fails it when `DCROXIDE_REQUIRE_ORACLE` is set), the TLS
+  interop tests' harness on the oracle under dcrd's `GODEBUG`, a
   deterministic SplitMix64 PRNG that prints its seed so a failure
   reproduces, and hex helpers; a dev-dependency only, never published
 - `dcroxide-sigdiff` — the signature differential soak (no dcrd
@@ -773,8 +777,9 @@ tests; without Go those tests skip). Go 1.26.2 is the reference: the
 release dcrd's release image builds the parity pin with, and the one CI
 runs (`GO_VERSION` in `.github/workflows/ci.yml`; ADR-0001's 2026-10-26
 addendum on the reference Go). The oracle builds with Go 1.24 or later,
-but where an answer comes from Go's standard library, an oracle built
-with another release answers as that release does.
+its TLS commands, which the TLS interop tests run, only with Go 1.26 or
+later, and where an answer comes from Go's standard library, an oracle
+built with another release answers as that release does.
 `DCROXIDE_REQUIRE_ORACLE=1` turns a missing toolchain into a failure
 instead, so a run cannot silently pass with the differential coverage
 skipped — CI sets it.

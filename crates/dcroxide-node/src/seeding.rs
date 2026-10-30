@@ -18,6 +18,59 @@ use dcroxide_addrmgr::AddrManager;
 use std::io::{Read, Write};
 
 use dcroxide_addrmgr::{HttpsSeederFilters, MAX_RESP_SIZE, SeedEnv, SeederTransport, seed_addrs};
+use rustls::pki_types::CertificateDer;
+
+/// The certificates a seeder transport verifies a seeder's chain against.
+enum SeederRoots<'a> {
+    /// The compiled-in `webpki-roots`, the daemon's (PARITY records how
+    /// that differs from dcrd's use of the platform's store).
+    WebPki,
+    /// These alone, for a seeder whose chain roots nowhere public: the TLS
+    /// interop tests' local ones.
+    Certs(&'a [CertificateDer<'a>]),
+}
+
+impl SeederRoots<'_> {
+    /// The roots as ureq's client takes them.
+    fn for_ureq(&self) -> ureq::tls::RootCerts {
+        match self {
+            SeederRoots::WebPki => ureq::tls::RootCerts::WebPki,
+            // `to_owned` is how a borrowed certificate becomes `'static`
+            // (`ureq-3.4.2/src/tls/cert.rs:76`).
+            SeederRoots::Certs(certs) => ureq::tls::RootCerts::new_with_certs(
+                &certs
+                    .iter()
+                    .map(|der| ureq::tls::Certificate::from_der(der).to_owned())
+                    .collect::<Vec<_>>(),
+            ),
+        }
+    }
+
+    /// The roots as the proxied client's store, skipping a certificate
+    /// that does not parse, as ureq's client does
+    /// (`ureq-3.4.2/src/tls/rustls.rs:173-178`).
+    fn store(&self) -> rustls::RootCertStore {
+        let mut store = rustls::RootCertStore::empty();
+        match self {
+            SeederRoots::WebPki => store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned()),
+            SeederRoots::Certs(certs) => {
+                store.add_parsable_certificates(certs.iter().map(|der| der.clone().into_owned()));
+            }
+        }
+        store
+    }
+}
+
+/// The rustls crypto provider both seeder transports hand their TLS
+/// clients: ring's, the one ureq picks by itself, as the process default
+/// or as its fallback (`ureq-3.4.2/src/tls/rustls.rs:137-160`), and the
+/// one the proxy's client was built with, until ADR-0015's switch hands
+/// them `dcroxide-tlscrypto`'s.  Each is handed it explicitly, so neither
+/// depends on the process default that the RPC server's configuration
+/// installs and `--notls` or `--norpc` leaves unset.
+fn seeder_crypto_provider() -> Arc<rustls::crypto::CryptoProvider> {
+    Arc::new(rustls::crypto::ring::default_provider())
+}
 
 /// The TLS-capable seeder transport over `ureq` (dcrd's `dcrdDial`
 /// behind Go's `http.Client`; the proxy configuration plugs in with the
@@ -27,8 +80,26 @@ pub struct UreqTransport {
 }
 
 impl UreqTransport {
-    /// A transport with dcrd's one-minute per-seeder timeout.
+    /// A transport with dcrd's one-minute per-seeder timeout, verifying
+    /// seeders against the compiled-in `webpki-roots`: the daemon's.
     pub fn new() -> UreqTransport {
+        UreqTransport::with_roots(SeederRoots::WebPki)
+    }
+
+    /// [`UreqTransport::new`] trusting `roots` alone, for the TLS interop
+    /// tests' local seeders: the same transport and provider hand-off, on
+    /// other roots.
+    pub fn with_root_certs(roots: &[CertificateDer<'_>]) -> UreqTransport {
+        UreqTransport::with_roots(SeederRoots::Certs(roots))
+    }
+
+    /// The transport over `roots`, the one place its configuration is made.
+    fn with_roots(roots: SeederRoots<'_>) -> UreqTransport {
+        let tls = ureq::tls::TlsConfig::builder()
+            .provider(ureq::tls::TlsProvider::Rustls)
+            .root_certs(roots.for_ureq())
+            .unversioned_rustls_crypto_provider(seeder_crypto_provider())
+            .build();
         let config = ureq::Agent::config_builder()
             .timeout_global(Some(Duration::from_secs(60)))
             // The seeder logic inspects the status itself.
@@ -38,6 +109,7 @@ impl UreqTransport {
             // the environment; ureq's default config would route through
             // `ALL_PROXY`/`HTTPS_PROXY`/`HTTP_PROXY` instead.
             .proxy(None)
+            .tls_config(tls)
             .build();
         UreqTransport {
             agent: config.new_agent(),
@@ -93,15 +165,43 @@ impl SeederTransport for UreqTransport {
 pub struct ProxySeederTransport {
     dialer: crate::socks::NodeDialer,
     timeout: Duration,
+    /// The TLS client configuration an `https` seeder is dialed with.
+    tls: Arc<rustls::ClientConfig>,
 }
 
 impl ProxySeederTransport {
     /// A transport over the given dial routing with dcrd's one-minute
-    /// per-seeder request deadline.
+    /// per-seeder request deadline, verifying seeders against the
+    /// compiled-in `webpki-roots`: the daemon's.
     pub fn new(dialer: crate::socks::NodeDialer) -> ProxySeederTransport {
+        ProxySeederTransport::with_roots(dialer, SeederRoots::WebPki)
+    }
+
+    /// [`ProxySeederTransport::new`] trusting `roots` alone, for the TLS
+    /// interop tests' local seeders: the same transport and provider
+    /// hand-off, on other roots.
+    pub fn with_root_certs(
+        dialer: crate::socks::NodeDialer,
+        roots: &[CertificateDer<'_>],
+    ) -> ProxySeederTransport {
+        ProxySeederTransport::with_roots(dialer, SeederRoots::Certs(roots))
+    }
+
+    /// The transport over `roots`, the one place its configuration is
+    /// chosen: the shared one over `webpki-roots`, or one of its own over
+    /// other roots.
+    fn with_roots(
+        dialer: crate::socks::NodeDialer,
+        roots: SeederRoots<'_>,
+    ) -> ProxySeederTransport {
+        let tls = match roots {
+            SeederRoots::WebPki => seeder_tls_config(),
+            SeederRoots::Certs(_) => seeder_client_config(roots.store()),
+        };
         ProxySeederTransport {
             dialer,
             timeout: Duration::from_secs(60),
+            tls,
         }
     }
 }
@@ -151,19 +251,19 @@ fn parse_seeder_url(url: &str) -> Result<SeederUrl, String> {
 fn seeder_tls_config() -> Arc<rustls::ClientConfig> {
     static CONFIG: std::sync::OnceLock<Arc<rustls::ClientConfig>> = std::sync::OnceLock::new();
     CONFIG
-        .get_or_init(|| {
-            let mut roots = rustls::RootCertStore::empty();
-            roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-            let config = rustls::ClientConfig::builder_with_provider(Arc::new(
-                rustls::crypto::ring::default_provider(),
-            ))
-            .with_safe_default_protocol_versions()
-            .expect("rustls default protocol versions")
-            .with_root_certificates(roots)
-            .with_no_client_auth();
-            Arc::new(config)
-        })
+        .get_or_init(|| seeder_client_config(SeederRoots::WebPki.store()))
         .clone()
+}
+
+/// A proxied seeder's TLS client configuration over `roots`, on
+/// [`seeder_crypto_provider`].
+fn seeder_client_config(roots: rustls::RootCertStore) -> Arc<rustls::ClientConfig> {
+    let config = rustls::ClientConfig::builder_with_provider(seeder_crypto_provider())
+        .with_safe_default_protocol_versions()
+        .expect("rustls default protocol versions")
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    Arc::new(config)
 }
 
 /// A connection whose every read and write is bounded by the time left
@@ -291,7 +391,7 @@ impl SeederTransport for ProxySeederTransport {
         if parsed.tls {
             let server_name = rustls::pki_types::ServerName::try_from(parsed.host.clone())
                 .map_err(|e| format!("invalid seeder host {}: {e}", parsed.host))?;
-            let conn = rustls::ClientConnection::new(seeder_tls_config(), server_name)
+            let conn = rustls::ClientConnection::new(Arc::clone(&self.tls), server_name)
                 .map_err(|e| format!("seeder tls setup failed: {e}"))?;
             let mut tls = rustls::StreamOwned::new(conn, stream);
             tls.write_all(request.as_bytes())
@@ -878,8 +978,8 @@ mod tests {
         let (done, finished) = mpsc::channel();
         thread::spawn(move || {
             let mut transport = ProxySeederTransport {
-                dialer: crate::socks::NodeDialer::direct(),
                 timeout: Duration::from_millis(800),
+                ..ProxySeederTransport::new(crate::socks::NodeDialer::direct())
             };
             let started = Instant::now();
             let result = transport.get(&format!("https://127.0.0.1:{port}/api/addrs"));
@@ -890,5 +990,91 @@ mod tests {
             .expect("the request must end at its deadline, not ride the trickle");
         assert!(result.is_err(), "{result:?}");
         assert!(elapsed < Duration::from_secs(5), "{elapsed:?}");
+    }
+
+    /// Each seeder transport trusts the roots its constructor names and
+    /// nothing besides, `webpki-roots` for the daemon's and the given
+    /// certificates alone for the interop tests', and hands its TLS client
+    /// [`seeder_crypto_provider`]'s suites, groups and verification
+    /// schemes whichever roots it has.  The TLS interop matrix reaches a
+    /// local seeder through the second constructor alone, and no chain a
+    /// test can serve tells a public root's presence.
+    #[test]
+    fn seeder_transports_trust_their_roots_alone_on_one_provider() {
+        use rustls::pki_types::pem::PemObject;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (cert_pem, _) = crate::rpcrun::load_or_generate_cert_pair(
+            &dir.path().join("rpc.cert"),
+            &dir.path().join("rpc.key"),
+            &[],
+            dcroxide_certgen::Curve::P256,
+        )
+        .expect("a cert pair");
+        let cert = CertificateDer::from_pem_slice(&cert_pem).expect("a certificate");
+        let roots = [cert.clone()];
+        let anchor = webpki::anchor_from_trusted_cert(&cert)
+            .expect("an anchor")
+            .to_owned();
+
+        type Lists = (Vec<u16>, Vec<u16>, Vec<rustls::SignatureScheme>);
+        let lists = |provider: &rustls::crypto::CryptoProvider| -> Lists {
+            (
+                provider
+                    .cipher_suites
+                    .iter()
+                    .map(|suite| u16::from(suite.suite()))
+                    .collect(),
+                provider
+                    .kx_groups
+                    .iter()
+                    .map(|group| u16::from(group.name()))
+                    .collect(),
+                provider
+                    .signature_verification_algorithms
+                    .supported_schemes(),
+            )
+        };
+        let want = lists(&seeder_crypto_provider());
+
+        let tested = UreqTransport::with_root_certs(&roots);
+        let daemon = UreqTransport::new();
+        match tested.agent.config().tls_config().root_certs() {
+            ureq::tls::RootCerts::Specific(certs) => {
+                let ders: Vec<&[u8]> = certs.iter().map(|c| c.der()).collect();
+                assert_eq!(ders, [cert.as_ref()]);
+            }
+            other => panic!("ureq, the given roots: {other:?}"),
+        }
+        assert!(matches!(
+            daemon.agent.config().tls_config().root_certs(),
+            ureq::tls::RootCerts::WebPki
+        ));
+        for (what, transport) in [("given roots", &tested), ("webpki-roots", &daemon)] {
+            let provider = transport
+                .agent
+                .config()
+                .tls_config()
+                .unversioned_rustls_crypto_provider()
+                .as_ref()
+                .unwrap_or_else(|| panic!("ureq, {what}: no provider handed over"));
+            assert_eq!(lists(provider), want, "ureq, {what}");
+        }
+
+        assert_eq!(SeederRoots::Certs(&roots).store().roots, [anchor]);
+        assert_eq!(
+            SeederRoots::WebPki.store().roots.len(),
+            webpki_roots::TLS_SERVER_ROOTS.len()
+        );
+        let direct = crate::socks::NodeDialer::direct;
+        let tested = ProxySeederTransport::with_root_certs(direct(), &roots);
+        let daemon = ProxySeederTransport::new(direct());
+        for (what, transport) in [("given roots", &tested), ("webpki-roots", &daemon)] {
+            assert_eq!(
+                lists(transport.tls.crypto_provider()),
+                want,
+                "proxy, {what}"
+            );
+        }
     }
 }

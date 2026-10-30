@@ -1,0 +1,95 @@
+{
+  "about": "The ClientHello each seeder transport of dcroxide-node sends to a seeder named by its address, so without the server_name extension a seeder named by a DNS name gets, as Go's crypto/tls server sees it (ClientHelloInfo), its extensions sorted, since rustls orders them at random for each ClientHello: recorded by tests/tls_interop.rs's regenerate_seeder_client_hello under the reference Go, from a run on the provider below, before ADR-0015's switch, which must reproduce it, and read by seeder_clients_handshake_with_go_servers.",
+  "go_version": "go1.26.2",
+  "provider": "ring 0.17.14 through rustls 0.23.46",
+  "proxy": {
+    "cipher_suites": [
+      "TLS_AES_256_GCM_SHA384",
+      "TLS_AES_128_GCM_SHA256",
+      "TLS_CHACHA20_POLY1305_SHA256",
+      "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384",
+      "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256",
+      "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256",
+      "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
+      "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
+      "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256",
+      "0x00FF"
+    ],
+    "extensions": [
+      5,
+      10,
+      11,
+      13,
+      23,
+      35,
+      43,
+      45,
+      51
+    ],
+    "signature_schemes": [
+      "ECDSAWithP384AndSHA384",
+      "ECDSAWithP256AndSHA256",
+      "Ed25519",
+      "PSSWithSHA512",
+      "PSSWithSHA384",
+      "PSSWithSHA256",
+      "PKCS1WithSHA512",
+      "PKCS1WithSHA384",
+      "PKCS1WithSHA256"
+    ],
+    "supported_curves": [
+      "X25519",
+      "CurveP256",
+      "CurveP384"
+    ],
+    "supported_versions": [
+      "TLS 1.3",
+      "TLS 1.2"
+    ]
+  },
+  "ureq": {
+    "cipher_suites": [
+      "TLS_AES_256_GCM_SHA384",
+      "TLS_AES_128_GCM_SHA256",
+      "TLS_CHACHA20_POLY1305_SHA256",
+      "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384",
+      "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256",
+      "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256",
+      "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
+      "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
+      "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256",
+      "0x00FF"
+    ],
+    "extensions": [
+      5,
+      10,
+      11,
+      13,
+      23,
+      35,
+      43,
+      45,
+      51
+    ],
+    "signature_schemes": [
+      "ECDSAWithP384AndSHA384",
+      "ECDSAWithP256AndSHA256",
+      "Ed25519",
+      "PSSWithSHA512",
+      "PSSWithSHA384",
+      "PSSWithSHA256",
+      "PKCS1WithSHA512",
+      "PKCS1WithSHA384",
+      "PKCS1WithSHA256"
+    ],
+    "supported_curves": [
+      "X25519",
+      "CurveP256",
+      "CurveP384"
+    ],
+    "supported_versions": [
+      "TLS 1.3",
+      "TLS 1.2"
+    ]
+  }
+}

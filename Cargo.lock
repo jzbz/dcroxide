@@ -658,6 +658,7 @@ dependencies = [
  "rustls",
  "rustls-pki-types",
  "rustls-webpki",
+ "serde_json",
  "sha1",
  "socket2",
  "tempfile",
