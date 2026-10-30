@@ -14,9 +14,9 @@
 The project owner's rule, in the owner's words, is "pure rust everywhere",
 with the TLS providers to be checked first. The workspace already forbids
 `unsafe` in its own crates, with one audited exception (the project
-brief's principle 4, `docs/dcroxide-project-brief.md:528`), but that stops
+brief's principle 4, `docs/dcroxide-project-brief.md:530`), but that stops
 at its dependencies, two of which compile C and assembly into the node
-(`:772`). On 2026-10-26 the project owner approved three sets of
+(`:775`). On 2026-10-26 the project owner approved three sets of
 recommendations ("go with your recommendations"). The first settled the
 rule's scope and its two exceptions, its enforcement and the move of ECDSA
 to `k256`, and kept blake3. The second, ten answers numbered T1 to T10
@@ -81,7 +81,7 @@ cargo build compiles it: two Linux-only tests compile it with `cc` when
 they run and preload it into a child process
 (`crates/dcroxide-testutil/tests/review_powerloss_shim.rs:156-162`,
 `crates/dcroxide-node/tests/existsaddr_powerloss.rs:473-478`), and CI
-makes a skip of either a failure (`.github/workflows/ci.yml:16-25`).
+makes a skip of either a failure (`.github/workflows/ci.yml:26-35`).
 
 **Inline assembly in Rust crates.** Crates already in the node's build
 carry `asm!`, which rustc assembles itself, with no C toolchain: the
@@ -143,8 +143,8 @@ The approvals do not spell out five points, and this record reads them so:
   library.
 - **The targets the project builds for** are, on 2026-10-26, those of
   CI's test matrix, x86_64 and aarch64 Linux, macOS and Windows
-  (`.github/workflows/ci.yml:82`), and the no-OS target of its no_std
-  check (`:335-340`). [ADR-0014](0014-release-engineering.md) decides
+  (`.github/workflows/ci.yml:92`), and the no-OS target of its no_std
+  check (`:345-350`). [ADR-0014](0014-release-engineering.md) decides
   which of them get binaries.
 - **"What `cargo test` builds"** includes anything a test compiles while
   it runs, which reaches the shim and the oracle, though cargo itself
@@ -184,7 +184,7 @@ C that cgo links into the oracle included:
   the exception as covering, with the oracle, the Go generators under
   `tools/` that regenerate vector files from dcrd's own code (ADR-0001's
   addenda from 2026-10-02 on), and dcrd itself, which the interop job
-  builds and runs (`.github/workflows/ci.yml:191-245`).
+  builds and runs (`.github/workflows/ci.yml:201-255`).
 - **cargo-fuzz's libFuzzer**, which has no pure-Rust drop-in. `fuzz/` is
   outside the workspace (the root `Cargo.toml:39`) with its own lock, and
   `libfuzzer-sys` 0.4.13 (`fuzz/Cargo.lock:1109-1110`) compiles libFuzzer's
@@ -199,7 +199,7 @@ either: the third set answered that the rule already decides it.
 The rule as the second set defines it names C, C++ and assembly. This
 record reads it as not reaching tools in other languages that never ship:
 the Go tools `tools/pinbump` and `tools/dcrdstat`, which CI vets and tests
-beside the oracle (`ci.yml:268-272`), and the Python instruments
+beside the oracle (`ci.yml:278-282`), and the Python instruments
 `tools/dsample/dsample.py` and `tools/powerloss/replay.py`, the second run
 by the two power-cut tests. They are neither exceptions nor breaches. The
 shim beside `replay.py` is C, and the second set settles it (T9, below).
@@ -273,7 +273,7 @@ input fits in one BLAKE3 chunk of 1,024 bytes (blake3 1.8.7, `src/lib.rs:166`).
 The port departs from the brief's principle 3, which takes BLAKE3, with
 secp256k1 arithmetic, SHA-2 and Ed25519 field math, from audited or widely used
 crates and owns only Decred-specific constructions
-(`docs/dcroxide-project-brief.md:527`); T8 decides it for BLAKE3.
+(`docs/dcroxide-project-brief.md:529`); T8 decides it for BLAKE3.
 
 **The power-cut shim: rewritten in Rust** (T9). `tools/powerloss/shim.c` is to
 be rewritten as a small Rust library, which the two tests then build in its
@@ -301,7 +301,7 @@ Two checks, neither written yet (the first set's 1b):
   `multiple-versions = "deny"` and three `[[bans.skip]]` entries
   (`deny.toml:23-52`). It gains a `deny` list refusing the crates that
   compile or link C. cargo-deny 0.20.2, the version read here (CI's action
-  names none, `ci.yml:279`), matches a banned crate by its name and a
+  names none, `ci.yml:289`), matches a banned crate by its name and a
   version requirement, with no patterns (`src/lib.rs:482-484`), so the
   `-sys` crates that build C are refused through the means they build it
   with: `cc`; the other native build drivers, `cmake`, `pkg-config`,
@@ -384,7 +384,7 @@ which does not depend on the TLS answers, can start at once.
   (`crates/dcroxide-dcrec/Cargo.toml:13-18`, `:28`), loses its reason.
   Inference, not checked: `dcroxide-txscript`, which the no_std job leaves
   out because it fails on `secp256k1-sys` and nothing else
-  (`ci.yml:320-324`), may then pass that check.
+  (`ci.yml:330-334`), may then pass that check.
 - **libsecp's speed lead is to be measured, not assumed away.** In the one
   profile in the repository that splits out fully validated blocks,
   secp256k1 took about 38% of user-space cycles on all threads and
@@ -398,7 +398,7 @@ which does not depend on the TLS answers, can start at once.
   BLAKE-256 is, and owning it is the cost the first set's 1c argued
   against and the second set accepted. The brief's principle 3 still
   names BLAKE3 among the algorithms taken from outside crates
-  (`docs/dcroxide-project-brief.md:527`) and is to be brought in line when
+  (`docs/dcroxide-project-brief.md:529`) and is to be brought in line when
   the port lands. The port takes `blake3`, `arrayvec` 0.7.8 and
   `constant_time_eq` 0.4.2 out of the lock, since nothing else uses the
   last two.
@@ -443,6 +443,6 @@ which does not depend on the TLS answers, can start at once.
 - **Fuzz builds keep libFuzzer's C++**, as excepted above.
 - **Not drafted here:** the `deny.toml` bans and the CI job; and, as each
   breach goes, the dependency ledger's rows for it, the brief's figures
-  on line 772, its principle 3, the no_std job's notes on
-  `secp256k1-sys` (`ci.yml:313-331`), and the CI comment on dcrec's run
-  without `std` (`ci.yml:94-98`).
+  on line 775, its principle 3, the no_std job's notes on
+  `secp256k1-sys` (`ci.yml:323-341`), and the CI comment on dcrec's run
+  without `std` (`ci.yml:104-108`).

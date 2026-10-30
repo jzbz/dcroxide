@@ -121,7 +121,9 @@ exit criteria have not been demonstrated, and those are listed here too:
   and every pull request — and a nightly
   10-minute-per-target run over the 25 fuzz targets, five of which ask dcrd's
   own code through the oracle and one of which checks against a model of
-  dcrd's Ed25519, from a corpus kept between nights. Not wired: coverage
+  dcrd's Ed25519, from a corpus kept between nights, and the signature soak
+  against dcrd for 35 minutes each night on x86_64, on x86_64 with
+  `curve25519-dalek`'s portable backend, and on arm64. Not wired: coverage
   reporting (`cargo-llvm-cov`), `cargo-vet`, `cargo-mutants`, and any sanitizer
   coverage beyond the AddressSanitizer `cargo fuzz` builds in by default. [docs/dependency-ledger.md](dependency-ledger.md) records a decision per load-bearing crate — vendored, reviewed@V, accepted, or declined — while stating outright that it is not a review; a full manual audit and a version freeze are still Phase 15 items.
 - Three further ledger rows sit at "—" for reasons that are not debt:
@@ -730,9 +732,10 @@ its commit. The last two replace the two-reviewer sign-off on every PR that
 this plan first asked for, which a project with one maintainer
 ([docs/dependency-ledger.md](dependency-ledger.md), "What is deliberately not
 here") cannot meet; the external review of Phase 15 is still to come. Not all
-of this is in place. The soak has not been run for `dcrec`
+of this is in place. The soak that gates `dcrec` has not been run
 ([ADR-0006](adr/0006-secp256k1-backend.md)'s 2026-10-26 addendum), though five
-fuzz targets compare it with dcrd in CI, and `cargo-mutants` is not wired up
+fuzz targets and a shorter nightly soak compare it with dcrd in CI, and
+`cargo-mutants` is not wired up
 (the Phase 0 item in the list of outstanding work above).
 Workspace line coverage is to be reported and ratcheted (never decreases) once
 `cargo-llvm-cov` is wired up, which it is not yet; a target ≥90% overall is

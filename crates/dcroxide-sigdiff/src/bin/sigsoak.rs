@@ -39,15 +39,19 @@ answered by dcroxide and by dcrd's own code (tools/oracle), case by case;
 every case is reproducible from the printed master seed.
 
 usage:
-  sigsoak run --out DIR (--floors [--scale F] | --cases N | --budget DUR)
-              [--seed HEX] [--classes LIST] [--workers N] [--window N]
-              [--flush-every N] [--hang-timeout DUR] [--progress-every DUR]
-              [--oracle PATH] [--ledger FILE]
+  sigsoak run --out DIR (--floors [--scale F] | --cases N
+              | --budget DUR [--min-scale F]) [--seed HEX] [--classes LIST]
+              [--workers N] [--window N] [--flush-every N]
+              [--hang-timeout DUR] [--progress-every DUR] [--oracle PATH]
+              [--ledger FILE]
       Run the classes and write the record of the run into DIR, which must
       lie outside the repository and hold nothing (a canary/ directory
       aside).  --floors runs each class's floor (times --scale), --cases N
       runs N cases of each sampled class, --budget runs until the deadline
-      with the floors as weights; finite classes always run whole.
+      with the floors as weights; finite classes always run whole.  With
+      --min-scale F (0 < F <= 1), a budget run fails when a sampled class
+      completed fewer cases than its floor times F, or a finite class did
+      not run whole.
   sigsoak canary --out DIR [--seed HEX] [--canary LIST|all] [--cases N]
               [--workers N] [--oracle PATH]
       Stand deliberately broken models in for dcroxide and show that the
@@ -482,6 +486,7 @@ const RUN_FLAGS: &[&str] = &[
     "scale",
     "cases",
     "budget",
+    "min-scale",
     "seed",
     "classes",
     "workers",
@@ -499,6 +504,15 @@ fn cmd_run(args: &Args, raw: &[String]) -> Outcome {
     let scale: Option<f64> = args.number("scale")?;
     let cases: Option<u64> = args.number("cases")?;
     let budget = args.duration("budget")?;
+    let min_scale: Option<f64> = args.number("min-scale")?;
+    if let Some(share) = min_scale {
+        if budget.is_none() {
+            return Err(usage("--min-scale needs --budget"));
+        }
+        if !(share > 0.0 && share <= 1.0) {
+            return Err(usage("--min-scale takes a share of the floors in (0, 1]"));
+        }
+    }
     let mode = match (floors, cases, budget) {
         (true, None, None) => {
             let scale = scale.unwrap_or(1.0);
@@ -508,7 +522,10 @@ fn cmd_run(args: &Args, raw: &[String]) -> Outcome {
             Mode::Floors { scale }
         }
         (false, Some(n), None) if scale.is_none() && n > 0 => Mode::Cases(n),
-        (false, None, Some(d)) if scale.is_none() => Mode::Budget(d),
+        (false, None, Some(duration)) if scale.is_none() => Mode::Budget {
+            duration,
+            min_scale,
+        },
         _ => {
             return Err(usage(
                 "give exactly one of --floors [--scale F], --cases N (N > 0) or --budget DUR",

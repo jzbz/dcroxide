@@ -82,7 +82,7 @@ hashes no secrets and tunes for sync speed. Tracking would have meant a
 recurring read of dcr-rs for one decline and one comment, and it would add
 little to correctness here: this copy is compared with dcrd live on every
 CI run, where `DCROXIDE_REQUIRE_ORACLE` makes a missing Go toolchain a
-failure (`.github/workflows/ci.yml:14-15`), over the 17 KAT lengths and
+failure (`.github/workflows/ci.yml:24-25`), over the 17 KAT lengths and
 5,000 random inputs of up to 4,096 bytes
 (`crates/dcroxide-crypto/tests/oracle_differential.rs`), and the
 high-counter test reaches the counter's high word, which those inputs

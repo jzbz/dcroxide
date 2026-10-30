@@ -309,9 +309,15 @@ evaluating this code.
   a fixed number of cases each, and on its ported vectors; the signature
   soak, `dcroxide-sigdiff`'s `sigsoak`, runs the same classes at a
   recorded volume, and the run that gates the port to `k256` is still to
-  come (ADR-0006's 2026-10-26 addenda). For the TLS provider the
-  comparison with ring and Go rests on its parity corpus, its Wycheproof
-  vectors and its Go differential.
+  come (ADR-0006's 2026-10-26 addenda). Each night CI runs the soak for
+  35 minutes on x86_64, on x86_64 with `curve25519-dalek`'s portable
+  backend over the Ed25519 classes, and on arm64, failing on any
+  disagreement with dcrd, any intent a case missed, or any class short
+  of a hundredth of its floor, and then writes a fixed-seed record that
+  every later night's can be compared with; that is regression evidence,
+  not the run that gates the port. For the TLS provider the comparison
+  with ring and Go rests on its parity corpus, its Wycheproof vectors
+  and its Go differential.
   Stateless parsers still unfuzzed: the config-file and command-line
   parser, which takes the operator's input rather than a peer's, GCS
   filter decoding, and the ticket, index and address-manager stores.

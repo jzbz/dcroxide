@@ -5,9 +5,19 @@ on:
     branches: [master]
   pull_request:
   schedule:
-    # Nightly long-run fuzzing (see the nightly-fuzz job).
+    # Nightly long-run fuzzing and the signature soak (the nightly-fuzz and
+    # nightly-sigsoak jobs).
     - cron: "0 3 * * *"
   workflow_dispatch:
+    inputs:
+      seed:
+        description: >-
+          A sigsoak master seed (hex) for the nightly-sigsoak legs to run
+          again. Left empty, each leg draws a fresh one; given, nightly-fuzz
+          does not run.
+        type: string
+        required: false
+        default: ""
 
 env:
   CARGO_TERM_COLOR: always
@@ -458,7 +468,8 @@ jobs:
 
   nightly-fuzz:
     name: nightly fuzz (10m per target)
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    # A dispatch that names a sigsoak seed is for the soak alone.
+    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.seed == '')
     runs-on: ubuntu-latest
     # The run step starts a target only while twelve minutes remain of the
     # 295 minutes it gives itself, which leaves the steps around it the
@@ -601,3 +612,138 @@ jobs:
           name: fuzz-artifacts-nightly
           path: fuzz/artifacts/
           if-no-files-found: ignore
+
+  nightly-sigsoak:
+    name: nightly sigsoak (${{ matrix.leg }})
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    # The soak's budget is 35 minutes. The rest is the soak-profile build
+    # (release code generation), the oracle, the fixed-seed record and, on
+    # x86_64, the canaries.
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - leg: x86_64
+            os: ubuntu-latest
+            classes: all
+            rustflags: ""
+            canary: true
+          # dcroxide-dcrec's Ed25519 verification runs curve25519-dalek's
+          # double-base multiplication, which picks AVX2 at run time on
+          # these runners. This leg builds dalek's portable serial backend
+          # instead, with the cfg tls-soft-backends uses, and runs the
+          # Ed25519 classes, the only ones that backend reaches.
+          - leg: x86_64-dalek-serial
+            os: ubuntu-latest
+            classes: "DS-*,DK-*,DG-*,DV-*"
+            rustflags: '--cfg curve25519_dalek_backend="serial"'
+            canary: false
+          # k256 has no code that differs by architecture beyond the
+          # pointer width, so one arm64 leg covers it; no macOS or Windows
+          # leg is run, since the per-PR matrix runs every class there.
+          - leg: arm64
+            os: ubuntu-24.04-arm
+            classes: all
+            rustflags: ""
+            canary: false
+    runs-on: ${{ matrix.os }}
+    env:
+      # For the build and for the runs, whose manifests record it.
+      RUSTFLAGS: ${{ matrix.rustflags }}
+      SIGSOAK_CLASSES: ${{ matrix.classes }}
+      # The dispatch's seed. Empty, as on a schedule, each run draws one
+      # from the clock and prints it.
+      SIGSOAK_SEED: ${{ inputs.seed }}
+      # The fixed-seed record's master seed, "nightly1" in ASCII: every
+      # night's record under it is comparable with every other's.
+      SIGSOAK_FIXED_SEED: "0x6e696768746c7931"
+    steps:
+      - uses: actions/checkout@v7
+      # Toolchain comes from rust-toolchain.toml (see the lint job).
+      - run: rustup toolchain install
+      # See fuzz-smoke; sigsoak takes the oracle from DCROXIDE_ORACLE_BIN
+      # as the fuzz targets do.
+      - uses: actions/setup-go@v7
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: tools/oracle/go.sum
+      - name: Build the oracle
+        working-directory: tools/oracle
+        run: |
+          go build -o "$RUNNER_TEMP/dcrd-oracle" .
+          echo "DCROXIDE_ORACLE_BIN=$RUNNER_TEMP/dcrd-oracle" >> "$GITHUB_ENV"
+      # One cache per leg: the serial leg's RUSTFLAGS rebuild every crate.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.leg }}
+      # sigsoak refuses a build whose panics abort, as release's do, and
+      # finds the repository at the path it was built from, so it is built
+      # here with the soak profile and run from this checkout.
+      - name: Build sigsoak
+        id: build
+        run: cargo build --locked --profile soak -p dcroxide-sigdiff --bin sigsoak
+      # One worker per two processors, each keeping one busy and its oracle
+      # the other. sigsoak's own default holds a pair back for the system,
+      # which on a four-processor runner leaves a single worker.
+      - name: Count the workers
+        run: |
+          workers=$(( $(nproc) / 2 ))
+          echo "SIGSOAK_WORKERS=$(( workers > 0 ? workers : 1 ))" >> "$GITHUB_ENV"
+      # Fails on any disagreement or dcroxide panic, on an intent a case
+      # missed or an outcome mix out of its band, on a class short of a
+      # hundredth of its floor (finite classes whole), or on an abort.
+      - name: Run the soak for 35 minutes
+        run: |
+          args=(run --out "$RUNNER_TEMP/sigsoak" --budget 35m --min-scale 0.01
+            --classes "$SIGSOAK_CLASSES" --workers "$SIGSOAK_WORKERS" --progress-every 5m)
+          if [ -n "$SIGSOAK_SEED" ]; then
+            args+=(--seed "$SIGSOAK_SEED")
+          fi
+          target/soak/sigsoak "${args[@]}"
+      # 10^4 cases of each sampled class under one seed that never changes,
+      # finite classes whole: `sigsoak compare --exploratory` holds any two
+      # nights' records to equal digests, the nights before the port
+      # against the nights after it among them, and the legs to each other.
+      # It runs after a failing soak too.
+      - name: Run the fixed-seed record
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: |
+          target/soak/sigsoak run --out "$RUNNER_TEMP/sigsoak-fixed" --cases 10000 \
+            --seed "$SIGSOAK_FIXED_SEED" --classes "$SIGSOAK_CLASSES" --workers "$SIGSOAK_WORKERS"
+      # The canary run at its default volume, the soak's: each deliberately
+      # broken model must be caught in its primary class within 10^4 cases
+      # and nowhere outside its footprint, and the models with no break
+      # must agree with dcrd. It runs after a failing soak too.
+      - name: Run the canaries
+        if: matrix.canary && !cancelled() && steps.build.outcome == 'success'
+        run: |
+          args=(canary --out "$RUNNER_TEMP/sigsoak" --workers "$SIGSOAK_WORKERS")
+          if [ -n "$SIGSOAK_SEED" ]; then
+            args+=(--seed "$SIGSOAK_SEED")
+          fi
+          target/soak/sigsoak "${args[@]}"
+      - name: Summarize the run
+        if: always()
+        run: |
+          for f in "$RUNNER_TEMP/sigsoak/summary.txt" "$RUNNER_TEMP/sigsoak-fixed/summary.txt" \
+            "$RUNNER_TEMP/sigsoak/canary/summary.txt"; do
+            if [ -f "$f" ]; then
+              { echo '```'; cat "$f"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+            fi
+          done
+      # Every night's record, pass or fail: the seed, the counts and kinds
+      # per class, the digests, and any disagreement with its replay line.
+      # The nights before the port are the libsecp baseline the nights after
+      # it are compared with, so they are kept as long as the repository
+      # allows.
+      - name: Upload the soak's record
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: sigsoak-${{ matrix.leg }}
+          path: |
+            ${{ runner.temp }}/sigsoak/
+            ${{ runner.temp }}/sigsoak-fixed/
+          if-no-files-found: warn
+          retention-days: 90

@@ -1074,7 +1074,10 @@ fn a_deadline_and_a_stop_leave_a_prefix() {
             let mut cfg = RunConfig::new(
                 SEED,
                 vec![&T_DRAWN],
-                Mode::Budget(Duration::from_millis(300)),
+                Mode::Budget {
+                    duration: Duration::from_millis(300),
+                    min_scale: None,
+                },
                 me(),
             );
             cfg.oracle_args = vec![FAKE.into(), "echo".into()];

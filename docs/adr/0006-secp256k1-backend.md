@@ -8,7 +8,7 @@
 - **Date:** 2026-07-03 (proposed), 2026-07-26 (addendum: the split held),
   2026-10-26 (addendum: ECDSA and key handling to move to `k256`; a superseding
   ADR pending; second addendum: how the soak is run and compared), 2026-10-27
-  (addendum: the oracle-backed fuzz targets)
+  (addendum: the oracle-backed fuzz targets and the nightly soak)
 
 ## Context
 
@@ -422,7 +422,7 @@ The microbenchmark the plan names ran the same day, before any port (bench
 ledger, "ECDSA verification on libsecp256k1 and on k256 (2026-10-26)"): one
 ECDSA verification costs about twice as much on `k256` as on libsecp256k1.
 
-## Addendum, 2026-10-27 — the oracle-backed fuzz targets
+## Addendum, 2026-10-27 — the oracle-backed fuzz targets and the nightly soak
 
 The fuzz crate gains six signature targets, which read their inputs through the
 soak's tool, `dcroxide-sigdiff` (`crates/dcroxide-sigdiff/src/fuzz.rs`). Five
@@ -467,3 +467,20 @@ dependency rather than direct `curve25519-dalek` and `sha2` lines in
 libsecp256k1 reference: libsecp256k1 reaches it only through `dcroxide-dcrec`,
 as the code under test, and the references are dcrd, through the oracle, and
 the soak's models.
+
+The soak itself also runs in CI each night, in three legs: x86_64 over every
+class, x86_64 with `curve25519-dalek`'s portable serial backend over the Ed25519
+classes, and arm64 over every class. Each leg runs `sigsoak run` for 35 minutes
+from a fresh seed, which it prints, or from the seed a manual dispatch names.
+The run fails on any disagreement with dcrd, any dcroxide panic, any intent a
+case missed, any outcome mix out of its band, or any class short of a hundredth
+of its floor, finite classes whole; `sigsoak run` gains `--min-scale` for that
+last check, since a budget run did not judge the floors before. Each leg then
+runs a fixed-seed record, 10^4 cases of each sampled class and the finite
+classes whole under one master seed that never changes, which
+`sigsoak compare --exploratory` holds to equal digests from one night to the
+next; the nights before the port are the baseline, on libsecp256k1, that the
+nights after it are compared with. The x86_64 leg also runs the canaries at the
+soak's volume. Every night's records are kept for 90 days. None of these runs is
+gate-eligible: they are regression evidence, and the soak that gates the port is
+still the one run on the project owner's go.

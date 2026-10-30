@@ -732,7 +732,10 @@ mod tests {
         for mode in [
             Mode::Floors { scale: 0.5 },
             Mode::Cases(300),
-            Mode::Budget(std::time::Duration::from_secs(60)),
+            Mode::Budget {
+                duration: std::time::Duration::from_secs(60),
+                min_scale: Some(1.0),
+            },
         ] {
             assert!(
                 !gate_eligible(&soak, &[], &clean, &pinned, mode, &all),

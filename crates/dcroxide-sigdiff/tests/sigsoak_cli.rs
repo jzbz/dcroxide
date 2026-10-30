@@ -2,14 +2,15 @@
 //! The `sigsoak` binary end to end against the real oracle: a run writes
 //! every file of its record, a replayed case's leaf is the one its run's
 //! digest implies, `compare` passes equal runs and fails each kind of
-//! difference, a run that completes nothing fails, and `--out` is refused
-//! inside the repository or when it holds files.  A canary run writes its
-//! record beside a run's, each disagreement it records replays with its
-//! canary, `emit-corpus` writes the witness file `dcroxide-dcrec` keeps,
-//! `fuzz-seeds` writes the signature fuzz targets' seed inputs and
-//! `fuzz-replay` replays them, starting the oracle again after one that
-//! fails, a copy of the binary records its own build wherever it lies, and
-//! `list` ends quietly when its reader goes away.
+//! difference, a run that completes nothing fails, `--out` is refused
+//! inside the repository or when it holds files, and `--min-scale` judges a
+//! budget run's floors at its share, as the nightly soak in CI has it do.
+//! A canary run writes its record beside a run's, each disagreement it
+//! records replays with its canary, `emit-corpus` writes the witness file
+//! `dcroxide-dcrec` keeps, `fuzz-seeds` writes the signature fuzz targets'
+//! seed inputs and `fuzz-replay` replays them, starting the oracle again
+//! after one that fails, a copy of the binary records its own build
+//! wherever it lies, and `list` ends quietly when its reader goes away.
 
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -18,6 +19,7 @@ use dcroxide_sigdiff::canary::{CANARIES, CANARY_BOUND};
 use dcroxide_sigdiff::class::{CLASSES, Family, find_class};
 use dcroxide_sigdiff::digest::class_digest;
 use dcroxide_sigdiff::fuzz::{ED25519_MODEL_TARGET, SEED_MASTER, Target, seed_input};
+use dcroxide_sigdiff::manifest::repo_root;
 use dcroxide_sigdiff::run::{Mode, class_indices};
 use dcroxide_sigdiff::witness::{FILE_NAME, vector_lines};
 use dcroxide_testutil::{TempDir, hex, oracle_bin_or_skip, unhex};
@@ -264,6 +266,98 @@ fn run_replay_and_compare() {
     assert!(!inside.exists());
     let (code, text) = run("a", seed, "K-*", "1");
     assert_eq!(code, 2, "a run's directory holds files:\n{text}");
+}
+
+/// A budget run with `--min-scale` judges the floors at that share: a
+/// finite class run whole meets its floor, which ends the run long before
+/// its budget, while two seconds leave a sampled class short of its full
+/// floor and the run failed.  The manifest's mode carries the share.
+#[test]
+fn min_scale_judges_a_budget_run() {
+    let Some(oracle) = oracle_bin_or_skip() else {
+        return;
+    };
+    let oracle = oracle.display().to_string();
+    let dir = TempDir::new("sigsoak-min-scale");
+    let run = |name: &str, classes: &str, budget: &str| {
+        let out = dir.path().join(name).display().to_string();
+        let (code, text) = sigsoak(&[
+            "run",
+            "--out",
+            &out,
+            "--seed",
+            "0x1",
+            "--classes",
+            classes,
+            "--workers",
+            "2",
+            "--oracle",
+            &oracle,
+            "--progress-every",
+            "1h",
+            "--budget",
+            budget,
+            "--min-scale",
+            "1",
+        ]);
+        let floors = text
+            .lines()
+            .find(|l| l.trim_start().starts_with("2 floors:"))
+            .unwrap_or_else(|| panic!("no floors criterion:\n{text}"))
+            .trim()
+            .to_owned();
+        (code, floors, text)
+    };
+
+    let (code, floors, text) = run("whole", "K-length", "60s");
+    assert_eq!(code, 0, "{text}");
+    assert_eq!(
+        floors,
+        "2 floors: pass (every class reached its floor times 1 (finite classes whole))"
+    );
+    let manifest: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(dir.path().join("whole").join("manifest.json")).expect("read"),
+    )
+    .expect("JSON");
+    assert_eq!(
+        manifest["mode"],
+        serde_json::json!({ "kind": "budget", "seconds": 60, "min_scale": 1.0 })
+    );
+
+    let (code, floors, text) = run("short", "K-length,K-valid", "2s");
+    assert_eq!(code, 1, "{text}");
+    assert!(
+        floors.starts_with("2 floors: FAIL (below its floor times 1: ")
+            && floors.contains("K-valid "),
+        "{text}"
+    );
+}
+
+/// The nightly soak in CI judges its floors: its one budget run passes a
+/// share in (0, 1] as `--min-scale`, without which a budget run judges no
+/// floor and a night whose classes ran short would pass.
+#[test]
+fn the_nightly_soak_judges_its_floors() {
+    let root = repo_root().expect("the repository root");
+    let ci = std::fs::read_to_string(root.join(".github/workflows/ci.yml")).expect("read ci.yml");
+    let (_, job) = ci
+        .split_once("\n  nightly-sigsoak:\n")
+        .expect("the nightly-sigsoak job");
+    let budget: Vec<&str> = job
+        .lines()
+        .take_while(|l| l.is_empty() || l.starts_with("    "))
+        .filter(|l| l.contains("--budget"))
+        .collect();
+    let [run] = budget[..] else {
+        panic!("one budget run in nightly-sigsoak: {budget:?}");
+    };
+    let share = run
+        .split_whitespace()
+        .skip_while(|word| *word != "--min-scale")
+        .nth(1)
+        .unwrap_or_else(|| panic!("the budget run passes no --min-scale: {run}"));
+    let share: f64 = share.parse().expect("a number");
+    assert!(share > 0.0 && share <= 1.0, "{run}");
 }
 
 /// The canary run of two canaries, one of each kind: the model baseline
@@ -939,5 +1033,22 @@ fn usage() {
     ] {
         let (code, text) = sigsoak(&args);
         assert_eq!(code, 2, "{args:?}:\n{text}");
+    }
+    // --min-scale takes a share of the floors in (0, 1], and only with
+    // --budget.
+    let needs_budget = "--min-scale needs --budget";
+    let share = "--min-scale takes a share of the floors in (0, 1]";
+    for (size, min_scale, message) in [
+        ("--cases=4", "0.5", needs_budget),
+        ("--floors", "0.5", needs_budget),
+        ("--budget=1s", "0", share),
+        ("--budget=1s", "2", share),
+        ("--budget=1s", "nan", share),
+        ("--budget=1s", "x", "is not a number"),
+    ] {
+        let args = ["run", "--out", "/nowhere", size, "--min-scale", min_scale];
+        let (code, text) = sigsoak(&args);
+        assert_eq!(code, 2, "{args:?}:\n{text}");
+        assert!(text.contains(message), "{args:?}:\n{text}");
     }
 }

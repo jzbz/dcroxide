@@ -89,7 +89,13 @@ pub enum Mode {
     Cases(u64),
     /// Until the deadline, finite classes first and whole, the sampled
     /// classes weighted by their floors.
-    Budget(Duration),
+    Budget {
+        /// How long the run claims cases.
+        duration: Duration,
+        /// The share of its floor each sampled class must complete, a
+        /// finite class running whole; `None` leaves the floors unjudged.
+        min_scale: Option<f64>,
+    },
     /// The per-PR tests' counts: each class's `pr_cases` (or `cases` for
     /// every class); a finite class of at most 128 elements whole, a larger
     /// one `pr_cases` elements at an even stride.
@@ -105,7 +111,16 @@ impl Mode {
         match *self {
             Mode::Floors { scale } => json!({ "kind": "floors", "scale": scale }),
             Mode::Cases(n) => json!({ "kind": "cases", "cases": n }),
-            Mode::Budget(d) => json!({ "kind": "budget", "seconds": d.as_secs() }),
+            Mode::Budget {
+                duration,
+                min_scale,
+            } => {
+                let mut mode = json!({ "kind": "budget", "seconds": duration.as_secs() });
+                if let Some(share) = min_scale {
+                    mode["min_scale"] = json!(share);
+                }
+                mode
+            }
             Mode::PerPr { cases } => json!({ "kind": "per-pr", "cases": cases }),
         }
     }
@@ -448,7 +463,7 @@ impl Summary {
                 }
             );
         }
-        if let Mode::Budget(_) = self.mode {
+        if let Mode::Budget { .. } = self.mode {
             let rate = if secs > 0.0 {
                 self.requests as f64 / secs
             } else {
@@ -557,6 +572,13 @@ pub fn class_indices(class: &'static ClassSpec, mode: Mode) -> impl Iterator<Ite
     (0..plan.target).map_while(move |k| k.checked_mul(plan.stride))
 }
 
+/// A sampled class's floor times `scale`, rounded, and at least one case:
+/// what a `--floors` run at that scale runs, and what a budget run with
+/// that minimum share requires.
+fn scaled_floor(floor: u64, scale: f64) -> u64 {
+    ((floor as f64) * scale).round().max(1.0) as u64
+}
+
 fn plans(classes: &[&'static ClassSpec], mode: Mode) -> Vec<ClassPlan> {
     classes
         .iter()
@@ -569,11 +591,9 @@ fn plans(classes: &[&'static ClassSpec], mode: Mode) -> Vec<ClassPlan> {
                     (count, size.checked_div(count).unwrap_or(1).max(1))
                 }
                 (_, Some(size)) => (size, 1),
-                (Mode::Floors { scale }, None) => {
-                    (((floor as f64) * scale).round().max(1.0) as u64, 1)
-                }
+                (Mode::Floors { scale }, None) => (scaled_floor(floor, scale), 1),
                 (Mode::Cases(n), None) => (n, 1),
-                (Mode::Budget(_), None) => (u64::MAX, 1),
+                (Mode::Budget { .. }, None) => (u64::MAX, 1),
                 (Mode::PerPr { cases }, None) => (cases.unwrap_or(spec.pr_cases), 1),
             };
             let weight = if target == u64::MAX { floor } else { target }.max(1);
@@ -658,7 +678,7 @@ impl Shared {
             {
                 return None;
             }
-            let budget = matches!(self.mode, Mode::Budget(_));
+            let budget = matches!(self.mode, Mode::Budget { .. });
             let mut best: Option<(usize, (bool, f64))> = None;
             for (k, plan) in self.plans.iter().enumerate() {
                 let claimed = self.claimed[k].load(Ordering::SeqCst);
@@ -1436,7 +1456,7 @@ pub fn run(cfg: &RunConfig) -> Result<Summary, String> {
     let n = plans.len();
     let start = Instant::now();
     let deadline = match cfg.mode {
-        Mode::Budget(d) => start.checked_add(d),
+        Mode::Budget { duration, .. } => start.checked_add(duration),
         _ => None,
     };
     let shared = Arc::new(Shared {
@@ -1598,12 +1618,40 @@ fn summarize(shared: &Shared) -> Summary {
             format!("{disagreements} cases disagreed")
         },
     });
-    criteria.push(match shared.mode {
-        Mode::Floors { scale: 1.0 } => {
+    // The floors are judged in a --floors run at scale 1, and in a budget
+    // run at the share of them its min_scale names, finite classes whole.
+    let floors = match shared.mode {
+        Mode::Floors { scale: 1.0 } => Some((
+            classes.iter().map(|c| c.floor).collect::<Vec<u64>>(),
+            "every class reached its floor".to_owned(),
+            "below the floor".to_owned(),
+        )),
+        Mode::Budget {
+            min_scale: Some(share),
+            ..
+        } => Some((
+            shared
+                .plans
+                .iter()
+                .map(|p| {
+                    p.spec
+                        .size
+                        .finite()
+                        .unwrap_or_else(|| scaled_floor(p.spec.size.floor(), share))
+                })
+                .collect(),
+            format!("every class reached its floor times {share} (finite classes whole)"),
+            format!("below its floor times {share}"),
+        )),
+        _ => None,
+    };
+    criteria.push(match floors {
+        Some((required, reached, below)) => {
             let short: Vec<String> = classes
                 .iter()
-                .filter(|c| c.completed < c.floor)
-                .map(|c| format!("{} {}/{}", c.name, c.completed, c.floor))
+                .zip(required)
+                .filter(|&(c, n)| c.completed < n)
+                .map(|(c, n)| format!("{} {}/{n}", c.name, c.completed))
                 .collect();
             Criterion {
                 name: "2 floors",
@@ -1613,16 +1661,17 @@ fn summarize(shared: &Shared) -> Summary {
                     CriterionState::Fail
                 },
                 detail: if short.is_empty() {
-                    "every class reached its floor".to_owned()
+                    reached
                 } else {
-                    format!("below the floor: {}", short.join(", "))
+                    format!("{below}: {}", short.join(", "))
                 },
             }
         }
-        _ => Criterion {
+        None => Criterion {
             name: "2 floors",
             state: CriterionState::NotEvaluated,
-            detail: "not a --floors run at scale 1".to_owned(),
+            detail: "neither a --floors run at scale 1 nor a --budget run with --min-scale"
+                .to_owned(),
         },
     });
     let intent_failures = categories.get(&Category::Intent).copied().unwrap_or(0);
@@ -2431,6 +2480,14 @@ mod tests {
         doc: "",
     };
 
+    /// A budget run of `duration` that leaves the floors unjudged.
+    fn budget(duration: Duration) -> Mode {
+        Mode::Budget {
+            duration,
+            min_scale: None,
+        }
+    }
+
     fn shared_for(classes: &[&'static ClassSpec], mode: Mode) -> Shared {
         let plans = plans(classes, mode);
         let n = plans.len();
@@ -2444,7 +2501,7 @@ mod tests {
             plans,
             start,
             deadline: match mode {
-                Mode::Budget(d) => start.checked_add(d),
+                Mode::Budget { duration, .. } => start.checked_add(duration),
                 _ => None,
             },
             halt: AtomicBool::new(false),
@@ -2489,7 +2546,7 @@ mod tests {
         );
         assert_eq!(get(Mode::Cases(32)), [(32, 1), (100, 1), (2_050, 1)]);
         assert_eq!(
-            get(Mode::Budget(Duration::ZERO)),
+            get(budget(Duration::ZERO)),
             [(u64::MAX, 1), (100, 1), (2_050, 1)]
         );
         assert_eq!(
@@ -2553,14 +2610,11 @@ mod tests {
 
         // A budget run takes the finite classes first, and stops at its
         // deadline.
-        let shared = shared_for(
-            &[&SAMPLED, &SMALL],
-            Mode::Budget(Duration::from_secs(3_600)),
-        );
+        let shared = shared_for(&[&SAMPLED, &SMALL], budget(Duration::from_secs(3_600)));
         assert_eq!(shared.claim(), Some((1, 0..64)));
         assert_eq!(shared.claim(), Some((1, 64..100)));
         assert_eq!(shared.claim().map(|(k, _)| k), Some(0));
-        let shared = shared_for(&[&SAMPLED], Mode::Budget(Duration::ZERO));
+        let shared = shared_for(&[&SAMPLED], budget(Duration::ZERO));
         assert_eq!(shared.claim(), None);
     }
 
@@ -2612,7 +2666,7 @@ mod tests {
     /// A run that completed no case compared nothing, and fails.
     #[test]
     fn a_run_that_completes_nothing_fails() {
-        let shared = shared_for(&[&SAMPLED, &SMALL], Mode::Budget(Duration::ZERO));
+        let shared = shared_for(&[&SAMPLED, &SMALL], budget(Duration::ZERO));
         assert_eq!(shared.claim(), None);
         let summary = summarize(&shared);
         assert_eq!(summary.cases, 0);
@@ -2621,6 +2675,97 @@ mod tests {
         assert_eq!(
             summary.criteria[0].detail,
             "no case completed, so nothing was compared"
+        );
+    }
+
+    /// The floors are judged in a `--floors` run at scale 1, each class at
+    /// its floor, and in a budget run that names a minimum share, each
+    /// sampled class at its floor times the share (at least one case) and
+    /// each finite class whole; any other run leaves them unjudged.  The
+    /// manifest's mode carries the share.
+    #[test]
+    fn the_floors_are_judged_at_a_budget_runs_share() {
+        let judge = |mode: Mode, completed: [u64; 2]| {
+            let mut shared = shared_for(&[&SAMPLED, &SMALL], mode);
+            let mut totals = Totals::new(2);
+            for (k, n) in completed.into_iter().enumerate() {
+                totals.classes[k].completed = n;
+                shared.claimed[k].store(n, Ordering::SeqCst);
+            }
+            shared.slots.push(Slot {
+                health: Mutex::new(None),
+                busy_since: AtomicU64::new(0),
+                phase: AtomicU8::new(IDLE),
+                class: AtomicUsize::new(0),
+                index: AtomicU64::new(0),
+                totals: Mutex::new(totals),
+            });
+            let floors = summarize(&shared).criteria.swap_remove(1);
+            assert_eq!(floors.name, "2 floors");
+            (floors.state, floors.detail)
+        };
+        let share = |min_scale| Mode::Budget {
+            duration: Duration::from_secs(60),
+            min_scale: Some(min_scale),
+        };
+
+        assert_eq!(
+            judge(share(0.5), [5_000_000, 100]),
+            (
+                CriterionState::Pass,
+                "every class reached its floor times 0.5 (finite classes whole)".to_owned()
+            )
+        );
+        assert_eq!(
+            judge(share(0.5), [4_999_999, 99]),
+            (
+                CriterionState::Fail,
+                "below its floor times 0.5: T-sampled 4999999/5000000, T-small 99/100".to_owned()
+            )
+        );
+        // A share too small to round to a case still requires one.
+        assert_eq!(
+            judge(share(1e-9), [0, 100]),
+            (
+                CriterionState::Fail,
+                "below its floor times 0.000000001: T-sampled 0/1".to_owned()
+            )
+        );
+        assert_eq!(judge(share(1e-9), [1, 100]).0, CriterionState::Pass);
+
+        assert_eq!(
+            judge(Mode::Floors { scale: 1.0 }, [10_000_000, 100]),
+            (
+                CriterionState::Pass,
+                "every class reached its floor".to_owned()
+            )
+        );
+        assert_eq!(
+            judge(Mode::Floors { scale: 1.0 }, [9_999_999, 100]),
+            (
+                CriterionState::Fail,
+                "below the floor: T-sampled 9999999/10000000".to_owned()
+            )
+        );
+        for mode in [
+            budget(Duration::from_secs(60)),
+            Mode::Floors { scale: 0.5 },
+            Mode::Cases(100),
+        ] {
+            assert_eq!(
+                judge(mode, [0, 0]).0,
+                CriterionState::NotEvaluated,
+                "{mode:?}"
+            );
+        }
+
+        assert_eq!(
+            budget(Duration::from_secs(60)).to_json(),
+            json!({ "kind": "budget", "seconds": 60 })
+        );
+        assert_eq!(
+            share(0.01).to_json(),
+            json!({ "kind": "budget", "seconds": 60, "min_scale": 0.01 })
         );
     }
 
@@ -2634,7 +2779,7 @@ mod tests {
             ..SAMPLED
         };
         let render = |classes: &[&'static ClassSpec]| {
-            summarize(&shared_for(classes, Mode::Budget(Duration::ZERO))).render()
+            summarize(&shared_for(classes, budget(Duration::ZERO))).render()
         };
         let der = render(&[&SAMPLED]);
         assert!(
