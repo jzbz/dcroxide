@@ -24,7 +24,9 @@
 //! classes fail where an implementation gets dcrd's branches wrong, and
 //! [`witness`] picks the witness vectors `dcroxide-dcrec` keeps: cases of
 //! the constructed classes, with dcrd's answers, that its own Go-free test
-//! answers and re-derives.
+//! answers and re-derives.  [`fuzz`] is the entry the signature fuzz
+//! targets share: a fuzz input read as a case of one of the classes,
+//! answered on both sides and compared.
 //!
 //! # Independence
 //!
@@ -44,8 +46,10 @@
 //! of exactly those files as they were compiled into the binary, so two
 //! runs whose fingerprints differ are refused as a comparison.  The adapter
 //! (`src/ours.rs`) and the plumbing ([`fingerprint::PLUMBING`]) may change,
-//! since none of them can change an input, an answer as compared, a status
-//! or a digest.
+//! since none of them can change a soak case's input, its answers as
+//! compared, its status or a digest.  The fuzz entry decides those things
+//! for fuzz inputs only, and no soak run, digest, witness or gate run
+//! passes through it.
 
 pub mod answer;
 pub mod arith;
@@ -56,6 +60,7 @@ pub mod compare;
 pub mod digest;
 pub mod entropy;
 pub mod fingerprint;
+pub mod fuzz;
 // `gen` is reserved in the 2024 edition, so the generators' module is
 // declared, and named in paths, as a raw identifier.
 pub mod r#gen;

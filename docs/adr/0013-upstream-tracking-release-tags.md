@@ -95,8 +95,8 @@ other (`docs/PARITY.md:2307-2362`).
 things built for a master pin, whatever rule follows it:
 
 - The consistency test reads the `go.mod` header text after "dcrd master
-  commit " (`crates/dcroxide-testutil/src/lib.rs:1385-1391`) and fails when
-  no dcrd module is pinned by pseudo-version (`:993-996`). At a tag every
+  commit " (`crates/dcroxide-testutil/src/lib.rs:1447-1453`) and fails when
+  no dcrd module is pinned by pseudo-version (`:1055-1058`). At a tag every
   module would be pinned by tag.
 - The interop harness would refuse CI's own build. dcrd's note for
   maintainers sets the build metadata `release.local` on a release branch
@@ -107,8 +107,8 @@ things built for a master pin, whatever rule follows it:
   metadata is empty (`:161-177`). The harness's `assert_dcrd_revision`
   takes eight or more characters after a `+` for a stamped revision, and
   any revision but the pin's for a different specification
-  (`crates/dcroxide-testutil/src/lib.rs:630-672`, the check at
-  `:656-664`), so `release.local` is refused. Inference: the v2.2 tags
+  (`crates/dcroxide-testutil/src/lib.rs:692-734`, the check at
+  `:718-726`), so `release.local` is refused. Inference: the v2.2 tags
   follow the same documented process.
 - Nested modules. `tools/pinbump` lists the files a tree diff between the
   two refs changes (`tools/pinbump/main.go:166`), and the port's citations
@@ -191,17 +191,17 @@ v2.2.0 and on each part below, which lands with that move or before it.
 
 - **The consistency test's tag shape.**
   `the_dcrd_pin_matches_ci_and_the_oracle`
-  (`crates/dcroxide-testutil/src/lib.rs:1354-1401`) has to read a header
+  (`crates/dcroxide-testutil/src/lib.rs:1416-1463`) has to read a header
   that names the tag and its commit in place of "dcrd master commit "
-  (`:1385-1391`), and the rule that at least one dcrd module is pinned by
-  pseudo-version (`:993-996`) has to go. It already refuses a `replace`
-  of a dcrd module (`:985-992`). Inference: at a tag it also refuses any
+  (`:1447-1453`), and the rule that at least one dcrd module is pinned by
+  pseudo-version (`:1055-1058`) has to go. It already refuses a `replace`
+  of a dcrd module (`:1047-1054`). Inference: at a tag it also refuses any
   pseudo-version, and whether each module sits at the tag's required
   version needs dcrd's `go.mod` at the tag, which the repository does not
   hold, so that half is checked at the move unless a CI job with a dcrd
   clone takes it on.
 - **The harness's revision check.** `assert_dcrd_revision`
-  (`crates/dcroxide-testutil/src/lib.rs:630-672`) has to accept a dcrd that
+  (`crates/dcroxide-testutil/src/lib.rs:692-734`) has to accept a dcrd that
   CI built from the tag's commit. Two ways are open, neither chosen
   (inference): read the revision from the binary's Go build information,
   which `-buildvcs=true` records whatever the version string says; or

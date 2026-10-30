@@ -125,7 +125,7 @@ brief wants HD keys only for the optional `hdkeychain` library-parity
 milestone, not for the daemon, and dcroxide has no `hdkeychain` port.
 
 **Attribution stays.** The import is credited in `LICENSE` (line 4), the
-file's header (lines 1-5), `README.md` (lines 213-214 and 826) and
+file's header (lines 1-5), `README.md` (lines 213-214 and 828) and
 `PARITY.md`'s `crypto/blake256` row, which meets the brief's "either way
 pin + attribute" (§9). Each stays for as long as code derived from dcr-rs
 remains. No code, manifest or CI change follows from this addendum: dcr-rs

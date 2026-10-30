@@ -36,7 +36,10 @@
 //! process with exit code 3.
 //!
 //! [`answer_cases`] runs a few cases of one class the same way, through
-//! one oracle, for the witness vectors.
+//! one oracle, for the witness vectors.  The fuzz entry ([`crate::fuzz`])
+//! and `sigsoak` share the loop's answerer ([`ours_answerer`]), its plan of
+//! a class's indices ([`class_indices`]) and its printing of a failure and
+//! a request ([`failure_line`], [`RequestLines`]).
 
 use std::any::Any;
 use std::borrow::Cow;
@@ -55,14 +58,14 @@ use std::time::{Duration, Instant};
 use dcroxide_testutil::{SplitMix64, hex, oracle_bin_or_skip};
 use serde_json::{Value, json};
 
-use crate::answer::OursAnswer;
+use crate::answer::{Detail, OursAnswer};
 use crate::canary::{CANARY_BOUND, Canary, MODEL_BASELINE, Rule, StandIn, find_stand_in};
-use crate::class::{Case, ClassSpec, Family, find_class, generate};
-use crate::cmd::Request;
-use crate::compare::{CaseResult, Category, Status, compare};
+use crate::class::{Case, ClassSpec, Family, Intent, find_class, generate};
+use crate::cmd::{Cmd, Request};
+use crate::compare::{CaseResult, Category, Failure, Status, compare};
 use crate::digest::{ClassDigest, class_digest, leaf};
 use crate::manifest::check_pin;
-use crate::model::{self, ModelView};
+use crate::model::{self, ModelOutcome, ModelView};
 use crate::ours;
 use crate::pipe::{OracleFault, OraclePipe, Payload, PipeConfig, PipeFailure, PipeHealth};
 use crate::record::{MixResult, REACHABLE_KINDS, Recorder, Totals, UNREACHABLE, evaluate_mixes};
@@ -505,7 +508,9 @@ pub fn note_panic(info: &std::panic::PanicHookInfo<'_>) {
     PANIC_AT.with(|p| *p.borrow_mut() = at);
 }
 
-fn panic_message(payload: &(dyn Any + Send)) -> String {
+/// A panic's message, with its place when a panic hook noted one
+/// ([`note_panic`]).
+pub fn panic_message(payload: &(dyn Any + Send)) -> String {
     let message = payload
         .downcast_ref::<&str>()
         .map(|s| (*s).to_owned())
@@ -542,6 +547,14 @@ pub fn class_targets(classes: &[&'static ClassSpec], mode: Mode) -> Vec<Option<u
         .iter()
         .map(|p| (p.target != u64::MAX).then_some(p.target))
         .collect()
+}
+
+/// The indices of `class` a run in `mode` takes, in order, from the plan
+/// the run loop claims from: ordinal `k` is case `k × stride`.  Unbounded,
+/// in effect, for a budget run's sampled class.
+pub fn class_indices(class: &'static ClassSpec, mode: Mode) -> impl Iterator<Item = u64> {
+    let plan = plans(&[class], mode).pop().expect("one plan per class");
+    (0..plan.target).map_while(move |k| k.checked_mul(plan.stride))
 }
 
 fn plans(classes: &[&'static ClassSpec], mode: Mode) -> Vec<ClassPlan> {
@@ -775,16 +788,7 @@ impl Shared {
                     index: work.index,
                     status: result.status,
                     category,
-                    failures: result
-                        .failures
-                        .iter()
-                        .map(|f| match f.request {
-                            Some(j) => {
-                                format!("{} on request {j}: {}", f.category.name(), f.detail)
-                            }
-                            None => format!("{}: {}", f.category.name(), f.detail),
-                        })
-                        .collect(),
+                    failures: result.failures.iter().map(failure_line).collect(),
                     reproduced,
                     go_panic,
                 });
@@ -853,19 +857,107 @@ impl Payload for Probe {
     }
 }
 
-/// dcroxide's answers to `case`, each under `catch_unwind`: `canary`'s
-/// on the commands it covers, when one stands in.
+/// dcroxide's answerer, as the run loop calls it: each request under
+/// `catch_unwind`, a panic as `Err` with its message (and its place, when
+/// the binary's hook noted one), and `canary`'s answer on the commands it
+/// covers, when one stands in.
+pub fn ours_answerer(canary: Option<StandIn>) -> impl Fn(Cmd, &[u8]) -> Result<OursAnswer, String> {
+    move |cmd: Cmd, data: &[u8]| {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match canary {
+            Some(canary) if canary.covers(cmd) => canary.answer(cmd, data),
+            _ => ours::answer(cmd, data),
+        }))
+        .map_err(|payload| panic_message(payload.as_ref()))
+    }
+}
+
+/// dcroxide's answers to `case` ([`ours_answerer`]).
 fn ours_answers(case: &Case, canary: Option<StandIn>) -> Vec<Result<OursAnswer, String>> {
+    let answer = ours_answerer(canary);
     case.requests
         .iter()
-        .map(|r| {
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match canary {
-                Some(canary) if canary.covers(r.cmd) => canary.answer(r.cmd, &r.data),
-                _ => ours::answer(r.cmd, &r.data),
-            }))
-            .map_err(|payload| panic_message(payload.as_ref()))
-        })
+        .map(|r| answer(r.cmd, &r.data))
         .collect()
+}
+
+/// One failed check as a run's notes print it: `<category> on request
+/// <j>: <detail>`, or `<category>: <detail>` for a check across requests.
+pub fn failure_line(failure: &Failure) -> String {
+    match failure.request {
+        Some(j) => format!(
+            "{} on request {j}: {}",
+            failure.category.name(),
+            failure.detail
+        ),
+        None => format!("{}: {}", failure.category.name(), failure.detail),
+    }
+}
+
+/// One request's block, as `sigsoak replay`, `sigsoak fuzz-replay` and a
+/// fuzz target's report print it: `request <j>: <cmd> <hex>`, then,
+/// indented, the intent (and the intent checked, when given), each side's
+/// answer under its label (`no answer` where it has none, `panic: ..`
+/// where dcroxide panicked) and the models' outcome, when there is one.
+/// Lines are separated by newlines, with none after the last.
+#[derive(Debug, Clone, Copy)]
+pub struct RequestLines<'a> {
+    /// The request's place in its case.
+    pub j: usize,
+    /// The request.
+    pub request: &'a Request,
+    /// The intent it was built for.
+    pub intent: &'a Intent,
+    /// The intent a fuzz target held it to ([`crate::fuzz::rebase`]);
+    /// `None` where the intent it was built for is the one held.
+    pub checked: Option<&'a Intent>,
+    /// What dcroxide's answer is called.
+    pub ours_label: &'a str,
+    /// dcroxide's answer.
+    pub ours: Option<&'a Result<OursAnswer, String>>,
+    /// What the other side's answer is called.
+    pub theirs_label: &'a str,
+    /// The other side's reply, printed as received.
+    pub theirs: Option<&'a Reply>,
+    /// The models' outcome.
+    pub model: Option<ModelOutcome>,
+}
+
+impl std::fmt::Display for RequestLines<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "request {}: {} {}\n  intent: {:?}",
+            self.j,
+            self.request.cmd.name(),
+            hex(&self.request.data),
+            self.intent
+        )?;
+        if let Some(checked) = self.checked {
+            write!(f, ", checked: {checked:?}")?;
+        }
+        match self.ours {
+            Some(Ok(o)) if o.detail == Detail::None => {
+                write!(f, "\n  {}: {}", self.ours_label, o.answer.describe())?;
+            }
+            Some(Ok(o)) => write!(
+                f,
+                "\n  {}: {} ({:?})",
+                self.ours_label,
+                o.answer.describe(),
+                o.detail
+            )?,
+            Some(Err(message)) => write!(f, "\n  {}: panic: {message}", self.ours_label)?,
+            None => write!(f, "\n  {}: no answer", self.ours_label)?,
+        }
+        match self.theirs {
+            Some(reply) => write!(f, "\n  {}: {}", self.theirs_label, reply.raw)?,
+            None => write!(f, "\n  {}: no answer", self.theirs_label)?,
+        }
+        if let Some(model) = self.model {
+            write!(f, "\n  model: {model:?}")?;
+        }
+        Ok(())
+    }
 }
 
 fn category_of(fault: &OracleFault) -> Category {
@@ -1316,7 +1408,7 @@ fn hung_case(shared: &Shared, slot: &Slot) -> (Work, CaseResult) {
     };
     let result = CaseResult {
         status: Status::Disagree,
-        failures: vec![crate::compare::Failure {
+        failures: vec![Failure {
             category: Category::OursHung,
             request: None,
             detail,

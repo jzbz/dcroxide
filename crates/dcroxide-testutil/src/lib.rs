@@ -227,7 +227,7 @@ pub fn require_reference_go(go_version: &str) {
 /// is missing when that variable names anything but an absolute path to a
 /// file, or when it is unset and no Go toolchain is found.
 pub fn oracle_or_skip() -> Option<Oracle> {
-    oracle_bin_or_skip().map(|bin| Oracle::spawn_bin(&bin))
+    oracle_bin_or_skip().map(|bin| Oracle::spawn_at(&bin))
 }
 
 /// The oracle binary [`oracle_or_skip`] would spawn, under the same
@@ -408,15 +408,25 @@ impl Oracle {
     /// Spawn the oracle [`oracle_or_skip`] would, building it if needed;
     /// where that would skip, this panics.
     pub fn spawn() -> Self {
-        Oracle::spawn_bin(&oracle_bin())
+        Oracle::spawn_at(&oracle_bin())
     }
 
-    fn spawn_bin(bin: &Path) -> Self {
-        let mut child = Command::new(bin)
+    /// Spawn the oracle binary at `bin`.  Panics, naming it, when it cannot
+    /// be spawned.
+    pub fn spawn_at(bin: &Path) -> Self {
+        Oracle::from_command(&mut Command::new(bin))
+    }
+
+    /// Spawn `cmd` as the oracle, its stdin and stdout piped and its stderr
+    /// as `cmd` leaves it (inherited unless set): a test can stand a script
+    /// in for the oracle this way.  Panics, naming the program, when it
+    /// cannot be spawned.
+    pub fn from_command(cmd: &mut Command) -> Self {
+        let mut child = cmd
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()
-            .unwrap_or_else(|e| panic!("spawn {}: {e}", bin.display()));
+            .unwrap_or_else(|e| panic!("spawn {}: {e}", Path::new(cmd.get_program()).display()));
         let stdin = child.stdin.take().expect("oracle stdin");
         let stdout = BufReader::new(child.stdout.take().expect("oracle stdout"));
         Oracle {
@@ -428,20 +438,72 @@ impl Oracle {
     }
 
     /// Issue a command whose sole argument is `data` (hex-encoded bytes) and
-    /// return the raw JSON response object.
+    /// return the raw JSON response object.  Panics, naming `cmd`, when the
+    /// oracle does not answer ([`Self::try_call_line`]) or its answer is not
+    /// JSON.
     pub fn call(&mut self, cmd: &str, data: &[u8]) -> serde_json::Value {
+        let line = self
+            .try_call_line(cmd, data)
+            .unwrap_or_else(|why| panic!("oracle {cmd}: {why}"));
+        serde_json::from_str(line)
+            .unwrap_or_else(|e| panic!("oracle {cmd}: parse oracle response {line:?}: {e}"))
+    }
+
+    /// [`Self::call`]'s exchange with a failure returned rather than
+    /// panicked on: the response line as read, newline included, borrowed
+    /// until the next call.  Every failure names the oracle's exit status
+    /// when it has one, whether the oracle had exited before the request,
+    /// refused its write or closed its output without answering.
+    ///
+    /// The exit is looked for before the request is written, so a request
+    /// to an oracle that has exited is an error even in a process where
+    /// writing to a closed pipe ends the process by `SIGPIPE` (a libFuzzer
+    /// binary, whose `main` is not Rust's).  An oracle killed from outside
+    /// between that look and the write can still end such a process.
+    pub fn try_call_line(&mut self, cmd: &str, data: &[u8]) -> Result<&str, String> {
+        match self.child.try_wait() {
+            Ok(Some(status)) => return Err(format!("the oracle had already exited ({status})")),
+            Ok(None) => {}
+            Err(e) => return Err(format!("poll the oracle: {e}")),
+        }
         // One write for the whole line: `ChildStdin` is unbuffered, so
         // formatting straight into it costs a write(2) a piece.
         self.line.clear();
         push_request(&mut self.line, cmd, data);
-        self.stdin
-            .write_all(self.line.as_bytes())
-            .expect("write request");
+        if let Err(e) = self.stdin.write_all(self.line.as_bytes()) {
+            return Err(format!("write request: {e}; {}", self.exit_note()));
+        }
         self.line.clear();
-        self.stdout
-            .read_line(&mut self.line)
-            .expect("read response");
-        serde_json::from_str(&self.line).expect("parse oracle response")
+        match self.stdout.read_line(&mut self.line) {
+            Ok(0) => Err(format!(
+                "the oracle closed its output without answering; {}",
+                self.exit_note()
+            )),
+            Ok(_) => Ok(&self.line),
+            Err(e) => Err(format!("read response: {e}")),
+        }
+    }
+
+    /// The oracle's exit status, waited for at most 5 s, for the message of
+    /// a failed call.  A bounded poll rather than `wait`: an oracle that
+    /// closed its output but lives on would block `wait` for ever, since
+    /// its stdin is held here, out of the `Child`.
+    fn exit_note(&mut self) -> String {
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "now plus 5 seconds is far inside Instant's range"
+        )]
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(status)) => return format!("the oracle exited ({status})"),
+                Ok(None) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Ok(None) => return "the oracle had not exited after 5 s".to_owned(),
+                Err(e) => return format!("poll the oracle: {e}"),
+            }
+        }
     }
 
     /// Like [`Self::call`], but panics on an error response and returns the
@@ -1503,6 +1565,86 @@ mod tests {
         let written = std::fs::metadata(&log).expect("log exists").len();
         assert_eq!(written, 2 * EACH, "both streams land in the log");
         assert!(log_tail(&log).contains("last 65536 bytes"));
+    }
+
+    /// A shell script standing in for the oracle: nothing executable is
+    /// written to disk, so no test meets a file another thread's fork still
+    /// holds open for writing.
+    #[cfg(unix)]
+    fn stand_in(script: &str) -> Oracle {
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg(script);
+        Oracle::from_command(&mut cmd)
+    }
+
+    /// An oracle that answers once and exits: the answer is the line as
+    /// read, and the next call is an error naming the exit status, whether
+    /// the exit is seen before the write, by the write or by the read.
+    #[cfg(unix)]
+    #[test]
+    fn a_stand_in_oracle_answers_then_reports_its_exit() {
+        let mut oracle = stand_in(r#"read l; echo '{"result":"ok"}'"#);
+        assert_eq!(
+            oracle.try_call_line("blake256", b"abc"),
+            Ok("{\"result\":\"ok\"}\n")
+        );
+        let err = oracle
+            .try_call_line("blake256", b"abc")
+            .expect_err("the oracle has exited");
+        assert!(err.contains("exit status: 0"), "{err}");
+    }
+
+    /// An oracle that exits on a request without answering it is an error
+    /// that says so and names its status.
+    #[cfg(unix)]
+    #[test]
+    fn an_oracle_that_exits_without_answering_is_an_error() {
+        let mut oracle = stand_in("read l; exit 3");
+        let err = oracle
+            .try_call_line("blake256", b"")
+            .expect_err("no answer");
+        assert!(err.contains("without answering"), "{err}");
+        assert!(err.contains("exit status: 3"), "{err}");
+    }
+
+    /// A request to an oracle already seen to have exited is refused before
+    /// it is written, naming the exit status; in a libFuzzer binary the
+    /// write would end the process by `SIGPIPE` instead.
+    #[cfg(unix)]
+    #[test]
+    fn a_request_to_an_oracle_that_has_exited_is_refused() {
+        let mut oracle = stand_in("exit 3");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while let Ok(None) = oracle.child.try_wait() {
+            assert!(Instant::now() < deadline, "the stand-in did not exit");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            oracle.try_call_line("blake256", b""),
+            Err("the oracle had already exited (exit status: 3)".to_owned())
+        );
+    }
+
+    /// `spawn_at` runs the binary it is given: `cat` stands in for the
+    /// oracle and answers a request with the request itself.
+    #[cfg(unix)]
+    #[test]
+    fn spawn_at_runs_the_binary_it_is_given() {
+        let mut oracle = Oracle::spawn_at(Path::new("cat"));
+        let mut request = String::new();
+        push_request(&mut request, "blake256", b"abc");
+        assert_eq!(
+            oracle.try_call_line("blake256", b"abc"),
+            Ok(request.as_str())
+        );
+    }
+
+    /// `call` panics, naming the command, when the oracle does not answer.
+    #[cfg(unix)]
+    #[test]
+    #[should_panic(expected = "oracle blake256:")]
+    fn call_panics_naming_the_command() {
+        stand_in("exit 0").call("blake256", b"");
     }
 
     /// Spawning the oracle repeatedly builds it once per process, and one

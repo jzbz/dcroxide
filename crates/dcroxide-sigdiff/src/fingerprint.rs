@@ -11,8 +11,11 @@
 //!   [`fingerprint`] is a digest of them.
 //! - [`ADAPTER`]: `src/ours.rs`, which reaches the code under test and
 //!   changes as its API grows.
-//! - [`PLUMBING`]: modules that decide no input, answer, comparison or
-//!   status (the pipe, the run loop, the record, the CLI).
+//! - [`PLUMBING`]: modules that decide no soak case's input, answer,
+//!   comparison or status (the pipe, the run loop, the record, the CLI).
+//!   The fuzz entry (`src/fuzz.rs`) is plumbing too: it decides those
+//!   things for fuzz inputs only, and no soak run, digest, witness or gate
+//!   run passes through it.
 //!
 //! Each file's bytes are embedded at compile time, so the fingerprint
 //! describes the binary that runs, needs no git and cannot be stale.  The
@@ -75,6 +78,7 @@ pub static ADAPTER: &[Source] = sources!["src/ours.rs"];
 pub static PLUMBING: &[Source] = sources![
     "src/bin/sigsoak.rs",
     "src/fingerprint.rs",
+    "src/fuzz.rs",
     "src/lib.rs",
     "src/manifest.rs",
     "src/pipe.rs",

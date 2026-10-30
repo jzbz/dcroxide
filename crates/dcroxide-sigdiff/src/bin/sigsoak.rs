@@ -8,10 +8,14 @@ use std::process::ExitCode;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use dcroxide_sigdiff::canary::{CANARIES, MODEL_BASELINE, select_canaries};
+use dcroxide_sigdiff::canary::{CANARIES, MODEL_BASELINE, find_stand_in, select_canaries};
 use dcroxide_sigdiff::class::{CLASSES, ClassSpec, Family, select_classes};
 use dcroxide_sigdiff::cmd::{Cmd, Request};
+use dcroxide_sigdiff::compare::Category;
 use dcroxide_sigdiff::fingerprint::{fingerprint, source_differences};
+use dcroxide_sigdiff::fuzz::{
+    self, ED25519_MODEL_TARGET, FuzzOracle, SEED_MASTER, Target, seed_indices, seed_input,
+};
 use dcroxide_sigdiff::manifest::{
     Build, CARGO_LOCK, LOCKED_CRATES, PinCheck, SCHEMA, check_pin, crate_dir, gate_eligible,
     git_state, lock_versions, oracle_json, platform, repo_root, rustc_vv, unix_now, utc,
@@ -22,11 +26,11 @@ use dcroxide_sigdiff::record::{
 };
 use dcroxide_sigdiff::reply::Reply;
 use dcroxide_sigdiff::run::{
-    self, CanaryVolume, Mode, RunConfig, RunStatus, baseline_classes, class_targets,
-    default_workers,
+    self, CanaryVolume, Mode, RequestLines, RunConfig, RunStatus, baseline_classes, class_targets,
+    default_workers, failure_line,
 };
 use dcroxide_sigdiff::witness::{self, FILE_NAME, WITNESS_CLASSES, WITNESS_SEED};
-use dcroxide_testutil::{DCRD_PARITY_COMMIT, hex, parse_seed};
+use dcroxide_testutil::{DCRD_PARITY_COMMIT, Oracle, hex, parse_seed, unhex};
 use serde_json::{Value, json};
 
 const HELP: &str = "\
@@ -74,6 +78,23 @@ usage:
       with dcrd's answer.  Every case must agree with dcrd and get the
       answer it was built for, and each class must fill its lines within
       4096 cases.  DIR must lie outside the repository and hold nothing.
+  sigsoak fuzz-seeds --out DIR [--seed HEX] [--cases N]
+      Write DIR/<target>/<class>-<index> for each signature fuzz target
+      (the five dcrec_diff_* and dcrec_ed25519_model): the input that
+      regenerates case <index> of <class> under the seed (default
+      0x66757a7a73656564), for the cases the per-PR tests run, or, with
+      --cases, N of each sampled class (finite classes of at most 128
+      whole, larger ones N at an even stride).  Needs no oracle.  DIR must
+      lie outside the repository and hold nothing.
+  sigsoak fuzz-replay --target NAME [--canary NAME] [--oracle PATH]
+              (FILE... | --hex HEX)
+      Decode each input as fuzz target NAME decodes it (dcrec_diff_ecdsa,
+      dcrec_diff_recover, dcrec_diff_pubkey, dcrec_diff_schnorr,
+      dcrec_diff_ed25519, or dcrec_ed25519_model, which needs no oracle),
+      answer it as the target does and print the report: the class, index
+      and variant, each request with both intents and both answers, and
+      the comparison.  --canary stands a canary in for dcroxide.  An
+      oracle that fails on an input is started afresh for the next.
   sigsoak help
       Print this.
 
@@ -83,9 +104,9 @@ patterns the same way.  DUR is <n>s, <n>m or <n>h.  --oracle defaults to
 DCROXIDE_ORACLE_BIN, or tools/oracle built with the Go toolchain on PATH.
 --ledger appends one line per run to FILE.
 
-exit codes: 0 pass; 1 a criterion or comparison failed; 2 usage or
-configuration error; 3 aborted (dcroxide hung, oracle faults exhausted, or
-the oracle failed during emit-corpus).
+exit codes: 0 pass; 1 a criterion, a comparison or a replayed fuzz input
+failed; 2 usage or configuration error; 3 aborted (dcroxide hung, oracle
+faults exhausted, or the oracle failed during emit-corpus).
 ";
 
 /// Why a command did not run.
@@ -318,19 +339,26 @@ struct Preflight {
     build: Build,
 }
 
-/// The checks `run`, `canary` and `emit-corpus` make before they start,
-/// each a refusal (exit 2): a build whose panics unwind, a repository root
-/// that resolves, an `out` outside it that `usage` may write into, and an
-/// oracle that keeps the pin rule.  A binary built from another tree is
-/// only warned about.  Probes the build's overflow checks and installs the
-/// panic hook last.
-fn preflight(args: &Args, out: &str, usage: OutUse) -> Result<Preflight, Refusal> {
-    if cfg!(panic = "abort") {
-        return Err(config(
-            "built with panic = \"abort\": build with --profile soak (or soak-checked), whose \
-             panics unwind, so a panic in the code under test is recorded with its case",
-        ));
-    }
+/// Why an aborting build is refused: a panic in the code under test must
+/// unwind to be recorded with its case.
+const ABORTING_BUILD: &str = "built with panic = \"abort\": build with --profile soak (or \
+                              soak-checked), whose panics unwind, so a panic in the code \
+                              under test is recorded with its case";
+
+/// `--out`, checked for `usage`.
+struct OutDir {
+    /// The repository root, canonical.
+    root: PathBuf,
+    /// `--out`, absolute.
+    out: PathBuf,
+    /// How the binary's embedded source differs from the checkout's.
+    source_differs: Vec<String>,
+}
+
+/// `out` as `usage` may write into it, each problem a refusal (exit 2): a
+/// repository root that resolves, and an `out` outside it that `usage`
+/// may write into.  A binary built from another tree is only warned about.
+fn out_dir(out: &str, usage: OutUse) -> Result<OutDir, Refusal> {
     let root = repo_root().map_err(config)?;
     let cwd = std::env::current_dir().map_err(|e| config(format!("no current directory: {e}")))?;
     let out = PathBuf::from(out);
@@ -347,6 +375,7 @@ fn preflight(args: &Args, out: &str, usage: OutUse) -> Result<Preflight, Refusal
         let consequence = match usage {
             OutUse::Run | OutUse::Canary => "the run is not gate-eligible",
             OutUse::EmitCorpus => "the witness file may not match this checkout's generators",
+            OutUse::FuzzSeeds => "the seed inputs may not match this checkout's generators",
         };
         eprintln!(
             "sigsoak: warning: this binary was not built from the checkout at {} ({}); \
@@ -355,6 +384,26 @@ fn preflight(args: &Args, out: &str, usage: OutUse) -> Result<Preflight, Refusal
             source_differs.join(", ")
         );
     }
+    Ok(OutDir {
+        root,
+        out,
+        source_differs,
+    })
+}
+
+/// The checks `run`, `canary` and `emit-corpus` make before they start,
+/// each a refusal (exit 2): a build whose panics unwind, `out` as
+/// [`out_dir`] checks it, and an oracle that keeps the pin rule.  Probes
+/// the build's overflow checks and installs the panic hook last.
+fn preflight(args: &Args, out: &str, usage: OutUse) -> Result<Preflight, Refusal> {
+    if cfg!(panic = "abort") {
+        return Err(config(ABORTING_BUILD));
+    }
+    let OutDir {
+        root,
+        out,
+        source_differs,
+    } = out_dir(out, usage)?;
     let oracle = oracle_path(args)?;
     let build_info = oracle_build_info(&oracle)?;
     let pin = check_pin(&build_info);
@@ -639,6 +688,207 @@ fn cmd_emit_corpus(args: &Args) -> Outcome {
     Ok(ExitCode::SUCCESS)
 }
 
+const FUZZ_SEEDS_FLAGS: &[&str] = &["out", "seed", "cases"];
+
+/// `fuzz-seeds`: every signature fuzz target's seed inputs, one file each,
+/// in a directory per target; `dcrec_diff_ed25519`'s are written for
+/// `dcrec_ed25519_model` too, so each directory stands alone.
+fn cmd_fuzz_seeds(args: &Args) -> Outcome {
+    let out = args.require("out")?;
+    let master = match args.get("seed") {
+        Some(v) => parse_seed(v).ok_or_else(|| usage(format!("--seed {v:?} is not a hex seed")))?,
+        None => SEED_MASTER,
+    };
+    let cases: Option<u64> = args.number("cases")?;
+    if cases == Some(0) {
+        return Err(usage("--cases is at least 1"));
+    }
+    let out = out_dir(out, OutUse::FuzzSeeds)?.out;
+    println!("sigsoak: master seed {master:#018x}");
+    let mut total = 0usize;
+    for target in Target::ALL {
+        let mut names = vec![target.name()];
+        if target == Target::Ed25519 {
+            names.push(ED25519_MODEL_TARGET);
+        }
+        let dirs: Vec<PathBuf> = names.iter().map(|name| out.join(name)).collect();
+        for dir in &dirs {
+            std::fs::create_dir_all(dir)
+                .map_err(|e| config(format!("cannot create {}: {e}", dir.display())))?;
+        }
+        let mut written = 0usize;
+        for class in target.classes() {
+            for index in seed_indices(class, cases) {
+                let input = seed_input(class, master, index);
+                let file = format!("{}-{index}", class.name);
+                for dir in &dirs {
+                    let path = dir.join(&file);
+                    std::fs::write(&path, &input)
+                        .map_err(|e| config(format!("cannot write {}: {e}", path.display())))?;
+                }
+                written = written.saturating_add(1);
+            }
+        }
+        for name in &names {
+            eprintln!("  {name}: {written} inputs");
+        }
+        total = total.saturating_add(written.saturating_mul(names.len()));
+    }
+    eprintln!("sigsoak: wrote {total} inputs to {}", out.display());
+    Ok(ExitCode::SUCCESS)
+}
+
+/// The bytes `text` spells in hex, or `None` when it spells none.
+fn parse_hex(text: &str) -> Option<Vec<u8>> {
+    let text = text.trim();
+    (text.len().is_multiple_of(2) && text.bytes().all(|b| b.is_ascii_hexdigit()))
+        .then(|| unhex(text))
+}
+
+const FUZZ_REPLAY_FLAGS: &[&str] = &["target", "canary", "oracle", "hex"];
+
+/// The oracle at `path`, started and held to the pin, for `fuzz-replay`.
+fn start_fuzz_oracle(path: &Path) -> Result<FuzzOracle, String> {
+    let started = std::panic::catch_unwind(|| Oracle::spawn_at(path))
+        .map_err(|_| format!("the oracle {} did not start", path.display()))?;
+    FuzzOracle::new(started).map_err(|why| format!("{}: {why}", path.display()))
+}
+
+/// `fuzz-replay`: each input checked as its fuzz target checks it, with
+/// the target's report printed whatever the outcome.  dcroxide's panics
+/// unwind here, so each is reported with its input, and a panic anywhere
+/// else in the check (a generator's, say) is caught and reported too.  An
+/// oracle that fails on an input, by exiting or by a reply that breaks the
+/// protocol, may be gone or out of step with its pipe, so the inputs after
+/// that one go to a fresh oracle.
+fn cmd_fuzz_replay(args: &Args) -> Outcome {
+    if cfg!(panic = "abort") {
+        return Err(config(ABORTING_BUILD));
+    }
+    let name = args.require("target")?;
+    let target = match Target::find(name) {
+        Some(target) => Some(target),
+        None if name == ED25519_MODEL_TARGET => None,
+        None => {
+            let names: Vec<&str> = Target::ALL.iter().map(|t| t.name()).collect();
+            return Err(usage(format!(
+                "no fuzz target {name}: {}, or {ED25519_MODEL_TARGET}",
+                names.join(", ")
+            )));
+        }
+    };
+    let canary = args
+        .get("canary")
+        .map(|c| {
+            find_stand_in(c).ok_or_else(|| {
+                config(format!(
+                    "no canary {c} (sigsoak list --canaries prints them)"
+                ))
+            })
+        })
+        .transpose()?;
+    let inputs: Vec<(String, Vec<u8>)> = match (args.get("hex"), args.positional.as_slice()) {
+        (Some(text), []) => {
+            let data =
+                parse_hex(text).ok_or_else(|| usage(format!("--hex {text:?} is not hex")))?;
+            vec![("--hex".to_owned(), data)]
+        }
+        (None, files) if !files.is_empty() => files
+            .iter()
+            .map(|file| {
+                std::fs::read(file)
+                    .map(|data| (file.clone(), data))
+                    .map_err(|e| config(format!("cannot read {file}: {e}")))
+            })
+            .collect::<Result<_, _>>()?,
+        _ => {
+            return Err(usage(
+                "fuzz-replay takes input files or --hex HEX, not both",
+            ));
+        }
+    };
+    // The oracle, with the path it was started from.
+    let mut oracle = match target {
+        Some(_) => {
+            let path = oracle_path(args)?;
+            let oracle = start_fuzz_oracle(&path).map_err(config)?;
+            println!("sigsoak: {}", oracle.describe());
+            Some((path, oracle))
+        }
+        None => None,
+    };
+    install_panic_hook();
+    if let Some(canary) = &canary {
+        println!(
+            "canary {} answers in dcroxide's place on {}",
+            canary.name,
+            command_names(canary.commands)
+        );
+    }
+    let ours = run::ours_answerer(canary);
+    let mut failed = false;
+    for (at, (input, data)) in inputs.iter().enumerate() {
+        let report = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            match (target, oracle.as_mut()) {
+                (Some(target), Some((_, oracle))) => {
+                    fuzz::examine(target, data, &ours, &mut |request| oracle.answer(request))
+                }
+                _ => fuzz::examine_ed25519_model(data, &ours),
+            }
+        }));
+        let mut oracle_failed = false;
+        match report {
+            Ok(Some(report)) => {
+                println!("{input}:\n{report}");
+                failed |= !report.agreed();
+                oracle_failed = report.failures.iter().any(|f| {
+                    matches!(
+                        f.category,
+                        Category::OracleCrashed | Category::OracleHung | Category::Protocol
+                    )
+                });
+            }
+            Ok(None) => println!("{input}: its first byte reaches no class of {name}"),
+            Err(payload) => {
+                println!(
+                    "{input}: panicked: {}",
+                    run::panic_message(payload.as_ref())
+                );
+                failed = true;
+            }
+        }
+        let rest = inputs.len().saturating_sub(at).saturating_sub(1);
+        if let Some((path, failing)) = oracle.as_mut()
+            && oracle_failed
+            && rest > 0
+        {
+            match start_fuzz_oracle(path) {
+                Ok(fresh) => {
+                    *failing = fresh;
+                    println!("sigsoak: the oracle failed on {input}; a fresh one answers the rest");
+                }
+                Err(why) => {
+                    let unchecked = if rest == 1 {
+                        "the input after it was".to_owned()
+                    } else {
+                        format!("the {rest} inputs after it were")
+                    };
+                    println!(
+                        "sigsoak: the oracle failed on {input} and did not start again: {why}; \
+                         {unchecked} not checked"
+                    );
+                    break;
+                }
+            }
+        }
+    }
+    Ok(if failed {
+        ExitCode::from(1)
+    } else {
+        ExitCode::SUCCESS
+    })
+}
+
 fn cmd_replay(args: &Args) -> Outcome {
     let seed = args.require("seed")?;
     let seed =
@@ -664,23 +914,21 @@ fn cmd_replay(args: &Args) -> Outcome {
         );
     }
     for (j, request) in report.case.requests.iter().enumerate() {
-        println!("request {j}: {} {}", request.cmd.name(), hex(&request.data));
-        println!("  intent: {:?}", report.case.intents[j]);
-        let who = match &report.canary {
-            Some(canary) if canary.covers(request.cmd) => canary.name,
-            _ => "ours",
+        let lines = RequestLines {
+            j,
+            request,
+            intent: &report.case.intents[j],
+            checked: None,
+            ours_label: match &report.canary {
+                Some(canary) if canary.covers(request.cmd) => canary.name,
+                _ => "ours",
+            },
+            ours: report.ours.get(j),
+            theirs_label: "oracle",
+            theirs: report.replies.get(j),
+            model: report.model.per_request.get(j).copied().flatten(),
         };
-        match &report.ours[j] {
-            Ok(o) => println!("  {who}: {} ({:?})", o.answer.describe(), o.detail),
-            Err(message) => println!("  {who}: panic: {message}"),
-        }
-        match report.replies.get(j) {
-            Some(reply) => println!("  oracle: {}", reply.raw),
-            None => println!("  oracle: no answer"),
-        }
-        if let Some(Some(model)) = report.model.per_request.get(j) {
-            println!("  model: {model:?}");
-        }
+        println!("{lines}");
     }
     if let Some(fault) = &report.fault {
         println!("oracle fault: {fault}");
@@ -695,15 +943,7 @@ fn cmd_replay(args: &Args) -> Outcome {
         }
     );
     for failure in &report.result.failures {
-        println!(
-            "  {}{}: {}",
-            failure.category.name(),
-            failure
-                .request
-                .map(|j| format!(" (request {j})"))
-                .unwrap_or_default(),
-            failure.detail
-        );
+        println!("  {}", failure_line(failure));
     }
     println!("leaf {}", hex(&report.leaf));
     Ok(if report.result.failures.is_empty() {
@@ -1035,6 +1275,10 @@ fn main() -> ExitCode {
         .and_then(|a| cmd_compare(&a)),
         "list" => Args::parse(rest, &["canaries"], false).and_then(|a| cmd_list(&a)),
         "emit-corpus" => Args::parse(rest, EMIT_FLAGS, false).and_then(|a| cmd_emit_corpus(&a)),
+        "fuzz-seeds" => Args::parse(rest, FUZZ_SEEDS_FLAGS, false).and_then(|a| cmd_fuzz_seeds(&a)),
+        "fuzz-replay" => {
+            Args::parse(rest, FUZZ_REPLAY_FLAGS, true).and_then(|a| cmd_fuzz_replay(&a))
+        }
         "help" | "--help" | "-h" => {
             print!("{HELP}");
             Ok(ExitCode::SUCCESS)

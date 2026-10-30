@@ -550,11 +550,13 @@ work). Currently implemented:
   counterpart): generators for named input classes of all three signature
   types, public key parsing and compact recovery, built with their own
   curve arithmetic rather than the code under test, a pipelined client for
-  `tools/oracle`, and the `sigsoak` binary that runs the classes against
-  dcrd's own code at recorded volume, replays any case from its seed and
-  runs deliberately broken models to show the classes can fail, and emits
-  the witness vectors `dcroxide-dcrec` keeps; development only, never
-  published
+  `tools/oracle`, the entry the signature fuzz targets share, and the
+  `sigsoak` binary that runs the classes against dcrd's own code at
+  recorded volume, replays any case from its seed, runs deliberately
+  broken models to show the classes can fail, emits the witness vectors
+  `dcroxide-dcrec` keeps, and writes the fuzz targets' seed inputs
+  (`fuzz-seeds`) and replays a fuzz input without cargo-fuzz
+  (`fuzz-replay`); development only, never published
 - `dcroxide-bench` — the block replay harness (no dcrd counterpart):
   `export` writes the main chain of a stopped data directory to a
   bootstrap-format corpus, and `replay` drives that corpus back

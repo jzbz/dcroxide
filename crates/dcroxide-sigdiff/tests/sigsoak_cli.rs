@@ -6,15 +6,19 @@
 //! inside the repository or when it holds files.  A canary run writes its
 //! record beside a run's, each disagreement it records replays with its
 //! canary, `emit-corpus` writes the witness file `dcroxide-dcrec` keeps,
-//! a copy of the binary records its own build wherever it lies, and `list`
-//! ends quietly when its reader goes away.
+//! `fuzz-seeds` writes the signature fuzz targets' seed inputs and
+//! `fuzz-replay` replays them, starting the oracle again after one that
+//! fails, a copy of the binary records its own build wherever it lies, and
+//! `list` ends quietly when its reader goes away.
 
 use std::path::Path;
 use std::process::{Command, Stdio};
 
 use dcroxide_sigdiff::canary::{CANARIES, CANARY_BOUND};
-use dcroxide_sigdiff::class::{CLASSES, Family};
+use dcroxide_sigdiff::class::{CLASSES, Family, find_class};
 use dcroxide_sigdiff::digest::class_digest;
+use dcroxide_sigdiff::fuzz::{ED25519_MODEL_TARGET, SEED_MASTER, Target, seed_input};
+use dcroxide_sigdiff::run::{Mode, class_indices};
 use dcroxide_sigdiff::witness::{FILE_NAME, vector_lines};
 use dcroxide_testutil::{TempDir, hex, oracle_bin_or_skip, unhex};
 
@@ -459,6 +463,295 @@ fn emit_corpus_writes_the_witness_file() {
     assert!(!inside.exists());
 }
 
+/// `fuzz-seeds` writes a directory per signature fuzz target, holding the
+/// seed input of every case the per-PR plan takes at its count, each the
+/// bytes `seed_input` gives under the seed it is given and named by its
+/// case index; it needs no oracle, and refuses a directory that holds
+/// files or lies inside the repository.
+#[test]
+fn fuzz_seeds_writes_each_targets_inputs() {
+    let dir = TempDir::new("sigsoak-fuzz-seeds");
+    let out = dir.path().join("seeds");
+    let out_arg = out.display().to_string();
+    let (code, text) = sigsoak(&["fuzz-seeds", "--out", &out_arg, "--cases", "2"]);
+    assert_eq!(code, 0, "{text}");
+    assert!(
+        text.contains("sigsoak: master seed 0x66757a7a73656564"),
+        "{text}"
+    );
+    let planned = |target: Target| -> usize {
+        target
+            .classes()
+            .map(|c| class_indices(c, Mode::PerPr { cases: Some(2) }).count())
+            .sum()
+    };
+    let mut targets: Vec<(&str, usize)> = Target::ALL
+        .iter()
+        .map(|t| (t.name(), planned(*t)))
+        .collect();
+    targets.push((ED25519_MODEL_TARGET, planned(Target::Ed25519)));
+    for (name, want) in &targets {
+        let files = std::fs::read_dir(out.join(name))
+            .unwrap_or_else(|e| panic!("{name}: {e}"))
+            .count();
+        assert_eq!(files, *want, "{name}");
+    }
+    assert_eq!(
+        targets.iter().map(|(_, n)| *n).collect::<Vec<_>>(),
+        [52, 24, 93, 32, 333, 333]
+    );
+    assert_eq!(std::fs::read_dir(&out).expect("read").count(), 6);
+    let k_length = find_class("K-length").expect("registered");
+    for name in [
+        "dcrec_diff_pubkey/K-length-0",
+        "dcrec_diff_pubkey/K-length-70",
+    ] {
+        let index = name.rsplit('-').next().and_then(|i| i.parse().ok());
+        let want = seed_input(k_length, SEED_MASTER, index.expect("an index"));
+        assert_eq!(std::fs::read(out.join(name)).expect("read"), want, "{name}");
+    }
+    assert_eq!(
+        std::fs::read(out.join("dcrec_ed25519_model/DV-torsion-5")).expect("read"),
+        std::fs::read(out.join("dcrec_diff_ed25519/DV-torsion-5")).expect("read")
+    );
+    // A large finite class is taken at a stride, so its second file is
+    // named by the case index, not by its place in the list.
+    let k_small_x = find_class("K-smallX").expect("registered");
+    let second = class_indices(k_small_x, Mode::PerPr { cases: Some(2) })
+        .nth(1)
+        .expect("two cases");
+    assert_ne!(second, 1, "K-smallX is taken at a stride");
+    assert_eq!(
+        std::fs::read(out.join(format!("dcrec_diff_pubkey/K-smallX-{second}"))).expect("read"),
+        seed_input(k_small_x, SEED_MASTER, second)
+    );
+    // --seed names the master seed the inputs regenerate under.
+    let other = dir.path().join("other");
+    let (code, text) = sigsoak(&[
+        "fuzz-seeds",
+        "--out",
+        &other.display().to_string(),
+        "--seed",
+        "0x1",
+        "--cases",
+        "1",
+    ]);
+    assert_eq!(code, 0, "{text}");
+    assert!(
+        text.contains("sigsoak: master seed 0x0000000000000001"),
+        "{text}"
+    );
+    let honest = find_class("EV-honest").expect("registered");
+    let at_one = std::fs::read(other.join("dcrec_diff_ecdsa/EV-honest-0")).expect("read");
+    assert_eq!(at_one, seed_input(honest, 1, 0));
+    assert_ne!(
+        at_one,
+        std::fs::read(out.join("dcrec_diff_ecdsa/EV-honest-0")).expect("read")
+    );
+
+    let (code, text) = sigsoak(&["fuzz-seeds", "--out", &out_arg, "--cases", "2"]);
+    assert_eq!(code, 2, "the directory holds the seeds:\n{text}");
+    assert!(text.contains("is not empty"), "{text}");
+    let inside = Path::new(env!("CARGO_MANIFEST_DIR")).join("sigsoak-seeds-out");
+    let inside_arg = inside.display().to_string();
+    let (code, text) = sigsoak(&["fuzz-seeds", "--out", &inside_arg]);
+    assert_eq!(code, 2, "{text}");
+    assert!(text.contains("inside the repository"), "{text}");
+    assert!(!inside.exists());
+}
+
+/// `fuzz-replay` checks an input as its target does and prints the report:
+/// a seed input of each oracle-backed target agrees; a canary standing in
+/// for dcroxide fails one; the model target needs no oracle, agrees over
+/// DV-torsion's 128 cases and fails where a canary negates the scalar;
+/// and `--hex` replays the same bytes as the file.
+#[test]
+fn fuzz_replay_replays_inputs() {
+    let Some(oracle) = oracle_bin_or_skip() else {
+        return;
+    };
+    let oracle = oracle.display().to_string();
+    let dir = TempDir::new("sigsoak-fuzz-replay");
+    let seeds = dir.path().join("seeds");
+    let (code, text) = sigsoak(&[
+        "fuzz-seeds",
+        "--out",
+        &seeds.display().to_string(),
+        "--cases",
+        "1",
+    ]);
+    assert_eq!(code, 0, "{text}");
+    let file = |target: &str, name: &str| seeds.join(target).join(name).display().to_string();
+    let replay = |target: &str, extra: &[&str]| {
+        let mut args = vec!["fuzz-replay", "--target", target, "--oracle", &oracle];
+        args.extend(extra);
+        sigsoak(&args)
+    };
+    for target in Target::ALL {
+        let class = target.classes().next().expect("a class");
+        let input = file(target.name(), &format!("{}-0", class.name));
+        let (code, text) = replay(target.name(), &[&input]);
+        assert_eq!(code, 0, "{text}");
+        assert!(
+            text.contains(&format!(
+                "{}: {} case 0x0000000000000000",
+                target.name(),
+                class.name
+            )),
+            "{text}"
+        );
+        assert!(text.contains("dcroxide and dcrd agree"), "{text}");
+    }
+
+    let xgen = file("dcrec_diff_ecdsa", "EV-xGEN-true-0");
+    let (code, text) = replay(
+        "dcrec_diff_ecdsa",
+        &["--canary", "ecdsa-verify-no-rplusn", &xgen],
+    );
+    assert_eq!(code, 1, "{text}");
+    assert!(text.contains("dcroxide and dcrd disagree"), "{text}");
+
+    let (code, from_file) = replay("dcrec_diff_ecdsa", &[&xgen]);
+    assert_eq!(code, 0, "{from_file}");
+    let bytes = std::fs::read(&xgen).expect("read");
+    let (code, from_hex) = replay("dcrec_diff_ecdsa", &["--hex", &hex(&bytes)]);
+    assert_eq!(code, 0, "{from_hex}");
+    assert_eq!(from_file.replace(&xgen, "--hex"), from_hex);
+
+    // The model target asks no oracle: one that cannot be found is no
+    // obstacle.
+    let torsion: Vec<String> = (0..128)
+        .map(|i| file(ED25519_MODEL_TARGET, &format!("DV-torsion-{i}")))
+        .collect();
+    let model = |extra: &[&str]| {
+        let out = Command::new(env!("CARGO_BIN_EXE_sigsoak"))
+            .args(["fuzz-replay", "--target", ED25519_MODEL_TARGET])
+            .args(extra)
+            .args(&torsion)
+            .env("DCROXIDE_ORACLE_BIN", "/nonexistent/dcrd-oracle")
+            .env("PATH", dir.path())
+            .output()
+            .expect("run sigsoak");
+        let text = String::from_utf8_lossy(&out.stdout).into_owned();
+        (out.status.code().unwrap_or(-1), text)
+    };
+    let (code, text) = model(&[]);
+    assert_eq!(code, 0, "{text}");
+    assert_eq!(
+        text.matches("dcroxide and the model of dcrd's Ed25519 agree")
+            .count(),
+        128
+    );
+    let (code, text) = model(&["--canary", "ed25519-scalar-negation"]);
+    assert_eq!(code, 1, "{text}");
+    let differ = text
+        .matches("dcroxide and the model of dcrd's Ed25519 (src/model/ed25519.rs, frozen) disagree")
+        .count();
+    assert_eq!(differ, 48, "{text}");
+}
+
+/// `fuzz-replay` starts the oracle again after one that fails on an input.
+/// A stand-in at `--oracle` answers `build_info` through the real oracle,
+/// then exits on the next request, or answers it with a line that is no
+/// reply, and so fails the first input; started again, it is the real
+/// oracle, which answers the second.
+#[cfg(unix)]
+#[test]
+fn fuzz_replay_restarts_an_oracle_that_fails() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let Some(oracle) = oracle_bin_or_skip() else {
+        return;
+    };
+    let dir = TempDir::new("sigsoak-fuzz-replay-restarts");
+    let seeds = dir.path().join("seeds");
+    let (code, text) = sigsoak(&[
+        "fuzz-seeds",
+        "--out",
+        &seeds.display().to_string(),
+        "--cases",
+        "1",
+    ]);
+    assert_eq!(code, 0, "{text}");
+    let ecdsa = seeds.join("dcrec_diff_ecdsa");
+    let first = ecdsa.join("EV-honest-0").display().to_string();
+    let second = ecdsa.join("EV-highS-0").display().to_string();
+    for (name, then, failure) in [
+        (
+            "dies",
+            "read -r line\nexit 2\n",
+            "oracle-crashed on request 0: the oracle closed its output without answering; \
+             the oracle exited (exit status: 2)",
+        ),
+        (
+            "garbles",
+            "read -r line\necho garbage\nexec cat > /dev/null\n",
+            "protocol on request 0: not JSON",
+        ),
+    ] {
+        let stand_in = dir.path().join(name);
+        let script = format!(
+            "#!/bin/sh\n\
+             if [ -e \"$STAND_IN_STARTED\" ]; then exec \"$STAND_IN_ORACLE\"; fi\n\
+             : > \"$STAND_IN_STARTED\"\n\
+             read -r line && printf '%s\\n' \"$line\" | \"$STAND_IN_ORACLE\"\n\
+             {then}"
+        );
+        // `--oracle` takes a path, so the stand-in is a file. `sh` writes
+        // it, not this process, so that sigsoak never meets a file another
+        // thread's fork still holds open for writing.
+        let wrote = Command::new("sh")
+            .args(["-c", "printf '%s' \"$2\" > \"$1\"", "sh"])
+            .arg(&stand_in)
+            .arg(&script)
+            .status()
+            .expect("run sh");
+        assert!(
+            wrote.success(),
+            "{name}: sh did not write the stand-in: {wrote}"
+        );
+        std::fs::set_permissions(&stand_in, std::fs::Permissions::from_mode(0o755))
+            .expect("make the stand-in executable");
+        let started = dir.path().join(format!("{name}.started"));
+        let out = Command::new(env!("CARGO_BIN_EXE_sigsoak"))
+            .args(["fuzz-replay", "--target", "dcrec_diff_ecdsa", "--oracle"])
+            .arg(&stand_in)
+            .args([&first, &second])
+            .env("STAND_IN_ORACLE", &oracle)
+            .env("STAND_IN_STARTED", &started)
+            .output()
+            .expect("run sigsoak");
+        let text = String::from_utf8_lossy(&out.stdout).into_owned();
+        assert_eq!(out.status.code(), Some(1), "{name}:\n{text}");
+        let report = |input: &str| {
+            let mut lines = text.lines().skip_while(|l| *l != format!("{input}:"));
+            let headline = lines
+                .nth(1)
+                .unwrap_or_else(|| panic!("{name}: no report of {input}:\n{text}"));
+            (headline, lines.next().unwrap_or_default())
+        };
+        let (headline, line) = report(&first);
+        assert!(
+            headline.starts_with("dcrec_diff_ecdsa: EV-honest case 0x0000000000000000")
+                && headline.ends_with(": the oracle failed")
+                && line.trim_start().starts_with(failure),
+            "{name}:\n{text}"
+        );
+        assert!(
+            text.contains(&format!(
+                "sigsoak: the oracle failed on {first}; a fresh one answers the rest"
+            )),
+            "{name}:\n{text}"
+        );
+        let (headline, _) = report(&second);
+        assert!(
+            headline.starts_with("dcrec_diff_ecdsa: EV-highS case 0x0000000000000000")
+                && headline.ends_with(": dcroxide and dcrd agree"),
+            "{name}:\n{text}"
+        );
+    }
+}
+
 /// Whether this test binary computes with overflow checks, probed as
 /// sigsoak probes its own: the same profile builds both.
 fn overflow_checks() -> bool {
@@ -551,6 +844,8 @@ fn usage() {
     assert!(text.contains("sigsoak run --out DIR"), "{text}");
     assert!(text.contains("sigsoak canary --out DIR"), "{text}");
     assert!(text.contains("sigsoak emit-corpus --out DIR"), "{text}");
+    assert!(text.contains("sigsoak fuzz-seeds --out DIR"), "{text}");
+    assert!(text.contains("sigsoak fuzz-replay --target NAME"), "{text}");
     let (code, text) = sigsoak(&["list"]);
     assert_eq!(code, 0);
     for class in CLASSES {
@@ -597,6 +892,50 @@ fn usage() {
         vec!["emit-corpus"],
         vec!["emit-corpus", "--out", "/nowhere", "--seed", "zz"],
         vec!["emit-corpus", "--out", "/nowhere", "--cases", "1"],
+        vec!["fuzz-seeds"],
+        vec!["fuzz-seeds", "--out", "/nowhere", "--cases", "0"],
+        vec!["fuzz-seeds", "--out", "/nowhere", "--seed", "zz"],
+        vec!["fuzz-seeds", "--out", "/nowhere", "extra"],
+        vec!["fuzz-replay", "--hex", "00"],
+        vec!["fuzz-replay", "--target", "dcrec_nothing", "--hex", "00"],
+        vec!["fuzz-replay", "--target", "dcrec_ed25519_model"],
+        vec![
+            "fuzz-replay",
+            "--target",
+            "dcrec_ed25519_model",
+            "--hex",
+            "0g",
+        ],
+        vec![
+            "fuzz-replay",
+            "--target",
+            "dcrec_ed25519_model",
+            "--hex",
+            "000",
+        ],
+        vec![
+            "fuzz-replay",
+            "--target",
+            "dcrec_ed25519_model",
+            "--hex",
+            "00",
+            "f",
+        ],
+        vec![
+            "fuzz-replay",
+            "--target",
+            "dcrec_ed25519_model",
+            "--canary",
+            "C99",
+            "--hex",
+            "00",
+        ],
+        vec![
+            "fuzz-replay",
+            "--target",
+            "dcrec_ed25519_model",
+            "/nowhere/crash",
+        ],
     ] {
         let (code, text) = sigsoak(&args);
         assert_eq!(code, 2, "{args:?}:\n{text}");

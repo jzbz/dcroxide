@@ -50,7 +50,7 @@ check, docs, deny and fuzzing. No job builds the workspace's `release` or
 `codegen-units = 1`, `panic = "abort"`) has never been compiled in CI.
 Every timed sync ran on x86_64 machines (m1 to m3,
 `docs/bench-ledger.md:28-30`), none on Windows or macOS
-(`README.md:723-724`), and none on aarch64 of any OS. Ecosystem acceptance
+(`README.md:725-726`), and none on aarch64 of any OS. Ecosystem acceptance
 has been run once, on x86_64 Linux, without Decrediton's IPC lifecycle or
 config, IPC and service parity on Windows and macOS (the brief's status
 block), so the exit criterion that Decrediton launches, supervises and
@@ -334,10 +334,10 @@ recorded divergence in PARITY.md.
   distribution whose packaged rustc lags the pin cannot build the node
   with it.
 - Each promotion needs a sync timed on that architecture and OS, and none
-  has been timed on aarch64, Windows or macOS (`README.md:723-724`,
+  has been timed on aarch64, Windows or macOS (`README.md:725-726`,
   `docs/bench-ledger.md:28-30`): it needs such a machine, or a CI runner
   with room for a mainnet data directory, a median of 27.93 GiB after the
-  syncs of 2026-10-17 (`README.md:735-737`). Runner disk sizes were not
+  syncs of 2026-10-17 (`README.md:737-739`). Runner disk sizes were not
   checked.
 - Each release costs an LTO build per target off GitHub and two signatures
   by hand, and checking both the tag and the binaries takes two keys.

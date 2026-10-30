@@ -392,6 +392,8 @@ pub enum OutUse {
     Canary,
     /// `emit-corpus`: the directory may exist only empty.
     EmitCorpus,
+    /// `fuzz-seeds`: the directory may exist only empty.
+    FuzzSeeds,
 }
 
 /// Why `out` (taken relative to `cwd`) may not receive a run's files, or
@@ -485,7 +487,7 @@ pub fn out_dir_problem(out: &Path, cwd: &Path, repo_root: &Path, usage: OutUse) 
                 Some(Err(e)) => Some(e),
             }
         }
-        OutUse::EmitCorpus => match entries(&resolved) {
+        OutUse::EmitCorpus | OutUse::FuzzSeeds => match entries(&resolved) {
             Ok(list) if list.is_empty() => None,
             Ok(_) => Some(format!("{} is not empty", resolved.display())),
             Err(e) => Some(e),
@@ -789,6 +791,7 @@ mod tests {
         std::fs::write(outside.path().join("canary").join("summary.tsv"), b"x").expect("write");
         assert!(problem(outside.path(), &repo, OutUse::Canary).is_some());
         assert!(problem(outside.path(), &repo, OutUse::EmitCorpus).is_some());
+        assert!(problem(outside.path(), &repo, OutUse::FuzzSeeds).is_some());
         std::fs::write(outside.path().join("summary.txt"), b"x").expect("write");
         assert!(problem(outside.path(), &repo, OutUse::Run).is_some());
         assert!(problem(&outside.path().join("summary.txt"), &repo, OutUse::Run).is_some());
