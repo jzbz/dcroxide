@@ -105,9 +105,9 @@ That rustc needs its linker given is a constraint the enforcement below
 inherits.
 
 ADR-0006 put ECDSA on libsecp "for verification performance"
-(`0006-secp256k1-backend.md:25-26`), accepted two secp256k1 arithmetic
-stacks (`:41-43`), and gated its ratification on a differential soak that
-was never run (`:47-48`, and its addenda). The rule overrides the first,
+(`0006-secp256k1-backend.md:26-27`), accepted two secp256k1 arithmetic
+stacks (`:42-44`), and gated its ratification on a differential soak that
+was never run (`:48-49`, and its addenda). The rule overrides the first,
 ends the second, and keeps the third as a gate.
 
 ## Decision

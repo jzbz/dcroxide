@@ -7,8 +7,11 @@
 //! - [`FROZEN`]: everything that decides a case's inputs, dcrd's
 //!   normalized answer, the comparison, the status and the digest leaf, and
 //!   the canaries that stand in for dcroxide.
-//!   These do not change between the baseline soak and the gate soak, and
-//!   [`fingerprint`] is a digest of them.
+//!   These do not change between the baseline soak and the gate soak, save
+//!   a fix confined to `src/model/` that leaves every class's digest as it
+//!   was (ADR-0006's 2026-10-30 addendum).  [`fingerprint`] is a digest of
+//!   them, and [`frozen_hashes`] gives each its own hash, so that two runs'
+//!   records show which of them differ.
 //! - [`ADAPTER`]: `src/ours.rs`, which reaches the code under test and
 //!   changes as its API grows.
 //! - [`PLUMBING`]: modules that decide no soak case's input, answer,
@@ -118,6 +121,39 @@ fn fingerprint_of(files: &[Source]) -> [u8; 32] {
         );
         h.update(file.bytes);
     }
+    h.finalize()
+}
+
+/// Each [`FROZEN`] file's own hash, in byte order of its path: BLAKE-256
+/// over `"sigdiff-source-1"` followed by the file's part of
+/// [`fingerprint`]'s input, `u16be(len path) ‖ path ‖ u32be(len bytes) ‖
+/// bytes`.  A run's manifest records them beside the fingerprint, so that
+/// two runs' records name the frozen files that differ between their
+/// binaries, which the fingerprint alone cannot.
+pub fn frozen_hashes() -> Vec<(&'static str, [u8; 32])> {
+    let mut hashes: Vec<(&'static str, [u8; 32])> = FROZEN
+        .iter()
+        .map(|file| (file.path, source_hash(file.path, file.bytes)))
+        .collect();
+    hashes.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+    hashes
+}
+
+fn source_hash(path: &str, bytes: &[u8]) -> [u8; 32] {
+    let mut h = Blake256::new();
+    h.update(b"sigdiff-source-1");
+    h.update(
+        &u16::try_from(path.len())
+            .expect("a short path")
+            .to_be_bytes(),
+    );
+    h.update(path.as_bytes());
+    h.update(
+        &u32::try_from(bytes.len())
+            .expect("a source under 4 GiB")
+            .to_be_bytes(),
+    );
+    h.update(bytes);
     h.finalize()
 }
 
@@ -262,5 +298,37 @@ mod tests {
         let reversed: Vec<Source> = FROZEN.iter().rev().copied().collect();
         assert_eq!(fingerprint_of(&reversed), fingerprint());
         assert_ne!(fingerprint_of(&FROZEN[1..]), fingerprint());
+    }
+
+    /// Each frozen file has one hash, in path order, the documented digest
+    /// of its path and its bytes on disk, and no two are equal; a hash
+    /// moves with a byte of its file and with its path.
+    #[test]
+    fn each_frozen_file_has_its_own_hash() {
+        let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let hashes = frozen_hashes();
+        let paths: Vec<&str> = hashes.iter().map(|(path, _)| *path).collect();
+        let mut want: Vec<&str> = FROZEN.iter().map(|f| f.path).collect();
+        want.sort_unstable();
+        assert_eq!(paths, want);
+        for (path, hash) in &hashes {
+            let bytes = std::fs::read(crate_dir.join(path)).expect("read a frozen file");
+            let mut h = Blake256::new();
+            h.update(b"sigdiff-source-1");
+            h.update(&u16::try_from(path.len()).expect("short").to_be_bytes());
+            h.update(path.as_bytes());
+            h.update(&u32::try_from(bytes.len()).expect("small").to_be_bytes());
+            h.update(&bytes);
+            assert_eq!(*hash, h.finalize(), "{path}");
+        }
+        let distinct: BTreeSet<[u8; 32]> = hashes.iter().map(|(_, hash)| *hash).collect();
+        assert_eq!(distinct.len(), hashes.len());
+
+        let file = FROZEN[0];
+        let own = source_hash(file.path, file.bytes);
+        let mut edited = file.bytes.to_vec();
+        edited[0] ^= 1;
+        assert_ne!(source_hash(file.path, &edited), own);
+        assert_ne!(source_hash("src/model/moved.rs", file.bytes), own);
     }
 }

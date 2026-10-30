@@ -17,8 +17,9 @@ use dcroxide_sigdiff::fuzz::{
     self, ED25519_MODEL_TARGET, FuzzOracle, SEED_MASTER, Target, seed_indices, seed_input,
 };
 use dcroxide_sigdiff::manifest::{
-    Build, CARGO_LOCK, LOCKED_CRATES, PinCheck, SCHEMA, check_pin, crate_dir, gate_eligible,
-    git_state, lock_versions, oracle_json, platform, repo_root, rustc_vv, unix_now, utc,
+    Build, CARGO_LOCK, LOCKED_CRATES, MODEL_DIR, PinCheck, SCHEMA, check_pin, crate_dir,
+    frozen_sources_json, gate_eligible, git_state, lock_versions, model_only_change, oracle_json,
+    platform, repo_root, rustc_vv, unix_now, utc,
 };
 use dcroxide_sigdiff::pipe::{OraclePipe, Payload, PipeConfig, PipeFailure};
 use dcroxide_sigdiff::record::{
@@ -68,10 +69,15 @@ usage:
       requests, intents, both answers, the comparison and the digest leaf.
       --canary stands a canary (or model-baseline) in for dcroxide.
   sigsoak compare [--replay] [--exploratory] [--allow-subset]
-              [--allow-fingerprint-change] [--allow-pin-change] DIR_A DIR_B
+              [--allow-fingerprint-change | --allow-model-change]
+              [--allow-pin-change] DIR_A DIR_B
       Hold two runs' digests against each other; a class either run
       completed no case of compares nothing and fails.  --replay: DIR_B is
       a shorter run with DIR_A's seed, compared at DIR_A's checkpoints.
+      --allow-fingerprint-change accepts any two generator fingerprints;
+      --allow-model-change accepts two only when every frozen file that
+      differs, by the hashes both manifests record, lies under src/model/,
+      and takes neither --replay nor --allow-subset.
   sigsoak list [--canaries]
       Print every class, or every canary with its primary and footprint.
   sigsoak emit-corpus --out DIR [--seed HEX] [--oracle PATH]
@@ -132,12 +138,13 @@ fn config(message: impl Into<String>) -> Refusal {
 }
 
 /// Flags that take no value.
-const BOOL_FLAGS: [&str; 7] = [
+const BOOL_FLAGS: [&str; 8] = [
     "floors",
     "replay",
     "exploratory",
     "allow-subset",
     "allow-fingerprint-change",
+    "allow-model-change",
     "allow-pin-change",
     "canaries",
 ];
@@ -455,6 +462,7 @@ fn base_manifest(
         "tool": {
             "crate_version": env!("CARGO_PKG_VERSION"),
             "generator_fingerprint": hex(&fingerprint()),
+            "frozen_sources": frozen_sources_json(),
             "source_matches_checkout": pre.source_differs.is_empty(),
             "source_differs": pre.source_differs,
         },
@@ -1028,10 +1036,23 @@ fn cmd_compare(args: &Args) -> Outcome {
     let exploratory = args.flag("exploratory")?;
     let allow_subset = args.flag("allow-subset")?;
     let allow_fingerprint = args.flag("allow-fingerprint-change")?;
+    let allow_model = args.flag("allow-model-change")?;
     let allow_pin = args.flag("allow-pin-change")?;
     let [dir_a, dir_b] = &args.positional[..] else {
         return Err(usage("compare takes two run directories"));
     };
+    if allow_model && allow_fingerprint {
+        return Err(usage(
+            "--allow-model-change and --allow-fingerprint-change exclude each other: the first \
+             accepts frozen files that differ only under src/model/, the second any",
+        ));
+    }
+    if allow_model && (replay || allow_subset) {
+        return Err(usage(
+            "--allow-model-change compares whole runs at equal counts, not with --replay or \
+             --allow-subset",
+        ));
+    }
     let a = RunRecord::read(Path::new(dir_a))?;
     let b = RunRecord::read(Path::new(dir_b))?;
     let mut failures: Vec<String> = Vec::new();
@@ -1069,15 +1090,30 @@ fn cmd_compare(args: &Args) -> Outcome {
         }
     }
     let fp = |r: &RunRecord| r.manifest["tool"]["generator_fingerprint"].clone();
+    // The frozen files that differ, all under src/model/, when
+    // --allow-model-change accepted the difference.
+    let mut model_files: Vec<String> = Vec::new();
     if fp(&a) != fp(&b) {
+        let differ = format!("generator fingerprints differ: {} and {}", fp(&a), fp(&b));
         if allow_fingerprint {
             relaxations.push("--allow-fingerprint-change");
+        } else if allow_model {
+            match model_only_change((dir_a, &a.manifest), (dir_b, &b.manifest)) {
+                Ok(files) => {
+                    relaxations.push("--allow-model-change");
+                    model_files = files;
+                }
+                Err(problems) => {
+                    failures.push(differ);
+                    failures.extend(
+                        problems
+                            .into_iter()
+                            .map(|p| format!("--allow-model-change: {p}")),
+                    );
+                }
+            }
         } else {
-            failures.push(format!(
-                "generator fingerprints differ: {} and {}",
-                fp(&a),
-                fp(&b)
-            ));
+            failures.push(differ);
         }
     }
     if a.modules() != b.modules() {
@@ -1144,6 +1180,12 @@ fn cmd_compare(args: &Args) -> Outcome {
             fp(r),
             r.manifest["selection"],
             r.manifest["status"]
+        );
+    }
+    if !model_files.is_empty() {
+        println!(
+            "frozen files that differ, all under {MODEL_DIR}: {}",
+            model_files.join(", ")
         );
     }
     for failure in &failures {
@@ -1285,6 +1327,7 @@ fn main() -> ExitCode {
                 "exploratory",
                 "allow-subset",
                 "allow-fingerprint-change",
+                "allow-model-change",
                 "allow-pin-change",
             ],
             true,

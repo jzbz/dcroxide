@@ -44,7 +44,13 @@
 //! case's inputs, dcrd's normalized answer, the comparison, the status and
 //! the digest, and the canaries.  [`fingerprint::fingerprint`] is a digest
 //! of exactly those files as they were compiled into the binary, so two
-//! runs whose fingerprints differ are refused as a comparison.  The adapter
+//! runs whose fingerprints differ are refused as a comparison unless a flag
+//! says otherwise: `--allow-fingerprint-change` accepts any difference, for
+//! exploratory comparisons, and `--allow-model-change`, the one a gate
+//! comparison may use, accepts runs whose frozen files differ only under
+//! `src/model/`, by the per-file hashes their manifests record
+//! ([`manifest::model_only_change`]), still requiring every class's digest
+//! to be equal (ADR-0006's 2026-10-30 addendum).  The adapter
 //! (`src/ours.rs`) and the plumbing ([`fingerprint::PLUMBING`]) may change,
 //! since none of them can change a soak case's input, its answers as
 //! compared, its status or a digest.  The fuzz entry decides those things

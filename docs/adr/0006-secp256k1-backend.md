@@ -8,7 +8,8 @@
 - **Date:** 2026-07-03 (proposed), 2026-07-26 (addendum: the split held),
   2026-10-26 (addendum: ECDSA and key handling to move to `k256`; a superseding
   ADR pending; second addendum: how the soak is run and compared), 2026-10-27
-  (addendum: the oracle-backed fuzz targets and the nightly soak)
+  (addendum: the oracle-backed fuzz targets and the nightly soak), 2026-10-30
+  (addendum: a fix to the soak's model of dcrd between the soaks)
 
 ## Context
 
@@ -484,3 +485,59 @@ nights after it are compared with. The x86_64 leg also runs the canaries at the
 soak's volume. Every night's records are kept for 90 days. None of these runs is
 gate-eligible: they are regression evidence, and the soak that gates the port is
 still the one run on the project owner's go.
+
+## Addendum, 2026-10-30 — a fix to the soak's model of dcrd between the soaks
+
+The design of the oracle-backed fuzz targets and the nightly soak, the
+2026-10-27 addendum's subject, left one question to the project owner: what
+follows when fuzzing finds a bug in the soak's Go-free model of dcrd
+(`crates/dcroxide-sigdiff/src/model/`) after the baseline soak has run and
+before the gate soak. A model file is frozen, so item 1 of the second 2026-10-26
+addendum has the baseline run again. Of the three ways the design gave (run the
+baseline again; leave the bug until after the gate soak; or compare the gate
+soak, with the fix, with the original baseline), the owner chose the third on
+2026-10-30, with the three conditions recommended with it:
+
+1. **Model-only changes.** It applies only when every frozen file that differs
+   between the baseline's commit and the gate soak's lies under `src/model/`.
+   Any other frozen file that differs means the baseline is run again.
+2. **An exact match.** The gate soak runs at the baseline's seeds and counts,
+   and every class's digest equals the baseline's. A partial match does not
+   count.
+3. **A record.** The fix lands with the fuzz input that found it, shrunk to a
+   small test, and the comparison's output, with its line naming the
+   relaxation, is kept with the gate soak's record and noted in this ADR.
+
+In a soak run the model's view of a case is consulted only by two of the
+comparison's intent checks, those of the ECDSA branch and the EC-Schnorr-DCRv0
+reason a case was built for, never by the checks of dcroxide's answer against
+dcrd's (verdict, value, flag, error kind, text). The generators also build from
+`src/model/`: the recovery classes derive their compact signatures' header
+bytes, and some of their intents, from four constants of `src/model/ecdsa.rs`,
+and some ECDSA verification classes' intents are steps of the branch type that
+`src/model/mod.rs` defines. A change under `src/model/` can therefore alter a
+case's request bytes or intents as well as the model's view. A digest leaf
+covers a case's request bytes, dcrd's canonical answers and the case's status,
+and the status includes every intent check: a change that alters any soak case's
+requests or result changes its class's digest, and so equal digests leave a
+second baseline nothing to find.
+
+`sigsoak` gains what checks condition 1 from the two runs' records. Every
+manifest a run or a canary run writes holds, beside the generator fingerprint,
+each frozen file's own hash (`tool.frozen_sources`), and
+`sigsoak compare --allow-model-change` accepts two runs whose fingerprints
+differ only when both manifests hold the list and every frozen file that
+differs, by hash or by being in one list only, lies under `src/model/`;
+otherwise it fails, naming each file outside it or the run without a list. The
+comparison's verdict line names the relaxation. Every other check stays, equal
+final digests for every class among them, and the flag is refused beside
+`--replay` and `--allow-subset`, which compare only part of a run.
+`--allow-fingerprint-change`, which accepts any two fingerprints, is unchanged
+and serves exploratory comparisons. The recommendation the owner accepted named
+it for the comparison with the baseline; this record reads condition 1 as
+checked by the narrower `--allow-model-change`, so of the two fingerprint flags
+the gate soak's comparison with the baseline uses only that one, while
+`--allow-pin-change` stays available under item 5 of the second 2026-10-26
+addendum. `sigsoak compare` does not enforce the choice, but the kept output's
+verdict line (condition 3) names the flag used. No baseline soak has been run,
+so the baseline's record will hold the list.

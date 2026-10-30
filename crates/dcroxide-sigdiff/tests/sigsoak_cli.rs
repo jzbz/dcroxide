@@ -5,19 +5,24 @@
 //! difference, a run that completes nothing fails, `--out` is refused
 //! inside the repository or when it holds files, and `--min-scale` judges a
 //! budget run's floors at its share, as the nightly soak in CI has it do.
-//! A canary run writes its record beside a run's, each disagreement it
-//! records replays with its canary, `emit-corpus` writes the witness file
-//! `dcroxide-dcrec` keeps, `fuzz-seeds` writes the signature fuzz targets'
-//! seed inputs and `fuzz-replay` replays them, starting the oracle again
-//! after one that fails, a copy of the binary records its own build
-//! wherever it lies, and `list` ends quietly when its reader goes away.
+//! A run's manifest records each frozen file's hash, from which `compare
+//! --allow-model-change` accepts two runs whose frozen files differ only
+//! under `src/model/` and refuses any others.  A canary run writes its
+//! record beside a run's, each disagreement it records replays with its
+//! canary, `emit-corpus` writes the witness file `dcroxide-dcrec` keeps,
+//! `fuzz-seeds` writes the signature fuzz targets' seed inputs and
+//! `fuzz-replay` replays them, starting the oracle again after one that
+//! fails, a copy of the binary records its own build wherever it lies, and
+//! `list` ends quietly when its reader goes away.
 
 use std::path::Path;
 use std::process::{Command, Stdio};
 
+use dcroxide_crypto::blake256::Blake256;
 use dcroxide_sigdiff::canary::{CANARIES, CANARY_BOUND};
 use dcroxide_sigdiff::class::{CLASSES, Family, find_class};
 use dcroxide_sigdiff::digest::class_digest;
+use dcroxide_sigdiff::fingerprint::FROZEN;
 use dcroxide_sigdiff::fuzz::{ED25519_MODEL_TARGET, SEED_MASTER, Target, seed_input};
 use dcroxide_sigdiff::manifest::repo_root;
 use dcroxide_sigdiff::run::{Mode, class_indices};
@@ -47,6 +52,24 @@ fn final_digest(dir: &Path, class: &str) -> (u64, String) {
         .find(|f| f[0] == class && f[3] == "true")
         .map(|f| (f[1].parse().expect("a count"), f[2].to_owned()))
         .unwrap_or_else(|| panic!("no final digest for {class}:\n{text}"))
+}
+
+/// Replaces `class`'s final digest in a run's `digests.tsv` with another.
+fn edit_final_digest(dir: &Path, class: &str) {
+    let (n, digest) = final_digest(dir, class);
+    let edited = format!(
+        "{}{}",
+        if digest.starts_with('0') { '1' } else { '0' },
+        &digest[1..]
+    );
+    let digests = std::fs::read_to_string(dir.join("digests.tsv")).expect("read");
+    let row = format!("{class}\t{n}\t{digest}\ttrue");
+    assert!(digests.contains(&row), "{digests}");
+    std::fs::write(
+        dir.join("digests.tsv"),
+        digests.replace(&row, &format!("{class}\t{n}\t{edited}\ttrue")),
+    )
+    .expect("write");
 }
 
 #[test]
@@ -167,20 +190,7 @@ fn run_replay_and_compare() {
     for file in ["manifest.json", "digests.tsv"] {
         std::fs::copy(dir.path().join("b2").join(file), b3.join(file)).expect("copy");
     }
-    let (n, digest) = final_digest(&b3, "K-valid");
-    let edited = format!(
-        "{}{}",
-        if digest.starts_with('0') { '1' } else { '0' },
-        &digest[1..]
-    );
-    let digests = std::fs::read_to_string(b3.join("digests.tsv")).expect("read");
-    let row = format!("K-valid\t{n}\t{digest}\ttrue");
-    assert!(digests.contains(&row), "{digests}");
-    std::fs::write(
-        b3.join("digests.tsv"),
-        digests.replace(&row, &format!("K-valid\t{n}\t{edited}\ttrue")),
-    )
-    .expect("write");
+    edit_final_digest(&b3, "K-valid");
     let (code, text) = sigsoak(&["compare", "--exploratory", &out("b1"), &out("b3")]);
     assert_eq!(code, 1, "{text}");
     assert!(text.contains("K-valid: different at 32"), "{text}");
@@ -360,6 +370,258 @@ fn the_nightly_soak_judges_its_floors() {
     assert!(share > 0.0 && share <= 1.0, "{run}");
 }
 
+/// An edit of a record's manifest.
+type Edit = fn(&mut serde_json::Value);
+
+/// Gives `manifest` another generator fingerprint and changes its frozen
+/// files: each path given `Some` hash, or dropped for `None`.
+fn move_fingerprint(manifest: &mut serde_json::Value, changes: &[(&str, Option<&str>)]) {
+    let fingerprint = &mut manifest["tool"]["generator_fingerprint"];
+    let digit = if fingerprint.as_str().is_some_and(|f| f.starts_with('0')) {
+        "1"
+    } else {
+        "0"
+    };
+    *fingerprint = serde_json::json!(digit.repeat(64));
+    let sources = manifest["tool"]["frozen_sources"]
+        .as_object_mut()
+        .expect("an object");
+    for (path, hash) in changes {
+        match hash {
+            Some(hash) => {
+                sources.insert((*path).to_owned(), serde_json::json!(hash));
+            }
+            None => {
+                sources.remove(*path).expect("a frozen file");
+            }
+        }
+    }
+}
+
+/// The records `compare --allow-model-change` reads.  A real run's manifest
+/// holds every frozen file once, with the hash recomputed here from the
+/// file in the checkout.  Records made from that run's, gate-eligible as a
+/// gate run's are: frozen files that differ only under `src/model/`, by
+/// hash or by a file added or removed, compare equal with the flag, the
+/// relaxation and the files named, and fail without it, while
+/// `--allow-fingerprint-change` keeps accepting any difference; a file
+/// outside `src/model/` that differs, a record without the list, a
+/// malformed list, and lists that differ nowhere are refused with the flag,
+/// each named; a digest that differs still fails; and with equal
+/// fingerprints the flag relaxes nothing.
+#[test]
+fn a_model_only_change_is_compared_from_the_records() {
+    const MODEL: &str = "src/model/ecdsa.rs";
+    const OTHER: &str = "5555555555555555555555555555555555555555555555555555555555555555";
+    const SHORT: &str = "555";
+    const DOTTED: &str = "src/model/../gen/ecdsa.rs";
+    let Some(oracle) = oracle_bin_or_skip() else {
+        return;
+    };
+    let oracle = oracle.display().to_string();
+    let dir = TempDir::new("sigsoak-model-change");
+    let run = dir.path().join("run");
+    let (code, text) = sigsoak(&[
+        "run",
+        "--out",
+        &run.display().to_string(),
+        "--seed",
+        "0x1",
+        "--classes",
+        "K-valid",
+        "--cases",
+        "4",
+        "--workers",
+        "1",
+        "--oracle",
+        &oracle,
+        "--progress-every",
+        "1h",
+    ]);
+    assert_eq!(code, 0, "{text}");
+    let raw = std::fs::read_to_string(run.join("manifest.json")).expect("read");
+    let manifest: serde_json::Value = serde_json::from_str(&raw).expect("JSON");
+    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let sources = manifest["tool"]["frozen_sources"]
+        .as_object()
+        .expect("an object");
+    assert_eq!(sources.len(), FROZEN.len(), "{sources:?}");
+    for file in FROZEN {
+        let bytes = std::fs::read(crate_dir.join(file.path)).expect("read a frozen file");
+        let mut h = Blake256::new();
+        h.update(b"sigdiff-source-1");
+        h.update(&u16::try_from(file.path.len()).expect("short").to_be_bytes());
+        h.update(file.path.as_bytes());
+        h.update(&u32::try_from(bytes.len()).expect("small").to_be_bytes());
+        h.update(&bytes);
+        assert_eq!(sources[file.path], hex(&h.finalize()), "{}", file.path);
+        let key = format!("\"{}\":", file.path);
+        assert_eq!(raw.matches(&key).count(), 1, "{key} in:\n{raw}");
+    }
+
+    let record = |name: &str, edit: &dyn Fn(&mut serde_json::Value)| {
+        let out = dir.path().join(name);
+        std::fs::create_dir(&out).expect("create a record");
+        std::fs::copy(run.join("digests.tsv"), out.join("digests.tsv")).expect("copy");
+        let mut changed = manifest.clone();
+        changed["gate_eligible"] = serde_json::json!(true);
+        edit(&mut changed);
+        std::fs::write(out.join("manifest.json"), changed.to_string()).expect("write");
+        out.display().to_string()
+    };
+    let compare = |flags: &[&str], a: &str, b: &str| {
+        let mut args = vec!["compare"];
+        args.extend(flags);
+        args.extend([a, b]);
+        sigsoak(&args)
+    };
+    let g1 = record("g1", &|_| {});
+
+    // A model file whose hash differs, one added and one removed: each
+    // fails without a flag and compares equal with either.
+    for (name, (file, hash)) in [
+        ("fixed", (MODEL, Some(OTHER))),
+        ("added", ("src/model/added.rs", Some(OTHER))),
+        ("removed", ("src/model/schnorr.rs", None)),
+    ] {
+        let b = record(name, &|m| move_fingerprint(m, &[(file, hash)]));
+        let (code, text) = compare(&[], &g1, &b);
+        assert_eq!(code, 1, "{name}:\n{text}");
+        assert!(
+            text.contains("FAIL generator fingerprints differ"),
+            "{name}:\n{text}"
+        );
+        let (code, text) = compare(&["--allow-model-change"], &g1, &b);
+        assert_eq!(code, 0, "{name}:\n{text}");
+        assert!(
+            text.contains(&format!(
+                "frozen files that differ, all under src/model/: {file}\n"
+            )),
+            "{name}:\n{text}"
+        );
+        assert!(
+            text.contains("comparison: equal (relaxed: --allow-model-change)\n"),
+            "{name}:\n{text}"
+        );
+        let (code, text) = compare(&["--allow-fingerprint-change"], &g1, &b);
+        assert_eq!(code, 0, "{name}:\n{text}");
+        assert!(
+            text.contains("comparison: equal (relaxed: --allow-fingerprint-change)\n"),
+            "{name}:\n{text}"
+        );
+    }
+
+    // A file outside src/model/ that differs, alone or beside a model
+    // file, by hash, by being added or by being removed.
+    for (name, changes, why) in [
+        (
+            "gen",
+            vec![("src/gen/ecdsa.rs", Some(OTHER))],
+            "src/gen/ecdsa.rs differs outside src/model/ (its hash differs)".to_owned(),
+        ),
+        (
+            "compare",
+            vec![("src/compare.rs", Some(OTHER)), (MODEL, Some(OTHER))],
+            "src/compare.rs differs outside src/model/ (its hash differs)".to_owned(),
+        ),
+        (
+            "gen-added",
+            vec![("src/gen/added.rs", Some(OTHER))],
+            format!(
+                "src/gen/added.rs differs outside src/model/ (only {} records it)",
+                dir.path().join("gen-added").display()
+            ),
+        ),
+        (
+            "answer-removed",
+            vec![("src/answer.rs", None)],
+            format!("src/answer.rs differs outside src/model/ (only {g1} records it)"),
+        ),
+    ] {
+        let b = record(name, &|m| move_fingerprint(m, &changes));
+        let (code, text) = compare(&["--allow-model-change"], &g1, &b);
+        assert_eq!(code, 1, "{name}:\n{text}");
+        assert!(
+            text.contains(&format!("FAIL --allow-model-change: {why}\n")),
+            "{name}:\n{text}"
+        );
+        assert!(!text.contains("relaxed"), "{name}:\n{text}");
+    }
+
+    // A record without the list, either side, a malformed list, and lists
+    // that differ nowhere though the fingerprints do.
+    let old = record("old", &|m| {
+        move_fingerprint(m, &[]);
+        m["tool"]
+            .as_object_mut()
+            .expect("an object")
+            .remove("frozen_sources");
+    });
+    for (a, b) in [(&g1, &old), (&old, &g1)] {
+        let (code, text) = compare(&["--allow-model-change"], a, b);
+        assert_eq!(code, 1, "{text}");
+        assert!(
+            text.contains(&format!(
+                "FAIL --allow-model-change: {old}: records no tool.frozen_sources\n"
+            )),
+            "{text}"
+        );
+    }
+    let refused: [(&str, Edit, String); 4] = [
+        (
+            "dotted",
+            |m| move_fingerprint(m, &[(DOTTED, Some(OTHER))]),
+            format!("names {DOTTED:?}, not a path below src/ without .."),
+        ),
+        (
+            "short",
+            |m| move_fingerprint(m, &[(MODEL, Some(SHORT))]),
+            format!("gives {MODEL} the hash \"{SHORT}\", not 64 hex digits"),
+        ),
+        (
+            "number",
+            |m| {
+                move_fingerprint(m, &[]);
+                m["tool"]["frozen_sources"][MODEL] = serde_json::json!(7);
+            },
+            format!("gives {MODEL} the hash 7, not 64 hex digits"),
+        ),
+        (
+            "unchanged",
+            |m| move_fingerprint(m, &[]),
+            "tool.frozen_sources differ in no file, though the generator fingerprints differ"
+                .to_owned(),
+        ),
+    ];
+    for (name, edit, why) in refused {
+        let b = record(name, &edit);
+        let (code, text) = compare(&["--allow-model-change"], &g1, &b);
+        assert_eq!(code, 1, "{name}:\n{text}");
+        assert!(
+            text.lines()
+                .any(|l| l.starts_with("FAIL --allow-model-change: ") && l.ends_with(&why)),
+            "{name}: {why}\n{text}"
+        );
+    }
+
+    // A model-only change still fails on a digest that differs.
+    let digest = record("digest", &|m| move_fingerprint(m, &[(MODEL, Some(OTHER))]));
+    edit_final_digest(Path::new(&digest), "K-valid");
+    let (code, text) = compare(&["--allow-model-change"], &g1, &digest);
+    assert_eq!(code, 1, "{text}");
+    assert!(text.contains("FAIL K-valid: different at 4\n"), "{text}");
+    assert!(
+        text.contains("comparison: 1 failures (relaxed: --allow-model-change)\n"),
+        "{text}"
+    );
+
+    // Equal fingerprints need no relaxation.
+    let again = record("again", &|_| {});
+    let (code, text) = compare(&["--allow-model-change"], &g1, &again);
+    assert_eq!(code, 0, "{text}");
+    assert!(text.contains("comparison: equal\n"), "{text}");
+}
+
 /// The canary run of two canaries, one of each kind: the model baseline
 /// over the recovery classes and both canaries pass and leave their
 /// record; a run may then share the directory, and a second canary run
@@ -430,6 +692,19 @@ fn canary_run_and_replay() {
     assert_eq!(part_cases("model-baseline"), 32);
     assert_eq!(part_cases("recover-accepts-infinity/primary"), CANARY_BOUND);
     assert_eq!(part_cases("recover-accepts-infinity/others"), 32);
+    // The canary record and each part's carry the frozen files' hashes, as
+    // a run's does.
+    let frozen = &manifest["tool"]["frozen_sources"];
+    assert_eq!(
+        frozen.as_object().map(serde_json::Map::len),
+        Some(FROZEN.len()),
+        "{frozen}"
+    );
+    let part: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(record.join("model-baseline/manifest.json")).expect("read"),
+    )
+    .expect("JSON");
+    assert_eq!(&part["tool"]["frozen_sources"], frozen);
     let baseline: Vec<&str> = manifest["baseline_classes"]
         .as_array()
         .expect("a list")
@@ -940,6 +1215,10 @@ fn usage() {
     assert!(text.contains("sigsoak emit-corpus --out DIR"), "{text}");
     assert!(text.contains("sigsoak fuzz-seeds --out DIR"), "{text}");
     assert!(text.contains("sigsoak fuzz-replay --target NAME"), "{text}");
+    assert!(
+        text.contains("[--allow-fingerprint-change | --allow-model-change]"),
+        "{text}"
+    );
     let (code, text) = sigsoak(&["list"]);
     assert_eq!(code, 0);
     for class in CLASSES {
@@ -1047,6 +1326,24 @@ fn usage() {
         ("--budget=1s", "x", "is not a number"),
     ] {
         let args = ["run", "--out", "/nowhere", size, "--min-scale", min_scale];
+        let (code, text) = sigsoak(&args);
+        assert_eq!(code, 2, "{args:?}:\n{text}");
+        assert!(text.contains(message), "{args:?}:\n{text}");
+    }
+    // --allow-model-change takes neither the wider relaxation nor a partial
+    // comparison, and is refused before either run is read.
+    for (other, message) in [
+        ("--allow-fingerprint-change", "exclude each other"),
+        ("--replay", "not with --replay or --allow-subset"),
+        ("--allow-subset", "not with --replay or --allow-subset"),
+    ] {
+        let args = [
+            "compare",
+            "--allow-model-change",
+            other,
+            "/nowhere/a",
+            "/nowhere/b",
+        ];
         let (code, text) = sigsoak(&args);
         assert_eq!(code, 2, "{args:?}:\n{text}");
         assert!(text.contains(message), "{args:?}:\n{text}");

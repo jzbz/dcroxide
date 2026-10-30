@@ -9,8 +9,13 @@
 //! is recorded by running `rustc -vV` from the repository root, which
 //! resolves the same `rust-toolchain.toml` the build used, rather than by
 //! a build script.
+//!
+//! Beside the generator fingerprint, the manifest records each frozen
+//! file's own hash (`tool.frozen_sources`), from which
+//! [`model_only_change`] tells two runs whose frozen files differ only
+//! under [`MODEL_DIR`] from any others.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -20,6 +25,7 @@ use dcroxide_crypto::blake256::Blake256;
 use dcroxide_testutil::{DCRD_PARITY_COMMIT, hex, pseudo_version_commit};
 use serde_json::{Value, json};
 
+use crate::fingerprint::frozen_hashes;
 use crate::reply::Reply;
 use crate::run::Mode;
 
@@ -464,6 +470,120 @@ pub fn platform() -> Value {
     })
 }
 
+/// The directory below which a frozen file may differ between two runs
+/// that `sigsoak compare --allow-model-change` accepts: the soak's models of
+/// dcrd.  A soak run consults their view of a case only in two of the
+/// comparison's intent checks, but the generators also build requests and
+/// intents from the compact-signature constants and the ECDSA branch type
+/// defined below it; a digest leaf holds the request bytes, and the case's
+/// status every intent check (ADR-0006's 2026-10-30 addendum).
+pub const MODEL_DIR: &str = "src/model/";
+
+/// The manifest's `tool.frozen_sources`: each frozen file's path and its
+/// [`frozen_hashes`] hash in hex, in path order.
+pub fn frozen_sources_json() -> Value {
+    let sources: serde_json::Map<String, Value> = frozen_hashes()
+        .into_iter()
+        .map(|(path, hash)| (path.to_owned(), json!(hex(&hash))))
+        .collect();
+    Value::Object(sources)
+}
+
+/// A manifest's `tool.frozen_sources` read back, path to hash in lowercase
+/// hex, or every reason it cannot be: the manifest records none, it is not
+/// an object, or an entry's path does not start with `src/` or holds `..`,
+/// or its hash is not a string of 64 hex digits.  Paths are kept as the
+/// list writes them.
+pub fn read_frozen_sources(manifest: &Value) -> Result<BTreeMap<String, String>, Vec<String>> {
+    let list = &manifest["tool"]["frozen_sources"];
+    let Some(entries) = list.as_object() else {
+        return Err(vec![if list.is_null() {
+            "records no tool.frozen_sources".to_owned()
+        } else {
+            "tool.frozen_sources is not an object".to_owned()
+        }]);
+    };
+    let mut sources = BTreeMap::new();
+    let mut problems = Vec::new();
+    for (path, hash) in entries {
+        if !path.starts_with("src/") || path.contains("..") {
+            problems.push(format!(
+                "tool.frozen_sources names {path:?}, not a path below src/ without .."
+            ));
+            continue;
+        }
+        match hash.as_str() {
+            Some(h) if h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit()) => {
+                sources.insert(path.clone(), h.to_ascii_lowercase());
+            }
+            _ => problems.push(format!(
+                "tool.frozen_sources gives {path} the hash {hash}, not 64 hex digits"
+            )),
+        }
+    }
+    if problems.is_empty() {
+        Ok(sources)
+    } else {
+        Err(problems)
+    }
+}
+
+/// What `sigsoak compare --allow-model-change` makes of two runs whose
+/// generator fingerprints differ, `a` and `b` each a run's name and
+/// manifest: the frozen files that differ, by hash or by being in one list
+/// only, when every one lies below [`MODEL_DIR`]; otherwise every reason
+/// not, naming its run or its file.  A list missing or malformed
+/// ([`read_frozen_sources`]), each file that differs outside
+/// [`MODEL_DIR`], and lists that differ nowhere though the fingerprints
+/// do are each a reason.
+pub fn model_only_change(a: (&str, &Value), b: (&str, &Value)) -> Result<Vec<String>, Vec<String>> {
+    let read = |(name, manifest): (&str, &Value)| {
+        read_frozen_sources(manifest).map_err(|problems| {
+            problems
+                .into_iter()
+                .map(|p| format!("{name}: {p}"))
+                .collect::<Vec<_>>()
+        })
+    };
+    let (sources_a, sources_b) = match (read(a), read(b)) {
+        (Ok(sources_a), Ok(sources_b)) => (sources_a, sources_b),
+        (read_a, read_b) => {
+            return Err(read_a
+                .err()
+                .into_iter()
+                .chain(read_b.err())
+                .flatten()
+                .collect());
+        }
+    };
+    let paths: BTreeSet<&String> = sources_a.keys().chain(sources_b.keys()).collect();
+    let mut changed = Vec::new();
+    let mut outside = Vec::new();
+    for path in paths {
+        let how = match (sources_a.get(path), sources_b.get(path)) {
+            (Some(hash_a), Some(hash_b)) if hash_a == hash_b => continue,
+            (Some(_), Some(_)) => "its hash differs".to_owned(),
+            (Some(_), None) => format!("only {} records it", a.0),
+            (None, _) => format!("only {} records it", b.0),
+        };
+        if path.starts_with(MODEL_DIR) {
+            changed.push(path.clone());
+        } else {
+            outside.push(format!("{path} differs outside {MODEL_DIR} ({how})"));
+        }
+    }
+    if !outside.is_empty() {
+        return Err(outside);
+    }
+    if changed.is_empty() {
+        return Err(vec![
+            "tool.frozen_sources differ in no file, though the generator fingerprints differ"
+                .to_owned(),
+        ]);
+    }
+    Ok(changed)
+}
+
 /// BLAKE-256 of a file's contents.
 pub fn file_blake256(path: &Path) -> std::io::Result<[u8; 32]> {
     let mut file = std::fs::File::open(path)?;
@@ -773,5 +893,184 @@ mod tests {
         assert_eq!(current.debug_assertions, cfg!(debug_assertions));
         assert_eq!(current.panic_unwind, cfg!(panic = "unwind"));
         assert_eq!(current.overflow_checks, Some(true));
+    }
+
+    /// The list a manifest records reads back whole: every frozen file
+    /// once, in path order, with its own hash.
+    #[test]
+    fn the_frozen_sources_read_back() {
+        let manifest = json!({ "tool": { "frozen_sources": frozen_sources_json() } });
+        let sources = read_frozen_sources(&manifest).expect("well formed");
+        let want: BTreeMap<String, String> = frozen_hashes()
+            .into_iter()
+            .map(|(path, hash)| (path.to_owned(), hex(&hash)))
+            .collect();
+        assert_eq!(sources, want);
+        assert_eq!(sources.len(), crate::fingerprint::FROZEN.len());
+    }
+
+    const MODEL: &str = "src/model/ecdsa.rs";
+    const GEN: &str = "src/gen/ecdsa.rs";
+    const COMPARE: &str = "src/compare.rs";
+
+    /// A manifest whose `tool.frozen_sources` holds `entries`.
+    fn listing(entries: &[(&str, Value)]) -> Value {
+        let sources: serde_json::Map<String, Value> = entries
+            .iter()
+            .map(|(path, hash)| ((*path).to_owned(), hash.clone()))
+            .collect();
+        json!({ "tool": { "frozen_sources": sources } })
+    }
+
+    /// A hash of 64 hex digits, all `digit`.
+    fn hash(digit: char) -> Value {
+        json!(digit.to_string().repeat(64))
+    }
+
+    /// Three frozen files, one under `src/model/`, with `changes` applied:
+    /// each path given a hash, or dropped for `None`.
+    fn three(changes: &[(&str, Option<char>)]) -> Value {
+        let mut entries = vec![(MODEL, hash('1')), (GEN, hash('2')), (COMPARE, hash('3'))];
+        for (path, digit) in changes {
+            entries.retain(|(p, _)| p != path);
+            if let Some(digit) = digit {
+                entries.push((*path, hash(*digit)));
+            }
+        }
+        listing(&entries)
+    }
+
+    /// Only frozen files under `src/model/` may differ, by hash, by being
+    /// added or by being removed; any other that differs is named, with
+    /// how, and lists that differ nowhere are refused, since the check is
+    /// made only of runs whose fingerprints differ.
+    #[test]
+    fn a_model_only_change_is_told_from_any_other() {
+        let g1 = three(&[]);
+        let check = |b: &Value| model_only_change(("G1", &g1), ("G3", b));
+        assert_eq!(
+            check(&three(&[(MODEL, Some('9'))])),
+            Ok(vec![MODEL.to_owned()])
+        );
+        let added = "src/model/added.rs";
+        assert_eq!(
+            check(&three(&[(added, Some('4'))])),
+            Ok(vec![added.to_owned()])
+        );
+        assert_eq!(check(&three(&[(MODEL, None)])), Ok(vec![MODEL.to_owned()]));
+        assert_eq!(
+            check(&three(&[(MODEL, Some('9')), (added, Some('4'))])),
+            Ok(vec![added.to_owned(), MODEL.to_owned()])
+        );
+
+        for (b, why) in [
+            (
+                three(&[(GEN, Some('9'))]),
+                "src/gen/ecdsa.rs differs outside src/model/ (its hash differs)",
+            ),
+            (
+                three(&[(COMPARE, Some('9')), (MODEL, Some('9'))]),
+                "src/compare.rs differs outside src/model/ (its hash differs)",
+            ),
+            (
+                three(&[("src/gen/added.rs", Some('4'))]),
+                "src/gen/added.rs differs outside src/model/ (only G3 records it)",
+            ),
+            (
+                three(&[(COMPARE, None)]),
+                "src/compare.rs differs outside src/model/ (only G1 records it)",
+            ),
+            // Not under src/model/, though its name starts the same way.
+            (
+                three(&[("src/modelx.rs", Some('4'))]),
+                "src/modelx.rs differs outside src/model/ (only G3 records it)",
+            ),
+        ] {
+            assert_eq!(check(&b), Err(vec![why.to_owned()]), "{b}");
+        }
+        // Every file outside is named.
+        let both = check(&three(&[(GEN, Some('9')), (COMPARE, None)])).expect_err("refused");
+        assert_eq!(both.len(), 2, "{both:?}");
+        assert!(
+            both[0].starts_with(COMPARE) && both[1].starts_with(GEN),
+            "{both:?}"
+        );
+        assert_eq!(
+            check(&three(&[])),
+            Err(vec![
+                "tool.frozen_sources differ in no file, though the generator fingerprints differ"
+                    .to_owned()
+            ])
+        );
+        // Hex digits compare whatever their case.
+        let upper = three(&[(MODEL, Some('A'))]);
+        let lower = three(&[(MODEL, Some('a'))]);
+        assert!(
+            model_only_change(("A", &upper), ("B", &lower))
+                .is_err_and(|why| why[0].contains("differ in no file"))
+        );
+    }
+
+    /// A run without the list, or with one that is not an object, a path
+    /// that does not start with `src/` or holds `..`, or a hash that is not
+    /// a string of 64 hex digits, is refused, naming the run and the entry;
+    /// both runs' problems are reported.
+    #[test]
+    fn a_missing_or_malformed_list_is_refused() {
+        let g1 = three(&[]);
+        let check = |b: &Value| model_only_change(("G1", &g1), ("G3", b));
+        let mut old = json!({ "tool": { "generator_fingerprint": "00" } });
+        assert_eq!(
+            check(&old),
+            Err(vec!["G3: records no tool.frozen_sources".to_owned()])
+        );
+        old["tool"]["frozen_sources"] = json!([MODEL]);
+        assert_eq!(
+            check(&old),
+            Err(vec!["G3: tool.frozen_sources is not an object".to_owned()])
+        );
+        for path in [
+            "src/model/../gen/ecdsa.rs",
+            "src/../src/model/ecdsa.rs",
+            "../src/model/ecdsa.rs",
+            "model/ecdsa.rs",
+            "/src/model/ecdsa.rs",
+            "crates/dcroxide-sigdiff/src/model/ecdsa.rs",
+            "src",
+            "",
+        ] {
+            assert_eq!(
+                check(&three(&[(MODEL, None), (path, Some('9'))])),
+                Err(vec![format!(
+                    "G3: tool.frozen_sources names {path:?}, not a path below src/ without .."
+                )]),
+                "{path}"
+            );
+        }
+        for bad in [
+            json!(7),
+            Value::Null,
+            json!("1".repeat(63)),
+            json!("1".repeat(65)),
+            json!("g".repeat(64)),
+            json!(format!("0x{}", "1".repeat(62))),
+        ] {
+            let b = listing(&[(MODEL, bad.clone()), (GEN, hash('2')), (COMPARE, hash('3'))]);
+            assert_eq!(
+                check(&b),
+                Err(vec![format!(
+                    "G3: tool.frozen_sources gives {MODEL} the hash {bad}, not 64 hex digits"
+                )]),
+                "{bad}"
+            );
+        }
+        let without = json!({});
+        assert_eq!(
+            model_only_change(("G1", &without), ("G3", &old)),
+            Err(vec![
+                "G1: records no tool.frozen_sources".to_owned(),
+                "G3: tool.frozen_sources is not an object".to_owned(),
+            ])
+        );
     }
 }
