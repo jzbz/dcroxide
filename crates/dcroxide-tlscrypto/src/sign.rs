@@ -155,6 +155,11 @@ trait SigningCurve: 'static + Send + Sync {
     /// or gives a signature of zero.
     #[cfg(test)]
     fn sign_with_nonce(key: &Self::Key, nonce: &[u8], message: &[u8]) -> Option<Vec<u8>>;
+
+    /// The key whose scalar `scalar` encodes, big-endian at the field's
+    /// length, or `None` when it is not in `[1, n)` or of another length.
+    #[cfg(test)]
+    fn key_from_scalar(scalar: &[u8]) -> Option<Self::Key>;
 }
 
 /// [`SigningCurve`] for the curve type `$curve` of the crate `$krate`.
@@ -194,6 +199,12 @@ macro_rules! signing_curve {
                 )
                 .ok()?;
                 Some(signature.to_der().as_bytes().to_vec())
+            }
+
+            #[cfg(test)]
+            fn key_from_scalar(scalar: &[u8]) -> Option<Self::Key> {
+                let scalar = $krate::FieldBytes::try_from(scalar).ok()?;
+                $krate::ecdsa::SigningKey::from_bytes(&scalar).ok()
             }
         }
     };
@@ -404,14 +415,6 @@ impl Ed25519SigningKey {
             key: Arc::new(Ed25519Key::from_expanded(scalar, Zeroizing::new(prefix))),
         }
     }
-
-    /// For the timing check: the signature of `message` with `r`, reduced
-    /// mod L, in place of the nonce SHA-512(prefix || message) mod L.
-    #[cfg(test)]
-    fn sign_with_nonce(&self, r: [u8; 32], message: &[u8]) -> [u8; 64] {
-        self.key
-            .sign_with(&Scalar::from_bytes_mod_order(r), message)
-    }
 }
 
 impl fmt::Debug for Ed25519SigningKey {
@@ -526,6 +529,116 @@ pub fn fuzz_key_parse(der: &[u8]) -> bool {
         );
     }
     true
+}
+
+/// The timing check's hold on the signing keys (`crate::ct_check`,
+/// ADR-0015 T10), which must choose the secret each signature is made
+/// with: a key made from a secret the check picks, signing through this
+/// module's own code with the hedge or the nonce fixed.  The curves' trait
+/// and the key types stay private to this module; these two types hold
+/// them for the check.
+#[cfg(test)]
+pub(crate) mod timing {
+    use std::sync::Arc;
+
+    use curve25519_dalek::scalar::Scalar;
+    use rustls::SignatureScheme;
+
+    use super::{EcdsaSigner, EcdsaSigningKey, Ed25519SigningKey, SigningCurve};
+
+    /// An ECDSA key on P-256, P-384 or P-521.
+    pub(crate) struct Ecdsa(Box<dyn EcdsaKey>);
+
+    impl Ecdsa {
+        /// The key on the curve of `scheme`, one of the three ECDSA schemes
+        /// the keys sign with, whose scalar `scalar` encodes, big-endian at
+        /// the field's length; `None` for another scheme, or for a scalar
+        /// not in `[1, n)` or of another length.
+        pub(crate) fn new(scheme: SignatureScheme, scalar: &[u8]) -> Option<Ecdsa> {
+            fn on<C: SigningCurve>(scalar: &[u8]) -> Option<Ecdsa> {
+                let key = EcdsaSigningKey::<C>::new(C::key_from_scalar(scalar)?);
+                Some(Ecdsa(Box::new(key)))
+            }
+            match scheme {
+                SignatureScheme::ECDSA_NISTP256_SHA256 => on::<p256::NistP256>(scalar),
+                SignatureScheme::ECDSA_NISTP384_SHA384 => on::<p384::NistP384>(scalar),
+                SignatureScheme::ECDSA_NISTP521_SHA512 => on::<p521::NistP521>(scalar),
+                _ => None,
+            }
+        }
+
+        /// The handshake signer's signature of `message`, with `hedge`, at
+        /// the field's length, in place of its draw from the process
+        /// generator.
+        pub(crate) fn sign_hedged(&self, message: &[u8], hedge: &[u8]) -> Vec<u8> {
+            self.0.sign_hedged(message, hedge)
+        }
+
+        /// The signature of `message` with `nonce`, big-endian at the
+        /// field's length, as the nonce, or `None` when it is not in
+        /// `[1, n)` or gives a signature of zero.
+        pub(crate) fn sign_with_nonce(&self, nonce: &[u8], message: &[u8]) -> Option<Vec<u8>> {
+            self.0.sign_with_nonce(nonce, message)
+        }
+
+        /// The uncompressed SEC 1 encoding of the public point.
+        pub(crate) fn public(&self) -> Vec<u8> {
+            self.0.public()
+        }
+    }
+
+    /// [`Ecdsa`]'s operations on a key of one curve.
+    trait EcdsaKey {
+        fn sign_hedged(&self, message: &[u8], hedge: &[u8]) -> Vec<u8>;
+        fn sign_with_nonce(&self, nonce: &[u8], message: &[u8]) -> Option<Vec<u8>>;
+        fn public(&self) -> Vec<u8>;
+    }
+
+    impl<C: SigningCurve> EcdsaKey for EcdsaSigningKey<C> {
+        fn sign_hedged(&self, message: &[u8], hedge: &[u8]) -> Vec<u8> {
+            let signer = EcdsaSigner::<C> {
+                key: Arc::clone(&self.key),
+            };
+            signer.sign_drawing(message, |drawn| drawn.copy_from_slice(hedge))
+        }
+
+        fn sign_with_nonce(&self, nonce: &[u8], message: &[u8]) -> Option<Vec<u8>> {
+            EcdsaSigningKey::<C>::sign_with_nonce(self, nonce, message)
+        }
+
+        fn public(&self) -> Vec<u8> {
+            C::public(&self.key)
+        }
+    }
+
+    /// An Ed25519 key made from an expanded scalar and prefix.
+    pub(crate) struct Ed25519(Ed25519SigningKey);
+
+    impl Ed25519 {
+        /// The key for `scalar`, which is reduced mod L as a seed's
+        /// expanded scalar is, and `prefix`.
+        pub(crate) fn new(scalar: [u8; 32], prefix: [u8; 32]) -> Ed25519 {
+            Ed25519(Ed25519SigningKey::from_expanded(scalar, prefix))
+        }
+
+        /// The handshake signer's signature of `message`, its nonce hashed
+        /// from the prefix and the message.
+        pub(crate) fn sign(&self, message: &[u8]) -> [u8; 64] {
+            self.0.key.sign(message)
+        }
+
+        /// The signature of `message` with `r` as the nonce, in place of
+        /// SHA-512(prefix || message) mod L: the signer's own code from
+        /// there, with nothing reduced first.
+        pub(crate) fn sign_with_nonce(&self, r: &Scalar, message: &[u8]) -> [u8; 64] {
+            self.0.key.sign_with(r, message)
+        }
+
+        /// The public key, compressed.
+        pub(crate) fn public(&self) -> [u8; 32] {
+            self.0.key.public
+        }
+    }
 }
 
 #[cfg(test)]
@@ -828,8 +941,9 @@ mod tests {
     }
 
     /// RFC 8032 §7.1's first three Ed25519 tests: the public key and the
-    /// signature from the seed, and from the expanded key with the nonce
-    /// the RFC derives, through the timing check's constructors.
+    /// signature from the seed, and from the expanded key, made through the
+    /// timing check's constructor, with the nonce the RFC derives given to
+    /// the signer's `sign_with`.
     #[test]
     fn ed25519_answers_rfc_8032() {
         for (seed, public, message, signature) in [
@@ -879,12 +993,7 @@ mod tests {
                     .finalize()
                     .into(),
             );
-            assert_eq!(
-                expanded
-                    .sign_with_nonce(nonce.to_bytes(), &message)
-                    .to_vec(),
-                signature
-            );
+            assert_eq!(expanded.key.sign_with(&nonce, &message).to_vec(), signature);
         }
     }
 

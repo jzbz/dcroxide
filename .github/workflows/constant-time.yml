@@ -1,0 +1,150 @@
+name: Constant time
+
+# dcroxide-tlscrypto's timing check (ADR-0015 T10): dudect's fixed-against-
+# random t-test, in tree in crates/dcroxide-tlscrypto/src/ct_check.rs, on
+# ECDSA and Ed25519 signing, the four key exchanges, the three AEADs,
+# AES-GCM's keying and HMAC, with a positive control that must be found. A
+# workflow of its own, apart from ci.yml: it times code, so its jobs run
+# nothing else, and a change to the provider runs it without waiting on the
+# rest of CI.
+#
+# The paths are what changes the timed binary or the harness: the crate,
+# the lock (a dependency's version), the pinned compiler and the root
+# manifest's release profile (codegen, which can turn a constant-time
+# select into a branch), dcroxide-testutil (the generator that draws the
+# classes), dcroxide-crypto (a normal dependency of the crate, linked into
+# the timed binary, whose features on chacha20 merge with the AEAD's), and
+# this file.
+on:
+  push:
+    branches: [master]
+    paths:
+      - "crates/dcroxide-tlscrypto/**"
+      - "crates/dcroxide-testutil/**"
+      - "crates/dcroxide-crypto/**"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "rust-toolchain.toml"
+      - ".github/workflows/constant-time.yml"
+  pull_request:
+    paths:
+      - "crates/dcroxide-tlscrypto/**"
+      - "crates/dcroxide-testutil/**"
+      - "crates/dcroxide-crypto/**"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "rust-toolchain.toml"
+      - ".github/workflows/constant-time.yml"
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  constant-time:
+    name: constant time (${{ matrix.leg }})
+    # 27 targets, each running for its budget: at 10 s, about 5 minutes
+    # after the build; at 60 s, nightly and on dispatch, about 27.
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The backends each crate picks for the processor. On x86_64, at
+          # run time: AES-NI, CLMUL, SSE2 or AVX2 for ChaCha20, AVX2 for
+          # Poly1305, and SHA-NI for SHA-256 and AVX2 for SHA-512. On
+          # arm64: the ARMv8 AES and PMULL instructions and the SHA-2 and
+          # SHA-3 extensions at run time, and NEON for ChaCha20, which
+          # chacha20 fixes at compile time. poly1305 has only its portable
+          # code on arm64, so there both legs run the same Poly1305.
+          - leg: x86_64
+            os: ubuntu-latest
+            rustflags: ""
+          # The portable ones, forced with each crate's own cfg as ci.yml's
+          # tls-soft-backends job forces them: aes's fixslice, polyval's
+          # software multiply, chacha20's and poly1305's portable code,
+          # whose constant-time claims are what this checks, and sha2's
+          # portable compression. dalek's cfg is kept from that job,
+          # though it switches only verification's double-base
+          # multiplication, which no target times.
+          - leg: x86_64-soft
+            os: ubuntu-latest
+            rustflags: >-
+              --cfg aes_backend="soft"
+              --cfg polyval_backend="soft"
+              --cfg chacha20_backend="soft"
+              --cfg poly1305_backend="soft"
+              --cfg sha2_backend="soft"
+              --cfg curve25519_dalek_backend="serial"
+          - leg: arm64
+            os: ubuntu-24.04-arm
+            rustflags: ""
+          - leg: arm64-soft
+            os: ubuntu-24.04-arm
+            rustflags: >-
+              --cfg aes_backend="soft"
+              --cfg polyval_backend="soft"
+              --cfg chacha20_backend="soft"
+              --cfg poly1305_backend="soft"
+              --cfg sha2_backend="soft"
+              --cfg curve25519_dalek_backend="serial"
+    runs-on: ${{ matrix.os }}
+    env:
+      RUSTFLAGS: ${{ matrix.rustflags }}
+      # Each target's budget in seconds: a screen on pushes and pull
+      # requests, and six times as long nightly and on dispatch, which
+      # makes up for each fixed class's share of the samples, about
+      # 1/(2K) of them with K fixed classes.
+      DCROXIDE_CT_SECONDS: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '60' || '10' }}
+    steps:
+      - uses: actions/checkout@v7
+      # Toolchain comes from rust-toolchain.toml (see ci.yml's lint job).
+      - run: rustup toolchain install
+      # One cache per leg: the soft legs' RUSTFLAGS rebuild every crate.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.leg }}
+      # Built first, so that the timed step compiles nothing.
+      - name: Build the check
+        run: cargo test -p dcroxide-tlscrypto --release --lib --locked --no-run
+      # One target at a time, in release mode, the way the module's doc
+      # gives it. A target fails when a fixed class's |t| is above 10 and
+      # its mean time differs from the random class's by 1 ns an operation
+      # or more (the floor), or on too few samples to compare; the positive
+      # control fails unless its leak fails by the same rule. Every target
+      # runs after one fails.
+      - name: Time the targets
+        run: |
+          set -o pipefail
+          cargo test -p dcroxide-tlscrypto --release --lib --locked ct_check -- \
+            --ignored --test-threads=1 --nocapture 2>&1 | tee "$RUNNER_TEMP/ct-check.log"
+      # Each target's row: the fixed class that decides it (of the
+      # classes that fail, the one whose result has the largest |t|, or
+      # else the largest |t| of all) and that class's result, which for a
+      # class that fails is its comparison of the largest difference among
+      # those above 10, and otherwise its largest |t|: that comparison's t
+      # and effect size (the difference of the means in standard
+      # deviations, which unlike t does not grow with the samples), the
+      # random class's nanoseconds an operation and the fixed class's
+      # difference from them; the fixed class and the test (every sample,
+      # or a crop by the share of samples it keeps), the samples on each
+      # side, the samples counted, the operations in each sample, and the
+      # verdict: "reported" for |t| above 4.5,
+      # "reported (under the 1 ns floor)" for |t| above 10 on a smaller
+      # difference, and "control found" for the positive control's. The
+      # row is taken from wherever it falls on its line, which the test
+      # runner's own output may have begun.
+      - name: Summarize the run
+        if: always()
+        run: |
+          {
+            echo "### ${{ matrix.leg }}, ${DCROXIDE_CT_SECONDS} s a target"
+            echo
+            echo "| target | t | effect | ns/op | difference | class | test | fixed | random | samples | batch | verdict |"
+            echo "|---|---|---|---|---|---|---|---|---|---|---|---|"
+            if [ -f "$RUNNER_TEMP/ct-check.log" ]; then
+              sed -n 's/.*ct_check row //p' "$RUNNER_TEMP/ct-check.log"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

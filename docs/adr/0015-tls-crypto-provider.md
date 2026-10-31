@@ -9,9 +9,11 @@
   node's TLS provider for everything else until the in-tree provider
   passes the Go interop matrix: every cipher suite, key exchange group,
   key type and TLS version, plus client certificates, which is in the
-  tree (addendum of 2026-10-30). Then `ring` goes in one change.
+  tree (addendum of 2026-10-30). Then `ring` goes in one change. The
+  constant-time check T10 names is in the tree as well (addendum of
+  2026-10-31).
 - **Date:** 2026-10-26 (accepted), 2026-10-30 (addendum: the Go interop
-  matrix)
+  matrix), 2026-10-31 (addendum: the constant-time check)
 
 ## Context
 
@@ -613,3 +615,146 @@ own that run without the oracle. What gates the switch: both matrices
 green in CI's `test` job on the four systems and in `test-wrapping`, the
 provider's again on the portable backends of `tls-soft-backends`, and the
 oracle's Go tests in `go-tools`.
+
+## Addendum, 2026-10-31 — the constant-time check
+
+The constant-time check T10 names is in the tree, by the method this
+record left open and the provider's design recommended, which the project
+owner approved with the design's other answers on 2026-10-26: a dudect
+harness in the tree, in a CI workflow of its own. Its verdict departs
+from the design's by a floor the project owner added on 2026-10-30
+(below). This records what it holds, what each target compares and why
+the floor is there. It records no run of the workflow: CI first runs it
+once the change that adds it is pushed, and the switch's addendum cites
+those runs.
+
+- **The harness,** `crates/dcroxide-tlscrypto/src/ct_check.rs`, built only
+  into the crate's unit tests: dudect's fixed-against-random test
+  (Reparaz, Balasch and Verbauwhede, 2017), with no crate added and
+  nothing to install. A target times one operation with
+  `std::time::Instant` on inputs of several fixed classes and one random
+  class, interleaved: each sample is of the random class with probability
+  1/2, else of a fixed class chosen uniformly, the choice drawn from
+  `dcroxide-testutil`'s `SplitMix64`, and Welch's t compares each fixed
+  class with the random class. The fixed classes are corner cases of the
+  secret, since a fixed value drawn at random gives a leak no more to key
+  on than the random class does. A chunk of samples' inputs is built
+  before any of them is timed, every class's the same way: from a buffer
+  the random class's draw fills, a fixed class's bytes written over it, so
+  that what building allocates, and the heap the inputs lie in, does not
+  depend on the class. The timed region runs the operations, each on an
+  input it borrows, and keeps their results; the inputs and results are
+  dropped outside it, but for the exchange that `complete` consumes, as it
+  does in the provider. A chunk holds at most 256 KiB of inputs, the heap
+  they point to aside, so that an operation finds its input in a core's
+  cache, as the provider finds the cipher or key it keeps. An operation
+  quicker than 2 µs runs in a batch on inputs of one class, sized from the
+  median of 33 operations timed one by one, the clock's own cost included,
+  so that a sample takes about 2 µs. The first 1,000 samples, or the first
+  tenth of the budget, warm up, set dudect's 100 crops (the samples
+  quicker than the warm-up's quantile 1 - 0.5^(10(i + 1)/100)) and are
+  thrown away. Each fixed class is compared with the random class
+  uncropped and in each crop with 100 samples or more on each side. A
+  class fails the target when a comparison's |t| is above 10 and the
+  largest difference between the class's mean time and the random class's
+  among those comparisons is 1 ns an operation or more; above 10 on
+  smaller differences alone it is reported as under the floor, and above
+  4.5 it is reported, and both pass; and a target with no comparison of
+  that many samples fails too. A class's result is the comparison that
+  decides it: for a class that fails, the one of the largest difference
+  among those above 10, and otherwise its largest |t|. Each target's row
+  gives the class that decides it: of the classes that fail, the one whose
+  result has the largest |t|, or else the largest |t| of all. Beside t,
+  which grows with the root of the samples, each result gives its effect
+  size, the difference of the means in standard deviations, and the
+  difference in nanoseconds an operation. The positive control, an
+  early-exit comparison of 64 bytes, must fail by the same rule, or the
+  run fails; that shows the clock and the measurement see a leak at all,
+  not that a run could see a small one, which the effect sizes speak to.
+  The crop quantiles are dudect's as recalled for this change; no copy of
+  dudect's source was at hand to read them against. The harness's own
+  tests drive it with a simulated clock and time nothing, so they run in
+  every `cargo test`, beside tests that each fixed class is the extreme it
+  is named for and reaches the code it is timed through.
+- **The 1 ns floor** changes the verdict the provider's design gave (its
+  section 11.2, approved with the method on 2026-10-26), which failed a
+  target on |t| above 10 for any fixed class alone. The project owner
+  chose it on 2026-10-30, after a run in which a difference far smaller
+  than any instruction's cost failed a target. |t| grows with the root of
+  the samples, and a quick operation's run at the nightly budget counts
+  millions: timed on a 5-CPU x86_64 Linux container on a shared host,
+  AES-256-GCM's seal on the portable backends, 586 ns an operation,
+  failed one of two 60 s runs at |t| 13.28, each of its three fixed
+  classes 0.06 to 0.07 ns an operation slower than the random class (|t|
+  12.31 to 13.28, an effect of 0.011 standard deviations), and was
+  reported at 8.20 in the other, 0.09 ns slower. A secret-dependent
+  instruction path costs a few cycles an operation at least, about 1 ns at
+  3 to 5 GHz. The floor is more than ten times that difference. An
+  early-exit tag comparison planted in AES-128-GCM's open failed at |t|
+  2,720 and 2,819, on 5.31 and 3.20 ns an operation in two runs'
+  comparisons of the largest |t|, three times the floor or more. A smaller
+  leak, about 4.8 ns a call planted in ECDSA P-256 signing by the key, was
+  not found at 10 s or at 60 s: signing's spread, a standard deviation of
+  about 3.6 µs, needs a difference of a few hundred nanoseconds for |t| to
+  reach 10 in those budgets, a limit of the statistics and not of the
+  floor. The floor is judged on the largest difference among a class's
+  comparisons above |t| 10, not on the comparison of its largest |t|
+  alone: a crop keeps the samples quicker than its threshold, so one that
+  cuts into the slower class's times lowers its mean, and often its spread
+  more, and the comparison of the largest |t| can show less of the
+  difference than the class has, as with the planted tag comparison: 3.20
+  ns in a crop at the warm-up's quantile 0.732 in one run, against 5.31 ns
+  at 0.989 in the other. What the floor gives up is a class whose
+  comparisons above |t| 10 all differ by less than 1 ns an operation, as a
+  leak of fewer than about 3 to 5 cycles on a secret-dependent path would:
+  the target passes, and its row in the job's summary is marked as
+  reported under the floor.
+- **The targets,** 27 `#[ignore]` tests. ECDSA signing on P-256, P-384
+  and P-521, by the key, with the message and the hedge fixed so that RFC
+  6979's nonce follows the key, and by the nonce, with the key fixed,
+  through the test-only `sign_with_nonce`, each over twelve scalar
+  classes, eleven on P-521, whose top 4-bit window holds its top bit
+  alone: 1, 2, 0xff, 2^64 - 1, the top bit alone, n - 1, n - 2, n - 1
+  with its bottom half zero and with its top half zero, eight set bits,
+  n - 1 with eight of its bits cleared, and n - 1's top window alone. The
+  key exchange's `complete`, with the peer's share fixed, and the step
+  `start` takes after its draw, which computes the public key: on each
+  NIST curve over the same classes, and on X25519 over all zeros and all
+  ones, 2^254 and 2^255 - 8 once clamped, and the clamped scalars of low
+  and high weight (eight bits set, eight cleared). Ed25519 signing by the
+  expanded scalar, 2^254, 2^254 + 8, 2^255 - 8, low and high weight, and
+  6L + 2 and 5L - 1, within the clamp, whose residues mod L, which the
+  key's arithmetic uses, are 2 and L - 1; and by the nonce, 0, 1, L - 1,
+  and low and high weight. Sealing a record with each of the three
+  AEADs, by keys of all zeros, all ones and 0x55 and 0xaa in turn, with
+  the cipher made ahead as the provider makes one for each traffic key;
+  keying AES-128-GCM and AES-256-GCM, AES's key schedule and GHASH's
+  key, by the same keys; and opening a record with a tag wrong in its
+  first byte and in its last, against a tag wrong at random. HMAC-SHA256
+  and HMAC-SHA384, keyed by all zeros, all ones and one bit set. The keys
+  are made through `sign.rs`'s test-only module `timing` and the
+  exchanges through `kx.rs`'s test-only `exchange_with`; neither is in
+  the crate's public API or its build outside tests.
+- **The workflow,** `.github/workflows/constant-time.yml`, on pushes to
+  `master` and pull requests that touch `crates/dcroxide-tlscrypto/**`,
+  `crates/dcroxide-testutil/**`, `crates/dcroxide-crypto/**` (a normal
+  dependency of the crate, linked into the timed binary, whose features
+  on `chacha20` merge with the AEAD's), `Cargo.lock`, the root
+  `Cargo.toml`, `rust-toolchain.toml` or the workflow, nightly, and on
+  dispatch: four jobs, `ubuntu-latest` and `ubuntu-24.04-arm` each with
+  the backends the crates pick for the processor and with the portable
+  ones that `tls-soft-backends`'s cfgs force, each running
+  `cargo test -p dcroxide-tlscrypto --release --lib ct_check -- --ignored
+  --test-threads=1 --nocapture`, every target for `DCROXIDE_CT_SECONDS`
+  seconds, 10 on pushes and pull requests and 60 nightly and on dispatch,
+  and putting each target's row in the job's summary.
+
+It is statistical: it sees a difference large enough to show on a runner,
+fails only on one of 1 ns an operation or more, and a pass is not a
+proof. What is timed is each operation as the provider runs it, public
+work included: an ECDSA signature's DER encoding branches on the
+signature's leading bytes, which a fixed class repeats and the random
+class varies. No target reaches what
+`curve25519_dalek_backend` switches, verification's double-base
+multiplication. The switch waits on this workflow green on the change
+that adds it, as pushed, beside the matrices.

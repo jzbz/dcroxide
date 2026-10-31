@@ -47,6 +47,8 @@
 //! since the release build aborts on a panic and wraps on overflow.
 
 mod aead;
+#[cfg(test)]
+mod ct_check;
 mod der;
 mod hash;
 mod hmac;
