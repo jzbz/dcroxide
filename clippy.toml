@@ -1,0 +1,37 @@
+# Refused (ADR-0008's addendum of 2026-10-31, ADR-0015's T7 and its
+# answer on a process default): the six rustls constructors that take
+# its process-wide crypto provider; `CryptoProvider::install_default`,
+# which would set one; and the ureq entry points that build its default
+# agent, which falls back to one.  The node installs no default and
+# builds rustls with `custom-provider`, so each constructor and agent
+# would panic at its first use; every configuration names
+# `dcroxide-tlscrypto`'s provider instead, through `builder_with_provider`
+# or ureq's `TlsConfig`.  ureq's entries are `Agent::new_with_defaults`,
+# its default agent, and every public function of ureq 3.4.2 that calls
+# it inside ureq, where clippy cannot follow the call: the nine request
+# functions, `run`, `agent` and `RequestExt::with_default_agent`.  An
+# agent built from a `Config` whose `TlsConfig` names no provider falls
+# back the same way, which no lint can see; the node's
+# `tests/no_process_provider.rs` covers that.
+disallowed-methods = [
+    { path = "rustls::ClientConfig::builder", reason = "takes the process default provider, which the node never installs; use builder_with_provider with dcroxide_tlscrypto::default_provider() (ADR-0015 T7)" },
+    { path = "rustls::ClientConfig::builder_with_protocol_versions", reason = "takes the process default provider, which the node never installs; use builder_with_provider with dcroxide_tlscrypto::default_provider() (ADR-0015 T7)" },
+    { path = "rustls::ServerConfig::builder", reason = "takes the process default provider, which the node never installs; use builder_with_provider with dcroxide_tlscrypto::default_provider() (ADR-0015 T7)" },
+    { path = "rustls::ServerConfig::builder_with_protocol_versions", reason = "takes the process default provider, which the node never installs; use builder_with_provider with dcroxide_tlscrypto::default_provider() (ADR-0015 T7)" },
+    { path = "rustls::server::WebPkiClientVerifier::builder", reason = "takes the process default provider, which the node never installs; use builder_with_provider with dcroxide_tlscrypto::default_provider() (ADR-0015 T7)" },
+    { path = "rustls::client::WebPkiServerVerifier::builder", reason = "takes the process default provider, which the node never installs; use builder_with_provider with dcroxide_tlscrypto::default_provider() (ADR-0015 T7)" },
+    { path = "rustls::crypto::CryptoProvider::install_default", reason = "the node installs no process default: every rustls configuration names dcroxide-tlscrypto's provider (ADR-0015 T7)" },
+    { path = "ureq::get", reason = "ureq's default agent takes the process default provider, which the node never installs; build an agent whose TlsConfig names dcroxide-tlscrypto's provider (ADR-0015 T7)" },
+    { path = "ureq::post", reason = "ureq's default agent takes the process default provider, which the node never installs; build an agent whose TlsConfig names dcroxide-tlscrypto's provider (ADR-0015 T7)" },
+    { path = "ureq::put", reason = "ureq's default agent takes the process default provider, which the node never installs; build an agent whose TlsConfig names dcroxide-tlscrypto's provider (ADR-0015 T7)" },
+    { path = "ureq::delete", reason = "ureq's default agent takes the process default provider, which the node never installs; build an agent whose TlsConfig names dcroxide-tlscrypto's provider (ADR-0015 T7)" },
+    { path = "ureq::head", reason = "ureq's default agent takes the process default provider, which the node never installs; build an agent whose TlsConfig names dcroxide-tlscrypto's provider (ADR-0015 T7)" },
+    { path = "ureq::options", reason = "ureq's default agent takes the process default provider, which the node never installs; build an agent whose TlsConfig names dcroxide-tlscrypto's provider (ADR-0015 T7)" },
+    { path = "ureq::connect", reason = "ureq's default agent takes the process default provider, which the node never installs; build an agent whose TlsConfig names dcroxide-tlscrypto's provider (ADR-0015 T7)" },
+    { path = "ureq::patch", reason = "ureq's default agent takes the process default provider, which the node never installs; build an agent whose TlsConfig names dcroxide-tlscrypto's provider (ADR-0015 T7)" },
+    { path = "ureq::trace", reason = "ureq's default agent takes the process default provider, which the node never installs; build an agent whose TlsConfig names dcroxide-tlscrypto's provider (ADR-0015 T7)" },
+    { path = "ureq::run", reason = "ureq's default agent takes the process default provider, which the node never installs; build an agent whose TlsConfig names dcroxide-tlscrypto's provider (ADR-0015 T7)" },
+    { path = "ureq::agent", reason = "ureq's default agent takes the process default provider, which the node never installs; build an agent whose TlsConfig names dcroxide-tlscrypto's provider (ADR-0015 T7)" },
+    { path = "ureq::Agent::new_with_defaults", reason = "ureq's default agent takes the process default provider, which the node never installs; build an agent whose TlsConfig names dcroxide-tlscrypto's provider (ADR-0015 T7)" },
+    { path = "ureq::RequestExt::with_default_agent", reason = "ureq's default agent takes the process default provider, which the node never installs; build an agent whose TlsConfig names dcroxide-tlscrypto's provider (ADR-0015 T7)" },
+]

@@ -222,10 +222,10 @@ fn gencerts_authority_issues_a_working_tls_chain() {
     use std::io::{Read as _, Write as _};
     use std::sync::Arc;
 
-    // The tests pick the ring provider explicitly (the daemon installs
-    // it only when it builds a TLS RPC listener, in
-    // `build_server_config`).
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    // Both ends on the provider the daemon serves and dials with, named
+    // explicitly, as every configuration the daemon builds names it: there
+    // is no process default (ADR-0015).
+    let provider = Arc::new(dcroxide_tlscrypto::default_provider());
 
     let dir = scratch("gencerts");
     let ca_cert = dir.join("ca.pem").to_string_lossy().into_owned();
@@ -277,11 +277,15 @@ fn gencerts_authority_issues_a_working_tls_chain() {
         roots.add(cert).expect("trust the generated CA");
     }
 
-    let server_config = rustls::ServerConfig::builder()
+    let server_config = rustls::ServerConfig::builder_with_provider(Arc::clone(&provider))
+        .with_safe_default_protocol_versions()
+        .expect("the provider's versions")
         .with_no_client_auth()
         .with_single_cert(leaf_chain, key)
         .expect("server config over the issued pair");
-    let client_config = rustls::ClientConfig::builder()
+    let client_config = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .expect("the provider's versions")
         .with_root_certificates(roots)
         .with_no_client_auth();
 

@@ -4,7 +4,7 @@
 //! Nothing here signs, and nothing here is secret.
 //!
 //! ring verified the node's RSA signatures before this, and the rules
-//! below are ring's, so that the switch changes no verdict
+//! below are ring's, so that ADR-0015's switch changed no verdict
 //! (`ring-0.17.14/src/rsa/`):
 //!
 //! * The key is an `RSAPublicKey` as ring reads one (`rsa.rs:44-54`,

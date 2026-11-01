@@ -3265,12 +3265,13 @@ enum GoChains<'a> {
 /// below it).  The search ends when the budget runs out, keeping the
 /// chains built by then.
 ///
-/// The signature is verified with `sig_algs`, the ring provider's
-/// algorithms webpki uses, by the first one naming both the child's
-/// signature algorithm and the parent's key algorithm, as webpki picks
-/// it, after the RSA public exponent limit Go's verification applies and
-/// ring's does not (`go_rsa_exponent_fits`).  Go verifies some
-/// signatures those cannot, among them RSA keys of 1024 to 2047 bits or
+/// The signature is verified with `sig_algs`, the algorithms of
+/// `dcroxide-tlscrypto`'s provider that webpki uses, which keep ring's
+/// set, by the first one naming both the child's signature algorithm
+/// and the parent's key algorithm, as webpki picks it, after the RSA
+/// public exponent limit Go's verification applies and the provider's,
+/// ring's, does not (`go_rsa_exponent_fits`).  Go verifies some
+/// signatures those cannot, among them RSA keys of 1024 to 2040 bits or
 /// over 8192, P-224 and P-521 keys, ECDSA with SHA-512, ML-DSA (from
 /// Go 1.27: 1.26.2, the reference Go, leaves an ML-DSA key nil and
 /// passes the candidate over, at the same one check), a signature
@@ -3397,8 +3398,9 @@ fn check_signature_from(
         return false;
     };
     // Go's RSA verification refuses a public exponent above 2^31 - 1
-    // ("crypto/rsa: public exponent too large"), where ring takes one up
-    // to 2^33 - 1.
+    // ("crypto/rsa: public exponent too large"), where the provider takes
+    // one up to 2^33 - 1, as ring did, until Go's RSA rules move into it
+    // (ADR-0015, T4).
     if DerReader::new(key_algorithm).read_tag(0x06) == Some(RSA_ENCRYPTION)
         && !go_rsa_exponent_fits(key)
     {
@@ -3423,7 +3425,7 @@ const RSA_ENCRYPTION: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 
 /// takes, at most 2^31 - 1 (`crypto/internal/fips140/rsa`
 /// `checkPublicKey`); a key that does not read as `RSAPublicKey` is
 /// refused too.  The exponent's other limits, odd and at least 3, are
-/// ring's as well.
+/// the provider's as well, which keeps ring's.
 // Shifts over at most eight bytes.
 #[allow(clippy::arithmetic_side_effects)]
 fn go_rsa_exponent_fits(key: &[u8]) -> bool {
@@ -3516,9 +3518,9 @@ struct ClientCa {
 struct GoClientCertVerifier {
     cas: Vec<ClientCa>,
     all: Arc<dyn rustls::server::danger::ClientCertVerifier>,
-    /// The signature algorithms chains are verified with: the ring
-    /// provider's, which [`build_server_config`] installs and the
-    /// verifier over the whole pool uses.
+    /// The signature algorithms chains are verified with:
+    /// `dcroxide-tlscrypto`'s, which the verifier over the whole pool uses
+    /// too.
     sig_algs: &'static [&'static dyn rustls::pki_types::SignatureVerificationAlgorithm],
 }
 
@@ -4032,19 +4034,21 @@ impl GoClientCertVerifier {
         Ok(GoClientCertVerifier {
             cas,
             all,
-            sig_algs: rustls::crypto::ring::default_provider()
-                .signature_verification_algorithms
-                .all,
+            sig_algs: dcroxide_tlscrypto::SUPPORTED_SIG_ALGS.all,
         })
     }
 
-    /// webpki's client verifier over the given anchors.
+    /// webpki's client verifier over the given anchors, on
+    /// `dcroxide-tlscrypto`'s provider.
     fn webpki_over(
         roots: Vec<rustls::pki_types::TrustAnchor<'static>>,
     ) -> Result<Arc<dyn rustls::server::danger::ClientCertVerifier>, String> {
-        rustls::server::WebPkiClientVerifier::builder(Arc::new(rustls::RootCertStore { roots }))
-            .build()
-            .map_err(|e| format!("unable to build the RPC client verifier: {e}"))
+        rustls::server::WebPkiClientVerifier::builder_with_provider(
+            Arc::new(rustls::RootCertStore { roots }),
+            Arc::new(dcroxide_tlscrypto::default_provider()),
+        )
+        .build()
+        .map_err(|e| format!("unable to build the RPC client verifier: {e}"))
     }
 }
 
@@ -4387,6 +4391,51 @@ impl rustls::server::danger::ClientCertVerifier for GoClientCertVerifier {
     }
 }
 
+/// What the RPC listener refuses an RSA `rpc.key` with, at startup and on
+/// a rotation, where dcrd serves it (ADR-0015, T6; PARITY.md records it):
+/// `dcroxide-tlscrypto` signs with no RSA key, since the one pure-Rust RSA
+/// signer carries a private-key timing advisory (RUSTSEC-2023-0071),
+/// which is why `gencerts` writes none either.
+pub const RSA_RPC_KEY_REFUSED: &str = "the RPC key is an RSA key, and dcroxide signs TLS \
+    handshakes with ECDSA and Ed25519 keys only: replace the --rpckey and --rpccert pair with \
+    such a pair (remove both and the next start generates one on the --tlscurve curve, P-256 by \
+    default; gencerts writes P-256, P-384, P-521 and Ed25519 pairs)";
+
+/// The key block of an `rpc.key` as `tls.X509KeyPair` chooses it
+/// (`crypto/tls/tls.go:294-311`): the first block Go's `pem.Decode` finds
+/// whose type is `PRIVATE KEY` or ends in ` PRIVATE KEY`, whatever its
+/// headers, or Go's text for a file with none (`:298-305`).  So a key
+/// under a label of its own ending so is read, one under a label that
+/// runs into `PRIVATE KEY` with no space is skipped, and a first such
+/// block that does not parse, an `ENCRYPTED PRIVATE KEY` among them, is
+/// the one refused, though a readable key follows it.  The block's DER is
+/// wiped when it is dropped, as ring's loader wiped the DER it was
+/// handed; the PEM text it is decoded from, the file as read and the
+/// decoder's copies of the block's base64 body, is not, and was not
+/// before the switch.
+fn go_key_block(key_pem: &[u8]) -> Result<zeroize::Zeroizing<Vec<u8>>, String> {
+    let mut skipped_block_types = Vec::new();
+    let mut rest = key_pem;
+    while let Some((block, next)) = go_pem_decode(rest) {
+        rest = next;
+        if block.block_type == b"PRIVATE KEY" || block.block_type.ends_with(b" PRIVATE KEY") {
+            return Ok(zeroize::Zeroizing::new(block.bytes));
+        }
+        skipped_block_types.push(String::from_utf8_lossy(&block.block_type).into_owned());
+    }
+    Err(match skipped_block_types.as_slice() {
+        [] => "tls: failed to find any PEM data in key input".to_string(),
+        [only] if only == "CERTIFICATE" => {
+            "tls: found a certificate rather than a key in the PEM for the private key".to_string()
+        }
+        types => format!(
+            "tls: failed to find PEM block with type ending in \"PRIVATE KEY\" in key input \
+             after skipping PEM blocks of the following types: [{}]",
+            types.join(" ")
+        ),
+    })
+}
+
 /// Build the rustls server configurations from the PEM certificate
 /// pair (dcrd loading `rpc.cert`/`rpc.key` into its `tls.Config`): the
 /// set [`crate::rpctls`] chooses among per ClientHello, so the cipher
@@ -4400,25 +4449,21 @@ impl rustls::server::danger::ClientCertVerifier for GoClientCertVerifier {
 /// certificate is a hard startup error rather than a silently
 /// unauthenticated endpoint.
 ///
+/// The key is read as Go's `tls.X509KeyPair` reads it: the block by Go's
+/// rule ([`go_key_block`]) and its DER by Go's `parsePrivateKey`, through
+/// `dcroxide-tlscrypto`'s loader, which signs with ECDSA and Ed25519 keys
+/// alone.  An RSA key, which dcrd serves, is refused with
+/// [`RSA_RPC_KEY_REFUSED`] (ADR-0015, T6), at startup and on a rotation
+/// alike, since both come here.
+///
 /// The certificate, key and client verifier are read once and shared by
-/// every configuration in the set, which differ only in their providers.
+/// every configuration in the set, which differ only in their providers,
+/// each `dcroxide-tlscrypto`'s; no process default is installed or read.
 fn build_server_config(
     cert_pem: &[u8],
     key_pem: &[u8],
     client_cas_pem: Option<&[u8]>,
 ) -> Result<RpcTlsConfigs, String> {
-    use rustls::pki_types::pem::PemObject;
-    // Pin the process-level crypto provider.  Only `ring` is enabled in
-    // the tree, so this is unambiguous today; installing it explicitly
-    // keeps it that way if a dependency ever brings the other one in,
-    // since rustls refuses to guess when two are present.
-    //
-    // The choice has visible consequences: ring signs with P-256 and
-    // P-384 only (`rustls/src/crypto/ring/sign.rs:45-65`), so a P-521 key
-    // is served around the provider, by `dcroxide-tlscrypto`'s signer
-    // below, and it has no P-521 key exchange, which [`crate::rpctls`]
-    // adds from the same crate.
-    let _ = rustls::crypto::ring::default_provider().install_default();
     // The certificate chain is every `CERTIFICATE` block Go's
     // `pem.Decode` finds, skipping blocks of other types and malformed
     // ones, as `tls.X509KeyPair` collects it (`crypto/tls/tls.go`).
@@ -4448,40 +4493,36 @@ fn build_server_config(
             ),
         });
     }
-    let key = rustls::pki_types::PrivateKeyDer::from_pem_slice(key_pem)
-        .map_err(|e| format!("unable to parse the RPC key: {e}"))?;
+    // The key is parsed before the client CA file is, as dcrd's
+    // `newTLSConfig` loads the pair first (`server.go:3680-3683`), though
+    // both callers read that file beforehand, where dcrd reads it after.
+    // Its DER is parsed whatever the label, as Go's `parsePrivateKey` does,
+    // so no `PrivateKeyDer` variant is chosen and `load_der` takes it, not
+    // the `KeyProvider`.  `keys_match` is the certificate-against-key check
+    // `CertifiedKey::from_der` makes (`crypto/signer.rs:159-174`).
+    let key_der = go_key_block(key_pem)?;
+    if dcroxide_tlscrypto::sign::key_algorithm(&key_der)
+        == Some(dcroxide_tlscrypto::sign::KeyAlgorithm::Rsa)
+    {
+        return Err(format!(
+            "unable to build the RPC TLS configuration: {RSA_RPC_KEY_REFUSED}"
+        ));
+    }
+    let signing = dcroxide_tlscrypto::sign::load_der(&key_der)
+        .map_err(|e| format!("unable to build the RPC TLS configuration: {e}"))?;
+    drop(key_der);
+    let certified = rustls::sign::CertifiedKey::new(certs, signing);
+    certified
+        .keys_match()
+        .map_err(|e| format!("unable to build the RPC TLS configuration: {e}"))?;
+    let resolver: Arc<dyn rustls::server::ResolvesServerCert> =
+        Arc::new(rustls::sign::SingleCertAndKey::from(certified));
 
     let verifier: Option<Arc<dyn rustls::server::danger::ClientCertVerifier>> = match client_cas_pem
     {
         Some(cas_pem) => Some(Arc::new(GoClientCertVerifier::from_pem(cas_pem)?)),
         None => None,
     };
-    // Until the switch (ADR-0015 step 2) only a P-521 key goes to the
-    // in-tree provider, which parses its DER as Go's `tls.X509KeyPair`
-    // does, under whichever of its three labels the PEM reader above took
-    // it, and signs with it; every other key keeps ring's loader, which
-    // refuses P-521.  The certified key is built by hand for it, and
-    // `keys_match` is the same certificate-against-key check
-    // `CertifiedKey::from_der` makes (`crypto/signer.rs:159-174`).  Any
-    // other key takes `from_der`, the path `with_single_cert` takes, with
-    // its errors.
-    let certified = if dcroxide_tlscrypto::sign::key_algorithm(key.secret_der())
-        == Some(dcroxide_tlscrypto::sign::KeyAlgorithm::EcdsaP521)
-    {
-        let signing = dcroxide_tlscrypto::sign::KEY_PROVIDER
-            .load_private_key(key)
-            .map_err(|e| format!("unable to build the RPC TLS configuration: {e}"))?;
-        let certified = rustls::sign::CertifiedKey::new(certs, signing);
-        certified
-            .keys_match()
-            .map_err(|e| format!("unable to build the RPC TLS configuration: {e}"))?;
-        certified
-    } else {
-        rustls::sign::CertifiedKey::from_der(certs, key, &rustls::crypto::ring::default_provider())
-            .map_err(|e| format!("unable to build the RPC TLS configuration: {e}"))?
-    };
-    let resolver: Arc<dyn rustls::server::ResolvesServerCert> =
-        Arc::new(rustls::sign::SingleCertAndKey::from(certified));
 
     RpcTlsConfigs::build(|provider| {
         let builder = rustls::ServerConfig::builder_with_provider(provider)
@@ -9720,6 +9761,56 @@ mod tests {
         }
     }
 
+    /// An RSA key rotated in meets the refusal it meets at startup
+    /// (ADR-0015, T6, whose "at startup" names where the daemon stops, not
+    /// the check's reach): the working configuration stays, and the
+    /// reload's error, which `config_for_client`'s warning carries after
+    /// its own words, is T6's.  The provider loads no RSA key, so any
+    /// RSA key keeps the configuration; only these words show the check
+    /// ran on the reload.
+    #[test]
+    fn an_rsa_key_rotated_in_fails_the_reload_with_t6s_words() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let cert = dir.path().join("rpc.cert");
+        let key = dir.path().join("rpc.key");
+        load_or_generate_cert_pair(&cert, &key, &[], Curve::P256).expect("a cert pair");
+        let reloadable = reloadable_tls_config(&cert, &key, None, Duration::ZERO)
+            .expect("the reloadable configuration");
+        let before = reloadable.config_for_client();
+
+        // The test-key fixture's RSA-2048 key in PKCS#1 (RFC 8017
+        // §A.1.2), without the CRT values, which Go computes.
+        let rsa = dcroxide_testutil::rsa_test_key("rsa2048");
+        let integer = |value: &[u8]| {
+            let sign = value.first().is_none_or(|first| first & 0x80 != 0);
+            der_tlv(0x02, &[if sign { &[0][..] } else { &[] }, value].concat())
+        };
+        let fields: Vec<Vec<u8>> = [&[0][..], &rsa.n, &rsa.e, &rsa.d, &rsa.p, &rsa.q]
+            .into_iter()
+            .map(integer)
+            .collect();
+        let pkcs1 = der_tlv(0x30, &fields.concat());
+        let base64 = dcroxide_rpc::http::base64_std_encode(&pkcs1);
+        std::fs::write(
+            &key,
+            format!("-----BEGIN RSA PRIVATE KEY-----\n{base64}\n-----END RSA PRIVATE KEY-----\n"),
+        )
+        .expect("write the RSA key");
+
+        let after = reloadable.config_for_client();
+        assert!(
+            Arc::ptr_eq(&before, &after),
+            "an RSA key must not replace the working configuration"
+        );
+        let refused = format!("unable to build the RPC TLS configuration: {RSA_RPC_KEY_REFUSED}");
+        let state = reloadable.state.lock().expect("the reload state");
+        assert_eq!(
+            state.prev_attempt_err.as_deref(),
+            Some(refused.as_str()),
+            "the reload's error"
+        );
+    }
+
     /// cryptobyte's UTCTime and GeneralizedTime readers, as Go's
     /// certificate parser reads the validity window.  Every row is Go
     /// 1.27's `ParseCertificate` over a certificate with that notAfter,
@@ -10113,7 +10204,6 @@ mod tests {
         now: i64,
     ) -> Result<rustls::server::danger::ClientCertVerified, rustls::Error> {
         use rustls::server::danger::ClientCertVerifier;
-        let _ = rustls::crypto::ring::default_provider().install_default();
         let verifier = GoClientCertVerifier::from_pem(cas_pem).expect("verifier");
         verifier.verify_client_cert(
             &rustls::pki_types::CertificateDer::from(leaf),
@@ -10151,9 +10241,12 @@ mod tests {
         roots
             .add(rustls::pki_types::CertificateDer::from(ca.der.as_slice()))
             .expect("root");
-        let webpki = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots))
-            .build()
-            .expect("webpki verifier");
+        let webpki = rustls::server::WebPkiClientVerifier::builder_with_provider(
+            Arc::new(roots),
+            Arc::new(dcroxide_tlscrypto::default_provider()),
+        )
+        .build()
+        .expect("webpki verifier");
         assert!(
             webpki
                 .verify_client_cert(
@@ -10279,10 +10372,8 @@ mod tests {
         );
         // A TLS ECDSA signature is the same DER `ECDSA-Sig-Value` an
         // X.509 signature carries.
-        let key = rustls::pki_types::PrivateKeyDer::Pkcs8(
-            issuer_key.marshal_pkcs8().expect("pkcs8").into(),
-        );
-        let signature = rustls::crypto::ring::sign::any_ecdsa_type(&key)
+        let key = issuer_key.marshal_pkcs8().expect("pkcs8");
+        let signature = dcroxide_tlscrypto::sign::load_der(&key)
             .expect("signing key")
             .choose_scheme(&[rustls::SignatureScheme::ECDSA_NISTP256_SHA256])
             .expect("scheme")
@@ -10324,7 +10415,6 @@ mod tests {
         const EKU: &[u8] = &[0x55, 0x1d, 0x25];
         const SERVER_AUTH: &[u8] = &[0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x01];
         const CLIENT_AUTH: &[u8] = &[0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x02];
-        let _ = rustls::crypto::ring::default_provider().install_default();
         let now = rustls::pki_types::UnixTime::since_unix_epoch(Duration::from_secs(1_790_000_000));
         let key = || generate_key("P-256").expect("key");
         let (root_key, int_key, other_key, leaf_key, direct_key) =
@@ -10473,7 +10563,6 @@ mod tests {
         const SERVER_AUTH: &[u8] = &[0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x01];
         const CLIENT_AUTH: &[u8] = &[0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x02];
         const CODE_SIGNING: &[u8] = &[0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x03];
-        let _ = rustls::crypto::ring::default_provider().install_default();
         let now = rustls::pki_types::UnixTime::since_unix_epoch(Duration::from_secs(1_790_000_000));
         let key = || generate_key("P-256").expect("key");
         let (root_key, int_key, leaf_key, stranger_key) = (key(), key(), key(), key());
@@ -10505,9 +10594,12 @@ mod tests {
         roots
             .add(CertificateDer::from(root.as_slice()))
             .expect("the root");
-        let theirs = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots))
-            .build()
-            .expect("webpki's verifier");
+        let theirs = rustls::server::WebPkiClientVerifier::builder_with_provider(
+            Arc::new(roots),
+            Arc::new(dcroxide_tlscrypto::default_provider()),
+        )
+        .build()
+        .expect("webpki's verifier");
         let check = |verifier: &dyn ClientCertVerifier, leaf: &[u8], sent: &[&[u8]]| {
             let sent: Vec<_> = sent.iter().map(|der| CertificateDer::from(*der)).collect();
             verifier
@@ -10597,7 +10689,6 @@ mod tests {
         use rustls::server::danger::ClientCertVerifier;
         const BASIC_CONSTRAINTS: &[u8] = &[0x55, 0x1d, 0x13];
         const KEY_USAGE: &[u8] = &[0x55, 0x1d, 0x0f];
-        let _ = rustls::crypto::ring::default_provider().install_default();
         let now = rustls::pki_types::UnixTime::since_unix_epoch(Duration::from_secs(1_790_000_000));
         let key = || generate_key("P-256").expect("key");
         let (root_key, int_key, inner_key, leaf_key, decoy_key, mid_key) =
@@ -11128,11 +11219,12 @@ mod tests {
         }
     }
 
-    /// The replay's signature check refuses an RSA parent whose public
-    /// exponent Go's RSA verification refuses, above 2^31 - 1, though
-    /// ring would take it: with an algorithm that takes every signature,
-    /// a CA with exponent 65537 or 2^31 - 1 signs and one with 2^31 + 1
-    /// or 2^32 + 1 does not.
+    /// The replay's signature check refuses an RSA parent whose
+    /// public exponent Go's RSA verification refuses, above 2^31 - 1,
+    /// though the provider, keeping ring's limit, would take it: with
+    /// an algorithm that takes every signature, a CA with exponent
+    /// 65537 or 2^31 - 1 signs and one with 2^31 + 1 or 2^32 + 1 does
+    /// not.
     #[test]
     fn an_rsa_parent_past_gos_exponent_limit_signs_nothing() {
         const BASIC_CONSTRAINTS: &[u8] = &[0x55, 0x1d, 0x13];
@@ -11333,7 +11425,6 @@ mod tests {
         const KEY_USAGE: &[u8] = &[0x55, 0x1d, 0x0f];
         const SKI: &[u8] = &[0x55, 0x1d, 0x0e];
         const AKI: &[u8] = &[0x55, 0x1d, 0x23];
-        let _ = rustls::crypto::ring::default_provider().install_default();
         let secs = 1_790_000_000u64;
         let now = rustls::pki_types::UnixTime::since_unix_epoch(Duration::from_secs(secs));
         let mut oracle = dcroxide_testutil::oracle_or_skip();
@@ -11494,7 +11585,6 @@ mod tests {
         const KEY_USAGE: &[u8] = &[0x55, 0x1d, 0x0f];
         const SKI: &[u8] = &[0x55, 0x1d, 0x0e];
         const AKI: &[u8] = &[0x55, 0x1d, 0x23];
-        let _ = rustls::crypto::ring::default_provider().install_default();
         let secs = 1_790_000_000u64;
         let now = rustls::pki_types::UnixTime::since_unix_epoch(Duration::from_secs(secs));
         let mut oracle = dcroxide_testutil::oracle_or_skip();
@@ -11739,7 +11829,6 @@ mod tests {
         use rustls::server::danger::ClientCertVerifier;
         const BASIC_CONSTRAINTS: &[u8] = &[0x55, 0x1d, 0x13];
         const KEY_USAGE: &[u8] = &[0x55, 0x1d, 0x0f];
-        let _ = rustls::crypto::ring::default_provider().install_default();
         let secs = 1_790_000_000u64;
         let now = rustls::pki_types::UnixTime::since_unix_epoch(Duration::from_secs(secs));
         let mut oracle = dcroxide_testutil::oracle_or_skip();
@@ -11808,7 +11897,6 @@ mod tests {
         const KEY_USAGE: &[u8] = &[0x55, 0x1d, 0x0f];
         const EKU: &[u8] = &[0x55, 0x1d, 0x25];
         const SERVER_AUTH: &[u8] = &[0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x01];
-        let _ = rustls::crypto::ring::default_provider().install_default();
         let secs = 1_790_000_000u64;
         let now = rustls::pki_types::UnixTime::since_unix_epoch(Duration::from_secs(secs));
         let mut oracle = dcroxide_testutil::oracle_or_skip();
@@ -11879,7 +11967,6 @@ mod tests {
         use rustls::server::danger::ClientCertVerifier;
         const BASIC_CONSTRAINTS: &[u8] = &[0x55, 0x1d, 0x13];
         const KEY_USAGE: &[u8] = &[0x55, 0x1d, 0x0f];
-        let _ = rustls::crypto::ring::default_provider().install_default();
         let secs = 1_790_000_000u64;
         let now = rustls::pki_types::UnixTime::since_unix_epoch(Duration::from_secs(secs));
         let mut oracle = dcroxide_testutil::oracle_or_skip();
@@ -11961,7 +12048,6 @@ mod tests {
         // A registeredID GeneralName, 1.2.3, and a dNSName.
         let registered = der_tlv(0x88, &[0x2a, 0x03]);
         let dns = der_tlv(0x82, b"client.example");
-        let _ = rustls::crypto::ring::default_provider().install_default();
         let now = rustls::pki_types::UnixTime::since_unix_epoch(Duration::from_secs(1_790_000_000));
         let key = || generate_key("P-256").expect("key");
         let (root_key, int_key, leaf_key) = (key(), key(), key());
@@ -11981,9 +12067,12 @@ mod tests {
         roots
             .add(CertificateDer::from(root.as_slice()))
             .expect("the root");
-        let theirs = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots))
-            .build()
-            .expect("webpki's verifier");
+        let theirs = rustls::server::WebPkiClientVerifier::builder_with_provider(
+            Arc::new(roots),
+            Arc::new(dcroxide_tlscrypto::default_provider()),
+        )
+        .build()
+        .expect("webpki's verifier");
         let check = |verifier: &dyn ClientCertVerifier, leaf: &[u8], sent: &[&[u8]]| {
             let sent: Vec<_> = sent.iter().map(|der| CertificateDer::from(*der)).collect();
             verifier
@@ -12726,7 +12815,6 @@ mod tests {
         const POLICIES: &[u8] = &[0x55, 0x1d, 0x20];
         const POLICY_MAPPINGS: &[u8] = &[0x55, 0x1d, 0x21];
         const POLICY_CONSTRAINTS: &[u8] = &[0x55, 0x1d, 0x24];
-        let _ = rustls::crypto::ring::default_provider().install_default();
         let now = rustls::pki_types::UnixTime::since_unix_epoch(Duration::from_secs(1_790_000_000));
         let key = || generate_key("P-256").expect("key");
         let (root_key, int_key, leaf_key) = (key(), key(), key());
@@ -12760,9 +12848,12 @@ mod tests {
         roots
             .add(CertificateDer::from(root.as_slice()))
             .expect("the root");
-        let theirs = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots))
-            .build()
-            .expect("webpki's verifier");
+        let theirs = rustls::server::WebPkiClientVerifier::builder_with_provider(
+            Arc::new(roots),
+            Arc::new(dcroxide_tlscrypto::default_provider()),
+        )
+        .build()
+        .expect("webpki's verifier");
         let check = |verifier: &dyn ClientCertVerifier, leaf: &[u8], sent: &[&[u8]]| {
             let sent: Vec<_> = sent.iter().map(|der| CertificateDer::from(*der)).collect();
             verifier
@@ -16037,9 +16128,7 @@ mod tests {
         }
 
         fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-            rustls::crypto::ring::default_provider()
-                .signature_verification_algorithms
-                .supported_schemes()
+            dcroxide_tlscrypto::SUPPORTED_SIG_ALGS.supported_schemes()
         }
     }
 
@@ -16062,7 +16151,7 @@ mod tests {
         .expect("a cert pair");
         let server_configs = tls_server_config(&cert, &key, None).expect("server config");
         let client_config = rustls::ClientConfig::builder_with_provider(Arc::new(
-            rustls::crypto::ring::default_provider(),
+            dcroxide_tlscrypto::default_provider(),
         ))
         .with_safe_default_protocol_versions()
         .expect("protocol versions")
@@ -16200,11 +16289,10 @@ mod tests {
         let configs = tls_server_config(&cert, &key, None).expect("server config");
         // Every group the set offers, P-521 among them, so the client can
         // complete a handshake with each configuration.
-        let mut provider = rustls::crypto::ring::default_provider();
-        provider
-            .kx_groups
-            .push(dcroxide_tlscrypto::kx_group::SECP521R1);
-        let provider = Arc::new(provider);
+        let provider = Arc::new(rustls::crypto::CryptoProvider {
+            kx_groups: dcroxide_tlscrypto::ALL_KX_GROUPS.to_vec(),
+            ..dcroxide_tlscrypto::default_provider()
+        });
 
         for config in configs.configs() {
             assert_eq!(config.send_tls13_tickets, 0, "no ticket is prepared");

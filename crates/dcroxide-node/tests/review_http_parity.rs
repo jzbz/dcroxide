@@ -480,9 +480,7 @@ impl rustls::client::danger::ServerCertVerifier for AnyCertificate {
     }
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        rustls::crypto::ring::default_provider()
-            .signature_verification_algorithms
-            .supported_schemes()
+        dcroxide_tlscrypto::SUPPORTED_SIG_ALGS.supported_schemes()
     }
 }
 
@@ -503,7 +501,7 @@ fn tls_replies_end_with_close_notify() {
     let (listener, port) = listen(&server, RpcTransport::Tls(tls));
     let client_config = Arc::new(
         rustls::ClientConfig::builder_with_provider(Arc::new(
-            rustls::crypto::ring::default_provider(),
+            dcroxide_tlscrypto::default_provider(),
         ))
         .with_safe_default_protocol_versions()
         .expect("protocol versions")

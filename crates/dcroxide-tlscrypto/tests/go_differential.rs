@@ -5,9 +5,10 @@
 //! For key exchange, on all four groups: each takes and refuses the shares
 //! Go's `crypto/ecdh` takes and refuses, the generated ones of
 //! `kx_shares`, and agrees Go's secret over a fresh key share of its own.
-//! P-521 is the group these tests matter most for, since ring has none to
-//! hold it to; Wycheproof's vectors go through Go too, in the crate's
-//! unit tests, where a vector's private key can be set.
+//! P-521 is the group these tests mattered most for while ring was in the
+//! tree, since ring had none to hold it to; Wycheproof's vectors go
+//! through Go too, in the crate's unit tests, where a vector's private key
+//! can be set.
 //!
 //! For key loading: `sign::load_der` reads each key of `key_corpus` as
 //! Go's `tls.X509KeyPair` reads it under its PEM label, the key and its
@@ -23,8 +24,9 @@
 //! the algorithm serves, and Go's verdict is still the one the corpus
 //! recorded; but in the classes `sig_corpus::GO_DIFFERS` lists, RSA keys
 //! outside ring's bounds and Go's and an `RSAPublicKey` with bytes after
-//! its values, where ring differs from Go today (`GO_DIFFERS` says how
-//! much of that PARITY.md records).  Wycheproof's cases, which the corpus
+//! its values, where the provider keeps ring's differences from Go until
+//! Go's client-certificate set (ADR-0015, T4; `GO_DIFFERS` says where
+//! PARITY.md records them).  Wycheproof's cases, which the corpus
 //! holds too, are held to Go case by case in the crate's unit tests.
 //!
 //! Without an oracle the tests skip, unless `DCROXIDE_REQUIRE_ORACLE` is
@@ -442,6 +444,39 @@ fn go_scheme(scheme: rustls::SignatureScheme) -> &'static str {
     }
 }
 
+/// The SubjectPublicKeyInfo of `key` for the algorithm at `algorithm`, as a
+/// certificate would carry it, which is how Go is given a key.
+fn spki(algorithm: usize, key: &[u8]) -> Vec<u8> {
+    rustls::sign::public_key_to_spki(&sig_corpus::ours(algorithm).public_key_alg_id(), key)
+        .as_ref()
+        .to_vec()
+}
+
+/// Go's verdict on a case, through the oracle's `sig_verify`: the key as a
+/// SubjectPublicKeyInfo, checked as Go checks a certificate's signature
+/// under the algorithm's x509 name.
+fn go_verifies(
+    oracle: &mut Oracle,
+    algorithm: usize,
+    key: &[u8],
+    message: &[u8],
+    signature: &[u8],
+) -> bool {
+    let request = serde_json::json!({
+        "spki": hex(&spki(algorithm, key)),
+        "x509_alg": sig_corpus::ALGORITHMS[algorithm].1,
+        "message": hex(message),
+        "signature": hex(signature),
+    });
+    let response = oracle.call("sig_verify", request.to_string().as_bytes());
+    dcroxide_testutil::require_reference_go(response["go_version"].as_str().unwrap_or_default());
+    match response["result"].as_str() {
+        Some("ok") => true,
+        Some(refused) if refused.starts_with("refused: ") => false,
+        _ => panic!("the oracle answered {response}"),
+    }
+}
+
 /// Go's verdict on a case as its `crypto/tls` checks a handshake signature
 /// under `scheme`, through the oracle's `sig_verify`.
 fn go_verifies_handshake(
@@ -450,7 +485,7 @@ fn go_verifies_handshake(
     case: &sig_corpus::Case,
 ) -> bool {
     let request = serde_json::json!({
-        "spki": hex(&sig_corpus::spki(case.algorithm, &case.key)),
+        "spki": hex(&spki(case.algorithm, &case.key)),
         "tls_scheme": go_scheme(scheme),
         "message": hex(&case.message),
         "signature": hex(&case.signature),
@@ -486,7 +521,8 @@ fn signatures_verify_as_go_verifies_them() {
             .verify_signature(&case.key, &case.message, &case.signature)
             .is_ok();
         // Where Go differs, it differs from ring, whose verdict the
-        // provider gives (`tests/ring_parity.rs` holds every case to it).
+        // provider gives (`tests/recorded_parity.rs` holds every case to
+        // the verdict recorded from ring).
         assert_eq!(ours, case.ring, "{}: ring's recorded verdict", case.label);
         let allowed = sig_corpus::GO_DIFFERS
             .iter()
@@ -494,7 +530,7 @@ fn signatures_verify_as_go_verifies_them() {
             .map(|(class, _)| *class);
         let label = &case.label;
         if case.class != "wycheproof" {
-            let go = sig_corpus::go_verifies(
+            let go = go_verifies(
                 &mut oracle,
                 case.algorithm,
                 &case.key,

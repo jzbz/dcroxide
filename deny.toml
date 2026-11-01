@@ -22,8 +22,8 @@ allow = [
 
 [bans]
 # A new duplicate should fail the build, which is only meaningful once
-# the ones already in Cargo.lock are enumerated below.  Under "warn" a
-# fresh duplicate is just a fourth warning nobody reads.  Flipping to
+# the ones already in cargo-deny's graph are listed below.  Under "warn"
+# a fresh duplicate is just a second warning nobody reads.  Flipping to
 # "deny" is safe because Cargo.lock is committed, so the check is
 # deterministic and can only trip on a deliberate lockfile change.
 #
@@ -39,13 +39,24 @@ allow = [
 # does not turn an entry into an unmatched-skip warning.
 multiple-versions = "deny"
 
-[[bans.skip]]
-crate = "getrandom:0.2"
-reason = "ring 0.17 pins getrandom 0.2; the dcroxide crates, and crypto-bigint 0.7 and crypto-common 0.2 under elliptic-curve 0.14, are on 0.4"
-
-[[bans.skip]]
-crate = "windows-sys:0.52"
-reason = "ring 0.17 pins windows-sys 0.52; ctrlc, socket2 0.6 and windows-service 0.8 are on 0.61"
+# The crypto libraries in C and assembly rustls can take a provider from
+# (ADR-0012), refused now that dcroxide-tlscrypto is the node's only one
+# (ADR-0015).  Cargo.lock still lists ring, and `cargo metadata`'s
+# resolve graph has it under rustls-webpki, whose `alloc` feature names
+# the optional `ring?/alloc`: Cargo locks an optional dependency a
+# feature names that way, enabled or not.  No build compiles it.
+# cargo-deny's graph, which krates builds, follows the features that are
+# enabled and leaves out an optional dependency only a `?` feature names
+# (krates 0.21.2, src/builder.rs:1222, :1393), so it holds no ring, and
+# this ban fires only if something turns one on.  So too getrandom 0.2
+# and windows-sys 0.52, which only ring takes: the lock keeps them beside
+# 0.4 and 0.61, the graph does not, and they have no skip.  Were krates
+# to keep ring, this ban and those two duplicates would fail the check.
+deny = [
+    { crate = "ring", reason = "C and assembly; the node's TLS runs on dcroxide-tlscrypto (ADR-0012, ADR-0015)" },
+    { crate = "aws-lc-rs", reason = "binds aws-lc-sys, C and assembly; the node's TLS runs on dcroxide-tlscrypto (ADR-0012, ADR-0015)" },
+    { crate = "aws-lc-sys", reason = "C and assembly; the node's TLS runs on dcroxide-tlscrypto (ADR-0012, ADR-0015)" },
+]
 
 [[bans.skip]]
 crate = "syn:2"

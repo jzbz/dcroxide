@@ -48,7 +48,7 @@ or matched a second dcrd in the same role
 PARITY.md keep master's behaviour where 2.1.7 differs: `addnode` and
 `node`, protocol version 12 against 11 and `debuglevel`'s subsystems in
 one, and the retry backoff for an unreachable `--connect` peer in the
-other (`docs/PARITY.md:2307-2362`).
+other (`docs/PARITY.md:2309-2364`).
 
 **How dcrd releases**, read from its repository as fetched on 2026-10-25:
 
@@ -208,8 +208,8 @@ v2.2.0 and on each part below, which lands with that move or before it.
   build with the linker override `version.go` documents (`:51-54` at
   `release-v2.1.7`) set to the bare `X.Y.Z`, so that `init` stamps the
   revision as it does on master. `DCRD_COMMIT` becomes the tag's commit
-  (`.github/workflows/ci.yml:215`), and the comment that a release "is a
-  different specification" (`:239-242`) changes with it.
+  (`.github/workflows/ci.yml:221`), and the comment that a release "is a
+  different specification" (`:245-248`) changes with it.
 - **ADR-0001's original rule for the oracle and `fullblockgen`.** Every
   dcrd module in `tools/oracle/go.mod` and `tools/fullblockgen/go.mod`
   sits at exactly the version the tag's `go.mod` requires, as ADR-0001's
@@ -297,9 +297,9 @@ not PARITY.md's range sections, which record what the port claims.
   that a newer one supersedes before its move lands is pinned on the way
   or skipped; whether a scheduled CI job runs `tools/pinbump` against
   dcrd's newest tag and master (CI already clones dcrd for the interop
-  job, `.github/workflows/ci.yml:246`, and its scheduled jobs are the
-  nightly fuzz and the nightly signature soak, `:7-10`, `:469-472`,
-  `:616-618`); and the harness and build-metadata choices above.
+  job, `.github/workflows/ci.yml:252`, and its scheduled jobs are the
+  nightly fuzz and the nightly signature soak, `:7-10`, `:475-478`,
+  `:622-624`); and the harness and build-metadata choices above.
 
 ## Alternatives
 

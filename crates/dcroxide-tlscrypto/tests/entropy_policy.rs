@@ -9,17 +9,17 @@
 //!
 //! Every byte the provider draws but one comes from `rand::kernel_fill`:
 //! the bytes rustls asks its `SecureRandom` for, and the ephemeral key of
-//! each key exchange, which the RPC server draws once per TLS handshake a
-//! client steers to P-521 today and, from the switch (ADR-0015), once per
-//! TLS handshake the node serves or dials.  A peer paces those draws, and
-//! they stay on the kernel deliberately, on two grounds: Go's `crypto/tls`
-//! draws the same bytes from its standard-library `crypto/rand`, not from
-//! dcrd's package generator, and a failed read returns `GetRandomFailed`,
-//! which fails the one handshake rather than aborting the process.  An
-//! ephemeral scalar has a third: it is the session's whole secret, and the
-//! process generator, which keeps its key for 4 MiB of draws, would let a
-//! later read of the process's memory recover it, where the kernel's
-//! generator erases its key as it goes.
+//! each key exchange, which the node draws once per TLS handshake it
+//! serves or dials, since every rustls configuration it builds names this
+//! provider (ADR-0015).  A peer paces those draws, and they stay on the
+//! kernel deliberately, on two grounds: Go's `crypto/tls` draws the same
+//! bytes from its standard-library `crypto/rand`, not from dcrd's package
+//! generator, and a failed read returns `GetRandomFailed`, which fails the
+//! one handshake rather than aborting the process.  An ephemeral scalar
+//! has a third: it is the session's whole secret, and the process
+//! generator, which keeps its key for 4 MiB of draws, would let a later
+//! read of the process's memory recover it, where the kernel's generator
+//! erases its key as it goes.
 //!
 //! The one that is not the kernel's is the additional data each ECDSA
 //! handshake signature mixes into its RFC 6979 nonce, which comes from the
@@ -27,8 +27,8 @@
 //! `rand::ProcessRng`.  RFC 6979 keeps the nonce safe should that draw be
 //! weak, so it needs neither the kernel's freshness nor its fallibility,
 //! and that generator, seeded at startup, cannot fail after it.  The RPC
-//! server makes it once per TLS handshake it signs with a P-521 key today
-//! and, from the switch, once per handshake signed with any ECDSA key.
+//! server makes it once per TLS handshake it signs with an ECDSA key, on
+//! any of the three curves.
 //!
 //! The scans match literal text: `getrandom::`, so `use getrandom::fill;`
 //! followed by a bare `fill(..)`, or another entropy crate, walks straight

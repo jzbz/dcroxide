@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: ISC
-//! The key shares `tests/ring_parity.rs` and `tests/go_differential.rs` put
-//! to each key exchange group, valid and not, so that the groups' verdicts
-//! can be held to ring's and Go's share by share (ADR-0015, step 1).
+//! The key shares `tests/go_differential.rs` puts to each key exchange
+//! group, valid and not, so that the groups' verdicts are held to Go's
+//! share by share (ADR-0015), as they were held to ring's too until the
+//! switch removed ring.
 //!
 //! For each group: nothing at all, and every length from one byte to 140
 //! under each leading byte SEC 1 gives a meaning or reserves (`0x00`,

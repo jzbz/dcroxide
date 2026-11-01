@@ -160,14 +160,25 @@ evaluating this code.
   first, so it negotiates that with Go clients such as dcrctl and
   dcrwallet. This daemon picks among X25519, P-256, P-384 and P-521 as
   Go's server does, but negotiates plain X25519 with those clients,
-  because its rustls `ring` provider has no ML-KEM. RPC sessions recorded
-  on a non-local `--rpclisten` are therefore exposed to
-  harvest-now-decrypt-later attacks that dcrd's resist, including the
-  Basic credentials sent with every request. The P-521 key exchange,
-  which Decrediton requires, runs on the `p521` crate's arithmetic rather
-  than ring's, and that crate's curve arithmetic has never been
-  independently audited (docs/dependency-ledger.md). See PARITY.md's open
-  gaps.
+  because its TLS provider, the in-tree `dcroxide-tlscrypto`
+  ([ADR-0015](docs/adr/0015-tls-crypto-provider.md)), has no ML-KEM yet;
+  ADR-0015's T3 adds it. RPC sessions recorded on a non-local
+  `--rpclisten` are therefore exposed to harvest-now-decrypt-later
+  attacks that dcrd's resist, including the Basic credentials sent with
+  every request. Every key exchange and handshake signature runs on
+  RustCrypto's crates under that provider, X25519 and Ed25519 on
+  `curve25519-dalek` and P-256, P-384 and P-521, the last of which
+  Decrediton requires, on the `p256`, `p384` and `p521` crates, whose
+  curve arithmetic has never been independently audited
+  (docs/dependency-ledger.md). See PARITY.md's open gaps.
+- **An RSA RPC key is refused.** dcrd serves an `rpc.key` that is an RSA
+  key. This daemon refuses one at startup, and keeps the configuration it
+  serves when a rotation brings one in (ADR-0015, T6): its TLS provider
+  signs with ECDSA and Ed25519 keys alone, since the one pure-Rust RSA
+  signer carries a timing advisory on its private-key operations
+  (RUSTSEC-2023-0071). An operator with an RSA pair replaces it, as the
+  error says; `gencerts` and the daemon's own generation write none. See
+  PARITY.md's open gaps.
 - **Any host that can reach the RPC port can drive the TLS handshake
   error line.** `http: TLS handshake error from <addr>: <err>` is logged
   at error level for every refused handshake, as dcrd's net/http logs it,
@@ -280,15 +291,14 @@ evaluating this code.
   checksum to the address dispatch); the chain database's stored-row
   decoders; `chainhash` parsing; DER signature parsing; public-key
   parsing; ECDSA signing, verification and compact recovery; the Schnorr
-  and Ed25519 suites; `uint256`; BLAKE-256; and, in
-  `dcroxide-tlscrypto`, the TLS provider that is to replace `ring`
+  and Ed25519 suites; `uint256`; BLAKE-256; and, in `dcroxide-tlscrypto`,
+  the provider every TLS connection the node serves or dials runs on
   ([ADR-0015](docs/adr/0015-tls-crypto-provider.md)), its signature
   verification, which a peer's certificate chain and handshake signature
-  will reach before anything of theirs is trusted once the provider
-  replaces ring's (the fourteen algorithms, the in-tree RSA among them),
-  and its parsing of the RPC key (the port of Go's `parsePrivateKey`),
-  which the node already runs on every `rpc.key`. Five of the targets,
-  `dcrec_diff_ecdsa`, `dcrec_diff_recover`, `dcrec_diff_pubkey`,
+  reach before anything of theirs is trusted (the fourteen algorithms,
+  the in-tree RSA among them), and its parsing of the RPC key (the port
+  of Go's `parsePrivateKey`), which runs on every `rpc.key`. Five of the
+  targets, `dcrec_diff_ecdsa`, `dcrec_diff_recover`, `dcrec_diff_pubkey`,
   `dcrec_diff_schnorr` and `dcrec_diff_ed25519`, read each input as a
   case of one of `dcroxide-sigdiff`'s signature input classes and ask
   dcrd's own code for every answer through `tools/oracle`; a difference
@@ -316,8 +326,12 @@ evaluating this code.
   of a hundredth of its floor, and then writes a fixed-seed record that
   every later night's can be compared with; that is regression evidence,
   not the run that gates the port. For the TLS provider the comparison
-  with ring and Go rests on its parity corpus, its Wycheproof vectors
-  and its Go differential.
+  rests on ring's verdicts, recorded in its parity corpus before ring
+  left the tree, its Wycheproof vectors, its Go differential and the Go
+  interop matrix, and its timing on a statistical check in CI of its
+  signing, key exchange, record protection (sealing, a bad tag's refusal
+  and AES-GCM's keying) and HMAC keying, which a pass does not prove
+  constant-time (ADR-0015's addenda).
   Stateless parsers still unfuzzed: the config-file and command-line
   parser, which takes the operator's input rather than a peer's, GCS
   filter decoding, and the ticket, index and address-manager stores.
@@ -363,7 +377,9 @@ evaluating this code.
   review. Almost nothing in the tree has been read — one ledger entry
   is marked `reviewed@`, and one more was read in a single respect —
   and the tree includes the elliptic-curve implementations, the TLS
-  stack, and the storage engine that this node's key handling and
+  stack, rustls over RustCrypto's crates under the project's own
+  provider, `dcroxide-tlscrypto`, which nobody outside the project has
+  read either, and the storage engine that this node's key handling and
   on-disk consensus state rest on.
   [docs/dependency-ledger.md](docs/dependency-ledger.md) does not close
   this gap, but it bounds it: the twelve crates that are consensus-

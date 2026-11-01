@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: ISC
-//! The signature parity corpus that `tests/ring_parity.rs` and
+//! The signature parity corpus that `tests/recorded_parity.rs` and
 //! `tests/go_differential.rs` hold the fourteen verification algorithms to
-//! (ADR-0015, step 1): cases, valid and not, each with ring's verdict and
-//! Go's recorded beside it, so that the provider's verdicts can be held to
-//! both while ring is in the tree, and to ring's recorded ones after.
+//! (ADR-0015): cases, valid and not, each with ring's verdict and Go's
+//! recorded beside it, so that the provider's verdicts were held to both
+//! while ring was in the tree, and are held to ring's recorded ones since
+//! the switch removed it.
 //!
 //! `tests/data/parity/corpus.json.gz` holds it.  A case is an algorithm,
 //! by its place in `SUPPORTED_SIG_ALGS.all`, a key, a message and a
@@ -37,10 +38,12 @@
 //! other salt lengths; and each valid signature under every other
 //! algorithm of its key type.
 //!
-//! `regenerate_parity_corpus`, an ignored test in `tests/ring_parity.rs`,
-//! is the corpus's tool, through `sig_corpus_gen`.  Its ring column cannot
-//! be made again once the switch removes ring; its Go column can, through
-//! the oracle.
+//! `regenerate_parity_corpus`, an ignored test in what was
+//! `tests/ring_parity.rs`, made it, through a generator that took ring's
+//! verdict on each case it made, and the switch deleted both with ring:
+//! the corpus is not made again, and its ring column cannot be.  Its Go
+//! column is checked again through the oracle by
+//! `tests/go_differential.rs`.
 
 // Test-harness arithmetic over bounded lengths.
 #![allow(clippy::arithmetic_side_effects)]
@@ -48,9 +51,9 @@
 use std::collections::HashMap;
 use std::io::Read;
 
-use dcroxide_testutil::{Oracle, hex, rsa_test_key, unhex};
+use dcroxide_testutil::{rsa_test_key, unhex};
 use rustls::pki_types::SignatureVerificationAlgorithm;
-use serde_json::{Value, json};
+use serde_json::Value;
 
 /// The fourteen algorithms in `SUPPORTED_SIG_ALGS.all`'s order, each with
 /// webpki's name for it and Go's `x509.SignatureAlgorithm` name for what
@@ -73,18 +76,18 @@ pub const ALGORITHMS: [(&str, &str); 14] = [
 ];
 
 /// The classes whose cases Go may judge otherwise than ring and the
-/// provider, each with the reason: differences from Go that ring has today
-/// wherever it verifies a chain or a handshake signature, and that the
-/// switch keeps.  PARITY.md records only part of them so far: its
-/// client-certificate entry ("Under `--authtype=clientcert` webpki and ring
-/// still decide part of a client chain") records RSA keys outside ring's
-/// modulus range in a client's chain, and that the replay refuses a parent
-/// key's exponent above 2^31 - 1 as Go does.  The rest, that exponent in a
-/// client's own key, which signs its CertificateVerify, such keys in a
-/// seeder's chain, and an `RSAPublicKey` with bytes after its values, is
-/// not recorded yet, and is to be recorded with the switch.  Each closes
-/// when Go's RSA rules come with Go's client-certificate set (ADR-0015,
-/// T4).
+/// provider, each with the reason: differences from Go that ring had
+/// wherever it verified a chain or a handshake signature, and that the
+/// switch kept, since the provider keeps ring's RSA bounds and parse.
+/// PARITY.md records them: its client-certificate entry ("Under
+/// `--authtype=clientcert` webpki and the TLS provider still decide part
+/// of a client chain") RSA keys outside those bounds and an
+/// `RSAPublicKey` with bytes after its values, in a client's chain and in
+/// a client's own key, which signs its CertificateVerify, beside the
+/// replay's refusal of a parent key's exponent above 2^31 - 1, as Go
+/// refuses it; and its seeder entry the same keys in a seeder's chain.
+/// Each closes when Go's RSA rules come with Go's client-certificate set
+/// (ADR-0015, T4).
 pub const GO_DIFFERS: [(&str, &str); 5] = [
     (
         "rsa-modulus-1024",
@@ -333,37 +336,4 @@ fn wycheproof_cases(file: &str) -> HashMap<u64, WycheproofCase> {
         }
     }
     out
-}
-
-/// The SubjectPublicKeyInfo of `key` for the algorithm at `algorithm`, as a
-/// certificate would carry it, which is how Go is given a key.
-pub fn spki(algorithm: usize, key: &[u8]) -> Vec<u8> {
-    rustls::sign::public_key_to_spki(&ours(algorithm).public_key_alg_id(), key)
-        .as_ref()
-        .to_vec()
-}
-
-/// Go's verdict on a case, through the oracle's `sig_verify`: the key as a
-/// SubjectPublicKeyInfo, checked as Go checks a certificate's signature
-/// under the algorithm's x509 name.
-pub fn go_verifies(
-    oracle: &mut Oracle,
-    algorithm: usize,
-    key: &[u8],
-    message: &[u8],
-    signature: &[u8],
-) -> bool {
-    let request = json!({
-        "spki": hex(&spki(algorithm, key)),
-        "x509_alg": ALGORITHMS[algorithm].1,
-        "message": hex(message),
-        "signature": hex(signature),
-    });
-    let response = oracle.call("sig_verify", request.to_string().as_bytes());
-    dcroxide_testutil::require_reference_go(response["go_version"].as_str().unwrap_or_default());
-    match response["result"].as_str() {
-        Some("ok") => true,
-        Some(refused) if refused.starts_with("refused: ") => false,
-        _ => panic!("the oracle answered {response}"),
-    }
 }

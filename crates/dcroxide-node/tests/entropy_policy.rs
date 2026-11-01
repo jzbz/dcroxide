@@ -43,9 +43,11 @@
 //! The rest read the kernel once, at startup or in a tool.
 //!
 //! The scope is this crate's own source. Dependencies draw their own
-//! entropy — rustls and ring do so per TLS handshake, and
-//! `dcroxide-tlscrypto` for every handshake that negotiates P-521 or is
-//! signed with a P-521 key — and nothing here says otherwise.
+//! entropy, and nothing here says otherwise: every TLS draw, the
+//! handshake randoms and ephemeral keys on each TLS handshake and the
+//! hedge of each ECDSA handshake signature, comes through
+//! `dcroxide-tlscrypto`, the provider every rustls configuration here
+//! names, whose own `tests/entropy_policy.rs` accounts for them.
 //!
 //! What these tests pin is the mechanism: no kernel read on the
 //! peer-paced path, a stream that is seeded once from the OS, and an

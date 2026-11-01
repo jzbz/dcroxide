@@ -732,7 +732,7 @@ fn serves_tls_with_a_generated_certificate() {
                 message,
                 cert,
                 dss,
-                &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+                &dcroxide_tlscrypto::SUPPORTED_SIG_ALGS,
             )
         }
         fn verify_tls13_signature(
@@ -745,13 +745,11 @@ fn serves_tls_with_a_generated_certificate() {
                 message,
                 cert,
                 dss,
-                &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+                &dcroxide_tlscrypto::SUPPORTED_SIG_ALGS,
             )
         }
         fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-            rustls::crypto::ring::default_provider()
-                .signature_verification_algorithms
-                .supported_schemes()
+            dcroxide_tlscrypto::SUPPORTED_SIG_ALGS.supported_schemes()
         }
     }
     use rustls::pki_types::pem::PemObject;
@@ -807,11 +805,11 @@ fn serves_tls_with_a_generated_certificate() {
     let versions = [
         (
             rustls::ProtocolVersion::TLSv1_3,
-            rustls::ClientConfig::builder(),
+            client_builder(rustls::DEFAULT_VERSIONS),
         ),
         (
             rustls::ProtocolVersion::TLSv1_2,
-            rustls::ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS12]),
+            client_builder(&[&rustls::version::TLS12]),
         ),
     ];
     for (version, builder) in versions {
@@ -923,10 +921,11 @@ fn serves_tls_with_a_p521_certificate() {
         }
     }
 
-    /// Offers the schemes ring verifies, none of which is 0x0603.
+    /// Offers the schemes the provider verifies, ring's set, none of
+    /// which is 0x0603 until ADR-0015's T4.
     #[derive(Debug)]
-    struct RingSchemesOnly(Vec<rustls::SignatureScheme>);
-    impl ServerCertVerifier for RingSchemesOnly {
+    struct ProviderSchemesOnly(Vec<rustls::SignatureScheme>);
+    impl ServerCertVerifier for ProviderSchemesOnly {
         fn verify_server_cert(
             &self,
             _end_entity: &CertificateDer<'_>,
@@ -992,7 +991,7 @@ fn serves_tls_with_a_p521_certificate() {
             verified: AtomicUsize::new(0),
         });
         let config = Arc::new(
-            rustls::ClientConfig::builder_with_protocol_versions(&[version])
+            client_builder(&[version])
                 .dangerous()
                 .with_custom_certificate_verifier(
                     Arc::clone(&verifier) as Arc<dyn ServerCertVerifier>
@@ -1020,15 +1019,15 @@ fn serves_tls_with_a_p521_certificate() {
         );
     }
 
-    let ring_schemes = rustls::crypto::ring::default_provider()
-        .signature_verification_algorithms
-        .supported_schemes();
-    assert!(!ring_schemes.contains(&rustls::SignatureScheme::ECDSA_NISTP521_SHA512));
+    let provider_schemes = dcroxide_tlscrypto::SUPPORTED_SIG_ALGS.supported_schemes();
+    assert!(!provider_schemes.contains(&rustls::SignatureScheme::ECDSA_NISTP521_SHA512));
     for version in [&rustls::version::TLS13, &rustls::version::TLS12] {
         let config = Arc::new(
-            rustls::ClientConfig::builder_with_protocol_versions(&[version])
+            client_builder(&[version])
                 .dangerous()
-                .with_custom_certificate_verifier(Arc::new(RingSchemesOnly(ring_schemes.clone())))
+                .with_custom_certificate_verifier(Arc::new(ProviderSchemesOnly(
+                    provider_schemes.clone(),
+                )))
                 .with_no_client_auth(),
         );
         let session =
@@ -1201,27 +1200,39 @@ fn tls_getblockcount(
     })
 }
 
-/// ring's provider cut to `suites` and `groups`, in the order given.
+/// `dcroxide-tlscrypto`'s provider cut to `suites` and `groups`, in the
+/// order given.
 fn client_provider(
     suites: &[rustls::SupportedCipherSuite],
     groups: &[&'static dyn rustls::crypto::SupportedKxGroup],
 ) -> rustls::crypto::CryptoProvider {
-    let mut provider = rustls::crypto::ring::default_provider();
+    let mut provider = dcroxide_tlscrypto::default_provider();
     provider.cipher_suites = suites.to_vec();
     provider.kx_groups = groups.to_vec();
     provider
 }
 
+/// A client configuration on `dcroxide-tlscrypto`'s provider for
+/// `versions`, where `ClientConfig::builder_with_protocol_versions` would
+/// take a process default, which nothing installs.
+fn client_builder(
+    versions: &[&'static rustls::SupportedProtocolVersion],
+) -> rustls::ConfigBuilder<rustls::ClientConfig, rustls::WantsVerifier> {
+    rustls::ClientConfig::builder_with_provider(Arc::new(dcroxide_tlscrypto::default_provider()))
+        .with_protocol_versions(versions)
+        .expect("the provider's versions")
+}
+
 /// dcrd's Go server offers the P-521 key exchange by default, and
 /// Decrediton pins it (`ecdhCurve: "secp521r1"`), so a client offering
 /// nothing else must be served, over TLS 1.3 and TLS 1.2 alike, as it is
-/// by dcrd.  rustls's ring provider has no P-521 key exchange; the
-/// listener adds one.  A client offering only X25519 is still served
+/// by dcrd.  The provider's default groups, ring's three, leave P-521 out;
+/// the listener offers it.  A client offering only X25519 is still served
 /// with it.
 #[test]
 fn serves_a_client_offering_only_the_p521_key_exchange() {
     let (_dir, listener, port, _cert_pem, _key_pem) = serve_tls(dcroxide_certgen::Curve::P256);
-    let suites = rustls::crypto::ring::DEFAULT_CIPHER_SUITES;
+    let suites = dcroxide_tlscrypto::DEFAULT_CIPHER_SUITES;
     for version in [&rustls::version::TLS13, &rustls::version::TLS12] {
         let outcome = tls_getblockcount(port, client_provider(suites, &[&ClientP521]), version)
             .unwrap_or_else(|e| panic!("{version:?}: a P-521-only client is refused: {e}"));
@@ -1238,7 +1249,7 @@ fn serves_a_client_offering_only_the_p521_key_exchange() {
         assert_eq!(outcome.group, rustls::NamedGroup::secp521r1, "{version:?}");
         assert_eq!(outcome.kind, rustls::HandshakeKind::Full, "{version:?}");
 
-        let x25519 = [rustls::crypto::ring::kx_group::X25519];
+        let x25519 = [dcroxide_tlscrypto::kx_group::X25519];
         let outcome = tls_getblockcount(port, client_provider(suites, &x25519), version)
             .unwrap_or_else(|e| panic!("{version:?}: an X25519-only client is refused: {e}"));
         assert!(
@@ -1260,9 +1271,9 @@ fn serves_a_client_offering_only_the_p521_key_exchange() {
 /// would have retried for P-256, the client's first group it supports.
 #[test]
 fn negotiates_the_key_exchange_in_gos_order() {
-    use rustls::crypto::ring::kx_group;
+    use dcroxide_tlscrypto::kx_group;
     let (_dir, listener, port, _cert_pem, _key_pem) = serve_tls(dcroxide_certgen::Curve::P256);
-    let suites = rustls::crypto::ring::DEFAULT_CIPHER_SUITES;
+    let suites = dcroxide_tlscrypto::DEFAULT_CIPHER_SUITES;
     let outcome = tls_getblockcount(
         port,
         client_provider(
@@ -1336,14 +1347,14 @@ fn go_aes_gcm_hardware() -> bool {
 /// the client.
 #[test]
 fn negotiates_the_cipher_suite_in_gos_order() {
-    use rustls::CipherSuite as Id;
-    use rustls::crypto::ring::cipher_suite::{
+    use dcroxide_tlscrypto::cipher_suite::{
         TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256, TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
         TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256, TLS13_AES_128_GCM_SHA256,
         TLS13_AES_256_GCM_SHA384, TLS13_CHACHA20_POLY1305_SHA256,
     };
+    use rustls::CipherSuite as Id;
     let (_dir, listener, port, _cert_pem, _key_pem) = serve_tls(dcroxide_certgen::Curve::P256);
-    let groups = [rustls::crypto::ring::kx_group::X25519];
+    let groups = [dcroxide_tlscrypto::kx_group::X25519];
     let (aes_first, chacha_first) = (
         (
             Id::TLS13_AES_128_GCM_SHA256,
@@ -1651,7 +1662,7 @@ impl rustls::client::danger::ServerCertVerifier for AnyServerCert {
             message,
             cert,
             dss,
-            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+            &dcroxide_tlscrypto::SUPPORTED_SIG_ALGS,
         )
     }
 
@@ -1665,14 +1676,12 @@ impl rustls::client::danger::ServerCertVerifier for AnyServerCert {
             message,
             cert,
             dss,
-            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+            &dcroxide_tlscrypto::SUPPORTED_SIG_ALGS,
         )
     }
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        rustls::crypto::ring::default_provider()
-            .signature_verification_algorithms
-            .supported_schemes()
+        dcroxide_tlscrypto::SUPPORTED_SIG_ALGS.supported_schemes()
     }
 }
 
@@ -1687,7 +1696,7 @@ fn clientcert_handshake(
 ) -> Result<Vec<Vec<u8>>, rustls::Error> {
     let mut accepted = Vec::new();
     for version in [&rustls::version::TLS13, &rustls::version::TLS12] {
-        let client_config = rustls::ClientConfig::builder_with_protocol_versions(&[version])
+        let client_config = client_builder(&[version])
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(AnyServerCert))
             .with_client_auth_cert(
@@ -1907,7 +1916,7 @@ fn clientcert_getblockcount(
     version: &'static rustls::SupportedProtocolVersion,
     client: Option<(&[u8], &rustls::pki_types::PrivateKeyDer<'static>)>,
 ) -> std::io::Result<String> {
-    let builder = rustls::ClientConfig::builder_with_protocol_versions(&[version])
+    let builder = client_builder(&[version])
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(AnyServerCert));
     let config = match client {

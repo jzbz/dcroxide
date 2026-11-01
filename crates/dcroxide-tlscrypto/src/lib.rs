@@ -1,30 +1,30 @@
 // SPDX-License-Identifier: ISC
-//! The rustls crypto provider ADR-0015 moves the node's TLS to, written in
-//! this tree over RustCrypto's primitives, so that no C serves or dials TLS
-//! (ADR-0012).
+//! The rustls crypto provider the node serves and dials TLS with, written
+//! in this tree over RustCrypto's primitives, so that no C serves or dials
+//! TLS (ADR-0012).
 //!
 //! rustls does the protocol and leaves the cryptography to a provider:
 //! the record ciphers, the key exchanges, the signing keys, the signature
-//! checks and the random numbers.  The node's provider is still `ring`'s;
-//! this crate is built up beside it, step by step, until it does all ring
-//! does for the node, and the switch then replaces ring in one change
-//! (ADR-0015, "T1").  Each part keeps ring's choices: the same suites in
-//! the same order, the same limits, the same verdicts.
+//! checks and the random numbers.  This crate was built up beside `ring`'s
+//! provider, step by step, until it did all ring did for the node, and
+//! ADR-0015's switch then replaced ring with it in one change ("T1").
+//! Each part keeps ring's choices: the same suites in the same order, the
+//! same limits, the same verdicts.
 //!
-//! It holds all of that now.  Record protection is the nine cipher suites
-//! the node serves and the seeders dial with, TLS 1.3's AES-128-GCM,
-//! AES-256-GCM and ChaCha20-Poly1305 and TLS 1.2's ECDHE-ECDSA and
-//! ECDHE-RSA with each of the three, on `aes-gcm` and `chacha20poly1305`,
-//! with their transcript hashes, HKDF and PRF on `sha2` and `hmac`.  Key
-//! exchange is ring's three groups, X25519, P-256 and P-384, and P-521,
-//! which ring lacks and Go's server offers, on `curve25519-dalek` and the
-//! `p256`, `p384` and `p521` crates, each with Go's rules for the peer's
-//! share and its ephemeral key drawn from the kernel (`kx`, `rand`).  The
-//! suites and groups are items of their own under the names of rustls's
-//! ring provider (`rustls-0.23.46/src/crypto/ring/mod.rs:65-103`,
-//! `:172-181`), so the node can build both of Go's suite orders from them,
-//! and its per-group configurations, as it does from ring's.  The signing
-//! keys are ECDSA on the three NIST curves, hedged RFC 6979 on the curve
+//! Record protection is the nine cipher suites the node serves and the
+//! seeders dial with, TLS 1.3's AES-128-GCM, AES-256-GCM and
+//! ChaCha20-Poly1305 and TLS 1.2's ECDHE-ECDSA and ECDHE-RSA with each of
+//! the three, on `aes-gcm` and `chacha20poly1305`, with their transcript
+//! hashes, HKDF and PRF on `sha2` and `hmac`.  Key exchange is ring's
+//! three groups, X25519, P-256 and P-384, and P-521, which ring lacks and
+//! Go's server offers, on `curve25519-dalek` and the `p256`, `p384` and
+//! `p521` crates, each with Go's rules for the peer's share and its
+//! ephemeral key drawn from the kernel (`kx`, `rand`).  The suites and
+//! groups are items of their own under the names of rustls's ring
+//! provider (`rustls-0.23.46/src/crypto/ring/mod.rs:65-103`, `:172-181`),
+//! so the node can build both of Go's suite orders from them, and its
+//! per-group configurations, as it does from ring's.  The signing keys
+//! are ECDSA on the three NIST curves, hedged RFC 6979 on the curve
 //! crates, and Ed25519 on `curve25519-dalek`, read from an `rpc.key` by
 //! Go's `tls.X509KeyPair` rules and refusing RSA keys ([`sign`]).  The
 //! verification algorithms are ring's fourteen under `webpki::ring`'s
@@ -35,11 +35,10 @@
 //! [`default_provider`] puts them together with the kernel's random
 //! numbers.
 //!
-//! The node takes P-521 from here already, its key exchange and its
-//! signing key, both of which ring lacks; the rest is still ring's until
-//! the switch replaces ring's provider with [`default_provider`], and an
-//! item from here runs beside ring's in any `CryptoProvider` that lists
-//! it.
+//! The node names this provider in every rustls configuration it builds,
+//! and installs no process default: the seeders take [`default_provider`]
+//! as it is, and the RPC listener builds its per-group configurations
+//! from the suites and groups, P-521 among them.
 //!
 //! Every function a peer's record, key share, key or signature reaches
 //! computes on lengths with `checked_*` or compares them first, and fails

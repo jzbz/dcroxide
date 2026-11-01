@@ -22,8 +22,8 @@
 //! ring's groups make the same checks (`rustls-0.23.46/src/crypto/ring/
 //! kx.rs:92`, `:111-116`, and ring's own all-zero check,
 //! `ring-0.17.14/src/ec/curve25519/x25519.rs:158-162`), so where both
-//! offer a group they agree on every share: `tests/ring_parity.rs` holds
-//! them to that, and
+//! offered a group they agreed on every share, which a comparison with
+//! ring held them to until ADR-0015's switch removed ring, and
 //! `tests/go_differential.rs` holds all four groups to Go's verdicts.  A
 //! refused share is rustls's `InvalidKeyShare`, which rustls answers with
 //! an `illegal_parameter` alert, as Go answers its own.

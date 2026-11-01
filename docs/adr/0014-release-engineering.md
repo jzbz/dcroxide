@@ -5,7 +5,9 @@
   describes is built: no binary is published until the four conditions of
   part 2 hold; the release workflow, the reproduction script and the
   changes listed under Consequences are pending; and part 6 leaves two
-  questions for the first release.
+  questions for the first release. `ring`'s part of the first condition
+  is met (addendum of 2026-10-31); the rest of it, and the other three,
+  stand.
 - **Date:** 2026-10-26
 
 ## Context
@@ -44,13 +46,13 @@ arm64, not checked here) and `windows-latest` (`ci.yml:81-108`). The
 fault-injection tests in that run are Linux-only, so they run on the two
 Linux legs (`:26-35`). Everything else runs on x86_64 Linux only: rustfmt
 and clippy, the suites with overflow checks off as the release profile
-computes (`:110-140`), the live dcrd interop test (`:201-255`), the no_std
+computes (`:110-140`), the live dcrd interop test (`:207-261`), the no_std
 check, docs, deny and fuzzing. No job builds the workspace's `release` or
 `dist` profile on any target, so the configuration that ships (thin LTO,
 `codegen-units = 1`, `panic = "abort"`) has never been compiled in CI.
 Every timed sync ran on x86_64 machines (m1 to m3,
 `docs/bench-ledger.md:28-30`), none on Windows or macOS
-(`README.md:729-730`), and none on aarch64 of any OS. Ecosystem acceptance
+(`README.md:731-732`), and none on aarch64 of any OS. Ecosystem acceptance
 has been run once, on x86_64 Linux, without Decrediton's IPC lifecycle or
 config, IPC and service parity on Windows and macOS (the brief's status
 block), so the exit criterion that Decrediton launches, supervises and
@@ -206,7 +208,7 @@ signing, Apple's or Windows', is not decided here.
 - **Not decided here:** whether the release workflow uses only GitHub-owned
   actions, each pinned to a full commit SHA, and restores no cache, where
   `ci.yml` pins by tag and uses third-party actions (`ci.yml:54`, `:75`,
-  `:289`, `:313`); and where the two fingerprints, the SSH key's for tags
+  `:295`, `:319`); and where the two fingerprints, the SSH key's for tags
   and the OpenPGP key's for `SHA256SUMS`, are published with the
   verification steps, `SECURITY.md` and the README being candidates.
 
@@ -334,20 +336,35 @@ recorded divergence in PARITY.md.
   distribution whose packaged rustc lags the pin cannot build the node
   with it.
 - Each promotion needs a sync timed on that architecture and OS, and none
-  has been timed on aarch64, Windows or macOS (`README.md:729-730`,
+  has been timed on aarch64, Windows or macOS (`README.md:731-732`,
   `docs/bench-ledger.md:28-30`): it needs such a machine, or a CI runner
   with room for a mainnet data directory, a median of 27.93 GiB after the
-  syncs of 2026-10-17 (`README.md:741-743`). Runner disk sizes were not
+  syncs of 2026-10-17 (`README.md:743-745`). Runner disk sizes were not
   checked.
 - Each release costs an LTO build per target off GitHub and two signatures
   by hand, and checking both the tag and the binaries takes two keys.
 - M5's "reproducible signed release" stays open until the first release
   made under this ADR.
 - Pending, none of it written: the fallback rule in `rust-toolchain.toml`'s
-  header; `docs/operating.md`'s `cargo build --release` (`:1870-1872`),
+  header; `docs/operating.md`'s `cargo build --release` (`:1885-1887`),
   where artifacts are cut from `dist`; `SECURITY.md`'s supported versions;
   the fingerprints and verification steps, wherever part 3's open question
   puts them; the brief's status block; `.github/workflows/release.yml`
   with its runbook; the reproduction script; and the PARITY.md
   `buildmetadata` entry, with part 6. The change that records this ADR
   stops `docs/operating.md` calling D7 open and claiming reproducibility.
+
+## Addendum, 2026-10-31 — `ring` is out of the build
+
+`ring`'s part of the first publication condition is met: ADR-0015's
+switch made `dcroxide-tlscrypto` the node's only TLS provider, and no
+build for any target compiles `ring` (ADR-0015's and ADR-0012's addenda of
+2026-10-31). So `ring` is no longer one of the four things part 2's first
+condition names (`:133-139`), nor an input of the build the build-input
+paragraph describes (`:81-85`), nor the replacement the summary looks
+ahead to (`:101-102`): `Cargo.lock` still lists it, as an optional
+dependency of `rustls-webpki` that no build enables, so it reaches no
+binary. The rest of that condition stands: `secp256k1-sys`, blake3's
+compiler probe and the C power-cut shim still break ADR-0012's rule, and
+of its two checks only the first bans, on `ring`, `aws-lc-rs` and
+`aws-lc-sys`, are written. The other three conditions are unchanged.

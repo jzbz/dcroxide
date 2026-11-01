@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: ISC
-//! The private keys `tests/go_differential.rs` and `tests/ring_parity.rs`
-//! load, valid and not, so that the provider's key loading can be held to
-//! Go's `tls.X509KeyPair` and to ring's loader key by key (ADR-0015, step
-//! 1), and the test keys and certificates both use.
+//! The private keys `tests/go_differential.rs` loads, valid and not, so
+//! that the provider's key loading is held to Go's `tls.X509KeyPair` key
+//! by key (ADR-0015), as it was held to ring's loader too until the switch
+//! removed ring, and the test keys and certificates it uses.
 //!
 //! The corpus is a set of base keys, each written in the forms Go reads
 //! and then mutated in each rule of Go's `parsePrivateKey` that
@@ -1064,9 +1064,9 @@ fn rsa_cases(cases: &mut Vec<Case>) {
     }
 }
 
-/// The P-256 server certificate the ECDSA and TLS 1.3 handshakes of
-/// `tests/ring_parity.rs` use, and the certificate of the Go-made P-256
-/// base key: self-signed for `localhost`, valid from 2026 to 9999, made
+/// The certificate of the Go-made P-256 base key, which the ECDSA and TLS
+/// 1.3 handshakes against ring's provider used until the switch removed
+/// ring: self-signed for `localhost`, valid from 2026 to 9999, made
 /// once with Go 1.26.2's `crypto/x509` for these tests.
 pub const P256_CERT: &str = "\
     3082018b30820130a003020102020101300a06082a8648ce3d04030230273125\
@@ -1122,7 +1122,7 @@ pub const RSA2048_CERT: &str = "\
     51e1b396ef221476bbb94121d79cbc2599889bb9e40bab6819884e427c776ca1";
 
 /// [`RSA2048_CERT`]'s key, in PKCS#8.  A test key, made for these tests
-/// alone; ring signs with it, which this crate will not (ADR-0015 T6).
+/// alone; ring signed with it, which this crate will not (ADR-0015 T6).
 pub const RSA2048_KEY: &str = "\
     308204be020100300d06092a864886f70d0101010500048204a8308204a40201\
     000282010100b7b8234bf9ad5bb312abcbdd1f1ca7bec6617ca729d87afec32a\

@@ -4,12 +4,13 @@
 //! the node's production TLS code alone, the RPC listener as
 //! `start_rpc_listener` serves it over `reloadable_tls_config` and the
 //! seeder transports `UreqTransport` and `ProxySeederTransport` over the
-//! direct dialer, so that the same file runs before the switch, on ring's
-//! provider, and after it, on `dcroxide-tlscrypto`'s.  The provider's own
-//! half is that crate's `tests/go_interop.rs`.  The oracle runs under
-//! dcrd's `GODEBUG` (`dcroxide_testutil::tls_interop::DCRD_TLS_GODEBUG`),
-//! so Go's default client and server are dcrd's at the parity pin, the
-//! three hybrids first.
+//! direct dialer, so that the same file ran before the switch, on ring's
+//! provider, and runs after it, on `dcroxide-tlscrypto`'s, with one cell
+//! changed.  The provider's own half is that crate's
+//! `tests/go_interop.rs`.  The oracle runs under dcrd's `GODEBUG`
+//! (`dcroxide_testutil::tls_interop::DCRD_TLS_GODEBUG`), so Go's default
+//! client and server are dcrd's at the parity pin, the three hybrids
+//! first.
 //!
 //! - **Go's client against the RPC listener.**  Each server key, P-256
 //!   and P-521 from certgen, as the daemon's first start makes them,
@@ -27,16 +28,16 @@
 //!   one on Go's default list on every cell but those of the two profiles
 //!   the hybrids decide ([`HYBRID_GAP`]), whose differences are asserted.
 //!   So Go's AES-GCM preference is compared on this machine, not assumed.
-//! - **The RSA `rpc.key` cells.**  ring serves an RSA key its signer
-//!   loads, 2048 to 4096 bits with an exponent of at least 65537, today;
-//!   the switch refuses one (ADR-0015, T6), and the RSA-2048 cell, the one
-//!   the switch flips, then expects the refusal ([`RSA_RPC_KEY_SERVED`]).
-//!   The fixture's RSA-1024, RSA-8192 and e = 3 keys, which ring's signer
-//!   does not load, the listener refuses at startup today, in ring's words
-//!   ([`RSA_KEY_REFUSAL`]), where dcrd serves them ([`RSA_BOUNDS_GAP`]);
-//!   the switch, refusing every RSA key, changes only those words.  Go's
-//!   server serves each pair the listener refuses, so that the refusal is
-//!   the listener's policy and not a pair no stack serves.
+//! - **The RSA `rpc.key` cells.**  The listener refuses every RSA key at
+//!   startup, with T6's words (ADR-0015, [`RSA_KEY_REFUSAL`]), where dcrd
+//!   serves it ([`RSA_KEY_GAP`]).  ring served one its signer loaded, 2048
+//!   to 4096 bits with an exponent of at least 65537, until the switch,
+//!   which flipped the RSA-2048 cell ([`RSA_RPC_KEY_SERVED`]), the one cell
+//!   it changed; the fixture's RSA-1024, RSA-8192 and e = 3 keys, which
+//!   ring's signer did not load, were refused before it as well, in ring's
+//!   words, so for them the switch changed only the text.  Go's server
+//!   serves each pair the listener refuses, so that the refusal is the
+//!   listener's policy and not a pair no stack serves.
 //! - **`--authtype=clientcert`.**  The client certificates of the
 //!   provider's matrix (`dcroxide_testutil::tls_interop::ClientCerts`),
 //!   each key alone and under each kind of CA, in each version, through
@@ -56,26 +57,27 @@
 //!   being the daemon's: server keys P-256, P-384 and Ed25519, and an
 //!   RSA-4096 root over an RSA-2048 intermediate over a P-256 leaf, the
 //!   seeders' shape; TLS 1.3 and TLS 1.2; each group alone on the server,
-//!   P-521 refused, since the seeders offer ring's three groups, which
-//!   the switch keeps (`dcroxide_tlscrypto::DEFAULT_KX_GROUPS`).  The
-//!   addresses are read through `seed_addrs`.  In each version the
-//!   daemon's own constructors, `UreqTransport::new()` and
-//!   `ProxySeederTransport::new()`, and the test constructors given a root
-//!   that did not issue the chain refuse it as an unknown issuer, which
-//!   Go's server reads as [`refused_chain`] says.  Each ClientHello, as
-//!   Go's server saw it, equals
-//!   `tests/data/seeder-client-hello.json`, which
-//!   `regenerate_seeder_client_hello` wrote from a run on ring's provider
-//!   and the switch must reproduce: the same suites, groups, signature
-//!   schemes and versions, each in order, and the same extensions, as a
-//!   set, since rustls orders them at random for each ClientHello
-//!   (`rustls-0.23.46/src/msgs/handshake.rs:1063-1093`).  The description
-//!   is of a ClientHello to a seeder named by its address, as these cells
-//!   name Go's server, so it has no server_name extension; a seeder named
-//!   by a DNS name, as every seeder the daemon queries is, gets one, which
-//!   a cell naming ureq's seeder `localhost` checks; the proxy's client
-//!   reaches a name only through a proxy.  So the daemon's constructors'
-//!   hand-off, which no local chain gets through, is compared too.
+//!   P-521 refused, since the seeders offer the provider's default groups,
+//!   ring's three, which the switch kept
+//!   (`dcroxide_tlscrypto::DEFAULT_KX_GROUPS`).  The addresses are read
+//!   through `seed_addrs`.  In each version the daemon's own constructors,
+//!   `UreqTransport::new()` and `ProxySeederTransport::new()`, and the
+//!   test constructors given a root that did not issue the chain refuse it
+//!   as an unknown issuer, which Go's server reads as [`refused_chain`]
+//!   says.  Each ClientHello, as Go's server saw it, equals
+//!   `tests/data/seeder-client-hello.json`, recorded from a run on ring's
+//!   provider before the switch, by a regeneration the switch deleted with
+//!   ring, and reproduced on `dcroxide-tlscrypto`'s: the same suites,
+//!   groups, signature schemes and versions, each in order, and the same
+//!   extensions, as a set, since rustls orders them at random for each
+//!   ClientHello (`rustls-0.23.46/src/msgs/handshake.rs:1063-1093`).  The
+//!   description is of a ClientHello to a seeder named by its address, as
+//!   these cells name Go's server, so it has no server_name extension; a
+//!   seeder named by a DNS name, as every seeder the daemon queries is,
+//!   gets one, which a cell naming ureq's seeder `localhost` checks; the
+//!   proxy's client reaches a name only through a proxy.  So the daemon's
+//!   constructors' hand-off, which no local chain gets through, is
+//!   compared too.
 //!
 //! The oracle, the certificates, the client-certificate cells and Go's
 //! report of a connection are `dcroxide_testutil::tls_interop`'s, shared
@@ -111,33 +113,34 @@ use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use serde_json::{Value, json};
 
-/// Whether the listener serves an RSA `rpc.key` ring's signer loads, 2048
-/// to 4096 bits with an exponent of at least 65537.  ring signs with one
-/// today; the switch refuses it at startup and on rotation (ADR-0015,
-/// T6), and with it this, the one cell of the matrix the switch flips.
-/// The refusal's branch shows Go's server serving the pair, and the switch
-/// also pins T6's refusal text there, which only it can write.
-const RSA_RPC_KEY_SERVED: bool = true;
+/// Whether the listener serves an RSA `rpc.key` ring's signer loaded, 2048
+/// to 4096 bits with an exponent of at least 65537.  ring signed with one
+/// until the switch, which refuses it at startup and on rotation
+/// (ADR-0015, T6), and with it flipped this, the one cell of the matrix
+/// the switch changed.  The refusal's branch shows Go's server serving the
+/// pair, and holds the listener to T6's words.
+const RSA_RPC_KEY_SERVED: bool = false;
 
-/// The fixture's RSA keys ring's signer does not load: under 2048 bits,
+/// The fixture's RSA keys ring's signer did not load: under 2048 bits,
 /// over 4096, and with an exponent under 65537
 /// (`ring-0.17.14/src/rsa/keypair.rs:268-285`,
-/// `ring-0.17.14/src/rsa.rs:35`).  Go's server, as dcrd's, serves each to
-/// Go's client, which takes a server key of up to 8192 bits
+/// `ring-0.17.14/src/rsa.rs:35`).  The listener refused them before the
+/// switch too, in ring's words, and refuses them now as every RSA key.
+/// Go's server, as dcrd's, serves each to Go's client, which takes a
+/// server key of up to 8192 bits
 /// (`crypto/tls/handshake_client.go:1085-1112`).
-const RSA_KEYS_RING_REFUSES: [&str; 3] = ["rsa1024", "rsa8192", "rsa2048-e3"];
+const RSA_KEYS_RING_REFUSED: [&str; 3] = ["rsa1024", "rsa8192", "rsa2048-e3"];
 
-/// What the listener refuses [`RSA_KEYS_RING_REFUSES`] with today: ring's
-/// key loader's words for a key none of its signers takes
-/// (`rustls-0.23.46/src/crypto/ring/sign.rs:21-40`).  The switch refuses
-/// every RSA key with T6's words, which take these words' place, so for
-/// these keys it changes only the text.
-const RSA_KEY_REFUSAL: &str = "failed to parse private key as RSA, ECDSA, or EdDSA";
+/// What the listener refuses every RSA key with (ADR-0015, T6), the
+/// RSA-2048 key and [`RSA_KEYS_RING_REFUSED`] alike, in place of ring's
+/// loader's words for the keys none of its signers took ("failed to parse
+/// private key as RSA, ECDSA, or EdDSA") before the switch.
+const RSA_KEY_REFUSAL: &str = dcroxide_node::rpcrun::RSA_RPC_KEY_REFUSED;
 
 /// The PARITY.md entry the listener's refusal of RSA keys dcrd serves
 /// belongs to.
-const RSA_BOUNDS_GAP: &str = "PARITY.md, \"The RPC listener refuses an RSA `rpc.key` that ring \
-                              cannot sign with\"";
+const RSA_KEY_GAP: &str = "PARITY.md, \"The RPC listener refuses an RSA `rpc.key`, which dcrd \
+                           serves\"";
 
 /// The PARITY.md entry the listener's differences from Go's default
 /// server belong to: Go's server takes a hybrid post-quantum group the
@@ -149,10 +152,10 @@ const HYBRID_GAP: &str = "PARITY.md, \"The RPC listener's TLS key exchange is cl
 
 /// The PARITY.md entry the listener's refusals of client certificates Go
 /// accepts belong to: P-521 keys, ECDSA with SHA-512 and RSA keys under
-/// 2048 bits, which ring's verification set lacks and Go's
-/// client-certificate set (ADR-0015, T4) adds.
-const CLIENTCERT_GAP: &str = "PARITY.md, \"Under `--authtype=clientcert` webpki and ring still \
-                              decide part of a client chain\"";
+/// 2041 bits, which the provider's verification set, ring's, lacks and
+/// Go's client-certificate set (ADR-0015, T4) adds.
+const CLIENTCERT_GAP: &str = "PARITY.md, \"Under `--authtype=clientcert` webpki and the TLS \
+                              provider still decide part of a client chain\"";
 
 /// The listener's classical groups, Go's default list less the hybrids
 /// (`rpctls.rs`'s `RPC_KX_GROUP_IDS`), by Go's names.
@@ -540,7 +543,7 @@ fn go_clients_handshake_with_the_rpc_listener() {
     };
     let dir = tempfile::tempdir().expect("a temp dir");
     let mut specs = vec![spec("RSA-2048", "rsa2048", None, "server")];
-    specs.extend(RSA_KEYS_RING_REFUSES.map(|key| spec(key, key, None, "server")));
+    specs.extend(RSA_KEYS_RING_REFUSED.map(|key| spec(key, key, None, "server")));
     let rsa = go.pki(&specs);
     let pairs = [
         Pair::certgen("P-256 from certgen", &dir, Curve::P256),
@@ -560,6 +563,11 @@ fn go_clients_handshake_with_the_rpc_listener() {
             }
             Err(e) => {
                 assert!(rsa && !RSA_RPC_KEY_SERVED, "{}: refused: {e}", pair.name);
+                assert!(
+                    e.contains(RSA_KEY_REFUSAL),
+                    "{}: refused, as {RSA_KEY_GAP} records, but in other words: {e}",
+                    pair.name
+                );
                 // Go's server serves the pair the listener refuses.
                 reference(&mut go, pair, Some(&CLASSICAL), &json!({}), &request);
                 continue;
@@ -583,14 +591,15 @@ fn go_clients_handshake_with_the_rpc_listener() {
         }
         listening.listener.shutdown();
     }
-    // The RSA keys ring's signer does not load: refused at startup, where
-    // Go's server serves each.
-    for key in RSA_KEYS_RING_REFUSES {
+    // The RSA keys ring's signer did not load, refused before the switch
+    // in ring's words: refused at startup in T6's, where Go's server
+    // serves each.
+    for key in RSA_KEYS_RING_REFUSED {
         let pair = Pair::issued(key, &rsa[key], RSA_SUITES);
         match listen_rpc(&pair, None) {
             Ok(listening) => {
                 listening.listener.shutdown();
-                panic!("{key}: served, where {RSA_BOUNDS_GAP} records a refusal");
+                panic!("{key}: served, where {RSA_KEY_GAP} records a refusal");
             }
             Err(e) => assert!(e.contains(RSA_KEY_REFUSAL), "{key}: refused: {e}"),
         }
@@ -602,7 +611,7 @@ fn go_clients_handshake_with_the_rpc_listener() {
     assert_eq!(compared, keys * profiles, "every key by every profile");
     assert_eq!(
         go.handshakes(),
-        keys * profiles * 3 + (5 - keys) + RSA_KEYS_RING_REFUSES.len(),
+        keys * profiles * 3 + (5 - keys) + RSA_KEYS_RING_REFUSED.len(),
         "every cell with the listener and Go's two servers, and Go's server serving each pair \
          the listener refuses"
     );
@@ -1039,156 +1048,6 @@ fn seeder_clients_handshake_with_go_servers() {
         "two transports, each four chains in two versions under four groups and two refused \
          roots in two versions, and ureq's seeder named localhost"
     );
-}
-
-/// Go's names for what ring's provider, the seeders' before ADR-0015's
-/// switch, offers: its suites (`tls.CipherSuiteName`), groups
-/// (`tls.CurveID`'s String) and verification schemes
-/// (`tls.SignatureScheme`'s String).
-const RING_SUITES: [(rustls::CipherSuite, &str); 9] = [
-    (
-        rustls::CipherSuite::TLS13_AES_256_GCM_SHA384,
-        "TLS_AES_256_GCM_SHA384",
-    ),
-    (
-        rustls::CipherSuite::TLS13_AES_128_GCM_SHA256,
-        "TLS_AES_128_GCM_SHA256",
-    ),
-    (
-        rustls::CipherSuite::TLS13_CHACHA20_POLY1305_SHA256,
-        "TLS_CHACHA20_POLY1305_SHA256",
-    ),
-    (
-        rustls::CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
-        "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384",
-    ),
-    (
-        rustls::CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
-        "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256",
-    ),
-    (
-        rustls::CipherSuite::TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
-        "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256",
-    ),
-    (
-        rustls::CipherSuite::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
-        "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
-    ),
-    (
-        rustls::CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
-        "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
-    ),
-    (
-        rustls::CipherSuite::TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
-        "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256",
-    ),
-];
-
-/// See [`RING_SUITES`].
-const RING_GROUPS: [(rustls::NamedGroup, &str); 3] = [
-    (rustls::NamedGroup::X25519, "X25519"),
-    (rustls::NamedGroup::secp256r1, "CurveP256"),
-    (rustls::NamedGroup::secp384r1, "CurveP384"),
-];
-
-/// See [`RING_SUITES`].
-const RING_SCHEMES: [(rustls::SignatureScheme, &str); 9] = [
-    (
-        rustls::SignatureScheme::ECDSA_NISTP384_SHA384,
-        "ECDSAWithP384AndSHA384",
-    ),
-    (
-        rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
-        "ECDSAWithP256AndSHA256",
-    ),
-    (rustls::SignatureScheme::ED25519, "Ed25519"),
-    (rustls::SignatureScheme::RSA_PSS_SHA512, "PSSWithSHA512"),
-    (rustls::SignatureScheme::RSA_PSS_SHA384, "PSSWithSHA384"),
-    (rustls::SignatureScheme::RSA_PSS_SHA256, "PSSWithSHA256"),
-    (rustls::SignatureScheme::RSA_PKCS1_SHA512, "PKCS1WithSHA512"),
-    (rustls::SignatureScheme::RSA_PKCS1_SHA384, "PKCS1WithSHA384"),
-    (rustls::SignatureScheme::RSA_PKCS1_SHA256, "PKCS1WithSHA256"),
-];
-
-/// Go's name for each of `items`, from `names`.
-fn go_names<T: PartialEq + std::fmt::Debug>(
-    items: impl IntoIterator<Item = T>,
-    names: &[(T, &'static str)],
-) -> Vec<&'static str> {
-    items
-        .into_iter()
-        .map(|item| {
-            names
-                .iter()
-                .find(|(known, _)| *known == item)
-                .map_or_else(|| panic!("no Go name for {item:?}"), |(_, name)| *name)
-        })
-        .collect()
-}
-
-/// Writes `tests/data/seeder-client-hello.json`: the ClientHello each
-/// seeder transport sends to a seeder named by its address, as Go's server
-/// sees it, with its extensions sorted.  Ignored, since the description is
-/// recorded once, from a run on ring's provider before ADR-0015's switch,
-/// which must reproduce it; run it alone, under the reference Go, with
-/// `cargo test -p dcroxide-node --test tls_interop -- --ignored regenerate_seeder_client_hello`.
-/// It holds what it records to ring's provider's suites, groups and
-/// verification schemes, named here, so it records ring's ClientHello or
-/// nothing: the switch, which takes ring out, deletes this test, and the
-/// description stays ring's.
-#[test]
-#[ignore = "regenerates the committed seeder ClientHello fixture"]
-fn regenerate_seeder_client_hello() {
-    let mut go = TlsOracle::start().expect("the oracle");
-    let server = go.pki(&[spec("P-256", "P-256", None, "server")])["P-256"].clone();
-    let ring = rustls::crypto::ring::default_provider();
-    // rustls ends its suites with the renegotiation SCSV, 0x00ff, in a
-    // ClientHello that offers TLS 1.2.
-    let mut suites = go_names(ring.cipher_suites.iter().map(|s| s.suite()), &RING_SUITES);
-    suites.push("0x00FF");
-    let ring_offers = json!({
-        "cipher_suites": suites,
-        "supported_curves": go_names(ring.kx_groups.iter().map(|g| g.name()), &RING_GROUPS),
-        "signature_schemes": go_names(
-            ring.signature_verification_algorithms.supported_schemes(),
-            &RING_SCHEMES,
-        ),
-        "supported_versions": ["TLS 1.3", "TLS 1.2"],
-    });
-    let mut fixture = json!({
-        "about": "The ClientHello each seeder transport of dcroxide-node sends to a seeder named \
-                  by its address, so without the server_name extension a seeder named by a DNS \
-                  name gets, as Go's crypto/tls server sees it (ClientHelloInfo), its extensions \
-                  sorted, since rustls orders them at random for each ClientHello: recorded by \
-                  tests/tls_interop.rs's regenerate_seeder_client_hello under the reference Go, \
-                  from a run on the provider below, before ADR-0015's switch, which must \
-                  reproduce it, and read by seeder_clients_handshake_with_go_servers.",
-        "provider": "ring 0.17.14 through rustls 0.23.46",
-    });
-    for transport in TRANSPORTS {
-        let (addr, id) = seeder(&mut go, server.identity(&[]));
-        let found = seed(transport, &addr, Some(&server.cert));
-        let served = go.served(&id);
-        assert_eq!(found, Ok(vec![(9108, 1), (19108, 5)]), "{transport}");
-        let hello = described(&served["client_hello"]);
-        for (field, offered) in ring_offers.as_object().expect("an object") {
-            assert_eq!(
-                &hello[field], offered,
-                "{transport}: {field}, against ring's provider"
-            );
-        }
-        fixture[transport] = hello;
-    }
-    assert_eq!(
-        go.go_version(),
-        REFERENCE_GO,
-        "the description is the reference Go's"
-    );
-    fixture["go_version"] = json!(go.go_version());
-    let mut text = serde_json::to_string_pretty(&fixture).expect("the fixture");
-    text.push('\n');
-    let path = seeder_client_hello_path();
-    std::fs::write(&path, text).unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
 }
 
 /// [`assert_like_go`] holds the listener to Go's server on the classical

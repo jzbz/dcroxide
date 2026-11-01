@@ -868,11 +868,11 @@ pub fn pseudo_version_commit(version: &str) -> Option<&str> {
 /// nothing outside the tests and must never be used as real keys.
 ///
 /// `dcroxide-tlscrypto`'s signature parity corpus names these keys and
-/// records signatures under them, with ring's verdicts, so new keys make
-/// its recorded RSA verdicts wrong: the corpus has to be made again with
-/// them, which only a tree that still has ring can do.  Once ring is gone
-/// the fixture's keys stay as they are, and a key is added by appending
-/// `rsa_keygen`'s answer for it and its entry here.
+/// records signatures under them, with ring's verdicts, so a new key under
+/// an old name would make its recorded RSA verdicts wrong, and the corpus
+/// cannot be made again since ADR-0015's switch removed ring.  So the
+/// fixture's keys stay as they are, and a key is added by appending its
+/// entry here, which `regenerate_rsa_test_keys` then makes alone.
 pub const RSA_TEST_KEYS: &[(&str, u64, u64)] = &[
     ("rsa1024", 1024, 65537),
     ("rsa2040", 2040, 65537),
@@ -1691,22 +1691,31 @@ mod tests {
     }
 
     /// Writes the RSA test-key fixture, `data/rsa-test-keys.json`: each key
-    /// of [`RSA_TEST_KEYS`] from the oracle's `rsa_keygen`, under the
-    /// reference Go.  Ignored, since the fixture is made once and committed
-    /// (the 8192-bit keys take Go a while, and no two runs make the same
-    /// keys); run it alone, with
+    /// of [`RSA_TEST_KEYS`] the fixture holds already as it is, and each it
+    /// lacks from the oracle's `rsa_keygen`, under the reference Go.
+    /// Ignored, since the fixture is made once and committed (the 8192-bit
+    /// keys take Go a while, and no two runs make the same keys); run it
+    /// alone, with
     /// `cargo test -p dcroxide-testutil --lib -- --ignored regenerate_rsa_test_keys`,
-    /// and every test that takes its keys from the fixture sees new ones.
-    /// The signature parity corpus, which records signatures under the old
-    /// ones, must then be made again with `dcroxide-tlscrypto`'s
-    /// `regenerate_parity_corpus` while ring is in the tree; once ring is
-    /// gone, keys are only appended ([`RSA_TEST_KEYS`]).
+    /// and a test that takes a new key from the fixture sees it.  It keeps
+    /// the keys it has, which the signature parity corpus records
+    /// signatures under with ring's verdicts, and which nothing can record
+    /// again since ring left the tree ([`RSA_TEST_KEYS`]).
     #[test]
     #[ignore = "regenerates the committed RSA test-key fixture"]
     fn regenerate_rsa_test_keys() {
+        let kept: Vec<serde_json::Value> = std::fs::read_to_string(rsa_test_keys_path())
+            .ok()
+            .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+            .and_then(|fixture| fixture["keys"].as_array().cloned())
+            .unwrap_or_default();
         let mut oracle = Oracle::spawn();
         let mut keys = Vec::new();
         for &(name, bits, e) in RSA_TEST_KEYS {
+            if let Some(key) = kept.iter().find(|key| key["name"] == name) {
+                keys.push(key.clone());
+                continue;
+            }
             let request = serde_json::json!({ "bits": bits, "e": e });
             let response = oracle.call("rsa_keygen", request.to_string().as_bytes());
             let go_version = response["go_version"].as_str().unwrap_or_default();

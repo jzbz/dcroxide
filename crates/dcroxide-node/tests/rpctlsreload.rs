@@ -19,7 +19,12 @@
 //!
 //! The curve stays P-256 throughout. A P-521 pair builds the same
 //! configuration (pinned below), and serving one is pinned end to end in
-//! `rpclisten.rs`.
+//! `rpclisten.rs`.  The key file is read as Go's `tls.X509KeyPair` reads
+//! it, which the key cases below hold to Go's own reading through the
+//! oracle when it is present, an RSA key, refused (ADR-0015, T6), among
+//! them.  That a rotation to an RSA key fails with the same words is
+//! pinned beside the reloader, in `rpcrun.rs`'s tests, which can read the
+//! reload's error.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -27,9 +32,12 @@ use std::time::Duration;
 
 use dcroxide_certgen::Curve;
 use dcroxide_node::rpcrun::{
-    ReloadableTlsConfig, load_or_generate_cert_pair, reloadable_tls_config,
+    RSA_RPC_KEY_REFUSED, ReloadableTlsConfig, load_or_generate_cert_pair, reloadable_tls_config,
 };
 use dcroxide_node::{ConfigEnv, load_config_from_argv};
+use dcroxide_testutil::REFERENCE_GO;
+use dcroxide_testutil::tls_interop::{TlsOracle, spec};
+use serde_json::json;
 
 /// Write a fresh self-signed pair at the two paths, replacing whatever
 /// is there, and pad both files with `pad` trailing newlines so their
@@ -426,7 +434,7 @@ fn without_public_key(der: &[u8]) -> Vec<u8> {
 
 /// A SEC 1 key the port generated on `curve`, in PKCS#8: version 0, the
 /// `id-ecPublicKey` algorithm with the curve's OID, and the key, which
-/// names its curve inside too, as Go and ring read either way.
+/// names its curve inside too, as Go reads either way.
 fn as_pkcs8(curve: Curve, sec1: &[u8]) -> Vec<u8> {
     let named: &[u8] = match curve {
         Curve::P256 => &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07],
@@ -443,50 +451,362 @@ fn as_pkcs8(curve: Curve, sec1: &[u8]) -> Vec<u8> {
     )
 }
 
-/// Until ADR-0015's switch only a P-521 key reaches `dcroxide-tlscrypto`'s
-/// loader, which reads it by Go's `tls.X509KeyPair` rules; every other key
-/// keeps ring's.  A SEC 1 key without its public key, which Go loads, since
-/// it never reads that key (`crypto/x509/sec1.go:87-130`), and ring
-/// refuses, since it requires one, builds a configuration on P-521, as in
-/// dcrd, and not yet on P-256.
-#[test]
-fn until_the_switch_only_a_p521_key_is_read_by_gos_rules() {
-    for (curve, builds) in [(Curve::P521, true), (Curve::P256, false)] {
-        let (cert_pem, key_pem) = pair_with_edited_key(curve, without_public_key);
-        let built = dcroxide_node::rpcrun::tls_server_config(&cert_pem, &key_pem, None);
-        assert_eq!(built.is_ok(), builds, "{curve:?}: {:?}", built.err());
+/// Hold a pair to Go's `tls.X509KeyPair` through the oracle's
+/// `x509_key_pair`, when the oracle is present: `want` is its answer
+/// under the reference Go, `ok` and the key's type or `refused: ` and
+/// Go's error, compared whole there and as a verdict alone under another
+/// Go or where `want` is `refused: ` alone.
+fn assert_go_reads(
+    go: Option<&mut TlsOracle>,
+    what: &str,
+    cert_pem: &[u8],
+    key_pem: &[u8],
+    want: &str,
+) {
+    let Some(go) = go else {
+        return;
+    };
+    let answer = go.call(
+        "x509_key_pair",
+        &json!({
+            "cert_pem": String::from_utf8_lossy(cert_pem),
+            "key_pem": String::from_utf8_lossy(key_pem),
+        }),
+    );
+    let answer = answer["result"].as_str().expect("x509_key_pair's verdict");
+    if go.go_version() == REFERENCE_GO && want != "refused: " {
+        assert_eq!(answer, want, "{what}: Go");
+    } else {
+        assert_eq!(
+            answer.starts_with("ok "),
+            want.starts_with("ok "),
+            "{what}: Go answered {answer}"
+        );
     }
 }
 
-/// The RPC server routes a key by what its DER reads as by Go's rules,
-/// not by the PEM label the reader took it under, which Go ignores
-/// (`crypto/tls/tls.go:366-383`), so a P-521 pair builds with its SEC 1
-/// key under `EC PRIVATE KEY` or `RSA PRIVATE KEY` and with its PKCS#8
-/// form under `PRIVATE KEY`, as in dcrd.  A P-256 key still takes ring's
-/// loader, which reads the DER as the label names it, and until the switch
-/// is refused under `RSA PRIVATE KEY`.
+/// What the oracle's `x509_key_pair` answers for a pair the port generated
+/// on `curve`, its key read whole.
+fn go_reads_ecdsa(curve: Curve) -> &'static str {
+    match curve {
+        Curve::P256 => "ok ECDSA P-256",
+        Curve::P521 => "ok ECDSA P-521",
+    }
+}
+
+/// Every key is read by `dcroxide-tlscrypto`'s loader, by Go's
+/// `tls.X509KeyPair` rules, so a SEC 1 key without its public key, which
+/// Go loads, since it never reads that key (`crypto/x509/sec1.go:87-130`),
+/// builds a configuration on either curve, as in dcrd, and Go's own
+/// reading agrees through the oracle when it is present.
 #[test]
-fn a_p521_key_builds_under_each_label_the_reader_takes() {
-    for (curve, under_rsa_label) in [(Curve::P521, true), (Curve::P256, false)] {
+fn a_key_without_its_public_key_builds_on_either_curve() {
+    let mut go = TlsOracle::start();
+    for curve in [Curve::P521, Curve::P256] {
+        let (cert_pem, key_pem) = pair_with_edited_key(curve, without_public_key);
+        if let Err(err) = dcroxide_node::rpcrun::tls_server_config(&cert_pem, &key_pem, None) {
+            panic!("{curve:?}: {err}");
+        }
+        let what = format!("{curve:?}");
+        let want = go_reads_ecdsa(curve);
+        assert_go_reads(go.as_mut(), &what, &cert_pem, &key_pem, want);
+    }
+}
+
+/// The RPC server takes the key block by Go's rule, the first whose type
+/// is `PRIVATE KEY` or ends in ` PRIVATE KEY` (`crypto/tls/tls.go:294-311`),
+/// and reads its DER whatever the label, as Go's `parsePrivateKey` does
+/// (`:366-383`), so a pair builds with its SEC 1 key under `EC PRIVATE KEY`,
+/// `RSA PRIVATE KEY` or a label of its own, and with its PKCS#8 form under
+/// `PRIVATE KEY` or a label of its own, on either curve, as in dcrd, and
+/// Go's own reading agrees through the oracle when it is present.
+#[test]
+fn a_key_builds_under_every_label_go_takes() {
+    let mut go = TlsOracle::start();
+    for curve in [Curve::P521, Curve::P256] {
         let (cert_pem, sec1) = generated_pair(curve);
         let pkcs8 = as_pkcs8(curve, &sec1);
-        for (label, der, builds) in [
-            ("EC PRIVATE KEY", &sec1, true),
-            ("RSA PRIVATE KEY", &sec1, under_rsa_label),
-            ("PRIVATE KEY", &pkcs8, true),
+        for (label, der) in [
+            ("EC PRIVATE KEY", &sec1),
+            ("RSA PRIVATE KEY", &sec1),
+            ("TEST PRIVATE KEY", &sec1),
+            ("PRIVATE KEY", &pkcs8),
+            ("TEST PRIVATE KEY", &pkcs8),
         ] {
-            let built = dcroxide_node::rpcrun::tls_server_config(&cert_pem, &pem(label, der), None);
-            assert_eq!(
-                built.is_ok(),
-                builds,
-                "{curve:?} under {label}: {:?}",
-                built.err()
-            );
+            let key_pem = pem(label, der);
+            let built = dcroxide_node::rpcrun::tls_server_config(&cert_pem, &key_pem, None);
+            if let Err(err) = built {
+                panic!("{curve:?} under {label}: {err}");
+            }
+            let what = format!("{curve:?} under {label}");
+            let want = go_reads_ecdsa(curve);
+            assert_go_reads(go.as_mut(), &what, &cert_pem, &key_pem, want);
         }
     }
 }
 
-/// And P-256, the default, is unaffected.
+/// A DER element of `tag` holding `content`, its length in the fewest
+/// bytes.
+fn der(tag: u8, content: &[u8]) -> Vec<u8> {
+    let len = content.len().to_be_bytes();
+    let digits = &len[len.iter().position(|&b| b != 0).unwrap_or(len.len())..];
+    let mut out = vec![tag];
+    match digits {
+        [] => out.push(0),
+        [short] if *short < 0x80 => out.push(*short),
+        _ => {
+            out.push(0x80 | u8::try_from(digits.len()).expect("at most eight length bytes"));
+            out.extend_from_slice(digits);
+        }
+    }
+    out.extend_from_slice(content);
+    out
+}
+
+/// A DER INTEGER of the unsigned big-endian `value`.
+fn der_integer(value: &[u8]) -> Vec<u8> {
+    let sign = value.first().is_none_or(|first| first & 0x80 != 0);
+    der(0x02, &[if sign { &[0][..] } else { &[] }, value].concat())
+}
+
+/// The fields of a SEC 1 key the port generated, each a whole element.
+fn sec1_elements(der: &[u8]) -> Vec<&[u8]> {
+    let (_, mut bounds) = sec1_fields(der);
+    bounds.push(der.len());
+    bounds
+        .windows(2)
+        .map(|field| &der[field[0]..field[1]])
+        .collect()
+}
+
+/// An RSA private key of the test-key fixture in PKCS#1 (RFC 8017 §A.1.2),
+/// version 0 and its five values, followed by `crt`, which stand in the
+/// places of the two CRT exponents and the coefficient when given.
+fn pkcs1(key: &dcroxide_testutil::RsaTestKey, crt: &[&[u8]]) -> Vec<u8> {
+    let values = [&key.n, &key.e, &key.d, &key.p, &key.q];
+    let fields: Vec<Vec<u8>> = std::iter::once(der_integer(&[0]))
+        .chain(values.iter().map(|value| der_integer(value)))
+        .chain(crt.iter().map(|value| der_integer(value)))
+        .collect();
+    der(0x30, &fields.concat())
+}
+
+/// What one key file comes to: the port's verdict and Go's.
+struct KeyCase {
+    what: &'static str,
+    cert_pem: Vec<u8>,
+    key_pem: Vec<u8>,
+    /// The text the port's error ends with, or `None` where the pair
+    /// builds.
+    refused: Option<&'static str>,
+    /// `x509_key_pair`'s answer under the reference Go: `ok` and the key's
+    /// type, or `refused: ` and Go's error, or `refused: ` alone where only
+    /// the verdict is compared.
+    go: &'static str,
+}
+
+/// The RPC key is read as Go's `tls.X509KeyPair` reads it, and each case
+/// is held to Go's own reading through the oracle's `x509_key_pair` when
+/// the oracle is present: Go's words under the reference Go, else its
+/// verdict alone.
+///
+/// - P-256 keys ring refused and Go serves: a scalar with a leading zero
+///   byte, which Go strips (`crypto/x509/sec1.go:115-122`); no public key;
+///   and another key's public key, which Go never compares with the
+///   scalar, with the certificate the scalar's.
+/// - An RSA key, which Go serves and the port refuses with T6's text
+///   (ADR-0015): PKCS#1 without its CRT values, which Go computes, and in
+///   PKCS#8, each for its certificate from `tls_pki` (the oracle's alone);
+///   and a PKCS#1 structure with CRT values made up, which Go's `Validate`
+///   refuses too, since the port reads the structure alone.
+/// - A P-224 key, which Go loads and serves over TLS 1.2 only, and the
+///   port refuses at load: against a P-256 certificate, so that Go reads
+///   it as an ECDSA key and refuses it only as not the certificate's.
+/// - The block by Go's rule: a PKCS#8 key under `TEST PRIVATE KEY` serves;
+///   under `TESTPRIVATE KEY`, which runs into `PRIVATE KEY` with no space,
+///   it is skipped, refused alone with Go's text and served from a plain
+///   block after it; an `ENCRYPTED PRIVATE KEY` block ahead of a plain key
+///   is the block read, which does not parse; and a file of a certificate
+///   alone, of no PEM, and of other blocks, each with Go's text.
+#[test]
+fn an_rpc_key_is_read_as_x509_key_pair_reads_it() {
+    let (p256_cert, p256_sec1) = generated_pair(Curve::P256);
+    let (_, other_sec1) = generated_pair(Curve::P256);
+    let fields = sec1_elements(&p256_sec1);
+    let other_fields = sec1_elements(&other_sec1);
+    assert_eq!(fields.len(), 4, "version, scalar, curve and public key");
+    let sec1_of = |fields: &[&[u8]]| pem("EC PRIVATE KEY", &der(0x30, &fields.concat()));
+    let padded_scalar = der(0x04, &[&[0][..], &fields[1][2..]].concat());
+    let rsa_key = dcroxide_testutil::rsa_test_key("rsa2048");
+    // A P-224 scalar of 1, the curve named inside (1.3.132.0.33).
+    let p224 = der(
+        0x30,
+        &[
+            der_integer(&[1]),
+            der(0x04, &[&[0; 27][..], &[1]].concat()),
+            der(0xa0, &der(0x06, &[0x2b, 0x81, 0x04, 0x00, 0x21])),
+        ]
+        .concat(),
+    );
+    // An EncryptedPrivateKeyInfo's shape: PBES2's OID and no key.
+    let encrypted = der(
+        0x30,
+        &[
+            der(
+                0x30,
+                &der(
+                    0x06,
+                    &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x05, 0x0d],
+                ),
+            ),
+            der(0x04, &[0x55; 16]),
+        ]
+        .concat(),
+    );
+    let pkcs8 = pem("PRIVATE KEY", &as_pkcs8(Curve::P256, &p256_sec1));
+    let p256_cert_der = {
+        use rustls::pki_types::pem::PemObject;
+        rustls::pki_types::CertificateDer::from_pem_slice(&p256_cert).expect("the certificate")
+    };
+    let case = |what, key_pem, refused, go| KeyCase {
+        what,
+        cert_pem: p256_cert.clone(),
+        key_pem,
+        refused,
+        go,
+    };
+    let mut cases = vec![
+        case(
+            "a P-256 scalar with a leading zero byte",
+            sec1_of(&[fields[0], &padded_scalar, fields[2], fields[3]]),
+            None,
+            "ok ECDSA P-256",
+        ),
+        case(
+            "a P-256 key without its public key",
+            sec1_of(&fields[..3]),
+            None,
+            "ok ECDSA P-256",
+        ),
+        case(
+            "a P-256 key with another key's public key",
+            sec1_of(&[fields[0], fields[1], fields[2], other_fields[3]]),
+            None,
+            "ok ECDSA P-256",
+        ),
+        case(
+            "an RSA key, PKCS#1 with CRT values made up",
+            pem("RSA PRIVATE KEY", &pkcs1(&rsa_key, &[&[1], &[1], &[1]])),
+            Some(RSA_RPC_KEY_REFUSED),
+            "refused: ",
+        ),
+        case(
+            "a P-224 key",
+            pem("EC PRIVATE KEY", &p224),
+            Some("unsupported private key: ECDSA P-224"),
+            "refused: tls: private key does not match public key",
+        ),
+        case(
+            "a PKCS#8 key under TEST PRIVATE KEY",
+            pem("TEST PRIVATE KEY", &as_pkcs8(Curve::P256, &p256_sec1)),
+            None,
+            "ok ECDSA P-256",
+        ),
+        case(
+            "a PKCS#8 key under TESTPRIVATE KEY",
+            pem("TESTPRIVATE KEY", &as_pkcs8(Curve::P256, &p256_sec1)),
+            Some(
+                "tls: failed to find PEM block with type ending in \"PRIVATE KEY\" in key input \
+                 after skipping PEM blocks of the following types: [TESTPRIVATE KEY]",
+            ),
+            "refused: tls: failed to find PEM block with type ending in \"PRIVATE KEY\" in key \
+             input after skipping PEM blocks of the following types: [TESTPRIVATE KEY]",
+        ),
+        case(
+            "a TESTPRIVATE KEY block ahead of a plain key",
+            [
+                pem("TESTPRIVATE KEY", &as_pkcs8(Curve::P256, &p256_sec1)),
+                pkcs8.clone(),
+            ]
+            .concat(),
+            None,
+            "ok ECDSA P-256",
+        ),
+        case(
+            "an ENCRYPTED PRIVATE KEY block ahead of a plain key",
+            [pem("ENCRYPTED PRIVATE KEY", &encrypted), pkcs8.clone()].concat(),
+            Some("tls: failed to parse private key"),
+            "refused: tls: failed to parse private key",
+        ),
+        case(
+            "a certificate alone",
+            pem("CERTIFICATE", &p256_cert_der),
+            Some("tls: found a certificate rather than a key in the PEM for the private key"),
+            "refused: tls: found a certificate rather than a key in the PEM for the private key",
+        ),
+        case(
+            "no PEM",
+            b"not a key\n".to_vec(),
+            Some("tls: failed to find any PEM data in key input"),
+            "refused: tls: failed to find any PEM data in key input",
+        ),
+        case(
+            "a certificate and parameters",
+            [
+                pem("CERTIFICATE", &p256_cert_der),
+                pem("EC PARAMETERS", &fields[2][2..]),
+            ]
+            .concat(),
+            Some(
+                "tls: failed to find PEM block with type ending in \"PRIVATE KEY\" in key input \
+                 after skipping PEM blocks of the following types: [CERTIFICATE EC PARAMETERS]",
+            ),
+            "refused: tls: failed to find PEM block with type ending in \"PRIVATE KEY\" in key \
+             input after skipping PEM blocks of the following types: [CERTIFICATE EC PARAMETERS]",
+        ),
+    ];
+    let mut go = TlsOracle::start();
+    if let Some(go) = go.as_mut() {
+        let rsa = go
+            .pki(&[spec("RSA-2048", "rsa2048", None, "server")])
+            .remove("RSA-2048")
+            .expect("the RSA pair");
+        cases.push(KeyCase {
+            what: "an RSA key, PKCS#1 without its CRT values, for its certificate",
+            cert_pem: rsa.cert_pem.clone(),
+            key_pem: pem("RSA PRIVATE KEY", &pkcs1(&rsa_key, &[])),
+            refused: Some(RSA_RPC_KEY_REFUSED),
+            go: "ok RSA 2048",
+        });
+        cases.push(KeyCase {
+            what: "an RSA key, PKCS#8, for its certificate",
+            cert_pem: rsa.cert_pem.clone(),
+            key_pem: rsa.key_pem.clone(),
+            refused: Some(RSA_RPC_KEY_REFUSED),
+            go: "ok RSA 2048",
+        });
+    }
+    for case in &cases {
+        let built = dcroxide_node::rpcrun::tls_server_config(&case.cert_pem, &case.key_pem, None);
+        match (built, case.refused) {
+            (Ok(_), None) => {}
+            (Err(err), Some(text)) => assert!(err.ends_with(text), "{}: refused: {err}", case.what),
+            (Ok(_), Some(text)) => panic!("{}: built, where {text} was expected", case.what),
+            (Err(err), None) => panic!("{}: refused: {err}", case.what),
+        }
+        assert_go_reads(
+            go.as_mut(),
+            case.what,
+            &case.cert_pem,
+            &case.key_pem,
+            case.go,
+        );
+    }
+    let expected = if go.is_some() { 14 } else { 12 };
+    assert_eq!(cases.len(), expected, "every case ran");
+}
+
+/// And P-256, the default, builds.
 #[test]
 fn a_p256_key_still_builds() {
     let dir = tempfile::tempdir().expect("temp dir");

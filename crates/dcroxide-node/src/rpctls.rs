@@ -35,16 +35,17 @@
 //!   applied in TLS 1.3 at `handshake_server_tls13.go:179-197` and in
 //!   TLS 1.2 at `handshake_server.go:396-429`).
 //!
-//! rustls with the `ring` provider offers only X25519, P-256 and P-384,
-//! and it picks the group, and by default the suite, in the client's
-//! order.  The port closes most of that gap in three parts.  P-521 comes
-//! from `dcroxide-tlscrypto`, the in-tree provider ADR-0015 moves the
-//! node's TLS to, whose group takes a peer's share and draws its
-//! ephemeral key as Go's `crypto/ecdh` does.  A certificate pair is served
-//! by [`RpcTlsConfigs`], a set of rustls configurations, one for each
-//! cipher-suite order and TLS 1.3 key exchange Go can settle on, all with
-//! `ignore_client_order` set.  And [`handshake`] reads the ClientHello
-//! through `rustls::server::Acceptor` before it picks one of them, so the
+//! rustls picks the group, and by default the suite, in the client's
+//! order.  The port closes most of that gap in three parts.  The suites
+//! and groups come from `dcroxide-tlscrypto`, the in-tree provider the
+//! node's TLS runs on (ADR-0015), each an item of its own, so both of Go's
+//! suite orders can be built from them, and P-521 among the groups, whose
+//! exchanges take a peer's share and draw their ephemeral keys as Go's
+//! `crypto/ecdh` does.  A certificate pair is served by [`RpcTlsConfigs`],
+//! a set of rustls configurations, one for each cipher-suite order and
+//! TLS 1.3 key exchange Go can settle on, all with `ignore_client_order`
+//! set.  And [`handshake`] reads the ClientHello through
+//! `rustls::server::Acceptor` before it picks one of them, so the
 //! configuration a connection gets leaves rustls only Go's choice to
 //! make.  The ClientHello's key shares and offered versions, which
 //! rustls's `ClientHello` does not expose, are read from the raw records
@@ -85,22 +86,22 @@ const SECP521R1_ID: u16 = 0x0019;
 const RPC_KX_GROUP_IDS: [u16; 4] = [X25519_ID, SECP256R1_ID, SECP384R1_ID, SECP521R1_ID];
 
 /// The key exchanges the RPC server offers, in the order of
-/// [`RPC_KX_GROUP_IDS`]: ring's three, and P-521 from `dcroxide-tlscrypto`,
+/// [`RPC_KX_GROUP_IDS`]: `dcroxide-tlscrypto`'s four, P-521 among them,
 /// which Go's server offers by default (`defaultCurvePreferences`,
-/// `crypto/tls/defaults.go:21-35`) and ring's provider does not
-/// (`rustls-0.23.46/src/crypto/ring/mod.rs:180-181`).
+/// `crypto/tls/defaults.go:21-35`) and the provider's default list, kept
+/// to ring's three for the seeders' ClientHello, leaves out.
 ///
 /// Without P-521 a client that offers nothing else gets a
 /// `handshake_failure` alert where dcrd completes the handshake, and
 /// Decrediton is such a client: it pins `ecdhCurve: "secp521r1"` on its
 /// requests to a remote daemon.
 fn rpc_kx_groups() -> [&'static dyn SupportedKxGroup; 4] {
-    use rustls::crypto::ring::kx_group;
+    use dcroxide_tlscrypto::kx_group;
     [
         kx_group::X25519,
         kx_group::SECP256R1,
         kx_group::SECP384R1,
-        dcroxide_tlscrypto::kx_group::SECP521R1,
+        kx_group::SECP521R1,
     ]
 }
 
@@ -177,7 +178,7 @@ fn go_aes_gcm_preferred(aes_gcm_hardware: bool, client_suites: &[u16]) -> bool {
 /// does not implement.  ECDSA ahead of RSA at each step, as Go lists them;
 /// the certificate decides which half applies.
 fn rpc_cipher_suites(aes_gcm_first: bool) -> Vec<SupportedCipherSuite> {
-    use rustls::crypto::ring::cipher_suite::{
+    use dcroxide_tlscrypto::cipher_suite::{
         TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256, TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
         TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256, TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
         TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384, TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
@@ -270,9 +271,9 @@ pub struct RpcTlsConfigs {
 }
 
 impl RpcTlsConfigs {
-    /// Build the set, calling `build` once for each provider: ring's, with
-    /// the suites in one of Go's two orders and the key exchanges cut to
-    /// those the configuration offers.
+    /// Build the set, calling `build` once for each provider:
+    /// `dcroxide-tlscrypto`'s, with the suites in one of Go's two orders and
+    /// the key exchanges cut to those the configuration offers.
     pub(crate) fn build(
         mut build: impl FnMut(Arc<CryptoProvider>) -> Result<ServerConfig, String>,
     ) -> Result<RpcTlsConfigs, String> {
@@ -289,7 +290,7 @@ impl RpcTlsConfigs {
         build: &mut impl FnMut(Arc<CryptoProvider>) -> Result<ServerConfig, String>,
     ) -> Result<ConfigsByGroup, String> {
         let mut provider = |kx_groups: Vec<&'static dyn SupportedKxGroup>| {
-            let mut provider = rustls::crypto::ring::default_provider();
+            let mut provider = dcroxide_tlscrypto::default_provider();
             provider.cipher_suites = rpc_cipher_suites(aes_gcm_first);
             provider.kx_groups = kx_groups;
             build(Arc::new(provider)).map(Arc::new)
@@ -1212,7 +1213,7 @@ mod tests {
                 vec![rustls::SignatureScheme::ECDSA_NISTP256_SHA256]
             }
         }
-        let mut provider = rustls::crypto::ring::default_provider();
+        let mut provider = dcroxide_tlscrypto::default_provider();
         provider.kx_groups = kx_groups;
         let mut config = rustls::ClientConfig::builder_with_provider(Arc::new(provider))
             .with_protocol_versions(versions)
@@ -1234,11 +1235,11 @@ mod tests {
     /// share and versions, through one record or several.
     #[test]
     fn hello_facts_read_a_client_hello() {
-        use rustls::crypto::ring::kx_group;
+        use dcroxide_tlscrypto::kx_group;
         for fragment in [16384, 64] {
             let both = client_hello(
                 rustls::DEFAULT_VERSIONS,
-                vec![dcroxide_tlscrypto::kx_group::SECP521R1, kx_group::X25519],
+                vec![kx_group::SECP521R1, kx_group::X25519],
                 fragment,
             );
             let facts = HelloFacts::parse(&both).expect("parses");

@@ -95,9 +95,7 @@ impl rustls::client::danger::ServerCertVerifier for Verifier {
     }
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        rustls::crypto::ring::default_provider()
-            .signature_verification_algorithms
-            .supported_schemes()
+        dcroxide_tlscrypto::SUPPORTED_SIG_ALGS.supported_schemes()
     }
 }
 
@@ -240,7 +238,7 @@ fn refused_tls_handshakes_are_logged_as_dcrd_logs_them() {
     // A client that refuses the certificate sends an alert, which Go
     // reports as a remote error.
     let refusing = client(
-        rustls::crypto::ring::default_provider(),
+        dcroxide_tlscrypto::default_provider(),
         rustls::DEFAULT_VERSIONS,
         Verifier { accept: false },
     );
@@ -254,7 +252,7 @@ fn refused_tls_handshakes_are_logged_as_dcrd_logs_them() {
     );
 
     // No key exchange in common over TLS 1.3.
-    let mut provider = rustls::crypto::ring::default_provider();
+    let mut provider = dcroxide_tlscrypto::default_provider();
     provider.kx_groups = vec![&OnlyX448];
     let client_addr = attempt(
         &addr,
@@ -275,7 +273,7 @@ fn refused_tls_handshakes_are_logged_as_dcrd_logs_them() {
     // A ClientHello offering only TLS 1.1: a rustls TLS 1.2 ClientHello
     // whose `supported_versions` entry is rewritten to 0x0302.
     let mut hello_conn = client(
-        rustls::crypto::ring::default_provider(),
+        dcroxide_tlscrypto::default_provider(),
         &[&rustls::version::TLS12],
         Verifier { accept: true },
     );
@@ -313,7 +311,7 @@ fn refused_tls_handshakes_are_logged_as_dcrd_logs_them() {
     attempt(
         &addr,
         client(
-            rustls::crypto::ring::default_provider(),
+            dcroxide_tlscrypto::default_provider(),
             rustls::DEFAULT_VERSIONS,
             Verifier { accept: true },
         ),

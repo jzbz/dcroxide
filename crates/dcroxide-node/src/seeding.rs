@@ -61,15 +61,14 @@ impl SeederRoots<'_> {
     }
 }
 
-/// The rustls crypto provider both seeder transports hand their TLS
-/// clients: ring's, the one ureq picks by itself, as the process default
-/// or as its fallback (`ureq-3.4.2/src/tls/rustls.rs:137-160`), and the
-/// one the proxy's client was built with, until ADR-0015's switch hands
-/// them `dcroxide-tlscrypto`'s.  Each is handed it explicitly, so neither
-/// depends on the process default that the RPC server's configuration
-/// installs and `--notls` or `--norpc` leaves unset.
+/// The rustls crypto provider both seeder transports hand their TLS clients:
+/// `dcroxide-tlscrypto`'s (ADR-0015), whose default lists are ring's, so a
+/// seeder's ClientHello is the one it sent on ring's provider.  Each is
+/// handed it explicitly: the node installs no process default, and ureq,
+/// without its `rustls` feature's fallback to ring, panics on a connection
+/// with neither (`ureq-3.4.2/src/tls/rustls.rs:137-160`).
 fn seeder_crypto_provider() -> Arc<rustls::crypto::CryptoProvider> {
-    Arc::new(rustls::crypto::ring::default_provider())
+    Arc::new(dcroxide_tlscrypto::default_provider())
 }
 
 /// The TLS-capable seeder transport over `ureq` (dcrd's `dcrdDial`

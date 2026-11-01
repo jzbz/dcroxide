@@ -1,6 +1,6 @@
 [package]
 name = "dcroxide-tlscrypto"
-description = "The rustls crypto provider ADR-0015 moves the node's TLS to: RustCrypto primitives, in-tree RSA verification, and Go's key and point rules"
+description = "The rustls crypto provider the node serves and dials TLS with: RustCrypto primitives, in-tree RSA verification, and Go's key and point rules"
 version.workspace = true
 authors.workspace = true
 edition.workspace = true
@@ -60,9 +60,6 @@ zeroize = "1.9"
 dcroxide-testutil = { path = "../dcroxide-testutil" }
 serde_json = "1"
 flate2 = "1.1"
-# Step 1 only: the parity tests run ring's provider beside this one.
-# Removed by the switch, which leaves nothing in the build selecting ring.
-rustls = { version = "0.23.46", default-features = false, features = ["std", "tls12", "ring"] }
 
 [lints]
 workspace = true

@@ -307,7 +307,7 @@ impl Negotiated {
 
 /// Why a server on ring's verification set, the provider's today and with
 /// it the node's, refuses a client certificate Go's server accepts: no
-/// P-521 or SHA-512 ECDSA and no RSA key under 2048 bits until Go's
+/// P-521 or SHA-512 ECDSA and no RSA key under 2041 bits until Go's
 /// client-certificate set (ADR-0015, T4).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ClientCertRefusal {

@@ -180,11 +180,12 @@ jobs:
             --cfg poly1305_backend="soft"
             --cfg sha2_backend="soft"
             --cfg curve25519_dalek_backend="serial"
-      # The library on its own, which builds no dev-dependency. Under the
-      # workspace's resolver 3, with only this package selected, rustls's
-      # `ring` feature is off, since only the crate's ring parity tests ask
-      # for it, so a `rustls::crypto::ring` outside the tests fails here
-      # rather than first at the switch that removes ring (ADR-0015).
+      # The library on its own, which builds no dev-dependency, and then
+      # every workspace crate on every target with every kind of
+      # dependency: since ADR-0015's switch nothing selects rustls's or
+      # ureq's `ring`, so ring must reach no build. Cargo.lock still lists
+      # it (deny.toml says why), which is why the tree, which follows the
+      # enabled features, is what is checked.
       - name: Build the library without ring
         run: |
           set -o pipefail
@@ -195,6 +196,11 @@ jobs:
           ring=$(cargo tree -p dcroxide-tlscrypto -e normal --prefix none -f '{p}' | { grep -c '^ring ' || true; })
           if [ "$ring" -ne 0 ]; then
             echo "the dcroxide-tlscrypto library reaches ring" >&2
+            exit 1
+          fi
+          ring=$(cargo tree --workspace -e all --target all --prefix none -f '{p}' | { grep -c '^ring ' || true; })
+          if [ "$ring" -ne 0 ]; then
+            echo "a workspace crate reaches ring" >&2
             exit 1
           fi
 

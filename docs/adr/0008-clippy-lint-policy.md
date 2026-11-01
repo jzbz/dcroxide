@@ -351,3 +351,34 @@ crate-level `#![allow]`s this removed never figured in them, while every
 per-site attribute it added does. By the grep's count that row is now some
 650 higher, and the `#[expect]` migration the bullet adopts, which would
 catch an allow that outlives its site, covers that many more.
+
+## Addendum, 2026-10-31 — the calls that set or take a process provider are refused
+
+A root `clippy.toml` now exists, for one purpose: its `disallowed-methods`
+refuse the calls that would set or take rustls's process-wide crypto
+provider, since the node installs none (ADR-0015's T7 and its addendum
+of 2026-10-31, the switch). They are the six rustls constructors that
+take it, `rustls::ClientConfig::builder` and
+`builder_with_protocol_versions`, the same two of `rustls::ServerConfig`,
+`rustls::server::WebPkiClientVerifier::builder` and
+`rustls::client::WebPkiServerVerifier::builder`;
+`rustls::crypto::CryptoProvider::install_default`, which would set it;
+and ureq 3.4.2's default agent, `ureq::Agent::new_with_defaults`, which
+falls back to it, with every public function that builds one inside
+ureq, where clippy cannot follow the call: `get`, `post`, `put`,
+`delete`, `head`, `options`, `connect`, `patch`, `trace`, `run`, `agent`
+and `ureq::RequestExt::with_default_agent`. Each entry's reason names the
+replacement, a `builder_with_provider` given `dcroxide-tlscrypto`'s
+provider, an agent whose `TlsConfig` names it, or, for `install_default`,
+that every configuration names it. The provider's design answered this
+question, approved with its others on 2026-10-26, but its list left out
+`run`, `agent` and `with_default_agent`, which the switch adds; it also
+left open whether clippy resolves the paths, rustls's being re-exports
+and ureq's free functions and a trait's method. With a test file calling
+each of the twenty once, clippy on the pinned toolchain and on 1.99.1
+reported each call as a use of a disallowed method, and the file was then
+deleted. The lint is `clippy::all`'s, so CI's `-D warnings` makes each an
+error. What it cannot see is an agent built from a `Config` whose
+`TlsConfig` names no provider, which falls back the same way; the node's
+`tests/no_process_provider.rs` covers that at run time. Nothing else in
+the lint policy changes, and the file holds no other setting.

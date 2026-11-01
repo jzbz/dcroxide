@@ -25,7 +25,7 @@
 //!   trusts and a leaf under each kind of CA, P-256, P-384 signing with
 //!   ECDSA-SHA384, RSA-4096 signing with SHA256-RSA and with
 //!   SHA256-RSAPSS, and Ed25519, in each version: 48 cells.  Three are
-//!   refused today, as ring refuses them, and Go's client-certificate set
+//!   refused today, as ring refused them, and Go's client-certificate set
 //!   (ADR-0015, T4) is what makes them complete: a P-521 client key, an
 //!   issuer signing with ECDSA-SHA512 and an RSA-1024 client key, in each
 //!   version.
@@ -63,19 +63,19 @@
 //! and that Go's end refused, with the reference Go's words for it when the
 //! oracle runs that Go (`TlsOracle::assert_refused`).  Each refused cell's
 //! rustls error was checked once against ring's: a run of these tests with
-//! ring's provider put in for this one, while ring is in the tree, gave the
-//! same error in every refused cell it can run (all but those whose keys
-//! are P-521, which ring cannot load).  The oracle, the certificates, the
-//! client-certificate cells and Go's report of a connection are
-//! `dcroxide_testutil::tls_interop`'s, shared with the node's matrix.  Each
-//! matrix is one test with one oracle, which prints the handshakes it
-//! made, one a cell, its wall time and the Go that answered.  Without an
-//! oracle, or with one whose Go is older than 1.26, the tests skip, unless
-//! `DCROXIDE_REQUIRE_ORACLE` is set, as in CI, where they also require the
-//! reference Go.  Nothing leaves loopback, every accept, handshake, read
-//! and write on either side has a deadline, and the rustls end of a failed
-//! connection closes it only once its peer has, so that its alert is not
-//! lost to a reset.
+//! ring's provider put in for this one, while ring was in the tree, gave
+//! the same error in every refused cell it could run (all but those whose
+//! keys are P-521, which ring could not load).  The oracle, the
+//! certificates, the client-certificate cells and Go's report of a
+//! connection are `dcroxide_testutil::tls_interop`'s, shared with the
+//! node's matrix.  Each matrix is one test with one oracle, which prints
+//! the handshakes it made, one a cell, its wall time and the Go that
+//! answered.  Without an oracle, or with one whose Go is older than 1.26,
+//! the tests skip, unless `DCROXIDE_REQUIRE_ORACLE` is set, as in CI, where
+//! they also require the reference Go.  Nothing leaves loopback, every
+//! accept, handshake, read and write on either side has a deadline, and the
+//! rustls end of a failed connection closes it only once its peer has, so
+//! that its alert is not lost to a reset.
 
 // Test-harness arithmetic: a deadline and counts of cells.
 #![allow(clippy::arithmetic_side_effects)]
@@ -622,7 +622,7 @@ fn client_config(
 }
 
 /// The rustls error the provider's server refuses a client certificate
-/// with in `version` for `refusal`, which ring's provider gives too.
+/// with in `version` for `refusal`, which ring's provider gave too.
 fn refusal_error(refusal: ClientCertRefusal, version: Version) -> Error {
     match (refusal, version.1) {
         // Go's client sends no certificate it cannot sign with under a
@@ -772,7 +772,7 @@ fn go_clients_handshake_with_the_provider_server() {
     }
     assert_eq!(accepted, 48, "four keys, six chains, two versions");
 
-    // What ring's provider refuses too: rustls's own errors.
+    // What ring's provider refused too: rustls's own errors.
     let refusals = [
         (
             "ECDHE-RSA suites against an ECDSA key",

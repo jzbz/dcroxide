@@ -19,8 +19,8 @@ dcroxide-crypto = { path = "../crates/dcroxide-crypto" }
 dcroxide-dcrec = { path = "../crates/dcroxide-dcrec" }
 dcroxide-dcrjson = { path = "../crates/dcroxide-dcrjson" }
 # For http_head_parse and ws_frame_read.  It brings the node's whole tree
-# (rustls, ring, ureq) into the fuzz build, every crate of it pinned in
-# the workspace lockfile at the same version.
+# (rustls on dcroxide-tlscrypto's provider, ureq) into the fuzz build,
+# every crate of it pinned in the workspace lockfile at the same version.
 dcroxide-node = { path = "../crates/dcroxide-node" }
 dcroxide-rpc = { path = "../crates/dcroxide-rpc" }
 dcroxide-rpctypes = { path = "../crates/dcroxide-rpctypes" }
