@@ -851,7 +851,7 @@ pins this policy asks for.
 >   release tag and a reproduction prototype has passed, and then only for
 >   x86_64 Linux, while CI keeps testing Linux, macOS and Windows and the
 >   other targets build from source until each passes a named bar. MSRV
->   stays the pinned toolchain itself, 1.98.1, through the workspace
+>   stays the pinned toolchain itself, through the workspace
 >   `rust-version`. A release is an SSH-signed tag and a PGP-signed
 >   `SHA256SUMS`, signed only after an off-GitHub rebuild matches CI's
 >   bytes, with GitHub artifact attestations beside it, and stale binaries

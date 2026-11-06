@@ -73,8 +73,8 @@ than rewriting what was decided. Use [template.md](template.md).
   either copy, is checked against the other, and a later import from
   dcr-rs needs a decision of its own.
 - **D7** — accepted 2026-10-26 as policy, as ADR-0014. The MSRV stays the
-  pinned toolchain itself, 1.98.1, with a fallback for a Rust minor that
-  never gets a point release. No binary is published until the pure-Rust rule
+  pinned toolchain itself, with a fallback for a Rust minor that never gets
+  a point release. No binary is published until the pure-Rust rule
   is met, the D3 signature soak has passed, the pin is at a dcrd v2.2 release
   tag and a reproduction prototype has passed; then x86_64 Linux is the only
   Tier 1 target, and aarch64 Linux, macOS and Windows (by ADR-0014's reading,

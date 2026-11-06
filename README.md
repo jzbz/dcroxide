@@ -774,7 +774,7 @@ and 24.18 GiB under dcrd, 17.88 GiB of it block files in each
 
 ## Development
 
-Rust 1.98.1 and a Go toolchain (for the oracle-backed differential
+Rust 1.99.1 and a Go toolchain (for the oracle-backed differential
 tests; without Go those tests skip). Go 1.26.2 is the reference: the
 release dcrd's release image builds the parity pin with, and the one CI
 runs (`GO_VERSION` in `.github/workflows/ci.yml`; ADR-0001's 2026-10-26
