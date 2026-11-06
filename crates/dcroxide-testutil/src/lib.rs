@@ -1508,8 +1508,11 @@ mod tests {
     /// `fuzz/` is a workspace of its own, outside the root one, so its lock
     /// moves only when something re-resolves it there, and a bump of the
     /// root lock can leave the fuzz build on versions the node no longer
-    /// ships.  Every package both locks hold must be locked at the same
-    /// versions in each.  The fuzz build links the node, so the two share
+    /// ships.  Every version the fuzz lock holds of a package both locks
+    /// hold must be one the root lock holds.  The root lock may hold more
+    /// versions of a name, since its dev-dependencies are not the fuzz
+    /// build's: proptest takes rand 0.10 beside the 0.9 both locks list
+    /// for secp256k1.  The fuzz build links the node, so the two share
     /// most of the tree.  A package the fuzz lock lacks altogether is not
     /// caught here: cargo adds it, at the newest version it can, the next
     /// time the fuzz build resolves, which the fuzz jobs' `cargo fuzz run`
@@ -1524,8 +1527,8 @@ mod tests {
             let Some(locked) = workspace.get(name) else {
                 continue;
             };
-            assert_eq!(
-                versions, locked,
+            assert!(
+                versions.is_subset(locked),
                 "{name}: fuzz/Cargo.lock locks {versions:?} where Cargo.lock locks \
                  {locked:?}; move it with `cargo update --manifest-path fuzz/Cargo.toml \
                  -p {name} --precise <version>`"

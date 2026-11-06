@@ -1339,7 +1339,7 @@ suggests, and the opposite of what two microbenchmarks of 2026-07
 predicted: the 500,000-key insert loop that was the premise of ADR-0004's
 lever (b), and the 2,000,000-write grid reported when the knob was added,
 which the source comments still carry, marked superseded. There is no
-fixed split to reason from: redb 4.3.0
+fixed split to reason from: redb 4.5.0
 keeps a single cache figure and partitions it on demand, holding the write
 buffer at or below half of it, best effort, and letting the read cache grow
 into all of it. The advice rests on the full-chain measurement, not on a

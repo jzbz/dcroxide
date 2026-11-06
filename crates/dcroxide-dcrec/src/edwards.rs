@@ -326,7 +326,7 @@ mod tests {
     /// Ed25519 verification hashes `R || A || m` with SHA-512 from `sha2`
     /// (`verify_raw` above), which is consensus for signature type 1. From
     /// 0.11 `sha2` selects a SHA-512 backend on the ARMv8 SHA3 extension at
-    /// runtime on aarch64 (`sha2-0.11.0/src/sha512.rs`), where 0.10 ran
+    /// runtime on aarch64 (`sha2-0.11.1/src/sha512.rs`), where 0.10 ran
     /// portable code there; x86 keeps the runtime-selected AVX2 backend 0.10
     /// already had. A backend that disagreed with FIPS 180 would split
     /// consensus on the machines that select it and nowhere else. These are

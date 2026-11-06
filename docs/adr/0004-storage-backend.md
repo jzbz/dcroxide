@@ -82,7 +82,7 @@ believed and points at the evidence; nothing below it has been rewritten.
 > of 2026-10-10 at the end.
 
 **The metadata store now runs redb 4** (addendum, 2026-08-13, which took
-4.1.0; `Cargo.lock` now pins 4.3.0). The on-disk format changed with it:
+4.1.0; `Cargo.lock` now pins 4.5.0). The on-disk format changed with it:
 redb 4 reads only format 3 and returns
 `UpgradeRequired` for a 2.x file, mapped here to a typed error that names
 redb 2.x — a data directory written before 2026-08-13 is refused rather
@@ -94,7 +94,7 @@ half of it holds: 4.1.0 reproduces the 2.6.3 tree to four decimals on a
 free-page retention, which is the one row above that a 4.1.0 store reports
 smaller. None of these figures has been re-measured under 4.3.0, which
 shortens the branch keys of `&[u8]`-keyed tables, this crate's one table
-among them, to minimal separators.
+among them, to minimal separators, or under 4.5.0.
 
 **The engine is now measured against candidates, and redb loses on this
 workload.** Handed the identical engine-level journal, fjall 3.1.8 holds
@@ -418,7 +418,7 @@ transaction that triggers its own flush pins nothing.
 
 The second path is closed by locking rather than arithmetic.
 `Database::begin` takes the cache mutex and holds it across `begin_read()`
-(`lib.rs:3261-3289`, in `begin_seed`). It no longer holds it across the flush:
+(`lib.rs:3269-3297`, in `begin_seed`). It no longer holds it across the flush:
 since `d5aa17f` (2026-08-16) `flush_locked` takes the cache lock only to
 `begin_flush` and `finish_flush`, releasing it across `DbCache::run_flush` and
 redb's commit (`lib.rs:400-421`), so a *new* reader can now come into existence

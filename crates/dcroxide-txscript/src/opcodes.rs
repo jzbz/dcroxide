@@ -2500,7 +2500,7 @@ mod tests {
 
     /// OP_SHA1 and OP_SHA256 hash through `sha1` and `sha2`, and from 0.11
     /// both pick a hardware backend at runtime on aarch64 as well as x86
-    /// (`sha1-0.11.0/src/compress.rs`, `sha2-0.11.0/src/sha256.rs`), where
+    /// (`sha1-0.11.0/src/compress.rs`, `sha2-0.11.1/src/sha256.rs`), where
     /// 0.10 ran portable code on aarch64. A backend that disagreed with FIPS
     /// 180 would split consensus on the machines that select it and nowhere
     /// else, and script vectors hash inputs of a block or two. These are FIPS

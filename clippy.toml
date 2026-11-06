@@ -7,7 +7,7 @@
 # would panic at its first use; every configuration names
 # `dcroxide-tlscrypto`'s provider instead, through `builder_with_provider`
 # or ureq's `TlsConfig`.  ureq's entries are `Agent::new_with_defaults`,
-# its default agent, and every public function of ureq 3.4.2 that calls
+# its default agent, and every public function of ureq 3.5.1 that calls
 # it inside ureq, where clippy cannot follow the call: the nine request
 # functions, `run`, `agent` and `RequestExt::with_default_agent`.  An
 # agent built from a `Config` whose `TlsConfig` names no provider falls

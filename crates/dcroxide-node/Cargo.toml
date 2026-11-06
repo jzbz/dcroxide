@@ -83,13 +83,13 @@ rustls-webpki = { version = "0.103.16", default-features = false, features = ["s
 flate2 = "1.1"
 # Exact: the seeder transport hands ureq its rustls provider through
 # `TlsConfigBuilder::unversioned_rustls_crypto_provider`, which ureq does
-# not keep across its minor versions (`ureq-3.4.2/src/tls/mod.rs:246-254`),
+# not keep across its minor versions (`ureq-3.5.1/src/tls/mod.rs:248-256`),
 # so ADR-0015's T7 pins it while the node relies on that call.  Its
 # default `rustls` feature turns on rustls's `ring` (`_ring`,
-# `ureq-3.4.2/Cargo.toml:63`, `:101-105`); `rustls-no-provider` is the
+# `ureq-3.5.1/Cargo.toml:63`, `:101-105`); `rustls-no-provider` is the
 # same client without it, beside the default's `gzip` and the
 # `webpki-roots` the daemon's seeders trust.
-ureq = { version = "=3.4.2", default-features = false, features = [
+ureq = { version = "=3.5.1", default-features = false, features = [
     "rustls-no-provider",
     "rustls-webpki-roots",
     "gzip",

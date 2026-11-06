@@ -497,7 +497,7 @@ nothing. Note that 4.1.0 carries three issues (#1331, #1332, #1333: process
 aborts and unopenable files on malformed input) that were closed upstream on
 2026-08-13 and fixed in redb 4.2.0 of 2026-08-17, which this workspace had not
 taken when this was written -- `Cargo.lock` then pinned 4.1.0; it took 4.2.0 on
-2026-08-25 and has since moved to 4.3.0 -- and which argue for the upgrade being
+2026-08-25 and has since moved to 4.5.0 -- and which argue for the upgrade being
 routine maintenance rather than a security improvement.
 
 Everything below this line predates the 2026-08-13 measurement and is kept

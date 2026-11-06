@@ -249,8 +249,8 @@ struct TxState {
     /// to `None` made every key of the transaction read as missing, and
     /// redb does not stop that at one transaction.  `begin_read` takes
     /// its snapshot from memory and a read-cache hit skips redb's
-    /// failure check (redb-4.3.0 `page_manager.rs:1379-1382`,
-    /// `cached_file.rs:651-659`), so after an I/O error the master
+    /// failure check (redb-4.5.0 `page_manager.rs:1389-1392`,
+    /// `cached_file.rs:690-698`), so after an I/O error the master
     /// table root keeps opening from cache while every uncached page
     /// returns `PreviousIo`, for the rest of the process.
     table: Option<redb::ReadOnlyTable<&'static [u8], &'static [u8]>>,
@@ -563,7 +563,7 @@ impl Transaction {
     /// streams carry on: a goleveldb iterator goes invalid on an error
     /// and ffldb's merged cursor treats that as exhausted, never
     /// checking `Error()`.  redb's range iterator instead repeats
-    /// `PreviousIo` forever once it has failed (redb-4.3.0
+    /// `PreviousIo` forever once it has failed (redb-4.5.0
     /// `btree_cursor_range.rs:208-216`), so a scan that skipped errors
     /// -- as a `flatten()` here once did -- spun forever.
     ///

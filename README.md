@@ -274,7 +274,7 @@ work). Currently implemented:
   against dcrd
 - `dcroxide-database` — block and metadata storage with dcrd's
   `database` interface semantics (buckets, transactions, block storage
-  APIs, all error kinds), backed by redb 4.3.0 per ADR-0004 with
+  APIs, all error kinds), backed by redb 4.5.0 per ADR-0004 with
   dcrd's ffldb key layout and flat-file block record format, except
   that blocks and the other per-block rows are keyed by height first
   (ADR-0010, chain database version 15), plus

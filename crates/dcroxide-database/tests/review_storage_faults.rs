@@ -6,7 +6,7 @@
 //! that can be told to fail reads or writes and that counts reads, with
 //! redb's page cache set to zero.  The zero cache is what makes the
 //! faults reachable: a read-cache hit skips redb's failure check
-//! (redb-4.3.0 `cached_file.rs:651-659`), so with a warm cache a test
+//! (redb-4.5.0 `cached_file.rs:690-698`), so with a warm cache a test
 //! would only ever exercise whichever pages it happened not to touch
 //! first.  With no room to keep a page, each page a small store spreads
 //! across the cache's 131 stripes is evicted as soon as it is read, so
@@ -255,7 +255,7 @@ fn finishes<T: Send + 'static>(what: &str, f: impl FnOnce() -> T + Send + 'stati
 }
 
 /// redb's range iterator returns `PreviousIo` on every `next()` once it
-/// has failed and never `None` (redb-4.3.0
+/// has failed and never `None` (redb-4.5.0
 /// `btree_cursor_range.rs:208-216`), so a walk that skipped errors never
 /// ended.  ffldb's cursor ends where its goleveldb iterator goes
 /// invalid and carries on with the cached entries, and `ForEach` never

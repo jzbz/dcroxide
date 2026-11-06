@@ -2,9 +2,9 @@
 //! What the daemon's shutdown leaves in the header of the metadata store.
 //!
 //! redb keeps a recovery flag set in the header of `metadata.redb` while
-//! it has the file open for writing, and clears it only in the close its
-//! handle's drop runs (redb-4.3.0 `page_manager.rs:1458-1469`,
-//! `page_manager.rs:2466-2486`).  The daemon logged "Shutdown complete"
+//! it has the file open for writing, and clears it only in its close,
+//! which its handle's drop runs (redb-4.5.0 `page_manager.rs:1479-1486`,
+//! `page_manager.rs:2507-2523`).  The daemon logged "Shutdown complete"
 //! with the flag still set: the block database's close flushed and
 //! recorded the allocator state but left redb's handle to the drop of the
 //! last clone of the database handle, and the chain's clone never drops.
@@ -124,7 +124,7 @@ fn regnet_db_path(appdata: &Path) -> PathBuf {
 
 /// Whether the header of the metadata file in `db_path` has redb's
 /// recovery flag set: bit 1 of the byte after the nine-byte magic number
-/// (redb-4.3.0 `header.rs:46-62`).
+/// (redb-4.5.0 `header.rs:46-62`).
 fn recovery_flag(db_path: &Path) -> bool {
     let header = std::fs::read(db_path.join("metadata.redb")).expect("read the metadata file");
     header[9] & 0b10 != 0

@@ -21,8 +21,8 @@
 //! from its first read to its last, against a fresh store each time:
 //! redb latches a read failure, and every later uncached read fails with
 //! `PreviousIo` until the database is reopened.  redb gets no page cache,
-//! because a cache hit skips its failure check (redb-4.3.0
-//! `cached_file.rs:651-659`) and would hide the very pages under test.
+//! because a cache hit skips its failure check (redb-4.5.0
+//! `cached_file.rs:690-698`) and would hide the very pages under test.
 
 // Test-harness arithmetic over bounded row counts.
 #![allow(clippy::arithmetic_side_effects)]

@@ -36,7 +36,7 @@ impl SeederRoots<'_> {
         match self {
             SeederRoots::WebPki => ureq::tls::RootCerts::WebPki,
             // `to_owned` is how a borrowed certificate becomes `'static`
-            // (`ureq-3.4.2/src/tls/cert.rs:76`).
+            // (`ureq-3.5.1/src/tls/cert.rs:76`).
             SeederRoots::Certs(certs) => ureq::tls::RootCerts::new_with_certs(
                 &certs
                     .iter()
@@ -48,7 +48,7 @@ impl SeederRoots<'_> {
 
     /// The roots as the proxied client's store, skipping a certificate
     /// that does not parse, as ureq's client does
-    /// (`ureq-3.4.2/src/tls/rustls.rs:173-178`).
+    /// (`ureq-3.5.1/src/tls/rustls.rs:173-178`).
     fn store(&self) -> rustls::RootCertStore {
         let mut store = rustls::RootCertStore::empty();
         match self {
@@ -66,7 +66,7 @@ impl SeederRoots<'_> {
 /// seeder's ClientHello is the one it sent on ring's provider.  Each is
 /// handed it explicitly: the node installs no process default, and ureq,
 /// without its `rustls` feature's fallback to ring, panics on a connection
-/// with neither (`ureq-3.4.2/src/tls/rustls.rs:137-160`).
+/// with neither (`ureq-3.5.1/src/tls/rustls.rs:137-160`).
 fn seeder_crypto_provider() -> Arc<rustls::crypto::CryptoProvider> {
     Arc::new(dcroxide_tlscrypto::default_provider())
 }

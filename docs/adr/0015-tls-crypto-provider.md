@@ -40,7 +40,7 @@ certificate verification runs, and random numbers. rustls 0.23.46 is
 itself written in Rust with no C, and forbids `unsafe`
 (`rustls-0.23.46/src/lib.rs:332`); its provider in this node is `ring`
 0.17.14, about 151k lines of C and assembly
-(`docs/dependency-ledger.md:135`).
+(`docs/dependency-ledger.md:150`).
 
 `dcroxide-node` uses the provider in three places:
 
@@ -298,7 +298,7 @@ was not taken: the line of it built on the RustCrypto generation in the
 lock was a prerelease when the research read it, its stable 0.9 line is
 built on the generation before (`digest` 0.10,
 `rsa-0.9.10/Cargo.toml:108-109`, where the lock has 0.11.3,
-`Cargo.lock:840-841`), and it carries RUSTSEC-2023-0071, the
+`Cargo.lock:875-876`), and it carries RUSTSEC-2023-0071, the
 timing advisory `gencerts` already cites (`gentool.rs:12-15`). That
 advisory concerns private-key operations, which verification does not
 run; this is the research's reading, and the advisory was not re-read for
@@ -368,7 +368,7 @@ and ends the reliance on ureq's unstable provider API.
   under rustls can offer them. Every client the Decred tools ship offers
   an AES-GCM suite (`PARITY.md:3012-3013`).
 - **rustls 0.24 is unreleased.** The provider is written against 0.23,
-  the line the node is on (0.23.46, `Cargo.lock:1529-1530`), and is ported
+  the line the node is on (0.23.46, `Cargo.lock:1606-1607`), and is ported
   to 0.24 when that is stable. The research read 0.24.0-dev.2 as
   reshaping `CryptoProvider`, separate TLS 1.2 and TLS 1.3 suite lists
   among the changes, and estimated a modest port; it also found that
@@ -389,7 +389,7 @@ and ends the reliance on ureq's unstable provider API.
 ## Consequences
 
 - **C leaves the network surface** with the switch. ring's ~151k lines
-  go (`dependency-ledger.md:135`), and with them `getrandom` 0.2 and
+  go (`dependency-ledger.md:150`), and with them `getrandom` 0.2 and
   `windows-sys` 0.52, which only ring pulls in, and `deny.toml`'s two
   skip entries for them (`deny.toml:42-48` at `8e6ea23`).
   `fuzz/Cargo.lock` changes with the workspace's.

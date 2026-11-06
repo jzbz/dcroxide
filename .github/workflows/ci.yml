@@ -343,7 +343,7 @@ jobs:
     # dcroxide-database (all but txscript): it builds redb with redb's
     # default `std` feature, and stake fails on redb as well as on
     # secp256k1-sys. Turning redb's default features off is not enough on
-    # its own: 4.3.0 builds without `std` only when `std` is off and its
+    # its own: 4.5.0 builds without `std` only when `std` is off and its
     # `experimental-api-5` preview is on (`build.rs:5-13`).
     steps:
       - uses: actions/checkout@v7

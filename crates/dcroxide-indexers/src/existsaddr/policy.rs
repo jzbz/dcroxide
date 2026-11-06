@@ -21,7 +21,7 @@ pub(crate) const PARTITION_KEY_LEN: usize = 16;
 
 /// Keys per chunk row and per journal row: 192 x 21 = 4,032 value bytes,
 /// which with a chunk row's 29-byte key and redb's per-entry overhead fills
-/// exactly one 4 KiB leaf (redb 4.3.0 `btree_base.rs` `required_bytes`,
+/// exactly one 4 KiB leaf (redb 4.5.0 `btree_base.rs` `required_bytes`,
 /// `leaf_fits_one_page`).
 pub(crate) const CHUNK: usize = 192;
 

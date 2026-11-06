@@ -563,7 +563,7 @@ mod tests {
     /// Each curve the provider signs on takes a scalar of n - 1, at the
     /// field's length or stripped to it, and refuses n: the top of
     /// `[1, n)`, which the curve crate checks
-    /// (`elliptic-curve-0.14.1/src/scalar/value.rs:69-79`) where Go's
+    /// (`elliptic-curve-0.14.3/src/scalar/value.rs:69-79`) where Go's
     /// `NewPrivateKey` does
     /// (`crypto/internal/fips140/ecdsa/ecdsa.go:171-174`).
     #[test]

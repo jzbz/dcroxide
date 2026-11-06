@@ -438,9 +438,9 @@ pub(crate) struct DbInner {
     /// it ([`Database::close`]); `None` from then on.
     ///
     /// redb clears the recovery flag that its writable open set in the
-    /// file's header only in the close its handle's drop runs
-    /// (redb-4.3.0 `page_manager.rs:1458-1469`, `db.rs:1963-2028`,
-    /// `page_manager.rs:2466-2486`), and until then the file reads as one
+    /// file's header only in its close, which its handle's drop runs
+    /// (redb-4.5.0 `page_manager.rs:1479-1486`, `db.rs:2097-2168`,
+    /// `page_manager.rs:2507-2523`), and until then the file reads as one
     /// whose writer did not stop: every open recovers it, and a read-only
     /// open is refused.  So the handle has to be dropped for a clean close
     /// to leave a clean file, and the drop of the last [`Database`] clone
@@ -451,7 +451,7 @@ pub(crate) struct DbInner {
     /// whichever thread lets go last.  A flush holds one while it opens
     /// its write transaction; the close lets go only once no flush is in
     /// flight, and redb would leave its close to the end of a write
-    /// transaction still open in any case (redb-4.3.0 `db.rs:2012-2028`).
+    /// transaction still open in any case (redb-4.5.0 `db.rs:855-871`).
     /// Asked for once it is `None`, it answers [`ErrorKind::DbNotOpen`].
     /// The lock is a leaf: nothing else is locked while it is held.
     kv: Mutex<Option<Arc<redb::Database>>>,
@@ -1112,15 +1112,15 @@ pub struct Options {
     /// by ffldb's own write cache, whereas redb caches pages of the
     /// single metadata file. It is a ceiling filled on demand, not an
     /// allocation: the LRU stripes start empty
-    /// (redb-4.3.0 `cached_file.rs:348-353`) and a miss that would carry
+    /// (redb-4.5.0 `cached_file.rs:344-349`) and a miss that would carry
     /// the total past the limit evicts a page's worth before returning
-    /// (`:724-746`), so a small database never pays for a large setting
+    /// (`:768-790`), so a small database never pays for a large setting
     /// and the resident cost is bounded by the file size.
     ///
-    /// redb 4.3.0 keeps one cache figure and partitions it dynamically
-    /// (`db.rs:2153-2156`, `cached_file.rs:285-300`): the write buffer
+    /// redb 4.5.0 keeps one cache figure and partitions it dynamically
+    /// (`db.rs:2318-2321`, `cached_file.rs:282-297`): the write buffer
     /// is held at or below 50% of it, flushing the excess to disk best
-    /// effort (`:897-932`), and the read cache may grow to 100% when no
+    /// effort (`:943-978`), and the read cache may grow to 100% when no
     /// write is in flight. Once a commit's dirty set exceeds the write buffer,
     /// redb writes the spilled pages, re-reads them to finalize
     /// checksums, then writes the buffer again — measured against the
@@ -1130,7 +1130,7 @@ pub struct Options {
     /// default, 62,323 dirty pages cost 124,430 pwrites and 98,221
     /// preads, against 62,323 and 4 with the buffer large enough to hold
     /// them. The mechanism survives the upgrade; the counts were taken
-    /// at a write buffer five times smaller than 4.3.0 permits.
+    /// at a write buffer five times smaller than 4.5.0 permits.
     pub db_cache_bytes: usize,
     /// Called after every metadata flush, when set.
     ///
@@ -1233,11 +1233,11 @@ pub struct Options {
     /// transaction has ended, and with no reader open redb takes another
     /// path.  It frees the pages the commit replaced at once, in a second
     /// commit that is not synced and whose pages it keeps in its write
-    /// buffer (redb-4.3.0 `transactions.rs:2207-2288`,
-    /// `page_manager.rs:1880-1894`).  From then until the next durable
+    /// buffer (redb-4.5.0 `transactions.rs:2182-2263`,
+    /// `page_manager.rs:1904-1918`).  From then until the next durable
     /// commit has emptied that buffer, a read that misses redb's page
     /// cache while the cache is full makes room by writing a buffered
-    /// page to the file (`cached_file.rs:698-712`), and the buffer by
+    /// page to the file (`cached_file.rs:737-751`), and the buffer by
     /// then holds the pages of the next flush's write transaction: each
     /// is written when it is evicted, read back when its commit needs it
     /// and written again.  The snapshot keeps a handed-over commit on the
@@ -2291,16 +2291,16 @@ fn finish(
 /// allocator state and the next open loads it instead of repairing.
 ///
 /// Every flush commits one-phase with no allocator state, so an open
-/// after anything but redb's own `Database::drop` runs a full repair --
-/// "3 full scans" of the file (redb-4.3.0 `db.rs:1473`) -- because only
-/// that drop records the state.  `Database::close` makes it itself
+/// after anything but redb's own close runs a full repair -- "3 full
+/// scans" of the file (redb-4.5.0 `db.rs:1556`) -- because only that
+/// close records the state.  `Database::close` makes it itself
 /// before it lets go of redb's handle, so a failure is reported by the
 /// close, which redb's drop cannot do, and a clean close leaves a store
 /// that opens without a full repair even when a transaction still open
 /// keeps the handle, and with it the recovery flag, past the end of the
 /// process.  redb's own version of this commit is
-/// `ensure_allocator_state_table_and_trim` (`db.rs:1922-1955`), which its
-/// drop runs from `close_database` (`db.rs:1963`) before it clears the
+/// `ensure_allocator_state_table_and_trim` (`db.rs:2046-2088`), which its
+/// close runs from `close_database` (`db.rs:2097`) before it clears the
 /// flag.  Per-commit quick-repair would cover unclean stops too, at a
 /// second fsync on every flush; that is unmeasured and not done here.
 fn record_allocator_state(kv: &redb::Database) -> Result<(), Error> {
@@ -2365,17 +2365,19 @@ fn open_metadata(
 ///
 /// With `report_repair` and a log sink, redb's repair of a store that
 /// was not shut down cleanly is logged as it runs.  That repair reads
-/// the whole metadata file up to three times (redb-4.3.0 `db.rs:1473`)
+/// the whole metadata file up to three times (redb-4.5.0 `db.rs:1556`)
 /// and would otherwise be a silent stall after "Loading block database
 /// from '...'".  redb calls back at the start and at each scan
-/// boundary (`db.rs:1474`, `:1492`, `:1539`, `:1653`), so this is a
-/// handful of lines.  `create` leaves it off: redb repairs every new
-/// file once, because a fresh header records no allocator state, and
-/// that is not an unclean shutdown.  dcrd has no line for this --
-/// goleveldb replays its journal instead -- so the text is the port's,
-/// worded after dcrd's reconcile line ("Detected unclean shutdown -
-/// Repairing...") and followed by "Metadata store repair N% complete"
-/// at each scan boundary.  The operator docs quote both.
+/// boundary (`db.rs:1557`, `:1575`, `:1622`, `:1759`), so this is a
+/// handful of lines.  `create` leaves it off: a file it makes has no
+/// commit, and redb repairs no such file (`db.rs:1743-1748`), where
+/// before 4.4.0 it repaired every new file once, a fresh header
+/// recording no allocator state, which is not an unclean shutdown.
+/// dcrd has no line for this -- goleveldb replays its journal instead
+/// -- so the text is the port's, worded after dcrd's reconcile line
+/// ("Detected unclean shutdown - Repairing...") and followed by
+/// "Metadata store repair N% complete" at each scan boundary.  The
+/// operator docs quote both.
 fn redb_builder(opts: &Options, report_repair: bool) -> redb::Builder {
     let mut builder = redb::Builder::new();
     builder.set_cache_size(opts.db_cache_bytes);
@@ -2615,15 +2617,20 @@ impl RawStats {
 /// damaged metadata page reaches here.  Since 4.2.0 redb reports as
 /// `Corrupted` three malformed structures that used to abort the process,
 /// so they now arrive here as [`ErrorKind::Corruption`]: a branch cycle
-/// or over-deep chain, cut off at depth 128 (redb #1332; redb-4.3.0
-/// `btree.rs:1097-1118`, `btree_cursor.rs:170-174`), an oversized page
-/// order (#1331, `page_manager.rs:1251-1260`), and a corrupt freed-page
+/// or over-deep chain, cut off at depth 128 (redb #1332; redb-4.5.0
+/// `btree.rs:1089-1110`, `btree_cursor.rs:169-173`), an oversized page
+/// order (#1331, `page_manager.rs:1269-1278`), and a corrupt freed-page
 /// entry met while rebuilding the allocator (#1333,
-/// `page_manager.rs:1554-1575`).  A page whose type byte is neither leaf
-/// nor branch still hits `unreachable!()` in the descent
-/// (`btree.rs:1112`) and aborts the process under this workspace's
+/// `page_manager.rs:1585-1606`); 4.5.0 adds a malformed allocator state
+/// met by an open and some damage met by repair, `check_integrity` or a
+/// commit (its `CHANGELOG.md:101`, `:106`), but only in a build without
+/// debug assertions or with `--cfg fuzzing`: it makes those errors
+/// through `StorageError::unreachable`, which panics first otherwise,
+/// as in the test profile (`error.rs:84-94`).  A page whose type byte is
+/// neither leaf nor branch still hits `unreachable!()` in the descent
+/// (`btree.rs:1104`) and aborts the process under this workspace's
 /// `panic = "abort"`.  No read compares a page's checksum either: redb
-/// does that only when verifying whole trees (`db.rs:816-850`), which
+/// does that only when verifying whole trees (`db.rs:877-926`), which
 /// `check_integrity` and repair do, so damage that leaves a page
 /// well-formed comes back as data.  The issues are recorded in
 /// `docs/adr/0004-storage-backend.md`.  What does reach here is the
@@ -2649,13 +2656,14 @@ pub(crate) fn storage_error<E: Into<redb::Error>>(e: E) -> Error {
 /// redb locks the metadata file exclusively and reports
 /// `DatabaseAlreadyOpen` when another process already holds the lock,
 /// which is what stops two daemons from sharing one data directory.
-/// redb-4.3.0 takes it before reading anything from the file
-/// (`page_manager.rs:699-700`, `:1099`): byte-range locks on the open
+/// redb-4.5.0 takes it before reading anything from the file
+/// (`page_manager.rs:692-693`, `:1131`): in its default
+/// `ConcurrencyMode::ExclusiveWriter`, byte-range locks on the open
 /// file description on Linux and Apple targets
-/// (`file_backend/range_lock.rs:377-394`), `LockFileEx` range locks on
+/// (`file_backend/range_lock.rs:397-412`), `LockFileEx` range locks on
 /// Windows (`:95-307`), and on Linux also a best-effort whole-file
-/// `flock`, the lock earlier redb versions take
-/// (`file_backend/optimized.rs:87-104`).  That has to surface as
+/// `flock`, the lock redb before 4.3 takes
+/// (`file_backend/optimized.rs:122-140`).  That has to surface as
 /// [`ErrorKind::DbAlreadyOpen`] — dcrd's `ErrDbAlreadyOpen` —
 /// rather than a generic driver error, both because the operator needs an
 /// actionable message and because the lock is acquired before the flat
@@ -3451,10 +3459,10 @@ impl Database {
         self.inner.check_writable()?;
         flush_locked(&self.inner, FlushKind::Durable)?;
         // Then record the allocator state.  redb's own close records it
-        // too, but it can report no failure, and it runs only once the
-        // last transaction holding the handle has ended -- never, if one
-        // is still open when the process exits.  Without it the next open
-        // would then repair the whole file.
+        // too, but run by the drop of its handle it can report no failure,
+        // and it runs only once the last transaction holding the handle
+        // has ended -- never, if one is still open when the process exits.
+        // Without it the next open would then repair the whole file.
         let kv = self.inner.kv_or_closed()?;
         record_allocator_state(&kv).map_err(|e| self.inner.mark_fatal(e))?;
         drop(kv);
@@ -3801,10 +3809,10 @@ mod raw_stats_tests {
     /// `(leaf_pages + branch_pages) * page_size` reports 8.46 GiB against
     /// the true 9.79, because `leaf_pages` counts leaf *nodes* while the
     /// allocator rounds each node to a power-of-two run of pages
-    /// (`required_order = ceil_log2`, redb-4.3.0 `page_manager.rs:2217`),
+    /// (`required_order = ceil_log2`, redb-4.5.0 `page_manager.rs:2235`),
     /// so a single row too large to share a leaf can occupy 2, 4 or 32
     /// pages and still be counted once. Not overflow pages: redb has no
-    /// such mechanism in 2.6.3, 4.1.0 or 4.3.0. See
+    /// such mechanism in 2.6.3, 4.1.0, 4.3.0 or 4.5.0. See
     /// [`RawStats::live_tree_bytes`].
     #[test]
     fn derived_figures_match_the_adr_0004_decomposition() {

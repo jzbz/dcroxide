@@ -49,7 +49,7 @@
 //!
 //! That disk need not be failing reads.  From the first read, write or
 //! sync of its file that fails, redb refuses every read of a page it does
-//! not hold (redb-4.3.0 `cached_file.rs:198-261`), so the difference is
+//! not hold (redb-4.5.0 `cached_file.rs:195-258`), so the difference is
 //! there for the rest of a handle's life after a failed flush as well.
 //!
 //! Creating and deleting a bucket still read its row, and read such an

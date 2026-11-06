@@ -76,10 +76,10 @@ where
 // tag is computed on.  `hmac`'s core holds the two SHA-2 states and has no
 // `Drop` of its own (`hmac-0.13.0/src/block_api.rs:13-17`); each state
 // wipes itself under `sha2`'s `zeroize` feature
-// (`sha2-0.11.0/src/block_api.rs:89-101`, `:208-219`), and the block
+// (`sha2-0.11.1/src/block_api.rs:92-104`, `:217-228`), and the block
 // buffer beside them under `digest`'s
 // (`block-buffer-0.12.1/src/lib.rs:433-442`), which `sha2`'s feature turns
-// on, and `hmac`'s as well (`sha2-0.11.0/Cargo.toml:52`,
+// on, and `hmac`'s as well (`sha2-0.11.1/Cargo.toml:52`,
 // `hmac-0.13.0/Cargo.toml:44`).  So this pins `sha2`'s feature, without
 // which it does not compile.  The manifest enables `hmac`'s too, so that
 // the buffer's wipe does not rest on what `sha2`'s feature happens to

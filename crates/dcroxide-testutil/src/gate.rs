@@ -23,7 +23,7 @@
 //!
 //! **A commit held while it lengthens the file holds up every
 //! transaction.**  redb grows its file, and syncs the longer file, under
-//! the lock of its allocator state (redb-4.3.0 `page_manager.rs`, `grow`),
+//! the lock of its allocator state (redb-4.5.0 `page_manager.rs`, `grow`),
 //! and a transaction that begins takes that lock to find the newest
 //! commit (`latest_committed_snapshot`).  With real storage that is a
 //! wait of one `ftruncate` and one `fsync`.  At a gate it lasts until the

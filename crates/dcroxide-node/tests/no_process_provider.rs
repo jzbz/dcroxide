@@ -7,7 +7,7 @@
 //! `WebPkiClientVerifier::builder` and their kin, panics without one
 //! (`rustls-0.23.46/src/crypto/mod.rs:243-257`), and so does a ureq agent
 //! whose `TlsConfig` names no provider, at its first TLS connection
-//! (`ureq-3.4.2/src/tls/rustls.rs:153-159`): ureq picks its provider
+//! (`ureq-3.5.1/src/tls/rustls.rs:153-159`): ureq picks its provider
 //! lazily, so building an agent shows nothing.
 //!
 //! So this, a test binary of its own, that no other test may install a

@@ -392,7 +392,7 @@ evaluating this code.
   argued in ADR-0004's upgrade addendum rather than arriving as a
   lockfile change. It is maintenance, not hardening. 4.1.0 carried four
   known issues, none a regression against 2.6.3 and all concerning a
-  file that is already damaged or hostile. The lock now pins 4.3.0, and
+  file that is already damaged or hostile. The lock now pins 4.5.0, and
   redb 4.2.0 shipped a fix for three of them, each with a regression
   test that names the issue: #1331, an unvalidated 5-bit page order
   that aborted the process, and #1332, a cyclic branch pointer reached
@@ -409,7 +409,12 @@ evaluating this code.
   the error and spun forever on redb's repeated `PreviousIo`) — and
   #1333, a repair-path panic that left a file permanently unopenable, now
   returns an error for the corrupt freed-page entry that caused it.
-  Read-path checksum verification is not in 4.3.0: reads do not compare
+  4.5.0 reports two more kinds of damage as corruption where it
+  panicked: a malformed allocator state met by an open, and some damage
+  met by repair, `check_integrity` or a commit. A build with debug
+  assertions, which a release build is not, still panics at both,
+  unless it is a fuzzing build (`--cfg fuzzing`).
+  Read-path checksum verification is not in 4.5.0: reads do not compare
   page checksums, which redb checks only when `check_integrity` or
   repair walks whole trees. Some damage still aborts the process, too —
   a page whose type byte is neither leaf nor branch reaches an

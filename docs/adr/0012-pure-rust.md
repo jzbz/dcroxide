@@ -35,13 +35,13 @@ needs no C compiler, does its cryptography in assembly.
 provider chosen.
 
 **What drives a C compiler at `185b9d2`.** `cc` 1.5.1
-(`Cargo.lock:153`), the crate through which build scripts drive a C
-compiler, is a build dependency of exactly four crates in the lock, as
-`cargo tree -i cc --target all` shows. The lock has no `cmake`,
+(`Cargo.lock:153` at `85c0919`), the crate through which build scripts
+drive a C compiler, is a build dependency of exactly four crates in the
+lock, as `cargo tree -i cc --target all` shows. The lock has no `cmake`,
 `pkg-config`, `vcpkg` or `bindgen`, and no workspace crate has a build
 script.
 
-- **`secp256k1-sys` 0.14.1** (`Cargo.lock:1605`): ~67k lines of vendored
+- **`secp256k1-sys` 0.14.1** (`Cargo.lock:1682`): ~67k lines of vendored
   libsecp256k1 C (`docs/dependency-ledger.md:43`), under `secp256k1`
   0.33.1, which `dcroxide-dcrec` takes as `libsecp256k1`
   (`crates/dcroxide-dcrec/Cargo.toml:33`). It runs ECDSA verification
@@ -52,12 +52,12 @@ script.
   signature types 0 and 2. `k256` 0.14.0 sits beside it (`Cargo.toml:38`)
   for EC-Schnorr-DCRv0 and for ECDSA signing of a hash at or above the
   order (`ecdsa.rs:388-437`).
-- **`ring` 0.17.14** (`Cargo.lock:1484`): ~151k lines of C and assembly
-  (`dependency-ledger.md:135`), the crypto provider of `rustls` 0.23.46.
+- **`ring` 0.17.14** (`Cargo.lock:1561`): ~151k lines of C and assembly
+  (`dependency-ledger.md:150`), the crypto provider of `rustls` 0.23.46.
   `dcroxide-node` selects rustls's `ring` feature
   (`crates/dcroxide-node/Cargo.toml:59-69` at `8e6ea23`), `ureq` 3.4.2
   selects it through its default `rustls` feature, and `rustls-webpki`
-  0.103.16 depends on it (`Cargo.lock:1552-1560`). It runs the RPC and
+  0.103.16 depends on it (`Cargo.lock:1629-1637`). It runs the RPC and
   websocket TLS listener, the RPC client-certificate verifier
   (`rpcrun::GoClientCertVerifier`, which hands `rustls-webpki` ring's
   signature algorithms) and both TLS clients of the HTTPS seeder
@@ -320,7 +320,7 @@ Two checks, neither written yet (the first set's 1b):
   Operating-system bindings compile nothing and are not listed. A ban
   that matches nothing is doing its job, unlike the unmatched allowances
   and skips the file's comments argue against (`deny.toml:12-15`,
-  `:33-36`).
+  `:38-40`).
 
   `iana-time-zone-haiku` stays among `cc`'s wrappers after the other three
   have gone. `[graph]` names no targets (`deny.toml:1-2`), and with none
@@ -376,7 +376,7 @@ which does not depend on the TLS answers, can start at once.
 
 - **The C leaves the consensus path and the network surface**: about 67k
   lines under the signature checks and 151k under TLS
-  (`dependency-ledger.md:43`, `:135`), with the FFI between them and the
+  (`dependency-ledger.md:43`, `:150`), with the FFI between them and the
   node. A source build compiles no C, though on Linux rustc still links
   through the system's `cc` driver.
 - **One secp256k1 stack**, `k256`, where ADR-0006 accepted two. ECDSA
