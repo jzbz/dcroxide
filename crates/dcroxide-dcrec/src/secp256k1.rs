@@ -4,7 +4,11 @@
 
 use core::fmt;
 
-use zeroize::Zeroizing;
+use k256::elliptic_curve::group::CurveAffine;
+use k256::elliptic_curve::point::{AffineCoordinates, DecompressPoint};
+use k256::elliptic_curve::subtle::Choice;
+use k256::{AffinePoint, FieldBytes, ProjectivePoint, Scalar};
+use zeroize::{Zeroize, Zeroizing};
 
 pub mod ecdsa;
 pub mod nonce;
@@ -177,10 +181,25 @@ impl fmt::Display for Error {
 
 impl core::error::Error for Error {}
 
-/// A validated secp256k1 public key (always a point on the curve).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// A validated secp256k1 public key: a k256 affine point on the curve,
+/// never the identity, built only once dcrd's format, range and oddness
+/// checks have passed.
+///
+/// `PartialEq` compares the coordinates in constant time.  `Debug` prints
+/// the compressed serialization in hex, not the point's internal limbs.
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct PublicKey {
-    inner: libsecp256k1::PublicKey,
+    point: AffinePoint,
+}
+
+impl fmt::Debug for PublicKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("PublicKey(")?;
+        for b in self.serialize_compressed() {
+            write!(f, "{b:02x}")?;
+        }
+        f.write_str(")")
+    }
 }
 
 impl PublicKey {
@@ -220,11 +239,17 @@ impl PublicKey {
                     }
                 }
 
-                // Remaining failure mode is an off-curve point; libsecp256k1
-                // validates that (it accepts all three formats).
-                let inner = libsecp256k1::PublicKey::from_slice(serialized)
-                    .map_err(|_| Error::PubKeyNotOnCurve { x: *x, y: Some(*y) })?;
-                Ok(PublicKey { inner })
+                // The remaining failure is an off-curve point (dcrd's
+                // `IsOnCurve`): k256's `from_coordinates` tests
+                // y^2 = x^3 + 7 on coordinates already below the prime, so
+                // the range errors above keep their own kinds.  Its result
+                // is never the identity.
+                let point = Option::<AffinePoint>::from(AffinePoint::from_coordinates(
+                    &(*x).into(),
+                    &(*y).into(),
+                ))
+                .ok_or(Error::PubKeyNotOnCurve { x: *x, y: Some(*y) })?;
+                Ok(PublicKey { point })
             }
             PUB_KEY_BYTES_LEN_COMPRESSED => {
                 let format = serialized[0];
@@ -238,11 +263,16 @@ impl PublicKey {
                     return Err(Error::PubKeyXTooBig);
                 }
 
-                // Decompression fails iff there is no curve point with this
-                // X coordinate.
-                let inner = libsecp256k1::PublicKey::from_slice(serialized)
-                    .map_err(|_| Error::PubKeyNotOnCurve { x: *x, y: None })?;
-                Ok(PublicKey { inner })
+                // Decompression fails iff x^3 + 7 has no square root, so no
+                // curve point has this x (dcrd's `DecompressY`).  k256's
+                // `decompress` normalizes the root before choosing the one
+                // whose oddness the format byte asks for, 0x03 the odd one.
+                let point = Option::<AffinePoint>::from(AffinePoint::decompress(
+                    &(*x).into(),
+                    Choice::from(format & 1),
+                ))
+                .ok_or(Error::PubKeyNotOnCurve { x: *x, y: None })?;
+                Ok(PublicKey { point })
             }
             _ => Err(Error::PubKeyInvalidLen(serialized.len())),
         }
@@ -250,65 +280,83 @@ impl PublicKey {
 
     /// The 33-byte compressed serialization (dcrd `SerializeCompressed`).
     pub fn serialize_compressed(&self) -> [u8; PUB_KEY_BYTES_LEN_COMPRESSED] {
-        self.inner.serialize()
+        let mut out = [0u8; PUB_KEY_BYTES_LEN_COMPRESSED];
+        // 0x02, or 0x03 for an odd y.
+        out[0] = PUB_KEY_FORMAT_COMPRESSED_EVEN | self.point.y_is_odd().unwrap_u8();
+        out[1..].copy_from_slice(&self.point.x());
+        out
     }
 
     /// The 65-byte uncompressed serialization (dcrd `SerializeUncompressed`).
     /// Hybrid-parsed keys serialize with the 0x04 prefix; dcrd never emits
     /// the hybrid format either.
     pub fn serialize_uncompressed(&self) -> [u8; PUB_KEY_BYTES_LEN_UNCOMPRESSED] {
-        self.inner.serialize_uncompressed()
+        let mut out = [0u8; PUB_KEY_BYTES_LEN_UNCOMPRESSED];
+        out[0] = PUB_KEY_FORMAT_UNCOMPRESSED;
+        out[1..33].copy_from_slice(&self.point.x());
+        out[33..].copy_from_slice(&self.point.y());
+        out
     }
 
-    pub(crate) fn from_inner(inner: libsecp256k1::PublicKey) -> PublicKey {
-        PublicKey { inner }
+    /// The key from a k256 point, which must not be the identity: a point
+    /// on the curve that recovery computed.
+    pub(crate) fn from_affine(point: AffinePoint) -> PublicKey {
+        debug_assert!(!bool::from(point.is_identity()));
+        PublicKey { point }
     }
 
-    /// The key as a k256 projective point (for the Schnorr-DCRv0 math,
-    /// which needs raw group operations per ADR-0006).  Handed over
-    /// uncompressed, so k256 checks the point is on the curve rather than
-    /// recomputing y with a square root the key already paid for.
-    pub(crate) fn as_k256_point(&self) -> k256::ProjectivePoint {
-        let uncompressed = self.inner.serialize_uncompressed();
-        k256::PublicKey::from_sec1_bytes(&uncompressed)
-            .expect("PublicKey is always a valid curve point")
-            .to_projective()
+    /// The key as a k256 projective point, for the group operations of
+    /// ECDSA and Schnorr verification.  The key already holds the point, so
+    /// this only sets z = 1.
+    pub(crate) fn as_k256_point(&self) -> ProjectivePoint {
+        ProjectivePoint::from(self.point)
     }
 }
 
-/// A secp256k1 private key in the range `[1, N-1]`.
+/// A secp256k1 private key in the range `[1, N-1]`, held as a
+/// `k256::SecretKey`, which wipes the key when dropped.
+///
+/// `Debug` prints `PrivateKey(..)` and no key material.
 ///
 /// Note: dcrd's `PrivKeyFromBytes` silently reduces out-of-range values mod
 /// N; this constructor rejects them instead. The daemon's consensus paths
 /// never construct private keys from untrusted bytes, so the difference is
 /// not an observable-compatibility surface (tracked in `PARITY.md`).
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct PrivateKey {
-    inner: libsecp256k1::SecretKey,
+    inner: k256::SecretKey,
+}
+
+impl fmt::Debug for PrivateKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("PrivateKey(..)")
+    }
 }
 
 impl PrivateKey {
     /// Construct from 32 big-endian bytes; `None` if zero or >= N.
     pub fn from_bytes(bytes: &[u8; 32]) -> Option<PrivateKey> {
-        let inner = libsecp256k1::SecretKey::from_secret_bytes(*bytes).ok()?;
-        Some(PrivateKey { inner })
+        let repr = Zeroizing::new(FieldBytes::from(*bytes));
+        k256::SecretKey::from_bytes(&repr)
+            .ok()
+            .map(|inner| PrivateKey { inner })
     }
 
-    /// The corresponding public key.
+    /// The corresponding public key, dG.  The scalar copy is wiped; the
+    /// multiplication is k256's constant-time `GENERATOR * d`.
+    // The flagged operator is k256 point multiplication, a group operation.
+    #[allow(clippy::arithmetic_side_effects)]
     pub fn public_key(&self) -> PublicKey {
-        PublicKey {
-            inner: self.inner.public_key(),
-        }
-    }
-
-    pub(crate) fn inner(&self) -> &libsecp256k1::SecretKey {
-        &self.inner
+        let mut d = Scalar::from(self.inner.as_scalar_value());
+        let point = (ProjectivePoint::GENERATOR * d).to_affine();
+        d.zeroize();
+        PublicKey { point }
     }
 
     /// The key's 32 big-endian bytes, wiped when dropped (dcrd's signers
     /// copy the key out with `PutBytes` and zero the copy when done).
     pub(crate) fn secret_bytes(&self) -> Zeroizing<[u8; 32]> {
-        Zeroizing::new(self.inner.to_secret_bytes())
+        Zeroizing::new(self.inner.to_bytes().into())
     }
 }
 
@@ -542,6 +590,88 @@ mod tests {
         assert_eq!(uncompressed, hybrid);
         // Hybrid keys serialize with the standard prefixes, never 0x06/0x07.
         assert_eq!(hybrid.serialize_uncompressed()[0], 0x04);
+    }
+
+    /// The decimal digits of a 32-byte big-endian value, by long division.
+    // Test-only byte arithmetic: each remainder is below 10, so every
+    // intermediate fits in a u32.
+    #[allow(clippy::arithmetic_side_effects)]
+    fn decimal(v: &[u8; 32]) -> alloc::string::String {
+        let mut n = *v;
+        let mut digits = alloc::vec::Vec::new();
+        while !is_zero(&n) {
+            let mut rem = 0u32;
+            for b in n.iter_mut() {
+                let cur = (rem << 8) | u32::from(*b);
+                *b = (cur / 10) as u8;
+                rem = cur % 10;
+            }
+            digits.push(char::from(b'0' + rem as u8));
+        }
+        if digits.is_empty() {
+            digits.push('0');
+        }
+        digits.iter().rev().collect()
+    }
+
+    /// A private key's Debug output names the type and nothing else: no
+    /// hex and no decimal rendering of the key, plain or alternate.
+    #[test]
+    fn debug_prints_no_secret() {
+        let mut one = [0u8; 32];
+        one[31] = 1;
+        let mut random = [0u8; 32];
+        let mut rng = dcroxide_testutil::SplitMix64(0x6b32_3536_6b65_7973);
+        let random_key = loop {
+            rng.fill(&mut random);
+            if let Some(key) = PrivateKey::from_bytes(&random) {
+                break key;
+            }
+        };
+        let keys = [
+            (one, PrivateKey::from_bytes(&one).expect("key 1")),
+            (random, random_key),
+        ];
+        for (bytes, key) in &keys {
+            let hex = dcroxide_testutil::hex(bytes);
+            let hex_trimmed = hex.trim_start_matches('0');
+            let dec = decimal(bytes);
+            for shown in [alloc::format!("{key:?}"), alloc::format!("{key:#?}")] {
+                assert_eq!(shown, "PrivateKey(..)");
+                assert!(!shown.contains(&hex), "{shown}");
+                assert!(!shown.contains(hex_trimmed), "{shown}");
+                assert!(!shown.contains(&dec), "{shown}");
+            }
+        }
+        assert_eq!(decimal(&one), "1");
+    }
+
+    /// A public key's Debug output is its compressed serialization in hex,
+    /// however it was parsed.
+    #[test]
+    fn public_key_debug_is_compressed_hex() {
+        let compressed = "0311db93e1dcdb8a016b49840f8c53bc1eb68a382e97b1482ecad7b148a6909a5c";
+        for key in [
+            "0411db93e1dcdb8a016b49840f8c53bc1eb68a382e97b1482ecad7b148a6909a5cb2e0eaddfb84ccf9744464f82e160bfa9b8b64f9d4c03f999b8643f656b412a3",
+            "0711db93e1dcdb8a016b49840f8c53bc1eb68a382e97b1482ecad7b148a6909a5cb2e0eaddfb84ccf9744464f82e160bfa9b8b64f9d4c03f999b8643f656b412a3",
+            compressed,
+        ] {
+            let parsed = PublicKey::parse(&unhex(key)).expect(key);
+            assert_eq!(
+                alloc::format!("{parsed:?}"),
+                alloc::format!("PublicKey({compressed})")
+            );
+            assert_eq!(
+                dcroxide_testutil::hex(&parsed.serialize_compressed()),
+                compressed
+            );
+        }
+        let even = "02ce0b14fb842b1ba549fdd675c98075f12e9c510f8ef52bd021a9a1f4809d3b4d";
+        let parsed = PublicKey::parse(&unhex(even)).expect(even);
+        assert_eq!(
+            alloc::format!("{parsed:?}"),
+            alloc::format!("PublicKey({even})")
+        );
     }
 
     #[test]

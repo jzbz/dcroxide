@@ -434,6 +434,9 @@ pub const COMPACT_SIG_COMP_PUB_KEY: u8 = 4;
 // the range check above it.
 #[allow(clippy::result_unit_err, clippy::arithmetic_side_effects)]
 pub fn recover_compact(signature: &[u8], hash: &[u8; 32]) -> Result<(PublicKey, bool), ()> {
+    use k256::AffinePoint;
+    use k256::elliptic_curve::point::AffineCoordinates;
+
     // The signature must be the correct length.
     if signature.len() != COMPACT_SIG_SIZE {
         return Err(());
@@ -458,8 +461,16 @@ pub fn recover_compact(signature: &[u8], hash: &[u8; 32]) -> Result<(PublicKey, 
     let sig = libsecp256k1::ecdsa::RecoverableSignature::from_compact(&signature[1..], recovery_id)
         .map_err(|_| ())?;
     let msg = libsecp256k1::Message::from_digest(*hash);
-    let inner = sig.recover_ecdsa(msg).map_err(|_| ())?;
-    Ok((PublicKey::from_inner(inner), was_compressed))
+    let recovered = sig.recover_ecdsa(msg).map_err(|_| ())?;
+
+    // libsecp256k1 still recovers; its key becomes a k256 point by its
+    // coordinates, which lie on the curve.
+    let u = recovered.serialize_uncompressed();
+    let x: [u8; 32] = u[1..33].try_into().expect("32 bytes");
+    let y: [u8; 32] = u[33..65].try_into().expect("32 bytes");
+    let point = Option::<AffinePoint>::from(AffinePoint::from_coordinates(&x.into(), &y.into()))
+        .expect("libsecp256k1 returns a curve point");
+    Ok((PublicKey::from_affine(point), was_compressed))
 }
 
 /// dcrd's `sign` (ecdsa/signature.go:554-663): steps 2 to 6 of the

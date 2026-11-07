@@ -14,8 +14,8 @@ use dcroxide_dcrec::secp256k1::ecdsa::{Signature, parse_der_signature, sign};
 use dcroxide_dcrec::secp256k1::{PrivateKey, PublicKey};
 use dcroxide_testutil::{Oracle, SplitMix64, hex, oracle_or_skip};
 
-/// A random private key (rejection-sampled into [1, N-1], which libsecp
-/// enforces for us).
+/// A random private key (rejection-sampled into [1, N-1], which
+/// `PrivateKey::from_bytes` enforces).
 fn random_priv_key(rng: &mut SplitMix64) -> ([u8; 32], PrivateKey) {
     loop {
         let mut bytes = [0u8; 32];

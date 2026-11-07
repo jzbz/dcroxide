@@ -22,6 +22,7 @@ use k256::elliptic_curve::group::Group;
 use k256::elliptic_curve::ops::MulByGeneratorVartime;
 use k256::elliptic_curve::sec1::ToSec1Point;
 use k256::{ProjectivePoint, Scalar};
+use zeroize::{Zeroize, Zeroizing};
 
 use super::nonce::nonce_rfc6979;
 use super::{FIELD_PRIME_BYTES, GROUP_ORDER_BYTES, PrivateKey, PublicKey};
@@ -213,7 +214,8 @@ pub fn parse_signature(sig: &[u8]) -> Result<Signature, Error> {
 
 /// Sign `hash` with the given nonce scalar bytes (dcrd's internal
 /// `schnorrSign`); fails with [`Error::SchnorrHashValue`] when the challenge
-/// overflows, which the public [`sign`] retries with the next nonce.
+/// overflows, which the public [`sign`] retries with the next nonce.  The
+/// nonce scalar is wiped on both paths, as dcrd zeroes `k`.
 fn sign_with_nonce(
     priv_scalar: &Scalar,
     nonce: &[u8; 32],
@@ -236,10 +238,14 @@ fn sign_with_nonce(
     r.copy_from_slice(x);
 
     // Steps 7-8: e = BLAKE-256(r || m), retry on overflow.
-    let e = challenge(&r, hash).ok_or(Error::SchnorrHashValue)?;
+    let Some(e) = challenge(&r, hash) else {
+        k.zeroize();
+        return Err(Error::SchnorrHashValue);
+    };
 
     // Step 9: s = k - e*d mod n.
     let s = k - e * priv_scalar;
+    k.zeroize();
 
     Ok(Signature {
         r,
@@ -251,27 +257,32 @@ fn sign_with_nonce(
 /// byte-compatible with dcrd (verified differentially). The only reachable
 /// error is [`Error::InvalidHashLen`] for a hash that is not 32 bytes; the
 /// astronomically rare challenge-overflow case retries with the next
-/// RFC6979 nonce exactly as dcrd does.
+/// RFC6979 nonce exactly as dcrd does.  The key copies and each nonce
+/// are wiped, as dcrd zeroes its key bytes and each nonce.
 pub fn sign(priv_key: &PrivateKey, hash: &[u8]) -> Result<Signature, Error> {
     // Step 1: the hash must be 32 bytes. Step 2 (d != 0) holds by
     // construction of PrivateKey.
     let hash: &[u8; 32] = hash.try_into().map_err(|_| Error::InvalidHashLen)?;
 
-    let priv_bytes = priv_key.inner().to_secret_bytes();
-    let priv_scalar = Scalar::from_repr(priv_bytes.into()).expect("private key is a valid scalar");
+    let priv_bytes = priv_key.secret_bytes();
+    let mut priv_scalar =
+        Scalar::from_repr((*priv_bytes).into()).expect("private key is a valid scalar");
 
     // Step 3 + retry loop: RFC6979 nonces domain-separated for this scheme.
     let mut iteration = 0u32;
     loop {
-        let nonce = nonce_rfc6979(
-            &priv_bytes,
+        let nonce = Zeroizing::new(nonce_rfc6979(
+            &priv_bytes[..],
             hash,
             Some(&RFC6979_EXTRA_DATA_V0),
             None,
             iteration,
-        );
+        ));
         match sign_with_nonce(&priv_scalar, &nonce, hash) {
-            Ok(sig) => return Ok(sig),
+            Ok(sig) => {
+                priv_scalar.zeroize();
+                return Ok(sig);
+            }
             Err(_) => iteration = iteration.wrapping_add(1),
         }
     }
