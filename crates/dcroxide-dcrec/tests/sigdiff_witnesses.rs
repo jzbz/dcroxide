@@ -18,9 +18,6 @@
 //! the soak's crate is needed (that crate depends on this one); its
 //! `witness_file_regenerates` test rebuilds the lines from its generators
 //! and the oracle.
-//!
-//! This crate's `recover_compact` reports no error kind yet, so a recovery
-//! line whose answer is dcrd's error is held to it as a rejection only.
 
 // Byte offsets and big-endian carries over fixed lengths, and k256 and
 // curve25519-dalek scalar and point arithmetic, which is modular.
@@ -114,8 +111,7 @@ enum Answer {
     Recovered(Vec<u8>, bool),
     /// A rejection with one of dcrd's error kinds.
     Kind(String),
-    /// A rejection with no kind: this crate's recovery errors, and an
-    /// Ed25519 key error.
+    /// A rejection with no kind: an Ed25519 key error.
     Unnamed,
 }
 
@@ -229,7 +225,7 @@ fn answer(cmd: &str, data: &[u8]) -> Answer {
             match ecdsa::recover_compact(sig, hash.try_into().expect("32 bytes")) {
                 Ok((key, true)) => Answer::Recovered(key.serialize_compressed().to_vec(), true),
                 Ok((key, false)) => Answer::Recovered(key.serialize_uncompressed().to_vec(), false),
-                Err(()) => Answer::Unnamed,
+                Err(e) => Answer::Kind(e.kind_name().to_owned()),
             }
         }
         "schnorr_verify" => {
@@ -576,11 +572,7 @@ fn sigdiff_witness_vectors() {
             .unwrap_or_else(|| panic!("{text}: class {}", line.class));
 
         let got = answer(line.cmd, &line.request);
-        match (&got, &line.want) {
-            // Until recovery names dcrd's kinds, any rejection matches one.
-            (Answer::Unnamed, Answer::Kind(_)) if line.cmd == "ecdsa_recover_compact" => {}
-            _ => assert_eq!(got, line.want, "{text}"),
-        }
+        assert_eq!(got, line.want, "{text}");
 
         let pair = (bucket(line.variant), accepts(&line.want));
         assert!(

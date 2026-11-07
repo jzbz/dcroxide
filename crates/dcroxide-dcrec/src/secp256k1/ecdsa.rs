@@ -2,16 +2,17 @@
 //! ECDSA signatures over secp256k1 (Decred signature type 0), mirroring dcrd
 //! `dcrec/secp256k1/v4/ecdsa`: DER parsing with dcrd's exact acceptance
 //! rules and error identities, low-S DER serialization, verification that
-//! accepts high-S signatures (as dcrd does), and RFC6979 deterministic
-//! signing, plain and compact.
+//! accepts high-S signatures (as dcrd does), RFC6979 deterministic
+//! signing, plain and compact, and public key recovery from a compact
+//! signature.
 
 use alloc::vec::Vec;
 use core::fmt;
 
 use super::nonce::nonce_rfc6979;
 use super::{
-    GROUP_ORDER_BYTES, HALF_GROUP_ORDER, PRIME_MINUS_ORDER_BYTES, PrivateKey, PublicKey, is_zero,
-    negate_mod_n,
+    GROUP_ORDER_BYTES, HALF_GROUP_ORDER, PRIME_MINUS_ORDER_BYTES, PrivateKey, PublicKey,
+    add_group_order, is_zero, negate_mod_n,
 };
 
 /// The ASN.1 identifier for a sequence.
@@ -20,7 +21,8 @@ const ASN1_SEQUENCE_ID: u8 = 0x30;
 /// The ASN.1 identifier for an integer.
 const ASN1_INTEGER_ID: u8 = 0x02;
 
-/// DER signature parsing errors, 1:1 with dcrd `ecdsa.ErrorKind`.
+/// DER signature parsing and compact recovery errors, 1:1 with dcrd
+/// `ecdsa.ErrorKind` (ecdsa/error.go).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {
     /// Signature shorter than the 8-byte minimum (`ErrSigTooShort`).
@@ -62,6 +64,17 @@ pub enum Error {
     SigSIsZero,
     /// S is >= the group order (`ErrSigSTooBig`).
     SigSTooBig,
+    /// A compact signature is not 65 bytes long (`ErrSigInvalidLen`).
+    SigInvalidLen,
+    /// A compact signature's header is outside 27..=34, so it carries no
+    /// valid public key recovery code (`ErrSigInvalidRecoveryCode`).
+    SigInvalidRecoveryCode,
+    /// A compact signature's recovery code has the overflow bit set, but
+    /// R + N would reach the field prime (`ErrSigOverflowsPrime`).
+    SigOverflowsPrime,
+    /// Recovery found no curve point with R's x coordinate, or recovered
+    /// the point at infinity (`ErrPointNotOnCurve`).
+    PointNotOnCurve,
 }
 
 impl Error {
@@ -87,6 +100,10 @@ impl Error {
             Error::SigTooMuchSPadding => "ErrSigTooMuchSPadding",
             Error::SigSIsZero => "ErrSigSIsZero",
             Error::SigSTooBig => "ErrSigSTooBig",
+            Error::SigInvalidLen => "ErrSigInvalidLen",
+            Error::SigInvalidRecoveryCode => "ErrSigInvalidRecoveryCode",
+            Error::SigOverflowsPrime => "ErrSigOverflowsPrime",
+            Error::PointNotOnCurve => "ErrPointNotOnCurve",
         }
     }
 }
@@ -426,20 +443,38 @@ pub const COMPACT_SIG_COMP_PUB_KEY: u8 = 4;
 
 /// Recover the public key from a compact recoverable signature over
 /// the 32-byte hash, returning it along with whether the signature
-/// commits to its compressed serialization (dcrd
-/// `ecdsa.RecoverCompact`; the individual dcrd error variants are
-/// collapsed since every caller in scope treats any failure as an
-/// invalid signature).
-// The unit error mirrors the collapse; the subtraction is guarded by
-// the range check above it.
-#[allow(clippy::result_unit_err, clippy::arithmetic_side_effects)]
-pub fn recover_compact(signature: &[u8], hash: &[u8; 32]) -> Result<(PublicKey, bool), ()> {
-    use k256::AffinePoint;
-    use k256::elliptic_curve::point::AffineCoordinates;
+/// commits to its compressed serialization: dcrd's `ecdsa.RecoverCompact`
+/// (ecdsa/signature.go:792-997), with its error kinds in its order.
+///
+/// The checks run in dcrd's order, the first failing one deciding the
+/// error: the length ([`Error::SigInvalidLen`]); the header, 27 to 34
+/// ([`Error::SigInvalidRecoveryCode`]); R below N
+/// ([`Error::SigRTooBig`]) and nonzero ([`Error::SigRIsZero`]); S below N
+/// ([`Error::SigSTooBig`]) and nonzero ([`Error::SigSIsZero`]); with the
+/// recovery code's overflow bit, R + N below P
+/// ([`Error::SigOverflowsPrime`]); a curve point with that x coordinate
+/// and the code's oddness ([`Error::PointNotOnCurve`]); and a recovered
+/// key that is not the point at infinity ([`Error::PointNotOnCurve`]
+/// again).  dcrd's doc comment says it first verifies the signature; it
+/// does not, and neither does this: the key returned is the one the
+/// signature and code determine.
+///
+/// Every input is public, so like dcrd's `NonConst` operations the
+/// arithmetic runs in variable time.
+// The flagged operators are k256 scalar arithmetic, modular by definition,
+// and the header's subtraction, which the range check above it guards.
+#[allow(clippy::arithmetic_side_effects)]
+pub fn recover_compact(signature: &[u8], hash: &[u8; 32]) -> Result<(PublicKey, bool), Error> {
+    use k256::elliptic_curve::PrimeField;
+    use k256::elliptic_curve::group::Group;
+    use k256::elliptic_curve::ops::{MulByGeneratorVartime, Reduce};
+    use k256::elliptic_curve::point::{BatchNormalize, DecompressPoint};
+    use k256::elliptic_curve::subtle::Choice;
+    use k256::{AffinePoint, FieldBytes, ProjectivePoint, Scalar};
 
     // The signature must be the correct length.
     if signature.len() != COMPACT_SIG_SIZE {
-        return Err(());
+        return Err(Error::SigInvalidLen);
     }
 
     // The compact signature recovery code is the value 27 + the public
@@ -448,29 +483,76 @@ pub fn recover_compact(signature: &[u8], hash: &[u8; 32]) -> Result<(PublicKey, 
     if !(COMPACT_SIG_MAGIC_OFFSET..COMPACT_SIG_MAGIC_OFFSET + COMPACT_SIG_COMP_PUB_KEY * 2)
         .contains(&sig_recovery_code)
     {
-        return Err(());
+        return Err(Error::SigInvalidRecoveryCode);
     }
     let sig_recovery_code = sig_recovery_code - COMPACT_SIG_MAGIC_OFFSET;
     let was_compressed = sig_recovery_code & COMPACT_SIG_COMP_PUB_KEY != 0;
     let pub_key_recovery_code = sig_recovery_code & 3;
 
-    // R and S must be in the half-open range [1, N) like dcrd, which the
-    // library enforces during parsing and recovery.
-    let recovery_id = libsecp256k1::ecdsa::RecoveryId::try_from(i32::from(pub_key_recovery_code))
-        .map_err(|_| ())?;
-    let sig = libsecp256k1::ecdsa::RecoverableSignature::from_compact(&signature[1..], recovery_id)
-        .map_err(|_| ())?;
-    let msg = libsecp256k1::Message::from_digest(*hash);
-    let recovered = sig.recover_ecdsa(msg).map_err(|_| ())?;
+    // Step 1: R and S must be in [1, N-1], each checked against N before
+    // it is checked against zero.
+    let r_bytes: [u8; 32] = signature[1..33].try_into().expect("32 bytes");
+    let s_bytes: [u8; 32] = signature[33..65].try_into().expect("32 bytes");
+    let r = Option::<Scalar>::from(Scalar::from_repr(r_bytes.into())).ok_or(Error::SigRTooBig)?;
+    if bool::from(r.is_zero()) {
+        return Err(Error::SigRIsZero);
+    }
+    let s = Option::<Scalar>::from(Scalar::from_repr(s_bytes.into())).ok_or(Error::SigSTooBig)?;
+    if bool::from(s.is_zero()) {
+        return Err(Error::SigSIsZero);
+    }
 
-    // libsecp256k1 still recovers; its key becomes a k256 point by its
-    // coordinates, which lie on the curve.
-    let u = recovered.serialize_uncompressed();
-    let x: [u8; 32] = u[1..33].try_into().expect("32 bytes");
-    let y: [u8; 32] = u[33..65].try_into().expect("32 bytes");
-    let point = Option::<AffinePoint>::from(AffinePoint::from_coordinates(&x.into(), &y.into()))
-        .expect("libsecp256k1 returns a curve point");
-    Ok((PublicKey::from_affine(point), was_compressed))
+    // Steps 2 and 3: R as a field element, plus N when the overflow bit is
+    // set, which fails when R + N would reach P (dcrd's
+    // `IsGtOrEqPrimeMinusOrder`).  Big-endian byte order is numeric order.
+    let mut x_bytes = r_bytes;
+    if pub_key_recovery_code & 2 != 0 {
+        if r_bytes >= PRIME_MINUS_ORDER_BYTES {
+            return Err(Error::SigOverflowsPrime);
+        }
+        x_bytes = add_group_order(&r_bytes);
+    }
+
+    // Steps 4 and 5: the point X with that x and the y whose oddness the
+    // code's low bit gives, failing when x^3 + 7 has no square root (dcrd's
+    // `DecompressY`, which normalizes the root before choosing it, as
+    // k256's `decompress` does).  x is below P here.
+    let big_x = Option::<AffinePoint>::from(AffinePoint::decompress(
+        &x_bytes.into(),
+        Choice::from(pub_key_recovery_code & 1),
+    ))
+    .ok_or(Error::PointNotOnCurve)?;
+
+    // Step 6: e = H(m) mod N, one conditional subtraction of N.
+    let e = <Scalar as Reduce<FieldBytes>>::reduce(&(*hash).into());
+
+    // Step 7: w = R^-1 mod N, in variable time like dcrd's
+    // `InverseValNonConst`.
+    let w = Option::<Scalar>::from(r.invert_vartime()).expect("r is nonzero");
+
+    // Step 8: u1 = -(e * w) mod N and u2 = s * w mod N.
+    let u1 = -(e * w);
+    let u2 = s * w;
+
+    // Step 9: Q = u1 * G + u2 * X, as one variable-time GLV/wNAF pass.
+    // dcrd's `AddNonConst` doubles when its operands are equal; k256's
+    // complete additions need no such branch, as in verification.
+    let q = ProjectivePoint::mul_by_generator_and_mul_add_vartime(
+        &u1,
+        &u2,
+        &ProjectivePoint::from(big_x),
+    );
+
+    // Step 10: fail if Q is the point at infinity, dcrd's second use of
+    // `ErrPointNotOnCurve`, tested before Q is normalized.
+    if bool::from(q.is_identity()) {
+        return Err(Error::PointNotOnCurve);
+    }
+
+    // The key in affine coordinates: one variable-time inversion.
+    let [affine] =
+        <ProjectivePoint as BatchNormalize<[ProjectivePoint; 1]>>::batch_normalize_vartime(&[q]);
+    Ok((PublicKey::from_affine(affine), was_compressed))
 }
 
 /// dcrd's `sign` (ecdsa/signature.go:554-663): steps 2 to 6 of the
@@ -878,6 +960,65 @@ mod tests {
             zero_s.verify_detailed(&hash, &pub_key),
             VerifyStep::Step1Zero
         );
+    }
+
+    /// Compact recovery's checks run in dcrd's order
+    /// (ecdsa/signature.go:858-923): a signature failing two of them
+    /// reports the earlier one.
+    #[test]
+    fn recover_checks_in_dcrds_order() {
+        fn compact(header: u8, r: &[u8; 32], s: &[u8; 32]) -> Vec<u8> {
+            [&[header][..], r, s].concat()
+        }
+        let hash = [0x5au8; 32];
+        let zero = [0u8; 32];
+        let mut one = [0u8; 32];
+        one[31] = 1;
+        let n = GROUP_ORDER_BYTES;
+        let p_minus_n = PRIME_MINUS_ORDER_BYTES;
+        // 27 plus the overflow bit, for an uncompressed key.
+        let overflow = COMPACT_SIG_MAGIC_OFFSET + 2;
+
+        let cases: [(&str, Vec<u8>, Error); 7] = [
+            (
+                "64 bytes with a bad header",
+                compact(26, &n, &zero)[..64].to_vec(),
+                Error::SigInvalidLen,
+            ),
+            (
+                "header 26 with R >= N",
+                compact(26, &n, &one),
+                Error::SigInvalidRecoveryCode,
+            ),
+            (
+                "R >= N with S = 0",
+                compact(COMPACT_SIG_MAGIC_OFFSET, &n, &zero),
+                Error::SigRTooBig,
+            ),
+            (
+                "R = 0 with S >= N",
+                compact(COMPACT_SIG_MAGIC_OFFSET, &zero, &n),
+                Error::SigRIsZero,
+            ),
+            (
+                "overflow bit, R >= P - N and S >= N",
+                compact(overflow, &p_minus_n, &n),
+                Error::SigSTooBig,
+            ),
+            (
+                "overflow bit, R >= P - N and S = 0",
+                compact(overflow, &p_minus_n, &zero),
+                Error::SigSIsZero,
+            ),
+            (
+                "overflow bit with R = P - N",
+                compact(overflow, &p_minus_n, &one),
+                Error::SigOverflowsPrime,
+            ),
+        ];
+        for (name, sig, want) in cases {
+            assert_eq!(recover_compact(&sig, &hash), Err(want), "{name}");
+        }
     }
 
     /// dcrd's TestSignAndVerify rows that sign with an explicit nonce

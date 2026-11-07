@@ -101,11 +101,6 @@ jobs:
           cache-dependency-path: tools/oracle/go.sum
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace
-      # dcroxide-dcrec's vectors again without its default `std`. The run
-      # above only builds the crate with `std` on, and without it
-      # libsecp256k1 builds a context on the stack for every call where
-      # `std` keeps one per thread, so both configurations need running.
-      - run: cargo test -p dcroxide-dcrec --no-default-features
 
   test-wrapping:
     name: test (overflow checks off, as release ships)
@@ -322,29 +317,27 @@ jobs:
     name: no_std check (x86_64-unknown-none)
     runs-on: ubuntu-latest
     # The crates below advertise no_std via cfg_attr, but every other
-    # job builds with the std feature on, so nothing else ever compiles
+    # job builds them for a host with std, so nothing else ever compiles
     # the claim. This job checks them on a no-OS target so a dependency
     # or cfg mistake that drags std into a consensus core fails CI.
     #
-    # For dcrec this proves the *Rust* side is std-free. secp256k1-sys
-    # still compiles the C library with the host compiler for this
-    # triple, and `cargo check` never links, so a genuinely freestanding
-    # build would additionally need a cross C toolchain and a global
-    # allocator. The check is still worth having: it is what catches a
-    # `use std::` or a default-features dependency creeping back in.
+    # dcrec has no features and compiles no C, its secp256k1 arithmetic
+    # being k256's, and it is no_std outside its tests in every build, so
+    # any job already rejects a `use std::` in it. What only this job
+    # catches for dcrec is a dependency that needs std, such as one taken
+    # with default features that turn std on. `cargo check` never links.
     #
     # Not yet listed: blockchain, fees, gcs, mempool, mining, stake, and
-    # txscript. All seven reach secp256k1-sys with its `std` feature on
-    # through dcroxide-dcrec's default features, and secp256k1-sys does
-    # not build for this target that way: txscript fails on it and on
-    # nothing else. So each needs `default-features = false` on its
-    # dcroxide-* path dependencies plus a `std` feature that re-enables
-    # them. That is not the whole job for the six that also reach
-    # dcroxide-database (all but txscript): it builds redb with redb's
-    # default `std` feature, and stake fails on redb as well as on
-    # secp256k1-sys. Turning redb's default features off is not enough on
-    # its own: 4.5.0 builds without `std` only when `std` is off and its
-    # `experimental-api-5` preview is on (`build.rs:5-13`).
+    # txscript. The six that reach dcroxide-database (all but txscript)
+    # build redb with redb's default `std` feature, and stake fails on
+    # redb. So each needs `default-features = false` on its dcroxide-*
+    # path dependencies plus a `std` feature that re-enables them, and
+    # redb's `std` dealt with. Turning redb's default features off is not
+    # enough on its own: 4.5.0 builds without `std` only when `std` is
+    # off and its `experimental-api-5` preview is on (`build.rs:5-13`).
+    # txscript failed here on secp256k1-sys and nothing else, and
+    # dcroxide-dcrec no longer takes it, so txscript may now pass; that
+    # is untested, and it is not listed until a run shows it.
     steps:
       - uses: actions/checkout@v7
       - run: rustup toolchain install

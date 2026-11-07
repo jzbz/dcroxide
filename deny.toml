@@ -32,12 +32,7 @@ allow = [
 # 0.14.2).  proptest, the dev-dependency that brought rand_core 0.9,
 # getrandom 0.3 and r-efi 5 through rand 0.9, takes rand 0.10 since 1.12,
 # on the rand_core 0.10, getrandom 0.4 and r-efi 6 the rest of the graph
-# uses, so it brings no duplicate now.  rand 0.9 and those three stay in
-# Cargo.lock only as secp256k1's optional `rand`, which its `std` feature
-# names as `rand?/std`; cargo-deny's graph leaves them out for the reason
-# it leaves out ring (below), so they have no skip.  A skip for any of
-# them would be dead config that cargo-deny reports back as
-# unmatched-skip.
+# uses, so it brings no duplicate now.
 #
 # Semver-range specs rather than exact pins, so a transitive patch bump
 # does not turn an entry into an unmatched-skip warning.
@@ -64,7 +59,7 @@ deny = [
 
 [[bans.skip]]
 crate = "syn:2"
-reason = "the ecosystem is mid-migration to syn 3: serde_derive and wasm-bindgen-macro-support are on 3, while curve25519-dalek-derive, windows-implement, windows-interface and zerocopy-derive still pin 2 -- both majors are present until the laggards move, and neither side is this workspace's to choose"
+reason = "the ecosystem is mid-migration to syn 3: serde_derive and wasm-bindgen-macro-support are on 3, while curve25519-dalek-derive, windows-implement and windows-interface still pin 2 -- both majors are present until the laggards move, and neither side is this workspace's to choose"
 
 [sources]
 unknown-registry = "deny"

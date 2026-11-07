@@ -6,10 +6,11 @@
 //! This is the only module that names the code under test, and only the
 //! run loop (and the canaries, which stand in for it) call into it
 //! (`tests/independence.rs`).  It is outside the generator fingerprint:
-//! dcrec's later API is reached by changing this file alone, which changes
-//! no input, no answer as compared and no digest.  ECDSA verification
-//! reports dcrd's deciding step (`verify_detailed`, as the answer's
-//! detail); typed recovery errors are still to come.
+//! dcrec's later API was reached by changing this file alone, which changed
+//! no input, no answer as compared and no digest.  Every API it was waiting
+//! for is now reached: ECDSA verification reports dcrd's deciding step
+//! (`verify_detailed`, as the answer's detail), and compact recovery
+//! reports dcrd's error kinds.
 //!
 //! A request whose layout this cannot decode is a bug in a generator, so it
 //! panics, and the run records the case as `ours-panicked`.
@@ -105,10 +106,9 @@ pub fn answer(cmd: Cmd, data: &[u8]) -> OursAnswer {
                         },
                         flag: Some(compressed),
                     },
-                    // dcrec collapses recovery's errors, so no kind is
-                    // compared until it reports dcrd's.
-                    Err(()) => Answer::Reject {
-                        kind: Kind::Unavailable,
+                    // dcrd's kind; recovery's text is never compared.
+                    Err(e) => Answer::Reject {
+                        kind: Kind::Dcrd(e.kind_name().to_owned()),
                         text: None,
                     },
                 },
@@ -505,7 +505,8 @@ mod tests {
     /// The compact signer is dcrd's: `TestSignAndRecoverCompact`'s row for
     /// key 2 and BLAKE-256(01020304), whose recovery code has the oddness
     /// bit, under both flags; recovering it returns the signer's key, and
-    /// a header outside 27..=34 is rejected without a kind.
+    /// a header outside 27..=34 is rejected with dcrd's
+    /// `ErrSigInvalidRecoveryCode`.
     #[test]
     fn compact_signatures_follow_dcrds_vectors() {
         let mut d = [0u8; 32];
@@ -543,7 +544,7 @@ mod tests {
         assert_eq!(
             answer(req.cmd, &req.data).answer,
             Answer::Reject {
-                kind: Kind::Unavailable,
+                kind: Kind::Dcrd("ErrSigInvalidRecoveryCode".into()),
                 text: None
             }
         );

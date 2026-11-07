@@ -485,10 +485,8 @@ fn sign_and_recover_compact_vectors() {
 
 /// Ported from dcrd's TestRecoverCompactErrors (ecdsa/signature_test.go):
 /// the error paths of compact recovery, each signature otherwise valid
-/// where that is possible.  `recover_compact` collapses dcrd's errors
-/// into one, so only the verdict is asserted; `kind` keeps the dcrd
-/// error kind of each row so that the kinds are asserted once
-/// `recover_compact` reports them.
+/// where that is possible.  `recover_compact` must fail with each row's
+/// dcrd error kind, all eight of them across the 15 rows.
 #[test]
 fn recover_compact_error_vectors() {
     struct Case {
@@ -657,11 +655,11 @@ fn recover_compact_error_vectors() {
 
     for case in &cases {
         let got = recover_compact(&unhex(case.sig), &arr32(case.hash));
-        assert!(
-            got.is_err(),
-            "{}: recovered {got:?} where dcrd fails with {}",
-            case.name,
-            case.kind
+        assert_eq!(
+            got.map_err(|e| e.kind_name()),
+            Err(case.kind),
+            "{}",
+            case.name
         );
     }
 }

@@ -8,33 +8,22 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
-[features]
-default = ["std"]
-# `std` buys one pure-performance choice and nothing semantic.  secp256k1
-# runs its key, sign, verify and recover functions against a context it
-# manages itself: with `std`, one per thread, allocated on first use; without
-# it, one built on the stack for every call.  Every acceptance rule, error
-# identity, and byte encoding is identical either way, which the crate's own
-# vectors run in both configurations.
-#
-# k256's `std` and `precomputed-tables` are deliberately left off.  Schnorr
-# signing multiplies with `ProjectivePoint::GENERATOR * k`, which goes
-# through `lincomb`.  Verification uses `mul_by_generator_and_mul_add_vartime`,
-# a GLV/wNAF pass over the generator and the key.  Neither reads the
-# basepoint table -- only `mul_by_generator` and `mul_by_generator_vartime`
-# do, and the Schnorr code calls neither -- so the tables bought nothing,
-# and from 0.14 `k256/std` also pulls an OS RNG (getrandom) into a crate
-# that never draws randomness.
-std = ["libsecp256k1/std"]
-
 [dependencies]
-# The audited libsecp256k1 C library; dcrd's exact parsing/acceptance rules
-# are enforced by our own layer in front of it (ADR-0006).
-libsecp256k1 = { package = "secp256k1", version = "0.33", default-features = false, features = ["recovery"] }
-# Pure-Rust scalar/point arithmetic for EC-Schnorr-DCRv0, which needs raw
-# group operations no packaged signing API exposes (ADR-0006), and for
-# ECDSA signing of a hash at or above the group order, which libsecp256k1
-# would reduce before deriving its RFC6979 nonce (`ecdsa::sign`).
+# Pure-Rust secp256k1 arithmetic: every key, ECDSA verification, signing
+# and compact recovery, and EC-Schnorr-DCRv0, with dcrd's exact parsing and
+# acceptance rules enforced by this crate's own code (ADR-0006's 2026-10-26
+# addendum, ADR-0012).
+#
+# k256's `std` and `precomputed-tables` are deliberately left off.  ECDSA
+# and Schnorr signing, and `PrivateKey::public_key`, multiply with
+# `ProjectivePoint::GENERATOR * k` (or `* d`), which goes through
+# `lincomb`.  ECDSA verification and recovery, and Schnorr verification,
+# use `mul_by_generator_and_mul_add_vartime`, a GLV/wNAF pass over the
+# generator and a second point.  None reads the basepoint table -- only
+# `mul_by_generator` and `mul_by_generator_vartime` do, and this crate
+# calls neither -- so the tables would buy nothing, and from 0.14
+# `k256/std` also pulls an OS RNG (getrandom) into a crate that never
+# draws randomness.
 k256 = { version = "0.14", default-features = false, features = ["arithmetic"] }
 # RFC6979 nonce generation (dcrd's exact variant, ported in this crate).
 # `zeroize` on both: each HMAC the nonce's DRBG runs holds two SHA-2

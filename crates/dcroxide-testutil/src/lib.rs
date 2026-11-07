@@ -1511,9 +1511,9 @@ mod tests {
     /// ships.  Every version the fuzz lock holds of a package both locks
     /// hold must be one the root lock holds.  The root lock may hold more
     /// versions of a name, since its dev-dependencies are not the fuzz
-    /// build's: proptest takes rand 0.10 beside the 0.9 both locks list
-    /// for secp256k1.  The fuzz build links the node, so the two share
-    /// most of the tree.  A package the fuzz lock lacks altogether is not
+    /// build's: proptest takes rand 0.10, which the fuzz lock does not
+    /// hold.  The fuzz build links the node, so the two share most of the
+    /// tree.  A package the fuzz lock lacks altogether is not
     /// caught here: cargo adds it, at the newest version it can, the next
     /// time the fuzz build resolves, which the fuzz jobs' `cargo fuzz run`
     /// does without failing; the lint job's `cargo metadata --locked

@@ -42,11 +42,11 @@ so that rule as written can block a bump indefinitely.
 
 **Where the evidence is.** CI runs `cargo test --workspace` on four
 runners: `ubuntu-latest`, `ubuntu-24.04-arm`, `macos-latest` (taken to be
-arm64, not checked here) and `windows-latest` (`ci.yml:81-108`). The
+arm64, not checked here) and `windows-latest` (`ci.yml:81-103`). The
 fault-injection tests in that run are Linux-only, so they run on the two
 Linux legs (`:26-35`). Everything else runs on x86_64 Linux only: rustfmt
 and clippy, the suites with overflow checks off as the release profile
-computes (`:110-140`), the live dcrd interop test (`:207-261`), the no_std
+computes (`:105-135`), the live dcrd interop test (`:202-256`), the no_std
 check, docs, deny and fuzzing. No job builds the workspace's `release` or
 `dist` profile on any target, so the configuration that ships (thin LTO,
 `codegen-units = 1`, `panic = "abort"`) has never been compiled in CI.
@@ -208,7 +208,7 @@ signing, Apple's or Windows', is not decided here.
 - **Not decided here:** whether the release workflow uses only GitHub-owned
   actions, each pinned to a full commit SHA, and restores no cache, where
   `ci.yml` pins by tag and uses third-party actions (`ci.yml:54`, `:75`,
-  `:295`, `:319`); and where the two fingerprints, the SSH key's for tags
+  `:290`, `:314`); and where the two fingerprints, the SSH key's for tags
   and the OpenPGP key's for `SHA256SUMS`, are published with the
   verification steps, `SECURITY.md` and the README being candidates.
 

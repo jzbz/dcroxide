@@ -9,26 +9,19 @@
 //! three: **type 0 (ECDSA-secp256k1)**, **type 1 (Ed25519)**, and **type 2
 //! (EC-Schnorr-DCRv0)**.
 //!
-//! Per ADR-0006, ECDSA runs on the audited libsecp256k1 C library (via the
-//! `secp256k1` bindings crate), which also holds every secp256k1 key and
-//! checks that a parsed key is on the curve; EC-Schnorr-DCRv0, and ECDSA
-//! signing of a hash at or above the group order, run on `k256`'s
-//! arithmetic, and Ed25519 on `curve25519-dalek`'s.  Everything
+//! Per ADR-0006's 2026-10-26 addendum and ADR-0012, ECDSA,
+//! EC-Schnorr-DCRv0 and every secp256k1 key run on `k256`'s arithmetic,
+//! and Ed25519 on `curve25519-dalek`'s.  Everything
 //! dcrd-behavior-specific — DER signature acceptance, public key format
-//! acceptance, low-S serialization, error identities — is implemented here
-//! and differential-tested against dcrd's own code via `tools/oracle`.
+//! acceptance, low-S serialization, the order of compact recovery's
+//! checks, error identities — is implemented here and differential-tested
+//! against dcrd's own code via `tools/oracle`.
 //!
-//! Like the codec crates this one is `no_std` without its default `std`
-//! feature, and needs `alloc` (the DER `Vec`).  `std` selects one
-//! pure-performance option — a libsecp256k1 context kept per thread instead
-//! of one built on the stack for every call — and changes no
-//! acceptance rule, error identity, or encoded byte; the vectors run in both
-//! configurations.  Note that this makes the *Rust* side
-//! std-free: `secp256k1-sys` still compiles the C library, so a genuinely
-//! freestanding build additionally needs a cross C toolchain and a global
-//! allocator.
+//! Like the codec crates this one is `no_std` outside its own tests, and
+//! needs `alloc` (the DER `Vec`).  It has no features, and it compiles no
+//! C: every dependency it builds is Rust.
 
-#![cfg_attr(not(any(test, feature = "std")), no_std)]
+#![cfg_attr(not(test), no_std)]
 // This crate holds no hashed containers: every map and set in it is
 // ordered.  That is a property worth keeping rather than rediscovering
 // -- iteration order over a consensus structure must not depend on a

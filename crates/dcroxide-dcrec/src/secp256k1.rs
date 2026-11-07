@@ -70,6 +70,27 @@ pub(crate) fn negate_mod_n(s: &[u8; 32]) -> [u8; 32] {
     out
 }
 
+/// r + N for r below P - N (big-endian byte arithmetic): the x coordinate
+/// compact recovery takes when the recovery code's overflow bit is set
+/// (dcrd's `fieldR.Add(&orderAsFieldVal)`, ecdsa/signature.go:928).  The
+/// sum is below P, so it never carries out of 32 bytes.
+// Schoolbook carry addition over fixed 32-byte arrays; every intermediate
+// fits u16, and the input domain (r < P - N) makes a carry out of the top
+// byte impossible.
+#[allow(clippy::arithmetic_side_effects)]
+pub(crate) fn add_group_order(r: &[u8; 32]) -> [u8; 32] {
+    debug_assert!(*r < PRIME_MINUS_ORDER_BYTES);
+    let mut out = [0u8; 32];
+    let mut carry: u16 = 0;
+    for i in (0..32).rev() {
+        let sum = u16::from(r[i]) + u16::from(GROUP_ORDER_BYTES[i]) + carry;
+        out[i] = sum as u8;
+        carry = sum >> 8;
+    }
+    debug_assert_eq!(carry, 0);
+    out
+}
+
 /// Number of bytes of a serialized compressed public key.
 pub const PUB_KEY_BYTES_LEN_COMPRESSED: usize = 33;
 
@@ -682,6 +703,44 @@ mod tests {
                 .wrapping_sub(&U256::from_be_slice(&GROUP_ORDER_BYTES)),
             U256::from_be_slice(&PRIME_MINUS_ORDER_BYTES)
         );
+    }
+
+    /// r + N against crypto-bigint's wrapping addition, at the top of the
+    /// domain (P - N - 1, whose sum is P - 1), at 1 and at seeded random
+    /// values below P - N.
+    #[test]
+    fn add_group_order_adds_n() {
+        use k256::U256;
+        let n = U256::from_be_slice(&GROUP_ORDER_BYTES);
+        let adds_n = |r: &[u8; 32]| {
+            U256::from_be_slice(&add_group_order(r)) == U256::from_be_slice(r).wrapping_add(&n)
+        };
+
+        let mut top = PRIME_MINUS_ORDER_BYTES;
+        top[31] -= 1;
+        let mut p_minus_1 = FIELD_PRIME_BYTES;
+        p_minus_1[31] -= 1;
+        assert_eq!(add_group_order(&top), p_minus_1);
+        assert!(adds_n(&top));
+
+        let mut one = [0u8; 32];
+        one[31] = 1;
+        assert!(adds_n(&one));
+
+        let mut rng = dcroxide_testutil::SplitMix64(0x7270_6e5f_6164_6430);
+        let mut r = [0u8; 32];
+        let mut checked = 0;
+        while checked < 256 {
+            rng.fill(&mut r);
+            // Keep 129 random bits so that most draws fall below P - N.
+            r[..15].fill(0);
+            r[15] &= 1;
+            if r >= PRIME_MINUS_ORDER_BYTES {
+                continue;
+            }
+            assert!(adds_n(&r), "{r:02x?}");
+            checked += 1;
+        }
     }
 
     #[test]

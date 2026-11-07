@@ -55,24 +55,24 @@ script.
   beside it (`Cargo.toml:38` at `0c4154d`) for EC-Schnorr-DCRv0 and for
   ECDSA signing of a hash at or above the order
   (`ecdsa.rs:388-437` at `0c4154d`).
-- **`ring` 0.17.14** (`Cargo.lock:1562`): ~151k lines of C and assembly
+- **`ring` 0.17.14** (`Cargo.lock:1505`): ~151k lines of C and assembly
   (`dependency-ledger.md:150`), the crypto provider of `rustls` 0.23.46.
   `dcroxide-node` selects rustls's `ring` feature
   (`crates/dcroxide-node/Cargo.toml:59-69` at `8e6ea23`), `ureq` 3.4.2
   selects it through its default `rustls` feature, and `rustls-webpki`
-  0.103.16 depends on it (`Cargo.lock:1630-1638`). It runs the RPC and
+  0.103.16 depends on it (`Cargo.lock:1573-1581`). It runs the RPC and
   websocket TLS listener, the RPC client-certificate verifier
   (`rpcrun::GoClientCertVerifier`, which hands `rustls-webpki` ring's
   signature algorithms) and both TLS clients of the HTTPS seeder
   (`crates/dcroxide-node/src/seeding.rs`: `ureq` and
   `ProxySeederTransport`). P-521 signing and key exchange already run on
-  the pure-Rust `p521` (`dependency-ledger.md:54`). The listener is off
+  the pure-Rust `p521` (`dependency-ledger.md:52`). The listener is off
   under `--norpc`; the seeder runs at startup unless `--noseeders`
-  (`:51`). Two of `deny.toml`'s three skip entries exist only for it
+  (`:49`). Two of `deny.toml`'s three skip entries exist only for it
   (`deny.toml:42-48` at `8e6ea23`).
 - **`blake3` 1.8.7**, built with `pure`
   (`crates/dcroxide-wire/Cargo.toml:25`), which compiles none of the
-  crate's C or assembly (`dependency-ledger.md:46`). On x86 targets its
+  crate's C or assembly (`dependency-ledger.md:44`). On x86 targets its
   build script still asks a C compiler, when it finds one, whether it
   accepts two AVX-512 flags (`build.rs:161-175`), and asks before it reads
   `pure` (`:343-344`).
@@ -150,7 +150,7 @@ The approvals do not spell out five points, and this record reads them so:
 - **The targets the project builds for** are, on 2026-10-26, those of
   CI's test matrix, x86_64 and aarch64 Linux, macOS and Windows
   (`.github/workflows/ci.yml:92`), and the no-OS target of its no_std
-  check (`:351-356`). [ADR-0014](0014-release-engineering.md) decides
+  check (`:344-349`). [ADR-0014](0014-release-engineering.md) decides
   which of them get binaries.
 - **"What `cargo test` builds"** includes anything a test compiles while
   it runs, which reaches the shim and the oracle, though cargo itself
@@ -190,10 +190,10 @@ C that cgo links into the oracle included:
   the exception as covering, with the oracle, the Go generators under
   `tools/` that regenerate vector files from dcrd's own code (ADR-0001's
   addenda from 2026-10-02 on), and dcrd itself, which the interop job
-  builds and runs (`.github/workflows/ci.yml:207-261`).
+  builds and runs (`.github/workflows/ci.yml:202-256`).
 - **cargo-fuzz's libFuzzer**, which has no pure-Rust drop-in. `fuzz/` is
   outside the workspace (the root `Cargo.toml:39`) with its own lock, and
-  `libfuzzer-sys` 0.4.13 (`fuzz/Cargo.lock:1111-1112`) compiles
+  `libfuzzer-sys` 0.4.13 (`fuzz/Cargo.lock:1098-1099`) compiles
   libFuzzer's C++ with `cc` under its default `link_libfuzzer` feature
   (`build.rs:24-38`, `:43-44`).
 
@@ -205,7 +205,7 @@ either: the third set answered that the rule already decides it.
 The rule as the second set defines it names C, C++ and assembly. This
 record reads it as not reaching tools in other languages that never ship:
 the Go tools `tools/pinbump` and `tools/dcrdstat`, which CI vets and tests
-beside the oracle (`ci.yml:284-288`), and the Python instruments
+beside the oracle (`ci.yml:279-283`), and the Python instruments
 `tools/dsample/dsample.py` and `tools/powerloss/replay.py`, the second run
 by the two power-cut tests. They are neither exceptions nor breaches. The
 shim beside `replay.py` is C, and the second set settles it (T9, below).
@@ -234,7 +234,7 @@ be met on the ported code before it merges:
    port, on fully validated blocks, since no script is checked before the
    assume-valid block (`docs/operating.md:805-806`), with `k256`'s
    `precomputed-tables` feature tried. By the reading recorded in dcrec's
-   manifest (`crates/dcroxide-dcrec/Cargo.toml:20-27`), the tables serve
+   manifest (`crates/dcroxide-dcrec/Cargo.toml:20-27` at `0c4154d`), the tables serve
    only `mul_by_generator` and `mul_by_generator_vartime`, not the combined
    pass Schnorr verification uses, so they can help only an ECDSA path
    that calls one of those two (inference from that reading, not
@@ -307,7 +307,7 @@ Two checks, neither written yet (the first set's 1b):
   `multiple-versions = "deny"` and three `[[bans.skip]]` entries
   (`deny.toml:23-52` at `8e6ea23`). It gains a `deny` list refusing the
   crates that compile or link C. cargo-deny 0.20.2, the version read here
-  (CI's action names none, `ci.yml:295`), matches a banned crate by its
+  (CI's action names none, `ci.yml:290`), matches a banned crate by its
   name and a version requirement, with no patterns (`src/lib.rs:482-484`),
   so the `-sys` crates that build C are refused through the means they
   build it with: `cc`; the other native build drivers, `cmake`,
@@ -379,18 +379,18 @@ which does not depend on the TLS answers, can start at once.
 
 - **The C leaves the consensus path and the network surface**: about 67k
   lines under the signature checks and 151k under TLS
-  (`dependency-ledger.md:43`, `:150`), with the FFI between them and the
+  (`dependency-ledger.md:43` at `0c4154d`; `:150`), with the FFI between them and the
   node. A source build compiles no C, though on Linux rustc still links
   through the system's `cc` driver.
 - **One secp256k1 stack**, `k256`, where ADR-0006 accepted two. ECDSA
   verification moves from the most widely deployed implementation
-  (`dependency-ledger.md:43`) to a crate the ledger records as accepted,
-  not reviewed (`:44`); the soak is what bounds that risk. dcrec's `std`
+  (`dependency-ledger.md:43` at `0c4154d`) to a crate the ledger records as accepted,
+  not reviewed (`:42`); the soak is what bounds that risk. dcrec's `std`
   feature, which only selects libsecp's per-thread context
-  (`crates/dcroxide-dcrec/Cargo.toml:13-18`, `:28`), loses its reason.
+  (`crates/dcroxide-dcrec/Cargo.toml:13-18`, `:28` at `0c4154d`), loses its reason.
   Inference, not checked: `dcroxide-txscript`, which the no_std job leaves
   out because it fails on `secp256k1-sys` and nothing else
-  (`ci.yml:336-340`), may then pass that check.
+  (`ci.yml:336-340` at `0c4154d`), may then pass that check.
 - **libsecp's speed lead is to be measured, not assumed away.** In the one
   profile in the repository that splits out fully validated blocks,
   secp256k1 took about 38% of user-space cycles on all threads and
@@ -432,7 +432,7 @@ which does not depend on the TLS answers, can start at once.
 - **Two duplicates go with `ring`.** Removing it takes `getrandom`
   0.2.17, `windows-sys` 0.52.0, `windows-targets` 0.52.6 and the eight
   `windows_*` 0.52.6 import-library crates, which only it uses
-  (`deny.toml:42-48` at `8e6ea23`; `dependency-ledger.md:53`), and both
+  (`deny.toml:42-48` at `8e6ea23`; `dependency-ledger.md:51`), and both
   skip entries with them.
 - **The shim's rewrite meets C's variadic calls.** The shim interposes
   `open`, `open64` and `openat` (`tools/powerloss/shim.c:266`, `:276`,
