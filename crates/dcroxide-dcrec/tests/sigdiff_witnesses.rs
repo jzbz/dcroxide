@@ -12,8 +12,10 @@
 //! fails.  Then the branch the class was built for is derived again with
 //! `k256`, `curve25519-dalek`, SHA-512 and BLAKE-256, so a line that keeps
 //! dcrd's verdict by another path fails as well, and a second test holds
-//! each of those checks to a line off its branch.  Neither Go nor the
-//! soak's crate is needed (that crate depends on this one); its
+//! each of those checks to a line off its branch.  An ECDSA verify line
+//! must also be decided at the step of dcrd's `Verify` its class was built
+//! to reach, as this crate's `verify_detailed` reports it.  Neither Go nor
+//! the soak's crate is needed (that crate depends on this one); its
 //! `witness_file_regenerates` test rebuilds the lines from its generators
 //! and the oracle.
 //!
@@ -390,6 +392,21 @@ fn ecdsa_branch(class: &str, variant: &str, cmd: &str, data: &[u8]) {
     }
 }
 
+/// The step of dcrd's ECDSA `Verify` that decides an EV class's lines:
+/// X.x = r + N with r below P - N accepts at step 10, X.x neither r nor
+/// r + N rejects there, an r at or above P - N stops at step 9, a sum at
+/// infinity at step 6, and a doubling whose X.x is r accepts at step 8.
+fn ecdsa_step(class: &str) -> ecdsa::VerifyStep {
+    match class {
+        "EV-xGEN-true" => ecdsa::VerifyStep::Step10Accept,
+        "EV-xGEN-false" => ecdsa::VerifyStep::Step10Reject,
+        "EV-xGEN-wrap" => ecdsa::VerifyStep::Step9Reject,
+        "EV-infinity" => ecdsa::VerifyStep::Step6Infinity,
+        "EV-double" => ecdsa::VerifyStep::Step8Accept,
+        _ => unreachable!("{class}"),
+    }
+}
+
 /// The branch an ER line was built for, from the compact signature's
 /// header, r and s, and the point X its header names for r.
 fn recover_branch(class: &str, data: &[u8]) {
@@ -575,6 +592,15 @@ fn sigdiff_witness_vectors() {
             "{text}: a second line for {pair:?}"
         );
         branch(line.class, line.variant, line.cmd, &line.request, pair.1);
+        if line.class.starts_with("EV-") {
+            let (key, hash, sig) =
+                ecdsa_inputs(line.cmd, &line.request).expect("the key and signature parse");
+            assert_eq!(
+                sig.verify_detailed(&hash, &key),
+                ecdsa_step(line.class),
+                "{text}: decided at another step"
+            );
+        }
     }
     let missing: Vec<String> = WITNESS_CLASSES
         .iter()

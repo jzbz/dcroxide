@@ -2,9 +2,8 @@
 //! dcrd's fixed ECDSA vectors for signing, verification and compact
 //! recovery, ported from dcrec/secp256k1/v4 `ecdsa/signature_test.go` at
 //! the parity pin (v4.4.2-0.20261019113547-3360ae4dbef8, the version
-//! `tools/oracle` pins).  They run without Go, and they pin what the
-//! libsecp256k1-backed code returns today: every signature, verdict and
-//! recovered key here is dcrd's.
+//! `tools/oracle` pins).  They run without Go, and every signature,
+//! verdict and recovered key here is dcrd's.
 
 // Test-harness arithmetic over 32-byte scalars and the one-byte compact
 // signature header.
@@ -12,7 +11,8 @@
 
 use dcroxide_crypto::blake256;
 use dcroxide_dcrec::secp256k1::ecdsa::{
-    COMPACT_SIG_COMP_PUB_KEY, COMPACT_SIG_MAGIC_OFFSET, Signature, recover_compact, sign,
+    COMPACT_SIG_COMP_PUB_KEY, COMPACT_SIG_MAGIC_OFFSET, Signature, VerifyStep, recover_compact,
+    sign,
 };
 use dcroxide_dcrec::secp256k1::nonce::nonce_rfc6979;
 use dcroxide_dcrec::secp256k1::{GROUP_ORDER_BYTES, PrivateKey};
@@ -21,6 +21,10 @@ use dcroxide_testutil::{hex, unhex};
 /// The public key recovery code bit for an odd R.y (dcrd
 /// `pubKeyRecoveryCodeOddnessBit`).
 const PUB_KEY_RECOVERY_CODE_ODDNESS_BIT: u8 = 1;
+
+/// The public key recovery code bit for an R.x at or above N (dcrd
+/// `pubKeyRecoveryCodeOverflowBit`).
+const PUB_KEY_RECOVERY_CODE_OVERFLOW_BIT: u8 = 2;
 
 fn key(hex_key: &str) -> PrivateKey {
     let bytes: [u8; 32] = unhex(hex_key).try_into().expect("32 bytes");
@@ -310,6 +314,14 @@ fn compact_sig(test: &SignTest, compressed: bool) -> Vec<u8> {
 /// `sign` returns, must recover the signing key.  `sign` mirrors dcrd's
 /// exported `Sign`, which derives the RFC6979 nonce, so the RFC6979 rows
 /// also check the signature it produces.
+///
+/// Each verification must also be decided where the recovery code says:
+/// at step 8, or at step 10 when the code's overflow bit is set (dcrd's
+/// `pubKeyRecoveryCodeOverflowBit`, R.x at or above N).  No row sets that
+/// bit: every code is 0 or the oddness bit, and a signature whose nonce
+/// point has an x at or above N takes a discrete log to make.  So this
+/// checks step 8 alone; the signature soak's EV-xGEN-true witnesses
+/// (`tests/sigdiff_witnesses.rs`) and class are what reach step 10.
 #[test]
 fn sign_and_verify_vectors() {
     for test in sign_tests() {
@@ -322,6 +334,17 @@ fn sign_and_verify_vectors() {
         assert!(
             want_sig.verify(&hash, &pub_key),
             "{}: signature failed to verify",
+            test.name
+        );
+        let want_step = if test.want_code & PUB_KEY_RECOVERY_CODE_OVERFLOW_BIT == 0 {
+            VerifyStep::Step8Accept
+        } else {
+            VerifyStep::Step10Accept
+        };
+        assert_eq!(
+            want_sig.verify_detailed(&hash, &pub_key),
+            want_step,
+            "{}: verification decided at another step",
             test.name
         );
         assert_eq!(
@@ -362,7 +385,8 @@ fn sign_and_verify_vectors() {
 }
 
 /// Ported from dcrd's TestVerifyFailures (ecdsa/signature_test.go):
-/// verification edge conditions that must not verify.
+/// verification edge conditions that must not verify, each with the step
+/// of dcrd's `Verify` that rejects it.
 #[test]
 fn verify_failure_vectors() {
     struct Case {
@@ -371,6 +395,7 @@ fn verify_failure_vectors() {
         hash: &'static str,
         r: &'static str,
         s: &'static str,
+        step: VerifyStep,
     }
     let cases = [
         Case {
@@ -379,6 +404,7 @@ fn verify_failure_vectors() {
             hash: "c301ba9de5d6053caad9f5eb46523f007702add2c62fa39de03146a36b8026b7",
             r: "0000000000000000000000000000000000000000000000000000000000000000",
             s: "00ba213513572e35943d5acdd17215561b03f11663192a7252196cc8b2a99560",
+            step: VerifyStep::Step1Zero,
         },
         Case {
             name: "signature S is 0",
@@ -386,6 +412,7 @@ fn verify_failure_vectors() {
             hash: "c301ba9de5d6053caad9f5eb46523f007702add2c62fa39de03146a36b8026b7",
             r: "c6c4137b0e5fbfc88ae3f293d7e80c8566c43ae20340075d44f75b009c943d09",
             s: "0000000000000000000000000000000000000000000000000000000000000000",
+            step: VerifyStep::Step1Zero,
         },
         Case {
             name: "u1G + u2Q is the point at infinity",
@@ -393,6 +420,7 @@ fn verify_failure_vectors() {
             hash: "c301ba9de5d6053caad9f5eb46523f007702add2c62fa39de03146a36b8026b7",
             r: "3cfe45621a29fac355260a14b9adc0fe43ac2f13e918fc9ddfa117e964b61a8a",
             s: "00ba213513572e35943d5acdd17215561b03f11663192a7252196cc8b2a99560",
+            step: VerifyStep::Step6Infinity,
         },
         Case {
             name: "signature R < P-N, but invalid",
@@ -400,6 +428,7 @@ fn verify_failure_vectors() {
             hash: "c301ba9de5d6053caad9f5eb46523f007702add2c62fa39de03146a36b8026b7",
             r: "000000000000000000000000000000014551231950b75fc4402da1722fc9baed",
             s: "00ba213513572e35943d5acdd17215561b03f11663192a7252196cc8b2a99560",
+            step: VerifyStep::Step10Reject,
         },
     ];
 
@@ -412,6 +441,12 @@ fn verify_failure_vectors() {
             "{}: unexpected success for invalid signature: {}",
             case.name,
             hex(&sig.serialize())
+        );
+        assert_eq!(
+            sig.verify_detailed(&arr32(case.hash), &pub_key),
+            case.step,
+            "{}: rejected at another step",
+            case.name
         );
     }
 }

@@ -6,9 +6,10 @@
 //! This is the only module that names the code under test, and only the
 //! run loop (and the canaries, which stand in for it) call into it
 //! (`tests/independence.rs`).  It is outside the generator fingerprint:
-//! dcrec's later API (a compact signer, typed recovery errors, an ECDSA
-//! verify that reports its deciding step) is reached by changing this file
-//! alone, which changes no input, no answer as compared and no digest.
+//! dcrec's later API is reached by changing this file alone, which changes
+//! no input, no answer as compared and no digest.  ECDSA verification
+//! reports dcrd's deciding step (`verify_detailed`, as the answer's
+//! detail); a compact signer and typed recovery errors are still to come.
 //!
 //! A request whose layout this cannot decode is a bug in a generator, so it
 //! panics, and the run records the case as `ours-panicked`.
@@ -23,6 +24,7 @@ use dcroxide_dcrec::secp256k1::{PrivateKey, PublicKey, ecdsa, schnorr};
 
 use crate::answer::{Answer, Detail, Kind, OursAnswer};
 use crate::cmd::Cmd;
+use crate::model::EcdsaBranch;
 
 /// dcroxide's answer to `cmd` with argument bytes `data`.
 pub fn answer(cmd: Cmd, data: &[u8]) -> OursAnswer {
@@ -31,12 +33,7 @@ pub fn answer(cmd: Cmd, data: &[u8]) -> OursAnswer {
             Ok(sig) => value([sig.r_bytes().as_slice(), sig.s_bytes()].concat()),
             Err(e) => dcrd_reject(e.kind_name(), e.to_string()),
         }),
-        Cmd::EcdsaVerify | Cmd::EcdsaVerifyRaw => {
-            OursAnswer::plain(match ecdsa_verify_inputs(cmd, data) {
-                Ok((key, hash, sig)) => Answer::Verdict(sig.verify(hash, &key)),
-                Err(reject) => reject,
-            })
-        }
+        Cmd::EcdsaVerify | Cmd::EcdsaVerifyRaw => ecdsa_verify(cmd, data),
         Cmd::EcdsaSign => {
             let (key, hash) = key_and_hash(cmd, data);
             OursAnswer::plain(value(ecdsa::sign(&key, &hash).serialize()))
@@ -309,6 +306,30 @@ fn ecdsa_verify_inputs(
     Ok((key, hash, sig))
 }
 
+/// `ecdsa_verify` and `ecdsa_verify_raw`: `verify_detailed`, whose step is
+/// the answer's detail and whose verdict is the answer.  A parse rejection
+/// carries no step.
+fn ecdsa_verify(cmd: Cmd, data: &[u8]) -> OursAnswer {
+    match ecdsa_verify_inputs(cmd, data) {
+        Ok((key, hash, sig)) => {
+            let step = sig.verify_detailed(hash, &key);
+            let branch = match step {
+                ecdsa::VerifyStep::Step1Zero => EcdsaBranch::Step1Zero,
+                ecdsa::VerifyStep::Step6Infinity => EcdsaBranch::Step6Infinity,
+                ecdsa::VerifyStep::Step8Accept => EcdsaBranch::Step8Accept,
+                ecdsa::VerifyStep::Step9Reject => EcdsaBranch::Step9Reject,
+                ecdsa::VerifyStep::Step10Accept => EcdsaBranch::Step10Accept,
+                ecdsa::VerifyStep::Step10Reject => EcdsaBranch::Step10Reject,
+            };
+            OursAnswer {
+                answer: Answer::Verdict(step.accepts()),
+                detail: Detail::Ecdsa(branch),
+            }
+        }
+        Err(reject) => OursAnswer::plain(reject),
+    }
+}
+
 /// `schnorr_verify`'s key (parsed as `secp256k1.ParsePubKey` does, as the
 /// oracle parses it), hash and signature.
 fn schnorr_verify_inputs(
@@ -460,6 +481,50 @@ mod tests {
             b"message",
         );
         assert_eq!(answer(req.cmd, &req.data).answer, Answer::Verdict(true));
+    }
+
+    /// ECDSA verification reports the step of dcrd's `Verify` that decides
+    /// it: `TestSignAndVerify`'s RFC6979 signature by key 1 accepts at step
+    /// 8, and the four rows of `TestVerifyFailures` reject at steps 1, 1, 6
+    /// and 10.
+    #[test]
+    fn ecdsa_verify_reports_dcrds_step() {
+        let mut d = [0u8; 32];
+        d[31] = 1;
+        let g = PrivateKey::from_bytes(&d).expect("one").public_key();
+        let scalar = |hex: &str| -> [u8; 32] { unhex(hex).try_into().expect("32 bytes") };
+        let hash = scalar("c301ba9de5d6053caad9f5eb46523f007702add2c62fa39de03146a36b8026b7");
+        let good_r = "c6c4137b0e5fbfc88ae3f293d7e80c8566c43ae20340075d44f75b009c943d09";
+        let good_s = "00ba213513572e35943d5acdd17215561b03f11663192a7252196cc8b2a99560";
+        let zero = "0000000000000000000000000000000000000000000000000000000000000000";
+        for (r, s, verdict, step) in [
+            (good_r, good_s, true, EcdsaBranch::Step8Accept),
+            (zero, good_s, false, EcdsaBranch::Step1Zero),
+            (good_r, zero, false, EcdsaBranch::Step1Zero),
+            (
+                "3cfe45621a29fac355260a14b9adc0fe43ac2f13e918fc9ddfa117e964b61a8a",
+                good_s,
+                false,
+                EcdsaBranch::Step6Infinity,
+            ),
+            (
+                "000000000000000000000000000000014551231950b75fc4402da1722fc9baed",
+                good_s,
+                false,
+                EcdsaBranch::Step10Reject,
+            ),
+        ] {
+            let req =
+                cmd::ecdsa_verify_raw(&g.serialize_compressed(), &hash, &scalar(r), &scalar(s));
+            assert_eq!(
+                answer(req.cmd, &req.data),
+                OursAnswer {
+                    answer: Answer::Verdict(verdict),
+                    detail: Detail::Ecdsa(step)
+                },
+                "r {r}, s {s}"
+            );
+        }
     }
 
     /// The compact signer is dcrd's: `TestSignAndRecoverCompact`'s row for

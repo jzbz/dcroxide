@@ -9,7 +9,10 @@ use alloc::vec::Vec;
 use core::fmt;
 
 use super::nonce::nonce_rfc6979;
-use super::{GROUP_ORDER_BYTES, HALF_GROUP_ORDER, PrivateKey, PublicKey, is_zero, negate_mod_n};
+use super::{
+    GROUP_ORDER_BYTES, HALF_GROUP_ORDER, PRIME_MINUS_ORDER_BYTES, PrivateKey, PublicKey, is_zero,
+    negate_mod_n,
+};
 
 /// The ASN.1 identifier for a sequence.
 const ASN1_SEQUENCE_ID: u8 = 0x30;
@@ -96,6 +99,32 @@ impl fmt::Display for Error {
 
 impl core::error::Error for Error {}
 
+/// The step of dcrd's `Signature.Verify` (ecdsa/signature.go:169-294)
+/// that decides a verification, as [`Signature::verify_detailed`] reports
+/// it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerifyStep {
+    /// Step 1: r or s is zero; reject.
+    Step1Zero,
+    /// Step 6: u1 * G + u2 * Q is the point at infinity; reject.
+    Step6Infinity,
+    /// Step 8: r equals X.x; accept.
+    Step8Accept,
+    /// Step 9: r is at or above P - N, so r + N would wrap; reject.
+    Step9Reject,
+    /// Step 10: r + N equals X.x; accept.
+    Step10Accept,
+    /// Step 10: r + N does not equal X.x either; reject.
+    Step10Reject,
+}
+
+impl VerifyStep {
+    /// Whether dcrd's verdict at this step is true.
+    pub fn accepts(self) -> bool {
+        matches!(self, VerifyStep::Step8Accept | VerifyStep::Step10Accept)
+    }
+}
+
 /// An ECDSA signature: R and S as 32-byte big-endian scalars in `[0, N-1]`
 /// (parsing rejects zero, but like dcrd's `NewSignature` the direct
 /// constructor allows it; verification of a zero component always fails).
@@ -171,30 +200,101 @@ impl Signature {
     }
 
     /// Whether the signature is valid for the 32-byte hash and public key
-    /// (dcrd `Signature.Verify`). High-S signatures verify, matching dcrd —
-    /// the low-S rule applies to serialization, not verification.
+    /// (dcrd `Signature.Verify`), by dcrd's algorithm run by hand on k256
+    /// ([`Signature::verify_detailed`]). High-S signatures verify, matching
+    /// dcrd — the low-S rule applies to serialization, not verification.
     pub fn verify(&self, hash: &[u8; 32], pub_key: &PublicKey) -> bool {
-        // R and S must be in [1, N-1] (upper bound guaranteed by
-        // construction).
+        self.verify_detailed(hash, pub_key).accepts()
+    }
+
+    /// dcrd's `Signature.Verify` (ecdsa/signature.go:169-294) step by step
+    /// on k256, returning the step that decides the verdict
+    /// ([`VerifyStep::accepts`] is the verdict [`Signature::verify`]
+    /// returns).  dcrd exports only the verdict; the step is what the
+    /// signature soak holds against the branch each of its constructed
+    /// cases was built to reach.
+    ///
+    /// Every input is public, so like dcrd's `NonConst` operations this
+    /// runs in variable time.  dcrd's steps 7 and 8 compare r * Z^2 with
+    /// the Jacobian X.x to save an inversion.  k256 keeps its homogeneous
+    /// coordinates private, so the sum is normalized once and its affine x
+    /// compared instead: with r in [1, N-1], X.x below P and P < 2N, X.x
+    /// mod N equals r exactly when X.x is r or r + N, so one comparison
+    /// covers steps 7 to 10, and r's bytes tell which step decided.  No S
+    /// is normalized: dcrd accepts any S in [1, N-1].
+    // The flagged operators are k256 scalar arithmetic, modular by definition.
+    #[allow(clippy::arithmetic_side_effects)]
+    pub fn verify_detailed(&self, hash: &[u8; 32], pub_key: &PublicKey) -> VerifyStep {
+        use k256::elliptic_curve::PrimeField;
+        use k256::elliptic_curve::group::Group;
+        use k256::elliptic_curve::ops::{MulByGeneratorVartime, Reduce};
+        use k256::elliptic_curve::point::{AffineCoordinates, BatchNormalize};
+        use k256::{FieldBytes, ProjectivePoint, Scalar};
+
+        // Step 1: R and S must be in [1, N-1]; the upper bound holds by
+        // construction (`Signature::new`, `parse_der_signature`).
         if is_zero(&self.r) || is_zero(&self.s) {
-            return false;
+            return VerifyStep::Step1Zero;
+        }
+        let r = Scalar::from_repr(self.r.into()).expect("below N by construction");
+        let s = Scalar::from_repr(self.s.into()).expect("below N by construction");
+
+        // Step 2: e = H(m) mod N, as dcrd's `SetByteSlice` reduces the hash:
+        // one conditional subtraction of N, exact for any 256-bit value
+        // since 2^256 < 2N.
+        let e = <Scalar as Reduce<FieldBytes>>::reduce(&(*hash).into());
+
+        // Step 3: w = S^-1 mod N, in variable time like dcrd's
+        // `InverseValNonConst`.
+        let w = Option::<Scalar>::from(s.invert_vartime()).expect("s is nonzero");
+
+        // Step 4: u1 = e * w mod N and u2 = R * w mod N.
+        let u1 = e * w;
+        let u2 = r * w;
+
+        // Step 5: X = u1 * G + u2 * Q, as one variable-time GLV/wNAF pass
+        // over both scalars.  dcrd's `AddNonConst` doubles when its two
+        // operands are equal; every k256 addition is a complete formula,
+        // which needs no such branch.  A zero u1 (a hash that is a multiple
+        // of N) contributes the identity, as dcrd's
+        // `ScalarBaseMultNonConst` of zero does.
+        let big_x = ProjectivePoint::mul_by_generator_and_mul_add_vartime(
+            &u1,
+            &u2,
+            &pub_key.as_k256_point(),
+        );
+
+        // Step 6: fail if X is the point at infinity.  This comes before
+        // normalizing, which maps the identity to an x of zero and would
+        // report the rejection as step 9 or 10.
+        if bool::from(big_x.is_identity()) {
+            return VerifyStep::Step6Infinity;
         }
 
-        // libsecp256k1 verification enforces low-S; (r, s) and (r, N-s) are
-        // valid for exactly the same message/key pairs, so normalizing first
-        // yields dcrd's accept-any-S verdict.
-        let mut s = self.s;
-        if s > HALF_GROUP_ORDER {
-            s = negate_mod_n(&s);
+        // Steps 7 to 10 on X's affine x, below P: one variable-time
+        // inversion.
+        let [affine] =
+            <ProjectivePoint as BatchNormalize<[ProjectivePoint; 1]>>::batch_normalize_vartime(&[
+                big_x,
+            ]);
+        let x = affine.x();
+        if <Scalar as Reduce<FieldBytes>>::reduce(&x) == r {
+            // X.x is r (step 8) or r + N (step 10; step 9 lets it through,
+            // since r + N = X.x < P).
+            let x_bytes: [u8; 32] = x.into();
+            if x_bytes == self.r {
+                VerifyStep::Step8Accept
+            } else {
+                VerifyStep::Step10Accept
+            }
+        } else if self.r >= PRIME_MINUS_ORDER_BYTES {
+            // Step 9: r + N would reach P (big-endian byte order is
+            // numeric order).
+            VerifyStep::Step9Reject
+        } else {
+            // Step 10: X.x is neither r nor r + N.
+            VerifyStep::Step10Reject
         }
-        let mut compact = [0u8; 64];
-        compact[..32].copy_from_slice(&self.r);
-        compact[32..].copy_from_slice(&s);
-        let sig = libsecp256k1::ecdsa::Signature::from_compact(&compact)
-            .expect("r and s are reduced scalars");
-
-        let msg = libsecp256k1::Message::from_digest(*hash);
-        libsecp256k1::ecdsa::verify(&sig, msg, pub_key.inner()).is_ok()
     }
 }
 
@@ -688,5 +788,13 @@ mod tests {
         let zero_s = Signature::new(*sig.r_bytes(), [0u8; 32]).expect("in range");
         assert!(!zero_r.verify(&hash, &pub_key));
         assert!(!zero_s.verify(&hash, &pub_key));
+        assert_eq!(
+            zero_r.verify_detailed(&hash, &pub_key),
+            VerifyStep::Step1Zero
+        );
+        assert_eq!(
+            zero_s.verify_detailed(&hash, &pub_key),
+            VerifyStep::Step1Zero
+        );
     }
 }

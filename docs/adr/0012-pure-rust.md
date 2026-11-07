@@ -41,17 +41,20 @@ lock, as `cargo tree -i cc --target all` shows. The lock has no `cmake`,
 `pkg-config`, `vcpkg` or `bindgen`, and no workspace crate has a build
 script.
 
-- **`secp256k1-sys` 0.14.1** (`Cargo.lock:1682`): ~67k lines of vendored
-  libsecp256k1 C (`docs/dependency-ledger.md:43`), under `secp256k1`
+- **`secp256k1-sys` 0.14.1** (`Cargo.lock:1682` at `0c4154d`): ~67k
+  lines of vendored libsecp256k1 C
+  (`docs/dependency-ledger.md:43` at `0c4154d`), under `secp256k1`
   0.33.1, which `dcroxide-dcrec` takes as `libsecp256k1`
-  (`crates/dcroxide-dcrec/Cargo.toml:33`). It runs ECDSA verification
-  (`src/secp256k1/ecdsa.rs:176-198`), signing of a hash below the group
-  order (`:374-386`) and the compact recovery behind the `verifymessage`
-  RPC (`:336-363`), and it parses every secp256k1 key, Schnorr keys
-  included (`src/secp256k1.rs:214`, `:232`, `:286`): the consensus path of
-  signature types 0 and 2. `k256` 0.14.0 sits beside it (`Cargo.toml:38`)
-  for EC-Schnorr-DCRv0 and for ECDSA signing of a hash at or above the
-  order (`ecdsa.rs:388-437`).
+  (`crates/dcroxide-dcrec/Cargo.toml:33` at `0c4154d`). It runs ECDSA
+  verification (`src/secp256k1/ecdsa.rs:176-198` at `0c4154d`), signing
+  of a hash below the group order (`:374-386` at `0c4154d`) and the
+  compact recovery behind the `verifymessage` RPC
+  (`:336-363` at `0c4154d`), and it parses every secp256k1 key, Schnorr
+  keys included (`src/secp256k1.rs:214`, `:232`, `:286` at `0c4154d`):
+  the consensus path of signature types 0 and 2. `k256` 0.14.0 sits
+  beside it (`Cargo.toml:38` at `0c4154d`) for EC-Schnorr-DCRv0 and for
+  ECDSA signing of a hash at or above the order
+  (`ecdsa.rs:388-437` at `0c4154d`).
 - **`ring` 0.17.14** (`Cargo.lock:1561`): ~151k lines of C and assembly
   (`dependency-ledger.md:150`), the crypto provider of `rustls` 0.23.46.
   `dcroxide-node` selects rustls's `ring` feature
@@ -320,7 +323,7 @@ Two checks, neither written yet (the first set's 1b):
   Operating-system bindings compile nothing and are not listed. A ban
   that matches nothing is doing its job, unlike the unmatched allowances
   and skips the file's comments argue against (`deny.toml:12-15`,
-  `:38-40`).
+  `:38-40` at `0c4154d`).
 
   `iana-time-zone-haiku` stays among `cc`'s wrappers after the other three
   have gone. `[graph]` names no targets (`deny.toml:1-2`), and with none
@@ -447,8 +450,8 @@ which does not depend on the TLS answers, can start at once.
 - **Not drafted here:** the `deny.toml` bans and the CI job; and, as each
   breach goes, the dependency ledger's rows for it, the brief's figures
   on line 775, its principle 3, the no_std job's notes on
-  `secp256k1-sys` (`ci.yml:329-347`), and the CI comment on dcrec's run
-  without `std` (`ci.yml:104-108`).
+  `secp256k1-sys` (`ci.yml:329-347` at `0c4154d`), and the CI comment on
+  dcrec's run without `std` (`ci.yml:104-108` at `0c4154d`).
 
 ## Addendum, 2026-10-31 — `ring` leaves
 

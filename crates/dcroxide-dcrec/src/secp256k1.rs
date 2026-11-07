@@ -20,6 +20,15 @@ pub const GROUP_ORDER_BYTES: [u8; 32] = [
     0xba, 0xae, 0xdc, 0xe6, 0xaf, 0x48, 0xa0, 0x3b, 0xbf, 0xd2, 0x5e, 0x8c, 0xd0, 0x36, 0x41, 0x41,
 ];
 
+/// P - N, the field prime less the group order, as 32 big-endian bytes
+/// (0x14551231950b75fc4402da1722fc9baee): the bound of dcrd's
+/// `FieldVal.IsGtOrEqPrimeMinusOrder` (field.go).  ECDSA verification's
+/// step 9 rejects an r at or above it, since r + N would reach P.
+pub(crate) const PRIME_MINUS_ORDER_BYTES: [u8; 32] = [
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+    0x45, 0x51, 0x23, 0x19, 0x50, 0xb7, 0x5f, 0xc4, 0x40, 0x2d, 0xa1, 0x72, 0x2f, 0xc9, 0xba, 0xee,
+];
+
 /// Half the group order (floor(N/2)) as 32 big-endian bytes; S components
 /// above this are normalized on serialization, matching dcrd.
 pub(crate) const HALF_GROUP_ORDER: [u8; 32] = [
@@ -247,10 +256,6 @@ impl PublicKey {
     /// the hybrid format either.
     pub fn serialize_uncompressed(&self) -> [u8; PUB_KEY_BYTES_LEN_UNCOMPRESSED] {
         self.inner.serialize_uncompressed()
-    }
-
-    pub(crate) fn inner(&self) -> &libsecp256k1::PublicKey {
-        &self.inner
     }
 
     pub(crate) fn from_inner(inner: libsecp256k1::PublicKey) -> PublicKey {
@@ -529,6 +534,16 @@ mod tests {
         assert_eq!(uncompressed, hybrid);
         // Hybrid keys serialize with the standard prefixes, never 0x06/0x07.
         assert_eq!(hybrid.serialize_uncompressed()[0], 0x04);
+    }
+
+    #[test]
+    fn prime_minus_order_is_p_minus_n() {
+        use k256::U256;
+        assert_eq!(
+            U256::from_be_slice(&FIELD_PRIME_BYTES)
+                .wrapping_sub(&U256::from_be_slice(&GROUP_ORDER_BYTES)),
+            U256::from_be_slice(&PRIME_MINUS_ORDER_BYTES)
+        );
     }
 
     #[test]
