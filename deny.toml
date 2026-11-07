@@ -51,11 +51,51 @@ multiple-versions = "deny"
 # and windows-sys 0.52, which only ring takes: the lock keeps them beside
 # 0.4 and 0.61, the graph does not, and they have no skip.  Were krates
 # to keep ring, this ban and those two duplicates would fail the check.
+#
+# The rest refuse C where a build gets it (ADR-0012).  cargo-deny
+# matches a ban by name and version, with no patterns, so a -sys crate
+# is refused through the driver it builds or finds its C with: cc, which
+# runs a C or C++ compiler from a build script; cmake; pkg-config and
+# vcpkg, which find a C library to link; and bindgen, which reads C
+# headers through libclang.  Only cc is in the lock.  secp256k1-sys,
+# which left when secp256k1 moved to k256, is refused by name as well.
+# A ban lets a crate through only when every crate that takes it
+# directly is one of its wrappers, so a new crate that takes cc fails
+# the check.  In cargo-deny's graph cc's only takers are its two
+# wrappers (the lock's ring, which no build takes, lists it too):
+# blake3, whose build script still asks the C compiler about two
+# AVX-512 flags, and warns when none answers, until BLAKE3 is ported
+# into the tree, and whose features are held to `pure` below; and
+# iana-time-zone-haiku, which compiles C++ for Haiku alone, a target
+# the project does not build for, kept in view here.  A wrapper goes
+# with its crate, since cargo-deny warns of one it does not meet.
+# A ban that matches nothing is doing its job, unlike an unmatched skip.
+# Only this workspace is read: fuzz/, with its own lock, keeps
+# libFuzzer's C++, one of ADR-0012's two exceptions.  CI's
+# no-c-compiler job checks the rule another way, building every
+# workspace target with no C compiler a build script can reach.
 deny = [
     { crate = "ring", reason = "C and assembly; the node's TLS runs on dcroxide-tlscrypto (ADR-0012, ADR-0015)" },
     { crate = "aws-lc-rs", reason = "binds aws-lc-sys, C and assembly; the node's TLS runs on dcroxide-tlscrypto (ADR-0012, ADR-0015)" },
     { crate = "aws-lc-sys", reason = "C and assembly; the node's TLS runs on dcroxide-tlscrypto (ADR-0012, ADR-0015)" },
+    { crate = "secp256k1-sys", reason = "libsecp256k1's C; secp256k1 runs on k256 (ADR-0006's 2026-10-26 addendum, ADR-0012)" },
+    { crate = "cc", wrappers = ["blake3", "iana-time-zone-haiku"], reason = "runs a C or C++ compiler from a build script (ADR-0012)" },
+    { crate = "cmake", reason = "drives a C or C++ build through CMake (ADR-0012)" },
+    { crate = "pkg-config", reason = "finds a system C library for a build script to link (ADR-0012)" },
+    { crate = "vcpkg", reason = "finds or builds a C or C++ library to link (ADR-0012)" },
+    { crate = "bindgen", reason = "reads C headers through libclang, for C a crate compiles or links (ADR-0012)" },
 ]
+
+# A wrapper is let through cc's ban with any features, so blake3's are
+# held to `pure` alone.  Without it blake3's build script compiles C or
+# assembly wherever a compiler answers, and on x86_64 does without them
+# where none does, so neither the ban nor CI's no-c-compiler job would
+# see it.  This entry goes with blake3.
+[[bans.features]]
+crate = "blake3"
+allow = ["pure"]
+exact = true
+reason = "only `pure` keeps blake3's C and assembly out of a build (ADR-0012)"
 
 [[bans.skip]]
 crate = "syn:2"

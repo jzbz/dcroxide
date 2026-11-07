@@ -349,6 +349,186 @@ jobs:
             cargo check -p "dcroxide-$c" --no-default-features --target x86_64-unknown-none
           done
 
+  no-c-compiler:
+    name: build with no C compiler
+    runs-on: ubuntu-latest
+    # ADR-0012's second check: every workspace target builds with no C or
+    # C++ compiler a build script can reach, so a build script that needs
+    # one fails here, by whatever route deny.toml's bans do not name. One
+    # that compiles C only when a compiler answers, and does without when
+    # none does, passes, and so does one that runs a compiler by its
+    # absolute path (ADR-0012). The compilers are hidden from build
+    # scripts, not from the link step: rustc links through cc on Linux, so
+    # it is given the system's cc by absolute path, inside a wrapper that
+    # refuses the arguments of a compile it knows, since Cargo hands every
+    # build script the linker's path in RUSTC_LINKER. cargo runs under
+    # `env -i`, so no CC, CXX, CFLAGS or BLAKE3_CI reaches a build script
+    # (blake3's fails on its no-compiler warning when BLAKE3_CI is set),
+    # with a PATH of links to cargo's and the system's commands less every
+    # compiler, ahead of which rustup puts cargo's home's bin. No cache: a
+    # restored target directory would skip the build scripts that already
+    # ran, which are what this job watches. fuzz/, a workspace of its own
+    # whose libFuzzer is C++, one of ADR-0012's two exceptions, is outside
+    # the check.
+    steps:
+      - uses: actions/checkout@v7
+      # Toolchain comes from rust-toolchain.toml (see the lint job).
+      - run: rustup toolchain install
+      - name: Build every workspace target with no C compiler
+        run: |
+          set -euo pipefail
+          # The names hidden: the C, C++ and Fortran drivers (gfortran and the
+          # other GCC drivers compile C too), the preprocessor, the assembler and
+          # LLVM's tools that assemble or compile to an object (llvm-mc, llc,
+          # llvm-lto, llvm-lto2, llvm-ml, llvm-ml64), under any target prefix or
+          # version suffix (x86_64-linux-gnu-gcc-13, clang++-18). A few unrelated
+          # tools whose names end so go with them.
+          gnu='cc|c\+\+|cpp|c89|c99|gcc|g\+\+|gfortran|f77|f95|gccgo|gdc|gm2|as'
+          other='clang|clang\+\+|clang-cpp|clang-cl|clang-repl|llvm-mc|llc|tcc|zig'
+          other="$other|llvm-lto|llvm-lto2|llvm-ml|llvm-ml64"
+          other="$other|icx|icpx|nvcc|emcc|em\+\+"
+          compiler="^(.+-)?($gnu|$other)(-[0-9][0-9.]*)?\$"
+          linker=$(command -v cc)
+          cargo_bin=$(dirname "$(command -v cargo)")
+          host=$(rustc -vV | sed -n 's/^host: //p')
+          toolchain=$(rustup show active-toolchain | cut -d' ' -f1)
+          work=${RUNNER_TEMP:-$(mktemp -d)}/no-c-compiler
+          rm -rf "$work"
+          mkdir -p "$work/bin" "$work/link"
+          : > "$work/links"
+          : > "$work/refused"
+
+          # PATH becomes one directory of links: cargo's directory first, then
+          # the system's, the first of each name kept, and no name whose link or
+          # target is a compiler. Nothing else (/usr/local, /opt, the tool cache)
+          # is on it.
+          declare -A decided
+          hidden=()
+          seen=" "
+          for dir in "$cargo_bin" /usr/bin /usr/sbin /bin /sbin; do
+            real=$(readlink -f "$dir")
+            case "$seen" in *" $real "*) continue ;; esac
+            seen="$seen$real "
+            for f in "$real"/*; do
+              name=${f##*/}
+              [ -f "$f" ] && [ -x "$f" ] || continue
+              [ -z "${decided[$name]:-}" ] || continue
+              decided[$name]=1
+              target=$(readlink -f "$f")
+              if [[ $name =~ $compiler || ${target##*/} =~ $compiler ]]; then
+                hidden+=("$name")
+              else
+                ln -s "$f" "$work/bin/$name"
+              fi
+            done
+          done
+          echo "hidden from build scripts (${#hidden[@]}): ${hidden[*]}"
+          case " ${hidden[*]} " in
+            *" cc "*) ;;
+            *) echo "no cc was found to hide" >&2; exit 1 ;;
+          esac
+
+          # rustc's linker, by absolute path: the system's cc for a link. Cargo
+          # hands every build script the linker's path in RUSTC_LINKER, so the
+          # wrapper refuses, and logs, the arguments of a compile it knows: a
+          # compile-only or language flag, a relocatable link, a response file
+          # (rustc writes one only when a command line is too long) or a suffix
+          # GCC's driver compiles: every one GCC 16 does with all its languages,
+          # C, C++ and its headers and modules, Objective-C and C++, Fortran,
+          # Go, D, Ada, Modula-2, Rust, COBOL and assembly. It is a tripwire for
+          # that route, not a seal: an option it does not list gets past.
+          {
+            echo '#!/bin/sh'
+            echo "real='$linker' work='$work'"
+            cat <<'WRAPPER'
+          for arg in "$@"; do
+            case $arg in
+              -c | -S | -E | - | -r | -x* | --language* | @* | \
+                *.c | *.i | *.h | *.m | *.mi | *.mm | *.M | *.mii | \
+                *.cc | *.cp | *.cxx | *.cpp | *.CPP | *.c++ | *.C | *.ii | \
+                *.hh | *.H | *.hp | *.hxx | *.hpp | *.HPP | *.h++ | *.tcc | \
+                *.cppm | *.ixx | *.cxxm | *.c++m | *.ccm | \
+                *.f | *.for | *.ftn | *.F | *.FOR | *.fpp | *.FPP | *.FTN | \
+                *.f90 | *.f95 | *.f03 | *.f08 | *.F90 | *.F95 | *.F03 | *.F08 | \
+                *.fi | *.fii | *.go | *.d | *.di | *.dd | *.ads | *.adb | \
+                *.mod | *.rs | *.cob | *.COB | *.cbl | *.CBL | *.s | *.S | *.sx)
+                echo "$arg: $*" >> "$work/refused"
+                exit 1 ;;
+            esac
+          done
+          echo link >> "$work/links"
+          exec "$real" "$@"
+          WRAPPER
+          } > "$work/link/cc"
+          chmod +x "$work/link/cc"
+
+          # cargo runs with nothing but these, so no CC, CXX, CFLAGS, RUSTFLAGS
+          # or BLAKE3_CI reaches a build script.
+          keep=("HOME=$HOME" "PATH=$work/bin"
+            "CARGO_TARGET_$(echo "$host" | tr 'a-z.-' 'A-Z__')_LINKER=$work/link/cc")
+          for v in CARGO_HOME RUSTUP_HOME CARGO_TERM_COLOR CARGO_TARGET_DIR CARGO_NET_OFFLINE; do
+            if [ -n "${!v:-}" ]; then
+              keep+=("$v=${!v}")
+            fi
+          done
+
+          # A build script's PATH is the one rustup gives cargo, which puts
+          # cargo's home's bin first. None of its directories may hold a
+          # compiler, by name or by a link's target, and the common names must
+          # resolve to nothing.
+          cat > "$work/scan.sh" <<'SCAN'
+          status=0
+          echo "a build script's PATH: $PATH"
+          IFS=: read -ra dirs <<< "$PATH"
+          for d in "${dirs[@]}"; do
+            for f in "$d"/*; do
+              [ -e "$f" ] || continue
+              t=$(readlink -f "$f")
+              if [[ ${f##*/} =~ $1 || ${t##*/} =~ $1 ]]; then
+                echo "$f: a compiler a build script can reach" >&2
+                status=1
+              fi
+            done
+          done
+          for n in cc c++ cpp gcc g++ clang clang++ as; do
+            if command -v "$n"; then
+              echo "$n resolves" >&2
+              status=1
+            fi
+          done
+          exit "$status"
+          SCAN
+          env -i "${keep[@]}" rustup run "$toolchain" bash "$work/scan.sh" "$compiler"
+
+          # --keep-going, so one run names every build script that needs a
+          # compiler, not only the first to fail.
+          env -i "${keep[@]}" cargo build --workspace --all-targets --locked --keep-going
+
+          echo "links through the wrapper: $(wc -l < "$work/links")"
+          if [ -s "$work/refused" ]; then
+            echo "compiles the linker wrapper refused:" >&2
+            cat "$work/refused" >&2
+            exit 1
+          fi
+          if [ ! -s "$work/links" ]; then
+            echo "rustc linked nothing through the wrapper" >&2
+            exit 1
+          fi
+          # While blake3 is locked, its build script's compiler probe must have
+          # found none. Build scripts write under the build directory, which is
+          # the target directory unless configured apart.
+          if grep -qx 'name = "blake3"' Cargo.lock; then
+            meta=$(env -i "${keep[@]}" cargo metadata --locked --no-deps --format-version 1)
+            build=$(sed -n 's/.*"build_directory":"\([^"]*\)".*/\1/p' <<< "$meta")
+            if [ -z "$build" ]; then
+              build=$(sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p' <<< "$meta")
+            fi
+            if ! grep -l 'No C compiler' "$build"/debug/build/blake3-*/output; then
+              echo "blake3's build script did not report a missing compiler" >&2
+              exit 1
+            fi
+          fi
+
   fuzz-smoke:
     name: fuzz smoke (60s per target)
     runs-on: ubuntu-latest

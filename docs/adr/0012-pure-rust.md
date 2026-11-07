@@ -10,7 +10,8 @@
   library. Neither of the two checks that enforce the rule is written
   yet; `deny.toml` holds the first bans, on `ring`, `aws-lc-rs` and
   `aws-lc-sys`.
-- **Date:** 2026-10-26 (accepted), 2026-10-31 (addendum: `ring` leaves)
+- **Date:** 2026-10-26 (accepted), 2026-10-31 (addendum: `ring` leaves),
+  2026-11-06 (addendum: the two checks)
 
 ## Context
 
@@ -486,3 +487,105 @@ now, and are corrected here.
   native build drivers, with their wrappers, are not listed yet; `ring` is
   not among `cc`'s wrappers, having left before that ban. The build with
   no C compiler still waits on `secp256k1-sys`.
+
+## Addendum, 2026-11-06 — the two checks
+
+Both checks Enforcement describes are written, in the change that merges
+with D3's port, since the CI job cannot pass while `secp256k1-sys`
+remains (Enforcement).
+
+- **The bans.** `deny.toml`'s `deny` list gains `cc`, with `blake3` and
+  `iana-time-zone-haiku` as its wrappers; the other native build drivers,
+  `cmake`, `pkg-config`, `vcpkg` and `bindgen`; and `secp256k1-sys` by
+  name. `ring` is not among `cc`'s wrappers, having left the build before
+  this ban (addendum of 2026-10-31). `cargo tree -i cc --all-features
+  --target all -e all --workspace` gives `cc` those two direct dependents
+  and no other, as it does without `--all-features`, and finds no
+  `cmake`, `pkg-config`, `vcpkg`, `bindgen` or `secp256k1-sys`. CI's
+  action still runs cargo-deny 0.20.2, the version Enforcement read
+  (`deny_version` in the `Dockerfile` at cargo-deny-action's `v2`, read
+  on 2026-11-06). There a ban is lifted only when every direct dependent
+  of the banned crate is one of its wrappers, matched by name in any
+  version and with any features (`src/bans.rs:255`, `:608-653`); a
+  wrapper never met draws a warning (`:1120-1133`), and a ban that
+  matches no crate draws nothing, where a skip that matches none is
+  reported (`:1109-1111`). So a wrapper's features are its own:
+  `blake3` without `pure` compiles C or assembly wherever a compiler
+  answers (its `build.rs:344-370`), and on x86_64 does without them
+  where none does, which neither the ban nor the job would see. A
+  `[[bans.features]]` entry therefore holds `blake3` to exactly `pure`
+  (`allow`, `exact`; `src/bans/cfg.rs:44-76`, `src/bans.rs:717-773`),
+  the one feature its single taker, `dcroxide-wire`, turns on.
+  cargo-deny was not run on the change: CI's deny job is the first to
+  check it. `[bans.build]`, which Enforcement left to this change, is
+  not added: its list of the build scripts allowed would name every
+  crate with one in cargo-deny's graph, every target's, and without a
+  cargo-deny run such a list would be checked first by CI.
+- **The build with no C compiler** is CI's `no-c-compiler` job, on
+  `ubuntu-latest`. It runs `cargo build --workspace --all-targets
+  --locked --keep-going` under `env -i`, so no `CC`, `CXX`, `CFLAGS` or
+  `BLAKE3_CI` reaches a build script, and `--keep-going` names every
+  build script that fails, not only the first. The `PATH` it starts
+  cargo with is one directory of links to the commands of cargo's
+  directory and the system's, less every name, or target of a link, that
+  is a C, C++ or Fortran driver, the preprocessor, the assembler or an
+  LLVM tool that assembles or compiles to an object, under any target
+  prefix or version suffix; no other directory, `/usr/local` and the
+  hosted tool cache among them, is on it, save cargo's home's `bin`,
+  which rustup puts in front (below). Two routes to a compiler turned up
+  that Enforcement did not name, both seen on 2026-11-06 in a throwaway
+  crate whose build script printed what it was given. Cargo hands every
+  build script the linker's path in `RUSTC_LINKER`, so rustc's linker is
+  a wrapper that runs the system's `cc` for a link and refuses, and
+  logs, the arguments of a compile it knows: a compile-only or language
+  flag, a relocatable link, a response file, or a suffix GCC's driver
+  compiles, every one that GCC 16 with all its languages does. A refusal
+  fails the job even where a build script swallows the error. The
+  wrapper is a tripwire for that route, not a seal: an option it does
+  not list gets past. `cc` 1.11.0 reads `RUSTC_LINKER` only when cross
+  compiling, for a target prefix (`src/lib.rs:4342-4350`, `:5112-5118`),
+  and otherwise runs `cc` from `PATH` unless `CC` or a variant of it is
+  set (`:4225-4231`, `:4249`, `:4352`). And rustup puts cargo's home's
+  `bin` at the front of the `PATH` of what it runs, so the job checks
+  every directory of the `PATH` a build script gets, that one included,
+  for a compiler. While blake3 is locked, the job also requires its
+  build script to have reported no C compiler (`build.rs:186-192`),
+  which is `cc`'s own search coming up empty. The job restores no cache,
+  since a restored target directory would skip the build scripts that
+  already ran.
+- **What the job still misses.** It shows that the build succeeds with
+  no compiler, not that no build script would use one: a build script
+  that compiles C only when a compiler answers, and does without when
+  none does, passes, as blake3's would without `pure`. A build script
+  that runs a compiler by its absolute path, one written into it, read
+  from the wrapper or found through a locator left on `PATH`, such as
+  `llvm-config --bindir`, gets past too, as Enforcement recorded, and so
+  does a compiler whose name has no dash before its stem (`mpicc`,
+  `icc`, `distcc`), which the pattern does not hide. The job builds the
+  dev profile with the default features, so a build script that branches
+  on the profile, or a C route behind a feature the build leaves off, is
+  not built; cargo-deny reads every feature, and with every feature on
+  `cc` has the same two takers. Only the bans see a build for a target
+  other than x86_64 Linux. The fuzz crate is outside both checks:
+  cargo-deny reads the root workspace and the job builds it, while
+  `fuzz/` keeps libFuzzer's C++ under the exception above.
+- **Checked on 2026-11-06,** on x86_64 Linux, with the job's script: it
+  built every workspace target of this change; on a copy of `0c4154d`'s
+  tree, which still built `secp256k1-sys`, it failed in that crate's
+  build script and in no other, while the same build of that crate with
+  the compilers in view passed.
+- **What this corrects.** Enforcement's "neither written yet"; the
+  Consequences' "Until the bans land, nothing mechanical stops a further
+  crate that builds C from entering either", since the bans now stop one
+  that takes any of the five drivers directly (a wrapper of `cc` aside),
+  and the job one whose build script needs a compiler on x86_64 Linux;
+  and the addendum of 2026-10-31's "not listed yet" and "still waits on
+  `secp256k1-sys`". The status line's "Neither of the two checks ... is
+  written yet" and the index entry's "neither check written yet" are
+  corrected here too: both keep their words, with their account of
+  `secp256k1-sys`, until they are rewritten with the record that
+  supersedes ADR-0006. So is ADR-0014's addendum of 2026-10-31, whose
+  "of its two checks only the first bans ... are written" keeps its
+  words as dated text. The rule is met only once all four breaches are
+  gone and both checks run and pass (Enforcement); blake3's probe and
+  the shim remain.
