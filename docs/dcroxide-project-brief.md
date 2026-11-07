@@ -802,21 +802,21 @@ pins this policy asks for.
 >   which is the ADR's own documented fallback. Its addenda record what
 >   shipped and the evidence behind ratification.
 > - **D3** — [ADR-0006](adr/0006-secp256k1-backend.md), still *Proposed*, and
->   to be superseded. The split it proposed is what is built: libsecp256k1
->   bindings for ECDSA and for every secp256k1 key, `k256` for Schnorr-DCRv0
->   and, since 2026-09-24, for ECDSA signing of a hash at or above the group
->   order, curve25519-dalek for Ed25519. On 2026-10-26 the project owner
->   decided that, under [ADR-0012](adr/0012-pure-rust.md)'s pure-Rust rule,
->   ECDSA and secp256k1 key handling move to `k256`, and that Ed25519 stays on
->   curve25519-dalek. The port is not in the tree. The owner asked for an
->   oracle-backed differential fuzz soak of all three signature types, over
->   named input classes and to floors the owner accepted, and for the port to
->   merge only if its slowdown is small or optimized away, with further speed
->   work if full validation is more than 10% slower or a default sync moves
->   beyond one session's run-to-run noise. ADR-0006's 2026-10-26 addendum
->   reads these together as the bar to merge: the soak passed on the ported
->   code, and syncs within those two bounds, after speed work where they are
->   not. A new ADR then supersedes ADR-0006. None of this has been done.
+>   to be superseded. It proposed libsecp256k1 bindings for ECDSA and every
+>   secp256k1 key and `k256` for Schnorr-DCRv0. On 2026-10-26 the project
+>   owner decided that, under [ADR-0012](adr/0012-pure-rust.md)'s pure-Rust
+>   rule, ECDSA and secp256k1 key handling move to `k256`, and that Ed25519
+>   stays on curve25519-dalek. That port is built: ECDSA verification,
+>   signing (`SignCompact` included), every key and compact recovery run on
+>   `k256` by dcrd's algorithms, and libsecp256k1 and its C are out of the
+>   build. The owner asked for an oracle-backed differential fuzz soak of all
+>   three signature types, over named input classes and to floors the owner
+>   accepted, and for the port to merge only if its slowdown is small or
+>   optimized away, with further speed work if full validation is more than
+>   10% slower or a default sync moves beyond one session's run-to-run noise.
+>   ADR-0006's 2026-10-26 addendum reads these together as the bar to merge:
+>   the gate soak passed on the ported code, and syncs within those two
+>   bounds. The port merges only past it; a new ADR then supersedes ADR-0006.
 > - **D4** — [ADR-0007](adr/0007-json-emission-strategy.md), *Accepted*
 >   (ratified 2026-10-26 as shipped). Both halves were built but neither in
 >   the proposed shape: the emission layer uses no serde at all (a runtime Go

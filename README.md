@@ -230,9 +230,9 @@ work). Currently implemented:
   differentially tested against it across every operation
 - `dcroxide-dcrec` — all three Decred signature types with dcrd's exact
   acceptance rules and error identities: ECDSA-secp256k1 (type 0, over
-  libsecp256k1), Ed25519 (type 1, over curve25519-dalek with dcrd's
-  2017-agl verify semantics), and EC-Schnorr-DCRv0 (type 2, over k256 with
-  dcrd's RFC6979 nonce variant); every signing path differentially verified
+  k256), Ed25519 (type 1, over curve25519-dalek with dcrd's 2017-agl
+  verify semantics), and EC-Schnorr-DCRv0 (type 2, over k256 with dcrd's
+  RFC6979 nonce variant); every signing path differentially verified
   byte-for-byte against dcrd
 - `dcroxide-chaincfg` — all four networks' consensus parameters
   (mainnet/testnet3/simnet/regnet): genesis blocks reproducing dcrd's exact
