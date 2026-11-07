@@ -7,13 +7,39 @@
 //! `privkey || hash [|| extra [|| version]]` bytes (the hash is *not*
 //! reduced mod N first), and the `extra_iterations` parameter skips that
 //! many valid candidates from the DRBG stream rather than re-seeding.
+//!
+//! A candidate is tested in constant time, and the key buffer and the
+//! DRBG state, which hold the private key and derive the nonce, are wiped
+//! on return, as is each HMAC's state when it is dropped (the `zeroize`
+//! features of `hmac` and `sha2`, pinned below); dcrd wipes none of them.
 
-use hmac::{Hmac, KeyInit, Mac};
+use hmac::{EagerHash, Hmac, KeyInit, Mac};
+use k256::Scalar;
+use k256::elliptic_curve::PrimeField;
+use k256::elliptic_curve::subtle::Choice;
 use sha2::Sha256;
-
-use super::{GROUP_ORDER_BYTES, is_zero};
+use zeroize::Zeroizing;
 
 type HmacSha256 = Hmac<Sha256>;
+
+// What wipes each HMAC when it is dropped.  `hmac`'s core holds the two
+// SHA-2 states, keyed by K, and has no `Drop` of its own
+// (`hmac-0.13.0/src/block_api.rs:13-17`); each state wipes itself under
+// `sha2`'s `zeroize` feature (`sha2-0.11.1/src/block_api.rs:92-104`), and
+// the block buffer beside them, which the private key's bytes pass
+// through in steps D and F, under `digest`'s
+// (`block-buffer-0.12.1/src/lib.rs:433-442`), which `sha2`'s feature
+// turns on, and `hmac`'s as well.  So this does not compile without
+// `sha2`'s feature; the manifest enables `hmac`'s too, so that the
+// buffer's wipe does not rest on what `sha2`'s feature happens to
+// include.  Cargo unifies features, so only a build without
+// dcroxide-tlscrypto, which enables both as well, depends on this
+// crate's own.
+const _: () = {
+    fn wiped_on_drop<T: zeroize::ZeroizeOnDrop>() {}
+    let _ = wiped_on_drop::<<Sha256 as EagerHash>::Core>;
+    let _ = wiped_on_drop::<hmac::digest::block_api::Buffer<hmac::block_api::HmacCore<Sha256>>>;
+};
 
 /// HMAC-SHA256 of the concatenated message parts under `key`.
 fn hmac_sha256(key: &[u8], parts: &[&[u8]]) -> [u8; 32] {
@@ -44,7 +70,7 @@ pub fn nonce_rfc6979(
 ) -> [u8; 32] {
     // Assemble the HMAC key material: privkey(32) || hash(32) with dcrd's
     // truncate/left-pad handling, then the optional extra and version.
-    let mut key_buf = [0u8; 32 + 32 + 32 + 16];
+    let mut key_buf = Zeroizing::new([0u8; 32 + 32 + 32 + 16]);
     let priv_key = &priv_key[..priv_key.len().min(32)];
     let hash = &hash[..hash.len().min(32)];
 
@@ -79,32 +105,42 @@ pub fn nonce_rfc6979(
     // RFC 6979 HMAC-DRBG.
     //
     // Step B: V = 0x01 x 32.  Step C: K = 0x00 x 32.
-    let mut v = [0x01u8; 32];
-    let mut k = [0x00u8; 32];
+    let mut v = Zeroizing::new([0x01u8; 32]);
+    let mut k = Zeroizing::new([0x00u8; 32]);
 
     // Step D: K = HMAC_K(V || 0x00 || key).
-    k = hmac_sha256(&k, &[&v, &[0x00], key]);
+    *k = hmac_sha256(&*k, &[&*v, &[0x00], key]);
     // Step E: V = HMAC_K(V).
-    v = hmac_sha256(&k, &[&v]);
+    *v = hmac_sha256(&*k, &[&*v]);
     // Step F: K = HMAC_K(V || 0x01 || key).
-    k = hmac_sha256(&k, &[&v, &[0x01], key]);
+    *k = hmac_sha256(&*k, &[&*v, &[0x01], key]);
     // Step G: V = HMAC_K(V).
-    v = hmac_sha256(&k, &[&v]);
+    *v = hmac_sha256(&*k, &[&*v]);
 
     // Step H: draw candidates until one is in [1, N-1]; skip
     // `extra_iterations` valid candidates first.
     let mut generated: u32 = 0;
     loop {
-        v = hmac_sha256(&k, &[&v]);
+        *v = hmac_sha256(&*k, &[&*v]);
 
-        if v < GROUP_ORDER_BYTES && !is_zero(&v) {
+        // dcrd's `!overflow && !secret.IsZero()` (nonce.go), in constant
+        // time: `from_repr` compares with N in constant time, and the zero
+        // test runs on the value it selects.  The one branch is dcrd's, on
+        // a rejected candidate, at odds of about 2^-128.
+        let valid = bool::from(
+            Scalar::from_repr((*v).into())
+                .map(|candidate| !candidate.is_zero())
+                .unwrap_or(Choice::from(0)),
+        );
+        if valid {
             generated = generated.wrapping_add(1);
             if generated > extra_iterations {
-                return v;
+                // Copied out before `k`, `v` and `key_buf` are wiped.
+                return *v;
             }
         }
 
-        k = hmac_sha256(&k, &[&v, &[0x00]]);
-        v = hmac_sha256(&k, &[&v]);
+        *k = hmac_sha256(&*k, &[&*v, &[0x00]]);
+        *v = hmac_sha256(&*k, &[&*v]);
     }
 }

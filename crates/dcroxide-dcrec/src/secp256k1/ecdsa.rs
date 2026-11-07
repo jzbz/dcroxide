@@ -3,7 +3,7 @@
 //! `dcrec/secp256k1/v4/ecdsa`: DER parsing with dcrd's exact acceptance
 //! rules and error identities, low-S DER serialization, verification that
 //! accepts high-S signatures (as dcrd does), and RFC6979 deterministic
-//! signing.
+//! signing, plain and compact.
 
 use alloc::vec::Vec;
 use core::fmt;
@@ -462,78 +462,149 @@ pub fn recover_compact(signature: &[u8], hash: &[u8; 32]) -> Result<(PublicKey, 
     Ok((PublicKey::from_inner(inner), was_compressed))
 }
 
-/// Produce a deterministic (RFC6979) low-S signature for the 32-byte hash,
-/// matching dcrd `ecdsa.Sign` byte-for-byte (verified differentially).
+/// dcrd's `sign` (ecdsa/signature.go:554-663): steps 2 to 6 of the
+/// signature with the private key `d`, the nonce `k` in [1, N-1] and the
+/// hash reduced mod N, `e`.  It returns the low-S signature with its
+/// public key recovery code (bit 0: R.y is odd; bit 1: R.x is at or above
+/// N), or `None` when r or s is zero, for the caller to retry with the
+/// next nonce.
 ///
-/// libsecp256k1 reduces the hash mod N before it derives the RFC6979
-/// nonce, where dcrd's `NonceRFC6979` takes the hash as it is.  The two
-/// agree for every hash below N, which libsecp256k1 signs; a hash at or
-/// above N (odds of about 2^-128 for a real digest) goes through dcrd's
-/// own `signRFC6979` instead, so the nonce -- and the signature -- are
-/// dcrd's.
-pub fn sign(priv_key: &PrivateKey, hash: &[u8; 32]) -> Signature {
-    if *hash >= GROUP_ORDER_BYTES {
-        return sign_rfc6979_unreduced_hash(priv_key, hash);
-    }
-    let msg = libsecp256k1::Message::from_digest(*hash);
-    let sig = libsecp256k1::ecdsa::sign(msg, priv_key.inner());
-    let compact = sig.serialize_compact();
-    let mut r = [0u8; 32];
-    let mut s = [0u8; 32];
-    r.copy_from_slice(&compact[..32]);
-    s.copy_from_slice(&compact[32..]);
-    Signature { r, s }
-}
-
-/// dcrd's `signRFC6979` and `sign` (ecdsa/signature.go) for a hash at or
-/// above the group order: the RFC6979 nonce is derived from the raw hash,
-/// `r = (kG).x mod N` and `s = k^-1(e + d*r) mod N` with `e` the hash mod
-/// N, retrying with the next nonce when either is zero, and `s` negated
-/// when above half the order.
+/// `k` and `d` are secret, so this runs in constant time where dcrd uses
+/// its variable-time `ScalarBaseMultNonConst` and `InverseValNonConst`:
+/// k256's `GENERATOR * k`, `invert` and `to_affine`, the same values.
+/// dcrd branches on whether s is above half the order; the negation and
+/// the recovery code's oddness flip here are selected, not branched on,
+/// with the same result.  The only branches left are dcrd's retries on a
+/// zero r or s.
 // The flagged operators are k256 scalar arithmetic, modular by definition.
 #[allow(clippy::arithmetic_side_effects)]
-fn sign_rfc6979_unreduced_hash(priv_key: &PrivateKey, hash: &[u8; 32]) -> Signature {
+fn sign_with_nonce(
+    d: &k256::Scalar,
+    k: &k256::Scalar,
+    e: &k256::Scalar,
+) -> Option<(Signature, u8)> {
     use k256::elliptic_curve::PrimeField;
     use k256::elliptic_curve::ops::Reduce;
     use k256::elliptic_curve::point::AffineCoordinates;
     use k256::elliptic_curve::scalar::IsHigh;
+    use k256::elliptic_curve::subtle::{Choice, ConditionallySelectable};
     use k256::{FieldBytes, ProjectivePoint, Scalar};
+    use zeroize::Zeroize;
 
-    let priv_bytes = priv_key.inner().to_secret_bytes();
-    let d = Scalar::from_repr(priv_bytes.into()).expect("private key is a valid scalar");
+    // Step 2: kG, in affine coordinates.
+    let kg = (ProjectivePoint::GENERATOR * *k).to_affine();
 
-    // Step 4: e = H(m) mod N (dcrd `e.SetByteSlice(hash)`).
+    // Step 3: r = kG.x mod N (dcrd `fieldToModNScalar`), retrying when
+    // zero; overflow records whether kG.x was at or above N.
+    let xb = kg.x();
+    let overflow: Choice = Scalar::from_repr(xb).is_none();
+    let r = <Scalar as Reduce<FieldBytes>>::reduce(&xb);
+    if bool::from(r.is_zero()) {
+        return None;
+    }
+
+    // The public key recovery code: the overflow bit, then R.y's oddness.
+    let mut code = u8::conditional_select(&0, &2, overflow) | kg.y_is_odd().unwrap_u8();
+
+    // Step 4: e = H(m) mod N is the caller's, computed once per hash.
+
+    // Step 5: s = k^-1(e + dr) mod N, retrying when zero.
+    let mut k_inv = Option::<Scalar>::from(k.invert()).expect("nonce is nonzero");
+    let mut s = (*d * r + *e) * k_inv;
+    k_inv.zeroize();
+    if bool::from(s.is_zero()) {
+        return None;
+    }
+
+    // Modification B: s = -s when above N/2, which flips R.y's oddness
+    // (the point -k*G).
+    let high = s.is_high();
+    s = Scalar::conditional_select(&s, &-s, high);
+    code ^= high.unwrap_u8();
+
+    // Step 6.
+    Some((
+        Signature {
+            r: r.to_repr().into(),
+            s: s.to_repr().into(),
+        },
+        code,
+    ))
+}
+
+/// dcrd's `signRFC6979` (ecdsa/signature.go:668-720): the RFC6979 nonce
+/// from the private key and the raw hash, never reduced, through
+/// [`sign_with_nonce`], retrying with the next nonce while it returns
+/// `None`.  The key copy, the private scalar and each nonce are wiped, as
+/// dcrd zeroes its key bytes and each nonce.
+fn sign_rfc6979(priv_key: &PrivateKey, hash: &[u8; 32]) -> (Signature, u8) {
+    use k256::elliptic_curve::PrimeField;
+    use k256::elliptic_curve::ops::Reduce;
+    use k256::{FieldBytes, Scalar};
+    use zeroize::{Zeroize, Zeroizing};
+
+    let priv_bytes = priv_key.secret_bytes();
+    let mut d = Scalar::from_repr((*priv_bytes).into()).expect("private key is a valid scalar");
+
+    // Step 4: e = H(m) mod N (dcrd `e.SetByteSlice(hash)`), the same for
+    // every attempt.
     let e = <Scalar as Reduce<FieldBytes>>::reduce(&(*hash).into());
 
     let mut iteration = 0u32;
     loop {
         // Step 1: the deterministic nonce in [1, N-1].
-        let nonce = nonce_rfc6979(&priv_bytes, hash, None, None, iteration);
+        let nonce = Zeroizing::new(nonce_rfc6979(&priv_bytes[..], hash, None, None, iteration));
         iteration = iteration.wrapping_add(1);
-        let k = Scalar::from_repr(nonce.into()).expect("the nonce is a valid scalar");
+        let mut k = Scalar::from_repr((*nonce).into()).expect("the nonce is a valid scalar");
 
-        // Steps 2-3: r = kG.x mod N, retrying when zero.
-        let kg = (ProjectivePoint::GENERATOR * k).to_affine();
-        let r = <Scalar as Reduce<FieldBytes>>::reduce(&kg.x());
-        if bool::from(r.is_zero()) {
-            continue;
+        // Steps 2 to 6.
+        let attempt = sign_with_nonce(&d, &k, &e);
+        k.zeroize();
+        if let Some(result) = attempt {
+            d.zeroize();
+            return result;
         }
-
-        // Step 5: s = k^-1(e + dr) mod N, retrying when zero, then the
-        // low-S negation.
-        let k_inv = Option::<Scalar>::from(k.invert()).expect("the nonce is nonzero");
-        let mut s = (d * r + e) * k_inv;
-        if bool::from(s.is_zero()) {
-            continue;
-        }
-        if bool::from(s.is_high()) {
-            s = -s;
-        }
-        return Signature {
-            r: r.to_repr().into(),
-            s: s.to_repr().into(),
-        };
     }
+}
+
+/// Produce a deterministic (RFC6979) low-S signature for the 32-byte hash,
+/// dcrd's `ecdsa.Sign` (ecdsa/signature.go:727-730), byte for byte.
+///
+/// Every hash, below or above the group order N, is signed on k256
+/// through a port of dcrd's `signRFC6979`, which derives the nonce from
+/// the hash as it is, never reduced mod N.
+pub fn sign(priv_key: &PrivateKey, hash: &[u8; 32]) -> Signature {
+    sign_rfc6979(priv_key, hash).0
+}
+
+/// Produce a compact recoverable signature for the 32-byte hash, dcrd's
+/// `ecdsa.SignCompact` (ecdsa/signature.go:771-786), byte for byte.
+///
+/// The format is `<1-byte code><32-byte R><32-byte S>`, where the code is
+/// 27 ([`COMPACT_SIG_MAGIC_OFFSET`]) plus the public key recovery code,
+/// plus 4 ([`COMPACT_SIG_COMP_PUB_KEY`]) when `is_compressed_key` says the
+/// signer's key is serialized compressed.  [`recover_compact`] returns
+/// that key and the flag.  R and S are the signature [`sign`] makes.
+// The code is at most 27 + 3 + 4 = 34.
+#[allow(clippy::arithmetic_side_effects)]
+pub fn sign_compact(
+    priv_key: &PrivateKey,
+    hash: &[u8; 32],
+    is_compressed_key: bool,
+) -> [u8; COMPACT_SIG_SIZE] {
+    let (sig, code) = sign_rfc6979(priv_key, hash);
+    let mut b = [0u8; COMPACT_SIG_SIZE];
+    // `+`, as dcrd adds: 27 is 0b11011, so an OR would lose bits.
+    b[0] = COMPACT_SIG_MAGIC_OFFSET
+        + code
+        + if is_compressed_key {
+            COMPACT_SIG_COMP_PUB_KEY
+        } else {
+            0
+        };
+    b[1..33].copy_from_slice(&sig.r);
+    b[33..65].copy_from_slice(&sig.s);
+    b
 }
 
 #[cfg(test)]
@@ -796,5 +867,78 @@ mod tests {
             zero_s.verify_detailed(&hash, &pub_key),
             VerifyStep::Step1Zero
         );
+    }
+
+    /// dcrd's TestSignAndVerify rows that sign with an explicit nonce
+    /// rather than the RFC6979 one (ecdsa/signature_test.go): `sign_with_nonce`
+    /// returns each row's (r, s) and recovery code.  The RFC6979 rows check
+    /// the code through `sign_compact` (`tests/ecdsa_vectors.rs`).
+    #[test]
+    fn sign_with_nonce_returns_dcrds_code() {
+        use k256::elliptic_curve::PrimeField;
+        use k256::elliptic_curve::ops::Reduce;
+        use k256::{FieldBytes, Scalar};
+
+        /// A big-endian value left-padded to 32 bytes (one row's S has 31).
+        fn be32(hex: &str) -> [u8; 32] {
+            let bytes = unhex(hex);
+            let mut out = [0u8; 32];
+            out[32 - bytes.len()..].copy_from_slice(&bytes);
+            out
+        }
+        fn scalar(hex: &str) -> Scalar {
+            Scalar::from_repr(be32(hex).into()).expect("below the group order")
+        }
+
+        // (name, key, nonce, hash, r, s, code); code bit 0 is R.y's
+        // oddness (dcrd `pubKeyRecoveryCodeOddnessBit`).
+        let cases = [
+            (
+                "key 0x1, blake256(0x01020304), random nonce",
+                "0000000000000000000000000000000000000000000000000000000000000001",
+                "a6df66500afeb7711d4c8e2220960855d940a5ed57260d2c98fbf6066cca283e",
+                "c301ba9de5d6053caad9f5eb46523f007702add2c62fa39de03146a36b8026b7",
+                "b073759a96a835b09b79e7b93c37fdbe48fb82b000c4a0e1404ba5d1fbc15d0a",
+                "7e34928a3e3832ec21e7711644d9388f7deb6340ead661d7056b0665974b87f3",
+                1u8,
+            ),
+            (
+                "key 0x2, blake256(0x01020304), random nonce",
+                "0000000000000000000000000000000000000000000000000000000000000002",
+                "679a6d36e7fe6c02d7668af86d78186e8f9ccc04371ac1c8c37939d1f5cae07a",
+                "c301ba9de5d6053caad9f5eb46523f007702add2c62fa39de03146a36b8026b7",
+                "4a090d82f48ca12d9e7aa24b5dcc187ee0db2920496f671d63e86036aaa7997e",
+                "261ffe8ba45007fc5fbbba6b4c6ed41beafb48b09fa8af1d6a3fbc6ccefbad",
+                0,
+            ),
+            (
+                "key 0x1, blake256(0x0102030405), random nonce",
+                "0000000000000000000000000000000000000000000000000000000000000001",
+                "65f880c892fdb6e7f74f76b18c7c942cfd037ef9cf97c39c36e08bbc36b41616",
+                "dc063eba3c8d52a159e725c1a161506f6cb6b53478ad5ef3f08d534efa871d9f",
+                "72e5666f4e9d1099447b825cf737ee32112f17a67e2ca7017ae098da31dfbb8b",
+                "1a7326da661a62f66358dcf53300afdc8e8407939dae1192b5b0899b0254311b",
+                1,
+            ),
+            (
+                "key 0x2, blake256(0x0102030405), random nonce",
+                "0000000000000000000000000000000000000000000000000000000000000002",
+                "026ece4cfb704733dd5eef7898e44c33bd5a0d749eb043f48705e40fa9e9afa0",
+                "dc063eba3c8d52a159e725c1a161506f6cb6b53478ad5ef3f08d534efa871d9f",
+                "3c4c5a2f217ea758113fd4e89eb756314dfad101a300f48e5bd764d3b6e0f8bf",
+                "6513e82442f133cb892514926ed9158328ead488ff1b027a31827603a65009df",
+                1,
+            ),
+        ];
+
+        for (name, key, nonce, hash, r, s, code) in cases {
+            let e = <Scalar as Reduce<FieldBytes>>::reduce(&be32(hash).into());
+            let want = Signature::new(be32(r), be32(s)).expect("below the group order");
+            assert_eq!(
+                sign_with_nonce(&scalar(key), &scalar(nonce), &e),
+                Some((want, code)),
+                "{name}"
+            );
+        }
     }
 }

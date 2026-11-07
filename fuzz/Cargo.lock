@@ -474,6 +474,7 @@ dependencies = [
  "k256",
  "secp256k1",
  "sha2",
+ "zeroize",
 ]
 
 [[package]]

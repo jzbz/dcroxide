@@ -9,7 +9,7 @@
 //! dcrec's later API is reached by changing this file alone, which changes
 //! no input, no answer as compared and no digest.  ECDSA verification
 //! reports dcrd's deciding step (`verify_detailed`, as the answer's
-//! detail); a compact signer and typed recovery errors are still to come.
+//! detail); typed recovery errors are still to come.
 //!
 //! A request whose layout this cannot decode is a bug in a generator, so it
 //! panics, and the run records the case as `ours-panicked`.
@@ -158,13 +158,8 @@ fn key_and_hash(cmd: Cmd, data: &[u8]) -> (PrivateKey, [u8; 32]) {
     (key, hash)
 }
 
-/// `ecdsa_sign_compact`: compressed(1) ‖ key ‖ hash.  dcrec has no compact
-/// signer yet, so the answer is built from what it has: `sign`'s (r, s)
-/// under the one header 27 + c + 4·compressed, c in 0..=3, for which
-/// `recover_compact` returns the signer's key and the flag.  When no
-/// header does, dcroxide cannot make the signature, and the answer is a
-/// rejection, which disagrees with dcrd's signature.  Once dcrec signs
-/// compactly, this calls its signer instead.
+/// `ecdsa_sign_compact`: compressed(1) ‖ key ‖ hash, answered by dcrec's
+/// `sign_compact`.
 fn ecdsa_sign_compact(data: &[u8]) -> Answer {
     let cmd = Cmd::EcdsaSignCompact;
     let (flag, rest) = split_at_checked(cmd, data, 1);
@@ -174,27 +169,7 @@ fn ecdsa_sign_compact(data: &[u8]) -> Answer {
         other => panic!("{}: compressed flag {other}", cmd.name()),
     };
     let (key, hash) = key_and_hash(cmd, rest);
-    let sig = ecdsa::sign(&key, &hash);
-    let signer = key.public_key();
-    let first = ecdsa::COMPACT_SIG_MAGIC_OFFSET.saturating_add(if compressed {
-        ecdsa::COMPACT_SIG_COMP_PUB_KEY
-    } else {
-        0
-    });
-    let mut compact = Vec::with_capacity(ecdsa::COMPACT_SIG_SIZE);
-    compact.push(first);
-    compact.extend_from_slice(sig.r_bytes());
-    compact.extend_from_slice(sig.s_bytes());
-    for code in 0..=3u8 {
-        compact[0] = first.saturating_add(code);
-        if ecdsa::recover_compact(&compact, &hash) == Ok((signer, compressed)) {
-            return value(compact);
-        }
-    }
-    Answer::Reject {
-        kind: Kind::Unavailable,
-        text: Some("no recovery header recovers the signer's key".to_owned()),
-    }
+    value(ecdsa::sign_compact(&key, &hash, compressed).to_vec())
 }
 
 /// An ECDSA or Schnorr verify request's inputs as dcroxide parsed them,

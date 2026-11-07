@@ -4,6 +4,8 @@
 
 use core::fmt;
 
+use zeroize::Zeroizing;
+
 pub mod ecdsa;
 pub mod nonce;
 pub mod schnorr;
@@ -301,6 +303,12 @@ impl PrivateKey {
 
     pub(crate) fn inner(&self) -> &libsecp256k1::SecretKey {
         &self.inner
+    }
+
+    /// The key's 32 big-endian bytes, wiped when dropped (dcrd's signers
+    /// copy the key out with `PutBytes` and zero the copy when done).
+    pub(crate) fn secret_bytes(&self) -> Zeroizing<[u8; 32]> {
+        Zeroizing::new(self.inner.to_secret_bytes())
     }
 }
 

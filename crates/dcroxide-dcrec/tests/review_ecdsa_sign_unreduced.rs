@@ -1,10 +1,13 @@
 // SPDX-License-Identifier: ISC
 //! `ecdsa::sign` over a hash at or above the group order N matches dcrd's
-//! `ecdsa.Sign` byte for byte.  libsecp256k1 reduces the hash mod N before
-//! deriving its RFC6979 nonce and dcrd's `NonceRFC6979` does not, so for
-//! those hashes the two picked different nonces and returned different
-//! (both valid) signatures.  A random digest lands there with odds of
-//! about 2^-128, which is why the random-hash differential never saw it.
+//! `ecdsa.Sign` byte for byte.  The test dates from when libsecp256k1
+//! signed: it reduced the hash mod N before deriving its RFC6979 nonce,
+//! where dcrd's `NonceRFC6979` takes the hash as it is, so for these
+//! hashes the two picked different nonces and returned different (both
+//! valid) signatures.  A random digest lands there with odds of about
+//! 2^-128, which is why the random-hash differential never saw it.  dcrec
+//! now signs every hash through dcrd's algorithm, and these hashes stay
+//! the ones a nonce taken from the reduced hash would get wrong.
 
 use dcroxide_dcrec::secp256k1::ecdsa::sign;
 use dcroxide_dcrec::secp256k1::{GROUP_ORDER_BYTES, PrivateKey};
@@ -16,7 +19,8 @@ fn key(hex_key: &str) -> PrivateKey {
 }
 
 /// dcrd's `ecdsa.Sign` for key 1 over the all-ones hash (dcrec/secp256k1
-/// at the parity pin), which libsecp256k1's own nonce does not produce.
+/// at the parity pin), which libsecp256k1, when it signed, did not
+/// produce: its nonce came from the reduced hash.
 #[test]
 fn a_hash_above_the_order_signs_as_dcrd_does() {
     const DCRD: &str = "304402203f8fe493cf305a7f02b2d2c060ba66a8f7bd13a7a64d5200c0655ad069bd85b5\
@@ -26,16 +30,6 @@ fn a_hash_above_the_order_signs_as_dcrd_does() {
     let sig = sign(&priv_key, &hash);
     assert_eq!(hex(&sig.serialize()), DCRD);
     assert!(sig.verify(&hash, &priv_key.public_key()));
-
-    // libsecp256k1 signing the same hash reduces it first.
-    let secret = libsecp256k1::SecretKey::from_secret_bytes(
-        unhex("0000000000000000000000000000000000000000000000000000000000000001")
-            .try_into()
-            .expect("32 bytes"),
-    )
-    .expect("valid key");
-    let theirs = libsecp256k1::ecdsa::sign(libsecp256k1::Message::from_digest(hash), &secret);
-    assert_ne!(hex(&theirs.serialize_der()), DCRD);
 }
 
 #[test]

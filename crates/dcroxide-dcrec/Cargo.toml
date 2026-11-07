@@ -37,8 +37,14 @@ libsecp256k1 = { package = "secp256k1", version = "0.33", default-features = fal
 # would reduce before deriving its RFC6979 nonce (`ecdsa::sign`).
 k256 = { version = "0.14", default-features = false, features = ["arithmetic"] }
 # RFC6979 nonce generation (dcrd's exact variant, ported in this crate).
-hmac = { version = "0.13", default-features = false }
-sha2 = { version = "0.11", default-features = false }
+# `zeroize` on both: each HMAC the nonce's DRBG runs holds two SHA-2
+# states keyed by its K and a block buffer the private key's bytes pass
+# through, which `sha2`'s feature wipes on drop, the buffer through
+# `digest`'s, which `hmac`'s turns on as well (`src/secp256k1/nonce.rs`).
+hmac = { version = "0.13", default-features = false, features = ["zeroize"] }
+sha2 = { version = "0.11", default-features = false, features = ["zeroize"] }
+# Wipes the temporary private key copies signing makes, as dcrd zeroes its own.
+zeroize = { version = "1.9", default-features = false }
 # Ed25519 group/scalar primitives; dcrd's exact (2017-agl) acceptance
 # behavior is implemented in our edwards module on top of these.
 curve25519-dalek = "5"

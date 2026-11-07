@@ -12,7 +12,7 @@
 use dcroxide_crypto::blake256;
 use dcroxide_dcrec::secp256k1::ecdsa::{
     COMPACT_SIG_COMP_PUB_KEY, COMPACT_SIG_MAGIC_OFFSET, Signature, VerifyStep, recover_compact,
-    sign,
+    sign, sign_compact,
 };
 use dcroxide_dcrec::secp256k1::nonce::nonce_rfc6979;
 use dcroxide_dcrec::secp256k1::{GROUP_ORDER_BYTES, PrivateKey};
@@ -309,11 +309,13 @@ fn compact_sig(test: &SignTest, compressed: bool) -> Vec<u8> {
 
 /// Ported from dcrd's TestSignAndVerify (ecdsa/signature_test.go).  dcrd
 /// signs every row with the row's own nonce through its unexported
-/// `sign`, which has no public counterpart here, so every row's signature
-/// must verify, and its recovery code, which dcrd compares with the one
-/// `sign` returns, must recover the signing key.  `sign` mirrors dcrd's
-/// exported `Sign`, which derives the RFC6979 nonce, so the RFC6979 rows
-/// also check the signature it produces.
+/// `sign`, whose port here is private too; the crate's unit test
+/// `sign_with_nonce_returns_dcrds_code` signs the explicit-nonce rows
+/// through it.  Here every row's signature must verify, and its recovery
+/// code, which dcrd compares with the one `sign` returns, must recover
+/// the signing key.  `sign` mirrors dcrd's exported `Sign`, which derives
+/// the RFC6979 nonce, so the RFC6979 rows also check the signature it
+/// produces.
 ///
 /// Each verification must also be decided where the recovery code says:
 /// at step 8, or at step 10 when the code's overflow bit is set (dcrd's
@@ -452,11 +454,10 @@ fn verify_failure_vectors() {
 }
 
 /// Ported from dcrd's TestSignAndRecoverCompact (ecdsa/signature_test.go),
-/// over the RFC6979 rows of `signTests` and both key serializations.
-/// dcrec has no `SignCompact` yet, so the compact signature is the one
-/// the row describes: its R and S must be what `sign` produces (dcrd's
-/// `SignCompact` and `Sign` both sign through `signRFC6979`), and
-/// recovering it must return the signing key and the compressed flag.
+/// over the RFC6979 rows of `signTests` and both key serializations:
+/// `sign_compact` must produce the row's compact signature byte for byte,
+/// header and recovery code included, and recovering it must return the
+/// signing key and the compressed flag.
 #[test]
 fn sign_and_recover_compact_vectors() {
     for test in sign_tests().iter().filter(|test| test.rfc6979) {
@@ -464,13 +465,12 @@ fn sign_and_recover_compact_vectors() {
         let pub_key = priv_key.public_key();
         let hash = arr32(test.hash);
 
-        let sig = sign(&priv_key, &hash);
         for compressed in [true, false] {
             let want_sig = compact_sig(test, compressed);
             assert_eq!(
-                [*sig.r_bytes(), *sig.s_bytes()].concat(),
-                want_sig[1..],
-                "{}: unexpected signature",
+                hex(&sign_compact(&priv_key, &hash, compressed)),
+                hex(&want_sig),
+                "{}: unexpected signature, compressed {compressed}",
                 test.name
             );
             assert_eq!(
