@@ -14,7 +14,8 @@
 //! and point arithmetic, and Ed25519 on `curve25519-dalek`'s.  The
 //! variable-time a*G + b*P behind ECDSA verification and recovery and
 //! Schnorr verification is this crate's own loop over k256's public point
-//! operations, with static tables of the generator built on first use.
+//! operations, with static tables of the generator built on first use
+//! (ADR-0006's 2026-11-08 addendum).
 //! Everything dcrd-behavior-specific — DER signature acceptance, public
 //! key format acceptance, low-S serialization, the order of compact
 //! recovery's checks, error identities — is implemented here and

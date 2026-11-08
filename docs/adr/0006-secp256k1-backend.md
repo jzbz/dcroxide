@@ -9,7 +9,8 @@
   2026-10-26 (addendum: ECDSA and key handling to move to `k256`; a superseding
   ADR pending; second addendum: how the soak is run and compared), 2026-10-27
   (addendum: the oracle-backed fuzz targets and the nightly soak), 2026-10-30
-  (addendum: a fix to the soak's model of dcrd between the soaks)
+  (addendum: a fix to the soak's model of dcrd between the soaks), 2026-11-08
+  (addendum: stage 2a, the static-table multiply)
 
 ## Context
 
@@ -541,3 +542,99 @@ the gate soak's comparison with the baseline uses only that one, while
 addendum. `sigsoak compare` does not enforce the choice, but the kept output's
 verdict line (condition 3) names the flag used. No baseline soak has been run,
 so the baseline's record will hold the list.
+
+## Addendum, 2026-11-08 — stage 2a: dcrec's own multiply on static tables
+
+On 2026-11-08 the project owner decided to integrate stage 2a into
+`dcroxide-dcrec` on the port's branch. ECDSA verification's u1*G + u2*Q (step
+5), compact recovery's u1*G + u2*X (step 9) and EC-Schnorr-DCRv0 verification's
+s*G + e*Q (step 7) are now computed by the crate's own variable-time loop on
+static tables of the generator, in place of `k256`'s
+`mul_by_generator_and_mul_add_vartime`. The same decision approved route c, in
+which dcroxide owns its variable-time secp256k1 arithmetic in measured
+increments, each soaked against dcrd; that work gets its own record, the next
+free number, when it starts. Each sum is one group element, so the change is to
+how it is formed, not to any answer.
+
+**What the crate now owns.** One private module,
+`crates/dcroxide-dcrec/src/secp256k1/ecmult.rs`, with one crate-private entry
+point taking `k256`'s arguments. The second scalar is split by GLV into two
+halves below 2^128 in magnitude, the same arithmetic as `k256`'s
+`decompose_scalar`, which `k256` keeps `pub(super)`
+(`src/arithmetic/mul/glv.rs:149-156`), with its quotient taken from
+crypto-bigint's `widening_mul` in place of `k256`'s `pub(crate)`
+`mul_shift_vartime`. Those halves run over a per-call table of P, 3P, ..., 15P
+and its image under `endomorphism()`. The first scalar is split by bits at
+2^128, and its halves run over static affine tables of the odd multiples of G
+and of 2^128*G, 1024 points each (a window of 12), built once on first use. The
+wNAF recoding, libsecp256k1's `ecmult_wnaf`, and the interleaved (Straus) loop
+are the crate's. What stays `k256`'s is the field, scalar and point arithmetic,
+`endomorphism()`, inversion and normalization: every addition and doubling is
+still one of its complete formulas, so the doubling and infinity cases need no
+branch, as before, and the doubling and infinity witnesses still guard them.
+secp256k1's cofactor is 1, so every point that can reach the loop, an attacker's
+key or the point recovery decompresses from an attacker's r, lies in the group
+of order N, where `endomorphism()` is multiplication by lambda, as dcrd's
+`ScalarMultNonConst` also relies on. Verification's steps 6 to 10, recovery's
+checks before and after its multiply, and Schnorr verification's steps 8 to 10
+are untouched, and signing keeps the constant-time `GENERATOR * k`.
+
+**Why not the route the 2026-10-26 addendum named.** It named static tables
+built on the public `wnaf` crate. That crate keeps its tables and its digits
+private, holds only projective (`Group`) points, and gives every term of a
+multi-scalar product one point type and one window (`wnaf` 0.14.1
+`src/base.rs:33-35`, `:57-63`, `src/scalar.rs:20-21`). It cannot pair a wide
+static table of G, in affine form, with a narrow per-call table of P, and with
+it a caller cannot read the digits to run a loop of its own. The best it allows
+is static projective tables of G at the per-call window, which saves only
+`k256`'s two per-call builds of G's tables.
+
+**Table storage.** The tables, 176 KiB on 64-bit targets in release builds,
+sit in a `once_cell` `race::OnceBox`, built on first use and never freed, as
+dcrd loads its own base-point table lazily behind a `sync.Once` so that
+importers that never multiply pay no memory.
+`once_cell` 1.21.4 was already in both locks, so no package is added;
+`dcroxide-dcrec` takes it without default features, with `alloc`, and so without
+`std` when built alone (the dependency ledger's `once_cell` row). Under a race
+more than one thread may build the tables, and every caller gets the one that
+wins; their content is deterministic. `std`'s `OnceLock` is not available to a
+no_std crate, a hand-rolled atomic pointer would need `unsafe`, which the
+workspace forbids, and a caller-held context would change the signature of every
+verifying function for every dependent.
+
+**The guard.** `k256`'s proof, after libsecp256k1's, puts both folded GLV halves
+below 2^128 for every scalar. The loop checks the bound anyway, before it
+touches the tables, and should a half ever reach 2^128 it returns `k256`'s own
+`mul_by_generator_and_mul_add_vartime`, the code before this addendum. The
+answer is therefore the same as before on every input, proven or not; parity
+with dcrd in that impossible case rests on the proof, as it did before, since
+`k256` takes each half's low 128 bits unchecked
+(`src/arithmetic/mul/glv.rs:176-182`) and no `k256` entry point is free of the
+bound. Debug builds also assert it. An assertion in release would be an outage
+under `panic = "abort"`. A broken split would only send calls to the fallback,
+where every differential test would still pass, so the module's unit tests call
+the fast path directly and require it in every profile, and check the split
+against the same steps computed in unbounded integers. The module indexes no
+limbs, so it is the same code on 32- and 64-bit targets, and nothing in it can
+panic on any input.
+
+**Evidence.** Before integration an out-of-tree prototype of the same loop was
+reviewed, and its verifications, 1,462,459 cases, were compared with dcrd's
+`ecdsa.Signature.Verify` at the parity pin, with no difference. In the tree, the
+module's unit tests hold every table entry to `k256`'s scalar multiplication,
+the GLV constants to `k256`'s endomorphism and to the lattice they come from,
+and the multiply to `k256`'s combined pass, to its constant-time `lincomb` and
+to a GLV-free double-and-add, over edge scalars and random cases in the shapes
+of all three call sites; an integration test races the tables' first use from
+sixteen threads, each starting at one of the three call sites in turn. dcrd's
+vectors, the witness lines, the oracle differentials and the fixed-seed replay
+of the soak against the baseline soak's record all run through the new loop,
+and the replay compares equal.
+
+**What is not measured here.** No timing is in the tree, and none of this
+addendum rests on one. The measurement is the rerun of the microbenchmark and
+the sync comparison on the project owner's go, recorded in the bench ledger
+then, with the merge bar of the 2026-10-26 addendum unchanged. The dated text
+above, the 2026-07-26 addendum's note on Schnorr verification and the 2026-10-26
+addendum's account of the speed measurement and of stage 2, keeps its words;
+this addendum supersedes them where they describe how the sum is computed.
