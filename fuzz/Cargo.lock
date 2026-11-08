@@ -472,6 +472,7 @@ dependencies = [
  "dcroxide-crypto",
  "hmac",
  "k256",
+ "once_cell",
  "sha2",
  "zeroize",
 ]

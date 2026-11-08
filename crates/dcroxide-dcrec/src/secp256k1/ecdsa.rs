@@ -244,7 +244,7 @@ impl Signature {
     pub fn verify_detailed(&self, hash: &[u8; 32], pub_key: &PublicKey) -> VerifyStep {
         use k256::elliptic_curve::PrimeField;
         use k256::elliptic_curve::group::Group;
-        use k256::elliptic_curve::ops::{MulByGeneratorVartime, Reduce};
+        use k256::elliptic_curve::ops::Reduce;
         use k256::elliptic_curve::point::{AffineCoordinates, BatchNormalize};
         use k256::{FieldBytes, ProjectivePoint, Scalar};
 
@@ -269,17 +269,15 @@ impl Signature {
         let u1 = e * w;
         let u2 = r * w;
 
-        // Step 5: X = u1 * G + u2 * Q, as one variable-time GLV/wNAF pass
-        // over both scalars.  dcrd's `AddNonConst` doubles when its two
-        // operands are equal; every k256 addition is a complete formula,
-        // which needs no such branch.  A zero u1 (a hash that is a multiple
-        // of N) contributes the identity, as dcrd's
-        // `ScalarBaseMultNonConst` of zero does.
-        let big_x = ProjectivePoint::mul_by_generator_and_mul_add_vartime(
-            &u1,
-            &u2,
-            &pub_key.as_k256_point(),
-        );
+        // Step 5: X = u1 * G + u2 * Q, as one variable-time pass of this
+        // crate's interleaved wNAF loop (`ecmult`): u2 GLV-split over Q and
+        // lambda*Q, u1 split at bit 128 over static affine tables of G and
+        // 2^128*G.  dcrd's `AddNonConst` doubles when its two operands are
+        // equal; every addition and doubling is one of k256's complete
+        // formulas, which need no such branch.  A zero u1 (a hash that is a
+        // multiple of N) contributes nothing, as dcrd's
+        // `ScalarBaseMultNonConst` of zero gives the identity.
+        let big_x = super::ecmult::mul_g_add_vartime(&u1, &u2, &pub_key.as_k256_point());
 
         // Step 6: fail if X is the point at infinity.  This comes before
         // normalizing, which maps the identity to an x of zero and would
@@ -467,7 +465,7 @@ pub const COMPACT_SIG_COMP_PUB_KEY: u8 = 4;
 pub fn recover_compact(signature: &[u8], hash: &[u8; 32]) -> Result<(PublicKey, bool), Error> {
     use k256::elliptic_curve::PrimeField;
     use k256::elliptic_curve::group::Group;
-    use k256::elliptic_curve::ops::{MulByGeneratorVartime, Reduce};
+    use k256::elliptic_curve::ops::Reduce;
     use k256::elliptic_curve::point::{BatchNormalize, DecompressPoint};
     use k256::elliptic_curve::subtle::Choice;
     use k256::{AffinePoint, FieldBytes, ProjectivePoint, Scalar};
@@ -534,14 +532,11 @@ pub fn recover_compact(signature: &[u8], hash: &[u8; 32]) -> Result<(PublicKey, 
     let u1 = -(e * w);
     let u2 = s * w;
 
-    // Step 9: Q = u1 * G + u2 * X, as one variable-time GLV/wNAF pass.
-    // dcrd's `AddNonConst` doubles when its operands are equal; k256's
-    // complete additions need no such branch, as in verification.
-    let q = ProjectivePoint::mul_by_generator_and_mul_add_vartime(
-        &u1,
-        &u2,
-        &ProjectivePoint::from(big_x),
-    );
+    // Step 9: Q = u1 * G + u2 * X, the same variable-time multiply as
+    // verification's step 5 (`ecmult`).  dcrd's `AddNonConst` doubles when
+    // its operands are equal; k256's complete additions need no such
+    // branch, as in verification.
+    let q = super::ecmult::mul_g_add_vartime(&u1, &u2, &ProjectivePoint::from(big_x));
 
     // Step 10: fail if Q is the point at infinity, dcrd's second use of
     // `ErrPointNotOnCurve`, tested before Q is normalized.

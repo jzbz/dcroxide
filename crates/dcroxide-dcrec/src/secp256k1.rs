@@ -11,6 +11,7 @@ use k256::{AffinePoint, FieldBytes, ProjectivePoint, Scalar};
 use zeroize::{Zeroize, Zeroizing};
 
 pub mod ecdsa;
+mod ecmult;
 pub mod nonce;
 pub mod schnorr;
 

@@ -19,7 +19,6 @@ use core::fmt;
 
 use k256::elliptic_curve::PrimeField;
 use k256::elliptic_curve::group::Group;
-use k256::elliptic_curve::ops::MulByGeneratorVartime;
 use k256::elliptic_curve::sec1::ToSec1Point;
 use k256::{ProjectivePoint, Scalar};
 use zeroize::{Zeroize, Zeroizing};
@@ -149,13 +148,14 @@ impl Signature {
 
         // Step 7: R = s*G + e*Q.  Every input is public, so like dcrd
         // (`ScalarBaseMultNonConst`, `ScalarMultNonConst`, `AddNonConst`)
-        // this runs in variable time: one combined GLV/wNAF pass instead
-        // of two constant-time multiplications and an addition.  Signing
-        // keeps the constant-time `GENERATOR * k`, since its nonce is
-        // secret.
+        // this runs in variable time: one pass of the crate's interleaved
+        // wNAF loop (`ecmult`), the multiply ECDSA verification uses,
+        // instead of two constant-time multiplications and an addition.  A
+        // zero s, which parsing allows, contributes nothing.  Signing keeps
+        // the constant-time `GENERATOR * k`, since its nonce is secret.
         let s = Scalar::from_repr(self.s.into()).expect("s < n by construction");
         let q = pub_key.as_k256_point();
-        let big_r = ProjectivePoint::mul_by_generator_and_mul_add_vartime(&s, &e, &q);
+        let big_r = super::ecmult::mul_g_add_vartime(&s, &e, &q);
 
         // Step 8: fail if R is the point at infinity.
         if bool::from(big_r.is_identity()) {

@@ -18,13 +18,19 @@ repository.workspace = true
 # and Schnorr signing, and `PrivateKey::public_key`, multiply with
 # `ProjectivePoint::GENERATOR * k` (or `* d`), which goes through
 # `lincomb`.  ECDSA verification and recovery, and Schnorr verification,
-# use `mul_by_generator_and_mul_add_vartime`, a GLV/wNAF pass over the
-# generator and a second point.  None reads the basepoint table -- only
-# `mul_by_generator` and `mul_by_generator_vartime` do, and this crate
-# calls neither -- so the tables would buy nothing, and from 0.14
+# compute their sum with this crate's own variable-time loop over k256's
+# public point operations (`src/secp256k1/ecmult.rs`), which keeps static
+# tables of G and 2^128*G of its own.  None reads k256's basepoint table
+# -- only `mul_by_generator` and `mul_by_generator_vartime` do, and this
+# crate calls neither -- so k256's tables would buy nothing, and from 0.14
 # `k256/std` also pulls an OS RNG (getrandom) into a crate that never
 # draws randomness.
 k256 = { version = "0.14", default-features = false, features = ["arithmetic"] }
+# The first-use cell of those static generator tables: `race::OnceBox`
+# needs only core atomics and `alloc`, so default features stay off and
+# building this crate alone takes no `std`.  Already in both locks (rustls
+# takes it in both), so it adds no package.
+once_cell = { version = "1.21", default-features = false, features = ["alloc"] }
 # RFC6979 nonce generation (dcrd's exact variant, ported in this crate).
 # `zeroize` on both: each HMAC the nonce's DRBG runs holds two SHA-2
 # states keyed by its K and a block buffer the private key's bytes pass
