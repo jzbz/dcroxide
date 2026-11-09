@@ -10,6 +10,7 @@ use k256::elliptic_curve::subtle::Choice;
 use k256::{AffinePoint, FieldBytes, ProjectivePoint, Scalar};
 use zeroize::{Zeroize, Zeroizing};
 
+mod backend;
 pub mod ecdsa;
 mod ecmult;
 pub mod nonce;

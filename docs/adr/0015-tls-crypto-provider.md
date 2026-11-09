@@ -40,7 +40,7 @@ certificate verification runs, and random numbers. rustls 0.23.46 is
 itself written in Rust with no C, and forbids `unsafe`
 (`rustls-0.23.46/src/lib.rs:332`); its provider in this node is `ring`
 0.17.14, about 151k lines of C and assembly
-(`docs/dependency-ledger.md:151`).
+(`docs/dependency-ledger.md:152`).
 
 `dcroxide-node` uses the provider in three places:
 
@@ -99,7 +99,7 @@ feature turns on `_ring`, that is `rustls?/ring`
 features across the build, so `ring` leaves only when both switches
 change; either alone brings it back. `fuzz/`, outside the workspace with
 a lock of its own, takes the node's whole tree through `dcroxide-node`
-(`fuzz/Cargo.toml:21-24`) and locks `ring` too (`fuzz/Cargo.lock:1360`).
+(`fuzz/Cargo.toml:21-24`) and locks `ring` too (`fuzz/Cargo.lock:1367`).
 
 ### The process default
 
@@ -217,7 +217,7 @@ libraries, most of them already in the lock (`p256`, `p384` and `p521`
 with `curve25519-dalek` 5.0.0 beside them), with `aes-gcm`,
 `chacha20poly1305` and `ml-kem` new. It is held to ADR-0012's definition
 of pure Rust, and as a workspace crate it inherits `unsafe_code =
-"forbid"` (`Cargo.toml:134-135`). It exports a `CryptoProvider` and every
+"forbid"` (`Cargo.toml:146-147`). It exports a `CryptoProvider` and every
 suite and group as an item of its own, which (a) needs. The research
 estimated it at 1.5k to 2.5k lines plus tests, from the size of
 rustls-rustcrypto's source; nothing has been prototyped. Of the options
@@ -298,7 +298,7 @@ was not taken: the line of it built on the RustCrypto generation in the
 lock was a prerelease when the research read it, its stable 0.9 line is
 built on the generation before (`digest` 0.10,
 `rsa-0.9.10/Cargo.toml:108-109`, where the lock has 0.11.3,
-`Cargo.lock:876-877`), and it carries RUSTSEC-2023-0071, the
+`Cargo.lock:886-887`), and it carries RUSTSEC-2023-0071, the
 timing advisory `gencerts` already cites (`gentool.rs:12-15`). That
 advisory concerns private-key operations, which verification does not
 run; this is the research's reading, and the advisory was not re-read for
@@ -368,7 +368,7 @@ and ends the reliance on ureq's unstable provider API.
   under rustls can offer them. Every client the Decred tools ship offers
   an AES-GCM suite (`PARITY.md:3012-3013`).
 - **rustls 0.24 is unreleased.** The provider is written against 0.23,
-  the line the node is on (0.23.46, `Cargo.lock:1551-1552`), and is ported
+  the line the node is on (0.23.46, `Cargo.lock:1561-1562`), and is ported
   to 0.24 when that is stable. The research read 0.24.0-dev.2 as
   reshaping `CryptoProvider`, separate TLS 1.2 and TLS 1.3 suite lists
   among the changes, and estimated a modest port; it also found that
@@ -389,7 +389,7 @@ and ends the reliance on ureq's unstable provider API.
 ## Consequences
 
 - **C leaves the network surface** with the switch. ring's ~151k lines
-  go (`dependency-ledger.md:151`), and with them `getrandom` 0.2 and
+  go (`dependency-ledger.md:152`), and with them `getrandom` 0.2 and
   `windows-sys` 0.52, which only ring pulls in, and `deny.toml`'s two
   skip entries for them (`deny.toml:42-48` at `8e6ea23`).
   `fuzz/Cargo.lock` changes with the workspace's.

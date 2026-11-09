@@ -15,7 +15,11 @@
 //! variable-time a*G + b*P behind ECDSA verification and recovery and
 //! Schnorr verification is this crate's own loop over k256's public point
 //! operations, with static tables of the generator built on first use
-//! (ADR-0006's 2026-11-08 addendum).
+//! (ADR-0006's 2026-11-08 addendum).  The scalar inverse of ECDSA
+//! verification and compact recovery runs on `dcroxide-secp256k1-vartime`,
+//! variable-time arithmetic on public values owned in tree and ported from
+//! libsecp256k1, behind one seam module with k256 as its fallback
+//! (ADR-0016).
 //! Everything dcrd-behavior-specific — DER signature acceptance, public
 //! key format acceptance, low-S serialization, the order of compact
 //! recovery's checks, error identities — is implemented here and

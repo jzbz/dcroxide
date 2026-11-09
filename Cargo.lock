@@ -539,6 +539,7 @@ version = "0.1.0"
 dependencies = [
  "curve25519-dalek",
  "dcroxide-crypto",
+ "dcroxide-secp256k1-vartime",
  "dcroxide-testutil",
  "hmac",
  "k256",
@@ -744,6 +745,15 @@ version = "0.1.0"
 dependencies = [
  "dcroxide-dcrjson",
  "dcroxide-testutil",
+]
+
+[[package]]
+name = "dcroxide-secp256k1-vartime"
+version = "0.1.0"
+dependencies = [
+ "crypto-bigint",
+ "dcroxide-testutil",
+ "k256",
 ]
 
 [[package]]

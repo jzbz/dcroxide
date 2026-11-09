@@ -29,7 +29,7 @@ commits over master ending at `43beedc`, then stage 2a's two (below): ECDSA
 verification and signing, every key and compact recovery run on `k256`
 0.14.0 by dcrd's algorithms, and `secp256k1-sys` is out of the build, which
 the `cc` and `secp256k1-sys` bans (`deny.toml:81-82`) and the job that
-builds with no C compiler (`.github/workflows/ci.yml:352`) now hold. Master
+builds with no C compiler (`.github/workflows/ci.yml:372`) now hold. Master
 (`0c4154d`) still runs libsecp256k1 for ECDSA and keys.
 
 ### The gates, 2026-11-07
@@ -193,7 +193,7 @@ predicted (1.03-1.04 at window 12), for a reason the data does not show.
   `FieldVal` (`dcrec/secp256k1/v4` at the pin, `ecdsa/signature.go:256-258`,
   `curve.go:1102-1265`). Making it fast means changing its algorithms.
 - **A mechanical translation of libsecp256k1** (c2rust) is all `unsafe`,
-  which the workspace forbids (`Cargo.toml:134-135`).
+  which the workspace forbids (`Cargo.toml:146-147`).
 
 ### The approval
 
@@ -340,7 +340,7 @@ libsecp256k1's own proofs of them (`sage/prove_group_implementations.sage`):
   `DecompressY` does.
 
 **Nothing on the consensus path may panic.** Release is `panic = "abort"`
-(`Cargo.toml:81`). Where the new crate declines an input (a GLV half out of
+(`Cargo.toml:82`). Where the new crate declines an input (a GLV half out of
 range, the inverse's iteration caps) or a conversion or consistency check at
 the seam fails, dcrec takes the `k256` path with a debug assertion, and the
 unit tests call the crate's fallible forms directly and require them to
@@ -475,7 +475,7 @@ which is the decision point:
      whatever `secp256k1-sys` version then builds;
    - reverses policy: lifts the `secp256k1-sys` ban and lists it among
      `cc`'s wrappers (`deny.toml:81-82`), removes or narrows the job that
-     builds with no C compiler (`.github/workflows/ci.yml:352`), amends
+     builds with no C compiler (`.github/workflows/ci.yml:372`), amends
      ADR-0012's "No C or C++" (`0012-pure-rust.md:128-131`) for ECDSA, adds
      an addendum here, and changes back the dependency ledger, README,
      PARITY.md, SECURITY.md and dcrec's "compiles no C";
@@ -511,7 +511,7 @@ Poelstra and Jonas Nick for `ecmult_impl.h`; Peter Dettman for
 `NOTICE` lists only the files present in the tree at each commit, and grows
 with the increments. Each derived file says `SPDX-License-Identifier: ISC
 AND MIT` and names its upstream file; the crate's manifest says `license =
-"ISC AND MIT"` rather than inheriting the workspace's ISC (`Cargo.toml:51`);
+"ISC AND MIT"` rather than inheriting the workspace's ISC (`Cargo.toml:52`);
 the root `LICENSE` gains a paragraph pointing at the crate's notice, without
 adding the libsecp256k1 authors to its ISC holders. Two cases are settled
 on the conservative side:

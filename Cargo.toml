@@ -26,6 +26,7 @@ members = [
     "crates/dcroxide-ratelimit",
     "crates/dcroxide-rpc",
     "crates/dcroxide-rpctypes",
+    "crates/dcroxide-secp256k1-vartime",
     "crates/dcroxide-sigdiff",
     "crates/dcroxide-stake",
     "crates/dcroxide-standalone",
@@ -129,6 +130,17 @@ panic = "unwind"
 # to catch code that is only right because release wraps.
 [profile.soak-checked]
 inherits = "soak"
+overflow-checks = true
+
+# The assertions leg of a gate on dcroxide-secp256k1-vartime (ADR-0016):
+# release's code generation with debug assertions on, so the crate's
+# invariant checks (modinv64's bounds, the reduced-scalar checks) run on the
+# code release compiles, and with overflow checks on.  Nothing ships from it.
+#
+#   cargo test --locked --profile soak-asserts -p dcroxide-secp256k1-vartime
+[profile.soak-asserts]
+inherits = "soak"
+debug-assertions = true
 overflow-checks = true
 
 [workspace.lints.rust]

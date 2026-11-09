@@ -134,6 +134,24 @@ jobs:
         env:
           CARGO_PROFILE_DEV_DEBUG_ASSERTIONS: "false"
 
+  test-vartime-release:
+    name: test (dcroxide-secp256k1-vartime, release)
+    runs-on: ubuntu-latest
+    # dcroxide-secp256k1-vartime (ADR-0016) runs 20,000 random cases per
+    # operation in builds with debug assertions, which every other job
+    # builds. Here it runs 10^6 in release, the code generation the node
+    # ships, and in soak-asserts, release's code generation with debug
+    # assertions and overflow checks on, where its invariant checks run on
+    # every case. Its digest test pins one constant the dev builds share.
+    steps:
+      - uses: actions/checkout@v7
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --release -p dcroxide-secp256k1-vartime
+      - run: cargo test --profile soak-asserts -p dcroxide-secp256k1-vartime
+        env:
+          DCROXIDE_VARTIME_CASES: "1000000"
+
   tls-soft-backends:
     name: TLS provider (software backends, no ring)
     runs-on: ubuntu-latest
@@ -322,10 +340,12 @@ jobs:
     # or cfg mistake that drags std into a consensus core fails CI.
     #
     # dcrec has no features and compiles no C, its secp256k1 arithmetic
-    # being k256's, and it is no_std outside its tests in every build, so
-    # any job already rejects a `use std::` in it. What only this job
-    # catches for dcrec is a dependency that needs std, such as one taken
-    # with default features that turn std on. `cargo check` never links.
+    # being k256's and dcroxide-secp256k1-vartime's, and it is no_std
+    # outside its tests in every build, so any job already rejects a `use
+    # std::` in it. What only this job catches for dcrec is a dependency
+    # that needs std, such as one taken with default features that turn std
+    # on. `cargo check` never links. secp256k1-vartime has no dependencies
+    # and needs core alone, without alloc.
     #
     # Not yet listed: blockchain, fees, gcs, mempool, mining, stake, and
     # txscript. The six that reach dcroxide-database (all but txscript)
@@ -345,7 +365,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Check the no_std crates on a no-OS target
         run: |
-          for c in base58 chaincfg chainhash crypto dcrec standalone uint256 wire; do
+          for c in base58 chaincfg chainhash crypto dcrec secp256k1-vartime standalone uint256 wire; do
             cargo check -p "dcroxide-$c" --no-default-features --target x86_64-unknown-none
           done
 
@@ -590,11 +610,11 @@ jobs:
           # hide the rest. -timeout bounds one input, which libFuzzer
           # otherwise allows 20 minutes, so an input that hangs, waiting on
           # an oracle that stopped answering or otherwise, becomes a timeout
-          # with the input saved. The signature targets read a class, a
-          # case index and then entropy, so -len_control=0 has them mutate
-          # at full length from the start rather than grow inputs from a
-          # few bytes. Each target's wall time, its build or link included,
-          # goes to the job summary.
+          # with the input saved. The signature targets (a class, a case
+          # index, entropy) and the vartime target (a level, whole values)
+          # need long inputs, so -len_control=0 has them mutate at full
+          # length from the start. Each target's wall time, its build or
+          # link included, goes to the job summary.
           failed=""
           {
             echo "| target | seconds |"
@@ -603,7 +623,7 @@ jobs:
           for t in $targets; do
             args=(-max_total_time=60 -timeout=60)
             case "$t" in
-              dcrec_diff_* | dcrec_ed25519_model) args+=(-len_control=0) ;;
+              dcrec_diff_* | dcrec_ed25519_model | secp256k1_vartime_diff) args+=(-len_control=0) ;;
             esac
             start=$SECONDS
             if ! cargo fuzz run "$t" -- "${args[@]}"; then
@@ -734,7 +754,7 @@ jobs:
             # See the smoke job for -len_control=0.
             args=(-max_total_time=600 -timeout=60)
             case "$t" in
-              dcrec_diff_* | dcrec_ed25519_model) args+=(-len_control=0) ;;
+              dcrec_diff_* | dcrec_ed25519_model | secp256k1_vartime_diff) args+=(-len_control=0) ;;
             esac
             start=$SECONDS
             if ! cargo fuzz run "$t" "${dirs[@]}" -- "${args[@]}"; then
@@ -818,9 +838,10 @@ jobs:
             classes: "DS-*,DK-*,DG-*,DV-*"
             rustflags: '--cfg curve25519_dalek_backend="serial"'
             canary: false
-          # k256 has no code that differs by architecture beyond the
-          # pointer width, so one arm64 leg covers it; no macOS or Windows
-          # leg is run, since the per-PR matrix runs every class there.
+          # k256 and dcroxide-secp256k1-vartime have no code that differs
+          # by architecture beyond the pointer width, so one arm64 leg
+          # covers them; no macOS or Windows leg is run, since the per-PR
+          # matrix runs every class there.
           - leg: arm64
             os: ubuntu-24.04-arm
             classes: all

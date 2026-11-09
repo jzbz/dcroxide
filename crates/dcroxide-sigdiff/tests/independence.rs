@@ -4,8 +4,11 @@
 //! canaries stand in for dcroxide) name the adapter; `src/lib.rs` only
 //! declares it; and every other file under `src/` (generators, models, the
 //! registry, the arithmetic, the encoders, the comparison, the digest)
-//! names neither.  The files scanned must be exactly the ones the
-//! fingerprint module classifies, so a new file cannot escape the check.
+//! names neither.  No file under `src/`, `src/ours.rs` included, names
+//! `dcroxide_secp256k1_vartime`, the variable-time arithmetic dcrec runs
+//! on (ADR-0016): the soak reaches it only through dcrec, so its models
+//! and canaries stay on k256.  The files scanned must be exactly the ones
+//! the fingerprint module classifies, so a new file cannot escape the check.
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -55,6 +58,10 @@ fn only_the_adapter_reaches_the_code_under_test() {
     );
     for path in &files {
         let text = std::fs::read_to_string(crate_dir.join(path)).expect("read a source file");
+        assert!(
+            !text.contains("dcroxide_secp256k1_vartime"),
+            "{path} names dcroxide_secp256k1_vartime"
+        );
         let names_dcrec = text.contains("dcroxide_dcrec");
         match path.as_str() {
             "src/ours.rs" => assert!(names_dcrec, "the adapter calls dcrec"),

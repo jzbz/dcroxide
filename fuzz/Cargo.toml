@@ -24,6 +24,12 @@ dcroxide-dcrjson = { path = "../crates/dcroxide-dcrjson" }
 dcroxide-node = { path = "../crates/dcroxide-node" }
 dcroxide-rpc = { path = "../crates/dcroxide-rpc" }
 dcroxide-rpctypes = { path = "../crates/dcroxide-rpctypes" }
+# For secp256k1_vartime_diff: the variable-time arithmetic dcroxide-dcrec
+# runs on (ADR-0016), compared in process with k256, its reference.  The
+# crate joins this lock as a path package; k256 is already locked here at
+# the workspace lock's version.
+dcroxide-secp256k1-vartime = { path = "../crates/dcroxide-secp256k1-vartime" }
+k256 = { version = "0.14", default-features = false, features = ["arithmetic"] }
 # The signature input classes, the entry the dcrec_diff_* targets and
 # dcrec_ed25519_model share, and the Go-free model of dcrd's Ed25519 that
 # dcrec_ed25519_model checks against.  k256, curve25519-dalek, sha2 and
@@ -209,6 +215,13 @@ bench = false
 [[bin]]
 name = "tlscrypto_key_parse"
 path = "fuzz_targets/tlscrypto_key_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "secp256k1_vartime_diff"
+path = "fuzz_targets/secp256k1_vartime_diff.rs"
 test = false
 doc = false
 bench = false

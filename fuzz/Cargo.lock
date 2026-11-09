@@ -470,6 +470,7 @@ version = "0.1.0"
 dependencies = [
  "curve25519-dalek",
  "dcroxide-crypto",
+ "dcroxide-secp256k1-vartime",
  "hmac",
  "k256",
  "once_cell",
@@ -507,12 +508,14 @@ dependencies = [
  "dcroxide-node",
  "dcroxide-rpc",
  "dcroxide-rpctypes",
+ "dcroxide-secp256k1-vartime",
  "dcroxide-sigdiff",
  "dcroxide-stake",
  "dcroxide-tlscrypto",
  "dcroxide-txscript",
  "dcroxide-uint256",
  "dcroxide-wire",
+ "k256",
  "libfuzzer-sys",
 ]
 
@@ -680,6 +683,10 @@ version = "0.1.0"
 dependencies = [
  "dcroxide-dcrjson",
 ]
+
+[[package]]
+name = "dcroxide-secp256k1-vartime"
+version = "0.1.0"
 
 [[package]]
 name = "dcroxide-sigdiff"

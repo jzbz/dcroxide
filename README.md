@@ -234,6 +234,12 @@ work). Currently implemented:
   verify semantics), and EC-Schnorr-DCRv0 (type 2, over k256 with dcrd's
   RFC6979 nonce variant); every signing path differentially verified
   byte-for-byte against dcrd
+- `dcroxide-secp256k1-vartime` — variable-time secp256k1 arithmetic for
+  public values only, ported from libsecp256k1's portable C and owned in
+  tree (ADR-0016): the scalar mod N and its safegcd inverse, which ECDSA
+  verification and compact recovery take for s^-1 and r^-1 behind one
+  seam in `dcroxide-dcrec`, with k256 as the fallback; `no_std` on core
+  alone, no dependencies, ISC AND MIT (its `NOTICE`)
 - `dcroxide-chaincfg` — all four networks' consensus parameters
   (mainnet/testnet3/simnet/regnet): genesis blocks reproducing dcrd's exact
   hashes and quirks, the full consensus-agenda deployment history, and the
@@ -844,4 +850,7 @@ lists them.
 ## License
 
 ISC. Portions derived from dcrd and dcr-rs, both ISC; see [LICENSE](LICENSE)
-and per-file attribution headers.
+and per-file attribution headers. `crates/dcroxide-secp256k1-vartime` holds
+code translated from libsecp256k1, which is MIT; its
+[NOTICE](crates/dcroxide-secp256k1-vartime/NOTICE) carries that licence and
+the upstream copyright lines.

@@ -56,24 +56,24 @@ script.
   beside it (`Cargo.toml:38` at `0c4154d`) for EC-Schnorr-DCRv0 and for
   ECDSA signing of a hash at or above the order
   (`ecdsa.rs:388-437` at `0c4154d`).
-- **`ring` 0.17.14** (`Cargo.lock:1506`): ~151k lines of C and assembly
-  (`dependency-ledger.md:151`), the crypto provider of `rustls` 0.23.46.
+- **`ring` 0.17.14** (`Cargo.lock:1516`): ~151k lines of C and assembly
+  (`dependency-ledger.md:152`), the crypto provider of `rustls` 0.23.46.
   `dcroxide-node` selects rustls's `ring` feature
   (`crates/dcroxide-node/Cargo.toml:59-69` at `8e6ea23`), `ureq` 3.4.2
   selects it through its default `rustls` feature, and `rustls-webpki`
-  0.103.16 depends on it (`Cargo.lock:1574-1582`). It runs the RPC and
+  0.103.16 depends on it (`Cargo.lock:1584-1592`). It runs the RPC and
   websocket TLS listener, the RPC client-certificate verifier
   (`rpcrun::GoClientCertVerifier`, which hands `rustls-webpki` ring's
   signature algorithms) and both TLS clients of the HTTPS seeder
   (`crates/dcroxide-node/src/seeding.rs`: `ureq` and
   `ProxySeederTransport`). P-521 signing and key exchange already run on
-  the pure-Rust `p521` (`dependency-ledger.md:53`). The listener is off
+  the pure-Rust `p521` (`dependency-ledger.md:54`). The listener is off
   under `--norpc`; the seeder runs at startup unless `--noseeders`
-  (`:50`). Two of `deny.toml`'s three skip entries exist only for it
+  (`:51`). Two of `deny.toml`'s three skip entries exist only for it
   (`deny.toml:42-48` at `8e6ea23`).
 - **`blake3` 1.8.7**, built with `pure`
   (`crates/dcroxide-wire/Cargo.toml:25`), which compiles none of the
-  crate's C or assembly (`dependency-ledger.md:45`). On x86 targets its
+  crate's C or assembly (`dependency-ledger.md:46`). On x86 targets its
   build script still asks a C compiler, when it finds one, whether it
   accepts two AVX-512 flags (`build.rs:161-175`), and asks before it reads
   `pure` (`:343-344`).
@@ -151,7 +151,7 @@ The approvals do not spell out five points, and this record reads them so:
 - **The targets the project builds for** are, on 2026-10-26, those of
   CI's test matrix, x86_64 and aarch64 Linux, macOS and Windows
   (`.github/workflows/ci.yml:92`), and the no-OS target of its no_std
-  check (`:344-349`). [ADR-0014](0014-release-engineering.md) decides
+  check (`:364-369`). [ADR-0014](0014-release-engineering.md) decides
   which of them get binaries.
 - **"What `cargo test` builds"** includes anything a test compiles while
   it runs, which reaches the shim and the oracle, though cargo itself
@@ -191,10 +191,10 @@ C that cgo links into the oracle included:
   the exception as covering, with the oracle, the Go generators under
   `tools/` that regenerate vector files from dcrd's own code (ADR-0001's
   addenda from 2026-10-02 on), and dcrd itself, which the interop job
-  builds and runs (`.github/workflows/ci.yml:202-256`).
+  builds and runs (`.github/workflows/ci.yml:220-274`).
 - **cargo-fuzz's libFuzzer**, which has no pure-Rust drop-in. `fuzz/` is
-  outside the workspace (the root `Cargo.toml:39`) with its own lock, and
-  `libfuzzer-sys` 0.4.13 (`fuzz/Cargo.lock:1099-1100`) compiles
+  outside the workspace (the root `Cargo.toml:40`) with its own lock, and
+  `libfuzzer-sys` 0.4.13 (`fuzz/Cargo.lock:1106-1107`) compiles
   libFuzzer's C++ with `cc` under its default `link_libfuzzer` feature
   (`build.rs:24-38`, `:43-44`).
 
@@ -206,7 +206,7 @@ either: the third set answered that the rule already decides it.
 The rule as the second set defines it names C, C++ and assembly. This
 record reads it as not reaching tools in other languages that never ship:
 the Go tools `tools/pinbump` and `tools/dcrdstat`, which CI vets and tests
-beside the oracle (`ci.yml:279-283`), and the Python instruments
+beside the oracle (`ci.yml:297-301`), and the Python instruments
 `tools/dsample/dsample.py` and `tools/powerloss/replay.py`, the second run
 by the two power-cut tests. They are neither exceptions nor breaches. The
 shim beside `replay.py` is C, and the second set settles it (T9, below).
@@ -255,13 +255,13 @@ ADR-0006.
 **TLS: `ring` goes with an in-tree provider** (T1). rustls takes its
 cryptography from a provider, and both the node and `ureq` select ring's:
 `dcroxide-node` turns on rustls's `ring` feature, and `ureq` 3.4.2's
-default `rustls` feature turns on its `_ring` feature (`ureq`'s
-`Cargo.toml:63`, `:74-77`, `:101-105`), so both selections have to go for
-ring to leave. The provider is written in the tree, as a new crate built
-from RustCrypto crates. `ring` stays until that provider passes a full
-interop matrix against Go, every cipher suite, key exchange, key type and
-TLS version, plus client certificates, and is then deleted in one change.
-ADR-0015 records the choice and what goes with it.
+default `rustls` feature turns on its `_ring` feature
+(`ureq-3.4.2/Cargo.toml:63`, `:74-77`, `:101-105`), so both selections
+have to go for ring to leave. The provider is written in the tree, as a
+new crate built from RustCrypto crates. `ring` stays until that provider
+passes a full interop matrix against Go, every cipher suite, key exchange,
+key type and TLS version, plus client certificates, and is then deleted in
+one change. ADR-0015 records the choice and what goes with it.
 
 **blake3: an in-tree BLAKE3** (T8, which replaces the first set's 1c). By the
 rule's definition blake3's probe counts: on x86 targets its build script runs a
@@ -288,7 +288,7 @@ place. The shim interposes C library calls in another process: it exports
 `open`, `write`, `fsync` and their kin under their C names and reaches the C
 library's own definitions through `dlsym(RTLD_NEXT, ...)`
 (`tools/powerloss/shim.c:131-135`). In Rust both need `unsafe`, which the
-workspace's `unsafe_code = "forbid"` (`Cargo.toml:134-135`) refuses: on the
+workspace's `unsafe_code = "forbid"` (`Cargo.toml:146-147`) refuses: on the
 pinned toolchain the lint refuses even the `#[unsafe(no_mangle)]` an exported
 symbol needs (checked on 2026-10-26). Neither approval addresses that `unsafe`.
 This record reads T9 as accepting the `unsafe` a shim cannot do without,
@@ -308,7 +308,7 @@ Two checks, neither written yet (the first set's 1b):
   `multiple-versions = "deny"` and three `[[bans.skip]]` entries
   (`deny.toml:23-52` at `8e6ea23`). It gains a `deny` list refusing the
   crates that compile or link C. cargo-deny 0.20.2, the version read here
-  (CI's action names none, `ci.yml:290`), matches a banned crate by its
+  (CI's action names none, `ci.yml:308`), matches a banned crate by its
   name and a version requirement, with no patterns (`src/lib.rs:482-484`),
   so the `-sys` crates that build C are refused through the means they
   build it with: `cc`; the other native build drivers, `cmake`,
@@ -330,8 +330,9 @@ Two checks, neither written yet (the first set's 1b):
   have gone. `[graph]` names no targets (`deny.toml:1-2`), and with none
   cargo-deny applies no target filter (`src/cargo-deny/common.rs:279-288`;
   `krates` 0.21.2, `src/builder.rs:763`), so the bans read every target's
-  crates, Haiku's among them, where `iana-time-zone` takes the crate (its
-  `Cargo.toml:86-87`) and its build script compiles C++ (`build.rs:4-9`).
+  crates, Haiku's among them, where `iana-time-zone` takes the crate
+  (`iana-time-zone-0.1.65/Cargo.toml:86-87`) and its build script
+  compiles C++ (`build.rs:4-9`).
   This record's reading: the crate does not break the rule, since no
   target the project builds for compiles it, and it is listed as a
   lasting wrapper with that reason, so the C++ it carries stays in view in
@@ -380,7 +381,7 @@ which does not depend on the TLS answers, can start at once.
 
 - **The C leaves the consensus path and the network surface**: about 67k
   lines under the signature checks and 151k under TLS
-  (`dependency-ledger.md:43` at `0c4154d`; `:151`), with the FFI between them and the
+  (`dependency-ledger.md:43` at `0c4154d`; `:152`), with the FFI between them and the
   node. A source build compiles no C, though on Linux rustc still links
   through the system's `cc` driver.
 - **One secp256k1 stack**, `k256`, where ADR-0006 accepted two. ECDSA
@@ -433,7 +434,7 @@ which does not depend on the TLS answers, can start at once.
 - **Two duplicates go with `ring`.** Removing it takes `getrandom`
   0.2.17, `windows-sys` 0.52.0, `windows-targets` 0.52.6 and the eight
   `windows_*` 0.52.6 import-library crates, which only it uses
-  (`deny.toml:42-48` at `8e6ea23`; `dependency-ledger.md:52`), and both
+  (`deny.toml:42-48` at `8e6ea23`; `dependency-ledger.md:53`), and both
   skip entries with them.
 - **The shim's rewrite meets C's variadic calls.** The shim interposes
   `open`, `open64` and `openat` (`tools/powerloss/shim.c:266`, `:276`,

@@ -254,7 +254,6 @@ impl Signature {
             return VerifyStep::Step1Zero;
         }
         let r = Scalar::from_repr(self.r.into()).expect("below N by construction");
-        let s = Scalar::from_repr(self.s.into()).expect("below N by construction");
 
         // Step 2: e = H(m) mod N, as dcrd's `SetByteSlice` reduces the hash:
         // one conditional subtraction of N, exact for any 256-bit value
@@ -262,8 +261,11 @@ impl Signature {
         let e = <Scalar as Reduce<FieldBytes>>::reduce(&(*hash).into());
 
         // Step 3: w = S^-1 mod N, in variable time like dcrd's
-        // `InverseValNonConst`.
-        let w = Option::<Scalar>::from(s.invert_vartime()).expect("s is nonzero");
+        // `InverseValNonConst`: dcroxide-secp256k1-vartime's port of
+        // libsecp256k1's safegcd, through this crate's seam, which falls
+        // back to k256's `invert_vartime` (ADR-0016).  S is in [1, N-1] by
+        // step 1 and construction.
+        let w = super::backend::scalar_inverse(&self.s);
 
         // Step 4: u1 = e * w mod N and u2 = R * w mod N.
         let u1 = e * w;
@@ -525,8 +527,9 @@ pub fn recover_compact(signature: &[u8], hash: &[u8; 32]) -> Result<(PublicKey, 
     let e = <Scalar as Reduce<FieldBytes>>::reduce(&(*hash).into());
 
     // Step 7: w = R^-1 mod N, in variable time like dcrd's
-    // `InverseValNonConst`.
-    let w = Option::<Scalar>::from(r.invert_vartime()).expect("r is nonzero");
+    // `InverseValNonConst`, through the seam as in verification's step 3
+    // (ADR-0016).  R is in [1, N-1] by step 1.
+    let w = super::backend::scalar_inverse(&r_bytes);
 
     // Step 8: u1 = -(e * w) mod N and u2 = s * w mod N.
     let u1 = -(e * w);

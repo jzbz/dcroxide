@@ -1,0 +1,27 @@
+[package]
+name = "dcroxide-secp256k1-vartime"
+description = "Variable-time secp256k1 arithmetic on public data for dcroxide-dcrec, ported from libsecp256k1"
+publish = false
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+# Not the workspace's ISC alone: the arithmetic is translated from
+# libsecp256k1, which is MIT; NOTICE carries its licence and copyright
+# lines, and each derived file says so in its header (ADR-0016).
+license = "ISC AND MIT"
+repository.workspace = true
+
+# No [dependencies]: the crate builds on core alone, with no alloc.
+
+[dev-dependencies]
+# The references the tests compare against, each of a different origin
+# from the port and all already locked: crypto-bigint's modular
+# arithmetic, k256's scalar (RustCrypto), and testutil's SplitMix64 for
+# fixed-seed inputs.
+crypto-bigint = { version = "0.7", default-features = false }
+dcroxide-testutil = { path = "../dcroxide-testutil" }
+k256 = { version = "0.14", default-features = false, features = ["arithmetic"] }
+
+[lints]
+workspace = true
