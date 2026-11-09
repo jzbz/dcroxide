@@ -743,6 +743,20 @@ those runs.
   are made through `sign.rs`'s test-only module `timing` and the
   exchanges through `kx.rs`'s test-only `exchange_with`; neither is in
   the crate's public API or its build outside tests.
+  *(2026-11-08: the ECDSA targets now stop the clock at the signature as
+  r and s at the field's length each, before the DER encoding the
+  provider sends; production signing is unchanged. The encoding's path
+  and length follow r's and s's leading bytes. A fixed class signs the
+  same input on every sample, the message (and, by the key, the hedge)
+  being fixed, so it repeats one r and s and takes one path, where the
+  random class mixes them. With the encoding timed, P-256 signing by the
+  nonce failed the nightly runs of 2026-11-06, 11-07 and 11-08 on
+  differences of 3 to 9 ns an operation that followed the signature's
+  shape and no property of the nonce. The encoding depends only on the
+  signature, which the handshake publishes. The difference showed once the
+  dependency update of `0c4154d` made P-256 signing about twice as quick
+  and its timings steadier; the spread of about 3.6 µs given for the
+  planted leak above was measured before it.)*
 - **The workflow,** `.github/workflows/constant-time.yml`, on pushes to
   `master` and pull requests that touch `crates/dcroxide-tlscrypto/**`,
   `crates/dcroxide-testutil/**`, `crates/dcroxide-crypto/**` (a normal
@@ -762,7 +776,8 @@ fails only on one of 1 ns an operation or more, and a pass is not a
 proof. What is timed is each operation as the provider runs it, public
 work included: an ECDSA signature's DER encoding branches on the
 signature's leading bytes, which a fixed class repeats and the random
-class varies. No target reaches what
+class varies *(2026-11-08: no longer timed, as the note under the
+targets says)*. No target reaches what
 `curve25519_dalek_backend` switches, verification's double-base
 multiplication. The switch waits on this workflow green on the change
 that adds it, as pushed, beside the matrices.
