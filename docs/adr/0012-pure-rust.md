@@ -56,12 +56,12 @@ script.
   beside it (`Cargo.toml:38` at `0c4154d`) for EC-Schnorr-DCRv0 and for
   ECDSA signing of a hash at or above the order
   (`ecdsa.rs:388-437` at `0c4154d`).
-- **`ring` 0.17.14** (`Cargo.lock:1516`): ~151k lines of C and assembly
+- **`ring` 0.17.14** (`Cargo.lock:1517`): ~151k lines of C and assembly
   (`dependency-ledger.md:152`), the crypto provider of `rustls` 0.23.46.
   `dcroxide-node` selects rustls's `ring` feature
   (`crates/dcroxide-node/Cargo.toml:59-69` at `8e6ea23`), `ureq` 3.4.2
   selects it through its default `rustls` feature, and `rustls-webpki`
-  0.103.16 depends on it (`Cargo.lock:1584-1592`). It runs the RPC and
+  0.103.16 depends on it (`Cargo.lock:1585-1593`). It runs the RPC and
   websocket TLS listener, the RPC client-certificate verifier
   (`rpcrun::GoClientCertVerifier`, which hands `rustls-webpki` ring's
   signature algorithms) and both TLS clients of the HTTPS seeder
@@ -194,7 +194,7 @@ C that cgo links into the oracle included:
   builds and runs (`.github/workflows/ci.yml:220-274`).
 - **cargo-fuzz's libFuzzer**, which has no pure-Rust drop-in. `fuzz/` is
   outside the workspace (the root `Cargo.toml:40`) with its own lock, and
-  `libfuzzer-sys` 0.4.13 (`fuzz/Cargo.lock:1106-1107`) compiles
+  `libfuzzer-sys` 0.4.13 (`fuzz/Cargo.lock:1107-1108`) compiles
   libFuzzer's C++ with `cc` under its default `link_libfuzzer` feature
   (`build.rs:24-38`, `:43-44`).
 

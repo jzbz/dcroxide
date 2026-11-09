@@ -2,19 +2,25 @@
 //! The crate's tests, against references of different origin from the
 //! port:
 //!
-//! - a schoolbook multiplication and limb helpers over u64 words written
-//!   here, independent of libsecp256k1 and k256;
+//! - a schoolbook multiplication and fold mod p and N, and limb helpers,
+//!   over u64 words written here, independent of libsecp256k1 and k256;
 //! - crypto-bigint's modular arithmetic on `U256` and `U512`;
-//! - k256's `Scalar` (RustCrypto), through big-endian bytes;
-//! - libsecp256k1's own fixed vectors (`vectors.rs`).
+//! - k256's `Scalar`, field element and decompression (RustCrypto),
+//!   through big-endian bytes;
+//! - fiat-crypto's Dettman multiplication and squaring, limb for limb;
+//! - libsecp256k1's own fixed vectors (`vectors.rs`) and tests, and dcrd's
+//!   decompression vectors (`dcrd_vectors.rs`).
 //!
 //! Inputs come from `dcroxide_testutil::SplitMix64` with fixed seeds, so
-//! every run computes the same values and the digest test can pin them.
-//! Volume: `DCROXIDE_VARTIME_CASES` random cases per operation, by default
-//! 20,000 in builds with debug assertions, which keeps the dev suite to a
-//! few seconds, and 10^6 without, as CI's release run of the crate builds
+//! every run computes the same values and the digest tests can pin them.
+//! Volume: `DCROXIDE_VARTIME_CASES` (`cases()`), by default 20,000 in
+//! builds with debug assertions, which keeps the dev suite to a few
+//! seconds, and 10^6 without, as CI's release run of the crate builds
 //! them; CI's soak-asserts run sets 10^6, so the invariant checks see the
-//! full volume too.
+//! full volume too.  The scalar tests run that many cases per operation;
+//! the field and decompression tests, whose references cost more, a tenth
+//! of it or less, and the field's corner products their full grid once it
+//! reaches 10^6.
 
 #![allow(
     clippy::arithmetic_side_effects,
@@ -22,12 +28,18 @@
               bigint helpers whose bounds the tests themselves fix"
 )]
 
+mod dcrd_vectors;
+mod decompress_tests;
+mod field_tests;
 mod scalar_tests;
 mod vectors;
 
 use crypto_bigint::{NonZero, U256, U512};
 use dcroxide_testutil::SplitMix64;
 use k256::elliptic_curve::PrimeField;
+use k256::elliptic_curve::hazmat::FieldArithmetic;
+
+use crate::field::Fe;
 
 /// Random cases per operation (`DCROXIDE_VARTIME_CASES`, or the default
 /// for the build's assertions).
@@ -93,6 +105,9 @@ pub(crate) const NORD: [u64; 4] = [
     0xFFFF_FFFF_FFFF_FFFF,
 ];
 
+/// p's words, written out here rather than taken from the port.
+pub(crate) const P: [u64; 4] = [0xFFFF_FFFE_FFFF_FC2F, u64::MAX, u64::MAX, u64::MAX];
+
 /// a >= b.
 pub(crate) fn ge4(a: &[u64; 4], b: &[u64; 4]) -> bool {
     for i in (0..4).rev() {
@@ -129,6 +144,121 @@ pub(crate) fn mulw(a: &[u64; 4], b: &[u64; 4]) -> [u64; 8] {
         r[i + 4] = carry as u64;
     }
     r
+}
+
+/// sum l\[i\] << 52i (up to about 2^262) as six words.
+pub(crate) fn limbs_to_int(l: &[u64; 5]) -> [u64; 6] {
+    let mut r = [0u64; 6];
+    for (i, &li) in l.iter().enumerate() {
+        let sh = 52 * i;
+        let (w, b) = (sh / 64, sh % 64);
+        let v = u128::from(li) << b;
+        let mut carry = 0u128;
+        for (k, part) in [v as u64, (v >> 64) as u64].into_iter().enumerate() {
+            let s = u128::from(r[w + k]) + u128::from(part) + carry;
+            r[w + k] = s as u64;
+            carry = s >> 64;
+        }
+        let mut k = w + 2;
+        while carry != 0 {
+            let s = u128::from(r[k]) + carry;
+            r[k] = s as u64;
+            carry = s >> 64;
+            k += 1;
+        }
+    }
+    r
+}
+
+/// Words mod p, by folding 2^256 = 0x1000003D1 and then subtracting p.
+pub(crate) fn reduce_p<const W: usize>(v: &[u64; W]) -> [u64; 4] {
+    let mut v = *v;
+    loop {
+        if v[4..].iter().all(|&x| x == 0) {
+            break;
+        }
+        let mut lo = [0u64; W];
+        lo[..4].copy_from_slice(&v[..4]);
+        let mut carry = 0u128;
+        for (i, x) in lo.iter_mut().enumerate() {
+            let h = if i + 4 < W { v[i + 4] } else { 0 };
+            let s = u128::from(*x) + u128::from(h) * 0x1_0000_03D1 + carry;
+            *x = s as u64;
+            carry = s >> 64;
+        }
+        assert_eq!(carry, 0);
+        v = lo;
+    }
+    let mut r = [v[0], v[1], v[2], v[3]];
+    while ge4(&r, &P) {
+        r = sub4(&r, &P);
+    }
+    r
+}
+
+/// a * b mod p.
+pub(crate) fn mul_p(a: &[u64; 4], b: &[u64; 4]) -> [u64; 4] {
+    reduce_p(&mulw(a, b))
+}
+
+/// a + b mod p.
+pub(crate) fn add_p(a: &[u64; 4], b: &[u64; 4]) -> [u64; 4] {
+    let mut r = [0u64; 5];
+    let mut c = 0u128;
+    for i in 0..4 {
+        let s = u128::from(a[i]) + u128::from(b[i]) + c;
+        r[i] = s as u64;
+        c = s >> 64;
+    }
+    r[4] = c as u64;
+    reduce_p(&r)
+}
+
+/// -a mod p.
+pub(crate) fn neg_p(a: &[u64; 4]) -> [u64; 4] {
+    let a = reduce_p(a);
+    if a == [0; 4] { a } else { sub4(&P, &a) }
+}
+
+/// a - b mod p.
+pub(crate) fn sub_p(a: &[u64; 4], b: &[u64; 4]) -> [u64; 4] {
+    add_p(a, &neg_p(b))
+}
+
+/// The canonical value of a field element's limbs, by the reference.
+pub(crate) fn fe_val(a: &Fe) -> [u64; 4] {
+    reduce_p(&limbs_to_int(&a.raw().n))
+}
+
+/// A field element from words below p: normalized, magnitude 1.
+pub(crate) fn fe_w(w: &[u64; 4]) -> Fe {
+    Fe::set_b32_limit(&words_to_be(w)).expect("below p")
+}
+
+/// A normalized copy.
+pub(crate) fn norm(f: &Fe) -> Fe {
+    let mut t = *f;
+    t.normalize_var();
+    t
+}
+
+/// Canonical big-endian bytes of any field element.
+pub(crate) fn fe_bytes(f: &Fe) -> [u8; 32] {
+    norm(f).get_b32()
+}
+
+/// Random words below p, uniform or, every fourth call, structured.
+pub(crate) fn words_below_p(r: &mut SplitMix64) -> [u64; 4] {
+    loop {
+        let w = if r.below(4) == 0 {
+            words_structured(r)
+        } else {
+            words(r)
+        };
+        if !ge4(&w, &P) {
+            return w;
+        }
+    }
 }
 
 /// Words to 32 big-endian bytes.
@@ -174,6 +304,9 @@ pub(crate) fn cbw(x: &U256) -> [u64; 4] {
 pub(crate) fn cb_n() -> NonZero<U256> {
     NonZero::<U256>::new_unwrap(cb(&NORD))
 }
+pub(crate) fn cb_p() -> NonZero<U256> {
+    NonZero::<U256>::new_unwrap(cb(&P))
+}
 pub(crate) fn cb512(w: &[u64; 8]) -> U512 {
     let mut b = [0u8; 64];
     for (i, x) in w.iter().enumerate() {
@@ -190,4 +323,27 @@ pub(crate) fn ksc(w: &[u64; 4]) -> k256::Scalar {
 }
 pub(crate) fn ksc_w(x: &k256::Scalar) -> [u64; 4] {
     be_to_words(&x.to_repr().into())
+}
+
+/// k256's field element.
+pub(crate) type KFe = <k256::Secp256k1 as FieldArithmetic>::FieldElement;
+
+pub(crate) fn kfe(w: &[u64; 4]) -> KFe {
+    Option::from(KFe::from_repr(words_to_be(w).into())).expect("canonical field element")
+}
+pub(crate) fn kfe_w(x: &KFe) -> [u64; 4] {
+    be_to_words(&x.to_repr().into())
+}
+
+/// A point's coordinates, big-endian.
+pub(crate) type Bytes2 = ([u8; 32], [u8; 32]);
+
+/// k256's decompression.
+pub(crate) fn k_decompress(x: &[u8; 32], odd: bool) -> Option<Bytes2> {
+    use k256::AffinePoint;
+    use k256::elliptic_curve::point::{AffineCoordinates, DecompressPoint};
+    use k256::elliptic_curve::subtle::Choice;
+    let a: Option<AffinePoint> =
+        AffinePoint::decompress(&(*x).into(), Choice::from(u8::from(odd))).into();
+    a.map(|a| (a.x().into(), a.y().into()))
 }

@@ -14,13 +14,22 @@ repository.workspace = true
 
 # No [dependencies]: the crate builds on core alone, with no alloc.
 
+[features]
+# Re-exports the field types (doc-hidden) for the fuzz target's field
+# level, and nothing else: no code, no dependency, no change in behaviour.
+# No workspace crate turns it on.
+internals = []
+
 [dev-dependencies]
 # The references the tests compare against, each of a different origin
 # from the port and all already locked: crypto-bigint's modular
-# arithmetic, k256's scalar (RustCrypto), and testutil's SplitMix64 for
-# fixed-seed inputs.
+# arithmetic, k256's scalar and field (RustCrypto), fiat-crypto's
+# machine-checked Dettman multiplication and squaring, the limb-exact
+# oracle for the field kernel, and testutil's SplitMix64 for fixed-seed
+# inputs.
 crypto-bigint = { version = "0.7", default-features = false }
 dcroxide-testutil = { path = "../dcroxide-testutil" }
+fiat-crypto = { version = "0.3", default-features = false }
 k256 = { version = "0.14", default-features = false, features = ["arithmetic"] }
 
 [lints]

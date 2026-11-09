@@ -8,8 +8,8 @@
 //!   than a dev-dependency, and no manifest may rename it, which would
 //!   hide it from the source scans below;
 //! - inside dcroxide-dcrec only `src/secp256k1/backend.rs`, the seam, may
-//!   name it, and only the functions in [`MAY_USE_SEAM`] (verification and
-//!   recovery) may name the seam, so the signing functions (`sign*`,
+//!   name it, and only the functions in [`MAY_USE_SEAM`] (verification,
+//!   recovery and key parsing) may name the seam, so the signing functions (`sign*`,
 //!   `PrivateKey::public_key`, the nonce) reach neither;
 //! - the crate itself takes no dependency at all, and its code outside the
 //!   tests names neither `alloc` nor `std`.
@@ -40,9 +40,10 @@ const MAY_DEPEND: [&str; 3] = [
 
 /// The functions of dcrec's `src/` that may name the seam module, `backend`
 /// (file under `src/`, function name).  Each must exist and name it.
-const MAY_USE_SEAM: [(&str, &str); 2] = [
+const MAY_USE_SEAM: [(&str, &str); 3] = [
     ("secp256k1/ecdsa.rs", "verify_detailed"),
     ("secp256k1/ecdsa.rs", "recover_compact"),
+    ("secp256k1.rs", "parse"),
 ];
 
 fn repo_root() -> PathBuf {
@@ -414,13 +415,13 @@ fn only_the_seam_names_the_vartime_crate_in_dcrec() {
     assert_eq!(naming, ["secp256k1/backend.rs"], "files naming {IDENT}");
 }
 
-/// Only verification and recovery reach the seam: every use of `backend`
-/// in dcrec's code is `mod backend;` or inside a function of
+/// Only verification, recovery and key parsing reach the seam: every use
+/// of `backend` in dcrec's code is `mod backend;` or inside a function of
 /// `MAY_USE_SEAM`, and each of those exists and uses it, so a signing
 /// function that called the seam, or an import that let it do so
 /// without naming it, fails here.
 #[test]
-fn only_verification_and_recovery_reach_the_seam() {
+fn only_verification_recovery_and_parsing_reach_the_seam() {
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let (stray, allowed) = seam_uses(&src, &rust_files(&src));
     assert!(

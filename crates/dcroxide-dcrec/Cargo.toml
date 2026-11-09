@@ -12,8 +12,9 @@ repository.workspace = true
 # Pure-Rust secp256k1 arithmetic: every key, ECDSA verification, signing
 # and compact recovery, and EC-Schnorr-DCRv0, with dcrd's exact parsing and
 # acceptance rules enforced by this crate's own code (ADR-0006's 2026-10-26
-# addendum, ADR-0012).  The scalar inverse of verification and recovery is
-# dcroxide-secp256k1-vartime's, below, with k256's as its fallback.
+# addendum, ADR-0012).  The scalar inverse of verification and recovery,
+# and the decompression of compressed keys and of recovery's R, are
+# dcroxide-secp256k1-vartime's, below, with k256's as their fallback.
 #
 # k256's `std` and `precomputed-tables` are deliberately left off.  ECDSA
 # and Schnorr signing, and `PrivateKey::public_key`, multiply with
@@ -43,10 +44,11 @@ sha2 = { version = "0.11", default-features = false, features = ["zeroize"] }
 zeroize = { version = "1.9", default-features = false }
 # Variable-time secp256k1 arithmetic on public values, owned in tree and
 # ported from libsecp256k1 (ADR-0016): today the scalar inverse of ECDSA
-# verification (s^-1) and compact recovery (r^-1), by safegcd.  Only
-# `src/secp256k1/backend.rs` names it, and k256's path stays behind it as
-# the fallback.  It has no dependencies of its own and needs only core;
-# its licence is ISC AND MIT (its NOTICE).
+# verification (s^-1) and compact recovery (r^-1), by safegcd, and the
+# decompression of compressed keys and of recovery's R, by the 5x52
+# field's square root.  Only `src/secp256k1/backend.rs` names it, and
+# k256's path stays behind it as the fallback.  It has no dependencies of
+# its own and needs only core; its licence is ISC AND MIT (its NOTICE).
 dcroxide-secp256k1-vartime = { path = "../dcroxide-secp256k1-vartime" }
 # Ed25519 group/scalar primitives; dcrd's exact (2017-agl) acceptance
 # behavior is implemented in our edwards module on top of these.

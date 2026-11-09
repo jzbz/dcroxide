@@ -515,6 +515,7 @@ dependencies = [
  "dcroxide-txscript",
  "dcroxide-uint256",
  "dcroxide-wire",
+ "fiat-crypto",
  "k256",
  "libfuzzer-sys",
 ]

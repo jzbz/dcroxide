@@ -468,9 +468,8 @@ pub fn recover_compact(signature: &[u8], hash: &[u8; 32]) -> Result<(PublicKey, 
     use k256::elliptic_curve::PrimeField;
     use k256::elliptic_curve::group::Group;
     use k256::elliptic_curve::ops::Reduce;
-    use k256::elliptic_curve::point::{BatchNormalize, DecompressPoint};
-    use k256::elliptic_curve::subtle::Choice;
-    use k256::{AffinePoint, FieldBytes, ProjectivePoint, Scalar};
+    use k256::elliptic_curve::point::BatchNormalize;
+    use k256::{FieldBytes, ProjectivePoint, Scalar};
 
     // The signature must be the correct length.
     if signature.len() != COMPACT_SIG_SIZE {
@@ -515,13 +514,11 @@ pub fn recover_compact(signature: &[u8], hash: &[u8; 32]) -> Result<(PublicKey, 
 
     // Steps 4 and 5: the point X with that x and the y whose oddness the
     // code's low bit gives, failing when x^3 + 7 has no square root (dcrd's
-    // `DecompressY`, which normalizes the root before choosing it, as
-    // k256's `decompress` does).  x is below P here.
-    let big_x = Option::<AffinePoint>::from(AffinePoint::decompress(
-        &x_bytes.into(),
-        Choice::from(pub_key_recovery_code & 1),
-    ))
-    .ok_or(Error::PointNotOnCurve)?;
+    // `DecompressY`), through the seam as in key parsing (ADR-0016): the
+    // root is normalized before it is chosen and again after a negation,
+    // as dcrd does.  x is below P here.
+    let big_x = super::backend::decompress(&x_bytes, pub_key_recovery_code & 1 != 0)
+        .ok_or(Error::PointNotOnCurve)?;
 
     // Step 6: e = H(m) mod N, one conditional subtraction of N.
     let e = <Scalar as Reduce<FieldBytes>>::reduce(&(*hash).into());

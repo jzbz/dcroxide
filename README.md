@@ -235,11 +235,11 @@ work). Currently implemented:
   RFC6979 nonce variant); every signing path differentially verified
   byte-for-byte against dcrd
 - `dcroxide-secp256k1-vartime` — variable-time secp256k1 arithmetic for
-  public values only, ported from libsecp256k1's portable C and owned in
-  tree (ADR-0016): the scalar mod N and its safegcd inverse, which ECDSA
-  verification and compact recovery take for s^-1 and r^-1 behind one
-  seam in `dcroxide-dcrec`, with k256 as the fallback; `no_std` on core
-  alone, no dependencies, ISC AND MIT (its `NOTICE`)
+  public values only, ported from libsecp256k1's portable C (ADR-0016):
+  the scalar mod N with its safegcd inverse (s^-1, r^-1) and the 5x52
+  field with its square root (key decompression), for ECDSA verification,
+  recovery and key parsing behind one seam in `dcroxide-dcrec`, k256 the
+  fallback; `no_std` on core alone, no dependencies, ISC AND MIT (`NOTICE`)
 - `dcroxide-chaincfg` — all four networks' consensus parameters
   (mainnet/testnet3/simnet/regnet): genesis blocks reproducing dcrd's exact
   hashes and quirks, the full consensus-agenda deployment history, and the

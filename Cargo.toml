@@ -133,9 +133,9 @@ inherits = "soak"
 overflow-checks = true
 
 # The assertions leg of a gate on dcroxide-secp256k1-vartime (ADR-0016):
-# release's code generation with debug assertions on, so the crate's
-# invariant checks (modinv64's bounds, the reduced-scalar checks) run on the
-# code release compiles, and with overflow checks on.  Nothing ships from it.
+# release's code generation with debug assertions on, so its invariant checks
+# (the field's magnitudes and fe_verify, modinv64's bounds, the scalar range)
+# run on the code release compiles, with overflow checks on.  Nothing ships.
 #
 #   cargo test --locked --profile soak-asserts -p dcroxide-secp256k1-vartime
 [profile.soak-asserts]

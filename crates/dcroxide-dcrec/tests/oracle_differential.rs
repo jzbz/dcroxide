@@ -340,3 +340,156 @@ fn pubkey_parse_matches_dcrd_oracle() {
         check_pubkey_parse(&mut oracle, &mutated, &format!("mutated {i}"));
     }
 }
+
+/// The x coordinates at decompression's boundaries, big-endian: 0 (no
+/// point, since 7 is not a square), 1 (the smallest x with a point), P-3
+/// (the largest), P-2 and P-1 (none), P (refused before decompression), N
+/// (a point) and N-1 (none), and the x of every point whose y is below
+/// 200: y^2 - 7 must be a cube, since P = 7 mod 9 one cube root is
+/// (y^2 - 7)^((P+2)/9), and since P = 1 mod 3 the other two are it times
+/// beta and beta^2, beta a cube root of unity; each checked on k256's
+/// field.
+fn decompression_boundary_xs() -> Vec<[u8; 32]> {
+    use k256::elliptic_curve::hazmat::FieldArithmetic;
+    use k256::elliptic_curve::{Field, PrimeField};
+    type Fe = <k256::Secp256k1 as FieldArithmetic>::FieldElement;
+
+    const P: [u8; 32] = dcroxide_dcrec::secp256k1::FIELD_PRIME_BYTES;
+    const N: [u8; 32] = dcroxide_dcrec::secp256k1::GROUP_ORDER_BYTES;
+    // (P + 2) / 9, little-endian words.
+    const CUBE_ROOT_EXP: [u64; 4] = [
+        0x1c71_c71c_5555_54e9,
+        0x71c7_1c71_c71c_71c7,
+        0xc71c_71c7_1c71_c71c,
+        0x1c71_c71c_71c7_1c71,
+    ];
+    let small = |v: u8| {
+        let mut b = [0u8; 32];
+        b[31] = v;
+        b
+    };
+    let below = |b: [u8; 32], d: u8| {
+        let mut b = b;
+        b[31] -= d;
+        b
+    };
+    let mut xs = vec![
+        small(0),
+        small(1),
+        below(P, 3),
+        below(P, 2),
+        below(P, 1),
+        P,
+        N,
+        below(N, 1),
+    ];
+    // beta, big-endian, checked below.
+    const BETA: [u8; 32] = [
+        0x7a, 0xe9, 0x6a, 0x2b, 0x65, 0x7c, 0x07, 0x10, 0x6e, 0x64, 0x47, 0x9e, 0xac, 0x34, 0x34,
+        0xe9, 0x9c, 0xf0, 0x49, 0x75, 0x12, 0xf5, 0x89, 0x95, 0xc1, 0x39, 0x6c, 0x28, 0x71, 0x95,
+        0x01, 0xee,
+    ];
+    let beta: Fe = Option::from(Fe::from_repr(BETA.into())).expect("beta below P");
+    assert!(bool::from(
+        (beta.square() * beta - Fe::ONE).normalize().is_zero()
+    ));
+    assert!(!bool::from((beta - Fe::ONE).normalize().is_zero()));
+    let seven = Fe::from(7u64);
+    let mut tiny = 0;
+    for y in 1..200u64 {
+        let y = Fe::from(y);
+        let c = (y.square() - seven).normalize();
+        let x = c.pow_vartime(CUBE_ROOT_EXP);
+        if bool::from((x.square() * x - c).normalize().is_zero()) {
+            for x in [x, x * beta, x * beta.square()] {
+                assert!(bool::from((x.square() * x - c).normalize().is_zero()));
+                xs.push(x.normalize().to_repr().into());
+                tiny += 1;
+            }
+        }
+    }
+    assert_eq!(tiny, 183, "points with y < 200");
+    xs
+}
+
+/// Compressed keys and compact recoveries at decompression's boundaries
+/// against dcrd (ADR-0016's decompression runs on the vartime crate):
+/// every boundary x with both prefixes through key parsing, and as the R
+/// of compact signatures with both oddness bits, through recovery, r = x
+/// (or x - N with the overflow bit when x >= N), random s and hash.
+/// dcrd's verdict, error kind and key come from the oracle.
+#[test]
+fn decompression_boundaries_match_dcrd_oracle() {
+    use dcroxide_dcrec::secp256k1::ecdsa::recover_compact;
+
+    let Some(mut oracle) = oracle_or_skip() else {
+        return;
+    };
+    let n = dcroxide_dcrec::secp256k1::GROUP_ORDER_BYTES;
+    let mut rng = SplitMix64(0xdec0_b0d1);
+    let (mut recovered, mut refused) = (0u32, 0u32);
+    for x in decompression_boundary_xs() {
+        for prefix in [0x02u8, 0x03] {
+            let mut key = [prefix; 33];
+            key[1..].copy_from_slice(&x);
+            check_pubkey_parse(&mut oracle, &key, "boundary key");
+        }
+
+        // r = x, or x - N with the overflow bit (x < P keeps r below
+        // P - N).
+        let (r, overflow) = if x >= n {
+            let mut r = [0u8; 32];
+            let mut borrow = 0i16;
+            for i in (0..32).rev() {
+                let d = i16::from(x[i]) - i16::from(n[i]) - borrow;
+                borrow = i16::from(d < 0);
+                r[i] = (d + 256 * borrow) as u8;
+            }
+            (r, 2u8)
+        } else {
+            (x, 0u8)
+        };
+        for odd in [0u8, 1] {
+            let mut s = [0u8; 32];
+            rng.fill(&mut s);
+            s[0] &= 0x7f;
+            s[31] |= 1;
+            let mut hash = [0u8; 32];
+            rng.fill(&mut hash);
+            let mut sig = [0u8; 65];
+            sig[0] = 27 + 4 + overflow + odd;
+            sig[1..33].copy_from_slice(&r);
+            sig[33..].copy_from_slice(&s);
+
+            let ours = recover_compact(&sig, &hash);
+            let mut req = hash.to_vec();
+            req.extend_from_slice(&sig);
+            let resp = oracle.call("ecdsa_recover_compact", &req);
+            match (&ours, resp.get("error").and_then(|e| e.as_str())) {
+                (Ok((pk, compressed)), None) => {
+                    assert!(*compressed);
+                    assert_eq!(
+                        hex(&pk.serialize_compressed()),
+                        resp["result"].as_str().expect("result"),
+                        "recovered key for {}",
+                        hex(&sig)
+                    );
+                    recovered += 1;
+                }
+                (Err(err), Some(_)) => {
+                    let kind = resp["kind"].as_str().expect("kind present");
+                    assert_eq!(err.kind_name(), kind, "kind for {}", hex(&sig));
+                    refused += 1;
+                }
+                (ours, theirs) => panic!(
+                    "verdict mismatch for {}: ours {ours:?}, oracle error {theirs:?}",
+                    hex(&sig)
+                ),
+            }
+        }
+    }
+    assert!(
+        recovered > 100 && refused > 4,
+        "{recovered} recovered, {refused} refused"
+    );
+}

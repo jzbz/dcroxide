@@ -138,11 +138,11 @@ jobs:
     name: test (dcroxide-secp256k1-vartime, release)
     runs-on: ubuntu-latest
     # dcroxide-secp256k1-vartime (ADR-0016) runs 20,000 random cases per
-    # operation in builds with debug assertions, which every other job
-    # builds. Here it runs 10^6 in release, the code generation the node
-    # ships, and in soak-asserts, release's code generation with debug
-    # assertions and overflow checks on, where its invariant checks run on
-    # every case. Its digest test pins one constant the dev builds share.
+    # operation in debug-assertion builds, as every other job builds. Here
+    # it runs 10^6 and the field's full grid of corner products, in release
+    # (the node's code generation) and in soak-asserts (release's with debug
+    # assertions and overflow checks on, so its invariant checks see every
+    # case). Its digest tests pin constants the dev builds must reproduce.
     steps:
       - uses: actions/checkout@v7
       - run: rustup toolchain install

@@ -5,8 +5,7 @@
 use core::fmt;
 
 use k256::elliptic_curve::group::CurveAffine;
-use k256::elliptic_curve::point::{AffineCoordinates, DecompressPoint};
-use k256::elliptic_curve::subtle::Choice;
+use k256::elliptic_curve::point::AffineCoordinates;
 use k256::{AffinePoint, FieldBytes, ProjectivePoint, Scalar};
 use zeroize::{Zeroize, Zeroizing};
 
@@ -287,14 +286,13 @@ impl PublicKey {
                 }
 
                 // Decompression fails iff x^3 + 7 has no square root, so no
-                // curve point has this x (dcrd's `DecompressY`).  k256's
-                // `decompress` normalizes the root before choosing the one
-                // whose oddness the format byte asks for, 0x03 the odd one.
-                let point = Option::<AffinePoint>::from(AffinePoint::decompress(
-                    &(*x).into(),
-                    Choice::from(format & 1),
-                ))
-                .ok_or(Error::PubKeyNotOnCurve { x: *x, y: None })?;
+                // curve point has this x (dcrd's `DecompressY`).  The seam
+                // takes the root on dcroxide-secp256k1-vartime (ADR-0016),
+                // which normalizes it before choosing the one whose oddness
+                // the format byte asks for, 0x03 the odd one, and again
+                // after negating it, as dcrd does.
+                let point = backend::decompress(x, format & 1 == 1)
+                    .ok_or(Error::PubKeyNotOnCurve { x: *x, y: None })?;
                 Ok(PublicKey { point })
             }
             _ => Err(Error::PubKeyInvalidLen(serialized.len())),
