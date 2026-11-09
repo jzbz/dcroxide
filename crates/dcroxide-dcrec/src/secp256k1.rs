@@ -4,8 +4,6 @@
 
 use core::fmt;
 
-use k256::elliptic_curve::group::CurveAffine;
-use k256::elliptic_curve::point::AffineCoordinates;
 use k256::{AffinePoint, FieldBytes, ProjectivePoint, Scalar};
 use zeroize::{Zeroize, Zeroizing};
 
@@ -202,15 +200,18 @@ impl fmt::Display for Error {
 
 impl core::error::Error for Error {}
 
-/// A validated secp256k1 public key: a k256 affine point on the curve,
-/// never the identity, built only once dcrd's format, range and oddness
-/// checks have passed.
+/// A validated secp256k1 public key: a point on the curve, never the
+/// identity, held as dcroxide-secp256k1-vartime's affine point with both
+/// coordinates normalized (ADR-0016), built only once dcrd's format, range
+/// and oddness checks have passed.
 ///
-/// `PartialEq` compares the coordinates in constant time.  `Debug` prints
-/// the compressed serialization in hex, not the point's internal limbs.
+/// A public key is public data: `PartialEq` compares x and y, as dcrd's
+/// `IsEqual` does, on the normalized limbs and in variable time.
+/// `Debug` prints the compressed serialization in hex, not the point's
+/// internal limbs.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct PublicKey {
-    point: AffinePoint,
+    point: backend::KeyPoint,
 }
 
 impl fmt::Debug for PublicKey {
@@ -261,15 +262,13 @@ impl PublicKey {
                 }
 
                 // The remaining failure is an off-curve point (dcrd's
-                // `IsOnCurve`): k256's `from_coordinates` tests
-                // y^2 = x^3 + 7 on coordinates already below the prime, so
-                // the range errors above keep their own kinds.  Its result
-                // is never the identity.
-                let point = Option::<AffinePoint>::from(AffinePoint::from_coordinates(
-                    &(*x).into(),
-                    &(*y).into(),
-                ))
-                .ok_or(Error::PubKeyNotOnCurve { x: *x, y: Some(*y) })?;
+                // `IsOnCurve`): the seam tests y^2 = x^3 + 7 on
+                // dcroxide-secp256k1-vartime (ADR-0016), libsecp256k1's
+                // `ge_is_valid_var`, on coordinates already below the
+                // prime, so the range errors above keep their own kinds.
+                // Its result is never the identity.
+                let point = backend::from_coordinates(x, y)
+                    .ok_or(Error::PubKeyNotOnCurve { x: *x, y: Some(*y) })?;
                 Ok(PublicKey { point })
             }
             PUB_KEY_BYTES_LEN_COMPRESSED => {
@@ -300,10 +299,11 @@ impl PublicKey {
 
     /// The 33-byte compressed serialization (dcrd `SerializeCompressed`).
     pub fn serialize_compressed(&self) -> [u8; PUB_KEY_BYTES_LEN_COMPRESSED] {
+        let (x, _) = self.point.to_be_bytes();
         let mut out = [0u8; PUB_KEY_BYTES_LEN_COMPRESSED];
         // 0x02, or 0x03 for an odd y.
-        out[0] = PUB_KEY_FORMAT_COMPRESSED_EVEN | self.point.y_is_odd().unwrap_u8();
-        out[1..].copy_from_slice(&self.point.x());
+        out[0] = PUB_KEY_FORMAT_COMPRESSED_EVEN | u8::from(self.point.y_is_odd());
+        out[1..].copy_from_slice(&x);
         out
     }
 
@@ -311,25 +311,20 @@ impl PublicKey {
     /// Hybrid-parsed keys serialize with the 0x04 prefix; dcrd never emits
     /// the hybrid format either.
     pub fn serialize_uncompressed(&self) -> [u8; PUB_KEY_BYTES_LEN_UNCOMPRESSED] {
+        let (x, y) = self.point.to_be_bytes();
         let mut out = [0u8; PUB_KEY_BYTES_LEN_UNCOMPRESSED];
         out[0] = PUB_KEY_FORMAT_UNCOMPRESSED;
-        out[1..33].copy_from_slice(&self.point.x());
-        out[33..].copy_from_slice(&self.point.y());
+        out[1..33].copy_from_slice(&x);
+        out[33..].copy_from_slice(&y);
         out
     }
 
-    /// The key from a k256 point, which must not be the identity: a point
-    /// on the curve that recovery computed (the seam converts it from the
-    /// vartime crate's).
-    pub(crate) fn from_affine(point: AffinePoint) -> PublicKey {
-        debug_assert!(!bool::from(point.is_identity()));
-        PublicKey { point }
-    }
-
-    /// The key as a k256 projective point, for the seam's k256 arms.  The
-    /// key already holds the point, so this only sets z = 1.
-    pub(crate) fn as_k256_point(&self) -> ProjectivePoint {
-        ProjectivePoint::from(self.point)
+    /// The key k256 computed for a private key, its finished public point,
+    /// entering the key type through the vartime crate's curve check.
+    /// `None` only if that check refuses a point k256 computed, a fault in
+    /// one of them.
+    fn from_k256_point(point: &AffinePoint) -> Option<PublicKey> {
+        backend::key_from_k256(point).map(|point| PublicKey { point })
     }
 }
 
@@ -362,15 +357,28 @@ impl PrivateKey {
             .map(|inner| PrivateKey { inner })
     }
 
-    /// The corresponding public key, dG.  The scalar copy is wiped; the
-    /// multiplication is k256's constant-time `GENERATOR * d`.
+    /// The corresponding public key, dG.  The multiplication is k256's
+    /// constant-time `GENERATOR * d` and the scalar copy is wiped; the
+    /// product is public, and enters the public key type once, through the
+    /// vartime crate's curve check.
+    ///
+    /// # Panics
+    ///
+    /// Only if that curve check refuses the point k256 computed, a fault
+    /// in one of the two crates: there is no correct key to return then.
     // The flagged operator is k256 point multiplication, a group operation.
     #[allow(clippy::arithmetic_side_effects)]
     pub fn public_key(&self) -> PublicKey {
         let mut d = Scalar::from(self.inner.as_scalar_value());
         let point = (ProjectivePoint::GENERATOR * d).to_affine();
         d.zeroize();
-        PublicKey { point }
+        // dG is never the identity for d in [1, N-1], and k256's affine
+        // coordinates are below P and on the curve, so only a fault in the
+        // vartime crate's curve check, which also guards every uncompressed
+        // key parse, could refuse it.  There is no correct key to return
+        // without it, so this panics rather than hand back a wrong one, as
+        // the signing paths do on their impossible states.
+        PublicKey::from_k256_point(&point).expect("k256's dG passes the curve check")
     }
 
     /// The key's 32 big-endian bytes, wiped when dropped (dcrd's signers
@@ -753,5 +761,228 @@ mod tests {
         let mut want = GROUP_ORDER_BYTES;
         want[31] -= 1;
         assert_eq!(neg, want);
+    }
+
+    /// a - b, big-endian, for a >= b.
+    // Test-only byte arithmetic: each digit difference fits an i16.
+    #[allow(clippy::arithmetic_side_effects)]
+    fn sub_be(a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        let mut borrow = 0i16;
+        for i in (0..32).rev() {
+            let d = i16::from(a[i]) - i16::from(b[i]) - borrow;
+            out[i] = d.rem_euclid(256) as u8;
+            borrow = i16::from(d < 0);
+        }
+        assert_eq!(borrow, 0);
+        out
+    }
+
+    /// The private key of 32 seeded bytes, retried until they are a key.
+    fn seeded_key(rng: &mut dcroxide_testutil::SplitMix64) -> PrivateKey {
+        loop {
+            let mut d = [0u8; 32];
+            rng.fill(&mut d);
+            if let Some(key) = PrivateKey::from_bytes(&d) {
+                return key;
+            }
+        }
+    }
+
+    /// k256's dG for a private key, by its own constant-time multiply.
+    // The flagged operator is k256 point multiplication.
+    #[allow(clippy::arithmetic_side_effects)]
+    fn k256_point(key: &PrivateKey) -> AffinePoint {
+        (ProjectivePoint::GENERATOR * Scalar::from(key.inner.as_scalar_value())).to_affine()
+    }
+
+    /// lambda, the endomorphism's scalar, big-endian: lambda*(x, y) is
+    /// (beta*x, y), another point with the same y.
+    const LAMBDA: [u8; 32] = [
+        0x53, 0x63, 0xad, 0x4c, 0xc0, 0x5c, 0x30, 0xe0, 0xa5, 0x26, 0x1c, 0x02, 0x88, 0x12, 0x64,
+        0x5a, 0x12, 0x2e, 0x22, 0xea, 0x20, 0x81, 0x66, 0x78, 0xdf, 0x02, 0x96, 0x7c, 0x1b, 0x23,
+        0xbd, 0x72,
+    ];
+
+    /// Public key equality is point equality, however the key was made:
+    /// `public_key`, its compressed, uncompressed and hybrid encodings
+    /// parsed, and k256's own SEC1 encodings of dG parsed all give one
+    /// key; the negation (same x) and the endomorphism's image (same y)
+    /// give others; and over every pair, `==` holds exactly when the
+    /// uncompressed serializations are equal.
+    #[test]
+    fn equality_is_point_equality() {
+        use k256::elliptic_curve::PrimeField;
+        use k256::elliptic_curve::sec1::ToSec1Point;
+        let mut rng = dcroxide_testutil::SplitMix64(0x6571_7561_6c69_7479);
+        let lambda = Option::<Scalar>::from(Scalar::from_repr(LAMBDA.into())).expect("below N");
+        let mut keys = alloc::vec::Vec::new();
+        for _ in 0..64 {
+            let key = seeded_key(&mut rng);
+            let pk = key.public_key();
+            let c = pk.serialize_compressed();
+            let u = pk.serialize_uncompressed();
+            let mut h = u;
+            h[0] = PUB_KEY_FORMAT_HYBRID_EVEN | (u[64] & 1);
+            let k = k256_point(&key);
+            let (kc, ku) = (k.to_sec1_point(true), k.to_sec1_point(false));
+            for enc in [&c[..], &u[..], &h[..], kc.as_bytes(), ku.as_bytes()] {
+                assert_eq!(
+                    PublicKey::parse(enc),
+                    Ok(pk),
+                    "{}",
+                    dcroxide_testutil::hex(enc)
+                );
+            }
+
+            let mut neg = u;
+            let y: [u8; 32] = u[33..].try_into().expect("32 bytes");
+            neg[33..].copy_from_slice(&sub_be(&FIELD_PRIME_BYTES, &y));
+            let neg = PublicKey::parse(&neg).expect("the negation is on the curve");
+            assert_ne!(neg, pk);
+            assert_eq!(neg.serialize_compressed()[1..], c[1..]);
+
+            let d = Scalar::from(key.inner.as_scalar_value());
+            #[allow(clippy::arithmetic_side_effects)] // k256 scalar product mod N
+            let beta_key = PrivateKey::from_bytes(&(d * lambda).to_repr().into())
+                .expect("nonzero")
+                .public_key();
+            assert_ne!(beta_key, pk);
+            assert_eq!(beta_key.serialize_uncompressed()[33..], u[33..]);
+            keys.extend([pk, neg, beta_key]);
+        }
+        for (i, a) in keys.iter().enumerate() {
+            for b in &keys[i..] {
+                assert_eq!(
+                    a == b,
+                    a.serialize_uncompressed() == b.serialize_uncompressed(),
+                    "{a:?} {b:?}"
+                );
+            }
+        }
+    }
+
+    /// Both serializations equal k256's SEC1 encodings of dG for 1,024
+    /// seeded keys and for d = 1 and N - 1, and each parses back to the
+    /// same key.
+    #[test]
+    fn serialization_matches_k256_for_random_keys() {
+        use k256::elliptic_curve::sec1::ToSec1Point;
+        let mut rng = dcroxide_testutil::SplitMix64(0x7365_7269_616c_697a);
+        let mut one = [0u8; 32];
+        one[31] = 1;
+        let n_minus_1 = negate_mod_n(&one);
+        let mut keys: alloc::vec::Vec<PrivateKey> = [one, n_minus_1]
+            .iter()
+            .map(|d| PrivateKey::from_bytes(d).expect("a key"))
+            .collect();
+        while keys.len() < 1026 {
+            keys.push(seeded_key(&mut rng));
+        }
+        for key in &keys {
+            let pk = key.public_key();
+            let k = k256_point(key);
+            let (c, u) = (pk.serialize_compressed(), pk.serialize_uncompressed());
+            assert_eq!(&c[..], k.to_sec1_point(true).as_bytes());
+            assert_eq!(&u[..], k.to_sec1_point(false).as_bytes());
+            assert_eq!(PublicKey::parse(&c), Ok(pk));
+            assert_eq!(PublicKey::parse(&u), Ok(pk));
+        }
+    }
+
+    /// Hybrid keys are checked in dcrd's order: x's range, y's range, y's
+    /// parity against the format byte, then the curve, so the parity
+    /// error comes before the curve's and after both range errors, with
+    /// dcrd's text for each.
+    #[test]
+    fn hybrid_checks_run_in_dcrds_order() {
+        // dcrd's "uncompressed ok" vector, whose y is odd.
+        let x = "11db93e1dcdb8a016b49840f8c53bc1eb68a382e97b1482ecad7b148a6909a5c";
+        let y = "b2e0eaddfb84ccf9744464f82e160bfa9b8b64f9d4c03f999b8643f656b412a3";
+        // y + 1, even and not on the curve.
+        let y1 = "b2e0eaddfb84ccf9744464f82e160bfa9b8b64f9d4c03f999b8643f656b412a4";
+        let p = "fffffffffffffffffffffffffffffffffffffffffffffffffffffffefffffc2f";
+        let p1 = "fffffffffffffffffffffffffffffffffffffffffffffffffffffffefffffc30";
+        let key = |format: &str, x: &str, y: &str| {
+            PublicKey::parse(&unhex(&alloc::format!("{format}{x}{y}")))
+        };
+        let text = |r: Result<PublicKey, Error>| r.map(|_| ()).map_err(|e| e.to_string());
+
+        let good = key("04", x, y).expect("dcrd's vector");
+        assert_eq!(key("07", x, y), Ok(good));
+        assert_eq!(key("06", x, y), Err(Error::PubKeyMismatchedOddness(false)));
+        assert_eq!(
+            text(key("06", x, y)),
+            Err("invalid public key: y oddness does not match specified value of false".into())
+        );
+
+        // Off the curve: the right parity reaches the curve check, the
+        // wrong one stops at the parity.
+        let off = alloc::format!("invalid public key: [{x},{y1}] not on secp256k1 curve");
+        for format in ["04", "06"] {
+            assert!(matches!(
+                key(format, x, y1),
+                Err(Error::PubKeyNotOnCurve { y: Some(_), .. })
+            ));
+            assert_eq!(text(key(format, x, y1)), Err(off.clone()));
+        }
+        assert_eq!(key("07", x, y1), Err(Error::PubKeyMismatchedOddness(true)));
+
+        // y at or above P, either parity: y's range first.
+        for (format, yy) in [("06", p), ("07", p), ("06", p1), ("07", p1), ("04", p1)] {
+            assert_eq!(
+                key(format, x, yy),
+                Err(Error::PubKeyYTooBig),
+                "{format} {yy}"
+            );
+        }
+        // x at or above P: x's range before everything else.
+        for format in ["04", "06", "07"] {
+            for (xx, yy) in [(p, p), (p1, p1), (p, y), (p1, y1)] {
+                assert_eq!(
+                    key(format, xx, yy),
+                    Err(Error::PubKeyXTooBig),
+                    "{format} {xx} {yy}"
+                );
+            }
+        }
+    }
+
+    /// Two keys whose coordinates differ only in y's lowest 52-bit limb
+    /// are unequal: (x, y) and its negation for y = (P - 1) / 2 - 2, the
+    /// first y below (P - 1) / 2 with a point, so y and P - y differ by 5
+    /// and share their top 204 bits.  An equality that skipped a limb,
+    /// which random keys never notice, fails here.
+    #[test]
+    fn keys_differing_in_one_limb_are_unequal() {
+        let x = "8a369db2d6ecfaa666514299e447165e31fba21f0b2c3c1d5a0fc77c3e150672";
+        let y_odd = "7fffffffffffffffffffffffffffffffffffffffffffffffffffffff7ffffe15";
+        let y_even = "7fffffffffffffffffffffffffffffffffffffffffffffffffffffff7ffffe1a";
+        let key = |s: alloc::string::String| PublicKey::parse(&unhex(&s)).expect("on the curve");
+        let odd = key(alloc::format!("04{x}{y_odd}"));
+        let even = key(alloc::format!("04{x}{y_even}"));
+        assert_ne!(odd, even);
+        assert_eq!(odd, key(alloc::format!("03{x}")));
+        assert_eq!(even, key(alloc::format!("02{x}")));
+        assert_eq!(odd, key(alloc::format!("07{x}{y_odd}")));
+        assert_eq!(even, key(alloc::format!("06{x}{y_even}")));
+    }
+
+    /// The public key type keeps the traits its users rely on: copying,
+    /// equality, `Debug`, and sharing between threads.
+    #[test]
+    fn public_key_type_keeps_its_traits() {
+        fn traits<T: Copy + Eq + Send + Sync + core::fmt::Debug>() {}
+        traits::<PublicKey>();
+    }
+
+    /// In release the key is no larger than k256's affine point, which it
+    /// replaced.  On 64-bit targets both are two coordinates of five
+    /// 64-bit limbs and an infinity flag, so the sizes are equal; builds
+    /// with debug assertions add the field's bookkeeping.
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn public_key_is_no_larger_than_k256s_point() {
+        assert!(core::mem::size_of::<PublicKey>() <= core::mem::size_of::<AffinePoint>());
     }
 }

@@ -5,7 +5,8 @@
 //! limb; the boundary keys (the smallest and largest x with a point, and
 //! every point with a tiny y); y normalized after the negation, also from
 //! an x above magnitude 1; `from_be_coordinates`' acceptance and
-//! rejections; and the curve check refusing the point at infinity.
+//! rejections; equality on the normalized coordinates, whatever built the
+//! point; and the curve check refusing the point at infinity.
 
 use dcroxide_testutil::SplitMix64;
 use k256::elliptic_curve::point::AffineCoordinates;
@@ -13,8 +14,8 @@ use k256::{AffinePoint, ProjectivePoint};
 
 use super::dcrd_vectors::DECOMPRESS_Y;
 use super::*;
-use crate::Affine;
 use crate::group::Ge;
+use crate::{Affine, ecmult_var};
 
 /// dcrd's hex, any length up to 64 digits, as 32 big-endian bytes.
 fn dcrd_hex(h: &str) -> [u8; 32] {
@@ -336,6 +337,78 @@ fn from_be_coordinates_accepts_points_and_refuses_the_rest() {
     }
     assert!(off_curve > 0);
     assert!(Affine::from_be_coordinates(&[0; 32], &[0; 32]).is_none());
+}
+
+/// Equality of affine points is equality of their normalized
+/// coordinates, whatever built them: a point from `from_be_coordinates`,
+/// from `decompress_var` and from `to_affine_var` of the multiply's
+/// Jacobian output (Z not 1) compares equal, though builds with debug
+/// assertions give the three different bookkeeping; a point and its
+/// negation (same x) and a point and lambda times it (beta*x, same y)
+/// compare unequal; and over every pair, `==` agrees with the
+/// serialized coordinates.  dcrec's public key equality is this.
+#[test]
+fn affine_equality_is_coordinate_equality() {
+    let mut r = SplitMix64(0x6166_665f_6571_7521);
+    let one = crate::Scalar::reduce_be_bytes(&words_to_be(&[1, 0, 0, 0]));
+    let zero = crate::Scalar::reduce_be_bytes(&[0; 32]);
+    let lambda = crate::scalar::LAMBDA;
+    let mut points = Vec::new();
+    for _ in 0..32 {
+        let qx = words_to_be(&words_below_p(&mut r));
+        let odd = r.next_u64() & 1 == 1;
+        let Some(d) = Affine::decompress_var(&qx, odd) else {
+            continue;
+        };
+        let (x, y) = d.to_be_bytes();
+        let c = Affine::from_be_coordinates(&x, &y).expect("a curve point");
+        let j = ecmult_var(&d, &one, &zero)
+            .expect("the guard")
+            .to_affine_var()
+            .expect("the cap")
+            .expect("not infinity");
+        assert!(c == d && j == d && j == c);
+
+        let n = Affine::from_be_coordinates(&x, &words_to_be(&neg_p(&be_to_words(&y))))
+            .expect("the negation");
+        assert!(n != d);
+        assert_eq!(n.to_be_bytes().0, x);
+
+        let b = ecmult_var(&d, &lambda, &zero)
+            .expect("the guard")
+            .to_affine_var()
+            .expect("the cap")
+            .expect("not infinity");
+        assert!(b != d);
+        assert_eq!(b.to_be_bytes().1, y);
+        points.extend([d, c, j, n, b]);
+    }
+    assert!(points.len() >= 40, "{} points", points.len());
+    for (i, a) in points.iter().enumerate() {
+        for b in &points[i..] {
+            assert_eq!(a == b, a.to_be_bytes() == b.to_be_bytes());
+        }
+    }
+}
+
+/// Points whose coordinates differ only in y's lowest limb are unequal:
+/// (x, y) and (x, P - y) for y = (P - 1) / 2 - 2, whose y limbs differ in
+/// limb 0 alone (by 5).
+#[test]
+fn affine_equality_sees_every_limb() {
+    let x = dcrd_hex("8a369db2d6ecfaa666514299e447165e31fba21f0b2c3c1d5a0fc77c3e150672");
+    let odd = Affine::decompress_var(&x, true).expect("a point");
+    let even = Affine::decompress_var(&x, false).expect("a point");
+    assert_eq!(
+        odd.to_be_bytes().1,
+        dcrd_hex("7fffffffffffffffffffffffffffffffffffffffffffffffffffffff7ffffe15")
+    );
+    assert_eq!(
+        even.to_be_bytes().1,
+        dcrd_hex("7fffffffffffffffffffffffffffffffffffffffffffffffffffffff7ffffe1a")
+    );
+    assert!(odd != even);
+    assert!(odd == Affine::from_be_coordinates(&x, &odd.to_be_bytes().1).expect("on the curve"));
 }
 
 /// `Ge::is_valid_var` refuses the point at infinity, whatever its

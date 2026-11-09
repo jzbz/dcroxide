@@ -4,13 +4,15 @@
 //! This is the only module of the crate that names that crate, so another
 //! backend, k256's code before it or a libsecp256k1 binding, slots in, as
 //! code, by changing this module alone.  Only the verification, recovery
-//! and key-parsing functions name this module, so no signing function
-//! reaches it; `tests/vartime_boundary.rs` holds both rules.
+//! and key-parsing functions name this module, with the public key's
+//! field and the conversion of a private key's public point, so no
+//! signing function reaches it; `tests/vartime_boundary.rs` holds both
+//! rules.
 //!
 //! Every function here takes public values only, and none can panic: when
 //! the vartime crate declines (its safegcd loop past an iteration cap, a
-//! case its proof rules out) or hands back a value k256 refuses or the
-//! seam's own check rejects, the seam computes the answer on k256 instead,
+//! case its proof rules out) or hands back a value the seam's own check
+//! rejects, the seam computes the answer on k256 instead,
 //! as the code before it did, and debug builds assert.  An assertion in
 //! release would be an outage under `panic = "abort"`.  Tests can force
 //! that path, which production never takes, so it is tested too.
@@ -21,8 +23,11 @@
 //! recovery and Schnorr verification always need the affine point, so
 //! their entry points convert inside, where the inverse's cap can fall
 //! back, and return the answer resolved ([`Recovery`], R's x and parity).
-//! Until the key type moves, a parsed or recovered key is k256's point,
-//! converted inside the seam with its fallback beside it.
+//! dcrec's `PublicKey` holds the crate's affine point ([`KeyPoint`]), so
+//! verification hands it to the multiply as it is, and parsing and
+//! recovery produce it; k256 meets a public key only in the fallback
+//! arms, which convert it, and in `PrivateKey::public_key`, whose
+//! constant-time product enters the key type once.
 
 use dcroxide_secp256k1_vartime as vartime;
 use k256::elliptic_curve::PrimeField;
@@ -33,6 +38,75 @@ use k256::elliptic_curve::subtle::Choice;
 use k256::{AffinePoint, FieldBytes, ProjectivePoint, Scalar};
 
 use super::PublicKey;
+
+/// A public key's point on the vartime crate: on the curve, never
+/// infinity, both coordinates normalized.  dcrec's `PublicKey` holds it,
+/// and its equality compares x and y, as dcrd's `IsEqual` does, on the
+/// crate's normalized limbs and in variable time, since a public key is
+/// public.  Only this module names the crate, so the key type lives here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct KeyPoint(vartime::Affine);
+
+impl KeyPoint {
+    /// (x, y), each big-endian and below P.
+    pub(crate) fn to_be_bytes(self) -> ([u8; 32], [u8; 32]) {
+        self.0.to_be_bytes()
+    }
+
+    /// Whether y is odd.
+    pub(crate) fn y_is_odd(self) -> bool {
+        self.0.y_is_odd()
+    }
+}
+
+/// The key point (x, y), each given big-endian and below P, as dcrec's key
+/// parsing has checked: `None` unless y^2 = x^3 + 7, by the vartime
+/// crate's port of libsecp256k1's `ge_set_xy` and `ge_is_valid_var`
+/// (dcrd's `IsOnCurve`).  Its `None` is the answer, not a reason to fall
+/// back: the check has no cap or guard that could decline.  Builds with
+/// debug assertions hold it to k256's `from_coordinates`.
+pub(crate) fn from_coordinates(x: &[u8; 32], y: &[u8; 32]) -> Option<KeyPoint> {
+    let p = vartime::Affine::from_be_coordinates(x, y).map(KeyPoint);
+    #[cfg(test)]
+    let p = if curve_check_refused() { None } else { p };
+    debug_assert_eq!(
+        p.is_some(),
+        k256_affine(x, y).is_some(),
+        "the vartime crate and k256 disagree on whether a key is on the curve"
+    );
+    p
+}
+
+/// A point k256 computed, a finished public value, as the key type: its
+/// normalized coordinates through the vartime crate's curve check.
+/// `None` only if that check refuses a point k256 holds, a fault in one
+/// of them, which its callers reject on (or test builds force it).
+/// Callers: `PrivateKey::public_key`, and the k256 arms of decompression
+/// and recovery.
+pub(crate) fn key_from_k256(p: &AffinePoint) -> Option<KeyPoint> {
+    if conversion_refused() {
+        return None;
+    }
+    vartime::Affine::from_be_coordinates(&p.x().into(), &p.y().into()).map(KeyPoint)
+}
+
+/// The key as k256's point, for the fallback arms: `from_coordinates` on
+/// the key's coordinates, which the vartime crate has checked.  `None`
+/// only if k256 refuses them, a fault in one of the two curve checks (or
+/// test builds force it).
+fn k256_key(q: &PublicKey) -> Option<ProjectivePoint> {
+    if conversion_refused() {
+        return None;
+    }
+    let (x, y) = q.point.to_be_bytes();
+    k256_affine(&x, &y).map(ProjectivePoint::from)
+}
+
+/// k256's point (x, y), through `from_coordinates`, which checks both
+/// coordinates below P and the curve equation; `None` if it refuses.
+fn k256_affine(x: &[u8; 32], y: &[u8; 32]) -> Option<AffinePoint> {
+    Option::<AffinePoint>::from(AffinePoint::from_coordinates(&(*x).into(), &(*y).into()))
+}
 
 /// X = u1*G + u2*Q of ECDSA verification, from whichever backend computed
 /// it.  The caller asks only what dcrd's steps 6 to 10 ask.
@@ -76,8 +150,8 @@ impl Sum {
 /// static generator tables).
 ///
 /// Should the vartime crate decline anywhere (r or s not below N, the
-/// inverse's cap, the key's conversion, the wNAF builder's guard; none
-/// happens for valid inputs), the sum is k256's combined multiply and one
+/// inverse's cap, the wNAF builder's guard; none happens for valid
+/// inputs), the sum is k256's combined multiply and one
 /// `batch_normalize_vartime` instead, the code the last gate soak ran
 /// (stage 2a's fallback), and debug builds assert.  Builds with debug
 /// assertions also compute k256's sum every time and stop if the two
@@ -122,23 +196,21 @@ fn vartime_sum(
     mul_g_add(&u1, &u2, q)
 }
 
-/// u1*G + u2*Q on the vartime crate: the key enters through
-/// `from_be_coordinates`, which checks the curve equation again (k256 has
-/// checked it), and the multiply is `ecmult_var`.  ECDSA and Schnorr
+/// u1*G + u2*Q on the vartime crate: the key is already the crate's
+/// point, so it goes to `ecmult_var` as it is.  ECDSA and Schnorr
 /// verification share it.
 fn mul_g_add(u1: &vartime::Scalar, u2: &vartime::Scalar, q: &PublicKey) -> Option<vartime::Point> {
-    let k = q.serialize_uncompressed();
-    let (x, y) = k[1..].split_first_chunk::<32>()?;
-    let q = vartime::Affine::from_be_coordinates(x, y.first_chunk::<32>()?)?;
-    vartime::ecmult_var(&q, u2, u1)
+    vartime::ecmult_var(&q.point.0, u2, u1)
 }
 
 /// Steps 2 to 5 on k256, the code the last gate soak ran as stage 2a's
 /// fallback: its `invert_vartime`, its scalar products, its combined multiply
-/// `mul_by_generator_and_mul_add_vartime` and one `batch_normalize_vartime`.
-/// Should r or s not be below N, which the caller rules out, the sum is
-/// the identity, so verification fails at step 6, and debug builds
-/// assert.
+/// `mul_by_generator_and_mul_add_vartime` and one `batch_normalize_vartime`,
+/// on the key converted to k256's point.  Should r or s not be below N,
+/// which the caller rules out, or k256 refuse the key, which takes a
+/// fault in one of the two curve checks on top of the decline that sent
+/// the seam here, there is no answer to fall back to: the sum is the
+/// identity, so verification fails at step 6, and debug builds assert.
 #[allow(
     clippy::arithmetic_side_effects,
     reason = "k256's Scalar operators are arithmetic mod N"
@@ -151,12 +223,12 @@ fn k256_sum(hash: &[u8; 32], r: &[u8; 32], s: &[u8; 32], q: &PublicKey) -> Sum {
         debug_assert!(false, "k256_sum: r or s not in [1, N-1]");
         return Sum(SumInner::K256(None));
     };
+    let Some(q) = k256_key(q) else {
+        debug_assert!(false, "k256 refused a key the vartime crate holds");
+        return Sum(SumInner::K256(None));
+    };
     let e = <Scalar as Reduce<FieldBytes>>::reduce(&(*hash).into());
-    let x = ProjectivePoint::mul_by_generator_and_mul_add_vartime(
-        &(e * w),
-        &(r * w),
-        &q.as_k256_point(),
-    );
+    let x = ProjectivePoint::mul_by_generator_and_mul_add_vartime(&(e * w), &(r * w), &q);
     if bool::from(x.is_identity()) {
         return Sum(SumInner::K256(None));
     }
@@ -201,12 +273,11 @@ pub(crate) enum Recovery {
 /// coordinates, dcrd's order, all on the vartime crate's port of
 /// libsecp256k1 (its square root, its safegcd inverses, its scalar
 /// products, its Straus loop and one field inversion, x and y normalized
-/// as dcrd's `ToAffine` does).  Until the key type moves, the key enters
-/// k256 through `from_coordinates`, which checks the curve equation again.
+/// as dcrd's `ToAffine` does).  The key is the crate's point, as it came.
 ///
 /// Should the vartime crate decline anywhere (r or s not below N, R of
-/// the wrong x or oddness, an inverse's cap, the wNAF builder's guard, a
-/// point k256 refuses; none happens for valid inputs), the answer is
+/// the wrong x or oddness, an inverse's cap, the wNAF builder's guard;
+/// none happens for valid inputs), the answer is
 /// k256's instead, and debug builds assert.  Builds with debug assertions
 /// also compute k256's answer every time and stop unless both give the
 /// same outcome and, for a key, the same bytes; that check only reads.
@@ -252,10 +323,16 @@ fn vartime_recover(
     let u2 = s * w;
     #[cfg(test)]
     let u2 = if skewed_sum() { u2 + vt_one() } else { u2 };
+    #[cfg(test)]
+    let (u1, u2) = if negated_recovery() {
+        (-u1, -u2)
+    } else {
+        (u1, u2)
+    };
     let q = vartime::ecmult_var(&big_r, &u2, &u1)?;
     match vt_to_affine(&q) {
         Ok(None) => Some(Recovery::Infinity),
-        Ok(Some(a)) => to_k256(&a).map(|p| Recovery::Key(PublicKey::from_affine(p))),
+        Ok(Some(a)) => Some(Recovery::Key(PublicKey { point: KeyPoint(a) })),
         Err(vartime::Fallback) => None,
     }
 }
@@ -264,8 +341,11 @@ fn vartime_recover(
 /// decompression, its scalar arithmetic and `invert_vartime`, its combined
 /// multiply `mul_by_generator_and_mul_add_vartime` (the multiply stage
 /// 2a's loop fell back to) and one `batch_normalize_vartime`, recovery's
-/// normalization before the vartime crate took it.  Should r or s not be
-/// in [1, N-1], which the caller rules out, the answer is `Infinity`,
+/// normalization before the vartime crate took it, the key entering the
+/// key type through [`key_from_k256`].  Should r or s not be in [1, N-1],
+/// which the caller rules out, or that conversion fail, which takes a
+/// fault in one of the two curve checks on top of the decline that sent
+/// the seam here, there is no answer to fall back to: it is `Infinity`,
 /// which rejects, and debug builds assert.
 #[allow(
     clippy::arithmetic_side_effects,
@@ -293,7 +373,11 @@ fn k256_recover(hash: &[u8; 32], r: &[u8; 32], s: &[u8; 32], x: &[u8; 32], odd: 
     }
     let [a] =
         <ProjectivePoint as BatchNormalize<[ProjectivePoint; 1]>>::batch_normalize_vartime(&[q]);
-    Recovery::Key(PublicKey::from_affine(a))
+    let Some(point) = key_from_k256(&a) else {
+        debug_assert!(false, "the vartime crate refused a key k256 computed");
+        return Recovery::Infinity;
+    };
+    Recovery::Key(PublicKey { point })
 }
 
 /// Builds with debug assertions: the vartime crate's recovery gives
@@ -320,9 +404,9 @@ fn cross_check_recovery(vt: &Recovery, k: &Recovery) {
 /// e*Q is formed) and one field inversion, x and y normalized before
 /// either is read, as dcrd's `ToAffine` does.
 ///
-/// Should the vartime crate decline (s or e not below N, the key's
-/// conversion, the wNAF builder's guard, the inverse's cap; none happens
-/// for valid inputs), R is k256's instead, and debug builds assert.
+/// Should the vartime crate decline (s or e not below N, the wNAF
+/// builder's guard, the inverse's cap; none happens for valid inputs), R
+/// is k256's instead, and debug builds assert.
 /// Builds with debug assertions also compute k256's R every time and stop
 /// unless both agree on infinity, on x and on the parity; that check only
 /// reads.
@@ -372,8 +456,11 @@ fn vartime_schnorr(s: &[u8; 32], e: &[u8; 32], q: &PublicKey) -> Option<Option<(
 /// its combined multiply `mul_by_generator_and_mul_add_vartime` (the
 /// multiply stage 2a's loop fell back to) and the constant-time
 /// `to_affine` Schnorr verification used before the vartime crate took
-/// it.  Should s or e not be below N, which the caller rules out, R counts
-/// as infinity, so verification fails at step 8, and debug builds assert.
+/// it, on the key converted to k256's point.  Should s or e not be below
+/// N, which the caller rules out, or k256 refuse the key, which takes a
+/// fault in one of the two curve checks on top of the decline that sent
+/// the seam here, there is no answer to fall back to: R counts as
+/// infinity, so verification fails at step 8, and debug builds assert.
 fn k256_schnorr(s: &[u8; 32], e: &[u8; 32], q: &PublicKey) -> Option<([u8; 32], bool)> {
     let s = Option::<Scalar>::from(Scalar::from_repr((*s).into()));
     let e = Option::<Scalar>::from(Scalar::from_repr((*e).into()));
@@ -381,7 +468,11 @@ fn k256_schnorr(s: &[u8; 32], e: &[u8; 32], q: &PublicKey) -> Option<([u8; 32], 
         debug_assert!(false, "k256_schnorr: s or e not below N");
         return None;
     };
-    let x = ProjectivePoint::mul_by_generator_and_mul_add_vartime(&s, &e, &q.as_k256_point());
+    let Some(q) = k256_key(q) else {
+        debug_assert!(false, "k256 refused a key the vartime crate holds");
+        return None;
+    };
+    let x = ProjectivePoint::mul_by_generator_and_mul_add_vartime(&s, &e, &q);
     if bool::from(x.is_identity()) {
         return None;
     }
@@ -418,14 +509,6 @@ fn vt_decompress(x: &[u8; 32], odd: bool) -> Option<Option<vartime::Affine>> {
     (ax == *x && a.y_is_odd() == odd).then_some(Some(a))
 }
 
-/// The vartime crate's affine point as k256's, through `from_coordinates`,
-/// which checks both coordinates below P and the curve equation again;
-/// `None` if k256 refuses it.
-fn to_k256(a: &vartime::Affine) -> Option<AffinePoint> {
-    let (x, y) = a.to_be_bytes();
-    Option::<AffinePoint>::from(AffinePoint::from_coordinates(&x.into(), &y.into()))
-}
-
 /// The curve point whose x, below P, is given big-endian and whose y has
 /// the oddness `odd`, or `None` when x^3 + 7 has no square root, so that
 /// no point has this x: dcrd's `DecompressY`, on the vartime crate's port
@@ -436,26 +519,26 @@ fn to_k256(a: &vartime::Affine) -> Option<AffinePoint> {
 ///
 /// The vartime crate's `None` is the answer, not a reason to fall back;
 /// builds with debug assertions hold it to k256's.  Its point must have
-/// the x and the oddness asked for, two byte compares, and reaches k256
-/// through `from_coordinates`, which checks the curve equation again;
-/// should either check refuse it, the seam decompresses on k256 instead,
-/// the code before this, and debug builds assert.
-pub(crate) fn decompress(x: &[u8; 32], odd: bool) -> Option<AffinePoint> {
+/// the x and the oddness asked for, two byte compares, and is the key as
+/// it is; should either compare refuse it, the seam decompresses on k256
+/// instead, the code before this, its point entering the key type
+/// through [`key_from_k256`], and debug builds assert.  Should that
+/// conversion fail too, which takes two independent faults, there is no
+/// answer to fall back to, and the key is refused.
+pub(crate) fn decompress(x: &[u8; 32], odd: bool) -> Option<KeyPoint> {
     if !forced_fallback() {
-        let p = match vt_decompress(x, odd) {
-            Some(None) => return None,
-            Some(Some(a)) => to_k256(&a),
-            None => None,
-        };
+        let p = vt_decompress(x, odd);
         debug_assert!(
             p.is_some(),
-            "k256 refused the vartime crate's point, or its x or oddness differ"
+            "the vartime crate's decompressed point has another x or oddness"
         );
-        if p.is_some() {
-            return p;
+        if let Some(p) = p {
+            return p.map(KeyPoint);
         }
     }
-    k256_decompress(x, odd)
+    let p = key_from_k256(&k256_decompress(x, odd)?);
+    debug_assert!(p.is_some(), "the vartime crate refused a key k256 computed");
+    p
 }
 
 /// k256's decompression, the code before the vartime crate's.
@@ -483,6 +566,45 @@ std::thread_local! {
     /// Set by [`tests::force_cap`]: the vartime crate's affine conversion
     /// declines for a finite point, as past the field inverse's cap.
     static FORCE_CAP: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+    /// Set by [`tests::refuse_conversion`]: the conversions between the
+    /// key type and k256 ([`key_from_k256`], [`k256_key`]) refuse, as a
+    /// fault in either curve check would, so that the paths behind a
+    /// refused conversion are tested.
+    static REFUSE_CONVERSION: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+    /// Set by [`tests::negate_recovery`]: the vartime crate's recovery is
+    /// given -u1 and -u2, so it computes -Q, a key with the right x and
+    /// the other y, as a port bug might, and the debug cross-check must
+    /// stop it.
+    static NEGATE_RECOVERY: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+    /// Set by [`tests::refuse_curve_check`]: the vartime crate's curve
+    /// check of a 65-byte key refuses every point, as a port bug might,
+    /// so the debug cross-check must stop it.
+    static REFUSE_CURVE_CHECK: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+}
+
+/// Whether a test has the vartime crate's recovery negate u1 and u2.
+#[cfg(test)]
+fn negated_recovery() -> bool {
+    NEGATE_RECOVERY.with(core::cell::Cell::get)
+}
+
+/// Whether a test has the vartime crate's curve check refuse every point.
+#[cfg(test)]
+fn curve_check_refused() -> bool {
+    REFUSE_CURVE_CHECK.with(core::cell::Cell::get)
+}
+
+/// Whether a test has the key's conversions refuse on this thread.
+#[cfg(test)]
+fn conversion_refused() -> bool {
+    REFUSE_CONVERSION.with(core::cell::Cell::get)
+}
+
+/// Production converts every key it is given.
+#[cfg(not(test))]
+#[inline(always)]
+fn conversion_refused() -> bool {
+    false
 }
 
 /// Whether a test has the vartime crate's result count as declined.
@@ -600,6 +722,35 @@ mod tests {
         with_flag(&FORCE_CAP, f)
     }
 
+    /// Runs `f` with the key's conversions between the key type and k256
+    /// refusing on this thread.
+    fn refuse_conversion<T>(f: impl FnOnce() -> T) -> T {
+        with_flag(&REFUSE_CONVERSION, f)
+    }
+
+    /// Runs `f` with the vartime crate's recovery given -u1 and -u2 on
+    /// this thread.
+    #[cfg(debug_assertions)]
+    fn negate_recovery<T>(f: impl FnOnce() -> T) -> T {
+        with_flag(&NEGATE_RECOVERY, f)
+    }
+
+    /// Runs `f` with the vartime crate's curve check of a 65-byte key
+    /// refusing every point on this thread.
+    fn refuse_curve_check<T>(f: impl FnOnce() -> T) -> T {
+        with_flag(&REFUSE_CURVE_CHECK, f)
+    }
+
+    /// The key type of a point k256 holds, which must be on the curve.
+    fn key_of(a: &AffinePoint) -> PublicKey {
+        PublicKey::from_k256_point(a).expect("a curve point")
+    }
+
+    /// A k256 point's coordinates, big-endian.
+    fn bytes_of(a: &AffinePoint) -> ([u8; 32], [u8; 32]) {
+        (a.x().into(), a.y().into())
+    }
+
     /// Nonzero scalars below N for recovery's r, s and hash: 1, 2, N-1,
     /// N-2, every 2^k below N, and random ones, uniform and with long runs
     /// of zero or one bits.
@@ -706,16 +857,20 @@ mod tests {
         let (mut points, mut none) = (0u32, 0u32);
         for x in &decompress_inputs() {
             for odd in [false, true] {
-                let want = reference_decompress(x, odd);
+                let want = reference_decompress(x, odd).map(|p| bytes_of(&p));
                 let got = decompress(x, odd);
                 let forced = force_fallback(|| decompress(x, odd));
-                assert_eq!(got, want, "vartime path, x {x:02x?} odd {odd}");
-                assert_eq!(forced, want, "forced path, x {x:02x?} odd {odd}");
+                assert_eq!(
+                    got.map(KeyPoint::to_be_bytes),
+                    want,
+                    "vartime path, x {x:02x?} odd {odd}"
+                );
+                assert_eq!(forced, got, "forced path, x {x:02x?} odd {odd}");
                 match got {
                     Some(p) => {
                         points += 1;
-                        assert_eq!(<[u8; 32]>::from(p.x()), *x);
-                        assert_eq!(bool::from(p.y_is_odd()), odd);
+                        assert_eq!(p.to_be_bytes().0, *x);
+                        assert_eq!(p.y_is_odd(), odd);
                     }
                     None => none += 1,
                 }
@@ -737,13 +892,14 @@ mod tests {
     #[test]
     #[cfg_attr(
         debug_assertions,
-        should_panic(expected = "or its x or oddness differ")
+        should_panic(expected = "decompressed point has another x or oddness")
     )]
     fn a_point_of_the_wrong_oddness_is_not_passed_on() {
         for x in decompress_inputs().iter().take(64) {
             for odd in [false, true] {
                 let got = force_wrong_oddness(|| decompress(x, odd));
-                assert_eq!(got, reference_decompress(x, odd), "x {x:02x?} odd {odd}");
+                let want = reference_decompress(x, odd).map(|p| bytes_of(&p));
+                assert_eq!(got.map(KeyPoint::to_be_bytes), want, "x {x:02x?} odd {odd}");
             }
         }
         assert!(!wrong_oddness());
@@ -759,7 +915,8 @@ mod tests {
         for x in decompress_inputs().iter().take(64) {
             for odd in [false, true] {
                 let got = force_fallback(|| force_wrong_oddness(|| decompress(x, odd)));
-                assert_eq!(got, reference_decompress(x, odd), "x {x:02x?} odd {odd}");
+                let want = reference_decompress(x, odd).map(|p| bytes_of(&p));
+                assert_eq!(got.map(KeyPoint::to_be_bytes), want, "x {x:02x?} odd {odd}");
             }
         }
     }
@@ -815,11 +972,7 @@ mod tests {
         }
         let s = *r * u2i;
         let e = *u1 * s;
-        Some((
-            Signature::new(be(r), be(&s))?,
-            be(&e),
-            PublicKey::from_affine(q),
-        ))
+        Some((Signature::new(be(r), be(&s))?, be(&e), key_of(&q)))
     }
 
     /// The point with x and the given oddness, by k256.
@@ -928,7 +1081,7 @@ mod tests {
             let r = rand_scalar(&mut rng);
             let s = r * u2i;
             let sig = Signature::new(be(&r), be(&s)).expect("below N");
-            let st = step_both(&sig, &be(&(u1 * s)), &PublicKey::from_affine(q));
+            let st = step_both(&sig, &be(&(u1 * s)), &key_of(&q));
             assert_eq!(st, VerifyStep::Step6Infinity);
             seen[st as usize] += 1;
 
@@ -1120,7 +1273,7 @@ mod tests {
         if bool::from(a.is_identity()) {
             Recovery::Infinity
         } else {
-            Recovery::Key(PublicKey::from_affine(a))
+            Recovery::Key(key_of(&a))
         }
     }
 
@@ -1300,7 +1453,7 @@ mod tests {
                 let Recovery::Key(k) = recover_both(&h, &r, &s, code) else {
                     panic!("no key");
                 };
-                assert_eq!(k, PublicKey::from_affine(want));
+                assert_eq!(k, key_of(&want));
                 codes[usize::from(code)] += 1;
             }
         }
@@ -1321,10 +1474,7 @@ mod tests {
             let (h, r, s, code) = recovering(&big_r, &u1, &u2).expect("r nonzero");
             assert_eq!(code, 2 | u8::from(odd));
             let want = (g * u1 + big_r * u2).to_affine();
-            assert_eq!(
-                recover_both(&h, &r, &s, code),
-                Recovery::Key(PublicKey::from_affine(want))
-            );
+            assert_eq!(recover_both(&h, &r, &s, code), Recovery::Key(key_of(&want)));
             codes[usize::from(code)] += 1;
         }
         assert!(codes.iter().all(|&c| c > 0), "codes reached {codes:?}");
@@ -1363,6 +1513,9 @@ mod tests {
         assert!(!skewed_sum());
         assert!(!wrong_oddness());
         assert!(!FORCE_CAP.with(core::cell::Cell::get));
+        assert!(!conversion_refused());
+        assert!(refuse_conversion(conversion_refused));
+        assert!(!conversion_refused());
         let key = PrivateKey::from_bytes(&[9; 32]).expect("a key");
         let hash = [0x3c; 32];
         let sig = sign_compact(&key, &hash, false);
@@ -1406,6 +1559,19 @@ mod tests {
         let hash = [11u8; 32];
         let sig = sign_compact(&key, &hash, true);
         let _ = skew_sum(|| recover_compact(&sig, &hash));
+    }
+
+    /// The debug cross-check compares the whole recovered key, not just
+    /// its x: here the vartime crate computes -Q, which shares the
+    /// signer's x and has the other y.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "compact recovery: the key differs from k256's")]
+    fn the_cross_check_catches_a_negated_recovery() {
+        let key = PrivateKey::from_bytes(&[5; 32]).expect("a key");
+        let hash = [11u8; 32];
+        let sig = sign_compact(&key, &hash, true);
+        let _ = negate_recovery(|| recover_compact(&sig, &hash));
     }
 
     /// The forced fallback really skips the vartime crate's recovery: with
@@ -1576,7 +1742,7 @@ mod tests {
         let g = ProjectivePoint::GENERATOR;
         for _ in 0..16 {
             let d = rand_scalar(&mut rng);
-            let pk = PublicKey::from_affine((g * d).to_affine());
+            let pk = key_of(&(g * d).to_affine());
             let sig =
                 |r: [u8; 32], s: Scalar| schnorr::Signature::new(r, be(&s)).expect("in range");
 
@@ -1611,7 +1777,7 @@ mod tests {
             for odd in [false, true] {
                 let (k, r, hash, e) = nonce_and_hash(&mut rng, odd);
                 let q = g * (k * e.invert_vartime().expect("nonzero"));
-                let qk = PublicKey::from_affine(q.to_affine());
+                let qk = key_of(&q.to_affine());
                 let want = if odd {
                     Err(SchnorrError::SigRYIsOdd)
                 } else {
@@ -1713,11 +1879,287 @@ mod tests {
             Some(Recovery::Infinity)
         );
         let d = rand_scalar(&mut rng);
-        let pk = PublicKey::from_affine((g * d).to_affine());
+        let pk = key_of(&(g * d).to_affine());
         let e = rand_scalar(&mut rng);
         assert_eq!(
             force_cap(|| vartime_schnorr(&be(&-(e * d)), &be(&e), &pk)),
             Some(None)
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // The key type.
+
+    /// The x of the points with y = 1 (odd) and y = P - 1 (even), the
+    /// smallest y any point has: x^3 = 1 - 7 has a cube root.
+    const Y_ONE_X: [u8; 32] = [
+        0x1f, 0xe1, 0xe5, 0xef, 0x3f, 0xce, 0xb5, 0xc1, 0x35, 0xab, 0x77, 0x41, 0x33, 0x3c, 0xe5,
+        0xa6, 0xe8, 0x0d, 0x68, 0x16, 0x76, 0x53, 0xf6, 0xb2, 0xb2, 0x4b, 0xcb, 0xcf, 0xaa, 0xaf,
+        0xf5, 0x07,
+    ];
+
+    /// Points for the key tests: seeded keys' points and their negations,
+    /// and both points at x = 1 (the smallest x with a point), P-4 and P-3
+    /// (the largest two), N (the recovery boundary) and the x of y = 1.
+    fn key_points() -> Vec<AffinePoint> {
+        let mut rng = SplitMix64(0xbac4_e2d0_000c);
+        let g = ProjectivePoint::GENERATOR;
+        let mut v = Vec::new();
+        for _ in 0..32 {
+            let p = g * rand_scalar(&mut rng);
+            v.push(p.to_affine());
+            v.push((-p).to_affine());
+        }
+        let mut one = [0u8; 32];
+        one[31] = 1;
+        let below_p = |d: u8| {
+            let mut b = FIELD_PRIME_BYTES;
+            b[31] -= d;
+            b
+        };
+        for x in [one, below_p(4), below_p(3), GROUP_ORDER_BYTES, Y_ONE_X] {
+            for odd in [false, true] {
+                v.push(reference_decompress(&x, odd).expect("a point"));
+            }
+        }
+        let y_one = bytes_of(&reference_decompress(&Y_ONE_X, true).expect("a point")).1;
+        assert_eq!(y_one, one, "the x of y = 1");
+        v
+    }
+
+    /// y + 1, big-endian, wrapping at 2^256 (no input here is that high).
+    fn plus_one(y: &[u8; 32]) -> [u8; 32] {
+        let mut out = *y;
+        for b in out.iter_mut().rev() {
+            *b = b.wrapping_add(1);
+            if *b != 0 {
+                break;
+            }
+        }
+        out
+    }
+
+    /// The seam's curve check of an uncompressed key equals k256's
+    /// `from_coordinates` on every point of [`key_points`] and on the
+    /// near misses around it, (x, y + 1), (x, 0), (0, y) and (x, P - 1),
+    /// on random coordinates below P, and on coordinates at P, which key
+    /// parsing refuses before it asks; an accepted point gives back its
+    /// coordinates and y's parity.
+    #[test]
+    fn from_coordinates_matches_k256() {
+        let mut p_minus_1 = FIELD_PRIME_BYTES;
+        p_minus_1[31] -= 1;
+        let mut cases = Vec::new();
+        for a in key_points() {
+            let (x, y) = bytes_of(&a);
+            cases.extend([(x, y), (x, plus_one(&y)), (x, [0; 32]), ([0; 32], y)]);
+            cases.extend([
+                (x, p_minus_1),
+                (FIELD_PRIME_BYTES, y),
+                (x, FIELD_PRIME_BYTES),
+            ]);
+        }
+        let mut rng = SplitMix64(0xbac4_e2d0_000d);
+        while cases.len() < 1024 {
+            let (mut x, mut y) = ([0u8; 32], [0u8; 32]);
+            rng.fill(&mut x);
+            rng.fill(&mut y);
+            if x < FIELD_PRIME_BYTES && y < FIELD_PRIME_BYTES {
+                cases.push((x, y));
+            }
+        }
+        let (mut on, mut off) = (0u32, 0u32);
+        for (x, y) in &cases {
+            let got = from_coordinates(x, y);
+            let want = Option::<AffinePoint>::from(AffinePoint::from_coordinates(
+                &(*x).into(),
+                &(*y).into(),
+            ));
+            assert_eq!(
+                got.map(KeyPoint::to_be_bytes),
+                want.map(|a| bytes_of(&a)),
+                "x {x:02x?} y {y:02x?}"
+            );
+            match got {
+                Some(p) => {
+                    on += 1;
+                    assert_eq!(p.to_be_bytes(), (*x, *y));
+                    assert_eq!(p.y_is_odd(), y[31] & 1 == 1);
+                }
+                None => off += 1,
+            }
+        }
+        // Every point, and (x, P - 1) for both points at the x of y = 1,
+        // one of which is (x, P - 1) itself.
+        assert_eq!(on, 74 + 2, "{on} accepted");
+        assert!(off > 600, "{off} refused");
+    }
+
+    /// The curve check of a 65-byte key takes no fallback: should the
+    /// vartime crate refuse a point on the curve, as a port bug might,
+    /// builds with debug assertions stop on the disagreement with k256,
+    /// and release answers with the crate's refusal, dcrd's
+    /// `ErrPubKeyNotOnCurve`, in both formats that reach the check.
+    #[test]
+    #[cfg_attr(
+        debug_assertions,
+        should_panic(
+            expected = "the vartime crate and k256 disagree on whether a key is on the curve"
+        )
+    )]
+    fn a_refused_curve_check_is_the_answer() {
+        let pk = PrivateKey::from_bytes(&[3; 32])
+            .expect("a key")
+            .public_key();
+        let uncompressed = pk.serialize_uncompressed();
+        assert_eq!(PublicKey::parse(&uncompressed), Ok(pk));
+        let mut hybrid = uncompressed;
+        hybrid[0] = 0x06 | (uncompressed[64] & 1);
+        assert_eq!(PublicKey::parse(&hybrid), Ok(pk));
+        let (x, y) = pk.point.to_be_bytes();
+        for key in [uncompressed, hybrid] {
+            assert_eq!(
+                refuse_curve_check(|| PublicKey::parse(&key)),
+                Err(crate::secp256k1::Error::PubKeyNotOnCurve { x, y: Some(y) })
+            );
+        }
+    }
+
+    /// The two conversions are each other's inverse on curve points: k256's
+    /// point of a key is the point it came from, and the key type of that
+    /// point is the key; k256's identity has no key.
+    #[test]
+    fn key_conversions_round_trip() {
+        for a in key_points() {
+            let pk = key_of(&a);
+            assert_eq!(pk.point.to_be_bytes(), bytes_of(&a));
+            assert_eq!(pk.point.y_is_odd(), bool::from(a.y_is_odd()));
+            assert_eq!(k256_key(&pk), Some(ProjectivePoint::from(a)));
+            assert_eq!(key_from_k256(&a), Some(pk.point));
+        }
+        assert_eq!(key_from_k256(&AffinePoint::IDENTITY), None);
+    }
+
+    /// A k256 arm whose conversion of the key fails as well, two faults,
+    /// rejects and never panics in release: ECDSA verification at step 6
+    /// (the sum counts as infinity) and Schnorr verification at step 8.
+    /// Builds with debug assertions stop on the refusal.
+    #[test]
+    #[cfg_attr(
+        debug_assertions,
+        should_panic(expected = "k256 refused a key the vartime crate holds")
+    )]
+    fn a_refused_conversion_rejects_in_the_fallback() {
+        let key = PrivateKey::from_bytes(&[3; 32]).expect("a key");
+        let pk = key.public_key();
+        let hash = [9u8; 32];
+        let sig = sign(&key, &hash);
+        let ssig = schnorr::sign(&key, &hash).expect("a signature");
+        assert!(force_fallback(|| sig.verify_detailed(&hash, &pk)).accepts());
+        assert_eq!(force_fallback(|| ssig.verify_detailed(&hash, &pk)), Ok(()));
+        assert_eq!(
+            force_fallback(|| refuse_conversion(|| sig.verify_detailed(&hash, &pk))),
+            VerifyStep::Step6Infinity
+        );
+        assert_eq!(
+            force_fallback(|| refuse_conversion(|| ssig.verify_detailed(&hash, &pk))),
+            Err(SchnorrError::SigRNotOnCurve)
+        );
+    }
+
+    /// k256's recovered key that the key type refuses, two faults, is
+    /// `Infinity`, so recovery rejects with dcrd's `ErrPointNotOnCurve`
+    /// and never panics in release.  Builds with debug assertions stop on
+    /// the refusal.
+    #[test]
+    #[cfg_attr(
+        debug_assertions,
+        should_panic(expected = "the vartime crate refused a key k256 computed")
+    )]
+    fn a_refused_conversion_rejects_recovery() {
+        let key = PrivateKey::from_bytes(&[3; 32]).expect("a key");
+        let hash = [9u8; 32];
+        let sig = sign_compact(&key, &hash, true);
+        let r: [u8; 32] = sig[1..33].try_into().expect("32 bytes");
+        let s: [u8; 32] = sig[33..].try_into().expect("32 bytes");
+        let code = (sig[0] - 27) & 3;
+        let (x, odd) = (recovery_x(&r, code), code & 1 != 0);
+        assert!(matches!(
+            force_fallback(|| recover_key(&hash, &r, &s, &x, odd)),
+            Recovery::Key(_)
+        ));
+        assert_eq!(
+            force_fallback(|| refuse_conversion(|| recover_key(&hash, &r, &s, &x, odd))),
+            Recovery::Infinity
+        );
+        assert_eq!(
+            force_fallback(|| refuse_conversion(|| recover_compact(&sig, &hash))),
+            Err(RecoverError::PointNotOnCurve)
+        );
+    }
+
+    /// k256's decompressed point that the key type refuses, two faults,
+    /// is no key, on the forced path and behind a point of the wrong
+    /// oddness, and never a panic in release.  Builds with debug
+    /// assertions stop on the refusal.
+    #[test]
+    #[cfg_attr(
+        debug_assertions,
+        should_panic(expected = "the vartime crate refused a key k256 computed")
+    )]
+    fn a_refused_conversion_rejects_decompression() {
+        let mut points = 0u32;
+        for x in decompress_inputs().iter().take(64) {
+            for odd in [false, true] {
+                points += u32::from(reference_decompress(x, odd).is_some());
+                assert_eq!(
+                    force_fallback(|| refuse_conversion(|| decompress(x, odd))),
+                    None
+                );
+                assert_eq!(
+                    force_wrong_oddness(|| refuse_conversion(|| decompress(x, odd))),
+                    None
+                );
+            }
+        }
+        assert!(points > 32, "{points} points");
+    }
+
+    /// `PrivateKey::public_key` has no answer to fall back to when the
+    /// key type refuses k256's dG, so it stops, in every profile, rather
+    /// than return a wrong key.
+    #[test]
+    #[should_panic(expected = "k256's dG passes the curve check")]
+    fn public_key_stops_on_a_refused_conversion() {
+        let key = PrivateKey::from_bytes(&[3; 32]).expect("a key");
+        let _ = refuse_conversion(|| key.public_key());
+    }
+
+    /// Release's paths convert no key: with every conversion refused,
+    /// ECDSA verification, compact recovery, Schnorr verification and the
+    /// parsing of each key format still give the right answers, so none
+    /// of them reached a conversion.  (Builds with debug assertions run
+    /// the k256 arms beside them for the cross-checks, which do convert.)
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn the_vartime_path_converts_no_key() {
+        let key = PrivateKey::from_bytes(&[3; 32]).expect("a key");
+        let pk = key.public_key();
+        let hash = [9u8; 32];
+        let sig = sign(&key, &hash);
+        let csig = sign_compact(&key, &hash, true);
+        let ssig = schnorr::sign(&key, &hash).expect("a signature");
+        let compressed = pk.serialize_compressed();
+        let uncompressed = pk.serialize_uncompressed();
+        let mut hybrid = uncompressed;
+        hybrid[0] = 6 | (uncompressed[64] & 1);
+        refuse_conversion(|| {
+            assert!(sig.verify_detailed(&hash, &pk).accepts());
+            assert_eq!(recover_compact(&csig, &hash), Ok((pk, true)));
+            assert_eq!(ssig.verify_detailed(&hash, &pk), Ok(()));
+            for k in [&compressed[..], &uncompressed[..], &hybrid[..]] {
+                assert_eq!(PublicKey::parse(k), Ok(pk));
+            }
+        });
     }
 }

@@ -238,7 +238,7 @@ work). Currently implemented:
   public values only, ported from libsecp256k1's portable C (ADR-0016):
   scalar and field (safegcd inverses), group formulas, the Straus loop with
   static generator tables and the affine conversion (ECDSA and Schnorr
-  verification, compact recovery, key decompression), behind one seam in
+  verification, compact recovery, public keys), behind one seam in
   `dcroxide-dcrec`, k256 the fallback; core alone, ISC AND MIT (`NOTICE`)
 - `dcroxide-chaincfg` — all four networks' consensus parameters
   (mainnet/testnet3/simnet/regnet): genesis blocks reproducing dcrd's exact

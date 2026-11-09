@@ -145,8 +145,8 @@ jobs:
     # soak-asserts (release's with debug assertions and overflow checks on,
     # so its invariant checks see every case). Its digest tests pin
     # constants the dev builds must reproduce. dcrec's ECDSA, recovery and
-    # Schnorr branch signatures run in full here, judged by dcrd, and its
-    # unit tests' release arms (the seam's fallbacks) run here only.
+    # Schnorr branch signatures and its key cases run here, judged by dcrd,
+    # and its unit tests' release arms (the seam's fallbacks) run here only.
     steps:
       - uses: actions/checkout@v7
       - run: rustup toolchain install
@@ -159,8 +159,8 @@ jobs:
       - run: cargo test --profile soak-asserts -p dcroxide-secp256k1-vartime
         env:
           DCROXIDE_VARTIME_CASES: "1000000"
-      - run: cargo test --release -p dcroxide-dcrec --lib --test vartime_ecdsa_branches --test vartime_recovery_schnorr_branches
-      - run: cargo test --profile soak-asserts -p dcroxide-dcrec --test vartime_ecdsa_branches --test vartime_recovery_schnorr_branches
+      - run: cargo test --release -p dcroxide-dcrec --lib --test vartime_ecdsa_branches --test vartime_recovery_schnorr_branches --test vartime_pubkey_branches
+      - run: cargo test --profile soak-asserts -p dcroxide-dcrec --test vartime_ecdsa_branches --test vartime_recovery_schnorr_branches --test vartime_pubkey_branches
         env:
           DCROXIDE_VARTIME_CASES: "1000000"
 

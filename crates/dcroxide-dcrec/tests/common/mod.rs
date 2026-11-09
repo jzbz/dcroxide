@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: ISC
 //! Helpers shared by the dcrd-judged branch tests of the vartime seam
-//! (`vartime_ecdsa_branches.rs`, `vartime_recovery_schnorr_branches.rs`):
-//! big-endian byte arithmetic, k256 scalars and points, the collision
-//! grid's base points, the points with a tiny y, the volume switch, and
-//! the committed vector files' checks.
+//! (`vartime_ecdsa_branches.rs`, `vartime_recovery_schnorr_branches.rs`,
+//! `vartime_pubkey_branches.rs`): big-endian byte arithmetic, k256
+//! scalars and points, the collision grid's base points, the points with
+//! a tiny y, the volume switch, and the committed vector files' checks.
 
 #![allow(dead_code, reason = "each test file uses part of it")]
 #![allow(

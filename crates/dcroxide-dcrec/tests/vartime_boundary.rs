@@ -8,10 +8,13 @@
 //!   than a dev-dependency, and no manifest may rename it, which would
 //!   hide it from the source scans below;
 //! - inside dcroxide-dcrec only `src/secp256k1/backend.rs`, the seam, may
-//!   name it, and only the functions in [`MAY_USE_SEAM`] (ECDSA and Schnorr
-//!   verification, compact recovery and key parsing) may name the seam, so
-//!   the signing functions (ECDSA's `sign*`, Schnorr's `sign`,
-//!   `PrivateKey::public_key`, the nonce) reach neither;
+//!   name it; only the functions in [`MAY_USE_SEAM`] (ECDSA and Schnorr
+//!   verification, compact recovery, key parsing and the conversion of a
+//!   private key's public point) may name the seam, and the public key's
+//!   field its type ([`MAY_NAME_SEAM_TYPE`]), so the signing functions
+//!   (ECDSA's `sign*`, Schnorr's `sign`, the nonce) reach neither, and
+//!   `PrivateKey::public_key` reaches the seam only through that
+//!   conversion, with the point k256 computed in constant time;
 //! - the crate itself takes no dependency at all, and its code outside the
 //!   tests names neither `alloc` nor `std`.
 //!
@@ -41,12 +44,33 @@ const MAY_DEPEND: [&str; 3] = [
 
 /// The functions of dcrec's `src/` that may name the seam module, `backend`
 /// (file under `src/`, function name).  Each must exist and name it.
-const MAY_USE_SEAM: [(&str, &str); 4] = [
+const MAY_USE_SEAM: [(&str, &str); 5] = [
     ("secp256k1/ecdsa.rs", "verify_detailed"),
     ("secp256k1/ecdsa.rs", "recover_compact"),
     ("secp256k1/schnorr.rs", "verify_detailed"),
     ("secp256k1.rs", "parse"),
+    ("secp256k1.rs", "from_k256_point"),
 ];
+
+/// The structs of dcrec's `src/` whose fields may name the seam's types
+/// (file under `src/`, struct name): the public key holds the seam's key
+/// point.  Each must exist and name it.
+const MAY_NAME_SEAM_TYPE: [(&str, &str); 1] = [("secp256k1.rs", "PublicKey")];
+
+/// dcrec's signing functions (file under `src/secp256k1/`, function
+/// names), each of which must exist; none is in [`MAY_USE_SEAM`].
+const SIGNERS: [(&str, &[&str]); 2] = [
+    (
+        "ecdsa.rs",
+        &["sign", "sign_compact", "sign_with_nonce", "sign_rfc6979"],
+    ),
+    ("schnorr.rs", &["sign", "sign_with_nonce"]),
+];
+
+/// The files under `src/secp256k1/` that hold signing, the nonce and
+/// verification, none of whose functions may name the conversion of a
+/// private key's public point or `public_key`.
+const SIGNING_FILES: [&str; 3] = ["ecdsa.rs", "schnorr.rs", "nonce.rs"];
 
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -321,18 +345,72 @@ fn functions(code: &str) -> Vec<(String, std::ops::Range<usize>)> {
     out
 }
 
+/// Every struct in `code` (comments and literals blanked) with a braced
+/// body, as (name, byte range of its body, braces included); tuple and
+/// unit structs have none.
+fn structs(code: &str) -> Vec<(String, std::ops::Range<usize>)> {
+    let b = code.as_bytes();
+    let mut out = Vec::new();
+    for at in word_offsets(code, "struct") {
+        let name: String = code[at + "struct".len()..]
+            .trim_start()
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .collect();
+        // The body opens at the first `{`; a `(` or `;` before it means a
+        // tuple or unit struct, which has none.
+        let mut open = None;
+        for (k, &c) in b.iter().enumerate().skip(at) {
+            match c {
+                b'{' => {
+                    open = Some(k);
+                    break;
+                }
+                b'(' | b';' => break,
+                _ => {}
+            }
+        }
+        let Some(open) = open else { continue };
+        let mut level = 0u32;
+        let mut close = None;
+        for (k, &c) in b.iter().enumerate().skip(open) {
+            match c {
+                b'{' => level += 1,
+                b'}' => {
+                    level -= 1;
+                    if level == 0 {
+                        close = Some(k);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let close = close.expect("a struct body closes");
+        out.push((name, open..close + 1));
+    }
+    out
+}
+
 /// Where dcrec's `src/` names the seam module outside the functions that
-/// may (`MAY_USE_SEAM`) and outside `mod backend;`, as "file:line"; and
-/// each allowed function with how many times it names it.
+/// may (`MAY_USE_SEAM`), outside the structs whose fields may
+/// (`MAY_NAME_SEAM_TYPE`) and outside `mod backend;`, as "file:line"; and
+/// each allowed function and struct with how many times it names it.
 fn seam_uses(src: &Path, files: &[String]) -> (Vec<String>, Vec<(String, usize)>) {
     let mut stray = Vec::new();
     let mut allowed: Vec<(String, usize)> = MAY_USE_SEAM
         .iter()
         .map(|(f, n)| (format!("{f}::{n}"), 0))
+        .chain(
+            MAY_NAME_SEAM_TYPE
+                .iter()
+                .map(|(f, n)| (format!("{f}::struct {n}"), 0)),
+        )
         .collect();
     for f in files.iter().filter(|f| *f != "secp256k1/backend.rs") {
         let code = code_only(&read(&src.join(f)));
         let fns = functions(&code);
+        let types = structs(&code);
         for at in word_offsets(&code, "backend") {
             let line = code[..at].matches('\n').count() + 1;
             let decl = code[..at].trim_end().ends_with("mod")
@@ -340,12 +418,20 @@ fn seam_uses(src: &Path, files: &[String]) -> (Vec<String>, Vec<(String, usize)>
             if decl && f == "secp256k1.rs" {
                 continue;
             }
-            // The innermost function around this use.
+            // The innermost function around this use, else the innermost
+            // struct.
             let inner = fns
                 .iter()
                 .filter(|(_, r)| r.contains(&at))
                 .min_by_key(|(_, r)| r.len());
-            let key = inner.map(|(n, _)| format!("{f}::{n}"));
+            let key = match inner {
+                Some((n, _)) => Some(format!("{f}::{n}")),
+                None => types
+                    .iter()
+                    .filter(|(_, r)| r.contains(&at))
+                    .min_by_key(|(_, r)| r.len())
+                    .map(|(n, _)| format!("{f}::struct {n}")),
+            };
             match allowed.iter_mut().find(|(k, _)| Some(k) == key.as_ref()) {
                 Some((_, n)) => *n += 1,
                 None => stray.push(format!("{f}:{line}")),
@@ -417,18 +503,19 @@ fn only_the_seam_names_the_vartime_crate_in_dcrec() {
     assert_eq!(naming, ["secp256k1/backend.rs"], "files naming {IDENT}");
 }
 
-/// Only verification, recovery and key parsing reach the seam: every use
-/// of `backend` in dcrec's code is `mod backend;` or inside a function of
-/// `MAY_USE_SEAM`, and each of those exists and uses it, so a signing
-/// function that called the seam, or an import that let it do so
-/// without naming it, fails here.
+/// Only verification, recovery, key parsing and the conversion of a
+/// private key's public point reach the seam: every use of `backend` in
+/// dcrec's code is `mod backend;`, inside a function of `MAY_USE_SEAM` or
+/// inside a struct of `MAY_NAME_SEAM_TYPE`, and each of those exists and
+/// uses it, so a signing function that called the seam, or an import that
+/// let it do so without naming it, fails here.
 #[test]
 fn only_verification_recovery_and_parsing_reach_the_seam() {
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let (stray, allowed) = seam_uses(&src, &rust_files(&src));
     assert!(
         stray.is_empty(),
-        "the seam is named outside {MAY_USE_SEAM:?}: {stray:?}"
+        "the seam is named outside {MAY_USE_SEAM:?} and {MAY_NAME_SEAM_TYPE:?}: {stray:?}"
     );
     for (f, n) in &allowed {
         assert!(
@@ -436,10 +523,7 @@ fn only_verification_recovery_and_parsing_reach_the_seam() {
             "{f} does not name the seam (renamed, or the list is stale)"
         );
     }
-    for (file, signers) in [
-        ("ecdsa.rs", &["sign", "sign_compact", "sign_with_nonce"][..]),
-        ("schnorr.rs", &["sign", "sign_with_nonce"][..]),
-    ] {
+    for (file, signers) in SIGNERS {
         let code = code_only(&read(&src.join("secp256k1").join(file)));
         let names: Vec<String> = functions(&code).into_iter().map(|(n, _)| n).collect();
         for signer in signers {
@@ -447,6 +531,64 @@ fn only_verification_recovery_and_parsing_reach_the_seam() {
                 names.iter().any(|n| n == signer),
                 "{file} has no fn {signer}"
             );
+            assert!(
+                !MAY_USE_SEAM
+                    .iter()
+                    .any(|&(f, n)| f == format!("secp256k1/{file}") && n == *signer),
+                "{file}: the signer {signer} is allowed the seam"
+            );
+        }
+    }
+}
+
+/// `PrivateKey::public_key` reaches the seam only through the conversion
+/// of its finished point: outside its tests module, `secp256k1.rs` names
+/// `from_k256_point` in its definition and once in `public_key`, and
+/// nowhere else; the conversion takes one `&AffinePoint` and nothing
+/// else, so no scalar can pass through it; and no code of ECDSA, Schnorr
+/// or the nonce outside their tests, the signing functions of
+/// [`SIGNERS`] included, names the conversion or `public_key`.
+#[test]
+fn public_key_reaches_the_seam_only_through_its_point() {
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let code = code_only(&read(&src.join("secp256k1.rs")));
+    let code = &code[..code.find("mod tests").unwrap_or(code.len())];
+    let fns = functions(code);
+    let body_of = |name: &str| {
+        let found: Vec<_> = fns.iter().filter(|(n, _)| n == name).collect();
+        assert_eq!(found.len(), 1, "secp256k1.rs has one fn {name}");
+        found[0].1.clone()
+    };
+    let public_key = body_of("public_key");
+    let conversion = body_of("from_k256_point");
+    let mut definition = 0;
+    let mut in_public_key = 0;
+    for at in word_offsets(code, "from_k256_point") {
+        if code[..at].trim_end().ends_with("fn") {
+            definition += 1;
+            let params = &code[at + "from_k256_point".len()..conversion.start];
+            let params = params[params.find('(').expect("(") + 1..params.rfind(')').expect(")")]
+                .split_whitespace()
+                .collect::<String>();
+            let (_, ty) = params.split_once(':').expect("a parameter");
+            assert_eq!(ty, "&AffinePoint", "from_k256_point's parameters: {params}");
+        } else if public_key.contains(&at) {
+            in_public_key += 1;
+        } else {
+            let line = code[..at].matches('\n').count() + 1;
+            panic!("secp256k1.rs:{line} names from_k256_point outside public_key");
+        }
+    }
+    assert_eq!((definition, in_public_key), (1, 1));
+
+    for file in SIGNING_FILES {
+        let code = code_only(&read(&src.join("secp256k1").join(file)));
+        let code = &code[..code.find("mod tests").unwrap_or(code.len())];
+        for word in ["from_k256_point", "public_key"] {
+            if let Some(&at) = word_offsets(code, word).first() {
+                let line = code[..at].matches('\n').count() + 1;
+                panic!("{file}:{line} names {word}");
+            }
         }
     }
 }
@@ -512,8 +654,9 @@ fn the_manifest_reader_sees_every_form() {
     }
 }
 
-/// The source reader blanks comments and literals, finds whole words and
-/// function bodies, and places a seam use in its function.
+/// The source reader blanks comments and literals, finds whole words,
+/// function bodies and struct bodies, and places a seam use in its
+/// function or struct.
 #[test]
 fn the_source_reader_sees_code_only() {
     let src = "// backend\nfn a() { let s = \"backend}\"; let c = '}'; }\n\
@@ -530,4 +673,17 @@ fn the_source_reader_sees_code_only() {
     let (_, c_body) = &fns[1];
     assert!(c_body.contains(&uses[0]));
     assert!(!fns[0].1.contains(&uses[0]) && !fns[2].1.contains(&uses[0]));
+
+    let src = "struct A { p: backend::K }\nstruct B(backend::K);\nstruct C;\n\
+               pub struct D<T: Copy> { t: T }\ntype E = backend::K;\n";
+    let code = code_only(src);
+    let uses = word_offsets(&code, "backend");
+    assert_eq!(uses.len(), 3, "{code}");
+    let types = structs(&code);
+    let names: Vec<&str> = types.iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(names, ["A", "D"]);
+    assert!(types[0].1.contains(&uses[0]));
+    for at in &uses[1..] {
+        assert!(!types.iter().any(|(_, r)| r.contains(at)), "{at}");
+    }
 }

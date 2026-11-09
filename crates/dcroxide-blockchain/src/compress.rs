@@ -743,4 +743,72 @@ mod tests {
         );
         assert!(decompress_script(&row[1..]).is_empty());
     }
+
+    /// Pay-to-uncompressed-pubkey scripts whose keys sit at the edges of
+    /// the public key's curve check, each accepted by dcrd (dcrec's
+    /// `tests/vartime_pubkey_branches.rs` checks these classes against
+    /// it): y = P - 1 (even) and y = 1 (odd) at one x, x = P - 3, the
+    /// largest x with a point, and x = N, the bottom of the x values at or
+    /// above the group order.  Each compresses to the 33-byte special form
+    /// of its y's parity and decompresses to the same script byte for
+    /// byte.  With y's lowest bit flipped the key is no key (off the
+    /// curve, or y = P for the first), so the script is stored in the
+    /// general form and comes back unchanged, as dcrd's `isPubKey` is
+    /// false for it.
+    #[test]
+    fn uncompressed_p2pk_round_trips_at_key_edges() {
+        const KEYS: [(&str, &str); 4] = [
+            (
+                "1fe1e5ef3fceb5c135ab7741333ce5a6e80d68167653f6b2b24bcbcfaaaff507",
+                "fffffffffffffffffffffffffffffffffffffffffffffffffffffffefffffc2e",
+            ),
+            (
+                "1fe1e5ef3fceb5c135ab7741333ce5a6e80d68167653f6b2b24bcbcfaaaff507",
+                "0000000000000000000000000000000000000000000000000000000000000001",
+            ),
+            (
+                "fffffffffffffffffffffffffffffffffffffffffffffffffffffffefffffc2c",
+                "f166b4eb158d073c146a38e1096da8a188afa7ccd281ad2f66a307fb778e45b2",
+            ),
+            (
+                "fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141",
+                "670999be34f51e8894b9c14211c28801d9a70fde24b71d3753854b35d07c9a11",
+            ),
+        ];
+        let script_of = |key: &[u8]| {
+            let mut script = vec![OP_DATA_65];
+            script.extend_from_slice(key);
+            script.push(OP_CHECKSIG);
+            script
+        };
+        let mut parities = [0u32; 2];
+        for (x, y) in KEYS {
+            let key = dcroxide_testutil::unhex(&alloc::format!("04{x}{y}"));
+            let script = script_of(&key);
+            assert_eq!(compressed_script_size(0, &script), 33, "{x} {y}");
+            let mut out = vec![0u8; 33];
+            assert_eq!(put_compressed_script(&mut out, 0, &script), 33);
+            let odd = key[64] & 1 == 1;
+            let want = if odd {
+                CST_PAY_TO_PUB_KEY_UNCOMP_ODD
+            } else {
+                CST_PAY_TO_PUB_KEY_UNCOMP_EVEN
+            };
+            assert_eq!(u64::from(out[0]), want, "{x} {y}");
+            assert_eq!(out[1..], key[1..33]);
+            assert_eq!(decompress_script(&out), script, "{x} {y}");
+            parities[usize::from(odd)] += 1;
+
+            let mut off = key.clone();
+            off[64] ^= 1;
+            assert!(PublicKey::parse(&off).is_err(), "{x} {y}");
+            let script = script_of(&off);
+            let size = compressed_script_size(0, &script);
+            assert_eq!(size, 2 + 67);
+            let mut out = vec![0u8; size];
+            assert_eq!(put_compressed_script(&mut out, 0, &script), size);
+            assert_eq!(decompress_script(&out), script, "{x} {y}");
+        }
+        assert_eq!(parities, [2, 2]);
+    }
 }

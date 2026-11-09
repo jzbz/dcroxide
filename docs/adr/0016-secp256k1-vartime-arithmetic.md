@@ -158,7 +158,7 @@ group formulas the loop calls and of the loop body; with only the first two
 forced, window 12 measured 1.075-1.076.
 
 This is the prototype's in-process measurement. Its arms model the seam as
-it will be after RC6, with no conversion to `k256` types, which is
+it is after RC6, with no conversion to `k256` types, which is
 estimated to understate RC4's G4 by 0.2-0.5%; recovery and Schnorr
 verification were not timed; and 1.024-1.027 is below the floor the design
 predicted (1.03-1.04 at window 12), for a reason the data does not show.
@@ -244,8 +244,8 @@ values:
   R included;
 - EC-Schnorr-DCRv0 verification steps 7 to 10: R = s·G + e·Q, the infinity
   test, the affine conversion, the parity and the x comparison;
-- decompression of a compressed key, and later the uncompressed key's curve
-  check and key serialization.
+- decompression of a compressed key, the uncompressed key's curve check and
+  key serialization, and with them the public key itself.
 
 Keys made from secrets, ECDSA and Schnorr signing and the RFC 6979 nonce
 stay on `k256`, constant time and unchanged. Ed25519 is untouched. dcrd's
@@ -270,16 +270,20 @@ numbering (`VerifyStep`). The new code replaces arithmetic only.
   benchmark, and adds no behaviour. dcrec is its one production user; the
   fuzz crate and `dcroxide-bench` may use it. A workspace test holds that,
   that no manifest renames it, that it takes no dependency and no `alloc`,
-  and that dcrec's signing functions reach neither it nor the seam below.
+  that dcrec's signing functions reach neither it nor the seam below, and
+  that `PrivateKey::public_key` reaches the seam only to convert its
+  finished, public point.
   It joins CI's no_std check by name.
 - **One seam in dcrec**, a private `backend` module, the only place dcrec
   names the crate. Its contract is in dcrec's own terms (bytes and dcrec's
   key type), and ECDSA's steps 6 to 10 are written once above it, in dcrd's
   order (`dcrec/secp256k1/v4` `ecdsa/signature.go:263-293`): infinity, x
-  against r, r against P−N, x against r+N. Until RC6 moves the key type,
-  the seam returns `k256`'s point where a key comes out, in key parsing
-  and recovery, so the conversion and its fallback stay inside it rather
-  than in each caller.
+  against r, r against P−N, x against r+N. dcrec's public key holds the
+  seam's key type, the crate's affine point, so verification hands it to
+  the multiply as it is and parsing, recovery and serialization stay on
+  it; `k256` meets a public key only in the fallback arms, which convert
+  it, and in `PrivateKey::public_key`, whose constant-time product enters
+  the key type once.
 - **`k256` stays behind the seam as live code**: its combined multiply and
   normalization, the code G3 soaked, are the fallback when the new crate
   declines an input (below) and the reference the differential tests compare
@@ -349,7 +353,15 @@ unreachable by the proofs the ports carry; for them the fallback keeps the
 node's answer equal to the soaked one if a proof or a port is wrong.
 Decompression's `None`, no point with that x, is an answer rather than a
 decline, so it takes no fallback in release; builds with debug assertions
-hold every such `None` to `k256`'s.
+hold every such `None` to `k256`'s. The curve check of an uncompressed or
+hybrid key is the same: its `None` is the answer, with no fallback, and
+builds with debug assertions hold it to `k256`'s. Should a fallback arm's
+conversion of the key to `k256` fail as well, which takes two independent
+faults, there is no answer to fall back to, and the seam rejects with a
+debug assertion. `PrivateKey::public_key`, which serves signing and not the
+consensus path, has no answer to fall back to either: it panics if the
+crate's curve check refuses the point `k256` computed, rather than return a
+wrong key.
 
 ### Increments
 
@@ -375,7 +387,13 @@ and `invert_vartime` too; for both its combined multiply, the one stage
 2a's loop fell back to), held to the crate's answer by builds with
 debug assertions.
 Stage 2a's loop, its `once_cell` cell and the test that raced its first
-use left the tree with it.
+use left the tree with it. RC6 moves dcrec's public key onto the crate's
+affine point: parsing, the curve check of uncompressed and hybrid keys
+included, serialization and equality read it, verification hands it to
+the multiply with no conversion, and a recovered key is the point the
+crate computed. `k256` keeps private keys, signing and the nonce;
+`PrivateKey::public_key` converts its constant-time product once, and the
+fallback arms convert the key when they run.
 
 | step | what | wired | expected effect |
 |---|---|---|---|
@@ -419,10 +437,11 @@ G4 and the first milestone read both.
 - **Against dcrd**: the grid's inputs become ECDSA and recovery cases by
   choosing the signature that makes verification recompute them, and final
   points at the boundaries (X.x in [N, P), r just below P−N, tiny
-  coordinates, x near p, valid Schnorr signatures with s = 0) are built the
-  same way; each is judged by dcrd's code through the oracle in dcrec's
-  oracle tests. The ones that reach each branch are committed in data
-  files of dcrec's own, each with a test that regenerates or checks it; the
+  coordinates, x near p, valid Schnorr signatures with s = 0), and keys at
+  the curve check's edges in every format, are built the same way; each is
+  judged by dcrd's code through the oracle in dcrec's oracle tests. The
+  ones that reach each branch are committed in data files of dcrec's own,
+  each with a test that regenerates or checks it; the
   soak's witness file is generated by `sigsoak emit-corpus` and must equal
   its generators' output, so it takes no hand-added line. This is what
   holds the special cases to dcrd's answers rather than `k256`'s.
@@ -466,7 +485,7 @@ which is the decision point:
    merging is the switch back.
 2. **After the merge, pure Rust first.** The `k256` arm stays live behind
    the seam, so production can move back to it, or to stage 2a's loop by
-   reverting RC4 and RC5 in forward commits, with no policy change and one
+   reverting RC4 to RC6 in forward commits, with no policy change and one
    gate soak.
 3. **After the merge, the C library third.** A forward change that:
    - puts a libsecp256k1 backend behind the seam in the shape master has at

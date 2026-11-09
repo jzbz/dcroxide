@@ -9,12 +9,12 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-# Pure-Rust secp256k1 arithmetic: every key, ECDSA verification, signing
-# and compact recovery, and EC-Schnorr-DCRv0, with dcrd's exact parsing and
-# acceptance rules enforced by this crate's own code (ADR-0006's 2026-10-26
-# addendum, ADR-0012).  The variable-time arithmetic of ECDSA verification,
-# compact recovery and Schnorr verification, and key decompression, is
-# dcroxide-secp256k1-vartime's, below, with k256's as its fallback.
+# Pure-Rust secp256k1 arithmetic: private keys, ECDSA and EC-Schnorr-DCRv0
+# signing, and the fallbacks of verification, recovery and key parsing,
+# with dcrd's exact rules enforced by this crate's own code (ADR-0006's
+# 2026-10-26 addendum, ADR-0012).  The variable-time arithmetic of ECDSA
+# verification, compact recovery and Schnorr verification, and public
+# keys, is dcroxide-secp256k1-vartime's, below, with k256's as its fallback.
 #
 # k256's `std` and `precomputed-tables` are deliberately left off.  ECDSA
 # and Schnorr signing, and `PrivateKey::public_key`, multiply with
@@ -39,8 +39,8 @@ zeroize = { version = "1.9", default-features = false }
 # ported from libsecp256k1 (ADR-0016): ECDSA verification's steps 2-10,
 # compact recovery's steps 4-10 and Schnorr verification's steps 7-10
 # (scalars, the Straus loop over static generator tables, the x check and
-# the affine conversion), and compressed keys' decompression by the 5x52
-# field's square root.
+# the affine conversion), and public keys: compressed keys' decompression
+# by the 5x52 field's square root, the curve check and serialization.
 # Only `src/secp256k1/backend.rs` names it, and k256's path stays behind
 # it as the fallback.  It has no dependencies of its own and needs only
 # core; its licence is ISC AND MIT (its NOTICE).

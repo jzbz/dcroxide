@@ -9,13 +9,14 @@
 //! three: **type 0 (ECDSA-secp256k1)**, **type 1 (Ed25519)**, and **type 2
 //! (EC-Schnorr-DCRv0)**.
 //!
-//! Per ADR-0006's 2026-10-26 addendum and ADR-0012, ECDSA,
-//! EC-Schnorr-DCRv0 and every secp256k1 key run on `k256`'s field, scalar
-//! and point arithmetic, and Ed25519 on `curve25519-dalek`'s.  The
-//! variable-time arithmetic of ECDSA verification, compact recovery and
-//! EC-Schnorr-DCRv0 verification, and the decompression of compressed
-//! keys, run on `dcroxide-secp256k1-vartime`, owned in tree and ported
-//! from libsecp256k1, behind one seam module with k256 as its fallback
+//! Per ADR-0006's 2026-10-26 addendum and ADR-0012, ECDSA and
+//! EC-Schnorr-DCRv0 signing and secp256k1 private keys run on `k256`'s
+//! field, scalar and point arithmetic, and Ed25519 on `curve25519-dalek`'s.
+//! The variable-time arithmetic of ECDSA verification, compact recovery
+//! and EC-Schnorr-DCRv0 verification, and public keys (their parsing,
+//! curve check, decompression and serialization), run on
+//! `dcroxide-secp256k1-vartime`, owned in tree and ported from
+//! libsecp256k1, behind one seam module with k256 as its fallback
 //! (ADR-0016); keys from secrets and signing stay on k256.
 //! Everything dcrd-behavior-specific — DER signature acceptance, public
 //! key format acceptance, low-S serialization, the order of compact

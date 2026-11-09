@@ -27,7 +27,14 @@
 //! zero for zero, and equal to k256's inversion); and through key
 //! decompression, with the magnitude byte's low bit as the
 //! parity: `Affine::decompress_var` must give k256's point or k256's
-//! `None`, and the point must come back from `from_be_coordinates`.
+//! `None`, and the point must come back from `from_be_coordinates`.  The
+//! curve check of dcrec's uncompressed keys, `from_be_coordinates`, must
+//! accept (x, y), with y the first 32 bytes of b's limbs, exactly when
+//! k256's `from_coordinates` does (mostly not, so its refusal is
+//! exercised), accept the decompressed point's negation as the point of
+//! the other parity, and refuse the point with y's low bit flipped
+//! exactly when k256 does; an accepted point gives back its coordinates
+//! and y's parity.
 //!
 //! Multiply level (2), through the public API only: a mode byte, then 96
 //! bytes.  Raw mode (even): the key Q is k*G for the first 32 bytes as k
@@ -257,10 +264,37 @@ fn field_level(m_byte: u8, a_bytes: &[u8], b_bytes: &[u8]) {
         kp.map(|p| (p.x().into(), p.y().into())),
         "decompress_var {x:02x?} odd {odd}"
     );
+    let y: [u8; 32] = b_bytes[..32].try_into().expect("32 bytes");
+    let mut candidates = vec![(x, y)];
     if let Some(p) = point {
         let (px, py) = p.to_be_bytes();
         assert_eq!(p.y_is_odd(), odd);
         assert!(Affine::from_be_coordinates(&px, &py) == Some(p));
+        let ky = Option::<KFe>::from(KFe::from_repr(py.into())).expect("y below p");
+        let ny = kfb(&(-ky).normalize());
+        assert!(
+            Affine::from_be_coordinates(&px, &ny) == Affine::decompress_var(&px, !odd),
+            "the negation of {px:02x?}"
+        );
+        let mut flipped = py;
+        flipped[31] ^= 1;
+        candidates.extend([(px, ny), (px, flipped)]);
+    }
+    for (cx, cy) in candidates {
+        let ours = Affine::from_be_coordinates(&cx, &cy);
+        let theirs = Option::<AffinePoint>::from(AffinePoint::from_coordinates(
+            &cx.into(),
+            &cy.into(),
+        ));
+        assert_eq!(
+            ours.is_some(),
+            theirs.is_some(),
+            "from_be_coordinates {cx:02x?} {cy:02x?}"
+        );
+        if let Some(p) = ours {
+            assert_eq!(p.to_be_bytes(), (cx, cy));
+            assert_eq!(p.y_is_odd(), cy[31] & 1 == 1);
+        }
     }
 }
 
