@@ -146,15 +146,35 @@ trait SigningCurve: 'static + Send + Sync {
     /// The uncompressed SEC 1 encoding of the key's public point.
     fn public(key: &Self::Key) -> Vec<u8>;
 
-    /// The DER signature of `message`: the curve's hash, then RFC 6979's
-    /// nonce with `hedge` as additional data.
-    fn sign(key: &Self::Key, message: &[u8], hedge: &[u8]) -> Vec<u8>;
+    /// The curve crate's signature: r and s, before any encoding.
+    type Signature;
 
-    /// The DER signature of `message` with `nonce`, big-endian at the
-    /// field's length, as the nonce, or `None` when it is not in `[1, n)`
-    /// or gives a signature of zero.
+    /// The signature of `message`: the curve's hash, then RFC 6979's
+    /// nonce with `hedge` as additional data.
+    fn signature(key: &Self::Key, message: &[u8], hedge: &[u8]) -> Self::Signature;
+
+    /// `signature` in DER, as TLS carries it.
+    fn to_der(signature: &Self::Signature) -> Vec<u8>;
+
+    /// `signature` at its fixed size: r, then s, each big-endian at the
+    /// field's length.  The timing check (ADR-0015, T10) times signing up
+    /// to this form, since the DER encoding's length and path follow r and
+    /// s, which a fixed class repeats and the random class varies.
     #[cfg(test)]
-    fn sign_with_nonce(key: &Self::Key, nonce: &[u8], message: &[u8]) -> Option<Vec<u8>>;
+    fn to_fixed(signature: &Self::Signature) -> Vec<u8>;
+
+    /// The DER signature of `message`: [`SigningCurve::signature`], then
+    /// [`SigningCurve::to_der`], as the handshake signer makes it.
+    #[cfg(test)]
+    fn sign(key: &Self::Key, message: &[u8], hedge: &[u8]) -> Vec<u8> {
+        Self::to_der(&Self::signature(key, message, hedge))
+    }
+
+    /// The signature of `message` with `nonce`, big-endian at the field's
+    /// length, as the nonce, or `None` when it is not in `[1, n)` or gives
+    /// a signature of zero.
+    #[cfg(test)]
+    fn sign_with_nonce(key: &Self::Key, nonce: &[u8], message: &[u8]) -> Option<Self::Signature>;
 
     /// The key whose scalar `scalar` encodes, big-endian at the field's
     /// length, or `None` when it is not in `[1, n)` or of another length.
@@ -171,12 +191,13 @@ macro_rules! signing_curve {
             const FIELD_LEN: usize =
                 <ecdsa::elliptic_curve::FieldBytesSize<$krate::$curve> as Unsigned>::USIZE;
             type Key = $krate::ecdsa::SigningKey;
+            type Signature = $krate::ecdsa::Signature;
 
             fn public(key: &Self::Key) -> Vec<u8> {
                 key.verifying_key().to_sec1_point(false).as_bytes().to_vec()
             }
 
-            fn sign(key: &Self::Key, message: &[u8], hedge: &[u8]) -> Vec<u8> {
+            fn signature(key: &Self::Key, message: &[u8], hedge: &[u8]) -> Self::Signature {
                 type Hash = <$krate::$curve as ecdsa::DigestAlgorithm>::Digest;
                 let digest = Hash::digest(message);
                 let (signature, _) = ecdsa::hazmat::sign_prehashed_rfc6979::<Self, Hash>(
@@ -184,11 +205,24 @@ macro_rules! signing_curve {
                     &digest,
                     hedge,
                 );
+                signature
+            }
+
+            fn to_der(signature: &Self::Signature) -> Vec<u8> {
                 signature.to_der().as_bytes().to_vec()
             }
 
             #[cfg(test)]
-            fn sign_with_nonce(key: &Self::Key, nonce: &[u8], message: &[u8]) -> Option<Vec<u8>> {
+            fn to_fixed(signature: &Self::Signature) -> Vec<u8> {
+                signature.to_bytes().to_vec()
+            }
+
+            #[cfg(test)]
+            fn sign_with_nonce(
+                key: &Self::Key,
+                nonce: &[u8],
+                message: &[u8],
+            ) -> Option<Self::Signature> {
                 type Hash = <$krate::$curve as ecdsa::DigestAlgorithm>::Digest;
                 let nonce = $krate::FieldBytes::try_from(nonce).ok()?;
                 let nonce = $krate::NonZeroScalar::from_repr(nonce).into_option()?;
@@ -198,7 +232,7 @@ macro_rules! signing_curve {
                     &Hash::digest(message),
                 )
                 .ok()?;
-                Some(signature.to_der().as_bytes().to_vec())
+                Some(signature)
             }
 
             #[cfg(test)]
@@ -247,7 +281,7 @@ impl<C: SigningCurve> EcdsaSigningKey<C> {
     /// signature with `nonce` as the nonce, which RFC 6979 never gives at
     /// an extreme value of its own.
     #[cfg(test)]
-    fn sign_with_nonce(&self, nonce: &[u8], message: &[u8]) -> Option<Vec<u8>> {
+    fn sign_with_nonce(&self, nonce: &[u8], message: &[u8]) -> Option<C::Signature> {
         C::sign_with_nonce(&self.key, nonce, message)
     }
 }
@@ -290,12 +324,17 @@ impl<C: SigningCurve> EcdsaSigner<C> {
     /// The signature of `message` with a hedge of the field's length that
     /// `draw` fills, from a zeroed buffer.  `draw` is [`ProcessRng`] but in
     /// the tests, which stand in for it to see the draw.
-    fn sign_drawing(&self, message: &[u8], draw: impl FnOnce(&mut [u8])) -> Vec<u8> {
+    fn signature_drawing(&self, message: &[u8], draw: impl FnOnce(&mut [u8])) -> C::Signature {
         const { assert!(C::FIELD_LEN <= MAX_FIELD_LEN) };
         let mut hedge = [0; MAX_FIELD_LEN];
         let hedge = &mut hedge[..C::FIELD_LEN];
         draw(hedge);
-        C::sign(&self.key, message, hedge)
+        C::signature(&self.key, message, hedge)
+    }
+
+    /// [`EcdsaSigner::signature_drawing`]'s signature in DER.
+    fn sign_drawing(&self, message: &[u8], draw: impl FnOnce(&mut [u8])) -> Vec<u8> {
+        C::to_der(&self.signature_drawing(message, draw))
     }
 }
 
@@ -534,9 +573,12 @@ pub fn fuzz_key_parse(der: &[u8]) -> bool {
 /// The timing check's hold on the signing keys (`crate::ct_check`,
 /// ADR-0015 T10), which must choose the secret each signature is made
 /// with: a key made from a secret the check picks, signing through this
-/// module's own code with the hedge or the nonce fixed.  The curves' trait
-/// and the key types stay private to this module; these two types hold
-/// them for the check.
+/// module's own code with the hedge or the nonce fixed.  An ECDSA
+/// signature comes back as r and s at their fixed size, not in DER: the
+/// encoding depends only on the public signature, but its path differs
+/// with r's and s's leading bytes, which a fixed class repeats.  The
+/// curves' trait and the key types stay private to this module; these two
+/// types hold them for the check.
 #[cfg(test)]
 pub(crate) mod timing {
     use std::sync::Arc;
@@ -569,14 +611,16 @@ pub(crate) mod timing {
 
         /// The handshake signer's signature of `message`, with `hedge`, at
         /// the field's length, in place of its draw from the process
-        /// generator.
+        /// generator: r, then s, each at the field's length, the signature
+        /// as the signer has it before it encodes it in DER.
         pub(crate) fn sign_hedged(&self, message: &[u8], hedge: &[u8]) -> Vec<u8> {
             self.0.sign_hedged(message, hedge)
         }
 
         /// The signature of `message` with `nonce`, big-endian at the
-        /// field's length, as the nonce, or `None` when it is not in
-        /// `[1, n)` or gives a signature of zero.
+        /// field's length, as the nonce, as r, then s, each at the field's
+        /// length; or `None` when the nonce is not in `[1, n)` or gives a
+        /// signature of zero.
         pub(crate) fn sign_with_nonce(&self, nonce: &[u8], message: &[u8]) -> Option<Vec<u8>> {
             self.0.sign_with_nonce(nonce, message)
         }
@@ -599,11 +643,12 @@ pub(crate) mod timing {
             let signer = EcdsaSigner::<C> {
                 key: Arc::clone(&self.key),
             };
-            signer.sign_drawing(message, |drawn| drawn.copy_from_slice(hedge))
+            C::to_fixed(&signer.signature_drawing(message, |drawn| drawn.copy_from_slice(hedge)))
         }
 
         fn sign_with_nonce(&self, nonce: &[u8], message: &[u8]) -> Option<Vec<u8>> {
             EcdsaSigningKey::<C>::sign_with_nonce(self, nonce, message)
+                .map(|signature| C::to_fixed(&signature))
         }
 
         fn public(&self) -> Vec<u8> {
@@ -751,7 +796,8 @@ mod tests {
                 C::SCHEME
             );
             assert_eq!(
-                key.sign_with_nonce(&unhex(nonce), message.as_bytes()),
+                key.sign_with_nonce(&unhex(nonce), message.as_bytes())
+                    .map(|signature| C::to_der(&signature)),
                 Some(want),
                 "{:?}, {message:?}, with the RFC's nonce",
                 C::SCHEME
@@ -850,6 +896,55 @@ mod tests {
         check::<p521::NistP521>(p521, 66, |message, signature| {
             p521::ecdsa::DerSignature::from_bytes(signature)
                 .is_ok_and(|signature| p521_public.verify(message, &signature).is_ok())
+        });
+    }
+
+    /// The timing check's hook on the handshake signer keeps the signature
+    /// the signer makes, as r and s at the field's length each: encoded in
+    /// DER it is the signature the signer gives TLS for the same key,
+    /// message and hedge.
+    #[test]
+    fn the_timing_hook_keeps_the_signers_signature() {
+        fn check<C: SigningCurve>(der: impl Fn(&[u8]) -> Vec<u8>) {
+            // 1 then sevens, below n on each curve, P-521's included.
+            let mut scalar = vec![7; C::FIELD_LEN];
+            scalar[0] = 1;
+            let hedge = vec![0x5a; C::FIELD_LEN];
+            let message = b"a TLS 1.3 CertificateVerify's content";
+            let key = EcdsaSigningKey::<C>::new(C::key_from_scalar(&scalar).expect("a key"));
+            let signer = EcdsaSigner::<C> {
+                key: Arc::clone(&key.key),
+            };
+            let hook = timing::Ecdsa::new(C::SCHEME, &scalar).expect("a key");
+            let fixed = hook.sign_hedged(message, &hedge);
+            assert_eq!(fixed.len(), 2 * C::FIELD_LEN, "{:?}", C::SCHEME);
+            assert_eq!(
+                der(&fixed),
+                signer.sign_drawing(message, |drawn| drawn.copy_from_slice(&hedge)),
+                "{:?}",
+                C::SCHEME
+            );
+        }
+        check::<p256::NistP256>(|fixed| {
+            p256::ecdsa::Signature::from_slice(fixed)
+                .expect("r and s")
+                .to_der()
+                .as_bytes()
+                .to_vec()
+        });
+        check::<p384::NistP384>(|fixed| {
+            p384::ecdsa::Signature::from_slice(fixed)
+                .expect("r and s")
+                .to_der()
+                .as_bytes()
+                .to_vec()
+        });
+        check::<p521::NistP521>(|fixed| {
+            p521::ecdsa::Signature::from_slice(fixed)
+                .expect("r and s")
+                .to_der()
+                .as_bytes()
+                .to_vec()
         });
     }
 

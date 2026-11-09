@@ -85,19 +85,27 @@
 //! It is statistical.  It sees a difference large enough to show on the
 //! machine that runs it, fails only on one of a nanosecond an operation or
 //! more, and a pass is not a proof.  What is timed is the operation as the
-//! provider runs it, so public work inside it is timed too: an ECDSA
-//! signature's DER encoding branches on the signature's leading bytes,
-//! which a fixed class repeats and the random class varies, and a reported
-//! ECDSA target is read with that in mind.  A seal's cipher is built
-//! ahead, as the provider makes one for each traffic key and seals every
-//! record with it, so AES's key schedule and GHASH's key are timed by the
-//! keying targets alone (ChaCha20-Poly1305 keys itself in each seal).  The
-//! Ed25519 nonce target's nonce is a scalar built ahead too, where the
-//! provider reduces SHA-512's output to one inside the signing that the
-//! key target times.  The Ed25519 key reduces its expanded scalar mod L,
-//! as RFC 8032's signing does, so what its arithmetic sees of 2^254 or
-//! 2^255 - 8 is the residue; two of its classes are expanded scalars
-//! within the clamp whose residues are extremes themselves, 2 and L - 1.
+//! provider runs it, so public work inside it is timed too, with one
+//! exception: an ECDSA target's timed region ends at the signature as r
+//! and s at the field's length each, short of the DER encoding the
+//! provider sends.  The encoding's path and length follow r's and s's
+//! leading bytes.  A fixed class signs the same input on every sample, the
+//! message (and, by the key, the hedge) being fixed, so it repeats one r
+//! and s and always takes one path, where the random class mixes them.
+//! With the encoding timed, P-256 signing by the nonce failed nightly runs
+//! on differences of a few nanoseconds an operation that followed the
+//! signature's shape and no property of the nonce.  The encoding depends
+//! only on the signature, which the handshake publishes, so leaving it out
+//! hides nothing secret.  A seal's cipher is built ahead, as the provider
+//! makes one for each traffic key and seals every record with it, so AES's
+//! key schedule and GHASH's key are timed by the keying targets alone
+//! (ChaCha20-Poly1305 keys itself in each seal).  The Ed25519 nonce
+//! target's nonce is a scalar built ahead too, where the provider reduces
+//! SHA-512's output to one inside the signing that the key target times.
+//! The Ed25519 key reduces its expanded scalar mod L, as RFC 8032's signing
+//! does, so what its arithmetic sees of 2^254 or 2^255 - 8 is the residue;
+//! two of its classes are expanded scalars within the clamp whose residues
+//! are extremes themselves, 2 and L - 1.
 #![allow(
     clippy::arithmetic_side_effects,
     reason = "test-harness arithmetic over counts, lengths, bit positions and nanoseconds, \
@@ -147,9 +155,14 @@ const T_REPORT: f64 = 4.5;
 /// 2,720 and 2,819, 5.31 and 3.20 ns an operation in two runs' comparisons
 /// of the largest |t|.  A smaller leak, about 4.8 ns a call planted in
 /// ECDSA P-256 signing by the key, was not found at 10 or 60 seconds:
-/// signing's spread, about 3.6 microseconds, puts |t| 10 at a difference
-/// of a few hundred nanoseconds, a limit of the statistics and not of the
-/// floor.
+/// signing's spread, then about 3.6 microseconds, put |t| 10 at a
+/// difference of a few hundred nanoseconds, a limit of the statistics and
+/// not of the floor.  A dependency update since made P-256 signing about
+/// twice as quick and its timings steadier: in the nightly runs where
+/// P-256 signing by the nonce failed, the failing comparisons' spreads were
+/// about 40 to 160 ns, on differences of 3 to 9 ns an operation, well
+/// above the floor, which followed the DER encoding's path (the module's
+/// notes) rather than the nonce.
 const MIN_FAIL_NANOS: f64 = 1.0;
 
 /// dudect's crops, in addition to the uncropped test.
@@ -1157,7 +1170,8 @@ const REFERENCE: [u8; 64] = [0x5a; 64];
 
 /// ECDSA signing on `curve` by the key's extremes, with the message and the
 /// hedge fixed, so that RFC 6979's nonce follows the key as it does in the
-/// handshake signer.
+/// handshake signer.  The timed region ends at the signature as r and s,
+/// before the signer's DER encoding.
 fn ecdsa_signing_by_key(target: &str, curve: &Nist) {
     let order = unhex(curve.order);
     let hedge = vec![0xa5; order.len()];
@@ -1174,7 +1188,8 @@ fn ecdsa_signing_by_key(target: &str, curve: &Nist) {
 /// ECDSA signing on `curve` by the nonce's extremes, with the key fixed:
 /// the nonce reaches `k.invert()` and `mul_by_generator`
 /// (`ecdsa-0.17.0/src/hazmat.rs:64-67`), and RFC 6979's nonce never lands
-/// on an extreme of its own.
+/// on an extreme of its own.  The timed region ends at the signature as r
+/// and s, with no DER encoding.
 fn ecdsa_signing_by_nonce(target: &str, curve: &Nist) {
     let order = unhex(curve.order);
     let key = timing::Ecdsa::new(curve.scheme, &fixed_scalar(&order)).expect("the fixed key");
@@ -2534,22 +2549,35 @@ mod tests {
         }
     }
 
-    /// Whether `signature` of `message` verifies under the uncompressed
-    /// point `public` on the curve of `scheme`: by the provider's verifier
-    /// for P-256 and P-384, and the `p521` crate's for P-521, which the
-    /// provider does not verify.
+    /// Whether `signature` of `message`, r and s at the field's length
+    /// each as the timing hooks give it, verifies under the uncompressed
+    /// point `public` on the curve of `scheme`: in DER by the provider's
+    /// verifier for P-256 and P-384, and by the `p521` crate's for P-521,
+    /// which the provider does not verify.  The signature has exactly the
+    /// field's length twice, and the curve crate reads it as r and s.
     fn ecdsa_verifies(scheme: SignatureScheme, public: &[u8], signature: &[u8]) -> bool {
         match scheme {
-            SignatureScheme::ECDSA_NISTP256_SHA256 => verify::ECDSA_P256_SHA256
-                .verify_signature(public, MESSAGE, signature)
-                .is_ok(),
-            SignatureScheme::ECDSA_NISTP384_SHA384 => verify::ECDSA_P384_SHA384
-                .verify_signature(public, MESSAGE, signature)
-                .is_ok(),
+            SignatureScheme::ECDSA_NISTP256_SHA256 => {
+                let der = p256::ecdsa::Signature::from_slice(signature)
+                    .expect("r and s at 32 bytes each")
+                    .to_der();
+                verify::ECDSA_P256_SHA256
+                    .verify_signature(public, MESSAGE, der.as_bytes())
+                    .is_ok()
+            }
+            SignatureScheme::ECDSA_NISTP384_SHA384 => {
+                let der = p384::ecdsa::Signature::from_slice(signature)
+                    .expect("r and s at 48 bytes each")
+                    .to_der();
+                verify::ECDSA_P384_SHA384
+                    .verify_signature(public, MESSAGE, der.as_bytes())
+                    .is_ok()
+            }
             SignatureScheme::ECDSA_NISTP521_SHA512 => {
                 let key = p521::ecdsa::VerifyingKey::from_sec1_bytes(public).expect("a point");
-                p521::ecdsa::DerSignature::from_bytes(signature)
-                    .is_ok_and(|signature| key.verify(MESSAGE, &signature).is_ok())
+                let signature = p521::ecdsa::Signature::from_slice(signature)
+                    .expect("r and s at 66 bytes each");
+                key.verify(MESSAGE, &signature).is_ok()
             }
             other => panic!("{other:?}"),
         }
@@ -2605,17 +2633,6 @@ mod tests {
         }
     }
 
-    /// The r of the DER ECDSA signature `signature`, at `len` bytes.
-    fn der_r(signature: &[u8], len: usize) -> Vec<u8> {
-        // The SEQUENCE's length takes a second byte past 127, as P-521's
-        // can.
-        let at = if signature[1] == 0x81 { 3 } else { 2 };
-        assert_eq!(signature[at], 0x02, "{signature:02x?}");
-        let r = &signature[at + 2..at + 2 + usize::from(signature[at + 1])];
-        let r = r.strip_prefix(&[0]).unwrap_or(r);
-        [vec![0; len - r.len()], r.to_vec()].concat()
-    }
-
     /// `a` minus `b`, big-endian at their length, `a` at least `b`.
     fn minus(a: &[u8], b: &[u8]) -> Vec<u8> {
         let mut out = vec![0; a.len()];
@@ -2629,9 +2646,10 @@ mod tests {
         out
     }
 
-    /// Each nonce class reaches the signature: its r is the x-coordinate
-    /// of the nonce times the generator, reduced mod n, and the signature
-    /// verifies under the fixed key.
+    /// Each nonce class reaches the signature: its r, the signature's first
+    /// half at the field's length, is the x-coordinate of the nonce times
+    /// the generator, reduced mod n, and the signature verifies under the
+    /// fixed key.
     #[test]
     fn the_ecdsa_nonce_classes_reach_r() {
         for curve in [&P256, &P384, &P521] {
@@ -2649,7 +2667,8 @@ mod tests {
                 } else {
                     minus(&x, &n)
                 };
-                assert_eq!(der_r(&signature, len), want, "{:?}: {name}", curve.scheme);
+                assert_eq!(signature.len(), 2 * len, "{:?}: {name}", curve.scheme);
+                assert_eq!(signature[..len], want, "{:?}: {name}", curve.scheme);
                 assert!(
                     ecdsa_verifies(curve.scheme, &key.public(), &signature),
                     "{:?}: {name}",
