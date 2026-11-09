@@ -11,7 +11,6 @@ use zeroize::{Zeroize, Zeroizing};
 
 mod backend;
 pub mod ecdsa;
-mod ecmult;
 pub mod nonce;
 pub mod schnorr;
 
@@ -320,15 +319,15 @@ impl PublicKey {
     }
 
     /// The key from a k256 point, which must not be the identity: a point
-    /// on the curve that recovery computed.
+    /// on the curve that recovery computed (the seam converts it from the
+    /// vartime crate's).
     pub(crate) fn from_affine(point: AffinePoint) -> PublicKey {
         debug_assert!(!bool::from(point.is_identity()));
         PublicKey { point }
     }
 
-    /// The key as a k256 projective point, for the group operations of
-    /// ECDSA and Schnorr verification.  The key already holds the point, so
-    /// this only sets z = 1.
+    /// The key as a k256 projective point, for the seam's k256 arms.  The
+    /// key already holds the point, so this only sets z = 1.
     pub(crate) fn as_k256_point(&self) -> ProjectivePoint {
         ProjectivePoint::from(self.point)
     }

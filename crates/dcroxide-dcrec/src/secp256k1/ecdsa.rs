@@ -427,16 +427,13 @@ pub const COMPACT_SIG_COMP_PUB_KEY: u8 = 4;
 /// signature and code determine.
 ///
 /// Every input is public, so like dcrd's `NonConst` operations the
-/// arithmetic runs in variable time.
-// The flagged operators are k256 scalar arithmetic, modular by definition,
-// and the header's subtraction, which the range check above it guards.
+/// arithmetic runs in variable time.  Steps 4 to 10 run on
+/// dcroxide-secp256k1-vartime through the seam (ADR-0016), with k256 as
+/// the fallback.
+// The header's subtraction, which the range check above it guards.
 #[allow(clippy::arithmetic_side_effects)]
 pub fn recover_compact(signature: &[u8], hash: &[u8; 32]) -> Result<(PublicKey, bool), Error> {
-    use k256::elliptic_curve::PrimeField;
-    use k256::elliptic_curve::group::Group;
-    use k256::elliptic_curve::ops::Reduce;
-    use k256::elliptic_curve::point::BatchNormalize;
-    use k256::{FieldBytes, ProjectivePoint, Scalar};
+    use super::backend::Recovery;
 
     // The signature must be the correct length.
     if signature.len() != COMPACT_SIG_SIZE {
@@ -456,21 +453,25 @@ pub fn recover_compact(signature: &[u8], hash: &[u8; 32]) -> Result<(PublicKey, 
     let pub_key_recovery_code = sig_recovery_code & 3;
 
     // Step 1: R and S must be in [1, N-1], each checked against N before
-    // it is checked against zero.
+    // it is checked against zero.  Big-endian byte order is numeric order.
     let r_bytes: [u8; 32] = signature[1..33].try_into().expect("32 bytes");
     let s_bytes: [u8; 32] = signature[33..65].try_into().expect("32 bytes");
-    let r = Option::<Scalar>::from(Scalar::from_repr(r_bytes.into())).ok_or(Error::SigRTooBig)?;
-    if bool::from(r.is_zero()) {
+    if r_bytes >= GROUP_ORDER_BYTES {
+        return Err(Error::SigRTooBig);
+    }
+    if is_zero(&r_bytes) {
         return Err(Error::SigRIsZero);
     }
-    let s = Option::<Scalar>::from(Scalar::from_repr(s_bytes.into())).ok_or(Error::SigSTooBig)?;
-    if bool::from(s.is_zero()) {
+    if s_bytes >= GROUP_ORDER_BYTES {
+        return Err(Error::SigSTooBig);
+    }
+    if is_zero(&s_bytes) {
         return Err(Error::SigSIsZero);
     }
 
     // Steps 2 and 3: R as a field element, plus N when the overflow bit is
     // set, which fails when R + N would reach P (dcrd's
-    // `IsGtOrEqPrimeMinusOrder`).  Big-endian byte order is numeric order.
+    // `IsGtOrEqPrimeMinusOrder`).
     let mut x_bytes = r_bytes;
     if pub_key_recovery_code & 2 != 0 {
         if r_bytes >= PRIME_MINUS_ORDER_BYTES {
@@ -479,42 +480,29 @@ pub fn recover_compact(signature: &[u8], hash: &[u8; 32]) -> Result<(PublicKey, 
         x_bytes = add_group_order(&r_bytes);
     }
 
-    // Steps 4 and 5: the point X with that x and the y whose oddness the
-    // code's low bit gives, failing when x^3 + 7 has no square root (dcrd's
-    // `DecompressY`), through the seam as in key parsing (ADR-0016): the
-    // root is normalized before it is chosen and again after a negation,
-    // as dcrd does.  x is below P here.
-    let big_x = super::backend::decompress(&x_bytes, pub_key_recovery_code & 1 != 0)
-        .ok_or(Error::PointNotOnCurve)?;
-
-    // Step 6: e = H(m) mod N, one conditional subtraction of N.
-    let e = <Scalar as Reduce<FieldBytes>>::reduce(&(*hash).into());
-
-    // Step 7: w = R^-1 mod N, in variable time like dcrd's
-    // `InverseValNonConst`, through the seam as in verification's step 3
-    // (ADR-0016).  R is in [1, N-1] by step 1.
-    let w = super::backend::scalar_inverse(&r_bytes);
-
-    // Step 8: u1 = -(e * w) mod N and u2 = s * w mod N.
-    let u1 = -(e * w);
-    let u2 = s * w;
-
-    // Step 9: Q = u1 * G + u2 * X, the same variable-time multiply as
-    // verification's step 5 (`ecmult`).  dcrd's `AddNonConst` doubles when
-    // its operands are equal; k256's complete additions need no such
-    // branch, as in verification.
-    let q = super::ecmult::mul_g_add_vartime(&u1, &u2, &ProjectivePoint::from(big_x));
-
-    // Step 10: fail if Q is the point at infinity, dcrd's second use of
-    // `ErrPointNotOnCurve`, tested before Q is normalized.
-    if bool::from(q.is_identity()) {
-        return Err(Error::PointNotOnCurve);
+    // Steps 4 to 10, in dcrd's order, through the seam: the point X with
+    // that x and the y whose oddness the code's low bit gives, failing
+    // when x^3 + 7 has no square root (dcrd's `DecompressY`, steps 4 and
+    // 5); e = H(m) mod N (step 6); w = R^-1 mod N, in variable time like
+    // dcrd's `InverseValNonConst` (step 7); u1 = -(e * w) and u2 = s * w
+    // (step 8); Q = u1 * G + u2 * X, the same variable-time multiply as
+    // verification's (step 9); failing if Q is the point at infinity,
+    // dcrd's second use of `ErrPointNotOnCurve`, tested before Q is
+    // normalized (step 10); and the key in affine coordinates, by one
+    // variable-time inversion.
+    match super::backend::recover_key(
+        hash,
+        &r_bytes,
+        &s_bytes,
+        &x_bytes,
+        pub_key_recovery_code & 1 != 0,
+    ) {
+        // Steps 4 and 5: no point has the x.
+        Recovery::NoPoint => Err(Error::PointNotOnCurve),
+        // Step 10: Q is the point at infinity.
+        Recovery::Infinity => Err(Error::PointNotOnCurve),
+        Recovery::Key(key) => Ok((key, was_compressed)),
     }
-
-    // The key in affine coordinates: one variable-time inversion.
-    let [affine] =
-        <ProjectivePoint as BatchNormalize<[ProjectivePoint; 1]>>::batch_normalize_vartime(&[q]);
-    Ok((PublicKey::from_affine(affine), was_compressed))
 }
 
 /// dcrd's `sign` (ecdsa/signature.go:554-663): steps 2 to 6 of the

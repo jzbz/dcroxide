@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: ISC
 //! The crate's points at its API edge: [`Affine`], always on the curve,
 //! never infinity, both coordinates normalized, and [`Point`], an opaque
-//! Jacobian point with an infinity flag, the result of [`ecmult_var`].
-//! All inputs are public; everything is variable time.
+//! Jacobian point with an infinity flag, the result of [`ecmult_var`];
+//! and [`Fallback`], the answer of a step that declined.  All inputs are
+//! public; everything is variable time.
 
 use crate::field::Fe;
 use crate::group::{Ge, Gej};
@@ -92,8 +93,9 @@ impl Affine {
 }
 
 /// A curve point in Jacobian coordinates with an explicit infinity flag:
-/// what [`ecmult_var`] returns.  Opaque; it answers whether it is infinity
-/// and whether its affine x is a given value, without an inversion.
+/// what [`ecmult_var`] returns.  Opaque; it answers whether it is
+/// infinity, whether its affine x is a given value without an inversion,
+/// and its affine form with one.
 #[derive(Clone, Copy, Debug)]
 pub struct Point(Gej);
 
@@ -137,7 +139,30 @@ impl Point {
         };
         self.0.eq_x_var(&x)
     }
+
+    /// One field inversion (libsecp256k1's `ge_set_gej_var`), then x and y
+    /// normalized, as dcrd's `ToAffine` does: `Ok(None)` at infinity,
+    /// `Ok(Some(_))` otherwise, and `Err(Fallback)` only if the inversion
+    /// passes modinv64's release iteration cap, which the safegcd bound
+    /// rules out.  The cap is never an answer: a caller that took it for
+    /// infinity would turn a decline into a wrong "invalid".
+    #[inline]
+    pub fn to_affine_var(&self) -> Result<Option<Affine>, Fallback> {
+        if self.0.is_infinity() {
+            return Ok(None);
+        }
+        let g = Ge::set_gej_var(&self.0).ok_or(Fallback)?;
+        debug_assert!(!g.infinity);
+        Ok(Some(Affine::from_ge_unchecked(g)))
+    }
 }
+
+/// The arithmetic declined and the caller must compute the answer another
+/// way: modinv64's release iteration cap, which the safegcd bound rules
+/// out for every input.  It exists so that a bug in that argument costs
+/// time, never a verdict.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Fallback;
 
 /// ng*G + na*A, by libsecp256k1's Straus loop over the static window-12
 /// tables of G and 2^128*G.  `None` only if the wNAF builder declines a

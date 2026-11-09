@@ -16,7 +16,8 @@
 //! x-check's boundaries, with the check itself; wNAF strings that reach
 //! position 128 and digits that index the tables' last entries;
 //! libsecp256k1's known-answer hashes over many multiples of G; the
-//! public point API; and a digest of fixed-seed results that every build
+//! public point API, the affine conversion on boundary points and its
+//! declined inverse; and a digest of fixed-seed results that every build
 //! profile must reproduce.
 
 use dcroxide_testutil::SplitMix64;
@@ -657,7 +658,10 @@ fn ecmult_target_mode1() {
 /// `Affine::from_be_coordinates` with the key's y, its negation, a wrong y
 /// and coordinates at or above p; `y_is_odd`; and `ecmult_var` and
 /// `Point` against k256, an infinite sum every sixteenth case (na*G +
-/// (-na)*G).
+/// (-na)*G): `to_affine_var` is `Ok(None)` exactly at infinity, and
+/// otherwise k256's affine point, the bytes `gej_bytes` gives (the
+/// conversion the digest folds), with y's parity, and a round trip
+/// through `from_be_coordinates`.
 #[test]
 fn public_point_api() {
     use crate::{Affine, ecmult_var};
@@ -690,18 +694,151 @@ fn public_point_api() {
         let want = k_ref(&ge_to_kp(aa.as_ge()), &na, &ng);
         assert_eq!(gej_bytes(pt.as_gej()), want);
         assert_eq!(pt.is_infinity(), want.is_none());
-        match want {
-            None => {
+        let affine = pt.to_affine_var().expect("within the inverse's cap");
+        match (want, affine) {
+            (None, None) => {
                 assert!(!pt.x_equals_var(&[0; 32]));
                 inf += 1;
             }
-            Some((wx, _)) => {
+            (Some((wx, wy)), Some(af)) => {
                 assert!(pt.x_equals_var(&wx));
+                assert_eq!(af.to_be_bytes(), (wx, wy));
+                assert_eq!(af.y_is_odd(), wy[31] & 1 == 1);
+                let back = Affine::from_be_coordinates(&wx, &wy).expect("on the curve");
+                assert!(back == af);
                 fin += 1;
             }
+            (w, a) => panic!(
+                "to_affine_var finite {} vs k256 finite {}",
+                a.is_some(),
+                w.is_some()
+            ),
         }
     }
     assert!(inf > 0 && fin > 0);
+}
+
+/// With the field inverse forced to decline, as if modinv64 had passed its
+/// cap, `to_affine_var` gives `Err(Fallback)` for a finite point, never
+/// `Ok(None)`, which means infinity, and `set_gej_var` gives `None`; at
+/// infinity it is still `Ok(None)`, since no inversion is attempted.
+/// Once the switch clears, the same point converts as before.
+#[test]
+fn to_affine_var_cap_is_fallback() {
+    use crate::{Affine, Fallback, ecmult_var};
+    let mut r = SplitMix64(0x6361_705f_6661_6c6c);
+    let mut walk = Walk::new(&mut r);
+    let g = Affine::from_be_coordinates(&fe_bytes(&G.x), &fe_bytes(&G.y)).expect("G");
+    for _ in 0..256 {
+        let q = ge_from_k(&walk.next(&mut r));
+        let a = Affine::from_be_coordinates(&fe_bytes(&q.x), &fe_bytes(&q.y)).expect("a key");
+        let na = rand_scalar(&mut r);
+        let pt = ecmult_var(&a, &na, &rand_scalar(&mut r)).expect("guard");
+        let inf = ecmult_var(&g, &na, &-na).expect("guard");
+        assert!(inf.is_infinity());
+        let normal = pt.to_affine_var();
+        assert!(matches!(normal, Ok(Some(_))));
+        branches::with_cap_forced(|| {
+            assert!(branches::cap_forced());
+            assert_eq!(pt.to_affine_var(), Err(Fallback));
+            assert!(Ge::set_gej_var(pt.as_gej()).is_none());
+            assert_eq!(inf.to_affine_var(), Ok(None));
+        });
+        assert!(!branches::cap_forced());
+        assert_eq!(pt.to_affine_var(), normal);
+    }
+}
+
+/// The affine output at the points where a skipped normalization would
+/// show: tiny x, tiny y (every y or p - y below 200), x near p (the
+/// largest x with a point, P-3, and the next ones down), x in [P - N, N)
+/// and x in [N, N + 2^32).
+/// Each target is reached three ways: (a) a Jacobian point with a random
+/// Z and X, Y inflated to the magnitudes `gej_verify` allows; (b) as
+/// `ecmult_var`'s result for random (na, ng), A solved on k256; (c) the
+/// same with ng = 0, so the G half of the loop is empty.  The bytes equal
+/// the target's, both coordinates' limbs are canonical (equal to
+/// `normalize_var`'s), and `y_is_odd` is y's low bit.  Below the 10^6
+/// volume every eighth target per class runs, and every x near p.
+#[test]
+fn to_affine_var_normalizes_boundary_points() {
+    use crate::{Affine, Point, ecmult_var};
+    let mut pts: Vec<(&str, AffinePoint)> = boundary_points()
+        .into_iter()
+        .map(|(c, p)| {
+            let name = match c {
+                Class::XAboveN => "x in [N, N + 2^32)",
+                Class::XInPMinusNToN => "x in [P - N, N)",
+                Class::TinyX => "tiny x",
+                Class::TinyY => "tiny y",
+            };
+            (name, p)
+        })
+        .collect();
+    let (mut x, mut near_p) = (sub4(&P, &[1, 0, 0, 0]), 0);
+    while near_p < 16 {
+        for odd in [false, true] {
+            if let Some(p) = k_decomp(&x, odd) {
+                pts.push(("x near p", p));
+                near_p += 1;
+            }
+        }
+        x = sub4(&x, &[1, 0, 0, 0]);
+    }
+    assert!(
+        pts.iter()
+            .any(|(c, p)| *c == "x near p" && be_to_words(&p.x().into()) == sub4(&P, &[3, 0, 0, 0]))
+    );
+    let step = if full() { 1 } else { 8 };
+    let mut r = SplitMix64(0x6166_665f_6e6f_726d);
+    let check = |af: &Affine, want: &Bytes2, how: &str, class: &str| {
+        assert_eq!(af.to_be_bytes(), *want, "{class}, {how}");
+        let g = af.as_ge();
+        assert_eq!(g.x.raw().n, norm(&g.x).raw().n, "{class}, {how}: x limbs");
+        assert_eq!(g.y.raw().n, norm(&g.y).raw().n, "{class}, {how}: y limbs");
+        assert_eq!(af.y_is_odd(), want.1[31] & 1 == 1, "{class}, {how}: parity");
+    };
+    let mut seen = std::collections::BTreeMap::<&str, u64>::new();
+    let mut idx = std::collections::BTreeMap::<&str, usize>::new();
+    for (class, p) in &pts {
+        let i = idx.entry(class).or_insert(0);
+        *i += 1;
+        if *class != "x near p" && !(*i - 1).is_multiple_of(step) {
+            continue;
+        }
+        let want: Bytes2 = (p.x().into(), p.y().into());
+        let pp = ProjectivePoint::from(*p);
+
+        // (a) A Jacobian point with a random Z, at the magnitudes allowed.
+        let ge = ge_from_k(p);
+        let z = rand_fe_nz(&mut r);
+        let (mx, my) = (1 + r.below(4) as u8, 1 + r.below(4) as u8);
+        let pt = Point::from_gej(to_jac(&ge, &z, mx, my));
+        let af = pt.to_affine_var().expect("no cap").expect("finite");
+        check(&af, &want, "Jacobian", class);
+
+        // (b) ecmult_var's result, A solved for random (na, ng).
+        if let Some((qa, u1, u2)) = solve_q(&pp, &mut r) {
+            let a = Affine::from_be_coordinates(&qa.x().into(), &qa.y().into()).expect("A");
+            let pt = ecmult_var(&a, &u2, &u1).expect("guard");
+            let af = pt.to_affine_var().expect("no cap").expect("finite");
+            check(&af, &want, "ecmult_var", class);
+        }
+
+        // (c) ng = 0: A = target / na.
+        let na = rand_scalar(&mut r);
+        if !na.is_zero() {
+            let nai = to_k(&na).invert_vartime().expect("nonzero");
+            let qa = (pp * nai).to_affine();
+            let a = Affine::from_be_coordinates(&qa.x().into(), &qa.y().into()).expect("A");
+            let pt = ecmult_var(&a, &na, &Scalar::ZERO).expect("guard");
+            let af = pt.to_affine_var().expect("no cap").expect("finite");
+            check(&af, &want, "ecmult_var, ng = 0", class);
+        }
+        *seen.entry(class).or_insert(0) += 1;
+    }
+    println!("to_affine_var_normalizes_boundary_points: {seen:?}");
+    assert_eq!(seen.len(), 5, "{seen:?}");
 }
 
 /// x values at or above p for `x_equals_var`: p, p + k and 2^256 - 1.

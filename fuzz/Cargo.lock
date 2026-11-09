@@ -473,7 +473,6 @@ dependencies = [
  "dcroxide-secp256k1-vartime",
  "hmac",
  "k256",
- "once_cell",
  "sha2",
  "zeroize",
 ]

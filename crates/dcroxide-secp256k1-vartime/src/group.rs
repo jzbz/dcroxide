@@ -32,9 +32,9 @@
 //!   with `Negate(1).Normalize()` (curve.go, :1341-1342 at the parity
 //!   pin), so both coordinates of a decompressed point are normalized when
 //!   x is.
-//! - `Ge::set_gej_var`, compiled for the tests and the table generator
-//!   until the affine conversion calls it, normalizes x and y (libsecp256k1
-//!   leaves magnitude 1, group_impl.h:186-191), as dcrd's `ToAffine` does.
+//! - `Ge::set_gej_var`, behind `Point::to_affine_var`, normalizes x and y
+//!   (libsecp256k1 leaves magnitude 1, group_impl.h:186-191), as dcrd's
+//!   `ToAffine` does.
 //!
 //! Every function here is variable time and meant for public data.  In
 //! test builds each formula records the branch it took
@@ -193,9 +193,7 @@ impl Ge {
 
     /// `ge_set_gej_var` (group_impl.h:177-196), plus `normalize_var` on x
     /// and y: infinity, or both coordinates normalized.  One field
-    /// inversion; `None` only past its iteration cap.  Tests only, until
-    /// the affine conversion calls it.
-    #[cfg(test)]
+    /// inversion; `None` only past its iteration cap.
     #[must_use]
     pub(crate) fn set_gej_var(a: &Gej) -> Option<Self> {
         a.verify();

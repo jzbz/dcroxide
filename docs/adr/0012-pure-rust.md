@@ -56,24 +56,24 @@ script.
   beside it (`Cargo.toml:38` at `0c4154d`) for EC-Schnorr-DCRv0 and for
   ECDSA signing of a hash at or above the order
   (`ecdsa.rs:388-437` at `0c4154d`).
-- **`ring` 0.17.14** (`Cargo.lock:1518`): ~151k lines of C and assembly
-  (`dependency-ledger.md:152`), the crypto provider of `rustls` 0.23.46.
+- **`ring` 0.17.14** (`Cargo.lock:1517`): ~151k lines of C and assembly
+  (`dependency-ledger.md:151`), the crypto provider of `rustls` 0.23.46.
   `dcroxide-node` selects rustls's `ring` feature
   (`crates/dcroxide-node/Cargo.toml:59-69` at `8e6ea23`), `ureq` 3.4.2
   selects it through its default `rustls` feature, and `rustls-webpki`
-  0.103.16 depends on it (`Cargo.lock:1586-1594`). It runs the RPC and
+  0.103.16 depends on it (`Cargo.lock:1585-1593`). It runs the RPC and
   websocket TLS listener, the RPC client-certificate verifier
   (`rpcrun::GoClientCertVerifier`, which hands `rustls-webpki` ring's
   signature algorithms) and both TLS clients of the HTTPS seeder
   (`crates/dcroxide-node/src/seeding.rs`: `ureq` and
   `ProxySeederTransport`). P-521 signing and key exchange already run on
-  the pure-Rust `p521` (`dependency-ledger.md:54`). The listener is off
+  the pure-Rust `p521` (`dependency-ledger.md:53`). The listener is off
   under `--norpc`; the seeder runs at startup unless `--noseeders`
-  (`:51`). Two of `deny.toml`'s three skip entries exist only for it
+  (`:50`). Two of `deny.toml`'s three skip entries exist only for it
   (`deny.toml:42-48` at `8e6ea23`).
 - **`blake3` 1.8.7**, built with `pure`
   (`crates/dcroxide-wire/Cargo.toml:25`), which compiles none of the
-  crate's C or assembly (`dependency-ledger.md:46`). On x86 targets its
+  crate's C or assembly (`dependency-ledger.md:45`). On x86 targets its
   build script still asks a C compiler, when it finds one, whether it
   accepts two AVX-512 flags (`build.rs:161-175`), and asks before it reads
   `pure` (`:343-344`).
@@ -194,7 +194,7 @@ C that cgo links into the oracle included:
   builds and runs (`.github/workflows/ci.yml:232-286`).
 - **cargo-fuzz's libFuzzer**, which has no pure-Rust drop-in. `fuzz/` is
   outside the workspace (the root `Cargo.toml:40`) with its own lock, and
-  `libfuzzer-sys` 0.4.13 (`fuzz/Cargo.lock:1107-1108`) compiles
+  `libfuzzer-sys` 0.4.13 (`fuzz/Cargo.lock:1106-1107`) compiles
   libFuzzer's C++ with `cc` under its default `link_libfuzzer` feature
   (`build.rs:24-38`, `:43-44`).
 
@@ -381,7 +381,7 @@ which does not depend on the TLS answers, can start at once.
 
 - **The C leaves the consensus path and the network surface**: about 67k
   lines under the signature checks and 151k under TLS
-  (`dependency-ledger.md:43` at `0c4154d`; `:152`), with the FFI between them and the
+  (`dependency-ledger.md:43` at `0c4154d`; `:151`), with the FFI between them and the
   node. A source build compiles no C, though on Linux rustc still links
   through the system's `cc` driver.
 - **One secp256k1 stack**, `k256`, where ADR-0006 accepted two. ECDSA
@@ -434,7 +434,7 @@ which does not depend on the TLS answers, can start at once.
 - **Two duplicates go with `ring`.** Removing it takes `getrandom`
   0.2.17, `windows-sys` 0.52.0, `windows-targets` 0.52.6 and the eight
   `windows_*` 0.52.6 import-library crates, which only it uses
-  (`deny.toml:42-48` at `8e6ea23`; `dependency-ledger.md:53`), and both
+  (`deny.toml:42-48` at `8e6ea23`; `dependency-ledger.md:52`), and both
   skip entries with them.
 - **The shim's rewrite meets C's variadic calls.** The shim interposes
   `open`, `open64` and `openat` (`tools/powerloss/shim.c:266`, `:276`,

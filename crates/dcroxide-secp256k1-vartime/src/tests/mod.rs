@@ -25,8 +25,9 @@
 //! the field, decompression, group and multiply tests, whose references
 //! cost more, a tenth of it or less.  At 10^6 the heavy tests run in full
 //! (the field's corner products, the order-199 formulas and Straus loop,
-//! the collision grid at [-3, 3], libsecp256k1's ecmult hashes); below it
-//! they run a subset their docs name.
+//! the collision grid at [-3, 3], libsecp256k1's ecmult hashes, the
+//! affine conversion on boundary points); below it they run a subset
+//! their docs name.
 
 #![allow(
     clippy::arithmetic_side_effects,

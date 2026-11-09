@@ -4,8 +4,11 @@
 //! ([`note`], called from `group.rs`), and the loop counts that branch
 //! per call site ([`hit`], called from `ecmult.rs`), so the tests can
 //! require every special case of every addition site to have run.  The
-//! counters are per thread; production files hold only the `cfg(test)`
-//! calls, so the crate outside its tests needs `core` alone.
+//! cap switch ([`with_cap_forced`]) makes the field inverse decline as if
+//! modinv64 had passed its iteration cap, which no input reaches, so the
+//! affine conversion's fallback is tested.  The counters and the switch
+//! are per thread; production files hold only the `cfg(test)` calls, so
+//! the crate outside its tests needs `core` alone.
 
 use core::cell::Cell;
 
@@ -63,6 +66,27 @@ pub(crate) type Counts = [[u64; N_BRANCH]; N_SITE];
 std::thread_local! {
     static LAST: Cell<Branch> = const { Cell::new(Branch::Generic) };
     static HITS: Cell<Counts> = const { Cell::new([[0; N_BRANCH]; N_SITE]) };
+    static FORCE_CAP: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Whether this thread has the field inverse decline (`Fe::inv_var`).
+pub(crate) fn cap_forced() -> bool {
+    FORCE_CAP.with(Cell::get)
+}
+
+/// Runs `f` with the field inverse declining on this thread.  A guard
+/// clears the switch on the way out, so an assertion failing inside `f`
+/// cannot leave it set for the next test on the thread.
+pub(crate) fn with_cap_forced<T>(f: impl FnOnce() -> T) -> T {
+    struct Clear;
+    impl Drop for Clear {
+        fn drop(&mut self) {
+            FORCE_CAP.with(|c| c.set(false));
+        }
+    }
+    let _clear = Clear;
+    FORCE_CAP.with(|c| c.set(true));
+    f()
 }
 
 /// Records the branch a formula took.

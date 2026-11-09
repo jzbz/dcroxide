@@ -8,8 +8,9 @@
 //!   than a dev-dependency, and no manifest may rename it, which would
 //!   hide it from the source scans below;
 //! - inside dcroxide-dcrec only `src/secp256k1/backend.rs`, the seam, may
-//!   name it, and only the functions in [`MAY_USE_SEAM`] (verification,
-//!   recovery and key parsing) may name the seam, so the signing functions (`sign*`,
+//!   name it, and only the functions in [`MAY_USE_SEAM`] (ECDSA and Schnorr
+//!   verification, compact recovery and key parsing) may name the seam, so
+//!   the signing functions (ECDSA's `sign*`, Schnorr's `sign`,
 //!   `PrivateKey::public_key`, the nonce) reach neither;
 //! - the crate itself takes no dependency at all, and its code outside the
 //!   tests names neither `alloc` nor `std`.
@@ -40,9 +41,10 @@ const MAY_DEPEND: [&str; 3] = [
 
 /// The functions of dcrec's `src/` that may name the seam module, `backend`
 /// (file under `src/`, function name).  Each must exist and name it.
-const MAY_USE_SEAM: [(&str, &str); 3] = [
+const MAY_USE_SEAM: [(&str, &str); 4] = [
     ("secp256k1/ecdsa.rs", "verify_detailed"),
     ("secp256k1/ecdsa.rs", "recover_compact"),
+    ("secp256k1/schnorr.rs", "verify_detailed"),
     ("secp256k1.rs", "parse"),
 ];
 
@@ -434,13 +436,18 @@ fn only_verification_recovery_and_parsing_reach_the_seam() {
             "{f} does not name the seam (renamed, or the list is stale)"
         );
     }
-    let ecdsa = code_only(&read(&src.join("secp256k1/ecdsa.rs")));
-    let names: Vec<String> = functions(&ecdsa).into_iter().map(|(n, _)| n).collect();
-    for signer in ["sign", "sign_compact", "sign_with_nonce"] {
-        assert!(
-            names.iter().any(|n| n == signer),
-            "ecdsa.rs has no fn {signer}"
-        );
+    for (file, signers) in [
+        ("ecdsa.rs", &["sign", "sign_compact", "sign_with_nonce"][..]),
+        ("schnorr.rs", &["sign", "sign_with_nonce"][..]),
+    ] {
+        let code = code_only(&read(&src.join("secp256k1").join(file)));
+        let names: Vec<String> = functions(&code).into_iter().map(|(n, _)| n).collect();
+        for signer in signers {
+            assert!(
+                names.iter().any(|n| n == signer),
+                "{file} has no fn {signer}"
+            );
+        }
     }
 }
 

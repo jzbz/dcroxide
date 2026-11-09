@@ -7,9 +7,12 @@
 //! negation, `s = k - e*d`, signatures are 64 raw bytes `r || s`, and public
 //! keys are ordinary 33-byte compressed keys.
 //!
-//! Curve arithmetic uses the pure-Rust `k256` backend per ADR-0006 (the
-//! scheme needs raw scalar/point operations no packaged API exposes);
-//! correctness is pinned by dcrd's test vectors and live differential tests.
+//! Signing runs on the pure-Rust `k256` backend in constant time per
+//! ADR-0006 (the scheme needs raw scalar/point operations no packaged API
+//! exposes).  Verification's R = s*G + e*Q and its affine conversion run
+//! on `dcroxide-secp256k1-vartime` through the seam, with k256 as the
+//! fallback (ADR-0016).  Correctness is pinned by dcrd's test vectors,
+//! live differential tests and constructed signatures judged by dcrd.
 
 // The flagged operators are k256 scalar/point operations, which are modular
 // group arithmetic by definition — overflow is not a representable state.
@@ -18,7 +21,6 @@
 use core::fmt;
 
 use k256::elliptic_curve::PrimeField;
-use k256::elliptic_curve::group::Group;
 use k256::elliptic_curve::sec1::ToSec1Point;
 use k256::{ProjectivePoint, Scalar};
 use zeroize::{Zeroize, Zeroizing};
@@ -148,31 +150,26 @@ impl Signature {
 
         // Step 7: R = s*G + e*Q.  Every input is public, so like dcrd
         // (`ScalarBaseMultNonConst`, `ScalarMultNonConst`, `AddNonConst`)
-        // this runs in variable time: one pass of the crate's interleaved
-        // wNAF loop (`ecmult`), the multiply compact recovery uses,
-        // instead of two constant-time multiplications and an addition.  A
-        // zero s, which parsing allows, contributes nothing.  Signing keeps
-        // the constant-time `GENERATOR * k`, since its nonce is secret.
-        let s = Scalar::from_repr(self.s.into()).expect("s < n by construction");
-        let q = pub_key.as_k256_point();
-        let big_r = super::ecmult::mul_g_add_vartime(&s, &e, &q);
-
-        // Step 8: fail if R is the point at infinity.
-        if bool::from(big_r.is_identity()) {
+        // this runs in variable time, on dcroxide-secp256k1-vartime through
+        // the seam (ADR-0016): one pass of its Straus loop, then R's affine
+        // coordinates by one inversion, normalized before anything reads
+        // them, as dcrd's `ToAffine` does.  A zero s, which parsing allows,
+        // leaves only e*Q.  Signing keeps the constant-time
+        // `GENERATOR * k`, since its nonce is secret.
+        let Some((x, y_is_odd)) =
+            super::backend::schnorr_mul_g_add(&self.s, &e.to_repr().into(), pub_key)
+        else {
+            // Step 8: fail if R is the point at infinity.
             return Err(Error::SigRNotOnCurve);
-        }
+        };
 
         // Step 9: fail if R.y is odd.
-        let affine = big_r.to_affine();
-        let encoded = affine.to_sec1_point(false);
-        let y = encoded.y().expect("non-identity affine point has y");
-        if y[31] & 1 == 1 {
+        if y_is_odd {
             return Err(Error::SigRYIsOdd);
         }
 
         // Step 10: verified iff R.x == r.
-        let x = encoded.x().expect("non-identity affine point has x");
-        if x[..] != self.r {
+        if x != self.r {
             return Err(Error::UnequalRValues);
         }
         Ok(())
@@ -610,8 +607,11 @@ mod tests {
         );
     }
 
-    /// A zero s parses (as in dcrd) and verification rejects it: with s = 0
-    /// the combined multiplication is e*Q alone, never the signer's R.
+    /// A zero s parses (as in dcrd) and verification rejects it: for an
+    /// honest key, e*Q alone is never the signer's R.  A key built for it,
+    /// Q = (k/e)G, makes s = 0 valid, which
+    /// `a_zero_s_verifies_for_a_key_built_for_it` and the dcrd-judged tests
+    /// check.
     #[test]
     fn zero_s_parses_and_fails_verification() {
         let priv_key = key("0000000000000000000000000000000000000000000000000000000000000001");
@@ -625,6 +625,43 @@ mod tests {
                 .verify_detailed(&hash, &priv_key.public_key())
                 .is_err()
         );
+    }
+
+    /// A valid signature with s = 0: for a nonce k whose kG has an even y,
+    /// r = kG's x, e = BLAKE-256(r || hash) (the hash redrawn while e is
+    /// at or above N) and the key Q = (k/e)G, R = 0*G + e*Q = kG, so
+    /// (r, 0) verifies; with kG's y odd the same construction fails at
+    /// step 9.  dcrd judges the same construction in
+    /// `tests/vartime_recovery_schnorr_branches.rs`.
+    #[test]
+    fn a_zero_s_verifies_for_a_key_built_for_it() {
+        for (k, odd) in [(3u64, false), (3, true), (0x5eed, false), (0x5eed, true)] {
+            let mut k = Scalar::from(k);
+            let kg = (ProjectivePoint::GENERATOR * k).to_affine();
+            let parity = kg.to_sec1_point(false).y().expect("a point")[31] & 1 == 1;
+            if parity != odd {
+                k = -k;
+            }
+            let encoded = (ProjectivePoint::GENERATOR * k)
+                .to_affine()
+                .to_sec1_point(false);
+            let r: [u8; 32] = encoded.x().expect("a point")[..]
+                .try_into()
+                .expect("32 bytes");
+            let mut hash = [0x11u8; 32];
+            let e = loop {
+                match challenge(&r, &hash) {
+                    Some(e) if !bool::from(e.is_zero()) => break e,
+                    _ => hash[0] = hash[0].wrapping_add(1),
+                }
+            };
+            let q = ProjectivePoint::GENERATOR * (k * e.invert().expect("nonzero"));
+            let key =
+                PublicKey::parse(q.to_affine().to_sec1_point(true).as_bytes()).expect("a key");
+            let sig = Signature::new(r, [0; 32]).expect("in range");
+            let want = if odd { Err(Error::SigRYIsOdd) } else { Ok(()) };
+            assert_eq!(sig.verify_detailed(&hash, &key), want, "odd {odd}");
+        }
     }
 
     #[test]

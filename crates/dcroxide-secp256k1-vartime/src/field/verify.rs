@@ -418,15 +418,18 @@ impl Fe {
     /// `fe_inv_var` (field_impl.h:407-417, field_5x52_impl.h:463-471):
     /// 1/self, and 0 for 0; normalized, magnitude 1 (0 for a zero-magnitude
     /// input).  `None` only past modinv64's iteration cap, which the
-    /// safegcd bound rules out.  Tests and the table generator only, until
-    /// the affine conversion calls it.
-    #[cfg(test)]
+    /// safegcd bound rules out (test builds can force it, so that the
+    /// callers' fallbacks are tested).
     #[inline]
     #[must_use]
     pub fn inv_var(&self) -> Option<Self> {
         #[cfg(debug_assertions)]
         let input_is_zero = self.normalizes_to_zero();
         self.verify();
+        #[cfg(test)]
+        if crate::tests::branches::cap_forced() {
+            return None;
+        }
         let mut tmp = self.raw;
         tmp.normalize_var();
         let s = crate::modinv64::modinv64_var(&tmp.to_signed62(), &super::MODINFO_FE)?;

@@ -22,8 +22,10 @@
 //! `normalizes_to_zero` must agree with k256 by value.  The first 32 bytes
 //! of the limbs, big-endian, then go through the tracked `Fe`: the limit
 //! parse against k256's, `get_b32`, `is_odd`, `sqrt` (existence as k256's,
-//! the root squaring back to the value or to its negation) and `equal`; and
-//! through key decompression, with the magnitude byte's low bit as the
+//! the root squaring back to the value or to its negation), `equal` and
+//! `inv_var` (a value, its cap never reached, multiplying back to one, or
+//! zero for zero, and equal to k256's inversion); and through key
+//! decompression, with the magnitude byte's low bit as the
 //! parity: `Affine::decompress_var` must give k256's point or k256's
 //! `None`, and the point must come back from `from_be_coordinates`.
 //!
@@ -36,10 +38,14 @@
 //! +-2^128 G, +-lambda 2^128 G times a small k, and na = a + b*lambda and
 //! ng = c + d*2^128 with small signed a to d, all read from the input.
 //! `ecmult_var` must return a point; it is infinity exactly when k256's
-//! `mul_by_generator_and_mul_add_vartime` gives the identity; when finite,
-//! `x_equals_var` must accept k256's x and refuse x + 1 (below p), and
-//! dcrd's x check for r = X.x mod N (accept if X.x is r, reject if r >=
-//! P - N, accept if X.x is r + N) must decide as it does on k256's x.
+//! `mul_by_generator_and_mul_add_vartime` gives the identity, and
+//! `to_affine_var` must answer (never decline) with `None` exactly then;
+//! when finite, its point must be k256's affine point, with y's parity,
+//! and come back from `from_be_coordinates`, `x_equals_var` must accept
+//! k256's x and refuse x + 1 (below p), and dcrd's x check for r = X.x mod
+//! N (accept if X.x is r, reject if r >= P - N, accept if X.x is r + N)
+//! must decide as it does on k256's x.  Structured mode reaches ng = 0,
+//! where the G half of the loop is empty.
 //!
 //! Any difference panics with the inputs.  Builds with debug assertions
 //! also run the field's magnitude bookkeeping and `fe_verify`.
@@ -226,6 +232,19 @@ fn field_level(m_byte: u8, a_bytes: &[u8], b_bytes: &[u8]) {
         let want = if ok { kx } else { -kx };
         assert_eq!(r2.get_b32(), kfb(&want.normalize()), "sqrt {x:02x?}");
         assert!(r2.equal(&fx) == ok, "equal {x:02x?}");
+        let inv = fx.inv_var().expect("the inverse stays within its cap");
+        let kinv = Option::<KFe>::from(kx.invert());
+        match kinv {
+            None => assert_eq!(inv.get_b32(), [0; 32], "inverse of zero"),
+            Some(ki) => {
+                assert_eq!(inv.get_b32(), kfb(&ki.normalize()), "inv_var {x:02x?}");
+                let mut one = inv.mul(&fx);
+                one.normalize_var();
+                let mut want = [0u8; 32];
+                want[31] = 1;
+                assert_eq!(one.get_b32(), want, "x * inv_var(x) {x:02x?}");
+            }
+        }
     }
     let odd = m_byte & 1 == 1;
     let point = Affine::decompress_var(&x, odd);
@@ -356,10 +375,18 @@ fn ecmult_level(mode: u8, bytes: &[u8]) {
         kb(&na),
         kb(&ng)
     );
-    if inf {
+    let affine = ours.to_affine_var().expect("to_affine_var declined");
+    assert_eq!(affine.is_none(), inf, "to_affine_var at infinity");
+    let Some(af) = affine else {
         return;
-    }
-    let x: [u8; 32] = theirs.x().into();
+    };
+    let (x, y): ([u8; 32], [u8; 32]) = (theirs.x().into(), theirs.y().into());
+    assert_eq!(af.to_be_bytes(), (x, y), "to_affine_var, Q {qx:02x?}");
+    assert_eq!(af.y_is_odd(), y[31] & 1 == 1, "y_is_odd, Q {qx:02x?}");
+    assert!(
+        Affine::from_be_coordinates(&x, &y) == Some(af),
+        "from_be_coordinates of to_affine_var's point"
+    );
     assert!(
         ours.x_equals_var(&x),
         "x_equals_var refused k256's x {x:02x?}"

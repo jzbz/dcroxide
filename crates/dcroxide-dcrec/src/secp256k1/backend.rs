@@ -17,10 +17,12 @@
 //!
 //! ECDSA verification's sum, u1*G + u2*Q, comes back as an opaque [`Sum`]
 //! that answers dcrd's steps 6 to 10 (is it infinity, is its x this
-//! value) without the caller knowing which backend computed it.  Until
-//! recovery, Schnorr verification and the key type move, their callers
-//! compute on k256's types, so the seam returns those, converting inside
-//! where the conversion and its fallback can sit together.
+//! value) without the caller knowing which backend computed it.  Compact
+//! recovery and Schnorr verification always need the affine point, so
+//! their entry points convert inside, where the inverse's cap can fall
+//! back, and return the answer resolved ([`Recovery`], R's x and parity).
+//! Until the key type moves, a parsed or recovered key is k256's point,
+//! converted inside the seam with its fallback beside it.
 
 use dcroxide_secp256k1_vartime as vartime;
 use k256::elliptic_curve::PrimeField;
@@ -116,20 +118,14 @@ fn vartime_sum(
     let u1 = e * w;
     let u2 = r * w;
     #[cfg(test)]
-    let u2 = if skewed_sum() {
-        let mut one = [0u8; 32];
-        one[31] = 1;
-        u2 + vartime::Scalar::reduce_be_bytes(&one)
-    } else {
-        u2
-    };
+    let u2 = if skewed_sum() { u2 + vt_one() } else { u2 };
     mul_g_add(&u1, &u2, q)
 }
 
 /// u1*G + u2*Q on the vartime crate: the key enters through
 /// `from_be_coordinates`, which checks the curve equation again (k256 has
-/// checked it), and the multiply is `ecmult_var`.  The piece recovery and
-/// Schnorr verification will share.
+/// checked it), and the multiply is `ecmult_var`.  ECDSA and Schnorr
+/// verification share it.
 fn mul_g_add(u1: &vartime::Scalar, u2: &vartime::Scalar, q: &PublicKey) -> Option<vartime::Point> {
     let k = q.serialize_uncompressed();
     let (x, y) = k[1..].split_first_chunk::<32>()?;
@@ -186,39 +182,257 @@ fn cross_check(vt: &Sum, k: &Sum) {
     }
 }
 
-/// w = x^-1 mod N for a nonzero x below N, given big-endian, in variable
-/// time, as dcrd's `ModNScalar.InverseValNonConst`: the vartime crate's
-/// port of libsecp256k1's safegcd, else k256's `invert_vartime`.  The
-/// caller, compact recovery's step 7, has established 1 <= x < N.  Should
-/// x be zero or not below N anyway, the result is zero, which makes
-/// recovery fail at step 10, and debug builds assert.
-pub(crate) fn scalar_inverse(x: &[u8; 32]) -> Scalar {
-    debug_assert!(*x != [0; 32], "scalar_inverse of zero");
+/// Compact recovery's steps 4 to 10, from whichever backend computed them.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Recovery {
+    /// Steps 4 and 5: no curve point has the x (dcrd's `DecompressY`
+    /// fails).
+    NoPoint,
+    /// Step 10: Q = u1*G + u2*R is the point at infinity.
+    Infinity,
+    /// The recovered key.
+    Key(PublicKey),
+}
+
+/// Compact recovery's steps 4 to 10 for r and s in [1, N-1], as the
+/// caller's step 1 establishes, and x, below P, the R.x of its steps 2
+/// and 3, with the oddness of the code's low bit: R decompressed, e = H
+/// mod N, w = r^-1, u1 = -e*w, u2 = s*w, Q = u1*G + u2*R, and Q's affine
+/// coordinates, dcrd's order, all on the vartime crate's port of
+/// libsecp256k1 (its square root, its safegcd inverses, its scalar
+/// products, its Straus loop and one field inversion, x and y normalized
+/// as dcrd's `ToAffine` does).  Until the key type moves, the key enters
+/// k256 through `from_coordinates`, which checks the curve equation again.
+///
+/// Should the vartime crate decline anywhere (r or s not below N, R of
+/// the wrong x or oddness, an inverse's cap, the wNAF builder's guard, a
+/// point k256 refuses; none happens for valid inputs), the answer is
+/// k256's instead, and debug builds assert.  Builds with debug assertions
+/// also compute k256's answer every time and stop unless both give the
+/// same outcome and, for a key, the same bytes; that check only reads.
+pub(crate) fn recover_key(
+    hash: &[u8; 32],
+    r: &[u8; 32],
+    s: &[u8; 32],
+    x: &[u8; 32],
+    odd: bool,
+) -> Recovery {
     if !forced_fallback() {
-        let w = vartime::Scalar::from_be_bytes(x)
-            .and_then(|x| x.try_inverse_var())
-            .and_then(|w| Option::<Scalar>::from(Scalar::from_repr(w.to_be_bytes().into())));
-        debug_assert!(w.is_some(), "the vartime scalar inverse declined");
-        if let Some(w) = w {
-            return w;
+        let v = vartime_recover(hash, r, s, x, odd).filter(|_| !forced_decline());
+        debug_assert!(v.is_some(), "the vartime crate declined compact recovery");
+        if let Some(v) = v {
+            #[cfg(debug_assertions)]
+            cross_check_recovery(&v, &k256_recover(hash, r, s, x, odd));
+            return v;
         }
     }
-    let w = Option::<Scalar>::from(Scalar::from_repr((*x).into()))
-        .and_then(|x| Option::<Scalar>::from(x.invert_vartime()));
-    debug_assert!(
-        w.is_some(),
-        "scalar_inverse of zero or of a value not below N"
+    k256_recover(hash, r, s, x, odd)
+}
+
+/// Steps 4 to 10 on the vartime crate; `None` wherever it declines.
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "the vartime crate's Scalar operators are arithmetic mod N"
+)]
+fn vartime_recover(
+    hash: &[u8; 32],
+    r: &[u8; 32],
+    s: &[u8; 32],
+    x: &[u8; 32],
+    odd: bool,
+) -> Option<Recovery> {
+    let Some(big_r) = vt_decompress(x, odd)? else {
+        return Some(Recovery::NoPoint);
+    };
+    let r = vartime::Scalar::from_be_bytes(r)?;
+    let s = vartime::Scalar::from_be_bytes(s)?;
+    let e = vartime::Scalar::reduce_be_bytes(hash);
+    let w = r.try_inverse_var()?;
+    let u1 = -(e * w);
+    let u2 = s * w;
+    #[cfg(test)]
+    let u2 = if skewed_sum() { u2 + vt_one() } else { u2 };
+    let q = vartime::ecmult_var(&big_r, &u2, &u1)?;
+    match vt_to_affine(&q) {
+        Ok(None) => Some(Recovery::Infinity),
+        Ok(Some(a)) => to_k256(&a).map(|p| Recovery::Key(PublicKey::from_affine(p))),
+        Err(vartime::Fallback) => None,
+    }
+}
+
+/// Steps 4 to 10 on k256, the fallback and the reference: its
+/// decompression, its scalar arithmetic and `invert_vartime`, its combined
+/// multiply `mul_by_generator_and_mul_add_vartime` (the multiply stage
+/// 2a's loop fell back to) and one `batch_normalize_vartime`, recovery's
+/// normalization before the vartime crate took it.  Should r or s not be
+/// in [1, N-1], which the caller rules out, the answer is `Infinity`,
+/// which rejects, and debug builds assert.
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "k256's Scalar operators are arithmetic mod N"
+)]
+fn k256_recover(hash: &[u8; 32], r: &[u8; 32], s: &[u8; 32], x: &[u8; 32], odd: bool) -> Recovery {
+    let Some(big_r) = k256_decompress(x, odd) else {
+        return Recovery::NoPoint;
+    };
+    let w = Option::<Scalar>::from(Scalar::from_repr((*r).into()))
+        .and_then(|r| Option::<Scalar>::from(r.invert_vartime()));
+    let s = Option::<Scalar>::from(Scalar::from_repr((*s).into()));
+    let (Some(w), Some(s)) = (w, s) else {
+        debug_assert!(false, "k256_recover: r or s not in [1, N-1]");
+        return Recovery::Infinity;
+    };
+    let e = <Scalar as Reduce<FieldBytes>>::reduce(&(*hash).into());
+    let q = ProjectivePoint::mul_by_generator_and_mul_add_vartime(
+        &-(e * w),
+        &(s * w),
+        &ProjectivePoint::from(big_r),
     );
-    w.unwrap_or(Scalar::ZERO)
+    if bool::from(q.is_identity()) {
+        return Recovery::Infinity;
+    }
+    let [a] =
+        <ProjectivePoint as BatchNormalize<[ProjectivePoint; 1]>>::batch_normalize_vartime(&[q]);
+    Recovery::Key(PublicKey::from_affine(a))
+}
+
+/// Builds with debug assertions: the vartime crate's recovery gives
+/// k256's outcome and, for a key, k256's key bytes.  Reads and asserts
+/// only.
+#[cfg(debug_assertions)]
+fn cross_check_recovery(vt: &Recovery, k: &Recovery) {
+    if let (Recovery::Key(a), Recovery::Key(b)) = (vt, k) {
+        assert_eq!(
+            a.serialize_uncompressed(),
+            b.serialize_uncompressed(),
+            "compact recovery: the key differs from k256's"
+        );
+    } else {
+        assert_eq!(vt, k, "compact recovery: the outcome differs from k256's");
+    }
+}
+
+/// EC-Schnorr-DCRv0 verification's steps 7 to 10, the arithmetic, for s
+/// below N (parsing) and e below N (step 6), both given big-endian: R =
+/// s*G + e*Q in affine form, as R.x big-endian and whether R.y is odd, or
+/// `None` when R is the point at infinity.  On the vartime crate: one
+/// pass of its Straus loop (with s = 0 the G half has no digits, so only
+/// e*Q is formed) and one field inversion, x and y normalized before
+/// either is read, as dcrd's `ToAffine` does.
+///
+/// Should the vartime crate decline (s or e not below N, the key's
+/// conversion, the wNAF builder's guard, the inverse's cap; none happens
+/// for valid inputs), R is k256's instead, and debug builds assert.
+/// Builds with debug assertions also compute k256's R every time and stop
+/// unless both agree on infinity, on x and on the parity; that check only
+/// reads.
+pub(crate) fn schnorr_mul_g_add(
+    s: &[u8; 32],
+    e: &[u8; 32],
+    q: &PublicKey,
+) -> Option<([u8; 32], bool)> {
+    if !forced_fallback() {
+        let v = vartime_schnorr(s, e, q).filter(|_| !forced_decline());
+        debug_assert!(
+            v.is_some(),
+            "the vartime crate declined Schnorr verification's sum"
+        );
+        if let Some(v) = v {
+            #[cfg(debug_assertions)]
+            assert_eq!(
+                v,
+                k256_schnorr(s, e, q),
+                "Schnorr verification's R differs from k256's"
+            );
+            return v;
+        }
+    }
+    k256_schnorr(s, e, q)
+}
+
+/// Steps 7 to 10's arithmetic on the vartime crate: the outer `None`
+/// wherever it declines, the inner `None` at infinity.
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "the vartime crate's Scalar operators are arithmetic mod N"
+)]
+fn vartime_schnorr(s: &[u8; 32], e: &[u8; 32], q: &PublicKey) -> Option<Option<([u8; 32], bool)>> {
+    let s = vartime::Scalar::from_be_bytes(s)?;
+    let e = vartime::Scalar::from_be_bytes(e)?;
+    #[cfg(test)]
+    let e = if skewed_sum() { e + vt_one() } else { e };
+    match vt_to_affine(&mul_g_add(&s, &e, q)?) {
+        Ok(None) => Some(None),
+        Ok(Some(a)) => Some(Some((a.to_be_bytes().0, a.y_is_odd()))),
+        Err(vartime::Fallback) => None,
+    }
+}
+
+/// Steps 7 to 10's arithmetic on k256, the fallback and the reference:
+/// its combined multiply `mul_by_generator_and_mul_add_vartime` (the
+/// multiply stage 2a's loop fell back to) and the constant-time
+/// `to_affine` Schnorr verification used before the vartime crate took
+/// it.  Should s or e not be below N, which the caller rules out, R counts
+/// as infinity, so verification fails at step 8, and debug builds assert.
+fn k256_schnorr(s: &[u8; 32], e: &[u8; 32], q: &PublicKey) -> Option<([u8; 32], bool)> {
+    let s = Option::<Scalar>::from(Scalar::from_repr((*s).into()));
+    let e = Option::<Scalar>::from(Scalar::from_repr((*e).into()));
+    let (Some(s), Some(e)) = (s, e) else {
+        debug_assert!(false, "k256_schnorr: s or e not below N");
+        return None;
+    };
+    let x = ProjectivePoint::mul_by_generator_and_mul_add_vartime(&s, &e, &q.as_k256_point());
+    if bool::from(x.is_identity()) {
+        return None;
+    }
+    let a = x.to_affine();
+    Some((a.x().into(), bool::from(a.y_is_odd())))
+}
+
+/// The vartime crate's affine conversion: `Ok(None)` at infinity, and
+/// `Err(Fallback)`, a decline, should the field inverse pass its cap,
+/// which no input reaches.  Test builds can force that decline for a
+/// finite point, so that both callers' handling of it is tested.
+#[inline(always)]
+fn vt_to_affine(q: &vartime::Point) -> Result<Option<vartime::Affine>, vartime::Fallback> {
+    #[cfg(test)]
+    if !q.is_infinity() && FORCE_CAP.with(core::cell::Cell::get) {
+        return Err(vartime::Fallback);
+    }
+    q.to_affine_var()
+}
+
+/// x's point with the oddness asked for, on the vartime crate:
+/// `Some(None)` when no point has x, which is an answer (builds with debug
+/// assertions hold it to k256's), and `None`, a decline, when the point it
+/// returns has another x or oddness, as a port bug might give.
+fn vt_decompress(x: &[u8; 32], odd: bool) -> Option<Option<vartime::Affine>> {
+    let Some(a) = vartime::Affine::decompress_var(x, odd ^ wrong_oddness()) else {
+        debug_assert!(
+            k256_decompress(x, odd).is_none(),
+            "the vartime crate found no point for an x k256 decompresses"
+        );
+        return Some(None);
+    };
+    let (ax, _) = a.to_be_bytes();
+    (ax == *x && a.y_is_odd() == odd).then_some(Some(a))
+}
+
+/// The vartime crate's affine point as k256's, through `from_coordinates`,
+/// which checks both coordinates below P and the curve equation again;
+/// `None` if k256 refuses it.
+fn to_k256(a: &vartime::Affine) -> Option<AffinePoint> {
+    let (x, y) = a.to_be_bytes();
+    Option::<AffinePoint>::from(AffinePoint::from_coordinates(&x.into(), &y.into()))
 }
 
 /// The curve point whose x, below P, is given big-endian and whose y has
 /// the oddness `odd`, or `None` when x^3 + 7 has no square root, so that
 /// no point has this x: dcrd's `DecompressY`, on the vartime crate's port
 /// of libsecp256k1's square root, which normalizes the root before reading
-/// its oddness and again after negating it, as dcrd does.  Both callers,
-/// compressed key parsing and compact recovery's steps 4 and 5, have
-/// established x < P.
+/// its oddness and again after negating it, as dcrd does.  Its caller,
+/// compressed key parsing, has established x < P; compact recovery
+/// decompresses inside [`recover_key`].
 ///
 /// The vartime crate's `None` is the answer, not a reason to fall back;
 /// builds with debug assertions hold it to k256's.  Its point must have
@@ -228,18 +442,10 @@ pub(crate) fn scalar_inverse(x: &[u8; 32]) -> Scalar {
 /// the code before this, and debug builds assert.
 pub(crate) fn decompress(x: &[u8; 32], odd: bool) -> Option<AffinePoint> {
     if !forced_fallback() {
-        let Some(a) = vartime::Affine::decompress_var(x, odd ^ wrong_oddness()) else {
-            debug_assert!(
-                k256_decompress(x, odd).is_none(),
-                "the vartime crate found no point for an x k256 decompresses"
-            );
-            return None;
-        };
-        let (ax, ay) = a.to_be_bytes();
-        let p = if ax == *x && (ay[31] & 1 == 1) == odd {
-            Option::<AffinePoint>::from(AffinePoint::from_coordinates(&ax.into(), &ay.into()))
-        } else {
-            None
+        let p = match vt_decompress(x, odd) {
+            Some(None) => return None,
+            Some(Some(a)) => to_k256(&a),
+            None => None,
         };
         debug_assert!(
             p.is_some(),
@@ -267,27 +473,39 @@ std::thread_local! {
     /// Set by [`tests::force_wrong_oddness`]: the seam asks the vartime
     /// crate for the other oddness, as a port bug might answer.
     static WRONG_ODDNESS: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
-    /// Set by [`tests::force_decline`]: the vartime crate's sum counts as
-    /// declined.
+    /// Set by [`tests::force_decline`]: the vartime crate's result counts
+    /// as declined (ECDSA verification's sum, recovery, Schnorr's R).
     static FORCE_DECLINE: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
-    /// Set by [`tests::skew_sum`]: the vartime crate is given u2 + 1, as a
-    /// port bug might compute, so the debug cross-check must stop it.
+    /// Set by [`tests::skew_sum`]: the vartime crate is given u2 + 1
+    /// (ECDSA verification and recovery) or e + 1 (Schnorr verification),
+    /// as a port bug might compute, so the debug cross-check must stop it.
     static SKEW_SUM: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+    /// Set by [`tests::force_cap`]: the vartime crate's affine conversion
+    /// declines for a finite point, as past the field inverse's cap.
+    static FORCE_CAP: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
 }
 
-/// Whether a test has the vartime crate's sum count as declined.
+/// Whether a test has the vartime crate's result count as declined.
 #[cfg(test)]
 fn forced_decline() -> bool {
     FORCE_DECLINE.with(core::cell::Cell::get)
 }
 
-/// Whether a test has the vartime crate given a skewed u2.
+/// Whether a test has the vartime crate given a skewed u2 or e.
 #[cfg(test)]
 fn skewed_sum() -> bool {
     SKEW_SUM.with(core::cell::Cell::get)
 }
 
-/// Production never declines a sum it has.
+/// One, the skew.
+#[cfg(test)]
+fn vt_one() -> vartime::Scalar {
+    let mut one = [0u8; 32];
+    one[31] = 1;
+    vartime::Scalar::reduce_be_bytes(&one)
+}
+
+/// Production never declines a result it has.
 #[cfg(not(test))]
 #[inline(always)]
 fn forced_decline() -> bool {
@@ -336,49 +554,53 @@ mod tests {
 
     use crate::secp256k1::{FIELD_PRIME_BYTES, GROUP_ORDER_BYTES};
 
+    /// Runs `f` with `flag` set on this thread, and clears it on the way
+    /// out, a panic included.
+    fn with_flag<T>(
+        flag: &'static std::thread::LocalKey<core::cell::Cell<bool>>,
+        f: impl FnOnce() -> T,
+    ) -> T {
+        struct Clear(&'static std::thread::LocalKey<core::cell::Cell<bool>>);
+        impl Drop for Clear {
+            fn drop(&mut self) {
+                self.0.with(|c| c.set(false));
+            }
+        }
+        flag.with(|c| c.set(true));
+        let _clear = Clear(flag);
+        f()
+    }
+
     /// Runs `f` with the seam forced onto k256's path on this thread.
     pub(super) fn force_fallback<T>(f: impl FnOnce() -> T) -> T {
-        FORCE_FALLBACK.with(|c| c.set(true));
-        let r = f();
-        FORCE_FALLBACK.with(|c| c.set(false));
-        r
+        with_flag(&FORCE_FALLBACK, f)
     }
 
     /// Runs `f` with the seam asking the vartime crate for the other
     /// oddness on this thread.
     pub(super) fn force_wrong_oddness<T>(f: impl FnOnce() -> T) -> T {
-        WRONG_ODDNESS.with(|c| c.set(true));
-        let r = f();
-        WRONG_ODDNESS.with(|c| c.set(false));
-        r
+        with_flag(&WRONG_ODDNESS, f)
     }
 
-    /// Runs `f` with the vartime crate's ECDSA sum counted as declined on
+    /// Runs `f` with the vartime crate's result counted as declined on
     /// this thread.
     fn force_decline<T>(f: impl FnOnce() -> T) -> T {
-        FORCE_DECLINE.with(|c| c.set(true));
-        let r = f();
-        FORCE_DECLINE.with(|c| c.set(false));
-        r
+        with_flag(&FORCE_DECLINE, f)
     }
 
     /// Runs `f` with the vartime crate given u2 + 1 on this thread.
     #[cfg(debug_assertions)]
     fn skew_sum<T>(f: impl FnOnce() -> T) -> T {
-        SKEW_SUM.with(|c| c.set(true));
-        let r = f();
-        SKEW_SUM.with(|c| c.set(false));
-        r
+        with_flag(&SKEW_SUM, f)
     }
 
-    /// k256's own variable-time inverse, the reference.
-    fn reference(x: &[u8; 32]) -> [u8; 32] {
-        let s = Option::<Scalar>::from(Scalar::from_repr((*x).into())).expect("below N");
-        let w = Option::<Scalar>::from(s.invert_vartime()).expect("nonzero");
-        w.to_repr().into()
+    /// Runs `f` with the vartime crate's affine conversion declining for
+    /// a finite point on this thread.
+    fn force_cap<T>(f: impl FnOnce() -> T) -> T {
+        with_flag(&FORCE_CAP, f)
     }
 
-    /// The nonzero scalars below N the seam is checked on: 1, 2, N-1,
+    /// Nonzero scalars below N for recovery's r, s and hash: 1, 2, N-1,
     /// N-2, every 2^k below N, and random ones, uniform and with long runs
     /// of zero or one bits.
     fn inputs() -> Vec<[u8; 32]> {
@@ -418,63 +640,6 @@ mod tests {
             }
         }
         v
-    }
-
-    /// The seam's inverse equals k256's `invert_vartime` on every input,
-    /// through the vartime crate and through the forced fallback alike,
-    /// and x * w = 1.
-    #[test]
-    fn scalar_inverse_matches_k256_on_both_paths() {
-        let inputs = inputs();
-        assert!(inputs.len() > 700);
-        for x in &inputs {
-            let want = reference(x);
-            let w = scalar_inverse(x);
-            let wf = force_fallback(|| scalar_inverse(x));
-            assert_eq!(
-                <[u8; 32]>::from(w.to_repr()),
-                want,
-                "vartime path, x {x:02x?}"
-            );
-            assert_eq!(
-                <[u8; 32]>::from(wf.to_repr()),
-                want,
-                "forced path, x {x:02x?}"
-            );
-            let s = Option::<Scalar>::from(Scalar::from_repr((*x).into())).expect("below N");
-            assert!(bool::from((s * w - Scalar::ONE).is_zero()));
-        }
-    }
-
-    /// The forced path really is k256's: the switches are per thread and
-    /// clear themselves, and the vartime crate alone gives the same bytes.
-    #[test]
-    fn the_switch_forces_and_clears() {
-        let x = inputs()[10];
-        assert!(!forced_fallback());
-        assert!(force_fallback(forced_fallback));
-        assert!(!forced_fallback());
-        assert!(force_decline(forced_decline));
-        assert!(!forced_decline());
-        assert!(!skewed_sum());
-        let vt = vartime::Scalar::from_be_bytes(&x)
-            .and_then(|s| s.try_inverse_var())
-            .expect("the vartime inverse")
-            .to_be_bytes();
-        assert_eq!(vt, reference(&x));
-        assert_eq!(<[u8; 32]>::from(scalar_inverse(&x).to_repr()), vt);
-    }
-
-    /// Zero, which neither caller passes, asserts in builds with debug
-    /// assertions and gives zero on both paths without them, so a caller
-    /// bug fails verification rather than the node.
-    #[test]
-    #[cfg_attr(debug_assertions, should_panic(expected = "scalar_inverse of zero"))]
-    fn zero_asserts_or_gives_zero() {
-        assert!(bool::from(scalar_inverse(&[0; 32]).is_zero()));
-        assert!(bool::from(
-            force_fallback(|| scalar_inverse(&[0; 32])).is_zero()
-        ));
     }
 
     /// k256's own decompression, the reference.
@@ -582,6 +747,21 @@ mod tests {
             }
         }
         assert!(!wrong_oddness());
+    }
+
+    /// The forced fallback really skips the vartime crate's decompression:
+    /// with the vartime crate asked for the wrong oddness, the forced path
+    /// still gives k256's point and the debug check that stops a point of
+    /// the wrong oddness never runs.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn the_forced_fallback_skips_the_vartime_decompression() {
+        for x in decompress_inputs().iter().take(64) {
+            for odd in [false, true] {
+                let got = force_fallback(|| force_wrong_oddness(|| decompress(x, odd)));
+                assert_eq!(got, reference_decompress(x, odd), "x {x:02x?} odd {odd}");
+            }
+        }
     }
 
     // ---------------------------------------------------------------------
@@ -910,5 +1090,634 @@ mod tests {
         let sig = sign(&key, &hash);
         let pk = key.public_key();
         assert!(force_fallback(|| skew_sum(|| sig.verify_detailed(&hash, &pk))).accepts());
+    }
+
+    // ---------------------------------------------------------------------
+    // Compact recovery.
+
+    use crate::secp256k1::add_group_order;
+    use crate::secp256k1::ecdsa::{Error as RecoverError, recover_compact, sign_compact};
+
+    /// Recovery by k256's constant-time operations, independent of both
+    /// arms: decompression, `invert`, two multiplications and an addition,
+    /// `to_affine`.
+    fn reference_recover(
+        hash: &[u8; 32],
+        r: &[u8; 32],
+        s: &[u8; 32],
+        x: &[u8; 32],
+        odd: bool,
+    ) -> Recovery {
+        let Some(big_r) = reference_decompress(x, odd) else {
+            return Recovery::NoPoint;
+        };
+        let r = Option::<Scalar>::from(Scalar::from_repr((*r).into())).expect("r below N");
+        let s = Option::<Scalar>::from(Scalar::from_repr((*s).into())).expect("s below N");
+        let w = Option::<Scalar>::from(r.invert()).expect("r nonzero");
+        let e = <Scalar as Reduce<FieldBytes>>::reduce(&(*hash).into());
+        let q = ProjectivePoint::GENERATOR * -(e * w) + ProjectivePoint::from(big_r) * (s * w);
+        let a = q.to_affine();
+        if bool::from(a.is_identity()) {
+            Recovery::Infinity
+        } else {
+            Recovery::Key(PublicKey::from_affine(a))
+        }
+    }
+
+    /// R.x for r and a recovery code: r, or r + N with the overflow bit.
+    fn recovery_x(r: &[u8; 32], code: u8) -> [u8; 32] {
+        if code & 2 != 0 {
+            add_group_order(r)
+        } else {
+            *r
+        }
+    }
+
+    /// `recover_key` through the vartime crate and through the forced
+    /// k256 arm, which must agree with each other and, key bytes and all,
+    /// with the constant-time reference.
+    fn recover_both(hash: &[u8; 32], r: &[u8; 32], s: &[u8; 32], code: u8) -> Recovery {
+        let (x, odd) = (recovery_x(r, code), code & 1 != 0);
+        let vt = recover_key(hash, r, s, &x, odd);
+        let k = force_fallback(|| recover_key(hash, r, s, &x, odd));
+        let want = reference_recover(hash, r, s, &x, odd);
+        assert_eq!(vt, k, "the two arms disagree");
+        assert_eq!(vt, want, "the seam and the reference disagree");
+        if let (Recovery::Key(a), Recovery::Key(b)) = (&vt, &want) {
+            assert_eq!(a.serialize_uncompressed(), b.serialize_uncompressed());
+        }
+        vt
+    }
+
+    /// The public `recover_compact` through both arms; they must agree.
+    fn compact_both(sig: &[u8], hash: &[u8; 32]) -> Result<(PublicKey, bool), RecoverError> {
+        let vt = recover_compact(sig, hash);
+        let k = force_fallback(|| recover_compact(sig, hash));
+        assert_eq!(vt, k, "the two arms disagree");
+        vt
+    }
+
+    /// A compact signature's parts: the hash, r, s and the recovery code.
+    type Parts = ([u8; 32], [u8; 32], [u8; 32], u8);
+
+    /// The compact signature that makes recovery compute exactly (u1, u2)
+    /// with R as given: r = R.x (less N, with the overflow bit, when R.x
+    /// is at or above N), s = u2*r and e = -u1*r (below N, so the hash's
+    /// reduction keeps it), so that Q = u1*G + u2*R.  Returns the hash, r,
+    /// s and the recovery code, or `None` when r would be zero.
+    fn recovering(big_r: &ProjectivePoint, u1: &Scalar, u2: &Scalar) -> Option<Parts> {
+        let a = big_r.to_affine();
+        let x: [u8; 32] = a.x().into();
+        let mut code = u8::from(bool::from(a.y_is_odd()));
+        let rb = if x >= GROUP_ORDER_BYTES {
+            code |= 2;
+            let mut rb = [0u8; 32];
+            let mut borrow = 0i16;
+            for i in (0..32).rev() {
+                let d = i16::from(x[i]) - i16::from(GROUP_ORDER_BYTES[i]) - borrow;
+                rb[i] = d.rem_euclid(256) as u8;
+                borrow = i16::from(d < 0);
+            }
+            rb
+        } else {
+            x
+        };
+        let r = Option::<Scalar>::from(Scalar::from_repr(rb.into()))?;
+        if bool::from(r.is_zero()) {
+            return None;
+        }
+        Some((be(&-(*u1 * r)), rb, be(&(*u2 * r)), code))
+    }
+
+    /// Compact signatures signed by k256 (`sign_compact`) for random keys
+    /// and both compressed flags, with hashes at and above N (e = 0 for a
+    /// hash of N, so u1 = 0 and the G half is empty), recover the signer's
+    /// key on both arms; tampered hashes and s recover other keys, the
+    /// same on both arms.  r and s at the edges (1, 2, N-1, N-2, every
+    /// 2^k) with every recovery code that applies, and hashes 0 and N:
+    /// both arms and the reference give the same outcome and key bytes.
+    #[test]
+    fn recovery_matches_k256_on_both_paths() {
+        let mut rng = SplitMix64(0xbac4_e2d0_0006);
+        for i in 0..48 {
+            let mut d = [0u8; 32];
+            rng.fill(&mut d);
+            let Some(key) = PrivateKey::from_bytes(&d) else {
+                continue;
+            };
+            let mut hash = [0u8; 32];
+            rng.fill(&mut hash);
+            match i % 8 {
+                1 => hash = GROUP_ORDER_BYTES,
+                2 => hash = [0xff; 32],
+                3 => hash = [0; 32],
+                _ => {}
+            }
+            let compressed = i % 2 == 0;
+            let sig = sign_compact(&key, &hash, compressed);
+            assert_eq!(
+                compact_both(&sig, &hash),
+                Ok((key.public_key(), compressed))
+            );
+            let mut bad_hash = hash;
+            bad_hash[31] ^= 1;
+            let mut bad_s = sig;
+            bad_s[64] ^= 1;
+            for (sg, h) in [(sig, bad_hash), (bad_s, hash)] {
+                let got = compact_both(&sg, &h).map(|(k, _)| k);
+                assert_ne!(got, Ok(key.public_key()));
+            }
+            let r: [u8; 32] = sig[1..33].try_into().expect("32 bytes");
+            let s: [u8; 32] = sig[33..].try_into().expect("32 bytes");
+            assert!(matches!(
+                recover_both(&hash, &r, &s, (sig[0] - 27) & 3),
+                Recovery::Key(_)
+            ));
+        }
+
+        let edges: Vec<[u8; 32]> = inputs().into_iter().take(4 + 256).collect();
+        let (mut keys, mut no_point) = (0u32, 0u32);
+        for (j, r) in edges.iter().enumerate() {
+            let s = edges[(j * 7 + 3) % edges.len()];
+            let hash = match j % 3 {
+                0 => [0; 32],
+                1 => GROUP_ORDER_BYTES,
+                _ => edges[(j * 13 + 5) % edges.len()],
+            };
+            for code in 0..4u8 {
+                if code & 2 != 0 && *r >= PRIME_MINUS_ORDER_BYTES {
+                    continue;
+                }
+                match recover_both(&hash, r, &s, code) {
+                    Recovery::Key(_) => keys += 1,
+                    Recovery::NoPoint => no_point += 1,
+                    Recovery::Infinity => {}
+                }
+            }
+        }
+        assert!(
+            keys > 200 && no_point > 200,
+            "{keys} keys, {no_point} with no point"
+        );
+    }
+
+    /// Every outcome recovery can reach, constructed, on both arms: no
+    /// point for R.x (steps 4 and 5); Q at infinity (R = cG, u1 = -u2*c,
+    /// step 10); and a key for each recovery code, the overflow codes from
+    /// R.x in [N, P), the key's bytes equal to u1*G + u2*R by k256.
+    #[test]
+    fn each_recovery_step_on_both_paths() {
+        let mut rng = SplitMix64(0xbac4_e2d0_0007);
+        let g = ProjectivePoint::GENERATOR;
+
+        // Steps 4 and 5: the first r with no point, either oddness.
+        let r = (1u8..)
+            .map(|v| {
+                let mut b = [0u8; 32];
+                b[31] = v;
+                b
+            })
+            .find(|b| point_at(b, false).is_none())
+            .expect("an x with no point");
+        for code in [0u8, 1] {
+            assert_eq!(recover_both(&[7; 32], &r, &r, code), Recovery::NoPoint);
+        }
+
+        let mut codes = [0u32; 4];
+        for _ in 0..16 {
+            let (u1, u2) = (rand_scalar(&mut rng), rand_scalar(&mut rng));
+
+            // Step 10: R = cG and u1 = -u2*c.
+            let c = rand_scalar(&mut rng);
+            if let Some((h, r, s, code)) = recovering(&(g * c), &-(u2 * c), &u2) {
+                assert_eq!(recover_both(&h, &r, &s, code), Recovery::Infinity);
+            }
+
+            // A key, R random.
+            let big_r = g * rand_scalar(&mut rng);
+            if let Some((h, r, s, code)) = recovering(&big_r, &u1, &u2) {
+                let want = (g * u1 + big_r * u2).to_affine();
+                let Recovery::Key(k) = recover_both(&h, &r, &s, code) else {
+                    panic!("no key");
+                };
+                assert_eq!(k, PublicKey::from_affine(want));
+                codes[usize::from(code)] += 1;
+            }
+        }
+
+        // The overflow codes: R.x in [N, P), both oddnesses.
+        for (start, odd) in [(1u8, false), (1, true), (90, false), (90, true)] {
+            let mut from = GROUP_ORDER_BYTES;
+            from[31] = from[31].wrapping_add(start);
+            from[30] = from[30].wrapping_add(u8::from(from[31] < start));
+            let (mut xb, _) = first_point_from(from);
+            let big_r = loop {
+                if let Some(p) = point_at(&xb, odd) {
+                    break p;
+                }
+                xb[31] = xb[31].wrapping_add(1);
+            };
+            let (u1, u2) = (rand_scalar(&mut rng), rand_scalar(&mut rng));
+            let (h, r, s, code) = recovering(&big_r, &u1, &u2).expect("r nonzero");
+            assert_eq!(code, 2 | u8::from(odd));
+            let want = (g * u1 + big_r * u2).to_affine();
+            assert_eq!(
+                recover_both(&h, &r, &s, code),
+                Recovery::Key(PublicKey::from_affine(want))
+            );
+            codes[usize::from(code)] += 1;
+        }
+        assert!(codes.iter().all(|&c| c > 0), "codes reached {codes:?}");
+    }
+
+    /// The vartime crate alone, with no seam: decompression, the inverse,
+    /// the scalar products, the multiply and `to_affine_var`, as bytes.
+    fn crate_alone_recover(hash: &[u8; 32], r: &[u8; 32], s: &[u8; 32], code: u8) -> [u8; 65] {
+        let big_r =
+            vartime::Affine::decompress_var(&recovery_x(r, code), code & 1 != 0).expect("a point");
+        let r = vartime::Scalar::from_be_bytes(r).expect("below N");
+        let s = vartime::Scalar::from_be_bytes(s).expect("below N");
+        let w = r.try_inverse_var().expect("the inverse");
+        let e = vartime::Scalar::reduce_be_bytes(hash);
+        let q = vartime::ecmult_var(&big_r, &(s * w), &-(e * w)).expect("the guard");
+        let (x, y) = q
+            .to_affine_var()
+            .expect("the cap")
+            .expect("finite")
+            .to_be_bytes();
+        let mut out = [4u8; 65];
+        out[1..33].copy_from_slice(&x);
+        out[33..].copy_from_slice(&y);
+        out
+    }
+
+    /// The forced path really is k256's: the switches are per thread and
+    /// clear themselves, and the vartime crate alone gives the seam's key.
+    #[test]
+    fn the_switch_forces_and_clears() {
+        assert!(!forced_fallback());
+        assert!(force_fallback(forced_fallback));
+        assert!(!forced_fallback());
+        assert!(force_decline(forced_decline));
+        assert!(!forced_decline());
+        assert!(!skewed_sum());
+        assert!(!wrong_oddness());
+        assert!(!FORCE_CAP.with(core::cell::Cell::get));
+        let key = PrivateKey::from_bytes(&[9; 32]).expect("a key");
+        let hash = [0x3c; 32];
+        let sig = sign_compact(&key, &hash, false);
+        let r: [u8; 32] = sig[1..33].try_into().expect("32 bytes");
+        let s: [u8; 32] = sig[33..].try_into().expect("32 bytes");
+        let code = (sig[0] - 27) & 3;
+        let Recovery::Key(k) = recover_both(&hash, &r, &s, code) else {
+            panic!("no key");
+        };
+        assert_eq!(
+            crate_alone_recover(&hash, &r, &s, code),
+            k.serialize_uncompressed()
+        );
+        assert_eq!(k, key.public_key());
+    }
+
+    /// A recovery the vartime crate declines is k256's instead: builds
+    /// with debug assertions stop on the decline; without them the key is
+    /// k256's.
+    #[test]
+    #[cfg_attr(
+        debug_assertions,
+        should_panic(expected = "the vartime crate declined compact recovery")
+    )]
+    fn a_declined_recovery_falls_back() {
+        let key = PrivateKey::from_bytes(&[3; 32]).expect("a key");
+        let hash = [9u8; 32];
+        let sig = sign_compact(&key, &hash, true);
+        let declined = force_decline(|| recover_compact(&sig, &hash));
+        assert_eq!(declined, force_fallback(|| recover_compact(&sig, &hash)));
+        assert_eq!(declined, Ok((key.public_key(), true)));
+    }
+
+    /// The debug cross-check stops a recovered key that differs from
+    /// k256's: here the vartime crate is given u2 + 1.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "compact recovery: the key differs from k256's")]
+    fn the_cross_check_catches_a_skewed_recovery() {
+        let key = PrivateKey::from_bytes(&[5; 32]).expect("a key");
+        let hash = [11u8; 32];
+        let sig = sign_compact(&key, &hash, true);
+        let _ = skew_sum(|| recover_compact(&sig, &hash));
+    }
+
+    /// The forced fallback really skips the vartime crate's recovery: with
+    /// u2 skewed for the vartime crate only, the forced path still
+    /// recovers the signer's key and the debug cross-check never runs.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn the_forced_fallback_skips_the_vartime_recovery() {
+        let key = PrivateKey::from_bytes(&[5; 32]).expect("a key");
+        let hash = [11u8; 32];
+        let sig = sign_compact(&key, &hash, false);
+        assert_eq!(
+            force_fallback(|| skew_sum(|| recover_compact(&sig, &hash))),
+            Ok((key.public_key(), false))
+        );
+    }
+
+    /// Recovery's R of the other oddness from the vartime crate, as a port
+    /// bug might give, is not passed on: builds with debug assertions stop
+    /// on the decline; without them the key is k256's.
+    #[test]
+    #[cfg_attr(
+        debug_assertions,
+        should_panic(expected = "the vartime crate declined compact recovery")
+    )]
+    fn a_recovered_point_of_the_wrong_oddness_is_not_passed_on() {
+        let mut rng = SplitMix64(0xbac4_e2d0_0008);
+        for _ in 0..16 {
+            let mut d = [0u8; 32];
+            rng.fill(&mut d);
+            let Some(key) = PrivateKey::from_bytes(&d) else {
+                continue;
+            };
+            let mut hash = [0u8; 32];
+            rng.fill(&mut hash);
+            let sig = sign_compact(&key, &hash, true);
+            let got = force_wrong_oddness(|| recover_compact(&sig, &hash));
+            assert_eq!(got, Ok((key.public_key(), true)));
+        }
+        assert!(!wrong_oddness());
+    }
+
+    /// r or s at N, which no caller passes, into recovery, and s or e at N
+    /// into Schnorr verification's sum, reach neither a panic in release
+    /// nor an accepting answer: debug builds stop on the decline, and
+    /// without debug assertions both arms reject (Q or R at infinity).
+    #[test]
+    #[cfg_attr(debug_assertions, should_panic(expected = "declined"))]
+    fn out_of_range_recovery_and_schnorr_inputs_reject_without_panicking() {
+        let pk = PrivateKey::from_bytes(&[3; 32])
+            .expect("a key")
+            .public_key();
+        let mut one = [0u8; 32];
+        one[31] = 1;
+        let x = first_point_from(one).0;
+        for (r, s) in [(GROUP_ORDER_BYTES, one), (one, GROUP_ORDER_BYTES)] {
+            let odd = false;
+            assert_eq!(recover_key(&[1; 32], &r, &s, &x, odd), Recovery::Infinity);
+            assert_eq!(
+                force_fallback(|| recover_key(&[1; 32], &r, &s, &x, odd)),
+                Recovery::Infinity
+            );
+        }
+        for (s, e) in [(GROUP_ORDER_BYTES, one), (one, GROUP_ORDER_BYTES)] {
+            assert_eq!(schnorr_mul_g_add(&s, &e, &pk), None);
+            assert_eq!(force_fallback(|| schnorr_mul_g_add(&s, &e, &pk)), None);
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // EC-Schnorr-DCRv0 verification's sum.
+
+    use crate::secp256k1::schnorr::{self, Error as SchnorrError};
+
+    /// Schnorr verification through the vartime crate and through the
+    /// forced k256 arm; both must agree.
+    fn schnorr_both(
+        sig: &schnorr::Signature,
+        hash: &[u8; 32],
+        key: &PublicKey,
+    ) -> Result<(), SchnorrError> {
+        let vt = sig.verify_detailed(hash, key);
+        let k = force_fallback(|| sig.verify_detailed(hash, key));
+        assert_eq!(vt, k, "the two arms disagree");
+        vt
+    }
+
+    /// BLAKE-256(r || hash) as a scalar, `None` at or above N or at zero.
+    fn challenge_of(r: &[u8; 32], hash: &[u8; 32]) -> Option<Scalar> {
+        let mut input = [0u8; 64];
+        input[..32].copy_from_slice(r);
+        input[32..].copy_from_slice(hash);
+        let e = Option::<Scalar>::from(Scalar::from_repr(
+            dcroxide_crypto::blake256::sum256(&input).into(),
+        ))?;
+        (!bool::from(e.is_zero())).then_some(e)
+    }
+
+    /// A nonce whose kG has the y parity asked for, kG's x, and a hash
+    /// whose challenge for that x is below N (and not zero).
+    fn nonce_and_hash(rng: &mut SplitMix64, odd: bool) -> (Scalar, [u8; 32], [u8; 32], Scalar) {
+        let mut k = rand_scalar(rng);
+        let a = (ProjectivePoint::GENERATOR * k).to_affine();
+        if bool::from(a.y_is_odd()) != odd {
+            k = -k;
+        }
+        let r: [u8; 32] = (ProjectivePoint::GENERATOR * k).to_affine().x().into();
+        loop {
+            let mut hash = [0u8; 32];
+            rng.fill(&mut hash);
+            if let Some(e) = challenge_of(&r, &hash) {
+                return (k, r, hash, e);
+            }
+        }
+    }
+
+    /// Signatures signed by k256 (`schnorr::sign`) verify on both arms;
+    /// tampered hashes, s and keys, and s = 0 with random keys, reject
+    /// with the same error on both arms.
+    #[test]
+    fn schnorr_sum_matches_k256_on_both_paths() {
+        let mut rng = SplitMix64(0xbac4_e2d0_0009);
+        let mut errors = 0u32;
+        for _ in 0..48 {
+            let mut d = [0u8; 32];
+            rng.fill(&mut d);
+            let Some(key) = PrivateKey::from_bytes(&d) else {
+                continue;
+            };
+            let pk = key.public_key();
+            let mut hash = [0u8; 32];
+            rng.fill(&mut hash);
+            let sig = schnorr::sign(&key, &hash).expect("a signature");
+            assert_eq!(schnorr_both(&sig, &hash, &pk), Ok(()));
+            let mut bad_hash = hash;
+            bad_hash[0] ^= 0x80;
+            let mut s1 = *sig.s_bytes();
+            s1[31] ^= 1;
+            let other = PrivateKey::from_bytes(&[7; 32])
+                .expect("a key")
+                .public_key();
+            let zero_s = schnorr::Signature::new(*sig.r_bytes(), [0; 32]).expect("in range");
+            for (sg, h, k) in [
+                (sig, bad_hash, pk),
+                (
+                    schnorr::Signature::new(*sig.r_bytes(), s1).expect("in range"),
+                    hash,
+                    pk,
+                ),
+                (sig, hash, other),
+                (zero_s, hash, pk),
+            ] {
+                if schnorr_both(&sg, &h, &k).is_err() {
+                    errors += 1;
+                }
+            }
+        }
+        assert!(errors > 150, "{errors} rejections");
+    }
+
+    /// Every step Schnorr verification decides at, constructed, on both
+    /// arms: step 8 (s = -e*d, so R is infinity), step 9 (kG of odd y),
+    /// step 10 (R.x is not r) and acceptance, all for a key d; and a
+    /// valid s = 0 for a key built for it, Q = (k/e)G, and its odd twin.
+    #[test]
+    fn each_schnorr_step_on_both_paths() {
+        let mut rng = SplitMix64(0xbac4_e2d0_000a);
+        let g = ProjectivePoint::GENERATOR;
+        for _ in 0..16 {
+            let d = rand_scalar(&mut rng);
+            let pk = PublicKey::from_affine((g * d).to_affine());
+            let sig =
+                |r: [u8; 32], s: Scalar| schnorr::Signature::new(r, be(&s)).expect("in range");
+
+            // Accepting, and step 10 with another r for the same R.
+            let (k, r, hash, e) = nonce_and_hash(&mut rng, false);
+            assert_eq!(schnorr_both(&sig(r, k - e * d), &hash, &pk), Ok(()));
+            let mut r2 = r;
+            r2[0] ^= 0x01;
+            if r2 < FIELD_PRIME_BYTES
+                && let Some(e2) = challenge_of(&r2, &hash)
+            {
+                assert_eq!(
+                    schnorr_both(&sig(r2, k - e2 * d), &hash, &pk),
+                    Err(SchnorrError::UnequalRValues)
+                );
+            }
+
+            // Step 8: s = -e*d.
+            assert_eq!(
+                schnorr_both(&sig(r, -(e * d)), &hash, &pk),
+                Err(SchnorrError::SigRNotOnCurve)
+            );
+
+            // Step 9: kG of odd y.
+            let (k, r, hash, e) = nonce_and_hash(&mut rng, true);
+            assert_eq!(
+                schnorr_both(&sig(r, k - e * d), &hash, &pk),
+                Err(SchnorrError::SigRYIsOdd)
+            );
+
+            // A valid s = 0: Q = (k/e)G, so e*Q = kG.
+            for odd in [false, true] {
+                let (k, r, hash, e) = nonce_and_hash(&mut rng, odd);
+                let q = g * (k * e.invert_vartime().expect("nonzero"));
+                let qk = PublicKey::from_affine(q.to_affine());
+                let want = if odd {
+                    Err(SchnorrError::SigRYIsOdd)
+                } else {
+                    Ok(())
+                };
+                assert_eq!(schnorr_both(&sig(r, Scalar::ZERO), &hash, &qk), want);
+            }
+        }
+    }
+
+    /// A Schnorr sum the vartime crate declines is k256's instead: builds
+    /// with debug assertions stop on the decline; without them the verdict
+    /// is k256's.
+    #[test]
+    #[cfg_attr(
+        debug_assertions,
+        should_panic(expected = "the vartime crate declined Schnorr verification's sum")
+    )]
+    fn a_declined_schnorr_sum_falls_back() {
+        let key = PrivateKey::from_bytes(&[3; 32]).expect("a key");
+        let hash = [9u8; 32];
+        let sig = schnorr::sign(&key, &hash).expect("a signature");
+        let pk = key.public_key();
+        let declined = force_decline(|| sig.verify_detailed(&hash, &pk));
+        assert_eq!(declined, force_fallback(|| sig.verify_detailed(&hash, &pk)));
+        assert_eq!(declined, Ok(()));
+    }
+
+    /// The debug cross-check stops a Schnorr R that differs from k256's:
+    /// here the vartime crate is given e + 1.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "Schnorr verification's R differs from k256's")]
+    fn the_cross_check_catches_a_skewed_schnorr_sum() {
+        let key = PrivateKey::from_bytes(&[5; 32]).expect("a key");
+        let hash = [11u8; 32];
+        let sig = schnorr::sign(&key, &hash).expect("a signature");
+        let _ = skew_sum(|| sig.verify_detailed(&hash, &key.public_key()));
+    }
+
+    /// The forced fallback really skips the vartime crate's Schnorr sum:
+    /// with e skewed for the vartime crate only, the forced path still
+    /// accepts and the debug cross-check never runs.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn the_forced_fallback_skips_the_vartime_schnorr_sum() {
+        let key = PrivateKey::from_bytes(&[5; 32]).expect("a key");
+        let hash = [11u8; 32];
+        let sig = schnorr::sign(&key, &hash).expect("a signature");
+        assert_eq!(
+            force_fallback(|| skew_sum(|| sig.verify_detailed(&hash, &key.public_key()))),
+            Ok(())
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // Both affine conversions.
+
+    /// A capped affine conversion is a decline, never an answer: recovery
+    /// and Schnorr's sum return `None`, which sends the seam to k256, and
+    /// never `Infinity` or `Some(None)`, which would reject a valid
+    /// signature.  At infinity no inversion is attempted, so the answer
+    /// stands.
+    #[test]
+    fn a_capped_affine_conversion_is_a_decline() {
+        let key = PrivateKey::from_bytes(&[3; 32]).expect("a key");
+        let hash = [9u8; 32];
+        let sig = sign_compact(&key, &hash, true);
+        let r: [u8; 32] = sig[1..33].try_into().expect("32 bytes");
+        let s: [u8; 32] = sig[33..].try_into().expect("32 bytes");
+        let code = (sig[0] - 27) & 3;
+        let (x, odd) = (recovery_x(&r, code), code & 1 != 0);
+        assert!(matches!(
+            vartime_recover(&hash, &r, &s, &x, odd),
+            Some(Recovery::Key(_))
+        ));
+        assert_eq!(force_cap(|| vartime_recover(&hash, &r, &s, &x, odd)), None);
+
+        let ssig = schnorr::sign(&key, &hash).expect("a signature");
+        let pk = key.public_key();
+        let e = challenge_of(ssig.r_bytes(), &hash).expect("a challenge");
+        assert!(matches!(
+            vartime_schnorr(ssig.s_bytes(), &be(&e), &pk),
+            Some(Some(_))
+        ));
+        assert_eq!(
+            force_cap(|| vartime_schnorr(ssig.s_bytes(), &be(&e), &pk)),
+            None
+        );
+
+        // Q and R at infinity: the cap is never consulted.
+        let mut rng = SplitMix64(0xbac4_e2d0_000b);
+        let g = ProjectivePoint::GENERATOR;
+        let (c, u2) = (rand_scalar(&mut rng), rand_scalar(&mut rng));
+        let (h, r, s, code) = recovering(&(g * c), &-(u2 * c), &u2).expect("r nonzero");
+        let (x, odd) = (recovery_x(&r, code), code & 1 != 0);
+        assert_eq!(
+            force_cap(|| vartime_recover(&h, &r, &s, &x, odd)),
+            Some(Recovery::Infinity)
+        );
+        let d = rand_scalar(&mut rng);
+        let pk = PublicKey::from_affine((g * d).to_affine());
+        let e = rand_scalar(&mut rng);
+        assert_eq!(
+            force_cap(|| vartime_schnorr(&be(&-(e * d)), &be(&e), &pk)),
+            Some(None)
+        );
     }
 }

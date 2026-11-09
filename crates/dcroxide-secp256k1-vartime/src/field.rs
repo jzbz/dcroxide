@@ -20,10 +20,10 @@
 //! What the crate uses is here: bytes in and out, addition, small
 //! additions and multiples, negation, halving, multiplication, squaring,
 //! the weak and variable-time normalizations, both zero tests, the square
-//! root and the 4x64 storage form the generator tables use.  The inverse,
-//! the constant-time normalization and the conversion to storage form are
-//! compiled for the tests and the table generator only, until the affine
-//! conversion of recovery and Schnorr verification calls them.
+//! root, the inverse (safegcd, shared with the scalar) behind
+//! `Point::to_affine_var`, and the 4x64 storage form the generator tables
+//! use.  The constant-time normalization and the conversion to storage
+//! form are compiled for the tests and the table generator only.
 //!
 //! `FeRaw` keeps the C's signatures (a flag beside the value, `u32`
 //! magnitudes, `as` widenings in the kernel) so that it reads beside
@@ -617,9 +617,7 @@ impl FeRaw {
     }
 
     /// `fe_from_signed62` (field_5x52_impl.h:417-435): from modinv64's
-    /// output, limbs in [0, 2^62), value in [0, p).  Tests and the table
-    /// generator only.
-    #[cfg(test)]
+    /// output, limbs in [0, 2^62), value in [0, p).
     #[inline]
     #[must_use]
     pub(crate) fn from_signed62(a: &crate::modinv64::Signed62) -> Self {
@@ -646,8 +644,6 @@ impl FeRaw {
     }
 
     /// `fe_to_signed62` (field_5x52_impl.h:437-446); requires normalized.
-    /// Tests and the table generator only.
-    #[cfg(test)]
     #[inline]
     #[must_use]
     pub(crate) fn to_signed62(self) -> crate::modinv64::Signed62 {
@@ -666,8 +662,7 @@ impl FeRaw {
 }
 
 /// The field's modinv64 parameters (field_5x52_impl.h:448-451): p in
-/// signed62 form and p^-1 mod 2^62.  Tests and the table generator only.
-#[cfg(test)]
+/// signed62 form and p^-1 mod 2^62.
 pub(crate) const MODINFO_FE: crate::modinv64::ModInfo = crate::modinv64::ModInfo {
     modulus: crate::modinv64::Signed62 {
         v: [-0x1_0000_03D1, 0, 0, 0, 256],

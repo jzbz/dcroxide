@@ -13,7 +13,8 @@
 //!   form) and their inverse by safegcd (`modinv64`), which dcrec's
 //!   verification and recovery take for s^-1 and r^-1;
 //! - the base field in libsecp256k1's 5x52 form (`field`), with its
-//!   debug-build magnitude tracking, and its square root;
+//!   debug-build magnitude tracking, its square root, and its inverse by
+//!   the same safegcd;
 //! - affine points ([`Affine`]) with key decompression and the curve
 //!   check, which dcrec's key parsing and recovery take for decompression;
 //! - Jacobian points and libsecp256k1's addition and doubling formulas,
@@ -22,16 +23,19 @@
 //!   k256;
 //! - [`ecmult_var`], ng*G + na*A by libsecp256k1's Straus loop with the
 //!   GLV split, and the [`Point`] it returns, which answers dcrd's
-//!   inversion-free x check: dcrec's ECDSA verification takes both.
+//!   inversion-free x check (dcrec's ECDSA verification) and converts to
+//!   affine with one field inversion (`to_affine_var`, dcrec's compact
+//!   recovery and Schnorr verification).
 //!
 //! Every fallible step returns `Option` rather than panicking, so a caller
 //! on the consensus path can fall back: [`Scalar::try_inverse_var`] gives
 //! `None` past the safegcd loop's iteration cap, which the proof rules
 //! out, [`Affine::decompress_var`] gives `None` when x is not below p or
-//! no point has it, and [`ecmult_var`] gives `None` if a half of the GLV
+//! no point has it, [`ecmult_var`] gives `None` if a half of the GLV
 //! split does not fit the wNAF's 129 positions, which libsecp256k1's
-//! bound proof also rules out.  The crate needs `core` alone, with no
-//! `alloc`.
+//! bound proof also rules out, and [`Point::to_affine_var`] gives
+//! `Err(Fallback)` past the field inverse's cap, distinct from `Ok(None)`,
+//! the point at infinity.  The crate needs `core` alone, with no `alloc`.
 //!
 //! The `internals` feature, for the fuzz target only, re-exports the field
 //! types and adds nothing else; no workspace crate turns it on.
@@ -47,7 +51,7 @@ mod point;
 mod scalar;
 mod wnaf;
 
-pub use point::{Affine, Point, ecmult_var};
+pub use point::{Affine, Fallback, Point, ecmult_var};
 pub use scalar::Scalar;
 
 #[cfg(feature = "internals")]

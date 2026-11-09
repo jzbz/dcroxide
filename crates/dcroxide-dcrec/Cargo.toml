@@ -12,28 +12,20 @@ repository.workspace = true
 # Pure-Rust secp256k1 arithmetic: every key, ECDSA verification, signing
 # and compact recovery, and EC-Schnorr-DCRv0, with dcrd's exact parsing and
 # acceptance rules enforced by this crate's own code (ADR-0006's 2026-10-26
-# addendum, ADR-0012).  ECDSA verification's arithmetic, recovery's scalar
-# inverse and the decompression of compressed keys and of recovery's R are
-# dcroxide-secp256k1-vartime's, below, with k256's as their fallback.
+# addendum, ADR-0012).  The variable-time arithmetic of ECDSA verification,
+# compact recovery and Schnorr verification, and key decompression, is
+# dcroxide-secp256k1-vartime's, below, with k256's as its fallback.
 #
 # k256's `std` and `precomputed-tables` are deliberately left off.  ECDSA
 # and Schnorr signing, and `PrivateKey::public_key`, multiply with
 # `ProjectivePoint::GENERATOR * k` (or `* d`), which goes through
-# `lincomb`.  Recovery and Schnorr verification compute their sum with
-# this crate's own variable-time loop over k256's public point operations
-# (`src/secp256k1/ecmult.rs`), which keeps static tables of G and 2^128*G
-# of its own, and ECDSA verification falls back to k256's combined
-# multiply.  None reads k256's basepoint table -- only `mul_by_generator`
-# and `mul_by_generator_vartime` do, and this crate calls neither -- so
-# k256's tables would buy nothing, and from 0.14
-# `k256/std` also pulls an OS RNG (getrandom) into a crate that never
+# `lincomb`.  The seam's fallbacks use k256's combined multiply
+# `mul_by_generator_and_mul_add_vartime`.  None reads k256's basepoint
+# table -- only `mul_by_generator` and `mul_by_generator_vartime` do, and
+# this crate calls neither -- so k256's tables would buy nothing, and from
+# 0.14 `k256/std` also pulls an OS RNG (getrandom) into a crate that never
 # draws randomness.
 k256 = { version = "0.14", default-features = false, features = ["arithmetic"] }
-# The first-use cell of those static generator tables: `race::OnceBox`
-# needs only core atomics and `alloc`, so default features stay off and
-# building this crate alone takes no `std`.  Already in both locks (rustls
-# takes it in both), so it adds no package.
-once_cell = { version = "1.21", default-features = false, features = ["alloc"] }
 # RFC6979 nonce generation (dcrd's exact variant, ported in this crate).
 # `zeroize` on both: each HMAC the nonce's DRBG runs holds two SHA-2
 # states keyed by its K and a block buffer the private key's bytes pass
@@ -44,10 +36,11 @@ sha2 = { version = "0.11", default-features = false, features = ["zeroize"] }
 # Wipes the temporary private key copies signing makes, as dcrd zeroes its own.
 zeroize = { version = "1.9", default-features = false }
 # Variable-time secp256k1 arithmetic on public values, owned in tree and
-# ported from libsecp256k1 (ADR-0016): today ECDSA verification's steps
-# 2-10 (its scalars, the Straus loop over static generator tables and the
-# x check), compact recovery's r^-1 by safegcd, and the decompression of
-# compressed keys and of recovery's R, by the 5x52 field's square root.
+# ported from libsecp256k1 (ADR-0016): ECDSA verification's steps 2-10,
+# compact recovery's steps 4-10 and Schnorr verification's steps 7-10
+# (scalars, the Straus loop over static generator tables, the x check and
+# the affine conversion), and compressed keys' decompression by the 5x52
+# field's square root.
 # Only `src/secp256k1/backend.rs` names it, and k256's path stays behind
 # it as the fallback.  It has no dependencies of its own and needs only
 # core; its licence is ISC AND MIT (its NOTICE).
