@@ -29,7 +29,7 @@ commits over master ending at `43beedc`, then stage 2a's two (below): ECDSA
 verification and signing, every key and compact recovery run on `k256`
 0.14.0 by dcrd's algorithms, and `secp256k1-sys` is out of the build, which
 the `cc` and `secp256k1-sys` bans (`deny.toml:81-82`) and the job that
-builds with no C compiler (`.github/workflows/ci.yml:372`) now hold. Master
+builds with no C compiler (`.github/workflows/ci.yml:384`) now hold. Master
 (`0c4154d`) still runs libsecp256k1 for ECDSA and keys.
 
 ### The gates, 2026-11-07
@@ -362,7 +362,11 @@ from the profile and the probes; only the prototype's in-process ratio is
 measured. Each increment ships only code that its production callers or
 the crate's public API reach, with that code's tests, so an item whose
 first caller comes later (the GLV split, the field inverse, the
-generator tables) lands with that caller.
+generator tables) lands with that caller. RC3's group formulas, key
+table and generator tables would have had no caller before RC4's
+multiply; on 2026-11-08 the project owner folded RC3 into RC4 ("fold rc3
+into rc4"), so they land in one commit with the verification that calls
+them, under RC4's gate.
 
 | step | what | wired | expected effect |
 |---|---|---|---|
@@ -370,8 +374,8 @@ generator tables) lands with that caller.
 | RC0 | this record, Proposed | no | |
 | RC1 | the crate with the scalar and the safegcd; s^-1 and r^-1 through the seam | yes, may share RC2's gate | ~1.3 µs off each verification and recovery |
 | RC2 | the field and the square root; compressed-key decompression and recovery's R through the seam | yes, may share RC1's gate | compressed key parse from 1.65 toward 1.0 times libsecp256k1, ~1.9 µs per checksig that parses |
-| RC3 | the group formulas, the field inverse, the key table, the generated generator tables at window 12 and their tests | no | none in production |
-| RC4 | the wNAF and GLV split, the Straus loop, the x check; ECDSA verification on the new crate | yes, a gate of its own | from ~1.53 to a central ~1.10-1.15 times libsecp256k1 per verification by the design's model (floor ~1.03-1.04 at window 12); the prototype measured 1.024-1.027 |
+| RC3 | folded into RC4 (2026-11-08) | | |
+| RC4 | RC3's group formulas, key table and generated generator tables at window 12 with their tests; the wNAF and GLV split, the Straus loop, the x check; ECDSA verification on the new crate. The field inverse serves only the tests and the table generator until RC5's affine conversion calls it | yes, a gate of its own | from ~1.53 to a central ~1.10-1.15 times libsecp256k1 per verification by the design's model (floor ~1.03-1.04 at window 12); the prototype measured 1.024-1.027 |
 | RC5 | recovery and Schnorr verification on the new crate; stage 2a's loop and its `once_cell` dependency removed | yes, may share RC6's gate | Schnorr below base's cost; little in a sync, where Schnorr is rare and recovery is RPC only |
 | RC6 | dcrec's public key held as the crate's affine point; parse and serialization on it | yes, may share RC5's gate | ~0.5-1% of a verification |
 | RC7 | tuning, only if the first milestone asks for it | if changed | inlining; window 15 only if the first milestone lands between 1.10 and 1.15 (~2.5-3% of a verification) |
@@ -475,7 +479,7 @@ which is the decision point:
      whatever `secp256k1-sys` version then builds;
    - reverses policy: lifts the `secp256k1-sys` ban and lists it among
      `cc`'s wrappers (`deny.toml:81-82`), removes or narrows the job that
-     builds with no C compiler (`.github/workflows/ci.yml:372`), amends
+     builds with no C compiler (`.github/workflows/ci.yml:384`), amends
      ADR-0012's "No C or C++" (`0012-pure-rust.md:128-131`) for ECDSA, adds
      an addendum here, and changes back the dependency ledger, README,
      PARITY.md, SECURITY.md and dcrec's "compiles no C";
@@ -539,9 +543,6 @@ files taken from non-ISC sources need notices is a separate question.
 
 ### Not decided here
 
-- How RC3's code, which has no production caller of its own, lands without
-  shipping dead code: through `dcroxide-bench` and the `internals` feature,
-  or wired together with RC4. Settled before RC3 is staged.
 - Whether the soak harness is unfrozen once, for soak volume on valid
   s = 0 and u2 = 1: not needed for the gates; if wanted, at most once,
   between gates only, with a new baseline on libsecp256k1 before the next

@@ -236,10 +236,10 @@ work). Currently implemented:
   byte-for-byte against dcrd
 - `dcroxide-secp256k1-vartime` — variable-time secp256k1 arithmetic for
   public values only, ported from libsecp256k1's portable C (ADR-0016):
-  the scalar mod N with its safegcd inverse (s^-1, r^-1) and the 5x52
-  field with its square root (key decompression), for ECDSA verification,
-  recovery and key parsing behind one seam in `dcroxide-dcrec`, k256 the
-  fallback; `no_std` on core alone, no dependencies, ISC AND MIT (`NOTICE`)
+  the scalar with its safegcd inverse, the 5x52 field (key decompression),
+  the group formulas and the Straus loop with static generator tables
+  (ECDSA verification's multiply and x check), behind one seam in
+  `dcroxide-dcrec`, k256 the fallback; core alone, ISC AND MIT (`NOTICE`)
 - `dcroxide-chaincfg` — all four networks' consensus parameters
   (mainnet/testnet3/simnet/regnet): genesis blocks reproducing dcrd's exact
   hashes and quirks, the full consensus-agenda deployment history, and the

@@ -6,21 +6,32 @@ say so in their headers (SPDX-License-Identifier: ISC AND MIT).
 The copyright line of each upstream file, beside the files of this crate
 derived from it:
 
-  src/scalar.rs             <- src/scalar_4x64_impl.h:       Copyright (c) 2013, 2014 Pieter Wuille
-  src/scalar.rs             <- src/scalar_impl.h:            Copyright (c) 2014 Pieter Wuille
-  src/modinv64.rs           <- src/modinv64_impl.h:          Copyright (c) 2020 Peter Dettman
-  src/modinv64.rs           <- src/modinv64.h:               Copyright (c) 2020 Peter Dettman
-  src/field.rs              <- src/field_5x52_impl.h:        Copyright (c) 2013, 2014 Pieter Wuille
-  src/field.rs              <- src/field_5x52.h:             Copyright (c) 2013, 2014 Pieter Wuille
-  src/field/mul.rs          <- src/field_5x52_int128_impl.h: Copyright (c) 2013, 2014 Pieter Wuille
-  src/field/verify.rs       <- src/field_impl.h:             Copyright (c) 2013, 2014 Pieter Wuille
-  src/field/verify.rs       <- src/field.h:                  Copyright (c) 2013, 2014 Pieter Wuille
-  src/field/verify.rs       <- src/field_5x52_impl.h:        Copyright (c) 2013, 2014 Pieter Wuille
-  src/group.rs              <- src/group_impl.h:             Copyright (c) 2013, 2014 Pieter Wuille
-  src/group.rs              <- src/group.h:                  Copyright (c) 2013, 2014 Pieter Wuille
-  src/tests/scalar_tests.rs <- src/tests.c:                  Copyright (c) 2013, 2014, 2015 Pieter Wuille, Gregory Maxwell
-  src/tests/field_tests.rs  <- src/tests.c:                  Copyright (c) 2013, 2014, 2015 Pieter Wuille, Gregory Maxwell
-  src/tests/vectors.rs      <- src/tests.c:                  Copyright (c) 2013, 2014, 2015 Pieter Wuille, Gregory Maxwell
+  src/scalar.rs                <- src/scalar_4x64_impl.h:          Copyright (c) 2013, 2014 Pieter Wuille
+  src/scalar.rs                <- src/scalar_4x64.h:               Copyright (c) 2014 Pieter Wuille
+  src/scalar.rs                <- src/scalar_impl.h:               Copyright (c) 2014 Pieter Wuille
+  src/modinv64.rs              <- src/modinv64_impl.h:             Copyright (c) 2020 Peter Dettman
+  src/modinv64.rs              <- src/modinv64.h:                  Copyright (c) 2020 Peter Dettman
+  src/field.rs                 <- src/field_5x52_impl.h:           Copyright (c) 2013, 2014 Pieter Wuille
+  src/field.rs                 <- src/field_5x52.h:                Copyright (c) 2013, 2014 Pieter Wuille
+  src/field.rs                 <- src/field.h:                     Copyright (c) 2013, 2014 Pieter Wuille
+  src/field/mul.rs             <- src/field_5x52_int128_impl.h:    Copyright (c) 2013, 2014 Pieter Wuille
+  src/field/verify.rs          <- src/field_impl.h:                Copyright (c) 2013, 2014 Pieter Wuille
+  src/field/verify.rs          <- src/field.h:                     Copyright (c) 2013, 2014 Pieter Wuille
+  src/field/verify.rs          <- src/field_5x52_impl.h:           Copyright (c) 2013, 2014 Pieter Wuille
+  src/group.rs                 <- src/group_impl.h:                Copyright (c) 2013, 2014 Pieter Wuille
+  src/group.rs                 <- src/group.h:                     Copyright (c) 2013, 2014 Pieter Wuille
+  src/wnaf.rs                  <- src/ecmult_impl.h:               Copyright (c) 2013, 2014, 2017 Pieter Wuille, Andrew Poelstra, Jonas Nick
+  src/ecmult.rs                <- src/ecmult_impl.h:               Copyright (c) 2013, 2014, 2017 Pieter Wuille, Andrew Poelstra, Jonas Nick
+  src/ecmult.rs                <- src/ecmult.h:                    Copyright (c) 2013, 2014, 2017 Pieter Wuille, Andrew Poelstra
+  src/g_tables.rs              <- src/ecmult_compute_table_impl.h: Copyright (c) 2013, 2014, 2017, 2021 Pieter Wuille, Andrew Poelstra, Jonas Nick, Russell O'Connor
+  src/tests/table_gen.rs       <- src/ecmult_compute_table_impl.h: Copyright (c) 2013, 2014, 2017, 2021 Pieter Wuille, Andrew Poelstra, Jonas Nick, Russell O'Connor
+  src/tests/group_tests.rs     <- src/group_impl.h:                Copyright (c) 2013, 2014 Pieter Wuille
+  src/tests/group_tests.rs     <- src/scalar_impl.h:               Copyright (c) 2014 Pieter Wuille
+  src/tests/scalar_tests.rs    <- src/tests.c:                     Copyright (c) 2013, 2014, 2015 Pieter Wuille, Gregory Maxwell
+  src/tests/field_tests.rs     <- src/tests.c:                     Copyright (c) 2013, 2014, 2015 Pieter Wuille, Gregory Maxwell
+  src/tests/ecmult_tests.rs    <- src/tests.c:                     Copyright (c) 2013, 2014, 2015 Pieter Wuille, Gregory Maxwell
+  src/tests/glv_tests.rs       <- src/tests.c:                     Copyright (c) 2013, 2014, 2015 Pieter Wuille, Gregory Maxwell
+  src/tests/vectors.rs         <- src/tests.c:                     Copyright (c) 2013, 2014, 2015 Pieter Wuille, Gregory Maxwell
 
 Files not listed are ISC only, as is the rest of dcroxide; the seam in
 dcroxide-dcrec that calls this crate is ISC.

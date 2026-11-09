@@ -56,12 +56,12 @@ script.
   beside it (`Cargo.toml:38` at `0c4154d`) for EC-Schnorr-DCRv0 and for
   ECDSA signing of a hash at or above the order
   (`ecdsa.rs:388-437` at `0c4154d`).
-- **`ring` 0.17.14** (`Cargo.lock:1517`): ~151k lines of C and assembly
+- **`ring` 0.17.14** (`Cargo.lock:1518`): ~151k lines of C and assembly
   (`dependency-ledger.md:152`), the crypto provider of `rustls` 0.23.46.
   `dcroxide-node` selects rustls's `ring` feature
   (`crates/dcroxide-node/Cargo.toml:59-69` at `8e6ea23`), `ureq` 3.4.2
   selects it through its default `rustls` feature, and `rustls-webpki`
-  0.103.16 depends on it (`Cargo.lock:1585-1593`). It runs the RPC and
+  0.103.16 depends on it (`Cargo.lock:1586-1594`). It runs the RPC and
   websocket TLS listener, the RPC client-certificate verifier
   (`rpcrun::GoClientCertVerifier`, which hands `rustls-webpki` ring's
   signature algorithms) and both TLS clients of the HTTPS seeder
@@ -151,7 +151,7 @@ The approvals do not spell out five points, and this record reads them so:
 - **The targets the project builds for** are, on 2026-10-26, those of
   CI's test matrix, x86_64 and aarch64 Linux, macOS and Windows
   (`.github/workflows/ci.yml:92`), and the no-OS target of its no_std
-  check (`:364-369`). [ADR-0014](0014-release-engineering.md) decides
+  check (`:376-381`). [ADR-0014](0014-release-engineering.md) decides
   which of them get binaries.
 - **"What `cargo test` builds"** includes anything a test compiles while
   it runs, which reaches the shim and the oracle, though cargo itself
@@ -191,7 +191,7 @@ C that cgo links into the oracle included:
   the exception as covering, with the oracle, the Go generators under
   `tools/` that regenerate vector files from dcrd's own code (ADR-0001's
   addenda from 2026-10-02 on), and dcrd itself, which the interop job
-  builds and runs (`.github/workflows/ci.yml:220-274`).
+  builds and runs (`.github/workflows/ci.yml:232-286`).
 - **cargo-fuzz's libFuzzer**, which has no pure-Rust drop-in. `fuzz/` is
   outside the workspace (the root `Cargo.toml:40`) with its own lock, and
   `libfuzzer-sys` 0.4.13 (`fuzz/Cargo.lock:1107-1108`) compiles
@@ -206,7 +206,7 @@ either: the third set answered that the rule already decides it.
 The rule as the second set defines it names C, C++ and assembly. This
 record reads it as not reaching tools in other languages that never ship:
 the Go tools `tools/pinbump` and `tools/dcrdstat`, which CI vets and tests
-beside the oracle (`ci.yml:297-301`), and the Python instruments
+beside the oracle (`ci.yml:309-313`), and the Python instruments
 `tools/dsample/dsample.py` and `tools/powerloss/replay.py`, the second run
 by the two power-cut tests. They are neither exceptions nor breaches. The
 shim beside `replay.py` is C, and the second set settles it (T9, below).
@@ -308,7 +308,7 @@ Two checks, neither written yet (the first set's 1b):
   `multiple-versions = "deny"` and three `[[bans.skip]]` entries
   (`deny.toml:23-52` at `8e6ea23`). It gains a `deny` list refusing the
   crates that compile or link C. cargo-deny 0.20.2, the version read here
-  (CI's action names none, `ci.yml:308`), matches a banned crate by its
+  (CI's action names none, `ci.yml:320`), matches a banned crate by its
   name and a version requirement, with no patterns (`src/lib.rs:482-484`),
   so the `-sys` crates that build C are refused through the means they
   build it with: `cc`; the other native build drivers, `cmake`,

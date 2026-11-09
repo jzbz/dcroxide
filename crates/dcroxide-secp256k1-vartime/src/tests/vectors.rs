@@ -5,8 +5,9 @@
 // 0.14.1, at the lines each constant names; only the notation changes, to
 // big-endian hex.  MIT; see NOTICE.
 //
-//! libsecp256k1's fixed scalar vectors: the inverse cases and the static
-//! multiplication challenges, each value 32 bytes of big-endian hex.
+//! libsecp256k1's fixed vectors: the scalar and field inverse cases, the
+//! static scalar multiplication challenges and the scalars near the GLV
+//! split's bounds, each value 32 bytes of big-endian hex.
 
 /// `scalar_cases` (tests.c:3727-3811): pairs (x, 1/x) mod N, each
 /// `SECP256K1_SCALAR_CONST`'s eight 32-bit words written in order.
@@ -433,4 +434,220 @@ pub(crate) const RES: [[&str; 2]; 33] = [
         "db215c8d831db334c70e43a1587967131e865d8963e60a465c02971b624386f5",
         "db215c8d831db334c70e43a1587967131e865d8963e60a465c02971b624386f5",
     ],
+];
+
+/// `fe_cases` (tests.c:3622-3725, in `run_inverse_tests`): pairs (x,
+/// 1/x) mod p, each `SECP256K1_FE_CONST`'s eight 32-bit words written in
+/// order.
+pub(crate) const FE_CASES: [[&str; 2]; 46] = [
+    [
+        "0000000000000000000000000000000000000000000000000000000000000000",
+        "0000000000000000000000000000000000000000000000000000000000000000",
+    ],
+    [
+        "0000000000000000000000000000000000000000000000000000000000000001",
+        "0000000000000000000000000000000000000000000000000000000000000001",
+    ],
+    [
+        "fffffffffffffffffffffffffffffffffffffffffffffffffffffffefffffc2e",
+        "fffffffffffffffffffffffffffffffffffffffffffffffffffffffefffffc2e",
+    ],
+    [
+        "0000000000000000000000000000000000000000000000000000000000000002",
+        "7fffffffffffffffffffffffffffffffffffffffffffffffffffffff7ffffe18",
+    ],
+    [
+        "0000000000000000000000000000000100000000000000000000000000000000",
+        "bcb223fedc24a059d838091dd2253530ffffffffffffffffffffffff434dd931",
+    ],
+    [
+        "e34e9c956bee8a840dcb632adb8a13206688540806f3f9967c11ca8419199ec3",
+        "bd2cbd8f1c5368289bccda442582ac0c870152b08a3f09fb1aaadf9219b618e5",
+    ],
+    [
+        "f6bc3ba3636451c43e46357d2c21d6190988e234159856616672982ba7549bfc",
+        "b024fdc75547451e426c585fbd48142573df6b75eef6d9d0389d87d4fbb440ba",
+    ],
+    [
+        "b595d81b2e3c1e2f482dbc65e4865af79a0a50aa29f9e6186f87d7a58d1063ae",
+        "c983337c5d5c74e1499183300b53afb5a0428a0bce6eef86059bd8efe5b908de",
+    ],
+    [
+        "0000000000000000e0ff1f801f0000000000000000000000feff010000000000",
+        "9faf931677e5049d0b5e7a1bef70b89318c9e30c045e7fd729eddf8cd62e9e3d",
+    ],
+    [
+        "621a538d511b27803568825253f889a46317c3ac32ba0a466277c0d1ccd31192",
+        "38513b0c5eba856fe29e882e9b394d8c34bda011eaa669436a841a4c6ae8bcff",
+    ],
+    [
+        "00000200f0ffff1f000000000000e0fffffffffffffcffffffffffffffff0100",
+        "5da42a523640de9e13e643430c7591b76c1e3519f048c5b60484217cedbf8b2f",
+    ],
+    [
+        "d1343ef94b9526217c52a2ee4ea1281b4ab464109f26998da686a8ff9f2103e8",
+        "840443859a4619bf74e35b6da47e0c466b7fb47d9ffab128b0775aa3cb318bd1",
+    ],
+    [
+        "b27235d2c56a52be210db37ad50d23a4be621bdd5df22c6ae926ba62d2e4e440",
+        "67a26e54483a9d3ca568469ed258ab3db9ec9981dca9b1bd8d2775fe53ae429b",
+    ],
+    [
+        "000000000000000000e0ffffffffff83ffffffff3f00f00f000000e0ffffffff",
+        "310e10f823bbfab0ac94907d076c9a458d357d7fc763bcee00d0e6155a6acef6",
+    ],
+    [
+        "feff0300001c0000f80700c00ff0ffffffffffff0fffffffffff01007f0000fe",
+        "28e2fdb40709168b86f598b03453a370530cf21f32f978d51d527a7159269b0c",
+    ],
+    [
+        "c2591afa7bb98ef7090bb27385c14f87bb0b28e054d3c45385c66753d5574d2f",
+        "fdca70a270ce627c95e66fae848a6dbb07ffb15c5f63a058ba4140ed6113b503",
+    ],
+    [
+        "f5475db3edc7b5a3411c047eeaeb452fc625828e1cf5ad278eec1060c7d3e690",
+        "5eb756c0f963f4b9dc6a215eec8cc2d82e9dec01de5eb88d6aba7164aecb2c5a",
+    ],
+    [
+        "0000000000f8ffffffffffff01000000e0ff1f0000000000ffffff7f00000000",
+        "e0d2e3d849b6157de54e88c21a7f02ca7dd28167f1125d817bfa444ebe110037",
+    ],
+    [
+        "13cc08a4d8c41f0f179c3e6754c46c67c410922109ab3b13e24d9be1ffffe950",
+        "b80c8006d16abaa7cabd71e5cf6714f4966dd3d064767a2de92c444151008cd1",
+    ],
+    [
+        "aa6db99095efbca13cc6ff710602e24af49ff93899fffc1646f40993c6e72057",
+        "d5d3dd69b0c195e5285f1d49e639e48c9223f8a9ca1d731d9ca482f9a5b93e06",
+    ],
+    [
+        "1c680eacaeabffd89bdc4aee1781e3dea3b081080015f2e094449e1b2f67a058",
+        "7f083f8d31254f296510f475245c373dc56225904b32339332ed1719c127444b",
+    ],
+    [
+        "147d44b3012d83f8c160d3861a44a8709ba6be968b962707267cbc1ab65b2f0a",
+        "555554ff170aef1e50a43002e51fbd36afadb4587a8aded10ca6cd336ed9087c",
+    ],
+    [
+        "1242379622f0fe61f9ca017c5384d107a1fbf3b23b018013916a3c374000b98c",
+        "2025770008668f941177e306136c01f58ed1fbd295ec4589ae38edb9fd19b6d7",
+    ],
+    [
+        "dcf2d0309ab42cb493ffa181dcd2361939699b5208909a20b5a176953a9dcf21",
+        "1f701deae211fb1f4f37180d63a0f51c29fe1e40a40b61422e7b12eb982b06b6",
+    ],
+    [
+        "79a851f6a6314ed3b35a55e6ca1c7d7fe32369eaf902432e375308c5dfd5b600",
+        "caae00c5e6b438519dabb73738cba42ca02c85497895dcbfbd183d71afe4476a",
+    ],
+    [
+        "ede78fddcfc92bf14fec6c6cdb8d37e2fb66bc7b287018707fa27c9a307196ec",
+        "68193a6c9a8b87a72a760c6413e473f623ae7bed1de0542288865427a3418265",
+    ],
+    [
+        "a40b2079b8f88e89a761799789baf5ae174df34375138eae2711595d3fc3e66c",
+        "9f99c6a56d685267d4b87c379d9c4576358c692b6bbae0ed3389c93d7fdd2655",
+    ],
+    [
+        "7c74c6b6e98d915172645cf17f06e321cefee07415b2113a10a9be0708a45696",
+        "8c919a88898bc1e077f26f9712e655b79ba0ac40e15bb19e8364cc3be227a8ee",
+    ],
+    [
+        "109ba1cedafa6d4aa1cec2b2eb1069f4b7a79e5bec6eb99baec5f643ee0e723e",
+        "93d13eb84bb0bcf9e64f5a71dbe9f3597191401c6f057a4aa407fe1b7ecb65cc",
+    ],
+    [
+        "3db076cdec74a5c9f61dd13890e23e06eeedd2d074cbc4e03dbe1e91ded36a78",
+        "3f07f9668e2a1e09706c71df02b5e9d5cb92ddbfcdd5301016545564e660b107",
+    ],
+    [
+        "e31c73edb4c4b82c02ae35f74cdec15398b522fdf7d2460c6bf7c0f84cf67b0d",
+        "4b8f1faf94e8b07019af0ff6a319cd31df0a7ffbefaba62959c506661fe5b843",
+    ],
+    [
+        "4c8b0e6e83392ab6c0e3e9f1bbd8549716698897f552d50d79652ddb12f99870",
+        "56d5101fd23b794917dc38d6f24022efcf18e70a5cc34424438544c362da4bca",
+    ],
+    [
+        "b0e040e240cc35da7dd5c6117fccb17828888137bc930358ea2cbc90775417dc",
+        "ca37f0d4016dd7c8ab3ae57696e08d6968ed9155a9b44270900ae35d7c7800cd",
+    ],
+    [
+        "8a32ea497fbb0bae69724a9d8e2105b2bdf69178862577ef35055590667ddaef",
+        "d02d7eadc5e190f0559c9d72daef1ffc64f9f425f43645ea7341e08d11768e96",
+    ],
+    [
+        "a3592d989abe289d579ebea6bb0857a8e242ab7385f9a2ceb6998f0fbfffbfc6",
+        "093c153332032efa6aa460700039599e589c35f4ff5254307fe3777a44b43ddc",
+    ],
+    [
+        "647178a3229e607bcc98521acce3fdd91e1bc9c997fb7c6a61b961e099b10709",
+        "98217c13d51ddf7896310e77daebd908602ca683cb46d07aa1fcf17ec8e2feb3",
+    ],
+    [
+        "7334627c73f9896899464b4bf59649581b95870dc658227e5e3235d8dcab5787",
+        "000006fdc7e9dd9440ae367ae51d495c07603b9b2d0884186cc5c74c98514307",
+    ],
+    [
+        "82e8387696c28938a50dd1c5605c3ad1c048637d7a50825f335ed01a00005760",
+        "b0393f9f9f2aa55ef5607e2e5287d96160b3e704f3e16e80b4f9a3eafec7f02d",
+    ],
+    [
+        "c97b6cec3ee6b8dc98d24b583c1970a1fe06297aae813529e76bb6bd771ae51d",
+        "0507c702d407d09747ddeb06f662541979f48f797bf80d0bfc34b364253a5db1",
+    ],
+    [
+        "d559af6377ea9bc43cf1ad145c7a4bbb10e7d18b7ce0dfac380bb19d0bb99bd3",
+        "00196119b9b00d9234edfdb5bbdc42fcd2daa33a163356caaa8754c8b0ec8b0b",
+    ],
+    [
+        "8ddfa3dc52918da0640519dc0af8512aca2d33b2bde52514da9c0afccb29fce4",
+        "b3e4878d5cb69148cd54388bc23acce062518ba8f09def927b31e6aa6ba35b02",
+    ],
+    [
+        "f8207492e3049f0a65285f2b0bfff99600ca112ec05da837546d41f95194fb91",
+        "7b7ee50ba8ed4bbdf646993081419a5c071441c7290d046e3b82ea41611c5f95",
+    ],
+    [
+        "050f7c805bcd3c6b823cb7245ce74db7a4e39f5cbd8828d7fd4d3e073ec2926a",
+        "000d6730b01713144764053dee15711748fd61dadea0b9db1d5e91c6bdc3f59e",
+    ],
+    [
+        "3e3ea8eb05d760cf23009263b3cb3ac9088f6f0d3fc182a3bd57087ce67c62f9",
+        "be988716a29c1bf64456aed6ab1e47204992930551043bf4ebd833dddd511e8b",
+    ],
+    [
+        "6964d2a9a7fa6501a5959249142f4029ea0c1b5f2f487ef6301ac80a768be5cd",
+        "3918ffe407492543ed24d0b73df95f8faffd7cb40de2191c9ec2f2ad2c0cb3c6",
+    ],
+    [
+        "37c93520f6ddca572b42fd5eb5c7e4de11b5b81cb95e91f395c4d15639877ccb",
+        "9a94b9b557eb71ee4c975b8bac5262a8077b0595e12a6b1fd728edef1a6bf956",
+    ],
+];
+
+/// `scalars_near_split_bounds` (tests.c:4642-4663): scalars whose GLV
+/// split reaches the largest halves, a*lambda + (N+b)/2 for a in [-2, 2]
+/// and b in {-3, -1, 1, 3}.
+pub(crate) const SCALARS_NEAR_SPLIT_BOUNDS: [&str; 20] = [
+    "d938a5667f479e3eb5b3c7faefdb37493aa0585cc5ea2367e1b660db0209e6fc",
+    "d938a5667f479e3eb5b3c7faefdb37493aa0585cc5ea2367e1b660db0209e6fd",
+    "d938a5667f479e3eb5b3c7faefdb37493aa0585cc5ea2367e1b660db0209e6fe",
+    "d938a5667f479e3eb5b3c7faefdb37493aa0585cc5ea2367e1b660db0209e6ff",
+    "2c9c52b33fa3cf1f5ad9e3fd77ed9ba5b294b8933722e9a500e698ca4cf7632d",
+    "2c9c52b33fa3cf1f5ad9e3fd77ed9ba5b294b8933722e9a500e698ca4cf7632e",
+    "2c9c52b33fa3cf1f5ad9e3fd77ed9ba5b294b8933722e9a500e698ca4cf7632f",
+    "2c9c52b33fa3cf1f5ad9e3fd77ed9ba5b294b8933722e9a500e698ca4cf76330",
+    "7fffffffffffffffffffffffffffffffd576e73557a4501ddfe92f46681b209f",
+    "7fffffffffffffffffffffffffffffffd576e73557a4501ddfe92f46681b20a0",
+    "7fffffffffffffffffffffffffffffffd576e73557a4501ddfe92f46681b20a1",
+    "7fffffffffffffffffffffffffffffffd576e73557a4501ddfe92f46681b20a2",
+    "d363ad4cc05c30e0a5261c0288126459f85915d77825b696beebc5c2833ede11",
+    "d363ad4cc05c30e0a5261c0288126459f85915d77825b696beebc5c2833ede12",
+    "d363ad4cc05c30e0a5261c0288126459f85915d77825b696beebc5c2833ede13",
+    "d363ad4cc05c30e0a5261c0288126459f85915d77825b696beebc5c2833ede14",
+    "26c75a9980b861c14a4c38051024c8b4704d760ee95e7cd3de1bfdb1ce2c5a42",
+    "26c75a9980b861c14a4c38051024c8b4704d760ee95e7cd3de1bfdb1ce2c5a43",
+    "26c75a9980b861c14a4c38051024c8b4704d760ee95e7cd3de1bfdb1ce2c5a44",
+    "26c75a9980b861c14a4c38051024c8b4704d760ee95e7cd3de1bfdb1ce2c5a45",
 ];

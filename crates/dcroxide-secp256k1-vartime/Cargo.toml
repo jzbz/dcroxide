@@ -23,14 +23,16 @@ internals = []
 [dev-dependencies]
 # The references the tests compare against, each of a different origin
 # from the port and all already locked: crypto-bigint's modular
-# arithmetic, k256's scalar and field (RustCrypto), fiat-crypto's
-# machine-checked Dettman multiplication and squaring, the limb-exact
-# oracle for the field kernel, and testutil's SplitMix64 for fixed-seed
-# inputs.
+# arithmetic, k256's scalar, field and point arithmetic (RustCrypto),
+# fiat-crypto's machine-checked Dettman multiplication and squaring, the
+# limb-exact oracle for the field kernel, and testutil's SplitMix64 for
+# fixed-seed inputs.  sha2 hashes libsecp256k1's ecmult known-answer
+# tests' points and makes their scalars.
 crypto-bigint = { version = "0.7", default-features = false }
 dcroxide-testutil = { path = "../dcroxide-testutil" }
 fiat-crypto = { version = "0.3", default-features = false }
 k256 = { version = "0.14", default-features = false, features = ["arithmetic"] }
+sha2 = { version = "0.11", default-features = false }
 
 [lints]
 workspace = true

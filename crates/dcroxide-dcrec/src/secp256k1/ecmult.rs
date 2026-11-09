@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: ISC
-//! The variable-time sum a*G + b*P behind ECDSA verification (step 5),
-//! compact recovery (step 9) and EC-Schnorr-DCRv0 verification (step 7).
+//! The variable-time sum a*G + b*P behind compact recovery (step 9) and
+//! EC-Schnorr-DCRv0 verification (step 7); ECDSA's sum is the vartime crate's.
 //!
 //! dcrd computes each of these sums as `ScalarBaseMultNonConst` plus
-//! `ScalarMultNonConst` plus `AddNonConst` (ecdsa/signature.go:256-258 and
-//! :978-980, schnorr/signature.go:196-198).  The value is one group element,
+//! `ScalarMultNonConst` plus `AddNonConst` (ecdsa/signature.go:978-980,
+//! schnorr/signature.go:196-198).  The value is one group element,
 //! so any correct algorithm gives dcrd's answer.  k256's
 //! `mul_by_generator_and_mul_add_vartime` gives it too, but builds four
 //! 8-entry tables on every call, two of them for G.  This module keeps G's

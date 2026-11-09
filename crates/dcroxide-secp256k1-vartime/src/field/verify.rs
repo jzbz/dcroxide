@@ -5,7 +5,8 @@
 // vendored by secp256k1-sys 0.14.1.  MIT; see NOTICE.
 //
 //! [`Fe`]: a [`FeRaw`] plus libsecp256k1's VERIFY-mode bookkeeping
-//! (field_impl.h:148-168), which exists only under `cfg(debug_assertions)`.
+//! (field_impl.h:148-168), which exists only under `cfg(debug_assertions)`,
+//! and the field operations built from the raw ones (field_impl.h).
 //!
 //! Every operation asserts its precondition (magnitude, normalized), sets
 //! its postcondition, and runs [`Fe::verify`], a port of `fe_verify` and
@@ -17,7 +18,7 @@
 //! the arithmetic in every profile is the arithmetic that ships.  There is
 //! no derived equality or hashing; [`Fe::equal`] compares values.
 
-use super::FeRaw;
+use super::{FeRaw, FeStorage};
 
 /// A field element with debug-build magnitude tracking.
 #[derive(Clone, Copy, Debug)]
@@ -33,6 +34,11 @@ pub struct Fe {
 }
 
 impl Fe {
+    /// 0 (normalized, magnitude 0).
+    pub const ZERO: Self = Self::from_raw_const(FeRaw::from_int(0), 0, true);
+    /// 1 (normalized, magnitude 1).
+    pub const ONE: Self = Self::from_raw_const(FeRaw::from_int(1), 1, true);
+
     /// A value with its claimed magnitude and normalization, which debug
     /// builds check at first use, by any operation's `verify`.
     /// Crate-internal: a public version would let a caller claim
@@ -49,6 +55,14 @@ impl Fe {
             #[cfg(debug_assertions)]
             normalized,
         }
+    }
+
+    /// `SECP256K1_FE_CONST` (field.h:50-66): eight big-endian 32-bit words,
+    /// normalized, magnitude 1.  The words must encode a value below p,
+    /// which is why this is crate-internal.
+    #[must_use]
+    pub(crate) const fn from_be_u32(d: [u32; 8]) -> Self {
+        Self::from_raw_const(FeRaw::from_be_u32(d), 1, true)
     }
 
     /// The bare limbs.
@@ -151,6 +165,32 @@ impl Fe {
         );
     }
 
+    /// `fe_normalize` (field_impl.h:171-179): magnitude 1, normalized, by
+    /// the constant-time shape.  Tests and the table generator only.
+    #[cfg(test)]
+    pub fn normalize(&mut self) {
+        self.verify();
+        self.raw.normalize();
+        #[cfg(debug_assertions)]
+        {
+            self.magnitude = 1;
+            self.normalized = true;
+        }
+        self.verify();
+    }
+
+    /// `fe_normalize_weak` (field_impl.h:182-189): magnitude 1.
+    #[inline]
+    pub fn normalize_weak(&mut self) {
+        self.verify();
+        self.raw.normalize_weak();
+        #[cfg(debug_assertions)]
+        {
+            self.magnitude = 1;
+        }
+        self.verify();
+    }
+
     /// `fe_normalize_var` (field_impl.h:192-200): magnitude 1, normalized.
     #[inline]
     pub fn normalize_var(&mut self) {
@@ -170,6 +210,15 @@ impl Fe {
     pub fn normalizes_to_zero(&self) -> bool {
         self.verify();
         self.raw.normalizes_to_zero()
+    }
+
+    /// `fe_normalizes_to_zero_var` (field_impl.h:210-214): whether the
+    /// value is 0 mod p, returning early on most nonzero values.
+    #[inline]
+    #[must_use]
+    pub fn normalizes_to_zero_var(&self) -> bool {
+        self.verify();
+        self.raw.normalizes_to_zero_var()
     }
 
     /// `fe_add_int` (field_impl.h:228-237): 0 <= a <= 0x7FFF; the magnitude
@@ -291,6 +340,105 @@ impl Fe {
         let r = Self::from_raw_const(self.raw.sqr(), 1, false);
         r.verify();
         r
+    }
+
+    /// `fe_mul_int` (field.h:233, field_impl.h:310-320): a times the
+    /// magnitude must be at most 32; the magnitude is multiplied by a.
+    #[inline(always)]
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "bookkeeping: a times the magnitude is asserted <= 32 before \
+                  it is formed"
+    )]
+    pub fn mul_int(&mut self, a: u8) {
+        self.verify();
+        #[cfg(debug_assertions)]
+        assert!(
+            u32::from(a) * u32::from(self.magnitude) <= 32,
+            "fe_mul_int: {a} times magnitude {}",
+            self.magnitude
+        );
+        self.raw.mul_int_unchecked(u32::from(a));
+        #[cfg(debug_assertions)]
+        {
+            self.magnitude *= a;
+            self.normalized = false;
+        }
+        self.verify();
+    }
+
+    /// `self + a`, as [`Fe::add_assign`].
+    #[inline(always)]
+    #[must_use]
+    pub fn add(&self, a: &Self) -> Self {
+        let mut r = *self;
+        r.add_assign(a);
+        r
+    }
+
+    /// `fe_half` (field_impl.h:444-453): a/2; magnitude m <= 31 becomes
+    /// floor(m/2) + 1.
+    #[inline(always)]
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "bookkeeping: m <= 31 is asserted, so (m >> 1) + 1 <= 16"
+    )]
+    pub fn half(&mut self) {
+        self.verify();
+        self.verify_magnitude(31);
+        self.raw.half();
+        #[cfg(debug_assertions)]
+        {
+            self.magnitude = (self.magnitude >> 1) + 1;
+            self.normalized = false;
+        }
+        self.verify();
+    }
+
+    /// `fe_to_storage` (field_impl.h:377-382); requires normalized.  Tests
+    /// and the table generator only.
+    #[cfg(test)]
+    #[inline]
+    #[must_use]
+    pub fn to_storage(self) -> FeStorage {
+        self.verify();
+        self.verify_normalized();
+        self.raw.to_storage()
+    }
+
+    /// `fe_from_storage` (field_impl.h:385-391): normalized, magnitude 1.
+    #[inline(always)]
+    #[must_use]
+    pub fn from_storage(a: &FeStorage) -> Self {
+        let r = Self::from_raw_const(FeRaw::from_storage(a), 1, true);
+        r.verify();
+        r
+    }
+
+    /// `fe_inv_var` (field_impl.h:407-417, field_5x52_impl.h:463-471):
+    /// 1/self, and 0 for 0; normalized, magnitude 1 (0 for a zero-magnitude
+    /// input).  `None` only past modinv64's iteration cap, which the
+    /// safegcd bound rules out.  Tests and the table generator only, until
+    /// the affine conversion calls it.
+    #[cfg(test)]
+    #[inline]
+    #[must_use]
+    pub fn inv_var(&self) -> Option<Self> {
+        #[cfg(debug_assertions)]
+        let input_is_zero = self.normalizes_to_zero();
+        self.verify();
+        let mut tmp = self.raw;
+        tmp.normalize_var();
+        let s = crate::modinv64::modinv64_var(&tmp.to_signed62(), &super::MODINFO_FE)?;
+        #[cfg(debug_assertions)]
+        let m = u8::from(self.magnitude > 0);
+        #[cfg(not(debug_assertions))]
+        let m = 1;
+        let r = Self::from_raw_const(FeRaw::from_signed62(&s), m, true);
+        #[cfg(debug_assertions)]
+        assert_eq!(r.normalizes_to_zero(), input_is_zero);
+        r.verify();
+        Some(r)
     }
 
     /// `fe_equal` (field_impl.h:25-35): magnitude(self) <= 1,

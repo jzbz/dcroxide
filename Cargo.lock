@@ -755,6 +755,7 @@ dependencies = [
  "dcroxide-testutil",
  "fiat-crypto",
  "k256",
+ "sha2",
 ]
 
 [[package]]

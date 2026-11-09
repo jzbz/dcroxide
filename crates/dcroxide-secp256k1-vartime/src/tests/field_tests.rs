@@ -1,19 +1,22 @@
 // SPDX-License-Identifier: ISC AND MIT
 //
-// `libsecp_sqrt`, `libsecp_be32_overflow`, `libsecp_equal_magnitude_bounds`
-// and `libsecp_convert_bytes` follow libsecp256k1 src/tests.c (Copyright (c)
-// 2013, 2014, 2015 Pieter Wuille, Gregory Maxwell), as vendored by
-// secp256k1-sys 0.14.1.  MIT; see NOTICE.
+// `libsecp_sqrt`, `libsecp_be32_overflow`, `libsecp_equal_magnitude_bounds`,
+// `libsecp_convert_bytes`, `libsecp_inverse_identity` and the inverse edge
+// cases follow libsecp256k1 src/tests.c (Copyright (c) 2013, 2014, 2015
+// Pieter Wuille, Gregory Maxwell), as vendored by secp256k1-sys 0.14.1.
+// MIT; see NOTICE.
 //
 //! Field tests: every operation the field has today against the
 //! schoolbook reference, crypto-bigint and k256, at every magnitude its
 //! contract allows; `mul` and `sqr` limb for limb against fiat-crypto,
 //! with the corner products; the boundary lattice through the
-//! normalization, the zero test, negation, equality and the bytes; the
-//! byte limits; the square root; libsecp256k1's own field tests where they
-//! cover these operations; that `fe_verify` refuses limbs beyond their
-//! claim; and a digest of fixed-seed results that every build profile
-//! must reproduce.  Debug builds run every operation's magnitude
+//! normalizations, both zero tests, negation, halving, equality and the
+//! bytes; the byte limits and the storage form; the square root; the
+//! inverse against both references, with libsecp256k1's identity and
+//! fixed cases; libsecp256k1's own field tests where they cover these
+//! operations; that `fe_verify` and the preconditions refuse limbs beyond
+//! their claim; and a digest of fixed-seed results that every build
+//! profile must reproduce.  Debug builds run every operation's magnitude
 //! bookkeeping and `fe_verify` throughout.
 
 use dcroxide_testutil::SplitMix64;
@@ -22,7 +25,8 @@ use fiat_crypto::secp256k1_dettman_64::{
 };
 
 use super::*;
-use crate::field::{Fe, FeRaw};
+use crate::field::{Fe, FeRaw, FeStorage};
+use crate::modinv64::modinv64_var_counted;
 
 const M52: u64 = 0xF_FFFF_FFFF_FFFF;
 const M48: u64 = 0xFFFF_FFFF_FFFF;
@@ -197,6 +201,40 @@ fn small_ops_vs_reference() {
             let kt = kfe(&before) + KFe::from(u64::from(c));
             assert_eq!(fe_val(&t), kfe_w(&kt.normalize()), "add_int vs k256");
         }
+
+        // half: a/2, magnitude floor(m/2) + 1.
+        let mh = 1 + r.below(31) as u8;
+        let a = rand_fe(&mut r, mh, k % 8 == 3);
+        let mut h = a;
+        h.half();
+        assert_eq!(
+            add_p(&fe_val(&h), &fe_val(&h)),
+            fe_val(&a),
+            "half at magnitude {mh}"
+        );
+        #[cfg(debug_assertions)]
+        assert_eq!(h.magnitude(), (mh >> 1) + 1);
+
+        // mul_int: a*c with c*m <= 32.
+        let mm = 1 + r.below(16) as u8;
+        let c = 1 + r.below(u64::from(32 / mm)) as u8;
+        let a = rand_fe(&mut r, mm, k % 8 == 4);
+        let mut t = a;
+        t.mul_int(c);
+        assert_eq!(fe_val(&t), mul_p(&fe_val(&a), &[u64::from(c), 0, 0, 0]));
+        #[cfg(debug_assertions)]
+        assert_eq!(t.magnitude(), mm * c);
+
+        // normalize_weak and both zero tests.
+        let mw = 1 + r.below(32) as u8;
+        let a = rand_fe(&mut r, mw, k % 8 == 5);
+        let mut w = a;
+        w.normalize_weak();
+        assert_eq!(fe_val(&w), fe_val(&a));
+        assert!(w.raw().n[4] >> 49 == 0);
+        #[cfg(debug_assertions)]
+        assert_eq!(w.magnitude(), 1);
+        assert_eq!(a.normalizes_to_zero_var(), a.normalizes_to_zero());
     }
 }
 
@@ -239,6 +277,22 @@ fn boundary_lattice() {
             assert_eq!(t.raw().n, canon, "normalize_var {n:x?} m={m}");
             let z = v == [0; 4];
             assert_eq!(a.normalizes_to_zero(), z, "normalizes_to_zero {n:x?} m={m}");
+            assert_eq!(
+                a.normalizes_to_zero_var(),
+                z,
+                "normalizes_to_zero_var {n:x?} m={m}"
+            );
+            let mut ct = a;
+            ct.normalize();
+            assert_eq!(ct.raw().n, canon, "normalize {n:x?} m={m}");
+            let mut w = a;
+            w.normalize_weak();
+            assert_eq!(fe_val(&w), v, "normalize_weak {n:x?} m={m}");
+            if m <= 31 {
+                let mut h = a;
+                h.half();
+                assert_eq!(add_p(&fe_val(&h), &fe_val(&h)), v, "half {n:x?} m={m}");
+            }
             if m <= 31 {
                 assert_eq!(fe_val(&a.negate(m)), neg_p(&v), "negate {n:x?} m={m}");
             }
@@ -367,8 +421,20 @@ fn bytes_and_limits() {
             let m = 2 + r.below(31) as u8;
             let y = inflate(&x, m);
             assert_eq!(norm(&y).get_b32(), b);
+            // The storage form holds the value's words, and comes back.
+            let st = x.to_storage();
+            assert_eq!(st.n, w);
+            let back = Fe::from_storage(&st);
+            assert_eq!(back.raw().n, x.raw().n);
+            #[cfg(debug_assertions)]
+            assert!(back.is_normalized_claim());
         }
     }
+    // p - 1 in storage form.
+    let pm1 = sub4(&P, &[1, 0, 0, 0]);
+    let st = FeStorage { n: pm1 };
+    assert_eq!(fe_val(&Fe::from_storage(&st)), pm1);
+    assert_eq!(Fe::from_storage(&st).to_storage(), st);
 }
 
 /// `sqrt` against k256's and the reference: random values at magnitudes
@@ -560,6 +626,143 @@ fn fe_verify_refuses_a_normalized_claim_at_p() {
     let _ = Fe::from_limbs(words_to_limbs(&P), 1, true);
 }
 
+/// modinv64's outer iterations for a's inverse.
+fn fe_inv_iters(a: &Fe) -> u32 {
+    let t = norm(a);
+    modinv64_var_counted(&t.raw().to_signed62(), &crate::field::MODINFO_FE)
+        .expect("within the cap")
+        .1
+}
+
+/// libsecp256k1's `test_inverse_field` (tests.c:3594-3618): x * (1/x) =
+/// 1, and 1/(1/x - 1) + 1 = -1/(x - 1); 1/0 = 0.
+fn libsecp_inverse_identity(x: &Fe) -> Fe {
+    let minus_one = Fe::from_be_u32([
+        0xFFFF_FFFF,
+        0xFFFF_FFFF,
+        0xFFFF_FFFF,
+        0xFFFF_FFFF,
+        0xFFFF_FFFF,
+        0xFFFF_FFFF,
+        0xFFFF_FFFE,
+        0xFFFF_FC2E,
+    ]);
+    let l = x.inv_var().expect("cap");
+    if x.normalizes_to_zero_var() {
+        assert!(l.normalizes_to_zero());
+        return l;
+    }
+    let mut t = x.mul(&l);
+    t.add_assign(&minus_one);
+    assert!(t.normalizes_to_zero(), "x*(1/x) != 1");
+    let mut r = *x;
+    r.add_assign(&minus_one);
+    if r.normalizes_to_zero_var() {
+        return l;
+    }
+    let r = r.inv_var().expect("cap");
+    let mut l2 = l;
+    l2.add_assign(&minus_one);
+    let mut l2 = l2.inv_var().expect("cap");
+    l2.add_int(1);
+    l2.add_assign(&r);
+    assert!(l2.normalizes_to_zero_var(), "1/(1/x-1)+1 != -1/(x-1)");
+    l
+}
+
+/// A field element from 32 bytes mod p (`fe_set_b32_mod`), magnitude 1.
+fn fe_mod(b: &[u8; 32]) -> Fe {
+    Fe::from_limbs(FeRaw::set_b32_mod(b).n, 1, false)
+}
+
+/// The inverse, compiled for the tests and the table generator: against
+/// the reference, crypto-bigint and k256 on canonical values and on
+/// values at every magnitude; libsecp256k1's identity on 0, p (a zero not
+/// in canonical form), 1, p - 1, every 2^k and 2^k - 1, values with long
+/// runs of trailing zeros, 0..999 and their negations (tests.c:3834-3849),
+/// and its 46 fixed pairs both ways; never more than the 12 outer
+/// iterations the safegcd bound allows.
+#[test]
+fn inverse_vs_references_and_edges() {
+    let p = cb_p();
+    let mut r = SplitMix64(0x0f1e_1d00_0006);
+    let mut max_iters = 0u32;
+    for k in 0..tenth() {
+        let a = if k % 2 == 0 {
+            fe_w(&words_below_p(&mut r))
+        } else {
+            let m = 1 + r.below(32) as u8;
+            rand_fe(&mut r, m, k % 8 == 1)
+        };
+        let va = fe_val(&a);
+        let inv = a.inv_var().expect("within the cap");
+        #[cfg(debug_assertions)]
+        assert!(inv.is_normalized_claim());
+        let vi = fe_val(&inv);
+        assert_eq!(inv.raw().n, words_to_limbs(&vi), "inverse not normalized");
+        if va == [0; 4] {
+            assert_eq!(vi, [0; 4]);
+            continue;
+        }
+        assert_eq!(mul_p(&va, &vi), [1, 0, 0, 0], "a * inv(a) != 1");
+        if k % 4 == 0 {
+            assert_eq!(
+                cbw(&Option::<U256>::from(cb(&va).invert_mod(&p)).expect("invertible")),
+                vi
+            );
+            assert_eq!(
+                kfe_w(&Option::<KFe>::from(kfe(&va).invert()).expect("invertible")),
+                vi
+            );
+        }
+        if k % 16 == 0 {
+            max_iters = max_iters.max(fe_inv_iters(&a));
+        }
+    }
+    let mut edges: Vec<Fe> = vec![
+        Fe::ZERO,
+        Fe::from_limbs(words_to_limbs(&P), 1, false),
+        Fe::ONE,
+        fe_w(&sub4(&P, &[1, 0, 0, 0])),
+    ];
+    for b in 0..256 {
+        let mut w = [0u64; 4];
+        w[b / 64] = 1u64 << (b % 64);
+        edges.push(fe_mod(&words_to_be(&w)));
+        edges.push(fe_mod(&words_to_be(&sub4(&w, &[1, 0, 0, 0]))));
+        let mut t = words(&mut r);
+        for i in 0..b {
+            t[i / 64] &= !(1u64 << (i % 64));
+        }
+        edges.push(fe_mod(&words_to_be(&t)));
+    }
+    for i in 0..1000u16 {
+        let x = fe_int(i);
+        edges.push(x);
+        edges.push(x.negate(1));
+    }
+    for e in &edges {
+        libsecp_inverse_identity(e);
+        max_iters = max_iters.max(fe_inv_iters(e));
+    }
+    for [x, y] in super::vectors::FE_CASES {
+        let (x, y) = (fe_mod(&hex32(x)), fe_mod(&hex32(y)));
+        assert!(
+            libsecp_inverse_identity(&x).equal(&y),
+            "fe_cases: inv(x) != y"
+        );
+        assert!(
+            libsecp_inverse_identity(&y).equal(&x),
+            "fe_cases: inv(y) != x"
+        );
+        max_iters = max_iters.max(fe_inv_iters(&x)).max(fe_inv_iters(&y));
+    }
+    assert!(
+        max_iters <= 12,
+        "more than 12 outer iterations: {max_iters}"
+    );
+}
+
 /// `mul` refuses an operand above magnitude 8 in builds with debug
 /// assertions (its precondition, field_impl.h:340-341).
 #[cfg(debug_assertions)]
@@ -572,8 +775,9 @@ fn mul_refuses_magnitude_above_8() {
 
 /// Each debug precondition of the field refuses a magnitude one above its
 /// bound, operand by operand (field_impl.h's VERIFY checks of `fe_mul`,
-/// `fe_sqr`, `fe_sqrt` and `fe_equal`), and `mul` and `sqr` claim
-/// magnitude 1 for what they return.
+/// `fe_sqr`, `fe_sqrt`, `fe_equal`, `fe_half` and `fe_mul_int`), `mul`
+/// and `sqr` claim magnitude 1 for what they return, and `half` and
+/// `mul_int` drop the normalized claim.
 #[cfg(debug_assertions)]
 mod preconditions {
     use super::*;
@@ -616,6 +820,40 @@ mod preconditions {
     #[should_panic(expected = "magnitude 31 > 30")]
     fn equal_right_at_31() {
         let _ = fe_int(3).equal(&inflate(&fe_int(3), 31));
+    }
+
+    #[test]
+    #[should_panic(expected = "magnitude 32 > 31")]
+    fn half_at_32() {
+        let mut a = inflate(&fe_int(3), 32);
+        a.half();
+    }
+
+    #[test]
+    #[should_panic(expected = "fe_mul_int: 9 times magnitude 4")]
+    fn mul_int_past_32() {
+        let mut a = inflate(&fe_int(3), 4);
+        a.mul_int(9);
+    }
+
+    #[test]
+    #[should_panic(expected = "fe_mul_int: 11 times magnitude 3")]
+    fn mul_int_at_33() {
+        let mut a = inflate(&fe_int(3), 3);
+        a.mul_int(11);
+    }
+
+    #[test]
+    fn half_and_mul_int_drop_the_normalized_claim() {
+        let mut a = fe_int(3);
+        assert!(a.is_normalized_claim());
+        a.half();
+        assert!(!a.is_normalized_claim());
+        assert_eq!(a.magnitude(), 1);
+        let mut b = fe_int(3);
+        b.mul_int(2);
+        assert!(!b.is_normalized_claim());
+        assert_eq!(b.magnitude(), 2);
     }
 
     #[test]

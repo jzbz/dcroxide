@@ -298,7 +298,7 @@ was not taken: the line of it built on the RustCrypto generation in the
 lock was a prerelease when the research read it, its stable 0.9 line is
 built on the generation before (`digest` 0.10,
 `rsa-0.9.10/Cargo.toml:108-109`, where the lock has 0.11.3,
-`Cargo.lock:887-888`), and it carries RUSTSEC-2023-0071, the
+`Cargo.lock:888-889`), and it carries RUSTSEC-2023-0071, the
 timing advisory `gencerts` already cites (`gentool.rs:12-15`). That
 advisory concerns private-key operations, which verification does not
 run; this is the research's reading, and the advisory was not re-read for
@@ -368,7 +368,7 @@ and ends the reliance on ureq's unstable provider API.
   under rustls can offer them. Every client the Decred tools ship offers
   an AES-GCM suite (`PARITY.md:3012-3013`).
 - **rustls 0.24 is unreleased.** The provider is written against 0.23,
-  the line the node is on (0.23.46, `Cargo.lock:1562-1563`), and is ported
+  the line the node is on (0.23.46, `Cargo.lock:1563-1564`), and is ported
   to 0.24 when that is stable. The research read 0.24.0-dev.2 as
   reshaping `CryptoProvider`, separate TLS 1.2 and TLS 1.3 suite lists
   among the changes, and estimated a modest port; it also found that

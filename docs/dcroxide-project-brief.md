@@ -772,7 +772,7 @@ Not needed by the daemon (avoid scope creep): CBOR/airgap bits of dcr-rs, BIP39,
 There is no async runtime: `tokio` is not in the dependency graph and the daemon
 is OS-threaded throughout. There is no HTTP or websocket framework either —
 `hyper` and `tokio-tungstenite` were not adopted, and the RPC listener speaks
-HTTP/1.1 and RFC 6455 directly over `rustls`, on `dcroxide-tlscrypto`, the in-tree provider over RustCrypto's crates that replaced `ring` ([ADR-0015](adr/0015-tls-crypto-provider.md)) and keeps rustls' default `aws-lc-rs` provider out of the build; the signature checks run on `k256` with no C beneath them since `secp256k1-sys` left, and the workspace's `forbid(unsafe_code)` covers its own crates and not their dependencies. The RPC crates
+HTTP/1.1 and RFC 6455 directly over `rustls`, on `dcroxide-tlscrypto`, the in-tree provider over RustCrypto's crates that replaced `ring` ([ADR-0015](adr/0015-tls-crypto-provider.md)) and keeps rustls' default `aws-lc-rs` provider out of the build; the signature checks run on `k256` and the in-tree `dcroxide-secp256k1-vartime` with no C beneath them since `secp256k1-sys` left, and the workspace's `forbid(unsafe_code)` covers its own crates and not their dependencies. The RPC crates
 declare no serde dependency at all: dcrd's `dcrjson` is reflection-driven, so
 the port carries a runtime Go type model with `encoding/json` reimplemented over
 it, Go float formatting and all (ADR-0007). `certgen` is a direct port of dcrd's

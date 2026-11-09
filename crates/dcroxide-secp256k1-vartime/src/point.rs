@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: ISC
-//! [`Affine`], the crate's curve point at its API edge: always on the
-//! curve, never infinity, both coordinates normalized.  All inputs are
-//! public; everything is variable time.
+//! The crate's points at its API edge: [`Affine`], always on the curve,
+//! never infinity, both coordinates normalized, and [`Point`], an opaque
+//! Jacobian point with an infinity flag, the result of [`ecmult_var`].
+//! All inputs are public; everything is variable time.
 
 use crate::field::Fe;
-use crate::group::Ge;
+use crate::group::{Ge, Gej};
+use crate::scalar::Scalar;
 
 /// A curve point in affine coordinates: on the curve, never infinity, and
 /// both coordinates **normalized** (canonical limbs, value below p).
@@ -87,4 +89,63 @@ impl Affine {
         self.check();
         self.0.y.is_odd()
     }
+}
+
+/// A curve point in Jacobian coordinates with an explicit infinity flag:
+/// what [`ecmult_var`] returns.  Opaque; it answers whether it is infinity
+/// and whether its affine x is a given value, without an inversion.
+#[derive(Clone, Copy, Debug)]
+pub struct Point(Gej);
+
+impl Point {
+    /// Wraps a Jacobian point (tests).
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn from_gej(g: Gej) -> Self {
+        Self(g)
+    }
+
+    /// The inner Jacobian point (tests).
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn as_gej(&self) -> &Gej {
+        &self.0
+    }
+
+    /// Whether this is the point at infinity (the flag).
+    #[inline(always)]
+    #[must_use]
+    pub fn is_infinity(&self) -> bool {
+        self.0.is_infinity()
+    }
+
+    /// Whether the affine x of this point equals x, given big-endian:
+    /// libsecp256k1's `gej_eq_x_var`, X == x * Z^2, with no inversion.
+    /// False at infinity.  x is parsed with the limit check and not
+    /// reduced, so x >= p gives false, and builds with debug assertions
+    /// stop on it, since no caller passes one: ECDSA verification passes r
+    /// below N, and r + N only once r is below P - N.
+    #[inline]
+    #[must_use]
+    pub fn x_equals_var(&self, x_be: &[u8; 32]) -> bool {
+        if self.0.is_infinity() {
+            return false;
+        }
+        let Some(x) = Fe::set_b32_limit(x_be) else {
+            debug_assert!(false, "x_equals_var: x >= p");
+            return false;
+        };
+        self.0.eq_x_var(&x)
+    }
+}
+
+/// ng*G + na*A, by libsecp256k1's Straus loop over the static window-12
+/// tables of G and 2^128*G.  `None` only if the wNAF builder declines a
+/// half of the GLV split, which libsecp256k1's bound proof rules out;
+/// callers fall back, and the tests require `Some`.
+#[inline]
+#[must_use]
+pub fn ecmult_var(a: &Affine, na: &Scalar, ng: &Scalar) -> Option<Point> {
+    a.check();
+    crate::ecmult::ecmult_var(&a.0, na, ng).map(Point)
 }

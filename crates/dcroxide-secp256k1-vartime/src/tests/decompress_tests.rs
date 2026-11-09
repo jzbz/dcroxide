@@ -22,7 +22,7 @@ fn dcrd_hex(h: &str) -> [u8; 32] {
 }
 
 /// a + d (d small), wrapping past 2^256 as the caller allows.
-fn add_small(a: &[u64; 4], d: u64) -> [u64; 4] {
+pub(crate) fn add_small(a: &[u64; 4], d: u64) -> [u64; 4] {
     let mut r = *a;
     let (s, mut carry) = r[0].overflowing_add(d);
     r[0] = s;
@@ -64,7 +64,7 @@ fn fe_pow(a: &Fe, e: &[u64; 4]) -> Fe {
 /// the other two are it times beta and beta^2, beta a cube root of unity.
 /// Each x is checked by the reference (x^3 + 7 = y^2), independently of
 /// the exponentiation that found it.
-fn tiny_y_points(lim: u64) -> Vec<([u8; 32], u64)> {
+pub(crate) fn tiny_y_points(lim: u64) -> Vec<([u8; 32], u64)> {
     // beta, written out here and checked by the reference.
     const BETA: [u64; 4] = [
         0xc139_6c28_7195_01ee,

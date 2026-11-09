@@ -475,3 +475,127 @@ fn scalar_digest_is_pinned() {
     }
     assert_eq!(h, 0x9ed1_f629_6216_674f, "scalar digest {h:#018x}");
 }
+
+/// Bit i of little-endian words, `count` of them from `offset`, by the
+/// reference.
+fn ref_bits(w: &[u64; 4], offset: u32, count: u32) -> u32 {
+    let mut v = 0u32;
+    for i in 0..count {
+        let b = offset + i;
+        v |= (((w[(b / 64) as usize] >> (b % 64)) & 1) as u32) << i;
+    }
+    v
+}
+
+/// `get_bits_var` at every offset and count, `get_bits_limb32` wherever
+/// the bits stay within one 32-bit word, and `split_128`, on 0, N - 1,
+/// 2^128 - 1 and random scalars.
+#[test]
+fn bits_and_split_128() {
+    let mut r = SplitMix64(0x5ca1_0003);
+    for k in 0..64 {
+        let w = match k {
+            0 => [0u64; 4],
+            1 => sub4(&NORD, &[1, 0, 0, 0]),
+            2 => [u64::MAX, u64::MAX, 0, 0],
+            _ => rand_sc(&mut r),
+        };
+        let s = sc(&w);
+        for count in 1..=32u32 {
+            for offset in 0..=(256 - count) {
+                assert_eq!(
+                    s.get_bits_var(offset, count),
+                    ref_bits(&w, offset, count),
+                    "get_bits_var({offset}, {count})"
+                );
+                if (offset + count - 1) >> 5 == offset >> 5 {
+                    assert_eq!(
+                        s.get_bits_limb32(offset, count),
+                        ref_bits(&w, offset, count)
+                    );
+                }
+            }
+        }
+        let (lo, hi) = s.split_128();
+        assert_eq!(scw(&lo), [w[0], w[1], 0, 0]);
+        assert_eq!(scw(&hi), [w[2], w[3], 0, 0]);
+    }
+}
+
+/// `mul_shift_var` against an exact model: floor(a*b / 2^shift) plus the
+/// bit just below the cut, for the split's g1 and g2 at shift 384 and for
+/// random operands at shifts from 260 to 511.
+#[test]
+fn mul_shift_var_exact() {
+    let mut r = SplitMix64(0x5ca1_0004);
+    let g1 = scw(&crate::scalar::G1);
+    let g2 = scw(&crate::scalar::G2);
+    for k in 0..cases() / 10 {
+        let wa = rand_sc(&mut r);
+        let wb = match k % 4 {
+            0 => g1,
+            1 => g2,
+            _ => rand_sc(&mut r),
+        };
+        let shift = if k % 4 < 2 {
+            384
+        } else {
+            [260, 300, 320, 383, 384, 385, 447, 448, 449, 500, 511][(k % 11) as usize]
+        };
+        let l = mulw(&wa, &wb);
+        let mut want = [0u64; 4];
+        for i in 0..256u32 {
+            let b = shift + i;
+            if b < 512 && (l[(b / 64) as usize] >> (b % 64)) & 1 == 1 {
+                want[(i / 64) as usize] |= 1u64 << (i % 64);
+            }
+        }
+        let rb = shift - 1;
+        if (l[(rb / 64) as usize] >> (rb % 64)) & 1 == 1 {
+            // + 1, which cannot carry out: the quotient is below 2^252.
+            let mut c = 1u128;
+            for x in &mut want {
+                let s = u128::from(*x) + c;
+                *x = s as u64;
+                c = s >> 64;
+            }
+        }
+        assert_eq!(
+            scw(&sc(&wa).mul_shift_var(&sc(&wb), shift)),
+            want,
+            "mul_shift_var shift={shift}"
+        );
+    }
+}
+
+/// `mul_shift_var` where rounding carries out of the low limb: k chosen
+/// so that k*g / 2^384 has a low limb of all ones and the bit below the
+/// cut set, for g1 and g2, so the result is the next power of 2^64.
+#[test]
+fn mul_shift_var_carries_out_of_the_low_limb() {
+    for (g, k, want) in [
+        (
+            &crate::scalar::G1,
+            "000000000000000546840c7dd2a0e303927961bea87fcce183beaf72b4ae3968",
+            [0, 1, 0, 0],
+        ),
+        (
+            &crate::scalar::G1,
+            "00000546840c7dd7e76712b38e08e09562b7c65d44e33e5f1a1749975fe79706",
+            [0, (1 << 40) | 1, 0, 0],
+        ),
+        (
+            &crate::scalar::G2,
+            "00000000000000011f1b49aafb8129894a2d03bb2eda7726bed6d405cff7e79d",
+            [0, 1, 0, 0],
+        ),
+        (
+            &crate::scalar::G2,
+            "0000011f1b49aafca044d384b629ba35e538ef66e302c54d0444661d049db05d",
+            [0, (1 << 40) | 1, 0, 0],
+        ),
+    ] {
+        let k = Scalar::from_be_bytes(&hex32(k)).expect("below N");
+        assert_eq!(k.mul_shift_var(g, 384).limbs(), &want, "k {k:?}");
+    }
+}

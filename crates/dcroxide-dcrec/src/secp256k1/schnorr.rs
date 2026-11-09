@@ -149,7 +149,7 @@ impl Signature {
         // Step 7: R = s*G + e*Q.  Every input is public, so like dcrd
         // (`ScalarBaseMultNonConst`, `ScalarMultNonConst`, `AddNonConst`)
         // this runs in variable time: one pass of the crate's interleaved
-        // wNAF loop (`ecmult`), the multiply ECDSA verification uses,
+        // wNAF loop (`ecmult`), the multiply compact recovery uses,
         // instead of two constant-time multiplications and an addition.  A
         // zero s, which parsing allows, contributes nothing.  Signing keeps
         // the constant-time `GENERATOR * k`, since its nonce is secret.

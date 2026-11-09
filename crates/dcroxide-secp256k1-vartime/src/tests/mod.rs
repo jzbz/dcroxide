@@ -8,8 +8,12 @@
 //! - k256's `Scalar`, field element and decompression (RustCrypto),
 //!   through big-endian bytes;
 //! - fiat-crypto's Dettman multiplication and squaring, limb for limb;
-//! - libsecp256k1's own fixed vectors (`vectors.rs`) and tests, and dcrd's
-//!   decompression vectors (`dcrd_vectors.rs`).
+//! - k256's point arithmetic, its combined multiply and its `lincomb`;
+//! - an affine reference over the schoolbook words, and index arithmetic
+//!   on libsecp256k1's small test curves (`points.rs`, `group_tests.rs`);
+//! - libsecp256k1's own fixed vectors (`vectors.rs`), tests and ecmult
+//!   known-answer hashes, and dcrd's decompression and Jacobian vectors
+//!   (`dcrd_vectors.rs`).
 //!
 //! Inputs come from `dcroxide_testutil::SplitMix64` with fixed seeds, so
 //! every run computes the same values and the digest tests can pin them.
@@ -18,9 +22,11 @@
 //! seconds, and 10^6 without, as CI's release run of the crate builds
 //! them; CI's soak-asserts run sets 10^6, so the invariant checks see the
 //! full volume too.  The scalar tests run that many cases per operation;
-//! the field and decompression tests, whose references cost more, a tenth
-//! of it or less, and the field's corner products their full grid once it
-//! reaches 10^6.
+//! the field, decompression, group and multiply tests, whose references
+//! cost more, a tenth of it or less.  At 10^6 the heavy tests run in full
+//! (the field's corner products, the order-199 formulas and Straus loop,
+//! the collision grid at [-3, 3], libsecp256k1's ecmult hashes); below it
+//! they run a subset their docs name.
 
 #![allow(
     clippy::arithmetic_side_effects,
@@ -28,10 +34,17 @@
               bigint helpers whose bounds the tests themselves fix"
 )]
 
+pub(crate) mod branches;
 mod dcrd_vectors;
 mod decompress_tests;
+mod ecmult_tests;
 mod field_tests;
+mod glv_tests;
+mod group_tests;
+mod points;
 mod scalar_tests;
+mod table_gen;
+mod tables;
 mod vectors;
 
 use crypto_bigint::{NonZero, U256, U512};

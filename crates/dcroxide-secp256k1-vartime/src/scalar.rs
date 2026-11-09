@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: ISC AND MIT
 //
 // Derived from libsecp256k1 src/scalar_4x64_impl.h (Copyright (c) 2013,
-// 2014 Pieter Wuille) and src/scalar_impl.h (Copyright (c) 2014 Pieter
-// Wuille), as vendored by secp256k1-sys 0.14.1.  MIT; see NOTICE.
+// 2014 Pieter Wuille), src/scalar_4x64.h (Copyright (c) 2014 Pieter
+// Wuille) and src/scalar_impl.h (Copyright (c) 2014 Pieter Wuille), as
+// vendored by secp256k1-sys 0.14.1.  MIT; see NOTICE.
 //
 //! Integers mod the group order N in libsecp256k1's 4x64 representation,
 //! the portable C paths of `scalar_4x64_impl.h` (its x86_64 assembly
@@ -11,11 +12,17 @@
 //! them either).  Public data only: everything here is variable time where
 //! that is convenient.
 //!
-//! What this increment needs is here and nothing more: bytes in and out,
-//! addition, negation, multiplication and the inverse.  The bit access, the
-//! 128-bit split, `mul_shift_var` and the GLV split arrive with the
-//! multiply that calls them.
+//! Beside bytes in and out, addition, negation, multiplication and the
+//! inverse, the multiply's pieces are here: bit access for the wNAF
+//! builder, the split of a scalar at bit 128 (`split_128`, for the
+//! generator's two tables), and the GLV split by the endomorphism
+//! (`split_lambda`, scalar_impl.h:142-180) with its rounded product
+//! `mul_shift_var`.  Builds with debug assertions check every GLV split
+//! against the identity and the bounds that libsecp256k1's proof gives
+//! (`split_lambda_verify`, scalar_impl.h:287-317).
 
+#[cfg(any(debug_assertions, test))]
+use core::cmp::Ordering;
 use core::ops::{Add, Mul, Neg};
 
 /// N's limbs, little-endian (`SECP256K1_N_0..3`, scalar_4x64_impl.h:16-19).
@@ -160,6 +167,28 @@ impl Scalar {
     #[cfg(test)]
     pub(crate) const ONE: Self = Self { d: [1, 0, 0, 0] };
 
+    /// `SECP256K1_SCALAR_CONST` (scalar_4x64.h:17): eight big-endian
+    /// 32-bit words.  The value must be below N, which is why this is
+    /// crate-internal.
+    #[must_use]
+    pub(crate) const fn from_be_u32(w: [u32; 8]) -> Self {
+        Self {
+            d: [
+                join32(w[6], w[7]),
+                join32(w[4], w[5]),
+                join32(w[2], w[3]),
+                join32(w[0], w[1]),
+            ],
+        }
+    }
+
+    /// The limbs, little-endian.
+    #[inline(always)]
+    #[must_use]
+    pub(crate) const fn limbs(&self) -> &[u64; 4] {
+        &self.d
+    }
+
     /// `SECP256K1_SCALAR_VERIFY` (`scalar_verify`, scalar_impl.h:42-46):
     /// the value is below N.  Debug builds only; it reads and never writes.
     #[inline(always)]
@@ -172,6 +201,50 @@ impl Scalar {
     pub(crate) const fn from_u32(v: u32) -> Self {
         Self {
             d: [v as u64, 0, 0, 0],
+        }
+    }
+
+    /// `scalar_get_bits_limb32` (scalar_4x64_impl.h:41-48): `count` bits
+    /// at `offset`, within one 32-bit-aligned word.
+    #[inline(always)]
+    #[must_use]
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "count in 1..=32 and offset <= 256 - count (asserted in \
+                  debug), so the shifts are below 64 and the index below 4"
+    )]
+    pub(crate) fn get_bits_limb32(&self, offset: u32, count: u32) -> u32 {
+        self.verify();
+        debug_assert!(count > 0 && count <= 32);
+        debug_assert!(offset <= 256 - count);
+        debug_assert!((offset + count - 1) >> 5 == offset >> 5);
+        ((self.d[(offset >> 6) as usize] >> (offset & 0x3F)) as u32) & (0xFFFF_FFFF >> (32 - count))
+    }
+
+    /// `scalar_get_bits_var` (scalar_4x64_impl.h:50-62): `count` bits at
+    /// `offset`, possibly across a limb boundary.
+    #[inline(always)]
+    #[must_use]
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "count in 1..=32 and offset <= 256 - count (asserted in \
+                  debug): the shifts are below 64, and the second limb is \
+                  read only when the bits cross into it, so its index is \
+                  below 4"
+    )]
+    pub(crate) fn get_bits_var(&self, offset: u32, count: u32) -> u32 {
+        self.verify();
+        debug_assert!(count > 0 && count <= 32);
+        debug_assert!(offset <= 256 - count);
+        let lo = (offset >> 6) as usize;
+        let sh = offset & 0x3F;
+        if (offset + count - 1) >> 6 == offset >> 6 {
+            ((self.d[lo] >> sh) as u32) & (0xFFFF_FFFF >> (32 - count))
+        } else {
+            debug_assert!(lo + 1 < 4);
+            debug_assert!(sh > 0);
+            (((self.d[lo] >> sh) | (self.d[lo + 1] << (64 - sh))) as u32)
+                & (0xFFFF_FFFF >> (32 - count))
         }
     }
 
@@ -252,7 +325,7 @@ impl Scalar {
                   terms and a carry below 2^64, so it stays below 2^66; \
                   N[0] + 1 is a constant that does not wrap"
     )]
-    fn negate(&self) -> Self {
+    pub(crate) fn negate(&self) -> Self {
         let a = &self.d;
         let nonzero = if self.is_zero() { 0 } else { u64::MAX };
         self.verify();
@@ -315,6 +388,129 @@ impl Scalar {
         let r = Self { d: reduce_512(&l) };
         r.verify();
         r
+    }
+
+    /// `scalar_cadd_bit` (scalar_4x64_impl.h:122-145), branching on the
+    /// flag where the C masks: adds 2^bit when `flag`.  The sum must stay
+    /// below 2^256 (and below N, as `verify` checks), which
+    /// `mul_shift_var`, the one caller, guarantees.
+    #[inline(always)]
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "bit < 256 (asserted in debug), so the shift is below 64 \
+                  and the index below 4; the u128 carry chain adds two u64 \
+                  terms and a carry per limb, below 2^65"
+    )]
+    fn cadd_bit(&mut self, bit: u32, flag: bool) {
+        self.verify();
+        debug_assert!(bit < 256);
+        if !flag {
+            return;
+        }
+        let limb = (bit >> 6) as usize;
+        let add = 1u64 << (bit & 0x3F);
+        let mut t: u128 = 0;
+        for (i, d) in self.d.iter_mut().enumerate() {
+            t += u128::from(*d) + if i == limb { u128::from(add) } else { 0 };
+            *d = t as u64;
+            t >>= 64;
+        }
+        debug_assert!(t == 0);
+        self.verify();
+    }
+
+    /// `scalar_split_128` (scalar_4x64_impl.h:870-884): the low and high
+    /// 128-bit halves, so that self = lo + 2^128 * hi.
+    #[inline(always)]
+    #[must_use]
+    pub(crate) fn split_128(&self) -> (Self, Self) {
+        self.verify();
+        (
+            Self {
+                d: [self.d[0], self.d[1], 0, 0],
+            },
+            Self {
+                d: [self.d[2], self.d[3], 0, 0],
+            },
+        )
+    }
+
+    /// `scalar_mul_shift_var` (scalar_4x64_impl.h:893-913): round(self * b
+    /// / 2^shift) for shift >= 256, rounding half up by adding the bit just
+    /// below the cut.
+    #[inline]
+    #[must_use]
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "256 <= shift < 512 for every caller (asserted >= 256 in \
+                  debug): the limb indices shiftlimbs + 3 and (shift - 1) \
+                  >> 6 are below 8 wherever the guards read them, and the \
+                  shifts are below 64"
+    )]
+    pub(crate) fn mul_shift_var(&self, b: &Self, shift: u32) -> Self {
+        self.verify();
+        b.verify();
+        debug_assert!(shift >= 256);
+        let l = mul_512(&self.d, &b.d);
+        let shiftlimbs = (shift >> 6) as usize;
+        let shiftlow = shift & 0x3F;
+        let shifthigh = 64 - shiftlow;
+        let hi = |i: usize| if shiftlow != 0 { l[i] << shifthigh } else { 0 };
+        let mut r = Self { d: [0; 4] };
+        r.d[0] = if shift < 512 {
+            (l[shiftlimbs] >> shiftlow) | if shift < 448 { hi(1 + shiftlimbs) } else { 0 }
+        } else {
+            0
+        };
+        r.d[1] = if shift < 448 {
+            (l[1 + shiftlimbs] >> shiftlow) | if shift < 384 { hi(2 + shiftlimbs) } else { 0 }
+        } else {
+            0
+        };
+        r.d[2] = if shift < 384 {
+            (l[2 + shiftlimbs] >> shiftlow) | if shift < 320 { hi(3 + shiftlimbs) } else { 0 }
+        } else {
+            0
+        };
+        r.d[3] = if shift < 320 {
+            l[3 + shiftlimbs] >> shiftlow
+        } else {
+            0
+        };
+        r.cadd_bit(
+            0,
+            (l[((shift - 1) >> 6) as usize] >> ((shift - 1) & 0x3f)) & 1 == 1,
+        );
+        r.verify();
+        r
+    }
+
+    /// `scalar_split_lambda` (scalar_impl.h:142-180): (r1, r2) with r1 +
+    /// lambda * r2 = self mod N, each of r1 and r2 either below 2^128 or
+    /// with its negation below 2^128 (the proof at :182-286).  Builds with
+    /// debug assertions check both properties on every call.
+    #[inline]
+    #[must_use]
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "Scalar's operators are arithmetic mod N, as the C's \
+                  scalar_mul, scalar_add and scalar_negate"
+    )]
+    pub(crate) fn split_lambda(&self) -> (Self, Self) {
+        let k = self;
+        k.verify();
+        // these _var calls are constant time since the shift amount is constant
+        let c1 = k.mul_shift_var(&G1, 384);
+        let c2 = k.mul_shift_var(&G2, 384);
+        let c1 = c1 * MINUS_B1;
+        let c2 = c2 * MINUS_B2;
+        let r2 = c1 + c2;
+        let r1 = -(r2 * LAMBDA) + *k;
+        r1.verify();
+        r2.verify();
+        #[cfg(debug_assertions)]
+        split_lambda_verify(&r1, &r2, k);
+        (r1, r2)
     }
 
     /// `scalar_to_signed62` (:952-962).
@@ -442,6 +638,115 @@ pub(crate) const MODINFO_SCALAR: crate::modinv64::ModInfo = crate::modinv64::Mod
     },
     modulus_inv62: 0x34F2_0099_AA77_4EC1,
 };
+
+/// lambda, a primitive cube root of unity mod N, the scalar of the
+/// endomorphism (x, y) -> (beta*x, y) (scalar_impl.h:83-86).
+pub(crate) const LAMBDA: Scalar = Scalar::from_be_u32([
+    0x5363_AD4C,
+    0xC05C_30E0,
+    0xA526_1C02,
+    0x8812_645A,
+    0x122E_22EA,
+    0x2081_6678,
+    0xDF02_967C,
+    0x1B23_BD72,
+]);
+/// -b1 of the lattice basis (scalar_impl.h:144-147).
+pub(crate) const MINUS_B1: Scalar = Scalar::from_be_u32([
+    0,
+    0,
+    0,
+    0,
+    0xE443_7ED6,
+    0x010E_8828,
+    0x6F54_7FA9,
+    0x0ABF_E4C3,
+]);
+/// -b2 of the lattice basis (scalar_impl.h:148-151).
+pub(crate) const MINUS_B2: Scalar = Scalar::from_be_u32([
+    0xFFFF_FFFF,
+    0xFFFF_FFFF,
+    0xFFFF_FFFF,
+    0xFFFF_FFFE,
+    0x8A28_0AC5,
+    0x0774_346D,
+    0xD765_CDA8,
+    0x3DB1_562C,
+]);
+/// g1 = round(2^384 * b2 / N) (scalar_impl.h:152-155).
+pub(crate) const G1: Scalar = Scalar::from_be_u32([
+    0x3086_D221,
+    0xA7D4_6BCD,
+    0xE86C_90E4,
+    0x9284_EB15,
+    0x3DAA_8A14,
+    0x71E8_CA7F,
+    0xE893_209A,
+    0x45DB_B031,
+]);
+/// g2 = round(2^384 * (-b1) / N) (scalar_impl.h:156-159).
+pub(crate) const G2: Scalar = Scalar::from_be_u32([
+    0xE443_7ED6,
+    0x010E_8828,
+    0x6F54_7FA9,
+    0x0ABF_E4C4,
+    0x2212_08AC,
+    0x9DF5_06C6,
+    0x1571_B4AE,
+    0x8AC4_7F71,
+]);
+
+/// (a1 + a2 + 1)/2, the bound on |r1| (scalar_impl.h:292-296),
+/// little-endian.
+#[cfg(any(debug_assertions, test))]
+pub(crate) const K1_BOUND: [u64; 4] = [0x2016_D0B9_17E4_DD77, 0xA2A8_918C_A85B_AFE2, 0, 0];
+/// (-b1 + b2)/2 + 1, the bound on |r2| (scalar_impl.h:298-302),
+/// little-endian.
+#[cfg(any(debug_assertions, test))]
+pub(crate) const K2_BOUND: [u64; 4] = [0x2BE0_8846_CEA2_67ED, 0x8A65_287B_D471_79FB, 0, 0];
+
+/// `scalar_split_lambda_verify` (scalar_impl.h:287-317): r1 + lambda * r2
+/// = k, and each of r1 and r2, or its negation, is below its bound.
+/// Builds with debug assertions and tests only; it reads and asserts.
+#[cfg(any(debug_assertions, test))]
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "Scalar's operators are arithmetic mod N"
+)]
+pub(crate) fn split_lambda_verify(r1: &Scalar, r2: &Scalar, k: &Scalar) {
+    let s = LAMBDA * *r2 + *r1;
+    assert!(s == *k, "split_lambda: r1 + lambda*r2 != k");
+    let n1 = r1.negate();
+    assert!(
+        cmp_limbs(&r1.d, &K1_BOUND) == Ordering::Less
+            || cmp_limbs(&n1.d, &K1_BOUND) == Ordering::Less,
+        "split_lambda: |r1| above (a1 + a2 + 1)/2"
+    );
+    let n2 = r2.negate();
+    assert!(
+        cmp_limbs(&r2.d, &K2_BOUND) == Ordering::Less
+            || cmp_limbs(&n2.d, &K2_BOUND) == Ordering::Less,
+        "split_lambda: |r2| above (-b1 + b2)/2 + 1"
+    );
+}
+
+/// Little-endian 4-limb integers compared, as the C's `memcmp_var` on
+/// their big-endian encodings.
+#[cfg(any(debug_assertions, test))]
+fn cmp_limbs(a: &[u64; 4], b: &[u64; 4]) -> Ordering {
+    for i in (0..4).rev() {
+        match a[i].cmp(&b[i]) {
+            Ordering::Equal => {}
+            o => return o,
+        }
+    }
+    Ordering::Equal
+}
+
+/// (hi << 32) | lo.
+const fn join32(hi: u32, lo: u32) -> u64 {
+    ((hi as u64) << 32) | lo as u64
+}
 
 /// `scalar_check_overflow` (scalar_4x64_impl.h:64-74): whether d >= N.
 #[inline(always)]

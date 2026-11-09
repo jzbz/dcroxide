@@ -138,17 +138,29 @@ jobs:
     name: test (dcroxide-secp256k1-vartime, release)
     runs-on: ubuntu-latest
     # dcroxide-secp256k1-vartime (ADR-0016) runs 20,000 random cases per
-    # operation in debug-assertion builds, as every other job builds. Here
-    # it runs 10^6 and the field's full grid of corner products, in release
-    # (the node's code generation) and in soak-asserts (release's with debug
-    # assertions and overflow checks on, so its invariant checks see every
-    # case). Its digest tests pin constants the dev builds must reproduce.
+    # operation in debug-assertion builds, as every other job builds, and
+    # its heavy tests on a subset. Here it runs 10^6 and every test in full
+    # (the exhaustive small-curve loop, the collision grid, libsecp256k1's
+    # ecmult hashes), in release (the node's code generation) and in
+    # soak-asserts (release's with debug assertions and overflow checks on,
+    # so its invariant checks see every case). Its digest tests pin
+    # constants the dev builds must reproduce. dcrec's ECDSA branch
+    # signatures run in full here, judged by dcrd through the oracle, and
+    # its unit tests' release arms (the seam's fallbacks) run here only.
     steps:
       - uses: actions/checkout@v7
       - run: rustup toolchain install
+      - uses: actions/setup-go@v7
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: tools/oracle/go.sum
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --release -p dcroxide-secp256k1-vartime
       - run: cargo test --profile soak-asserts -p dcroxide-secp256k1-vartime
+        env:
+          DCROXIDE_VARTIME_CASES: "1000000"
+      - run: cargo test --release -p dcroxide-dcrec --lib --test vartime_ecdsa_branches
+      - run: cargo test --profile soak-asserts -p dcroxide-dcrec --test vartime_ecdsa_branches
         env:
           DCROXIDE_VARTIME_CASES: "1000000"
 

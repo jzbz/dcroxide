@@ -217,99 +217,66 @@ impl Signature {
     }
 
     /// Whether the signature is valid for the 32-byte hash and public key
-    /// (dcrd `Signature.Verify`), by dcrd's algorithm run by hand on k256
+    /// (dcrd `Signature.Verify`), by dcrd's algorithm step by step
     /// ([`Signature::verify_detailed`]). High-S signatures verify, matching
     /// dcrd — the low-S rule applies to serialization, not verification.
     pub fn verify(&self, hash: &[u8; 32], pub_key: &PublicKey) -> bool {
         self.verify_detailed(hash, pub_key).accepts()
     }
 
-    /// dcrd's `Signature.Verify` (ecdsa/signature.go:169-294) step by step
-    /// on k256, returning the step that decides the verdict
-    /// ([`VerifyStep::accepts`] is the verdict [`Signature::verify`]
-    /// returns).  dcrd exports only the verdict; the step is what the
-    /// signature soak holds against the branch each of its constructed
-    /// cases was built to reach.
+    /// dcrd's `Signature.Verify` (ecdsa/signature.go:169-294) step by step,
+    /// returning the step that decides the verdict ([`VerifyStep::accepts`]
+    /// is the verdict [`Signature::verify`] returns).  dcrd exports only
+    /// the verdict; the step is what the signature soak holds against the
+    /// branch each of its constructed cases was built to reach.
     ///
     /// Every input is public, so like dcrd's `NonConst` operations this
-    /// runs in variable time.  dcrd's steps 7 and 8 compare r * Z^2 with
-    /// the Jacobian X.x to save an inversion.  k256 keeps its homogeneous
-    /// coordinates private, so the sum is normalized once and its affine x
-    /// compared instead: with r in [1, N-1], X.x below P and P < 2N, X.x
-    /// mod N equals r exactly when X.x is r or r + N, so one comparison
-    /// covers steps 7 to 10, and r's bytes tell which step decided.  No S
-    /// is normalized: dcrd accepts any S in [1, N-1].
-    // The flagged operators are k256 scalar arithmetic, modular by definition.
-    #[allow(clippy::arithmetic_side_effects)]
+    /// runs in variable time.  Steps 2 to 5 (e = H mod N, w = S^-1, u1 =
+    /// e*w, u2 = R*w, X = u1*G + u2*Q) run on dcroxide-secp256k1-vartime,
+    /// libsecp256k1's arithmetic ported, through this crate's seam, which
+    /// falls back to k256's combined multiply (ADR-0016).  Steps 7 to 10
+    /// are dcrd's: R * Z^2 compared with X's Jacobian x, with no inversion,
+    /// then R + N when R is below P - N.  No S is normalized: dcrd accepts
+    /// any S in [1, N-1].
     pub fn verify_detailed(&self, hash: &[u8; 32], pub_key: &PublicKey) -> VerifyStep {
-        use k256::elliptic_curve::PrimeField;
-        use k256::elliptic_curve::group::Group;
-        use k256::elliptic_curve::ops::Reduce;
-        use k256::elliptic_curve::point::{AffineCoordinates, BatchNormalize};
-        use k256::{FieldBytes, ProjectivePoint, Scalar};
-
         // Step 1: R and S must be in [1, N-1]; the upper bound holds by
         // construction (`Signature::new`, `parse_der_signature`).
         if is_zero(&self.r) || is_zero(&self.s) {
             return VerifyStep::Step1Zero;
         }
-        let r = Scalar::from_repr(self.r.into()).expect("below N by construction");
 
-        // Step 2: e = H(m) mod N, as dcrd's `SetByteSlice` reduces the hash:
-        // one conditional subtraction of N, exact for any 256-bit value
-        // since 2^256 < 2N.
-        let e = <Scalar as Reduce<FieldBytes>>::reduce(&(*hash).into());
+        // Steps 2 to 5: e = H(m) mod N, reduced as dcrd's `SetByteSlice`
+        // does, by one conditional subtraction of N; w = S^-1 mod N in
+        // variable time, as dcrd's `InverseValNonConst`; u1 = e * w and
+        // u2 = R * w mod N; and X = u1 * G + u2 * Q by libsecp256k1's
+        // Straus loop.  Where dcrd's `AddNonConst` doubles for equal
+        // operands and gives infinity for opposite ones, so do
+        // libsecp256k1's formulas; a zero u1 (a hash that is a multiple of
+        // N) contributes nothing, as dcrd's `ScalarBaseMultNonConst` of
+        // zero gives infinity.
+        let big_x = super::backend::ecdsa_mul_g_add(hash, &self.r, &self.s, pub_key);
 
-        // Step 3: w = S^-1 mod N, in variable time like dcrd's
-        // `InverseValNonConst`: dcroxide-secp256k1-vartime's port of
-        // libsecp256k1's safegcd, through this crate's seam, which falls
-        // back to k256's `invert_vartime` (ADR-0016).  S is in [1, N-1] by
-        // step 1 and construction.
-        let w = super::backend::scalar_inverse(&self.s);
-
-        // Step 4: u1 = e * w mod N and u2 = R * w mod N.
-        let u1 = e * w;
-        let u2 = r * w;
-
-        // Step 5: X = u1 * G + u2 * Q, as one variable-time pass of this
-        // crate's interleaved wNAF loop (`ecmult`): u2 GLV-split over Q and
-        // lambda*Q, u1 split at bit 128 over static affine tables of G and
-        // 2^128*G.  dcrd's `AddNonConst` doubles when its two operands are
-        // equal; every addition and doubling is one of k256's complete
-        // formulas, which need no such branch.  A zero u1 (a hash that is a
-        // multiple of N) contributes nothing, as dcrd's
-        // `ScalarBaseMultNonConst` of zero gives the identity.
-        let big_x = super::ecmult::mul_g_add_vartime(&u1, &u2, &pub_key.as_k256_point());
-
-        // Step 6: fail if X is the point at infinity.  This comes before
-        // normalizing, which maps the identity to an x of zero and would
-        // report the rejection as step 9 or 10.
-        if bool::from(big_x.is_identity()) {
+        // Step 6: fail if X is the point at infinity.
+        if big_x.is_infinity() {
             return VerifyStep::Step6Infinity;
         }
 
-        // Steps 7 to 10 on X's affine x, below P: one variable-time
-        // inversion.
-        let [affine] =
-            <ProjectivePoint as BatchNormalize<[ProjectivePoint; 1]>>::batch_normalize_vartime(&[
-                big_x,
-            ]);
-        let x = affine.x();
-        if <Scalar as Reduce<FieldBytes>>::reduce(&x) == r {
-            // X.x is r (step 8) or r + N (step 10; step 9 lets it through,
-            // since r + N = X.x < P).
-            let x_bytes: [u8; 32] = x.into();
-            if x_bytes == self.r {
-                VerifyStep::Step8Accept
-            } else {
-                VerifyStep::Step10Accept
-            }
-        } else if self.r >= PRIME_MINUS_ORDER_BYTES {
-            // Step 9: r + N would reach P (big-endian byte order is
-            // numeric order).
-            VerifyStep::Step9Reject
+        // Steps 7 and 8: accept if R * Z^2 equals X's Jacobian x, that is,
+        // if X.x is R.
+        if big_x.x_equals(&self.r) {
+            return VerifyStep::Step8Accept;
+        }
+
+        // Step 9: fail if R + N would reach P (big-endian byte order is
+        // numeric order).
+        if self.r >= PRIME_MINUS_ORDER_BYTES {
+            return VerifyStep::Step9Reject;
+        }
+
+        // Step 10: accept if (R + N) * Z^2 equals X's Jacobian x.
+        if big_x.x_equals(&add_group_order(&self.r)) {
+            VerifyStep::Step10Accept
         } else {
-            // Step 10: X.x is neither r nor r + N.
             VerifyStep::Step10Reject
         }
     }
