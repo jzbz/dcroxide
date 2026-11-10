@@ -815,8 +815,8 @@ pins this policy asks for.
 >   signature types, to floors the owner accepted, and for the port to merge
 >   only if its slowdown is small or optimized away, with further speed work
 >   if full validation is more than 10% slower or a default sync moves
->   beyond one session's run-to-run noise. The gate soak passed; the port
->   merges only once the merge-bar run, not yet made, is inside that bar.
+>   beyond one session's run-to-run noise. The soak passed and the merge-bar
+>   run of 2026-11-10 was inside that bar; the merge is the owner's word.
 > - **D4** — [ADR-0007](adr/0007-json-emission-strategy.md), *Accepted*
 >   (ratified 2026-10-26 as shipped). Both halves were built but neither in
 >   the proposed shape: the emission layer uses no serde at all (a runtime Go

@@ -7,7 +7,7 @@
   changes listed under Consequences are pending; and part 6 leaves two
   questions for the first release. Met (addenda): `ring`'s part of the
   first condition (2026-10-31), and on the port's branch `secp256k1-sys`'s
-  part; the D3 gate soak passed there, its extra legs to run (2026-11-09).
+  part (2026-11-09) and the second condition, the D3 soak (2026-11-10).
 - **Date:** 2026-10-26
 
 ## Context
@@ -52,7 +52,7 @@ check, docs, deny and fuzzing. No job builds the workspace's `release` or
 `codegen-units = 1`, `panic = "abort"`) has never been compiled in CI.
 Every timed sync ran on x86_64 machines (m1 to m3,
 `docs/bench-ledger.md:28-30`), none on Windows or macOS
-(`README.md:737-738`), and none on aarch64 of any OS. Ecosystem acceptance
+(`README.md:745-746`), and none on aarch64 of any OS. Ecosystem acceptance
 has been run once, on x86_64 Linux, without Decrediton's IPC lifecycle or
 config, IPC and service parity on Windows and macOS (the brief's status
 block), so the exit criterion that Decrediton launches, supervises and
@@ -336,17 +336,17 @@ recorded divergence in PARITY.md.
   distribution whose packaged rustc lags the pin cannot build the node
   with it.
 - Each promotion needs a sync timed on that architecture and OS, and none
-  has been timed on aarch64, Windows or macOS (`README.md:737-738`,
+  has been timed on aarch64, Windows or macOS (`README.md:745-746`,
   `docs/bench-ledger.md:28-30`): it needs such a machine, or a CI runner
   with room for a mainnet data directory, a median of 27.93 GiB after the
-  syncs of 2026-10-17 (`README.md:749-751`). Runner disk sizes were not
+  syncs of 2026-10-17 (`README.md:757-759`). Runner disk sizes were not
   checked.
 - Each release costs an LTO build per target off GitHub and two signatures
   by hand, and checking both the tag and the binaries takes two keys.
 - M5's "reproducible signed release" stays open until the first release
   made under this ADR.
 - Pending, none of it written: the fallback rule in `rust-toolchain.toml`'s
-  header; `docs/operating.md`'s `cargo build --release` (`:1885-1887`),
+  header; `docs/operating.md`'s `cargo build --release` (`:1892-1894`),
   where artifacts are cut from `dist`; `SECURITY.md`'s supported versions;
   the fingerprints and verification steps, wherever part 3's open question
   puts them; the brief's status block; `.github/workflows/release.yml`
@@ -390,3 +390,17 @@ the port merges, which waits on the merge-bar run of
 [ADR-0016](0016-secp256k1-vartime-arithmetic.md). blake3's compiler probe
 and the C power-cut shim still break ADR-0012's rule, and the pin at a
 dcrd v2.2 release tag and the reproduction prototype are unchanged.
+
+## Addendum, 2026-11-10 — the D3 soak's extra legs
+
+The port plan's extra soak legs passed: with overflow checks on and
+with `curve25519-dalek`'s serial and AVX-512 IFMA backends on x86_64,
+and on arm64 in CI. [ADR-0017](0017-secp256k1-in-pure-rust.md)'s
+addendum of this date records each. So the second condition, the D3
+soak, is met on the port's branch, and holds for a release once the
+port merges; the merge-bar run of
+[ADR-0016](0016-secp256k1-vartime-arithmetic.md) passed the same day,
+so the merge waits only on the project owner's word. The rest of the
+first condition, and the third and fourth, are unchanged. The citations
+of `README.md` and `docs/operating.md` above are renumbered for the same
+day's text in both on the background commit.

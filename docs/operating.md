@@ -1747,9 +1747,16 @@ at 2,456 to 2,470 MiB against 2,959 and 2,964 MiB when the clock
 stopped, for 893.7 to 902.9 s of process CPU time against 877.8 s and
 874.6 s (the storage tuning above, which also has the measurements of
 2026-10-16 and 2026-10-17); the default as it stands, whose thread has
-also synced a handed-over flush's block files since `aa157d1`, has not
-been measured against the variable; the form of 2026-08-16, on m1, lost
-9.5% where commits ran back to back. On slower storage, or with few
+also synced a handed-over flush's block files since `aa157d1`, took a
+sync of a build of `012192b` from a block server on the LAN on
+2026-11-10, with transparent huge pages at `always`, from 324.60 s with
+the variable set to 233.575 s by the means, 91.0 s or 28.0% less, though
+the two runs with the variable came after the four at the default rather
+than between them. Those syncs record no end state, so the variable's
+end state was not compared there, and the build, the huge-page setting
+and the kernel's write-back settings all differ from 2026-10-19's, so
+the larger gap is not a trend. The form of 2026-08-16, on m1,
+lost 9.5% where commits ran back to back. On slower storage, or with few
 spare cores, measure it with the variable set before relying on the
 default. `DCROXIDE_PREVERIFY` is read once at startup too, and turns
 off, or sets the most helpers of, the signature pre-verification of the

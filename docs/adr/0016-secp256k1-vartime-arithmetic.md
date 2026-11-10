@@ -5,18 +5,20 @@
   approved the route on 2026-11-08 and started it the same day (Context,
   "The approval"); it is built on the port's branch in five increments,
   RC1 to RC6, with RC3 folded into RC4 and RC7 not needed. **The
-  merge-bar run has not been made.** The port merges only if that run, a
-  fresh G5 against master, puts full validation at no more than 1.10
-  times libsecp256k1's and the default sync within base's spread in that
-  session; a result between 1.10 and 1.20 goes back to the project owner
-  with the numbers, and above 1.20 the options are accepting the
-  residual, asking RustCrypto upstream or switching back (Decision, "The
-  merge bar"). That run's numbers go in a later record. This record
-  supersedes nothing: [ADR-0017](0017-secp256k1-in-pure-rust.md) records
-  D3 as built and supersedes [ADR-0006](0006-secp256k1-backend.md). It
-  serves [ADR-0012](0012-pure-rust.md)'s rule.
+  merge-bar run passed on 2026-11-10**: a fresh G5 against master put
+  full validation at 1.034 times libsecp256k1's and the default sync
+  1.8 s slower, inside base's spread of 11.4 s in that session, where the
+  bar is no more than 1.10 times and within that spread (Decision, "The
+  merge bar"). The port plan's criteria 8 and 9, the extra soak legs and
+  the committed witness vectors, are met as well (addendum of
+  2026-11-10). By the bar the port merges on the project owner's word.
+  This record supersedes nothing:
+  [ADR-0017](0017-secp256k1-in-pure-rust.md) records D3 as built and
+  supersedes [ADR-0006](0006-secp256k1-backend.md). It serves
+  [ADR-0012](0012-pure-rust.md)'s rule.
 - **Date:** 2026-11-08 (proposed), 2026-11-09 (accepted; addendum: the
-  measured results, the merge bar pending)
+  measured results, the merge bar pending), 2026-11-10 (addendum: the
+  merge-bar run passed; criteria 8 and 9 met)
 
 ## Context
 
@@ -413,7 +415,7 @@ fallback arms convert the key when they run.
 | RC5 | recovery and Schnorr verification on the new crate; stage 2a's loop and its `once_cell` dependency removed | yes, may share RC6's gate | Schnorr below base's cost; little in a sync, where Schnorr is rare and recovery is RPC only |
 | RC6 | dcrec's public key held as the crate's affine point; parse and serialization on it | yes, may share RC5's gate | ~0.5-1% of a verification |
 | RC7 | tuning, only if the first milestone asks for it | if changed | inlining; window 15 only if the first milestone lands between 1.10 and 1.15 (~2.5-3% of a verification) |
-| RC8 | records (2026-11-09), then the merge-bar run | no | |
+| RC8 | records (2026-11-09), then the merge-bar run (2026-11-10, passed) | no | |
 
 Pre-registered thresholds, on the prototype's in-process ratio and on
 RC4's G4 (one thread, head over base): at most 1.08, go on; 1.08 to 1.15,
@@ -479,7 +481,8 @@ the owner with the numbers; above 1.20 the options are accepting the
 residual (re-deciding the first set's answer 2b), asking RustCrypto
 upstream, or switching back. The port plan's criteria 8 and 9 (the extra
 soak legs and the committed witness vectors) complete after the last
-arithmetic change and before the merge.
+arithmetic change and before the merge. The run passed and both
+criteria were met on 2026-11-10 (addendum of that date).
 
 ### Switching back
 
@@ -615,12 +618,14 @@ acceptance on the port's branch; it takes effect with the merge.
   use, went with RC5.
 - **The merge may not come.** If the merge-bar run lands above 1.10, the
   decision returns to the project owner with the numbers; the branch stays
-  unmerged meanwhile and master keeps libsecp256k1.
+  unmerged meanwhile and master keeps libsecp256k1. It landed at 1.034
+  on 2026-11-10 (addendum of that date).
 - **Speed is measured in the shapes of the 2026-11-07 gates**: the
   prototype in process, G4 after RC4 and after RC6, and the first G5
   milestone after RC4 (addendum of 2026-11-09); the expected effects in
-  the Increments table are the model's. The merge-bar G5 is still to come,
-  on the project owner's go like every timed run.
+  the Increments table are the model's. The merge-bar G5 ran on
+  2026-11-10, on the project owner's go like every timed run (addendum
+  of that date).
 - **32-bit targets** compute correctly by u128 semantics but are untested;
   every CI target is 64-bit.
 - **Notices**: the crate's NOTICE must reach release archives;
@@ -780,3 +785,79 @@ RC6 have since narrowed to keys from secrets, signing, the nonce and the
 fallback arms. So does the approval's "ADR-0006's superseding record
 taking the next free number after the merge": that is the approval as
 given, and the sentence after "Not decided here" says how it was met.
+
+## Addendum, 2026-11-10 — the merge-bar run passed; criteria 8 and 9 met
+
+**The merge-bar run.** One session on the x86_64 Linux desktop of the
+earlier milestones, on the project owner's go. Master's tip had moved
+from `0c4154d` to `012192b`, which changes only TLS signing code and
+ADR-0015, so base is `012192b` on libsecp256k1. Head is `3a231c6`, whose
+shipped code is RC6's with that same TLS change, merged into the
+branch; otherwise only comments and tests changed after RC6. Both
+arms ran at the node's defaults, route e having closed. The bench
+ledger has the runs ("Route c at the merge bar in syncs
+(2026-11-10)").
+
+| | base `012192b` | head `3a231c6` |
+|---|---|---|
+| full validation, B H H B B H | 486.9 s, 476.1 s, 477.9 s; mean 480.30 s, spread 10.8 s | 498.1 s, 496.2 s, 496.2 s; mean 496.83 s, spread 1.9 s |
+| default sync from a LAN peer, B H H B H B B H | 234.5 s, 239.5 s, 228.1 s, 232.2 s; mean 233.575 s, spread 11.4 s | 235.8 s, 236.0 s, 235.6 s, 234.0 s; mean 235.35 s, spread 2.0 s |
+
+Full validation took **1.034** times as long in head, 1.019 to 1.046
+over the nine pairings, with 1.060 times the process CPU time. The
+default sync took **1.8 s** longer in head, inside base's spread of
+11.4 s. All six full-validation runs ended on one UTXO set at block
+1,116,035 (serialized hash `eb7f88de…c30c`, 1,850,903 outputs), the set
+of every full-validation run of the first milestone, of stage 2a and of
+2026-11-07; since RC6 holds public keys on the crate's point, and the
+UTXO set's compressed scripts go through key parsing and serialization,
+that equality is the end-to-end check RC6 was to get here. Every default
+sync reached the target's hash. No run was marked disturbed, none was
+repeated, and every one exited cleanly.
+
+Against the bar: 1.034 is at most 1.10, and the default sync's
+difference is within base's spread. **The run passes.** By "The merge
+bar" above, the port merges on the project owner's word.
+
+- The first milestone, at RC4, measured 1.035 and -2.90 s. RC5 and RC6
+  made no difference to full validation that three runs a side resolve.
+- Base's first full-validation run was 9 to 11 s slower than its other
+  two. The block server read 19.5 GB from its drive in that run and
+  13.2 GB in head's first, and nothing in the four after; head's first
+  was only 1.9 s slower than its others, so the reads do not explain the
+  difference alone, and its cause is not established. Without that run
+  the ratio is 1.042.
+- A system package upgrade after the first milestone changed the
+  kernel's dirty-page write-back limits from fixed sizes, 256 MiB and
+  64 MiB, to ratios of memory, 10% and 3%. Both arms of this run ran
+  under the new settings, so its ratio and difference stand, but any
+  comparison across sessions crosses that change, which was not
+  isolated: base's means are 9.17 s lower in full validation and 11.95 s
+  lower in the default sync than at the first milestone.
+
+**Criterion 8, the extra soak legs.** Overflow checks on,
+`curve25519-dalek`'s serial and AVX-512 IFMA backends, and arm64 all
+passed. [ADR-0017](0017-secp256k1-in-pure-rust.md)'s addendum of this
+date records each leg with the soak, as ADR-0014's second condition
+asks of it.
+
+**Criterion 9, the committed witness vectors.** The soak's witness
+file, `crates/dcroxide-dcrec/tests/data/sigdiff_witness_vectors.txt`
+(`298e570`), and dcrec's three branch files,
+`vartime_ecdsa_branches.txt` (RC4, `8c672e9`),
+`vartime_recovery_schnorr_branches.txt` (RC5, `0632b75`) and
+`vartime_pubkey_branches.txt` (RC6, `b479c1c`), hold dcrd's verdicts for
+every constructed input class of the soak and every adversarial family
+of "Against dcrd" above, checked without Go and regenerated through
+the oracle in CI on every platform.
+`3a231c6` added the one branch no committed line reached: the Straus
+loop's doubling through an addition, at each of its four call sites, as
+four grid cases in each of the ECDSA and recovery files, with a test in
+the crate that each still doubles at its site. With it, "Against dcrd"
+holds as written: the vectors that reach each branch are committed.
+
+**What this corrects.** The status line; the Increments' RC8 row; the
+sentence that ends "The merge bar"; and the Consequences on the merge
+that may not come and on the merge-bar G5 still to come. The addendum
+of 2026-11-09 keeps its words, its "not run" cells and its "What
+remains before the merge" included: this addendum is what came of them.

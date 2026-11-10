@@ -101,6 +101,8 @@ path) has been measured yet, so this crossover is unconfirmed.
 | 2026-11-08 | m3 | `3c50313`, stage 2a, against `0c4154d` | not run in this session | mainnet, genesis to 1,116,035 | Full validation as in the row above, in the order B S S B B S: `0c4154d` 488.4 s, 476.3 s and 477.0 s, mean 480.57 s; `3c50313` 626.4 s, 626.9 s and 620.7 s, mean 624.67 s — **1.300**, with 1.490 times the CPU time; the UTXO sets equal to those of the row above. Default syncs from the LAN server, two each: means 239.20 s (spread 5.6 s) and 261.85 s (spread 10.1 s), **+22.65 s** | this file, "Stage 2a in syncs (2026-11-08)" |
 | 2026-11-08 | m3 | diagnostic builds of `43beedc` and `0c4154d` that read two settings from the environment, not for commit | not run in this session | mainnet, genesis to 1,116,035 | Fifteen pre-verification helpers and a read-ahead depth of 64 against the defaults of ten and 16, in the harness of the row above. `43beedc`: full validation 714.20 s against 712.90 s, two runs each, **+1.30 s**; default sync 265.15 s against 266.45 s, two each, **-1.30 s**. `0c4154d`: 515.4 s against 478.4 s, one run each, and 244.25 s against 237.30 s, two each. Neither difference on `43beedc` reached the bar set before the runs, 15 s and 5 s faster | this file, "Two node settings on both arms (2026-11-08)" |
 | 2026-11-09 | m3 | `8c672e9`, route c through RC4, against `0c4154d` | not run in this session | mainnet, genesis to 1,116,035 | Full validation as in the rows above, B H H B B H: `0c4154d` 489.0 s, 489.2 s and 490.2 s, mean 489.47 s; `8c672e9` 500.9 s, 511.3 s and 507.5 s, mean 506.57 s — **1.035**, 1.022 to 1.046 over the nine pairings, with 1.063 times the CPU time; the UTXO sets equal to those of the rows above. Default syncs from the LAN server, four each: means 245.52 s (spread 9.5 s) and 242.62 s (spread 11.6 s), **-2.90 s**. The block server read 9.6-17.5 GB from its drive in every full-validation run, none in those of the rows above | this file, "Route c through RC4 in syncs (2026-11-09)" |
+| 2026-11-10 | m3 | `3a231c6`, route c's signature code at RC6 with comment and test changes since, against `012192b`, master on libsecp256k1, which differs from `0c4154d` only in TLS signing code that `3a231c6` also holds | not run in this session | mainnet, genesis to 1,116,035 | The merge-bar run of ADR-0016. Full validation as in the rows above, B H H B B H: `012192b` 486.9 s, 476.1 s and 477.9 s, mean 480.30 s; `3a231c6` 498.1 s, 496.2 s and 496.2 s, mean 496.83 s — **1.034**, 1.019 to 1.046 over the nine pairings, with 1.060 times the CPU time; the UTXO sets equal to those of the rows above. Default syncs from the LAN server, four each: means 233.575 s (spread 11.4 s) and 235.35 s (spread 2.0 s), **+1.78 s**. A system package upgrade since the row above changed the kernel's dirty-page write-back limits | this file, "Route c at the merge bar in syncs (2026-11-10)" |
+| 2026-11-10 | m3 | `012192b`, the base binary of the row above, with `DCROXIDE_DB_SYNC_COMMIT=1` | not run in this session | mainnet, genesis to 1,116,035 | From the LAN server, in the session of the row above and after its default syncs: 324.0 s and 325.2 s, mean 324.60 s, against a mean of 233.575 s for the four default syncs of `012192b` in the row above, so the default is **91.0 s or 28.0% less**, in each of the eight pairings, and peaks lower, at 2,509 to 2,541 MiB against 2,960 and 2,962 MiB. No end state is recorded | this file, "The background commit against `DCROXIDE_DB_SYNC_COMMIT=1` on `012192b` (2026-11-10)" |
 
 > **The headline 1.29x predates the fan-out fix, so it is conservative for
 > master.** That figure was measured on `b6d0c63`; `c091b46` (one validation
@@ -7704,3 +7706,104 @@ governor with the `balance_performance` preference, kernel 7.3.1.
 Raw: `1-base.txt`, `2-rc6.txt`, `3-rc4.txt`, `4-rc6.txt`, `5-rc6.txt`,
 `6-rc4.txt`, `7-rc6.txt` and `8-base.txt`, with their `.err` files;
 `binaries.sha256`; `nice.txt`; `state.txt`; `times.txt`.
+
+## Route c at the merge bar in syncs (2026-11-10)
+
+The merge-bar run of ADR-0016, a G5 at the final branch against master,
+ran on m3 on 2026-11-10: fourteen syncs, all exiting cleanly, none
+disturbed, none repeated and no build running, of base, master
+`012192b`, and H, `3a231c6`. Master had moved from `0c4154d`, the base
+of the earlier sessions, by `012192b`, which changes TLS signing code
+and ADR-0015 only; the port's branch holds that change by a merge, and
+otherwise `3a231c6` changes only comments and tests after RC6.
+
+| | runs | mean | spread | process CPU | coverage |
+|---|---|---|---|---|---|
+| full validation, B | 486.9 s, 476.1 s, 477.9 s | 480.30 s | 10.8 s | 4,723.5 s | 90.23% |
+| full validation, H | 498.1 s, 496.2 s, 496.2 s | 496.83 s | 1.9 s | 5,005.5 s | 88.23% |
+| default sync, B | 234.5 s, 239.5 s, 228.1 s, 232.2 s | 233.575 s | 11.4 s | 926.7 s | 87.77% |
+| default sync, H | 235.8 s, 236.0 s, 235.6 s, 234.0 s | 235.35 s | 2.0 s | 959.7 s | 84.77% |
+
+Full validation ran B H H B B H from the dcrd block server on the same
+machine with `--assumevalid=0`: H took **1.034** times as long (16.53 s
+more; 1.019-1.046 over the nine pairings), with 1.060 times the CPU
+time. The default syncs ran from the LAN server in two blocks, B H H B
+and H B B H: H took **1.78 s, 0.76%, longer**, inside base's spread.
+All six full-validation runs ended on the UTXO set of the syncs of
+2026-11-07, 2026-11-08 and 2026-11-09, and every default sync reached
+the target's hash.
+
+| | `43beedc` (2026-11-07) | `3c50313` (2026-11-08) | `8c672e9` (2026-11-09) | `3a231c6` (2026-11-10) |
+|---|---|---|---|---|
+| full validation, head / base | 1.497 | 1.300 | 1.035 | 1.034 |
+| default sync, head - base | +12.23% | +9.47% (two runs a side) | -1.18% | +0.76% |
+
+**What it shows.** Under ADR-0016's merge bar, 1.034 is at most 1.10
+and the default sync's difference is within base's spread, so the run
+passes. RC5 and RC6 made no difference to full validation that three
+runs a side can resolve.
+
+**What it does not show.** Base's first full-validation run, the
+session's first, was 9 to 11 s slower than its other two. The block
+server read 19.5 GB from its drive in it and 13.2 GB in H's first, and
+nothing in the four after, but H's first was only 1.9 s slower than its
+others, so the reads do not explain it alone; the cause is not
+established. Without that run H/B is 1.042. A system package upgrade
+after the first milestone's session of 2026-11-09 replaced the kernel's
+dirty-page write-back limits, `vm.dirty_bytes` 268,435,456 and
+`vm.dirty_background_bytes` 67,108,864, with `vm.dirty_ratio` 10 and
+`vm.dirty_background_ratio` 3. Both arms ran under the new settings;
+base's means, 9.17 s lower in full validation and 11.95 s lower in the
+default syncs than in that session, cross the change, which was not
+isolated.
+
+Machine state: transparent huge pages at `always`, the `powersave`
+governor with the `balance_performance` preference, kernel 7.3.1.
+
+Raw: `m2-fullval.jsonl` and `m2-lan.jsonl`, the harness's records, and
+the node logs.
+
+## The background commit against `DCROXIDE_DB_SYNC_COMMIT=1` on `012192b` (2026-11-10)
+
+In the session of the section above and after its fourteen syncs, the
+base binary, master `012192b`, which holds `aa157d1`, synced twice more
+from the LAN server with `DCROXIDE_DB_SYNC_COMMIT=1`, which puts every
+commit back on the committing thread. Both exited cleanly and neither
+was disturbed; each node logged the variable's startup line, which none
+of the eight default syncs did, and none of their flushes ran on the
+commit thread, where 52 of each default sync's 53 did.
+
+| | runs | mean | spread | process CPU | peak memory when the clock stops |
+|---|---|---|---|---|---|
+| default, the four base syncs of the section above | 234.5 s, 239.5 s, 228.1 s, 232.2 s | 233.575 s | 11.4 s | 926.7 s | 2,509–2,541 MiB |
+| `DCROXIDE_DB_SYNC_COMMIT=1` | 324.0 s, 325.2 s | 324.60 s | 1.2 s | 904.4 s | 2,960 MiB, 2,962 MiB |
+
+The default took **91.0 s or 28.0% less** by the means, and less in
+each of the eight pairings, by 84.5 to 97.1 s. Interpolated between
+10 s samples, the gap is 90.51 s: 77.55 s before the assume-valid block,
+1,026,597, and 12.96 s after it. By the flush logs the syncing threads
+spent 107.4 s and 108.3 s in flushes with the variable and under 0.05 s
+at the default, while the commits themselves took 58.6 s and 59.4 s
+against 61.8 to 69.5 s: the commit work is about the same, and what
+differs is which thread waits for it. That flush time does not turn one
+for one into wall time, and nothing more is attributed.
+
+**What it shows.** On a build that holds `aa157d1` the background commit
+still pays in wall time. The runs of 2026-10-19, 78.7 s or 22.5% on a
+build of `797a213`'s code with transparent huge pages at `madvise`,
+point the same way; the build, the huge-page setting and the kernel's
+write-back settings all differ between the two sessions, so the larger
+gap is not a trend.
+
+**What it does not show.** An end state. Syncs from the LAN server
+record no UTXO set and no block files, since the node goes on past the
+target, and their check of the block at 1,116,035 against the target's
+hash cannot fail on a run that completes. The last sync with the
+variable set whose end state was recorded ran on 2026-10-18, before the
+commit thread of 2026-10-19 and `aa157d1`. The two runs with the
+variable came after the eight default syncs, not between them.
+
+Machine state as in the section above.
+
+Raw: `m2-synccommit.jsonl`, the harness's records, the node logs and
+the flush logs.

@@ -2,14 +2,15 @@
 
 - **Status:** Accepted 2026-11-09. Supersedes
   [ADR-0006](0006-secp256k1-backend.md). It takes effect with the merge of
-  the port's branch, which waits on the merge-bar run of
-  [ADR-0016](0016-secp256k1-vartime-arithmetic.md), not yet made; until
-  then master runs libsecp256k1 and ADR-0006 describes it. The port
-  merges only if that run is inside the bar ("The speed measurement and
-  the merge bar", below). The results so far are recorded here and in
-  ADR-0016's addendum of this date; that run's numbers go in a later
-  record.
-- **Date:** 2026-11-09
+  the port's branch; until then master runs libsecp256k1 and ADR-0006
+  describes it. The merge-bar run of
+  [ADR-0016](0016-secp256k1-vartime-arithmetic.md) passed on 2026-11-10
+  ("The speed measurement and the merge bar", below), and the port
+  plan's criteria 8 and 9, the extra soak legs and the committed witness
+  vectors, were met that day (addendum of 2026-11-10), so the merge waits
+  only on the project owner's word.
+- **Date:** 2026-11-09, 2026-11-10 (addendum: the extra soak legs, the
+  merge-bar run and the witness vectors)
 
 ## Context
 
@@ -138,27 +139,28 @@ it to record the result.
 
 ## The speed measurement and the merge bar
 
-On an x86_64 Linux desktop, against master `0c4154d` in the same session
-each time (ADR-0016's addendum of 2026-11-09 has the full table, the bench
-ledger each run):
+On an x86_64 Linux desktop, against master in the same session each
+time, `0c4154d` until the merge-bar run and `012192b` in it, which differs
+only in TLS signing code (ADR-0016's addenda of 2026-11-09 and 2026-11-10
+have the full tables, the bench ledger each run):
 
 | | `k256` port | stage 2a | route c, RC4 | route c, RC6 |
 |---|---|---|---|---|
 | ECDSA verification, one thread | 1.963 | 1.582 | 1.036 | 1.031 |
-| full validation, wall | 1.497 | 1.300 | 1.035 | not run |
-| default sync, head - base | +29.1 s | +22.65 s | -2.90 s | not run |
+| full validation, wall | 1.497 | 1.300 | 1.035 | 1.034 (merge-bar run) |
+| default sync, head - base | +29.1 s | +22.65 s | -2.90 s | +1.8 s (merge-bar run) |
 
 The bar, as ADR-0006's addendum of 2026-10-26 reads it and the project
 owner's decision 4 of 2026-11-08 keeps it: a fresh G5 at the final branch
 against master, with full validation at no more than 1.10 times base and
 the default sync's mean difference within base's spread in that session.
-**That run has not been made.** A result between 1.10 and 1.20 goes back
-to the project owner with the numbers; above 1.20 the options are
-accepting the residual, asking RustCrypto upstream, or switching back.
-The first milestone after RC4, at 1.035 with the default sync inside
-base's spread, would pass on an informal reading; it is not that run.
-This record takes effect only if the port merges, and the run's numbers
-are added to it then.
+**That run passed on 2026-11-10**, at `3a231c6`, whose shipped code is
+RC6's: full validation 1.034 times base's, and the default sync 1.8 s
+slower, inside base's spread of 11.4 s, with every full-validation run
+ending on the same UTXO set. ADR-0016's addendum of that date has the
+numbers. The first milestone after RC4 had measured 1.035 and -2.90 s.
+By the bar the port merges on the project owner's word, and this record
+takes effect with it.
 
 ## Switching back
 
@@ -209,9 +211,9 @@ status and date lines.
 - No C runs under the signature checks on the port's branch, nor on
   master once it merges. ADR-0012's rule loses its `secp256k1-sys` breach
   then, and ADR-0014's first release condition the same part. Its second
-  condition, the D3 soak, has passed its gate runs, recorded here; it is
-  met once the extra soak legs below pass, and counts for a release once
-  the port merges.
+  condition, the D3 soak, has passed its gate runs and the extra soak
+  legs (addendum of 2026-11-10), recorded here, and counts for a release
+  once the port merges.
 - Two secp256k1 stacks, both Rust, where ADR-0012's Consequences expected
   one, `k256`. The owned crate is unaudited; the literal port, its tests
   and the soaks against dcrd bound that.
@@ -222,8 +224,10 @@ status and date lines.
 - The dependency ledger narrows `k256` to keys, signing, the nonce and the
   fallbacks, and gives the crate an owned row; fiat-crypto is a
   development dependency only.
-- Before the merge: the merge-bar run, then the port plan's criteria 8
-  and 9 (the extra soak legs and the committed witness vectors).
+- Before the merge: the merge-bar run and the port plan's criteria 8
+  and 9 (the extra soak legs and the committed witness vectors), all met
+  on 2026-11-10 (addendum of that date); what remains is the project
+  owner's word.
 
 ## Not decided here
 
@@ -231,3 +235,84 @@ status and date lines.
 - Pull requests to RustCrypto with any of this work, each the project
   owner's call.
 - The sweep of other files derived from non-ISC sources.
+
+## Addendum, 2026-11-10 — the extra soak legs, the merge-bar run and the witness vectors
+
+**The extra soak legs**, the port plan's criterion 8. Three legs ran on
+the x86_64 Linux desktop of the gate soaks, at `e0cdf66`, whose
+signature code is that of the gate after RC6 with comments changed;
+`3a231c6` after it changes six files, all tests, none built into the
+soak binary. Each used the
+baseline's master seed and oracle binary, at pin `3360ae4d` with
+generator fingerprint `c21c897e`:
+
+- **S**, the 16 Ed25519 classes at their floors, 94,000,307 cases, with
+  `curve25519-dalek`'s serial backend (`--cfg
+  curve25519_dalek_backend="serial"`); a probe of the binary found no
+  vector entry point and the serial doubling running.
+- **X**, the same classes and cases with dalek's AVX-512 IFMA backend,
+  built as the leg's plan allows in place of its first design: AVX-512
+  IFMA through `curve25519-dalek`'s `--cfg
+  curve25519_dalek_backend="avx512"`, which compiles dalek's IFMA code
+  and selects it at run time; the crate-wide target-feature build hits
+  an LLVM crash compiling `k256` under rustc 1.99.1. The soak's record
+  therefore names the backend `avx2`, as an AVX2 run's would. A debugger
+  probe of the leg's own binary after the run settles it: on an honest
+  Ed25519 case dalek's IFMA double-base multiplication
+  (`spec_avx512ifma_avx512vl`) ran once and its AVX2 one (`spec_avx2`)
+  never, and on a random case neither.
+- **C**, all 82 classes at their floors, 427,002,940 cases and
+  547,005,573 requests, in a release profile with overflow checks on in
+  every crate of the soak binary, which holds 612 call sites that panic
+  on overflow, in `k256`, the owned crate, `curve25519-dalek` and dcrec
+  among others. No panic was logged. It took 1.016 times as long as the
+  baseline soak and 1.037 times as long as the gate after RC6, in other
+  sessions.
+
+Each leg had no disagreement and no oracle fault, passed every check of
+its plan, replayed equal, and caught its canaries: the model baseline
+and C7, C8, C15 and C16 in S and X, and the model baseline and C1-C18 in
+C. Every digest checkpoint of every leg equals the baseline's on
+libsecp256k1; S and X, which run 16 of the 82 classes, are compared
+with it as a subset, 16 classes equal and 66 absent. The soak's
+criterion 4, that each reachable error kind is seen, holds vacuously
+for S and X: no error kind it checks is reachable from the Ed25519
+classes.
+
+- **A**, arm64: the nightly soak job of CI, dispatched on `3a231c6` with
+  the baseline's master seed, ran all 82 classes for its 2,100 s budget
+  on a two-worker arm64 runner, every class reaching at least a
+  hundredth of its floor: 40,632,764 cases, no disagreement and no
+  oracle fault. Its replay equals the baseline's in all 82 classes, and
+  its fixed-seed record equals an x86_64 one of `e0cdf66` in all 82,
+  both compared as exploratory, since a budget run is not a gate. The
+  same dispatch's x86_64 canary run, which caught the model baseline and
+  C1-C18, stands in for the canaries on arm64. The leg's plan asked that
+  the diff from `e0cdf66` to the dispatched commit over dcrec's sources,
+  the owned crate, the soak, the oracle and `Cargo.lock` be empty. It
+  holds one file, a `#[cfg(test)]` module of
+  `dcroxide-secp256k1-vartime` with criterion 9's new test, which the
+  soak binary does not compile; the generator's fingerprint and frozen
+  sources are the baseline's in every record of both commits, and the
+  lock record is the same in all of the port's. The plan's optional
+  further comparison, against master's nightly arm64 record, was not
+  run.
+
+With these legs the D3 soak of ADR-0014's second condition is complete
+on the port's branch.
+
+**The merge-bar run** passed: full validation 1.034 times
+libsecp256k1's, the default sync 1.8 s slower within base's spread of
+11.4 s, and every full-validation run ending on the same UTXO set ("The
+speed measurement and the merge bar", above, and ADR-0016's addendum of
+this date).
+
+**The witness vectors**, criterion 9: the soak's witness file and
+dcrec's three branch files hold dcrd's verdicts for every constructed
+class and every adversarial family of route c, the Straus loop's
+doubling through an addition at each of its four call sites included
+since `3a231c6` (ADR-0016's addendum of this date).
+
+**What this corrects.** The status and date lines, the speed table's
+last column and the paragraph under it, and the two Consequences that
+named these as still to come.

@@ -681,7 +681,15 @@ mean of 271.68 s over four at the default: the default was 78.7 s or
 2,959 and 2,964 MiB, for 893.7 to 902.9 s of CPU time against 877.8 s
 and 874.6 s; on m3's storage only
 ([docs/operating.md](docs/operating.md) says when to set the variable).
-No build that holds `aa157d1` has been run with the variable set.
+On 2026-11-10, with transparent huge pages at `always`, a build of
+master `012192b`, which holds `aa157d1`, took a mean of 233.575 s over
+four syncs from the LAN at the default against 324.0 s and 325.2 s with
+the variable set: the default was 91.0 s or 28.0% less, in each of the
+eight pairings, though the two runs with the variable came after the
+four, not between them. Syncs from the LAN record no end state, so the
+variable's end state on that build was not compared. The build, the
+huge-page setting and the kernel's write-back settings all differ from
+2026-10-19's, so the larger gap is not a trend.
 
 Both daemons skip connect validation, script checks included, up to the
 assume-valid block, 1,026,597, and validate in full after it, where the

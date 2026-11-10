@@ -396,7 +396,7 @@ which does not depend on the TLS answers, can start at once.
 - **libsecp's speed lead is to be measured, not assumed away.** In the one
   profile in the repository that splits out fully validated blocks,
   secp256k1 took about 38% of user-space cycles on all threads and
-  BLAKE-256 compression 48.4% (`docs/bench-ledger.md:2710-2711`), libsecp
+  BLAKE-256 compression 48.4% (`docs/bench-ledger.md:2712-2713`), libsecp
   and `k256` not separated; the repository holds no ECDSA figure for
   `k256`. With no script checked before the assume-valid block, a default
   sync up to it should not move (inference); `--assumevalid=0` syncs and

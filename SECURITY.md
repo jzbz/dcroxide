@@ -327,13 +327,16 @@ evaluating this code.
   of the owned arithmetic of
   [ADR-0016](docs/adr/0016-secp256k1-vartime-arithmetic.md), after RC4
   and after RC6, every class's digest equal to that of the baseline run
-  on libsecp256k1 ([ADR-0017](docs/adr/0017-secp256k1-in-pure-rust.md));
-  the port is not merged yet. Each night CI runs the soak for 35 minutes
-  on x86_64, on x86_64 with `curve25519-dalek`'s portable backend over
-  the Ed25519 classes, and on arm64, failing on any disagreement with
-  dcrd, any intent a case missed, or any class short of a hundredth of
-  its floor, and then writes a fixed-seed record that every later
-  night's can be compared with; that is regression evidence, not a gate
+  on libsecp256k1 ([ADR-0017](docs/adr/0017-secp256k1-in-pure-rust.md)),
+  and so did its extra legs: with overflow checks on, with
+  `curve25519-dalek`'s serial and AVX-512 IFMA backends over the Ed25519
+  classes, and a shorter run on arm64 in CI. The port is not merged yet.
+  Each night CI runs the soak for 35 minutes on x86_64, on x86_64 with
+  `curve25519-dalek`'s serial backend over the Ed25519 classes, and on
+  arm64, failing on any disagreement with dcrd, any intent a case
+  missed, or any class short of a hundredth of its floor, and then
+  writes a fixed-seed record that every later night's can be compared
+  with; that is regression evidence, not a gate
   run. For the TLS provider the comparison rests on ring's verdicts, recorded in its parity corpus before ring
   left the tree, its Wycheproof vectors, its Go differential and the Go
   interop matrix, and its timing on a statistical check in CI of its
