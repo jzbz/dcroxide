@@ -26,9 +26,10 @@
 //! run sets it) or in builds with debug assertions, the grid runs [-1, 1]
 //! and the boundary classes a fixed subset.  The committed file
 //! `tests/data/vartime_ecdsa_branches.txt` holds the first case of each
-//! (grid key or boundary class, step) of the small selection with dcrd's
-//! answer: one test checks it everywhere, without Go, and one rebuilds it
-//! with dcrd and compares it byte for byte.
+//! (grid key or boundary class, step) of the small selection, and the grid
+//! cases whose Straus loop doubles through an addition at each of its four
+//! call sites, with dcrd's answer: one test checks it everywhere, without
+//! Go, and one rebuilds it with dcrd and compares it byte for byte.
 
 #![allow(
     clippy::arithmetic_side_effects,
@@ -391,20 +392,28 @@ fn u2_one_signatures_match_dcrd() {
 }
 
 /// The committed selection: the first case of each (grid key, step) of the
-/// grid at [-1, 1], and of each (class, step) of the boundary subset, plus
-/// the first u2 = 1 case, in that order.
+/// grid at [-1, 1], with the grid's doubling cases
+/// ([`common::DOUBLING_CELLS`], labelled `<key>/<cell>/<step>`) in their
+/// place, then the first case of each (class, step) of the boundary
+/// subset, and the first u2 = 1 case.
 fn selection() -> Vec<(usize, Case)> {
     let mut seen = BTreeSet::new();
     let mut out = Vec::new();
     for set in [grid(1), boundary(true), u2_one(1)] {
-        for (i, c) in set.into_iter().enumerate() {
+        for (i, mut c) in set.into_iter().enumerate() {
             let what = c.variant.split('/').next().unwrap_or("").to_owned();
             let key = if c.class == "grid" {
                 format!("grid {what} {}", step_name(c.step))
             } else {
                 format!("{} {}", c.class, step_name(c.step))
             };
-            if seen.insert(key) {
+            let cell = (c.class == "grid")
+                .then(|| common::doubling_cell(i))
+                .flatten();
+            if let Some(cell) = cell {
+                c.variant = format!("{what}/{cell}/{}", step_name(c.step));
+            }
+            if seen.insert(key) || cell.is_some() {
                 out.push((i, c));
             }
         }
@@ -420,7 +429,9 @@ fn file_text(oracle: &mut Oracle) -> String {
         "# per grid key or boundary class, the first case of each step dcrd's",
         "# algorithm decides at, as tests/vartime_ecdsa_branches.rs constructs them",
         "# on k256 from its fixed seeds (the collision grid at [-1, 1], the boundary",
-        "# subset of eight targets per class, u2 = 1), each answer given by dcrd's",
+        "# subset of eight targets per class, u2 = 1), plus the grid cases whose",
+        "# Straus loop doubles through an addition at each call site (labelled",
+        "# dbl-<site>), each answer given by dcrd's",
         "# dcrec/secp256k1/v4 at the parity pin 3360ae4d through tools/oracle.",
         "# committed_branch_vectors_regenerate rebuilds the file and fails on any",
         "# difference; committed_branch_vectors_hold checks it without Go.",
@@ -463,6 +474,7 @@ fn committed_branch_vectors_hold() {
     for s in ["step6", "step8", "step9", "step10-accept", "step10-reject"] {
         assert!(steps.contains(s), "no committed line reaches {s}");
     }
+    common::assert_doubling_cells_named(data_lines(COMMITTED).map(|(_, f)| f[1]));
 }
 
 /// The committed file is the selection with dcrd's answers, byte for byte.

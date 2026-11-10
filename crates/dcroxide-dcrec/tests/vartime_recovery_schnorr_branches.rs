@@ -40,9 +40,10 @@
 //! run sets it) or in builds with debug assertions, the grid runs [-1, 1]
 //! and the other classes a fixed subset.  The committed file
 //! `tests/data/vartime_recovery_schnorr_branches.txt` holds the first case
-//! of each (grid key or class, step) of the small selection with dcrd's
-//! answer: one test checks it everywhere, without Go, and one rebuilds it
-//! with dcrd and compares it byte for byte.
+//! of each (grid key or class, step) of the small selection, and the grid
+//! cases whose Straus loop doubles through an addition at each of its four
+//! call sites, with dcrd's answer: one test checks it everywhere, without
+//! Go, and one rebuilds it with dcrd and compares it byte for byte.
 
 #![allow(
     clippy::arithmetic_side_effects,
@@ -813,7 +814,9 @@ fn r_at_infinity_schnorr_matches_dcrd() {
 }
 
 /// The committed selection, in this order: the first case of each (grid
-/// key, step) of the grid at [-1, 1]; of each (what, step) of the code,
+/// key, step) of the grid at [-1, 1], with the grid's doubling cases
+/// ([`common::DOUBLING_CELLS`], labelled `<key>/<cell>/<step>`) in their
+/// place; of each (what, step) of the code,
 /// e = 0, no-point and s = 0 classes; of each step of the other recovery
 /// shapes; and, for the Schnorr R classes, of each step, with the
 /// accepting step kept apart for a random s and for s = 0.
@@ -827,7 +830,7 @@ fn selection() -> Vec<(usize, Case)> {
         tiny_r(true),
         r_infinity(8),
     ] {
-        for (i, c) in set.into_iter().enumerate() {
+        for (i, mut c) in set.into_iter().enumerate() {
             let what = c.variant.split('/').next().unwrap_or("").to_owned();
             let key = match c.class {
                 "grid" | "code" | "e-zero" | "no-point" | "zero-s" => {
@@ -838,7 +841,13 @@ fn selection() -> Vec<(usize, Case)> {
                 }
                 class => format!("{class} {}", c.step()),
             };
-            if seen.insert(key) {
+            let cell = (c.class == "grid")
+                .then(|| common::doubling_cell(i))
+                .flatten();
+            if let Some(cell) = cell {
+                c.variant = format!("{what}/{cell}/{}", c.step());
+            }
+            if seen.insert(key) || cell.is_some() {
                 out.push((i, c));
             }
         }
@@ -856,7 +865,9 @@ fn file_text(oracle: &mut Oracle) -> String {
         "# tests/vartime_recovery_schnorr_branches.rs constructs them on k256 from",
         "# its fixed seeds (the recovery grid at [-1, 1], recovery's shapes, valid",
         "# s = 0 signatures, Schnorr R with tiny coordinates and near p, Schnorr R",
-        "# at infinity, each in its small selection), each answer given by dcrd's",
+        "# at infinity, each in its small selection, plus the grid cases whose",
+        "# Straus loop doubles through an addition at each call site, labelled",
+        "# dbl-<site>), each answer given by dcrd's",
         "# dcrec/secp256k1/v4 at the parity pin 3360ae4d through tools/oracle.",
         "# committed_recovery_schnorr_vectors_regenerate rebuilds the file and",
         "# fails on any difference; committed_recovery_schnorr_vectors_hold checks",
@@ -917,6 +928,11 @@ fn committed_recovery_schnorr_vectors_hold() {
     ] {
         assert!(steps.contains(s), "no committed line reaches {s}");
     }
+    common::assert_doubling_cells_named(
+        data_lines(COMMITTED)
+            .filter(|(_, f)| f[0] == "grid")
+            .map(|(_, f)| f[1]),
+    );
 }
 
 /// The committed file is the selection with dcrd's answers, byte for byte.

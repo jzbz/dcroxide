@@ -135,6 +135,112 @@ fn collision_grid() {
     assert!(infinities > 0);
 }
 
+/// dcroxide-dcrec's committed ECDSA and recovery vectors
+/// (`tests/data/vartime_{ecdsa,recovery_schnorr}_branches.txt`).  Their
+/// `dbl-<site>` lines are the collision-grid cases chosen for the Straus
+/// loop's doubling branch at one call site each; dcrec's integration
+/// tests cannot read this crate's counters, so the check that each line
+/// still reaches its cell lives here.
+const DCREC_ECDSA_VECTORS: &str =
+    include_str!("../../../dcroxide-dcrec/tests/data/vartime_ecdsa_branches.txt");
+const DCREC_RECOVERY_VECTORS: &str =
+    include_str!("../../../dcroxide-dcrec/tests/data/vartime_recovery_schnorr_branches.txt");
+
+/// The loop inputs (base, na, ng) dcrec's seam hands `ecmult_var` for one
+/// committed request: ECDSA (Q, r/s, e/s) from key_len || key || hash ||
+/// r || s, recovery (R, s/r, -e/r) from hash || header || r || s with R
+/// decompressed from r (plus N under the overflow code) and the code's
+/// parity.
+fn dcrec_loop_input(command: &str, request: &[u8]) -> (crate::point::Affine, Scalar, Scalar) {
+    let b32 = |at: usize| -> [u8; 32] { request[at..at + 32].try_into().expect("32 bytes") };
+    let sc = |at: usize| Scalar::from_be_bytes(&b32(at)).expect("below N");
+    match command {
+        "ecdsa_verify_raw" => {
+            assert_eq!(
+                (request.len(), request[0]),
+                (130, 33),
+                "a compressed-key request"
+            );
+            let q = crate::point::Affine::decompress_var(&b32(2), request[1] == 3).expect("a key");
+            let e = Scalar::reduce_be_bytes(&b32(34));
+            let w = sc(98).try_inverse_var().expect("s nonzero");
+            (q, sc(66) * w, e * w)
+        }
+        "ecdsa_recover_compact" => {
+            assert_eq!(request.len(), 97, "hash || compact signature");
+            let code = (request[32] - 27) & 3;
+            let mut x = be_to_words(&b32(33));
+            if code & 2 != 0 {
+                let mut carry = 0u128;
+                for (xi, ni) in x.iter_mut().zip(NORD) {
+                    let t = u128::from(*xi) + u128::from(ni) + carry;
+                    *xi = t as u64;
+                    carry = t >> 64;
+                }
+                assert_eq!(carry, 0);
+            }
+            let big_r = crate::point::Affine::decompress_var(&words_to_be(&x), code & 1 != 0)
+                .expect("R on the curve");
+            let e = Scalar::reduce_be_bytes(&b32(0));
+            let w = sc(33).try_inverse_var().expect("r nonzero");
+            (big_r, sc(65) * w, -(e * w))
+        }
+        other => panic!("command {other}"),
+    }
+}
+
+/// Every `dbl-<site>` line of dcrec's two committed vector files still
+/// takes the doubling branch at its site when dcrec's seam runs it, and
+/// each file names all four sites.  The lines are dcrd-judged and checked
+/// without Go by dcrec's hold tests; this ties them to the cell they were
+/// chosen for, so a change to the grid's enumeration cannot move them off
+/// it unnoticed.
+#[test]
+fn committed_lines_reach_their_doubling_cells() {
+    for (file, text) in [
+        ("vartime_ecdsa_branches.txt", DCREC_ECDSA_VECTORS),
+        (
+            "vartime_recovery_schnorr_branches.txt",
+            DCREC_RECOVERY_VECTORS,
+        ),
+    ] {
+        let mut sites = Vec::new();
+        for line in text
+            .lines()
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        {
+            let f: Vec<&str> = line.split('|').collect();
+            let Some(cell) = f[1].split('/').nth(1).filter(|c| c.starts_with("dbl-")) else {
+                continue;
+            };
+            let site = match cell {
+                "dbl-A" => Site::A,
+                "dbl-lambdaA" => Site::LambdaA,
+                "dbl-G" => Site::G,
+                "dbl-2^128G" => Site::G128,
+                other => panic!("{file}: unknown cell {other} in {line}"),
+            };
+            let (base, na, ng) = dcrec_loop_input(f[3], &dcroxide_testutil::unhex(f[4]));
+            branches::reset();
+            let _ = crate::point::ecmult_var(&base, &na, &ng).expect("the wNAF guard declined");
+            let c = branches::get();
+            assert!(
+                c[site as usize][3] > 0,
+                "{file}: {line} no longer doubles at {}: {:?}",
+                SITE_NAMES[site as usize],
+                c[site as usize]
+            );
+            sites.push(site as usize);
+        }
+        sites.sort_unstable();
+        assert_eq!(
+            sites,
+            [Site::A, Site::LambdaA, Site::G, Site::G128].map(|s| s as usize),
+            "{file}: one dbl line per call site"
+        );
+    }
+}
+
 /// Random keys from a k256 walk with na and ng uniform, structured, zero,
 /// small, near N or near 2^128, against k256's combined multiply, and on
 /// every eighth case also against its constant-time `lincomb`.  A tenth

@@ -109,6 +109,40 @@ pub fn grid_bases() -> [(&'static str, ProjectivePoint); 7] {
     ]
 }
 
+/// The grid cases at [-1, 1] whose Straus loop doubles through an
+/// addition, one per call site: (index in the grid's enumeration, label).
+/// Recovery's grid enumerates the same (key, a, b, c, d) and hands the
+/// loop the same (base, u2, u1), so the indices hold for both.  The
+/// selections key on dcrd's step, which never picks these, so they are
+/// added by index; dcroxide-secp256k1-vartime's
+/// `committed_lines_reach_their_doubling_cells` checks that each committed
+/// line still reaches its cell.
+pub const DOUBLING_CELLS: [(usize, &str); 4] = [
+    (1, "dbl-A"),
+    (61, "dbl-G"),
+    (451, "dbl-lambdaA"),
+    (779, "dbl-2^128G"),
+];
+
+/// The doubling cell a grid case at [-1, 1] is committed for, if any.
+pub fn doubling_cell(index: usize) -> Option<&'static str> {
+    DOUBLING_CELLS
+        .iter()
+        .find(|(i, _)| *i == index)
+        .map(|(_, cell)| *cell)
+}
+
+/// The doubling cells the committed lines' variants name (`<key>/<cell>/<step>`);
+/// a vector file must name every one of [`DOUBLING_CELLS`].
+pub fn assert_doubling_cells_named<'a>(variants: impl IntoIterator<Item = &'a str>) {
+    let named: std::collections::BTreeSet<&str> = variants
+        .into_iter()
+        .filter_map(|v| v.split('/').nth(1).filter(|c| c.starts_with("dbl-")))
+        .collect();
+    let want: std::collections::BTreeSet<&str> = DOUBLING_CELLS.iter().map(|(_, c)| *c).collect();
+    assert_eq!(named, want, "the committed doubling-cell lines");
+}
+
 /// 2^128 as a scalar.
 pub fn pow2_128() -> Scalar {
     let mut two128 = [0u8; 32];
