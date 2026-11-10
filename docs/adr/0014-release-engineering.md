@@ -5,9 +5,9 @@
   describes is built: no binary is published until the four conditions of
   part 2 hold; the release workflow, the reproduction script and the
   changes listed under Consequences are pending; and part 6 leaves two
-  questions for the first release. `ring`'s part of the first condition
-  is met (addendum of 2026-10-31); the rest of it, and the other three,
-  stand.
+  questions for the first release. Met (addenda): `ring`'s part of the
+  first condition (2026-10-31), and on the port's branch `secp256k1-sys`'s
+  part; the D3 gate soak passed there, its extra legs to run (2026-11-09).
 - **Date:** 2026-10-26
 
 ## Context
@@ -368,3 +368,25 @@ binary. The rest of that condition stands: `secp256k1-sys`, blake3's
 compiler probe and the C power-cut shim still break ADR-0012's rule, and
 of its two checks only the first bans, on `ring`, `aws-lc-rs` and
 `aws-lc-sys`, are written. The other three conditions are unchanged.
+
+## Addendum, 2026-11-09 — `secp256k1-sys` and the D3 soak
+
+On the port's branch `secp256k1-sys` is out of every build since
+`7bc3816`, which moved compact recovery to `k256` and removed the
+`secp256k1` dependency, and the bans and the job with no C compiler of
+ADR-0012's addendum of 2026-11-06 hold it out. So it is no longer one of
+the things part 2's first condition names (`:135-136`). The D3 gate soak
+has run to the floors of ADR-0006's addendum of 2026-10-26 on x86_64,
+with `curve25519-dalek`'s default backend: G3 on the `k256` port, then
+gate soaks on stage 2a and at route c's two gates, after RC4 and after
+RC6, the last on the tree of route c's final increment, each with every
+class digest equal to the baseline's on libsecp256k1;
+[ADR-0017](0017-secp256k1-in-pure-rust.md), which supersedes ADR-0006,
+records the result, as the second condition asks. The port plan's extra
+soak legs, with overflow checks, `curve25519-dalek`'s serial and AVX-512
+backends and on arm64, are still to run before the merge, so the second
+condition is met once they pass. Both parts hold for a release only once
+the port merges, which waits on the merge-bar run of
+[ADR-0016](0016-secp256k1-vartime-arithmetic.md). blake3's compiler probe
+and the C power-cut shim still break ADR-0012's rule, and the pin at a
+dcrd v2.2 release tag and the reproduction prototype are unchanged.

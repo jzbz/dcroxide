@@ -152,11 +152,11 @@ impl Sum {
 /// Should the vartime crate decline anywhere (r or s not below N, the
 /// inverse's cap, the wNAF builder's guard; none happens for valid
 /// inputs), the sum is k256's combined multiply and one
-/// `batch_normalize_vartime` instead, the code the last gate soak ran
-/// (stage 2a's fallback), and debug builds assert.  Builds with debug
-/// assertions also compute k256's sum every time and stop if the two
-/// disagree on infinity or on x; that check only reads, so they compute
-/// what release computes.
+/// `batch_normalize_vartime` instead, the code G3 soaked at `43beedc`
+/// and stage 2a's loop fell back to, and debug builds assert.  Builds
+/// with debug assertions also compute k256's sum every time and stop if
+/// the two disagree on infinity or on x; that check only reads, so they
+/// compute what release computes.
 pub(crate) fn ecdsa_mul_g_add(hash: &[u8; 32], r: &[u8; 32], s: &[u8; 32], q: &PublicKey) -> Sum {
     if !forced_fallback() {
         let x = vartime_sum(hash, r, s, q).filter(|_| !forced_decline());
@@ -203,8 +203,8 @@ fn mul_g_add(u1: &vartime::Scalar, u2: &vartime::Scalar, q: &PublicKey) -> Optio
     vartime::ecmult_var(&q.point.0, u2, u1)
 }
 
-/// Steps 2 to 5 on k256, the code the last gate soak ran as stage 2a's
-/// fallback: its `invert_vartime`, its scalar products, its combined multiply
+/// Steps 2 to 5 on k256, the code G3 soaked and stage 2a's fallback: its
+/// `invert_vartime`, its scalar products, its combined multiply
 /// `mul_by_generator_and_mul_add_vartime` and one `batch_normalize_vartime`,
 /// on the key converted to k256's point.  Should r or s not be below N,
 /// which the caller rules out, or k256 refuse the key, which takes a

@@ -7,7 +7,7 @@
 //! The arithmetic is a port of libsecp256k1's portable C (see `NOTICE`),
 //! owned in tree as ADR-0016 records, for `dcroxide-dcrec`'s ECDSA
 //! verification, compact recovery, EC-Schnorr-DCRv0 verification and
-//! public keys.  It lands in increments.  Today it holds:
+//! public keys.  It landed in increments (ADR-0016) and holds:
 //!
 //! - the integers mod the group order N ([`Scalar`], libsecp256k1's 4x64
 //!   form) and their inverse by safegcd (`modinv64`), which dcrec's

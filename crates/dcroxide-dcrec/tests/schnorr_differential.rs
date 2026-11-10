@@ -3,9 +3,10 @@
 //! `dcrec/secp256k1/v4/schnorr`, live — signatures byte-for-byte, verify
 //! verdicts across tampering variants and the rejection paths signing never
 //! reaches (R at infinity, zero s, odd R, arbitrary bytes), and parse
-//! verdicts with exact error kinds. This also cross-validates the k256
-//! arithmetic backend against dcrd's own field/scalar implementation
-//! (ADR-0006 constraint).
+//! verdicts with exact error kinds. This also cross-validates the
+//! arithmetic beneath them, k256's for signing and
+//! dcroxide-secp256k1-vartime's for verification, against dcrd's own
+//! field/scalar implementation (ADR-0017).
 
 use dcroxide_dcrec::secp256k1::schnorr::{Error, Signature, parse_pub_key, parse_signature, sign};
 use dcroxide_dcrec::secp256k1::{FIELD_PRIME_BYTES, GROUP_ORDER_BYTES, PrivateKey, PublicKey};

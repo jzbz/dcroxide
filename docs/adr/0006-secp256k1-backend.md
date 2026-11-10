@@ -1,16 +1,16 @@
 # ADR-0006 — D3: secp256k1 backend split
 
-- **Status:** Proposed (draft for decision D3) — on 2026-10-26 the project
-  owner decided that ECDSA and secp256k1 key handling move to `k256` under
-  ADR-0012 and that Ed25519 stays on `curve25519-dalek`; a new ADR is to
-  supersede this one after the port, its differential soak and its speed
-  measurement; see the 2026-10-26 addendum
+- **Status:** Superseded by [ADR-0017](0017-secp256k1-in-pure-rust.md)
+  (2026-11-09), effective with the merge of the port's branch. Proposed
+  (draft for decision D3) and never ratified; on 2026-10-26 the
+  project owner decided that ECDSA and secp256k1 key handling move to `k256`
+  under ADR-0012 and that Ed25519 stays on `curve25519-dalek` (addendum)
 - **Date:** 2026-07-03 (proposed), 2026-07-26 (addendum: the split held),
-  2026-10-26 (addendum: ECDSA and key handling to move to `k256`; a superseding
-  ADR pending; second addendum: how the soak is run and compared), 2026-10-27
-  (addendum: the oracle-backed fuzz targets and the nightly soak), 2026-10-30
-  (addendum: a fix to the soak's model of dcrd between the soaks), 2026-11-08
-  (addendum: stage 2a, the static-table multiply)
+  2026-10-26 (addendum: ECDSA and key handling to move to `k256`; second
+  addendum: how the soak is run and compared), 2026-10-27 (addendum: the
+  oracle-backed fuzz targets and the nightly soak), 2026-10-30 (addendum: a
+  fix to the soak's model of dcrd between the soaks), 2026-11-08 (addendum:
+  stage 2a, the static-table multiply), 2026-11-09 (superseded by ADR-0017)
 
 ## Context
 

@@ -9,9 +9,9 @@
 //! three: **type 0 (ECDSA-secp256k1)**, **type 1 (Ed25519)**, and **type 2
 //! (EC-Schnorr-DCRv0)**.
 //!
-//! Per ADR-0006's 2026-10-26 addendum and ADR-0012, ECDSA and
-//! EC-Schnorr-DCRv0 signing and secp256k1 private keys run on `k256`'s
-//! field, scalar and point arithmetic, and Ed25519 on `curve25519-dalek`'s.
+//! Per ADR-0017 and ADR-0012, ECDSA and EC-Schnorr-DCRv0 signing and
+//! secp256k1 private keys run on `k256`'s field, scalar and point
+//! arithmetic, and Ed25519 on `curve25519-dalek`'s.
 //! The variable-time arithmetic of ECDSA verification, compact recovery
 //! and EC-Schnorr-DCRv0 verification, and public keys (their parsing,
 //! curve check, decompression and serialization), run on

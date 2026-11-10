@@ -272,7 +272,7 @@ evaluating this code.
   connection is then read as dcrd reads, and no frame is kept. Details
   are in PARITY.md, *Reading ahead of the block handler*.
 - **Fuzzing reaches the stateless parsers, not the state machines.**
-  Twenty-five `cargo-fuzz` targets run for 60 seconds apiece on every
+  Twenty-six `cargo-fuzz` targets run for 60 seconds apiece on every
   push to `master` and every pull request, and for ten minutes apiece
   nightly: wire framing, decoded at every protocol version a peer can
   negotiate (9 through 12); the `tx` and `blockheader` decoders, with
@@ -290,9 +290,11 @@ evaluating this code.
   that check-encodes a chosen address ID and payload gets past the
   checksum to the address dispatch); the chain database's stored-row
   decoders; `chainhash` parsing; DER signature parsing; public-key
-  parsing; ECDSA signing, verification and compact recovery; the Schnorr
-  and Ed25519 suites; `uint256`; BLAKE-256; and, in `dcroxide-tlscrypto`,
-  the provider every TLS connection the node serves or dials runs on
+  parsing; ECDSA signing, verification and compact recovery; the
+  secp256k1 arithmetic of `dcroxide-secp256k1-vartime`, every operation
+  the node calls on it; the Schnorr and Ed25519 suites; `uint256`;
+  BLAKE-256; and, in `dcroxide-tlscrypto`, the provider every TLS
+  connection the node serves or dials runs on
   ([ADR-0015](docs/adr/0015-tls-crypto-provider.md)), its signature
   verification, which a peer's certificate chain and handshake signature
   reach before anything of theirs is trusted (the fourteen algorithms,
@@ -312,21 +314,27 @@ evaluating this code.
   holds that decoding to dcrd. The other four signature targets and the
   two TLS ones check dcroxide only against itself, that parsing, signing
   and verifying do not panic, that what it signs verifies and that what
-  it serializes parses back. No other target asks dcrd or Go for an
-  answer. Beyond the fuzz jobs, the comparison with dcrd for signatures
-  rests on the oracle batteries of the test suite
+  it serializes parses back. `secp256k1_vartime_diff` holds
+  `dcroxide-secp256k1-vartime`'s arithmetic to `k256`'s, and its field
+  multiplication to fiat-crypto's limb for limb. No other target asks dcrd
+  or Go for an answer. Beyond the fuzz jobs, the comparison with dcrd for
+  signatures rests on the oracle batteries of the test suite
   ([ADR-0006](docs/adr/0006-secp256k1-backend.md)'s addenda), which run
   a fixed number of cases each, and on its ported vectors; the signature
   soak, `dcroxide-sigdiff`'s `sigsoak`, runs the same classes at a
-  recorded volume, and the run that gates the port to `k256` is still to
-  come (ADR-0006's 2026-10-26 addenda). Each night CI runs the soak for
-  35 minutes on x86_64, on x86_64 with `curve25519-dalek`'s portable
-  backend over the Ed25519 classes, and on arm64, failing on any
-  disagreement with dcrd, any intent a case missed, or any class short
-  of a hundredth of its floor, and then writes a fixed-seed record that
-  every later night's can be compared with; that is regression evidence,
-  not the run that gates the port. For the TLS provider the comparison
-  rests on ring's verdicts, recorded in its parity corpus before ring
+  recorded volume. The run that gates the port, at the floors the project
+  owner set, passed on the `k256` port, on stage 2a, and at the two gates
+  of the owned arithmetic of
+  [ADR-0016](docs/adr/0016-secp256k1-vartime-arithmetic.md), after RC4
+  and after RC6, every class's digest equal to that of the baseline run
+  on libsecp256k1 ([ADR-0017](docs/adr/0017-secp256k1-in-pure-rust.md));
+  the port is not merged yet. Each night CI runs the soak for 35 minutes
+  on x86_64, on x86_64 with `curve25519-dalek`'s portable backend over
+  the Ed25519 classes, and on arm64, failing on any disagreement with
+  dcrd, any intent a case missed, or any class short of a hundredth of
+  its floor, and then writes a fixed-seed record that every later
+  night's can be compared with; that is regression evidence, not a gate
+  run. For the TLS provider the comparison rests on ring's verdicts, recorded in its parity corpus before ring
   left the tree, its Wycheproof vectors, its Go differential and the Go
   interop matrix, and its timing on a statistical check in CI of its
   signing, key exchange, record protection (sealing, a bad tag's refusal
@@ -379,8 +387,12 @@ evaluating this code.
   and the tree includes the elliptic-curve implementations, the TLS
   stack, rustls over RustCrypto's crates under the project's own
   provider, `dcroxide-tlscrypto`, which nobody outside the project has
-  read either, and the storage engine that this node's key handling and
-  on-disk consensus state rest on.
+  read either, `dcroxide-secp256k1-vartime`, the project's port of
+  libsecp256k1's variable-time arithmetic, which every ECDSA and
+  EC-Schnorr-DCRv0 verification on the port's branch runs on and which
+  nobody outside the project has read either (ADR-0016), and the storage
+  engine that this node's key handling and on-disk consensus state rest
+  on.
   [docs/dependency-ledger.md](docs/dependency-ledger.md) does not close
   this gap, but it bounds it: the twelve crates that are consensus-
   observable or touch key material now carry an explicit decision each,

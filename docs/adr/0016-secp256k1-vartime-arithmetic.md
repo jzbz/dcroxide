@@ -1,15 +1,22 @@
 # ADR-0016 — D3 stage 2: variable-time secp256k1 arithmetic owned in tree
 
-- **Status:** Proposed 2026-11-08. The project owner approved the route on
-  2026-11-08, approved the design's recommendations and started the work
-  the same day, after the prototype's measurement (Context, "The
-  approval"); this record states its scope, the increments, the merge bar
-  and the way back. It supersedes nothing yet. It builds on
-  [ADR-0006](0006-secp256k1-backend.md), whose superseding record waits for
-  the merge of the `k256` port, and on [ADR-0012](0012-pure-rust.md), whose
-  rule it serves. It moves to Accepted with the measured results of the
-  merge-bar run.
-- **Date:** 2026-11-08 (proposed)
+- **Status:** Accepted 2026-11-09, with the measured results through the
+  shared gate of RC5 and RC6 (addendum of that date). The project owner
+  approved the route on 2026-11-08 and started it the same day (Context,
+  "The approval"); it is built on the port's branch in five increments,
+  RC1 to RC6, with RC3 folded into RC4 and RC7 not needed. **The
+  merge-bar run has not been made.** The port merges only if that run, a
+  fresh G5 against master, puts full validation at no more than 1.10
+  times libsecp256k1's and the default sync within base's spread in that
+  session; a result between 1.10 and 1.20 goes back to the project owner
+  with the numbers, and above 1.20 the options are accepting the
+  residual, asking RustCrypto upstream or switching back (Decision, "The
+  merge bar"). That run's numbers go in a later record. This record
+  supersedes nothing: [ADR-0017](0017-secp256k1-in-pure-rust.md) records
+  D3 as built and supersedes [ADR-0006](0006-secp256k1-backend.md). It
+  serves [ADR-0012](0012-pure-rust.md)'s rule.
+- **Date:** 2026-11-08 (proposed), 2026-11-09 (accepted; addendum: the
+  measured results, the merge bar pending)
 
 ## Context
 
@@ -238,8 +245,8 @@ more work we care about code quality and efficiency".
 dcroxide owns the arithmetic of these operations, all of which run on public
 values:
 
-- ECDSA verification steps 3 to 10: s^-1, u1 and u2, X = u1·G + u2·Q, the
-  infinity test and the x comparison with r and r+N;
+- ECDSA verification steps 2 to 10: e = H mod N, s^-1, u1 and u2,
+  X = u1·G + u2·Q, the infinity test and the x comparison with r and r+N;
 - compact recovery steps 4 to 10 and its affine output, the decompression of
   R included;
 - EC-Schnorr-DCRv0 verification steps 7 to 10: R = s·G + e·Q, the infinity
@@ -366,7 +373,7 @@ wrong key.
 ### Increments
 
 The prototype of the whole route was built and measured outside the tree
-first (Context); the route now lands as increments, each a commit the
+first (Context); the route landed as increments, each a commit the
 project owner signs, stacked on the port's branch after stage 2a. Every
 wired increment is soaked before the next, RC1 and RC2 together if the
 owner prefers, and RC5 and RC6 likewise. Expected effects are estimates
@@ -406,7 +413,7 @@ fallback arms convert the key when they run.
 | RC5 | recovery and Schnorr verification on the new crate; stage 2a's loop and its `once_cell` dependency removed | yes, may share RC6's gate | Schnorr below base's cost; little in a sync, where Schnorr is rare and recovery is RPC only |
 | RC6 | dcrec's public key held as the crate's affine point; parse and serialization on it | yes, may share RC5's gate | ~0.5-1% of a verification |
 | RC7 | tuning, only if the first milestone asks for it | if changed | inlining; window 15 only if the first milestone lands between 1.10 and 1.15 (~2.5-3% of a verification) |
-| RC8 | records, and the merge-bar run | no | |
+| RC8 | records (2026-11-09), then the merge-bar run | no | |
 
 Pre-registered thresholds, on the prototype's in-process ratio and on
 RC4's G4 (one thread, head over base): at most 1.08, go on; 1.08 to 1.15,
@@ -536,7 +543,7 @@ speed reference after the merge.
 
 libsecp256k1 is MIT. The crate carries a `NOTICE` holding libsecp256k1's
 `COPYING` verbatim and the copyright line of each file it follows (Pieter
-Wuille for the field, group, scalar and ECDSA files; Pieter Wuille, Andrew
+Wuille for the field, group and scalar files; Pieter Wuille, Andrew
 Poelstra and Jonas Nick for `ecmult_impl.h`; Peter Dettman for
 `modinv64_impl.h`; and Russell O'Connor with the three for
 `ecmult_compute_table_impl.h`, which the table generator follows). The
@@ -555,8 +562,7 @@ on the conservative side:
 - test modules ported from libsecp256k1's `tests.c` (the inverse identities
   and their case tables, the scalar and field vectors) are `ISC AND MIT`
   with `tests.c`'s line ("2013, 2014, 2015 Pieter Wuille, Gregory
-  Maxwell"), so Gregory Maxwell is among the `NOTICE`'s holders once one
-  lands.
+  Maxwell"), so Gregory Maxwell is among the `NOTICE`'s holders.
 
 Code is ported from libsecp256k1 alone, not from `k256`, whose field
 credits libsecp256k1 under its own licences. Release archives must carry
@@ -577,9 +583,11 @@ files taken from non-ISC sources need notices is a separate question.
   gate.
 - Pull requests to RustCrypto with any of this work, each the project
   owner's call.
-- The record that supersedes ADR-0006, which takes the next free number when
-  it is written, after the merge.
 - The sweep of other files derived from non-ISC sources, after route c.
+
+The record that supersedes ADR-0006 is
+[ADR-0017](0017-secp256k1-in-pure-rust.md), written with this record's
+acceptance on the port's branch; it takes effect with the merge.
 
 ## Consequences
 
@@ -589,7 +597,8 @@ files taken from non-ISC sources need notices is a separate question.
   it follows has changed little in years, so the cost is mostly review. The
   code is unaudited; the literal port of reviewed, proven formulas, the
   differential and exhaustive tests and the soaks against dcrd are what
-  bound that, and no audit is planned.
+  bound that, and no audit is planned. It is a further exception to the
+  project brief's principle 3, which lists it.
 - **Incomplete formulas come back**, and with them the attacker-reachable
   special cases complete formulas avoid: doubling through an addition, a sum
   at infinity, and the r+N comparison, the three branches the third set of
@@ -607,10 +616,11 @@ files taken from non-ISC sources need notices is a separate question.
 - **The merge may not come.** If the merge-bar run lands above 1.10, the
   decision returns to the project owner with the numbers; the branch stays
   unmerged meanwhile and master keeps libsecp256k1.
-- **Speed is measured once, in process.** The prototype's ratio against
-  libsecp256k1 is the only measurement of this route; every other expected
-  effect above is a model estimate. G4 at RC4 and the two G5 milestones are
-  still to come, each on the project owner's go like every timed run.
+- **Speed is measured in the shapes of the 2026-11-07 gates**: the
+  prototype in process, G4 after RC4 and after RC6, and the first G5
+  milestone after RC4 (addendum of 2026-11-09); the expected effects in
+  the Increments table are the model's. The merge-bar G5 is still to come,
+  on the project owner's go like every timed run.
 - **32-bit targets** compute correctly by u128 semantics but are untested;
   every CI target is 64-bit.
 - **Notices**: the crate's NOTICE must reach release archives;
@@ -643,3 +653,130 @@ files taken from non-ISC sources need notices is a separate question.
   2026-10-26.
 - **Staying on libsecp256k1**: reverses "pure rust everywhere" and ADR-0012;
   available as the way back above.
+
+## Addendum, 2026-11-09 — accepted, with the measured results; the merge bar pending
+
+**What landed.** Five commits on the port's branch, each signed by the
+project owner: RC1 `8851e57`, the crate with the scalar and the safegcd,
+taking s^-1 and r^-1; RC2 `e7c7a6e`, the field and the square root,
+taking the decompression of compressed keys and of recovery's R; RC4
+`8c672e9`, RC3's group formulas and tables with the wNAF, the GLV split,
+the Straus loop and the x check, taking ECDSA verification; RC5
+`0632b75`, compact recovery and EC-Schnorr-DCRv0 verification, with stage
+2a's loop and its `once_cell` dependency removed; and RC6 `b479c1c`,
+dcrec's public key held as the crate's affine point. RC7 was to run only
+if the first milestone asked for it, and its window change only if that
+milestone landed between 1.10 and 1.15; the first milestone (M1) landed
+at 1.035, so RC7 was not needed and the window stays at 12.
+
+**Why Accepted before the merge bar.** The route is decided, built and
+soaked, and its speed is measured in every shape but the last; what the
+merge-bar run decides is whether the port merges, not whether this is
+the route. The repository accepts decisions with an open condition the
+same way, saying so in the status line
+([ADR-0013](0013-upstream-tracking-release-tags.md), accepted "to take
+effect when dcrd tags v2.2.0"). If the run fails the bar, the outcomes
+of "The merge bar" above apply and a further addendum records which was
+taken.
+
+**The gates as run.** The project owner deferred the gates while the
+increments were built, so RC1, RC2 and RC4
+were soaked together at `8c672e9`, and RC5 and RC6 together at the tree
+of `b479c1c`, where the Increments allowed RC1 with RC2, RC5 with RC6 and
+RC4 alone. Each gate soak used the baseline soak's master seed
+`0x18e56cebf8f0edf0` and its oracle binary, ran 427,002,940 cases with
+no disagreement, matched every one of the 82 class digests of the
+baseline run on libsecp256k1, replayed equal and caught the model
+baseline and canaries C1-C18, at pin `3360ae4d` with generator
+fingerprint `c21c897e`; the pin rule held. Each had a `soak-asserts` leg
+of 762,940 cases, 10^4 per class and six small classes at their full
+size, with no disagreement and replay digests equal to the baseline's.
+In the RC5 and RC6 leg a decline of the crate on verification, recovery,
+Schnorr verification or decompression stops the run, and the owned
+results of the first three are compared with `k256`'s on every call, so
+its clean pass also shows that each such call took the owned path, and
+those three agreed with `k256`.
+
+**The measurements.** On an x86_64 Linux desktop, base = master
+`0c4154d` (libsecp256k1) in the same session as each head. G4 figures
+are head over base in time per operation, the least over processes and
+rounds, at one thread unless noted; EC-Schnorr-DCRv0 verification runs
+on `k256` in base, so its row compares with that. The bench ledger
+holds each run ("The k256 port against libsecp256k1, one operation at a
+time (2026-11-07)" through "Route c through RC6, one operation at a time
+(2026-11-09, evening)").
+
+| measurement | `43beedc` (`k256`) | stage 2a `3c50313` | RC4 `8c672e9` | RC6 `b479c1c` |
+|---|---|---|---|---|
+| ECDSA verification, G4 | 1.963 | 1.582 | 1.036 | 1.031 |
+| checksig (key parse, DER parse, verification), G4 | 1.917 | 1.589 | 1.033 | 1.026 |
+| compressed key parse, G4 | 1.648 | 1.617 | 1.011 | 0.993 |
+| compact recovery, G4 | 1.867 | 1.544 | 1.397 | 1.029 |
+| EC-Schnorr-DCRv0 verification, G4 | 0.996 | 0.795 | 0.796 | 0.549 |
+| RFC6979 signing, G4 (`k256` in every head) | 1.214 | 1.216 | 1.215 | 1.216 |
+| ECDSA verification, G4, 16 threads | 2.002 | 1.570 | 1.106-1.146 | 1.106-1.126 |
+| full validation, G5, wall mean head/base | 1.497 | 1.300 | **1.035** (M1) | not run |
+| default sync, G5, mean head - base | +29.1 s (base spread 16.0 s) | +22.65 s (5.6 s) | -2.90 s (9.5 s) | not run |
+| gate soak against the libsecp256k1 baseline | equal (G3) | equal | equal | equal |
+
+- The compressed key's parse reads 1.648 for `43beedc` and 1.617 for
+  stage 2a, each from its own session; stage 2a did not change parsing,
+  and in the RC4 session the two read the other way round, 1.617 and
+  1.648.
+- RC4's integrated verification came in at 1.034-1.036, 0.7 to 1.2
+  points above the prototype's in-process 1.024-1.030, more than the
+  0.2-0.5% the conversions at the seam were expected to cost. The cause
+  is not attributed.
+- RC6's expected gain of 0.5-1% on a verification is not seen: against
+  RC4 in the same session the difference, -0.15% to -0.19%, is within
+  the spread. RC6 is faster than RC4 on the compressed key's parse
+  (-1.87%), recovery (-26.1%) and Schnorr verification (-30.9%). Recovery
+  now costs what a verification does, relative to libsecp256k1, and
+  Schnorr verification about as much as an ECDSA verification, 0.549 of
+  base's `k256` Schnorr.
+- The RC6 session read about 0.4 points more favourably than RC4's on
+  byte-identical binaries; on RC4's conditions RC6's verification is
+  about 1.035.
+- The 16-thread figures are indicative only: identical code moved by
+  15-20% between processes at 16 threads in the RC4 session.
+- M1, three full-validation runs a side: all nine pairings 1.022-1.046,
+  and every UTXO set equal at block 1,116,035, as in the earlier
+  sessions. The default sync, four runs a side, differed by -2.90 s,
+  inside base's 9.5 s spread. In that session the dcrd block server read
+  its chain from disk in every full-validation run, 9.6-17.5 GB, where
+  it read none before, so the walls are higher than on 2026-11-07 and
+  2026-11-08 (base 489.47 s against 477.7 s and 480.57 s); if that cost
+  both arms alike the ratio is about 1.036, and head against the
+  2026-11-07 base gives 1.060.
+- The node-side tuning of decision 3 was closed on 2026-11-08 (Context),
+  so the merge-bar run runs both arms at the defaults.
+
+**Against the rules.** RC4's G4 is in the first band of the
+pre-registered thresholds (at most 1.08, go on), and M1 at 1.035 is at
+most 1.10, which continues RC5 and RC6 as planned. Read informally
+against the merge bar, M1 would pass both conditions. It is not the
+merge-bar run: that is a fresh G5 at the final branch against master's
+tip, recorded with base's commit, in one session, with three
+full-validation runs a side in the order B H H B B H and four default
+syncs a side.
+
+**What remains before the merge.** The merge-bar run, on the project
+owner's go, then a records commit with its numbers in this record and in
+ADR-0017; and the port plan's criteria 8 and 9, the extra soak legs
+(overflow checks, `curve25519-dalek`'s serial and AVX-512 backends,
+arm64) and the committed witness vectors, after the last arithmetic
+change. The soak harness's unfreeze is not needed.
+
+**What this corrects.** The status line; the Consequences' "Speed is
+measured once, in process", rewritten above, and their new sentence on
+the brief's principle 3; the Increments' tense and their RC8 row; the
+Scope's ECDSA steps, 2 to 10, since e = H mod N runs on the crate; the
+licence section's tense and its list of upstream files, which has no
+ECDSA file; and "Not decided here", whose bullet on ADR-0006's
+superseding record is now a sentence naming ADR-0017. The Context's
+account of where D3 stands is that of 2026-11-08 and keeps its words,
+including "every key and compact recovery run on `k256`", which RC1 to
+RC6 have since narrowed to keys from secrets, signing, the nonce and the
+fallback arms. So does the approval's "ADR-0006's superseding record
+taking the next free number after the merge": that is the approval as
+given, and the sentence after "Not decided here" says how it was met.

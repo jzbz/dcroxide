@@ -97,6 +97,10 @@ path) has been measured yet, so this crossover is unconfirmed.
 | 2026-10-22 | m3 | `8bda92e`, the head of master when the syncs ran, in a home directory created as usual and in one created with btrfs's no-copy-on-write attribute (`chattr +C`); and W0b, `8bda92e` with each block record started on a fresh 4 KiB page, a diagnostic build not for commit | not run in this session | mainnet, genesis to 1,116,035 | From the LAN server of the rows above, at the defaults, with transparent huge pages at `always` and kernel 7.3.0 where the LAN rows above ran at `madvise` on an older kernel, so the walls are compared within the session only. As created: 254.8 s and 255.1 s, mean 254.95 s — **4,377.5 blk/s** at 3.69 mean cores. Without copy-on-write: 232.1 s and 232.8 s, mean 232.45 s — **4,801.2 blk/s** at 3.99–4.01, 22.50 s or 8.8% less, with 40.4 and 40.7 GB written at the volume against 57.0 and 57.9 GB, and the block thread uninterruptible for 8.6 s against 30.6 s, nearly all of it in btrfs's write paths, one run of each under a wait sampler. W0b, one run under the sampler: 252.8 s, 2.0 s under its pair, which one run against one does not resolve | this file, "`8bda92e` in a directory without copy-on-write, and block records on fresh pages" |
 | 2026-10-24 | m3 | `f37d763`, the head of master when the syncs ran, which holds the eighteen commits after `797a213` that change the node's code, against `797a213` | not run in this session | mainnet, genesis to 1,116,035 | From the LAN server of the rows above, at the defaults, with transparent huge pages at `always` and kernel 7.3.0, as on 2026-10-22 but in a later package release of it, so the walls are compared within the session only. `f37d763`: 254.9 s, 252.8 s, 252.0 s and 253.2 s, mean 253.23 s — **4,407.3 blk/s** at 3.65–3.68 mean cores, with a peak resident memory of 2,465 to 2,507 MiB. `797a213`, run second and fourth of the six: 270.3 s and 268.8 s, mean 269.55 s — 4,140.4 blk/s at 3.34–3.36 mean cores. `f37d763` took **16.33 s or 6.1% less**, and less in each of the eight pairings. From the loopback dcrd v2.1.6 server `f37d763` ended on the UTXO set and block files of every full sync from it since 2026-10-17, at the defaults and with `--assumevalid=0`, which took 491.7 s from a server that read nothing from its drive, in another session than the 583.4 s of 2026-10-19 | this file, "`f37d763` against `797a213`, its end state and a sync that checks every script" |
 | 2026-10-25 | m3 | `dfa77fe`, the head of master when the syncs ran, whose node code is `f37d763`'s and whose binary is the one of the row above | release v2.1.7 (go1.25.4), the binary of the 2026-10-19 rows, two runs, and one with `--noexistsaddrindex` | mainnet, genesis to 1,116,035 | From the LAN server of the rows above, at the defaults, with transparent huge pages at `always` and kernel 7.3.0 as in the row above, where the 2026-10-19 rows ran at `madvise`, so the walls are compared within the session only. `dfa77fe`, four runs: 251.2 s, 253.1 s, 252.4 s and 249.6 s, mean 251.58 s — **4,436.2 blk/s** at 3.66–3.72 mean cores, with a peak resident memory of 2,462 to 2,496 MiB. dcrd v2.1.7: 2,997.7 s and 2,972.5 s, mean 2,985.1 s — **372.3 and 375.5 blk/s** at 1.88 and 1.87 mean cores, peaking at 1,854 and 1,855 MiB; with the index off, one run, 1,325.3 s — 842.1 blk/s. So `dfa77fe` is **11.87x** as fast at the defaults, 11.74x to 12.01x over the eight pairings, and 5.74x with the index off (230.5 s and 231.0 s against one dcrd run of 1,325.3 s) | this file, "`dfa77fe` against dcrd v2.1.7, with the exists-address index on and off" |
+| 2026-11-07 | m3 | `43beedc`, the `k256` port, against `0c4154d`, master on libsecp256k1 | not run in this session | mainnet, genesis to 1,116,035 | Full validation, `--assumevalid=0`, from a dcrd block server on the same machine, in the order B H H B B H: `0c4154d` 481.1 s, 472.1 s and 480.0 s, mean 477.7 s; `43beedc` 715.4 s, 712.8 s and 717.2 s, mean 715.1 s — **1.497** times as long, with 1.802 times the process CPU time; all six UTXO sets equal. Default syncs from the LAN server, four each: means 238.1 s (spread 16.0 s) and 267.3 s (spread 3.9 s), **1.122** | this file, "The k256 port against libsecp256k1 in syncs (2026-11-07)" |
+| 2026-11-08 | m3 | `3c50313`, stage 2a, against `0c4154d` | not run in this session | mainnet, genesis to 1,116,035 | Full validation as in the row above, in the order B S S B B S: `0c4154d` 488.4 s, 476.3 s and 477.0 s, mean 480.57 s; `3c50313` 626.4 s, 626.9 s and 620.7 s, mean 624.67 s — **1.300**, with 1.490 times the CPU time; the UTXO sets equal to those of the row above. Default syncs from the LAN server, two each: means 239.20 s (spread 5.6 s) and 261.85 s (spread 10.1 s), **+22.65 s** | this file, "Stage 2a in syncs (2026-11-08)" |
+| 2026-11-08 | m3 | diagnostic builds of `43beedc` and `0c4154d` that read two settings from the environment, not for commit | not run in this session | mainnet, genesis to 1,116,035 | Fifteen pre-verification helpers and a read-ahead depth of 64 against the defaults of ten and 16, in the harness of the row above. `43beedc`: full validation 714.20 s against 712.90 s, two runs each, **+1.30 s**; default sync 265.15 s against 266.45 s, two each, **-1.30 s**. `0c4154d`: 515.4 s against 478.4 s, one run each, and 244.25 s against 237.30 s, two each. Neither difference on `43beedc` reached the bar set before the runs, 15 s and 5 s faster | this file, "Two node settings on both arms (2026-11-08)" |
+| 2026-11-09 | m3 | `8c672e9`, route c through RC4, against `0c4154d` | not run in this session | mainnet, genesis to 1,116,035 | Full validation as in the rows above, B H H B B H: `0c4154d` 489.0 s, 489.2 s and 490.2 s, mean 489.47 s; `8c672e9` 500.9 s, 511.3 s and 507.5 s, mean 506.57 s — **1.035**, 1.022 to 1.046 over the nine pairings, with 1.063 times the CPU time; the UTXO sets equal to those of the rows above. Default syncs from the LAN server, four each: means 245.52 s (spread 9.5 s) and 242.62 s (spread 11.6 s), **-2.90 s**. The block server read 9.6-17.5 GB from its drive in every full-validation run, none in those of the rows above | this file, "Route c through RC4 in syncs (2026-11-09)" |
 
 > **The headline 1.29x predates the fan-out fix, so it is conservative for
 > master.** That figure was measured on `b6d0c63`; `c091b46` (one validation
@@ -7229,3 +7233,474 @@ processes' outputs, with their `.err` files; `state.txt`, the machine
 state before and after each; `build.txt`, the toolchain line, the two
 binaries' digests and the CPU's name; and the program's `main.rs`,
 `Cargo.toml`, `Cargo.lock` and `run.sh`.
+
+## The k256 port against libsecp256k1, one operation at a time (2026-11-07)
+
+The speed measurement of ADR-0006's addendum of 2026-10-26, for the port
+of dcroxide-dcrec's ECDSA and keys to `k256`, includes G4, a signature
+microbenchmark of the port against master. It ran on m3 between 05:43 and
+05:50 on 2026-11-07, before the syncs of "The k256 port against
+libsecp256k1 in syncs (2026-11-07)" below.
+
+**The program.** An out-of-tree benchmark, not in the tree, the successor
+of the program of "ECDSA verification on libsecp256k1 and on k256
+(2026-10-26)" above, built once against each commit's dcroxide-dcrec:
+base, master `0c4154d` on libsecp256k1, and head, `43beedc`, the port.
+Each build also carries libsecp256k1 and `k256` called directly, as
+reference arms. 32,768 cases, three rounds, on one thread and then on
+sixteen; four processes, in the order base, head, head, base. Every arm
+of each operation gave the same digest over every case in all four.
+
+**Head over base**, the time per operation of dcroxide-dcrec as the node
+calls it, the least over rounds and processes:
+
+| operation | one thread | sixteen threads |
+|---|---|---|
+| ECDSA verify, low S | 1.963 | 2.002 |
+| ECDSA verify, high S | 1.962 | 2.003 |
+| ECDSA verify, invalid | 1.962 | 2.006 |
+| key parse, DER parse and verify, as `OP_CHECKSIG` | 1.917 | 1.947 |
+| parse of a compressed key | 1.648 | 1.344 |
+| parse of an uncompressed key | 0.747 | 0.947 |
+| compact recovery | 1.867 | 1.619 |
+| RFC6979 signing | 1.214 | 1.230 |
+| EC-Schnorr-DCRv0 verify, on `k256` in both | 0.996 | 0.994 |
+
+The reference arms, the same code in both builds, stayed within
+0.983-1.001 of each other at one thread.
+
+**What it shows.** One ECDSA verification through the port costs about
+twice what it does on libsecp256k1, as the 2026-10-26 program found,
+and a compressed key's parse about 1.65 times.
+
+**What it does not show.** The cost to a sync, which the next section
+measures. This entry keeps the ratios only; the absolute times were in
+`analyze-final.txt`.
+
+Raw: `1-base.txt`, `2-head.txt`, `3-head.txt` and `4-base.txt`, with
+their `.err` files; `build.txt`; `state.txt`; and `analyze-final.txt`,
+the full table.
+
+## The k256 port against libsecp256k1 in syncs (2026-11-07)
+
+G5 compares a sync of the port with one of master. Fourteen syncs ran on
+m3 between 05:57 and 09:30 on 2026-11-07, all exiting cleanly, none
+repeated and none disturbed: base is master `0c4154d`, on libsecp256k1,
+and head `43beedc`, the `k256` port.
+
+**Full validation.** `--assumevalid=0`, from a dcrd block server on the
+same machine, in the order B H H B B H:
+
+| | runs | mean | process CPU | pre-verification coverage |
+|---|---|---|---|---|
+| `0c4154d` | 481.1 s, 472.1 s, 480.0 s | 477.7 s | 4,708 s | 90.78% |
+| `43beedc` | 715.4 s, 712.8 s, 717.2 s | 715.1 s | 8,485 s | 62.23% |
+
+Head took **1.497** times as long, 49.7% more, with 1.802 times the CPU
+time. All six runs ended on the same UTXO set at block 1,116,035.
+
+**Default syncs** from the LAN server, four each:
+
+| | runs | mean | spread | coverage |
+|---|---|---|---|---|
+| `0c4154d` | 246.7 s, 239.2 s, 230.7 s, 236.0 s | 238.1 s | 16.0 s | 87.99% |
+| `43beedc` | 265.7 s, 267.8 s, 269.6 s, 266.0 s | 267.3 s | 3.9 s | 52.03% |
+
+Head took **1.122** times as long, with 1.435 times the CPU time; every
+run reached the target's hash.
+
+**Profiles.** One full-validation run of each arm in a build with frame
+pointers, 487.7 s and 726.7 s, put secp256k1 at 76.7% of base's cycles
+and 88.0% of head's, and the whole wall-clock regression in verification
+on the block-connect path: the pre-verifier, which checks scripts before
+the block thread reaches them, keeps up on base and falls behind on head,
+as the coverage above shows. Base's top symbols were libsecp256k1's
+`gej_double` (31.4%), `gej_add_ge_var` (20.7%), `fe_sqrt` (8.4%) and
+`gej_add_zinv_var` (7.5%), and BLAKE-256 (6.9%); head's were `k256`'s
+projective `add_assign` (39.5%) and `double_in_place` (22.3%), its field
+square (6.6%), `lincomb_vartime_glv_wnaf` (4.6%), `sqrt` (4.5%) and
+`crypto-bigint`'s safegcd (4.2%, 2.4% and 1.1% in three functions).
+
+**Binary size.** Head's release binary is 5.52 MB smaller, with 138 KB
+less text and 1.14 MB less read-only data.
+
+**What it shows.** Both conditions of the bar ADR-0006's addendum of
+2026-10-26 sets are missed: full validation at 1.497 against 1.10, and a
+default sync 29.1 s slower against base's spread of 16.0 s. Stage 2
+follows.
+
+**What it does not show.** Where in verification the extra time goes,
+beyond the profile's attribution; any other thread count or machine.
+
+Raw: `g5-fullval.jsonl` and `g5-lan.jsonl`, the harness's records; the
+node logs; `perf-g5.jsonl` and the two profiles.
+
+## A stage-2a prototype in process (2026-11-07)
+
+Stage 2a keeps `k256`'s public API and replaces its combined multiply with
+dcroxide's own Straus loop, with the GLV split on the key and static
+affine tables of G and 2^128·G at window 12. A prototype was built
+outside the tree and reviewed, and its verification compared with dcrd's
+Go `ecdsa.Signature.Verify` on 1,462,459 cases, with no mismatch. It was
+timed on m3 between 10:33 and 10:50 on 2026-11-07, after the syncs above.
+
+**The run.** The benchmark program of "The k256 port against
+libsecp256k1, one operation at a time (2026-11-07)" with a stage-2a arm,
+32,768 cases, three rounds, on one and sixteen threads; six processes in
+the order base, stage 2a, head, stage 2a, head, base. All arms agreed.
+
+**Results.** ECDSA verification at one thread: head over base 1.961,
+stage 2a over base 1.584, 0.808 of head; at sixteen threads 2.03 and
+1.60. The design had put stage 2a at 1.48-1.60, and the profile's models
+put full validation with it at about 1.33-1.35.
+
+**What it does not show.** A sync; recovery and Schnorr verification on
+the loop. "Stage 2a, one operation at a time (2026-11-08)" below times
+the integrated code.
+
+Raw: the six processes' outputs, `1-base.txt` to `6-base.txt`, with their
+`.err` files, and `summary.txt`.
+
+## Route c's prototype in process (2026-11-08)
+
+Route c (ADR-0016) ports libsecp256k1's variable-time arithmetic into a
+crate of dcroxide's own. Before anything was staged, the whole route was
+built outside the tree as the prototype P0, and its pre-registered rule
+was its ECDSA verification time against libsecp256k1's, at one thread and
+in the same process: at most 1.08, go on; 1.08 to 1.15, go on with the
+levers; 1.15 to 1.20, back to the project owner; above 1.20, stop. It ran
+on m3 between 09:10:56 and 09:27:15 on 2026-11-08, on CPUs 0-7 and 16-23.
+
+**The run.** Two binaries: the default, which forces inlining of the
+field multiplication and squaring, the group formulas the loop calls and
+the loop body, and a second with the last two not forced. Four processes
+alternated, default first, each 32,768 cases and three rounds on one and
+sixteen threads, with arms for P0 at windows 12, 14 and 15, for
+dcroxide-dcrec at `43beedc` and for the stage-2a prototype. Every run
+reported no fallback taken and every arm agreeing.
+
+**ECDSA verification, low S, at one thread**, over libsecp256k1 in the
+same process (least / median of three rounds):
+
+| arm | default, run 1 | default, run 3 | second build, run 2 | second build, run 4 |
+|---|---|---|---|---|
+| P0, window 12 | 1.0237 / 1.0220 | 1.0269 / 1.0219 | 1.0760 / 1.0697 | 1.0754 / 1.0719 |
+| P0, window 14 | 1.0019 / 1.0001 | 1.0034 / 0.9986 | 1.0535 / 1.0469 | 1.0527 / 1.0489 |
+| P0, window 15 | 0.9975 / 0.9962 | 0.9990 / 0.9951 | 1.0488 / 1.0428 | 1.0476 / 1.0440 |
+| dcroxide-dcrec, `43beedc` | 1.9638 | 1.9638 | 1.9642 | 1.9606 |
+| stage-2a prototype | 1.5755 | 1.5769 | 1.5815 | 1.5796 |
+
+- The worst over the low-S, high-S and invalid groups and both
+  statistics: 1.0296 for the default build at window 12.
+- `OP_CHECKSIG`'s shape: 1.024-1.025 at window 12, 1.001-1.002 at window
+  15. A compressed key's parse: 1.016-1.017.
+- Per operation, P0 against `k256`: a field multiplication 14 ns against
+  20, a square 11 against 18, a field inverse 783-784 ns against
+  2,753-2,769, a scalar inverse 799 ns against 2,892-2,898.
+- At sixteen threads, on the high-S group: 1.103 and 1.105 at window 12,
+  1.077 and 1.079 at window 14.
+- The second build is 4.2-5.1% slower on a verification at one thread;
+  the gap disappears at sixteen.
+
+**What it shows.** P0 at window 12 is in the first band, so the route went
+on at window 12 with the default inlining.
+
+**What it does not show.** The integrated code: P0's arms model the seam
+as it is after RC6, with no conversion to `k256` types, estimated to
+understate RC4's figure by 0.2-0.5%. Recovery and Schnorr verification
+had no P0 arm. 1.024-1.027 is below the floor the design predicted,
+1.03-1.04, and the data does not say why. The program prints only the
+least and median of three rounds.
+
+Raw: `1-p0.txt`, `2-plain-inline.txt`, `3-p0.txt` and
+`4-plain-inline.txt`, with their `.err` files; `binaries.sha256`;
+`state.txt`; `times.txt`.
+
+## Stage 2a, one operation at a time (2026-11-08)
+
+Stage 2a landed in dcroxide-dcrec as `d50fc1c` and `3c50313`. It was
+timed on m3 between 09:29:46 and 09:45:10 on 2026-11-08, in G4's shape:
+six processes of the program of the 2026-11-07 G4, byte-identical
+source, in the order base (`0c4154d`), head (`43beedc`), stage 2a
+(`3c50313`), stage 2a, head, base, each 32,768 cases and three rounds on
+one and sixteen threads, on CPUs 0-7 and 16-23. Every arm of every
+process gave one digest per group, the same as on 2026-11-07.
+
+**dcroxide-dcrec's time per operation**, the least over two processes and
+three rounds:
+
+| operation | base | head | stage 2a | stage 2a / base | head / base | stage 2a / base, sixteen threads |
+|---|---|---|---|---|---|---|
+| ECDSA verify, low S | 23,374 ns | 45,755 ns | 36,967 ns | 1.582 | 1.958 | 1.570 |
+| ECDSA verify, high S | 23,395 ns | 45,789 ns | 36,939 ns | 1.579 | 1.957 | 1.590 |
+| ECDSA verify, invalid | 23,379 ns | 45,777 ns | 36,929 ns | 1.580 | 1.958 | 1.590 |
+| `OP_CHECKSIG`'s shape | 26,383 ns | 50,646 ns | 41,932 ns | 1.589 | 1.920 | 1.598 |
+| parse of a compressed key | 2,966 ns | 4,880 ns | 4,796 ns | 1.617 | 1.645 | 1.480 |
+| EC-Schnorr-DCRv0 verify (base on `k256`) | 44,408 ns | 44,253 ns | 35,298 ns | 0.795 | 0.997 | 0.789 |
+| compact recovery | 27,129 ns | 50,643 ns | 41,886 ns | 1.544 | 1.867 | 1.564 |
+| RFC6979 signing | 34,339 ns | 41,703 ns | 41,743 ns | 1.216 | 1.214 | 1.373 |
+
+- The integrated loop is within 0.9999-1.0013 of the 2026-11-07
+  prototype on a verification at one thread.
+- Head over base was 1.963 on 2026-11-07 and 1.958 here; between the
+  days the same code moved by 0.993-0.999.
+- Between processes the dcroxide-dcrec arm moved by at most 0.6% at one
+  thread, but for the key parses.
+
+**What it shows.** Stage 2a removes about 19% of a verification's cost
+on `k256`, and leaves it 1.58 times libsecp256k1's.
+
+**What it does not show.** A sync. The sixteen-thread figures are good
+to about ±10%: identical reference arms moved by 0.92-1.20 between
+processes. Signing at sixteen threads read 1.109 times head's on
+unchanged code, in both stage-2a processes, unexplained.
+
+Raw: `1-base.txt`, `2-head.txt`, `3-s2a.txt`, `4-s2a.txt`, `5-head.txt`
+and `6-base.txt`, with their `.err` files.
+
+## Stage 2a in syncs (2026-11-08)
+
+Ten syncs of stage 2a and master ran on m3 on 2026-11-08 in G5's harness,
+in one queue, all exiting cleanly, none repeated: B is the 2026-11-07
+build of master `0c4154d`, S the build of `3c50313`.
+
+| | runs | mean | spread | process CPU |
+|---|---|---|---|---|
+| full validation, B | 488.4 s, 476.3 s, 477.0 s | 480.57 s | 12.1 s | 4,696.8 s |
+| full validation, S | 626.4 s, 626.9 s, 620.7 s | 624.67 s | 6.2 s | 6,997.1 s |
+| default sync, B | 242.0 s, 236.4 s | 239.20 s | 5.6 s | 931.9 s |
+| default sync, S | 266.9 s, 256.8 s | 261.85 s | 10.1 s | 1,180.2 s |
+
+Full validation ran in the order B S S B B S, from the dcrd block server
+on the same machine with `--assumevalid=0`; S took **1.300** times as
+long (1.271-1.316 over the nine pairings), with 1.490 times the CPU time.
+The default syncs ran from the LAN server in the order B S S B; S took
+**22.65 s, 9.47%,** longer, and 14.8 s to 30.5 s longer in each pairing.
+Pre-verification coverage: full validation 90.96% and 71.95%, default
+sync 88.05% and 63.71%. All six full-validation runs ended on the UTXO
+set of the 2026-11-07 runs, and every default sync reached the target's
+hash.
+
+**What it shows.** Against 2026-11-07, full validation fell from 1.497 to
+1.300 and the CPU excess from 80% to 49%; base was steady across the
+days. Stage 2a misses both conditions of the bar.
+
+**What it does not show.** The merge-bar run: two default syncs a side,
+where that run takes four, and the 2026-11-07 base binary. The first run
+in the queue, a base full validation, warmed slowly; without it S/B is
+1.311.
+
+Raw: `s2a-fullval.jsonl` and `s2a-lan.jsonl`, the harness's records, and
+the node logs.
+
+## Two node settings on both arms (2026-11-08)
+
+Decision 3 of 2026-11-08 asked whether node-side settings close part of
+the gap: more pre-verification helpers, so that the pre-verifier keeps up
+on the slower head, and a deeper read-ahead. Fourteen syncs ran on m3
+between 12:05:15 and 15:11:04 on 2026-11-08, all exiting cleanly and
+none disturbed, of diagnostic builds of `0c4154d` and `43beedc` that read
+both settings from the environment, not for commit: E is fifteen helpers
+and a depth of 64, D the defaults, ten and 16. The bar, set before the
+runs: head's E at least 15 s faster than its D in full validation, or 5 s
+in a default sync, beyond the pairings' spread, with coverage up.
+
+| | default sync | mean | coverage | full validation | mean | coverage |
+|---|---|---|---|---|---|---|
+| base, D | 238.0 s, 236.6 s | 237.30 s | 0.876 | 478.4 s | 478.4 s | 0.912 |
+| base, E | 239.2 s, 249.3 s | 244.25 s | 0.997 | 515.4 s | 515.4 s | 0.998 |
+| head, D | 263.8 s, 269.1 s | 266.45 s | 0.523 | 713.1 s, 712.7 s | 712.90 s | 0.624 |
+| head, E | 268.6 s, 261.7 s | 265.15 s | 0.864 | 713.3 s, 715.1 s | 714.20 s | 0.894 |
+
+Head's E against its D: full validation **+1.30 s** (+0.18%; +0.2 s to
++2.4 s in the four pairings), default sync **-1.30 s** (-0.49%; -7.4 s to
++4.8 s). On head, E raised coverage from 62% to 89% and cut the block
+thread's CPU time from 545.5 s to 479.7 s, but the block thread's wait in
+the run queue rose from 27.0 s to 118.1 s and its involuntary context
+switches from 77,870 to 403,428; the two effects cancel. Base under E was
+slower: +37.0 s in full validation, one run each, and +6.95 s in a
+default sync. Every full-validation run ended on the UTXO set of the
+syncs above.
+
+**What it shows.** Neither setting closes the gap; the defaults stay,
+and the rest has to come from the cost of each verification.
+
+**What it does not show.** The two settings apart, which were not run
+separately; stage 2a under them; base's full validation beyond one run a
+cell, whose difference is confounded with its place in the queue.
+
+Raw: `routee-fullval.jsonl` and `routee-lan.jsonl`, the harness's
+records, and the node logs.
+
+## Route c through RC4, one operation at a time (2026-11-09)
+
+RC4 (`8c672e9`) put ECDSA verification on dcroxide-secp256k1-vartime,
+after RC1 and RC2 had put the scalar inverse and key decompression there.
+G4 ran on m3 at the start of a window that began at 02:22:09 on
+2026-11-09, at nice -4: six processes of the program of the 2026-11-07
+G4, byte-identical source, base (`0c4154d`) in slots 1 and 6, RC4 in 2
+and 5, stage 2a (`3c50313`) in 3 and head (`43beedc`) in 4, each 32,768
+cases and three rounds on one and sixteen threads. Every arm of every
+process gave one digest per group, the same as on 2026-11-07 and
+2026-11-08.
+
+**dcroxide-dcrec's time per operation**, the least over processes and
+rounds:
+
+| operation | base | RC4 | stage 2a | head | RC4 / base (median) | stage 2a / base | head / base |
+|---|---|---|---|---|---|---|---|
+| ECDSA verify, low S | 23,443 ns | 24,297 ns | 37,149 ns | 45,985 ns | 1.036 (1.031) | 1.585 | 1.962 |
+| ECDSA verify, high S | 23,494 ns | 24,295 ns | 37,124 ns | 45,968 ns | 1.034 (1.029) | 1.580 | 1.957 |
+| ECDSA verify, invalid | 23,458 ns | 24,293 ns | 37,118 ns | 45,976 ns | 1.036 (1.033) | 1.582 | 1.960 |
+| `OP_CHECKSIG`'s shape | 26,516 ns | 27,388 ns | 42,151 ns | 50,971 ns | 1.033 (1.031) | 1.590 | 1.922 |
+| parse of a compressed key | 2,991 ns | 3,025 ns | 4,929 ns | 4,836 ns | 1.011 | 1.648 | 1.617 |
+| EC-Schnorr-DCRv0 verify (base on `k256`) | 44,522 ns | 35,429 ns | 35,540 ns | 44,456 ns | 0.796 | 0.798 | 0.999 |
+| compact recovery | 27,234 ns | 38,058 ns | 42,117 ns | 50,952 ns | 1.397 | 1.546 | 1.871 |
+| RFC6979 signing | 34,460 ns | 41,863 ns | 41,988 ns | 41,923 ns | 1.215 | 1.218 | 1.217 |
+
+- The verification ratio over the four pairings of processes: 1.021-1.042;
+  within each RC4 process, dcroxide-dcrec over libsecp256k1: 1.035-1.037,
+  where both arms of base, libsecp256k1 twice, gave 0.997-1.001.
+- Against P0's in-process ratios, group by group, RC4 is 0.7 to 1.2
+  points higher, 24,293-24,297 ns against P0's 24,005-24,122 ns, more than
+  the 0.2-0.5% the conversions at the seam were expected to cost. The
+  cause is not attributed.
+- Recovery and Schnorr verification still ran on stage 2a's loop;
+  recovery is 1.397 rather than about 1.544 because RC1 and RC2 already
+  took its inverse and its decompression.
+- On identical binaries, base read 0.30% slower than on 2026-11-08 and
+  0.11% slower than on 2026-11-07, head 0.50% and 0.03%, stage 2a 0.49%.
+- At sixteen threads RC4 over base was 1.106-1.146, indicative only:
+  identical code moved by 15-20% between processes there.
+
+**What it shows.** RC4's verification is in the first band of ADR-0016's
+thresholds, at the floor the design predicted.
+
+**What it does not show.** A sync, which the next section measures. Slot
+1 ran slow on its libsecp256k1 arm, 1.41% above the other slots' mean on
+a low-S verification; the least-of-processes reading takes base from slot
+6, and a reading by means gives about 1.031. The program prints only the
+least and median of three rounds.
+
+Machine state: transparent huge pages at `always`, the `powersave`
+governor with the `balance_performance` preference, kernel 7.3.1.
+
+Raw: `1-base.txt`, `2-rc4.txt`, `3-s2a.txt`, `4-head.txt`, `5-rc4.txt`
+and `6-base.txt`, with their `.err` files; `binaries.sha256`; `nice.txt`;
+`state.txt`; `times.txt`.
+
+## Route c through RC4 in syncs (2026-11-09)
+
+The first milestone of ADR-0016, a G5 after RC4, ran on m3 in the same
+window as the section above: fourteen syncs, all exiting cleanly, none
+disturbed and no build running, of base, master `0c4154d` (the binary of
+the 2026-11-08 syncs), and H, `8c672e9`.
+
+| | runs | mean | spread | process CPU | coverage |
+|---|---|---|---|---|---|
+| full validation, B | 489.0 s, 489.2 s, 490.2 s | 489.47 s | 1.2 s | 4,709.9 s | 91.10% |
+| full validation, H | 500.9 s, 511.3 s, 507.5 s | 506.57 s | 10.4 s | 5,008.2 s | 88.85% |
+| default sync, B | 250.2 s, 249.2 s, 240.7 s, 242.0 s | 245.52 s | 9.5 s | 931.8 s | 88.51% |
+| default sync, H | 238.1 s, 249.7 s, 239.8 s, 242.9 s | 242.62 s | 11.6 s | 967.4 s | 85.04% |
+
+Full validation ran B H H B B H from the dcrd block server on the same
+machine with `--assumevalid=0`: H took **1.035** times as long (17.10 s
+more; 1.022-1.046 over the nine pairings), with 1.063 times the CPU time.
+The default syncs ran from the LAN server in two blocks, B H H B and
+H B B H: H took **2.90 s, 1.18%, less**, inside base's spread. All six
+full-validation runs ended on the UTXO set of the syncs of 2026-11-07 and
+2026-11-08, and every default sync reached the target's hash.
+
+| | `43beedc` (2026-11-07) | `3c50313` (2026-11-08) | `8c672e9` (2026-11-09) |
+|---|---|---|---|
+| full validation, head / base | 1.497 | 1.300 | 1.035 |
+| default sync, head - base | +12.23% | +9.47% (two runs a side) | -1.18% |
+
+**What it shows.** RC4 removes 88% of stage 2a's full-validation excess.
+Under ADR-0016's rule for this milestone, 1.035 is at most 1.10, so RC5
+and RC6 went on as planned. Read informally against the merge bar, both
+conditions would pass.
+
+**What it does not show.** The merge-bar run, which is a fresh G5 at the
+final branch. In this session the block server read 9.6-17.5 GB from its
+drive in every full-validation run, where it read none before, and every
+run warmed slowly; base's walls are higher than on the two days before
+(489.5 s against 480.6 s and 477.7 s). The reads were balanced across
+the arms. If the extra time cost both alike, H/B is about 1.036; if it
+slowed only base, H against the 2026-11-07 base gives 1.060. A system
+package upgrade on 2026-11-08 also falls between this session and the
+one before. H's full-validation spread, 10.4 s against base's 1.2 s, was
+not looked into.
+
+Raw: `rc4-fullval.jsonl` and `rc4-lan.jsonl`, the harness's records, and
+the node logs.
+
+## Route c through RC6, one operation at a time (2026-11-09, evening)
+
+RC5 (`0632b75`) put compact recovery and Schnorr verification on
+dcroxide-secp256k1-vartime, and RC6 (`b479c1c`) dcrec's public key. G4
+ran on m3 in a window that began at 18:00:52 on 2026-11-09, at nice -4:
+eight processes of the program of the 2026-11-07 G4, base (`0c4154d`) in
+slots 1 and 8, RC6 in 2, 4, 5 and 7, and RC4 (`8c672e9`) in 3 and 6, the
+base and RC4 binaries byte-identical to the morning's, each 32,768 cases
+and three rounds on one and sixteen threads. Seven ran on CPU 0 and one
+on CPU 0's other hardware thread. Every arm of every process gave one
+digest per group, the same as the morning's.
+
+**dcroxide-dcrec's time per operation**, the least over processes and
+rounds; RC6's ratio is the least of its outer slots, 2 and 7, over
+base's, which came from slot 7 and slot 8:
+
+| operation | base | RC4 | RC6 | RC6 / base | RC6 / RC4 |
+|---|---|---|---|---|---|
+| ECDSA verify, low S | 23,560 ns | 24,312 ns | 24,294 ns | 1.0312 | 0.9988 |
+| ECDSA verify, high S | 23,571 ns | 24,347 ns | 24,330 ns | 1.0322 | 0.9988 |
+| ECDSA verify, invalid | 23,591 ns | 24,323 ns | 24,315 ns | 1.0307 | 1.0000 |
+| parse of a compressed key | 2,999 ns | 3,044 ns | 2,977 ns | 0.9927 | 0.9783 |
+| parse of an uncompressed key | 80 ns | 60 ns | 50 ns | 0.625 | 0.833 |
+| `OP_CHECKSIG`'s shape | 26,644 ns | 27,472 ns | 27,333 ns | 1.0259 | 0.9957 |
+| EC-Schnorr-DCRv0 verify (base on `k256`) | 44,706 ns | 35,636 ns | 24,561 ns | 0.5494 | 0.6898 |
+| compact recovery | 27,369 ns | 38,184 ns | 28,169 ns | 1.0292 | 0.7376 |
+| RFC6979 signing | 34,543 ns | 41,993 ns | 42,011 ns | 1.2162 | 0.9997 |
+
+The last column takes RC6's central slots, 4 and 5.
+
+- The verification ratio over the four pairings of processes:
+  1.0240-1.0355; within each RC6 process, dcroxide-dcrec over
+  libsecp256k1: 1.0288-1.0328.
+- RC6 against RC4, within each process against its own control: faster
+  on a compressed key's parse (-1.87%), an uncompressed key's (50 ns
+  against 60), Schnorr verification (-30.9%) and recovery (-26.1%), and
+  marginally on `OP_CHECKSIG`'s shape (-0.41%); on verification (-0.15%
+  to -0.19%) and signing (-0.07%) the two cannot be told apart. The
+  expected 0.5-1% gain on a verification is not seen. Nothing is slower.
+- Recovery now costs what a verification does, relative to
+  libsecp256k1, and Schnorr verification about as much as an ECDSA
+  verification, 0.549 of base's, which runs it on `k256`.
+- At sixteen threads, good to about ±10%: verification 1.106-1.126,
+  `OP_CHECKSIG`'s shape 1.118, Schnorr 0.566, recovery 1.099, signing
+  1.229, RC6 and RC4 indistinguishable.
+- On the byte-identical base and RC4 binaries most arms read 0.13% to
+  0.75% slower than in the morning, where RC4's own verification moved
+  0.06% to 0.21%, so this session reads RC6 about 0.4 points more
+  favourably: about 1.035 on the morning's conditions. A system package
+  upgrade ran between the sessions, with the same kernel and no reboot.
+
+**What it shows.** RC6's verification stays in the first band, and
+recovery and Schnorr verification are now on the owned arithmetic:
+recovery at 1.029 times libsecp256k1's, and Schnorr verification at
+0.549 of base's `k256` Schnorr, about the cost of an ECDSA verification.
+
+**What it does not show.** A sync: no G5 ran in this window. A browser
+started inside slot 2, other desktop applications were briefly active
+in slots 4, 6 and 7, and light background polling ran in every slot; no
+control arm shows an effect. Slot 2 enters neither the primary figure,
+slot 7 over slot 8, nor the central pair. The program prints only the
+least and median of three rounds.
+
+Machine state: transparent huge pages at `always`, the `powersave`
+governor with the `balance_performance` preference, kernel 7.3.1.
+
+Raw: `1-base.txt`, `2-rc6.txt`, `3-rc4.txt`, `4-rc6.txt`, `5-rc6.txt`,
+`6-rc4.txt`, `7-rc6.txt` and `8-base.txt`, with their `.err` files;
+`binaries.sha256`; `nice.txt`; `state.txt`; `times.txt`.

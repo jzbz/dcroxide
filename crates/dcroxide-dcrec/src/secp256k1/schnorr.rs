@@ -8,7 +8,7 @@
 //! keys are ordinary 33-byte compressed keys.
 //!
 //! Signing runs on the pure-Rust `k256` backend in constant time per
-//! ADR-0006 (the scheme needs raw scalar/point operations no packaged API
+//! ADR-0017 (the scheme needs raw scalar/point operations no packaged API
 //! exposes).  Verification's R = s*G + e*Q and its affine conversion run
 //! on `dcroxide-secp256k1-vartime` through the seam, with k256 as the
 //! fallback (ADR-0016).  Correctness is pinned by dcrd's test vectors,

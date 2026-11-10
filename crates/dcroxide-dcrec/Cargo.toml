@@ -11,10 +11,10 @@ repository.workspace = true
 [dependencies]
 # Pure-Rust secp256k1 arithmetic: private keys, ECDSA and EC-Schnorr-DCRv0
 # signing, and the fallbacks of verification, recovery and key parsing,
-# with dcrd's exact rules enforced by this crate's own code (ADR-0006's
-# 2026-10-26 addendum, ADR-0012).  The variable-time arithmetic of ECDSA
-# verification, compact recovery and Schnorr verification, and public
-# keys, is dcroxide-secp256k1-vartime's, below, with k256's as its fallback.
+# with dcrd's exact rules enforced by this crate's own code (ADR-0017,
+# ADR-0012).  The variable-time arithmetic of ECDSA verification, compact
+# recovery and Schnorr verification, and public keys, is
+# dcroxide-secp256k1-vartime's, below, with k256's as its fallback.
 #
 # k256's `std` and `precomputed-tables` are deliberately left off.  ECDSA
 # and Schnorr signing, and `PrivateKey::public_key`, multiply with

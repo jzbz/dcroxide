@@ -78,7 +78,7 @@ deny = [
     { crate = "ring", reason = "C and assembly; the node's TLS runs on dcroxide-tlscrypto (ADR-0012, ADR-0015)" },
     { crate = "aws-lc-rs", reason = "binds aws-lc-sys, C and assembly; the node's TLS runs on dcroxide-tlscrypto (ADR-0012, ADR-0015)" },
     { crate = "aws-lc-sys", reason = "C and assembly; the node's TLS runs on dcroxide-tlscrypto (ADR-0012, ADR-0015)" },
-    { crate = "secp256k1-sys", reason = "libsecp256k1's C; secp256k1 runs on k256 (ADR-0006's 2026-10-26 addendum, ADR-0012)" },
+    { crate = "secp256k1-sys", reason = "libsecp256k1's C; secp256k1 runs on k256 and dcroxide-secp256k1-vartime (ADR-0012, ADR-0017)" },
     { crate = "cc", wrappers = ["blake3", "iana-time-zone-haiku"], reason = "runs a C or C++ compiler from a build script (ADR-0012)" },
     { crate = "cmake", reason = "drives a C or C++ build through CMake (ADR-0012)" },
     { crate = "pkg-config", reason = "finds a system C library for a build script to link (ADR-0012)" },

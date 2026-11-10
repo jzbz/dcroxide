@@ -1,15 +1,15 @@
 # ADR-0012 — Pure Rust everywhere
 
 - **Status:** Accepted 2026-10-26. Four things broke the rule on that
-  date, and three still do. `ring` went on 2026-10-31, with ADR-0015's
-  switch, once the in-tree TLS provider had passed its interop matrix
-  against Go (addendum of 2026-10-31). `secp256k1-sys` goes with D3's
-  move of ECDSA to `k256`, behind a differential soak and a speed
-  measurement; blake3's build-time compiler probe goes with an in-tree
-  BLAKE3; and the C power-cut shim goes with its rewrite as a Rust
-  library. Neither of the two checks that enforce the rule is written
-  yet; `deny.toml` holds the first bans, on `ring`, `aws-lc-rs` and
-  `aws-lc-sys`.
+  date. `ring` went on 2026-10-31 with ADR-0015's switch (addendum of
+  2026-10-31). `secp256k1-sys` is out of every build on the port's
+  branch since D3's move of ECDSA and its keys to `k256` (`7bc3816`), and
+  leaves master with its merge ([ADR-0017](0017-secp256k1-in-pure-rust.md),
+  which also corrects "One secp256k1 stack" below). blake3's build-time
+  compiler probe goes with an in-tree BLAKE3, and the C power-cut shim
+  with its rewrite as a Rust library. Both checks that enforce the rule
+  are written, on the port's branch (addendum of 2026-11-06): the
+  `cargo-deny` bans and the CI build with no C compiler.
 - **Date:** 2026-10-26 (accepted), 2026-10-31 (addendum: `ring` leaves),
   2026-11-06 (addendum: the two checks)
 
@@ -396,7 +396,7 @@ which does not depend on the TLS answers, can start at once.
 - **libsecp's speed lead is to be measured, not assumed away.** In the one
   profile in the repository that splits out fully validated blocks,
   secp256k1 took about 38% of user-space cycles on all threads and
-  BLAKE-256 compression 48.4% (`docs/bench-ledger.md:2706-2707`), libsecp
+  BLAKE-256 compression 48.4% (`docs/bench-ledger.md:2710-2711`), libsecp
   and `k256` not separated; the repository holds no ECDSA figure for
   `k256`. With no script checked before the assume-valid block, a default
   sync up to it should not move (inference); `--assumevalid=0` syncs and

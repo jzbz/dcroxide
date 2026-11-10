@@ -229,11 +229,11 @@ work). Currently implemented:
   math) ported operation-for-operation from dcrd's `math/uint256`,
   differentially tested against it across every operation
 - `dcroxide-dcrec` — all three Decred signature types with dcrd's exact
-  acceptance rules and error identities: ECDSA-secp256k1 (type 0, over
-  k256), Ed25519 (type 1, over curve25519-dalek with dcrd's 2017-agl
-  verify semantics), and EC-Schnorr-DCRv0 (type 2, over k256 with dcrd's
-  RFC6979 nonce variant); every signing path differentially verified
-  byte-for-byte against dcrd
+  acceptance rules and error identities: ECDSA-secp256k1 (type 0), Ed25519
+  (type 1, over curve25519-dalek with dcrd's 2017-agl verify semantics) and
+  EC-Schnorr-DCRv0 (type 2, with dcrd's RFC6979 nonce variant); private
+  keys and signing over k256, verification, recovery and public keys over
+  `dcroxide-secp256k1-vartime`; every signing path matches dcrd byte for byte
 - `dcroxide-secp256k1-vartime` — variable-time secp256k1 arithmetic for
   public values only, ported from libsecp256k1's portable C (ADR-0016):
   scalar and field (safegcd inverses), group formulas, the Straus loop with
