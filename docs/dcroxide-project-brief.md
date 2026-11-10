@@ -119,7 +119,7 @@ exit criteria have not been demonstrated, and those are listed here too:
   licenses/advisories/sources/bans, a
   60-second-per-target fuzz smoke — all of those on every push to `master`
   and every pull request — and a nightly
-  10-minute-per-target run over the 25 fuzz targets, five of which ask dcrd's
+  10-minute-per-target run over the 26 fuzz targets, five of which ask dcrd's
   own code through the oracle and one of which checks against a model of
   dcrd's Ed25519, from a corpus kept between nights, and the signature soak
   against dcrd for 35 minutes each night on x86_64, on x86_64 with
@@ -732,8 +732,8 @@ its commit. The last two replace the two-reviewer sign-off on every PR that
 this plan first asked for, which a project with one maintainer
 ([docs/dependency-ledger.md](dependency-ledger.md), "What is deliberately not
 here") cannot meet; the external review of Phase 15 is still to come. Not all
-of this is in place. The soak that gates `dcrec` has passed on the port's
-branch ([ADR-0017](adr/0017-secp256k1-in-pure-rust.md)), not yet merged;
+of this is in place. The soak that gates `dcrec` passed on the port, merged
+to master on 2026-11-10 ([ADR-0017](adr/0017-secp256k1-in-pure-rust.md));
 five fuzz targets and a shorter nightly soak compare it with dcrd in CI, and
 `cargo-mutants` is not wired up
 (the Phase 0 item in the list of outstanding work above).
@@ -803,7 +803,7 @@ pins this policy asks for.
 >   shipped and the evidence behind ratification.
 > - **D3** — [ADR-0006](adr/0006-secp256k1-backend.md), never ratified, and
 >   superseded by [ADR-0017](adr/0017-secp256k1-in-pure-rust.md) on
->   2026-11-09, effective with the port's merge. It proposed libsecp256k1
+>   2026-11-09, effective 2026-11-10. It proposed libsecp256k1
 >   bindings for ECDSA and every secp256k1 key and `k256` for Schnorr-DCRv0.
 >   On 2026-10-26 the project owner decided that, under
 >   [ADR-0012](adr/0012-pure-rust.md)'s pure-Rust rule, ECDSA and secp256k1
@@ -816,7 +816,7 @@ pins this policy asks for.
 >   only if its slowdown is small or optimized away, with further speed work
 >   if full validation is more than 10% slower or a default sync moves
 >   beyond one session's run-to-run noise. The soak passed and the merge-bar
->   run of 2026-11-10 was inside that bar; the merge is the owner's word.
+>   run of 2026-11-10 was inside that bar; the port merged that day.
 > - **D4** — [ADR-0007](adr/0007-json-emission-strategy.md), *Accepted*
 >   (ratified 2026-10-26 as shipped). Both halves were built but neither in
 >   the proposed shape: the emission layer uses no serde at all (a runtime Go

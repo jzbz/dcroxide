@@ -6,9 +6,13 @@
   part 2 hold; the release workflow, the reproduction script and the
   changes listed under Consequences are pending; and part 6 leaves two
   questions for the first release. Met (addenda): `ring`'s part of the
-  first condition (2026-10-31), and on the port's branch `secp256k1-sys`'s
-  part (2026-11-09) and the second condition, the D3 soak (2026-11-10).
-- **Date:** 2026-10-26
+  first condition (2026-10-31); `secp256k1-sys`'s part (2026-11-09) and
+  the second condition, the D3 soak (2026-11-10), on the port's branch,
+  and on master since its merge at `28ad696` on 2026-11-10 (ADR-0017's
+  second addendum of that date).
+- **Date:** 2026-10-26 (accepted), 2026-10-31 (addendum: `ring`'s part),
+  2026-11-09 (addendum: `secp256k1-sys`'s part and the D3 gate soak),
+  2026-11-10 (addendum: the extra soak legs; status: the merge)
 
 ## Context
 
@@ -360,9 +364,9 @@ recorded divergence in PARITY.md.
 switch made `dcroxide-tlscrypto` the node's only TLS provider, and no
 build for any target compiles `ring` (ADR-0015's and ADR-0012's addenda of
 2026-10-31). So `ring` is no longer one of the four things part 2's first
-condition names (`:133-139`), nor an input of the build the build-input
-paragraph describes (`:81-85`), nor the replacement the summary looks
-ahead to (`:101-102`): `Cargo.lock` still lists it, as an optional
+condition names (`:137-143`), nor an input of the build the build-input
+paragraph describes (`:85-89`), nor the replacement the summary looks
+ahead to (`:105-106`): `Cargo.lock` still lists it, as an optional
 dependency of `rustls-webpki` that no build enables, so it reaches no
 binary. The rest of that condition stands: `secp256k1-sys`, blake3's
 compiler probe and the C power-cut shim still break ADR-0012's rule, and
@@ -375,7 +379,7 @@ On the port's branch `secp256k1-sys` is out of every build since
 `7bc3816`, which moved compact recovery to `k256` and removed the
 `secp256k1` dependency, and the bans and the job with no C compiler of
 ADR-0012's addendum of 2026-11-06 hold it out. So it is no longer one of
-the things part 2's first condition names (`:135-136`). The D3 gate soak
+the things part 2's first condition names (`:139-140`). The D3 gate soak
 has run to the floors of ADR-0006's addendum of 2026-10-26 on x86_64,
 with `curve25519-dalek`'s default backend: G3 on the `k256` port, then
 gate soaks on stage 2a and at route c's two gates, after RC4 and after

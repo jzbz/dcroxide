@@ -2,16 +2,16 @@
 
 - **Status:** Accepted 2026-10-26. Four things broke the rule on that
   date. `ring` went on 2026-10-31 with ADR-0015's switch (addendum of
-  2026-10-31). `secp256k1-sys` is out of every build on the port's
-  branch since D3's move of ECDSA and its keys to `k256` (`7bc3816`), and
-  leaves master with its merge ([ADR-0017](0017-secp256k1-in-pure-rust.md),
-  which also corrects "One secp256k1 stack" below). blake3's build-time
-  compiler probe goes with an in-tree BLAKE3, and the C power-cut shim
-  with its rewrite as a Rust library. Both checks that enforce the rule
-  are written, on the port's branch (addendum of 2026-11-06): the
-  `cargo-deny` bans and the CI build with no C compiler.
+  2026-10-31). `secp256k1-sys`'s breach ended on 2026-11-10, when D3's
+  port merged to master at `28ad696` and took it out of the build
+  ([ADR-0017](0017-secp256k1-in-pure-rust.md), which also corrects "One
+  secp256k1 stack" below). blake3's build-time compiler probe goes with
+  an in-tree BLAKE3, and the C power-cut shim with its rewrite as a Rust
+  library. Both checks that enforce the rule, the `cargo-deny` bans on C
+  and the CI build with no C compiler (addendum of 2026-11-06), reached
+  master with the port.
 - **Date:** 2026-10-26 (accepted), 2026-10-31 (addendum: `ring` leaves),
-  2026-11-06 (addendum: the two checks)
+  2026-11-06 (addendum: the two checks), 2026-11-10 (status: the merge)
 
 ## Context
 
@@ -112,9 +112,9 @@ That rustc needs its linker given is a constraint the enforcement below
 inherits.
 
 ADR-0006 put ECDSA on libsecp "for verification performance"
-(`0006-secp256k1-backend.md:27-28`), accepted two secp256k1 arithmetic
-stacks (`:43-45`), and gated its ratification on a differential soak that
-was never run (`:49-50`, and its addenda). The rule overrides the first,
+(`0006-secp256k1-backend.md:28-29`), accepted two secp256k1 arithmetic
+stacks (`:44-46`), and gated its ratification on a differential soak that
+was never run (`:50-51`, and its addenda). The rule overrides the first,
 ends the second, and keeps the third as a gate.
 
 ## Decision

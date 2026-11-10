@@ -328,9 +328,9 @@ evaluating this code.
   [ADR-0016](docs/adr/0016-secp256k1-vartime-arithmetic.md), after RC4
   and after RC6, every class's digest equal to that of the baseline run
   on libsecp256k1 ([ADR-0017](docs/adr/0017-secp256k1-in-pure-rust.md)),
-  and so did its extra legs: with overflow checks on, with
-  `curve25519-dalek`'s serial and AVX-512 IFMA backends over the Ed25519
-  classes, and a shorter run on arm64 in CI. The port is not merged yet.
+  and so did its extra legs: with overflow checks on, with the serial and
+  AVX-512 IFMA backends of `curve25519-dalek` over the Ed25519 classes,
+  and a shorter run on arm64 in CI. The port merged to master on 2026-11-10.
   Each night CI runs the soak for 35 minutes on x86_64, on x86_64 with
   `curve25519-dalek`'s serial backend over the Ed25519 classes, and on
   arm64, failing on any disagreement with dcrd, any intent a case
@@ -392,8 +392,8 @@ evaluating this code.
   provider, `dcroxide-tlscrypto`, which nobody outside the project has
   read either, `dcroxide-secp256k1-vartime`, the project's port of
   libsecp256k1's variable-time arithmetic, which every ECDSA and
-  EC-Schnorr-DCRv0 verification on the port's branch runs on and which
-  nobody outside the project has read either (ADR-0016), and the storage
+  EC-Schnorr-DCRv0 verification runs on and which nobody outside the
+  project has read either (ADR-0016), and the storage
   engine that this node's key handling and on-disk consensus state rest
   on.
   [docs/dependency-ledger.md](docs/dependency-ledger.md) does not close

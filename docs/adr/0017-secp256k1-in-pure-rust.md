@@ -1,16 +1,16 @@
 # ADR-0017 — D3: secp256k1 in pure Rust, as built
 
 - **Status:** Accepted 2026-11-09. Supersedes
-  [ADR-0006](0006-secp256k1-backend.md). It takes effect with the merge of
-  the port's branch; until then master runs libsecp256k1 and ADR-0006
-  describes it. The merge-bar run of
+  [ADR-0006](0006-secp256k1-backend.md). In effect since the port's
+  branch merged to master at `28ad696` on 2026-11-10 (second addendum of
+  that date); master no longer runs libsecp256k1. The merge-bar run of
   [ADR-0016](0016-secp256k1-vartime-arithmetic.md) passed on 2026-11-10
   ("The speed measurement and the merge bar", below), and the port
   plan's criteria 8 and 9, the extra soak legs and the committed witness
-  vectors, were met that day (addendum of 2026-11-10), so the merge waits
-  only on the project owner's word.
+  vectors, were met that day (first addendum of 2026-11-10), before the
+  merge.
 - **Date:** 2026-11-09, 2026-11-10 (addendum: the extra soak legs, the
-  merge-bar run and the witness vectors)
+  merge-bar run and the witness vectors; second addendum: the merge)
 
 ## Context
 
@@ -316,3 +316,31 @@ since `3a231c6` (ADR-0016's addendum of this date).
 **What this corrects.** The status and date lines, the speed table's
 last column and the paragraph under it, and the two Consequences that
 named these as still to come.
+
+## Addendum, 2026-11-10 (second) — the merge
+
+The port's pull request merged by fast-forward on 2026-11-10, moving
+master from `012192b` to `28ad696`, the records commit of the merge-bar
+run and criteria 8 and 9. From that commit this record is in effect and
+ADR-0006 is superseded. On master `secp256k1` and `secp256k1-sys` are
+out of every build and out of both lockfiles, and the `cargo-deny` bans
+and the CI job with no C compiler of ADR-0012's addendum of 2026-11-06
+hold them out of the workspace. So the `secp256k1-sys` breach of
+ADR-0012's rule is gone from master, that part of ADR-0014's first
+release condition is met there, and ADR-0014's second condition, the D3
+soak, holds there. blake3's compiler probe and the C power-cut shim
+still break ADR-0012's rule, and ADR-0014's third and fourth conditions
+are unchanged.
+
+**What this corrects.** The status and date lines. The Context's "it
+takes effect only with the merge, which waits on that run" (`:36-38`)
+and its "The port is five commits on the branch of the pull request
+that carries it" (`:40-41`), which is on master now; "No C"'s "on the
+port's branch" (`:104-105`), which now holds on master as well; the
+sentence that ends "The speed measurement and the merge bar"
+(`:162-163`); Switching back's first step (`:169-170`), which no longer
+applies, so a switch back starts at the second; and the Consequences'
+first item (`:211-216`), whose "once it merges" and "once the port
+merges" are now past, and their last (`:227-230`). The first addendum
+of this date keeps its words, its "complete on the port's branch"
+(`:301-302`) included: that soak is the one master now has.

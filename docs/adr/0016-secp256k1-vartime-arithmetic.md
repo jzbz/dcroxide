@@ -3,7 +3,7 @@
 - **Status:** Accepted 2026-11-09, with the measured results through the
   shared gate of RC5 and RC6 (addendum of that date). The project owner
   approved the route on 2026-11-08 and started it the same day (Context,
-  "The approval"); it is built on the port's branch in five increments,
+  "The approval"); it was built on the port's branch in five increments,
   RC1 to RC6, with RC3 folded into RC4 and RC7 not needed. **The
   merge-bar run passed on 2026-11-10**: a fresh G5 against master put
   full validation at 1.034 times libsecp256k1's and the default sync
@@ -11,14 +11,14 @@
   bar is no more than 1.10 times and within that spread (Decision, "The
   merge bar"). The port plan's criteria 8 and 9, the extra soak legs and
   the committed witness vectors, are met as well (addendum of
-  2026-11-10). By the bar the port merges on the project owner's word.
-  This record supersedes nothing:
+  2026-11-10). The port merged to master at `28ad696` that day (second
+  addendum of that date). This record supersedes nothing:
   [ADR-0017](0017-secp256k1-in-pure-rust.md) records D3 as built and
   supersedes [ADR-0006](0006-secp256k1-backend.md). It serves
   [ADR-0012](0012-pure-rust.md)'s rule.
 - **Date:** 2026-11-08 (proposed), 2026-11-09 (accepted; addendum: the
   measured results, the merge bar pending), 2026-11-10 (addendum: the
-  merge-bar run passed; criteria 8 and 9 met)
+  merge-bar run passed, criteria 8 and 9 met; second addendum: the merge)
 
 ## Context
 
@@ -861,3 +861,25 @@ sentence that ends "The merge bar"; and the Consequences on the merge
 that may not come and on the merge-bar G5 still to come. The addendum
 of 2026-11-09 keeps its words, its "not run" cells and its "What
 remains before the merge" included: this addendum is what came of them.
+
+## Addendum, 2026-11-10 (second) — the merge
+
+The port's pull request merged by fast-forward on 2026-11-10, moving
+master from `012192b` to `28ad696`, the records commit of the run above.
+RC1 to RC6 and `3a231c6`'s vectors are on master, every ECDSA and
+EC-Schnorr-DCRv0 verification there runs on `dcroxide-secp256k1-vartime`,
+and libsecp256k1 is out of master's build.
+[ADR-0017](0017-secp256k1-in-pure-rust.md) is in effect from that
+commit; its second addendum of this date has the rest.
+
+**What this corrects.** The status and date lines. The Context's "The
+port is built on the branch of the pull request that carries it"
+(`:36`), which is on master now; Switching back's first step
+(`:492-495`), which no longer applies, so a switch back starts at the
+second; the sentence after "Not decided here" (`:591-593`), since
+ADR-0017 has taken effect; the Consequence on the merge that may not
+come (`:619-622`); and, in the first addendum of this date, the sentence
+after "The run passes" (`:819-820`). "The merge bar" (`:476-479`), whose
+rule the merge followed, the addendum of 2026-11-09, its "What remains
+before the merge" (`:768-773`) included, and the rest of the first
+addendum of this date keep their words.
