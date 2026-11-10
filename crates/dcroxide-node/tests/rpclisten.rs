@@ -3048,10 +3048,13 @@ fn a_websocket_upgrade_declaring_a_body_is_refused() {
         "GET /ws HTTP/1.1\r\nHost: localhost\r\nAuthorization: Basic {auth}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: AAAAAAAAAAAAAAAAAAAAAA==\r\nContent-Length: 5\r\n\r\nABCDE"
     );
     let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect");
-    stream.write_all(request.as_bytes()).expect("write");
+    // Set before writing: the server may refuse and reset the connection
+    // as soon as the request arrives, and macOS rejects the option on a
+    // reset socket with EINVAL.
     stream
         .set_read_timeout(Some(std::time::Duration::from_secs(5)))
         .expect("read timeout");
+    stream.write_all(request.as_bytes()).expect("write");
     // Read raw rather than to EOF: the refusal closes over the unread
     // body, and a reset would discard a buffered response before
     // `read_to_string` returned it -- which would pass this assertion
