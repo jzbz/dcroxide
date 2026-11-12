@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: ISC
 //! Decred network parameters, mirroring dcrd's `chaincfg` package (the
-//! in-tree `chaincfg/v3` at the parity pin, master `3360ae4d`, which
+//! in-tree `chaincfg/v3` at the parity pin, master `46e9df48`, which
 //! the oracle links as that commit's pseudo-version; see
 //! `tools/oracle/go.mod`): all four networks' genesis
 //! blocks, consensus agenda deployments, block-one (premine) ledgers, and

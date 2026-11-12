@@ -868,7 +868,7 @@ fn file_text(oracle: &mut Oracle) -> String {
         "# at infinity, each in its small selection, plus the grid cases whose",
         "# Straus loop doubles through an addition at each call site, labelled",
         "# dbl-<site>), each answer given by dcrd's",
-        "# dcrec/secp256k1/v4 at the parity pin 3360ae4d through tools/oracle.",
+        "# dcrec/secp256k1/v4 at the parity pin 46e9df48 through tools/oracle.",
         "# committed_recovery_schnorr_vectors_regenerate rebuilds the file and",
         "# fails on any difference; committed_recovery_schnorr_vectors_hold checks",
         "# it without Go.",

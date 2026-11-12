@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: ISC
 //! Decred cryptographic primitives for dcroxide.
 //!
-//! Mirrors dcrd's `crypto/*` packages at the parity pin, master `3360ae4d`.
+//! Mirrors dcrd's `crypto/*` packages at the parity pin, master `46e9df48`.
 //! Provides BLAKE-256 (vendored), RIPEMD-160 (RustCrypto-backed,
 //! mirroring dcrd's `crypto/ripemd160`), and -- behind the `rand`
 //! feature -- dcrd's `crypto/rand` userspace CSPRNG.

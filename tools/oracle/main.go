@@ -7,16 +7,17 @@
 // generation and differential tests.
 //
 // Every dcrd module dependency in go.mod is pinned to the project's parity
-// pin, dcrd master 3360ae4d, so the oracle links the code the dcrd binary
+// pin, dcrd master 46e9df48, so the oracle links the code the dcrd binary
 // at that commit links: each module sits either at the pin's pseudo-version
 // or at a published tag whose source is byte-identical to the pin's. The
 // pseudo-versions are not what dcrd's own go.mod requires: it requires
 // published releases and builds most of them from the in-tree source through
 // replace directives. The tag pins, by contrast, are the very releases it
-// requires at 3360ae4d, all but one: blockchain/stake is pinned at v5.0.3, the
-// tag its in-tree source matches, where dcrd's go.mod still requires v5.0.2
-// and builds the in-tree source in its place. go.mod's header records the rule
-// and how each module was placed; dcroxide-testutil's
+// requires at 46e9df48. blockchain/stake, which dcrd's go.mod still requires
+// at v5.0.2, sat at v5.0.3, the tag its in-tree source matched, until
+// 01eef9f7 added a test to staketx_test.go; it now sits at the pin's
+// pseudo-version, and dcrd builds the in-tree source. go.mod's header
+// records the rule and how each module was placed; dcroxide-testutil's
 // the_dcrd_pin_matches_ci_and_the_oracle checks the pseudo-versions against
 // the harness pin. Do not bump them independently of a parity-pin move.
 //

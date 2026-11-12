@@ -2,7 +2,7 @@ module github.com/jzbz/dcroxide/tools/fullblockgen
 
 go 1.27.0
 
-// Pinned to the parity pin, dcrd master commit 3360ae4d, by the rule
+// Pinned to the parity pin, dcrd master commit 46e9df48, by the rule
 // tools/oracle/go.mod's header records: every dcrd module the generator links
 // either sits at the pseudo-version at that commit or is a published tag whose
 // .go, go.mod and go.sum files are byte-identical to the in-tree module there.
@@ -15,8 +15,10 @@ go 1.27.0
 // sources at that commit.  wire moved from the pseudo-version to its v1.8.0
 // tag at 382ff4dd, as the oracle's did, and its indirect requirement is what
 // holds it there: the modules the generator links ask for v1.7.5 at most,
-// whose source is not the pin's.  The pseudo-versions were computed by `go
-// get` at the full commit hash, followed by `go mod tidy`.
+// whose source is not the pin's.  The pseudo-versions are the ones `go get`
+// computed at the full commit hash for the oracle; blockchain's is formed the
+// same way from its v5.1.1 tag, and the proxy serves it.  `go mod tidy`
+// followed.
 //
 // Until 6f6cf21b this module kept chaincfg, blake256 and crypto/rand on their
 // v3.3.0, v1.1.0 and v1.0.1 tags although the rule already called for the
@@ -24,22 +26,22 @@ go 1.27.0
 // directives and comments, none of which reaches the regression network the
 // battery runs on, so the vectors generated at 036b7090 were unaffected.  Do
 // not bump any pin independently of a parity-pin move.
-require github.com/decred/dcrd/blockchain/v5 v5.1.2-0.20261019113547-3360ae4dbef8
+require github.com/decred/dcrd/blockchain/v5 v5.1.2-0.20261106175134-46e9df48109a
 
 require (
 	github.com/agl/ed25519 v0.0.0-20170116200512-5312a6153412 // indirect
 	github.com/dchest/siphash v1.2.3 // indirect
 	github.com/decred/base58 v1.0.6 // indirect
 	github.com/decred/dcrd/chaincfg/chainhash v1.0.5 // indirect
-	github.com/decred/dcrd/chaincfg/v3 v3.3.1-0.20261019113547-3360ae4dbef8 // indirect
-	github.com/decred/dcrd/crypto/blake256 v1.1.1-0.20261019113547-3360ae4dbef8 // indirect
-	github.com/decred/dcrd/crypto/rand v1.0.2-0.20261019113547-3360ae4dbef8 // indirect
+	github.com/decred/dcrd/chaincfg/v3 v3.3.1-0.20261106175134-46e9df48109a // indirect
+	github.com/decred/dcrd/crypto/blake256 v1.1.1-0.20261106175134-46e9df48109a // indirect
+	github.com/decred/dcrd/crypto/rand v1.0.2-0.20261106175134-46e9df48109a // indirect
 	github.com/decred/dcrd/crypto/ripemd160 v1.0.2 // indirect
 	github.com/decred/dcrd/dcrec v1.0.1 // indirect
-	github.com/decred/dcrd/dcrec/edwards/v2 v2.0.5-0.20261019113547-3360ae4dbef8 // indirect
-	github.com/decred/dcrd/dcrec/secp256k1/v4 v4.4.2-0.20261019113547-3360ae4dbef8 // indirect
+	github.com/decred/dcrd/dcrec/edwards/v2 v2.0.5-0.20261106175134-46e9df48109a // indirect
+	github.com/decred/dcrd/dcrec/secp256k1/v4 v4.4.2-0.20261106175134-46e9df48109a // indirect
 	github.com/decred/dcrd/dcrutil/v4 v4.0.3 // indirect
-	github.com/decred/dcrd/txscript/v4 v4.1.3-0.20261019113547-3360ae4dbef8 // indirect
+	github.com/decred/dcrd/txscript/v4 v4.1.3-0.20261106175134-46e9df48109a // indirect
 	github.com/decred/dcrd/wire v1.8.0 // indirect
 	github.com/decred/slog v1.2.0 // indirect
 	github.com/klauspost/cpuid/v2 v2.0.9 // indirect

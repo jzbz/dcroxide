@@ -5,7 +5,7 @@
 # subset of eight targets per class, u2 = 1), plus the grid cases whose
 # Straus loop doubles through an addition at each call site (labelled
 # dbl-<site>), each answer given by dcrd's
-# dcrec/secp256k1/v4 at the parity pin 3360ae4d through tools/oracle.
+# dcrec/secp256k1/v4 at the parity pin 46e9df48 through tools/oracle.
 # committed_branch_vectors_regenerate rebuilds the file and fails on any
 # difference; committed_branch_vectors_hold checks it without Go.
 #

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: ISC
 //! dcrd's fixed ECDSA vectors for signing, verification and compact
 //! recovery, ported from dcrec/secp256k1/v4 `ecdsa/signature_test.go` at
-//! the parity pin (v4.4.2-0.20261019113547-3360ae4dbef8, the version
+//! the parity pin (v4.4.2-0.20261106175134-46e9df48109a, the version
 //! `tools/oracle` pins).  They run without Go, and every signature,
 //! verdict and recovered key here is dcrd's.
 

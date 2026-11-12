@@ -9,10 +9,13 @@
   first condition (2026-10-31); `secp256k1-sys`'s part (2026-11-09) and
   the second condition, the D3 soak (2026-11-10), on the port's branch,
   and on master since its merge at `28ad696` on 2026-11-10 (ADR-0017's
-  second addendum of that date).
+  second addendum of that date). The third condition is not met: on
+  2026-11-12 the pin moved to master `46e9df48`, still 2.2.0-pre, where
+  part 2 names the pin of 2026-10-26.
 - **Date:** 2026-10-26 (accepted), 2026-10-31 (addendum: `ring`'s part),
   2026-11-09 (addendum: `secp256k1-sys`'s part and the D3 gate soak),
-  2026-11-10 (addendum: the extra soak legs; status: the merge)
+  2026-11-10 (addendum: the extra soak legs; status: the merge),
+  2026-11-12 (status: the pin's move)
 
 ## Context
 

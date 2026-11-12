@@ -4,8 +4,11 @@
   with the other recommendations of that day, to take effect when dcrd
   tags v2.2.0. Until then the pin follows master as set on 2026-10-25 (see
   "Until the tag"). Nothing the first tag move needs is built yet: "What
-  the first tag move needs" lists it, and that move waits on it.
-- **Date:** 2026-10-26
+  the first tag move needs" lists it, and that move waits on it. On
+  2026-11-12 the pin moved to master `46e9df48` under that cadence; "Until
+  the tag" names the pin of 2026-10-26, and the two `go.mod` headers it
+  cites now end at `:48` and `:27`.
+- **Date:** 2026-10-26, 2026-11-12 (status: the pin's move)
 
 ## Context
 

@@ -4,7 +4,7 @@ A from-scratch Rust implementation of the Decred full-node daemon, built as a
 drop-in replacement for [dcrd](https://github.com/decred/dcrd).
 
 Parity target: **dcrd v2.2**, which upstream has not yet released: until it is
-tagged, the pin follows dcrd master, now **`3360ae4d`** (version 2.2.0-pre) —
+tagged, the pin follows dcrd master, now **`46e9df48`** (version 2.2.0-pre) —
 wire protocol 12, JSON-RPC API 8.3.0. dcrd's behavior at the pinned commit is
 the specification; see [QUIRKS.md](docs/QUIRKS.md) for deliberate bug-for-bug
 reproductions and [PARITY.md](docs/PARITY.md) for per-package status. The full
@@ -578,7 +578,7 @@ work). Currently implemented:
   interval, so an optimization is measured on the same blocks before
   and after
 - `tools/oracle` — Go shim linking dcrd's own packages (pinned to the
-  parity pin, master `3360ae4d`: each dcrd module at that commit's
+  parity pin, master `46e9df48`: each dcrd module at that commit's
   pseudo-version or at a tag whose source is byte-identical to it, as the
   header of `tools/oracle/go.mod` records) as a test oracle over
   line-delimited JSON
@@ -789,7 +789,7 @@ and 24.18 GiB under dcrd, 17.88 GiB of it block files in each
 ## Development
 
 Rust 1.99.1 and a Go toolchain (for the oracle-backed differential
-tests; without Go those tests skip). Go 1.26.2 is the reference: the
+tests; without Go those tests skip). Go 1.27.3 is the reference: the
 release dcrd's release image builds the parity pin with, and the one CI
 runs (`GO_VERSION` in `.github/workflows/ci.yml`; ADR-0001's 2026-10-26
 addendum on the reference Go). The oracle builds with Go 1.24 or later,

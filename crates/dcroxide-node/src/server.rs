@@ -94,10 +94,11 @@ pub fn netsync_max_outbound_peers(max_peers: i64) -> u64 {
 const GO_MAX_ALLOC: i64 = 1 << 48;
 
 /// `unsafe.Sizeof(hchan{})` rounded to `maxAlign` (`runtime/chan.go`).
-/// Measured as 104 under go1.27; go1.26.2, the reference Go that CI
-/// runs, declares `hchan`, `waitq` and `mutex` the same.  The limit
-/// below is the same integer for any value in `[104, 136]`, which spans
-/// the plausible range, so the constant does not track the Go release.
+/// Measured as 104 under go1.27; go1.27.3, the reference Go that CI
+/// runs, and go1.26.2 declare `hchan`, `waitq` and `mutex` the same.
+/// The limit below is the same integer for any value in `[104, 136]`,
+/// which spans the plausible range, so the constant does not track the
+/// Go release.
 const GO_HCHAN_SIZE: i64 = 104;
 
 /// `unsafe.Sizeof(relayMsg{})`, measured in the pin; `broadcastMsg` is

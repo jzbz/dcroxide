@@ -38,6 +38,8 @@ import (
 	"encoding/hex"
 	"fmt"
 	"os"
+	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -54,6 +56,17 @@ import (
 // 2026-10-13 22:36:39 UTC.  It stays fixed when the pin moves, so the clock
 // adds no difference of its own at a later pin.
 var exportNow = time.Unix(1791930999, 0)
+
+// exportCalledFromFlush reports whether the cache's clock was read by
+// UtxoCache.flush, the caller of the function that calls it.
+func exportCalledFromFlush() bool {
+	pc := make([]uintptr, 1)
+	if runtime.Callers(3, pc) == 0 {
+		return false
+	}
+	frame, _ := runtime.CallersFrames(pc).Next()
+	return strings.HasSuffix(frame.Function, ".(*UtxoCache).flush")
+}
 
 // exportTimeSource is a MedianTimeSource fixed at exportNow.
 type exportTimeSource struct{}
@@ -224,8 +237,11 @@ func exportScenarios(t *testing.T, flushUtxoCache bool, blocks *exportBlocks) []
 	cache := g.chain.utxoCache.(*testUtxoCache).UtxoCache
 	cache.timeNow = func() time.Time {
 		// The cache stamps every completed flush, right after it records
-		// the hash flushed through (utxocache.go:768-769).
-		r.flushes = append(r.flushes, cache.lastFlushHash)
+		// the hash flushed through (utxocache.go:768-769).  shouldFlush
+		// reads the clock too (:678), so only flush's reading is a flush.
+		if exportCalledFromFlush() {
+			r.flushes = append(r.flushes, cache.lastFlushHash)
+		}
 		return time.Now()
 	}
 	mode := "flush-enabled"

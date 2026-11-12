@@ -36,7 +36,7 @@ use dcroxide_node::rpcrun::{
 };
 use dcroxide_node::{ConfigEnv, load_config_from_argv};
 use dcroxide_testutil::REFERENCE_GO;
-use dcroxide_testutil::tls_interop::{TlsOracle, spec};
+use dcroxide_testutil::tls_interop::{TlsOracle, spec, without_key_parse_cause};
 use serde_json::json;
 
 /// Write a fresh self-signed pair at the two paths, replacing whatever
@@ -454,8 +454,9 @@ fn as_pkcs8(curve: Curve, sec1: &[u8]) -> Vec<u8> {
 /// Hold a pair to Go's `tls.X509KeyPair` through the oracle's
 /// `x509_key_pair`, when the oracle is present: `want` is its answer
 /// under the reference Go, `ok` and the key's type or `refused: ` and
-/// Go's error, compared whole there and as a verdict alone under another
-/// Go or where `want` is `refused: ` alone.
+/// Go's error, compared whole there, but for the cause Go gives for a key
+/// it cannot parse ([`without_key_parse_cause`]), and as a verdict alone
+/// under another Go or where `want` is `refused: ` alone.
 fn assert_go_reads(
     go: Option<&mut TlsOracle>,
     what: &str,
@@ -473,7 +474,8 @@ fn assert_go_reads(
             "key_pem": String::from_utf8_lossy(key_pem),
         }),
     );
-    let answer = answer["result"].as_str().expect("x509_key_pair's verdict");
+    let answer =
+        without_key_parse_cause(answer["result"].as_str().expect("x509_key_pair's verdict"));
     if go.go_version() == REFERENCE_GO && want != "refused: " {
         assert_eq!(answer, want, "{what}: Go");
     } else {

@@ -2,7 +2,7 @@
 //! Internal test utilities for dcroxide differential tests.
 //!
 //! Provides the harness for `tools/oracle` (the Go shim linking dcrd's own
-//! packages at the parity pin, master `3360ae4d`; its `go.mod` records how
+//! packages at the parity pin, master `46e9df48`; its `go.mod` records how
 //! each module is pinned) plus a deterministic PRNG and hex helpers, so every
 //! crate's differential tests share one implementation, the power-loss
 //! storage rig the crash suites cut power under ([`powerloss`]), the gate
@@ -204,7 +204,7 @@ pub const ORACLE_BIN_VAR: &str = "DCROXIDE_ORACLE_BIN";
 /// The Go CI takes the oracle's verdicts from, as `runtime.Version()`
 /// names it: the reference Go of ADR-0001's 2026-10-26 addendum, which
 /// `ci.yml`'s `GO_VERSION` installs.
-pub const REFERENCE_GO: &str = "go1.26.2";
+pub const REFERENCE_GO: &str = "go1.27.3";
 
 /// Under `DCROXIDE_REQUIRE_ORACLE`, as in CI, panic unless `go_version`, the
 /// `go_version` an oracle response reports, is [`REFERENCE_GO`]: a test
@@ -556,7 +556,7 @@ impl Drop for Oracle {
 /// match it.  CI's `DCRD_COMMIT` and the pseudo-versions in
 /// `tools/oracle/go.mod` and `tools/fullblockgen/go.mod` must name the same
 /// commit; a unit test below holds them all together.
-pub const DCRD_PARITY_COMMIT: &str = "3360ae4d";
+pub const DCRD_PARITY_COMMIT: &str = "46e9df48";
 
 /// A dcrd process running on simnet, for interop tests over a real socket.
 ///

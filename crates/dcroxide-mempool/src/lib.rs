@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: ISC
 //! The transaction memory pool, ported from dcrd's `internal/mempool`
-//! package at the parity pin, master `3360ae4d`, whose changes since
+//! package at the parity pin, master `46e9df48`, whose changes since
 //! `6f6cf21b`, the pin before `382ff4dd`, are carried: the refusal of
 //! spends of outputs controlled by a misbehaving mixing peer
 //! (`3c8a1734`), vote metadata kept in a tracker and pruned ten blocks

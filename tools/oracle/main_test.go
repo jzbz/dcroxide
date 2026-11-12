@@ -815,8 +815,14 @@ func TestX509KeyPair(t *testing.T) {
 			"refused: tls: private key type does not match public key type"},
 		"X25519": {keyPairRequest(t, p256.cert, pkcs8(t, x25519), "PRIVATE KEY"),
 			"refused: tls: found unknown private key type in PKCS#8 wrapping"},
+		// Since Go 1.27 the refusal carries the PKCS#8 parser's error, and
+		// this is the reference Go's text; Go 1.26 gave the bare prefix.
 		"not a key": {keyPairRequest(t, p256.cert, []byte("not a key"), "PRIVATE KEY"),
-			"refused: tls: failed to parse private key"},
+			"refused: tls: failed to parse private key: asn1: structure error: " +
+				"tags don't match (16 vs {class:1 tag:14 length:111 isCompound:true}) " +
+				"{optional:false explicit:false application:false private:false " +
+				"defaultValue:<nil> tag:<nil> stringType:0 timeType:0 set:false " +
+				"omitEmpty:false} pkcs8 @2"},
 	} {
 		resp := call("x509_key_pair", tc.data)
 		if resp.Error != "" || resp.Result != tc.want || resp.GoVersion != runtime.Version() {

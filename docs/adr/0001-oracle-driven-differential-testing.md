@@ -4,7 +4,8 @@
 - **Date:** 2026-07-03 (accepted), 2026-07-26 (addendum: the pin moved with
   the parity target), 2026-08-20 through 2026-10-25 (addenda: the pin's
   later moves), 2026-10-26 (addendum: frozen batteries whose exporters were
-  scratch code; second addendum: one reference Go, and CI on it)
+  scratch code; second addendum: one reference Go, and CI on it), 2026-11-12
+  (addendum: the pin at `46e9df48` and the reference Go at 1.27.3)
 
 ## Context
 
@@ -394,3 +395,93 @@ What is pending, each in a change of its own and gated on its review:
   Dockerfile at the pin names. PARITY.md's bump check, which reads the
   Dockerfile, now names `GO_VERSION` as moving with it; a check that fails
   when the two differ is not built.
+
+## Addendum, 2026-11-12 — pin and generators at `46e9df48`, reference Go 1.27.3
+
+The pin moved to master `46e9df48`, five commits past `3360ae4d`, and
+`tools/oracle/go.mod` and `tools/fullblockgen/go.mod` moved with it.
+`46e9df48` moves dcrd's release image from golang 1.26.2 to golang 1.27.3, so
+under the second 2026-10-26 addendum the reference Go is now go1.27.3, and
+CI's `GO_VERSION` and the harness's `REFERENCE_GO` moved in the same change.
+The move was decided on 2026-11-12, with the port's Go behaviour to follow
+1.27.3: what it had already taken from Go 1.27 becomes the reference's, and
+the rest is to be brought in line.
+
+**Modules and generators.** No module was tagged in the delta. Of the in-tree
+modules the two tools link, only `blockchain/stake`'s directory changed, in
+`staketx_test.go` alone. Stake leaves its v5.0.3 tag for the pin's
+pseudo-version, by the oracle header's rule, which compares every file; every
+other module that moved is byte-identical, as the module proxy serves it, at
+both commits. The delta changes `internal/blockchain`, so `tools/chainopsgen`,
+`tools/disapprovalgen` and `tools/utxoviewgen` were run again at the pin, and
+each wrote its files back byte for byte, two of them once adapted to the delta
+(`docs/PARITY.md`'s *Oracle pin* paragraph). Under go1.27.3,
+`tools/helpgen`, `tools/mempoolvectors`, `tools/mixpoolgen` and
+`tools/profilergen` wrote theirs back unchanged as well; `tools/fullblockgen`,
+whose file records the time of its run, was not run again.
+
+**Batteries due and not built.** Under the 2026-10-26 addendum on frozen
+batteries this move brings due every battery without a kept exporter that was
+dumped in `internal/blockchain` or `blockchain/stake`, the two packages its
+delta changes, and the move of the reference Go brings due those whose Go-JSON
+texts 1.27.3 words differently. No exporter of any of them is rebuilt yet;
+until one is, the port is held to its file as it stands. Due as of this
+addendum:
+
+- 29 files under `crates/dcroxide-blockchain/tests/data`, dumped in
+  `internal/blockchain`: `agenda_vectors.txt`, `blockcontext_vectors.txt`,
+  `blocksanity_vectors.txt`, `cfilterserve_vectors.txt`, `chainio_vectors.txt`,
+  `compress_vectors.txt`, `connectblock_vectors.txt`,
+  `contextual_vectors.txt`, `contextual2_vectors.txt`, `ctac_vectors.txt`,
+  `difficulty_vectors.txt`, `liveticket_vectors.txt`, `lottery_vectors.txt`,
+  `positional_vectors.txt`, `processheaders_vectors.txt`,
+  `query_vectors.txt`, `seqlock_vectors.txt`, `sigops_vectors.txt`,
+  `stakeinputs_vectors.txt`, `stakenode_vectors.txt`, `stakever_vectors.txt`,
+  `template_vectors.txt`, `threshold_vectors.txt`, `ticketspend_vectors.txt`,
+  `tpv_vectors.txt`, `treasury_vectors.txt`, `txinputs_vectors.txt`,
+  `utxoio_vectors.txt` and `validate_vectors.txt`. The other six files there
+  are written by kept tools.
+- 3 files under `crates/dcroxide-stake/tests/data`, dumped in
+  `blockchain/stake`: `stakedb_vectors.txt`, `staketx_vectors.txt` and
+  `ticketnode_vectors.txt`. The rule goes by the package, and the delta's
+  change there, a case `01eef9f7` adds to `staketx_test.go`, is to a test
+  file, for which it names no exemption.
+  `review_ticketnode_expiring.txt`, from a Go test placed in a copy of the
+  same package, comes due as well if the review tables count as batteries,
+  which is not settled.
+- `dcrjson_vectors.txt`, `rpchandlers13_vectors.txt` and
+  `seed_tor_vectors.txt`, whose Go-JSON syntax-error texts Go 1.27's default
+  `jsonv2` words differently. The port keeps Go 1.26.2's texts until they are
+  regenerated, an interim divergence `docs/PARITY.md` records.
+- The seventeen `internal/rpcserver` files, due since the `3360ae4d` move.
+  `rpchandlers13_vectors.txt`, in the group above, is one of them.
+
+**The second 2026-10-26 addendum's pending items.**
+
+- **Behaviour the port took from a later Go.** The five cases, the 500
+  header-value cap, the quoted MIME header texts, ML-DSA keys in the chain
+  search, the mux redirect's escaping and the 431 for a long leading-space
+  line, are now the reference's behaviour, and the code was not changed back.
+  Each holds in 1.27.3 as in 1.27.1, from which the port took it. Behaviour
+  newer than 1.27.1 is pending: the count of `Trailer` values against the cap
+  (1.27.2), and in 1.27.3 a failed continuation-line read reported as an error
+  and the drop of chains through distrusted keys. So are Go 1.27's refusal of
+  an IPv4-mapped IPv6 address as a subject alternative name or IP name
+  constraint, the runes Unicode 17 makes printable for `strconv.IsPrint`, the
+  cause Go gives for a key it cannot parse, ML-DSA keys, certificates and
+  signatures, and the Go-JSON texts. `docs/PARITY.md` records them as interim
+  divergences; all but the Go-JSON texts are to be followed in the changes
+  that complete this move.
+- **Citations of Go 1.27.** The item turns over: the citations written against
+  1.26.2, and those written against 1.27.1, are now the ones to re-point, to
+  1.27.3.
+- **The oracle's GODEBUG defaults.** Stands.
+- **`tools/fullblockgen`.** Its `go 1.27.0` is now within the reference;
+  `go-tools` takes it in a change of its own.
+- **The bump check.** Stands.
+
+Soak records made before and after this move compare only with `sigsoak
+compare --allow-pin-change`. The condition item 5 of ADR-0006's second
+2026-10-26 addendum set for that flag, unchanged `dcrec/secp256k1` and
+`dcrec/edwards` source, holds between the two pins; the oracle on the later
+side is also built with go1.27.3. The nightly job compares no records itself.

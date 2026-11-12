@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: ISC
 //! dcrd's decompression, Jacobian addition and doubling vectors, copied
 //! from github.com/decred/dcrd/dcrec/secp256k1/v4 curve_test.go at the
-//! parity pin 3360ae4d (`TestDecompressY`, :1128-1228, vectors
+//! parity pin 46e9df48 (`TestDecompressY`, :1128-1228, vectors
 //! :1135-1171; `TestAddJacobian`, :352-560, vectors :353-526;
 //! `TestDoubleJacobian`, :564-635, vectors :565-605; ISC, Copyright (c)
 //! 2015-2024 The Decred developers, 2013-2016 The btcsuite developers).

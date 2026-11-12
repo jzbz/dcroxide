@@ -299,14 +299,17 @@ func TestTLSListenAndDial(t *testing.T) {
 		}
 		return tlsDialOf(t, fields)
 	}
-	// Go 1.26.2's signature schemes, without SHA-1 (tlssha1=0), and in TLS
-	// 1.3 without PKCS#1 v1.5 either (crypto/tls/common.go:1752-1794).
+	// Go 1.27.3's signature schemes (crypto/tls/defaults.go:49-67), without
+	// SHA-1 (tlssha1=0), in TLS 1.3 without PKCS#1 v1.5 either, and in TLS
+	// 1.2 without ML-DSA, which only TLS 1.3 defines
+	// (crypto/tls/common.go:1777-1835).  Go 1.26 had no ML-DSA.
 	tls12Schemes := []string{
 		"PSSWithSHA256", "ECDSAWithP256AndSHA256", "Ed25519", "PSSWithSHA384", "PSSWithSHA512",
 		"PKCS1WithSHA256", "PKCS1WithSHA384", "PKCS1WithSHA512", "ECDSAWithP384AndSHA384",
 		"ECDSAWithP521AndSHA512",
 	}
 	tls13Schemes := []string{
+		"MLDSA44", "MLDSA65", "MLDSA87",
 		"PSSWithSHA256", "ECDSAWithP256AndSHA256", "Ed25519", "PSSWithSHA384", "PSSWithSHA512",
 		"ECDSAWithP384AndSHA384", "ECDSAWithP521AndSHA512",
 	}

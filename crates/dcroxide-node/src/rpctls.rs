@@ -7,12 +7,14 @@
 //! `--authtype=clientcert`, the client CAs, and nothing else
 //! (`newTLSConfig`, `server.go:3685-3699`; the outer config adds only
 //! `GetConfigForClient`, `:3818-3821`), so every negotiation choice is
-//! Go's default.  The reference Go, 1.26.2 (ADR-0001's 2026-10-26
-//! addendum on the reference Go), makes these choices for that
+//! Go's default.  Go 1.26.2, the reference Go until the `46e9df48` move
+//! (ADR-0001's 2026-10-26 addendum on the reference Go) and the release
+//! the citations below are read in, makes these choices for that
 //! configuration, and Go 1.27, which built dcrd 2.1.7's published
-//! linux-amd64 binary, makes the same ones:
+//! linux-amd64 binary and is the reference from that move on as
+//! go1.27.3, makes the same ones:
 //!
-//! * At `3360ae4d`, the parity pin, as on master, dcrd's `debug.go` sets
+//! * At `46e9df48`, the parity pin, as on master, dcrd's `debug.go` sets
 //!   `//go:debug default=go1.26`, and a build there offers X25519MLKEM768,
 //!   SecP256r1MLKEM768, SecP384r1MLKEM1024, X25519, P-256, P-384 and
 //!   P-521, in that order (`crypto/tls/defaults.go:29-33`), the hybrids in

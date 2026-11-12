@@ -296,9 +296,11 @@ func TestExportUtxoViewVectors(t *testing.T) {
 		t.Fatal(err)
 	}
 	w.row("block %s", blockHex)
+	// The parent's tree was connected above with the agenda active, so the
+	// parent's flag, which the undo and the redo take, is the same.
 	var stxos []spentTxOut
 	err = view.connectBlock(chain.db, params, block, parent, &stxos,
-		isTreasuryEnabled)
+		isTreasuryEnabled, isTreasuryEnabled)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -306,7 +308,8 @@ func TestExportUtxoViewVectors(t *testing.T) {
 	w.snapshot("afterconnect", view)
 
 	// Disconnect the child again, which redoes the parent's regular tree.
-	err = view.disconnectBlock(params, block, parent, stxos, isTreasuryEnabled)
+	err = view.disconnectBlock(params, block, parent, stxos, isTreasuryEnabled,
+		isTreasuryEnabled)
 	if err != nil {
 		t.Fatal(err)
 	}

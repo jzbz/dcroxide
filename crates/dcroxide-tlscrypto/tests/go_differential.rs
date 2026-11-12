@@ -42,6 +42,7 @@ mod sig_corpus;
 use std::collections::{BTreeMap, HashMap};
 
 use curve25519_dalek::montgomery::MontgomeryPoint;
+use dcroxide_testutil::tls_interop::without_key_parse_cause;
 use dcroxide_testutil::{Oracle, SplitMix64, hex, unhex};
 use dcroxide_tlscrypto::sign::{self, KeyAlgorithm};
 use p256::elliptic_curve::sec1::ToSec1Point;
@@ -249,7 +250,8 @@ fn pem(label: &str, der: &[u8]) -> String {
 }
 
 /// Go's verdict on a certificate and a key: `tls.X509KeyPair` on the
-/// certificate's PEM and the key's under `label`.
+/// certificate's PEM and the key's under `label`, without the cause Go
+/// gives for a key it cannot parse ([`without_key_parse_cause`]).
 fn go_key_pair(oracle: &mut Oracle, cert: &[u8], label: &str, key: &[u8]) -> String {
     let request = serde_json::json!({
         "cert_pem": pem("CERTIFICATE", cert),
@@ -257,10 +259,10 @@ fn go_key_pair(oracle: &mut Oracle, cert: &[u8], label: &str, key: &[u8]) -> Str
     });
     let response = oracle.call("x509_key_pair", request.to_string().as_bytes());
     dcroxide_testutil::require_reference_go(response["go_version"].as_str().unwrap_or_default());
-    response["result"]
+    let answer = response["result"]
         .as_str()
-        .unwrap_or_else(|| panic!("the oracle answered {response}"))
-        .to_owned()
+        .unwrap_or_else(|| panic!("the oracle answered {response}"));
+    without_key_parse_cause(answer).to_owned()
 }
 
 /// Go's name for a key's type, in `x509_key_pair`'s answer.

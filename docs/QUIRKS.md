@@ -1,6 +1,6 @@
 # Quirks ledger
 
-dcrd's behavior at the pinned upstream (master `3360ae4d`, version `2.2.0-pre`,
+dcrd's behavior at the pinned upstream (master `46e9df48`, version `2.2.0-pre`,
 on the way to the unreleased v2.2) is the specification — including where it
 deviates from written documentation (DCPs, `docs/`). Every intentional
 reproduction of such a deviation is recorded here, with a test pinning it so it

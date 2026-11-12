@@ -2,7 +2,7 @@
 
 **A full Rust re-implementation of the Decred full-node daemon (`dcrd`), built as a drop-in replacement.**
 
-Prepared for the implementing developer/team. Parity target: **dcrd v2.2**, which upstream has not yet released, so the pin follows dcrd master until v2.2 is tagged: now **`3360ae4d`** (version `2.2.0-pre`) — moved up seven times, from the `release-v2.1.5` tag this plan was originally written against and then through `452c1a6c`, `29f17894`, `036b7090`, `b9634e01`, `6f6cf21b` and `382ff4dd`; see the status block below. Wire protocol version **12**, JSON-RPC API version **8.3.0**.
+Prepared for the implementing developer/team. Parity target: **dcrd v2.2**, which upstream has not yet released, so the pin follows dcrd master until v2.2 is tagged: now **`46e9df48`** (version `2.2.0-pre`) — moved up eight times, from the `release-v2.1.5` tag this plan was originally written against and then through `452c1a6c`, `29f17894`, `036b7090`, `b9634e01`, `6f6cf21b`, `382ff4dd` and `3360ae4d`; see the status block below. Wire protocol version **12**, JSON-RPC API version **8.3.0**.
 
 ---
 
@@ -44,14 +44,14 @@ P2P server with sync, relay, and StakeShuffle mixing message relay, the
 JSON-RPC/websocket server, the tool commands, the pipe IPC lifecycle, and the
 Windows service wrapper. The gate runs 2,682 tests across 453 suites on Linux,
 most of them differential against dcrd or replaying sessions generated inside dcrd's own
-packages. The parity pin moved seven times during the port, from
+packages. The parity pin moved eight times during the port, from
 `release-v2.1.5` to upstream master `452c1a6c` and then through `29f17894`,
-`036b7090`, `b9634e01`, `6f6cf21b` and `382ff4dd` to `3360ae4d` (2.2.0-pre); the
-target is now dcrd v2.2, which upstream has not yet released, so the pin follows
-master until v2.2 is tagged. The oracle rig was re-pinned for the first move,
-kept at `452c1a6c` for the second, since nothing in that delta changes what the
-exporters emit, and has moved with the pin since, so it now links `3360ae4d`
-(see PARITY.md and `tools/oracle/go.mod`).
+`036b7090`, `b9634e01`, `6f6cf21b`, `382ff4dd` and `3360ae4d` to `46e9df48`
+(2.2.0-pre); the target is now dcrd v2.2, which upstream has not yet released,
+so the pin follows master until v2.2 is tagged. The oracle rig was re-pinned
+for the first move, kept at `452c1a6c` for the second, since nothing in that
+delta changes what the exporters emit, and has moved with the pin since, so it
+now links `46e9df48` (see PARITY.md and `tools/oracle/go.mod`).
 
 Work from earlier phases that is genuinely still outstanding. "Complete" above
 means the implementation work of those phases is done; several of their written
@@ -432,7 +432,7 @@ it with funds.**
 | Item | Fact |
 |---|---|
 | Reference implementation | [decred/dcrd](https://github.com/decred/dcrd), Go, ISC license, in production since Feb 2016, ~7,300 commits |
-| Parity target | Planned as the `release-v2.1.5` tag (Apr 2026), tracking upstream releases thereafter. It did move: the target is now dcrd v2.2, not yet released, so the pin follows master, now `3360ae4d` (2.2.0-pre), reached via `452c1a6c`, `29f17894`, `036b7090`, `b9634e01`, `6f6cf21b` and `382ff4dd` |
+| Parity target | Planned as the `release-v2.1.5` tag (Apr 2026), tracking upstream releases thereafter. It did move: the target is now dcrd v2.2, not yet released, so the pin follows master, now `46e9df48` (2.2.0-pre), reached via `452c1a6c`, `29f17894`, `036b7090`, `b9634e01`, `6f6cf21b`, `382ff4dd` and `3360ae4d` |
 | Implementation size | ~168,000 lines of non-test Go; ~134,000 lines of Go tests |
 | Protocol facts | P2P wire protocol 12 (mixing added at v10, batched cfilters at v11); JSON-RPC API semver 8.3.0; mainnet ports 9108 (p2p) / 9109 (RPC) |
 | RPC surface | 77 HTTP methods + 17 websocket methods, spec in `docs/json_rpc_api.mediawiki` |
@@ -530,7 +530,7 @@ Every task in this project serves one of six compatibility surfaces. They are li
 4. **Memory safety as a feature.** `#![forbid(unsafe_code)]` in all dcroxide crates; `unsafe` allowed only inside vetted third-party dependencies, tracked via `cargo-deny`/`cargo-vet`/`cargo-audit` in CI. This is a headline advantage of the project — protect it. One audited exception exists: `dcroxide-winsvc` denies rather than forbids `unsafe_code`, for the `windows-service` entry macro's shim and for the Windows console control handler and pipe-handle adoption that std does not wrap, each unsafe block allowed individually with a `SAFETY` comment ([ADR-0008](adr/0008-clippy-lint-policy.md)'s 2026-09-25 addendum).
 5. **Consensus code is boring code.** No cleverness in validation paths: explicit integer widths, checked arithmetic mirroring dcrd's `checkedmath`, no floating point anywhere near consensus, deterministic iteration orders, and exhaustive error enums mapped 1:1 to dcrd's error kinds (RPC and reject messages leak error identity — parity matters).
 6. **DoS posture parity.** dcrd's limits (message sizes, orphan pools, ban scores, per-peer rate limits, mixpool limits, APBF sizing) are consensus-adjacent: divergence lets an attacker partition mixed networks. Port limits verbatim; test them.
-7. **Pin, then track.** All parity claims reference one pinned upstream commit — `release-v2.1.5` when this plan was written, now master `3360ae4d`: the target is dcrd v2.2, which upstream has not yet released, and the pin follows master until v2.2 is tagged, then dcrd's release tags ([ADR-0013](adr/0013-upstream-tracking-release-tags.md)). A standing "upstream watch" task reviews every dcrd release/merged consensus PR and files parity issues. ADR-0013 makes the watch the project owner's, with nothing scheduling it; from the v2.2 tag on, each release is reviewed as a pin move, and master's consensus and policy commits are read ahead into dated notes, not ported until a release carries them. A `PARITY.md` ledger maps each dcrd package to its dcroxide crate and status.
+7. **Pin, then track.** All parity claims reference one pinned upstream commit — `release-v2.1.5` when this plan was written, now master `46e9df48`: the target is dcrd v2.2, which upstream has not yet released, and the pin follows master until v2.2 is tagged, then dcrd's release tags ([ADR-0013](adr/0013-upstream-tracking-release-tags.md)). A standing "upstream watch" task reviews every dcrd release/merged consensus PR and files parity issues. ADR-0013 makes the watch the project owner's, with nothing scheduling it; from the v2.2 tag on, each release is reviewed as a pin move, and master's consensus and policy commits are read ahead into dated notes, not ported until a release carries them. A `PARITY.md` ledger maps each dcrd package to its dcroxide crate and status.
 
 ---
 
@@ -828,7 +828,7 @@ pins this policy asks for.
 > - **D5** — [ADR-0013](adr/0013-upstream-tracking-release-tags.md),
 >   *Accepted* 2026-10-26, effective when dcrd tags v2.2.0. The parity pin
 >   moved to master `452c1a6c` and on through `29f17894`, `036b7090`,
->   `b9634e01`, `6f6cf21b` and `382ff4dd` to `3360ae4d`, and on 2026-10-25
+>   `b9634e01`, `6f6cf21b`, `382ff4dd` and `3360ae4d` to `46e9df48`, and on 2026-10-25
 >   the project owner made dcrd v2.2 the target, the pin following master
 >   until it is tagged, at upstream milestones and on the project owner's
 >   word. From the tag on, the pin follows dcrd's release tags, and master
@@ -916,7 +916,7 @@ at the tip ([docs/bench-ledger.md](bench-ledger.md), "Per-block comparison
 with dcrd, genesis to block 1,116,035"). It compares stored records, not chain
 state recomputed at each height, and leaves the transaction index out, since
 dcrd's store has none; the dcrd that wrote that store is 70 commits behind
-`382ff4dd`, the parity pin then, and 71 behind `3360ae4d`, commits that change
+`382ff4dd`, the parity pin then, and 76 behind `46e9df48`, commits that change
 no row format but do change behaviour; and the sync, at the defaults, validated
 in full only the blocks after the assume-valid block. Read the acceptance
 column, not the phase list, when judging readiness.
