@@ -198,6 +198,36 @@ evaluating this code.
   failing then latches the database fatal: the node keeps running and
   answering RPC, but stops connecting blocks until it is restarted.
   Details are in PARITY.md's open gaps.
+- **The script engine copies stack items where dcrd shares them.** Each
+  item on the script stack is a buffer of its own (`dcroxide-txscript`,
+  `stack.rs:38`). A data push copies the bytes it pushes once, and the
+  duplicating opcodes, `OP_DUP`, `OP_2DUP`, `OP_3DUP`, `OP_OVER`,
+  `OP_2OVER`, `OP_PICK`, `OP_TUCK` and `OP_IFDUP`, copy the item's bytes
+  each time, as do `OP_SUBSTR`, `OP_LEFT` and `OP_RIGHT` for the part
+  they keep. dcrd's engine pushes the same slice again
+  (`stack.go:222-237`, `opcode.go:715-717`) or reslices it
+  (`opcode.go:1377`, `opcode.go:1425`, `opcode.go:1478`), and copies an
+  item's bytes only in `OP_CAT` (`opcode.go:1302-1305`), where the port
+  copies them too (`opcodes.rs:758-761`). Stack contents and verdicts
+  are the same in both; only the cost differs, and the consensus limits
+  bound it per script: 255 counted operations, 2,048 bytes per item,
+  1,024 items. The costliest standard spend found is a P2SH spend of
+  about 300 to 350 bytes with no signature operations, whose redeem
+  script builds 2,048-byte items with `OP_CAT` and then interleaves
+  `OP_3DUP` with `OP_2DROP`. Each such input copies about 590 KB, and a
+  393,216-byte block of them about 0.6 GB, roughly 35 to 80 ms of CPU
+  spread over the script threads. That stays below a worst case both
+  nodes already accept: a redeem script that hashes 2,048-byte items in
+  a loop costs dcrd and the port about the same, roughly 0.1 to 0.45 s
+  per block. A block a miner builds can do several times more of both,
+  by spending outputs mined earlier whose public key scripts carry the
+  program, so the comparison holds there too. These figures are
+  estimates from the limits and typical allocation, copy and hash
+  speeds, not measurements. Memory stays within the 1,024 items of up
+  to 2,048 bytes that either engine already allows. Sharing items as
+  dcrd does would change the stack's item type in the consensus script
+  engine, on the path every ordinary spend takes, so it would need a
+  timed run of that path, before and after, before it is considered.
 - **The sync peer's connection is read ahead of its block handler.**
   During the initial sync a thread of its own reads the sync peer's
   connection up to sixteen frames ahead of the thread that handles that
