@@ -1335,14 +1335,17 @@ mod tests {
             roots: vec![vec![0x33; 32], vec![0x44; 1]],
             seen_slot_reserves: hashes(2),
         }));
-        out.push(Message::MixDCNet(MsgMixDCNet {
-            signature: [1; 64],
-            identity: [2; 33],
-            session_id: [3; 32],
-            run: 0,
-            dc_net: vec![vec![[0x55; MIX_MSG_SIZE]; 3]; 2],
-            seen_slot_reserves: hashes(2),
-        }));
+        // A matrix of empty rows, so serialize_size and mix_hash see one too.
+        for dc_net in [vec![vec![[0x55; MIX_MSG_SIZE]; 3]; 2], vec![Vec::new(); 2]] {
+            out.push(Message::MixDCNet(MsgMixDCNet {
+                signature: [1; 64],
+                identity: [2; 33],
+                session_id: [3; 32],
+                run: 0,
+                dc_net,
+                seen_slot_reserves: hashes(2),
+            }));
+        }
         out.push(Message::MixConfirm(MsgMixConfirm {
             signature: [1; 64],
             identity: [2; 33],

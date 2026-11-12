@@ -14,7 +14,9 @@ use dcroxide_chainhash::Hash;
 
 use crate::cursor::Cursor;
 use crate::error::{MessageText, WireError};
-use crate::msgtx::{MsgTx, OutPoint, TxOut, read_out_point, read_script, write_out_point};
+use crate::msgtx::{
+    MsgTx, OutPoint, TxOut, capped_capacity, read_out_point, read_script, write_out_point,
+};
 use crate::protocol::{MIX_VERSION, is_strict_ascii};
 use crate::varint::{
     read_ascii_var_string, read_var_bytes, read_var_int, var_int_serialize_size, write_var_bytes,
@@ -769,9 +771,13 @@ fn read_mix_vects(r: &mut Cursor<'_>, op: &'static str) -> Result<Vec<MixVect>, 
     if msize != MIX_MSG_SIZE as u64 {
         return Err(mix_msg_size_mismatch(op, msize));
     }
-    let mut vecs = Vec::new();
+    // dcrd's `make([]MixVect, x)` and `make(MixVect, y)`.  The outer
+    // vector takes x, already held to MAX_MIX_MCOUNT.  Each row is capped
+    // by the bytes left, dividing by the constant message size, since y
+    // may be 0 (a matrix of empty rows decodes).
+    let mut vecs = Vec::with_capacity(x as usize);
     for _ in 0..x {
-        let mut vect = MixVect::new();
+        let mut vect = MixVect::with_capacity(capped_capacity(y, r.remaining(), MIX_MSG_SIZE));
         for _ in 0..y {
             vect.push(r.take_array()?);
         }
@@ -1002,6 +1008,8 @@ impl MsgMixSecrets {
             if msize != MIX_MSG_SIZE as u64 {
                 return Err(mix_msg_size_mismatch(OP, msize));
             }
+            // dcrd's `make(MixVect, n)`, capped by the bytes left.
+            dc_net_msgs = MixVect::with_capacity(capped_capacity(n, r.remaining(), MIX_MSG_SIZE));
             for _ in 0..n {
                 dc_net_msgs.push(r.take_array()?);
             }
