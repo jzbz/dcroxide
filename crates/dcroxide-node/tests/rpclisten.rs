@@ -2668,7 +2668,10 @@ fn connection_level_errors_are_go_shaped() {
 /// forgives (`net/http/server.go:1915-1926`, used at `:2090-2091`), but
 /// a close *after* the head has started is rewritten to
 /// `io.ErrUnexpectedEOF` (`request.go:1108-1112`), which is not in that
-/// set and falls through to the bare 400.
+/// set and falls through to the bare 400.  So does a close inside a
+/// continuation line: since 1.27.2 Go reports the failed read as an
+/// error, where 1.27.1 kept the field read so far
+/// (`net/textproto/reader.go:181-184`), and both answer that 400.
 #[test]
 fn only_a_connection_that_never_spoke_goes_unanswered() {
     let (_dir, listener, port, _genesis_hash, _chain) = serve_rpc();
@@ -2678,6 +2681,12 @@ fn only_a_connection_that_never_spoke_goes_unanswered() {
     assert!(
         response.starts_with("HTTP/1.1 400 Bad Request"),
         "a truncated head is still answered: {response:?}"
+    );
+    let response = send_raw(port, "POST / HTTP/1.1\r\nHost: localhost\r\nX-A: b\r\n ");
+    assert_eq!(
+        response,
+        "HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n400 Bad Request",
+        "a head cut inside a continuation line"
     );
 
     // Never spoke: silence.

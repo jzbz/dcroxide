@@ -12464,6 +12464,205 @@ mod tests {
         }
     }
 
+    /// Name constraints on a chain are webpki's, which evaluates those on
+    /// IP addresses and DNS names and fails closed on the rest, where Go
+    /// evaluates mailboxes and URIs too (PARITY.md, the clientcert entry).
+    /// An IP subtree with host bits set covers what its masked network
+    /// covers, in both.  An rfc822Name, URI or otherName subtree refuses
+    /// every leaf naming a name of the subtree's own form, covered or
+    /// not, and a directoryName subtree in a constraints extension that
+    /// is not critical refuses every leaf, where Go accepts each.  The
+    /// other way round, a DNS name or a mailbox Go cannot read, or a URI
+    /// whose host is an IP address, refuses the chain under a constraint
+    /// of any form, and passes webpki under one of another form.  These
+    /// divergent rows are the recorded ones, but for the mailbox whose
+    /// domain holds `@`, which Go refuses since 1.27, PARITY.md's interim
+    /// entry.
+    #[test]
+    fn name_constraints_on_a_chain_are_webpkis() {
+        use dcroxide_certgen::gentool::generate_key;
+        use rustls::pki_types::CertificateDer;
+        use rustls::server::danger::ClientCertVerifier;
+        const BASIC_CONSTRAINTS: &[u8] = &[0x55, 0x1d, 0x13];
+        const KEY_USAGE: &[u8] = &[0x55, 0x1d, 0x0f];
+        const SAN: &[u8] = &[0x55, 0x1d, 0x11];
+        const NAME_CONSTRAINTS: &[u8] = &[0x55, 0x1d, 0x1e];
+        let secs = 1_790_000_000u64;
+        let now = rustls::pki_types::UnixTime::since_unix_epoch(Duration::from_secs(secs));
+        let mut oracle = dcroxide_testutil::oracle_or_skip();
+        let key = || generate_key("P-256").expect("key");
+        let (root_key, leaf_key) = (key(), key());
+        // A subtree list ([0] permitted or [1] excluded) of one base.
+        let subtrees = |tag: u8, base: Vec<u8>| der_tlv(tag, &der_tlv(0x30, &base));
+        let permitted = |base: Vec<u8>| subtrees(0xa0, base);
+        let excluded = |base: Vec<u8>| subtrees(0xa1, base);
+        let ip = |bytes: &[u8]| der_tlv(0x87, bytes);
+        let email = |name: &[u8]| der_tlv(0x81, name);
+        let dns = |name: &[u8]| der_tlv(0x82, name);
+        let uri = |name: &[u8]| der_tlv(0x86, name);
+        let directory = der_tlv(0xa4, &der_tlv(0x30, &[]));
+        // A user principal name (1.3.6.1.4.1.311.20.2.3), an otherName.
+        let upn = || {
+            let upn_oid = [
+                0x06, 0x0a, 0x2b, 0x06, 0x01, 0x04, 0x01, 0x82, 0x37, 0x14, 0x02, 0x03,
+            ];
+            let value = der_tlv(0xa0, &der_tlv(0x0c, b"a@example.com"));
+            der_tlv(0xa0, &[&upn_oid[..], &value].concat())
+        };
+        let mask8 = [10, 0, 0, 1, 0xff, 0, 0, 0];
+        // label, constraints, whether critical, the leaf's one name, and
+        // the verdicts of the port and of Go.
+        for (label, constraints, critical, name, port_accepts, go_accepts) in [
+            (
+                "an IP inside a subtree with host bits",
+                permitted(ip(&mask8)),
+                true,
+                ip(&[10, 1, 2, 3]),
+                true,
+                true,
+            ),
+            (
+                "an IP outside it",
+                permitted(ip(&mask8)),
+                true,
+                ip(&[11, 1, 2, 3]),
+                false,
+                false,
+            ),
+            (
+                "a mailbox a permitted subtree covers",
+                permitted(email(b"example.com")),
+                true,
+                email(b"a@example.com"),
+                false,
+                true,
+            ),
+            (
+                "a mailbox no excluded subtree covers",
+                excluded(email(b"other.example")),
+                true,
+                email(b"a@example.com"),
+                false,
+                true,
+            ),
+            (
+                "a DNS name under a mailbox subtree",
+                permitted(email(b"example.com")),
+                true,
+                dns(b"client.example.com"),
+                true,
+                true,
+            ),
+            (
+                "a URI a permitted subtree covers",
+                permitted(uri(b"example.com")),
+                true,
+                uri(b"https://example.com/"),
+                false,
+                true,
+            ),
+            (
+                "a directoryName subtree, not critical",
+                permitted(directory),
+                false,
+                dns(b"client.example.com"),
+                false,
+                true,
+            ),
+            (
+                "an otherName subtree, not critical, over an otherName",
+                permitted(upn()),
+                false,
+                upn(),
+                false,
+                true,
+            ),
+            (
+                "a mailbox under a DNS subtree",
+                permitted(dns(b"example.com")),
+                true,
+                email(b"a@example.com"),
+                true,
+                true,
+            ),
+            (
+                "a mailbox whose domain holds @ under a DNS subtree",
+                permitted(dns(b"example.com")),
+                true,
+                email(b"a@b@example.com"),
+                true,
+                false,
+            ),
+            (
+                "a DNS name with an empty label under an IP subtree",
+                permitted(ip(&mask8)),
+                true,
+                dns(b"a..example.com"),
+                true,
+                false,
+            ),
+            (
+                "a URI whose host is an IP under a DNS subtree",
+                permitted(dns(b"example.com")),
+                true,
+                uri(b"https://1.2.3.4/"),
+                true,
+                false,
+            ),
+        ] {
+            let root = signed_p256_certificate(
+                1,
+                "root",
+                &root_key,
+                "root",
+                &root_key,
+                &[
+                    der_extension(
+                        BASIC_CONSTRAINTS,
+                        true,
+                        &der_tlv(0x30, &der_tlv(0x01, &[0xff])),
+                    ),
+                    der_extension(KEY_USAGE, true, &der_tlv(0x03, &[0x02, 0x84])),
+                    der_extension(NAME_CONSTRAINTS, critical, &der_tlv(0x30, &constraints)),
+                ],
+            );
+            let leaf = signed_p256_certificate(
+                2,
+                "leaf",
+                &leaf_key,
+                "root",
+                &root_key,
+                &[
+                    der_extension(KEY_USAGE, true, &der_tlv(0x03, &[0x07, 0x80])),
+                    der_extension(SAN, false, &der_tlv(0x30, &name)),
+                ],
+            );
+            let verifier =
+                GoClientCertVerifier::from_pem(&certificate_pem(&root)).expect("verifier");
+            let got = verifier
+                .verify_client_cert(&CertificateDer::from(leaf.as_slice()), &[], now)
+                .map(|_| ());
+            if port_accepts {
+                assert!(got.is_ok(), "{label}: {got:?}");
+            } else {
+                assert!(
+                    matches!(
+                        &got,
+                        Err(rustls::Error::InvalidCertificate(rustls::CertificateError::Other(other)))
+                            if other.0.downcast_ref::<webpki::Error>()
+                                == Some(&webpki::Error::NameConstraintViolation)
+                    ),
+                    "{label}: {got:?}"
+                );
+            }
+            if let Some(GoVerdict { verdict, .. }) =
+                go_client_verdict(&mut oracle, &[&root], &leaf, &[], secs)
+            {
+                assert_eq!(verdict == "ok", go_accepts, "{label}: Go says {verdict}");
+            }
+        }
+    }
+
     /// Every certificate a client presents is held to Go's
     /// `ParseCertificate`, as far as [`CertFacts::parse`] reads it, and to
     /// the unhandled critical extension rule of Go's `isValid`, where
@@ -16867,7 +17066,10 @@ mod tests {
     /// `Content-Length` but not its body; and a bodiless answer to a HEAD
     /// carries no `Content-Length` at all.  The port wrote `HTTP/1.1` and
     /// the body whatever the request, and a `Content-Length: 0` on the
-    /// 417 and the asterisk 400 to a HEAD.
+    /// 417 and the asterisk 400 to a HEAD.  The 404 to an HTTP/1.1
+    /// CONNECT is Go 1.27.3's byte for byte, `Date` aside, its
+    /// `Connection: close` included: Go closes after every CONNECT
+    /// since 1.27.2.
     #[test]
     fn answers_follow_the_request_method_and_protocol() {
         let unauthorized = |method: &str, version| {
@@ -16925,6 +17127,12 @@ mod tests {
             error("CONNECT", (1, 0), "404 Not Found", "404 page not found"),
             format!(
                 "HTTP/1.0 404 Not Found\r\n{plain}\r\nContent-Length: 19\r\nConnection: close\r\n\r\n404 page not found\n"
+            )
+        );
+        assert_eq!(
+            error("CONNECT", (1, 1), "404 Not Found", "404 page not found"),
+            format!(
+                "HTTP/1.1 404 Not Found\r\n{plain}\r\nContent-Length: 19\r\nConnection: close\r\n\r\n404 page not found\n"
             )
         );
         assert_eq!(
