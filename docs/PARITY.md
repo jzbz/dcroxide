@@ -3048,6 +3048,30 @@ closing it would cost.
   negative serial number or a dNSName that is not ASCII in its subject
   alternative name, can still verify.
 
+  Go 1.27.3 also drops a chain on which the leaf, an intermediate or the
+  root has a subject public key info whose SHA-256 is one of eight it lists
+  (`containsDistrustedSPKIHash`, `crypto/x509/verify.go:1414-1438`), after
+  the policies, the key usage and the name constraints (`:630-651`), and so
+  does the port. The path callback refuses such a path after the policies,
+  so the search goes on to another, as Go keeps the other chains, and a
+  pooled certificate with such a key is refused after its key usage, as Go
+  drops its one-certificate chain. Go keeps no count of these chains, so
+  when the callback has also refused a path for its policies the refusal is
+  logged with the count of those alone, a path that fails both among them.
+  Otherwise it is logged as Go's bare `x509: no valid chains built`
+  (`:653-668`), with `certificate_unknown` where Go sends `bad_certificate`,
+  also when one of webpki's budgets then ran out, though Go's search would
+  go on there, as above, to a chain it accepts or drops for another reason;
+  but when webpki's search also failed on a chain's key usage or on a name
+  constraint, which Go reports ahead of it, webpki's error for that is
+  logged, as it is without a distrusted key. The eight hashes are Go's as
+  written. The tests check the rule with keys they generate in their place
+  (`a_chain_through_a_distrusted_key_is_dropped`), and a Go 1.27.3 built
+  with those keys added to its table gave the same verdicts on each of
+  their chains (2026-11-13). The tests do not compare with Go's own
+  `Verify`: that would take a certificate carrying one of the eight keys,
+  which is not in the tree.
+
   Every handshake signature goes to a `WebPkiClientVerifier`
   (`GoClientCertVerifier::webpki_over`), and client certificates of these
   kinds that dcrd accepts are refused, each failing closed. A P-521 client key
@@ -3169,10 +3193,17 @@ closing it would cost.
   constraints, or for a mailbox constraint whose domain holds `@`, which the
   client-certificate reader refuses (the entry on `--authtype=clientcert`
   above), passes the port's check while webpki finds nothing else wrong
-  with it. Following Go would take a verifier of the port's own on the
+  with it. Go 1.27.3's client also drops every chain on which a
+  certificate has one of the eight keys `Verify` distrusts
+  (`crypto/x509/verify.go:647-649`, and on macOS and Windows
+  `root_darwin.go:98-100` and `root_windows.go:271`), which the
+  client-certificate verifier drops too and the seeders' check does not.
+  None of the eight is a root in the `webpki-roots` snapshot, so this
+  reaches the port only through a leaf or an intermediate the seeder sends.
+  Following Go in either would take a verifier of the port's own on the
   proxied transport and a connector of its own for ureq on the direct one,
-  new code on the path a seeder MITM attacks, so it is recorded rather than
-  followed (decided 2026-11-12).
+  new code on the path a seeder MITM attacks, so both are recorded rather
+  than followed (decided 2026-11-12).
 
 - **The RPC key file is read as Go's `tls.X509KeyPair` reads it, but a
   P-224 key is refused where dcrd serves it over TLS 1.2.** Since ADR-0015's
@@ -3311,12 +3342,12 @@ closing it would cost.
   complete the move bring ML-DSA in line with Go 1.27.3, and any new
   dependency that takes comes under ADR-0012's and ADR-0015's review.
 
-- **Three more points where Go 1.27.3 differs and the port does not yet.**
+- **Two more points where Go 1.27.3 differs and the port does not yet.**
   Go 1.27's `strconv.IsPrint` takes the runes Unicode 17 adds, which the
   port's two copies of its tables (`dcroxide-dcrjson`'s `gojson/isprint.rs`
   and `dcroxide-txscript`'s `stdaddr.rs`) still lack. Go 1.27.3 reports a
-  failed continuation-line read as an error and drops every chain through
-  one of eight distrusted keys. The port does each as Go 1.26.2 did.
+  failed continuation-line read as an error. The port does both as Go
+  1.26.2 did.
   This is interim: each is to be followed in the changes that complete the
   move to 1.27.3, the continuation-line read once it is shown that the
   port's reader can reach that path (ADR-0001's 2026-11-12 addendum).

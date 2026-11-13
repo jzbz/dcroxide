@@ -1012,12 +1012,16 @@ fn go_error_text(err: &rustls::Error, hello: Option<&HelloFacts>) -> String {
                 .to_string()
         }
         // Every chain the search completed failed Go's policy
-        // validation (`GoClientCertVerifier`).
+        // validation, or held a key Go distrusts (`GoClientCertVerifier`).
         Error::InvalidCertificate(CertificateError::Other(other))
             if other
                 .0
                 .downcast_ref::<crate::rpcrun::InvalidPolicies>()
-                .is_some() =>
+                .is_some()
+                || other
+                    .0
+                    .downcast_ref::<crate::rpcrun::NoValidChains>()
+                    .is_some() =>
         {
             format!("tls: failed to verify certificate: {}", other.0)
         }
@@ -1455,6 +1459,13 @@ mod tests {
                 ))),
                 Some(&tls13),
                 "tls: failed to verify certificate: x509: no valid chains built: 2 candidate chains with invalid policies",
+            ),
+            (
+                Error::InvalidCertificate(rustls::CertificateError::Other(rustls::OtherError(
+                    std::sync::Arc::new(crate::rpcrun::NoValidChains),
+                ))),
+                Some(&tls13),
+                "tls: failed to verify certificate: x509: no valid chains built",
             ),
             (
                 Error::InvalidCertificate(rustls::CertificateError::UnhandledCriticalExtension),

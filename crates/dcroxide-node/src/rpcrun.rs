@@ -2738,9 +2738,11 @@ struct PolicyFacts {
 }
 
 /// What Go's `alreadyInChain` (`crypto/x509/verify.go`) compares to
-/// keep a certificate off a chain that holds its like: the subject and
-/// the subject public key info, as DER contents, and the value of the
-/// subject alternative name extension where there is one.
+/// keep a certificate off a chain that holds its like: the subject, as
+/// DER contents, the subject public key info, as the whole element, and
+/// the value of the subject alternative name extension where there is
+/// one.  The whole element is `RawSubjectPublicKeyInfo`, which Go also
+/// hashes to find a distrusted key ([`go_distrusted_spki`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ChainIdentity<'a> {
     subject: &'a [u8],
@@ -3117,7 +3119,7 @@ impl CertFacts {
         let (tag, content) = validity.read()?;
         let not_after = parse_asn1_time(tag, content)?;
         let subject = tbs.read_tag(0x30)?;
-        let spki = tbs.read_tag(0x30)?;
+        let (_, spki_content, spki) = tbs.read_raw(0x30)?;
 
         let mut facts = CertFacts {
             not_before,
@@ -3138,7 +3140,7 @@ impl CertFacts {
             tbs: tbs_element,
             signature_algorithm,
             signature: (signature.0 == 0).then_some(signature.1),
-            key: go_public_key(spki),
+            key: go_public_key(spki_content),
         };
         let mut policies = PolicyFacts {
             self_issued: issuer == subject,
@@ -3655,7 +3657,9 @@ struct ClientCa {
 ///   rule ([`GoClientAuthUsage`]), and the path to Go's policy
 ///   validation ([`go_policies_valid`]); a path holding a certificate
 ///   Go's `alreadyInChain` takes for its root, a copy of the root the
-///   client sent, say, is refused, as Go builds no such chain.
+///   client sent, say, is refused, as Go builds no such chain.  Last, a
+///   path holding a key Go 1.27.3 distrusts is refused
+///   ([`go_distrusted_spki`]), and so is a pooled certificate with one.
 ///   The search runs over one copy of each certificate sent, as Go's
 ///   pool of intermediates keeps one.  webpki's trust anchors carry
 ///   no validity window or extensions, so an expired, not yet valid,
@@ -3683,6 +3687,9 @@ struct GoClientCertVerifier {
     /// `dcroxide-tlscrypto`'s, which the verifier over the whole pool uses
     /// too.
     sig_algs: &'static [&'static dyn rustls::pki_types::SignatureVerificationAlgorithm],
+    /// The keys whose chains are dropped, as Go 1.27.3 drops them:
+    /// [`GO_DISTRUSTED_SPKI_SHA256`], which only the tests replace.
+    distrusted: &'static [&'static str],
 }
 
 /// Go's extended key usage rule for one certificate of a client chain
@@ -4087,6 +4094,66 @@ impl std::fmt::Display for InvalidPolicies {
 
 impl std::error::Error for InvalidPolicies {}
 
+/// Go's error when every chain its search built was dropped, and none
+/// for its policies, key usage or a name constraint (`Verify`,
+/// `crypto/x509/verify.go`: `NoValidChains` with no detail): a search
+/// whose chains all hold a distrusted key ([`go_distrusted_spki`]).
+/// Carried to the RPC log (`rpctls::go_error_text`).
+#[derive(Debug)]
+pub(crate) struct NoValidChains;
+
+impl std::fmt::Display for NoValidChains {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("x509: no valid chains built")
+    }
+}
+
+impl std::error::Error for NoValidChains {}
+
+/// The SHA-256 hashes, in hex, of the subject public key infos Go 1.27.3
+/// drops every chain through (`distrustedSPKIHashes`,
+/// `crypto/x509/verify.go:1417-1426`), as written there.
+const GO_DISTRUSTED_SPKI_SHA256: &[&str] = &[
+    "ebed6475c2c2d80fcb199f3fe8dd6e6b3ce60b77eb15d4e42c3dec0c6f5b5105",
+    "49dd353dc2b919a3770645117d0e60c16115e7d1bc259eefe734b00ea434fe5f",
+    "e0254c7fcdc265e2f0f8a428dabb75ab4ae039b4872d62f5ee57f0877d5a8a41",
+    "5c0660a2b164910d8ff589c18e14552e9e0ec237dcefe2cb736d41a4811f81a0",
+    "43bffa19d6ef651451f6841e019931e96f6f2eaeff28ab4b6f1ce4576de2717b",
+    "63ecefee431d49523bc1136c4e72d0206a477086caf606cd5cf025686c109cf8",
+    "ec4ffa1ad0ac88081314b7aaffef6a91f97cd57291bb5ba686c5415f5eb4f6b6",
+    "92c063d67e8f14db71d288e11266ffdaf69cbf115f7bab14f3bc2f68d25e0e30",
+];
+
+/// The SHA-256 of `data` in lower-case hex, as Go's
+/// `hex.EncodeToString(sha256.Sum256(data))` gives it, with the
+/// provider's SHA-256, the hash of its `TLS13_AES_128_GCM_SHA256`; `None`
+/// if that suite were ever to hash otherwise.
+fn go_sha256_hex(data: &[u8]) -> Option<String> {
+    use std::fmt::Write as _;
+    let hash = dcroxide_tlscrypto::cipher_suite::TLS13_AES_128_GCM_SHA256
+        .tls13()?
+        .common
+        .hash_provider;
+    if hash.algorithm() != rustls::crypto::hash::HashAlgorithm::SHA256 {
+        return None;
+    }
+    let mut hex = String::with_capacity(64);
+    for byte in hash.hash(data).as_ref() {
+        write!(hex, "{byte:02x}").ok()?;
+    }
+    Some(hex)
+}
+
+/// Whether `spki`, a whole SubjectPublicKeyInfo element, is a key
+/// `distrusted` lists, as Go's `containsDistrustedSPKIHash` asks it of
+/// each certificate on a chain (`crypto/x509/verify.go:1430-1438`).
+/// Without the hash the key is taken as distrusted, so the check fails
+/// closed.  The verifier's table is [`GO_DISTRUSTED_SPKI_SHA256`]; only
+/// the tests give it another, naming keys they generate.
+fn go_distrusted_spki(spki: &[u8], distrusted: &[&str]) -> bool {
+    go_sha256_hex(spki).is_none_or(|hex| distrusted.contains(&hex.as_str()))
+}
+
 /// A webpki error as rustls's client verifier reports it (rustls
 /// `webpki/mod.rs` `pki_error`), so a chain [`GoClientCertVerifier`]
 /// refuses fails with the error rustls's own verifier gives, and the
@@ -4196,7 +4263,15 @@ impl GoClientCertVerifier {
             cas,
             all,
             sig_algs: dcroxide_tlscrypto::SUPPORTED_SIG_ALGS.all,
+            distrusted: GO_DISTRUSTED_SPKI_SHA256,
         })
+    }
+
+    /// The verifier with `distrusted` in place of Go's table, for tests
+    /// of the check, whose certificates carry keys of their own.
+    #[cfg(test)]
+    fn distrusting(self, distrusted: &'static [&'static str]) -> GoClientCertVerifier {
+        GoClientCertVerifier { distrusted, ..self }
     }
 
     /// webpki's client verifier over the given anchors, on
@@ -4271,6 +4346,13 @@ impl rustls::server::danger::ClientCertVerifier for GoClientCertVerifier {
             if !facts.client_auth {
                 return Err(rustls::Error::InvalidCertificate(
                     rustls::CertificateError::InvalidPurpose,
+                ));
+            }
+            // Go then drops `[c]` if its key is distrusted, and no chain
+            // is left.
+            if go_distrusted_spki(leaf_identity.spki, self.distrusted) {
+                return Err(rustls::Error::InvalidCertificate(
+                    rustls::CertificateError::Other(rustls::OtherError(Arc::new(NoValidChains))),
                 ));
             }
             return Ok(rustls::server::danger::ClientCertVerified::assertion());
@@ -4408,6 +4490,7 @@ impl rustls::server::danger::ClientCertVerifier for GoClientCertVerifier {
             .collect();
         let refused_unhandled = std::cell::Cell::new(false);
         let refused_policies = std::cell::Cell::new(0usize);
+        let refused_distrusted = std::cell::Cell::new(false);
         let within_path_len = |path: &webpki::VerifiedPath<'_>| {
             let ders: Vec<rustls::pki_types::CertificateDer<'_>> = path
                 .intermediate_certificates()
@@ -4475,6 +4558,19 @@ impl rustls::server::danger::ClientCertVerifier for GoClientCertVerifier {
                 refused_policies.set(refused_policies.get().saturating_add(1));
                 return Err(webpki::Error::UnknownIssuer);
             }
+            // Go 1.27.3 then drops a chain on which the leaf, an
+            // intermediate or the root has a distrusted key, and keeps no
+            // count of it (`verify.go:647-649`).  Its key usage and name
+            // constraint checks come before this one too, and webpki has
+            // made them before the callback.
+            if std::iter::once(&leaf_identity)
+                .chain(parsed.iter().map(|(_, _, identity)| identity))
+                .chain(roots[i].iter())
+                .any(|identity| go_distrusted_spki(identity.spki, self.distrusted))
+            {
+                refused_distrusted.set(true);
+                return Err(webpki::Error::UnknownIssuer);
+            }
             Ok(())
         };
         let cert = webpki::EndEntityCert::try_from(end_entity).map_err(go_pki_error)?;
@@ -4505,6 +4601,26 @@ impl rustls::server::danger::ClientCertVerifier for GoClientCertVerifier {
             _ if refused_policies.get() > 0 => {
                 rustls::Error::InvalidCertificate(rustls::CertificateError::Other(
                     rustls::OtherError(Arc::new(InvalidPolicies(refused_policies.get()))),
+                ))
+            }
+            // Otherwise a chain Go built and dropped for a distrusted key
+            // leaves Go's bare `NoValidChains` (`verify.go:653-668`),
+            // whatever the candidates that made no chain met, and whether
+            // or not a budget of webpki's then ran out; but a chain
+            // dropped for its key usage gives Go's `IncompatibleUsage`, and
+            // one that broke a name constraint Go's error for that, which
+            // webpki ranks above the callback's refusal and reports.
+            #[allow(deprecated)]
+            _ if refused_distrusted.get()
+                && !matches!(
+                    err,
+                    webpki::Error::RequiredEkuNotFound
+                        | webpki::Error::RequiredEkuNotFoundContext(_)
+                        | webpki::Error::NameConstraintViolation
+                ) =>
+            {
+                rustls::Error::InvalidCertificate(rustls::CertificateError::Other(
+                    rustls::OtherError(Arc::new(NoValidChains)),
                 ))
             }
             // Go's search ended without a chain and without running out,
@@ -13322,6 +13438,336 @@ mod tests {
         invalid(
             check(&ours, &no_policy, &sent).expect_err("the budget ran out"),
             50,
+        );
+    }
+
+    /// The table holds Go 1.27.3's eight hashes as `verify.go:1417-1426`
+    /// writes them, and a key is matched as Go matches it: the SHA-256 of
+    /// the whole SubjectPublicKeyInfo, in lower-case hex.
+    #[test]
+    fn the_distrusted_keys_are_gos_eight() {
+        assert_eq!(
+            GO_DISTRUSTED_SPKI_SHA256,
+            [
+                "ebed6475c2c2d80fcb199f3fe8dd6e6b3ce60b77eb15d4e42c3dec0c6f5b5105",
+                "49dd353dc2b919a3770645117d0e60c16115e7d1bc259eefe734b00ea434fe5f",
+                "e0254c7fcdc265e2f0f8a428dabb75ab4ae039b4872d62f5ee57f0877d5a8a41",
+                "5c0660a2b164910d8ff589c18e14552e9e0ec237dcefe2cb736d41a4811f81a0",
+                "43bffa19d6ef651451f6841e019931e96f6f2eaeff28ab4b6f1ce4576de2717b",
+                "63ecefee431d49523bc1136c4e72d0206a477086caf606cd5cf025686c109cf8",
+                "ec4ffa1ad0ac88081314b7aaffef6a91f97cd57291bb5ba686c5415f5eb4f6b6",
+                "92c063d67e8f14db71d288e11266ffdaf69cbf115f7bab14f3bc2f68d25e0e30",
+            ]
+        );
+        assert_eq!(
+            go_sha256_hex(b"abc").as_deref(),
+            Some("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+        );
+        let abc = ["ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"];
+        assert!(go_distrusted_spki(b"abc", &abc));
+        assert!(!go_distrusted_spki(b"abcd", &abc));
+        assert!(!go_distrusted_spki(b"abc", GO_DISTRUSTED_SPKI_SHA256));
+        // A certificate's identity holds the element Go hashes.
+        let key = dcroxide_certgen::gentool::generate_key("P-256").expect("key");
+        let der = signed_p256_certificate(1, "client", &key, "client", &key, &[]);
+        let (_, _, identity) = CertFacts::parse_all(&der).expect("parses");
+        let mut tbs = DerReader::new(DerReader::new(&der).read_tag(0x30).expect("certificate"));
+        let mut fields = DerReader::new(tbs.read_tag(0x30).expect("tbs"));
+        for tag in [0xa0, 0x02, 0x30, 0x30, 0x30, 0x30] {
+            fields.read_tag(tag).expect("field");
+        }
+        assert_eq!(identity.spki, fields.read_raw(0x30).expect("spki").2);
+        assert_eq!(identity.spki[0], 0x30);
+    }
+
+    /// A client chain on which the leaf, an intermediate or the root has
+    /// a key Go 1.27.3 distrusts is dropped (`verify.go:647-649`), keys
+    /// the test generates standing in for Go's eight: a pooled
+    /// certificate with one is refused, after its key usage; the search
+    /// goes on past a refused path to another; and when nothing else is
+    /// left the refusal is logged as Go's bare `NoValidChains`.  Go
+    /// keeps no count of these, so a search that also refused paths for
+    /// their policies logs those alone, a path that fails both among
+    /// them, since the policies come first; and Go's key usage and name
+    /// constraint errors rank ahead of the bare text, as webpki's do
+    /// ahead of the callback's refusal.  When webpki's signature budget
+    /// runs out on the paths after one refused for its key, the refusal
+    /// is still logged as Go's bare text, Go having built those chains
+    /// and dropped every one.  Not compared with Go's own `Verify`, which
+    /// would take a certificate with one of the eight keys.
+    #[test]
+    fn a_chain_through_a_distrusted_key_is_dropped() {
+        use dcroxide_certgen::gentool::generate_key;
+        use rustls::pki_types::CertificateDer;
+        use rustls::server::danger::ClientCertVerifier;
+        const BASIC_CONSTRAINTS: &[u8] = &[0x55, 0x1d, 0x13];
+        const KEY_USAGE: &[u8] = &[0x55, 0x1d, 0x0f];
+        const EKU: &[u8] = &[0x55, 0x1d, 0x25];
+        const SERVER_AUTH: &[u8] = &[0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x01];
+        const SAN: &[u8] = &[0x55, 0x1d, 0x11];
+        const NAME_CONSTRAINTS: &[u8] = &[0x55, 0x1d, 0x1e];
+        const POLICIES: &[u8] = &[0x55, 0x1d, 0x20];
+        const POLICY_CONSTRAINTS: &[u8] = &[0x55, 0x1d, 0x24];
+        const BARE: &str = "tls: failed to verify certificate: x509: no valid chains built";
+        let now = rustls::pki_types::UnixTime::since_unix_epoch(Duration::from_secs(1_790_000_000));
+        let key = || generate_key("P-256").expect("key");
+        let (root_key, int_key, cross_key, upper_key, leaf_key) =
+            (key(), key(), key(), key(), key());
+        let authority = vec![
+            der_extension(
+                BASIC_CONSTRAINTS,
+                true,
+                &der_tlv(0x30, &der_tlv(0x01, &[0xff])),
+            ),
+            der_extension(KEY_USAGE, true, &der_tlv(0x03, &[0x02, 0x84])),
+        ];
+        let with = |extra: Vec<Vec<u8>>| [authority.clone(), extra].concat();
+        let signing = der_extension(KEY_USAGE, true, &der_tlv(0x03, &[0x07, 0x80]));
+        let server_only = der_extension(EKU, false, &der_tlv(0x30, &der_tlv(0x06, SERVER_AUTH)));
+        // requireExplicitPolicy 0 and one policy, which no leaf names.
+        let requiring = vec![
+            der_extension(
+                POLICY_CONSTRAINTS,
+                false,
+                &der_tlv(0x30, &der_tlv(0x80, &[0])),
+            ),
+            der_extension(
+                POLICIES,
+                false,
+                &der_tlv(
+                    0x30,
+                    &der_tlv(0x30, &der_tlv(0x06, &oid_contents(&[1, 2, 3, 1]))),
+                ),
+            ),
+        ];
+
+        // The table names the keys of the certificates given.
+        let table = |ders: &[&[u8]]| -> &'static [&'static str] {
+            let hashes: Vec<&'static str> = ders
+                .iter()
+                .map(|der| {
+                    let (_, _, identity) = CertFacts::parse_all(der).expect("parses");
+                    &*Box::leak(
+                        go_sha256_hex(identity.spki)
+                            .expect("sha-256")
+                            .into_boxed_str(),
+                    )
+                })
+                .collect();
+            Box::leak(hashes.into_boxed_slice())
+        };
+        let verifier = |pool: &[u8], distrusted: &[&[u8]]| {
+            GoClientCertVerifier::from_pem(&certificate_pem(pool))
+                .expect("verifier")
+                .distrusting(table(distrusted))
+        };
+        let check = |verifier: &GoClientCertVerifier, leaf: &[u8], sent: &[&[u8]]| {
+            let sent: Vec<_> = sent.iter().map(|der| CertificateDer::from(*der)).collect();
+            verifier
+                .verify_client_cert(&CertificateDer::from(leaf), &sent, now)
+                .map(|_| ())
+        };
+        let text = |label: &str, got: Result<(), rustls::Error>| {
+            let err = got.expect_err(label);
+            crate::rpctls::go_error_text_for_tests(&err)
+        };
+
+        // A pooled certificate is its own chain, dropped once its key
+        // usage has passed.
+        let pooled =
+            signed_p256_certificate(2, "client", &leaf_key, "client", &leaf_key, &authority);
+        check(&verifier(&pooled, &[]), &pooled, &[]).expect("pooled");
+        assert_eq!(
+            text(
+                "pooled",
+                check(&verifier(&pooled, &[&pooled]), &pooled, &[])
+            ),
+            BARE
+        );
+        let pooled_server = signed_p256_certificate(
+            3,
+            "client",
+            &leaf_key,
+            "client",
+            &leaf_key,
+            &with(vec![server_only.clone()]),
+        );
+        let got = check(
+            &verifier(&pooled_server, &[&pooled_server]),
+            &pooled_server,
+            &[],
+        );
+        assert!(
+            matches!(
+                got,
+                Err(rustls::Error::InvalidCertificate(
+                    rustls::CertificateError::InvalidPurpose
+                ))
+            ),
+            "{got:?}"
+        );
+
+        // A chain is dropped for the key of its leaf, its intermediate or
+        // its root.
+        let root = signed_p256_certificate(1, "root", &root_key, "root", &root_key, &authority);
+        let int = signed_p256_certificate(4, "int", &int_key, "root", &root_key, &authority);
+        let leaf = signed_p256_certificate(
+            5,
+            "leaf",
+            &leaf_key,
+            "int",
+            &int_key,
+            std::slice::from_ref(&signing),
+        );
+        check(&verifier(&root, &[]), &leaf, &[&int]).expect("no key distrusted");
+        check(
+            &GoClientCertVerifier::from_pem(&certificate_pem(&root)).expect("verifier"),
+            &leaf,
+            &[&int],
+        )
+        .expect("Go's table");
+        for distrusted in [&leaf, &int, &root] {
+            assert_eq!(
+                text(
+                    "distrusted",
+                    check(&verifier(&root, &[distrusted]), &leaf, &[&int])
+                ),
+                BARE
+            );
+        }
+
+        // The leaf's issuer issued by the root through `cross`, whose key
+        // is distrusted: the only path is dropped, and with the direct
+        // intermediate sent too the search goes on to it.
+        let cross = signed_p256_certificate(6, "cross", &cross_key, "root", &root_key, &authority);
+        let int_x = signed_p256_certificate(7, "int", &int_key, "cross", &cross_key, &authority);
+        let crossed = verifier(&root, &[&cross]);
+        assert_eq!(
+            text("only path", check(&crossed, &leaf, &[&int_x, &cross])),
+            BARE
+        );
+        check(&crossed, &leaf, &[&int_x, &cross, &int]).expect("the other path");
+
+        // Policy refusals are counted and the distrusted path is not; a
+        // path through a copy of `cross` that requires a policy fails the
+        // policies before its key is asked, and is counted.
+        let int_req = signed_p256_certificate(
+            8,
+            "int",
+            &int_key,
+            "root",
+            &root_key,
+            &with(requiring.clone()),
+        );
+        let cross_req = signed_p256_certificate(
+            9,
+            "cross",
+            &cross_key,
+            "root",
+            &root_key,
+            &with(requiring.clone()),
+        );
+        let policies = |label: &str, got, chains: usize| {
+            assert_eq!(
+                text(label, got),
+                format!(
+                    "tls: failed to verify certificate: x509: no valid chains built: {chains} \
+                     candidate chains with invalid policies"
+                ),
+                "{label}"
+            );
+        };
+        policies(
+            "one policy refusal",
+            check(&crossed, &leaf, &[&int_x, &cross, &int_req]),
+            1,
+        );
+        policies(
+            "policies first",
+            check(&crossed, &leaf, &[&int_x, &cross, &cross_req, &int_req]),
+            2,
+        );
+
+        // A chain dropped for its key usage beside it gives the usage
+        // error, as Go's `IncompatibleUsage` ranks ahead.
+        let int_server = signed_p256_certificate(
+            10,
+            "int",
+            &int_key,
+            "root",
+            &root_key,
+            &with(vec![server_only.clone()]),
+        );
+        let got = check(&crossed, &leaf, &[&int_x, &cross, &int_server]);
+        assert!(
+            matches!(
+                got,
+                Err(rustls::Error::InvalidCertificate(
+                    rustls::CertificateError::InvalidPurposeContext { .. }
+                ))
+            ),
+            "{got:?}"
+        );
+
+        // So does one that breaks a name constraint, Go's constraint
+        // error ranking ahead.
+        let named = signed_p256_certificate(
+            11,
+            "leaf",
+            &leaf_key,
+            "int",
+            &int_key,
+            &[
+                signing.clone(),
+                der_extension(SAN, false, &der_tlv(0x30, &der_tlv(0x82, b"other.example"))),
+            ],
+        );
+        let int_constrained = signed_p256_certificate(
+            12,
+            "int",
+            &int_key,
+            "root",
+            &root_key,
+            &with(vec![der_extension(
+                NAME_CONSTRAINTS,
+                true,
+                &der_tlv(
+                    0x30,
+                    &der_tlv(0xa0, &der_tlv(0x30, &der_tlv(0x82, b"allowed.example"))),
+                ),
+            )]),
+        );
+        check(&crossed, &named, &[&int_x, &cross, &int]).expect("the other path");
+        let got = check(&crossed, &named, &[&int_x, &cross, &int_constrained]);
+        assert!(
+            matches!(
+                &got,
+                Err(rustls::Error::InvalidCertificate(rustls::CertificateError::Other(other)))
+                    if other.0.downcast_ref::<webpki::Error>()
+                        == Some(&webpki::Error::NameConstraintViolation)
+            ),
+            "{got:?}"
+        );
+
+        // Sixty copies of the intermediate's issuer `upper`, which the
+        // root signs: Go builds a chain through each of the first 49 and
+        // then runs out of checks, keeping the chains, and drops them
+        // all for the intermediate's key; webpki, checking three
+        // signatures on each path, runs out of its 100 on the 34th, after
+        // the callback has refused 33 of them.
+        let int_up = signed_p256_certificate(13, "int", &int_key, "upper", &upper_key, &authority);
+        let uppers: Vec<Vec<u8>> = (20..80u8)
+            .map(|serial| {
+                signed_p256_certificate(serial, "upper", &upper_key, "root", &root_key, &authority)
+            })
+            .collect();
+        let sent: Vec<&[u8]> = std::iter::once(int_up.as_slice())
+            .chain(uppers.iter().map(Vec::as_slice))
+            .collect();
+        check(&verifier(&root, &[]), &leaf, &sent).expect("no key distrusted");
+        assert_eq!(
+            text("budget", check(&verifier(&root, &[&int]), &leaf, &sent)),
+            BARE
         );
     }
 
