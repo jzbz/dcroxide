@@ -109,12 +109,37 @@ jobs:
       # Built first, so that the timed step compiles nothing.
       - name: Build the check
         run: cargo test -p dcroxide-tlscrypto --release --lib --locked --no-run
+      # The machine the job landed on, so that one run's timings can be
+      # read against another's: lscpu, the kernel, and the processor as
+      # /proc/cpuinfo names it, each distinct line once with its count of
+      # CPUs (on arm64 the implementer, part, variant and revision, on
+      # x86_64 the vendor, model, stepping and microcode). On arm64 also
+      # the first CPU's features and whether they hold DIT, the mode in
+      # which Arm promises that the timing of its listed instructions does
+      # not depend on their data. Linux leaves DIT off for user space, and
+      # nothing here turns it on. The step only describes, so it never
+      # fails the job.
+      - name: Describe the processor
+        continue-on-error: true
+        run: |
+          lscpu
+          uname -r
+          grep -E '^(CPU (implementer|architecture|variant|part|revision)|vendor_id|cpu family|model|model name|stepping|microcode)[[:space:]]*:' /proc/cpuinfo | sort | uniq -c
+          if [ "$(uname -m)" = aarch64 ]; then
+            grep -m 1 '^Features' /proc/cpuinfo
+            if grep -m 1 '^Features' /proc/cpuinfo | grep -qw dit; then
+              echo "DIT: supported"
+            else
+              echo "DIT: not supported"
+            fi
+          fi
       # One target at a time, in release mode, the way the module's doc
       # gives it. A target fails when a fixed class's |t| is above 10 and
       # its mean time differs from the random class's by 1 ns an operation
       # or more (the floor), or on too few samples to compare; the positive
       # control fails unless its leak fails by the same rule. Every target
-      # runs after one fails.
+      # runs after one fails. Each prints its row and, when it passes,
+      # each class's result below it, the lines a failure's message gives.
       - name: Time the targets
         run: |
           set -o pipefail

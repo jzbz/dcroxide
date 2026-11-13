@@ -757,6 +757,17 @@ those runs.
   dependency update of `0c4154d` made P-256 signing about twice as quick
   and its timings steadier; the spread of about 3.6 µs given for the
   planted leak above was measured before it.)*
+  *(2026-11-12: P-384's four targets time two classes more, a placebo,
+  whose input is the random class's draw under a fixed label of its own,
+  and n - 2 again under a name of its own, each judged like any other
+  class. P-384's complete failed the arm64 nightly runs of 2026-11-10 and
+  11-12 on classes about 250 ns an operation quicker than the random
+  class, n - 1 and n - 2 the first night and the top window alone the
+  second, and passed its thirteen other 60 s runs there. A placebo that
+  leans shows the harness or the machine and not a value; the two copies
+  of n - 2 leaning together show that a lean follows the value. Each
+  fixed class's share of P-384's samples falls from 1/24 to 1/28. The
+  thresholds, the floor and the budgets are unchanged.)*
 - **The workflow,** `.github/workflows/constant-time.yml`, on pushes to
   `master` and pull requests that touch `crates/dcroxide-tlscrypto/**`,
   `crates/dcroxide-testutil/**`, `crates/dcroxide-crypto/**` (a normal
@@ -770,6 +781,10 @@ those runs.
   --test-threads=1 --nocapture`, every target for `DCROXIDE_CT_SECONDS`
   seconds, 10 on pushes and pull requests and 60 nightly and on dispatch,
   and putting each target's row in the job's summary.
+  *(2026-11-12: each job also prints the processor it ran on, from
+  `lscpu` and `/proc/cpuinfo`, with whether an arm64 processor has DIT,
+  and a target that passes prints each class's result below its row, as
+  a failing one's message gives them.)*
 
 It is statistical: it sees a difference large enough to show on a runner,
 fails only on one of 1 ns an operation or more, and a pass is not a

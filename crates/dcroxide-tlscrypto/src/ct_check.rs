@@ -66,6 +66,17 @@
 //!   clock and the measurement see a leak at all.  Its leak is far larger
 //!   than any a target looks for, so finding it says nothing of a run's
 //!   power.
+//! * **Two classes on P-384 that check the check.**  P-384's complete
+//!   failed the nightly arm64 runs of 2026-11-10 and 11-12 on fixed
+//!   classes about 250 ns an operation quicker than the random class,
+//!   n - 1 and n - 2 the first night and the top window alone the second,
+//!   and by then had passed every other 60 s run there (ADR-0015's note
+//!   of 2026-11-12).  P-384's targets time two more classes to tell why: a
+//!   placebo, whose input is the random class's draw under a fixed label
+//!   of its own, which leans only on what the label and not the value
+//!   brings, from the harness or the machine; and n - 2 again, under a
+//!   name of its own, which leans with n - 2 if a lean follows the value.
+//!   Each is compared and judged like any other class.
 //!
 //! The targets are `#[ignore]` tests: they time code, so they run only when
 //! asked, one at a time and in release mode, each for `DCROXIDE_CT_SECONDS`
@@ -79,8 +90,11 @@
 //! backends and with the portable ones, on x86_64 and arm64.  Each prints
 //! one row, marked `ct_check row |`, which the workflow takes from the log
 //! wherever on its line the test runner's own output leaves it and puts in
-//! the job's summary.  The harness's own tests run in every `cargo test`
-//! and time nothing: they drive it with a simulated clock.
+//! the job's summary.  Below the row a target that passes prints each
+//! class's result, a line each, as a failure's message gives them, so that
+//! every run's log holds them and not only a failing one's.  The harness's
+//! own tests run in every `cargo test` and time nothing: they drive it
+//! with a simulated clock.
 //!
 //! It is statistical.  It sees a difference large enough to show on the
 //! machine that runs it, fails only on one of a nanosecond an operation or
@@ -694,14 +708,31 @@ impl Report {
         out
     }
 
-    /// Prints the row, and fails when a fixed class has a comparison of
-    /// |t| above [`T_FAIL`] on a difference of [`MIN_FAIL_NANOS`] an
-    /// operation or more, or no comparison had the samples to count.
-    fn assert_constant_time(&self) {
+    /// What a target prints: the row, with `verdict` as its verdict, and
+    /// below it, when the target `passed`, the target's name and its
+    /// detail, the lines a failure's message gives.
+    fn printed(&self, verdict: &str, passed: bool) -> String {
+        let mut out = self.row(verdict) + "\n";
+        if passed {
+            out += &format!("{}: {}", self.target, self.detail());
+        }
+        out
+    }
+
+    /// Prints the row, and the detail when the target passes, and fails
+    /// when a fixed class has a comparison of |t| above [`T_FAIL`] on a
+    /// difference of [`MIN_FAIL_NANOS`] an operation or more, or no
+    /// comparison had the samples to count.  Returns what it printed.
+    fn assert_constant_time(&self) -> String {
         let verdict = self.verdict();
-        println!("{}", self.row(&verdict.word()));
+        let passed = matches!(
+            verdict,
+            Verdict::Pass | Verdict::Reported | Verdict::UnderFloor
+        );
+        let printed = self.printed(&verdict.word(), passed);
+        print!("{printed}");
         match verdict {
-            Verdict::Pass | Verdict::Reported | Verdict::UnderFloor => {}
+            Verdict::Pass | Verdict::Reported | Verdict::UnderFloor => printed,
             Verdict::Leak => panic!(
                 "{}: a fixed class's time differs from the random class's, |t| above {T_FAIL} \
                  and by {MIN_FAIL_NANOS} ns an operation or more\n{}",
@@ -717,22 +748,22 @@ impl Report {
         }
     }
 
-    /// The positive control's check: prints the row, and fails unless the
-    /// control fails by the targets' rule, a comparison of |t| above
-    /// [`T_FAIL`] on a difference of [`MIN_FAIL_NANOS`] an operation or
-    /// more, since a run that does not see the control's leak, far larger
-    /// than any a target looks for, sees none: its clock or its
-    /// measurement is broken.
-    fn assert_leak_found(&self) {
+    /// The positive control's check: prints the row, and the detail when
+    /// the control is found, and fails unless the control fails by the
+    /// targets' rule, a comparison of |t| above [`T_FAIL`] on a difference
+    /// of [`MIN_FAIL_NANOS`] an operation or more, since a run that does
+    /// not see the control's leak, far larger than any a target looks for,
+    /// sees none: its clock or its measurement is broken.  Returns what it
+    /// printed.
+    fn assert_leak_found(&self) -> String {
         let found = self.verdict() == Verdict::Leak;
-        println!(
-            "{}",
-            self.row(if found {
-                "control found"
-            } else {
-                "CONTROL NOT FOUND"
-            })
-        );
+        let verdict = if found {
+            "control found"
+        } else {
+            "CONTROL NOT FOUND"
+        };
+        let printed = self.printed(verdict, found);
+        print!("{printed}");
         assert!(
             found,
             "{}: the control's leak was not found, no comparison of |t| above {T_FAIL} on \
@@ -741,6 +772,7 @@ impl Report {
             self.target,
             self.detail()
         );
+        printed
     }
 }
 
@@ -772,7 +804,10 @@ fn budget_seconds(value: Option<&str>) -> Result<u64, String> {
 /// fixed class's bytes are written over it, of the same length, and
 /// `build` makes the input from it before it is freed.  So what building
 /// allocates and frees, and the heap the inputs lie in, does not depend on
-/// the class.
+/// the class.  The placebo ([`PLACEBO`]) is the one class of no bytes:
+/// nothing is written over its draw, so its input is drawn as the random
+/// class's is.  Any other class of no bytes, or a placebo with bytes, is
+/// a mistake in the class list, and building its input panics.
 fn by_class<I>(
     classes: &[(&'static str, Vec<u8>)],
     mut draw: impl FnMut(&mut SplitMix64) -> Vec<u8>,
@@ -781,11 +816,25 @@ fn by_class<I>(
     move |class, rng| {
         let mut bytes = draw(rng);
         if let Some(fixed) = class {
-            bytes.copy_from_slice(&classes[fixed].1);
+            let (label, value) = &classes[fixed];
+            assert_eq!(
+                value.is_empty(),
+                *label == PLACEBO,
+                "{label}: only the placebo is a class of no bytes"
+            );
+            if !value.is_empty() {
+                bytes.copy_from_slice(value);
+            }
         }
         build(&bytes)
     }
 }
+
+/// The label of a placebo class, which has no bytes of its own: its
+/// samples' inputs are drawn as the random class's are ([`by_class`]), so
+/// it can lean only on what its label brings, from the harness or the
+/// machine, and not on a value.
+const PLACEBO: &str = "placebo";
 
 /// Times `op` as the target `target`, for the budget [`BUDGET_VAR`] gives,
 /// on inputs made from byte strings by [`by_class`]: each fixed class's
@@ -950,6 +999,19 @@ fn nist_classes(order: &[u8]) -> Vec<(&'static str, Vec<u8>)> {
         ("high weight", clear_eight(&n_minus_1)),
         ("top window alone", windows),
     ])
+}
+
+/// The classes `curve`'s targets time: [`nist_classes`], and on P-384 two
+/// more after them that check the check (the module's notes), a placebo
+/// ([`PLACEBO`]) and n - 2 again, under a name of its own.
+fn nist_target_classes(curve: &Nist) -> Vec<(&'static str, Vec<u8>)> {
+    let order = unhex(curve.order);
+    let mut classes = nist_classes(&order);
+    if curve.group == NamedGroup::secp384r1 {
+        classes.push((PLACEBO, Vec::new()));
+        classes.push(("n - 2 again", plus(&order, -2)));
+    }
+    classes
 }
 
 /// A random scalar of the curve of order `order`: the field's length in
@@ -1177,7 +1239,7 @@ fn ecdsa_signing_by_key(target: &str, curve: &Nist) {
     let hedge = vec![0xa5; order.len()];
     time_target(
         target,
-        &nist_classes(&order),
+        &nist_target_classes(curve),
         |rng| random_scalar(&order, rng),
         |scalar| timing::Ecdsa::new(curve.scheme, scalar).expect("a scalar in [1, n)"),
         |key| key.sign_hedged(MESSAGE, &hedge),
@@ -1195,7 +1257,7 @@ fn ecdsa_signing_by_nonce(target: &str, curve: &Nist) {
     let key = timing::Ecdsa::new(curve.scheme, &fixed_scalar(&order)).expect("the fixed key");
     time_target(
         target,
-        &nist_classes(&order),
+        &nist_target_classes(curve),
         |rng| random_scalar(&order, rng),
         <[u8]>::to_vec,
         |nonce| key.sign_with_nonce(nonce, MESSAGE),
@@ -1367,7 +1429,7 @@ fn nist_complete(target: &str, curve: &Nist) {
     exchange_complete(
         target,
         curve.group,
-        &nist_classes(&order),
+        &nist_target_classes(curve),
         &fixed_scalar(&order),
         |rng| random_scalar(&order, rng),
     );
@@ -1376,7 +1438,7 @@ fn nist_complete(target: &str, curve: &Nist) {
 /// [`exchange_public`] on `curve`, by the scalar's extremes.
 fn nist_public(target: &str, curve: &Nist) {
     let order = unhex(curve.order);
-    exchange_public(target, curve.group, &nist_classes(&order), |rng| {
+    exchange_public(target, curve.group, &nist_target_classes(curve), |rng| {
         random_scalar(&order, rng)
     });
 }
@@ -2213,6 +2275,42 @@ mod tests {
         assert!(uncropped.iter().all(|&n| n >= MIN_SAMPLES), "{uncropped:?}");
     }
 
+    /// A placebo, a class of no bytes, is built from its draw as it is,
+    /// as the random class is, where a fixed class's bytes are written
+    /// over the draw: from generators alike, a placebo's input and the
+    /// random class's are the same draw, and inputs drawn one after
+    /// another differ.
+    #[test]
+    fn a_placebo_is_built_from_the_draw_itself() {
+        let classes = [("ones", vec![1; 8]), (PLACEBO, Vec::new())];
+        let mut build = by_class(&classes, |rng| random_bytes(rng, 8), <[u8]>::to_vec);
+        let seed = 0x706c_6163_6562_6f21;
+        let (mut placebo, mut random) = (SplitMix64(seed), SplitMix64(seed));
+        let mut inputs = Vec::new();
+        for _ in 0..8 {
+            let input = build(Some(1), &mut placebo);
+            assert_eq!(input, build(None, &mut random));
+            assert_eq!(build(Some(0), &mut random), vec![1; 8]);
+            build(Some(0), &mut placebo);
+            inputs.push(input);
+        }
+        assert!(
+            inputs.windows(2).all(|pair| pair[0] != pair[1]),
+            "{inputs:02x?}"
+        );
+    }
+
+    /// Only the placebo may have no bytes: a fixed class of none under
+    /// another label is a mistake, and building its input panics rather
+    /// than timing it as a placebo under a value's name.
+    #[test]
+    #[should_panic(expected = "only the placebo is a class of no bytes")]
+    fn an_empty_class_that_is_not_the_placebo_panics() {
+        let classes = [("ones", Vec::new())];
+        let mut build = by_class(&classes, |rng| random_bytes(rng, 8), <[u8]>::to_vec);
+        build(Some(0), &mut SplitMix64(1));
+    }
+
     /// The timed region holds the operations alone: an input's drop and a
     /// result's come after the clock is read, however long they take.
     /// Here each drop takes a simulated millisecond and each operation
@@ -2289,6 +2387,27 @@ mod tests {
         let report = simulated_report(40_000_000, 0);
         assert_eq!(report.verdict(), Verdict::Pass, "{}", report.detail());
         report.assert_constant_time();
+    }
+
+    /// A target that passes prints its row and below it its detail under
+    /// its name, every class's line as a failure's message gives them, and
+    /// so does a control that is found; printed as a failure, with
+    /// `passed` false, a target gives its row alone.
+    #[test]
+    fn a_passing_target_prints_its_detail_below_its_row() {
+        let check = |report: &Report, printed: String, verdict: &str| {
+            let (row, detail) = printed.split_once('\n').expect("a row and a detail");
+            assert_eq!(row, report.row(verdict));
+            assert_eq!(detail, format!("simulated: {}", report.detail()));
+            for name in SIMULATED {
+                assert!(detail.contains(&format!("\n  {name}: t ")), "{detail}");
+            }
+        };
+        let alike = simulated_report(40_000_000, 0);
+        check(&alike, alike.assert_constant_time(), "pass");
+        let leak = simulated_report(40_000_000, 100);
+        check(&leak, leak.assert_leak_found(), "control found");
+        assert_eq!(leak.printed("LEAK", false), leak.row("LEAK") + "\n");
     }
 
     #[test]
@@ -2546,6 +2665,35 @@ mod tests {
                 );
             }
             assert!(exchange_with(curve.group, &n).is_none(), "{name}: n");
+        }
+    }
+
+    /// P-384's targets time [`nist_classes`] and after them a placebo, of
+    /// no bytes, and n - 2 again, n - 2's value under a name of its own;
+    /// P-256's and P-521's time [`nist_classes`] alone.  Every name is its
+    /// own.
+    #[test]
+    fn p384s_targets_add_a_placebo_and_n_minus_2_again() {
+        for curve in [&P256, &P384, &P521] {
+            let n = unhex(curve.order);
+            let extremes = nist_classes(&n);
+            let classes = nist_target_classes(curve);
+            assert_eq!(classes[..extremes.len()], extremes, "{:?}", curve.group);
+            let added = &classes[extremes.len()..];
+            if curve.group == NamedGroup::secp384r1 {
+                let n_minus_2 = class(&classes, "n - 2");
+                assert_eq!(n_minus_2, plus(&n, -2));
+                assert_eq!(added, [(PLACEBO, Vec::new()), ("n - 2 again", n_minus_2)]);
+            } else {
+                assert!(added.is_empty(), "{:?}: {added:?}", curve.group);
+            }
+            for (i, (name, _)) in classes.iter().enumerate() {
+                assert!(
+                    classes[..i].iter().all(|(other, _)| other != name),
+                    "{:?}: {name}",
+                    curve.group
+                );
+            }
         }
     }
 
