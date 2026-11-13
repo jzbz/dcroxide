@@ -2867,6 +2867,147 @@ fn go_oid_ok(content: &[u8]) -> bool {
     true
 }
 
+/// Whether a 16-byte address is an IPv4-mapped IPv6 address, one for
+/// which Go's `net.IP.To4` is not nil (`net/ip.go:217-228`): ten zero
+/// bytes, then two of 0xff.
+fn ipv4_mapped(ip: &[u8]) -> bool {
+    <[u8; 16]>::try_from(ip).is_ok_and(|ip| std::net::Ipv6Addr::from(ip).to_ipv4_mapped().is_some())
+}
+
+/// Whether Go 1.27.3's `parseSANExtension` takes an iPAddress name
+/// (`crypto/x509/parser.go:497-507`): four bytes, or sixteen that are
+/// not an IPv4-mapped address.  Go refuses any other length (`x509:
+/// cannot parse IP address of length N`) and, since 1.27, a mapped
+/// address (`x509: SAN iPAddress contains IPv4-mapped IPv6 address`).
+fn go_san_ip_ok(ip: &[u8]) -> bool {
+    match ip.len() {
+        4 => true,
+        16 => !ipv4_mapped(ip),
+        _ => false,
+    }
+}
+
+/// Whether Go 1.27.3's `parseNameConstraintsExtension` takes an IP
+/// constraint (`crypto/x509/parser.go:670-695`): an address and a mask
+/// of four bytes each or sixteen each, the mask some one bits followed
+/// only by zero bits (`isValidIPMask`, `:583-605`), and, since 1.27, a
+/// sixteen-byte address that is not IPv4-mapped.
+fn go_ip_constraint_ok(value: &[u8]) -> bool {
+    let half = match value.len() {
+        8 => 4,
+        32 => 16,
+        _ => return false,
+    };
+    let (ip, mask) = value.split_at(half);
+    let mut seen_zero = false;
+    for &b in mask {
+        if seen_zero {
+            if b != 0 {
+                return false;
+            }
+            continue;
+        }
+        match b {
+            0x00 | 0x80 | 0xc0 | 0xe0 | 0xf0 | 0xf8 | 0xfc | 0xfe => seen_zero = true,
+            0xff => {}
+            _ => return false,
+        }
+    }
+    !ipv4_mapped(ip)
+}
+
+/// Go's `domainNameValid` (`crypto/x509/parser.go:1378-1433`): empty, or
+/// labels of the characters 33 to 126 that are none of them empty and
+/// end with no trailing period, one leading period allowed in a
+/// constraint.
+fn go_domain_name_valid(name: &[u8], constraint: bool) -> bool {
+    if name.is_empty() {
+        return true;
+    }
+    if name.last() == Some(&b'.') {
+        return false;
+    }
+    let name = match name {
+        [b'.', rest @ ..] if constraint => rest,
+        _ => name,
+    };
+    name.split(|&b| b == b'.')
+        .all(|label| !label.is_empty() && label.iter().all(|b| (33..=126).contains(b)))
+}
+
+/// Whether Go 1.27.3's `parseRFC2821Mailbox` reads `mailbox`
+/// (`crypto/x509/verify.go:267-406`): a quoted string or dot-separated
+/// atoms, with backslash escapes in either, then `@` and a domain that
+/// passes [`go_domain_name_valid`] and, since 1.27, holds no `@`.
+fn go_rfc2821_mailbox(mailbox: &[u8]) -> bool {
+    let mut rest = mailbox;
+    match rest.split_first() {
+        None => return false,
+        Some((b'"', tail)) => {
+            // qcontent up to the closing quote: qtext, or a backslash and
+            // the character it quotes.
+            rest = tail;
+            loop {
+                let Some((&c, tail)) = rest.split_first() else {
+                    return false;
+                };
+                rest = tail;
+                match c {
+                    b'"' => break,
+                    b'\\' => match rest.split_first() {
+                        Some((1..=9 | 11 | 12 | 14..=127, tail)) => rest = tail,
+                        _ => return false,
+                    },
+                    1..=8 | 11 | 12 | 14..=33 | 35..=91 | 93..=127 => {}
+                    _ => return false,
+                }
+            }
+        }
+        Some(_) => {
+            // atext and periods, a backslash taking the next character
+            // whatever it is, which may not start or end the local part
+            // nor stand twice in a row as periods.
+            let mut local = Vec::new();
+            while let Some((&c, tail)) = rest.split_first() {
+                if c == b'\\' {
+                    let Some((&escaped, tail)) = tail.split_first() else {
+                        return false;
+                    };
+                    local.push(escaped);
+                    rest = tail;
+                } else if c.is_ascii_alphanumeric() || b"!#$%&'*+-/=?^_`{|}~.".contains(&c) {
+                    local.push(c);
+                    rest = tail;
+                } else {
+                    break;
+                }
+            }
+            if local.first().is_none_or(|&b| b == b'.')
+                || local.last() == Some(&b'.')
+                || local.windows(2).any(|pair| pair == b"..")
+            {
+                return false;
+            }
+        }
+    }
+    rest.strip_prefix(b"@")
+        .is_some_and(|domain| go_domain_name_valid(domain, false) && !domain.contains(&b'@'))
+}
+
+/// Whether Go 1.27.3's `parseNameConstraintsExtension` takes an
+/// rfc822Name constraint (`crypto/x509/parser.go:697-714`): ASCII
+/// (`isIA5String`), and a mailbox [`go_rfc2821_mailbox`] reads when it
+/// holds `@`, a domain [`go_domain_name_valid`] takes as a constraint
+/// when it does not.  Go 1.26 took a mailbox whose domain held `@`.
+fn go_email_constraint_ok(value: &[u8]) -> bool {
+    value.is_ascii()
+        && if value.contains(&b'@') {
+            go_rfc2821_mailbox(value)
+        } else {
+            go_domain_name_valid(value, true)
+        }
+}
+
 impl CertFacts {
     /// Read the facts from a DER certificate, or `None` where Go's
     /// `ParseCertificate` (`crypto/x509/parser.go`) fails on what this
@@ -2877,8 +3018,13 @@ impl CertFacts {
     /// and no OID twice), the critical marking `processExtensions`
     /// refuses on the key identifiers and the authority information
     /// access, and the extensions whose facts are kept, the key
-    /// identifiers and the key usage among them.  Go's other checks (the
-    /// serial number, names, public key, and the contents of other
+    /// identifiers and the key usage among them.  Of the names in the
+    /// subject alternative name and name constraints extensions, the IP
+    /// addresses and the rfc822Name constraints are read as Go 1.27.3
+    /// reads them ([`go_san_ip_ok`], [`go_ip_constraint_ok`],
+    /// [`go_email_constraint_ok`]).  Go's other checks (the serial
+    /// number, the subject and issuer names, the other names of those
+    /// two extensions, the public key, and the contents of other
     /// extensions) are not ported, so `Some` does not promise Go parses
     /// the certificate.
     /// The four policy extensions are among those read, with Go's rules,
@@ -3047,18 +3193,24 @@ impl CertFacts {
                     14 | 35 if critical => return None,
                     14 | 15 | 19 | 31 | 32 | 33 | 35 | 36 | 37 | 54 => false,
                     // A subject alternative name counts as handled only
-                    // when Go collected a name from it.
+                    // when Go collected a name from it, and an IP
+                    // address Go refuses fails the parse.
                     17 => {
                         identity.san = Some(value);
                         let mut names = DerReader::new(DerReader::new(value).read_tag(0x30)?);
                         let mut any_known = false;
                         while !names.is_empty() {
-                            any_known |= known_name(names.read()?.0);
+                            let (tag, name) = names.read()?;
+                            if tag == 0x87 && !go_san_ip_ok(name) {
+                                return None;
+                            }
+                            any_known |= known_name(tag);
                         }
                         !any_known
                     }
                     // Name constraints are unhandled when a subtree's
-                    // base is a form Go does not enforce.
+                    // base is a form Go does not enforce, and an IP or
+                    // rfc822Name base Go refuses fails the parse.
                     30 => {
                         let mut top = DerReader::new(DerReader::new(value).read_tag(0x30)?);
                         let mut unhandled = false;
@@ -3066,7 +3218,16 @@ impl CertFacts {
                             let mut subtrees = DerReader::new(top.read()?.1);
                             while !subtrees.is_empty() {
                                 let subtree = subtrees.read_tag(0x30)?;
-                                unhandled |= !known_name(DerReader::new(subtree).read()?.0);
+                                let (tag, base) = DerReader::new(subtree).read()?;
+                                let refused = match tag {
+                                    0x87 => !go_ip_constraint_ok(base),
+                                    0x81 => !go_email_constraint_ok(base),
+                                    _ => false,
+                                };
+                                if refused {
+                                    return None;
+                                }
+                                unhandled |= !known_name(tag);
                             }
                         }
                         unhandled
@@ -11204,6 +11365,154 @@ mod tests {
         }
     }
 
+    /// The IP addresses of a subject alternative name and of name
+    /// constraints, and rfc822Name constraints, are read as Go 1.27.3's
+    /// `ParseCertificate` reads them.  An IPv4-mapped address, which Go
+    /// 1.27 refuses in either, fails the parse, and so do an address or
+    /// constraint of another length, a mask that is not ones then zeros,
+    /// and a mailbox constraint Go cannot read, one whose domain holds
+    /// `@` among them, which Go 1.26 took.  Where the oracle runs, Go's
+    /// own verdict on each is compared.
+    #[test]
+    fn ip_names_and_mailbox_constraints_follow_gos_parser() {
+        const SAN: &[u8] = &[0x55, 0x1d, 0x11];
+        const NAME_CONSTRAINTS: &[u8] = &[0x55, 0x1d, 0x1e];
+        let mut oracle = dcroxide_testutil::oracle_or_skip();
+        let key = dcroxide_certgen::gentool::generate_key("P-256").expect("key");
+        let base = CertParts::base(&key.public_bytes());
+        let with_extension = |oid: &[u8], value: Vec<u8>| {
+            let mut parts = base.clone();
+            parts.extensions = vec![der_extension(oid, false, &value)];
+            parts.der()
+        };
+        let mut agrees = |label: &str, der: &[u8], parses: bool| {
+            assert_eq!(CertFacts::parse(der).is_some(), parses, "{label}");
+            if let Some(go) = go_parses(&mut oracle, der) {
+                assert_eq!(go, parses, "{label}: Go's verdict");
+            }
+        };
+        let mapped = |v4: [u8; 4]| [[0u8; 10].as_slice(), &[0xff, 0xff], &v4].concat();
+        let v6 = |head: &[u8], tail: &[u8]| {
+            let mut ip = [0u8; 16];
+            ip[..head.len()].copy_from_slice(head);
+            ip[16 - tail.len()..].copy_from_slice(tail);
+            ip.to_vec()
+        };
+
+        let san = |names: &[Vec<u8>]| with_extension(SAN, der_tlv(0x30, &names.concat()));
+        for (label, ip, parses) in [
+            ("a SAN 192.0.2.1", vec![192, 0, 2, 1], true),
+            ("a SAN ::1", v6(&[], &[1]), true),
+            (
+                "a SAN ::fffe:102:304",
+                v6(&[], &[0xff, 0xfe, 1, 2, 3, 4]),
+                true,
+            ),
+            ("a SAN ::1.2.3.4", v6(&[], &[1, 2, 3, 4]), true),
+            ("a SAN ::ffff:1.2.3.4", mapped([1, 2, 3, 4]), false),
+            ("a SAN ::ffff:0.0.0.0", mapped([0; 4]), false),
+            ("a SAN of five bytes", vec![192, 0, 2, 1, 0], false),
+            ("an empty SAN iPAddress", Vec::new(), false),
+        ] {
+            agrees(label, &san(&[der_tlv(0x87, &ip)]), parses);
+        }
+        agrees(
+            "a mapped SAN after a DNS name",
+            &san(&[
+                der_tlv(0x82, b"client.example"),
+                der_tlv(0x87, &mapped([1, 2, 3, 4])),
+            ]),
+            false,
+        );
+
+        // A constraint as the only subtree of the permitted [0] or the
+        // excluded [1] subtrees.
+        let constraint = |list: u8, base: Vec<u8>| {
+            with_extension(
+                NAME_CONSTRAINTS,
+                der_tlv(0x30, &der_tlv(list, &der_tlv(0x30, &base))),
+            )
+        };
+        let ones = |count: usize| {
+            let mut mask = [0u8; 16];
+            mask[..count].fill(0xff);
+            mask.to_vec()
+        };
+        for (label, value, parses) in [
+            ("10.0.0.0/8", vec![10, 0, 0, 0, 0xff, 0, 0, 0], true),
+            ("0.0.0.0/0", vec![0; 8], true),
+            (
+                "10.0.0.0/255.0.255.0",
+                vec![10, 0, 0, 0, 0xff, 0, 0xff, 0],
+                false,
+            ),
+            (
+                "fe80::/10",
+                [v6(&[0xfe, 0x80], &[]), v6(&[0xff, 0xc0], &[])].concat(),
+                true,
+            ),
+            (
+                "::ffff:10.0.0.0/104",
+                [mapped([10, 0, 0, 0]), ones(13)].concat(),
+                false,
+            ),
+            (
+                "::ffff:0.0.0.0/0",
+                [mapped([0; 4]), vec![0; 16]].concat(),
+                false,
+            ),
+            (
+                "a constraint of nine bytes",
+                vec![10, 0, 0, 0, 0xff, 0, 0, 0, 0],
+                false,
+            ),
+            ("a constraint of sixteen bytes", ones(16), false),
+        ] {
+            agrees(
+                &format!("permitted {label}"),
+                &constraint(0xa0, der_tlv(0x87, &value)),
+                parses,
+            );
+            agrees(
+                &format!("excluded {label}"),
+                &constraint(0xa1, der_tlv(0x87, &value)),
+                parses,
+            );
+        }
+
+        for (value, parses) in [
+            (&b"a@example.com"[..], true),
+            (b"example.com", true),
+            (b".example.com", true),
+            (b"", true),
+            (b"a@", true),
+            (b"\"a b\"@example.com", true),
+            (b"a\\@b@example.com", true),
+            (b"a@b@example.com", false),
+            (b"\"a\"@b@example.com", false),
+            (b"a..b@example.com", false),
+            (b".a@example.com", false),
+            (b"a@example.com.", false),
+            (b"example..com", false),
+            (b"example.com.", false),
+            (b"a b@example.com", false),
+            (b"\"a@example.com", false),
+            (b"a\\\xe9@example.com", false),
+        ] {
+            let shown = String::from_utf8_lossy(value);
+            agrees(
+                &format!("a permitted rfc822Name constraint {shown}"),
+                &constraint(0xa0, der_tlv(0x81, value)),
+                parses,
+            );
+            agrees(
+                &format!("an excluded rfc822Name constraint {shown}"),
+                &constraint(0xa1, der_tlv(0x81, value)),
+                parses,
+            );
+        }
+    }
+
     /// rsaEncryption and sha256WithRSAEncryption identifiers' contents,
     /// each with its NULL parameters.
     const RSA_AI: &[u8] = &[
@@ -12049,9 +12358,11 @@ mod tests {
     /// path through an intermediate whose critical name constraints hold
     /// a registered identifier subtree is passed over for another, and
     /// refused when it is the only one; and a certificate Go's parser
-    /// refuses, here one carrying an extension twice, ends the handshake
-    /// even when no path uses it.  rustls's own client verifier accepts
-    /// each of the refused chains.
+    /// refuses, here one carrying an extension twice or an IPv4-mapped
+    /// address in its subject alternative name, ends the handshake even
+    /// when no path uses it, as does an intermediate on the path whose
+    /// mailbox constraint Go 1.27 cannot read.  rustls's own client
+    /// verifier accepts each of the refused chains.
     #[test]
     fn a_presented_certificate_takes_gos_unhandled_critical_rule() {
         use dcroxide_certgen::gentool::generate_key;
@@ -12169,6 +12480,40 @@ mod tests {
         check(&*theirs, &leaf, &[&plain, &doubled_spare])
             .expect("webpki builds no path through the spare");
         assert_eq!(check(&ours, &leaf, &[&plain, &doubled_spare]), unparsed);
+
+        // Names Go 1.27 refuses at parse: an IPv4-mapped address in the
+        // subject alternative name of an intermediate sent beside the
+        // path, and a mailbox constraint whose domain holds `@` on the
+        // only intermediate of the path, which webpki leaves alone while
+        // the leaf names no mailbox.
+        let mapped = der_tlv(0x87, &[&[0u8; 10][..], &[0xff, 0xff, 1, 2, 3, 4]].concat());
+        let mapped_spare = signed_p256_certificate(
+            9,
+            "spare",
+            &int_key,
+            "root",
+            &root_key,
+            &[
+                authority.clone(),
+                vec![der_extension(SAN, false, &der_tlv(0x30, &mapped))],
+            ]
+            .concat(),
+        );
+        check(&*theirs, &leaf, &[&plain, &mapped_spare])
+            .expect("webpki builds no path through the spare");
+        assert_eq!(check(&ours, &leaf, &[&plain, &mapped_spare]), unparsed);
+        let mailbox = {
+            let subtree = der_tlv(0x30, &der_tlv(0x81, b"a@b@example.com"));
+            let constraints = der_extension(
+                NAME_CONSTRAINTS,
+                true,
+                &der_tlv(0x30, &der_tlv(0xa0, &subtree)),
+            );
+            let extensions = [authority.clone(), vec![constraints]].concat();
+            signed_p256_certificate(10, "int", &int_key, "root", &root_key, &extensions)
+        };
+        check(&*theirs, &leaf, &[&mailbox]).expect("webpki takes the path");
+        assert_eq!(check(&ours, &leaf, &[&mailbox]), unparsed);
     }
 
     /// One of Go's certificate policy vectors (`tests/data/x509-policy`),
@@ -13026,7 +13371,9 @@ mod tests {
     /// `AppendCertsFromPEM` skips it: it neither authenticates as a
     /// pooled certificate nor anchors a chain, and a file holding only
     /// such certificates fails with dcrd's text.  The fact reader used
-    /// to read both, so they were pooled and authenticated.
+    /// to read both, so they were pooled and authenticated.  So is an
+    /// authority whose name constraints Go 1.27 refuses, which then
+    /// anchors no chain.
     #[test]
     fn a_certificate_gos_parser_refuses_stays_out_of_the_pool() {
         use dcroxide_certgen::gentool::generate_key;
@@ -13063,6 +13410,59 @@ mod tests {
             let verifier = GoClientCertVerifier::from_pem(&file).expect("the authority");
             assert_eq!(verifier.cas.len(), 1);
             assert!(verify_client_at(&file, refused, now).is_err());
+        }
+
+        // An authority whose name constraints Go 1.27 refuses, an
+        // IPv4-mapped address or a mailbox whose domain holds `@`, is
+        // skipped too, so a leaf it signed finds no root, where with a
+        // constraint Go takes the leaf authenticates.
+        const BASIC_CONSTRAINTS: &[u8] = &[0x55, 0x1d, 0x13];
+        const KEY_USAGE: &[u8] = &[0x55, 0x1d, 0x0f];
+        const NAME_CONSTRAINTS: &[u8] = &[0x55, 0x1d, 0x1e];
+        let leaf_key = generate_key("P-256").expect("key");
+        let signing = der_extension(KEY_USAGE, true, &der_tlv(0x03, &[0x07, 0x80]));
+        let leaf = signed_p256_certificate(4, "leaf", &leaf_key, "authority", &key, &[signing]);
+        let authority = |serial: u8, base: Vec<u8>| {
+            let subtrees = der_tlv(0x30, &der_tlv(0xa0, &der_tlv(0x30, &base)));
+            let extensions = [
+                der_extension(
+                    BASIC_CONSTRAINTS,
+                    true,
+                    &der_tlv(0x30, &der_tlv(0x01, &[0xff])),
+                ),
+                der_extension(KEY_USAGE, true, &der_tlv(0x03, &[0x02, 0x84])),
+                der_extension(NAME_CONSTRAINTS, true, &subtrees),
+            ];
+            certificate_pem(&signed_p256_certificate(
+                serial,
+                "authority",
+                &key,
+                "authority",
+                &key,
+                &extensions,
+            ))
+        };
+        let ten = der_tlv(0x87, &[10, 0, 0, 0, 0xff, 0, 0, 0]);
+        let file = [ca.pem.as_slice(), &authority(5, ten)].concat();
+        verify_client_at(&file, &leaf, now).expect("a leaf under an authority Go parses");
+        let mapped_ten = [
+            &[0u8; 10][..],
+            &[0xff, 0xff, 10, 0, 0, 0],
+            &[0xff; 13],
+            &[0; 3],
+        ]
+        .concat();
+        for (serial, base) in [
+            (6, der_tlv(0x87, &mapped_ten)),
+            (7, der_tlv(0x81, b"a@b@example.com")),
+        ] {
+            let pem = authority(serial, base);
+            assert_eq!(
+                GoClientCertVerifier::from_pem(&pem).expect_err("nothing Go parses"),
+                NO_CLIENT_CAS
+            );
+            let file = [ca.pem.as_slice(), &pem].concat();
+            assert!(verify_client_at(&file, &leaf, now).is_err());
         }
     }
 

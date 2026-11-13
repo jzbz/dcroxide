@@ -2855,11 +2855,19 @@ closing it would cost.
   encoding, a DER critical flag, no OID twice), the critical marking Go
   forbids on the key identifiers and the authority information access, and
   the key identifiers, key usage, basic constraints, extended key usage,
-  subject alternative name and name constraints the reader keeps. Go's
-  remaining parse checks are not ported: the serial number, names, public
-  key, and the contents of other extensions. A certificate malformed only
-  there stays in the pool where dcrd skips it, and only the operator can place
-  one there.
+  subject alternative name and name constraints the reader keeps. Of the
+  names in the last two it reads the IP addresses and the rfc822Name
+  constraints as Go 1.27.3 does (`crypto/x509/parser.go:497-507`,
+  `:670-714`), refusing an address or constraint of the wrong length, a mask
+  that is not ones then zeros, an IPv4-mapped address, which Go 1.27 refuses
+  in either, and an rfc822Name constraint that is not ASCII, a domain
+  `domainNameValid` refuses, or a mailbox `parseRFC2821Mailbox` cannot read,
+  one whose domain holds `@` among them since Go 1.27
+  (`crypto/x509/verify.go:394-401`). Go's remaining parse checks are not
+  ported: the serial number, the subject and issuer names, the other names in
+  those two extensions, the public key, and the contents of other extensions.
+  A certificate malformed only there stays in the pool where dcrd skips it,
+  and only the operator can place one there.
 
   webpki and the provider's verification algorithms, `dcroxide-tlscrypto`'s,
   which keep ring's set (ADR-0015), still decide the rest.
@@ -3034,10 +3042,11 @@ closing it would cost.
   where the port reports rustls's bad encoding with `bad_certificate`. The
   reader covers the version, the validity times, the extension list and the
   extensions whose facts it keeps, but not the names inside a subject
-  alternative name or name constraints extension beyond their forms, nor Go's
-  other parse checks, so a certificate Go refuses to parse only for those, such
-  as one with a negative serial number or an IP address of five bytes in its
-  subject alternative name, can still verify.
+  alternative name or name constraints extension beyond their forms, IP
+  addresses and rfc822Name constraints aside, nor Go's other parse checks, so
+  a certificate Go refuses to parse only for those, such as one with a
+  negative serial number or a dNSName that is not ASCII in its subject
+  alternative name, can still verify.
 
   Every handshake signature goes to a `WebPkiClientVerifier`
   (`GoClientCertVerifier::webpki_over`), and client certificates of these
@@ -3151,6 +3160,20 @@ closing it would cost.
   those bounds. They close with Go's client-certificate set (ADR-0015, T4),
   whose RSA rules and algorithms the seeders' check takes too.
 
+  Go's client also parses every certificate a seeder sends with
+  `ParseCertificate` and ends the handshake on one it cannot parse
+  (`crypto/tls/handshake_client.go:1108-1112`), where the port's
+  transports leave the chain to webpki, which reads a certificate only as
+  far as its own checks need. So a seeder certificate Go 1.27 refuses for an
+  IPv4-mapped address in its subject alternative name or IP name
+  constraints, or for a mailbox constraint whose domain holds `@`, which the
+  client-certificate reader refuses (the entry on `--authtype=clientcert`
+  above), passes the port's check while webpki finds nothing else wrong
+  with it. Following Go would take a verifier of the port's own on the
+  proxied transport and a connector of its own for ureq on the direct one,
+  new code on the path a seeder MITM attacks, so it is recorded rather than
+  followed (decided 2026-11-12).
+
 - **The RPC key file is read as Go's `tls.X509KeyPair` reads it, but a
   P-224 key is refused where dcrd serves it over TLS 1.2.** Since ADR-0015's
   switch `build_server_config` takes the key block by Go's rule, the first block
@@ -3234,6 +3257,24 @@ closing it would cost.
   would take an RSA signer, which ADR-0015 declines for the reasons under its T5
   and T6, the `rsa` crate's timing advisory among them.
 
+- **The `rpc.cert` leaf is not parsed as Go's `tls.X509KeyPair` parses it.**
+  `X509KeyPair` runs `x509.ParseCertificate` over the first certificate
+  and fails with its error (`crypto/tls/tls.go:305-311`), so dcrd stops at
+  startup on an `rpc.cert` whose leaf Go cannot parse, one carrying an
+  IPv4-mapped address in its subject alternative name among them since Go
+  1.27. The port checks the key against the certificate with rustls's
+  `CertifiedKey::keys_match`, which reads the leaf with webpki
+  (`rustls-0.23.46/src/crypto/signer.rs:190-200`), and webpki reads none of
+  the names inside a subject alternative name, so the port loads and serves
+  such a leaf. The gap predates the move to Go 1.27; the mapped address only
+  widens it. Neither generator writes such a certificate: Go's
+  `CreateCertificate` writes an IPv4 address in four bytes
+  (`crypto/x509/x509.go:1267-1271`), and so does `dcroxide-certgen`
+  (`x509.rs`), so only a pair made elsewhere reaches this. Following Go
+  would take the client-certificate reader over the leaf, with words of the
+  port's own where Go gives its parser's error, and it is recorded rather
+  than followed (decided 2026-11-12).
+
 - **A key the RPC key reader cannot parse is refused without the cause Go
   1.27.3 gives.** Go 1.27's `tls.X509KeyPair` tries PKCS#8 first, then PKCS#1,
   then SEC 1, and refuses a key none of them reads with `tls: failed to parse
@@ -3270,14 +3311,12 @@ closing it would cost.
   complete the move bring ML-DSA in line with Go 1.27.3, and any new
   dependency that takes comes under ADR-0012's and ADR-0015's review.
 
-- **Four more points where Go 1.27.3 differs and the port does not yet.** Go
-  1.27 refuses an IPv4-mapped IPv6 address as a subject alternative name or
-  as an IP name constraint when it parses a certificate, and its
-  `strconv.IsPrint` takes the runes Unicode 17 adds, which the port's two
-  copies of its tables (`dcroxide-dcrjson`'s `gojson/isprint.rs` and
-  `dcroxide-txscript`'s `stdaddr.rs`) still lack. Go 1.27.3 reports a failed
-  continuation-line read as an error and drops every chain through one of
-  eight distrusted keys. The port does each as Go 1.26.2 did.
+- **Three more points where Go 1.27.3 differs and the port does not yet.**
+  Go 1.27's `strconv.IsPrint` takes the runes Unicode 17 adds, which the
+  port's two copies of its tables (`dcroxide-dcrjson`'s `gojson/isprint.rs`
+  and `dcroxide-txscript`'s `stdaddr.rs`) still lack. Go 1.27.3 reports a
+  failed continuation-line read as an error and drops every chain through
+  one of eight distrusted keys. The port does each as Go 1.26.2 did.
   This is interim: each is to be followed in the changes that complete the
   move to 1.27.3, the continuation-line read once it is shown that the
   port's reader can reach that path (ADR-0001's 2026-11-12 addendum).
