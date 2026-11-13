@@ -6241,7 +6241,10 @@ const MAX_CHUNK_EXCESS: i64 = 16 * 1024;
 /// same count to `readMIMEHeader` for the head and to `readTransfer`
 /// for the trailer (`request.go:1152`, `:1181`).  One value more is
 /// textproto's "message too large".  The cap is new in Go 1.27
-/// (`api/go1.27.txt`, go.dev/issue/79936).
+/// (`api/go1.27.txt`, go.dev/issue/79936).  Since Go 1.27.2 the values
+/// a chunked request's `Trailer` header announces count against the
+/// same 500, in `fixTrailer` (`transfer.go:791-796`), and more of them
+/// is the 431 too.
 const MAX_HEADER_VALUES: usize = 500;
 
 /// A chunked request body read to its end, or to where reading stops.
@@ -7958,10 +7961,10 @@ fn read_http_head<S: Read + SocketTimeout>(
     // From here the order is Go's, and it is observable whenever a head
     // is wrong in more than one way.  `readRequestLimit` refuses a
     // second Host (`request.go:1161-1163`) and then runs `readTransfer`
-    // -- transfer encoding, content length, then the trailer keys
-    // (`transfer.go:534-557`) -- before `conn.readRequest`'s version
-    // gate (`server.go:1062`) and its Host and field-name checks
-    // (`:1070-1080`).
+    // -- transfer encoding, content length, then the trailer's value
+    // count and keys (`transfer.go:534-557`) -- before
+    // `conn.readRequest`'s version gate (`server.go:1062`) and its Host
+    // and field-name checks (`:1070-1080`).
     if host_repeated {
         return Err(HeadError::Malformed);
     }
@@ -7975,10 +7978,23 @@ fn read_http_head<S: Read + SocketTimeout>(
     if let Some(value) = content_length {
         head.content_length = parse_content_length(&value).map_err(|_| HeadError::Malformed)?;
     }
-    // `fixTrailer` (`transfer.go:775-814`) vets a chunked body's
-    // announced trailer: each comma-separated element, trimmed, must not
-    // name a framing field.  Without chunking the header is left alone.
+    // `fixTrailer` (`transfer.go:775-820`) vets a chunked body's
+    // announced trailer.  First it counts the values the header
+    // announces, one more than its commas for each copy, an empty one
+    // included, against the whole of `MAX_HEADER_VALUES` -- not what
+    // the head left of it -- and more than that is the 431 (`:791-796`,
+    // new in Go 1.27.2).  Then each comma-separated element, trimmed,
+    // must not name a framing field.  Without chunking the header is
+    // left alone.
     let chunked = matches!(framing, BodyFraming::Chunked);
+    if chunked {
+        let announced = trailer.iter().fold(0usize, |sum, value| {
+            sum.saturating_add(value.matches(',').count().saturating_add(1))
+        });
+        if announced > MAX_HEADER_VALUES {
+            return Err(HeadError::TooLarge);
+        }
+    }
     if chunked
         && trailer.iter().any(|value| {
             value.split(',').any(|key| {
@@ -15309,6 +15325,87 @@ mod tests {
         ] {
             assert_eq!(head_outcome(&raw), outcome, "{} bytes", raw.len());
         }
+    }
+
+    /// Since Go 1.27.2 the values a chunked request's `Trailer` header
+    /// announces count against the 500 too: one more than its commas for
+    /// each copy, an empty copy included, against the whole cap rather
+    /// than what the head left, and more of them is the 431.  The count
+    /// comes after a second Host, the transfer encoding and the content
+    /// length, and ahead of the trailer keys, the version and the Host
+    /// checks; without chunking nothing is counted.  Every row is a
+    /// go1.27.3 server's answer.  The port did not count them.
+    #[test]
+    fn a_chunked_trailer_announces_at_most_gos_value_count() {
+        let chunked = "Transfer-Encoding: chunked\r\n";
+        let trailer = |commas: usize| format!("Trailer: {}\r\n", ",".repeat(commas));
+        let many = ",".repeat(500);
+        let over = trailer(500);
+        for (version, fields, outcome) in [
+            ("1.1", format!("Host: x\r\n{chunked}{}", trailer(499)), "ok"),
+            ("1.1", format!("Host: x\r\n{chunked}{over}"), "431"),
+            (
+                "1.1",
+                format!("Host: x\r\n{chunked}{}{}", trailer(249), trailer(250)),
+                "431",
+            ),
+            (
+                "1.1",
+                format!("Host: x\r\n{chunked}{}Trailer:\r\n", trailer(499)),
+                "431",
+            ),
+            (
+                "1.1",
+                format!("Host: x\r\n{chunked}trailer: {many}\r\n"),
+                "431",
+            ),
+            (
+                "1.1",
+                format!("Host: x\r\n{chunked}Trailer: content-length{many}\r\n"),
+                "431",
+            ),
+            (
+                "1.1",
+                format!("Host: x\r\n{chunked}Trailer : {many}\r\n"),
+                "400 Bad Request: invalid header name",
+            ),
+            (
+                "1.1",
+                format!("Host: x\r\nContent-Length: 0\r\n{over}"),
+                "ok",
+            ),
+            ("1.0", format!("{chunked}{over}"), "ok"),
+            (
+                "1.1",
+                format!("Host: x\r\nHost: y\r\n{chunked}{over}"),
+                "400",
+            ),
+            (
+                "1.1",
+                format!("Host: x\r\nTransfer-Encoding: gzip\r\n{over}"),
+                "501",
+            ),
+            (
+                "1.1",
+                format!("Host: x\r\n{chunked}Content-Length: x\r\n{over}"),
+                "400",
+            ),
+            (
+                "1.1",
+                format!("Host: x\r\n{chunked}Content-Length: 1\r\nContent-Length: 2\r\n{over}"),
+                "400",
+            ),
+            ("3.0", format!("Host: x\r\n{chunked}{over}"), "431"),
+            ("1.1", format!("{chunked}{over}"), "431"),
+            ("1.1", format!("Host: a b\r\n{chunked}{over}"), "431"),
+        ] {
+            let raw = format!("POST / HTTP/{version}\r\n{fields}\r\n");
+            assert_eq!(head_outcome(&raw), outcome, "{raw:?}");
+        }
+        // The bare HTTP/2 preface needs no Host, and is counted all the
+        // same.
+        let raw = format!("PRI * HTTP/2.0\r\n{chunked}{over}\r\n");
+        assert_eq!(head_outcome(&raw), "431", "{raw:?}");
     }
 
     /// A head wrong in more than one way is answered for the check Go
