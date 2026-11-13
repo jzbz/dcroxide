@@ -111,20 +111,26 @@ pub(crate) fn chain_fetch_utxo_view(
                 view = cached_view.clone();
             }
             _ => {
-                let is_treasury_enabled = chain
-                    .is_treasury_agenda_active(&best.hash, params)
-                    .map_err(|e| e.description)?;
                 let tip_block = chain
                     .block_by_hash(&best.hash)
                     .ok_or_else(|| format!("no block data for tip {}", best.hash))?;
+                // The tip's regular tree is undone with the tip's own
+                // treasury flag, the agenda state at its parent, which
+                // its spend journal was written with; the flag of the
+                // block after the tip differs from it when the tip is
+                // the last block before the agenda (dcrd `37fd3a3e`,
+                // `utxoviewpoint.go:1352-1359`).
+                let is_tip_treasury_enabled = chain
+                    .is_treasury_agenda_active(&best.prev_hash, params)
+                    .map_err(|e| e.description)?;
                 let stxos = chain
-                    .fetch_spend_journal(&tip_block, is_treasury_enabled)
+                    .fetch_spend_journal(&tip_block, is_tip_treasury_enabled)
                     .map_err(|e| e.description)?;
                 view.disconnect_disapproved_block(
                     &tip_block,
                     &stxos,
                     &|op: &OutPoint| chain.fetch_utxo_entry(op),
-                    is_treasury_enabled,
+                    is_tip_treasury_enabled,
                 )
                 .map_err(|e| e.description)?;
                 *cached = Some(view.clone());

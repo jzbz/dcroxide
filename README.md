@@ -620,8 +620,9 @@ work). Currently implemented:
 - `tools/trsyboundarygen` — plays chains that cross the treasury
   agenda's activation boundary with a block that disapproves its parent
   inside dcrd's own `internal/blockchain` package, and dumps what dcrd's
-  chain did with them, which `tests/trsyboundary_vectors.rs` replays (Go
-  sources overlaid on a dcrd checkout by `run.sh`)
+  chain did with them, which `tests/trsyboundary_vectors.rs` and the
+  node's `tests/trsyboundary_fetch_view.rs` replay (Go sources overlaid
+  on a dcrd checkout by `run.sh`)
 - `tools/profilergen` — the generator of `profiler_vectors.txt`, run as
   a test inside a dcrd checkout's package main through
   `go test -overlay`, so every row is what dcrd's own

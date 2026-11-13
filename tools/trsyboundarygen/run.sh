@@ -3,7 +3,8 @@
 #
 # Generate crates/dcroxide-blockchain/tests/data/trsyboundary_vectors.txt,
 # the treasury agenda boundary chains tests/trsyboundary_vectors.rs
-# replays, from a dcrd checkout at the parity pin:
+# replays (and dcroxide-node's tests/trsyboundary_fetch_view.rs, the
+# fetchview case), from a dcrd checkout at the parity pin:
 #
 #   tools/trsyboundarygen/run.sh <dcrd checkout> <output file>
 #

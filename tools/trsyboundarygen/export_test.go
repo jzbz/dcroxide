@@ -39,7 +39,13 @@
 //   - beyond: d71, the block after H_act, disapproves h70 on the tip, and a
 //     reorganization to a branch on h70 that approves it detaches d71
 //     again.  Both flags are active there, so the parent's flag is checked
-//     where it is true as well as where it is false.
+//     where it is true as well as where it is false;
+//   - fetchview: the utxo view FetchUtxoView gives the mempool without the
+//     tip's regular tree, as the mempool asks for it once the votes it holds
+//     for the tip disapprove that tree, on the tip H_act-1 and then on the
+//     tip H_act.
+//     The tip's regular tree is disconnected with the tip's own flag, which
+//     on H_act-1 differs from the flag of the block after it.
 //
 // chaingen stamps block one with the wall clock, draws coinbase extra nonces
 // from crypto/rand and takes whichever proof of work solution one of its
@@ -59,7 +65,8 @@
 // every case passes.  Built against a dcrd from before 37fd3a3e, every case
 // panics at its first step across the boundary, when
 // disconnectDisapprovedBlock finds one spent output fewer than H_act-1's
-// transactions spend.
+// transactions spend; in the fetchview case that step is the view on the tip
+// H_act-1.
 //
 // Rows, after a `block <name> <hex>` row for every block any case processes
 // or checks, in the order first seen:
@@ -94,7 +101,11 @@
 //     the regular tree of the tip's parent creates or spends, where the
 //     entry is `missing` (the view holds none), `spent`, or the amount,
 //     block height, block index, transaction type, coinbase and expiry
-//     flags, script version and script of the unspent entry.
+//     flags, script version and script of the unspent entry;
+//   - `fetchview <name> <index>`: FetchUtxoView, without the tip's regular
+//     tree, returned a view for the named block's regular transaction at the
+//     index, followed by a `viewentry` row for each output the regular tree
+//     of the tip and the transaction create or spend.
 
 package blockchain
 
@@ -377,6 +388,41 @@ func (r *exportRecorder) ParentTemplateView(name string) {
 	var outpoints []wire.OutPoint
 	for i, block := range []*wire.MsgBlock{parent, tip, msgBlock} {
 		for _, op := range exportBlockOutpoints(block, i != 0) {
+			if !seen[op] {
+				seen[op] = true
+				outpoints = append(outpoints, op)
+			}
+		}
+	}
+	for _, op := range outpoints {
+		r.row("viewentry %s %d %d %s", op.Hash, op.Index, op.Tree,
+			exportEntry(view.LookupEntry(op)))
+	}
+}
+
+// FetchView runs FetchUtxoView, without the tip's regular tree, on the
+// regular transaction at txIndex of the named block, and writes the view's
+// entry for every output the regular tree of the tip and the transaction
+// create or spend: the outputs the view's disconnection of the tip's regular
+// tree changes, and the ones it fetches for the transaction.
+func (r *exportRecorder) FetchView(name string, txIndex int) {
+	r.t.Helper()
+	msgBlock := r.g.BlockByName(name)
+	r.blocks.add(r.t, name, msgBlock)
+	msgTx := msgBlock.Transactions[txIndex]
+	view, err := r.g.chain.FetchUtxoView(dcrutil.NewTx(msgTx), false)
+	if err != nil {
+		r.t.Fatalf("utxo view for %q transaction %d: %v", name, txIndex, err)
+	}
+	r.row("fetchview %s %d", name, txIndex)
+
+	tipHash := r.g.chain.BestSnapshot().Hash
+	tip := r.g.BlockByHash(&tipHash)
+	txOnly := &wire.MsgBlock{Transactions: []*wire.MsgTx{msgTx}}
+	seen := make(map[wire.OutPoint]bool)
+	var outpoints []wire.OutPoint
+	for _, block := range []*wire.MsgBlock{tip, txOnly} {
+		for _, op := range exportBlockOutpoints(block, false) {
 			if !seen[op] {
 				seen[op] = true
 				outpoints = append(outpoints, op)
@@ -805,6 +851,24 @@ func exportBeyond(c *exportCase) {
 	c.expectRegularTree(exportPreActivationName, false)
 }
 
+// exportFetchView: the mempool's view without the tip's regular tree, for
+// h70's regular spend on the tip H_act-1, whose own flag is inactive while
+// the flag of the block after it is active, and then for h71's on the tip
+// h70, where both are active.  h70 disapproves H_act-1 and h71 approves h70,
+// as in the extend case, but neither vote matters to FetchUtxoView, which
+// leaves the tip's regular tree out for the caller.
+func exportFetchView(c *exportCase) {
+	c.disapprovingAct()
+	c.FetchView("h70", 1)
+	c.AcceptTipBlock()
+	c.ExpectTip("h70")
+	c.ExpectTreasury("h70", true)
+
+	c.next("h71", false)
+	c.FetchView("h71", 1)
+	c.ExpectTip("h70")
+}
+
 // exportCases are the cases in the order the file holds them.
 var exportCases = []struct {
 	name string
@@ -815,6 +879,7 @@ var exportCases = []struct {
 	{"restart", exportRestart},
 	{"templates", exportTemplates},
 	{"beyond", exportBeyond},
+	{"fetchview", exportFetchView},
 }
 
 // TestExportTrsyBoundaryVectors writes the vector file to the path in

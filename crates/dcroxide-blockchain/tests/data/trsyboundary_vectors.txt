@@ -764,3 +764,106 @@ unspendable c2cfaebf56f8fc828a3c5490207c52dd582f773a43ecbd25b58724a322068b75 4 0
 unspendable c2cfaebf56f8fc828a3c5490207c52dd582f773a43ecbd25b58724a322068b75 5 0
 unspendable c2cfaebf56f8fc828a3c5490207c52dd582f773a43ecbd25b58724a322068b75 6 0
 unspendable c2cfaebf56f8fc828a3c5490207c52dd582f773a43ecbd25b58724a322068b75 7 0
+test fetchview
+params quickvote
+now 1793987494
+process bfb 0
+process bm0 0
+process bm1 0
+process bse0 0
+process bsv0 0
+process bsv1 0
+process bsv2 0
+process bsv3 0
+process bsv4 0
+process bsv5 0
+process bvu0 0
+process bvu1 0
+process bvu2 0
+process bvu3 0
+process bvu4 0
+process bvu5 0
+process bvu6 0
+process bvu7 0
+process bvu8 0
+process bvu9 0
+process bvu10 0
+process bvu11 0
+process bvu12 0
+process bvu13 0
+process bvu14 0
+process bvu15 0
+process bvu16 0
+process bvu17 0
+process bvu18 0
+process bvli0 0
+process bvli1 0
+process bvli2 0
+process bvli3 0
+process bvli4 0
+process bvli5 0
+process bvli6 0
+process bvli7 0
+process bvli8 0
+process bvli9 0
+process bvli10 0
+process bvli11 0
+process bvli12 0
+process bvli13 0
+process bvli14 0
+process bvli15 0
+process bvli16 0
+process bvli17 0
+process bvli18 0
+process bvli19 0
+process bva0 0
+process bva1 0
+process bva2 0
+process bva3 0
+process bva4 0
+process bva5 0
+process bva6 0
+process bva7 0
+process bva8 0
+process bva9 0
+process bva10 0
+process bva11 0
+process bva12 0
+process bva13 0
+process bva14 0
+process bva15 0
+process bva16 0
+process bva17 0
+process bva18 0
+process bva19 0
+state 658b17577f256f2aa018ba4b884e67833233544b6c21610c928b46954706491b 69
+tip bva19
+treasury bva18 false
+treasury bva19 true
+disapproves h70
+fetchview h70 1
+viewentry c2cfaebf56f8fc828a3c5490207c52dd582f773a43ecbd25b58724a322068b75 0 0 spent
+viewentry c2cfaebf56f8fc828a3c5490207c52dd582f773a43ecbd25b58724a322068b75 2 0 spent
+viewentry c2cfaebf56f8fc828a3c5490207c52dd582f773a43ecbd25b58724a322068b75 3 0 spent
+viewentry c2cfaebf56f8fc828a3c5490207c52dd582f773a43ecbd25b58724a322068b75 4 0 spent
+viewentry c2cfaebf56f8fc828a3c5490207c52dd582f773a43ecbd25b58724a322068b75 5 0 spent
+viewentry c2cfaebf56f8fc828a3c5490207c52dd582f773a43ecbd25b58724a322068b75 6 0 spent
+viewentry c2cfaebf56f8fc828a3c5490207c52dd582f773a43ecbd25b58724a322068b75 7 0 spent
+viewentry 8d5dad7911055eed58108f6bc2f2f0247dd37b6b17bd7897ad4967b3e2a51e82 2 0 5000000010 66 0 0 true false 0 a914f5a8302ee8695bf836258b8f2b57b38a0be14e4787
+viewentry f5fa2810528b7aa8638d58d96036d4fe4fa969480eeb516167fd73027de73d13 0 0 missing
+process h70 0
+state 07cc7a4d3ed0eddf92c3a1fa8defe5e4087d219e9c87d200f242637c216f335e 70
+tip h70
+treasury h70 true
+fetchview h71 1
+viewentry 4423ed1f7ecc3e8eef91e55c9fcef14c37829b82ae5db6c634abc6b9bb463bdf 1 0 spent
+viewentry 4423ed1f7ecc3e8eef91e55c9fcef14c37829b82ae5db6c634abc6b9bb463bdf 2 0 spent
+viewentry 4423ed1f7ecc3e8eef91e55c9fcef14c37829b82ae5db6c634abc6b9bb463bdf 3 0 spent
+viewentry 4423ed1f7ecc3e8eef91e55c9fcef14c37829b82ae5db6c634abc6b9bb463bdf 4 0 spent
+viewentry 4423ed1f7ecc3e8eef91e55c9fcef14c37829b82ae5db6c634abc6b9bb463bdf 5 0 spent
+viewentry 4423ed1f7ecc3e8eef91e55c9fcef14c37829b82ae5db6c634abc6b9bb463bdf 6 0 spent
+viewentry 8d5dad7911055eed58108f6bc2f2f0247dd37b6b17bd7897ad4967b3e2a51e82 2 0 5000000010 66 0 0 true false 0 a914f5a8302ee8695bf836258b8f2b57b38a0be14e4787
+viewentry f5fa2810528b7aa8638d58d96036d4fe4fa969480eeb516167fd73027de73d13 0 0 spent
+viewentry 495c88b6e3336acf66b2f8d140eb1bbb9674918be03768151dc81b8d42d232c6 2 0 5000000010 67 0 0 true false 0 a914f5a8302ee8695bf836258b8f2b57b38a0be14e4787
+viewentry 921a7e9a99d798d2d4ff678515c736111d96a8374aa03e3eaad71fea4b4ca78e 0 0 missing
+tip h70

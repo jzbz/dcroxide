@@ -36,6 +36,11 @@
 //!   active as well as d71's, and a reorganization detaches d71 again,
 //!   redoing h70's regular tree, whose entries the `entry` rows check.
 //!
+//! The file's sixth case, fetchview, is dcrd's `FetchUtxoView` on the
+//! tips H_act-1 and h70, which the port has in the node's mempool
+//! adapter; `dcroxide-node`'s `tests/trsyboundary_fetch_view.rs` replays
+//! it, and nothing here reads its section.
+//!
 //! Each place the port takes the parent's flag fails a case when it
 //! takes the child's instead.  Every one fails by a panic: where the
 //! parent is undone, its journal comes up one spent output short of
@@ -45,7 +50,7 @@
 //!
 //! | site | cases | the panic |
 //! | --- | --- | --- |
-//! | `check_connect_block` | all five, at h70 | journal short |
+//! | `check_connect_block` | all five replayed here, at h70 | journal short |
 //! | reorganization, attach of a validated block | reorg, h70 again | journal short |
 //! | reorganization, detach | reorg, restart | coinbase input |
 //! | startup catch-up, attach | restart, first restart | journal short |
