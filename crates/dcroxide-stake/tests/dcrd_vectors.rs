@@ -10,8 +10,9 @@
 //! implementation and compares the full dump, so the curated dcrd edge
 //! cases stay covered without a Go toolchain.
 //!
-//! Also ports the fixed reward-calculation tables and the 100k-iteration
-//! Hash256PRNG state vector from dcrd's tests.
+//! Also ports the fixed reward-calculation tables, the 100k-iteration
+//! Hash256PRNG state vector and the wrong ticket input index case of
+//! TestSSGenErrors from dcrd's tests.
 
 // Test-harness arithmetic over bounded lengths.
 #![allow(clippy::arithmetic_side_effects)]
@@ -110,6 +111,33 @@ fn staketx_vectors() {
         seen += 1;
     }
     assert_eq!(seen, 31, "expected all staketx_test.go vectors");
+}
+
+/// dcrd TestSSGenErrors' wrong ticket input index case
+/// (staketx_test.go:414-429): `ssgenMsgTx` with its ticket input naming
+/// output 1 is not a vote. dcrd mutates the vector in the test, so the
+/// dump above never carried it.
+#[test]
+fn ssgen_wrong_input_index() {
+    let data = include_str!("data/staketx_vectors.txt");
+    let tx_hex = data
+        .lines()
+        .find_map(|line| line.strip_prefix("tx ssgenMsgTx "))
+        .expect("the ssgenMsgTx vector");
+    let (mut tx, _) = MsgTx::from_bytes(&unhex(tx_hex)).expect("vector tx deserializes");
+    assert!(stake::is_ssgen(&tx), "the vector itself is a vote");
+
+    tx.tx_in[1].previous_out_point.index = 1;
+    let err = stake::check_ssgen(&tx).expect_err("a ticket input naming output 1");
+    assert_eq!(err.kind, stake::ErrorKind::SSGenWrongIndex);
+    assert_eq!(
+        err.description,
+        "SSGen used an invalid input idx (got 1, want 0)"
+    );
+    assert!(
+        !stake::is_ssgen(&tx),
+        "is_ssgen claimed an invalid ssgen is valid"
+    );
 }
 
 /// dcrd TestBasicPRNG: 100,000 draws from a PRNG seeded with

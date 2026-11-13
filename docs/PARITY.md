@@ -197,11 +197,14 @@ files. The `6f6cf21b` move was one (`3fe61c02`); the `382ff4dd`, `3360ae4d` and
   (`utxo_periodic_flush_due` in `process.rs`). `tools/disapprovalgen`, which
   records each flush through that clock, now counts only the reading `flush`
   makes.
-- **Tests not yet carried:** `01eef9f7` adds a case to
-  `staketx_test.go` (an SSGen whose ticket input names output 1) and
-  `6e2df320` one to `validate_test.go` (a vote whose ticket input names
-  output 2). Neither changes code, and the port has a test of neither case
-  yet.
+- **Test carried:** `01eef9f7` adds a case to `staketx_test.go`, an SSGen
+  whose ticket input names output 1, and changes no code. The case mutates
+  `ssgenMsgTx` inside the test, so `staketx_vectors.txt` never held it;
+  `dcroxide-stake`'s `tests/dcrd_vectors.rs` makes the same change to that
+  vector by hand (`ssgen_wrong_input_index`).
+- **Test not yet carried:** `6e2df320` adds one to `validate_test.go` (a
+  vote whose ticket input names output 2). It changes no code, and the port
+  has no test of the case yet.
 - **The reference Go is 1.27.3:** the paragraph on the release image's Go
   above, and ADR-0001's 2026-11-12 addendum.
 
