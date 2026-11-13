@@ -1124,6 +1124,26 @@ pub fn is_treasury_agenda_active(
     is_agenda_active(view, prev_height, VOTE_ID_TREASURY, params)
 }
 
+/// Whether the DCP0006 treasury agenda is active for the given node
+/// itself, the parent of the block after it: the flag that node's
+/// transactions were connected and its spend journal written with, so
+/// the one a child that disapproves it must undo and redo them with
+/// (dcrd `isTreasuryAgendaActive(grandparent(node))`, which `37fd3a3e`
+/// added, `blockindex.go:415-422`, `validate.go:4419`).  It differs from
+/// [`is_treasury_agenda_active`] at the same node only at the last block
+/// before the agenda is active.  The genesis block has no parent, and
+/// the agenda is inactive for it.
+pub fn is_parent_treasury_agenda_active(
+    view: &impl VoteChainView,
+    prev_height: Option<i64>,
+    params: &Params,
+) -> Result<bool, RuleError> {
+    let grandparent_height = prev_height
+        .and_then(|height| height.checked_sub(1))
+        .filter(|height| *height >= 0);
+    is_treasury_agenda_active(view, grandparent_height, params)
+}
+
 /// Whether the DCP0007 revert treasury expenditure policy agenda is
 /// active for the block AFTER the given node (dcrd
 /// `isRevertTreasuryPolicyActive`).

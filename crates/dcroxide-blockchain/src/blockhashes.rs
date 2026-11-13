@@ -2339,9 +2339,10 @@ mod tests {
             None,
             None,
             &one_transaction_block(),
-            || Ok(Vec::new()),
+            |_| Ok(Vec::new()),
             &|_: &dcroxide_wire::OutPoint| -> Option<crate::utxoentry::UtxoEntry> { None },
             None,
+            false,
             false,
         );
     }
@@ -2359,9 +2360,10 @@ mod tests {
             Some(&types),
             None,
             &one_transaction_block(),
-            || Ok(Vec::new()),
+            |_| Ok(Vec::new()),
             &|_: &dcroxide_wire::OutPoint| -> Option<crate::utxoentry::UtxoEntry> { None },
             None,
+            false,
             false,
         );
     }

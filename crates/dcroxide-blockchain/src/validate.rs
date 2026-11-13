@@ -6563,10 +6563,11 @@ pub(crate) fn connected_block_filter(
 /// `hdrCommitments` out-param for the same reason).
 ///
 /// `parent_stxos` is only invoked when the block disapproves its
-/// parent, so callers must not pay to decode it on the approve path —
-/// and decoding it there with this block's treasury flag would be
-/// wrong at the treasury activation boundary, where the parent's flag
-/// differs from the child's.
+/// parent, so callers must not pay to decode it on the approve path.
+/// It is handed the parent's own treasury flag, computed here from the
+/// parent's parent as dcrd computes it (`validate.go:4416-4428`), which
+/// differs from the block's own at the treasury agenda activation
+/// boundary; the parent is undone with the same flag.
 #[allow(clippy::too_many_arguments)]
 pub fn check_connect_block<SP: dcroxide_standalone::SubsidyParams>(
     view_chain: &impl FullChainView,
@@ -6577,7 +6578,7 @@ pub fn check_connect_block<SP: dcroxide_standalone::SubsidyParams>(
     node_vote_bits: u16,
     block: &MsgBlock,
     parent: &MsgBlock,
-    parent_stxos: impl FnOnce() -> Result<Vec<crate::chainio::SpentTxOut>, RuleError>,
+    parent_stxos: impl FnOnce(bool) -> Result<Vec<crate::chainio::SpentTxOut>, RuleError>,
     view: &mut crate::utxoview::UtxoView,
     resolver: &impl crate::utxoview::UtxoResolver,
     stxos: Option<&mut Vec<crate::chainio::SpentTxOut>>,
@@ -6632,7 +6633,7 @@ pub(crate) fn check_connect_block_with_hashes<SP: dcroxide_standalone::SubsidyPa
     tx_hashes: &crate::blockhashes::BlockTxHashes,
     tx_types: &crate::blockhashes::BlockTxTypes,
     parent: &MsgBlock,
-    parent_stxos: impl FnOnce() -> Result<Vec<crate::chainio::SpentTxOut>, RuleError>,
+    parent_stxos: impl FnOnce(bool) -> Result<Vec<crate::chainio::SpentTxOut>, RuleError>,
     view: &mut crate::utxoview::UtxoView,
     resolver: &impl crate::utxoview::UtxoResolver,
     mut stxos: Option<&mut Vec<crate::chainio::SpentTxOut>>,
@@ -6698,11 +6699,22 @@ pub(crate) fn check_connect_block_with_hashes<SP: dcroxide_standalone::SubsidyPa
         crate::agendas::is_auto_revocations_agenda_active(view_chain, Some(prev_height), params)?;
 
     // Undo the parent's regular transactions when this block
-    // disapproves them.  The parent spend journal is only decoded here,
-    // on the disapprove path, exactly like dcrd.
+    // disapproves them, with the parent's own treasury flag.  The parent
+    // spend journal is only decoded here, on the disapprove path,
+    // exactly like dcrd.
     if node_height > 1 && !vote_bits_approve_parent(node_vote_bits) {
-        let parent_stxos = parent_stxos()?;
-        view.disconnect_disapproved_block(parent, &parent_stxos, resolver, is_treasury_enabled)?;
+        let is_parent_treasury_enabled = crate::agendas::is_parent_treasury_agenda_active(
+            view_chain,
+            Some(prev_height),
+            params,
+        )?;
+        let parent_stxos = parent_stxos(is_parent_treasury_enabled)?;
+        view.disconnect_disapproved_block(
+            parent,
+            &parent_stxos,
+            resolver,
+            is_parent_treasury_enabled,
+        )?;
     }
 
     // Duplicate transaction checking is a no-op at this version.

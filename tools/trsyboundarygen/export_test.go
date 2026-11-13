@@ -35,7 +35,11 @@
 //   - templates: block templates checked on the tip H_act-1 and beside a
 //     disapproving tip H_act, and the utxo view of the parent of the
 //     template beside the tip, for templates that disapprove and approve
-//     H_act-1.
+//     H_act-1;
+//   - beyond: d71, the block after H_act, disapproves h70 on the tip, and a
+//     reorganization to a branch on h70 that approves it detaches d71
+//     again.  Both flags are active there, so the parent's flag is checked
+//     where it is true as well as where it is false.
 //
 // chaingen stamps block one with the wall clock, draws coinbase extra nonces
 // from crypto/rand and takes whichever proof of work solution one of its
@@ -765,6 +769,42 @@ func exportTemplates(c *exportCase) {
 	c.ExpectTip("h70")
 }
 
+// exportBeyond: h70 on the tip, then d71 on h70 disapproving it, where
+// isTreasuryAgendaActive is true for h70's parent and for h70 itself, so
+// h70 is undone with an active flag.  A reorganization to e72, on a branch
+// from h70 whose e71 approves it, then detaches d71, which redoes h70's
+// regular tree with that flag, and the entries left are the redo's.
+func exportBeyond(c *exportCase) {
+	h70 := c.disapprovingAct()
+	c.AcceptTipBlock()
+	c.ExpectTip("h70")
+	c.ExpectTreasury("h70", true)
+
+	d71 := c.next("d71", true)
+	c.AssertTipDisapprovesPrevious()
+	c.AcceptTipBlock()
+	c.ExpectTip("d71")
+	c.expectRegularTree("h70", false)
+	c.ExpectUtxoSpendable(spendInput(h70))
+	c.ExpectUtxoSpendable(spendOutput(d71))
+	c.expectRegularTree(exportPreActivationName, false)
+
+	c.g.SetTip("h70")
+	c.next("e71", false)
+	c.AcceptedToSideChainWithExpectedTip("d71")
+	c.next("e72", false)
+	c.AcceptTipBlock()
+	c.ExpectTip("e72")
+	// Detaching d71 redid h70's regular tree, so its entries carry the
+	// coinbase flag that redo gave them.
+	for _, op := range exportRegularOutputs(h70) {
+		c.ExpectUtxoEntry(op)
+	}
+	c.ExpectUtxoUnspendable(spendInput(h70))
+	c.ExpectUtxoUnspendable(spendOutput(d71))
+	c.expectRegularTree(exportPreActivationName, false)
+}
+
 // exportCases are the cases in the order the file holds them.
 var exportCases = []struct {
 	name string
@@ -774,6 +814,7 @@ var exportCases = []struct {
 	{"reorg", exportReorg},
 	{"restart", exportRestart},
 	{"templates", exportTemplates},
+	{"beyond", exportBeyond},
 }
 
 // TestExportTrsyBoundaryVectors writes the vector file to the path in

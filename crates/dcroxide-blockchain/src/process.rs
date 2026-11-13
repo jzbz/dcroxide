@@ -2684,14 +2684,25 @@ impl Chain {
             let parent_id = self.store.node(id).parent.expect("detached block parent");
             let parent = self.block_arc(parent_id)?;
 
+            // The treasury agenda state of the block being detached and
+            // that of its parent, which it may have disapproved
+            // (`utxocache.go:926-935`).
             let prev_height = Some(self.store.node(parent_id).height);
-            let is_treasury_enabled = {
+            let (is_treasury_enabled, is_parent_treasury_enabled) = {
                 let parent_view = NodeBranchView {
                     store: &self.store,
                     tip: parent_id,
                 };
-                crate::agendas::is_treasury_agenda_active(&parent_view, prev_height, params)
-                    .map_err(crate::chaindb::ChainDbError::Rule)?
+                (
+                    crate::agendas::is_treasury_agenda_active(&parent_view, prev_height, params)
+                        .map_err(crate::chaindb::ChainDbError::Rule)?,
+                    crate::agendas::is_parent_treasury_agenda_active(
+                        &parent_view,
+                        prev_height,
+                        params,
+                    )
+                    .map_err(crate::chaindb::ChainDbError::Rule)?,
+                )
             };
             let stxos = self
                 .fetch_spend_journal(&block, is_treasury_enabled)
@@ -2703,6 +2714,7 @@ impl Chain {
                 &stxos,
                 &ChainUtxoResolver { chain: self },
                 is_treasury_enabled,
+                is_parent_treasury_enabled,
             )
             .map_err(|e| {
                 crate::chaindb::ChainDbError::Corrupt(format!("utxo catch-up disconnect: {e:?}"))
@@ -2750,23 +2762,35 @@ impl Chain {
                 parent.header.block_hash(),
                 "attach block node parent hash does not match the parent block"
             );
+            // The treasury agenda state of the block being attached and
+            // that of its parent, which it may disapprove
+            // (`utxocache.go:1019-1028`).
             let prev_height = Some(self.store.node(parent_id).height);
-            let is_treasury_enabled = {
+            let (is_treasury_enabled, is_parent_treasury_enabled) = {
                 let parent_view = NodeBranchView {
                     store: &self.store,
                     tip: parent_id,
                 };
-                crate::agendas::is_treasury_agenda_active(&parent_view, prev_height, params)
-                    .map_err(crate::chaindb::ChainDbError::Rule)?
+                (
+                    crate::agendas::is_treasury_agenda_active(&parent_view, prev_height, params)
+                        .map_err(crate::chaindb::ChainDbError::Rule)?,
+                    crate::agendas::is_parent_treasury_agenda_active(
+                        &parent_view,
+                        prev_height,
+                        params,
+                    )
+                    .map_err(crate::chaindb::ChainDbError::Rule)?,
+                )
             };
             view.connect_block(
                 params,
                 &block,
                 &parent,
-                || self.fetch_spend_journal(&parent, is_treasury_enabled),
+                |flag| self.fetch_spend_journal(&parent, flag),
                 &ChainUtxoResolver { chain: self },
                 None,
                 is_treasury_enabled,
+                is_parent_treasury_enabled,
             )
             .map_err(|e| {
                 crate::chaindb::ChainDbError::Corrupt(format!("utxo catch-up connect: {e:?}"))
@@ -4457,6 +4481,9 @@ impl Chain {
             let parent = self.stored_block_arc(parent_id)?;
             next_block_to_detach = Some(Arc::clone(&parent));
 
+            // The treasury agenda state of the block being detached and
+            // that of its parent, which it may have disapproved
+            // (`chain.go:1086-1095`).
             let parent_view = NodeBranchView {
                 store: &self.store,
                 tip: parent_id,
@@ -4464,6 +4491,11 @@ impl Chain {
             let prev_height = Some(self.store.node(parent_id).height);
             let is_treasury_enabled =
                 crate::agendas::is_treasury_agenda_active(&parent_view, prev_height, params)?;
+            let is_parent_treasury_enabled = crate::agendas::is_parent_treasury_agenda_active(
+                &parent_view,
+                prev_height,
+                params,
+            )?;
 
             // Load the spent txos for the block from the spend
             // journal and update the view to unspend them.
@@ -4475,6 +4507,7 @@ impl Chain {
                 &stxos,
                 &ChainUtxoResolver { chain: self },
                 is_treasury_enabled,
+                is_parent_treasury_enabled,
             )?;
 
             // Update the chain state.
@@ -4528,13 +4561,23 @@ impl Chain {
             );
             prev_block_attached = Some(Arc::clone(&block));
 
+            // The treasury agenda state of the block being attached and
+            // that of its parent, which it may disapprove
+            // (`chain.go:1181-1190`).
             let prev_height = Some(self.store.node(parent_id).height);
-            let is_treasury_enabled = {
+            let (is_treasury_enabled, is_parent_treasury_enabled) = {
                 let parent_view = NodeBranchView {
                     store: &self.store,
                     tip: parent_id,
                 };
-                crate::agendas::is_treasury_agenda_active(&parent_view, prev_height, params)?
+                (
+                    crate::agendas::is_treasury_agenda_active(&parent_view, prev_height, params)?,
+                    crate::agendas::is_parent_treasury_agenda_active(
+                        &parent_view,
+                        prev_height,
+                        params,
+                    )?,
+                )
             };
 
             // Skip validation when the block has already been
@@ -4558,10 +4601,11 @@ impl Chain {
                     Some(&tx_types),
                     Some(&mut journal_starts),
                     &parent,
-                    || self.fetch_spend_journal(&parent, is_treasury_enabled),
+                    |flag| self.fetch_spend_journal(&parent, flag),
                     &ChainUtxoResolver { chain: self },
                     Some(&mut stxos),
                     is_treasury_enabled,
+                    is_parent_treasury_enabled,
                 )?;
                 // A block added without full validation is attached
                 // here, so this lookup is made for every such block.
@@ -4642,7 +4686,7 @@ impl Chain {
                         &tx_hashes,
                         &tx_types,
                         &parent,
-                        || self.fetch_spend_journal(&parent, is_treasury_enabled),
+                        |flag| self.fetch_spend_journal(&parent, flag),
                         &mut view,
                         &ChainUtxoResolver { chain: self },
                         Some(&mut stxos),
@@ -6036,7 +6080,7 @@ impl Chain {
                 template_info.3,
                 block,
                 &parent,
-                || self.fetch_spend_journal(&parent, is_treasury_enabled),
+                |flag| self.fetch_spend_journal(&parent, flag),
                 &mut view,
                 &ChainUtxoResolver { chain: self },
                 None,
@@ -6049,10 +6093,19 @@ impl Chain {
         }
 
         // The template builds on the parent of the current tip: undo
-        // the tip block to reach the template's point of view.
+        // the tip block to reach the template's point of view.  The
+        // tip's treasury agenda state is the template's, and its parent's
+        // is redone with that parent's own (`validate.go:4732-4755`).
         let tip_block = self.stored_block_arc(tip)?;
         let parent = self.stored_block_arc(prev_node)?;
         let stxos = self.fetch_spend_journal(&tip_block, is_treasury_enabled)?;
+        let is_parent_treasury_enabled = {
+            let view = NodeBranchView {
+                store: &self.store,
+                tip: prev_node,
+            };
+            crate::agendas::is_parent_treasury_agenda_active(&view, Some(prev_height), params)?
+        };
         view.disconnect_block(
             params,
             &tip_block,
@@ -6060,6 +6113,7 @@ impl Chain {
             &stxos,
             &ChainUtxoResolver { chain: self },
             is_treasury_enabled,
+            is_parent_treasury_enabled,
         )?;
         let branch_view = NodeBranchView {
             store: &self.store,
@@ -6074,7 +6128,7 @@ impl Chain {
             template_info.3,
             block,
             &parent,
-            || self.fetch_spend_journal(&parent, is_treasury_enabled),
+            |flag| self.fetch_spend_journal(&parent, flag),
             &mut view,
             &ChainUtxoResolver { chain: self },
             None,
@@ -6124,10 +6178,21 @@ impl Chain {
         let tip_block = self.block_arc(tip).map_err(|e| format!("{e}"))?;
         let parent = self.block_arc(tip_parent).map_err(|e| format!("{e}"))?;
 
-        // Determine if the treasury agenda is active.
+        // Determine if the treasury agenda is active for the tip block
+        // and its parent (`headercmt.go:96-105`).  The template's parent
+        // is the tip's, so these are the template's and its parent's too.
         let is_treasury_enabled = self
             .is_treasury_agenda_active(&tip_parent_hash, params)
             .map_err(|e| e.description)?;
+        let is_parent_treasury_enabled = {
+            let view = NodeBranchView {
+                store: &self.store,
+                tip: tip_parent,
+            };
+            let height = self.store.node(tip_parent).height;
+            crate::agendas::is_parent_treasury_agenda_active(&view, Some(height), params)
+                .map_err(|e| e.description)?
+        };
 
         // Load all of the spent txos for the tip block from the spend
         // journal, then update the view to unspend all of them and
@@ -6144,6 +6209,7 @@ impl Chain {
             &stxos,
             &ChainUtxoResolver { chain: self },
             is_treasury_enabled,
+            is_parent_treasury_enabled,
         )
         .map_err(|e| e.description)?;
 
@@ -6161,10 +6227,11 @@ impl Chain {
             params,
             block,
             &parent,
-            || self.fetch_spend_journal(&parent, is_treasury_enabled),
+            |flag| self.fetch_spend_journal(&parent, flag),
             &ChainUtxoResolver { chain: self },
             None,
             is_treasury_enabled,
+            is_parent_treasury_enabled,
         )
         .map_err(|e| e.description)?;
 
@@ -11969,7 +12036,7 @@ mod tests {
             &wrong,
             &BlockTxTypes::compute(&genesis),
             &genesis,
-            || Ok(Vec::new()),
+            |_| Ok(Vec::new()),
             &mut view,
             &|_: &OutPoint| -> Option<UtxoEntry> { None },
             None,
@@ -13414,7 +13481,7 @@ mod tests {
             &tx_hashes,
             &BlockTxTypes::compute(&genesis),
             &genesis,
-            || Ok(Vec::new()),
+            |_| Ok(Vec::new()),
             &mut view,
             &|_: &OutPoint| -> Option<UtxoEntry> { None },
             None,

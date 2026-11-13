@@ -2,8 +2,8 @@
 # SPDX-License-Identifier: ISC
 #
 # Generate crates/dcroxide-blockchain/tests/data/trsyboundary_vectors.txt,
-# the treasury agenda boundary chains, from a dcrd checkout at the parity
-# pin:
+# the treasury agenda boundary chains tests/trsyboundary_vectors.rs
+# replays, from a dcrd checkout at the parity pin:
 #
 #   tools/trsyboundarygen/run.sh <dcrd checkout> <output file>
 #

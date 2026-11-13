@@ -1304,6 +1304,11 @@ impl UtxoView {
     /// block, given its spend journal (dcrd
     /// `disconnectDisapprovedBlock` with the journal supplied by the
     /// caller).
+    ///
+    /// The treasury flag must say whether the agenda is active for the
+    /// passed block, not for the block that disapproves it
+    /// (`utxoviewpoint.go:583-584`), and the journal must have been
+    /// decoded with the same flag.
     pub fn disconnect_disapproved_block(
         &mut self,
         parent: &MsgBlock,
@@ -1778,20 +1783,23 @@ impl UtxoView {
     /// parent, so it is supplied lazily and decoded solely on that
     /// path — matching dcrd, which fetches it inside `connectBlock`
     /// only when the block disapproves its parent rather than eagerly
-    /// at every caller.  This avoids decoding the parent journal with
-    /// the wrong treasury flag on the common approve path (the child's
-    /// flag differs from the parent's exactly at the treasury agenda
-    /// activation boundary).
+    /// at every caller.  The parent is undone with its own treasury
+    /// flag, `is_parent_treasury_enabled`, which differs from the
+    /// block's own at the treasury agenda activation boundary, and
+    /// `parent_stxos` is handed that flag to decode the journal with,
+    /// as dcrd's `disconnectDisapprovedBlock` decodes it with the one
+    /// flag it is given (`utxoviewpoint.go:941-949`).
     #[allow(clippy::too_many_arguments)]
     pub fn connect_block(
         &mut self,
         params: &Params,
         block: &MsgBlock,
         parent: &MsgBlock,
-        parent_stxos: impl FnOnce() -> Result<Vec<SpentTxOut>, RuleError>,
+        parent_stxos: impl FnOnce(bool) -> Result<Vec<SpentTxOut>, RuleError>,
         resolver: &impl UtxoResolver,
         stxos: Option<&mut Vec<SpentTxOut>>,
         is_treasury_enabled: bool,
+        is_parent_treasury_enabled: bool,
     ) -> Result<(), RuleError> {
         let tx_hashes = crate::blockhashes::BlockTxHashes::compute(block);
         self.connect_block_with_hashes(
@@ -1805,6 +1813,7 @@ impl UtxoView {
             resolver,
             stxos,
             is_treasury_enabled,
+            is_parent_treasury_enabled,
         )
     }
 
@@ -1831,10 +1840,11 @@ impl UtxoView {
         tx_types: Option<&crate::blockhashes::BlockTxTypes>,
         journal_starts: Option<&mut crate::journalscripts::BlockJournalStarts>,
         parent: &MsgBlock,
-        parent_stxos: impl FnOnce() -> Result<Vec<SpentTxOut>, RuleError>,
+        parent_stxos: impl FnOnce(bool) -> Result<Vec<SpentTxOut>, RuleError>,
         resolver: &impl UtxoResolver,
         stxos: Option<&mut Vec<SpentTxOut>>,
         is_treasury_enabled: bool,
+        is_parent_treasury_enabled: bool,
     ) -> Result<(), RuleError> {
         self.connect_block_with_lookup_typed(
             &sbss_violation_lookup(params),
@@ -1847,6 +1857,7 @@ impl UtxoView {
             resolver,
             stxos,
             is_treasury_enabled,
+            is_parent_treasury_enabled,
         )
     }
 
@@ -1861,10 +1872,11 @@ impl UtxoView {
         block: &MsgBlock,
         tx_hashes: &crate::blockhashes::BlockTxHashes,
         parent: &MsgBlock,
-        parent_stxos: impl FnOnce() -> Result<Vec<SpentTxOut>, RuleError>,
+        parent_stxos: impl FnOnce(bool) -> Result<Vec<SpentTxOut>, RuleError>,
         resolver: &impl UtxoResolver,
         stxos: Option<&mut Vec<SpentTxOut>>,
         is_treasury_enabled: bool,
+        is_parent_treasury_enabled: bool,
     ) -> Result<(), RuleError> {
         self.connect_block_with_lookup_typed(
             sbss_violation,
@@ -1877,6 +1889,7 @@ impl UtxoView {
             resolver,
             stxos,
             is_treasury_enabled,
+            is_parent_treasury_enabled,
         )
     }
 
@@ -1891,22 +1904,23 @@ impl UtxoView {
         tx_types: Option<&crate::blockhashes::BlockTxTypes>,
         journal_starts: Option<&mut crate::journalscripts::BlockJournalStarts>,
         parent: &MsgBlock,
-        parent_stxos: impl FnOnce() -> Result<Vec<SpentTxOut>, RuleError>,
+        parent_stxos: impl FnOnce(bool) -> Result<Vec<SpentTxOut>, RuleError>,
         resolver: &impl UtxoResolver,
         mut stxos: Option<&mut Vec<SpentTxOut>>,
         is_treasury_enabled: bool,
+        is_parent_treasury_enabled: bool,
     ) -> Result<(), RuleError> {
         tx_hashes.assert_for(block);
         if let Some(tx_types) = tx_types {
             tx_types.assert_for(block);
         }
         if !crate::validate::header_approves_parent(&block.header) {
-            let parent_stxos = parent_stxos()?;
+            let parent_stxos = parent_stxos(is_parent_treasury_enabled)?;
             self.disconnect_disapproved_block(
                 parent,
                 &parent_stxos,
                 resolver,
-                is_treasury_enabled,
+                is_parent_treasury_enabled,
             )?;
         }
         self.add_sbss_violations_with(
@@ -1944,7 +1958,11 @@ impl UtxoView {
     /// marking spent again the output a grandfathered same-block stake
     /// spend restored, and reconnecting the parent's regular
     /// transactions when the block disapproved them (dcrd
-    /// `disconnectBlock`).
+    /// `disconnectBlock`).  The parent's are redone with its own
+    /// treasury flag, `is_parent_treasury_enabled`, which differs from
+    /// the block's own at the treasury agenda activation boundary
+    /// (`utxoviewpoint.go:1058-1069`).
+    #[allow(clippy::too_many_arguments)]
     pub fn disconnect_block(
         &mut self,
         params: &Params,
@@ -1953,6 +1971,7 @@ impl UtxoView {
         stxos: &[SpentTxOut],
         resolver: &impl UtxoResolver,
         is_treasury_enabled: bool,
+        is_parent_treasury_enabled: bool,
     ) -> Result<(), RuleError> {
         self.disconnect_block_with_lookup(
             &sbss_violation_lookup(params),
@@ -1961,11 +1980,13 @@ impl UtxoView {
             stxos,
             resolver,
             is_treasury_enabled,
+            is_parent_treasury_enabled,
         )
     }
 
     /// [`Self::disconnect_block`] over the given lookup of the
     /// grandfathered same-block stake spends.
+    #[allow(clippy::too_many_arguments)]
     fn disconnect_block_with_lookup(
         &mut self,
         sbss_violation: &impl Fn(i64) -> Option<Hash>,
@@ -1974,6 +1995,7 @@ impl UtxoView {
         stxos: &[SpentTxOut],
         resolver: &impl UtxoResolver,
         is_treasury_enabled: bool,
+        is_parent_treasury_enabled: bool,
     ) -> Result<(), RuleError> {
         assert_eq!(
             stxos.len(),
@@ -1992,13 +2014,13 @@ impl UtxoView {
                 parent,
                 &parent_regular_tx_hashes,
                 resolver,
-                is_treasury_enabled,
+                is_parent_treasury_enabled,
             );
             self.connect_regular_transactions(
                 parent,
                 &parent_regular_tx_hashes,
                 None,
-                is_treasury_enabled,
+                is_parent_treasury_enabled,
             );
         }
         self.set_best_hash(block.header.prev_block);
@@ -3023,9 +3045,10 @@ mod tests {
                 &block,
                 &tx_hashes,
                 &parent,
-                || Ok(Vec::new()),
+                |_| Ok(Vec::new()),
                 &backend,
                 None,
+                false,
                 false,
             );
         });
@@ -3042,9 +3065,10 @@ mod tests {
             &block,
             &tx_hashes,
             &parent,
-            || Ok(Vec::new()),
+            |_| Ok(Vec::new()),
             &backend,
             Some(&mut stxos),
+            false,
             false,
         )
         .expect("connect");
@@ -3086,9 +3110,10 @@ mod tests {
                 &block,
                 &tx_hashes,
                 &parent,
-                || Ok(Vec::new()),
+                |_| Ok(Vec::new()),
                 &resolve,
                 Some(&mut stxos),
+                false,
                 false,
             )
             .expect("connect");
@@ -3102,8 +3127,10 @@ mod tests {
         ] {
             let resolve = |op: &OutPoint| backend.get(&(op.hash.0, op.index, op.tree)).cloned();
             let mut view = UtxoView::new();
-            view.disconnect_block_with_lookup(&lookup, &block, &parent, &stxos, &resolve, false)
-                .expect("disconnect");
+            view.disconnect_block_with_lookup(
+                &lookup, &block, &parent, &stxos, &resolve, false, false,
+            )
+            .expect("disconnect");
             let entry = view
                 .lookup_entry(&origin_out(origin_hash, 0))
                 .expect("in the view");
@@ -3342,9 +3369,10 @@ mod tests {
                 &block,
                 &tx_hashes,
                 &parent,
-                || Ok(Vec::new()),
+                |_| Ok(Vec::new()),
                 &resolve,
                 Some(&mut stxos),
+                false,
                 false,
             )
             .expect("connect");
@@ -3356,13 +3384,29 @@ mod tests {
 
         let mut fresh = UtxoView::new();
         fresh
-            .disconnect_block_with_lookup(&no_violation, &block, &parent, &stxos, &resolve, false)
+            .disconnect_block_with_lookup(
+                &no_violation,
+                &block,
+                &parent,
+                &stxos,
+                &resolve,
+                false,
+                false,
+            )
             .expect("disconnect");
         assert_eq!(state_of(&fresh, &origin_out(a_hash, 0)), SPENT_BY_ZERO_CONF);
         assert_eq!(state_of(&fresh, &origin_out(a_hash, 1)), SPENT);
 
         connected
-            .disconnect_block_with_lookup(&no_violation, &block, &parent, &stxos, &resolve, false)
+            .disconnect_block_with_lookup(
+                &no_violation,
+                &block,
+                &parent,
+                &stxos,
+                &resolve,
+                false,
+                false,
+            )
             .expect("disconnect");
         assert_eq!(state_of(&connected, &origin_out(a_hash, 0)), SPENT);
     }
@@ -3477,9 +3521,10 @@ mod tests {
             &block,
             &tx_hashes,
             &parent,
-            || Ok(Vec::new()),
+            |_| Ok(Vec::new()),
             &backend,
             None,
+            false,
             false,
         )
         .expect("connect");
@@ -3656,9 +3701,10 @@ mod tests {
             block,
             &tx_hashes,
             &parent,
-            || Ok(Vec::new()),
+            |_| Ok(Vec::new()),
             &resolve,
             None,
+            is_treasury_enabled,
             is_treasury_enabled,
         )
         .expect("connect");
@@ -4310,9 +4356,10 @@ mod tests {
             &block,
             &tx_hashes,
             &parent,
-            || Ok(Vec::new()),
+            |_| Ok(Vec::new()),
             &backend,
             None,
+            false,
             false,
         )
         .expect("connect");
@@ -4461,9 +4508,10 @@ mod tests {
                 &block,
                 &tx_hashes,
                 &parent,
-                || Ok(Vec::new()),
+                |_| Ok(Vec::new()),
                 &resolve,
                 Some(&mut stxos),
+                false,
                 false,
             )
             .expect("connect");
@@ -4476,8 +4524,16 @@ mod tests {
         let resolve = |op: &OutPoint| backend.get(&(op.hash.0, op.index, op.tree)).cloned();
 
         let mut view = UtxoView::new();
-        view.disconnect_block_with_lookup(&no_violation, &block, &parent, &stxos, &resolve, false)
-            .expect("disconnect");
+        view.disconnect_block_with_lookup(
+            &no_violation,
+            &block,
+            &parent,
+            &stxos,
+            &resolve,
+            false,
+            false,
+        )
+        .expect("disconnect");
         let b_hash = tx_hashes.regular()[2];
         let want: BTreeSet<UtxoKey> = [
             key(&origin_out(a_hash, 0)),

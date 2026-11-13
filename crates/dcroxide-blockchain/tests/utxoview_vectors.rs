@@ -283,8 +283,16 @@ fn utxoview_vectors() {
         if f[0] == "afterconnect" {
             let blk = block.as_ref().expect("block");
             let parent = parent.as_ref().expect("parent");
-            view.disconnect_block(&params, blk, parent, &stxos, &none_resolver, TREASURY)
-                .expect("disconnect block");
+            view.disconnect_block(
+                &params,
+                blk,
+                parent,
+                &stxos,
+                &none_resolver,
+                TREASURY,
+                TREASURY,
+            )
+            .expect("disconnect block");
         }
     }
 }

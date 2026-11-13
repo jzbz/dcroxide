@@ -112,6 +112,8 @@ file records the time of its run, was not run again. The 29 files under
 due under ADR-0001's 2026-10-26 addendum on frozen batteries.
 ADR-0001's 2026-11-12 addendum lists them; no exporter of theirs is rebuilt
 yet, and until one is, the port is held to them as they are.
+`trsyboundary_vectors.txt` is new at `46e9df48`, from `tools/trsyboundarygen`,
+which also runs in `internal/blockchain`.
 
 `tools/pinbump` lists changed upstream `_test.go` files in a section of
 their own, resolved to crates like the source files, and reports a moved
@@ -166,16 +168,24 @@ files. The `6f6cf21b` move was one (`3fe61c02`); the `382ff4dd`, `3360ae4d` and
 `contrib/docker` unmapped: `46e9df48` moves dcrd's release image from golang
 1.26.2 to golang 1.27.3.
 
-- **Not yet ported:** `37fd3a3e` corrects the treasury flag used to undo and
-  redo the regular tree of a block its child disapproves. Every caller passed
-  the child's flag where the parent's own is right. The two differ only when
-  the child is the first block under the treasury agenda, and then the
-  parent's spend journal is decoded, and its coinbase checked, as if the
-  agenda already applied to the parent, which, as read, fails (dcrd's
-  journal decode or its coinbase check). dcrd now takes the
-  parent's flag from the grandparent at each site, and `FetchUtxoView`
-  disconnects the tip with the tip's own flag. The port has the same bug at
-  the same sites. dcrd adds no test for it.
+- **Ported, but for the mempool's view:** `37fd3a3e` corrects the treasury
+  flag used to undo and redo the regular tree of a block its child
+  disapproves. Every caller passed the child's flag where the parent's own is
+  right. The two differ only when the child is the first block under the
+  treasury agenda, and then the parent's spend journal is decoded, and its
+  coinbase checked, as if the agenda already applied to the parent. dcrd now
+  takes the parent's flag from the grandparent at each site. So does the
+  port (`is_parent_treasury_agenda_active` in `agendas.rs`), and
+  `check_connect_block` and `UtxoView::connect_block` hand the parent's
+  journal provider the flag they undo the parent with. dcrd adds no test for
+  it. `tools/trsyboundarygen` plays such chains inside dcrd's package, one
+  of them a block past the boundary where both flags are active, and
+  `tests/trsyboundary_vectors.rs` replays them. Run on a dcrd at `3360ae4d`,
+  the generator panics in every case at its first block across the boundary,
+  where `disconnectDisapprovedBlock` finds fewer spent outputs in the
+  parent's journal than its transactions spend, and the replay fails the
+  same way on a port without the fix. Still to port: `FetchUtxoView` now
+  disconnects the tip with the tip's own flag (`txmempool.rs`).
 - **No change needed:** `397048b1` has the UTXO cache's periodic flush check
   read the cache's clock, `timeNow`, where it read the wall clock, so that the
   check and the stamp a flush leaves read one clock (`utxocache.go:678`). The
