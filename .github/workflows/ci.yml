@@ -294,14 +294,11 @@ jobs:
     # tools/pinbump's main_test.go, which pins the bump review list
     # keeping upstream `_test.go` changes and both sides of a move, ran
     # only when someone ran it by hand, and a stale tool surfaced only
-    # at the next manual regeneration. fullblockgen is left out for now:
-    # its go.mod's `go 1.27.0` was newer than GO_VERSION until the move to
-    # 1.27.3 (ADR-0001's 2026-11-12 addendum), and it is added in a change
-    # of its own.
+    # at the next manual regeneration.
     # chainopsgen, disapprovalgen, mempoolvectors, mixpoolgen,
     # profilergen, trsyboundarygen and utxoviewgen are not modules but
     # overlays that compile only inside a dcrd checkout's packages, so
-    # they are left out too.
+    # they are left out.
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
@@ -310,7 +307,7 @@ jobs:
           cache-dependency-path: tools/oracle/go.sum
       - name: Vet and test the tool modules
         run: |
-          for m in pinbump helpgen oracle dcrdstat; do
+          for m in pinbump helpgen oracle dcrdstat fullblockgen; do
             (cd "tools/$m" && go vet ./... && go test ./...)
           done
 

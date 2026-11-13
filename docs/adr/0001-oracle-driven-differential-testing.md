@@ -5,7 +5,8 @@
   the parity target), 2026-08-20 through 2026-10-25 (addenda: the pin's
   later moves), 2026-10-26 (addendum: frozen batteries whose exporters were
   scratch code; second addendum: one reference Go, and CI on it), 2026-11-12
-  (addendum: the pin at `46e9df48` and the reference Go at 1.27.3)
+  (addendum: the pin at `46e9df48` and the reference Go at 1.27.3; second
+  addendum: `tools/fullblockgen` in `go-tools`)
 
 ## Context
 
@@ -485,3 +486,13 @@ compare --allow-pin-change`. The condition item 5 of ADR-0006's second
 2026-10-26 addendum set for that flag, unchanged `dcrec/secp256k1` and
 `dcrec/edwards` source, holds between the two pins; the oracle on the later
 side is also built with go1.27.3. The nightly job compares no records itself.
+
+## Addendum, 2026-11-12 (second) — `tools/fullblockgen` in `go-tools`
+
+`go-tools` now vets and tests `tools/fullblockgen` with the other four
+modules, which settles the `tools/fullblockgen` item that the first addendum
+of this date carried over from the second 2026-10-26 addendum. Its `go.mod`
+keeps `go 1.27.0`: since the move to 1.27.3 that line is within the
+reference, so the drop to dcrd's `go 1.25.0` that the 2026-10-26 item
+planned is not needed. Under go1.27.3 the module vets cleanly; it has no
+tests of its own.
