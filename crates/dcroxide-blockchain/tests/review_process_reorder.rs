@@ -460,7 +460,7 @@ fn stored_votes(chain: &Chain, hash: &Hash) -> Option<usize> {
 
 /// Accepting a block's data populates its node's ticket and vote
 /// information, which marks the node for the next flush (dcrd
-/// `PopulateTicketInfo`, `blockindex.go:955-960`, called at
+/// `PopulateTicketInfo`, `blockindex.go:964-969`, called at
 /// `process.go:296-298`), even when a later check rejects the data
 /// without marking the block, so the stored row of the header is
 /// rewritten with the block's votes.  The battery's `bmf20` (five votes,
@@ -769,7 +769,7 @@ fn a_known_header_is_not_sanity_checked_again() {
 }
 
 /// A block template's data preconditions come before its sanity checks
-/// (dcrd `validate.go:4667-4677`): a template whose header no longer
+/// (dcrd `validate.go:4672-4682`): a template whose header no longer
 /// commits to its data and whose size commitment is wrong fails the
 /// merkle check.
 #[test]

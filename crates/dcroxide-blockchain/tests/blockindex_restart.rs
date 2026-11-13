@@ -2,9 +2,9 @@
 //! Loading the block index from storage does not mark its rows for
 //! rewriting (RVW-009).
 //!
-//! dcrd has two entry points: `addNode` (`blockindex.go:665-722`), which
+//! dcrd has two entry points: `addNode` (`blockindex.go:674-731`), which
 //! never touches `bi.modified`, and the exported `AddNode`
-//! (`:757-762`), which adds the mark.  `addNodeFromDB` (`:733-751`) uses
+//! (`:766-771`), which adds the mark.  `addNodeFromDB` (`:742-760`) uses
 //! the un-marking one, and `loadBlockIndex` (`chainio.go:1502`) goes
 //! through it for every stored row.
 //!
@@ -200,7 +200,7 @@ fn the_first_flush_after_a_restart_rewrites_no_block_index_rows() {
 /// inserts it with `addNodeFromDB`, which never marks it modified, so
 /// the flush `initChainState` runs "since blocks may have been
 /// unmarked" finds an empty modified set and writes nothing
-/// (`chainio.go:1494-1502`, `:1779-1789`; `blockindex.go:1411`).  The
+/// (`chainio.go:1494-1502`, `:1779-1789`; `blockindex.go:1420`).  The
 /// stored deployment version then advances, the pass does not run
 /// again, and a second restart reloads the block as failed.  The port
 /// used to mark the node and persist the cleared status (review finding

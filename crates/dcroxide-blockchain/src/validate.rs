@@ -2439,7 +2439,7 @@ pub(crate) fn check_merkle_roots_with_leaves(
 /// give such a block, but for a block that also fails a check they
 /// make before the size, the proof of stake or the presence of a
 /// regular transaction (`validate.go:884-895`), or for a template the
-/// header's sanity checks (`:4674`, `:973-979`): that block is now
+/// header's sanity checks (`:4679`, `:973-979`): that block is now
 /// refused for its size instead.  With the agenda undecided nothing is
 /// proven, and the order is dcrd's (PARITY.md, *The header's size and a
 /// proven data commitment*).
@@ -6723,7 +6723,7 @@ pub(crate) fn check_connect_block_with_hashes<SP: dcroxide_standalone::SubsidyPa
     // Add utxo entries that were valid under old consensus rules but
     // are no longer valid and would therefore cause the block to be
     // incorrectly rejected, ahead of the fetch as dcrd does since
-    // `96a55a74` (`validate.go:4433-4436`).
+    // `96a55a74` (`validate.go:4438-4441`).
     view.add_sbss_violations(params, block, regular_tx_hashes, is_treasury_enabled);
 
     // Load all of the utxos referenced by the block that are not
@@ -6876,7 +6876,7 @@ pub(crate) fn check_connect_block_with_hashes<SP: dcroxide_standalone::SubsidyPa
     // and returned for the caller to store rather than rebuilt there
     // (dcrd sets it into the caller's `hdrCommitments`).
     // dcrd returns `ruleError(ErrMissingTxOut, err.Error())`
-    // (`validate.go:4575-4578`): for a missing script that is
+    // (`validate.go:4580-4583`): for a missing script that is
     // blockcf2's `PrevScriptError` text, which prints the tree too.  With
     // a journal the previous scripts are read from it where it can place
     // them (`connected_block_filter`).

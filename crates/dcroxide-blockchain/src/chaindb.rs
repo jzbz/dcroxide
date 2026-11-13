@@ -137,7 +137,7 @@ pub enum ChainDbError {
     Interrupted,
     /// A consensus rule or context error raised while opening the
     /// chain, which dcrd's `New` returns unchanged: a deployment or
-    /// historical agenda that `makeAgendas` refuses (`chain.go:2156`),
+    /// historical agenda that `makeAgendas` refuses (`chain.go:2166`),
     /// or an agenda query failing in the startup state load
     /// (`chainio.go:1749-1752`).
     Rule(crate::RuleError),

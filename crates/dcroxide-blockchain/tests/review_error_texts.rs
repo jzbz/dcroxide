@@ -13,7 +13,7 @@
 //!   amounts.
 //! - `CheckConnectBlockTemplate` names the tip's parent when it has one,
 //!   and has a second form for a tip without one
-//!   (`internal/blockchain/validate.go:4665-4675`).  The texts are those
+//!   (`internal/blockchain/validate.go:4670-4680`).  The texts are those
 //!   dcrd returned on regnet for the battery's `bfb` with its previous
 //!   block replaced, before and after `bfb` was processed.
 

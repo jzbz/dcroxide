@@ -212,7 +212,7 @@ pub struct UtxoView {
 
 impl Clone for UtxoView {
     /// A copy of the view's entries and best hash (dcrd `clone`,
-    /// `utxoviewpoint.go:1287-1300`), without the zero-confirmation
+    /// `utxoviewpoint.go:1291-1304`), without the zero-confirmation
     /// set, which dcrd's copy does not carry either.  The record of
     /// the outputs a disconnect marked spent describes the entries, so
     /// it goes with them.
@@ -1123,7 +1123,7 @@ impl UtxoView {
 
     /// Whether the view holds any output of the transaction in the
     /// regular tree (dcrd `hasAnyRegularTxOut`,
-    /// `utxoviewpoint.go:1106-1118`).  dcrd tests for a non-nil entry;
+    /// `utxoviewpoint.go:1110-1122`).  dcrd tests for a non-nil entry;
     /// the view stores no entry where dcrd stores a nil one, so
     /// presence is the same test.
     fn has_any_regular_tx_out(&self, tx: &MsgTx, tx_hash: &Hash) -> bool {
@@ -1141,7 +1141,7 @@ impl UtxoView {
     /// directly and replacing the view's zero-confirmation set with the
     /// ones eligible to bypass cache updates (the set-construction
     /// half of dcrd `fetchRegularInputUtxos`, `addRegularInputUtxos`,
-    /// `utxoviewpoint.go:1128-1198`).  `regular_tx_hashes` carries the
+    /// `utxoviewpoint.go:1132-1202`).  `regular_tx_hashes` carries the
     /// hash of each regular transaction, computed once per block.
     fn queue_regular_input_utxos(
         &mut self,
@@ -1173,7 +1173,7 @@ impl UtxoView {
                         // newly creates: the creating transaction is
                         // eligible when the view holds none of its
                         // outputs before any of them is added here
-                        // (`utxoviewpoint.go:1161-1183`).  The answer
+                        // (`utxoviewpoint.go:1165-1187`).  The answer
                         // is kept per transaction, since later
                         // transactions can spend several of its
                         // outputs.
@@ -1226,7 +1226,7 @@ impl UtxoView {
         for (tx_idx, stx) in block.stransactions.iter().enumerate() {
             // Treasurybases and treasury spends have no inputs.  dcrd
             // uses the strict stake.IsTreasuryBase here
-            // (utxoviewpoint.go:1262), not the minimal standalone check.
+            // (utxoviewpoint.go:1266), not the minimal standalone check.
             let should_be_treasury_base = is_treasury_enabled && tx_idx == 0;
             if should_be_treasury_base && dcroxide_stake::is_treasury_base(stx) {
                 continue;
@@ -1245,7 +1245,7 @@ impl UtxoView {
     }
 
     /// Load the utxos for the regular transactions' inputs into the
-    /// view (dcrd `fetchRegularInputUtxos`, `utxoviewpoint.go:1200-1222`,
+    /// view (dcrd `fetchRegularInputUtxos`, `utxoviewpoint.go:1204-1226`,
     /// over the resolver: the missing outpoints collect into one set
     /// and resolve in one batch).  `regular_tx_hashes` carries the hash
     /// of each regular transaction, computed once per block.
@@ -1274,7 +1274,7 @@ impl UtxoView {
     }
 
     /// Load the utxos for all of the block's inputs into the view
-    /// (dcrd `fetchInputUtxos`, `utxoviewpoint.go:1224-1285`, over the
+    /// (dcrd `fetchInputUtxos`, `utxoviewpoint.go:1228-1289`, over the
     /// resolver: every missing outpoint across both trees resolves in
     /// one batch, so a database-backed resolver reads them all in one
     /// transaction).  `regular_tx_hashes` carries the hash of each
@@ -1340,7 +1340,7 @@ impl UtxoView {
     /// Add the output that older consensus rules let a stake
     /// transaction spend in the block that created it, when the block
     /// is at a height that has one (dcrd `addSBSSViolations`,
-    /// `utxoviewpoint.go:613-631`): output 0 of the regular
+    /// `utxoviewpoint.go:616-634`): output 0 of the regular
     /// transaction [`crate::validate::sbss_violation_hash`] names for
     /// the network and height.  Without it the block, which is part of
     /// the network's history, would be rejected.  Callers add it after
@@ -1385,7 +1385,7 @@ impl UtxoView {
 
     /// Panic unless the view is consistent with the completed
     /// transition the block represents (dcrd `assertBlockUtxoView`,
-    /// `utxoviewpoint.go:633-917`, since `22fd2431`): every input the
+    /// `utxoviewpoint.go:636-920`, since `22fd2431`): every input the
     /// block spends must have a spent entry whose details match the
     /// input's fraud proof, and every spendable output it creates must
     /// have an entry with the output's details, marked modified, and
@@ -1397,7 +1397,7 @@ impl UtxoView {
     /// Only for a fully validated block whose transactions have been
     /// applied to the view.  The reorganization calls it for every block
     /// it attaches, just before the block is connected
-    /// (`chain.go:1236-1238`).  These are assertions rather than errors,
+    /// (`chain.go:1246-1248`).  These are assertions rather than errors,
     /// as dcrd's commit gives the reason: there is no recovering from a
     /// view that violates them, and processing more blocks over it could
     /// corrupt the utxo set.  The texts are dcrd's.
@@ -1738,7 +1738,7 @@ impl UtxoView {
     /// Mark spent the output [`Self::add_sbss_violations`] adds, once
     /// the block that holds it has been disconnected, so the disconnect
     /// does not leave it in the set (dcrd `removeSBSSViolations`,
-    /// `utxoviewpoint.go:974-1004`): the disconnect of the stake tree
+    /// `utxoviewpoint.go:978-1008`): the disconnect of the stake tree
     /// restores it as an input of the stake transaction that spent it.
     ///
     /// # Panics
@@ -2164,7 +2164,7 @@ mod tests {
 
     /// dcrd `fetchInputUtxos` skips the stake-tree input set only for
     /// what the strict `stake.IsTreasuryBase` accepts
-    /// (utxoviewpoint.go:1262), so the input of a transaction that
+    /// (utxoviewpoint.go:1266), so the input of a transaction that
     /// merely passes the minimal check is requested from the backend.
     #[test]
     fn fetch_input_utxos_uses_the_strict_treasury_base_check() {
@@ -2971,7 +2971,7 @@ mod tests {
         }
     }
 
-    /// dcrd `addSBSSViolations` (`utxoviewpoint.go:613-631`): for a
+    /// dcrd `addSBSSViolations` (`utxoviewpoint.go:616-634`): for a
     /// block at a height with a violation, output 0 of the regular
     /// transaction it names is added, at the block's height and the
     /// transaction's index; nothing else, and nothing for any other
@@ -3026,7 +3026,7 @@ mod tests {
     }
 
     /// dcrd `connectBlock` adds the grandfathered output before the
-    /// fetch (`utxoviewpoint.go:947-957`), so the ticket finds the
+    /// fetch (`utxoviewpoint.go:951-961`), so the ticket finds the
     /// output it spends.  The regular tree, connected after the stake
     /// tree, then adds the output back unspent, which is what the
     /// historical chain holds.  Without the lookup the ticket's input
@@ -3088,7 +3088,7 @@ mod tests {
 
     /// dcrd `disconnectBlock` marks the grandfathered output spent once
     /// both trees are disconnected (`removeSBSSViolations`,
-    /// `utxoviewpoint.go:1051`): the stake tree's disconnect restores it
+    /// `utxoviewpoint.go:1055`): the stake tree's disconnect restores it
     /// as the ticket's input, and without the lookup it is left unspent
     /// in a view of the parent, where it never existed.
     #[test]
@@ -3146,7 +3146,7 @@ mod tests {
     }
 
     /// dcrd panics when the grandfathered output is missing from the
-    /// view after the disconnect (`utxoviewpoint.go:994-999`), with
+    /// view after the disconnect (`utxoviewpoint.go:998-1003`), with
     /// this text.
     #[test]
     fn a_grandfathered_output_missing_after_a_disconnect_panics() {
@@ -3265,7 +3265,7 @@ mod tests {
     /// dcrd decides eligibility once per creating transaction, before
     /// any of its outputs is added to the view, and keeps the answer
     /// for later spends of its other outputs
-    /// (`utxoviewpoint.go:1166-1177`): spends of A:0 and A:1 by two
+    /// (`utxoviewpoint.go:1170-1181`): spends of A:0 and A:1 by two
     /// later transactions are both zero-confirmation spends, although
     /// the first adds A:0 to the view before the second is looked at.
     #[test]
@@ -3288,7 +3288,7 @@ mod tests {
     }
 
     /// dcrd's `hasAnyRegularTxOut` looks at every output of the
-    /// creating transaction (`utxoviewpoint.go:1106-1118`).  A's output
+    /// creating transaction (`utxoviewpoint.go:1110-1122`).  A's output
     /// 0 is provably unspendable, so no view holds it; a view that holds
     /// A:1 before the fetch, as the undo of a disapproved parent that
     /// confirmed A leaves it, makes the spend of A:1 later in the block
@@ -3417,7 +3417,7 @@ mod tests {
     /// the regular tree of `checkTransactionsAndConnect` clear it
     /// (`utxoviewpoint.go:396`, `:562`, `validate.go:4092-4094`), the
     /// stake tree's leave it, and a copy of the view does not carry it
-    /// (`utxoviewpoint.go:1287-1300`).
+    /// (`utxoviewpoint.go:1291-1304`).
     #[test]
     fn the_zero_conf_set_lasts_from_the_fetch_to_its_regular_tree() {
         let (block, a_hash) = zero_conf_block(&[0]);
@@ -3493,8 +3493,8 @@ mod tests {
     }
 
     /// dcrd adds the grandfathered output before the fetch, so it is in
-    /// the view when eligibility is decided (`utxoviewpoint.go:1235-1239`,
-    /// `:947-957`): a later regular transaction's spend of another
+    /// the view when eligibility is decided (`utxoviewpoint.go:1239-1243`,
+    /// `:951-961`): a later regular transaction's spend of another
     /// output of the listed transaction is then not a zero-confirmation
     /// spend.
     #[test]
@@ -3741,7 +3741,7 @@ mod tests {
         })
     }
 
-    /// dcrd `assertBlockUtxoView` (`utxoviewpoint.go:633-917`, since
+    /// dcrd `assertBlockUtxoView` (`utxoviewpoint.go:636-920`, since
     /// `22fd2431`): the view a block leaves once connected holds, and
     /// each family of its checks panics with dcrd's text when the view,
     /// or the block, is changed in the one way that check catches.
@@ -4123,8 +4123,8 @@ mod tests {
     /// dcrd `assertBlockUtxoView` under the treasury agenda: a
     /// treasurybase's outputs never enter the view and are not checked,
     /// a treasury spend's first input is a null outpoint, and a treasury
-    /// add's output 0 is not a utxo (`utxoviewpoint.go:705-707`,
-    /// `:804-806`, `:817-818`).  The view a block with all three leaves
+    /// add's output 0 is not a utxo (`utxoviewpoint.go:708-710`,
+    /// `:807-809`, `:820-821`).  The view a block with all three leaves
     /// holds; the treasurybase is skipped only with the agenda active,
     /// and the other parts of those transactions are checked as any
     /// other transaction's.
@@ -4225,7 +4225,7 @@ mod tests {
 
     /// Which of a block's outputs must be spent follows dcrd's map of
     /// the regular tree's spends, which the last spender of an output
-    /// writes (`utxoviewpoint.go:648-674`, `:831-839`): an output of the
+    /// writes (`utxoviewpoint.go:651-677`, `:834-842`): an output of the
     /// regular tree is spent when that spender comes after its creator,
     /// and an output of the stake tree never is.  Validation refuses
     /// every block below before its view is built, so the views are laid
@@ -4341,7 +4341,7 @@ mod tests {
     /// lookup and fails without it, as dcrd's comment says the
     /// assertion would have caught those spends.  The exception covers
     /// output 0 of the regular transaction the lookup names, spent from
-    /// the stake tree, and nothing else (`utxoviewpoint.go:738-740`).
+    /// the stake tree, and nothing else (`utxoviewpoint.go:741-743`).
     #[test]
     fn the_grandfathered_spend_is_the_assertions_one_exception() {
         let (block, origin_hash) = sbss_block();

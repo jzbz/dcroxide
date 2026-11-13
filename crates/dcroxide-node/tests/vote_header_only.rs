@@ -5,7 +5,7 @@
 //! dcrd master checks that the block a vote votes on is known at the
 //! height the vote claims (`6816d9de`, `checkVoteBlock`), from the block
 //! index, where a block known only by its header has a node too
-//! (`internal/blockchain/chain.go:1666-1673`).  After the scripts it asks
+//! (`internal/blockchain/chain.go:1676-1683`).  After the scripts it asks
 //! for the block's winning tickets (`023c42ff`, `checkVoteTicket`), from
 //! `LotteryDataForBlock`, whose stake node needs the block's ticket data
 //! (`stakenode.go:63-84`).  So between a block's header and its data, a

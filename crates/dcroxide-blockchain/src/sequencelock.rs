@@ -71,8 +71,8 @@ impl<V: VoteChainView> VersionChainView for AsVersionView<'_, V> {
 /// been spent" is in its error text alone), and the block path relies
 /// on that: `check_connect_block` computes each tree's locks after
 /// that tree has been connected, when every input it looks up is
-/// already spent in the view (`validate.go:4467` before `:4498`, and
-/// `:4533` before `:4547`).
+/// already spent in the view (`validate.go:4472` before `:4503`, and
+/// `:4538` before `:4552`).
 ///
 /// This calculates the sequence lock regardless of the state of the
 /// agenda which conditionally activates it — `is_active` conveys that

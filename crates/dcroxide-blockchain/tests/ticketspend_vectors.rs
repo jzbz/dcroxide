@@ -13,7 +13,7 @@
 //!   input points at the tip block's revocation output instead.  These
 //!   run at the tip height plus one, the height the mempool uses for
 //!   the next block.
-//! - `TestAutoRevocations` through `b5` (`validate_test.go:1946`, with
+//! - `TestAutoRevocations` through `b5` (`validate_test.go:2006`, with
 //!   `855dc8be`'s new `b4`): blocks under `quickVoteActivationParams`
 //!   (`validate_test.go:239`) with the automatic revocations deployment
 //!   always open for voting.  `b4` carries a version 2 revocation whose

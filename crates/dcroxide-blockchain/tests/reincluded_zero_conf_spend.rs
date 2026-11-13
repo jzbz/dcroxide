@@ -12,7 +12,7 @@
 //! exist in the view alone, which is only guaranteed for outputs the
 //! creating transaction newly creates, so an output is eligible only
 //! when the view holds none of its transaction's regular outputs at
-//! that moment (`utxoviewpoint.go:1161-1183`).  The undo of the
+//! that moment (`utxoviewpoint.go:1165-1187`).  The undo of the
 //! disapproved parent runs first and puts every output of the parent's
 //! transactions in the view (`utxoviewpoint.go:444-503`), so the
 //! reincluded transaction is not eligible, the spend is an ordinary

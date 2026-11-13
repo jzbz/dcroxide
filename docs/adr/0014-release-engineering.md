@@ -53,13 +53,13 @@ arm64, not checked here) and `windows-latest` (`ci.yml:81-103`). The
 fault-injection tests in that run are Linux-only, so they run on the two
 Linux legs (`:26-35`). Everything else runs on x86_64 Linux only: rustfmt
 and clippy, the suites with overflow checks off as the release profile
-computes (`:105-135`), the live dcrd interop test (`:232-286`), the no_std
+computes (`:105-135`), the live dcrd interop test (`:232-287`), the no_std
 check, docs, deny and fuzzing. No job builds the workspace's `release` or
 `dist` profile on any target, so the configuration that ships (thin LTO,
 `codegen-units = 1`, `panic = "abort"`) has never been compiled in CI.
 Every timed sync ran on x86_64 machines (m1 to m3,
 `docs/bench-ledger.md:28-30`), none on Windows or macOS
-(`README.md:745-746`), and none on aarch64 of any OS. Ecosystem acceptance
+(`README.md:751-752`), and none on aarch64 of any OS. Ecosystem acceptance
 has been run once, on x86_64 Linux, without Decrediton's IPC lifecycle or
 config, IPC and service parity on Windows and macOS (the brief's status
 block), so the exit criterion that Decrediton launches, supervises and
@@ -215,7 +215,7 @@ signing, Apple's or Windows', is not decided here.
 - **Not decided here:** whether the release workflow uses only GitHub-owned
   actions, each pinned to a full commit SHA, and restores no cache, where
   `ci.yml` pins by tag and uses third-party actions (`ci.yml:54`, `:75`,
-  `:320`, `:344`); and where the two fingerprints, the SSH key's for tags
+  `:319`, `:343`); and where the two fingerprints, the SSH key's for tags
   and the OpenPGP key's for `SHA256SUMS`, are published with the
   verification steps, `SECURITY.md` and the README being candidates.
 
@@ -343,10 +343,10 @@ recorded divergence in PARITY.md.
   distribution whose packaged rustc lags the pin cannot build the node
   with it.
 - Each promotion needs a sync timed on that architecture and OS, and none
-  has been timed on aarch64, Windows or macOS (`README.md:745-746`,
+  has been timed on aarch64, Windows or macOS (`README.md:751-752`,
   `docs/bench-ledger.md:28-30`): it needs such a machine, or a CI runner
   with room for a mainnet data directory, a median of 27.93 GiB after the
-  syncs of 2026-10-17 (`README.md:757-759`). Runner disk sizes were not
+  syncs of 2026-10-17 (`README.md:763-765`). Runner disk sizes were not
   checked.
 - Each release costs an LTO build per target off GitHub and two signatures
   by hand, and checking both the tag and the binaries takes two keys.

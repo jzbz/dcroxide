@@ -38,7 +38,7 @@ commits over master ending at `43beedc`, then stage 2a's two (below): ECDSA
 verification and signing, every key and compact recovery run on `k256`
 0.14.0 by dcrd's algorithms, and `secp256k1-sys` is out of the build, which
 the `cc` and `secp256k1-sys` bans (`deny.toml:81-82`) and the job that
-builds with no C compiler (`.github/workflows/ci.yml:384`) now hold. Master
+builds with no C compiler (`.github/workflows/ci.yml:383`) now hold. Master
 (`0c4154d`) still runs libsecp256k1 for ECDSA and keys.
 
 ### The gates, 2026-11-07
@@ -517,7 +517,7 @@ which is the decision point:
      whatever `secp256k1-sys` version then builds;
    - reverses policy: lifts the `secp256k1-sys` ban and lists it among
      `cc`'s wrappers (`deny.toml:81-82`), removes or narrows the job that
-     builds with no C compiler (`.github/workflows/ci.yml:384`), amends
+     builds with no C compiler (`.github/workflows/ci.yml:383`), amends
      ADR-0012's "No C or C++" (`0012-pure-rust.md:128-131`) for ECDSA, adds
      an addendum here, and changes back the dependency ledger, README,
      PARITY.md, SECURITY.md and dcrec's "compiles no C";

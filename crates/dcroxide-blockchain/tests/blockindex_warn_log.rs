@@ -9,7 +9,7 @@
 //! log.Warnf("Unable to flush block index changes to db: %v", err)
 //! ```
 //!
-//! (`internal/blockchain/chain.go:1509-1513`). The port kept the
+//! (`internal/blockchain/chain.go:1519-1523`). The port kept the
 //! control flow and dropped the line, so an operator invalidating a
 //! block against a failing store was told the call succeeded, restarted
 //! into missing index rows, and had nothing naming the flush.
@@ -17,7 +17,7 @@
 //! Two tests, bracketing the behaviour from both sides: the failure
 //! warns, and an empty modified set stays silent. The second is not
 //! decoration. dcrd's `blockIndex.Flush` returns before it opens a
-//! transaction when nothing is modified (`blockindex.go:1409-1414`);
+//! transaction when nothing is modified (`blockindex.go:1418-1423`);
 //! this port's flush did not, and `Database::update` fails at
 //! `check_open` even with zero rows, so without that short-circuit the
 //! new line would fire where dcrd cannot — including on

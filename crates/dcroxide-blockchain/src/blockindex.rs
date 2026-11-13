@@ -871,7 +871,7 @@ impl BlockIndex {
     /// from it, from the best chain candidates, leaving every status as
     /// it is.  These are the candidates
     /// [`Self::mark_block_failed_validation`] removes (dcrd
-    /// `MarkBlockFailedValidation`, `blockindex.go:1115-1209`); dcrd has
+    /// `MarkBlockFailedValidation`, `blockindex.go:1124-1218`); dcrd has
     /// no form that removes them without marking the blocks.
     pub fn remove_best_chain_candidates_from(&mut self, store: &NodeStore, node: NodeId) {
         self.best_chain_candidates
@@ -974,7 +974,7 @@ impl BlockIndex {
     /// The engine's block index flush reads this to skip the database
     /// write entirely when nothing is modified, as dcrd's
     /// `blockIndex.Flush` returns early on an empty set
-    /// (`blockindex.go:1409-1414`).
+    /// (`blockindex.go:1418-1423`).
     pub fn modified_len(&self) -> usize {
         self.modified.len()
     }

@@ -453,7 +453,7 @@ Entry format:
 
 - **Where:** dcrd `internal/blockchain/process.go:356-386`
   (`maybeAcceptBlocks`), `validate.go:2110-2114` (`checkBlockContext`'s
-  cache short circuit) and `chain.go:1208-1219` (the reorganization attach
+  cache short circuit) and `chain.go:1218-1229` (the reorganization attach
   loop) / dcroxide-blockchain `process.rs` `maybe_accept_blocks`,
   `reorganize_chain_internal`, `recent_context_checks` (an `LruHashSet`)
 - **What:** `ProcessBlock` sets `BFFastAdd` when the processed block is an
@@ -481,7 +481,7 @@ Entry format:
 
 - **Where:** dcrd `internal/blockchain/chainio.go:1494-1502`
   (`loadBlockIndex`) and `:1779-1796` (`initChainState`),
-  `blockindex.go:733-751` (`addNodeFromDB`) and `:1411` (`Flush`) /
+  `blockindex.go:742-760` (`addNodeFromDB`) and `:1420` (`Flush`) /
   dcroxide-blockchain `process.rs` `load_chain_state`,
   `Chain::open_with_config`
 - **What:** when new consensus rules are detected, `loadBlockIndex` clears

@@ -123,7 +123,7 @@ pub trait PoolChain {
     /// `Config.HeaderByHash`).
     ///
     /// dcrd's real lookup answers from the block index and fails only
-    /// with `ErrUnknownBlock` (`internal/blockchain/chain.go:1666-1673`),
+    /// with `ErrUnknownBlock` (`internal/blockchain/chain.go:1676-1683`),
     /// so `None` is that failure; the pool has no other one to tell apart.
     fn header_by_hash(&self, hash: &Hash) -> Option<BlockHeader>;
     /// The median time of the current chain tip as unix seconds (dcrd

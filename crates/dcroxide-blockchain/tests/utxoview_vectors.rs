@@ -33,15 +33,16 @@
 //!    The step fetches before it connects, as dcrd's `connectBlock`
 //!    does; without the fetch nothing is eligible.
 //! 2. `block`: the undo of P fetches P's inputs first
-//!    (`disconnectDisapprovedBlock`, `:598`), and the view still holds
-//!    A:0 and A:1 from step 1, so A is not eligible and the undo leaves
-//!    A:1 spent without the mark: `afterconnect` A:1 goes from 7 to 3.
+//!    (`disconnectDisapprovedBlock`, `utxoviewpoint.go:601`), and the
+//!    view still holds A:0 and A:1 from step 1, so A is not eligible
+//!    and the undo leaves A:1 spent without the mark: `afterconnect`
+//!    A:1 goes from 7 to 3.
 //!    N's own fetch finds no output of C, so C:0 is eligible and D's
 //!    spend marks it: `afterconnect` C:0 stays at 7.
 //! 3. The disconnect of N fetches N's inputs (`disconnectBlock`,
-//!    `:1035`) while the view holds C:0, so C is not eligible:
+//!    `:1039`) while the view holds C:0, so C is not eligible:
 //!    `afterdisconnect` C:0 goes from 7 to 3.  The redo of P fetches
-//!    P's inputs (`:1059`) while the view holds A's outputs again, so
+//!    P's inputs (`:1063`) while the view holds A's outputs again, so
 //!    B's spend is not marked: `afterdisconnect` A:1 goes from 7 to 3.
 //!
 //! Every other row, the journals and the best hashes are unchanged.

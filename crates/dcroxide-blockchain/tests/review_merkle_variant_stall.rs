@@ -12,13 +12,13 @@
 //! candidate.  The contextual merkle check then rejects it with
 //! `ErrBadMerkleRoot` (`validate.go:2063-2078`, `:2134-2142`), which
 //! `maybeAcceptBlocks` and `reorganizeChainInternal` do not mark
-//! (`process.go:367-374`, `chain.go:1209-1215`): data that matches a
+//! (`process.go:367-374`, `chain.go:1219-1225`): data that matches a
 //! header only under the variant not in force does not show the header
 //! invalid.
 //!
 //! dcrd then keeps the block as a candidate.  While it, or a branch on
 //! it, is the best candidate, `reorganizeChain` is handed it again after
-//! the failed attempt and stops (`chain.go:1338-1341`), so the genuine
+//! the failed attempt and stops (`chain.go:1348-1351`), so the genuine
 //! block, which ties on work and lost on received order, is rejected
 //! with the copy's error, and the tip stays at the fork point until a
 //! branch with strictly more work arrives.  The port takes the block,
@@ -364,7 +364,7 @@ fn reconsidering_the_copy_does_not_stall_the_chain() {
 }
 
 /// Neither place dcrd exempts a contextual `ErrBadMerkleRoot` from
-/// marking (`process.go:367-374`, `chain.go:1209-1215`) marks the block,
+/// marking (`process.go:367-374`, `chain.go:1219-1225`) marks the block,
 /// or its descendants.  A copy of the tip, `bm2`, ties with it on work
 /// and loses on received order, so its processing reaches only the
 /// check made as it is accepted: one error.  A block on the copy has
@@ -464,7 +464,7 @@ fn chain_after_the_fallbacks(
 }
 
 /// dcrd's candidates always hold at least the current tip, which
-/// `RemoveLessWorkCandidates` asserts (`blockindex.go:1279-1284`).  The
+/// `RemoveLessWorkCandidates` asserts (`blockindex.go:1288-1293`).  The
 /// fallbacks above took every candidate, and the tip, `s6`, never was
 /// one; a forced reorganization to its sibling `a6` then connected a
 /// block with no candidate left and panicked on that assertion.  The tip
@@ -492,7 +492,7 @@ fn the_tip_stays_a_candidate_when_the_fallbacks_drop_every_other() {
 
 /// With no candidate left, a sibling of the tip with equal work, received
 /// after it, became the only candidate and replaced it, where a tie goes
-/// to the block received first (`blockindex.go:469-473`).  With the tip a
+/// to the block received first (`blockindex.go:478-482`).  With the tip a
 /// candidate again it keeps the tie.
 #[test]
 fn a_later_sibling_of_equal_work_does_not_replace_the_tip_after_the_fallbacks() {

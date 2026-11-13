@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: ISC
 //! The reorganization asserts the view of every block it attaches
-//! before it connects the block (dcrd `chain.go:1236-1238`, since
+//! before it connects the block (dcrd `chain.go:1246-1248`, since
 //! `22fd2431`), on the branch that skips validation for a block already
 //! marked validated as on the one that validates it.  dcrd's message
 //! gives the reason these are assertions rather than errors: there is no

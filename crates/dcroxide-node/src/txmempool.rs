@@ -102,7 +102,7 @@ pub(crate) fn chain_fetch_utxo_view(
         // Disconnect the disapproved regular tree of the tip block
         // (dcrd `disconnectDisapprovedBlock`) only once per tip, and
         // afterwards clone the cached result so the caller can mutate
-        // its copy (dcrd `FetchUtxoView`, `utxoviewpoint.go:1342-1369`).
+        // its copy (dcrd `FetchUtxoView`, `utxoviewpoint.go:1340-1372`).
         // A failed build leaves the cache as it was, as dcrd's early
         // returns do.
         let mut cached = disapproved.0.lock().expect("disapproved view poisoned");
@@ -792,7 +792,7 @@ mod tests {
 
     /// dcrd `FetchUtxoView` disconnects the tip's regular tree once per
     /// tip and afterwards clones the cached `disapprovedView`
-    /// (`utxoviewpoint.go:1342-1369`).  An entry planted in the memo
+    /// (`utxoviewpoint.go:1340-1372`).  An entry planted in the memo
     /// comes back from the next disapproved fetch -- so that fetch was
     /// served from the memo, not rebuilt -- while a fetch that includes
     /// the regular tree never reads it and a new tip rebuilds it.

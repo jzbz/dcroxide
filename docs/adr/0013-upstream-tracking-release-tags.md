@@ -30,19 +30,19 @@ dcrd tag" (§12's definition of done).
 carrying 294, 19, 19, 3, 31, 39 and 1 upstream commits, each move landing
 within six days of the upstream commit it pinned. Since the `036b7090`
 move each one has a PARITY.md section, titled by its commit range, that
-ports or accounts for every upstream commit in it (`docs/PARITY.md:134`,
-`:165`, `:394`, `:805`, `:832`), starting from `tools/pinbump`'s review
+ports or accounts for every upstream commit in it (`docs/PARITY.md:228`,
+`:259`, `:488`, `:899`, `:926`), starting from `tools/pinbump`'s review
 list (`tools/pinbump/main.go:3-31`). On 2026-10-25 the project owner made
 dcrd v2.2 the target: upstream has not released it, so the pin follows
 master until v2.2 is tagged, moving at upstream milestones and on the
 project owner's word (`docs/PARITY.md:5-7`; ADR-0001's addendum of that
 date). That cadence covers only the time until the tag. `3360ae4d` was
 master's head on 2026-10-25, with no `release-v2.2` branch
-(`docs/PARITY.md:136-137`) and no `release-v2.2` tag.
+(`docs/PARITY.md:230-231`) and no `release-v2.2` tag.
 
 **What the master pin cost.** A move shifts citations even when it changes
 little: the one-commit `3360ae4d` move moved 62 undated citations of
-`rpcserver.go` four lines (`docs/PARITY.md:159-163`). And the reference an
+`rpcserver.go` four lines (`docs/PARITY.md:253-257`). And the reference an
 operator runs is a release. The acceptance run of 2026-10-23 used the dcrd
 2.1.7 release binaries, and every reply that differed followed dcrd
 master's source at the pin of the day, came from a part not yet ported,
@@ -51,7 +51,7 @@ or matched a second dcrd in the same role
 PARITY.md keep master's behaviour where 2.1.7 differs: `addnode` and
 `node`, protocol version 12 against 11 and `debuglevel`'s subsystems in
 one, and the retry backoff for an unreachable `--connect` peer in the
-other (`docs/PARITY.md:2309-2364`).
+other (`docs/PARITY.md:2404-2459`).
 
 **How dcrd releases**, read from its repository as fetched on 2026-10-25:
 
@@ -79,7 +79,7 @@ other (`docs/PARITY.md:2309-2364`).
   shipped the same-block stake-spend rule without master's testnet3
   exception (`9b7ab54a`, 2026-08-19), which the release line took in
   v2.1.7 (`059742a9`, 2026-10-13); the port took both together
-  (`docs/PARITY.md:836-839`).
+  (`docs/PARITY.md:930-933`).
 - A tag drops the replace block. dcrd's `go.mod` has no `replace` at
   `release-v2.0.0`, `release-v2.1.0` or `release-v2.1.7`, against 28
   replace lines at master `3360ae4d`, and neither carries a `go.work`. A
@@ -127,7 +127,7 @@ things built for a master pin, whatever rule follows it:
 2. **Triggers.**
    - Each point release is pinned, at the project owner's timing.
    - A release that changes consensus, or one dcrd calls mandatory, is
-     pinned promptly. v2.1.6 was such a release (`docs/PARITY.md:839-840`).
+     pinned promptly. v2.1.6 was such a release (`docs/PARITY.md:933-934`).
 3. **Master is read ahead, not ported.** At each point release, or on the
    project owner's word, `tools/pinbump` runs from the pin to dcrd master's
    head, and the master commits in that range that touch consensus or
@@ -212,7 +212,7 @@ v2.2.0 and on each part below, which lands with that move or before it.
   `release-v2.1.7`) set to the bare `X.Y.Z`, so that `init` stamps the
   revision as it does on master. `DCRD_COMMIT` becomes the tag's commit
   (`.github/workflows/ci.yml:246`), and the comment that a release "is a
-  different specification" (`:270-273`) changes with it.
+  different specification" (`:271-274`) changes with it.
 - **ADR-0001's original rule for the oracle and `fullblockgen`.** Every
   dcrd module in `tools/oracle/go.mod` and `tools/fullblockgen/go.mod`
   sits at exactly the version the tag's `go.mod` requires, as ADR-0001's
@@ -300,9 +300,9 @@ not PARITY.md's range sections, which record what the port claims.
   that a newer one supersedes before its move lands is pinned on the way
   or skipped; whether a scheduled CI job runs `tools/pinbump` against
   dcrd's newest tag and master (CI already clones dcrd for the interop
-  job, `.github/workflows/ci.yml:277`, and its scheduled jobs are the
-  nightly fuzz and the nightly signature soak, `:7-10`, `:680-683`,
-  `:827-829`); and the harness and build-metadata choices above.
+  job, `.github/workflows/ci.yml:278`, and its scheduled jobs are the
+  nightly fuzz and the nightly signature soak, `:7-10`, `:679-682`,
+  `:826-828`); and the harness and build-metadata choices above.
 
 ## Alternatives
 

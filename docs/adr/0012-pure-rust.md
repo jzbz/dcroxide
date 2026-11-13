@@ -151,7 +151,7 @@ The approvals do not spell out five points, and this record reads them so:
 - **The targets the project builds for** are, on 2026-10-26, those of
   CI's test matrix, x86_64 and aarch64 Linux, macOS and Windows
   (`.github/workflows/ci.yml:92`), and the no-OS target of its no_std
-  check (`:376-381`). [ADR-0014](0014-release-engineering.md) decides
+  check (`:375-380`). [ADR-0014](0014-release-engineering.md) decides
   which of them get binaries.
 - **"What `cargo test` builds"** includes anything a test compiles while
   it runs, which reaches the shim and the oracle, though cargo itself
@@ -191,7 +191,7 @@ C that cgo links into the oracle included:
   the exception as covering, with the oracle, the Go generators under
   `tools/` that regenerate vector files from dcrd's own code (ADR-0001's
   addenda from 2026-10-02 on), and dcrd itself, which the interop job
-  builds and runs (`.github/workflows/ci.yml:232-286`).
+  builds and runs (`.github/workflows/ci.yml:232-287`).
 - **cargo-fuzz's libFuzzer**, which has no pure-Rust drop-in. `fuzz/` is
   outside the workspace (the root `Cargo.toml:40`) with its own lock, and
   `libfuzzer-sys` 0.4.13 (`fuzz/Cargo.lock:1106-1107`) compiles
@@ -206,7 +206,7 @@ either: the third set answered that the rule already decides it.
 The rule as the second set defines it names C, C++ and assembly. This
 record reads it as not reaching tools in other languages that never ship:
 the Go tools `tools/pinbump` and `tools/dcrdstat`, which CI vets and tests
-beside the oracle (`ci.yml:309-313`), and the Python instruments
+beside the oracle (`ci.yml:308-312`), and the Python instruments
 `tools/dsample/dsample.py` and `tools/powerloss/replay.py`, the second run
 by the two power-cut tests. They are neither exceptions nor breaches. The
 shim beside `replay.py` is C, and the second set settles it (T9, below).
@@ -308,7 +308,7 @@ Two checks, neither written yet (the first set's 1b):
   `multiple-versions = "deny"` and three `[[bans.skip]]` entries
   (`deny.toml:23-52` at `8e6ea23`). It gains a `deny` list refusing the
   crates that compile or link C. cargo-deny 0.20.2, the version read here
-  (CI's action names none, `ci.yml:320`), matches a banned crate by its
+  (CI's action names none, `ci.yml:319`), matches a banned crate by its
   name and a version requirement, with no patterns (`src/lib.rs:482-484`),
   so the `-sys` crates that build C are refused through the means they
   build it with: `cc`; the other native build drivers, `cmake`,

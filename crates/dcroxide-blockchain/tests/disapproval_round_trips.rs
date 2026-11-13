@@ -14,7 +14,7 @@
 //! the block that disapproves it.  Since `2115b56b` a spend inside a
 //! block bypasses the cache only when the view holds none of its
 //! creating transaction's regular outputs when the block's inputs are
-//! fetched (`utxoviewpoint.go:1161-1183`), so the spend of a reincluded
+//! fetched (`utxoviewpoint.go:1165-1187`), so the spend of a reincluded
 //! transaction's output goes through the cache like any other.  The
 //! last two reach a commit that adds a reincluded output again; after a
 //! restart, or once flushes have evicted the output's entry, the cache
@@ -61,7 +61,7 @@
 //! - The same on the disconnect side: N reincludes T1 and is flushed, a
 //!   crash loses the cache, and a branch approving P outgrows N and
 //!   spends T1:0.  Detaching N builds T1's outputs from N's copy of T1,
-//!   and the redo of P adds them again (`utxoviewpoint.go:1064`).  The
+//!   and the redo of P adds them again (`utxoviewpoint.go:1068`).  The
 //!   forced flush after every detach writes them before anything can
 //!   spend them, so the scenario turns the flushes off, as dcrd's tests
 //!   do with `disableFlush`, to reach the spend before a flush.

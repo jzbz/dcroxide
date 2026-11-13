@@ -185,13 +185,13 @@ fn template_vectors() {
 /// rejection checkpoint and block index (`validate.go:1298-1312`), so
 /// the check is live for `checkBlockPositional`'s only consumer,
 /// `CheckConnectBlockTemplate` (`checkBlockPositional` at
-/// `validate.go:1391-1412`, called at `:4682`). The port passed a
+/// `validate.go:1391-1412`, called at `:4687`). The port passed a
 /// literal `None` instead, which made the rule structurally unreachable
 /// for the one path that can trigger it.
 ///
 /// The state is built rather than replayed because `Chain::new` sets
 /// `allow_old_forks` whenever the network's `assume_valid` is zero, as
-/// simnet's is (dcrd `New`, `chain.go:2200`), so the checkpoint is never
+/// simnet's is (dcrd `New`, `chain.go:2210`), so the checkpoint is never
 /// discovered on simnet.
 #[test]
 fn a_template_forking_before_the_checkpoint_is_rejected() {
