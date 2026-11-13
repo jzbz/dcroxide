@@ -617,6 +617,11 @@ work). Currently implemented:
   dcrd's own `internal/blockchain` package and dumps the chains
   `tests/disapproval_vectors.rs` replays (Go sources overlaid on a dcrd
   checkout by `run.sh`)
+- `tools/trsyboundarygen` — plays chains that cross the treasury
+  agenda's activation boundary with a block that disapproves its parent
+  inside dcrd's own `internal/blockchain` package, and dumps what dcrd's
+  chain did with them (Go sources overlaid on a dcrd checkout by
+  `run.sh`)
 - `tools/profilergen` — the generator of `profiler_vectors.txt`, run as
   a test inside a dcrd checkout's package main through
   `go test -overlay`, so every row is what dcrd's own
@@ -781,6 +786,8 @@ and 24.18 GiB under dcrd, 17.88 GiB of it block files in each
   reorganization vector generator (Go, overlay sources)
 - `tools/disapprovalgen/` — the disapproval scenario vector generator
   (Go, overlay sources)
+- `tools/trsyboundarygen/` — the treasury agenda boundary vector
+  generator (Go, overlay sources)
 - `tools/profilergen/` — the profile server vector generator, an overlay
   test for dcrd's package main (Go + sh)
 - `fuzz/` — `cargo-fuzz` targets (nightly toolchain)
