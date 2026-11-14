@@ -30,6 +30,10 @@
 //! Go's client-certificate set (ADR-0015, T4; `GO_DIFFERS` says where
 //! PARITY.md records them).  Wycheproof's cases, which the corpus
 //! holds too, are held to Go case by case in the crate's unit tests.
+//! ML-DSA's three algorithms, which ring never had and the corpus does not
+//! hold, give Go's verdict on Go's own signatures and the crate's, and on
+//! signatures mutated in each field FIPS 204's decoding checks, under each
+//! set's x509 name and TLS scheme.
 //!
 //! Without an oracle the tests skip, unless `DCROXIDE_REQUIRE_ORACLE` is
 //! set, as in CI, where they also require the reference Go.
@@ -897,4 +901,403 @@ fn signatures_verify_as_go_verifies_them() {
     // Every generated case but those of the three algorithms the mapping
     // does not list, PKCS#1 v1.5 under the identifiers without NULL.
     assert_eq!(handshakes, 929, "handshake verdicts asked of Go");
+}
+
+/// An ML-DSA parameter set as these tests take it: the provider's
+/// algorithm and scheme, Go's x509 and TLS names, the last byte of its
+/// OID, and the layout of its signatures (FIPS 204, table 2): c̃'s bytes,
+/// the bits of each of z's coefficients, β = τη, and the hint's ω and k.
+struct MlDsaSet {
+    algorithm: &'static dyn rustls::pki_types::SignatureVerificationAlgorithm,
+    scheme: rustls::SignatureScheme,
+    x509: &'static str,
+    tls: &'static str,
+    oid: u8,
+    c_tilde: usize,
+    z_bits: usize,
+    beta: u32,
+    omega: usize,
+    k: usize,
+}
+
+/// The three sets.
+fn ml_dsa_sets() -> [MlDsaSet; 3] {
+    use dcroxide_tlscrypto::verify;
+    use rustls::SignatureScheme as S;
+    [
+        MlDsaSet {
+            algorithm: verify::ML_DSA_44,
+            scheme: S::ML_DSA_44,
+            x509: "ML-DSA-44",
+            tls: "MLDSA44",
+            oid: 0x11,
+            c_tilde: 32,
+            z_bits: 18,
+            beta: 78,
+            omega: 80,
+            k: 4,
+        },
+        MlDsaSet {
+            algorithm: verify::ML_DSA_65,
+            scheme: S::ML_DSA_65,
+            x509: "ML-DSA-65",
+            tls: "MLDSA65",
+            oid: 0x12,
+            c_tilde: 48,
+            z_bits: 20,
+            beta: 196,
+            omega: 55,
+            k: 6,
+        },
+        MlDsaSet {
+            algorithm: verify::ML_DSA_87,
+            scheme: S::ML_DSA_87,
+            x509: "ML-DSA-87",
+            tls: "MLDSA87",
+            oid: 0x13,
+            c_tilde: 64,
+            z_bits: 20,
+            beta: 120,
+            omega: 75,
+            k: 8,
+        },
+    ]
+}
+
+impl MlDsaSet {
+    /// The set's AlgorithmIdentifier, its OID alone.
+    fn algorithm_identifier(&self) -> Vec<u8> {
+        key_corpus::seq(&[&key_corpus::tlv(
+            0x06,
+            &[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x03, self.oid],
+        )])
+    }
+
+    /// The PKCS#8 seed form of the key from `seed`, as Go writes it.
+    fn pkcs8(&self, seed: &[u8; 32]) -> Vec<u8> {
+        key_corpus::seq(&[
+            &key_corpus::tlv(0x02, &[0]),
+            &self.algorithm_identifier(),
+            &key_corpus::tlv(0x04, &[&[0x80, 0x20][..], seed].concat()),
+        ])
+    }
+
+    /// The SubjectPublicKeyInfo of the public key `key`.
+    fn spki(&self, key: &[u8]) -> Vec<u8> {
+        key_corpus::seq(&[
+            &self.algorithm_identifier(),
+            &key_corpus::tlv(0x03, &[&[0][..], key].concat()),
+        ])
+    }
+
+    /// The public key of the seed, and the crate's deterministic signature
+    /// of `message` with it, empty context.
+    fn crate_signed(&self, seed: &[u8; 32], message: &[u8]) -> (Vec<u8>, Vec<u8>) {
+        fn signed<P: ml_dsa::MlDsaParams>(seed: &[u8; 32], message: &[u8]) -> (Vec<u8>, Vec<u8>) {
+            let key = ml_dsa::ExpandedSigningKey::<P>::from_seed(&(*seed).into());
+            let signature = key.sign_deterministic(message, b"").expect("signed");
+            (
+                key.verifying_key().encode().to_vec(),
+                signature.encode().to_vec(),
+            )
+        }
+        match self.oid {
+            0x11 => signed::<ml_dsa::MlDsa44>(seed, message),
+            0x12 => signed::<ml_dsa::MlDsa65>(seed, message),
+            _ => signed::<ml_dsa::MlDsa87>(seed, message),
+        }
+    }
+
+    /// `signature` with z's first coefficient written as `encoded`, the
+    /// value `BitPack` stores for it, γ1 − z.
+    fn with_z0(&self, signature: &[u8], encoded: u32) -> Vec<u8> {
+        let mut out = signature.to_vec();
+        for bit in 0..self.z_bits {
+            let (byte, shift) = (self.c_tilde + bit / 8, bit % 8);
+            let value = ((encoded >> bit) & 1) as u8;
+            out[byte] = (out[byte] & !(1 << shift)) | (value << shift);
+        }
+        out
+    }
+
+    /// `signature` mutated in each place FIPS 204's `sigDecode` and the
+    /// verification check, each named: its length, c̃, z against the
+    /// bound γ1 − β on either side, and the hint's index order, its unused
+    /// indices and its cuts against ω.  Every one is a signature Go
+    /// refuses.
+    fn mutations(&self, signature: &[u8]) -> Vec<(&'static str, Vec<u8>)> {
+        let gamma1 = 1u32 << (self.z_bits - 1);
+        let len = signature.len();
+        let hints = len - self.omega - self.k;
+        let cuts: Vec<usize> = signature[hints + self.omega..]
+            .iter()
+            .map(|&cut| usize::from(cut))
+            .collect();
+        let last = cuts[self.k - 1];
+        let mut out = vec![
+            ("a byte long", [signature, &[0]].concat()),
+            ("a byte short", signature[..len - 1].to_vec()),
+            ("empty", Vec::new()),
+            ("a bit of c~", {
+                let mut s = signature.to_vec();
+                s[0] ^= 1;
+                s
+            }),
+            ("a bit of z", {
+                let mut s = signature.to_vec();
+                s[self.c_tilde + 5] ^= 0x10;
+                s
+            }),
+            ("z at the bound", self.with_z0(signature, self.beta)),
+            ("z under the bound", self.with_z0(signature, self.beta + 1)),
+            (
+                "z at the negative bound",
+                self.with_z0(signature, 2 * gamma1 - self.beta),
+            ),
+            (
+                "z under the negative bound",
+                self.with_z0(signature, 2 * gamma1 - self.beta - 1),
+            ),
+            ("a cut above omega", {
+                let mut s = signature.to_vec();
+                s[len - 1] = (self.omega + 1) as u8;
+                s
+            }),
+            ("no hints", {
+                let mut s = signature.to_vec();
+                s[hints..].fill(0);
+                s
+            }),
+        ];
+        if last < self.omega {
+            let mut s = signature.to_vec();
+            s[hints + self.omega - 1] = 1;
+            out.push(("an index past the hints", s));
+            let mut s = signature.to_vec();
+            s[len - 2] = (last + 1) as u8;
+            out.push(("cuts falling", s));
+        }
+        // The first polynomial with two hints or more.
+        let mut start = 0;
+        for &end in &cuts {
+            if end >= start + 2 {
+                let mut s = signature.to_vec();
+                s.swap(hints + start, hints + start + 1);
+                out.push(("hints out of order", s));
+                let mut s = signature.to_vec();
+                s[hints + start + 1] = s[hints + start];
+                out.push(("a repeated hint", s));
+                break;
+            }
+            start = end;
+        }
+        out
+    }
+}
+
+/// Go's verdict on an ML-DSA signature under `name`, an x509 algorithm when
+/// `x509`, else a TLS scheme, through the oracle's `sig_verify`.
+fn go_verifies_ml_dsa(
+    oracle: &mut Oracle,
+    spki: &[u8],
+    x509: bool,
+    name: &str,
+    message: &[u8],
+    signature: &[u8],
+) -> bool {
+    let field = if x509 { "x509_alg" } else { "tls_scheme" };
+    let request = serde_json::json!({
+        "spki": hex(spki),
+        field: name,
+        "message": hex(message),
+        "signature": hex(signature),
+    });
+    let response = oracle.call("sig_verify", request.to_string().as_bytes());
+    dcroxide_testutil::require_reference_go(response["go_version"].as_str().unwrap_or_default());
+    match response["result"].as_str() {
+        Some("ok") => true,
+        Some(refused) if refused.starts_with("refused: ") => false,
+        _ => panic!("{name}: the oracle answered {response}"),
+    }
+}
+
+/// Each ML-DSA algorithm gives Go's verdict, as Go checks a certificate's
+/// signature under the set's x509 name and as its `crypto/tls` checks a
+/// TLS 1.3 handshake signature under the set's scheme, which the provider's
+/// RPC set maps to the algorithm alone: on Go's signatures, made through
+/// the oracle's `sig_sign` with a key in PKCS#8 seed form, which verify
+/// under the key the crate derives from the same seed; on the crate's
+/// deterministic signatures; on each mutation of a signature in a field
+/// the decoding checks; on another set's signature and key; and on
+/// signatures of the set's length drawn at random.  The counts are pinned,
+/// so that cases gone wrong cannot pass on agreement alone.
+#[test]
+fn ml_dsa_verifies_as_go_verifies() {
+    let Some(mut oracle) = dcroxide_testutil::ml_dsa_oracle_or_skip() else {
+        return;
+    };
+    let sets = ml_dsa_sets();
+    let mut rng = SplitMix64(0x3d5a_2026_1113);
+    let (mut cases, mut taken) = (0, 0);
+    let mut seen: BTreeMap<&str, usize> = BTreeMap::new();
+    for (index, set) in sets.iter().enumerate() {
+        let mapped = dcroxide_tlscrypto::RPC_SIG_ALGS
+            .mapping
+            .iter()
+            .find(|(scheme, _)| *scheme == set.scheme)
+            .map(|(_, algorithms)| {
+                algorithms
+                    .iter()
+                    .map(|a| format!("{a:?}"))
+                    .collect::<Vec<_>>()
+            });
+        assert_eq!(
+            mapped,
+            Some(vec![format!("{:?}", set.algorithm)]),
+            "{}",
+            set.x509
+        );
+        let other = &sets[(index + 1) % 3];
+        for _ in 0..2 {
+            let mut seed = [0; 32];
+            rng.fill(&mut seed);
+            let pkcs8 = set.pkcs8(&seed);
+            let (key, _) = set.crate_signed(&seed, b"");
+            let spki = set.spki(&key);
+            let mut check = |oracle: &mut Oracle,
+                             algorithm: &dyn rustls::pki_types::SignatureVerificationAlgorithm,
+                             what: &str,
+                             key: &[u8],
+                             spki: &[u8],
+                             x509: &str,
+                             tls: &str,
+                             message: &[u8],
+                             signature: &[u8],
+                             expected: bool| {
+                let ours = algorithm.verify_signature(key, message, signature).is_ok();
+                for (is_x509, name) in [(true, x509), (false, tls)] {
+                    let go = go_verifies_ml_dsa(oracle, spki, is_x509, name, message, signature);
+                    assert_eq!(ours, go, "{}, {what}: Go's verdict under {name}", set.x509);
+                }
+                assert_eq!(ours, expected, "{}, {what}", set.x509);
+                cases += 1;
+                taken += usize::from(ours);
+            };
+            for len in [0, 1, 100, 1000] {
+                let mut message = vec![0; len];
+                rng.fill(&mut message);
+                for name in [set.x509, set.tls] {
+                    let field = if name == set.x509 {
+                        "x509_alg"
+                    } else {
+                        "scheme"
+                    };
+                    let request = serde_json::json!({
+                        "key_pkcs8": hex(&pkcs8),
+                        field: name,
+                        "message": hex(&message),
+                    });
+                    let response = oracle.call("sig_sign", request.to_string().as_bytes());
+                    dcroxide_testutil::require_reference_go(
+                        response["go_version"].as_str().unwrap_or_default(),
+                    );
+                    let go = unhex(
+                        response["result"]
+                            .as_str()
+                            .unwrap_or_else(|| panic!("the oracle answered {response}")),
+                    );
+                    check(
+                        &mut oracle,
+                        set.algorithm,
+                        "Go's signature",
+                        &key,
+                        &spki,
+                        set.x509,
+                        set.tls,
+                        &message,
+                        &go,
+                        true,
+                    );
+                }
+                let (_, ours) = set.crate_signed(&seed, &message);
+                check(
+                    &mut oracle,
+                    set.algorithm,
+                    "the crate's signature",
+                    &key,
+                    &spki,
+                    set.x509,
+                    set.tls,
+                    &message,
+                    &ours,
+                    true,
+                );
+            }
+            let message = b"a TLS 1.3 CertificateVerify's content";
+            let (_, signature) = set.crate_signed(&seed, message);
+            for (what, mutated) in set.mutations(&signature) {
+                *seen.entry(what).or_default() += 1;
+                check(
+                    &mut oracle,
+                    set.algorithm,
+                    what,
+                    &key,
+                    &spki,
+                    set.x509,
+                    set.tls,
+                    message,
+                    &mutated,
+                    false,
+                );
+            }
+            check(
+                &mut oracle,
+                set.algorithm,
+                "another message",
+                &key,
+                &spki,
+                set.x509,
+                set.tls,
+                b"another",
+                &signature,
+                false,
+            );
+            // The signature and its key under the next set's algorithm and
+            // names: refused by length here, and by Go as a set mismatch.
+            check(
+                &mut oracle,
+                other.algorithm,
+                "under another set's names",
+                &key,
+                &spki,
+                other.x509,
+                other.tls,
+                message,
+                &signature,
+                false,
+            );
+            for _ in 0..10 {
+                let mut random = vec![0; signature.len()];
+                rng.fill(&mut random);
+                check(
+                    &mut oracle,
+                    set.algorithm,
+                    "random bytes",
+                    &key,
+                    &spki,
+                    set.x509,
+                    set.tls,
+                    message,
+                    &random,
+                    false,
+                );
+            }
+        }
+    }
+    // Every mutation reached at least once a set, the hint ones included.
+    for (what, count) in &seen {
+        assert!(*count >= 3, "{what}: {count}");
+    }
+    assert_eq!(seen.len(), 15, "{seen:?}");
+    assert_eq!((cases, taken), (234, 72), "cases, and those taken");
 }

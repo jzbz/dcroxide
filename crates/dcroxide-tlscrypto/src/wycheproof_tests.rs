@@ -5,9 +5,9 @@
 //! and `open` every record goes through; HMAC as rustls asks for a tag;
 //! HKDF as rustls builds it on that HMAC; each key exchange group's
 //! `complete`, from the case's private key; and the verification
-//! algorithms of `SUPPORTED_SIG_ALGS`, on the key as a certificate's
-//! SubjectPublicKeyInfo carries it.  The files, their commit and their
-//! hashes are in `tests/data/wycheproof/SOURCE`.
+//! algorithms of `SUPPORTED_SIG_ALGS` and ML-DSA's three, on the key as a
+//! certificate's SubjectPublicKeyInfo carries it.  The files, their commit
+//! and their hashes are in `tests/data/wycheproof/SOURCE`.
 //!
 //! A unit-test module rather than an integration test, because the AEADs
 //! and a key exchange with a fixed private key are reached through
@@ -43,7 +43,7 @@ use serde_json::Value;
 use crate::aead::{self, RecordAead};
 use crate::hmac::{HKDF_SHA256, HKDF_SHA384, HMAC_SHA256, HMAC_SHA384};
 use crate::kx::exchange_with;
-use crate::verify;
+use crate::verify::{self, MlDsaVerify};
 
 /// The parsed vector file `name`, from `tests/data/wycheproof`.
 fn load(name: &str) -> Value {
@@ -1010,4 +1010,101 @@ fn rsa_pss_answers_wycheproof() {
             rsa_key,
         );
     }
+}
+
+/// Run an ML-DSA verification file, every case of which is a valid or an
+/// invalid one: each must get Wycheproof's verdict, on the group's raw
+/// public key.  A case with no context, or an empty one, goes through
+/// `algorithm`, which verifies with an empty context as Go's x509 and TLS
+/// do, and is held to Go's verdict through the oracle as Go checks a
+/// certificate's signature under `x509_alg`, where there is an oracle that
+/// knows ML-DSA.  A case with a context, which no certificate or
+/// handshake carries, goes through the same decoding and verification
+/// with its context (`MlDsaVerify::verifies`), and must be refused by
+/// `algorithm`, whose context is empty; there are `contexts` of them.
+fn ml_dsa_answers_wycheproof<P: ml_dsa::MlDsaParams>(
+    file: &str,
+    algorithm: &'static dyn SignatureVerificationAlgorithm,
+    x509_alg: &str,
+    expected: Tally,
+    contexts: usize,
+) {
+    let mut oracle = dcroxide_testutil::ml_dsa_oracle_or_skip();
+    let mut with_context = 0usize;
+    run_file(
+        file,
+        x509_alg,
+        "mldsa_verify_schema.json",
+        expected,
+        |group, tally| {
+            assert_eq!(text(group, "type"), "MlDsaVerify", "{file}");
+            let public_key = bytes(group, "publicKey");
+            for case in cases(group) {
+                let id = number(case, "tcId");
+                let expect = expect(case);
+                let (message, signature) = (bytes(case, "msg"), bytes(case, "sig"));
+                let context = case
+                    .get("ctx")
+                    .map(|_| bytes(case, "ctx"))
+                    .unwrap_or_default();
+                let plain = algorithm
+                    .verify_signature(&public_key, &message, &signature)
+                    .is_ok();
+                let ours = if context.is_empty() {
+                    if let Some(oracle) = oracle.as_mut() {
+                        let spki = text(group, "publicKeyDer");
+                        assert_eq!(
+                            plain,
+                            go_verifies(oracle, spki, x509_alg, case),
+                            "{file} tcId {id}: Go's verdict"
+                        );
+                    }
+                    plain
+                } else {
+                    with_context = with_context.saturating_add(1);
+                    assert!(!plain, "{file} tcId {id}: a context's signature, empty");
+                    MlDsaVerify::<P>::verifies(&public_key, &message, &context, &signature)
+                };
+                assert_eq!(ours, expect == Expect::Valid, "{file} tcId {id}");
+                tally.ran(expect);
+            }
+        },
+    );
+    assert_eq!(with_context, contexts, "{file}: cases with a context");
+}
+
+#[test]
+fn ml_dsa_44_answers_wycheproof() {
+    let expected = Tally {
+        valid: 77,
+        invalid: 103,
+        acceptable: 0,
+        skipped: 0,
+    };
+    let file = "mldsa_44_verify_test.json";
+    ml_dsa_answers_wycheproof::<ml_dsa::MlDsa44>(file, verify::ML_DSA_44, "ML-DSA-44", expected, 7);
+}
+
+#[test]
+fn ml_dsa_65_answers_wycheproof() {
+    let expected = Tally {
+        valid: 79,
+        invalid: 131,
+        acceptable: 0,
+        skipped: 0,
+    };
+    let file = "mldsa_65_verify_test.json";
+    ml_dsa_answers_wycheproof::<ml_dsa::MlDsa65>(file, verify::ML_DSA_65, "ML-DSA-65", expected, 7);
+}
+
+#[test]
+fn ml_dsa_87_answers_wycheproof() {
+    let expected = Tally {
+        valid: 71,
+        invalid: 170,
+        acceptable: 0,
+        skipped: 0,
+    };
+    let file = "mldsa_87_verify_test.json";
+    ml_dsa_answers_wycheproof::<ml_dsa::MlDsa87>(file, verify::ML_DSA_87, "ML-DSA-87", expected, 7);
 }

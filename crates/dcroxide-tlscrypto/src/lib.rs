@@ -33,7 +33,9 @@
 //! within ring's limits and returning ring's verdicts, listed with ring's
 //! mapping to TLS signature schemes in [`SUPPORTED_SIG_ALGS`].
 //! [`default_provider`] puts them together with the kernel's random
-//! numbers.
+//! numbers.  ML-DSA-44, -65 and -87, which Go 1.27 verifies and ring
+//! never had, are three more on the `ml-dsa` crate, in a second set,
+//! [`RPC_SIG_ALGS`], which nothing outside the crate uses yet.
 //!
 //! The node names this provider in every rustls configuration it builds,
 //! and installs no process default: the seeders take [`default_provider`]
@@ -200,6 +202,84 @@ pub static SUPPORTED_SIG_ALGS: WebPkiSupportedAlgorithms = WebPkiSupportedAlgori
         (
             SignatureScheme::RSA_PKCS1_SHA256,
             &[verify::RSA_PKCS1_2048_8192_SHA256],
+        ),
+    ],
+};
+
+/// The verification set for the RPC listener, which follows Go: ring's
+/// fourteen algorithms of [`SUPPORTED_SIG_ALGS`] and ML-DSA-44, -65 and
+/// -87 ([`verify`]), with the mapping in the order of Go 1.27.3's default
+/// signature schemes (`crypto/tls/defaults.go:49-67`), less the schemes
+/// ring's algorithms do not serve: ECDSA with P-521 and SHA-512, and the
+/// two SHA-1 schemes, which TLS 1.3 refuses and dcrd's `go1.26` defaults
+/// refuse in TLS 1.2 (`crypto/tls/common.go:1821-1833`).  rustls offers a
+/// mapping's schemes in its order; a TLS 1.2 CertificateRequest drops
+/// those that name no TLS 1.2 algorithm, as the three ML-DSA schemes do
+/// (`rustls-0.23.46/src/server/tls12.rs:410-411`, `enums.rs:524-542`),
+/// and a TLS 1.3 one drops none (`server/tls13.rs:759-765`).  So a
+/// CertificateRequest built on this set lists Go's schemes but P-521's in
+/// TLS 1.2, and in TLS 1.3 those with PKCS#1 v1.5's three as well, which
+/// Go's TLS 1.3 list leaves out.  In a TLS 1.2 handshake the ECDSA
+/// schemes take either curve's key, and in TLS 1.3 the first algorithm
+/// is the one tried, as in [`SUPPORTED_SIG_ALGS`].
+/// [`SUPPORTED_SIG_ALGS`] and [`default_provider`] stay ring's, so the
+/// seeders offer what they did.
+pub static RPC_SIG_ALGS: WebPkiSupportedAlgorithms = WebPkiSupportedAlgorithms {
+    all: &[
+        verify::ML_DSA_44,
+        verify::ML_DSA_65,
+        verify::ML_DSA_87,
+        verify::ECDSA_P256_SHA256,
+        verify::ECDSA_P256_SHA384,
+        verify::ECDSA_P384_SHA256,
+        verify::ECDSA_P384_SHA384,
+        verify::ED25519,
+        verify::RSA_PSS_2048_8192_SHA256_LEGACY_KEY,
+        verify::RSA_PSS_2048_8192_SHA384_LEGACY_KEY,
+        verify::RSA_PSS_2048_8192_SHA512_LEGACY_KEY,
+        verify::RSA_PKCS1_2048_8192_SHA256,
+        verify::RSA_PKCS1_2048_8192_SHA384,
+        verify::RSA_PKCS1_2048_8192_SHA512,
+        verify::RSA_PKCS1_2048_8192_SHA256_ABSENT_PARAMS,
+        verify::RSA_PKCS1_2048_8192_SHA384_ABSENT_PARAMS,
+        verify::RSA_PKCS1_2048_8192_SHA512_ABSENT_PARAMS,
+    ],
+    mapping: &[
+        (SignatureScheme::ML_DSA_44, &[verify::ML_DSA_44]),
+        (SignatureScheme::ML_DSA_65, &[verify::ML_DSA_65]),
+        (SignatureScheme::ML_DSA_87, &[verify::ML_DSA_87]),
+        (
+            SignatureScheme::RSA_PSS_SHA256,
+            &[verify::RSA_PSS_2048_8192_SHA256_LEGACY_KEY],
+        ),
+        (
+            SignatureScheme::ECDSA_NISTP256_SHA256,
+            &[verify::ECDSA_P256_SHA256, verify::ECDSA_P384_SHA256],
+        ),
+        (SignatureScheme::ED25519, &[verify::ED25519]),
+        (
+            SignatureScheme::RSA_PSS_SHA384,
+            &[verify::RSA_PSS_2048_8192_SHA384_LEGACY_KEY],
+        ),
+        (
+            SignatureScheme::RSA_PSS_SHA512,
+            &[verify::RSA_PSS_2048_8192_SHA512_LEGACY_KEY],
+        ),
+        (
+            SignatureScheme::RSA_PKCS1_SHA256,
+            &[verify::RSA_PKCS1_2048_8192_SHA256],
+        ),
+        (
+            SignatureScheme::RSA_PKCS1_SHA384,
+            &[verify::RSA_PKCS1_2048_8192_SHA384],
+        ),
+        (
+            SignatureScheme::RSA_PKCS1_SHA512,
+            &[verify::RSA_PKCS1_2048_8192_SHA512],
+        ),
+        (
+            SignatureScheme::ECDSA_NISTP384_SHA384,
+            &[verify::ECDSA_P384_SHA384, verify::ECDSA_P256_SHA384],
         ),
     ],
 };

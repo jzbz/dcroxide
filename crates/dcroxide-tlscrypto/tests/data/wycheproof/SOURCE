@@ -5,7 +5,8 @@ Commit:      d17cc89fa5c8f4f4d378b5385ebf75da5d0926c9 (2026-10-23)
 Directory:   testvectors_v1/
 Fetched:     2026-10-26, from raw.githubusercontent.com at that commit; each
              file's git blob hash and size matched the repository's listing
-             at the commit.
+             at the commit.  The three mldsa_*_verify_test.json files were
+             fetched the same way, at the same commit, on 2026-11-12.
 Licence:     Apache License 2.0, the repository's LICENSE, copied unchanged
              beside this file.
 
@@ -48,6 +49,12 @@ hmac_sha256_test.json          69111   2d201cfa61d1bf95e6f5d07d96634b4a348b31e8e
                                        19181195d1bfa01ded2ca5620f0aedd0e50dc31f
 hmac_sha384_test.json          78567   28b9776e979dd755d852ca471043ea6cedce8b15f7a28abdf6ea9efd982b43c0
                                        3ba4fbac6744df6ef62c6d0a205cc7466a8a7cbc
+mldsa_44_verify_test.json    1082507   f70759c95146ff3057ae9708438f6e8d25ba822e3af11d2e87bb20d9a9c39d0e
+                                       07abbf04d8790f3fa6dd8a09c1b497db42b97546
+mldsa_65_verify_test.json    1664284   1ca235f61928421a173a171780beb00264ae9155dc33c52a11e1766cc7979034
+                                       fa871a3c8c76b0cf871879243ad34fa2cbd79000
+mldsa_87_verify_test.json    2590324   54adffe10f6dad7941ffd97f77ad4e5c85cb3a54d44cf5ce1c95cb1757b9ba14
+                                       a36d36421cf441440624446d2b8419646609b077
 rsa_pss_2048_sha256_mgf1_32_test.json
                                85280   7f6efafc160f4816b96cbf1c12188a31051d7e3f001e27505d9edb5f2a0e325c
                                        bdb7694c4b44e8f0a3569bc2a9c56c33e9d24cec
@@ -91,4 +98,4 @@ x25519_test.json              253890   35c3f5231cf25cc640b524d403461deee9e49441d
 LICENSE                        11357   58d1e17ffe5109a7ae296caafcadfdbe6a7d176f0bc4ab01e12a689b0499d8bd
                                        7a4a3ea2424c09fbe48d455aed1eaa94d9124835
 
-Compressed, the 27 vector files are 2,034,370 bytes, from 6,794,805.
+Compressed, the 30 vector files are 3,853,581 bytes, from 12,131,920.

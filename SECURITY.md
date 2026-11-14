@@ -327,10 +327,12 @@ evaluating this code.
   connection the node serves or dials runs on
   ([ADR-0015](docs/adr/0015-tls-crypto-provider.md)), its signature
   verification, which a peer's certificate chain and handshake signature
-  reach before anything of theirs is trusted (the fourteen algorithms,
-  the in-tree RSA among them), and its parsing of the RPC key (the port
-  of Go's `parsePrivateKey`), which runs on every `rpc.key`. Five of the
-  targets, `dcrec_diff_ecdsa`, `dcrec_diff_recover`, `dcrec_diff_pubkey`,
+  reach before anything of theirs is trusted (the seventeen algorithms
+  its fuzz target runs, among them the in-tree RSA and ML-DSA's three,
+  which a peer reaches once the listener verifies ML-DSA client
+  certificates), and its parsing of the RPC key (the port of Go's
+  `parsePrivateKey`), which runs on every `rpc.key`. Five of the targets,
+  `dcrec_diff_ecdsa`, `dcrec_diff_recover`, `dcrec_diff_pubkey`,
   `dcrec_diff_schnorr` and `dcrec_diff_ed25519`, read each input as a
   case of one of `dcroxide-sigdiff`'s signature input classes and ask
   dcrd's own code for every answer through `tools/oracle`; a difference

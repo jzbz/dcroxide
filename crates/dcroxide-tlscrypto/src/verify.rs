@@ -31,6 +31,21 @@
 //!   identifiers a certificate may name each by, and PSS with each, in this
 //!   tree (`src/rsa.rs`, ADR-0015 T5).
 //!
+//! Beside them, and in no set ring had, ML-DSA-44, -65 and -87 (FIPS 204),
+//! which Go 1.27 verifies in a certificate and in a TLS 1.3
+//! CertificateVerify, on the `ml-dsa` crate, under the names and
+//! identifiers `webpki::aws_lc_rs` gives them.  Each algorithm's two
+//! identifiers are its set's bare OID, so a certificate whose key or
+//! signature algorithm carries parameters, or names another set, finds no
+//! algorithm, as Go refuses the one (`crypto/x509/parser.go:366-374`) and
+//! makes the other an unknown algorithm or a set mismatch
+//! (`crypto/x509/x509.go:433-444`, `:1115-1134`).  The key and the
+//! signature must be exactly the set's lengths; the signature is decoded
+//! as FIPS 204's `sigDecode` with its hint and norm checks before the key
+//! is expanded, and verified over the message with an empty context, as Go
+//! calls `mldsa.Verify` (`crypto/x509/x509.go:1135`,
+//! `crypto/tls/auth.go:49-56`).  [`crate::RPC_SIG_ALGS`] lists them.
+//!
 //! Verification touches only public values and runs in variable time.
 
 use core::fmt;
@@ -45,6 +60,8 @@ use rustls::pki_types::{
     AlgorithmIdentifier, InvalidSignature, SignatureVerificationAlgorithm, alg_id,
 };
 use sha2::{Digest, Sha256, Sha384, Sha512};
+
+use ml_dsa::{EncodedSignature, EncodedVerifyingKey, MlDsaParams, Signature, VerifyingKey};
 
 use crate::rsa::{Hash, RsaVerify};
 
@@ -166,6 +183,27 @@ pub static RSA_PSS_2048_8192_SHA512_LEGACY_KEY: &dyn SignatureVerificationAlgori
         Hash::Sha512,
         alg_id::RSA_PSS_SHA512,
     );
+
+/// ML-DSA-44 signatures (FIPS 204), pure, with an empty context.
+pub static ML_DSA_44: &dyn SignatureVerificationAlgorithm = &MlDsaVerify::<ml_dsa::MlDsa44> {
+    name: "ML_DSA_44",
+    alg_id: alg_id::ML_DSA_44,
+    set: PhantomData,
+};
+
+/// ML-DSA-65 signatures, pure, with an empty context.
+pub static ML_DSA_65: &dyn SignatureVerificationAlgorithm = &MlDsaVerify::<ml_dsa::MlDsa65> {
+    name: "ML_DSA_65",
+    alg_id: alg_id::ML_DSA_65,
+    set: PhantomData,
+};
+
+/// ML-DSA-87 signatures, pure, with an empty context.
+pub static ML_DSA_87: &dyn SignatureVerificationAlgorithm = &MlDsaVerify::<ml_dsa::MlDsa87> {
+    name: "ML_DSA_87",
+    alg_id: alg_id::ML_DSA_87,
+    set: PhantomData,
+};
 
 /// `sha256WithRSAEncryption` with no parameters: webpki's data file's bytes
 /// (`rustls-webpki-0.103.16/src/data/alg-rsa-pkcs1-sha256-absent-params.der`).
@@ -326,21 +364,96 @@ impl SignatureVerificationAlgorithm for Ed25519Verify {
     }
 }
 
+/// ML-DSA on the parameter set `P`.
+pub(crate) struct MlDsaVerify<P: MlDsaParams> {
+    /// `webpki::aws_lc_rs`'s name for it, for `Debug`.
+    name: &'static str,
+    /// The set's identifier, the bare OID, for its keys and its signatures
+    /// alike.
+    alg_id: AlgorithmIdentifier,
+    /// The set, which the value does not hold.
+    set: PhantomData<fn() -> P>,
+}
+
+impl<P: MlDsaParams> fmt::Debug for MlDsaVerify<P> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.name)
+    }
+}
+
+impl<P: MlDsaParams> MlDsaVerify<P> {
+    /// Whether `signature` is `P`'s signature of `message` under
+    /// `public_key` with `context`: each exactly `P`'s length, the
+    /// signature's hints and the norm of its z as FIPS 204's `sigDecode`
+    /// requires (`ml-dsa-0.1.2/src/lib.rs:115-128`, `src/hint.rs:128-161`),
+    /// checked before the key is expanded, and a context of at most 255
+    /// bytes.  The algorithm passes an empty context; the Wycheproof tests
+    /// pass a case's own.
+    pub(crate) fn verifies(
+        public_key: &[u8],
+        message: &[u8],
+        context: &[u8],
+        signature: &[u8],
+    ) -> bool {
+        let (Ok(public_key), Ok(signature)) = (
+            <&EncodedVerifyingKey<P>>::try_from(public_key),
+            <&EncodedSignature<P>>::try_from(signature),
+        ) else {
+            return false;
+        };
+        let Some(signature) = Signature::<P>::decode(signature) else {
+            return false;
+        };
+        VerifyingKey::<P>::decode(public_key).verify_with_context(message, context, &signature)
+    }
+}
+
+impl<P: MlDsaParams> SignatureVerificationAlgorithm for MlDsaVerify<P> {
+    /// Go's `mldsa.Verify` with no context.
+    fn verify_signature(
+        &self,
+        public_key: &[u8],
+        message: &[u8],
+        signature: &[u8],
+    ) -> Result<(), InvalidSignature> {
+        if Self::verifies(public_key, message, b"", signature) {
+            Ok(())
+        } else {
+            Err(InvalidSignature)
+        }
+    }
+
+    fn public_key_alg_id(&self) -> AlgorithmIdentifier {
+        self.alg_id
+    }
+
+    fn signature_alg_id(&self) -> AlgorithmIdentifier {
+        self.alg_id
+    }
+}
+
 /// The body of the `tlscrypto_verify` fuzz target, not part of the API:
-/// each of the fourteen algorithms on a key, a message and a signature cut
+/// each of the seventeen algorithms of [`crate::RPC_SIG_ALGS`], ring's
+/// fourteen and ML-DSA's three, on a key, a message and a signature cut
 /// from `data`, none of which may panic, and the number that accept.
 ///
 /// `data` is a byte that picks the key, the message's length in two bytes,
 /// big-endian, and then, for a key taken from `data`, the key's length in
 /// two more and the key; what follows is the message and then the
 /// signature, each cut short where `data` ends.  The picking byte takes a
-/// key from `data` but for 1 to 4, which put in a key the parsers take, so
+/// key from `data` but for 1 to 7, which put in a key the parsers take, so
 /// that arbitrary signatures reach the arithmetic as well as the parsers:
 /// 1, 2 and 3 the P-256 and P-384 generators, uncompressed, and Ed25519's
-/// base point, each the public key of the secret scalar 1; and 4 an
+/// base point, each the public key of the secret scalar 1; 4 an
 /// `RSAPublicKey` of e = 65537 and a 2048-bit odd modulus, the next 256
 /// bytes of `data` (`fuzz_rsa_key`), under which a signature of 256
-/// bytes below the modulus is raised and both paddings are checked.
+/// bytes below the modulus is raised and both paddings are checked; and 5,
+/// 6 and 7 an ML-DSA-44, -65 or -87 key of zero bytes, which is a key
+/// (its t1 zero), under which the signature is laid over one of the set's
+/// length whose z is zero and whose hints are empty
+/// (`fuzz_ml_dsa_signature`), so that whatever `data` holds is decoded
+/// whole, its hints and z checked, and a signature that passes them
+/// reaches the arithmetic.
 #[doc(hidden)]
 pub fn fuzz_verify(data: &[u8]) -> usize {
     /// `len` bytes from the front of `data`, or all of it, and the rest.
@@ -358,22 +471,33 @@ pub fn fuzz_verify(data: &[u8]) -> usize {
         return 0;
     };
     let (message_len, rest) = length(rest);
+    // The ML-DSA set's place in `FUZZ_ML_DSA` that picks 5 to 7 name.
+    let ml_dsa = match pick {
+        5 => Some(0),
+        6 => Some(1),
+        7 => Some(2),
+        _ => None,
+    };
     let fixed;
-    let (key, rest): (&[u8], &[u8]) = match pick {
-        1 => {
+    let (key, rest): (&[u8], &[u8]) = match (pick, ml_dsa) {
+        (_, Some(set)) => {
+            fixed = vec![0; FUZZ_ML_DSA.get(set).map_or(0, |lengths| lengths.0)];
+            (&fixed, rest)
+        }
+        (1, _) => {
             fixed = p256::PublicKey::from_affine(p256::AffinePoint::GENERATOR)
                 .map(|key| key.to_sec1_point(false).as_bytes().to_vec())
                 .unwrap_or_default();
             (&fixed, rest)
         }
-        2 => {
+        (2, _) => {
             fixed = p384::PublicKey::from_affine(p384::AffinePoint::GENERATOR)
                 .map(|key| key.to_sec1_point(false).as_bytes().to_vec())
                 .unwrap_or_default();
             (&fixed, rest)
         }
-        3 => (ED25519_BASEPOINT_COMPRESSED.as_bytes(), rest),
-        4 => {
+        (3, _) => (ED25519_BASEPOINT_COMPRESSED.as_bytes(), rest),
+        (4, _) => {
             let (modulus, rest) = take(rest, 256);
             fixed = fuzz_rsa_key(modulus);
             (&fixed, rest)
@@ -384,11 +508,57 @@ pub fn fuzz_verify(data: &[u8]) -> usize {
         }
     };
     let (message, signature) = take(rest, message_len);
-    crate::SUPPORTED_SIG_ALGS
+    let laid;
+    let signature = match ml_dsa {
+        Some(set) => {
+            laid = fuzz_ml_dsa_signature(set, signature);
+            &laid[..]
+        }
+        None => signature,
+    };
+    crate::RPC_SIG_ALGS
         .all
         .iter()
         .filter(|algorithm| algorithm.verify_signature(key, message, signature).is_ok())
         .count()
+}
+
+/// ML-DSA-44's, -65's and -87's lengths, as the fuzz body lays them out:
+/// the public key, the signature, its challenge c̃, the bits of each of
+/// z's coefficients and z's number of polynomials (FIPS 204, table 2).
+const FUZZ_ML_DSA: [(usize, usize, usize, usize, usize); 3] = [
+    (1312, 2420, 32, 18, 4),
+    (1952, 3309, 48, 20, 5),
+    (2592, 4627, 64, 20, 7),
+];
+
+/// The fuzz body's ML-DSA signature for the set at `set` in
+/// [`FUZZ_ML_DSA`]: `bytes` laid over a signature of the set's length
+/// whose c̃ is zero, every coefficient of z zero, which `BitPack` writes
+/// as γ1 with only the top bit of its field set, and its hints empty, all
+/// zero bytes; `bytes` beyond that length are dropped.
+fn fuzz_ml_dsa_signature(set: usize, bytes: &[u8]) -> Vec<u8> {
+    let Some(&(_, len, c_tilde, bits, polys)) = FUZZ_ML_DSA.get(set) else {
+        return Vec::new();
+    };
+    let mut signature = vec![0u8; len];
+    let coefficients = polys.saturating_mul(256);
+    for index in 0..coefficients {
+        let top = index
+            .checked_mul(bits)
+            .and_then(|bit| bit.checked_add(bits))
+            .and_then(|bit| bit.checked_sub(1))
+            .and_then(|bit| Some((c_tilde.checked_add(bit / 8)?, bit % 8)));
+        if let Some((byte, shift)) = top
+            && let Some(byte) = signature.get_mut(byte)
+        {
+            *byte |= 1 << shift;
+        }
+    }
+    for (to, from) in signature.iter_mut().zip(bytes) {
+        *to = *from;
+    }
+    signature
 }
 
 /// The fuzz body's RSA key: the `RSAPublicKey` of e = 65537 and a 2048-bit
@@ -509,6 +679,199 @@ mod tests {
             assert!(pairs.insert(pair), "{algorithm:?}: a pair of its own");
         }
         assert_eq!(format!("{ECDSA_P384_SHA256:?}"), "ECDSA_P384_SHA256");
+    }
+
+    /// The RPC set is ring's fourteen algorithms and ML-DSA's three, the
+    /// mapping in Go 1.27.3's order of preference less P-521 and SHA-1
+    /// (`crypto/tls/defaults.go:49-67`), each of ring's schemes mapped to
+    /// the algorithms ring's mapping gives it; and each ML-DSA algorithm
+    /// carries its set's bare OID as both identifiers, with no
+    /// parameters, a pair of its own.
+    #[test]
+    fn the_rpc_set_is_rings_and_ml_dsa_in_gos_order() {
+        use rustls::SignatureScheme as S;
+        let name = |algorithm: &&dyn SignatureVerificationAlgorithm| format!("{algorithm:?}");
+        let ml_dsa = [ML_DSA_44, ML_DSA_65, ML_DSA_87];
+        let all: Vec<String> = crate::RPC_SIG_ALGS.all.iter().map(name).collect();
+        let expected: Vec<String> = ml_dsa
+            .iter()
+            .chain(crate::SUPPORTED_SIG_ALGS.all)
+            .map(name)
+            .collect();
+        assert_eq!(all, expected);
+        let schemes: Vec<S> = crate::RPC_SIG_ALGS
+            .mapping
+            .iter()
+            .map(|(scheme, _)| *scheme)
+            .collect();
+        assert_eq!(
+            schemes,
+            [
+                S::ML_DSA_44,
+                S::ML_DSA_65,
+                S::ML_DSA_87,
+                S::RSA_PSS_SHA256,
+                S::ECDSA_NISTP256_SHA256,
+                S::ED25519,
+                S::RSA_PSS_SHA384,
+                S::RSA_PSS_SHA512,
+                S::RSA_PKCS1_SHA256,
+                S::RSA_PKCS1_SHA384,
+                S::RSA_PKCS1_SHA512,
+                S::ECDSA_NISTP384_SHA384,
+            ]
+        );
+        for (scheme, algorithms) in crate::RPC_SIG_ALGS.mapping {
+            let ours: Vec<String> = algorithms.iter().map(name).collect();
+            let expected: Vec<String> = match crate::SUPPORTED_SIG_ALGS
+                .mapping
+                .iter()
+                .find(|(ring, _)| ring == scheme)
+            {
+                Some((_, ring)) => ring.iter().map(name).collect(),
+                // An ML-DSA scheme, to its algorithm of the same name.
+                None => vec![format!("{scheme:?}")],
+            };
+            assert_eq!(ours, expected, "{scheme:?}");
+        }
+        let mut pairs = std::collections::BTreeSet::new();
+        for algorithm in crate::RPC_SIG_ALGS.all {
+            let pair = (
+                algorithm.public_key_alg_id().as_ref().to_vec(),
+                algorithm.signature_alg_id().as_ref().to_vec(),
+            );
+            assert!(pairs.insert(pair), "{algorithm:?}: a pair of its own");
+            assert!(!algorithm.fips(), "{algorithm:?}");
+        }
+        for (algorithm, last) in ml_dsa.iter().zip([0x11, 0x12, 0x13]) {
+            let oid = [
+                0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x03, last,
+            ];
+            assert_eq!(algorithm.public_key_alg_id().as_ref(), oid, "{algorithm:?}");
+            assert_eq!(algorithm.signature_alg_id().as_ref(), oid, "{algorithm:?}");
+        }
+    }
+
+    /// An ML-DSA key from a seed of `seed` bytes, its public key and its
+    /// signature of `message` with `context`, made with the crate's
+    /// deterministic signer.
+    fn ml_dsa_signed<P: MlDsaParams>(
+        seed: u8,
+        message: &[u8],
+        context: &[u8],
+    ) -> (Vec<u8>, Vec<u8>) {
+        let key = ml_dsa::ExpandedSigningKey::<P>::from_seed(&[seed; 32].into());
+        let signature = key.sign_deterministic(message, context).expect("signed");
+        (
+            key.verifying_key().encode().to_vec(),
+            signature.encode().to_vec(),
+        )
+    }
+
+    /// Each ML-DSA set verifies its own signature with an empty context,
+    /// and refuses it under the other two sets, with the key or the
+    /// signature a byte long or short, with a bit of c̃ changed, with z's
+    /// first coefficient at the bound FIPS 204's `sigDecode` sets, γ1 − β,
+    /// where just under it decodes and fails, for another message, and
+    /// when it was made over a context, which TLS and x509 never give.
+    #[test]
+    fn ml_dsa_takes_its_own_set_at_its_lengths() {
+        // Each set: its algorithm, its key and signature, γ1's bits and β.
+        let message = b"a TLS 1.3 CertificateVerify's content";
+        let sets = [
+            (
+                ML_DSA_44,
+                ml_dsa_signed::<ml_dsa::MlDsa44>(1, message, b""),
+                17,
+                78,
+                32,
+            ),
+            (
+                ML_DSA_65,
+                ml_dsa_signed::<ml_dsa::MlDsa65>(2, message, b""),
+                19,
+                196,
+                48,
+            ),
+            (
+                ML_DSA_87,
+                ml_dsa_signed::<ml_dsa::MlDsa87>(3, message, b""),
+                19,
+                120,
+                64,
+            ),
+        ];
+        let lengths = [(1312, 2420), (1952, 3309), (2592, 4627)];
+        for (index, (algorithm, (key, signature), gamma1_bits, beta, c_tilde)) in
+            sets.iter().enumerate()
+        {
+            assert_eq!(
+                (key.len(), signature.len()),
+                lengths[index],
+                "{algorithm:?}"
+            );
+            for (other_index, (other, ..)) in sets.iter().enumerate() {
+                assert_eq!(
+                    other.verify_signature(key, message, signature).is_ok(),
+                    other_index == index,
+                    "{algorithm:?}'s signature under {other:?}"
+                );
+            }
+            let long = |bytes: &[u8]| [bytes, &[0]].concat();
+            let short = |bytes: &[u8]| bytes[..bytes.len() - 1].to_vec();
+            for (what, key, signature) in [
+                ("a key a byte long", long(key), signature.clone()),
+                ("a key a byte short", short(key), signature.clone()),
+                ("a signature a byte long", key.clone(), long(signature)),
+                ("a signature a byte short", key.clone(), short(signature)),
+            ] {
+                assert!(
+                    algorithm
+                        .verify_signature(&key, message, &signature)
+                        .is_err(),
+                    "{algorithm:?}, {what}"
+                );
+            }
+            let mut flipped = signature.clone();
+            flipped[0] ^= 1;
+            assert!(algorithm.verify_signature(key, message, &flipped).is_err());
+            assert!(
+                algorithm
+                    .verify_signature(key, b"another", signature)
+                    .is_err()
+            );
+            // z's first coefficient, written as γ1 − z in the low bits of
+            // the bytes after c̃: γ1 − β is refused as it is decoded, and
+            // γ1 − β − 1 decodes and fails the challenge.
+            let bits = gamma1_bits + 1;
+            for (encoded, decodes) in [(*beta, false), (beta + 1, true)] {
+                let mut at = signature.clone();
+                for bit in 0..bits {
+                    let (byte, shift) = (c_tilde + bit / 8, bit % 8);
+                    at[byte] =
+                        (at[byte] & !(1 << shift)) | ((((encoded >> bit) & 1) as u8) << shift);
+                }
+                assert!(algorithm.verify_signature(key, message, &at).is_err());
+                let decoded = match index {
+                    0 => ml_dsa::Signature::<ml_dsa::MlDsa44>::try_from(&at[..]).is_ok(),
+                    1 => ml_dsa::Signature::<ml_dsa::MlDsa65>::try_from(&at[..]).is_ok(),
+                    _ => ml_dsa::Signature::<ml_dsa::MlDsa87>::try_from(&at[..]).is_ok(),
+                };
+                assert_eq!(decoded, decodes, "{algorithm:?}, z0 written as {encoded}");
+            }
+        }
+        let (key, signature) = ml_dsa_signed::<ml_dsa::MlDsa44>(1, message, b"a context");
+        assert!(
+            ML_DSA_44
+                .verify_signature(&key, message, &signature)
+                .is_err()
+        );
+        assert!(MlDsaVerify::<ml_dsa::MlDsa44>::verifies(
+            &key,
+            message,
+            b"a context",
+            &signature
+        ));
     }
 
     /// A P-256 or P-384 key's own signature verifies under each ECDSA
@@ -783,13 +1146,17 @@ mod tests {
     /// whose public key is the generator or the base point, two for a test
     /// key's PKCS#1 v1.5 signature under the RSA pick with the key's modulus
     /// as its bytes, the algorithm and its twin without NULL parameters,
-    /// and none once the signature changes.  And over inputs from a fixed
-    /// generator, nothing panics: six in seven cut as it cuts them, with a
-    /// key from the data or each pick's, and signatures of any length and
-    /// of each algorithm's shape, 64 bytes with S below L, a DER SEQUENCE
-    /// of two INTEGERs at the curve's length and the RSA modulus's 256
-    /// bytes, so that many reach the arithmetic; and the seventh of any
-    /// shape, so that lengths run past the end of the data.
+    /// one for an ML-DSA key's signature with the key cut from the data,
+    /// and none once the signature changes.  The ML-DSA picks lay what
+    /// follows the message over a signature that decodes, so that z and the
+    /// hints are checked and the arithmetic reached whatever the data's
+    /// length.  And over inputs from a fixed generator, nothing panics:
+    /// eight in nine cut as it cuts them, with a key from the data or each
+    /// pick's, and signatures of any length and of each algorithm's shape,
+    /// 64 bytes with S below L, a DER SEQUENCE of two INTEGERs at the
+    /// curve's length, the RSA modulus's 256 bytes and ML-DSA bytes up to
+    /// the set's length, so that many reach the arithmetic; and the ninth
+    /// of any shape, so that lengths run past the end of the data.
     #[test]
     fn the_fuzz_body_counts_what_accepts() {
         let message = b"fuzzed".to_vec();
@@ -853,6 +1220,45 @@ mod tests {
         let mut changed = rsa_signature.clone();
         changed[255] ^= 1;
         assert_eq!(fuzz_verify(&rsa_input(&changed)), 0);
+        // An ML-DSA key and signature of each set, the key cut from the
+        // input; and the laid signature of each ML-DSA pick, which decodes
+        // under its set, refused under the zero key.
+        let ml_dsa = [
+            ml_dsa_signed::<ml_dsa::MlDsa44>(4, &message, b""),
+            ml_dsa_signed::<ml_dsa::MlDsa65>(5, &message, b""),
+            ml_dsa_signed::<ml_dsa::MlDsa87>(6, &message, b""),
+        ];
+        for (key, signature) in &ml_dsa {
+            let with_key = |signature: &[u8]| {
+                [
+                    &[0][..],
+                    &u16::try_from(message.len()).expect("short").to_be_bytes(),
+                    &u16::try_from(key.len()).expect("short").to_be_bytes(),
+                    key,
+                    &message,
+                    signature,
+                ]
+                .concat()
+            };
+            assert_eq!(fuzz_verify(&with_key(signature)), 1);
+            let mut changed = signature.clone();
+            changed[0] ^= 1;
+            assert_eq!(fuzz_verify(&with_key(&changed)), 0);
+        }
+        for (set, pick) in (5..=7u8).enumerate() {
+            let laid = fuzz_ml_dsa_signature(set, &[]);
+            assert_eq!(laid.len(), FUZZ_ML_DSA[set].1);
+            let decodes = match set {
+                0 => ml_dsa::Signature::<ml_dsa::MlDsa44>::try_from(&laid[..]).is_ok(),
+                1 => ml_dsa::Signature::<ml_dsa::MlDsa65>::try_from(&laid[..]).is_ok(),
+                _ => ml_dsa::Signature::<ml_dsa::MlDsa87>::try_from(&laid[..]).is_ok(),
+            };
+            assert!(decodes, "pick {pick}");
+            let longer = [&laid[..], &[0xff; 5]].concat();
+            assert_eq!(fuzz_ml_dsa_signature(set, &longer), laid, "pick {pick}");
+            assert_eq!(fuzz_verify(&input(pick, &[])), 0, "pick {pick}");
+            assert_eq!(fuzz_verify(&input(pick, &laid)), 0, "pick {pick}");
+        }
         // The same P-256 key and signature, the key cut from the input.
         let key = p256
             .verifying_key()
@@ -882,7 +1288,7 @@ mod tests {
             let mut data = vec![pick];
             data.extend_from_slice(&u16::try_from(message.len()).expect("short").to_be_bytes());
             match pick {
-                1..=3 => {}
+                1..=3 | 5..=7 => {}
                 4 => data.extend(random(rng, 256)),
                 _ => {
                     let key = rng.bytes(600);
@@ -892,6 +1298,11 @@ mod tests {
             }
             data.extend_from_slice(&message);
             let signature = match rng.below(4) {
+                _ if (5..=7).contains(&pick) => {
+                    let len = FUZZ_ML_DSA[usize::from(pick - 5)].1;
+                    let len = rng.below(len as u64 + 1) as usize;
+                    random(rng, len)
+                }
                 0 => rng.bytes(600),
                 // R and an S below 2^252, so below L.
                 1 => {
@@ -916,16 +1327,16 @@ mod tests {
             data.extend_from_slice(&signature);
             data
         };
-        for case in 0..1400u64 {
-            // Every seventh input is bytes of any shape, whose lengths
+        for case in 0..1800u64 {
+            // Every ninth input is bytes of any shape, whose lengths
             // mostly run past the bytes that follow them.
-            let data = if case % 7 == 6 {
+            let data = if case % 9 == 8 {
                 rng.bytes(600)
             } else {
-                shaped(&mut rng, (case % 6) as u8)
+                shaped(&mut rng, (case % 9) as u8)
             };
             assert!(
-                fuzz_verify(&data) <= crate::SUPPORTED_SIG_ALGS.all.len(),
+                fuzz_verify(&data) <= crate::RPC_SIG_ALGS.all.len(),
                 "case {case}"
             );
         }

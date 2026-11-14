@@ -232,6 +232,28 @@ pub fn oracle_or_skip() -> Option<Oracle> {
     oracle_or_skip_with_env(&[])
 }
 
+/// [`oracle_or_skip`] for a test that asks the oracle about ML-DSA, which
+/// it knows only when built with Go 1.27 or later: an oracle built with an
+/// older Go answers that ML-DSA needs a newer one, and the test skips, as
+/// it would without an oracle, unless `DCROXIDE_REQUIRE_ORACLE` is set,
+/// which then requires the reference Go anyway.
+pub fn ml_dsa_oracle_or_skip() -> Option<Oracle> {
+    let mut oracle = oracle_or_skip()?;
+    let probe = br#"{"spki": "", "x509_alg": "ML-DSA-44", "message": "", "signature": ""}"#;
+    let response = oracle.call("sig_verify", probe);
+    match response["error"].as_str() {
+        Some(error) if error.contains("needs Go 1.27") => {
+            assert!(
+                env::var_os("DCROXIDE_REQUIRE_ORACLE").is_none(),
+                "DCROXIDE_REQUIRE_ORACLE is set but {error}"
+            );
+            eprintln!("skipping: {error} (set DCROXIDE_REQUIRE_ORACLE to make this an error)");
+            None
+        }
+        _ => Some(oracle),
+    }
+}
+
 /// [`oracle_or_skip`] with `env` added to the oracle's environment, which
 /// is otherwise this process's: [`tls_interop::DCRD_TLS_GODEBUG`] as
 /// `GODEBUG`, say, for the TLS interop tests.

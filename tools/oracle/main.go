@@ -207,7 +207,9 @@
 //	                     that name (tls.SignatureScheme's or
 //	                     x509.SignatureAlgorithm's String): ed25519.Sign,
 //	                     ecdsa.SignASN1, rsa.SignPKCS1v15 or rsa.SignPSS
-//	                     with a salt the hash's length; with "raw", for an
+//	                     with a salt the hash's length, or, under Go 1.27
+//	                     and later, an ML-DSA key's Sign with no context
+//	                     (mldsa.go); with "raw", for an
 //	                     RSA key, the encoding built by hand and raised to
 //	                     d with math/big, "encoding" and "salt_len" making
 //	                     it deliberately wrong; {"result": "<hex
@@ -217,8 +219,10 @@
 //	                     hex}; the key through x509.ParsePKIXPublicKey,
 //	                     then Certificate.CheckSignature for an x509
 //	                     algorithm or crypto/tls's handshake verification
-//	                     for a scheme; {"result": "ok"} or {"result":
-//	                     "refused: <error>"}, each with "go_version":
+//	                     for a scheme, with Go's TLS 1.3 check that an
+//	                     ML-DSA scheme is the key's own (mldsa.go);
+//	                     {"result": "ok"} or {"result": "refused:
+//	                     <error>"}, each with "go_version":
 //	                     runtime.Version()
 //	rsa_keygen         → data is JSON {"bits": number, "e": number}; a
 //	                     test-only RSA key of exactly that many bits and
@@ -1856,8 +1860,10 @@ func handle(req request) response {
 		// signature, or for a TLS signature scheme what
 		// verifyHandshakeSignature does with a handshake's
 		// (crypto/tls/auth.go:22-66): ecdsa.VerifyASN1, ed25519.Verify,
-		// rsa.VerifyPKCS1v15, or rsa.VerifyPSS with a salt the hash's
-		// length. A key Go refuses is a refusal, like a signature.
+		// rsa.VerifyPKCS1v15, rsa.VerifyPSS with a salt the hash's
+		// length, or, under Go 1.27, mldsa.Verify after Go's TLS 1.3
+		// check that the scheme is the key's own (mldsa.go). A key Go
+		// refuses is a refusal, like a signature.
 		var in struct {
 			SPKI      string `json:"spki"`
 			X509Alg   string `json:"x509_alg"`
@@ -1985,6 +1991,10 @@ const (
 	sigPSS
 	sigECDSA
 	sigEd25519
+	// sigMLDSA is ML-DSA, which Go 1.27 added: mldsa.go registers its
+	// schemes and algorithms, and under an older Go mldsa_old.go answers
+	// that it needs a newer one.
+	sigMLDSA
 )
 
 // sigAlgorithm is what a TLS signature scheme or an x509 signature
@@ -1995,6 +2005,9 @@ type sigAlgorithm struct {
 	kind sigKind
 	hash crypto.Hash
 	x509 x509.SignatureAlgorithm
+	// mldsa is an ML-DSA parameter set's number, 44, 65 or 87, for
+	// sigMLDSA.
+	mldsa int
 }
 
 // sigSchemes are the TLS signature schemes sig_sign and sig_verify take.
@@ -2060,6 +2073,9 @@ func lookupSigAlgorithm(scheme, x509Alg string) (sigAlgorithm, error) {
 				return alg, nil
 			}
 		}
+		if err := mldsaUnavailable(scheme); err != nil {
+			return sigAlgorithm{}, err
+		}
 		return sigAlgorithm{}, fmt.Errorf("unknown scheme %q", scheme)
 	case x509Alg != "" && scheme == "":
 		for a, alg := range sigX509Algorithms {
@@ -2067,6 +2083,9 @@ func lookupSigAlgorithm(scheme, x509Alg string) (sigAlgorithm, error) {
 				alg.x509 = a
 				return alg, nil
 			}
+		}
+		if err := mldsaUnavailable(x509Alg); err != nil {
+			return sigAlgorithm{}, err
 		}
 		return sigAlgorithm{}, fmt.Errorf("unknown x509_alg %q", x509Alg)
 	}
@@ -2087,6 +2106,9 @@ func digestOf(hash crypto.Hash, message []byte) []byte {
 // signWith signs message with key as crypto/tls signs a handshake and
 // crypto/x509 a certificate for alg.
 func signWith(key crypto.Signer, alg sigAlgorithm, message []byte) ([]byte, error) {
+	if alg.kind == sigMLDSA {
+		return mldsaSign(key, alg, message)
+	}
 	digest := digestOf(alg.hash, message)
 	switch k := key.(type) {
 	case ed25519.PrivateKey:
@@ -2114,6 +2136,8 @@ func signWith(key crypto.Signer, alg sigAlgorithm, message []byte) ([]byte, erro
 func verifyHandshakeSignature(alg sigAlgorithm, pub crypto.PublicKey, signed, sig []byte) error {
 	signed = digestOf(alg.hash, signed)
 	switch alg.kind {
+	case sigMLDSA:
+		return mldsaVerifyHandshake(alg, pub, signed, sig)
 	case sigECDSA:
 		key, ok := pub.(*stdecdsa.PublicKey)
 		if !ok {
