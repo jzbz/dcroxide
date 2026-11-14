@@ -171,8 +171,12 @@ evaluating this code.
   Decrediton requires, on the `p256`, `p384` and `p521` crates, whose
   curve arithmetic has never been independently audited, and an operator's
   ML-DSA `rpc.key` signs in TLS 1.3 on the `ml-dsa` crate, which has never
-  been independently audited either (docs/dependency-ledger.md). See
-  PARITY.md's open gaps.
+  been independently audited either (docs/dependency-ledger.md). Under
+  `--authtype=clientcert` the same crate verifies a client's ML-DSA
+  certificates and handshake signature, so any host that can reach the RPC
+  port hands it keys and signatures of its choosing before it is
+  authenticated, as dcrd's Go code verifies them. See PARITY.md's open
+  gaps.
 - **An RSA RPC key is refused.** dcrd serves an `rpc.key` that is an RSA
   key. This daemon refuses one at startup, and keeps the configuration it
   serves when a rotation brings one in (ADR-0015, T6): its TLS provider
@@ -304,7 +308,7 @@ evaluating this code.
   connection is then read as dcrd reads, and no frame is kept. Details
   are in PARITY.md, *Reading ahead of the block handler*.
 - **Fuzzing reaches the stateless parsers, not the state machines.**
-  Twenty-six `cargo-fuzz` targets run for 60 seconds apiece on every
+  Twenty-seven `cargo-fuzz` targets run for 60 seconds apiece on every
   push to `master` and every pull request, and for ten minutes apiece
   nightly: wire framing, decoded at every protocol version a peer can
   negotiate (9 through 12); the `tx` and `blockheader` decoders, with
@@ -331,9 +335,13 @@ evaluating this code.
   verification, which a peer's certificate chain and handshake signature
   reach before anything of theirs is trusted (the seventeen algorithms
   its fuzz target runs, among them the in-tree RSA and ML-DSA's three,
-  which a peer reaches once the listener verifies ML-DSA client
-  certificates), and its parsing of the RPC key (the port of Go's
-  `parsePrivateKey`), which runs on every `rpc.key`. Five of the targets,
+  which a client reaches under `--authtype=clientcert`), and its parsing
+  of the RPC key (the port of Go's `parsePrivateKey`), which runs on
+  every `rpc.key`; and what the RPC listener does under
+  `--authtype=clientcert` with a client's certificates and handshake
+  signature before the client is authenticated, the certificate reader,
+  the replay of Go's chain search, webpki's search and the signature
+  checks, ML-DSA's among them. Five of the targets,
   `dcrec_diff_ecdsa`, `dcrec_diff_recover`, `dcrec_diff_pubkey`,
   `dcrec_diff_schnorr` and `dcrec_diff_ed25519`, read each input as a
   case of one of `dcroxide-sigdiff`'s signature input classes and ask

@@ -6,8 +6,8 @@
 //!
 //! A peer's certificate chain and handshake signature reach ring's
 //! fourteen of these before anything else of theirs is trusted, and the
-//! ML-DSA three once the RPC listener verifies ML-DSA client
-//! certificates, so under `panic = "abort"` a panic in a key parser, a
+//! ML-DSA three under the RPC listener's `--authtype=clientcert`, so
+//! under `panic = "abort"` a panic in a key parser, a
 //! DER reader, a signature decoder or the arithmetic would be a
 //! pre-authentication abort.  The input is cut into the three by
 //! `verify::fuzz_verify`, which can also put the P-256 and P-384

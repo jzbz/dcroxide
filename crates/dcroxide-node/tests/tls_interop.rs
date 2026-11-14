@@ -59,6 +59,18 @@
 //!   reference Go the count Go's server accepts, so a `tls_pki` chain
 //!   every verifier refused would fail the test rather than pass each
 //!   cell.
+//! - **ML-DSA client certificates.**  Under the same auth type, from
+//!   `tls_pki`, an ML-DSA-44 certificate the listener trusts itself, one
+//!   of ML-DSA-65 under a P-256 authority, one of ML-DSA-87 under an
+//!   ML-DSA-44 authority and a P-256 one under the same, each accepted in
+//!   TLS 1.3 by the listener and by Go's server; in TLS 1.2 Go's client
+//!   sends no ML-DSA certificate, which both refuse, each with its own
+//!   alert ([`ML_DSA_GAP`]), and the P-256 one is accepted; the schemes
+//!   each CertificateRequest lists, as Go's client reads them, compared;
+//!   and a rustls client that signs a TLS 1.2 handshake with its ML-DSA
+//!   key all the same, refused by both with `illegal_parameter`, Go's
+//!   server in Go's words.  Under an oracle older than Go 1.27 these skip,
+//!   unless `DCROXIDE_REQUIRE_ORACLE` is set.
 //! - **The seeder clients against Go's HTTPS server**, serving seeder
 //!   JSON under a chain from `tls_pki` whose root the transports' test
 //!   constructors take in place of `webpki-roots`, the provider hand-off
@@ -829,6 +841,374 @@ fn go_client_certificates_under_clientcert_auth() {
         2 * clients.cells.len() * 2,
         "every cell in two versions, with the listener and with Go's server"
     );
+}
+
+/// The signature schemes the listener's CertificateRequest lists in TLS
+/// 1.3, by Go's names: `dcroxide_tlscrypto::RPC_SIG_ALGS`, Go 1.27.3's
+/// default list (`crypto/tls/defaults.go:49-67`) in Go's order, less the
+/// SHA-1 schemes dcrd's `tlssha1=0` turns off and P-521's, which the
+/// provider lacks, with PKCS#1 v1.5's three, which Go leaves out of TLS 1.3
+/// (`crypto/tls/common.go:1821-1827`).
+const OUR_TLS13_REQUEST: [&str; 12] = [
+    "MLDSA44",
+    "MLDSA65",
+    "MLDSA87",
+    "PSSWithSHA256",
+    "ECDSAWithP256AndSHA256",
+    "Ed25519",
+    "PSSWithSHA384",
+    "PSSWithSHA512",
+    "PKCS1WithSHA256",
+    "PKCS1WithSHA384",
+    "PKCS1WithSHA512",
+    "ECDSAWithP384AndSHA384",
+];
+
+/// The PARITY.md entry the listener's differences from Go on ML-DSA
+/// client certificates belong to, its CertificateRequest's schemes among
+/// them.
+const ML_DSA_GAP: &str = "PARITY.md, \"The port serves an ML-DSA `rpc.key` and takes ML-DSA \
+                          client certificates as Go 1.27.3 does\"";
+
+/// `--authtype=clientcert` with ML-DSA keys, from `tls_pki`: an ML-DSA-44
+/// client certificate the server trusts itself, one of ML-DSA-65 under a
+/// P-256 authority, one of ML-DSA-87 under an ML-DSA-44 authority and a
+/// P-256 one under the same, each presented by Go's client to the
+/// listener and to Go's server requiring and verifying client
+/// certificates under the same roots.  In TLS 1.3 both accept each.  In
+/// TLS 1.2 neither lists an ML-DSA scheme, so Go's client sends no
+/// ML-DSA certificate and both refuse it for want of one, while the P-256
+/// one under the ML-DSA authority is accepted, Go asking only the leaf to
+/// take TLS 1.3 (`crypto/tls/handshake_server.go:1005-1012`).  The
+/// schemes each CertificateRequest lists, as Go's client reads them, are
+/// the listener's set's ([`OUR_TLS13_REQUEST`]) and Go's, which differ as
+/// [`ML_DSA_GAP`] records.
+#[test]
+fn go_ml_dsa_client_certificates_under_clientcert_auth() {
+    let Some(mut go) = TlsOracle::start_ml_dsa() else {
+        return;
+    };
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let server = Pair::certgen("P-256 from certgen", &dir, Curve::P256);
+    let cells = [
+        ("client ML-DSA-44 alone", "ML-DSA-44", None),
+        (
+            "client ML-DSA-65 under ca-p256",
+            "ML-DSA-65",
+            Some(("ca-p256", "ECDSA-SHA256")),
+        ),
+        (
+            "client ML-DSA-87 under ca-mldsa44",
+            "ML-DSA-87",
+            Some(("ca-mldsa44", "ML-DSA-44")),
+        ),
+        (
+            "client P-256 under ca-mldsa44",
+            "P-256",
+            Some(("ca-mldsa44", "ML-DSA-44")),
+        ),
+    ];
+    let mut specs = vec![
+        spec("ca-p256", "P-256", None, "ca"),
+        spec("ca-mldsa44", "ML-DSA-44", None, "ca"),
+    ];
+    specs.extend(
+        cells
+            .iter()
+            .map(|(name, key, issuer)| spec(name, key, *issuer, "client")),
+    );
+    let pki = go.pki(&specs);
+    let trusted = ["ca-p256", "ca-mldsa44", "client ML-DSA-44 alone"];
+    let clients_pem: Vec<u8> = trusted
+        .iter()
+        .flat_map(|name| pki[*name].cert_pem.clone())
+        .collect();
+    let client_cas: Vec<String> = trusted.iter().map(|name| hex(&pki[*name].cert)).collect();
+    let listening = listen_rpc(&server, Some(&clients_pem)).expect("a clientcert listener");
+    let request = getblockcount(false);
+    let our_tls12: Vec<&str> = OUR_TLS13_REQUEST[3..].to_vec();
+    let mut go_tls12 = our_tls12.clone();
+    go_tls12.push("ECDSAWithP521AndSHA512");
+    let mut go_tls13: Vec<&str> = OUR_TLS13_REQUEST
+        .iter()
+        .copied()
+        .filter(|scheme| !scheme.starts_with("PKCS1"))
+        .collect();
+    go_tls13.push("ECDSAWithP521AndSHA512");
+    for (version, fields, ours_requested, go_requested) in [
+        (
+            "TLS 1.3",
+            json!({ "min_version": "TLS 1.3" }),
+            OUR_TLS13_REQUEST.to_vec(),
+            go_tls13,
+        ),
+        (
+            "TLS 1.2",
+            json!({ "max_version": "TLS 1.2" }),
+            our_tls12,
+            go_tls12,
+        ),
+    ] {
+        for (name, key, _) in &cells {
+            let what = format!("{version}, {name}");
+            let client = &pki[*name];
+            let mut fields = fields.clone();
+            fields["client_cert"] = client.identity(&[]);
+            let detail = dial(&mut go, &listening.addr, &server.cert, &fields, &request);
+            let (addr, id) = listen(
+                &mut go,
+                json!({
+                    "chain": [hex(&server.cert)],
+                    "key_pkcs8": hex(&server.key_pkcs8),
+                    "client_auth": "RequireAndVerifyClientCert",
+                    "client_cas": client_cas,
+                }),
+            );
+            let theirs = dial(&mut go, &addr, &server.cert, &fields, &request);
+            let served = go.served(&id);
+            if version == "TLS 1.2" && key.starts_with("ML-DSA") {
+                // Go's client finds no scheme of the request its key signs
+                // with and sends no certificate
+                // (`crypto/tls/handshake_client.go:1274-1288`), which Go's
+                // server refuses with `handshake_failure` in TLS 1.2 and
+                // the listener with rustls's `certificate_required`.
+                assert_eq!(served["ok"], false, "{what}: Go's server {served}");
+                go.assert_refused(&what, &served, "tls: client didn't provide a certificate");
+                go.assert_refused(&what, &theirs, "remote error: tls: handshake failure");
+                assert_refused_by_the_node(
+                    &go,
+                    &what,
+                    &detail,
+                    "remote error: tls: certificate required",
+                );
+                assert_eq!(detail["http_status"], 0, "{what}: the listener {detail}");
+            } else {
+                assert!(answered(&detail), "{what}: the listener {detail}");
+                assert_eq!(served["ok"], true, "{what}: Go's server {served}");
+                assert_eq!(
+                    served["peer_certificates"],
+                    json!([hex(&client.cert)]),
+                    "{what}: Go's server"
+                );
+            }
+            assert_eq!(
+                detail["certificate_request"],
+                json!(ours_requested),
+                "{what}: the listener's CertificateRequest"
+            );
+            if go.go_version() == REFERENCE_GO {
+                assert_eq!(
+                    theirs["certificate_request"],
+                    json!(go_requested),
+                    "{what}: Go's CertificateRequest, which differs as {ML_DSA_GAP} records"
+                );
+            }
+        }
+    }
+    listening.listener.shutdown();
+    go.report("go_ml_dsa_client_certificates_under_clientcert_auth");
+    assert_eq!(
+        go.handshakes(),
+        2 * cells.len() * 2,
+        "every cell in two versions, with the listener and with Go's server"
+    );
+}
+
+/// A server certificate verifier that takes any certificate, for a client
+/// whose own certificate is under test, and checks the server's handshake
+/// signature with the provider's algorithms.
+#[derive(Debug)]
+struct AnyServerCert;
+
+impl rustls::client::danger::ServerCertVerifier for AnyServerCert {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &dcroxide_tlscrypto::SUPPORTED_SIG_ALGS,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &dcroxide_tlscrypto::SUPPORTED_SIG_ALGS,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        dcroxide_tlscrypto::SUPPORTED_SIG_ALGS.supported_schemes()
+    }
+}
+
+/// A signing key that answers every offer with `key`'s one scheme, as a
+/// client that ignores the CertificateRequest's list would, which Go's
+/// client never does.
+#[derive(Debug)]
+struct OwnSchemeOnly(Arc<dyn rustls::sign::SigningKey>, rustls::SignatureScheme);
+
+impl rustls::sign::SigningKey for OwnSchemeOnly {
+    fn choose_scheme(
+        &self,
+        _offered: &[rustls::SignatureScheme],
+    ) -> Option<Box<dyn rustls::sign::Signer>> {
+        self.0.choose_scheme(&[self.1])
+    }
+
+    fn public_key(&self) -> Option<rustls::pki_types::SubjectPublicKeyInfoDer<'_>> {
+        self.0.public_key()
+    }
+
+    fn algorithm(&self) -> rustls::SignatureAlgorithm {
+        self.0.algorithm()
+    }
+}
+
+/// A client certificate resolver that always presents one chain.
+#[derive(Debug)]
+struct Presents(Arc<rustls::sign::CertifiedKey>);
+
+impl rustls::client::ResolvesClientCert for Presents {
+    fn resolve(
+        &self,
+        _root_hint_subjects: &[&[u8]],
+        _sigschemes: &[rustls::SignatureScheme],
+    ) -> Option<Arc<rustls::sign::CertifiedKey>> {
+        Some(Arc::clone(&self.0))
+    }
+
+    fn has_certs(&self) -> bool {
+        true
+    }
+}
+
+/// A TLS 1.2 client whose certificate has an ML-DSA key, which signs its
+/// CertificateVerify with the key's own scheme though the request lists
+/// none, refused by the listener as Go's server refuses it: Go's server
+/// with `illegal_parameter` and Go's words, after the chain checks
+/// (`crypto/tls/handshake_server.go:1005-1012`), and the listener with the
+/// same alert, its words held to Go's by the verifier's unit test.  The
+/// client is rustls on the provider, an ML-DSA-65 key under an ML-DSA-44
+/// authority from `tls_pki`.
+#[test]
+fn a_tls12_client_with_an_ml_dsa_key_is_refused_as_go_refuses_it() {
+    let Some(mut go) = TlsOracle::start_ml_dsa() else {
+        return;
+    };
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let server = Pair::certgen("P-256 from certgen", &dir, Curve::P256);
+    let pki = go.pki(&[
+        spec("ca-mldsa44", "ML-DSA-44", None, "ca"),
+        spec(
+            "client",
+            "ML-DSA-65",
+            Some(("ca-mldsa44", "ML-DSA-44")),
+            "client",
+        ),
+    ]);
+    let ca = &pki["ca-mldsa44"];
+    let client = &pki["client"];
+    let key = dcroxide_tlscrypto::sign::load_der(&client.key_pkcs8).expect("the client's key");
+    let certified = Arc::new(rustls::sign::CertifiedKey::new(
+        vec![CertificateDer::from(client.cert.clone())],
+        Arc::new(OwnSchemeOnly(key, rustls::SignatureScheme::ML_DSA_65)),
+    ));
+    let config = Arc::new(
+        rustls::ClientConfig::builder_with_provider(Arc::new(
+            dcroxide_tlscrypto::default_provider(),
+        ))
+        .with_protocol_versions(&[&rustls::version::TLS12])
+        .expect("TLS 1.2")
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(AnyServerCert))
+        .with_client_cert_resolver(Arc::new(Presents(certified))),
+    );
+    // The client's handshake and one request, to `addr`: the error it
+    // ends with, or none.
+    let connect = |addr: &str| -> Option<String> {
+        use std::io::{Read, Write};
+        let tcp = std::net::TcpStream::connect(addr).expect("a connection");
+        tcp.set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .expect("a timeout");
+        let conn = rustls::ClientConnection::new(
+            Arc::clone(&config),
+            rustls::pki_types::ServerName::try_from("localhost").expect("a name"),
+        )
+        .expect("a client");
+        let mut stream = rustls::StreamOwned::new(conn, tcp);
+        let body = "{\"jsonrpc\":\"1.0\",\"method\":\"getblockcount\",\"params\":[],\"id\":1}";
+        let request = format!(
+            "POST / HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        if let Err(err) = stream.write_all(request.as_bytes()) {
+            return Some(err.to_string());
+        }
+        let mut answer = Vec::new();
+        match stream.read_to_end(&mut answer) {
+            Err(err) => Some(err.to_string()),
+            Ok(_) if answer.is_empty() => Some("no answer".to_owned()),
+            Ok(_) => None,
+        }
+    };
+    let illegal = "received fatal alert: IllegalParameter";
+    let reset = |err: &str| err.contains("reset by peer") || err.contains("forcibly closed");
+
+    let clients_pem = ca.cert_pem.clone();
+    let listening = listen_rpc(&server, Some(&clients_pem)).expect("a clientcert listener");
+    let ours = connect(&listening.addr);
+    listening.listener.shutdown();
+    let ours = ours.expect("the listener refuses the client");
+    assert!(
+        ours.contains(illegal) || (!cfg!(target_os = "linux") && reset(&ours)),
+        "the listener: {ours}"
+    );
+
+    let (addr, id) = listen(
+        &mut go,
+        json!({
+            "chain": [hex(&server.cert)],
+            "key_pkcs8": hex(&server.key_pkcs8),
+            "client_auth": "RequireAndVerifyClientCert",
+            "client_cas": [hex(&ca.cert)],
+        }),
+    );
+    let theirs = connect(&addr).expect("Go's server refuses the client");
+    let served = go.served(&id);
+    assert!(
+        theirs.contains(illegal) || reset(&theirs),
+        "Go's server: {theirs}"
+    );
+    go.assert_refused(
+        "Go's server",
+        &served,
+        "tls: client certificate uses ML-DSA, which requires TLS 1.3",
+    );
+    go.report("a_tls12_client_with_an_ml_dsa_key_is_refused_as_go_refuses_it");
 }
 
 /// The seeder JSON Go's server answers with: two loopback addresses,

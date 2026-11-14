@@ -35,12 +35,14 @@
 //! [`SUPPORTED_SIG_ALGS`].  [`default_provider`] puts them together with
 //! the kernel's random numbers.  ML-DSA-44, -65 and -87, which Go 1.27
 //! verifies and ring never had, are three more on the `ml-dsa` crate, in a
-//! second set, [`RPC_SIG_ALGS`], which nothing outside the crate uses yet.
+//! second set, [`RPC_SIG_ALGS`], which the RPC listener verifies client
+//! certificates with.
 //!
 //! The node names this provider in every rustls configuration it builds,
 //! and installs no process default: the seeders take [`default_provider`]
 //! as it is, and the RPC listener builds its per-group configurations
-//! from the suites and groups, P-521 among them.
+//! from the suites and groups, P-521 among them, and its client
+//! certificate verifier on [`RPC_SIG_ALGS`].
 //!
 //! Every function a peer's record, key share, key or signature reaches
 //! computes on lengths with `checked_*` or compares them first, and fails
@@ -221,7 +223,8 @@ pub static SUPPORTED_SIG_ALGS: WebPkiSupportedAlgorithms = WebPkiSupportedAlgori
 /// TLS 1.2, and in TLS 1.3 those with PKCS#1 v1.5's three as well, which
 /// Go's TLS 1.3 list leaves out.  In a TLS 1.2 handshake the ECDSA
 /// schemes take either curve's key, and in TLS 1.3 the first algorithm
-/// is the one tried, as in [`SUPPORTED_SIG_ALGS`].
+/// is the one tried, as in [`SUPPORTED_SIG_ALGS`].  The RPC listener
+/// verifies client certificates and their handshake signatures with it.
 /// [`SUPPORTED_SIG_ALGS`] and [`default_provider`] stay ring's, so the
 /// seeders offer what they did.
 pub static RPC_SIG_ALGS: WebPkiSupportedAlgorithms = WebPkiSupportedAlgorithms {

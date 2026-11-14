@@ -1106,6 +1106,14 @@ fn go_error_text(err: &rustls::Error, hello: Option<&HelloFacts>) -> String {
             "tls: invalid ClientKeyExchange message".to_string()
         }
         Error::NoCertificatesPresented => "tls: client didn't provide a certificate".to_string(),
+        // A TLS 1.2 client whose certificate has an ML-DSA key, which the
+        // client certificate verifier refuses as Go refuses it
+        // (`handshake_server.go:1005-1012`).
+        Error::PeerMisbehaved(misbehaved)
+            if *misbehaved == crate::rpcrun::ML_DSA_CLIENT_KEY_IN_TLS12 =>
+        {
+            "tls: client certificate uses ML-DSA, which requires TLS 1.3".to_string()
+        }
         Error::InvalidCertificate(CertificateError::UnknownIssuer) => {
             "tls: failed to verify certificate: x509: certificate signed by unknown authority"
                 .to_string()

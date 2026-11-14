@@ -209,6 +209,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "rpc_client_cert"
+path = "fuzz_targets/rpc_client_cert.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "tlscrypto_verify"
 path = "fuzz_targets/tlscrypto_verify.rs"
 test = false

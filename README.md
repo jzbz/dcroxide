@@ -499,7 +499,8 @@ work). Currently implemented:
   TLS 1.3 alone) signing keys, loaded by Go's `tls.X509KeyPair` rules
   with RSA keys refused; and ring's fourteen verification algorithms,
   ECDSA, Ed25519 by Go's rules and RSA PKCS#1 v1.5 and PSS verified in
-  tree on `num-bigint`, within ring's limits; pinned by Wycheproof's
+  tree on `num-bigint`, within ring's limits, with ML-DSA's three beside
+  them for the RPC listener's client certificates; pinned by Wycheproof's
   vectors on hardware and portable backends, by RFC 6979's and RFC 8032's
   known answers, by a corpus of signatures whose verdicts it gives as ring
   gave them, recorded while ring was in the tree, and as Go gives them but

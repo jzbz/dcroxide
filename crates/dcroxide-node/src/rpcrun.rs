@@ -2584,6 +2584,58 @@ fn go_public_key(spki: &[u8]) -> Option<(&[u8], &[u8])> {
     }
 }
 
+/// The three ML-DSA parameter sets' key algorithms, as DER object
+/// identifier contents (`crypto/x509/x509.go:519-532`), with the length
+/// of each set's public key (FIPS 204, table 2).
+const ML_DSA_KEYS: [(&[u8], usize); 3] = [
+    (
+        &[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x03, 0x11],
+        1312,
+    ),
+    (
+        &[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x03, 0x12],
+        1952,
+    ),
+    (
+        &[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x03, 0x13],
+        2592,
+    ),
+];
+
+/// Whether a subject public key info, the whole element, names one of the
+/// three ML-DSA parameter sets as its algorithm.
+fn is_ml_dsa_spki(spki: &[u8]) -> bool {
+    DerReader::new(spki)
+        .read_tag(0x30)
+        .and_then(|content| DerReader::new(content).read_tag(0x30))
+        .and_then(|algorithm| DerReader::new(algorithm).read_tag(0x06))
+        .is_some_and(|oid| ML_DSA_KEYS.iter().any(|&(known, _)| known == oid))
+}
+
+/// Whether Go 1.27.3's `parsePublicKey` takes the key of a subject
+/// public key info whose algorithm is ML-DSA (`crypto/x509/parser.go:366-374`):
+/// nothing after the object identifier, which `parseAI` would read as
+/// parameters, and a key of the set's length, which `mldsa.NewPublicKey`
+/// checks and nothing else; `true` for every other algorithm.  The key's
+/// length is the BIT STRING's bytes, as `RightAlign` leaves them.
+fn go_ml_dsa_key_ok(spki: &[u8]) -> bool {
+    let mut spki = DerReader::new(spki);
+    let Some(mut algorithm) = spki.read_tag(0x30).map(DerReader::new) else {
+        return true;
+    };
+    let Some(&(_, len)) = algorithm
+        .read_tag(0x06)
+        .and_then(|oid| ML_DSA_KEYS.iter().find(|&&(known, _)| known == oid))
+    else {
+        return true;
+    };
+    algorithm.is_empty()
+        && spki
+            .read_tag(0x03)
+            .and_then(go_bit_string)
+            .is_some_and(|(_, key)| key.len() == len)
+}
+
 /// Unix seconds from a proleptic Gregorian civil date and time.
 // Calendar arithmetic over four-digit years.
 #[allow(clippy::arithmetic_side_effects)]
@@ -3079,9 +3131,10 @@ impl CertFacts {
     /// subject alternative name and name constraints extensions, the IP
     /// addresses and the rfc822Name constraints are read as Go 1.27.3
     /// reads them ([`go_san_ip_ok`], [`go_ip_constraint_ok`],
-    /// [`go_email_constraint_ok`]).  Go's other checks (the serial
-    /// number, the subject and issuer names, the other names of those
-    /// two extensions, the public key, and the contents of other
+    /// [`go_email_constraint_ok`]), and so is an ML-DSA public key
+    /// ([`go_ml_dsa_key_ok`]).  Go's other checks (the serial number, the
+    /// subject and issuer names, the other names of those two
+    /// extensions, the other public keys, and the contents of other
     /// extensions) are not ported, so `Some` does not promise Go parses
     /// the certificate.
     /// The four policy extensions are among those read, with Go's rules,
@@ -3175,6 +3228,9 @@ impl CertFacts {
         let not_after = parse_asn1_time(tag, content)?;
         let subject = tbs.read_tag(0x30)?;
         let (_, spki_content, spki) = tbs.read_raw(0x30)?;
+        if !go_ml_dsa_key_ok(spki_content) {
+            return None;
+        }
 
         let mut facts = CertFacts {
             not_before,
@@ -3485,20 +3541,23 @@ enum GoChains<'a> {
 /// below it).  The search ends when the budget runs out, keeping the
 /// chains built by then.
 ///
-/// The signature is verified with `sig_algs`, the algorithms of
-/// `dcroxide-tlscrypto`'s provider that webpki uses, which keep ring's
-/// set, by the first one naming both the child's signature algorithm
-/// and the parent's key algorithm, as webpki picks it, after the RSA
-/// public exponent limit Go's verification applies and the provider's,
-/// ring's, does not (`go_rsa_exponent_fits`).  Go verifies some
-/// signatures those cannot, among them RSA keys of 1024 to 2040 bits or
-/// over 8192, P-224 and P-521 keys, ECDSA with SHA-512, ML-DSA (from
-/// Go 1.27: 1.26.2, the reference Go, leaves an ML-DSA key nil and
-/// passes the candidate over, at the same one check), a signature
-/// algorithm identifier Go matches by its OID alone, and a signature BIT
-/// STRING with unused bits, which Go right-aligns; such a candidate is
-/// taken here as failing its signature check, where Go would go on
-/// through it.
+/// The signature is verified with `sig_algs`, the algorithms webpki uses,
+/// the listener's set of `dcroxide-tlscrypto` (ring's and ML-DSA's), by
+/// the first one naming both the child's signature algorithm and the
+/// parent's key algorithm, as webpki picks it, after the RSA public
+/// exponent limit Go's verification applies and ring's set does not
+/// (`go_rsa_exponent_fits`).  An ML-DSA signature is verified as Go
+/// 1.27.3's `checkSignature` verifies it, with an empty context, and an
+/// ML-DSA signature algorithm identifier with parameters, or of another
+/// set than the key's, finds no algorithm, as Go refuses both
+/// (`crypto/x509/x509.go:433-444`, `:1115-1136`).  Go verifies some
+/// signatures the set cannot, among them RSA keys of 1024 to 2040 bits or
+/// over 8192, P-224 and P-521 keys, ECDSA with SHA-512, a signature
+/// algorithm identifier Go matches by its OID alone, and a signature or
+/// key BIT STRING with unused bits, which Go right-aligns, an ML-DSA key
+/// with them being a key whenever its octets are its set's length; such a
+/// candidate is taken here as failing its signature check, where Go would
+/// go on through it.
 fn go_build_chains<'a>(
     leaf: &ChainCandidate<'a>,
     roots: &[ChainCandidate<'a>],
@@ -3739,14 +3798,15 @@ struct ClientCa {
 ///   nothing, though webpki's anchors check none of it.
 ///
 /// The root hints and the handshake signature checks are webpki's over
-/// the whole pool.
+/// the whole pool, but for a TLS 1.2 client whose key is ML-DSA, which is
+/// refused as Go refuses it.
 #[derive(Debug)]
 struct GoClientCertVerifier {
     cas: Vec<ClientCa>,
     all: Arc<dyn rustls::server::danger::ClientCertVerifier>,
     /// The signature algorithms chains are verified with:
-    /// `dcroxide-tlscrypto`'s, which the verifier over the whole pool uses
-    /// too.
+    /// `dcroxide-tlscrypto`'s `RPC_SIG_ALGS`, which the verifier over the
+    /// whole pool uses too.
     sig_algs: &'static [&'static dyn rustls::pki_types::SignatureVerificationAlgorithm],
     /// The keys whose chains are dropped, as Go 1.27.3 drops them:
     /// [`GO_DISTRUSTED_SPKI_SHA256`], which only the tests replace.
@@ -4282,24 +4342,31 @@ impl GoClientCertVerifier {
     /// certificate already added is not added again, as `addCertFunc`
     /// keeps one copy of each.
     fn from_pem(cas_pem: &[u8]) -> Result<GoClientCertVerifier, String> {
-        let mut cas: Vec<ClientCa> = Vec::new();
+        let mut blocks = Vec::new();
         let mut rest = cas_pem;
         while !rest.is_empty() {
             let Some((block, next)) = go_pem_decode(rest) else {
                 break;
             };
             rest = next;
-            if block.block_type != b"CERTIFICATE"
-                || block.has_headers
-                || cas.iter().any(|ca| ca.der == block.bytes)
-            {
+            if block.block_type == b"CERTIFICATE" && !block.has_headers {
+                blocks.push(block.bytes);
+            }
+        }
+        Self::from_certificates(blocks)
+    }
+
+    /// [`GoClientCertVerifier::from_pem`] for the DER certificates of the
+    /// file's `CERTIFICATE` blocks without headers, in the file's order.
+    fn from_certificates(ders: Vec<Vec<u8>>) -> Result<GoClientCertVerifier, String> {
+        let mut cas: Vec<ClientCa> = Vec::new();
+        for der in ders {
+            if cas.iter().any(|ca| ca.der == der) {
                 continue;
             }
             let mut one = rustls::RootCertStore::empty();
             if one
-                .add(rustls::pki_types::CertificateDer::from(
-                    block.bytes.as_slice(),
-                ))
+                .add(rustls::pki_types::CertificateDer::from(der.as_slice()))
                 .is_err()
             {
                 continue;
@@ -4307,14 +4374,10 @@ impl GoClientCertVerifier {
             let Some(anchor) = one.roots.pop() else {
                 continue;
             };
-            let Some(facts) = CertFacts::parse(&block.bytes) else {
+            let Some(facts) = CertFacts::parse(&der) else {
                 continue;
             };
-            cas.push(ClientCa {
-                der: block.bytes,
-                anchor,
-                facts,
-            });
+            cas.push(ClientCa { der, anchor, facts });
         }
         if cas.is_empty() {
             return Err(NO_CLIENT_CAS.to_string());
@@ -4323,7 +4386,7 @@ impl GoClientCertVerifier {
         Ok(GoClientCertVerifier {
             cas,
             all,
-            sig_algs: dcroxide_tlscrypto::SUPPORTED_SIG_ALGS.all,
+            sig_algs: dcroxide_tlscrypto::RPC_SIG_ALGS.all,
             distrusted: GO_DISTRUSTED_SPKI_SHA256,
         })
     }
@@ -4336,13 +4399,19 @@ impl GoClientCertVerifier {
     }
 
     /// webpki's client verifier over the given anchors, on
-    /// `dcroxide-tlscrypto`'s provider.
+    /// `dcroxide-tlscrypto`'s provider with the listener's verification
+    /// set, `RPC_SIG_ALGS`, which adds ML-DSA to ring's set and lists the
+    /// schemes in Go's order, and so is the list the CertificateRequest
+    /// offers.
     fn webpki_over(
         roots: Vec<rustls::pki_types::TrustAnchor<'static>>,
     ) -> Result<Arc<dyn rustls::server::danger::ClientCertVerifier>, String> {
         rustls::server::WebPkiClientVerifier::builder_with_provider(
             Arc::new(rustls::RootCertStore { roots }),
-            Arc::new(dcroxide_tlscrypto::default_provider()),
+            Arc::new(rustls::crypto::CryptoProvider {
+                signature_verification_algorithms: dcroxide_tlscrypto::RPC_SIG_ALGS,
+                ..dcroxide_tlscrypto::default_provider()
+            }),
         )
         .build()
         .map_err(|e| format!("unable to build the RPC client verifier: {e}"))
@@ -4733,12 +4802,27 @@ impl rustls::server::danger::ClientCertVerifier for GoClientCertVerifier {
         })
     }
 
+    /// Go refuses a client whose certificate has an ML-DSA key in TLS 1.2,
+    /// asking only of the leaf, after its chain checks
+    /// (`crypto/tls/handshake_server.go:1005-1012`), and so does this,
+    /// whatever the scheme, with [`ML_DSA_CLIENT_KEY_IN_TLS12`], which
+    /// rustls answers with Go's `illegal_parameter` and the RPC log gives
+    /// in Go's words.  webpki alone refuses such a client too, in words of
+    /// its own: an ML-DSA scheme, which names no TLS 1.2 algorithm, as one
+    /// never offered, with the same alert
+    /// (`rustls-0.23.46/src/webpki/verify.rs:161-163`), and any other as a
+    /// scheme that does not fit the key, with `decrypt_error`.
     fn verify_tls12_signature(
         &self,
         message: &[u8],
         cert: &rustls::pki_types::CertificateDer<'_>,
         dss: &rustls::DigitallySignedStruct,
     ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        if CertFacts::parse_all(cert.as_ref())
+            .is_some_and(|(_, _, identity)| is_ml_dsa_spki(identity.spki))
+        {
+            return Err(rustls::Error::PeerMisbehaved(ML_DSA_CLIENT_KEY_IN_TLS12));
+        }
         self.all.verify_tls12_signature(message, cert, dss)
     }
 
@@ -4755,6 +4839,17 @@ impl rustls::server::danger::ClientCertVerifier for GoClientCertVerifier {
         self.all.supported_verify_schemes()
     }
 }
+
+/// The refusal of a TLS 1.2 client whose certificate has an ML-DSA key
+/// (`GoClientCertVerifier::verify_tls12_signature`), for which rustls has
+/// no error of its own.  rustls's server never raises this one, which is
+/// a client's refusal of a ServerKeyExchange
+/// (`rustls-0.23.46/src/client/tls12.rs:906`, `:923`), so the RPC log reads it
+/// as Go's text for the refusal, and rustls sends `illegal_parameter` for
+/// it, as for every `PeerMisbehaved` a verifier returns
+/// (`rustls-0.23.46/src/common_state.rs:622-631`), Go's alert here.
+pub(crate) const ML_DSA_CLIENT_KEY_IN_TLS12: rustls::PeerMisbehaved =
+    rustls::PeerMisbehaved::SignedKxWithWrongAlgorithm;
 
 /// What the RPC listener refuses an RSA `rpc.key` with, at startup and on
 /// a rotation, where dcrd serves it (ADR-0015, T6; PARITY.md records it):
@@ -8454,6 +8549,300 @@ pub fn fuzz_pre_auth_request(raw: &[u8]) -> Option<usize> {
     let _ = check_origin(&head);
     drain_declared_body(&mut stream, &head, deadline);
     Some(head_len)
+}
+
+/// The time the client-certificate fuzz body verifies at, inside its
+/// certificates' validity, 2024 through 2049.
+const FUZZ_CLIENT_CERT_NOW: u64 = 1_790_000_000;
+
+/// The client-certificate fuzz body's pool and chains, built once.  The
+/// pool is one root, a self-signed ML-DSA-44 authority, and each chain,
+/// one for each ML-DSA set, is an authority on that set's key, issued by
+/// the root, over a leaf on the same set, issued by it.  Every key is the
+/// set's key of zero bytes, which is a key (its t1 zero), and every
+/// signature the set's signature that decodes with z zero and no hints
+/// (`dcroxide_tlscrypto::verify::fuzz_ml_dsa_signature`), so each check
+/// runs whole.
+struct FuzzClientCerts {
+    verifier: GoClientCertVerifier,
+    chains: Vec<FuzzClientChain>,
+}
+
+/// One of [`FuzzClientCerts`]' chains, with where its leaf's signature
+/// and its authority's key start in their DER.
+struct FuzzClientChain {
+    authority: Vec<u8>,
+    authority_key_at: usize,
+    leaf: Vec<u8>,
+    leaf_signature_at: usize,
+}
+
+/// A DER element, its length in the fewest octets, for the fuzz body's
+/// certificates, which are under 64 KiB.
+fn fuzz_der(tag: u8, parts: &[&[u8]]) -> Vec<u8> {
+    let content = parts.concat();
+    let len = content.len();
+    let mut der = vec![tag];
+    match (u8::try_from(len), u16::try_from(len)) {
+        (Ok(short), _) if short < 0x80 => der.push(short),
+        (Ok(byte), _) => der.extend([0x81, byte]),
+        (_, Ok(two)) => {
+            der.push(0x82);
+            der.extend(two.to_be_bytes());
+        }
+        _ => return Vec::new(),
+    }
+    der.extend(content);
+    der
+}
+
+impl FuzzClientCerts {
+    fn new() -> Option<FuzzClientCerts> {
+        // basicConstraints and keyUsage, critical, for an authority:
+        // cA, and digitalSignature with keyCertSign.
+        let authority_extensions = fuzz_der(
+            0xa3,
+            &[&fuzz_der(
+                0x30,
+                &[
+                    &fuzz_der(
+                        0x30,
+                        &[
+                            &fuzz_der(0x06, &[&[0x55, 0x1d, 0x13]]),
+                            &fuzz_der(0x01, &[&[0xff]]),
+                            &fuzz_der(0x04, &[&fuzz_der(0x30, &[&fuzz_der(0x01, &[&[0xff]])])]),
+                        ],
+                    ),
+                    &fuzz_der(
+                        0x30,
+                        &[
+                            &fuzz_der(0x06, &[&[0x55, 0x1d, 0x0f]]),
+                            &fuzz_der(0x01, &[&[0xff]]),
+                            &fuzz_der(0x04, &[&fuzz_der(0x03, &[&[0x02, 0x84]])]),
+                        ],
+                    ),
+                ],
+            )],
+        );
+        // A certificate on `set`'s zero key for `subject`, issued by
+        // `issuer` with `issuer_set`'s algorithm, and where its key and
+        // its signature start.
+        let certificate = |serial: u8,
+                           subject: &[u8],
+                           set: usize,
+                           issuer: &[u8],
+                           issuer_set: usize,
+                           extensions: &[u8]|
+         -> Option<(Vec<u8>, usize, usize)> {
+            let (key_oid, key_len) = *ML_DSA_KEYS.get(set)?;
+            let (signature_oid, _) = *ML_DSA_KEYS.get(issuer_set)?;
+            let name = |cn: &[u8]| {
+                fuzz_der(
+                    0x30,
+                    &[&fuzz_der(
+                        0x31,
+                        &[&fuzz_der(
+                            0x30,
+                            &[
+                                &fuzz_der(0x06, &[&[0x55, 0x04, 0x03]]),
+                                &fuzz_der(0x0c, &[cn]),
+                            ],
+                        )],
+                    )],
+                )
+            };
+            let algorithm = |oid: &[u8]| fuzz_der(0x30, &[&fuzz_der(0x06, &[oid])]);
+            let key = vec![0u8; key_len];
+            let spki = fuzz_der(0x30, &[&algorithm(key_oid), &fuzz_der(0x03, &[&[0], &key])]);
+            let validity = fuzz_der(
+                0x30,
+                &[
+                    &fuzz_der(0x17, &[b"240101000000Z"]),
+                    &fuzz_der(0x17, &[b"491231235959Z"]),
+                ],
+            );
+            let tbs = fuzz_der(
+                0x30,
+                &[
+                    &fuzz_der(0xa0, &[&fuzz_der(0x02, &[&[2]])]),
+                    &fuzz_der(0x02, &[&[serial]]),
+                    &algorithm(signature_oid),
+                    &name(issuer),
+                    &validity,
+                    &name(subject),
+                    &spki,
+                    extensions,
+                ],
+            );
+            let signature = dcroxide_tlscrypto::verify::fuzz_ml_dsa_signature(issuer_set, &[]);
+            let der = fuzz_der(
+                0x30,
+                &[
+                    &tbs,
+                    &algorithm(signature_oid),
+                    &fuzz_der(0x03, &[&[0], &signature]),
+                ],
+            );
+            let key_at = der.windows(spki.len()).position(|w| w == spki)?;
+            let key_at = key_at.checked_add(spki.len())?.checked_sub(key_len)?;
+            let signature_at = der.len().checked_sub(signature.len())?;
+            Some((der, key_at, signature_at))
+        };
+        let (root, _, _) = certificate(1, b"root", 0, b"root", 0, &authority_extensions)?;
+        let verifier = GoClientCertVerifier::from_certificates(vec![root]).ok()?;
+        let mut chains = Vec::new();
+        for (set, serial) in [(0usize, 2u8), (1, 4), (2, 6)] {
+            let (authority, authority_key_at, _) =
+                certificate(serial, b"authority", set, b"root", 0, &authority_extensions)?;
+            let (leaf, _, leaf_signature_at) =
+                certificate(serial.checked_add(1)?, b"leaf", set, b"authority", set, &[])?;
+            chains.push(FuzzClientChain {
+                authority,
+                authority_key_at,
+                leaf,
+                leaf_signature_at,
+            });
+        }
+        Some(FuzzClientCerts { verifier, chains })
+    }
+}
+
+/// `bytes` laid over `template` from `at`, cut where `template` ends.
+fn fuzz_lay(template: &[u8], at: usize, bytes: &[u8]) -> Vec<u8> {
+    let mut laid = template.to_vec();
+    if let Some(tail) = laid.get_mut(at..) {
+        for (to, from) in tail.iter_mut().zip(bytes) {
+            *to = *from;
+        }
+    }
+    laid
+}
+
+/// The body of the `rpc_client_cert` fuzz target: what the RPC listener
+/// does with a client's certificates and its handshake signature under
+/// `--authtype=clientcert` before the client is authenticated
+/// ([`GoClientCertVerifier`]: the reader every certificate goes through,
+/// the replay of Go's chain search, webpki's search, and the handshake
+/// signature checks), over a pool of one ML-DSA-44 root
+/// ([`FuzzClientCerts`]).  Whether the client was accepted, which a key of
+/// zero bytes allows, since anyone can sign for it.
+///
+/// The first byte picks one of the three ML-DSA sets, by its value modulo
+/// three, and one of four uses for the rest, by its value divided by three,
+/// modulo four:
+///
+/// - 0: the client's certificates, each a two-byte big-endian length and
+///   that many bytes, the leaf first;
+/// - 1: the set's chain, with the rest laid over its leaf's signature, so
+///   that the signature reaches the authority's key's checks, in the replay
+///   and in webpki's search;
+/// - 2: the set's chain, with the rest laid over its authority's key, so
+///   that the leaf's signature is checked with that key;
+/// - 3: a handshake signature by the set's leaf, its scheme the one the
+///   rest's first byte picks of the listener's list, modulo its length,
+///   and its signature what follows, laid over the set's signature when
+///   the scheme is ML-DSA, checked as TLS 1.3 and as TLS 1.2 check it.
+///
+/// For the `rpc_client_cert` fuzz target only; not part of the API.
+#[doc(hidden)]
+pub fn fuzz_client_cert(data: &[u8]) -> bool {
+    // `DigitallySignedStruct` has no public constructor, so mode 3 decodes
+    // one with rustls's hidden `internal` codec, which is outside rustls's
+    // stable interface: a rustls update may need to touch this (the
+    // dependency ledger's rustls row).
+    use rustls::internal::msgs::codec::{Codec, Reader};
+    use rustls::pki_types::CertificateDer;
+    use rustls::server::danger::ClientCertVerifier;
+    static FIXTURE: std::sync::OnceLock<Option<FuzzClientCerts>> = std::sync::OnceLock::new();
+    let Some(fixture) = FIXTURE.get_or_init(FuzzClientCerts::new).as_ref() else {
+        return false;
+    };
+    let Some((&pick, rest)) = data.split_first() else {
+        return false;
+    };
+    let Some(chain) = fixture.chains.get(usize::from(pick % 3)) else {
+        return false;
+    };
+    let now =
+        rustls::pki_types::UnixTime::since_unix_epoch(Duration::from_secs(FUZZ_CLIENT_CERT_NOW));
+    let verify = |leaf: &[u8], sent: &[&[u8]]| {
+        let sent: Vec<CertificateDer<'_>> =
+            sent.iter().map(|der| CertificateDer::from(*der)).collect();
+        fixture
+            .verifier
+            .verify_client_cert(&CertificateDer::from(leaf), &sent, now)
+            .is_ok()
+    };
+    match (pick / 3) % 4 {
+        0 => {
+            let mut certs: Vec<&[u8]> = Vec::new();
+            let mut rest = rest;
+            while let Some((len, tail)) = rest.split_first_chunk::<2>() {
+                let (cert, tail) =
+                    tail.split_at(usize::from(u16::from_be_bytes(*len)).min(tail.len()));
+                certs.push(cert);
+                rest = tail;
+            }
+            match certs.split_first() {
+                Some((leaf, sent)) => verify(leaf, sent),
+                None => false,
+            }
+        }
+        1 => verify(
+            &fuzz_lay(&chain.leaf, chain.leaf_signature_at, rest),
+            &[&chain.authority],
+        ),
+        2 => {
+            let authority = fuzz_lay(&chain.authority, chain.authority_key_at, rest);
+            verify(&chain.leaf, &[&authority])
+        }
+        _ => {
+            let Some((&scheme_pick, signature)) = rest.split_first() else {
+                return false;
+            };
+            let mapping = dcroxide_tlscrypto::RPC_SIG_ALGS.mapping;
+            let Some(&(scheme, _)) = usize::from(scheme_pick)
+                .checked_rem(mapping.len())
+                .and_then(|at| mapping.get(at))
+            else {
+                return false;
+            };
+            let set = [
+                rustls::SignatureScheme::ML_DSA_44,
+                rustls::SignatureScheme::ML_DSA_65,
+                rustls::SignatureScheme::ML_DSA_87,
+            ]
+            .iter()
+            .position(|&ml_dsa| ml_dsa == scheme);
+            let signature = match set {
+                Some(set) => dcroxide_tlscrypto::verify::fuzz_ml_dsa_signature(set, signature),
+                None => signature.to_vec(),
+            };
+            let Ok(len) = u16::try_from(signature.len()) else {
+                return false;
+            };
+            let encoded = [
+                &u16::from(scheme).to_be_bytes()[..],
+                &len.to_be_bytes(),
+                &signature,
+            ]
+            .concat();
+            let Ok(dss) = rustls::DigitallySignedStruct::read(&mut Reader::init(&encoded)) else {
+                return false;
+            };
+            let leaf = CertificateDer::from(chain.leaf.as_slice());
+            let message = b"the client's handshake transcript";
+            let tls13 = fixture
+                .verifier
+                .verify_tls13_signature(message, &leaf, &dss)
+                .is_ok();
+            let tls12 = fixture
+                .verifier
+                .verify_tls12_signature(message, &leaf, &dss)
+                .is_ok();
+            tls13 || tls12
+        }
+    }
 }
 
 /// Go's `shouldClose` as `readRequest` applies it to set
@@ -12551,6 +12940,751 @@ mod tests {
             {
                 assert_eq!(verdict == "ok", go_accepts, "{label}: Go says {verdict}");
             }
+        }
+    }
+
+    /// An ML-DSA key of the set at `set` in [`ML_DSA_KEYS`], from a seed of
+    /// 32 `seed` bytes: its PKCS#8 seed form, as Go's
+    /// `MarshalPKCS8PrivateKey` writes it, and its subject public key info.
+    fn ml_dsa_test_key(set: usize, seed: u8) -> (Vec<u8>, Vec<u8>) {
+        let (oid, _) = ML_DSA_KEYS[set];
+        let pkcs8 = der_tlv(
+            0x30,
+            &[
+                der_tlv(0x02, &[0]),
+                der_tlv(0x30, &der_tlv(0x06, oid)),
+                der_tlv(0x04, &der_tlv(0x80, &[seed; 32])),
+            ]
+            .concat(),
+        );
+        let spki = dcroxide_tlscrypto::sign::load_der(&pkcs8)
+            .expect("an ML-DSA key")
+            .public_key()
+            .expect("its public key")
+            .as_ref()
+            .to_vec();
+        (pkcs8, spki)
+    }
+
+    /// The TLS signature scheme of the ML-DSA set at `set`.
+    const ML_DSA_SCHEMES: [rustls::SignatureScheme; 3] = [
+        rustls::SignatureScheme::ML_DSA_44,
+        rustls::SignatureScheme::ML_DSA_65,
+        rustls::SignatureScheme::ML_DSA_87,
+    ];
+
+    /// A certificate for `spki`, valid from 2024 through 2049 and carrying
+    /// `extensions`, issued by `issuer` and signed by the PKCS#8 key
+    /// `issuer_key` under `scheme`, whose signature an X.509 signature
+    /// carries as it is, naming `algorithm`, an AlgorithmIdentifier's
+    /// contents, as its signature algorithm.
+    #[allow(clippy::too_many_arguments)]
+    fn certificate_signed_by(
+        serial: u8,
+        subject: &str,
+        spki: Vec<u8>,
+        issuer: &str,
+        issuer_key: &[u8],
+        scheme: rustls::SignatureScheme,
+        algorithm: &[u8],
+        extensions: &[Vec<u8>],
+    ) -> Vec<u8> {
+        const COMMON_NAME: &[u8] = &[0x55, 0x04, 0x03];
+        let name = |cn: &str| {
+            let attribute = [der_tlv(0x06, COMMON_NAME), der_tlv(0x0c, cn.as_bytes())].concat();
+            der_tlv(0x30, &der_tlv(0x31, &der_tlv(0x30, &attribute)))
+        };
+        let algorithm = der_tlv(0x30, algorithm);
+        let validity = [
+            der_tlv(0x17, b"240101000000Z"),
+            der_tlv(0x17, b"491231235959Z"),
+        ]
+        .concat();
+        let mut tbs = [
+            der_tlv(0xa0, &der_tlv(0x02, &[2])),
+            der_tlv(0x02, &[serial]),
+            algorithm.clone(),
+            name(issuer),
+            der_tlv(0x30, &validity),
+            name(subject),
+            spki,
+        ]
+        .concat();
+        if !extensions.is_empty() {
+            tbs.extend(der_tlv(0xa3, &der_tlv(0x30, &extensions.concat())));
+        }
+        let tbs = der_tlv(0x30, &tbs);
+        let signature = dcroxide_tlscrypto::sign::load_der(issuer_key)
+            .expect("signing key")
+            .choose_scheme(&[scheme])
+            .expect("scheme")
+            .sign(&tbs)
+            .expect("sign");
+        der_tlv(
+            0x30,
+            &[
+                tbs,
+                algorithm,
+                der_tlv(0x03, &[&[0u8][..], &signature].concat()),
+            ]
+            .concat(),
+        )
+    }
+
+    /// The subject public key info of a P-256 key.
+    fn p256_spki(key: &dcroxide_certgen::gentool::ToolKeyPair) -> Vec<u8> {
+        // id-ecPublicKey and prime256v1.
+        const EC_PUBLIC_KEY: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01];
+        const P256: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07];
+        der_tlv(
+            0x30,
+            &[
+                der_tlv(
+                    0x30,
+                    &[der_tlv(0x06, EC_PUBLIC_KEY), der_tlv(0x06, P256)].concat(),
+                ),
+                der_tlv(0x03, &[&[0u8][..], &key.public_bytes()].concat()),
+            ]
+            .concat(),
+        )
+    }
+
+    /// A CA's critical basic constraints, asserting cA, and its critical
+    /// key usage, digitalSignature with keyCertSign.
+    fn ca_extensions() -> Vec<Vec<u8>> {
+        const BASIC_CONSTRAINTS: &[u8] = &[0x55, 0x1d, 0x13];
+        const KEY_USAGE: &[u8] = &[0x55, 0x1d, 0x0f];
+        vec![
+            der_extension(
+                BASIC_CONSTRAINTS,
+                true,
+                &der_tlv(0x30, &der_tlv(0x01, &[0xff])),
+            ),
+            der_extension(KEY_USAGE, true, &der_tlv(0x03, &[0x02, 0x84])),
+        ]
+    }
+
+    /// A handshake signature as rustls hands it to a verifier, which only
+    /// rustls builds: decoded from its encoding.
+    fn digitally_signed(
+        scheme: rustls::SignatureScheme,
+        signature: &[u8],
+    ) -> rustls::DigitallySignedStruct {
+        use rustls::internal::msgs::codec::{Codec, Reader};
+        let len = u16::try_from(signature.len()).expect("a short signature");
+        let encoded = [
+            &u16::from(scheme).to_be_bytes()[..],
+            &len.to_be_bytes(),
+            signature,
+        ]
+        .concat();
+        rustls::DigitallySignedStruct::read(&mut Reader::init(&encoded)).expect("a signature")
+    }
+
+    /// An ML-DSA key in a certificate is read as Go 1.27.3's parser reads
+    /// it (`crypto/x509/parser.go:366-374`): with no parameters and at its
+    /// set's length, 1312, 1952 or 2592 bytes, and refused otherwise, one
+    /// byte short or long, empty, at another set's length, or with NULL or
+    /// other parameters.  A refused certificate ends the handshake when the
+    /// client sends it, and is skipped in the client CA file, as Go's
+    /// `ParseCertificate` refuses it.  Each verdict is Go's, and is
+    /// compared with the oracle's where it runs Go 1.27 or later.
+    #[test]
+    fn ml_dsa_keys_in_certificates_follow_gos_parser() {
+        use dcroxide_certgen::gentool::generate_key;
+        use rustls::pki_types::CertificateDer;
+        use rustls::server::danger::ClientCertVerifier;
+        let now = rustls::pki_types::UnixTime::since_unix_epoch(Duration::from_secs(1_790_000_000));
+        let mut oracle = dcroxide_testutil::ml_dsa_oracle_or_skip();
+        let root_key = generate_key("P-256").expect("key");
+        let leaf_key = generate_key("P-256").expect("key");
+        let root =
+            signed_p256_certificate(1, "root", &root_key, "root", &root_key, &ca_extensions());
+        let leaf = signed_p256_certificate(2, "leaf", &leaf_key, "root", &root_key, &[]);
+        let not_after = || der_tlv(0x17, b"491231235959Z");
+        for (set, &(oid, len)) in ML_DSA_KEYS.iter().enumerate() {
+            let spki = |parameters: &[u8], key_len: usize| {
+                der_tlv(
+                    0x30,
+                    &[
+                        der_tlv(0x30, &[&der_tlv(0x06, oid)[..], parameters].concat()),
+                        der_tlv(0x03, &[vec![0u8], vec![0x5a; key_len]].concat()),
+                    ]
+                    .concat(),
+                )
+            };
+            let other = ML_DSA_KEYS[(set + 1) % 3].1;
+            for (label, spki, go_parses_it) in [
+                ("the set's length", spki(&[], len), true),
+                ("one byte short", spki(&[], len - 1), false),
+                ("one byte long", spki(&[], len + 1), false),
+                ("empty", spki(&[], 0), false),
+                ("another set's length", spki(&[], other), false),
+                ("NULL parameters", spki(&[0x05, 0x00], len), false),
+                (
+                    "an OID as parameters",
+                    spki(&der_tlv(0x06, oid), len),
+                    false,
+                ),
+            ] {
+                let what = format!("{:?}, {label}", ML_DSA_SCHEMES[set]);
+                let named = signed_certificate_with_spki(
+                    3,
+                    "named",
+                    spki.clone(),
+                    "root",
+                    &root_key,
+                    not_after(),
+                    &[],
+                );
+                assert_eq!(CertFacts::parse(&named).is_some(), go_parses_it, "{what}");
+                if let Some(go) = go_parses(&mut oracle, &named) {
+                    assert_eq!(go, go_parses_it, "{what}: Go");
+                }
+                let authority = signed_certificate_with_spki(
+                    4,
+                    "authority",
+                    spki,
+                    "root",
+                    &root_key,
+                    not_after(),
+                    &ca_extensions(),
+                );
+                let verifier =
+                    GoClientCertVerifier::from_pem(&certificate_pem(&root)).expect("verifier");
+                let got = verifier.verify_client_cert(
+                    &CertificateDer::from(leaf.as_slice()),
+                    &[CertificateDer::from(authority.as_slice())],
+                    now,
+                );
+                if go_parses_it {
+                    got.expect("an unused intermediate Go parses");
+                } else {
+                    assert!(
+                        matches!(
+                            got,
+                            Err(rustls::Error::InvalidCertificate(
+                                rustls::CertificateError::BadEncoding
+                            ))
+                        ),
+                        "{what}: sent {got:?}"
+                    );
+                }
+                assert_eq!(
+                    GoClientCertVerifier::from_pem(&certificate_pem(&authority)).is_ok(),
+                    go_parses_it,
+                    "{what}: in the client CA file"
+                );
+            }
+        }
+    }
+
+    /// Client chains with ML-DSA keys verify as Go 1.27.3's `Verify`
+    /// verifies them (`crypto/x509/x509.go:1115-1136`): an ML-DSA root,
+    /// intermediate or leaf of each set, mixed with P-256 ones, and refused
+    /// for a signature algorithm of another set than the key's, for
+    /// parameters on an ML-DSA signature algorithm, on the leaf or on an
+    /// intermediate (`x509.go:433-444`), for a signature that does not
+    /// verify, and under a root of the wrong length, which the client CA
+    /// file skips.  Each verdict is Go's, and is compared with the
+    /// oracle's where it runs Go 1.27 or later.
+    #[test]
+    fn ml_dsa_client_chains_verify_as_go_verifies() {
+        use dcroxide_certgen::gentool::generate_key;
+        use rustls::pki_types::CertificateDer;
+        use rustls::server::danger::ClientCertVerifier;
+        let secs = 1_790_000_000u64;
+        let now = rustls::pki_types::UnixTime::since_unix_epoch(Duration::from_secs(secs));
+        let mut oracle = dcroxide_testutil::ml_dsa_oracle_or_skip();
+        let oid = |set: usize| der_tlv(0x06, ML_DSA_KEYS[set].0);
+        let (ml44, ml44_spki) = ml_dsa_test_key(0, 0x44);
+        let (ml65, ml65_spki) = ml_dsa_test_key(1, 0x65);
+        let (_, ml87_spki) = ml_dsa_test_key(2, 0x87);
+        let p256 = generate_key("P-256").expect("key");
+        let p256_key = p256.marshal_pkcs8().expect("pkcs8");
+        let leaf_key = generate_key("P-256").expect("key");
+        // ecdsa-with-SHA256.
+        let ecdsa = der_tlv(0x06, &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x02]);
+        let ecdsa_scheme = rustls::SignatureScheme::ECDSA_NISTP256_SHA256;
+        let ca = ca_extensions();
+        let ml_root = certificate_signed_by(
+            1,
+            "ml-root",
+            ml44_spki.clone(),
+            "ml-root",
+            &ml44,
+            ML_DSA_SCHEMES[0],
+            &oid(0),
+            &ca,
+        );
+        let p256_root = certificate_signed_by(
+            2,
+            "p256-root",
+            p256_spki(&p256),
+            "p256-root",
+            &p256_key,
+            ecdsa_scheme,
+            &ecdsa,
+            &ca,
+        );
+        let ml_int = certificate_signed_by(
+            3,
+            "ml-int",
+            ml65_spki.clone(),
+            "ml-root",
+            &ml44,
+            ML_DSA_SCHEMES[0],
+            &oid(0),
+            &ca,
+        );
+        let ml_int_under_p256 = certificate_signed_by(
+            4,
+            "ml-int",
+            ml65_spki.clone(),
+            "p256-root",
+            &p256_key,
+            ecdsa_scheme,
+            &ecdsa,
+            &ca,
+        );
+        let null = |set: usize| [oid(set), vec![0x05, 0x00]].concat();
+        let ml_int_null = certificate_signed_by(
+            5,
+            "ml-int",
+            ml65_spki.clone(),
+            "ml-root",
+            &ml44,
+            ML_DSA_SCHEMES[0],
+            &null(0),
+            &ca,
+        );
+        let ml87_leaf = |serial: u8, issuer: &str, key: &[u8], set: usize, algorithm: &[u8]| {
+            certificate_signed_by(
+                serial,
+                "leaf",
+                ml87_spki.clone(),
+                issuer,
+                key,
+                ML_DSA_SCHEMES[set],
+                algorithm,
+                &[],
+            )
+        };
+        let p256_leaf_under_ml_int = certificate_signed_by(
+            6,
+            "leaf",
+            p256_spki(&leaf_key),
+            "ml-int",
+            &ml65,
+            ML_DSA_SCHEMES[1],
+            &oid(1),
+            &[],
+        );
+        let ml44_leaf_under_p256 = certificate_signed_by(
+            7,
+            "leaf",
+            ml44_spki.clone(),
+            "p256-root",
+            &p256_key,
+            ecdsa_scheme,
+            &ecdsa,
+            &[],
+        );
+        let mut flipped = ml87_leaf(8, "ml-root", &ml44, 0, &oid(0));
+        let last = flipped.len() - 1;
+        flipped[last] ^= 0x01;
+        // The ML-DSA-44 root with NULL parameters on its key, which the
+        // client CA file skips.
+        let with_parameters = |spki: &[u8], set: usize| {
+            let mut reader = DerReader::new(DerReader::new(spki).read_tag(0x30).expect("an SPKI"));
+            reader.read_tag(0x30).expect("its algorithm");
+            let (_, _, bits) = reader.read_raw(0x03).expect("its key");
+            der_tlv(0x30, &[der_tlv(0x30, &null(set)), bits.to_vec()].concat())
+        };
+        let skipped_root = certificate_signed_by(
+            13,
+            "ml-root",
+            with_parameters(&ml44_spki, 0),
+            "ml-root",
+            &ml44,
+            ML_DSA_SCHEMES[0],
+            &oid(0),
+            &ca,
+        );
+        for (label, roots, leaf, sent, go_accepts) in [
+            (
+                "an ML-DSA-87 leaf under an ML-DSA-44 root",
+                vec![&ml_root],
+                ml87_leaf(9, "ml-root", &ml44, 0, &oid(0)),
+                vec![],
+                true,
+            ),
+            (
+                "a P-256 leaf under an ML-DSA-65 intermediate under an ML-DSA-44 root",
+                vec![&ml_root],
+                p256_leaf_under_ml_int.clone(),
+                vec![&ml_int],
+                true,
+            ),
+            (
+                "an ML-DSA-87 leaf under an ML-DSA-65 intermediate under a P-256 root",
+                vec![&p256_root],
+                ml87_leaf(10, "ml-int", &ml65, 1, &oid(1)),
+                vec![&ml_int_under_p256],
+                true,
+            ),
+            (
+                "an ML-DSA-44 leaf under a P-256 root",
+                vec![&p256_root],
+                ml44_leaf_under_p256.clone(),
+                vec![],
+                true,
+            ),
+            (
+                "a signature naming ML-DSA-65 by an ML-DSA-44 key",
+                vec![&ml_root],
+                ml87_leaf(11, "ml-root", &ml44, 0, &oid(1)),
+                vec![],
+                false,
+            ),
+            (
+                "NULL parameters on the leaf's ML-DSA signature algorithm",
+                vec![&ml_root],
+                ml87_leaf(12, "ml-root", &ml44, 0, &null(0)),
+                vec![],
+                false,
+            ),
+            (
+                "NULL parameters on the intermediate's ML-DSA signature algorithm",
+                vec![&ml_root],
+                p256_leaf_under_ml_int.clone(),
+                vec![&ml_int_null],
+                false,
+            ),
+            (
+                "an ML-DSA signature with a bit flipped",
+                vec![&ml_root],
+                flipped.clone(),
+                vec![],
+                false,
+            ),
+            (
+                "an ML-DSA root with parameters on its key",
+                vec![&skipped_root, &p256_root],
+                ml87_leaf(14, "ml-root", &ml44, 0, &oid(0)),
+                vec![],
+                false,
+            ),
+        ] {
+            let pem: Vec<u8> = roots
+                .iter()
+                .flat_map(|root| certificate_pem(root))
+                .collect();
+            let verifier = GoClientCertVerifier::from_pem(&pem).expect("verifier");
+            let ders: Vec<_> = sent
+                .iter()
+                .map(|der| CertificateDer::from(der.as_slice()))
+                .collect();
+            let got = verifier
+                .verify_client_cert(&CertificateDer::from(leaf.as_slice()), &ders, now)
+                .map(|_| ());
+            assert_eq!(got.is_ok(), go_accepts, "{label}: {got:?}");
+            let roots: Vec<&[u8]> = roots.iter().map(|root| root.as_slice()).collect();
+            let sent: Vec<&[u8]> = sent.iter().map(|der| der.as_slice()).collect();
+            if let Some(GoVerdict { verdict, .. }) =
+                go_client_verdict(&mut oracle, &roots, &leaf, &sent, secs)
+            {
+                assert_eq!(verdict == "ok", go_accepts, "{label}: Go says {verdict}");
+            }
+        }
+    }
+
+    /// A candidate whose ML-DSA signature verifies is gone into, as Go
+    /// 1.27.3's chain search goes into it, at the one check of Go's budget
+    /// of 100: certificates named as the leaf's issuer that hold the
+    /// ML-DSA-65 key that signed it and lead to no root each verify the
+    /// leaf's signature, and 98 of them sent ahead of the real intermediate
+    /// leave room for the chain where 99 run the budget out, as the P-256
+    /// decoys of `gos_signature_budget_charges_every_candidate`, whose
+    /// signatures fail, do.  Each verdict is Go's, and is compared with the
+    /// oracle's where it runs Go 1.27 or later.
+    #[test]
+    fn verified_ml_dsa_candidates_spend_gos_budget() {
+        use dcroxide_certgen::gentool::generate_key;
+        use rustls::pki_types::CertificateDer;
+        use rustls::server::danger::ClientCertVerifier;
+        const LIMIT: &str =
+            "x509: signature check attempts limit reached while verifying certificate chain";
+        let secs = 1_790_000_000u64;
+        let now = rustls::pki_types::UnixTime::since_unix_epoch(Duration::from_secs(secs));
+        let mut oracle = dcroxide_testutil::ml_dsa_oracle_or_skip();
+        let (ml65, ml65_spki) = ml_dsa_test_key(1, 0x65);
+        let p256 = generate_key("P-256").expect("key");
+        let p256_key = p256.marshal_pkcs8().expect("pkcs8");
+        let leaf_key = generate_key("P-256").expect("key");
+        // ecdsa-with-SHA256.
+        let ecdsa = der_tlv(0x06, &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x02]);
+        let ecdsa_scheme = rustls::SignatureScheme::ECDSA_NISTP256_SHA256;
+        let ca = ca_extensions();
+        let by_root = |serial: u8, subject: &str, spki: Vec<u8>, issuer: &str| {
+            certificate_signed_by(
+                serial,
+                subject,
+                spki,
+                issuer,
+                &p256_key,
+                ecdsa_scheme,
+                &ecdsa,
+                &ca,
+            )
+        };
+        let root = by_root(1, "root", p256_spki(&p256), "root");
+        let int = by_root(2, "int", ml65_spki.clone(), "root");
+        let leaf = certificate_signed_by(
+            3,
+            "leaf",
+            p256_spki(&leaf_key),
+            "int",
+            &ml65,
+            ML_DSA_SCHEMES[1],
+            &der_tlv(0x06, ML_DSA_KEYS[1].0),
+            &[],
+        );
+        // The intermediate's name and key, issued by a name no certificate
+        // holds.  Serials stay below 0x80.
+        let decoys: Vec<Vec<u8>> = (0..99u8)
+            .map(|i| by_root(4 + i, "int", ml65_spki.clone(), "nowhere"))
+            .collect();
+        let verifier = GoClientCertVerifier::from_pem(&certificate_pem(&root)).expect("verifier");
+        for (n, go_accepts) in [(98, true), (99, false)] {
+            let mut sent: Vec<&[u8]> = decoys[..n].iter().map(Vec::as_slice).collect();
+            sent.push(&int);
+            let ders: Vec<_> = sent.iter().map(|der| CertificateDer::from(*der)).collect();
+            let got = verifier
+                .verify_client_cert(&CertificateDer::from(leaf.as_slice()), &ders, now)
+                .map(|_| ());
+            assert_eq!(got.is_ok(), go_accepts, "{n} decoys: {got:?}");
+            if let Err(err) = &got {
+                assert!(
+                    crate::rpctls::go_error_text_for_tests(err).ends_with(LIMIT),
+                    "{n} decoys: {err:?}"
+                );
+            }
+            if let Some(GoVerdict { verdict, .. }) =
+                go_client_verdict(&mut oracle, &[&root], &leaf, &sent, secs)
+            {
+                let want = if go_accepts { "ok" } else { LIMIT };
+                assert_eq!(verdict, want, "{n} decoys: Go");
+            }
+        }
+    }
+
+    /// An ML-DSA client key signs a TLS 1.3 handshake with its own set's
+    /// scheme alone, as Go checks it (`crypto/tls/handshake_server_tls13.go:1086-1100`),
+    /// and is refused in TLS 1.2 whatever the scheme and whether or not the
+    /// signature verifies, with Go's text and `illegal_parameter`
+    /// (`handshake_server.go:1005-1012`), which keys on the leaf alone: a
+    /// P-256 leaf under ML-DSA authorities signs a TLS 1.2 handshake.  The
+    /// schemes the CertificateRequest lists are the listener's set's, Go
+    /// 1.27.3's in Go's order but P-521's, with PKCS#1 v1.5's three, which
+    /// Go's TLS 1.3 list leaves out (PARITY.md, the ML-DSA entry).
+    #[test]
+    fn an_ml_dsa_client_key_signs_in_tls13_alone() {
+        use dcroxide_certgen::gentool::generate_key;
+        use rustls::SignatureScheme as S;
+        use rustls::pki_types::CertificateDer;
+        use rustls::server::danger::ClientCertVerifier;
+        let now = rustls::pki_types::UnixTime::since_unix_epoch(Duration::from_secs(1_790_000_000));
+        let oid = |set: usize| der_tlv(0x06, ML_DSA_KEYS[set].0);
+        let ca = ca_extensions();
+        let (ml44, ml44_spki) = ml_dsa_test_key(0, 1);
+        let (ml87, ml87_spki) = ml_dsa_test_key(2, 2);
+        let root = certificate_signed_by(
+            1,
+            "root",
+            ml44_spki.clone(),
+            "root",
+            &ml44,
+            ML_DSA_SCHEMES[0],
+            &oid(0),
+            &ca,
+        );
+        let leaf = certificate_signed_by(
+            2,
+            "leaf",
+            ml87_spki,
+            "root",
+            &ml44,
+            ML_DSA_SCHEMES[0],
+            &oid(0),
+            &[],
+        );
+        let p256 = generate_key("P-256").expect("key");
+        let p256_key = p256.marshal_pkcs8().expect("pkcs8");
+        let p256_leaf = certificate_signed_by(
+            3,
+            "leaf",
+            p256_spki(&p256),
+            "root",
+            &ml44,
+            ML_DSA_SCHEMES[0],
+            &oid(0),
+            &[],
+        );
+        let verifier = GoClientCertVerifier::from_pem(&certificate_pem(&root)).expect("verifier");
+        let leaf = CertificateDer::from(leaf.as_slice());
+        let p256_leaf = CertificateDer::from(p256_leaf.as_slice());
+        verifier
+            .verify_client_cert(&leaf, &[], now)
+            .expect("the ML-DSA-87 chain");
+        verifier
+            .verify_client_cert(&p256_leaf, &[], now)
+            .expect("the P-256 leaf's chain");
+
+        let message = b"a handshake transcript";
+        let sign = |key: &[u8], scheme: S| {
+            dcroxide_tlscrypto::sign::load_der(key)
+                .expect("key")
+                .choose_scheme(&[scheme])
+                .expect("scheme")
+                .sign(message)
+                .expect("sign")
+        };
+        let ml87_signature = sign(&ml87, S::ML_DSA_87);
+        verifier
+            .verify_tls13_signature(
+                message,
+                &leaf,
+                &digitally_signed(S::ML_DSA_87, &ml87_signature),
+            )
+            .expect("the leaf's own scheme in TLS 1.3");
+        for (label, scheme, message) in [
+            ("another set's scheme", S::ML_DSA_65, &message[..]),
+            ("the first set's scheme", S::ML_DSA_44, &message[..]),
+            ("an ECDSA scheme", S::ECDSA_NISTP256_SHA256, &message[..]),
+            ("another message", S::ML_DSA_87, &b"another transcript"[..]),
+        ] {
+            assert!(
+                verifier
+                    .verify_tls13_signature(
+                        message,
+                        &leaf,
+                        &digitally_signed(scheme, &ml87_signature)
+                    )
+                    .is_err(),
+                "TLS 1.3, {label}"
+            );
+        }
+        for scheme in [S::ML_DSA_87, S::ECDSA_NISTP256_SHA256] {
+            let err = verifier
+                .verify_tls12_signature(message, &leaf, &digitally_signed(scheme, &ml87_signature))
+                .expect_err("an ML-DSA client key in TLS 1.2");
+            assert_eq!(
+                err,
+                rustls::Error::PeerMisbehaved(ML_DSA_CLIENT_KEY_IN_TLS12),
+                "TLS 1.2, {scheme:?}"
+            );
+            assert_eq!(
+                crate::rpctls::go_error_text_for_tests(&err),
+                "tls: client certificate uses ML-DSA, which requires TLS 1.3"
+            );
+        }
+        verifier
+            .verify_tls12_signature(
+                message,
+                &p256_leaf,
+                &digitally_signed(
+                    S::ECDSA_NISTP256_SHA256,
+                    &sign(&p256_key, S::ECDSA_NISTP256_SHA256),
+                ),
+            )
+            .expect("a P-256 leaf under ML-DSA authorities in TLS 1.2");
+
+        assert_eq!(
+            verifier.supported_verify_schemes(),
+            [
+                S::ML_DSA_44,
+                S::ML_DSA_65,
+                S::ML_DSA_87,
+                S::RSA_PSS_SHA256,
+                S::ECDSA_NISTP256_SHA256,
+                S::ED25519,
+                S::RSA_PSS_SHA384,
+                S::RSA_PSS_SHA512,
+                S::RSA_PKCS1_SHA256,
+                S::RSA_PKCS1_SHA384,
+                S::RSA_PKCS1_SHA512,
+                S::ECDSA_NISTP384_SHA384,
+            ]
+        );
+    }
+
+    /// The client-certificate fuzz body's chains are what it says: each
+    /// certificate parses as Go's parser reads it, the leaf's signature
+    /// starts where the body lays its input, over the set's template, and
+    /// is checked by the authority's key of zero bytes with the set's
+    /// algorithm, in the replay and in webpki's search.  Inputs of each
+    /// use run, and a forged certificate list, a laid signature or key, or
+    /// a laid handshake signature authenticates no one.
+    #[test]
+    fn the_client_cert_fuzz_body_reaches_ml_dsa() {
+        let fixture = FuzzClientCerts::new().expect("the fixture");
+        assert_eq!(fixture.chains.len(), 3);
+        for (set, chain) in fixture.chains.iter().enumerate() {
+            let (_, key_len) = ML_DSA_KEYS[set];
+            let leaf = ChainCandidate::parse(&chain.leaf).expect("the leaf parses");
+            let authority = ChainCandidate::parse(&chain.authority).expect("the authority parses");
+            assert_eq!(
+                &chain.leaf[chain.leaf_signature_at..],
+                dcroxide_tlscrypto::verify::fuzz_ml_dsa_signature(set, &[]),
+                "set {set}: the leaf's signature"
+            );
+            assert_eq!(
+                chain
+                    .authority
+                    .get(chain.authority_key_at..chain.authority_key_at + key_len),
+                Some(&vec![0u8; key_len][..]),
+                "set {set}: the authority's key"
+            );
+            let (key_algorithm, _) = authority.links.key.expect("the authority's key");
+            assert!(
+                dcroxide_tlscrypto::RPC_SIG_ALGS.all.iter().any(|alg| {
+                    alg.signature_alg_id().as_ref() == leaf.links.signature_algorithm
+                        && alg.public_key_alg_id().as_ref() == key_algorithm
+                }),
+                "set {set}: an algorithm checks the leaf's signature"
+            );
+            assert!(
+                !check_signature_from(&leaf, &authority, dcroxide_tlscrypto::RPC_SIG_ALGS.all),
+                "set {set}: the template signature does not verify"
+            );
+        }
+        let len = |cert: &[u8]| u16::try_from(cert.len()).expect("short").to_be_bytes();
+        let listed = [
+            &[0u8][..],
+            &len(&fixture.chains[0].leaf),
+            &fixture.chains[0].leaf,
+            &len(&fixture.chains[0].authority),
+            &fixture.chains[0].authority,
+        ]
+        .concat();
+        for input in [
+            vec![],
+            listed,
+            vec![0, 0xff, 0xff, 0x30],
+            vec![1, 0x12, 0x34],
+            vec![4, 0x56],
+            [vec![8], vec![0xff; 40]].concat(),
+            vec![9, 0],
+            vec![10, 1, 2, 3],
+            vec![11, 11],
+            vec![255; 300],
+        ] {
+            assert!(
+                !fuzz_client_cert(&input),
+                "{:02x?}",
+                &input[..input.len().min(8)]
+            );
         }
     }
 

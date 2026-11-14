@@ -10,7 +10,9 @@
   (addendum of 2026-10-30), and the constant-time check T10 names ran
   green beside it (addendum of 2026-10-31, the constant-time check); then
   `ring` left the build in one change, with T6's refusal of an RSA server
-  key (addendum of 2026-10-31, the switch). The hybrids (T3), Go's
+  key (addendum of 2026-10-31, the switch). ML-DSA follows Go 1.27.3 in
+  TLS 1.3 (addendum of 2026-11-13): the RPC listener serves an ML-DSA key
+  and verifies ML-DSA client certificates. The hybrids (T3), Go's
   client-certificate set (T4) and T7's in-tree seeder client remain.
 - **Date:** 2026-10-26 (accepted), 2026-10-30 (addendum: the Go interop
   matrix), 2026-10-31 (addenda: the constant-time check; the switch),

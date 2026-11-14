@@ -1880,7 +1880,9 @@ any other must chain to a bundle certificate that dcrd would accept at
 the top of the chain: within its validity window, with no critical
 extension Go does not handle, an extended key usage that allows client
 authentication, and a path length constraint the chain's intermediates
-stay within. The client certificate shapes the daemon still refuses
+stay within. A client certificate with an ML-DSA key authenticates in
+TLS 1.3 alone, and a client held to TLS 1.2 with one is refused, as dcrd
+refuses it. The client certificate shapes the daemon still refuses
 where dcrd accepts them are listed in [PARITY.md](PARITY.md).
 
 Default ports are dcrd's, unchanged: mainnet 9108 (P2P) and 9109 (RPC).

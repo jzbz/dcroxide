@@ -536,8 +536,11 @@ const FUZZ_ML_DSA: [(usize, usize, usize, usize, usize); 3] = [
 /// [`FUZZ_ML_DSA`]: `bytes` laid over a signature of the set's length
 /// whose c̃ is zero, every coefficient of z zero, which `BitPack` writes
 /// as γ1 with only the top bit of its field set, and its hints empty, all
-/// zero bytes; `bytes` beyond that length are dropped.
-fn fuzz_ml_dsa_signature(set: usize, bytes: &[u8]) -> Vec<u8> {
+/// zero bytes; `bytes` beyond that length are dropped.  Set 0 is
+/// ML-DSA-44, 1 ML-DSA-65 and 2 ML-DSA-87.  Not part of the API: the RPC
+/// listener's client-certificate fuzz body lays its input the same way.
+#[doc(hidden)]
+pub fn fuzz_ml_dsa_signature(set: usize, bytes: &[u8]) -> Vec<u8> {
     let Some(&(_, len, c_tilde, bits, polys)) = FUZZ_ML_DSA.get(set) else {
         return Vec::new();
     };

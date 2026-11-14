@@ -119,7 +119,7 @@ exit criteria have not been demonstrated, and those are listed here too:
   licenses/advisories/sources/bans, a
   60-second-per-target fuzz smoke — all of those on every push to `master`
   and every pull request — and a nightly
-  10-minute-per-target run over the 26 fuzz targets, five of which ask dcrd's
+  10-minute-per-target run over the 27 fuzz targets, five of which ask dcrd's
   own code through the oracle and one of which checks against a model of
   dcrd's Ed25519, from a corpus kept between nights, and the signature soak
   against dcrd for 35 minutes each night on x86_64, on x86_64 with

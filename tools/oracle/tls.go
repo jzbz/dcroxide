@@ -423,25 +423,35 @@ type tlsRequest struct {
 
 // tlsDialDetail is tls_dial's answer: whether the handshake and the
 // request, when there is one, both succeeded, the first error otherwise,
-// the connection's state, and the response.
+// the connection's state, the signature schemes of the server's
+// CertificateRequest by Go's names, as Go's client reads them in
+// CertificateRequestInfo.SignatureSchemes, or null when it sent none, and
+// the response. In TLS 1.3 that is the list as sent; in TLS 1.2 Go keeps,
+// in their order, only the schemes it knows that fit the request's
+// certificate types, so an ML-DSA scheme there would not show
+// (crypto/tls/handshake_client.go:1251-1271).
 type tlsDialDetail struct {
 	OK    bool   `json:"ok"`
 	Error string `json:"error"`
 	tlsState
-	DidResume  bool   `json:"did_resume"`
-	HTTPStatus int    `json:"http_status"`
-	HTTPBody   string `json:"http_body"`
+	DidResume          bool     `json:"did_resume"`
+	CertificateRequest []string `json:"certificate_request"`
+	HTTPStatus         int      `json:"http_status"`
+	HTTPBody           string   `json:"http_body"`
 }
 
 // tlsDial answers tls_dial: one connection to a loopback address by
 // crypto/tls's client, configured as the request says and verifying the
 // server against the roots given and server_name, then, when the request
 // has one, an HTTP/1.1 request over it, closing the connection, and the
-// response read. A server's refusal of a TLS 1.3 client's certificate
-// arrives after the client's handshake is done, so it shows as the
-// request's error, and a client_cert without a request is refused: its ok
-// would cover the client's handshake alone and read a refusal as an
-// acceptance.
+// response read. A CertificateRequest's signature schemes are read in
+// GetClientCertificate, which then chooses the certificate as crypto/tls
+// chooses one without it (crypto/tls/handshake_client.go:1274-1288): the
+// client_cert if the request admits it, and none otherwise. A server's
+// refusal of a TLS 1.3 client's certificate arrives after the client's
+// handshake is done, so it shows as the request's error, and a
+// client_cert without a request is refused: its ok would cover the
+// client's handshake alone and read a refusal as an acceptance.
 func tlsDial(data []byte) response {
 	var in struct {
 		Addr             string       `json:"addr"`
@@ -495,6 +505,19 @@ func tlsDial(data []byte) response {
 			return errResp("tls_dial: client_cert without a request, which alone shows a TLS 1.3 server's refusal of it")
 		}
 	}
+	var detail tlsDialDetail
+	config.GetClientCertificate = func(cri *tls.CertificateRequestInfo) (*tls.Certificate, error) {
+		detail.CertificateRequest = []string{}
+		for _, scheme := range cri.SignatureSchemes {
+			detail.CertificateRequest = append(detail.CertificateRequest, scheme.String())
+		}
+		for i := range config.Certificates {
+			if cri.SupportsCertificate(&config.Certificates[i]) == nil {
+				return &config.Certificates[i], nil
+			}
+		}
+		return new(tls.Certificate), nil
+	}
 	var req *http.Request
 	if in.Request != nil {
 		req, err = http.NewRequest(in.Request.Method, "https://"+in.Addr+in.Request.Path,
@@ -508,7 +531,6 @@ func tlsDial(data []byte) response {
 		req.Close = true
 	}
 
-	var detail tlsDialDetail
 	deadline := time.Now().Add(timeout)
 	if err := tlsDialOnce(in.Addr, config, req, deadline, &detail); err != nil {
 		detail.Error = err.Error()

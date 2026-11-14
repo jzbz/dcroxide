@@ -389,7 +389,9 @@ func TestTLSListenAndDial(t *testing.T) {
 		t.Errorf("TLS 1.3: suites %v", hello.CipherSuites)
 	}
 	state = tlsState{"TLS 1.3", hello.CipherSuites[0], "CurveP256", true}
-	wantDial = tlsDialDetail{OK: true, tlsState: state, HTTPStatus: 200, HTTPBody: `{"result":0}`}
+	wantDial = tlsDialDetail{
+		OK: true, tlsState: state, CertificateRequest: tls13Schemes, HTTPStatus: 200, HTTPBody: `{"result":0}`,
+	}
 	if !reflect.DeepEqual(got, wantDial) {
 		t.Errorf("TLS 1.3: dial %+v, want %+v", got, wantDial)
 	}
@@ -418,6 +420,20 @@ func TestTLSListenAndDial(t *testing.T) {
 		if !slices.Contains(hello.Extensions, ext) {
 			t.Errorf("TLS 1.3: extensions %v, without %d", hello.Extensions, ext)
 		}
+	}
+
+	// TLS 1.2 with a client certificate: the CertificateRequest lists the
+	// TLS 1.2 schemes.
+	addr, id = listen(map[string]any{
+		"max_version": "TLS 1.2",
+		"client_auth": "RequireAndVerifyClientCert",
+		"client_cas":  []string{pki["ca"].Cert},
+	})
+	got = dial(addr, map[string]any{"client_cert": identity("client")})
+	served = tlsListenResultOf(t, id)
+	if !got.OK || got.Version != "TLS 1.2" || !slices.Equal(got.CertificateRequest, tls12Schemes) ||
+		!served.OK || !slices.Equal(served.PeerCertificates, []string{pki["client"].Cert}) {
+		t.Errorf("TLS 1.2 client certificate: dial %+v, listen %+v", got, served)
 	}
 
 	// Go's defaults on both sides, under dcrd's GODEBUG: all seven groups
