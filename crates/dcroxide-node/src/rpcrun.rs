@@ -2869,8 +2869,8 @@ fn go_new_oid_from_der(der: &[u8]) -> bool {
 }
 
 /// A basic constraints `pathLenConstraint` as Go's
-/// `parseBasicConstraintsExtension` reads it (the same in 1.26.2 and
-/// 1.27.1), through cryptobyte's `ReadASN1Integer` into a `uint`: a
+/// `parseBasicConstraintsExtension` reads it (the same in 1.26.2, 1.27.1
+/// and 1.27.3), through cryptobyte's `ReadASN1Integer` into a `uint`: a
 /// minimally encoded, non-negative integer no larger than `math.MaxInt`.
 /// `None` is Go's `x509: invalid basic constraints`.
 // Byte shifts over at most eight bytes.
@@ -3518,9 +3518,9 @@ enum GoChains<'a> {
     SignatureLimit,
 }
 
-/// Go's `buildChains` for `leaf` (`crypto/x509/verify.go`, the same text
-/// in 1.26.2 and 1.27.1), over the `--clientcafile` pool and the pool of
-/// certificates the client sent, each deduplicated and in the order it
+/// Go's `buildChains` for `leaf` (`crypto/x509/verify.go`, the same text in
+/// 1.26.2, 1.27.1 and 1.27.3), over the `--clientcafile` pool and the pool
+/// of certificates the client sent, each deduplicated and in the order it
 /// was filled, as Go's `CertPool.AddCert` leaves them, at `now`.
 ///
 /// It looks for the leaf's issuer among the roots and then among the
@@ -3725,8 +3725,8 @@ fn go_rsa_exponent_fits(key: &[u8]) -> bool {
 
 /// Go's `isValid` for a root or intermediate `candidate` placed above a
 /// chain of `chain_len` certificates (`crypto/x509/verify.go`, the same
-/// text in 1.26.2 and 1.27.1); the name check it opens with holds for
-/// every candidate [`potential_parents`] gives.
+/// text in 1.26.2, 1.27.1 and 1.27.3); the name check it opens with holds
+/// for every candidate [`potential_parents`] gives.
 // `chain_len` counts the leaf, so it is at least one.
 #[allow(clippy::arithmetic_side_effects)]
 fn go_is_valid(candidate: &ChainCandidate<'_>, is_root: bool, chain_len: usize, now: i64) -> bool {
@@ -10431,10 +10431,11 @@ mod tests {
     }
 
     /// Go's `pem.Decode` over the malformed shapes a client CA file or
-    /// rpc.cert can hold, with the blocks Go 1.27 returns for each, as
-    /// go1.26.2, the reference Go, returns them too (review finding
-    /// GAP06#3): each entry is the input and, for every block decoded in
-    /// turn, its `type|has headers|hex bytes`.
+    /// rpc.cert can hold, with the blocks Go 1.27 returns for each, whose
+    /// `encoding/pem` go1.27.3, the reference Go, keeps, as go1.26.2
+    /// returns them too (review finding GAP06#3): each entry is the input
+    /// and, for every block decoded in turn, its
+    /// `type|has headers|hex bytes`.
     #[test]
     fn go_pem_decode_matches_go() {
         let good = "-----BEGIN CERTIFICATE-----\nAQID\n-----END CERTIFICATE-----\n";
@@ -10585,9 +10586,9 @@ mod tests {
     /// cryptobyte's UTCTime and GeneralizedTime readers, as Go's
     /// certificate parser reads the validity window.  Every row is Go
     /// 1.27's `ParseCertificate` over a certificate with that notAfter,
-    /// whose time readers 1.26.2, the reference Go, shares: a fraction of
-    /// a second is refused in either form, and a zone hour of 24 is
-    /// accepted.
+    /// whose time readers go1.27.3, the reference Go, and 1.26.2 share: a
+    /// fraction of a second is refused in either form, and a zone hour of
+    /// 24 is accepted.
     #[test]
     fn asn1_times_parse_as_go_reads_them() {
         let cases: [(u8, &str, Option<i64>); 21] = [
@@ -10778,8 +10779,8 @@ mod tests {
             );
         }
 
-        // The basic constraints' path length, read as Go reads it (the
-        // same in 1.26.2 and 1.27.1): absent is no constraint, and a
+        // The basic constraints' path length, read as Go reads it (the same
+        // in 1.26.2, 1.27.1 and 1.27.3): absent is no constraint, and a
         // negative or non-minimal integer fails the parse.
         const BASIC_CONSTRAINTS: &[u8] = &[0x55, 0x1d, 0x13];
         let constraints = |content: &[u8]| {
@@ -10822,8 +10823,8 @@ mod tests {
 
         // What Go's parser refuses outright, so that the client CA file
         // skips it, each checked against Go 1.27's `ParseCertificate`,
-        // whose code for these 1.26.2, the reference Go, shares: a
-        // fractional validity time, a key identifier or authority
+        // whose code for these go1.27.3, the reference Go, and 1.26.2
+        // share: a fractional validity time, a key identifier or authority
         // information access marked critical, an extension twice, a
         // critical flag or cA boolean that is not a DER BOOLEAN, and an
         // OID cryptobyte does not read.
@@ -12323,19 +12324,19 @@ mod tests {
 
     /// Go's chain search is replayed before webpki's, and its budget of
     /// 100 signature checks charges every candidate it considers (Go's
-    /// `buildChains`, the same in 1.26.2 and 1.27.1): certificates named
-    /// as the leaf's issuer that lead to no root cost Go a check each and
-    /// webpki none, so 98 of them sent ahead of the real intermediate
+    /// `buildChains`, the same in 1.26.2, 1.27.1 and 1.27.3): certificates
+    /// named as the leaf's issuer that lead to no root cost Go a check each
+    /// and webpki none, so 98 of them sent ahead of the real intermediate
     /// leave room for the chain, the intermediate's check being the 99th
-    /// and the root's the 100th, and 99 do not, where webpki alone
-    /// accepted both.  The candidates go in Go's order: those whose
-    /// subject key identifier matches the child's authority key
-    /// identifier first, then those where only one of the two is present,
-    /// then the rest; so the same flood is no obstacle to an intermediate
-    /// whose identifier matches and the whole obstacle to one that comes
-    /// after the matching decoys.  Each verdict is the reference Go's,
-    /// 1.26.2's, as it is 1.27's, and is compared with the oracle's Go,
-    /// of whatever release, where it runs.
+    /// and the root's the 100th, and 99 do not, where webpki alone accepted
+    /// both.  The candidates go in Go's order: those whose subject key
+    /// identifier matches the child's authority key identifier first, then
+    /// those where only one of the two is present, then the rest; so the
+    /// same flood is no obstacle to an intermediate whose identifier
+    /// matches and the whole obstacle to one that comes after the matching
+    /// decoys.  Each verdict is the reference Go's, go1.27.3's, as it is
+    /// 1.26.2's, and is compared with the oracle's Go, of whatever release,
+    /// where it runs.
     #[test]
     fn gos_signature_budget_charges_every_candidate() {
         use dcroxide_certgen::gentool::generate_key;
@@ -12473,8 +12474,8 @@ mod tests {
     }
 
     /// More of how Go's candidate order and checks shape its budget, each
-    /// verdict the reference Go's, 1.26.2's, as it is 1.27's, and, where
-    /// the oracle runs, Go's own:
+    /// verdict the reference Go's, go1.27.3's, as it is 1.26.2's, and,
+    /// where the oracle runs, Go's own:
     /// - the one-identifier group goes before the mismatched one, and two
     ///   absent identifiers count as matching, so 99 decoys behind
     ///   either do not keep the chain from its first two checks;
@@ -12620,7 +12621,7 @@ mod tests {
         );
 
         // Decoys under X25519, a key algorithm Go leaves without a key,
-        // in 1.26.2 as in 1.27.
+        // in go1.27.3, the reference, as in 1.26.2.
         let x25519 = |i: u8| {
             der_tlv(
                 0x30,
@@ -12733,7 +12734,7 @@ mod tests {
     }
 
     /// A candidate Go's `alreadyInChain` passes over still costs a
-    /// signature check (go1.26.2, the reference, and 1.27; go1.24.13,
+    /// signature check (go1.27.3, the reference, and go1.26.2; go1.24.13,
     /// go1.25.4 and go1.26.0 counted it only after).  The leaf's issuer
     /// `a` and a `b` sign each other, and a second `a` under the same key
     /// leads to the root.  Go goes into the first `a`, then `b`, where
@@ -15993,9 +15994,10 @@ mod tests {
     /// segments, encoded separators and dots, non-ASCII bytes, and the
     /// characters that force a path to be re-escaped, which is the
     /// combination the escaped-path rule turns on.  The server was Go
-    /// 1.27's; against go1.26.2, the reference Go, 1,634 of the rows, all
-    /// redirects, come out differently, its redirect escaping the cleaned
-    /// path again (PARITY.md's RPC mux row).
+    /// 1.27's, whose mux and request reading go1.27.3, the reference Go,
+    /// keeps; against go1.26.2, 1,634 of the rows, all redirects, come out
+    /// differently, its redirect escaping the cleaned path again
+    /// (PARITY.md's RPC mux row).
     ///
     /// This is the only check that covers the request-target parser
     /// itself rather than the routing decision on top of it.
@@ -17511,12 +17513,13 @@ mod tests {
 
     /// The chunked decoder refuses what Go's refuses, with Go's text, and
     /// accepts what it accepts.  Every row is a real server's answer: Go
-    /// 1.27's `net/http` behind dcrd's handler shape, which answers a
-    /// failed read `400 error reading JSON message: <err>`.  Against
-    /// go1.26.2, the reference Go, every row agrees but four, whose
-    /// malformed MIME header line it writes unquoted.  The decoder took a
-    /// bare-LF size line, trimmed any whitespace, and parsed the size
-    /// with `from_str_radix`, which takes a `+`.
+    /// 1.27's `net/http`, whose chunked reader go1.27.3, the reference Go,
+    /// keeps, behind dcrd's handler shape, which answers a failed read
+    /// `400 error reading JSON message: <err>`.  Against go1.26.2 every row
+    /// agrees but four, whose malformed MIME header line it writes
+    /// unquoted.  The decoder took a bare-LF size line, trimmed any
+    /// whitespace, and parsed the size with `from_str_radix`, which takes
+    /// a `+`.
     #[test]
     fn chunked_framing_follows_gos_reader() {
         let ok = |body: &[u8]| Ok(body.to_vec());
@@ -18122,8 +18125,9 @@ mod tests {
 
     /// Request targets through `url.ParseRequestURI` and the mux, and the
     /// host an absolute-form or CONNECT target names, each row a real
-    /// server's answer (Go 1.27, as go1.26.2, the reference Go, answers
-    /// each too; dcrd's two patterns, the handler echoing `URL.Host`).
+    /// server's answer (Go 1.27, whose code go1.27.3, the reference Go,
+    /// keeps, as go1.26.2 answers each too; dcrd's two patterns, the
+    /// handler echoing `URL.Host`).
     /// The port had no control-byte check, found a scheme by searching
     /// for `://` and never validated the authority, and read every
     /// CONNECT target as a bare authority.

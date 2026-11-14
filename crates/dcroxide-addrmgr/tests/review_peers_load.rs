@@ -7,10 +7,12 @@
 //! The decoder rows were checked against Go's `json.NewDecoder(r).Decode`
 //! into dcrd's `serializedAddrManager` types, and the filesystem rows
 //! against dcrd's `os.Stat`/`os.Open`/`os.Remove` sequence, all built
-//! with Go 1.26.5.  dcrd's release image builds with Go 1.26.2 at the
-//! parity pin (`contrib/docker/Dockerfile`).  (Go 1.27's
-//! `encoding/json`, built on its v2 implementation, words several syntax
-//! errors differently.)
+//! with Go 1.26.5.  dcrd's release image built with Go 1.26.2 until
+//! `46e9df48` moved it to Go 1.27.3 (`contrib/docker/Dockerfile`).
+//! (Go 1.27's `encoding/json`, built on its v2 implementation, words
+//! several syntax errors differently; the port keeps Go 1.26's texts
+//! until the batteries that pin them are regenerated, PARITY.md's open
+//! Go-JSON entry.)
 
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -406,16 +408,16 @@ fn files_go_rejects_are_rejected() {
 }
 
 /// What `json.Decoder.Decode` makes of a file that is not one good value,
-/// byte for byte (Go 1.26, dcrd's release toolchain).  The decoder scans
-/// as it reads, so a syntax error inside the first value is reported at
-/// the byte that breaks it, even when the brackets never balance.  A file
-/// that ends partway through a value is `unexpected EOF`, whatever the
-/// scanner was in the middle of.  A complete value is decoded without
-/// what follows it, which for a number or a literal starts at the first
-/// byte that cannot continue it.  The port framed the value by counting
-/// brackets: an unbalanced value was always `unexpected EOF`, a leading
-/// `,` was `unexpected end of JSON input`, and a primitive ran on to the
-/// next space or comma.
+/// byte for byte (Go 1.26, the release toolchain dcrd used until
+/// `46e9df48`).  The decoder scans as it reads, so a syntax error inside
+/// the first value is reported at the byte that breaks it, even when the
+/// brackets never balance.  A file that ends partway through a value is
+/// `unexpected EOF`, whatever the scanner was in the middle of.  A
+/// complete value is decoded without what follows it, which for a number
+/// or a literal starts at the first byte that cannot continue it.  The
+/// port framed the value by counting brackets: an unbalanced value was
+/// always `unexpected EOF`, a leading `,` was `unexpected end of JSON
+/// input`, and a primitive ran on to the next space or comma.
 #[test]
 fn decode_errors_carry_gos_text() {
     enum Want {

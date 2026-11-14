@@ -5,7 +5,8 @@
 //! counting brackets and then insisted on UTF-8, where the peers file
 //! already went through the crate's scanner-driven model of the same
 //! decoder.  Every row was checked against Go 1.26.5's `encoding/json`,
-//! the toolchain dcrd's release image uses, running dcrd's loop.
+//! the v1 package of the Go 1.26 that dcrd's release image used until
+//! `46e9df48`, running dcrd's loop.
 
 // Test scaffolding uses bounded counters.
 #![allow(clippy::arithmetic_side_effects)]

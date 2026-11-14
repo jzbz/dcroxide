@@ -4938,12 +4938,13 @@ pub fn handle_help<C: RpcChain>(server: &Server<C>, cmd: &GoValue) -> Result<GoV
 mod tests {
     use super::*;
 
-    /// Go 1.27 `base64.StdEncoding.DecodeString` over each input, which
-    /// go1.26.2, the reference Go, answers alike: the
-    /// decoded hex, or the error text.  The error offsets come from Go's
-    /// quantum-at-a-time walk (`decodeQuantum`), so a problem is reported
-    /// where the walk meets it -- not at the first non-alphabet byte, and
-    /// with `si - 1` / `si - j` offsets that count skipped newlines.
+    /// Go 1.27 `base64.StdEncoding.DecodeString` over each input, whose
+    /// `encoding/base64` go1.27.3, the reference Go, keeps, and which
+    /// go1.26.2 answers alike: the decoded hex, or the error text.  The
+    /// error offsets come from Go's quantum-at-a-time walk (`decodeQuantum`),
+    /// so a problem is reported where the walk meets it -- not at the first
+    /// non-alphabet byte, and with `si - 1` / `si - j` offsets that count
+    /// skipped newlines.
     const GO_STD_BASE64_DECODES: &[(&str, &str)] = &[
         ("", "OK:"),
         ("\n", "OK:"),

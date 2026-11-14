@@ -203,8 +203,9 @@ mod tests {
 
     use std::sync::Mutex;
 
-    /// Go's `fmt.Sprintf("%v", f)` for each value, as go1.27 prints it and
-    /// go1.26.2, the reference Go, prints it alike:
+    /// Go's `fmt.Sprintf("%v", f)` for each value, as go1.27 prints it,
+    /// whose `fmt` and `strconv` go1.27.3, the reference Go, keeps, and as
+    /// go1.26.2 prints it alike:
     /// ticket prices of every size the template line carries, the
     /// exponent forms on both sides, and the values Go spells by name.
     #[test]

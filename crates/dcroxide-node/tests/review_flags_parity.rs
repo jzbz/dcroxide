@@ -2,8 +2,9 @@
 //! The go-flags and Go standard library behaviours `loadConfig`
 //! observes, end to end through the configuration pipeline, with the
 //! outcomes and texts a go-flags v1.6.1 / Go 1.27 run over dcrd's config
-//! struct gives (the standard library's texts among them come out the
-//! same from go1.26.2, the reference Go):
+//! struct gives (the standard library's texts among them, from
+//! `strconv`, `time` and `net`, whose code go1.27.3, the reference Go,
+//! keeps, come out the same from go1.26.2):
 //!
 //! - The help option ends the help pre-parse with `ErrHelp` where it
 //!   stands, so no argument after it, nor the rest of a short cluster,

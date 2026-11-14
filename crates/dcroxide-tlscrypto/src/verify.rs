@@ -18,7 +18,7 @@
 //!   `split_rs_asn1` and Go's `ecdsa.VerifyASN1` read it.  The digest is
 //!   cut to the order's length and reduced (`hazmat.rs:136-173`), which is
 //!   ring's and Go's reading of a SHA-384 digest under P-256.
-//! * Ed25519, as Go 1.26.2 verifies it
+//! * Ed25519, as Go 1.27.3 verifies it
 //!   (`crypto/internal/fips140/ed25519/ed25519.go:290-327`) and ring does
 //!   (`ring-0.17.14/src/ec/curve25519/ed25519/verification.rs:36-74`),
 //!   written here on `curve25519-dalek`: the key's 32 bytes decoded as Go's

@@ -400,10 +400,11 @@ pub fn go_quote(s: &str) -> String {
 /// `strconv.IsPrint` calls printable -- printable ASCII and U+00A1..U+00FF
 /// but the soft hyphen -- names the seven C escapes, spells the other
 /// ASCII controls `\xNN` and every other rune `\uNNNN`, and backslashes
-/// a backslash.  This is Go 1.26's `encoding/json`, the toolchain dcrd's
-/// release image builds with (`contrib/docker/Dockerfile`); a toolchain
-/// that builds the package on its v2 implementation spells a high byte
-/// `'\xff'` instead.
+/// a backslash.  This is Go 1.26's `encoding/json`, which dcrd's release
+/// image built with until the `46e9df48` pin (`contrib/docker/Dockerfile`);
+/// a toolchain that builds the package on its v2 implementation spells a
+/// high byte `'\xff'` instead, and the port keeps Go 1.26's text until the
+/// batteries that pin it are regenerated (PARITY.md's open Go-JSON entry).
 fn quote_char(c: u8) -> String {
     // The quote characters are the special cases, different from
     // quoted strings.

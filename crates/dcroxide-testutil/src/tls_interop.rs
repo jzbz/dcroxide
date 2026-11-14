@@ -486,11 +486,11 @@ mod tests {
     /// given it, the server's defaults hold the hybrid and the two
     /// negotiate it; under the oracle module's own defaults, an empty
     /// `GODEBUG`, the server's defaults leave it out and the server
-    /// refuses.  The setting reaches only the defaults: Go 1.27 takes a
-    /// configured list as it is (Go 1.27.3's
-    /// `crypto/tls/common.go:1287-1309` and `defaults.go:23-35`).  The
-    /// empty one alone would hold were the environment dropped, since Go
-    /// reads it as an unset one.
+    /// refuses.  The setting reaches only the defaults: Go 1.27 keeps each
+    /// configured key exchange it implements, whether or not its default
+    /// list has it (Go 1.27.3's `crypto/tls/common.go:1287-1308` and
+    /// `defaults.go:23-34`).  The empty one alone would hold were the
+    /// environment dropped, since Go reads it as an unset one.
     #[test]
     fn the_oracle_runs_with_the_environment_it_is_given() {
         let Some(mut dcrd) = TlsOracle::start() else {

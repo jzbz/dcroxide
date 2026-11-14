@@ -6,7 +6,8 @@
   later moves), 2026-10-26 (addendum: frozen batteries whose exporters were
   scratch code; second addendum: one reference Go, and CI on it), 2026-11-12
   (addendum: the pin at `46e9df48` and the reference Go at 1.27.3; second
-  addendum: `tools/fullblockgen` in `go-tools`)
+  addendum: `tools/fullblockgen` in `go-tools`), 2026-11-14 (addendum: the
+  2026-11-12 pending items, followed or recorded)
 
 ## Context
 
@@ -465,9 +466,10 @@ addendum:
   line, are now the reference's behaviour, and the code was not changed back.
   Each holds in 1.27.3 as in 1.27.1, from which the port took it. Behaviour
   newer than 1.27.1 is pending: the count of `Trailer` values against the cap
-  (1.27.2), and in 1.27.3 a failed continuation-line read reported as an error
-  and the drop of chains through distrusted keys. So are Go 1.27's refusal of
-  an IPv4-mapped IPv6 address as a subject alternative name or IP name
+  and a failed continuation-line read reported as an error (both 1.27.2;
+  corrected 2026-11-14, see the addendum of that date), and in 1.27.3 the drop
+  of chains through distrusted keys. So are Go 1.27's refusal of an
+  IPv4-mapped IPv6 address as a subject alternative name or IP name
   constraint, the runes Unicode 17 makes printable for `strconv.IsPrint`, the
   cause Go gives for a key it cannot parse, ML-DSA keys, certificates and
   signatures, and the Go-JSON texts. `docs/PARITY.md` records them as interim
@@ -496,3 +498,115 @@ keeps `go 1.27.0`: since the move to 1.27.3 that line is within the
 reference, so the drop to dcrd's `go 1.25.0` that the 2026-10-26 item
 planned is not needed. Under go1.27.3 the module vets cleanly; it has no
 tests of its own.
+
+## Addendum, 2026-11-14 — the 2026-11-12 pending items, followed or recorded
+
+The first 2026-11-12 addendum listed the Go behaviour newer than 1.27.1 that
+the port did not yet have, with Go 1.27's other changes it had not taken, and
+said that all but the Go-JSON texts were to be followed in the changes that
+complete the move to go1.27.3. Those changes are made, and not every item was
+followed: each that was not is recorded in `docs/PARITY.md` as a divergence,
+for the reason given here. Item by item, with the change that settled each:
+
+- **The count of `Trailer` values against the header value cap** (Go 1.27.2):
+  followed in `b14db10`, "Count Trailer values against the header value cap".
+- **A failed continuation-line read reported as an error.** This is Go
+  1.27.2's change, not 1.27.3's as the 2026-11-12 addendum first said
+  (corrected there). It needs no code: the port reads a request head whole
+  before it parses a field line, and a trailer only once its closing blank
+  line is buffered, as Go reads a trailer, so neither read fails inside a
+  continuation line, and a head that ends inside one gets the answer Go gives.
+  `2e72ad4`, "Record the Go 1.27.3 points that need no code", pins and records
+  it. The trailer reader keeps a `break` in its continuation loop, which it
+  cannot reach, where Go now returns the error (decided 2026-11-12).
+- **The drop of chains through distrusted keys** (Go 1.27.3): followed for
+  client certificates in `8fee0dc`, "Drop client-cert chains through Go's
+  distrusted keys". Recorded for the HTTPS seeders (decided 2026-11-12): ureq
+  3.5.1 has no hook for a verifier of the port's own, so following Go there
+  would take a verifier on the proxied transport and a connector for ureq on
+  the direct one, new code on the path a seeder MITM attacks.
+- **IPv4-mapped IPv6 addresses refused as subject alternative names and IP
+  name constraints** (Go 1.27): followed for client certificates in `33cdc97`,
+  "Refuse the IP names and mailbox constraints Go 1.27.3 refuses", with Go's
+  refusal of IP addresses and masks of other lengths and its rule for reading
+  an rfc822Name constraint, which refuses one whose domain holds `@`. Recorded
+  for the seeders, for the reason above (decided 2026-11-12), and for the
+  `rpc.cert` leaf, which the port does not parse as `tls.X509KeyPair` does, so
+  that a leaf naming such an address loads (decided 2026-11-12), a gap older
+  than 1.27.
+- **A mailbox whose domain holds `@` below a certificate with name constraints
+  of any form.** Not on the 2026-11-12 list: Go 1.27 refuses such a chain,
+  which came to light as the points that need no code were recorded. Followed
+  for client certificates in `bc71504`, "Refuse client chains naming a mailbox
+  whose domain holds @" (decided 2026-11-13), for the `@` alone, which is what
+  1.27 newly refuses. Go's older refusal of other names it cannot read under
+  any constraint, such as a DNS name with an empty label or a URI whose host
+  is an IP address or empty, stays recorded, as does webpki's own evaluation
+  of rfc822Name and URI constraints, which differs from Go's (decided
+  2026-11-12). Recorded for the seeders, for the reason above (decided
+  2026-11-14).
+- **The runes Unicode 17 makes printable for `strconv.IsPrint`**: followed in
+  `1cf0be4`, "Take Go 1.27.3's IsPrint tables".
+- **The cause Go gives for a key it cannot parse**: followed for the RPC key
+  in `8d6a2d7`, "Read an RPC key in Go 1.27's order and keep asn1's error
+  texts", and `64f876f`, "Give Go 1.27.3's cause when an RPC key does not
+  parse", and for gencerts' CA key in `efe8265`, "Load gencerts' CA key as
+  Go's X509KeyPair does". Recorded: an RSA key keeps the port's words, also
+  where Go refuses its values with a cause of its own, since the provider
+  refuses an RSA `rpc.key` whatever its values (ADR-0015, T6; decided
+  2026-11-12); and gencerts refuses RSA, P-224 and ML-DSA CA keys in words of
+  its own, where Go issues with them (ML-DSA decided 2026-11-12).
+- **ML-DSA keys, certificates and signatures**: followed in TLS 1.3 on the
+  `ml-dsa` crate, as ADR-0015's addendum of 2026-11-13 records: `323d51f`,
+  "Add the ml-dsa crate for the TLS provider", `2151955`, "Verify ML-DSA
+  signatures in the TLS provider", and the changes "Load and serve an ML-DSA
+  RPC key as Go 1.27.3 does" and "Take ML-DSA client certificates as Go 1.27.3
+  does". Recorded in `docs/PARITY.md`'s ML-DSA entry: the seeders keep ring's
+  verification set and gencerts refuses an ML-DSA CA key (both decided
+  2026-11-12); some refusals come later than Go's, or in rustls's or webpki's
+  words or alerts, since those libraries make them; the TLS 1.3
+  CertificateRequest lists PKCS#1 v1.5's three schemes, which Go leaves out of
+  TLS 1.3, and not ECDSA with P-521, which the provider lacks, and carries no
+  `signature_algorithms_cert`, which rustls 0.23.46 does not write; and a
+  handshake message over rustls's 64 KiB is refused, where Go reads a
+  Certificate message of up to 256 KiB. The entry on `--authtype=clientcert`
+  records that a chain through an ML-DSA key whose BIT STRING has unused bits,
+  which Go right-aligns, does not verify, failing closed. No ML-DSA code is
+  under the constant-time check (ADR-0015's addenda of 2026-11-13 and
+  2026-11-14).
+- **The Go-JSON texts**: not followed, as the 2026-11-12 addendum excepted
+  them. The three batteries that pin them are regenerated by rebuilt
+  exporters, not re-expected by hand (the 2026-10-26 addendum on frozen
+  batteries), and until those exist the port keeps Go 1.26.2's texts, an
+  interim divergence `docs/PARITY.md` records.
+
+**Gaps the move brought to light.** Checking the ML-DSA changes against Go
+showed TLS differences older than the move, each in how rustls reads a
+ClientHello or which alert it sends. A hello with a non-empty
+`renegotiation_info` completes the handshake in TLS 1.3 with any key, and in
+TLS 1.2 with any key but ML-DSA, where Go refuses it. With any key but ML-DSA,
+a TLS 1.2 hello with compressed point formats alone draws `illegal_parameter`,
+where Go sends `missing_extension`, and a TLS 1.2 hello without
+`signature_algorithms` is refused by rustls first, and in its words. With any
+key, rustls's `protocol_version` alert goes out in a record of version 0x0303,
+where Go's carries 0x0301; a TLS 1.3 client that offers none of the key's
+schemes is refused after the ServerHello, where Go refuses it before; and
+under `--authtype=clientcert` a TLS 1.2 client that sends no certificate gets
+`certificate_required`, where Go sends `handshake_failure`, and a TLS 1.3
+CertificateVerify under a scheme that does not fit the leaf's key gets
+`decrypt_error`, where Go sends `illegal_parameter`. Closing the four in
+rustls's reading of the ClientHello would take a check ahead of rustls for
+every key, like the one the port now makes for an ML-DSA key; the others come
+later in the handshake. All of them are recorded in `docs/PARITY.md` as open.
+
+**The other pending items.**
+
+- **Citations of Go 1.27**: settled. "Re-point Go citations to 1.27.3"
+  re-pointed the Go standard library line citations outside the ADR bodies to
+  go1.27.3, except those a release beside them dates, and the change that adds
+  this addendum names go1.27.3 as the reference where comments and docs still
+  named 1.26.2. ADR bodies keep the citations they were written with;
+  ADR-0015's addendum of this date says which release its body's read in, and
+  ADR-0007's that its tie check stands under go1.27.3.
+- **The oracle's GODEBUG defaults** and **the bump check**: stand.
+  **`tools/fullblockgen`**: settled by the second 2026-11-12 addendum.

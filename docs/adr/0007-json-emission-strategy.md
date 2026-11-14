@@ -4,7 +4,8 @@
   `encoding/json` reimplemented over a runtime type model, not serde, and
   vectors dumped inside dcrd, not live captures; see the addenda
 - **Date:** 2026-07-03 (proposed), 2026-07-26 (addendum: what shipped),
-  2026-10-26 (ratified)
+  2026-10-26 (ratified), 2026-11-14 (addendum: the reference Go at
+  go1.27.3)
 
 ## Context
 
@@ -240,3 +241,25 @@ port fails as dcrd does or records a divergence is left open.
 
 The Decision section above still describes serde and live captures. It reads
 correctly only through the addenda, as ADR-0005's does.
+
+## Addendum, 2026-11-14 — the reference Go at go1.27.3
+
+The reference Go moved from go1.26.2 to go1.27.3 with the pin's move to
+`46e9df48` (ADR-0001's first 2026-11-12 addendum). The tie check of the
+2026-10-26 addendum stands. The 90 tie rows and both trigger values came out
+the same under go1.26.2 and under Go 1.27.1, and `strconv`, `internal/strconv`
+and `fmt` are the same in 1.27.0, 1.27.1 and 1.27.3, file for file, so
+go1.27.3 writes the same digits; this was read from the sources, and the rows
+were not run again under go1.27.3. What 1.27.2 and 1.27.3 change in
+`encoding/json` (`internal/internal.go`, `v2/arshal_any.go`,
+`v2/arshal_default.go`, `v2/arshal_methods.go` and `v2_inject.go`) concerns
+decoding, the values errors carry and when marshal methods are called on map
+keys and unaddressable values, not how a float is written.
+
+Beyond the digits, Go 1.27's exposure is what `docs/PARITY.md`'s open entry on
+the Go-JSON texts lists: the syntax-error and type-error texts, the quoting of
+bytes that are not ASCII, and invalid UTF-8 written as a raw U+FFFD. The port
+keeps all of them at Go 1.26.2's until the batteries that pin them are
+regenerated, an interim divergence (ADR-0001's 2026-10-26 addendum on frozen
+batteries). The 2026-10-26 addendum's paragraph on the Go reference still
+describes how the tie check was made, under the reference of that time.

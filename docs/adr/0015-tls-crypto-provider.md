@@ -17,7 +17,8 @@
 - **Date:** 2026-10-26 (accepted), 2026-10-30 (addendum: the Go interop
   matrix), 2026-10-31 (addenda: the constant-time check; the switch),
   2026-11-13 (addendum: ML-DSA, with the `ml-dsa` crate), 2026-11-14
-  (addendum: ML-DSA's key expansion, outside the constant-time check)
+  (addenda: ML-DSA's key expansion, outside the constant-time check; the
+  reference Go at go1.27.3)
 
 ## Context
 
@@ -1036,3 +1037,30 @@ The expansion runs once, when an `rpc.key` loads at startup or is rotated
 in, and never in a handshake. T10 applies to ML-DSA through the other
 three items of the addendum of 2026-11-13, which stands as written but
 for this item.
+
+## Addendum, 2026-11-14 (second) — the reference Go at go1.27.3
+
+The reference Go moved from 1.26.2 to go1.27.3 with the pin's move to
+`46e9df48` (ADR-0001's first 2026-11-12 addendum). This record's Context and
+Decision, and the addenda written before that move, cite Go as they were
+written: the lines they cite in Go's sources are 1.26.2's
+(`crypto/tls/defaults.go:30-33`, `common.go:158-165`,
+`cipher_suites.go:290-291`, `crypto/x509/x509.go:539-540` and the rest), and
+"the reference Go, 1.26.2" in the Context, and "the reference Go, go1.26.2" in
+the 2026-10-30 addendum, name the reference of that time. They are not
+re-pointed.
+
+What the body takes from those lines holds in go1.27.3. Go 1.27 replaced
+`defaultCurvePreferences` with `defaultCurveEnabled` and one fixed
+`curvePreferenceOrder` (`crypto/tls/defaults.go:23-43`), which also lists the
+pure MLKEM1024 but does not enable it by default. Under the `default=go1.26`
+that dcrd's `debug.go` sets at the pin, the groups enabled by default and
+their order are 1.26.2's, the three hybrids first, so T3's target is
+unchanged. The default cipher suites are the same in effect: 1.27 drops the
+`tlsrsakex` and `tls3des` settings and lists those suites in
+`disabledCipherSuites` instead, and both of Go's suite orders are 1.26.2's
+(`cipher_suites.go:284-336`, the choice between them at `:361-398`), so Go's
+four TLS 1.2 CBC suites remain the gap the Known limits name. The 2026-10-30
+addendum's rule that holds a refusal to Go's words only when the oracle runs
+the reference Go now applies under go1.27.3, the release `REFERENCE_GO` in
+`dcroxide-testutil` names.

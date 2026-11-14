@@ -218,7 +218,8 @@ impl RpcProfilerManager for ProfileServer {
 /// Whether `netip.ParseAddrPort` accepts the address and its address is
 /// an IPv4 or IPv6 loopback address, dcrd's `addr.IsValid() &&
 /// addr.Addr().IsLoopback()` (`net/netip/netip.go`: `ParseAddrPort`,
-/// `splitAddrPort` and `IsLoopback`, Go 1.26.2; the same in 1.27.1).
+/// `splitAddrPort` and `IsLoopback`, the same in Go 1.26.2, 1.27.1 and
+/// 1.27.3).
 fn is_loopback_addr_port(s: &str) -> bool {
     // The port follows the last colon, and neither half may be empty.
     let Some((ip, port)) = s.rsplit_once(':') else {
