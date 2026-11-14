@@ -90,6 +90,18 @@ pub trait UtxoResolver {
     fn resolve_batch(&self, outpoints: &[OutPoint]) -> Vec<Option<UtxoEntry>> {
         outpoints.iter().map(|op| self.resolve(op)).collect()
     }
+
+    /// [`Self::resolve_batch`] into a buffer the caller keeps: whatever
+    /// the buffer held is replaced with one result per outpoint in
+    /// order.  The default puts the batch's own allocation in the
+    /// buffer's place, which costs what [`Self::resolve_batch`] costs;
+    /// a resolver that can write its results into the buffer it is
+    /// handed overrides this, so a view that resolves a batch for every
+    /// block fills the one buffer, which grows only for a batch larger
+    /// than any before it.
+    fn resolve_batch_into(&self, outpoints: &[OutPoint], results: &mut Vec<Option<UtxoEntry>>) {
+        *results = self.resolve_batch(outpoints);
+    }
 }
 
 impl<F: Fn(&OutPoint) -> Option<UtxoEntry>> UtxoResolver for F {
@@ -181,6 +193,97 @@ pub fn collect_tx_hashes(txs: &[MsgTx]) -> Vec<Hash> {
     txs.iter().map(|tx| tx.tx_hash()).collect()
 }
 
+/// The buffers a view fills and empties again for each block it
+/// connects: the outpoints it asks its resolver for, the resolver's
+/// answers, and the entries a commit hands on.  Each was allocated and
+/// freed for every block, at a size that changes from block to
+/// block.  A view keeps them from one use to the next, and the chain,
+/// which makes a new view for every reorganization, hands them from
+/// each view to the one after it ([`UtxoView::set_scratch`],
+/// [`UtxoView::take_scratch`]), so a block allocates one only when it
+/// needs more room than any block before it did.
+///
+/// Only the allocations are kept.  Every buffer is empty between uses,
+/// so what a view does with a block never depends on the buffers it
+/// was handed, and a view that was handed none allocates its own, as
+/// it did before there were any to hand over.
+#[derive(Default)]
+pub(crate) struct ViewScratch {
+    /// The outpoints missing from the view, queued for one resolve.
+    needed: Vec<OutPoint>,
+    /// The resolver's answers for `needed`.
+    resolved: Vec<Option<UtxoEntry>>,
+    /// The modified entries a commit takes out of the view.
+    updates: Vec<(OutPointKey, UtxoEntry)>,
+}
+
+#[cfg(test)]
+impl ViewScratch {
+    /// The address and capacity of each buffer's allocation and how
+    /// much the buffer holds, for the tests that hold a buffer to the
+    /// allocation it had.
+    pub(crate) fn allocations(&self) -> [(&'static str, usize, usize, usize); 3] {
+        [
+            (
+                "needed",
+                self.needed.as_ptr().addr(),
+                self.needed.capacity(),
+                self.needed.len(),
+            ),
+            (
+                "resolved",
+                self.resolved.as_ptr().addr(),
+                self.resolved.capacity(),
+                self.resolved.len(),
+            ),
+            (
+                "updates",
+                self.updates.as_ptr().addr(),
+                self.updates.capacity(),
+                self.updates.len(),
+            ),
+        ]
+    }
+}
+
+/// The buffers [`UtxoView::assert_block_utxo_view`] fills for each
+/// block it is called for, the second once for each ticket the block
+/// buys, kept by its caller from one block to the next so that a call
+/// allocates one only when it needs more room than the calls before
+/// it did.  What they hold between calls means nothing: each call
+/// empties a buffer before it fills it.
+#[derive(Default)]
+pub(crate) struct AssertScratch {
+    /// Every output the block's regular tree spends, with the index of
+    /// the transaction that spends it.
+    spent_regular_outs: Vec<(UtxoKey, u32)>,
+    /// The minimal outputs of a ticket, serialized to compare with the
+    /// ones the ticket's entry carries.
+    want_data: Vec<u8>,
+}
+
+#[cfg(test)]
+impl AssertScratch {
+    /// The address, capacity and length of each buffer, as
+    /// [`ViewScratch::allocations`] gives them.
+    pub(crate) fn allocations(&self) -> [(&'static str, usize, usize, usize); 2] {
+        [
+            (
+                "spent_regular_outs",
+                self.spent_regular_outs.as_ptr().addr(),
+                self.spent_regular_outs.capacity(),
+                self.spent_regular_outs.len(),
+            ),
+            (
+                "want_data",
+                self.want_data.as_ptr().addr(),
+                self.want_data.capacity(),
+                self.want_data.len(),
+            ),
+        ]
+    }
+}
+
 /// A view into the set of unspent transaction outputs from a specific
 /// point of view in the chain (dcrd `UtxoViewpoint`).
 #[derive(Default)]
@@ -208,6 +311,9 @@ pub struct UtxoView {
     /// allocation here.  The view's entries and their states are not
     /// affected.
     disconnected_outs: BTreeSet<UtxoKey>,
+    /// The buffers the view fills for each block, empty between uses;
+    /// see [`ViewScratch`].
+    scratch: ViewScratch,
 }
 
 impl Clone for UtxoView {
@@ -215,13 +321,15 @@ impl Clone for UtxoView {
     /// `utxoviewpoint.go:1291-1304`), without the zero-confirmation
     /// set, which dcrd's copy does not carry either.  The record of
     /// the outputs a disconnect marked spent describes the entries, so
-    /// it goes with them.
+    /// it goes with them.  The copy starts without buffers of its own:
+    /// the original keeps the ones it holds.
     fn clone(&self) -> UtxoView {
         UtxoView {
             entries: self.entries.clone(),
             best_hash: self.best_hash,
             zero_conf_outs: BTreeSet::new(),
             disconnected_outs: self.disconnected_outs.clone(),
+            scratch: ViewScratch::default(),
         }
     }
 }
@@ -230,6 +338,19 @@ impl UtxoView {
     /// A new empty view (dcrd `NewUtxoViewpoint`).
     pub fn new() -> UtxoView {
         UtxoView::default()
+    }
+
+    /// Hand the view the buffers an earlier view filled, in place of
+    /// the ones it holds, so it allocates one only for a block that
+    /// needs more room than they have; see [`ViewScratch`].
+    pub(crate) fn set_scratch(&mut self, scratch: ViewScratch) {
+        self.scratch = scratch;
+    }
+
+    /// Take the view's buffers, for the next view.  The view allocates
+    /// its own if it is used again.
+    pub(crate) fn take_scratch(&mut self) -> ViewScratch {
+        core::mem::take(&mut self.scratch)
     }
 
     /// The hash of the best block in the chain the view represents
@@ -278,6 +399,12 @@ impl UtxoView {
     /// a cache that needs it takes it first
     /// (`take_disconnected_outs`).
     ///
+    /// The changes are returned in the view's own buffer for them.  A
+    /// caller that commits a view for each block gives the buffer back
+    /// once it has taken the changes out (`keep_commit_buffer`), and
+    /// the view's next commit fills it again; a caller that keeps the
+    /// changes just keeps them.
+    ///
     /// # Panics
     ///
     /// With dcrd's texts (`utxocache.go:594-606`, since `e60cedc5` and
@@ -293,7 +420,9 @@ impl UtxoView {
         // rebalanced around each removal.  The view of a connected
         // block holds little but modified entries; the unmodified ones
         // go back in, in the order they came out.
-        let mut updates = Vec::with_capacity(self.entries.len());
+        let mut updates = core::mem::take(&mut self.scratch.updates);
+        updates.clear();
+        updates.reserve(self.entries.len());
         for (key, entry) in core::mem::take(&mut self.entries) {
             if !entry.is_modified() {
                 self.entries.insert(key, entry);
@@ -333,6 +462,14 @@ impl UtxoView {
         }
         self.disconnected_outs = BTreeSet::new();
         updates
+    }
+
+    /// Give back the buffer [`Self::commit`] returned its changes in,
+    /// for the view's next commit to fill.  Anything left in it is
+    /// dropped.
+    pub(crate) fn keep_commit_buffer(&mut self, mut updates: Vec<(OutPointKey, UtxoEntry)>) {
+        updates.clear();
+        self.scratch.updates = updates;
     }
 
     /// Take the outputs a disconnect of a transaction tree has marked
@@ -1106,9 +1243,12 @@ impl UtxoView {
         if needed.is_empty() {
             return;
         }
-        let resolved = resolver.resolve_batch(needed);
+        // The answers go into the view's buffer for them, which is
+        // emptied again as they are written into the view.
+        let mut resolved = core::mem::take(&mut self.scratch.resolved);
+        resolver.resolve_batch_into(needed, &mut resolved);
         debug_assert_eq!(needed.len(), resolved.len(), "resolver batch size mismatch");
-        for (outpoint, entry) in needed.iter().zip(resolved) {
+        for (outpoint, entry) in needed.iter().zip(resolved.drain(..)) {
             let k = key(outpoint);
             match entry {
                 Some(entry) => {
@@ -1119,6 +1259,23 @@ impl UtxoView {
                 }
             }
         }
+        self.scratch.resolved = resolved;
+    }
+
+    /// The view's buffer for the outpoints to resolve, emptied, with
+    /// room for `capacity` of them.  [`Self::keep_needed`] gives it
+    /// back.
+    fn take_needed(&mut self, capacity: usize) -> Vec<OutPoint> {
+        let mut needed = core::mem::take(&mut self.scratch.needed);
+        needed.clear();
+        needed.reserve(capacity);
+        needed
+    }
+
+    /// Give back the buffer [`Self::take_needed`] handed out, emptied.
+    fn keep_needed(&mut self, mut needed: Vec<OutPoint>) {
+        needed.clear();
+        self.scratch.needed = needed;
     }
 
     /// Whether the view holds any output of the transaction in the
@@ -1268,9 +1425,10 @@ impl UtxoView {
         resolver: &impl UtxoResolver,
         is_treasury_enabled: bool,
     ) {
-        let mut needed = Vec::new();
+        let mut needed = self.take_needed(0);
         self.queue_regular_input_utxos(block, regular_tx_hashes, &mut needed, is_treasury_enabled);
         self.resolve_queued(resolver, &needed);
+        self.keep_needed(needed);
     }
 
     /// Load the utxos for all of the block's inputs into the view
@@ -1294,10 +1452,11 @@ impl UtxoView {
         resolver: &impl UtxoResolver,
         is_treasury_enabled: bool,
     ) {
-        let mut needed = Vec::with_capacity(block_input_count(block));
+        let mut needed = self.take_needed(block_input_count(block));
         self.queue_regular_input_utxos(block, regular_tx_hashes, &mut needed, is_treasury_enabled);
         self.queue_stake_input_utxos(block, &mut needed, is_treasury_enabled);
         self.resolve_queued(resolver, &needed);
+        self.keep_needed(needed);
     }
 
     /// Disconnect the regular transactions of a disapproved parent
@@ -1405,6 +1564,10 @@ impl UtxoView {
     /// Each stake transaction's type is read from `tx_types`, which must
     /// be this very block's, where dcrd classifies each stake transaction
     /// twice, once for its inputs and once for its outputs.
+    ///
+    /// `scratch` holds the two buffers the assertions fill, which the
+    /// caller keeps from one block to the next; what it holds on entry
+    /// is not read.
     pub(crate) fn assert_block_utxo_view(
         &self,
         params: &Params,
@@ -1412,6 +1575,7 @@ impl UtxoView {
         tx_hashes: &crate::blockhashes::BlockTxHashes,
         tx_types: &crate::blockhashes::BlockTxTypes,
         is_treasury_enabled: bool,
+        scratch: &mut AssertScratch,
     ) {
         self.assert_block_utxo_view_with(
             &sbss_violation_lookup(params),
@@ -1419,6 +1583,7 @@ impl UtxoView {
             tx_hashes,
             tx_types,
             is_treasury_enabled,
+            scratch,
         );
     }
 
@@ -1431,9 +1596,14 @@ impl UtxoView {
         tx_hashes: &crate::blockhashes::BlockTxHashes,
         tx_types: &crate::blockhashes::BlockTxTypes,
         is_treasury_enabled: bool,
+        scratch: &mut AssertScratch,
     ) {
         tx_hashes.assert_for(block);
         tx_types.assert_for(block);
+        let AssertScratch {
+            spent_regular_outs,
+            want_data,
+        } = scratch;
         let height = i64::from(block.header.height);
         // The header is hashed only for a panic's text.
         let block_hash = || block.header.block_hash();
@@ -1443,8 +1613,8 @@ impl UtxoView {
         // block's own outputs must be spent.  Sorted, a lookup finds
         // the last spender of an output, as a later write to dcrd's map
         // replaces an earlier one.
-        let mut spent_regular_outs: Vec<(UtxoKey, u32)> =
-            Vec::with_capacity(count_spent_regular_outputs(block));
+        spent_regular_outs.clear();
+        spent_regular_outs.reserve(count_spent_regular_outputs(block));
         for (tx_idx, tx) in block.transactions.iter().enumerate() {
             // A coinbase has a single null input instead of real ones,
             // and the input checks below make sure of it.  Only its
@@ -1578,7 +1748,7 @@ impl UtxoView {
         // Every spendable output the block creates must have an entry
         // with the output's details and the spent state the block leaves
         // it in.
-        let assert_outputs = |transactions: &[MsgTx], hashes: &[Hash], stake_tree: bool| {
+        let mut assert_outputs = |transactions: &[MsgTx], hashes: &[Hash], stake_tree: bool| {
             let (tx_tree, tree_name) = if stake_tree {
                 (dcroxide_wire::TX_TREE_STAKE, "stake")
             } else {
@@ -1702,11 +1872,9 @@ impl UtxoView {
                         );
                     }
                     if let Some(min_outs) = min_outs.filter(|_| want_min_outs) {
-                        let mut want_data = alloc::vec![
-                            0u8;
-                            crate::chainio::serialize_size_for_minimal_outputs(tx)
-                        ];
-                        let written = crate::chainio::put_tx_to_minimal_outputs(&mut want_data, tx);
+                        want_data.clear();
+                        want_data.resize(crate::chainio::serialize_size_for_minimal_outputs(tx), 0);
+                        let written = crate::chainio::put_tx_to_minimal_outputs(want_data, tx);
                         if written != want_data.len() {
                             panic!(
                                 "{}: ticket minimal outputs serialization size mismatch \
@@ -2030,8 +2198,8 @@ impl UtxoView {
 
 /// The number of inputs of the block's transactions in both trees: at
 /// least as many as [`UtxoView::fetch_input_utxos`] queues, since each
-/// input queues at most one outpoint, so the queue is allocated once at
-/// this size rather than grown as the inputs are queued.  A block's
+/// input queues at most one outpoint, so the queue is given room for
+/// this many once rather than grown as the inputs are queued.  A block's
 /// queue used to grow from four outpoints by doubling, with a
 /// reallocation at each step, which copies what the queue held unless
 /// the allocator can extend it where it is.
@@ -3262,6 +3430,57 @@ mod tests {
             .state_bits()
     }
 
+    /// A view keeps its queue of outpoints to resolve from one fetch to
+    /// the next, whichever of the two fetches fills it: after a fetch
+    /// that queued an outpoint the queue is empty and has an allocation,
+    /// and a second fetch leaves it the same one.
+    #[test]
+    fn a_view_keeps_its_fetch_queue_from_one_fetch_to_the_next() {
+        let (block, _) = zero_conf_block(&[0, 1]);
+        let hashes = collect_tx_hashes(&block.transactions);
+        let backend = external_backend();
+        let resolve = |op: &OutPoint| backend.get(&(op.hash.0, op.index, op.tree)).cloned();
+
+        for both_trees in [false, true] {
+            let fetch = |view: &mut UtxoView| {
+                if both_trees {
+                    view.fetch_input_utxos(&block, &hashes, &resolve, false);
+                } else {
+                    view.fetch_regular_input_utxos(&block, &hashes, &resolve, false);
+                }
+            };
+            let mut view = UtxoView::new();
+            fetch(&mut view);
+            let (name, _, capacity, len) = view.scratch.allocations()[0];
+            assert_eq!(name, "needed");
+            assert!(capacity > 0, "both trees {both_trees}: the queue is kept");
+            assert_eq!(len, 0, "both trees {both_trees}: the queue is empty");
+
+            let kept = view.scratch.allocations()[0];
+            fetch(&mut view);
+            assert_eq!(
+                view.scratch.allocations()[0],
+                kept,
+                "both trees {both_trees}"
+            );
+        }
+    }
+
+    /// A resolver that does not write into the buffer it is handed
+    /// still replaces what the buffer held with its batch's results.
+    #[test]
+    fn a_batch_resolved_into_a_buffer_replaces_what_the_buffer_held() {
+        let (external, entry) = sbss_external();
+        let backend = external_backend();
+        let resolve = |op: &OutPoint| backend.get(&(op.hash.0, op.index, op.tree)).cloned();
+        let outpoints = [origin_out(Hash([7; 32]), 0), external];
+
+        let mut results = alloc::vec![Some(entry.clone()); 5];
+        resolve.resolve_batch_into(&outpoints, &mut results);
+        assert_eq!(results, alloc::vec![None, Some(entry)]);
+        assert_eq!(results, resolve.resolve_batch(&outpoints));
+    }
+
     /// dcrd decides eligibility once per creating transaction, before
     /// any of its outputs is added to the view, and keeps the answer
     /// for later spends of its other outputs
@@ -3723,22 +3942,56 @@ mod tests {
         is_treasury_enabled: bool,
     ) -> Option<String> {
         let tx_hashes = crate::blockhashes::BlockTxHashes::compute(block);
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            view.assert_block_utxo_view_with(
-                &no_violation,
-                block,
-                &tx_hashes,
-                &crate::blockhashes::BlockTxTypes::compute(block),
-                is_treasury_enabled,
-            );
-        }))
-        .err()
-        .map(|payload| {
-            payload
-                .downcast_ref::<String>()
-                .cloned()
-                .expect("a text payload")
-        })
+        let text_with = |scratch: &mut AssertScratch| {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                view.assert_block_utxo_view_with(
+                    &no_violation,
+                    block,
+                    &tx_hashes,
+                    &crate::blockhashes::BlockTxTypes::compute(block),
+                    is_treasury_enabled,
+                    scratch,
+                );
+            }))
+            .err()
+            .map(|payload| {
+                payload
+                    .downcast_ref::<String>()
+                    .cloned()
+                    .expect("a text payload")
+            })
+        };
+        let text = text_with(&mut AssertScratch::default());
+
+        // The assertion's buffers are kept from block to block, and what
+        // an earlier block left in them must not reach this one.  Here
+        // they are left holding a later spender for every output the
+        // block's regular tree creates, which would make each of them
+        // read as spent, and bytes no ticket serializes to.
+        let mut left_over = AssertScratch {
+            spent_regular_outs: block
+                .transactions
+                .iter()
+                .zip(tx_hashes.regular())
+                .flat_map(|(tx, hash)| {
+                    (0..tx.tx_out.len() as u32).map(|index| {
+                        let created = OutPoint {
+                            hash: *hash,
+                            index,
+                            tree: dcroxide_wire::TX_TREE_REGULAR,
+                        };
+                        (key(&created), u32::MAX)
+                    })
+                })
+                .collect(),
+            want_data: alloc::vec![0xff; 4096],
+        };
+        assert_eq!(
+            text_with(&mut left_over),
+            text,
+            "what the buffers held changed the assertion"
+        );
+        text
     }
 
     /// dcrd `assertBlockUtxoView` (`utxoviewpoint.go:636-920`, since
@@ -4365,11 +4618,25 @@ mod tests {
         .expect("connect");
 
         let tx_types = crate::blockhashes::BlockTxTypes::compute(&block);
-        view.assert_block_utxo_view_with(&lookup, &block, &tx_hashes, &tx_types, false);
+        view.assert_block_utxo_view_with(
+            &lookup,
+            &block,
+            &tx_hashes,
+            &tx_types,
+            false,
+            &mut AssertScratch::default(),
+        );
 
         let ticket = tx_hashes.stake()[0];
         let text = panic_text(|| {
-            view.assert_block_utxo_view_with(&no_violation, &block, &tx_hashes, &tx_types, false);
+            view.assert_block_utxo_view_with(
+                &no_violation,
+                &block,
+                &tx_hashes,
+                &tx_types,
+                false,
+                &mut AssertScratch::default(),
+            );
         });
         assert_eq!(
             text,
@@ -4402,6 +4669,7 @@ mod tests {
                 &spend_hashes,
                 &crate::blockhashes::BlockTxTypes::compute(&regular_spend),
                 false,
+                &mut AssertScratch::default(),
             );
         });
         assert_eq!(
@@ -4431,6 +4699,7 @@ mod tests {
                 &changed_hashes,
                 &crate::blockhashes::BlockTxTypes::compute(&changed),
                 false,
+                &mut AssertScratch::default(),
             );
         });
         assert_eq!(
@@ -4474,6 +4743,7 @@ mod tests {
                 &changed_hashes,
                 &crate::blockhashes::BlockTxTypes::compute(&changed),
                 false,
+                &mut AssertScratch::default(),
             );
         });
         assert_eq!(

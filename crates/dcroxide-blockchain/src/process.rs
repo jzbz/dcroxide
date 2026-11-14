@@ -147,9 +147,11 @@ fn utxo_entry_size(entry: &UtxoEntry) -> u64 {
 /// The chain's read-through resolver over its utxo cache and backend
 /// (dcrd's utxo viewpoints fetch through `UtxoCache`): single
 /// lookups go through [`Chain::fetch_utxo_entry`], and the view's
-/// per-block batches go through [`Chain::fetch_utxo_entries`] so all
-/// cache misses of a block read the backend in one database view
-/// transaction.
+/// per-block batches go through [`Chain::fetch_utxo_entries_into`],
+/// which fills the view's own buffer, so all cache misses of a block
+/// read the backend in one database view transaction.  A view
+/// asks for a batch through `resolve_batch_into` alone; `resolve_batch`
+/// is here so the trait's other form takes the same route.
 struct ChainUtxoResolver<'a> {
     chain: &'a Chain,
 }
@@ -161,6 +163,54 @@ impl crate::utxoview::UtxoResolver for ChainUtxoResolver<'_> {
 
     fn resolve_batch(&self, outpoints: &[OutPoint]) -> Vec<Option<UtxoEntry>> {
         self.chain.fetch_utxo_entries(outpoints)
+    }
+
+    fn resolve_batch_into(&self, outpoints: &[OutPoint], results: &mut Vec<Option<UtxoEntry>>) {
+        self.chain.fetch_utxo_entries_into(outpoints, results);
+    }
+}
+
+/// The buffers the chain fills again for each block a reorganization
+/// attaches or detaches, kept from one block to the next: the ones a
+/// view fills, the ones the assertion over the connected view fills,
+/// and the spend journal the connect builds.  Each used to be
+/// allocated anew for every block, the assertion's ticket bytes for
+/// every ticket, and freed by the time the block was connected; see
+/// [`crate::utxoview::ViewScratch`].
+///
+/// Nothing is read from a buffer that the block at hand did not put
+/// there: the view's buffers and the journal are empty between
+/// reorganizations, and the assertion's are emptied by their next use.
+/// The buffers are kept however a reorganization returns, so a block
+/// that is refused costs the next one nothing.  None of them shrinks:
+/// each has room for the largest block a reorganization has worked on
+/// so far, attached, detached or refused, and less than twice that
+/// where it grew by doubling.
+#[derive(Default)]
+struct AttachScratch {
+    /// The buffers of the view a reorganization works on.
+    view: crate::utxoview::ViewScratch,
+    /// The buffers of the assertion each attached block's view passes.
+    assert: crate::utxoview::AssertScratch,
+    /// The spend journal of the block being attached, empty between
+    /// reorganizations.
+    stxos: Vec<SpentTxOut>,
+}
+
+#[cfg(test)]
+impl AttachScratch {
+    /// The address and capacity of every buffer's allocation, and
+    /// how much the buffer holds.
+    fn allocations(&self) -> Vec<(&'static str, usize, usize, usize)> {
+        let mut all = self.view.allocations().to_vec();
+        all.extend(self.assert.allocations());
+        all.push((
+            "stxos",
+            self.stxos.as_ptr().addr(),
+            self.stxos.capacity(),
+            self.stxos.len(),
+        ));
+        all
     }
 }
 
@@ -502,6 +552,8 @@ pub struct Chain {
     /// it (`accepted_block_tx_types`, `tx_types_for`), where dcrd
     /// classifies each transaction at each step that reads its type.
     accepted_tx_hashes: Option<AcceptedHashes>,
+    /// The buffers each attached block fills, kept between blocks.
+    attach_scratch: AttachScratch,
     /// How many connects hashed their block's transactions again
     /// because the block was not the one being processed: the other
     /// blocks a reorganization attaches, a block linked by a later
@@ -961,6 +1013,7 @@ impl Chain {
             recent_context_checks: LruHashSet::new(CONTEXT_CHECK_CACHE_SIZE),
             recent_merkle_checks: LruHashSet::new(MERKLE_CHECK_CACHE_SIZE),
             accepted_tx_hashes: None,
+            attach_scratch: AttachScratch::default(),
             tx_hash_recomputes: 0,
             arrivals_hashed: 0,
             arrivals_checked: 0,
@@ -1968,10 +2021,10 @@ impl Chain {
         // dcrd reads its cache map directly here, so an explicit spent
         // marker counts as no entry, as its nil does.
         let cache = &self.utxo_cache.get_mut().0;
-        let updates = view.commit(
+        let mut updates = view.commit(
             |key| matches!(cache.get(&UtxoKey(*key)), Some(Some(entry)) if !entry.is_spent()),
         );
-        for (key, entry) in updates {
+        for (key, entry) in updates.drain(..) {
             if entry.is_spent() {
                 self.cache_spend_entry(key);
             } else {
@@ -1979,6 +2032,8 @@ impl Chain {
                 self.cache_add_entry(key, entry, backend_may_hold);
             }
         }
+        // The view fills the same buffer at its next commit.
+        view.keep_commit_buffer(updates);
     }
 
     /// Add or update an unspent entry in the cache (dcrd
@@ -2863,9 +2918,24 @@ impl Chain {
     /// `UtxoCache.FetchEntries` needs no such batching because its
     /// leveldb reads are transactionless).
     pub fn fetch_utxo_entries(&self, outpoints: &[OutPoint]) -> Vec<Option<UtxoEntry>> {
+        let mut results = Vec::with_capacity(outpoints.len());
+        self.fetch_utxo_entries_into(outpoints, &mut results);
+        results
+    }
+
+    /// [`Self::fetch_utxo_entries`] into a buffer the caller keeps:
+    /// whatever `results` held is replaced with the batch's results.
+    /// The view of each attached block resolves its inputs through
+    /// here, into the one buffer the chain hands from view to view.
+    fn fetch_utxo_entries_into(
+        &self,
+        outpoints: &[OutPoint],
+        results: &mut Vec<Option<UtxoEntry>>,
+    ) {
         // Serve cache hits and collect the missing indexes (one
         // borrow across the pass; the counters update in bulk after).
-        let mut results: Vec<Option<UtxoEntry>> = Vec::with_capacity(outpoints.len());
+        results.clear();
+        results.reserve(outpoints.len());
         let mut missing: Vec<usize> = Vec::new();
         {
             let cache = self.utxo_cache.borrow();
@@ -2900,7 +2970,7 @@ impl Chain {
                 .wrapping_add((outpoints.len().wrapping_sub(missing.len())) as u64),
         );
         if missing.is_empty() {
-            return results;
+            return;
         }
 
         // Read every miss from the backend in one view transaction
@@ -2952,7 +3022,6 @@ impl Chain {
             }
             results[i] = entry;
         }
-        results
     }
 
     /// Force the UTXO cache out to the backend at the current tip, so
@@ -3844,7 +3913,7 @@ impl Chain {
             parent,
             tx_hashes,
             view,
-            stxos,
+            &stxos,
             num_spent_outputs,
             filter,
             params,
@@ -3869,7 +3938,7 @@ impl Chain {
         parent: &Arc<MsgBlock>,
         tx_hashes: Arc<BlockTxHashes>,
         view: &mut UtxoView,
-        stxos: Vec<SpentTxOut>,
+        stxos: &[SpentTxOut],
         num_spent_outputs: usize,
         filter: FilterV2,
         params: &Params,
@@ -3968,7 +4037,7 @@ impl Chain {
         parent: &Arc<MsgBlock>,
         tx_hashes: Arc<BlockTxHashes>,
         view: &mut UtxoView,
-        stxos: Vec<SpentTxOut>,
+        stxos: &[SpentTxOut],
         filter: FilterV2,
         params: &Params,
         check_tx_flags: crate::validate::AgendaFlags,
@@ -4049,7 +4118,7 @@ impl Chain {
         // themselves, and the connect transaction below writes each row
         // from the mirror's entry.
         let serialized_journal =
-            crate::chainio::serialize_spend_journal_entry(&stxos).unwrap_or_default();
+            crate::chainio::serialize_spend_journal_entry(stxos).unwrap_or_default();
         self.spend_journal.insert(node_hash.0, serialized_journal);
         self.write_stake_db_rows(node);
         self.filters.insert(node_hash.0, Arc::new(filter));
@@ -4452,11 +4521,33 @@ impl Chain {
         target: NodeId,
         params: &Params,
     ) -> Result<(), RuleError> {
+        // The view, and the attach of each block, work in the buffers
+        // the last reorganization left, and leave them for the next
+        // one however this one returns.
+        let mut scratch = core::mem::take(&mut self.attach_scratch);
+        let mut view = UtxoView::new();
+        view.set_scratch(core::mem::take(&mut scratch.view));
+        let result = self.reorganize_chain_internal_with(target, params, &mut view, &mut scratch);
+        scratch.view = view.take_scratch();
+        scratch.stxos.clear();
+        self.attach_scratch = scratch;
+        result
+    }
+
+    /// [`Self::reorganize_chain_internal`] over the view it made, which
+    /// holds its own buffers, and the rest of the chain's buffers for
+    /// attaching a block.
+    fn reorganize_chain_internal_with(
+        &mut self,
+        target: NodeId,
+        params: &Params,
+        view: &mut UtxoView,
+        scratch: &mut AttachScratch,
+    ) -> Result<(), RuleError> {
         let mut tip = self.best_chain.tip();
         let fork = self.best_chain.find_fork(&self.store, target);
 
         // Disconnect all of the blocks back to the point of the fork.
-        let mut view = UtxoView::new();
         if let Some(t) = tip {
             view.set_best_hash(self.store.node(t).hash);
         }
@@ -4511,7 +4602,7 @@ impl Chain {
             )?;
 
             // Update the chain state.
-            self.disconnect_block(n, &block, &parent, &mut view, params)?;
+            self.disconnect_block(n, &block, &parent, view, params)?;
             tip = Some(parent_id);
         }
 
@@ -4584,7 +4675,9 @@ impl Chain {
             // validated; the view, stxos, and header commitment data
             // are still needed.
             let num_spent_outputs = count_spent_outputs(&block);
-            let mut stxos: Vec<SpentTxOut> = Vec::with_capacity(num_spent_outputs);
+            let stxos = &mut scratch.stxos;
+            stxos.clear();
+            stxos.reserve(num_spent_outputs);
             let filter;
             if self.index.node_status(&self.store, node).has_validated() {
                 // The connect of each transaction and the filter read the
@@ -4603,7 +4696,7 @@ impl Chain {
                     &parent,
                     |flag| self.fetch_spend_journal(&parent, flag),
                     &ChainUtxoResolver { chain: self },
-                    Some(&mut stxos),
+                    Some(&mut *stxos),
                     is_treasury_enabled,
                     is_parent_treasury_enabled,
                 )?;
@@ -4618,7 +4711,7 @@ impl Chain {
                     block_hash.as_ref(),
                     Some(&tx_types),
                     Some((stxos.as_slice(), &journal_starts)),
-                    &view,
+                    view,
                 )?;
             } else {
                 // The block must pass all of the validation rules
@@ -4687,9 +4780,9 @@ impl Chain {
                         &tx_types,
                         &parent,
                         |flag| self.fetch_spend_journal(&parent, flag),
-                        &mut view,
+                        view,
                         &ChainUtxoResolver { chain: self },
-                        Some(&mut stxos),
+                        Some(&mut *stxos),
                         run_scripts,
                         // The scripts of the blocks the chain connects
                         // run on the persistent script pool.  The three
@@ -4730,7 +4823,14 @@ impl Chain {
             // transaction of the block, on either branch above, before
             // anything of the block is written (dcrd
             // `chain.go:1246-1248`).
-            view.assert_block_utxo_view(params, &block, &tx_hashes, &tx_types, is_treasury_enabled);
+            view.assert_block_utxo_view(
+                params,
+                &block,
+                &tx_hashes,
+                &tx_types,
+                is_treasury_enabled,
+                &mut scratch.assert,
+            );
 
             // Update the chain state and drop any best chain
             // candidates that now have less work than the new tip.
@@ -4739,7 +4839,7 @@ impl Chain {
                 &block,
                 &parent,
                 tx_hashes,
-                &mut view,
+                view,
                 stxos,
                 num_spent_outputs,
                 filter,
@@ -11315,7 +11415,7 @@ mod tests {
             &genesis,
             Arc::new(wrong),
             &mut view,
-            Vec::new(),
+            &[],
             0,
             filter,
             &params,
@@ -11387,7 +11487,7 @@ mod tests {
             &parent,
             Arc::new(BlockTxHashes::compute(&block)),
             &mut view,
-            Vec::new(),
+            &[],
             count,
             filter,
             &params,
@@ -11409,7 +11509,7 @@ mod tests {
             &parent,
             Arc::new(BlockTxHashes::compute(&block)),
             &mut view,
-            vec![SpentTxOut::default(); count + 1],
+            &vec![SpentTxOut::default(); count + 1],
             count + 1,
             filter,
             &params,
@@ -11472,6 +11572,177 @@ mod tests {
         assert!(
             unlike_the_parent >= 10,
             "{unlike_the_parent} unlike the parent"
+        );
+    }
+
+    /// A batch fetched into a buffer replaces whatever the buffer held:
+    /// the results, and what the fetch does to the cache and its
+    /// accounting, are those of the fetch that returns a vector of its
+    /// own, over outpoints the cache holds, ones only the backend
+    /// holds, and one neither holds.
+    #[test]
+    fn a_batch_fetched_into_a_buffer_replaces_what_the_buffer_held() {
+        let (chain, _) = chain_and_view_to_commit(5);
+        let (reference, _) = chain_and_view_to_commit(5);
+        let mut keys: alloc::collections::BTreeSet<OutPointKey> =
+            chain.utxo_backend.keys().copied().collect();
+        let backend_only = keys
+            .iter()
+            .filter(|key| chain.utxo_cache.borrow().get(key).is_none())
+            .count();
+        keys.extend(chain.utxo_cache.borrow().0.keys().map(|key| key.0));
+        let mut outpoints: Vec<OutPoint> = keys
+            .iter()
+            .map(|&(hash, index, tree)| OutPoint {
+                hash: Hash(hash),
+                index,
+                tree,
+            })
+            .collect();
+        outpoints.push(OutPoint {
+            hash: Hash([0xee; 32]),
+            index: 9,
+            tree: 0,
+        });
+        assert!(backend_only >= 50, "{backend_only} only in the backend");
+        let cached = keys.len() - backend_only;
+        assert!(cached >= 50, "{cached} in the cache");
+
+        let stale = chain.utxo_backend.values().next().cloned();
+        assert!(stale.is_some());
+        let mut got = vec![stale; outpoints.len() + 3];
+        chain.fetch_utxo_entries_into(&outpoints, &mut got);
+        let want = reference.fetch_utxo_entries(&outpoints);
+        assert!(got == want, "the batch's results");
+        assert!(want.last() == Some(&None), "the outpoint nothing holds");
+        assert!(
+            utxo_state_of(&chain) == utxo_state_of(&reference),
+            "the chain after the batch"
+        );
+
+        // A smaller batch into the buffer the larger one filled, for an
+        // outpoint whose answer is not the one the buffer starts with.
+        let at = (0..want.len())
+            .find(|&i| want[i] != want[0])
+            .expect("the answers differ");
+        let smaller = &outpoints[at..=at];
+        chain.fetch_utxo_entries_into(smaller, &mut got);
+        assert!(
+            got == reference.fetch_utxo_entries(smaller),
+            "the smaller batch's results"
+        );
+        assert!(
+            utxo_state_of(&chain) == utxo_state_of(&reference),
+            "the chain after the smaller batch"
+        );
+    }
+
+    /// The buffers the attach of a block fills are the ones the block
+    /// before it filled.  Over dcrd's full block battery, with its
+    /// reorganizations and the blocks it refuses, no processing call
+    /// leaves a buffer smaller than it found it, and a buffer that did
+    /// not grow is still the same allocation, and the view's buffers and
+    /// the spend journal hold nothing between calls.  Every buffer comes into
+    /// use, the ones sized by a block's inputs end with room for the
+    /// largest block connected, and most calls that connect a block
+    /// which spends outputs find every buffer large enough and leave
+    /// all of them where they were.
+    #[test]
+    fn attaching_a_block_fills_the_buffers_the_block_before_it_filled() {
+        let params = dcroxide_chaincfg::regnet_params();
+        let mut chain = Chain::new(&params, Hash::ZERO, false);
+        // The outputs spent by the blocks the current call connected,
+        // and the most inputs, spent outputs and outputs spent by the
+        // regular tree that any connected block had.
+        let counts: Arc<[core::sync::atomic::AtomicUsize; 4]> = Arc::default();
+        let sink = Arc::clone(&counts);
+        chain.set_notification_callback(Box::new(move |ntfn| {
+            if let Notification::BlockConnected(data) = ntfn {
+                let block = &data.block;
+                let inputs: usize = block
+                    .transactions
+                    .iter()
+                    .chain(&block.stransactions)
+                    .map(|tx| tx.tx_in.len())
+                    .sum();
+                let spent = count_spent_outputs(block);
+                let regular = crate::utxoview::count_spent_regular_outputs(block);
+                sink[0].fetch_add(spent, Ordering::SeqCst);
+                sink[1].fetch_max(inputs, Ordering::SeqCst);
+                sink[2].fetch_max(spent, Ordering::SeqCst);
+                sink[3].fetch_max(regular, Ordering::SeqCst);
+            }
+        }));
+
+        let mut before = chain.attach_scratch.allocations();
+        let (mut spending_calls, mut settled_calls) = (0usize, 0usize);
+        let mut now = 0;
+        for line in include_str!("../tests/data/fullblock_vectors.txt").lines() {
+            let f: Vec<&str> = line.split(' ').collect();
+            let block_hex = match f[0] {
+                "now" => {
+                    now = f[1].parse().expect("now");
+                    continue;
+                }
+                "accept" => f[4],
+                "reject" => f[3],
+                "orphanorreject" => f[2],
+                _ => continue,
+            };
+            let (block, _) =
+                MsgBlock::from_bytes(&dcroxide_testutil::unhex(block_hex)).expect("block");
+            counts[0].store(0, Ordering::SeqCst);
+            // The verdicts are `fullblock_vectors.rs`'s to check.
+            let _ = chain.process_block(&block, now, &params);
+            let after = chain.attach_scratch.allocations();
+            let mut settled = true;
+            for (was, is) in before.iter().zip(&after) {
+                let (name, was_at, was_capacity, _) = *was;
+                let (_, at, capacity, len) = *is;
+                assert!(
+                    capacity >= was_capacity,
+                    "{name} went from room for {was_capacity} to room for {capacity}"
+                );
+                // A buffer with no allocation has no address to keep.
+                if capacity == was_capacity && capacity > 0 {
+                    assert_eq!(at, was_at, "{name} moved without growing");
+                }
+                settled &= capacity == was_capacity;
+                // The assertion's buffers are emptied by their next
+                // use; the others hold nothing between calls.
+                if !matches!(name, "spent_regular_outs" | "want_data") {
+                    assert_eq!(len, 0, "{name} holds something between calls");
+                }
+            }
+            if counts[0].load(Ordering::SeqCst) > 0 {
+                spending_calls += 1;
+                settled_calls += usize::from(settled);
+            }
+            before = after;
+        }
+
+        // Each buffer was used, and the ones whose size a block's shape
+        // gives have room for the largest block connected: a buffer
+        // that only some other path filled would be smaller.
+        let most = |i: usize| counts[i].load(Ordering::SeqCst);
+        for (name, _, capacity, _) in &before {
+            assert!(*capacity > 0, "{name} was never used");
+            let needs = match *name {
+                "needed" => most(1),
+                "stxos" => most(2),
+                "spent_regular_outs" => most(3),
+                _ => continue,
+            };
+            assert!(needs > 100, "{name}: the largest block needs {needs}");
+            assert!(
+                *capacity >= needs,
+                "{name} has room for {capacity}, and the largest block needs {needs}"
+            );
+        }
+        assert!(spending_calls >= 100, "{spending_calls} spending calls");
+        assert!(
+            settled_calls * 2 > spending_calls,
+            "{settled_calls} of {spending_calls} spending calls left every buffer in place"
         );
     }
 
