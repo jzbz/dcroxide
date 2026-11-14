@@ -13,7 +13,8 @@
   key (addendum of 2026-10-31, the switch). The hybrids (T3), Go's
   client-certificate set (T4) and T7's in-tree seeder client remain.
 - **Date:** 2026-10-26 (accepted), 2026-10-30 (addendum: the Go interop
-  matrix), 2026-10-31 (addenda: the constant-time check; the switch)
+  matrix), 2026-10-31 (addenda: the constant-time check; the switch),
+  2026-11-13 (addendum: ML-DSA, with the `ml-dsa` crate)
 
 ## Context
 
@@ -948,3 +949,56 @@ rules, which closes the RSA bounds, exponent and trailing-data gaps
 PARITY.md records for client and seeder chains; T7's in-tree seeder
 client; and the port to rustls 0.24. ADR-0012's rule no longer has `ring`
 among its breaches (that record's Status).
+
+## Addendum, 2026-11-13 — ML-DSA, with the `ml-dsa` crate
+
+The reference Go moved to go1.27.3 on 2026-11-12 (ADR-0001's addendum of
+that date), and Go 1.27's `crypto/tls` signs and verifies with ML-DSA-44,
+-65 and -87. In go1.27.3 it loads an ML-DSA key pair
+(`crypto/tls/tls.go:343-350`), verifies ML-DSA certificates and handshake
+signatures, lists the three schemes first among those it offers
+(`defaults.go:49-53`), and takes them in TLS 1.3 only
+(`common.go:1800-1808`). On 2026-11-12 it was decided that
+the port follows Go here, with the `ml-dsa` crate after a review of it.
+That turns over T4's reading of ML-DSA keys as not added, made when the
+reference Go's `crypto/x509` knew no ML-DSA.
+
+- **What it covers.** The RPC listener: an ML-DSA `rpc.key` loads and
+  signs TLS 1.3 handshakes with its own scheme, and a client that cannot
+  take TLS 1.3 is refused as Go refuses it; in `clientcert` mode, a
+  client's ML-DSA certificate, the ML-DSA signatures on its chain and its
+  ML-DSA handshake signature are verified as Go verifies them. The
+  seeders keep ring's verification set, and `gencerts` keeps refusing an
+  ML-DSA CA key, both decided 2026-11-12 and to be recorded in PARITY.md
+  as differences from Go.
+- **The crate.** `ml-dsa` 0.1.2, pinned exactly in `dcroxide-tlscrypto`
+  for 0.1.2's constant-time fixes, without its `pkcs8` and `getrandom`
+  features, since the provider reads keys by Go's rules and draws its own
+  randomness. `module-lattice` 0.2.4 and `shake` 0.1.0 come new to the
+  lock with it. None of the three has `unsafe`, `asm!`, a build script or
+  C, so ADR-0012's rule holds and the ledger's inline-assembly table gains
+  no row. The crate's README says it has never been independently
+  audited; its ledger row records that, and that Go's acceptance rules
+  are to stand in the provider in front of it, so that the crate is
+  handed only a seed, a public key and a signature of the lengths Go
+  accepts. The dependency lands alone, before any code calls it, so that
+  it is reviewed apart from that code.
+- **T10 applies to ML-DSA** through its four items:
+  - the ledger row, with the dependency;
+  - Wycheproof's ML-DSA vectors, the three verification files and the
+    three signing-from-seed files of `testvectors_v1/` at `d17cc89f`, the
+    commit the 27 files in tree come from, fetched on 2026-11-12; the
+    verification files are to be committed with the verification code,
+    and the signing-from-seed files with the code that expands a key from
+    its seed;
+  - the Go interop matrix, against go1.27.3 through the oracle, for
+    ML-DSA keys and client certificates;
+  - the constant-time check, for the key's expansion from its seed but
+    not for signing, which is recorded as outside the check, decided
+    2026-11-12: the number of rejection rounds a signature takes, and so
+    its time, varies with the key, the message and the hedge by design,
+    which the check's t-test does not tell apart from a leak.
+
+  Beyond T10, the verification that runs before a client is
+  authenticated is to be fuzzed in the commit that adds it, decided
+  2026-11-12.

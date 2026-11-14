@@ -43,6 +43,15 @@ ecdsa = { version = "0.17", default-features = false, features = ["algorithm", "
 curve25519-dalek = "5"
 # X25519's all-zero check, made in constant time.
 subtle = "2.6"
+# ML-DSA-44, -65 and -87, which Go 1.27 signs and verifies with in TLS
+# 1.3 (ADR-0015's addendum of 2026-11-13).  Exact, for 0.1.2's
+# constant-time fixes.  No `pkcs8`: keys are read by Go's rules in
+# `src/keys.rs`, so the crate is handed a seed, a public key and a
+# signature.  No `getrandom`: `rand_core` takes the hedge's bytes from
+# `src/rand.rs`.  `alloc` keeps the expanded key's matrix and vectors,
+# tens of kilobytes for ML-DSA-87, in boxes rather than on the stack, and
+# `zeroize` wipes the expanded key and the SHAKE state.
+ml-dsa = { version = "=0.1.2", default-features = false, features = ["alloc", "zeroize", "rand_core"] }
 # RSA verification, public-key arithmetic (ADR-0015 T5, `src/rsa.rs`):
 # `modpow` on public values; and Go's text for a SEC 1 scalar the key
 # reader refuses, zero or at or above the order, never a key
