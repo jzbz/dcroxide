@@ -3090,8 +3090,21 @@ closing it would cost.
   evaluation of rfc822Name and URI subtrees is recorded rather than
   followed (decided 2026-11-12), and the other cases here are recorded
   with it. One refusal is new in Go 1.27: a mailbox whose domain holds
-  `@` is one Go cannot read (`verify.go:398-401`), the interim entry
-  below.
+  `@` is one Go cannot read (`verify.go:398-401`), and the
+  client-certificate verifier follows it (decided 2026-11-13). Its path
+  callback refuses a chain on which a certificate below one with name
+  constraints of any form names such a mailbox, after the policies and
+  ahead of the distrusted keys, where Go checks it (`verify.go:630-651`).
+  This check is the port's own, beside webpki's, and reads only
+  mailboxes. The refusal is webpki's `NameConstraintViolation`, as above,
+  with `certificate_unknown`, where Go logs `x509: a root or intermediate
+  certificate is not authorized to sign for this name: cannot parse
+  rfc822Name ...` with `bad_certificate` (`constraints.go:609-620`,
+  `verify.go:641-646`), and is reported ahead of whatever the other paths
+  failed on, as Go reports a broken constraint ahead of the rest
+  (`:653-656`). The mailboxes Go 1.26 could not read either stay among the
+  gaps above, and the seeders' check does not follow it (the seeders'
+  entry below).
 
   Go 1.27.3 also drops a chain on which the leaf, an intermediate or the
   root has a subject public key info whose SHA-256 is one of eight it lists
@@ -3248,7 +3261,14 @@ closing it would cost.
   Following Go in either would take a verifier of the port's own on the
   proxied transport and a connector of its own for ureq on the direct one,
   new code on the path a seeder MITM attacks, so both are recorded rather
-  than followed (decided 2026-11-12).
+  than followed (decided 2026-11-12). Where Go verifies the chain itself,
+  its client also refuses one on which a certificate below one with name
+  constraints names a mailbox whose domain holds `@`
+  (`crypto/x509/verify.go:398-401`, `constraints.go:609-620`), which the
+  client-certificate verifier refuses too (the entry on
+  `--authtype=clientcert` above) and the seeders' check does not, since
+  following it would take the same new code; whether to follow it there
+  is still to be decided in the changes that complete the move to 1.27.3.
 
 - **The RPC key file is read as Go's `tls.X509KeyPair` reads it, but a
   P-224 key is refused where dcrd serves it over TLS 1.2.** Since ADR-0015's
@@ -3386,20 +3406,6 @@ closing it would cost.
   parameters nor its length. This is interim as well: the changes that
   complete the move bring ML-DSA in line with Go 1.27.3, and any new
   dependency that takes comes under ADR-0012's and ADR-0015's review.
-
-- **A client certificate naming a mailbox whose domain holds `@` passes a
-  name constraint of another form, which Go 1.27 refuses.** Under a name
-  constraints extension of any form, Go 1.27 refuses a chain on which a
-  certificate below it names such a mailbox in its subject alternative
-  name, with `cannot parse rfc822Name` in its "not authorized to sign"
-  error (`crypto/x509/constraints.go:554-561`, `:609-620`, and
-  `verify.go:398-401`). Go 1.26.2 accepted the chain, and so does the
-  port, whose name constraints are webpki's, which reads no mailbox under
-  a subtree of another form (the entry on `--authtype=clientcert` above;
-  pinned by `name_constraints_on_a_chain_are_webpkis`). This is interim:
-  whether the port follows it or records it, as that entry records the
-  older gaps, is still to be decided in the changes that complete the
-  move to 1.27.3.
 
 - **A `--maxpeers` inside the host-dependent band exhausts memory in dcrd
   and not the port.** `newServer` builds its relay and broadcast queues as

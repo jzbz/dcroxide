@@ -2695,6 +2695,9 @@ struct CertFacts {
     /// Go's `KeyUsage`: the first nine bits of the key usage extension,
     /// as `parseKeyUsageExtension` keeps them, and zero without one.
     key_usage: u16,
+    /// Go's `hasNameConstraints`: the certificate carries a name
+    /// constraints extension, whatever it holds.
+    name_constraints: bool,
 }
 
 /// What Go's `buildChains` reads from a certificate to find and check
@@ -2938,30 +2941,47 @@ fn go_domain_name_valid(name: &[u8], constraint: bool) -> bool {
 }
 
 /// Whether Go 1.27.3's `parseRFC2821Mailbox` reads `mailbox`
-/// (`crypto/x509/verify.go:267-406`): a quoted string or dot-separated
-/// atoms, with backslash escapes in either, then `@` and a domain that
-/// passes [`go_domain_name_valid`] and, since 1.27, holds no `@`.
+/// (`crypto/x509/verify.go:267-406`): [`go_rfc2821_domain`] reads it,
+/// and its domain holds no `@`, which Go refuses since 1.27
+/// (`:398-401`).
 fn go_rfc2821_mailbox(mailbox: &[u8]) -> bool {
+    go_rfc2821_domain(mailbox).is_some_and(|domain| !domain.contains(&b'@'))
+}
+
+/// Whether `mailbox` is one Go 1.26.2's `parseRFC2821Mailbox` read and
+/// Go 1.27.3's does not: [`go_rfc2821_domain`] reads it, and its domain
+/// holds `@`.  That is the only change between the two: go1.26.2 checked
+/// the domain with `domainToReverseLabels` alone, which takes the same
+/// domains as `domainNameValid`, and go1.27.3 adds the `@` refusal
+/// (`crypto/x509/verify.go:394-401`).
+fn go_mailbox_domain_holds_at(mailbox: &[u8]) -> bool {
+    go_rfc2821_domain(mailbox).is_some_and(|domain| domain.contains(&b'@'))
+}
+
+/// The domain of `mailbox` as Go's `parseRFC2821Mailbox` reads it
+/// (`crypto/x509/verify.go:267-406`), short of the `@` refusal: a quoted
+/// string or dot-separated atoms, with backslash escapes in either, then
+/// `@` and a domain that passes [`go_domain_name_valid`], which may hold
+/// `@`.  `None` where Go refuses the mailbox for anything else.
+fn go_rfc2821_domain(mailbox: &[u8]) -> Option<&[u8]> {
     let mut rest = mailbox;
     match rest.split_first() {
-        None => return false,
+        None => return None,
         Some((b'"', tail)) => {
             // qcontent up to the closing quote: qtext, or a backslash and
             // the character it quotes.
             rest = tail;
             loop {
-                let Some((&c, tail)) = rest.split_first() else {
-                    return false;
-                };
+                let (&c, tail) = rest.split_first()?;
                 rest = tail;
                 match c {
                     b'"' => break,
                     b'\\' => match rest.split_first() {
                         Some((1..=9 | 11 | 12 | 14..=127, tail)) => rest = tail,
-                        _ => return false,
+                        _ => return None,
                     },
                     1..=8 | 11 | 12 | 14..=33 | 35..=91 | 93..=127 => {}
-                    _ => return false,
+                    _ => return None,
                 }
             }
         }
@@ -2972,9 +2992,7 @@ fn go_rfc2821_mailbox(mailbox: &[u8]) -> bool {
             let mut local = Vec::new();
             while let Some((&c, tail)) = rest.split_first() {
                 if c == b'\\' {
-                    let Some((&escaped, tail)) = tail.split_first() else {
-                        return false;
-                    };
+                    let (&escaped, tail) = tail.split_first()?;
                     local.push(escaped);
                     rest = tail;
                 } else if c.is_ascii_alphanumeric() || b"!#$%&'*+-/=?^_`{|}~.".contains(&c) {
@@ -2988,12 +3006,49 @@ fn go_rfc2821_mailbox(mailbox: &[u8]) -> bool {
                 || local.last() == Some(&b'.')
                 || local.windows(2).any(|pair| pair == b"..")
             {
-                return false;
+                return None;
             }
         }
     }
     rest.strip_prefix(b"@")
-        .is_some_and(|domain| go_domain_name_valid(domain, false) && !domain.contains(&b'@'))
+        .filter(|domain| go_domain_name_valid(domain, false))
+}
+
+/// Whether Go 1.27.3's `checkChainConstraints` refuses a chain for a
+/// mailbox whose domain holds `@` (`crypto/x509/constraints.go:515-571`).
+/// `chain` holds, leaf first and root last, whether each certificate
+/// carries a name constraints extension ([`CertFacts`]) and the value of
+/// its subject alternative name extension, where it has one
+/// ([`ChainIdentity`]).  Go reads every mailbox in the subject
+/// alternative name of a certificate below one with name constraints,
+/// whatever their forms, and refuses the chain on a mailbox it cannot
+/// read (`:542-561`, `parseMailboxes` at `:609-620`).  Of those, this
+/// takes only the ones Go 1.26.2 still read
+/// ([`go_mailbox_domain_holds_at`]); the older refusals stay webpki's,
+/// which makes none of them under a subtree of another form (PARITY.md,
+/// the clientcert entry).
+fn go_chain_names_an_at_domain_mailbox(chain: &[(bool, Option<&[u8]>)]) -> bool {
+    let Some(top) = chain.iter().rposition(|&(constrained, _)| constrained) else {
+        return false;
+    };
+    chain
+        .iter()
+        .take(top)
+        .filter_map(|&(_, san)| san)
+        .any(|san| {
+            let names_one = || -> Option<bool> {
+                let mut names = DerReader::new(DerReader::new(san).read_tag(0x30)?);
+                let mut found = false;
+                while !names.is_empty() {
+                    let (tag, name) = names.read()?;
+                    found |= tag == 0x81 && go_mailbox_domain_holds_at(name);
+                }
+                Some(found)
+            };
+            // `CertFacts::parse` has read the extension, so this reads it
+            // too; were it not to, the chain would be refused.
+            names_one().unwrap_or(true)
+        })
 }
 
 /// Whether Go 1.27.3's `parseNameConstraintsExtension` takes an
@@ -3131,6 +3186,7 @@ impl CertFacts {
             basic_constraints: false,
             is_ca: false,
             key_usage: 0,
+            name_constraints: false,
         };
         let mut links = ChainLinks {
             issuer,
@@ -3214,6 +3270,7 @@ impl CertFacts {
                     // base is a form Go does not enforce, and an IP or
                     // rfc822Name base Go refuses fails the parse.
                     30 => {
+                        facts.name_constraints = true;
                         let mut top = DerReader::new(DerReader::new(value).read_tag(0x30)?);
                         let mut unhandled = false;
                         while !top.is_empty() {
@@ -3657,9 +3714,13 @@ struct ClientCa {
 ///   rule ([`GoClientAuthUsage`]), and the path to Go's policy
 ///   validation ([`go_policies_valid`]); a path holding a certificate
 ///   Go's `alreadyInChain` takes for its root, a copy of the root the
-///   client sent, say, is refused, as Go builds no such chain.  Last, a
-///   path holding a key Go 1.27.3 distrusts is refused
-///   ([`go_distrusted_spki`]), and so is a pooled certificate with one.
+///   client sent, say, is refused, as Go builds no such chain.  Then a
+///   path on which a certificate below one with name constraints names
+///   a mailbox whose domain holds `@` is refused, as Go 1.27 refuses it
+///   ([`go_chain_names_an_at_domain_mailbox`]); the other name
+///   constraint checks are webpki's.  Last, a path holding a key Go
+///   1.27.3 distrusts is refused ([`go_distrusted_spki`]), and so is a
+///   pooled certificate with one.
 ///   The search runs over one copy of each certificate sent, as Go's
 ///   pool of intermediates keeps one.  webpki's trust anchors carry
 ///   no validity window or extensions, so an expired, not yet valid,
@@ -4491,6 +4552,7 @@ impl rustls::server::danger::ClientCertVerifier for GoClientCertVerifier {
         let refused_unhandled = std::cell::Cell::new(false);
         let refused_policies = std::cell::Cell::new(0usize);
         let refused_distrusted = std::cell::Cell::new(false);
+        let refused_mailbox = std::cell::Cell::new(false);
         let within_path_len = |path: &webpki::VerifiedPath<'_>| {
             let ders: Vec<rustls::pki_types::CertificateDer<'_>> = path
                 .intermediate_certificates()
@@ -4558,11 +4620,32 @@ impl rustls::server::danger::ClientCertVerifier for GoClientCertVerifier {
                 refused_policies.set(refused_policies.get().saturating_add(1));
                 return Err(webpki::Error::UnknownIssuer);
             }
+            // Go then holds the chain's names to its name constraints
+            // (`checkChainConstraints`, `verify.go:641-646`), after the
+            // key usage, which webpki has checked before the callback.
+            // webpki has made its own name constraint checks there too;
+            // the one Go 1.27 added is made here, in Go's place after
+            // the policies: a mailbox whose domain holds `@` below a
+            // certificate with name constraints of any form.
+            let named: Vec<(bool, Option<&[u8]>)> =
+                std::iter::once((leaf_facts.name_constraints, leaf_identity.san))
+                    .chain(
+                        parsed
+                            .iter()
+                            .map(|(facts, _, identity)| (facts.name_constraints, identity.san)),
+                    )
+                    .chain(std::iter::once((
+                        usable[i].facts.name_constraints,
+                        roots[i].and_then(|root| root.san),
+                    )))
+                    .collect();
+            if go_chain_names_an_at_domain_mailbox(&named) {
+                refused_mailbox.set(true);
+                return Err(webpki::Error::NameConstraintViolation);
+            }
             // Go 1.27.3 then drops a chain on which the leaf, an
             // intermediate or the root has a distrusted key, and keeps no
-            // count of it (`verify.go:647-649`).  Its key usage and name
-            // constraint checks come before this one too, and webpki has
-            // made them before the callback.
+            // count of it (`verify.go:647-649`).
             if std::iter::once(&leaf_identity)
                 .chain(parsed.iter().map(|(_, _, identity)| identity))
                 .chain(roots[i].iter())
@@ -4585,6 +4668,11 @@ impl rustls::server::danger::ClientCertVerifier for GoClientCertVerifier {
         )
         .map(|_| rustls::server::danger::ClientCertVerified::assertion())
         .map_err(|err| match err {
+            // A chain Go built that broke a name constraint gives Go's
+            // error for that, whatever dropped the others
+            // (`verify.go:653-656`); the port gives webpki's for every
+            // name constraint refusal.
+            _ if refused_mailbox.get() => go_pki_error(webpki::Error::NameConstraintViolation),
             // Once Go's search has built a chain it drops its signature
             // limit (`buildChains`) and the errors of the candidates that
             // made none, and `Verify` reports what dropped every chain it
@@ -10243,6 +10331,7 @@ mod tests {
                 basic_constraints: false,
                 is_ca: false,
                 key_usage: 0,
+                name_constraints: false,
             }
         );
 
@@ -12474,10 +12563,16 @@ mod tests {
     /// is not critical refuses every leaf, where Go accepts each.  The
     /// other way round, a DNS name or a mailbox Go cannot read, or a URI
     /// whose host is an IP address, refuses the chain under a constraint
-    /// of any form, and passes webpki under one of another form.  These
-    /// divergent rows are the recorded ones, but for the mailbox whose
-    /// domain holds `@`, which Go refuses since 1.27, PARITY.md's interim
-    /// entry.
+    /// of any form, and passes webpki under one of another form, a
+    /// mailbox with two periods in a row among them.  These divergent rows
+    /// are the recorded ones.  A mailbox whose domain holds `@`, which Go
+    /// 1.27 cannot read, refuses the chain in both under a constraint of
+    /// any form, permitted or excluded, a registeredID subtree among them,
+    /// on a certificate above the one naming it, the leaf or an
+    /// intermediate, even one with constraints of its own, and after
+    /// another name or a quoted local part; not when no certificate above
+    /// it carries constraints, nor when only the one naming it does, and
+    /// an `@` quoted or escaped in the local part is read.
     #[test]
     fn name_constraints_on_a_chain_are_webpkis() {
         use dcroxide_certgen::gentool::generate_key;
@@ -12491,7 +12586,7 @@ mod tests {
         let now = rustls::pki_types::UnixTime::since_unix_epoch(Duration::from_secs(secs));
         let mut oracle = dcroxide_testutil::oracle_or_skip();
         let key = || generate_key("P-256").expect("key");
-        let (root_key, leaf_key) = (key(), key());
+        let (root_key, int_key, leaf_key) = (key(), key(), key());
         // A subtree list ([0] permitted or [1] excluded) of one base.
         let subtrees = |tag: u8, base: Vec<u8>| der_tlv(tag, &der_tlv(0x30, &base));
         let permitted = |base: Vec<u8>| subtrees(0xa0, base);
@@ -12510,6 +12605,96 @@ mod tests {
             der_tlv(0xa0, &[&upn_oid[..], &value].concat())
         };
         let mask8 = [10, 0, 0, 1, 0xff, 0, 0, 0];
+        // A CA's extensions, with name constraints and whether they are
+        // critical, and a subject alternative name of one name.
+        let authority = |constraints: Option<(&[u8], bool)>, name: Option<&[u8]>| {
+            let mut extensions = vec![
+                der_extension(
+                    BASIC_CONSTRAINTS,
+                    true,
+                    &der_tlv(0x30, &der_tlv(0x01, &[0xff])),
+                ),
+                der_extension(KEY_USAGE, true, &der_tlv(0x03, &[0x02, 0x84])),
+            ];
+            if let Some((constraints, critical)) = constraints {
+                extensions.push(der_extension(
+                    NAME_CONSTRAINTS,
+                    critical,
+                    &der_tlv(0x30, constraints),
+                ));
+            }
+            if let Some(name) = name {
+                extensions.push(der_extension(SAN, false, &der_tlv(0x30, name)));
+            }
+            extensions
+        };
+        let leaf_below = |issuer: &str, issuer_key, name: &[u8]| {
+            signed_p256_certificate(
+                2,
+                "leaf",
+                &leaf_key,
+                issuer,
+                issuer_key,
+                &[
+                    der_extension(KEY_USAGE, true, &der_tlv(0x03, &[0x07, 0x80])),
+                    der_extension(SAN, false, &der_tlv(0x30, name)),
+                ],
+            )
+        };
+        // Whether a certificate names a mailbox whose domain holds `@`.
+        let names_an_at_domain = |der: &[u8]| {
+            let (_, _, identity) = CertFacts::parse_all(der).expect("parses");
+            identity.san.is_some_and(|san| {
+                let mut names = DerReader::new(DerReader::new(san).read_tag(0x30).expect("names"));
+                std::iter::from_fn(|| names.read())
+                    .any(|(tag, name)| tag == 0x81 && go_mailbox_domain_holds_at(name))
+            })
+        };
+        // The port's verdict on a chain and Go's, `sent` the certificates
+        // the client sends beside the leaf.  Where Go refuses a chain
+        // naming such a mailbox, it says it cannot read it.
+        let mut judge = |label: &str,
+                         root: &[u8],
+                         sent: &[&[u8]],
+                         leaf: &[u8],
+                         port_accepts: bool,
+                         go_accepts: bool| {
+            let verifier =
+                GoClientCertVerifier::from_pem(&certificate_pem(root)).expect("verifier");
+            let presented: Vec<CertificateDer<'_>> =
+                sent.iter().map(|der| CertificateDer::from(*der)).collect();
+            let got = verifier
+                .verify_client_cert(&CertificateDer::from(leaf), &presented, now)
+                .map(|_| ());
+            if port_accepts {
+                assert!(got.is_ok(), "{label}: {got:?}");
+            } else {
+                assert!(
+                    matches!(
+                        &got,
+                        Err(rustls::Error::InvalidCertificate(rustls::CertificateError::Other(other)))
+                            if other.0.downcast_ref::<webpki::Error>()
+                                == Some(&webpki::Error::NameConstraintViolation)
+                    ),
+                    "{label}: {got:?}"
+                );
+            }
+            if let Some(GoVerdict { verdict, .. }) =
+                go_client_verdict(&mut oracle, &[root], leaf, sent, secs)
+            {
+                assert_eq!(verdict == "ok", go_accepts, "{label}: Go says {verdict}");
+                if !go_accepts
+                    && std::iter::once(leaf)
+                        .chain(sent.iter().copied())
+                        .any(names_an_at_domain)
+                {
+                    assert!(
+                        verdict.contains("cannot parse rfc822Name"),
+                        "{label}: Go says {verdict}"
+                    );
+                }
+            }
+        };
         // label, constraints, whether critical, the leaf's one name, and
         // the verdicts of the port and of Go.
         for (label, constraints, critical, name, port_accepts, go_accepts) in [
@@ -12590,6 +12775,86 @@ mod tests {
                 permitted(dns(b"example.com")),
                 true,
                 email(b"a@b@example.com"),
+                false,
+                false,
+            ),
+            (
+                "a mailbox whose domain holds @ under an IP subtree",
+                permitted(ip(&mask8)),
+                true,
+                email(b"a@b@example.com"),
+                false,
+                false,
+            ),
+            (
+                "a mailbox whose domain holds @ under an excluded subtree",
+                excluded(dns(b"other.example")),
+                true,
+                email(b"a@b@example.com"),
+                false,
+                false,
+            ),
+            (
+                "a mailbox whose domain holds @ under a constraint not critical",
+                permitted(dns(b"example.com")),
+                false,
+                email(b"a@b@example.com"),
+                false,
+                false,
+            ),
+            (
+                "a mailbox whose domain holds @ under a registeredID subtree not critical",
+                permitted(der_tlv(0x88, &[0x2a, 0x03])),
+                false,
+                email(b"a@b@example.com"),
+                false,
+                false,
+            ),
+            (
+                "a mailbox whose domain holds @ after a DNS name",
+                permitted(dns(b"example.com")),
+                true,
+                [&dns(b"client.example.com")[..], &email(b"a@b@example.com")].concat(),
+                false,
+                false,
+            ),
+            (
+                "a quoted local part, then a domain holding @",
+                permitted(dns(b"example.com")),
+                true,
+                email(br#""a@b"@c@example.com"#),
+                false,
+                false,
+            ),
+            (
+                "a quoted local part holding @",
+                permitted(dns(b"example.com")),
+                true,
+                email(br#""a@b"@example.com"#),
+                true,
+                true,
+            ),
+            (
+                "an escaped @ in the local part",
+                permitted(dns(b"example.com")),
+                true,
+                email(br"a\@b@example.com"),
+                true,
+                true,
+            ),
+            (
+                "an escaped backslash, then a domain holding @",
+                permitted(dns(b"example.com")),
+                true,
+                email(br"a\\@b@example.com"),
+                false,
+                false,
+            ),
+            (
+                "a mailbox Go 1.26 could not read either under a DNS subtree",
+                permitted(dns(b"example.com")),
+                true,
+                email(b"a..b@example.com"),
                 true,
                 false,
             ),
@@ -12616,49 +12881,268 @@ mod tests {
                 &root_key,
                 "root",
                 &root_key,
-                &[
-                    der_extension(
-                        BASIC_CONSTRAINTS,
-                        true,
-                        &der_tlv(0x30, &der_tlv(0x01, &[0xff])),
-                    ),
-                    der_extension(KEY_USAGE, true, &der_tlv(0x03, &[0x02, 0x84])),
-                    der_extension(NAME_CONSTRAINTS, critical, &der_tlv(0x30, &constraints)),
-                ],
+                &authority(Some((&constraints, critical)), None),
             );
-            let leaf = signed_p256_certificate(
-                2,
-                "leaf",
-                &leaf_key,
+            let leaf = leaf_below("root", &root_key, &name);
+            judge(label, &root, &[], &leaf, port_accepts, go_accepts);
+        }
+        // The same through an intermediate: label, the constraints on the
+        // root and on the intermediate, the intermediate's one name and
+        // the leaf's, and the verdicts of the port and of Go.
+        for (label, root_constraints, int_constraints, int_name, name, port_accepts, go_accepts) in [
+            (
+                "a mailbox whose domain holds @ named by an intermediate below a \
+                 constrained root",
+                Some(permitted(dns(b"example.com"))),
+                None,
+                Some(email(b"a@b@example.com")),
+                dns(b"client.example.com"),
+                false,
+                false,
+            ),
+            (
+                "a mailbox whose domain holds @ named by a constrained intermediate \
+                 below a constrained root",
+                Some(permitted(dns(b"example.com"))),
+                Some(permitted(dns(b"example.com"))),
+                Some(email(b"a@b@example.com")),
+                dns(b"client.example.com"),
+                false,
+                false,
+            ),
+            (
+                "a mailbox whose domain holds @ named by the constrained intermediate",
+                None,
+                Some(permitted(dns(b"example.com"))),
+                Some(email(b"a@b@example.com")),
+                dns(b"client.example.com"),
+                true,
+                true,
+            ),
+            (
+                "a mailbox whose domain holds @ below a constrained intermediate",
+                None,
+                Some(permitted(dns(b"example.com"))),
+                None,
+                email(b"a@b@example.com"),
+                false,
+                false,
+            ),
+            (
+                "a mailbox whose domain holds @ with no constraints above it",
+                None,
+                None,
+                None,
+                email(b"a@b@example.com"),
+                true,
+                true,
+            ),
+        ] {
+            let root = signed_p256_certificate(
+                1,
                 "root",
                 &root_key,
-                &[
-                    der_extension(KEY_USAGE, true, &der_tlv(0x03, &[0x07, 0x80])),
-                    der_extension(SAN, false, &der_tlv(0x30, &name)),
-                ],
+                "root",
+                &root_key,
+                &authority(root_constraints.as_deref().map(|c| (c, true)), None),
             );
-            let verifier =
-                GoClientCertVerifier::from_pem(&certificate_pem(&root)).expect("verifier");
-            let got = verifier
-                .verify_client_cert(&CertificateDer::from(leaf.as_slice()), &[], now)
+            let int = signed_p256_certificate(
+                3,
+                "int",
+                &int_key,
+                "root",
+                &root_key,
+                &authority(
+                    int_constraints.as_deref().map(|c| (c, true)),
+                    int_name.as_deref(),
+                ),
+            );
+            let leaf = leaf_below("int", &int_key, &name);
+            judge(label, &root, &[&int], &leaf, port_accepts, go_accepts);
+        }
+    }
+
+    /// A chain refused for a mailbox whose domain holds `@` is refused in
+    /// Go's order (`verify.go:630-668`): after the policies, so the only
+    /// chain failing both is logged with the policy count; after the key
+    /// usage, which webpki checks first; ahead of a distrusted key; and
+    /// ahead of every other reason the other chains were dropped for, so
+    /// one chain dropped for its policies beside it leaves the name
+    /// constraint error, whichever comes first.  Each verdict is compared
+    /// with Go's, the distrusted key's chain with Go's verdict on the same
+    /// chain, whose table does not hold the key.
+    #[test]
+    fn a_mailbox_whose_domain_holds_at_is_refused_in_gos_order() {
+        use dcroxide_certgen::gentool::generate_key;
+        use rustls::pki_types::CertificateDer;
+        use rustls::server::danger::ClientCertVerifier;
+        const BASIC_CONSTRAINTS: &[u8] = &[0x55, 0x1d, 0x13];
+        const KEY_USAGE: &[u8] = &[0x55, 0x1d, 0x0f];
+        const EKU: &[u8] = &[0x55, 0x1d, 0x25];
+        const SERVER_AUTH: &[u8] = &[0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x01];
+        const SAN: &[u8] = &[0x55, 0x1d, 0x11];
+        const NAME_CONSTRAINTS: &[u8] = &[0x55, 0x1d, 0x1e];
+        const POLICIES: &[u8] = &[0x55, 0x1d, 0x20];
+        const POLICY_CONSTRAINTS: &[u8] = &[0x55, 0x1d, 0x24];
+        const CONSTRAINT: &str = "x509: a root or intermediate certificate is not authorized to \
+                                  sign for this name: cannot parse rfc822Name";
+        let secs = 1_790_000_000u64;
+        let now = rustls::pki_types::UnixTime::since_unix_epoch(Duration::from_secs(secs));
+        let mut oracle = dcroxide_testutil::oracle_or_skip();
+        let key = || generate_key("P-256").expect("key");
+        let (root_key, int_key, leaf_key) = (key(), key(), key());
+        let authority = vec![
+            der_extension(
+                BASIC_CONSTRAINTS,
+                true,
+                &der_tlv(0x30, &der_tlv(0x01, &[0xff])),
+            ),
+            der_extension(KEY_USAGE, true, &der_tlv(0x03, &[0x02, 0x84])),
+        ];
+        let constrained = der_extension(
+            NAME_CONSTRAINTS,
+            true,
+            &der_tlv(
+                0x30,
+                &der_tlv(0xa0, &der_tlv(0x30, &der_tlv(0x82, b"example.com"))),
+            ),
+        );
+        // requireExplicitPolicy 0 and one policy, which the leaf does not
+        // name.
+        let requiring = [
+            der_extension(
+                POLICY_CONSTRAINTS,
+                false,
+                &der_tlv(0x30, &der_tlv(0x80, &[0])),
+            ),
+            der_extension(
+                POLICIES,
+                false,
+                &der_tlv(
+                    0x30,
+                    &der_tlv(0x30, &der_tlv(0x06, &oid_contents(&[1, 2, 3, 1]))),
+                ),
+            ),
+        ];
+        let server_only = der_extension(EKU, false, &der_tlv(0x30, &der_tlv(0x06, SERVER_AUTH)));
+        let root = signed_p256_certificate(1, "root", &root_key, "root", &root_key, &authority);
+        // Copies of the leaf's issuer, each with the extensions given.
+        let int = |serial: u8, extra: &[&Vec<u8>]| {
+            let extensions: Vec<Vec<u8>> = authority
+                .iter()
+                .chain(extra.iter().copied())
+                .cloned()
+                .collect();
+            signed_p256_certificate(serial, "int", &int_key, "root", &root_key, &extensions)
+        };
+        let int_constrained = int(3, &[&constrained]);
+        let int_requiring = int(4, &[&requiring[0], &requiring[1]]);
+        let int_both = int(5, &[&constrained, &requiring[0], &requiring[1]]);
+        let int_server = int(6, &[&constrained, &server_only]);
+        let leaf = signed_p256_certificate(
+            2,
+            "leaf",
+            &leaf_key,
+            "int",
+            &int_key,
+            &[
+                der_extension(KEY_USAGE, true, &der_tlv(0x03, &[0x07, 0x80])),
+                der_extension(
+                    SAN,
+                    false,
+                    &der_tlv(0x30, &der_tlv(0x81, b"a@b@example.com")),
+                ),
+            ],
+        );
+        // The verifier over the root, with a table naming the keys of the
+        // certificates given in place of Go's.
+        let verifier = |distrusted: &[&[u8]]| {
+            let hashes: Vec<&'static str> = distrusted
+                .iter()
+                .map(|der| {
+                    let (_, _, identity) = CertFacts::parse_all(der).expect("parses");
+                    &*Box::leak(
+                        go_sha256_hex(identity.spki)
+                            .expect("sha-256")
+                            .into_boxed_str(),
+                    )
+                })
+                .collect();
+            GoClientCertVerifier::from_pem(&certificate_pem(&root))
+                .expect("verifier")
+                .distrusting(Box::leak(hashes.into_boxed_slice()))
+        };
+        let is_constraint = |got: &Result<(), rustls::Error>| {
+            matches!(
+                got,
+                Err(rustls::Error::InvalidCertificate(rustls::CertificateError::Other(other)))
+                    if other.0.downcast_ref::<webpki::Error>()
+                        == Some(&webpki::Error::NameConstraintViolation)
+            )
+        };
+        for (label, sent, distrusted, want_go) in [
+            (
+                "policies first",
+                vec![&int_both],
+                vec![],
+                "x509: no valid chains built: 1 candidate chains with invalid policies",
+            ),
+            (
+                "key usage first",
+                vec![&int_server],
+                vec![],
+                "x509: certificate specifies an incompatible key usage",
+            ),
+            (
+                "ahead of a distrusted key",
+                vec![&int_constrained],
+                vec![&int_constrained],
+                CONSTRAINT,
+            ),
+            (
+                "ahead of a chain dropped for its policies, sent after",
+                vec![&int_constrained, &int_requiring],
+                vec![],
+                CONSTRAINT,
+            ),
+            (
+                "ahead of a chain dropped for its policies, sent before",
+                vec![&int_requiring, &int_constrained],
+                vec![],
+                CONSTRAINT,
+            ),
+        ] {
+            let distrusted: Vec<&[u8]> = distrusted.iter().map(|der| der.as_slice()).collect();
+            let sent: Vec<&[u8]> = sent.iter().map(|der| der.as_slice()).collect();
+            let presented: Vec<CertificateDer<'_>> =
+                sent.iter().map(|der| CertificateDer::from(*der)).collect();
+            let got = verifier(&distrusted)
+                .verify_client_cert(&CertificateDer::from(leaf.as_slice()), &presented, now)
                 .map(|_| ());
-            if port_accepts {
-                assert!(got.is_ok(), "{label}: {got:?}");
-            } else {
+            if want_go == CONSTRAINT {
+                assert!(is_constraint(&got), "{label}: {got:?}");
+            } else if want_go.contains("key usage") {
                 assert!(
                     matches!(
-                        &got,
-                        Err(rustls::Error::InvalidCertificate(rustls::CertificateError::Other(other)))
-                            if other.0.downcast_ref::<webpki::Error>()
-                                == Some(&webpki::Error::NameConstraintViolation)
+                        got,
+                        Err(rustls::Error::InvalidCertificate(
+                            rustls::CertificateError::InvalidPurposeContext { .. }
+                        ))
                     ),
                     "{label}: {got:?}"
                 );
+            } else {
+                let err = got.expect_err(label);
+                assert_eq!(
+                    crate::rpctls::go_error_text_for_tests(&err),
+                    format!("tls: failed to verify certificate: {want_go}"),
+                    "{label}"
+                );
             }
             if let Some(GoVerdict { verdict, .. }) =
-                go_client_verdict(&mut oracle, &[&root], &leaf, &[], secs)
+                go_client_verdict(&mut oracle, &[&root], &leaf, &sent, secs)
             {
-                assert_eq!(verdict == "ok", go_accepts, "{label}: Go says {verdict}");
+                assert!(verdict.starts_with(want_go), "{label}: Go says {verdict}");
             }
         }
     }
