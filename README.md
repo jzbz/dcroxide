@@ -495,24 +495,26 @@ work). Currently implemented:
   1.2 PRF; the X25519, P-256, P-384 and P-521 key exchanges over
   `curve25519-dalek` and RustCrypto's curve crates, with Go's rules for a
   peer's share and ephemeral keys from the kernel; the ECDSA (P-256,
-  P-384, P-521, hedged RFC 6979) and Ed25519 signing keys, loaded by Go's
-  `tls.X509KeyPair` rules with RSA keys refused; and ring's fourteen
-  verification algorithms, ECDSA, Ed25519 by Go's rules and RSA PKCS#1
-  v1.5 and PSS verified in tree on `num-bigint`, within ring's limits;
-  pinned by Wycheproof's vectors on hardware and portable backends, by RFC
-  6979's and RFC 8032's known answers, by a corpus of signatures whose
-  verdicts it gives as ring gave them, recorded while ring was in the
-  tree, and as Go gives them but on RSA keys outside either's limits and
-  keys with bytes after their values, where it keeps ring's differences
-  from Go, by Go's `crypto/ecdh`, `tls.X509KeyPair`, `ed25519.Sign` and
-  signature checks through the oracle, by the Go interop matrix, Go's
-  `crypto/tls` client and server against the provider's every suite,
-  group, key type and version, and client certificates, and by a
-  statistical timing check of its signing, key exchange, record protection
-  (sealing, a bad tag's refusal and AES-GCM's keying) and HMAC keying in a
-  CI workflow of its own (dudect's t-test with a 1 ns floor, evidence and
-  not a proof of constant time); every rustls configuration the node
-  builds names it, and the node installs no process default
+  P-384, P-521, hedged RFC 6979), Ed25519 and ML-DSA (on `ml-dsa`, hedged,
+  TLS 1.3 alone) signing keys, loaded by Go's `tls.X509KeyPair` rules
+  with RSA keys refused; and ring's fourteen verification algorithms,
+  ECDSA, Ed25519 by Go's rules and RSA PKCS#1 v1.5 and PSS verified in
+  tree on `num-bigint`, within ring's limits; pinned by Wycheproof's
+  vectors on hardware and portable backends, by RFC 6979's and RFC 8032's
+  known answers, by a corpus of signatures whose verdicts it gives as ring
+  gave them, recorded while ring was in the tree, and as Go gives them but
+  on RSA keys outside either's limits and keys with bytes after their
+  values, where it keeps ring's differences from Go, by Go's
+  `crypto/ecdh`, `tls.X509KeyPair`, `ed25519.Sign` and signature checks
+  through the oracle, by the Go interop matrix, Go's `crypto/tls` client
+  and server against the provider's every suite, group, key type and
+  version, and client certificates, and by a statistical timing check of
+  its ECDSA and Ed25519 signing (ML-DSA is not timed), key exchange,
+  record protection (sealing, a bad tag's refusal and AES-GCM's keying)
+  and HMAC keying in a CI workflow of its own (dudect's t-test with a 1 ns
+  floor, evidence and not a proof of constant time); every rustls
+  configuration the node builds names it, and the node installs no
+  process default
 - `dcroxide-ratelimit` — dcrd 2.2's `internal/ratelimit` token bucket:
   a bucket seeded with `burst` tokens refilling at a fixed rate,
   reproducing dcrd's `f64` operations in dcrd's order — including

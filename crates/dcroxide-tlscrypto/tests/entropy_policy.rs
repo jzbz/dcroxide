@@ -21,14 +21,17 @@
 //! read of the process's memory recover it, where the kernel's generator
 //! erases its key as it goes.
 //!
-//! The one that is not the kernel's is the additional data each ECDSA
-//! handshake signature mixes into its RFC 6979 nonce, which comes from the
-//! process-wide generator of `dcroxide_crypto::rand`, through
-//! `rand::ProcessRng`.  RFC 6979 keeps the nonce safe should that draw be
-//! weak, so it needs neither the kernel's freshness nor its fallibility,
-//! and that generator, seeded at startup, cannot fail after it.  The RPC
-//! server makes it once per TLS handshake it signs with an ECDSA key, on
-//! any of the three curves.
+//! The one that is not the kernel's is a handshake signature's hedge,
+//! which comes from the process-wide generator of `dcroxide_crypto::rand`,
+//! through `rand::ProcessRng`: the additional data each ECDSA signature
+//! mixes into its RFC 6979 nonce, and the 32 bytes of FIPS 204's `rnd`
+//! each ML-DSA signature hashes with the key's secret `K` and the message.
+//! Each signature is safe should that draw be weak, deterministic RFC 6979
+//! or deterministic ML-DSA, so it needs neither the kernel's freshness nor
+//! its fallibility, and that generator, seeded at startup, cannot fail
+//! after it.  The RPC server makes it once per TLS handshake it signs with
+//! an ECDSA key, on any of the three curves, or an ML-DSA key, of any of
+//! the three sets.
 //!
 //! The scans match literal text: `getrandom::`, so `use getrandom::fill;`
 //! followed by a bare `fill(..)`, or another entropy crate, walks straight
@@ -157,13 +160,14 @@ fn every_draw_from_the_process_generator_is_accounted_for() {
         "rand.rs",
         (
             1,
-            "per-event but correct: ProcessRng, the hedge of every ECDSA handshake \
-             signature, once per TLS handshake signed with an ECDSA key; RFC 6979 derives \
-             the nonce from the key and the transcript, so a weak draw leaves the signature \
-             safe and only makes two signatures of one transcript differ, and the generator, \
-             seeded at startup, cannot fail after it, where a kernel read on a peer-paced path \
-             can; Go hedges from its standard-library crypto/rand, which a failure there \
-             aborts",
+            "per-event but correct: ProcessRng, the hedge of every ECDSA and ML-DSA \
+             handshake signature, once per TLS handshake signed with such a key; RFC 6979 \
+             derives the nonce from the key and the transcript, and ML-DSA its masking seed \
+             from the key's secret K and the transcript as well as the hedge, so a weak draw \
+             leaves the signature safe and only makes two signatures of one transcript \
+             differ, and the generator, seeded at startup, cannot fail after it, where a \
+             kernel read on a peer-paced path can; Go hedges from its standard-library \
+             crypto/rand, which a failure there aborts",
         ),
     )]
     .into_iter()
@@ -191,19 +195,19 @@ fn every_draw_from_the_process_generator_is_accounted_for() {
 }
 
 /// The process generator is drawn only through `ProcessRng`, which only
-/// the ECDSA signer uses: the lines of code outside the unit tests that
-/// name it, less comments and `use` declarations, are its definition in
-/// `rand.rs` and the signer's one draw in `sign.rs`.  So the
-/// `SecureRandom`, a key exchange or the Ed25519 signer drawing from it
-/// fails here.
+/// the ECDSA and ML-DSA signers use: the lines of code outside the unit
+/// tests that name it, less comments and `use` declarations, are its
+/// definition in `rand.rs` and the two signers' one draw each in
+/// `sign.rs`.  So the `SecureRandom`, a key exchange or the Ed25519
+/// signer drawing from it fails here.
 #[test]
-fn only_the_ecdsa_signer_draws_from_the_process_generator() {
+fn only_the_hedged_signers_draw_from_the_process_generator() {
     let uses = code_lines_where(|line| {
         let line = line.trim_start();
         line.contains("ProcessRng") && !line.starts_with("//") && !line.starts_with("use ")
     });
     assert_eq!(
         uses,
-        BTreeMap::from([("rand.rs".to_owned(), 2), ("sign.rs".to_owned(), 1)])
+        BTreeMap::from([("rand.rs".to_owned(), 2), ("sign.rs".to_owned(), 2)])
     );
 }

@@ -13,8 +13,8 @@
 //! For key loading: `sign::load_der` reads each key of `key_corpus` as
 //! Go's `tls.X509KeyPair` reads it under its PEM label, the key and its
 //! type where Go loads it, Go's text where Go refuses it, the cause after
-//! "tls: failed to parse private key: " whole; the RSA, P-224 and ML-DSA
-//! keys Go reads are refused with this crate's texts.  Mutations of every
+//! "tls: failed to parse private key: " whole; the RSA and P-224 keys Go
+//! reads are refused with this crate's texts.  Mutations of every
 //! key are held to Go's answers the same way, a sample of them in each run
 //! and all of them in the nightly job.  And Ed25519, which is
 //! deterministic, signs as Go's `ed25519.Sign` signs, byte for byte.
@@ -319,6 +319,9 @@ fn go_type(algorithm: KeyAlgorithm) -> &'static str {
         KeyAlgorithm::EcdsaP384 => "ECDSA P-384",
         KeyAlgorithm::EcdsaP521 => "ECDSA P-521",
         KeyAlgorithm::Ed25519 => "Ed25519",
+        KeyAlgorithm::MlDsa44 => "ML-DSA-44",
+        KeyAlgorithm::MlDsa65 => "ML-DSA-65",
+        KeyAlgorithm::MlDsa87 => "ML-DSA-87",
         other => panic!("a key load_der loads cannot be {other:?}"),
     }
 }
@@ -380,12 +383,12 @@ fn shape(cause: &str) -> String {
 /// refuses it with that text, whole, against the certificate of the key
 /// it was mutated from, which Go would load were the refusal wrong.  An
 /// RSA key it refuses with its own text is loaded by Go, or refused by
-/// Go's `Validate` (`RSA_GO_REFUSES`); a P-224 key is loaded by Go as
-/// P-224; and an ML-DSA key, refused with this crate's interim text, is
-/// read by Go and refused only as not the certificate's type.  The count
-/// of each verdict is pinned too, a refusal's by the shape of its cause
-/// ([`shape`]), so that a corpus gone wrong, a case lost or sent to
-/// another verdict, cannot pass on agreement alone.
+/// Go's `Validate` (`RSA_GO_REFUSES`); and a P-224 key is loaded by Go as
+/// P-224.  An ML-DSA seed is a key both load, and Go's key of it is the
+/// crate's only if the expansions agree.  The count of each verdict is
+/// pinned too, a refusal's by the shape of its cause ([`shape`]), so that
+/// a corpus gone wrong, a case lost or sent to another verdict, cannot
+/// pass on agreement alone.
 #[test]
 fn keys_load_as_go_loads_them() {
     let Some(mut oracle) = dcroxide_testutil::oracle_or_skip() else {
@@ -423,9 +426,6 @@ fn keys_load_as_go_loads_them() {
                 } else if text == "unsupported private key: ECDSA P-224" {
                     assert_eq!(go, "ok ECDSA P-224", "{label}");
                     text
-                } else if text.starts_with("unsupported private key: ML-DSA-") {
-                    assert_eq!(go, GO_READ_ANOTHER_KEY[1], "{label}");
-                    text
                 } else {
                     assert_eq!(go, format!("refused: {text}"), "{label}");
                     match text.strip_prefix(UNPARSABLE) {
@@ -459,11 +459,11 @@ fn keys_load_as_go_loads_them() {
         ("ok ECDSA P-384", 55),
         ("ok ECDSA P-521", 57),
         ("ok Ed25519", 9),
+        ("ok ML-DSA-44", 1),
+        ("ok ML-DSA-65", 1),
+        ("ok ML-DSA-87", 1),
         ("tls: found unknown private key type in PKCS#8 wrapping", 1),
         ("unsupported private key: ECDSA P-224", 48),
-        ("unsupported private key: ML-DSA-44", 1),
-        ("unsupported private key: ML-DSA-65", 1),
-        ("unsupported private key: ML-DSA-87", 1),
         ("x509: ML-DSA private keys with both seed and expanded key are not supported, use e.g. \"openssl pkey -provparam ml-dsa.output_formats=seed-only\" to convert to a seed-only key", 1),
         ("x509: PKCS#8 wrapping contained private key with unknown algorithm: N.N", 2),
         ("x509: PKCS#8 wrapping contained private key with unknown algorithm: N.N.N", 1),
@@ -581,8 +581,8 @@ fn go_refuses_rsa_values(go: &str) -> bool {
 /// certificate of the corpus case the key was mutated from, a refusal in
 /// Go's words, the same text; an RSA key, one Go reads, or refuses for
 /// its values ([`go_refuses_rsa_values`]), which Go checks and this
-/// crate does not; and the P-224 and ML-DSA keys it refuses with its own
-/// text, keys Go reads.  The text it gives is the error.
+/// crate does not; and the P-224 keys it refuses with its own text, keys
+/// Go reads.  The text it gives is the error.
 fn sweep_class(ours: &SweepAnswer, go: &str) -> Result<&'static str, String> {
     let read_another = GO_READ_ANOTHER_KEY.contains(&go);
     match ours {
@@ -604,8 +604,6 @@ fn sweep_class(ours: &SweepAnswer, go: &str) -> Result<&'static str, String> {
                 }
             } else if text == "unsupported private key: ECDSA P-224" {
                 (go == "ok ECDSA P-224" || read_another).then_some("P-224, which Go reads")
-            } else if text.starts_with("unsupported private key: ML-DSA-") {
-                (go == GO_READ_ANOTHER_KEY[1]).then_some("ML-DSA, which Go reads")
             } else {
                 (go == format!("refused: {text}")).then_some("refused in Go's words")
             };
@@ -687,7 +685,6 @@ fn mutated_keys_load_as_go_loads_them() {
         "RSA, which Go reads",
         "RSA, which Go refuses",
         "P-224, which Go reads",
-        "ML-DSA, which Go reads",
         "refused in Go's words",
     ] {
         assert!(classes.contains_key(class), "no input of the class {class}");

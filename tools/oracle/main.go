@@ -186,8 +186,10 @@
 //	                     string}; the pair loaded as crypto/tls's
 //	                     X509KeyPair loads a certificate and its key;
 //	                     {"result": "ok <key type>"}, the type "ECDSA
-//	                     <curve name>", "Ed25519" or "RSA <modulus bits>",
-//	                     or {"result": "refused: <error>"}, each with
+//	                     <curve name>", "Ed25519", "RSA <modulus bits>"
+//	                     or, under Go 1.27 and later, "ML-DSA-44",
+//	                     "ML-DSA-65" or "ML-DSA-87" (mldsa.go), or
+//	                     {"result": "refused: <error>"}, each with
 //	                     "go_version": runtime.Version()
 //	x509_key_pairs     → data is JSON {"cert_pem": string, "label":
 //	                     string, "keys": [hex DER], "cert_pems":
@@ -230,7 +232,9 @@
 //	                     "p", "q": hex}} with "go_version":
 //	                     runtime.Version()
 //	tls_pki            → data is JSON {"certs": [{"name", "key": "P-256" |
-//	                     "P-384" | "P-521" | "Ed25519" | "rsa": {"n",
+//	                     "P-384" | "P-521" | "Ed25519" | "ML-DSA-44" |
+//	                     "ML-DSA-65" | "ML-DSA-87" (Go 1.27 and later,
+//	                     mldsa.go) | "rsa": {"n",
 //	                     "e", "d", "p", "q": hex}, "issuer": name,
 //	                     "sig_alg": x509 name, "ca": bool, "eku":
 //	                     ["server_auth" | "client_auth" | "any"], "dns":
@@ -2058,6 +2062,9 @@ func x509KeyPair(certPEM, keyPEM []byte) (string, error) {
 	case *rsa.PrivateKey:
 		return fmt.Sprintf("ok RSA %d", key.N.BitLen()), nil
 	default:
+		if name, ok := mldsaKeyType(key); ok {
+			return "ok " + name, nil
+		}
 		return "", fmt.Errorf("a key of type %T", key)
 	}
 }

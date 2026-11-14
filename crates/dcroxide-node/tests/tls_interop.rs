@@ -28,6 +28,14 @@
 //!   one on Go's default list on every cell but those of the two profiles
 //!   the hybrids decide ([`HYBRID_GAP`]), whose differences are asserted.
 //!   So Go's AES-GCM preference is compared on this machine, not assumed.
+//! - **An ML-DSA `rpc.key`.**  One of each set, from `tls_pki`, served to
+//!   each of the TLS 1.3 profiles above, each cell compared with Go's two
+//!   servers as the other keys' are, and refused to a client held to TLS
+//!   1.2, as Go's server refuses it: Go's client hears `internal_error`
+//!   from both, and Go's server's words are Go's
+//!   (`crypto/tls/handshake_server.go:310-314`).  The oracle makes ML-DSA
+//!   keys only under Go 1.27 or later; under an older one the test skips,
+//!   unless `DCROXIDE_REQUIRE_ORACLE` is set.
 //! - **The RSA `rpc.key` cells.**  The listener refuses every RSA key at
 //!   startup, with T6's words (ADR-0015, [`RSA_KEY_REFUSAL`]), where dcrd
 //!   serves it ([`RSA_KEY_GAP`]).  ring served one its signer loaded, 2048
@@ -650,6 +658,83 @@ fn assert_like_go(
             );
         }
     }
+}
+
+/// Go's TLS 1.2 server text for a client that negotiates TLS 1.2 with an
+/// ML-DSA key (`crypto/tls/handshake_server.go:310-314`).
+const ML_DSA_TLS12_REFUSED: &str =
+    "tls: ML-DSA certificates require TLS 1.3, but client negotiated TLS 1.2";
+
+/// An ML-DSA `rpc.key` of each set, from `tls_pki`, served by the listener
+/// as Go's server serves it: to each TLS 1.3 client profile, its
+/// negotiation compared with Go's servers as the other keys' are; and to
+/// a client held to TLS 1.2 refused, Go's client hearing `internal_error`
+/// from the listener as from Go's server, whose words are held to Go's
+/// text.
+#[test]
+fn go_clients_and_an_ml_dsa_rpc_key() {
+    let Some(mut go) = TlsOracle::start_ml_dsa() else {
+        return;
+    };
+    let sets = ["ML-DSA-44", "ML-DSA-65", "ML-DSA-87"];
+    let specs: Vec<Value> = sets
+        .iter()
+        .map(|set| spec(set, set, None, "server"))
+        .collect();
+    let pki = go.pki(&specs);
+    let request = getblockcount(true);
+    let mut compared = 0;
+    for set in sets {
+        let pair = Pair::issued(set, &pki[set], ECDSA_SUITES);
+        let listening = listen_rpc(&pair, None).expect("an ML-DSA rpc.key served");
+        for profile in profiles(&pair)
+            .into_iter()
+            .filter(|profile| !profile.name.starts_with("TLS 1.2"))
+        {
+            let what = format!("{set}, {}", profile.name);
+            let detail = dial(
+                &mut go,
+                &listening.addr,
+                &pair.cert,
+                &profile.dial,
+                &request,
+            );
+            assert!(answered(&detail), "{what}: the listener {detail}");
+            let ours = Negotiated::of_go(&detail).expect("a completed handshake");
+            assert_eq!(ours.version, "TLS 1.3", "{what}");
+            let classical = reference(&mut go, &pair, Some(&CLASSICAL), &profile.dial, &request);
+            let default = reference(&mut go, &pair, None, &profile.dial, &request);
+            assert_like_go(&what, &ours, &classical, &default, profile.hybrid);
+            compared += 1;
+        }
+        let what = format!("{set}, TLS 1.2");
+        let tls12 = json!({ "max_version": "TLS 1.2" });
+        let detail = dial(&mut go, &listening.addr, &pair.cert, &tls12, &request);
+        assert_refused_by_the_node(&go, &what, &detail, "remote error: tls: internal error");
+        assert_eq!(detail["http_status"], 0, "{what}: the listener {detail}");
+        let (addr, id) = listen(
+            &mut go,
+            json!({ "chain": [hex(&pair.cert)], "key_pkcs8": hex(&pair.key_pkcs8) }),
+        );
+        let detail = dial(&mut go, &addr, &pair.cert, &tls12, &request);
+        go.assert_refused(&what, &detail, "remote error: tls: internal error");
+        let served = go.served(&id);
+        go.assert_refused(&what, &served, ML_DSA_TLS12_REFUSED);
+        listening.listener.shutdown();
+    }
+    go.report("go_clients_and_an_ml_dsa_rpc_key");
+    let profiles = 1 + CLASSICAL.len() + 1;
+    assert_eq!(
+        compared,
+        sets.len() * profiles,
+        "every set by every TLS 1.3 profile"
+    );
+    assert_eq!(
+        go.handshakes(),
+        sets.len() * (profiles * 3 + 2),
+        "every TLS 1.3 cell with the listener and Go's two servers, and the TLS 1.2 client \
+         with the listener and with Go's server"
+    );
 }
 
 /// `--authtype=clientcert`: each client certificate cell, in each version,

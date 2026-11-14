@@ -1,13 +1,15 @@
 // SPDX-License-Identifier: ISC
 //! Wycheproof's vectors for the crate's record protection, HMAC, HKDF, key
-//! exchange and signature verification (ADR-0015 T10), run through the
-//! crate's own code: the AEADs the suites instantiate, through the `seal`
-//! and `open` every record goes through; HMAC as rustls asks for a tag;
-//! HKDF as rustls builds it on that HMAC; each key exchange group's
-//! `complete`, from the case's private key; and the verification
-//! algorithms of `SUPPORTED_SIG_ALGS` and ML-DSA's three, on the key as a
-//! certificate's SubjectPublicKeyInfo carries it.  The files, their commit
-//! and their hashes are in `tests/data/wycheproof/SOURCE`.
+//! exchange, signature verification and ML-DSA signing (ADR-0015 T10),
+//! run through the crate's own code: the AEADs the suites instantiate,
+//! through the `seal` and `open` every record goes through; HMAC as rustls
+//! asks for a tag; HKDF as rustls builds it on that HMAC; each key
+//! exchange group's `complete`, from the case's private key; the
+//! verification algorithms of `SUPPORTED_SIG_ALGS` and ML-DSA's three, on
+//! the key as a certificate's SubjectPublicKeyInfo carries it; and
+//! ML-DSA's key, loaded from its seed, and its handshake signer.  The
+//! files, their commit and their hashes are in
+//! `tests/data/wycheproof/SOURCE`.
 //!
 //! A unit-test module rather than an integration test, because the AEADs
 //! and a key exchange with a fixed private key are reached through
@@ -1107,4 +1109,244 @@ fn ml_dsa_87_answers_wycheproof() {
     };
     let file = "mldsa_87_verify_test.json";
     ml_dsa_answers_wycheproof::<ml_dsa::MlDsa87>(file, verify::ML_DSA_87, "ML-DSA-87", expected, 7);
+}
+
+/// What one run of an ML-DSA signing-from-seed file met beyond its tally:
+/// the cases signed with a context, the cases of a precomputed μ alone,
+/// the cases with a hedge, and the groups whose seed is not 32 bytes.
+#[derive(Default, PartialEq, Debug)]
+struct SignSeedKinds {
+    /// Valid cases with a context, signed by the crate with it.
+    contexts: usize,
+    /// Valid cases of a μ with no message, signed by the crate from it.
+    internal: usize,
+    /// Valid cases with a non-zero `rnd`, signed by the handshake signer
+    /// with it.
+    hedged: usize,
+    /// Invalid cases whose context is longer than 255 bytes.
+    long_contexts: usize,
+    /// Invalid cases of a group whose seed is not 32 bytes.
+    bad_seeds: usize,
+}
+
+/// The ML-DSA key of the set whose OID ends in `set`, with `seed`, in
+/// PKCS#8's seed form, as Go's `x509.MarshalPKCS8PrivateKey` writes it.
+fn ml_dsa_pkcs8(set: u8, seed: &[u8]) -> Vec<u8> {
+    let tlv = |tag: u8, content: &[u8]| {
+        let mut out = vec![tag, u8::try_from(content.len()).expect("short")];
+        out.extend_from_slice(content);
+        out
+    };
+    let algorithm = tlv(
+        0x30,
+        &tlv(0x06, &[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x03, set]),
+    );
+    let key = tlv(0x04, &tlv(0x80, seed));
+    tlv(0x30, &[tlv(0x02, &[0]), algorithm, key].concat())
+}
+
+/// Run an ML-DSA signing-from-seed file, the half of Wycheproof's ML-DSA
+/// vectors that checks a key's expansion and signing: each group's key in
+/// PKCS#8, Go's form of the seed, which must be Wycheproof's where it gives
+/// one, is loaded by `sign::load_der`'s reader, and its public key must be
+/// the group's.  Each valid case with a message and no context is
+/// signed by the handshake signer with the case's `rnd`, all zeros where
+/// it gives none, FIPS 204's deterministic signing, and must give the
+/// case's signature byte for byte.  A case with a context, or of a μ with
+/// no message, neither of which a handshake signs, is signed by the crate
+/// on the same seed, with its context or from its μ, and must give the
+/// case's signature; a context longer than 255 bytes must be refused.  A
+/// group whose seed is not 32 bytes is refused at load with Go's text for
+/// the key's length.
+fn ml_dsa_signs_as_wycheproof_signs<P: crate::sign::MlDsaSet>(
+    file: &str,
+    set: u8,
+    algorithm: &str,
+    expected: Tally,
+    kinds: SignSeedKinds,
+) {
+    let alg_id = match set {
+        0x11 => rustls::pki_types::alg_id::ML_DSA_44,
+        0x12 => rustls::pki_types::alg_id::ML_DSA_65,
+        _ => rustls::pki_types::alg_id::ML_DSA_87,
+    };
+    let mut seen = SignSeedKinds::default();
+    run_file(
+        file,
+        algorithm,
+        "mldsa_sign_seed_schema.json",
+        expected,
+        |group, tally| {
+            assert_eq!(text(group, "type"), "MlDsaSign", "{file}");
+            let seed = bytes(group, "privateSeed");
+            let der = ml_dsa_pkcs8(set, &seed);
+            if let Some(given) = group
+                .get("privateKeyPkcs8")
+                .map(|_| bytes(group, "privateKeyPkcs8"))
+            {
+                // Empty for a seed of another length, which has no PKCS#8 form.
+                assert!(
+                    given == der || (given.is_empty() && seed.len() != 32),
+                    "{file}: Go's PKCS#8 form"
+                );
+            }
+            if seed.len() != 32 {
+                let refused = crate::sign::load_der(&der).map(|_| ()).unwrap_err();
+                assert_eq!(
+                    refused,
+                    Error::General(format!(
+                        "tls: failed to parse private key: x509: invalid ML-DSA private key \
+                         length: {}",
+                        seed.len().saturating_add(2)
+                    )),
+                    "{file}: a seed of {} bytes",
+                    seed.len()
+                );
+                for case in cases(group) {
+                    assert_eq!(
+                        expect(case),
+                        Expect::Invalid,
+                        "{file} tcId {}",
+                        number(case, "tcId")
+                    );
+                    seen.bad_seeds = seen.bad_seeds.saturating_add(1);
+                    tally.ran(Expect::Invalid);
+                }
+                return;
+            }
+            let seed: [u8; 32] = seed.try_into().expect("32 bytes");
+            let expanded = ml_dsa::ExpandedSigningKey::<P>::from_seed(&seed.into());
+            let public_key = bytes(group, "publicKey");
+            let spki = rustls::sign::public_key_to_spki(&alg_id, &public_key);
+            for case in cases(group) {
+                let id = number(case, "tcId");
+                let expect = expect(case);
+                let context = case.get("ctx").map(|_| bytes(case, "ctx"));
+                if expect == Expect::Invalid {
+                    let context = context.unwrap_or_else(|| panic!("{file} tcId {id}: no context"));
+                    assert!(context.len() > 255, "{file} tcId {id}");
+                    assert!(
+                        expanded
+                            .sign_deterministic(&bytes(case, "msg"), &context)
+                            .is_err(),
+                        "{file} tcId {id}"
+                    );
+                    seen.long_contexts = seen.long_contexts.saturating_add(1);
+                    tally.ran(expect);
+                    continue;
+                }
+                let signature = bytes(case, "sig");
+                let ours = match (case.get("msg"), context) {
+                    (None, _) => {
+                        seen.internal = seen.internal.saturating_add(1);
+                        let mu = bytes(case, "mu");
+                        let mu = mu[..].try_into().expect("a μ of 64 bytes");
+                        expanded.sign_mu_deterministic(mu).encode().to_vec()
+                    }
+                    (Some(_), Some(context)) => {
+                        seen.contexts = seen.contexts.saturating_add(1);
+                        expanded
+                            .sign_deterministic(&bytes(case, "msg"), &context)
+                            .expect("signed")
+                            .encode()
+                            .to_vec()
+                    }
+                    (Some(_), None) => {
+                        let rnd: [u8; 32] = match case.get("rnd") {
+                            Some(_) => {
+                                seen.hedged = seen.hedged.saturating_add(1);
+                                bytes(case, "rnd").try_into().expect("32 bytes")
+                            }
+                            None => [0; 32],
+                        };
+                        let (our_spki, signed) =
+                            crate::sign::ml_dsa_signed_with::<P>(&der, &bytes(case, "msg"), &rnd)
+                                .unwrap_or_else(|| panic!("{file} tcId {id}: not this set's key"));
+                        assert_eq!(our_spki, spki.as_ref(), "{file} tcId {id}: the public key");
+                        signed
+                    }
+                };
+                assert_eq!(hex(&ours), hex(&signature), "{file} tcId {id}");
+                tally.ran(expect);
+            }
+            assert_eq!(
+                hex(&expanded.verifying_key().encode()),
+                hex(&public_key),
+                "{file}: the group's public key"
+            );
+        },
+    );
+    assert_eq!(seen, kinds, "{file}: the kinds of case");
+}
+
+#[test]
+fn ml_dsa_44_signs_as_wycheproof_signs() {
+    let expected = Tally {
+        valid: 82,
+        invalid: 4,
+        acceptable: 0,
+        skipped: 0,
+    };
+    let kinds = SignSeedKinds {
+        contexts: 4,
+        internal: 8,
+        hedged: 1,
+        long_contexts: 1,
+        bad_seeds: 3,
+    };
+    ml_dsa_signs_as_wycheproof_signs::<ml_dsa::MlDsa44>(
+        "mldsa_44_sign_seed_test.json",
+        0x11,
+        "ML-DSA-44",
+        expected,
+        kinds,
+    );
+}
+
+#[test]
+fn ml_dsa_65_signs_as_wycheproof_signs() {
+    let expected = Tally {
+        valid: 101,
+        invalid: 4,
+        acceptable: 0,
+        skipped: 0,
+    };
+    let kinds = SignSeedKinds {
+        contexts: 4,
+        internal: 17,
+        hedged: 1,
+        long_contexts: 1,
+        bad_seeds: 3,
+    };
+    ml_dsa_signs_as_wycheproof_signs::<ml_dsa::MlDsa65>(
+        "mldsa_65_sign_seed_test.json",
+        0x12,
+        "ML-DSA-65",
+        expected,
+        kinds,
+    );
+}
+
+#[test]
+fn ml_dsa_87_signs_as_wycheproof_signs() {
+    let expected = Tally {
+        valid: 92,
+        invalid: 4,
+        acceptable: 0,
+        skipped: 0,
+    };
+    let kinds = SignSeedKinds {
+        contexts: 4,
+        internal: 17,
+        hedged: 1,
+        long_contexts: 1,
+        bad_seeds: 3,
+    };
+    ml_dsa_signs_as_wycheproof_signs::<ml_dsa::MlDsa87>(
+        "mldsa_87_sign_seed_test.json",
+        0x13,
+        "ML-DSA-87",
+        expected,
+        kinds,
+    );
 }

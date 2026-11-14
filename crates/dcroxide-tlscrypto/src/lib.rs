@@ -23,19 +23,19 @@
 //! groups are items of their own under the names of rustls's ring
 //! provider (`rustls-0.23.46/src/crypto/ring/mod.rs:65-103`, `:172-181`),
 //! so the node can build both of Go's suite orders from them, and its
-//! per-group configurations, as it does from ring's.  The signing keys
-//! are ECDSA on the three NIST curves, hedged RFC 6979 on the curve
-//! crates, and Ed25519 on `curve25519-dalek`, read from an `rpc.key` by
-//! Go's `tls.X509KeyPair` rules and refusing RSA keys ([`sign`]).  The
-//! verification algorithms are ring's fourteen under `webpki::ring`'s
-//! names ([`verify`]): ECDSA and Ed25519 on the same crates, and RSA
-//! PKCS#1 v1.5 and PSS written here on `num-bigint` (ADR-0015 T5), each
-//! within ring's limits and returning ring's verdicts, listed with ring's
-//! mapping to TLS signature schemes in [`SUPPORTED_SIG_ALGS`].
-//! [`default_provider`] puts them together with the kernel's random
-//! numbers.  ML-DSA-44, -65 and -87, which Go 1.27 verifies and ring
-//! never had, are three more on the `ml-dsa` crate, in a second set,
-//! [`RPC_SIG_ALGS`], which nothing outside the crate uses yet.
+//! per-group configurations, as it does from ring's.  The signing keys are
+//! ECDSA on the three NIST curves, hedged RFC 6979 on the curve crates,
+//! Ed25519 on `curve25519-dalek`, and ML-DSA-44, -65 and -87 on `ml-dsa`,
+//! in TLS 1.3 alone, read from an `rpc.key` by Go's `tls.X509KeyPair` rules
+//! and refusing RSA keys ([`sign`]).  The verification algorithms are
+//! ring's fourteen under `webpki::ring`'s names ([`verify`]): ECDSA and
+//! Ed25519 on the same crates, and RSA PKCS#1 v1.5 and PSS written here on
+//! `num-bigint` (ADR-0015 T5), each within ring's limits and returning
+//! ring's verdicts, listed with ring's mapping to TLS signature schemes in
+//! [`SUPPORTED_SIG_ALGS`].  [`default_provider`] puts them together with
+//! the kernel's random numbers.  ML-DSA-44, -65 and -87, which Go 1.27
+//! verifies and ring never had, are three more on the `ml-dsa` crate, in a
+//! second set, [`RPC_SIG_ALGS`], which nothing outside the crate uses yet.
 //!
 //! The node names this provider in every rustls configuration it builds,
 //! and installs no process default: the seeders take [`default_provider`]

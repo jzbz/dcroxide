@@ -1091,8 +1091,10 @@ fn add(a: &[u8], b: &[u8]) -> Vec<u8> {
 /// The cases for the shapes of Go's causes the other rules do not give,
 /// most of them inside PKCS#8, where `parsePrivateKey` reports the inner
 /// parser's error (`crypto/tls/tls.go:361-372`).  The ML-DSA keys are
-/// given against the Go-made P-256 key's certificate: Go reads a seed and
-/// then refuses it only as not that certificate's type.
+/// given against the Go-made P-256 key's certificate, which only a key
+/// that is refused is held to: a seed loads, and is held to Go against a
+/// certificate of the key it gives, and each other form is refused, by
+/// Go whatever the certificate.
 fn cause_cases(cases: &mut Vec<Case>) {
     const PKCS8: &str = "PRIVATE KEY";
     let bases = ec_bases();

@@ -101,6 +101,29 @@ impl TlsOracle {
         })
     }
 
+    /// [`TlsOracle::start`] for a matrix that asks for ML-DSA keys, which
+    /// the oracle makes only when built with Go 1.27 or later: an oracle
+    /// built with an older Go answers that ML-DSA needs a newer one, and the
+    /// tests skip, as they would without an oracle, unless
+    /// `DCROXIDE_REQUIRE_ORACLE` is set, which then requires the reference
+    /// Go anyway.
+    pub fn start_ml_dsa() -> Option<TlsOracle> {
+        let mut go = TlsOracle::start()?;
+        let probe = json!({ "certs": [{ "name": "probe", "key": "ML-DSA-44" }] });
+        let response = go.oracle.call("tls_pki", probe.to_string().as_bytes());
+        match response["error"].as_str() {
+            Some(error) if error.contains("needs Go 1.27") => {
+                assert!(
+                    env::var_os("DCROXIDE_REQUIRE_ORACLE").is_none(),
+                    "DCROXIDE_REQUIRE_ORACLE is set but {error}"
+                );
+                eprintln!("skipping: {error} (set DCROXIDE_REQUIRE_ORACLE to make this an error)");
+                None
+            }
+            _ => Some(go),
+        }
+    }
+
     /// The oracle's answer to `cmd` with `request`, which must be no error,
     /// from the reference Go under `DCROXIDE_REQUIRE_ORACLE`.
     pub fn call(&mut self, cmd: &str, request: &Value) -> Value {
@@ -234,8 +257,9 @@ impl Issued {
     }
 }
 
-/// A `tls_pki` certificate: `name`, on `key`, a curve's name or an RSA key
-/// of the test-key fixture by its name there ([`crate::rsa_test_key`]),
+/// A `tls_pki` certificate: `name`, on `key`, a curve's or an ML-DSA
+/// parameter set's name or an RSA key of the test-key fixture by its name
+/// there ([`crate::rsa_test_key`]),
 /// issued by `issuer` with `sig_alg` or self-signed, for `usage`:
 /// `"server"` names localhost and the loopback address, `"client"` names
 /// nobody, `"ca"` is an authority.

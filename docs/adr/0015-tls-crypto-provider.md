@@ -14,7 +14,8 @@
   client-certificate set (T4) and T7's in-tree seeder client remain.
 - **Date:** 2026-10-26 (accepted), 2026-10-30 (addendum: the Go interop
   matrix), 2026-10-31 (addenda: the constant-time check; the switch),
-  2026-11-13 (addendum: ML-DSA, with the `ml-dsa` crate)
+  2026-11-13 (addendum: ML-DSA, with the `ml-dsa` crate), 2026-11-14
+  (addendum: ML-DSA's key expansion, outside the constant-time check)
 
 ## Context
 
@@ -1002,3 +1003,23 @@ reference Go's `crypto/x509` knew no ML-DSA.
   Beyond T10, the verification that runs before a client is
   authenticated is to be fuzzed in the commit that adds it, decided
   2026-11-12.
+
+## Addendum, 2026-11-14 — ML-DSA's key expansion, outside the constant-time check
+
+The addendum of 2026-11-13 kept the constant-time check for an ML-DSA
+key's expansion from its seed and left only signing outside it. On
+2026-11-14 it was decided that the expansion is outside the check too, in
+all three sets, so that the check times no ML-DSA code. The expansion
+samples by rejection, as signing does. For each polynomial of the secret
+vectors (FIPS 204's `ExpandS`), how many bytes of the hash of the secret
+seed the sampling reads, and which values it rejects, follow that seed,
+in `ml-dsa` 0.1.2 (`src/sampling.rs:122-146`) as in Go's
+`sampleBoundedPoly` (`crypto/internal/fips140/mldsa/field.go:330-365`);
+and the public matrix (`ExpandA`) rejects as many values as the seed's
+hash gives it. A fixed seed repeats one such walk where the check's random
+class mixes them, which its t-test does not tell apart from a leak, so a
+target for the expansion would fail by design, as one for signing would.
+The expansion runs once, when an `rpc.key` loads at startup or is rotated
+in, and never in a handshake. T10 applies to ML-DSA through the other
+three items of the addendum of 2026-11-13, which stands as written but
+for this item.

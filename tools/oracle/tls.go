@@ -264,8 +264,9 @@ var tlsPKIUsages = map[string]x509.ExtKeyUsage{
 }
 
 // tlsPKIKey is the key a tls_pki certificate is for: one generated here on
-// the named curve, which is cheap, or the caller's RSA key, since one
-// generated here would be slow and, from Go 1.26, never the same twice.
+// the named curve or of the named ML-DSA parameter set, which is cheap, or
+// the caller's RSA key, since one generated here would be slow and, from
+// Go 1.26, never the same twice.
 func tlsPKIKey(c tlsPKICert) (crypto.Signer, error) {
 	if c.RSA != nil {
 		if c.Key != "" {
@@ -282,6 +283,9 @@ func tlsPKIKey(c tlsPKICert) (crypto.Signer, error) {
 		return stdecdsa.GenerateKey(elliptic.P521(), rand.Reader)
 	case "Ed25519":
 		_, key, err := ed25519.GenerateKey(rand.Reader)
+		return key, err
+	}
+	if key, ok, err := mldsaGenerateKey(c.Key); ok {
 		return key, err
 	}
 	return nil, fmt.Errorf("unknown key %q", c.Key)

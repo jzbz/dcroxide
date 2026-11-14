@@ -2,10 +2,11 @@
 // Use of this source code is governed by an ISC license that can be found in
 // the LICENSE file.
 
-// ML-DSA in sig_sign and sig_verify. crypto/mldsa, tls.MLDSA44 and
-// x509.MLDSA44 are new in Go 1.27, and this module's go line is go1.24,
-// so this file is built by Go 1.27 or later alone, and mldsa_old.go
-// answers for the ML-DSA names under an older Go.
+// ML-DSA in sig_sign and sig_verify, in tls_pki's keys and in
+// x509_key_pair's answers. crypto/mldsa, tls.MLDSA44 and x509.MLDSA44 are
+// new in Go 1.27, and this module's go line is go1.24, so this file is
+// built by Go 1.27 or later alone, and mldsa_old.go answers for the
+// ML-DSA names under an older Go.
 
 //go:build go1.27
 
@@ -40,6 +41,42 @@ func init() {
 
 // mldsaUnavailable is nil: this Go has ML-DSA.
 func mldsaUnavailable(string) error { return nil }
+
+// mldsaSetNames are the parameter sets by the names x509_key_pair answers
+// with and tls_pki takes, x509.SignatureAlgorithm's names for them.
+var mldsaSetNames = map[string]mldsa.Parameters{
+	"ML-DSA-44": mldsa.MLDSA44(),
+	"ML-DSA-65": mldsa.MLDSA65(),
+	"ML-DSA-87": mldsa.MLDSA87(),
+}
+
+// mldsaGenerateKey is a new key of the parameter set name names, for
+// tls_pki, with ok; ok is false for a name that is no ML-DSA set's.
+// CreateCertificate signs with it (crypto/x509/x509.go:1669-1696), and
+// MarshalPKCS8PrivateKey writes its seed (crypto/x509/pkcs8.go:181-189).
+func mldsaGenerateKey(name string) (crypto.Signer, bool, error) {
+	params, ok := mldsaSetNames[name]
+	if !ok {
+		return nil, false, nil
+	}
+	key, err := mldsa.GenerateKey(params)
+	return key, true, err
+}
+
+// mldsaKeyType is the name of key's parameter set, with ok, for an ML-DSA
+// key, which tls.X509KeyPair loads under Go 1.27 (crypto/tls/tls.go:374).
+func mldsaKeyType(key crypto.PrivateKey) (string, bool) {
+	k, ok := key.(*mldsa.PrivateKey)
+	if !ok {
+		return "", false
+	}
+	for name, params := range mldsaSetNames {
+		if k.PublicKey().Parameters() == params {
+			return name, true
+		}
+	}
+	return "", false
+}
 
 // mldsaParameters is the parameter set alg names.
 func mldsaParameters(alg sigAlgorithm) (mldsa.Parameters, error) {

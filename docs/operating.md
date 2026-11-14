@@ -1856,15 +1856,18 @@ type is `PRIVATE KEY` or ends in ` PRIVATE KEY`, whatever the label says
 the key is, read as PKCS#1, PKCS#8 or SEC 1, whichever parses. An
 encrypted key is not decrypted; a file whose first such block is one is
 refused, even with a plain key after it. The key may be ECDSA on P-256,
-P-384 or P-521, or Ed25519. An RSA key, which dcrd serves, is refused,
-because this daemon's TLS provider signs with no RSA key (ADR-0015): at
-startup the daemon stops with `unable to build the RPC TLS configuration:
-the RPC key is an RSA key, ...`, and a rotation to one keeps the working
-pair with that warning. Replace an RSA pair with another kind: remove
-both files and the next start generates a pair on the `--tlscurve` curve,
-P-256 by default, or write one with `gencerts`, which makes P-256, P-384,
-P-521 and Ed25519 pairs. A P-224 key, which dcrd serves over TLS 1.2
-only, is refused at startup too. [PARITY.md](PARITY.md) records both.
+P-384 or P-521, Ed25519, or ML-DSA-44, -65 or -87 in PKCS#8's seed form,
+the one form dcrd's Go code loads; an ML-DSA key is served in TLS 1.3
+alone, and a client held to TLS 1.2 is refused, as dcrd refuses it. An
+RSA key, which dcrd serves, is refused, because this daemon's TLS
+provider signs with no RSA key (ADR-0015): at startup the daemon stops
+with `unable to build the RPC TLS configuration: the RPC key is an RSA
+key, ...`, and a rotation to one keeps the working pair with that
+warning. Replace an RSA pair with another kind: remove both files and
+the next start generates a pair on the `--tlscurve` curve, P-256 by
+default, or write one with `gencerts`, which makes P-256, P-384, P-521
+and Ed25519 pairs. A P-224 key, which dcrd serves over TLS 1.2 only, is
+refused at startup too. [PARITY.md](PARITY.md) records both.
 
 The `--clientcafile` bundle is read the way dcrd's Go code reads it:
 malformed PEM blocks, blocks with headers, other block types and

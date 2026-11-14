@@ -754,7 +754,10 @@ pub const RSA_CA_KEY_REFUSED: &str = "RSA private keys are not supported: gencer
 /// for a key none of them reads (`crypto/tls/tls.go:361-379`), through the
 /// TLS provider's reader.  The keys Go loads that gencerts does not issue
 /// with are refused with words of the port's own: RSA
-/// ([`RSA_CA_KEY_REFUSED`]), and P-224 and ML-DSA, with the provider's.
+/// ([`RSA_CA_KEY_REFUSED`]), P-224 with the provider's, and ML-DSA, which
+/// the provider loads to sign handshakes with, as `unsupported private
+/// key: ML-DSA-44` and the like, the words the provider refused it with
+/// before it did.
 pub fn parse_private_key(key_der: &[u8]) -> Result<ToolKeyPair, String> {
     match parse_go_private_key(key_der) {
         Ok(ParsedKey::EcdsaP256(key)) => Ok(ToolKeyPair::P256(key)),
@@ -762,6 +765,9 @@ pub fn parse_private_key(key_der: &[u8]) -> Result<ToolKeyPair, String> {
         Ok(ParsedKey::EcdsaP521(key)) => Ok(ToolKeyPair::P521(key)),
         Ok(ParsedKey::Ed25519(seed)) => Ok(ToolKeyPair::Ed25519(*seed)),
         Ok(ParsedKey::Rsa) => Err(RSA_CA_KEY_REFUSED.to_string()),
+        Ok(ParsedKey::MlDsa44(_)) => Err("unsupported private key: ML-DSA-44".to_string()),
+        Ok(ParsedKey::MlDsa65(_)) => Err("unsupported private key: ML-DSA-65".to_string()),
+        Ok(ParsedKey::MlDsa87(_)) => Err("unsupported private key: ML-DSA-87".to_string()),
         Err(refused) => Err(refused.to_string()),
     }
 }

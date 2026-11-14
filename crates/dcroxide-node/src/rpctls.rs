@@ -53,6 +53,13 @@
 //! rustls's `ClientHello` does not expose, are read from the raw records
 //! ([`HelloFacts`]).
 //!
+//! An ML-DSA `rpc.key`, which Go 1.27.3 serves in TLS 1.3 alone, is
+//! refused to a client that would negotiate TLS 1.2 as Go refuses it: with
+//! `internal_error` and Go's text, after the refusals Go makes first, each
+//! with its own alert and text, and before any suite or curve is chosen
+//! (`crypto/tls/handshake_server.go:216-318`), where rustls would find no
+//! TLS 1.2 suite for the key and send `handshake_failure`.
+//!
 //! The handshake runs to completion before the request is read, as
 //! `conn.serve` runs it (`net/http/server.go:1924-1945`), and a failure
 //! comes back as the text Go's error would print, for the
@@ -261,6 +268,10 @@ struct ConfigsByGroup {
 /// HelloRetryRequest when the client sent no share for it.  In TLS 1.2,
 /// where Go also takes the client's first curve, the configuration
 /// offering every group already agrees.
+///
+/// The set also says whether its key is one Go serves in TLS 1.3 alone,
+/// an ML-DSA key, which `handshake` refuses to a client that would
+/// negotiate TLS 1.2 before rustls looks for a suite, as Go does.
 #[derive(Debug)]
 pub struct RpcTlsConfigs {
     /// AES-128-GCM, AES-256-GCM, ChaCha20-Poly1305.
@@ -270,19 +281,26 @@ pub struct RpcTlsConfigs {
     /// Whether this machine has the hardware Go's AES-GCM preference
     /// turns on, read once.
     aes_gcm_hardware: bool,
+    /// Whether the key is one Go serves in TLS 1.3 alone
+    /// (`KeyAlgorithm::tls13_only`).
+    tls13_only: bool,
 }
 
 impl RpcTlsConfigs {
     /// Build the set, calling `build` once for each provider:
     /// `dcroxide-tlscrypto`'s, with the suites in one of Go's two orders and
     /// the key exchanges cut to those the configuration offers.
+    /// `tls13_only` says whether the key the configurations serve is one Go
+    /// serves in TLS 1.3 alone.
     pub(crate) fn build(
+        tls13_only: bool,
         mut build: impl FnMut(Arc<CryptoProvider>) -> Result<ServerConfig, String>,
     ) -> Result<RpcTlsConfigs, String> {
         Ok(RpcTlsConfigs {
             aes_gcm_first: Self::by_group(true, &mut build)?,
             chacha_first: Self::by_group(false, &mut build)?,
             aes_gcm_hardware: go_has_aes_gcm_hardware(),
+            tls13_only,
         })
     }
 
@@ -329,14 +347,22 @@ impl RpcTlsConfigs {
 }
 
 /// What a ClientHello offers, read from its raw records: the fields
-/// Go's server negotiates on, among them the two rustls's `ClientHello`
-/// does not expose, the key shares and the offered versions.
+/// Go's server negotiates on, among them those rustls's `ClientHello`
+/// does not expose, the key shares, the offered versions and the two
+/// extensions Go checks before it refuses an ML-DSA key in TLS 1.2.
 #[derive(Debug, Default, PartialEq)]
 pub(crate) struct HelloFacts {
     /// `legacy_version`.
     legacy_version: u16,
     /// The cipher suites, in the client's order.
     cipher_suites: Vec<u16>,
+    /// The `renegotiation_info` extension's `renegotiated_connection`,
+    /// empty when the extension is absent, as Go's
+    /// `clientHelloMsg.secureRenegotiation` is.
+    renegotiation: Vec<u8>,
+    /// The `ec_point_formats` extension's formats, empty when it is
+    /// absent.
+    point_formats: Vec<u8>,
     /// The `supported_versions` extension, when present.
     supported_versions: Option<Vec<u16>>,
     /// The `supported_groups` extension, in the client's order.
@@ -436,7 +462,9 @@ impl HelloFacts {
             let mut data = HelloReader(extensions.vec16()?);
             match extension_type {
                 10 => facts.supported_groups = HelloReader::u16s(data.vec16()?)?,
+                11 => facts.point_formats = data.vec8()?.to_vec(),
                 43 => facts.supported_versions = Some(HelloReader::u16s(data.vec8()?)?),
+                0xff01 => facts.renegotiation = data.vec8()?.to_vec(),
                 51 => {
                     let mut shares = HelloReader(data.vec16()?);
                     while !shares.0.is_empty() {
@@ -452,7 +480,9 @@ impl HelloFacts {
 
     /// The facts rustls's `ClientHello` exposes, for a ClientHello the raw
     /// records could not be read back for: the suites and groups, without
-    /// the key shares or versions, so the TLS 1.2 choice is made.
+    /// the key shares or versions, so the TLS 1.2 choice is made, and the
+    /// TLS 1.2 refusal of an ML-DSA key is left to rustls, which reports
+    /// no suite in common.
     fn from_rustls(hello: &rustls::server::ClientHello<'_>) -> HelloFacts {
         HelloFacts {
             cipher_suites: hello
@@ -478,6 +508,38 @@ impl HelloFacts {
         self.supported_versions
             .as_ref()
             .is_some_and(|versions| versions.contains(&0x0304))
+    }
+
+    /// The alert and the text Go's server, holding a key it serves in TLS
+    /// 1.3 alone, refuses this client with in `processClientHello`
+    /// (`crypto/tls/handshake_server.go:216-318`), when the client offers
+    /// TLS 1.2, which Go then negotiates, and not TLS 1.3; `None`
+    /// otherwise.  Go refuses, in this order: a client without null
+    /// compression (`:221-233`), which rustls refuses first as well, in
+    /// `Acceptor::accept`, so it never reaches this; a non-empty
+    /// `renegotiation_info` (`:253-256`); point formats that do not
+    /// include the uncompressed one (`supportsECDHE`, `:287-291`,
+    /// `:376-393`); and then the key (`:310-314`).  ALPN and the
+    /// certificate, which Go looks at between them, refuse nothing for the
+    /// RPC server's configuration.  All of it comes before Go chooses a
+    /// suite or a curve, so it is what a client with neither in common
+    /// hears, and before Go looks for signature_algorithms, which rustls
+    /// requires as it reads the ClientHello, so [`handshake`] asks for this
+    /// when rustls refuses a ClientHello for that.
+    fn go_tls13_only_refusal(&self) -> Option<(u8, &'static str)> {
+        if self.offers_tls13() || !self.go_client_versions().contains(&0x0303) {
+            return None;
+        }
+        Some(if !self.renegotiation.is_empty() {
+            (
+                40,
+                "tls: initial handshake had non-empty renegotiation extension",
+            )
+        } else if !self.point_formats.is_empty() && !self.point_formats.contains(&0) {
+            (109, "tls: client offered only incompatible point formats")
+        } else {
+            (80, TLS13_ONLY_KEY_REFUSED)
+        })
     }
 
     /// The versions Go reads the client as offering, for its refusal
@@ -797,6 +859,14 @@ fn flush_tls(
     Ok(())
 }
 
+/// Send `sock` the alert of a [`HelloFacts::go_tls13_only_refusal`], in
+/// the record version Go has negotiated, TLS 1.2 (`writeRecordLocked`,
+/// `crypto/tls/conn.go`), and give its text.
+fn refuse_tls12(sock: &mut TcpStream, (alert, text): (u8, &'static str)) -> String {
+    let _ = sock.write_all(&[0x15, 0x03, 0x03, 0x00, 0x02, 0x02, alert]);
+    text.to_string()
+}
+
 /// Run an accepted RPC connection's TLS handshake to completion, as Go's
 /// `conn.serve` does before it reads a request
 /// (`net/http/server.go:1924-1945`), under the deadline the connection's
@@ -812,7 +882,8 @@ fn flush_tls(
 /// net/http's `http: TLS handshake error from %s: %v`.  The common
 /// failures are rendered as Go renders them: an early close, the
 /// deadline, a reset, a first record that is not TLS (with net/http's 400
-/// for a plaintext HTTP request), an alert from the client, and the
+/// for a plaintext HTTP request), an alert from the client, an ML-DSA
+/// key's refusal of a client that would negotiate TLS 1.2, and the
 /// refusals Go and rustls share; anything else carries rustls's own
 /// description of it.
 pub(crate) fn handshake(
@@ -835,6 +906,24 @@ pub(crate) fn handshake(
             Ok(Some(accepted)) => break accepted,
             Ok(None) => {}
             Err((err, mut alert)) => {
+                // rustls refuses a ClientHello without signature_algorithms
+                // as it reads it, where Go refuses a client that would
+                // negotiate TLS 1.2 with a key it serves in TLS 1.3 alone
+                // first, in `processClientHello`, ahead of the check
+                // `selectSignatureScheme` makes (`crypto/tls/auth.go:273-281`).
+                if err
+                    == rustls::Error::PeerIncompatible(
+                        rustls::PeerIncompatible::SignatureAlgorithmsExtensionRequired,
+                    )
+                    && let Some(hello) = HelloFacts::parse(&tap.recorded)
+                {
+                    let configs = configs();
+                    if let Some(refusal) =
+                        hello.go_tls13_only_refusal().filter(|_| configs.tls13_only)
+                    {
+                        return Err(refuse_tls12(&mut sock, refusal));
+                    }
+                }
                 let _ = alert.write_all(&mut sock);
                 return Err(go_error_text(&err, None));
             }
@@ -845,7 +934,11 @@ pub(crate) fn handshake(
         .unwrap_or_else(|| HelloFacts::from_rustls(&accepted.client_hello()));
     tap.recorded = Vec::new();
 
-    let config = configs().for_hello(&hello);
+    let configs = configs();
+    if let Some(refusal) = hello.go_tls13_only_refusal().filter(|_| configs.tls13_only) {
+        return Err(refuse_tls12(&mut sock, refusal));
+    }
+    let config = configs.for_hello(&hello);
     let mut conn = accepted
         .into_connection(config)
         .map_err(|(err, mut alert)| {
@@ -868,6 +961,12 @@ pub(crate) fn handshake(
     }
     Ok(rustls::StreamOwned::new(conn, sock))
 }
+
+/// Go's text for a client that negotiates TLS 1.2 with a server whose key
+/// is ML-DSA (`crypto/tls/handshake_server.go:310-314`), always TLS 1.2,
+/// since dcrd's `MinVersion` is TLS 1.2.
+const TLS13_ONLY_KEY_REFUSED: &str =
+    "tls: ML-DSA certificates require TLS 1.3, but client negotiated TLS 1.2";
 
 /// Go's alert descriptions (`alertText`, `crypto/tls/alert.go:64-99`).
 const GO_ALERT_TEXT: [(u8, &str); 34] = [
@@ -1527,6 +1626,7 @@ mod tests {
             }),
             supported_groups: supported.to_vec(),
             key_shares: shares.to_vec(),
+            ..HelloFacts::default()
         };
         let aes_first = if configs.aes_gcm_hardware {
             Some(0x1301)
@@ -1675,5 +1775,502 @@ mod tests {
             remote: Some(remote),
         };
         assert_eq!(unnamed.timeout(), "read tcp6 [::1]:50000: i/o timeout");
+    }
+
+    /// What [`hand_hello`] writes into a ClientHello besides its suites,
+    /// compression methods and groups: each extension where given.
+    struct HelloExtras<'a> {
+        /// supported_versions.
+        versions: Option<&'a [u16]>,
+        /// signature_algorithms.
+        signature_algorithms: Option<&'a [u16]>,
+        /// ec_point_formats.
+        points: Option<&'a [u8]>,
+        /// renegotiation_info's content.
+        renegotiation: Option<&'a [u8]>,
+    }
+
+    /// The extras of a TLS 1.2 client: supported_versions of TLS 1.2
+    /// alone and signature_algorithms the key's schemes are not among,
+    /// without point formats or renegotiation_info.
+    const TLS12: HelloExtras<'static> = HelloExtras {
+        versions: Some(&[0x0303]),
+        signature_algorithms: Some(&[0x0403, 0x0804, 0x0807]),
+        points: None,
+        renegotiation: None,
+    };
+
+    /// A ClientHello record of `legacy_version` TLS 1.2, written by hand so
+    /// that each field Go checks before it refuses an ML-DSA key can be
+    /// set: `suites`, the compression methods, `groups`, and the
+    /// extensions in `extras`.
+    fn hand_hello(
+        suites: &[u16],
+        compression: &[u8],
+        groups: &[u16],
+        extras: &HelloExtras<'_>,
+    ) -> Vec<u8> {
+        fn len8(bytes: &[u8]) -> Vec<u8> {
+            [&[u8::try_from(bytes.len()).expect("short")][..], bytes].concat()
+        }
+        fn len16(bytes: &[u8]) -> Vec<u8> {
+            let len = u16::try_from(bytes.len()).expect("short").to_be_bytes();
+            [&len[..], bytes].concat()
+        }
+        fn u16s(values: &[u16]) -> Vec<u8> {
+            values
+                .iter()
+                .flat_map(|value| value.to_be_bytes())
+                .collect()
+        }
+        let extension =
+            |kind: u16, data: Vec<u8>| [&kind.to_be_bytes()[..], &len16(&data)].concat();
+        let mut extensions = Vec::new();
+        if let Some(algorithms) = extras.signature_algorithms {
+            extensions.push(extension(13, len16(&u16s(algorithms))));
+        }
+        extensions.push(extension(10, len16(&u16s(groups))));
+        if let Some(versions) = extras.versions {
+            extensions.push(extension(43, len8(&u16s(versions))));
+        }
+        if let Some(points) = extras.points {
+            extensions.push(extension(11, len8(points)));
+        }
+        if let Some(renegotiation) = extras.renegotiation {
+            extensions.push(extension(0xff01, len8(renegotiation)));
+        }
+        let body = [
+            &[0x03, 0x03][..],
+            &[0x5a; 32],
+            &len8(&[]),
+            &len16(&u16s(suites)),
+            &len8(compression),
+            &len16(&extensions.concat()),
+        ]
+        .concat();
+        let len = u32::try_from(body.len()).expect("short").to_be_bytes();
+        let message = [&[1][..], &len[1..], &body].concat();
+        [&[22, 3, 1][..], &len16(&message)].concat()
+    }
+
+    /// What a client sending `hello` reads before the server closes,
+    /// for at most ten seconds.
+    fn answer_to(sock: &mut TcpStream, hello: &[u8]) -> Vec<u8> {
+        sock.set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("timeout");
+        sock.write_all(hello).expect("send");
+        let mut answer = Vec::new();
+        let _ = sock.read_to_end(&mut answer);
+        answer
+    }
+
+    /// A rustls client's verifier that offers `schemes` alone in its
+    /// signature_algorithms and takes no server.
+    #[derive(Debug)]
+    struct OffersOnly(Vec<rustls::SignatureScheme>);
+
+    impl rustls::client::danger::ServerCertVerifier for OffersOnly {
+        fn verify_server_cert(
+            &self,
+            _end_entity: &rustls::pki_types::CertificateDer<'_>,
+            _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+            _server_name: &rustls::pki_types::ServerName<'_>,
+            _ocsp: &[u8],
+            _now: rustls::pki_types::UnixTime,
+        ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+            Err(rustls::Error::General("no server is taken".into()))
+        }
+        fn verify_tls12_signature(
+            &self,
+            _message: &[u8],
+            _cert: &rustls::pki_types::CertificateDer<'_>,
+            _dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            Err(rustls::Error::General("no server is taken".into()))
+        }
+        fn verify_tls13_signature(
+            &self,
+            _message: &[u8],
+            _cert: &rustls::pki_types::CertificateDer<'_>,
+            _dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            Err(rustls::Error::General("no server is taken".into()))
+        }
+        fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+            self.0.clone()
+        }
+    }
+
+    /// How a TLS 1.3 rustls client offering `schemes` alone fares over
+    /// `sock`: the error it ends with, which is the server's refusal.
+    fn tls13_client_ends(sock: &mut TcpStream, schemes: &[rustls::SignatureScheme]) -> String {
+        sock.set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("timeout");
+        let config = rustls::ClientConfig::builder_with_provider(Arc::new(
+            dcroxide_tlscrypto::default_provider(),
+        ))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .expect("TLS 1.3")
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(OffersOnly(schemes.to_vec())))
+        .with_no_client_auth();
+        let name = rustls::pki_types::ServerName::try_from("localhost").expect("name");
+        let mut conn = rustls::ClientConnection::new(Arc::new(config), name).expect("client");
+        loop {
+            while conn.wants_write() {
+                if let Err(e) = conn.write_tls(sock) {
+                    return format!("write: {e}");
+                }
+            }
+            match conn.read_tls(sock) {
+                Ok(0) => return "EOF".to_owned(),
+                Ok(_) => {}
+                Err(e) => return format!("read: {e}"),
+            }
+            if let Err(e) = conn.process_new_packets() {
+                return format!("{e:?}");
+            }
+        }
+    }
+
+    /// An ML-DSA `rpc.key` is refused as Go 1.27.3's server refuses it,
+    /// alert and text, held to Go's `tls_listen` serving the same pair:
+    /// to a client held to TLS 1.2 with `internal_error`, whether or not
+    /// it shares a suite or a curve, since Go refuses before it chooses
+    /// either, and whether or not it sends signature_algorithms or
+    /// supported_versions; with the refusal Go makes first for a client
+    /// without null compression, with a non-empty renegotiation_info or
+    /// with only compressed point formats, in Go's order where it sends
+    /// more than one; and to a TLS 1.3 client that offers none of the
+    /// key's schemes, another ML-DSA set's among them (critique F8), with
+    /// Go's text and the handshake_failure the client hears.
+    #[test]
+    fn an_ml_dsa_key_is_refused_as_go_refuses_it() {
+        use dcroxide_testutil::tls_interop::{TlsOracle, spec};
+        use rustls::SignatureScheme as S;
+        let Some(mut go) = TlsOracle::start_ml_dsa() else {
+            return;
+        };
+        let pki = go.pki(&[spec("server", "ML-DSA-65", None, "server")]);
+        let server = &pki["server"];
+        let configs = crate::rpcrun::tls_server_config(&server.cert_pem, &server.key_pem, None)
+            .expect("the listener serves an ML-DSA key");
+        assert!(configs.tls13_only);
+        let alert = |description: u8| vec![0x15, 0x03, 0x03, 0x00, 0x02, 0x02, description];
+        let ml_dsa = TLS13_ONLY_KEY_REFUSED;
+        let compression = "tls: client does not support uncompressed connections";
+        let renegotiated = "tls: initial handshake had non-empty renegotiation extension";
+        let incompatible = "tls: client offered only incompatible point formats";
+        let tls12 = |extras: HelloExtras<'_>| hand_hello(&[0xc02b], &[0], &[X25519_ID], &extras);
+        let rows: Vec<(&str, Vec<u8>, Vec<u8>, &str)> = vec![
+            (
+                "a suite and a curve in common",
+                tls12(HelloExtras {
+                    points: Some(&[0]),
+                    renegotiation: Some(&[]),
+                    ..TLS12
+                }),
+                alert(80),
+                ml_dsa,
+            ),
+            (
+                "no suite in common",
+                hand_hello(&[0x009c], &[0], &[X25519_ID], &TLS12),
+                alert(80),
+                ml_dsa,
+            ),
+            (
+                "no curve in common",
+                hand_hello(&[0xc02b], &[0], &[0x001e], &TLS12),
+                alert(80),
+                ml_dsa,
+            ),
+            (
+                "no signature_algorithms",
+                tls12(HelloExtras {
+                    signature_algorithms: None,
+                    ..TLS12
+                }),
+                alert(80),
+                ml_dsa,
+            ),
+            (
+                "no supported_versions",
+                tls12(HelloExtras {
+                    versions: None,
+                    ..TLS12
+                }),
+                alert(80),
+                ml_dsa,
+            ),
+            (
+                "the uncompressed point format after a compressed one",
+                tls12(HelloExtras {
+                    points: Some(&[1, 0]),
+                    ..TLS12
+                }),
+                alert(80),
+                ml_dsa,
+            ),
+            (
+                "no null compression",
+                hand_hello(&[0xc02b], &[1], &[X25519_ID], &TLS12),
+                alert(47),
+                compression,
+            ),
+            (
+                "no null compression and a non-empty renegotiation_info",
+                hand_hello(
+                    &[0xc02b],
+                    &[1],
+                    &[X25519_ID],
+                    &HelloExtras {
+                        renegotiation: Some(&[7; 12]),
+                        ..TLS12
+                    },
+                ),
+                alert(47),
+                compression,
+            ),
+            (
+                "a non-empty renegotiation_info",
+                tls12(HelloExtras {
+                    points: Some(&[0]),
+                    renegotiation: Some(&[7; 12]),
+                    ..TLS12
+                }),
+                alert(40),
+                renegotiated,
+            ),
+            (
+                "a non-empty renegotiation_info and compressed point formats alone",
+                tls12(HelloExtras {
+                    points: Some(&[1, 2]),
+                    renegotiation: Some(&[7; 12]),
+                    ..TLS12
+                }),
+                alert(40),
+                renegotiated,
+            ),
+            (
+                "compressed point formats alone",
+                tls12(HelloExtras {
+                    points: Some(&[1, 2]),
+                    ..TLS12
+                }),
+                alert(109),
+                incompatible,
+            ),
+        ];
+        for (what, hello, want_alert, want_text) in rows {
+            let (sock, mut client) = loopback();
+            let configs = Arc::clone(&configs);
+            let serving = std::thread::spawn(move || {
+                handshake(
+                    sock,
+                    Instant::now() + Duration::from_secs(10),
+                    Duration::from_millis(50),
+                    || configs,
+                )
+                .map(|_| ())
+            });
+            let ours = answer_to(&mut client, &hello);
+            let text = serving.join().expect("the handshake").expect_err(what);
+            assert_eq!(
+                (ours.as_slice(), text.as_str()),
+                (&want_alert[..], want_text),
+                "{what}"
+            );
+
+            let (addr, id) = go.listen(serde_json::json!({
+                "chain": [dcroxide_testutil::hex(&server.cert)],
+                "key_pkcs8": dcroxide_testutil::hex(&server.key_pkcs8),
+            }));
+            let mut sock = TcpStream::connect(&addr).expect("Go's server");
+            let theirs = answer_to(&mut sock, &hello);
+            let served = go.served(&id);
+            assert_eq!(theirs, want_alert, "{what}: Go's alert");
+            go.assert_refused(what, &served, want_text);
+        }
+
+        for (what, schemes) in [
+            (
+                "TLS 1.3 without ML-DSA",
+                vec![S::ECDSA_NISTP256_SHA256, S::ED25519, S::RSA_PSS_SHA256],
+            ),
+            ("TLS 1.3 with ML-DSA-44 alone", vec![S::ML_DSA_44]),
+            ("TLS 1.3 with ML-DSA-87 alone", vec![S::ML_DSA_87]),
+        ] {
+            let want = "tls: peer doesn't support any of the certificate's signature algorithms";
+            let (sock, mut client) = loopback();
+            let serving = {
+                let configs = Arc::clone(&configs);
+                std::thread::spawn(move || {
+                    handshake(
+                        sock,
+                        Instant::now() + Duration::from_secs(10),
+                        Duration::from_millis(50),
+                        || configs,
+                    )
+                    .map(|_| ())
+                })
+            };
+            let ours = tls13_client_ends(&mut client, &schemes);
+            drop(client);
+            let text = serving.join().expect("the handshake").expect_err(what);
+            assert_eq!(text, want, "{what}");
+
+            let (addr, id) = go.listen(serde_json::json!({
+                "chain": [dcroxide_testutil::hex(&server.cert)],
+                "key_pkcs8": dcroxide_testutil::hex(&server.key_pkcs8),
+            }));
+            let mut sock = TcpStream::connect(&addr).expect("Go's server");
+            let theirs = tls13_client_ends(&mut sock, &schemes);
+            let served = go.served(&id);
+            assert_eq!(ours, theirs, "{what}: what the client hears");
+            assert_eq!(ours, "AlertReceived(HandshakeFailure)", "{what}");
+            go.assert_refused(what, &served, want);
+        }
+        go.report("an_ml_dsa_key_is_refused_as_go_refuses_it");
+    }
+
+    /// The length of the DER element at the start of `der`, header and
+    /// content, and where its content starts.
+    fn der_extent(der: &[u8]) -> (usize, usize) {
+        match der[1] {
+            short @ 0..0x80 => (2 + usize::from(short), 2),
+            long => {
+                let count = usize::from(long & 0x7f);
+                let len = der[2..2 + count]
+                    .iter()
+                    .fold(0, |len, &byte| len << 8 | usize::from(byte));
+                (2 + count + len, 2 + count)
+            }
+        }
+    }
+
+    /// The elements inside the DER element `der`.
+    fn der_children(der: &[u8]) -> Vec<&[u8]> {
+        let (end, start) = der_extent(der);
+        let mut rest = &der[start..end];
+        let mut out = Vec::new();
+        while !rest.is_empty() {
+            let (element, after) = rest.split_at(der_extent(rest).0);
+            out.push(element);
+            rest = after;
+        }
+        out
+    }
+
+    /// A DER element of `tag` holding `content`.
+    fn der(tag: u8, content: &[u8]) -> Vec<u8> {
+        let len = content.len();
+        let header = match u8::try_from(len) {
+            Ok(short @ 0..0x80) => vec![tag, short],
+            _ => {
+                let bytes = u32::try_from(len).expect("short").to_be_bytes();
+                let skip = bytes.iter().take_while(|&&byte| byte == 0).count();
+                let count = u8::try_from(4 - skip).expect("four bytes at most");
+                [&[tag, 0x80 | count][..], &bytes[skip..]].concat()
+            }
+        };
+        [&header[..], content].concat()
+    }
+
+    /// An ML-DSA `rpc.cert` whose key Go cannot parse, with parameters
+    /// after its algorithm or a key a byte short, is refused at startup as
+    /// a key that does not match its certificate, in rustls's words, where
+    /// Go's `tls.X509KeyPair` refuses it with its parser's error, through
+    /// the oracle's `x509_key_pair` (PARITY.md, the ML-DSA entry).  The
+    /// certificate is the oracle's with the key's SubjectPublicKeyInfo
+    /// changed; neither Go nor the listener checks its signature when it
+    /// loads a pair.
+    #[test]
+    fn an_ml_dsa_certificate_go_cannot_parse_is_refused_as_a_mismatch() {
+        use dcroxide_testutil::tls_interop::{TlsOracle, spec};
+        let Some(mut go) = TlsOracle::start_ml_dsa() else {
+            return;
+        };
+        let pki = go.pki(&[spec("server", "ML-DSA-65", None, "server")]);
+        let server = &pki["server"];
+        let certificate = der_children(&server.cert);
+        let tbs = der_children(certificate[0]);
+        // The version, serial, signature algorithm, issuer, validity and
+        // subject come first.
+        assert_eq!(tbs[0][0], 0xa0, "a version 3 certificate");
+        let spki = der_children(tbs[6]);
+        let algorithm = der_children(spki[0]);
+        let bits = &spki[1][der_extent(spki[1]).1..];
+        let with_spki = |spki: &[u8]| {
+            let mut tbs = tbs.clone();
+            tbs[6] = spki;
+            let der = der(
+                0x30,
+                &[
+                    &der(0x30, &tbs.concat())[..],
+                    certificate[1],
+                    certificate[2],
+                ]
+                .concat(),
+            );
+            format!(
+                "-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----\n",
+                dcroxide_rpc::http::base64_std_encode(&der)
+            )
+        };
+        let mismatch = "unable to build the RPC TLS configuration: keys may not be consistent: \
+                        KeyMismatch";
+        let rows = [
+            (
+                "the certificate as issued",
+                with_spki(tbs[6]),
+                None,
+                "ok ML-DSA-65",
+            ),
+            (
+                "NULL parameters",
+                with_spki(&der(
+                    0x30,
+                    &[
+                        &der(0x30, &[algorithm[0], &[0x05, 0x00]].concat())[..],
+                        spki[1],
+                    ]
+                    .concat(),
+                )),
+                Some(mismatch),
+                "refused: x509: ML-DSA key encoded with illegal parameters",
+            ),
+            (
+                "a key a byte short",
+                with_spki(&der(
+                    0x30,
+                    &[spki[0], &der(0x03, &bits[..bits.len() - 1])].concat(),
+                )),
+                Some(mismatch),
+                "refused: mldsa: invalid public key length",
+            ),
+        ];
+        for (what, cert_pem, want_ours, want_go) in rows {
+            let ours =
+                crate::rpcrun::tls_server_config(cert_pem.as_bytes(), &server.key_pem, None).err();
+            assert_eq!(ours.as_deref(), want_ours, "{what}");
+            let answer = go.call(
+                "x509_key_pair",
+                &serde_json::json!({
+                    "cert_pem": cert_pem,
+                    "key_pem": String::from_utf8_lossy(&server.key_pem),
+                }),
+            );
+            let answer = answer["result"].as_str().expect("x509_key_pair's verdict");
+            if go.go_version() == dcroxide_testutil::REFERENCE_GO {
+                assert_eq!(answer, want_go, "{what}: Go");
+            } else {
+                assert_eq!(
+                    answer.starts_with("ok "),
+                    want_go.starts_with("ok "),
+                    "{what}: Go"
+                );
+            }
+        }
     }
 }

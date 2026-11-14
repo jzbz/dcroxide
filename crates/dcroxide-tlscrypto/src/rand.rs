@@ -21,11 +21,13 @@
 //! the process.
 //!
 //! One draw goes to the process-wide generator of `dcroxide_crypto::rand`
-//! instead, through [`ProcessRng`]: the additional data an ECDSA
-//! handshake signature mixes into its RFC 6979 nonce.  RFC 6979 derives
-//! the nonce from the key and the message, so the signature is safe
-//! should that draw be weak, and the draw only makes two signatures of
-//! the same transcript differ, as Go's and ring's hedged nonces do.  A
+//! instead, through [`ProcessRng`]: a handshake signature's hedge, the
+//! additional data an ECDSA signature mixes into its RFC 6979 nonce and
+//! the `rnd` an ML-DSA signature hashes with the key's secret and the
+//! message (FIPS 204).  Either derives what it needs from the key and the
+//! message too, so the signature is safe should that draw be weak, and
+//! the draw only makes two signatures of the same transcript differ, as
+//! Go's hedged signatures do.  A
 //! handshake is paced by a peer, and that generator, seeded once at
 //! startup, cannot fail after it, where a kernel read can (the node's
 //! `tests/entropy_policy.rs` gives the reasons for its draws).
@@ -64,7 +66,7 @@ impl SecureRandom for KernelRandom {
 }
 
 /// The process-wide generator ([`dcroxide_crypto::rand`]) as the source
-/// of an ECDSA signature's hedge, which `sign.rs` draws for each
+/// of an ECDSA or ML-DSA signature's hedge, which `sign.rs` draws for each
 /// handshake it signs.
 ///
 /// The generator produces keystream by XOR, so the buffer is zeroed
@@ -121,9 +123,9 @@ mod tests {
         assert_ne!(first, second, "fresh bytes each read");
     }
 
-    /// Every length an ECDSA hedge takes, the three curves' field
-    /// lengths, is written in full by the process generator, as the
-    /// kernel reads are above, and two draws differ.
+    /// Every length a hedge takes, the three curves' field lengths and
+    /// ML-DSA's 32 bytes, is written in full by the process generator, as
+    /// the kernel reads are above, and two draws differ.
     #[test]
     fn each_process_draw_fills_its_buffer() {
         for len in [32, 48, 66] {

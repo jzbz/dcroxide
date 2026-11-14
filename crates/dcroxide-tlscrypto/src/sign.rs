@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: ISC
 //! Signing keys, and the key loader that makes them from an `rpc.key`.
 //!
-//! The keys are ECDSA on P-256, P-384 and P-521 and Ed25519, each a
-//! rustls `SigningKey` under the shape of rustls's ring provider
-//! (`rustls-0.23.46/src/crypto/ring/sign.rs`): one signature scheme per
-//! key, offered in both TLS versions when the peer lists it.  For P-256
+//! The keys are ECDSA on P-256, P-384 and P-521, Ed25519 and ML-DSA-44,
+//! -65 and -87, each a rustls `SigningKey` under the shape of rustls's
+//! ring provider (`rustls-0.23.46/src/crypto/ring/sign.rs`): one signature
+//! scheme per key, offered when the peer lists it, in both TLS versions
+//! but for ML-DSA's, which are TLS 1.3's alone.  For P-256
 //! and P-384 that is ring's choice (`:284-294`).  For P-521, which ring
 //! cannot sign with, it is `ECDSA_NISTP521_SHA512`, the scheme Go offers
 //! by default (`crypto/tls/defaults.go:52`) and the one its TLS 1.3 picks
@@ -23,12 +24,27 @@
 //! * Ed25519 is RFC 8032's, on `curve25519-dalek` with `sha2`'s SHA-512:
 //!   deterministic, so a signature is ring's and Go's `ed25519.Sign`'s
 //!   byte for byte for the same seed and message.
+//! * ML-DSA is FIPS 204's, on the `ml-dsa` crate, with the key expanded
+//!   from its 32-byte seed as Go's `mldsa.NewPrivateKey` expands it: pure
+//!   ML-DSA with an empty context, as Go's TLS 1.3 signs, with no hash
+//!   (`crypto/tls/handshake_server_tls13.go:869-873`) and so no context
+//!   (`crypto/mldsa/mldsa_fips140v1.26.go:105-118`), and hedged as Go's
+//!   `Sign` is, with the 32 bytes of FIPS 204's `rnd` from the process
+//!   generator, so that two signatures of the same transcript differ and a
+//!   weak draw leaves the deterministic signature's safety.  The key's
+//!   `algorithm` is `Unknown(0)`, which no TLS 1.2 suite takes, so rustls
+//!   never chooses it below TLS 1.3, where Go refuses it too
+//!   (`crypto/tls/common.go:1800-1808`); the RPC listener refuses a client
+//!   that cannot take TLS 1.3 before rustls looks for a suite, as Go
+//!   does.  A signature the crate's rejection sampling finds none for
+//!   within its bound of rounds (`ml-dsa-0.1.2/src/signing.rs:681-683`),
+//!   thousands where a handful are needed, fails the one handshake.
 //!
 //! [`KEY_PROVIDER`] and [`load_der`] read a key as Go's `tls.X509KeyPair`
 //! does (`crate::keys`), with Go's texts for a key Go refuses and this
 //! provider's own for the keys it does not sign with: an RSA key, whether
-//! or not Go loads it, and the P-224 and ML-DSA keys Go loads.  The
-//! secrets are wiped when the last handshake holding them drops them.
+//! or not Go loads it, and the P-224 keys Go loads.  The secrets are wiped
+//! when the last handshake holding them drops them.
 //! [`parse_go_private_key`] reads a key the same way for a caller that
 //! signs with it on its own, `gencerts` with its CA key.
 
@@ -38,6 +54,8 @@ use std::sync::Arc;
 use curve25519_dalek::edwards::EdwardsPoint;
 use curve25519_dalek::scalar::{Scalar, clamp_integer};
 use ecdsa::elliptic_curve::array::typenum::Unsigned;
+use ml_dsa::signature::rand_core::{TryCryptoRng, TryRng};
+use ml_dsa::{ExpandedSigningKey, MlDsaParams};
 use rustls::crypto::KeyProvider;
 use rustls::pki_types::{AlgorithmIdentifier, PrivateKeyDer, SubjectPublicKeyInfoDer, alg_id};
 use rustls::sign::{Signer, SigningKey, public_key_to_spki};
@@ -56,7 +74,7 @@ pub static KEY_PROVIDER: &dyn KeyProvider = &KeyLoader;
 
 /// [`KEY_PROVIDER`]'s and [`load_der`]'s text for an RSA key.
 pub const RSA_KEY_REFUSED: &str = "RSA private keys are not supported: this provider signs with \
-                                   ECDSA (P-256, P-384, P-521) and Ed25519 keys";
+                                   ECDSA (P-256, P-384, P-521), Ed25519 and ML-DSA keys";
 
 /// What Go's `parsePrivateKey` reads a key as, when it is one of these.
 #[non_exhaustive]
@@ -72,11 +90,29 @@ pub enum KeyAlgorithm {
     Ed25519,
     /// RSA, which [`load_der`] refuses.
     Rsa,
+    /// ML-DSA-44, which Go serves in TLS 1.3 alone.
+    MlDsa44,
+    /// ML-DSA-65, likewise.
+    MlDsa65,
+    /// ML-DSA-87, likewise.
+    MlDsa87,
+}
+
+impl KeyAlgorithm {
+    /// Whether Go serves a key of this type in TLS 1.3 alone, refusing a
+    /// client that negotiates TLS 1.2 (`crypto/tls/handshake_server.go:310-314`):
+    /// ML-DSA's three.
+    pub fn tls13_only(self) -> bool {
+        matches!(
+            self,
+            KeyAlgorithm::MlDsa44 | KeyAlgorithm::MlDsa65 | KeyAlgorithm::MlDsa87
+        )
+    }
 }
 
 /// What Go's `parsePrivateKey` reads `der` as, whatever PEM label it came
 /// under: `None` for a key it does not read, and for a key of another
-/// type (P-224, X25519, ML-DSA).
+/// type (P-224, X25519).
 pub fn key_algorithm(der: &[u8]) -> Option<KeyAlgorithm> {
     Some(match keys::parse(der).ok()? {
         ParsedKey::EcdsaP256(_) => KeyAlgorithm::EcdsaP256,
@@ -84,6 +120,9 @@ pub fn key_algorithm(der: &[u8]) -> Option<KeyAlgorithm> {
         ParsedKey::EcdsaP521(_) => KeyAlgorithm::EcdsaP521,
         ParsedKey::Ed25519(_) => KeyAlgorithm::Ed25519,
         ParsedKey::Rsa => KeyAlgorithm::Rsa,
+        ParsedKey::MlDsa44(_) => KeyAlgorithm::MlDsa44,
+        ParsedKey::MlDsa65(_) => KeyAlgorithm::MlDsa65,
+        ParsedKey::MlDsa87(_) => KeyAlgorithm::MlDsa87,
     })
 }
 
@@ -104,8 +143,8 @@ impl std::error::Error for KeyRefused {}
 /// for a caller that makes its own signatures with the key: `gencerts`,
 /// whose CA pair dcrd opens with `tls.LoadX509KeyPair`.  The key, an RSA
 /// key read for its structure alone, or the refusal [`load_der`] gives:
-/// Go's text for a key Go refuses, and this crate's for the P-224 and
-/// ML-DSA keys Go loads.
+/// Go's text for a key Go refuses, and this crate's for the P-224 keys Go
+/// loads.
 pub fn parse_go_private_key(der: &[u8]) -> Result<ParsedKey, KeyRefused> {
     keys::parse(der).map_err(KeyRefused)
 }
@@ -120,6 +159,15 @@ pub fn load_der(der: &[u8]) -> Result<Arc<dyn SigningKey>, Error> {
         Ok(ParsedKey::EcdsaP521(key)) => Ok(Arc::new(EcdsaSigningKey::<p521::NistP521>::new(key))),
         Ok(ParsedKey::Ed25519(seed)) => Ok(Arc::new(Ed25519SigningKey::from_seed(&seed))),
         Ok(ParsedKey::Rsa) => refused(RSA_KEY_REFUSED),
+        Ok(ParsedKey::MlDsa44(seed)) => {
+            Ok(Arc::new(MlDsaSigningKey::<ml_dsa::MlDsa44>::new(&seed)))
+        }
+        Ok(ParsedKey::MlDsa65(seed)) => {
+            Ok(Arc::new(MlDsaSigningKey::<ml_dsa::MlDsa65>::new(&seed)))
+        }
+        Ok(ParsedKey::MlDsa87(seed)) => {
+            Ok(Arc::new(MlDsaSigningKey::<ml_dsa::MlDsa87>::new(&seed)))
+        }
         Err(error) => refused(&error.to_string()),
     }
 }
@@ -520,15 +568,208 @@ impl Signer for Ed25519Signer {
     }
 }
 
+/// An ML-DSA parameter set as the signer takes it: the one scheme its keys
+/// sign with, in TLS 1.3 alone, and the SubjectPublicKeyInfo algorithm of
+/// its keys, the set's bare OID, as Go writes it
+/// (`crypto/x509/x509.go:519-532`).
+pub(crate) trait MlDsaSet: MlDsaParams + 'static {
+    /// The one signature scheme a key of the set signs with.
+    const SCHEME: SignatureScheme;
+    /// The SubjectPublicKeyInfo algorithm of a key of the set.
+    const ALG_ID: AlgorithmIdentifier;
+}
+
+impl MlDsaSet for ml_dsa::MlDsa44 {
+    const SCHEME: SignatureScheme = SignatureScheme::ML_DSA_44;
+    const ALG_ID: AlgorithmIdentifier = alg_id::ML_DSA_44;
+}
+
+impl MlDsaSet for ml_dsa::MlDsa65 {
+    const SCHEME: SignatureScheme = SignatureScheme::ML_DSA_65;
+    const ALG_ID: AlgorithmIdentifier = alg_id::ML_DSA_65;
+}
+
+impl MlDsaSet for ml_dsa::MlDsa87 {
+    const SCHEME: SignatureScheme = SignatureScheme::ML_DSA_87;
+    const ALG_ID: AlgorithmIdentifier = alg_id::ML_DSA_87;
+}
+
+/// The key of the set `P` whose seed is `seed`: FIPS 204's
+/// `ML-DSA.KeyGen_internal`, which Go's `mldsa.NewPrivateKey` runs on a
+/// PKCS#8 seed (`crypto/x509/pkcs8.go:111`).  The expanded key wipes
+/// itself when dropped (`ml-dsa-0.1.2/src/signing.rs:660-678`).
+fn ml_dsa_key<P: MlDsaSet>(seed: &[u8; 32]) -> ExpandedSigningKey<P> {
+    ExpandedSigningKey::<P>::from_seed(seed.into())
+}
+
+/// An ML-DSA key of the set `P`, with its SubjectPublicKeyInfo, which
+/// `CertifiedKey::keys_match` compares with the certificate's.
+struct MlDsaSigningKey<P: MlDsaSet> {
+    /// The expanded key, shared with each handshake's signer.
+    key: Arc<ExpandedSigningKey<P>>,
+    /// The public key, as a certificate carries it.
+    spki: SubjectPublicKeyInfoDer<'static>,
+}
+
+impl<P: MlDsaSet> MlDsaSigningKey<P> {
+    /// The signing key whose seed is `seed`.
+    fn new(seed: &[u8; 32]) -> MlDsaSigningKey<P> {
+        let key = ml_dsa_key::<P>(seed);
+        let spki = public_key_to_spki(&P::ALG_ID, key.verifying_key().encode());
+        MlDsaSigningKey {
+            key: Arc::new(key),
+            spki,
+        }
+    }
+}
+
+impl<P: MlDsaSet> fmt::Debug for MlDsaSigningKey<P> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MlDsaSigningKey")
+            .field("scheme", &P::SCHEME)
+            .finish()
+    }
+}
+
+impl<P: MlDsaSet> SigningKey for MlDsaSigningKey<P> {
+    /// The set's one scheme, when the peer offers it.  rustls looks only
+    /// in TLS 1.3, since no TLS 1.2 suite takes the key's algorithm, and
+    /// Go offers the key's own scheme alone there too
+    /// (`crypto/tls/auth.go:242-252`, `:261-297`).
+    fn choose_scheme(&self, offered: &[SignatureScheme]) -> Option<Box<dyn Signer>> {
+        offered.contains(&P::SCHEME).then(|| {
+            Box::new(MlDsaSigner::<P> {
+                key: Arc::clone(&self.key),
+            }) as Box<dyn Signer>
+        })
+    }
+
+    fn public_key(&self) -> Option<SubjectPublicKeyInfoDer<'_>> {
+        Some(self.spki.clone())
+    }
+
+    /// No algorithm a TLS 1.2 suite names, as rustls's aws-lc-rs provider
+    /// gives for its ML-DSA keys (`rustls-0.23.46/src/crypto/aws_lc_rs/sign.rs:366-368`).
+    fn algorithm(&self) -> SignatureAlgorithm {
+        SignatureAlgorithm::Unknown(0)
+    }
+}
+
+/// One handshake's signer for an [`MlDsaSigningKey`].
+struct MlDsaSigner<P: MlDsaSet> {
+    /// The key.
+    key: Arc<ExpandedSigningKey<P>>,
+}
+
+/// The `Error::General` an ML-DSA handshake signature fails with when the
+/// crate gives none: with an empty context and a hedge handed over whole,
+/// its one error is rejection sampling that ran out of rounds
+/// (`ml-dsa-0.1.2/src/signing.rs:340-374`), where Go's signer would go on
+/// (`crypto/internal/fips140/mldsa/mldsa.go:439-440`).
+pub(crate) const ML_DSA_SIGNING_FAILED: &str =
+    "ML-DSA signing failed: rejection sampling found no signature";
+
+impl<P: MlDsaSet> MlDsaSigner<P> {
+    /// The signature of `message`, pure ML-DSA with an empty context, with
+    /// the 32-byte hedge `draw` fills, from a zeroed buffer wiped
+    /// afterwards: FIPS 204's hedged `ML-DSA.Sign`, through the crate's
+    /// `sign_randomized`, which fails where its infallible signer would
+    /// panic.  `draw` is [`ProcessRng`] but in the tests, which stand in
+    /// for it to see the draw and to give FIPS 204's deterministic `rnd`
+    /// of zeros.
+    fn sign_drawing(
+        &self,
+        message: &[u8],
+        draw: impl FnOnce(&mut [u8; 32]),
+    ) -> Result<Vec<u8>, Error> {
+        let mut rnd = Zeroizing::new([0; 32]);
+        draw(&mut rnd);
+        self.sign_with(message, &mut Rnd(Some(&rnd)))
+    }
+
+    /// The signature of `message` with the hedge `rnd` hands over, or
+    /// [`ML_DSA_SIGNING_FAILED`] for any error of the crate's.
+    fn sign_with(&self, message: &[u8], rnd: &mut Rnd<'_>) -> Result<Vec<u8>, Error> {
+        self.key
+            .sign_randomized(message, b"", rnd)
+            .map(|signature| signature.encode().to_vec())
+            .map_err(|_| Error::General(ML_DSA_SIGNING_FAILED.to_owned()))
+    }
+}
+
+impl<P: MlDsaSet> fmt::Debug for MlDsaSigner<P> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MlDsaSigner")
+            .field("scheme", &P::SCHEME)
+            .finish()
+    }
+}
+
+impl<P: MlDsaSet> Signer for MlDsaSigner<P> {
+    /// The hedged signature, its 32 bytes of `rnd` drawn from the process
+    /// generator, as the ECDSA hedge is, which cannot fail.
+    fn sign(&self, message: &[u8]) -> Result<Vec<u8>, Error> {
+        self.sign_drawing(message, |rnd| ProcessRng.fill(rnd))
+    }
+
+    fn scheme(&self) -> SignatureScheme {
+        P::SCHEME
+    }
+}
+
+/// A signature's `rnd`, drawn ahead, as the crate's randomized signer takes
+/// it: a generator that hands over those 32 bytes once, to the one read of
+/// 32 bytes the signer makes (`ml-dsa-0.1.2/src/signing.rs:404-405`), and
+/// fails any other read, so that no byte of a signature's hedge is made up
+/// here.
+struct Rnd<'a>(Option<&'a [u8; 32]>);
+
+/// [`Rnd`]'s error: a read it does not answer.
+#[derive(Debug)]
+struct RndSpent;
+
+impl fmt::Display for RndSpent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("the hedge was read otherwise than once, whole")
+    }
+}
+
+impl core::error::Error for RndSpent {}
+
+impl TryRng for Rnd<'_> {
+    type Error = RndSpent;
+
+    fn try_next_u32(&mut self) -> Result<u32, RndSpent> {
+        Err(RndSpent)
+    }
+
+    fn try_next_u64(&mut self) -> Result<u64, RndSpent> {
+        Err(RndSpent)
+    }
+
+    fn try_fill_bytes(&mut self, dst: &mut [u8]) -> Result<(), RndSpent> {
+        match self.0.take() {
+            Some(rnd) if dst.len() == rnd.len() => {
+                dst.copy_from_slice(rnd);
+                Ok(())
+            }
+            _ => Err(RndSpent),
+        }
+    }
+}
+
+impl TryCryptoRng for Rnd<'_> {}
+
 /// The body of the `tlscrypto_key_parse` fuzz target, not part of the API:
 /// [`load_der`] on `der`, which must not panic and must agree with
 /// [`key_algorithm`].  A key it loads is of the type that names, signs
 /// `der` with that type's scheme, and, for the types this provider
-/// verifies, P-256, P-384 and Ed25519, gives a signature the provider's
-/// own verifier takes under the key's public key; a key it refuses as RSA
-/// is RSA, and any other it refuses has no type, and is refused with Go's
-/// "tls: failed to parse private key: " and a cause of one line, or with
-/// one of the fixed texts for the X25519, P-224 and ML-DSA keys Go reads.
+/// verifies, P-256, P-384, Ed25519 and ML-DSA's three, gives a signature
+/// the provider's own verifier takes under the key's public key; a key it
+/// refuses as RSA is RSA, and any other it refuses has no type, and is
+/// refused with Go's "tls: failed to parse private key: " and a cause of
+/// one line, or with one of the fixed texts for the X25519 and P-224 keys
+/// Go reads.
 /// Returns whether the key loaded.
 #[doc(hidden)]
 pub fn fuzz_key_parse(der: &[u8]) -> bool {
@@ -546,9 +787,6 @@ pub fn fuzz_key_parse(der: &[u8]) -> bool {
                     rsa || [
                         "tls: found unknown private key type in PKCS#8 wrapping",
                         "unsupported private key: ECDSA P-224",
-                        "unsupported private key: ML-DSA-44",
-                        "unsupported private key: ML-DSA-65",
-                        "unsupported private key: ML-DSA-87",
                     ]
                     .contains(&text.as_str()),
                     "{text:?}"
@@ -574,6 +812,21 @@ pub fn fuzz_key_parse(der: &[u8]) -> bool {
             Some(KeyAlgorithm::Ed25519) => {
                 (SignatureScheme::ED25519, Some(crate::verify::ED25519), 32)
             }
+            Some(KeyAlgorithm::MlDsa44) => (
+                SignatureScheme::ML_DSA_44,
+                Some(crate::verify::ML_DSA_44),
+                1312,
+            ),
+            Some(KeyAlgorithm::MlDsa65) => (
+                SignatureScheme::ML_DSA_65,
+                Some(crate::verify::ML_DSA_65),
+                1952,
+            ),
+            Some(KeyAlgorithm::MlDsa87) => (
+                SignatureScheme::ML_DSA_87,
+                Some(crate::verify::ML_DSA_87),
+                2592,
+            ),
             other => panic!("load_der loaded a key key_algorithm reads as {other:?}"),
         };
     let signature = key
@@ -597,6 +850,33 @@ pub fn fuzz_key_parse(der: &[u8]) -> bool {
         );
     }
     true
+}
+
+/// For Wycheproof's signing-from-seed vectors (`crate::wycheproof_tests`):
+/// the key [`load_der`] loads from `der`, an ML-DSA key of the set `P`, its
+/// public key as the SubjectPublicKeyInfo carries it, and the handshake
+/// signer's signature of `message` with `rnd` in place of its draw from
+/// the process generator; `None` for a key of another type or set.
+#[cfg(test)]
+pub(crate) fn ml_dsa_signed_with<P: MlDsaSet>(
+    der: &[u8],
+    message: &[u8],
+    rnd: &[u8; 32],
+) -> Option<(Vec<u8>, Vec<u8>)> {
+    let seed = match (keys::parse(der).ok()?, P::SCHEME) {
+        (ParsedKey::MlDsa44(seed), SignatureScheme::ML_DSA_44)
+        | (ParsedKey::MlDsa65(seed), SignatureScheme::ML_DSA_65)
+        | (ParsedKey::MlDsa87(seed), SignatureScheme::ML_DSA_87) => seed,
+        _ => return None,
+    };
+    let key = MlDsaSigningKey::<P>::new(&seed);
+    let signer = MlDsaSigner::<P> {
+        key: Arc::clone(&key.key),
+    };
+    let signature = signer
+        .sign_drawing(message, |drawn| drawn.copy_from_slice(rnd))
+        .expect("the signer's signature");
+    Some((key.spki.as_ref().to_vec(), signature))
 }
 
 /// The timing check's hold on the signing keys (`crate::ct_check`,
@@ -723,6 +1003,11 @@ mod tests {
     use ecdsa::signature::Verifier;
 
     use super::*;
+
+    /// [`ml_dsa_key`] under a name the PKCS#8 builder below leaves free.
+    fn ml_dsa_key_of<P: MlDsaSet>(seed: &[u8; 32]) -> ExpandedSigningKey<P> {
+        super::ml_dsa_key(seed)
+    }
 
     /// An RFC 6979 known answer: the key, its public point, and the
     /// message, nonce and signature of each case on the curve's own hash.
@@ -1005,6 +1290,21 @@ mod tests {
                 SignatureScheme::ED25519,
                 SignatureAlgorithm::ED25519,
             ),
+            (
+                ml_dsa_key(0x11, &[7; 32]),
+                SignatureScheme::ML_DSA_44,
+                SignatureAlgorithm::Unknown(0),
+            ),
+            (
+                ml_dsa_key(0x12, &[7; 32]),
+                SignatureScheme::ML_DSA_65,
+                SignatureAlgorithm::Unknown(0),
+            ),
+            (
+                ml_dsa_key(0x13, &[7; 32]),
+                SignatureScheme::ML_DSA_87,
+                SignatureAlgorithm::Unknown(0),
+            ),
         ];
         let all = [
             SignatureScheme::ECDSA_NISTP256_SHA256,
@@ -1012,6 +1312,9 @@ mod tests {
             SignatureScheme::ECDSA_NISTP384_SHA384,
             SignatureScheme::ECDSA_NISTP521_SHA512,
             SignatureScheme::ED25519,
+            SignatureScheme::ML_DSA_44,
+            SignatureScheme::ML_DSA_65,
+            SignatureScheme::ML_DSA_87,
         ];
         for (der, scheme, algorithm) in keys {
             let key = load_der(&der).expect("a key");
@@ -1049,6 +1352,123 @@ mod tests {
             ]
             .concat(),
         )
+    }
+
+    /// A PKCS#8 ML-DSA key in the seed form, of the set whose OID ends in
+    /// `set` (0x11, 0x12 or 0x13), with `seed`.
+    fn ml_dsa_key(set: u8, seed: &[u8; 32]) -> Vec<u8> {
+        tlv(
+            0x30,
+            &[
+                tlv(0x02, &[0]),
+                tlv(
+                    0x30,
+                    &tlv(0x06, &[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x03, set]),
+                ),
+                tlv(0x04, &[&[0x80, 0x20][..], seed].concat()),
+            ]
+            .concat(),
+        )
+    }
+
+    /// The handshake signer of each ML-DSA set draws a hedge of 32 bytes,
+    /// FIPS 204's `rnd`, from a zeroed buffer, and signs with it, empty
+    /// context: with `rnd` all zeros its signature is the crate's
+    /// deterministic one, with another `rnd` it is not, and from the
+    /// process generator two signatures of one message differ; each
+    /// verifies under the key's public key with the provider's verifier,
+    /// and the key's public key is the crate's for the seed.
+    #[test]
+    fn ml_dsa_signatures_are_hedged() {
+        fn check<P: MlDsaSet>(
+            set: u8,
+            alg_id: AlgorithmIdentifier,
+            verify: &dyn rustls::pki_types::SignatureVerificationAlgorithm,
+        ) {
+            let seed = [set; 32];
+            let expanded = ExpandedSigningKey::<P>::from_seed(&seed.into());
+            let public = expanded.verifying_key().encode().to_vec();
+            let key = load_der(&ml_dsa_key(set, &seed)).expect("the key");
+            assert_eq!(
+                key.public_key().expect("its public key").as_ref(),
+                public_key_to_spki(&alg_id, &public).as_ref(),
+                "{:?}",
+                P::SCHEME
+            );
+            let signer = MlDsaSigner::<P> {
+                key: Arc::new(ml_dsa_key_of::<P>(&seed)),
+            };
+            let message = b"a TLS 1.3 CertificateVerify's content";
+            let mut drawn = None;
+            let zeros = signer
+                .sign_drawing(message, |rnd| drawn = Some(*rnd))
+                .expect("signed");
+            assert_eq!(drawn, Some([0; 32]), "{:?}", P::SCHEME);
+            let deterministic = expanded
+                .sign_deterministic(message, b"")
+                .expect("signed")
+                .encode()
+                .to_vec();
+            assert_eq!(zeros, deterministic, "{:?}", P::SCHEME);
+            let hedged = signer
+                .sign_drawing(message, |rnd| rnd.fill(0x5a))
+                .expect("signed");
+            assert_ne!(hedged, deterministic, "{:?}", P::SCHEME);
+            let signer = key.choose_scheme(&[P::SCHEME]).expect("its scheme");
+            let first = signer.sign(message).expect("signed");
+            let second = signer.sign(message).expect("signed");
+            assert_ne!(first, second, "{:?}", P::SCHEME);
+            for signature in [&first, &second, &hedged, &deterministic] {
+                assert!(
+                    verify.verify_signature(&public, message, signature).is_ok(),
+                    "{:?}",
+                    P::SCHEME
+                );
+            }
+        }
+        check::<ml_dsa::MlDsa44>(0x11, alg_id::ML_DSA_44, crate::verify::ML_DSA_44);
+        check::<ml_dsa::MlDsa65>(0x12, alg_id::ML_DSA_65, crate::verify::ML_DSA_65);
+        check::<ml_dsa::MlDsa87>(0x13, alg_id::ML_DSA_87, crate::verify::ML_DSA_87);
+    }
+
+    /// The hedge goes to the crate's signer once, whole: a read of another
+    /// length, a second read and a read of a word all fail, so no byte of
+    /// `rnd` is made up, and a signature with no hedge to read fails.
+    #[test]
+    fn the_hedge_is_read_once_whole() {
+        let rnd = [3; 32];
+        let mut buf = [0; 32];
+        let mut once = Rnd(Some(&rnd));
+        assert!(once.try_fill_bytes(&mut buf[..31]).is_err());
+        let mut once = Rnd(Some(&rnd));
+        assert!(once.try_fill_bytes(&mut buf).is_ok());
+        assert_eq!(buf, rnd);
+        assert!(once.try_fill_bytes(&mut buf).is_err());
+        let mut once = Rnd(Some(&rnd));
+        assert!(once.try_next_u32().is_err());
+        assert!(once.try_next_u64().is_err());
+        let key = ml_dsa_key_of::<ml_dsa::MlDsa44>(&[1; 32]);
+        assert!(
+            key.sign_randomized(b"message", b"", &mut Rnd(None))
+                .is_err()
+        );
+    }
+
+    /// An error from the crate's signer fails the handshake with
+    /// [`ML_DSA_SIGNING_FAILED`]: here its error for a hedge it cannot
+    /// read, which comes back as rejection sampling that ran out of rounds
+    /// would.
+    #[test]
+    fn a_signing_error_fails_the_handshake_in_its_words() {
+        let signer = MlDsaSigner::<ml_dsa::MlDsa44> {
+            key: Arc::new(ml_dsa_key_of::<ml_dsa::MlDsa44>(&[1; 32])),
+        };
+        assert_eq!(
+            signer.sign_with(b"message", &mut Rnd(None)),
+            Err(Error::General(ML_DSA_SIGNING_FAILED.to_owned()))
+        );
+        let rnd = [0; 32];
+        assert!(signer.sign_with(b"message", &mut Rnd(Some(&rnd))).is_ok());
     }
 
     /// A PKCS#8 Ed25519 key with `seed`.
@@ -1123,8 +1543,8 @@ mod tests {
 
     /// Each refusal has its text: Go's for what Go refuses, the PKCS#8
     /// parser's error after Go's prefix among them, and this provider's
-    /// for the RSA, P-224 and ML-DSA keys Go loads; and the type each key
-    /// reads as.
+    /// for the RSA and P-224 keys Go loads; and the type each key reads
+    /// as, an ML-DSA seed's among them, which loads.
     #[test]
     fn each_refusal_has_its_text() {
         let text = |der: &[u8]| match load_der(der) {
@@ -1154,8 +1574,7 @@ mod tests {
             ]
             .concat(),
         );
-        // ML-DSA-65's seed form, which Go loads, and this provider does not
-        // sign with yet.
+        // ML-DSA-65's seed form, which Go loads, and so does this provider.
         let ml_dsa = tlv(
             0x30,
             &[
@@ -1177,7 +1596,7 @@ mod tests {
             text(&x25519),
             "tls: found unknown private key type in PKCS#8 wrapping"
         );
-        assert_eq!(text(&ml_dsa), "unsupported private key: ML-DSA-65");
+        assert!(load_der(&ml_dsa).is_ok());
         // Go 1.27.3's texts, as `tools/oracle/main_test.go` pins the first.
         assert_eq!(
             text(b"not a key"),
@@ -1208,13 +1627,32 @@ mod tests {
             key_algorithm(&ed25519_key(&[7; 32])),
             Some(KeyAlgorithm::Ed25519)
         );
-        for other in [p224, x25519, ml_dsa, b"not a key".to_vec()] {
+        assert_eq!(key_algorithm(&ml_dsa), Some(KeyAlgorithm::MlDsa65));
+        for (set, algorithm) in [
+            (0x11, KeyAlgorithm::MlDsa44),
+            (0x12, KeyAlgorithm::MlDsa65),
+            (0x13, KeyAlgorithm::MlDsa87),
+        ] {
+            assert_eq!(key_algorithm(&ml_dsa_key(set, &[7; 32])), Some(algorithm));
+            assert!(algorithm.tls13_only());
+        }
+        for algorithm in [
+            KeyAlgorithm::EcdsaP256,
+            KeyAlgorithm::EcdsaP384,
+            KeyAlgorithm::EcdsaP521,
+            KeyAlgorithm::Ed25519,
+            KeyAlgorithm::Rsa,
+        ] {
+            assert!(!algorithm.tls13_only(), "{algorithm:?}");
+        }
+        for other in [p224, x25519, b"not a key".to_vec()] {
             assert_eq!(key_algorithm(&other), None, "{other:02x?}");
         }
     }
 
-    /// The fuzz target's body loads and signs with each key type, its
-    /// signature verified by the provider's own verifier but for P-521's,
+    /// The fuzz target's body loads and signs with each key type, ML-DSA's
+    /// three among them, its signature verified by the provider's own
+    /// verifier but for P-521's,
     /// refuses an RSA key as RSA, and over every truncation of each key, a
     /// bit flipped in every byte, and inputs from a fixed generator, never
     /// panics.
@@ -1227,6 +1665,9 @@ mod tests {
             sec1_key(P384_OID, &[7; 48]),
             sec1_key(P521_OID, &p521),
             ed25519_key(&[7; 32]),
+            ml_dsa_key(0x11, &[7; 32]),
+            ml_dsa_key(0x12, &[7; 32]),
+            ml_dsa_key(0x13, &[7; 32]),
         ];
         for key in &keys {
             assert!(fuzz_key_parse(key), "{key:02x?}");
@@ -1256,7 +1697,7 @@ mod tests {
                 loaded += usize::from(fuzz_key_parse(&flipped));
             }
         }
-        assert!(loaded > 4, "{loaded} mutated keys loaded");
+        assert!(loaded > 7, "{loaded} mutated keys loaded");
         let mut rng = dcroxide_testutil::SplitMix64(0x4b65_7950_6172_7365);
         for _ in 0..2000 {
             assert!(!fuzz_key_parse(&rng.bytes(200)));

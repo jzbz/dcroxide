@@ -4762,9 +4762,9 @@ impl rustls::server::danger::ClientCertVerifier for GoClientCertVerifier {
 /// signer carries a private-key timing advisory (RUSTSEC-2023-0071),
 /// which is why `gencerts` writes none either.
 pub const RSA_RPC_KEY_REFUSED: &str = "the RPC key is an RSA key, and dcroxide signs TLS \
-    handshakes with ECDSA and Ed25519 keys only: replace the --rpckey and --rpccert pair with \
-    such a pair (remove both and the next start generates one on the --tlscurve curve, P-256 by \
-    default; gencerts writes P-256, P-384, P-521 and Ed25519 pairs)";
+    handshakes with ECDSA, Ed25519 and ML-DSA keys only: replace the --rpckey and --rpccert \
+    pair with such a pair (remove both and the next start generates one on the --tlscurve \
+    curve, P-256 by default; gencerts writes P-256, P-384, P-521 and Ed25519 pairs)";
 
 /// The key block of an `rpc.key` as `tls.X509KeyPair` chooses it
 /// (`crypto/tls/tls.go:294-311`): the first block Go's `pem.Decode` finds
@@ -4816,10 +4816,11 @@ fn go_key_block(key_pem: &[u8]) -> Result<zeroize::Zeroizing<Vec<u8>>, String> {
 ///
 /// The key is read as Go's `tls.X509KeyPair` reads it: the block by Go's
 /// rule ([`go_key_block`]) and its DER by Go's `parsePrivateKey`, through
-/// `dcroxide-tlscrypto`'s loader, which signs with ECDSA and Ed25519 keys
-/// alone.  An RSA key, which dcrd serves, is refused with
+/// `dcroxide-tlscrypto`'s loader, which signs with ECDSA, Ed25519 and
+/// ML-DSA keys.  An RSA key, which dcrd serves, is refused with
 /// [`RSA_RPC_KEY_REFUSED`] (ADR-0015, T6), at startup and on a rotation
-/// alike, since both come here.
+/// alike, since both come here.  An ML-DSA key is served in TLS 1.3
+/// alone, as Go serves it (`crate::rpctls::handshake`).
 ///
 /// The certificate, key and client verifier are read once and shared by
 /// every configuration in the set, which differ only in their providers,
@@ -4866,9 +4867,8 @@ fn build_server_config(
     // the `KeyProvider`.  `keys_match` is the certificate-against-key check
     // `CertifiedKey::from_der` makes (`crypto/signer.rs:159-174`).
     let key_der = go_key_block(key_pem)?;
-    if dcroxide_tlscrypto::sign::key_algorithm(&key_der)
-        == Some(dcroxide_tlscrypto::sign::KeyAlgorithm::Rsa)
-    {
+    let key_algorithm = dcroxide_tlscrypto::sign::key_algorithm(&key_der);
+    if key_algorithm == Some(dcroxide_tlscrypto::sign::KeyAlgorithm::Rsa) {
         return Err(format!(
             "unable to build the RPC TLS configuration: {RSA_RPC_KEY_REFUSED}"
         ));
@@ -4889,7 +4889,8 @@ fn build_server_config(
         None => None,
     };
 
-    RpcTlsConfigs::build(|provider| {
+    let tls13_only = key_algorithm.is_some_and(|algorithm| algorithm.tls13_only());
+    RpcTlsConfigs::build(tls13_only, |provider| {
         let builder = rustls::ServerConfig::builder_with_provider(provider)
             .with_protocol_versions(rustls::DEFAULT_VERSIONS)
             .map_err(|e| format!("unable to build the RPC TLS configuration: {e}"))?;

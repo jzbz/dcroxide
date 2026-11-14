@@ -120,6 +120,22 @@
 //! does, so what its arithmetic sees of 2^254 or 2^255 - 8 is the residue;
 //! two of its classes are expanded scalars within the clamp whose residues
 //! are extremes themselves, 2 and L - 1.
+//!
+//! ML-DSA is not timed: neither its signing nor its key's expansion from
+//! the seed (ADR-0015's addenda of 2026-11-13 and 2026-11-14).  The
+//! rounds of signing's rejection loop, and so its time, follow the key,
+//! the message and the hedge by design.  The expansion samples by
+//! rejection too.  For each polynomial of the secret vectors (FIPS 204's
+//! `RejBoundedPoly`) the crate squeezes two SHAKE256 blocks up front,
+//! enough for nearly every seed (`ml-dsa-0.1.2/src/sampling.rs:122-146`),
+//! but how many of their bytes it reads, and which of their halves it
+//! rejects, follow the secret seed in all three sets, as they do in Go's
+//! `sampleBoundedPoly` (`crypto/internal/fips140/mldsa/field.go:330-365`);
+//! and the public matrix's sampling rejects as many values as the seed's
+//! hash gives it.  A fixed seed repeats one such walk where the random
+//! class mixes them, which the t-test does not tell apart from a leak.
+//! The expansion runs once when a key loads or is rotated in, never in a
+//! handshake.
 #![allow(
     clippy::arithmetic_side_effects,
     reason = "test-harness arithmetic over counts, lengths, bit positions and nanoseconds, \

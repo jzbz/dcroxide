@@ -169,13 +169,15 @@ evaluating this code.
   RustCrypto's crates under that provider, X25519 and Ed25519 on
   `curve25519-dalek` and P-256, P-384 and P-521, the last of which
   Decrediton requires, on the `p256`, `p384` and `p521` crates, whose
-  curve arithmetic has never been independently audited
-  (docs/dependency-ledger.md). See PARITY.md's open gaps.
+  curve arithmetic has never been independently audited, and an operator's
+  ML-DSA `rpc.key` signs in TLS 1.3 on the `ml-dsa` crate, which has never
+  been independently audited either (docs/dependency-ledger.md). See
+  PARITY.md's open gaps.
 - **An RSA RPC key is refused.** dcrd serves an `rpc.key` that is an RSA
   key. This daemon refuses one at startup, and keeps the configuration it
   serves when a rotation brings one in (ADR-0015, T6): its TLS provider
-  signs with ECDSA and Ed25519 keys alone, since the one pure-Rust RSA
-  signer carries a timing advisory on its private-key operations
+  signs with ECDSA, Ed25519 and ML-DSA keys alone, since the one pure-Rust
+  RSA signer carries a timing advisory on its private-key operations
   (RUSTSEC-2023-0071). An operator with an RSA pair replaces it, as the
   error says; `gencerts` and the daemon's own generation write none. See
   PARITY.md's open gaps.
@@ -372,9 +374,9 @@ evaluating this code.
   run. For the TLS provider the comparison rests on ring's verdicts, recorded in its parity corpus before ring
   left the tree, its Wycheproof vectors, its Go differential and the Go
   interop matrix, and its timing on a statistical check in CI of its
-  signing, key exchange, record protection (sealing, a bad tag's refusal
-  and AES-GCM's keying) and HMAC keying, which a pass does not prove
-  constant-time (ADR-0015's addenda).
+  ECDSA and Ed25519 signing (ML-DSA is not timed), key exchange, record
+  protection (sealing, a bad tag's refusal and AES-GCM's keying) and HMAC
+  keying, which a pass does not prove constant-time (ADR-0015's addenda).
   Stateless parsers still unfuzzed: the config-file and command-line
   parser, which takes the operator's input rather than a peer's, GCS
   filter decoding, and the ticket, index and address-manager stores.

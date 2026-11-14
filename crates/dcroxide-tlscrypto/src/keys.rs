@@ -21,11 +21,11 @@
 //!   which then wins over any curve inside.  `id-Ed25519` holds the
 //!   32-byte seed in an OCTET STRING, with no parameters.  ML-DSA-44, -65
 //!   and -87 hold, with no parameters, a 32-byte seed in an implicit
-//!   `[0]`, which Go loads and this provider does not sign with; the
-//!   semi-expanded and the expanded forms Go refuses, each with its own
-//!   text.  `id-X25519`, with no parameters and 32 bytes, is a key Go
-//!   reads and `crypto/tls` refuses as "tls: found unknown private key
-//!   type in PKCS#8 wrapping".  Any other algorithm is refused, naming it.
+//!   `[0]`, which is the key; the semi-expanded and the expanded forms Go
+//!   refuses, each with its own text.  `id-X25519`, with no parameters
+//!   and 32 bytes, is a key Go reads and `crypto/tls` refuses as "tls:
+//!   found unknown private key type in PKCS#8 wrapping".  Any other
+//!   algorithm is refused, naming it.
 //! * **PKCS#1** (`crypto/x509/pkcs1.go:16-36`, `:54-122`): version, N, E,
 //!   D, P and Q, each an INTEGER, the version and E fitting an `int`;
 //!   then Dp, Dq and Qinv, each only if the next element is an INTEGER;
@@ -156,28 +156,12 @@ pub enum ParsedKey {
     Ed25519(Zeroizing<[u8; 32]>),
     /// An RSA key, read for its structure alone.
     Rsa,
-}
-
-/// An ML-DSA parameter set (FIPS 204), as Go names it
-/// (`crypto/x509/x509.go:401-403`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum MlDsa {
-    /// ML-DSA-44.
-    MlDsa44,
-    /// ML-DSA-65.
-    MlDsa65,
-    /// ML-DSA-87.
-    MlDsa87,
-}
-
-impl fmt::Display for MlDsa {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            MlDsa::MlDsa44 => "ML-DSA-44",
-            MlDsa::MlDsa65 => "ML-DSA-65",
-            MlDsa::MlDsa87 => "ML-DSA-87",
-        })
-    }
+    /// An ML-DSA-44 key (FIPS 204): its seed, wiped when dropped.
+    MlDsa44(Zeroizing<[u8; 32]>),
+    /// An ML-DSA-65 key: its seed, wiped when dropped.
+    MlDsa65(Zeroizing<[u8; 32]>),
+    /// An ML-DSA-87 key: its seed, wiped when dropped.
+    MlDsa87(Zeroizing<[u8; 32]>),
 }
 
 /// Why a key is not a [`ParsedKey`], which prints as the text the key is
@@ -194,10 +178,6 @@ pub(crate) enum KeyError {
     /// A P-224 key, which Go loads and serves over TLS 1.2 only, and ring
     /// refused, as this provider does.
     P224,
-    /// An ML-DSA key in the seed form, which Go loads
-    /// (`crypto/x509/pkcs8.go:83-111`) and this provider does not sign
-    /// with yet.
-    MlDsa(MlDsa),
 }
 
 impl fmt::Display for KeyError {
@@ -208,7 +188,6 @@ impl fmt::Display for KeyError {
                 f.write_str("tls: found unknown private key type in PKCS#8 wrapping")
             }
             KeyError::P224 => f.write_str("unsupported private key: ECDSA P-224"),
-            KeyError::MlDsa(set) => write!(f, "unsupported private key: {set}"),
         }
     }
 }
@@ -428,9 +407,9 @@ fn parse_pkcs8(der: &[u8]) -> Result<Read, Cause> {
             seed.copy_from_slice(bytes);
             Ok(Ok(ParsedKey::Ed25519(seed)))
         }
-        ML_DSA_44 => ml_dsa(MlDsa::MlDsa44, &key),
-        ML_DSA_65 => ml_dsa(MlDsa::MlDsa65, &key),
-        ML_DSA_87 => ml_dsa(MlDsa::MlDsa87, &key),
+        ML_DSA_44 => ml_dsa(ParsedKey::MlDsa44, &key),
+        ML_DSA_65 => ml_dsa(ParsedKey::MlDsa65, &key),
+        ML_DSA_87 => ml_dsa(ParsedKey::MlDsa87, &key),
         X25519 => {
             if key.parameters.is_some() {
                 return Err(Cause::Text("x509: invalid X25519 private key parameters"));
@@ -462,8 +441,10 @@ fn named_curve(parameters: &[u8]) -> Option<&[u8]> {
 /// (`crypto/x509/pkcs8.go:83-111`), on the key's bytes as they are: no
 /// parameters, a first byte that is the seed's implicit `[0]`, 34 bytes in
 /// all, and a seed's length in the second.  Go's `mldsa.NewPrivateKey`
-/// takes any 32-byte seed, so a key that passes is one Go loads.
-fn ml_dsa(set: MlDsa, key: &Pkcs8<'_>) -> Result<Read, Cause> {
+/// takes any 32-byte seed (`crypto/x509/pkcs8.go:111`), so a key that
+/// passes is one Go loads: the key of the parameter set `key_of` makes,
+/// from its seed.
+fn ml_dsa(key_of: fn(Zeroizing<[u8; 32]>) -> ParsedKey, key: &Pkcs8<'_>) -> Result<Read, Cause> {
     if key.parameters.is_some() {
         return Err(Cause::Text("x509: invalid ML-DSA private key parameters"));
     }
@@ -493,7 +474,9 @@ fn ml_dsa(set: MlDsa, key: &Pkcs8<'_>) -> Result<Read, Cause> {
             "x509: invalid ML-DSA private key ASN.1 encoding",
         ));
     }
-    Ok(Err(KeyError::MlDsa(set)))
+    let mut seed = Zeroizing::new([0; 32]);
+    seed.copy_from_slice(&private_key[2..]);
+    Ok(Ok(key_of(seed)))
 }
 
 /// Go's `ParsePKCS1PrivateKey` (`crypto/x509/pkcs1.go:54-122`), as far as
@@ -694,6 +677,9 @@ mod tests {
             Ok(ParsedKey::EcdsaP521(_)) => "P-521".to_owned(),
             Ok(ParsedKey::Ed25519(_)) => "Ed25519".to_owned(),
             Ok(ParsedKey::Rsa) => "RSA".to_owned(),
+            Ok(ParsedKey::MlDsa44(_)) => "ML-DSA-44".to_owned(),
+            Ok(ParsedKey::MlDsa65(_)) => "ML-DSA-65".to_owned(),
+            Ok(ParsedKey::MlDsa87(_)) => "ML-DSA-87".to_owned(),
             Err(error) => error.to_string(),
         }
     }
@@ -977,9 +963,8 @@ mod tests {
     /// at the top level and inside the algorithm identifier and the
     /// embedded keys, each type name Go prints for a field of another tag,
     /// with the offset Go counts, the hints, and each `crypto/x509` and
-    /// `crypto/ecdsa` text, written out as Go 1.27.3 gives them; but for
-    /// the three ML-DSA seeds, which Go loads and this provider refuses
-    /// with its own text.
+    /// `crypto/ecdsa` text, written out as Go 1.27.3 gives them; and the
+    /// three ML-DSA seeds, which load.
     #[test]
     fn each_cause_reads_as_go_gives_it() {
         let ec = oid(EC_PUBLIC_KEY);
@@ -1525,17 +1510,13 @@ mod tests {
             (
                 "ML-DSA-44, a seed",
                 pkcs8_key(&[&oid(ML_DSA_44)], &ml_seed),
-                "unsupported private key: ML-DSA-44",
+                "ML-DSA-44",
             ),
-            (
-                "ML-DSA-65, a seed",
-                in_ml65(&ml_seed),
-                "unsupported private key: ML-DSA-65",
-            ),
+            ("ML-DSA-65, a seed", in_ml65(&ml_seed), "ML-DSA-65"),
             (
                 "ML-DSA-87, a seed",
                 pkcs8_key(&[&oid(ML_DSA_87)], &ml_seed),
-                "unsupported private key: ML-DSA-87",
+                "ML-DSA-87",
             ),
             (
                 "ML-DSA-65, NULL parameters",
