@@ -145,7 +145,7 @@ const PKCS8_HINT: &str =
     "x509: failed to parse private key (use ParsePKCS8PrivateKey instead for this key format)";
 
 /// A key Go's `parsePrivateKey` reads, of a type this provider knows.
-pub(crate) enum ParsedKey {
+pub enum ParsedKey {
     /// An ECDSA key on P-256.
     EcdsaP256(p256::ecdsa::SigningKey),
     /// An ECDSA key on P-384.

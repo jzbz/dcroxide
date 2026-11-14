@@ -6,23 +6,35 @@
 //! self-signed authority generation, CA-issued certificates with the
 //! parent checks Go's `x509.CreateCertificate` performs, PKCS#8 key
 //! marshaling for every supported algorithm, and the CA pair loading
-//! `tls.LoadX509KeyPair` performs (PEM decode, the key/certificate
-//! match check, and both PKCS#8 and SEC 1 private key forms).
+//! `tls.LoadX509KeyPair` performs (PEM decode, Go's `parsePrivateKey`
+//! through the TLS provider, and the key/certificate match check).
 //!
 //! Documented divergences: dcrd's `RSA4096` algorithm is not offered
 //! — the `rsa` crate carries the unfixed Marvin-attack advisory
 //! (RUSTSEC-2023-0071) and no dcrd daemon component uses RSA, so
-//! gencerts here supports P-256/P-384/P-521/Ed25519 only; the CA key
-//! loader accepts the forms the Decred tools emit rather than every
-//! ` PRIVATE KEY` suffix Go probes; the elapsed-validity error
-//! renders the date as whole-second UTC where Go renders the local
-//! zone with the monotonic-clock suffix; and OS error texts use
-//! Rust's rendering rather than Go's `*PathError` form.
+//! gencerts here supports P-256/P-384/P-521/Ed25519 only, and refuses
+//! an RSA, P-224 or ML-DSA CA key, which Go issues with; the CA pair
+//! is found by a PEM search of the port's own rather than Go's
+//! `pem.Decode`: the key only under the `PRIVATE KEY` and
+//! `EC PRIVATE KEY` labels, a `PRIVATE KEY` block ahead of an earlier
+//! `EC PRIVATE KEY` one, where Go takes the first block labelled
+//! `PRIVATE KEY` or ending in ` PRIVATE KEY`, and a pair with no block
+//! found is refused with "tls: failed to find any PEM data in ...
+//! input" where Go names the blocks it skipped, though the key is read
+//! in whatever form its block holds; the CA certificate is read for
+//! the fields issuance needs, its key's algorithm and bytes among
+//! them, not as `x509.ParseCertificate` reads it: its key's curve and
+//! parameters are not checked, and a structure the reader cannot
+//! follow is refused with "x509: malformed certificate"; the
+//! elapsed-validity error renders the date as whole-second UTC where
+//! Go renders the local zone with the monotonic-clock suffix; and OS
+//! error texts use Rust's rendering rather than Go's `*PathError` form.
 
 // The assembly mirrors Go's arithmetic over bounded buffers and
 // calendar math over euclidean division outputs.
 #![allow(clippy::arithmetic_side_effects)]
 
+use dcroxide_tlscrypto::sign::{ParsedKey, parse_go_private_key};
 use p256::ecdsa::signature::Signer;
 
 use crate::x509::SigAlg;
@@ -567,8 +579,8 @@ pub fn create_issued_cert<E: GenEnv>(
 
 // ---------------------------------------------------------------------------
 // CA pair loading (the slice of Go's `tls.LoadX509KeyPair` the tool
-// exercises: PEM decode, certificate field extraction, PKCS#8 or
-// SEC 1 private keys, and the pair match check).
+// exercises: PEM decode, certificate field extraction, the private key
+// as Go's `parsePrivateKey` reads it, and the pair match check).
 // ---------------------------------------------------------------------------
 
 /// Decode the first PEM block with the given types.
@@ -731,115 +743,78 @@ fn parse_time(tag: u8, content: &[u8]) -> Result<i64, String> {
     }
 }
 
-/// The curve OIDs the EC key loader recognizes.
-///
-/// The scalar is normalized as Go's `x509` does before building the key
-/// (`crypto/x509/sec1.go:115-127`): zero padding past the field size is
-/// dropped and any other excess refused, and a short scalar is left-padded.
-fn ec_key_from_scalar(curve_oid: &[u8], scalar: &[u8]) -> Result<ToolKeyPair, String> {
-    let p256_oid = der::oid(&[1, 2, 840, 10045, 3, 1, 7]);
-    let p384_oid = der::oid(&[1, 3, 132, 0, 34]);
-    let p521_oid = der::oid(&[1, 3, 132, 0, 35]);
-    let size = if curve_oid == &p256_oid[..] {
-        32
-    } else if curve_oid == &p384_oid[..] {
-        48
-    } else if curve_oid == &p521_oid[..] {
-        66
-    } else {
-        return Err("tls: failed to parse private key".to_string());
-    };
-    let mut scalar = scalar;
-    while scalar.len() > size {
-        match scalar.split_first() {
-            Some((0, rest)) => scalar = rest,
-            _ => return Err("x509: invalid private key length".to_string()),
-        }
-    }
-    let mut padded = vec![0u8; size];
-    padded[size - scalar.len()..].copy_from_slice(scalar);
-    let invalid = |_| "invalid elliptic curve private key value".to_string();
-    Ok(match size {
-        32 => ToolKeyPair::P256(p256::ecdsa::SigningKey::from_slice(&padded).map_err(invalid)?),
-        48 => ToolKeyPair::P384(p384::ecdsa::SigningKey::from_slice(&padded).map_err(invalid)?),
-        _ => ToolKeyPair::P521(p521::ecdsa::SigningKey::from_slice(&padded).map_err(invalid)?),
-    })
-}
+/// [`parse_private_key`]'s text for an RSA key, which Go loads and issues
+/// with and gencerts does not: dcrd's `RSA4096` is not offered either.
+pub const RSA_CA_KEY_REFUSED: &str = "RSA private keys are not supported: gencerts issues with \
+                                      ECDSA (P-256, P-384, P-521) and Ed25519 keys";
 
-/// Parse a private key from its PEM block (PKCS#8 `PRIVATE KEY` or
-/// SEC 1 `EC PRIVATE KEY`, the forms Go's `tls.X509KeyPair` accepts
-/// that the Decred tools emit).
-pub fn parse_private_key(block_type: &str, key_der: &[u8]) -> Result<ToolKeyPair, String> {
-    let parse_err = || "tls: failed to parse private key".to_string();
-    if block_type == "EC PRIVATE KEY" {
-        // SEC 1 ECPrivateKey with the [0] curve parameters inside.
-        let mut r = Reader::new(key_der);
-        let (seq, _) = r.expect(0x30)?;
-        let mut r = Reader::new(seq);
-        // Go refuses any version but 1 (`crypto/x509/sec1.go:98-100`).
-        let (version, _) = r.expect(0x02)?;
-        if version != [1] {
-            return Err("x509: unknown EC private key version".to_string());
-        }
-        let (scalar, _) = r.expect(0x04)?;
-        let (params, _) = r.expect(0xa0)?;
-        return ec_key_from_scalar(params, scalar);
-    }
-
-    // PKCS#8: version, AlgorithmIdentifier, key octets.
-    let mut r = Reader::new(key_der);
-    let (seq, _) = r.expect(0x30)?;
-    let mut r = Reader::new(seq);
-    r.expect(0x02)?;
-    let (alg, _) = r.expect(0x30)?;
-    let (key_octets, _) = r.expect(0x04)?;
-    let mut alg_r = Reader::new(alg);
-    let (alg_oid, _) = alg_r.expect(0x06)?;
-
-    let ec_oid = &der::oid(&[1, 2, 840, 10045, 2, 1])[2..];
-    let ed_oid = &der::oid(&[1, 3, 101, 112])[2..];
-    if alg_oid == ec_oid {
-        let (params, _) = alg_r.expect(0x06).map_err(|_| parse_err())?;
-        let curve = der::tlv(0x06, params);
-        let mut inner = Reader::new(key_octets);
-        let (ec_seq, _) = inner.expect(0x30)?;
-        let mut inner = Reader::new(ec_seq);
-        let (version, _) = inner.expect(0x02)?;
-        if version != [1] {
-            return Err("x509: unknown EC private key version".to_string());
-        }
-        let (scalar, _) = inner.expect(0x04)?;
-        ec_key_from_scalar(&curve, scalar)
-    } else if alg_oid == ed_oid {
-        let mut inner = Reader::new(key_octets);
-        let (seed, _) = inner.expect(0x04)?;
-        let seed: [u8; 32] = seed.try_into().map_err(|_| parse_err())?;
-        Ok(ToolKeyPair::Ed25519(seed))
-    } else {
-        Err(parse_err())
+/// Parse a private key from its DER as Go's `tls.X509KeyPair` does,
+/// whatever PEM label it came under: PKCS#8, then PKCS#1, then SEC 1, with
+/// Go's "tls: failed to parse private key: " and the PKCS#8 parser's error
+/// for a key none of them reads (`crypto/tls/tls.go:361-379`), through the
+/// TLS provider's reader.  The keys Go loads that gencerts does not issue
+/// with are refused with words of the port's own: RSA
+/// ([`RSA_CA_KEY_REFUSED`]), and P-224 and ML-DSA, with the provider's.
+pub fn parse_private_key(key_der: &[u8]) -> Result<ToolKeyPair, String> {
+    match parse_go_private_key(key_der) {
+        Ok(ParsedKey::EcdsaP256(key)) => Ok(ToolKeyPair::P256(key)),
+        Ok(ParsedKey::EcdsaP384(key)) => Ok(ToolKeyPair::P384(key)),
+        Ok(ParsedKey::EcdsaP521(key)) => Ok(ToolKeyPair::P521(key)),
+        Ok(ParsedKey::Ed25519(seed)) => Ok(ToolKeyPair::Ed25519(*seed)),
+        Ok(ParsedKey::Rsa) => Err(RSA_CA_KEY_REFUSED.to_string()),
+        Err(refused) => Err(refused.to_string()),
     }
 }
+
+/// `rsaEncryption`, `id-ecPublicKey`, `id-Ed25519` and `id-ml-dsa-44`, -65
+/// and -87: the public key algorithms whose keys Go's `tls.X509KeyPair`
+/// pairs with a private key (`crypto/tls/tls.go:318-353`).
+const PAIRED_ALGORITHMS: [&[u8]; 6] = [
+    &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01],
+    EC_PUBLIC_KEY,
+    ED25519,
+    &[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x03, 0x11],
+    &[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x03, 0x12],
+    &[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x03, 0x13],
+];
+/// `id-ecPublicKey`, 1.2.840.10045.2.1.
+const EC_PUBLIC_KEY: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01];
+/// `id-Ed25519`, 1.3.101.112.
+const ED25519: &[u8] = &[0x2b, 0x65, 0x70];
 
 /// Load and pair a CA certificate and key (the gencerts slice of Go's
 /// `tls.LoadX509KeyPair`): decode both PEM blocks, extract the fields
-/// issuance needs, parse the private key, and require the key to
-/// match the certificate's public key.
+/// issuance needs, parse the private key ([`parse_private_key`]), and
+/// require the key to be the certificate's, refusing it as Go does when
+/// the certificate's key is of a type Go pairs with none, of another
+/// type, or another key (`crypto/tls/tls.go:318-353`).
 pub fn load_ca_pair(cert_pem: &[u8], key_pem: &[u8]) -> Result<(LoadedCa, ToolKeyPair), String> {
     let (_, cert_der) = pem_decode(cert_pem, &["CERTIFICATE"])
         .ok_or_else(|| "tls: failed to find any PEM data in certificate input".to_string())?;
-    let (block_type, key_der) = pem_decode(key_pem, &["PRIVATE KEY", "EC PRIVATE KEY"])
+    let (_, key_der) = pem_decode(key_pem, &["PRIVATE KEY", "EC PRIVATE KEY"])
         .ok_or_else(|| "tls: failed to find any PEM data in key input".to_string())?;
 
-    let ca = parse_certificate(&cert_der)?;
-    let key = parse_private_key(&block_type, &key_der)?;
+    let (ca, algorithm) = parse_certificate(&cert_der)?;
+    let key = parse_private_key(&key_der)?;
+    let key_algorithm = match key {
+        ToolKeyPair::P256(_) | ToolKeyPair::P384(_) | ToolKeyPair::P521(_) => EC_PUBLIC_KEY,
+        ToolKeyPair::Ed25519(_) => ED25519,
+    };
+    if !PAIRED_ALGORITHMS.contains(&algorithm.as_slice()) {
+        return Err("tls: unknown public key algorithm".to_string());
+    }
+    if algorithm != key_algorithm {
+        return Err("tls: private key type does not match public key type".to_string());
+    }
     if key.public_bytes() != ca.public_bytes {
         return Err("tls: private key does not match public key".to_string());
     }
     Ok((ca, key))
 }
 
-/// Extract the CA fields from a certificate.
-fn parse_certificate(cert_der: &[u8]) -> Result<LoadedCa, String> {
+/// Extract the CA fields from a certificate, and the content of its
+/// public key algorithm's OBJECT IDENTIFIER.
+fn parse_certificate(cert_der: &[u8]) -> Result<(LoadedCa, Vec<u8>), String> {
     let malformed = |_| "x509: malformed certificate".to_string();
     let mut r = Reader::new(cert_der);
     let (cert, _) = r.expect(0x30).map_err(malformed)?;
@@ -866,7 +841,10 @@ fn parse_certificate(cert_der: &[u8]) -> Result<LoadedCa, String> {
 
     // The SPKI bit-string content (skipping the unused-bits byte).
     let mut s = Reader::new(spki);
-    s.expect(0x30).map_err(malformed)?;
+    let (spki_algorithm, _) = s.expect(0x30).map_err(malformed)?;
+    let (algorithm, _) = Reader::new(spki_algorithm)
+        .expect(0x06)
+        .map_err(malformed)?;
     let (bits, _) = s.expect(0x03).map_err(malformed)?;
     let public_bytes = bits.get(1..).unwrap_or_default().to_vec();
 
@@ -907,11 +885,14 @@ fn parse_certificate(cert_der: &[u8]) -> Result<LoadedCa, String> {
         }
     }
 
-    Ok(LoadedCa {
-        raw_subject: subject_raw.to_vec(),
-        subject_key_id,
-        not_after_unix,
-        cert_sign,
-        public_bytes,
-    })
+    Ok((
+        LoadedCa {
+            raw_subject: subject_raw.to_vec(),
+            subject_key_id,
+            not_after_unix,
+            cert_sign,
+            public_bytes,
+        },
+        algorithm.to_vec(),
+    ))
 }

@@ -969,10 +969,7 @@ fn serves_tls_with_a_p521_certificate() {
         .as_ref()
         .to_vec();
     let key_der = PrivateKeyDer::from_pem_slice(&key_pem).expect("parse key");
-    let verifying_key = match dcroxide_certgen::gentool::parse_private_key(
-        "EC PRIVATE KEY",
-        key_der.secret_der(),
-    ) {
+    let verifying_key = match dcroxide_certgen::gentool::parse_private_key(key_der.secret_der()) {
         Ok(dcroxide_certgen::gentool::ToolKeyPair::P521(key)) => *key.verifying_key(),
         _ => panic!("the generated key is P-521"),
     };

@@ -401,6 +401,7 @@ name = "dcroxide-certgen"
 version = "0.1.0"
 dependencies = [
  "dcroxide-dcrec",
+ "dcroxide-tlscrypto",
  "getrandom 0.4.3",
  "p256",
  "p384",

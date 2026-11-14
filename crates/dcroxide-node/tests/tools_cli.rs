@@ -313,3 +313,36 @@ fn gencerts_authority_issues_a_working_tls_chain() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A CA key none of Go's parsers reads is refused as dcrd's gencerts
+/// refuses it (`cmd/gencerts/gencerts.go:140-143`): "open CA keypair: ",
+/// then `tls.X509KeyPair`'s "tls: failed to parse private key: " and the
+/// PKCS#8 parser's error, and exit 1.
+#[test]
+fn gencerts_refuses_an_unreadable_ca_key_with_gos_cause() {
+    let dir = scratch("gencerts-ca-key");
+    let path = |name: &str| dir.join(name).to_string_lossy().into_owned();
+    let (ca_cert, ca_key) = (path("ca.pem"), path("ca.key"));
+    let (_, stderr, code) = run_gencerts(&["-S", "-o", "test-ca", &ca_cert, &ca_key]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+
+    // "not a key", in base64.
+    std::fs::write(
+        &ca_key,
+        "-----BEGIN PRIVATE KEY-----\nbm90IGEga2V5\n-----END PRIVATE KEY-----\n",
+    )
+    .expect("write the key");
+    let (leaf_cert, leaf_key) = (path("leaf.pem"), path("leaf.key"));
+    let (_, stderr, code) = run_gencerts(&["-C", &ca_cert, "-K", &ca_key, &leaf_cert, &leaf_key]);
+    assert_eq!(code, 1);
+    assert_eq!(
+        stderr,
+        "open CA keypair: tls: failed to parse private key: asn1: structure error: tags don't \
+         match (16 vs {class:1 tag:14 length:111 isCompound:true}) {optional:false \
+         explicit:false application:false private:false defaultValue:<nil> tag:<nil> \
+         stringType:0 timeType:0 set:false omitEmpty:false} pkcs8 @2\n"
+    );
+    assert!(!std::path::Path::new(&leaf_cert).exists());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

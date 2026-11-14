@@ -29,6 +29,8 @@
 //! provider's own for the keys it does not sign with: an RSA key, whether
 //! or not Go loads it, and the P-224 and ML-DSA keys Go loads.  The
 //! secrets are wiped when the last handshake holding them drops them.
+//! [`parse_go_private_key`] reads a key the same way for a caller that
+//! signs with it on its own, `gencerts` with its CA key.
 
 use core::fmt;
 use std::sync::Arc;
@@ -43,7 +45,8 @@ use rustls::{Error, SignatureAlgorithm, SignatureScheme};
 use sha2::{Digest, Sha512};
 use zeroize::{Zeroize, Zeroizing};
 
-use crate::keys::{self, ParsedKey};
+pub use crate::keys::ParsedKey;
+use crate::keys::{self, KeyError};
 use crate::rand::ProcessRng;
 
 /// Go's `tls.X509KeyPair` key parsing, less RSA: the key provider whose
@@ -82,6 +85,29 @@ pub fn key_algorithm(der: &[u8]) -> Option<KeyAlgorithm> {
         ParsedKey::Ed25519(_) => KeyAlgorithm::Ed25519,
         ParsedKey::Rsa => KeyAlgorithm::Rsa,
     })
+}
+
+/// Why [`parse_go_private_key`] refused a key, which prints as the text
+/// [`load_der`] refuses it with.
+#[derive(Debug, PartialEq, Eq)]
+pub struct KeyRefused(KeyError);
+
+impl fmt::Display for KeyRefused {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl std::error::Error for KeyRefused {}
+
+/// Go's `parsePrivateKey` on raw DER, whatever PEM label it came under,
+/// for a caller that makes its own signatures with the key: `gencerts`,
+/// whose CA pair dcrd opens with `tls.LoadX509KeyPair`.  The key, an RSA
+/// key read for its structure alone, or the refusal [`load_der`] gives:
+/// Go's text for a key Go refuses, and this crate's for the P-224 and
+/// ML-DSA keys Go loads.
+pub fn parse_go_private_key(der: &[u8]) -> Result<ParsedKey, KeyRefused> {
+    keys::parse(der).map_err(KeyRefused)
 }
 
 /// Go's `parsePrivateKey` on raw DER, whatever PEM label it came under:

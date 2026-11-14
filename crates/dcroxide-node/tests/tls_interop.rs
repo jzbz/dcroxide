@@ -337,11 +337,7 @@ impl Pair {
             .as_ref()
             .to_vec();
         let key = PrivateKeyDer::from_pem_slice(&key_pem).expect("a key");
-        let label = match key {
-            PrivateKeyDer::Sec1(_) => "EC PRIVATE KEY",
-            _ => "PRIVATE KEY",
-        };
-        let key_pkcs8 = gentool::parse_private_key(label, key.secret_der())
+        let key_pkcs8 = gentool::parse_private_key(key.secret_der())
             .and_then(|key| key.marshal_pkcs8())
             .expect("a key gencerts reads");
         Pair {

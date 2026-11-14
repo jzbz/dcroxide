@@ -10,6 +10,12 @@ repository.workspace = true
 
 [dependencies]
 dcroxide-dcrec = { path = "../dcroxide-dcrec" }
+# The CA key gencerts opens is read by the TLS provider's port of Go's
+# `parsePrivateKey`, as dcrd's `tls.LoadX509KeyPair` reads it, with Go's
+# texts (`gentool::parse_private_key`).  A path dependency, which adds no
+# package: this crate now builds rustls and the provider's crates, which
+# the node, its one user, links already.
+dcroxide-tlscrypto = { path = "../dcroxide-tlscrypto" }
 getrandom = "0.4"
 p256 = { version = "0.14", default-features = false, features = ["ecdsa", "sha256", "std"] }
 p384 = { version = "0.14", default-features = false, features = ["ecdsa", "sha384", "std"] }
@@ -18,6 +24,7 @@ sha2 = { version = "0.11", default-features = false }
 
 [dev-dependencies]
 dcroxide-testutil = { path = "../dcroxide-testutil" }
+serde_json = "1"
 
 [lints]
 workspace = true

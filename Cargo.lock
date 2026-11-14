@@ -460,10 +460,12 @@ version = "0.1.0"
 dependencies = [
  "dcroxide-dcrec",
  "dcroxide-testutil",
+ "dcroxide-tlscrypto",
  "getrandom 0.4.3",
  "p256",
  "p384",
  "p521",
+ "serde_json",
  "sha2",
 ]
 
