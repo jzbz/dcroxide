@@ -66,17 +66,29 @@
 //!   clock and the measurement see a leak at all.  Its leak is far larger
 //!   than any a target looks for, so finding it says nothing of a run's
 //!   power.
-//! * **Two classes on P-384 that check the check.**  P-384's complete
-//!   failed the nightly arm64 runs of 2026-11-10 and 11-12 on fixed
-//!   classes about 250 ns an operation quicker than the random class,
-//!   n - 1 and n - 2 the first night and the top window alone the second,
-//!   and by then had passed every other 60 s run there (ADR-0015's note
-//!   of 2026-11-12).  P-384's targets time two more classes to tell why: a
-//!   placebo, whose input is the random class's draw under a fixed label
-//!   of its own, which leans only on what the label and not the value
-//!   brings, from the harness or the machine; and n - 2 again, under a
-//!   name of its own, which leans with n - 2 if a lean follows the value.
-//!   Each is compared and judged like any other class.
+//! * **Two classes on P-256 and P-384 that check the check.**  P-384's
+//!   complete failed the nightly arm64 runs of 2026-11-10 and 11-12 on
+//!   fixed classes about 250 ns an operation quicker than the random
+//!   class, n - 1 and n - 2 the first night and the top window alone the
+//!   second, and by then had passed every other 60 s run there (ADR-0015's
+//!   note of 2026-11-12).  P-256's signing by the key failed the nightly
+//!   x86_64 run of 2026-11-13 on the portable backends on n - 2, about 11
+//!   ns an operation quicker than the random class, an offset its earlier
+//!   runs did not show (ADR-0015's note of 2026-11-14).  The targets of
+//!   both curves time two more classes to tell why: a placebo, whose input
+//!   is the random class's draw under a fixed label of its own, which
+//!   leans only on what the label and not the value brings, from the
+//!   harness or the machine; and n - 2 again, under a name of its own,
+//!   which leans with n - 2 if a lean follows the value.  Each is compared
+//!   and judged like any other class.
+//! * **A hedge for each sample in signing by the key.**  The handshake
+//!   signer mixes a hedge it draws for each signature into RFC 6979's
+//!   nonce, and signing by the key draws one for each sample's input, in
+//!   the building and so outside the timed region, the same way for every
+//!   class.  A fixed class fixes the key alone: with the hedge fixed too,
+//!   each fixed class repeated one nonce, and so one r and s, on every
+//!   sample and in every run, and a lean on the key could not be told from
+//!   one on them.  Signing by the nonce times the nonce's own classes.
 //!
 //! The targets are `#[ignore]` tests: they time code, so they run only when
 //! asked, one at a time and in release mode, each for `DCROXIDE_CT_SECONDS`
@@ -103,9 +115,10 @@
 //! exception: an ECDSA target's timed region ends at the signature as r
 //! and s at the field's length each, short of the DER encoding the
 //! provider sends.  The encoding's path and length follow r's and s's
-//! leading bytes.  A fixed class signs the same input on every sample, the
-//! message (and, by the key, the hedge) being fixed, so it repeats one r
-//! and s and always takes one path, where the random class mixes them.
+//! leading bytes.  A fixed nonce, with the message and the key fixed,
+//! makes the same signature on every sample, so it repeats one r and s and
+//! always takes one path, where the random class mixes them, as a fixed key
+//! did while its hedge was fixed.
 //! With the encoding timed, P-256 signing by the nonce failed nightly runs
 //! on differences of a few nanoseconds an operation that followed the
 //! signature's shape and no property of the nonce.  The encoding depends
@@ -846,6 +859,21 @@ fn by_class<I>(
     }
 }
 
+/// The inputs `input` makes, each with a hedge of `len` bytes drawn after
+/// it from the same generator, for every class alike: a fixed class fixes
+/// what `input` makes and not the hedge, which differs from one input to
+/// the next, as the handshake signer's draw does from one signature to
+/// the next.
+fn with_hedge<I>(
+    mut input: impl FnMut(Option<usize>, &mut SplitMix64) -> I,
+    len: usize,
+) -> impl FnMut(Option<usize>, &mut SplitMix64) -> (I, Vec<u8>) {
+    move |class, rng| {
+        let made = input(class, rng);
+        (made, random_bytes(rng, len))
+    }
+}
+
 /// The label of a placebo class, which has no bytes of its own: its
 /// samples' inputs are drawn as the random class's are ([`by_class`]), so
 /// it can lean only on what its label brings, from the harness or the
@@ -862,6 +890,19 @@ fn time_target<I, R>(
     build: impl FnMut(&[u8]) -> I,
     op: impl FnMut(&mut I) -> R,
 ) -> Report {
+    time_inputs(target, classes, by_class(classes, draw, build), op)
+}
+
+/// Times `op` as the target `target` of fixed classes `classes`, for the
+/// budget [`BUDGET_VAR`] gives, on inputs `input` makes from the sample's
+/// class, `None` for the random class, and the generator the random
+/// class's input is drawn from.
+fn time_inputs<I, R>(
+    target: &str,
+    classes: &[(&'static str, Vec<u8>)],
+    input: impl FnMut(Option<usize>, &mut SplitMix64) -> I,
+    op: impl FnMut(&mut I) -> R,
+) -> Report {
     let value = env::var_os(BUDGET_VAR);
     let value = value.as_deref().map(|value| value.to_string_lossy());
     let seconds = budget_seconds(value.as_deref()).unwrap_or_else(|e| panic!("{e}"));
@@ -871,7 +912,7 @@ fn time_target<I, R>(
         &mut rng,
         seconds * 1_000_000_000,
         classes.len(),
-        by_class(classes, draw, build),
+        input,
         op,
     );
     let names = classes.iter().map(|(name, _)| *name).collect();
@@ -1017,13 +1058,13 @@ fn nist_classes(order: &[u8]) -> Vec<(&'static str, Vec<u8>)> {
     ])
 }
 
-/// The classes `curve`'s targets time: [`nist_classes`], and on P-384 two
-/// more after them that check the check (the module's notes), a placebo
-/// ([`PLACEBO`]) and n - 2 again, under a name of its own.
+/// The classes `curve`'s targets time: [`nist_classes`], and on P-256 and
+/// P-384 two more after them that check the check (the module's notes), a
+/// placebo ([`PLACEBO`]) and n - 2 again, under a name of its own.
 fn nist_target_classes(curve: &Nist) -> Vec<(&'static str, Vec<u8>)> {
     let order = unhex(curve.order);
     let mut classes = nist_classes(&order);
-    if curve.group == NamedGroup::secp384r1 {
+    if [NamedGroup::secp256r1, NamedGroup::secp384r1].contains(&curve.group) {
         classes.push((PLACEBO, Vec::new()));
         classes.push(("n - 2 again", plus(&order, -2)));
     }
@@ -1246,21 +1287,47 @@ const HMAC_MESSAGE: &[u8] = b"tls13 derived";
 /// What the positive control compares with.
 const REFERENCE: [u8; 64] = [0x5a; 64];
 
-/// ECDSA signing on `curve` by the key's extremes, with the message and the
-/// hedge fixed, so that RFC 6979's nonce follows the key as it does in the
-/// handshake signer.  The timed region ends at the signature as r and s,
-/// before the signer's DER encoding.
+/// ECDSA signing on `curve` by the key's extremes, with the message fixed
+/// and a hedge drawn for each sample ([`by_key_inputs`]), so that RFC
+/// 6979's nonce follows the key and the hedge as it does in the handshake
+/// signer, and a fixed class fixes the key alone.  The timed region ends at
+/// the signature as r and s, before the signer's DER encoding.
 fn ecdsa_signing_by_key(target: &str, curve: &Nist) {
-    let order = unhex(curve.order);
-    let hedge = vec![0xa5; order.len()];
-    time_target(
+    let classes = nist_target_classes(curve);
+    time_inputs(
         target,
-        &nist_target_classes(curve),
-        |rng| random_scalar(&order, rng),
-        |scalar| timing::Ecdsa::new(curve.scheme, scalar).expect("a scalar in [1, n)"),
-        |key| key.sign_hedged(MESSAGE, &hedge),
+        &classes,
+        by_key_inputs(curve, &classes),
+        sign_by_key,
     )
     .assert_constant_time();
+}
+
+/// The inputs of signing on `curve` by the key, of the fixed classes
+/// `classes`: the key made from the class's scalar ([`by_class`]), and a
+/// hedge of the field's length drawn for it in the building, outside the
+/// timed region, whatever the class ([`with_hedge`]).
+fn by_key_inputs<'a>(
+    curve: &'a Nist,
+    classes: &'a [(&'static str, Vec<u8>)],
+) -> impl FnMut(Option<usize>, &mut SplitMix64) -> (timing::Ecdsa, Vec<u8>) + 'a {
+    let order = unhex(curve.order);
+    let len = order.len();
+    with_hedge(
+        by_class(
+            classes,
+            move |rng| random_scalar(&order, rng),
+            |scalar| timing::Ecdsa::new(curve.scheme, scalar).expect("a scalar in [1, n)"),
+        ),
+        len,
+    )
+}
+
+/// Signing by the key's timed operation: the input's key signs [`MESSAGE`]
+/// with the input's hedge.
+fn sign_by_key(input: &mut (timing::Ecdsa, Vec<u8>)) -> Vec<u8> {
+    let (key, hedge) = input;
+    key.sign_hedged(MESSAGE, hedge)
 }
 
 /// ECDSA signing on `curve` by the nonce's extremes, with the key fixed:
@@ -2316,6 +2383,36 @@ mod tests {
         );
     }
 
+    /// A hedge is drawn for every input, after it, whatever its class:
+    /// from generators alike, a fixed class's hedge and the placebo's are
+    /// the random class's, and a fixed class's inputs one after another
+    /// keep its value and differ in their hedges.
+    #[test]
+    fn a_hedge_is_drawn_for_every_input_whatever_its_class() {
+        let classes = [("ones", vec![1; 8]), (PLACEBO, Vec::new())];
+        let mut build = with_hedge(
+            by_class(&classes, |rng| random_bytes(rng, 8), <[u8]>::to_vec),
+            16,
+        );
+        let seed = 0x6865_6467_6573_2121;
+        let (mut fixed, mut placebo, mut random) =
+            (SplitMix64(seed), SplitMix64(seed), SplitMix64(seed));
+        let mut hedges = Vec::new();
+        for _ in 0..8 {
+            let (value, hedge) = build(Some(0), &mut fixed);
+            assert_eq!(value, vec![1; 8]);
+            assert_eq!(hedge.len(), 16);
+            let (drawn, random_hedge) = build(None, &mut random);
+            assert_eq!(hedge, random_hedge);
+            assert_eq!(build(Some(1), &mut placebo), (drawn, random_hedge));
+            hedges.push(hedge);
+        }
+        assert!(
+            hedges.windows(2).all(|pair| pair[0] != pair[1]),
+            "{hedges:02x?}"
+        );
+    }
+
     /// Only the placebo may have no bytes: a fixed class of none under
     /// another label is a mistake, and building its input panics rather
     /// than timing it as a placebo under a value's name.
@@ -2684,19 +2781,19 @@ mod tests {
         }
     }
 
-    /// P-384's targets time [`nist_classes`] and after them a placebo, of
-    /// no bytes, and n - 2 again, n - 2's value under a name of its own;
-    /// P-256's and P-521's time [`nist_classes`] alone.  Every name is its
+    /// P-256's and P-384's targets time [`nist_classes`] and after them a
+    /// placebo, of no bytes, and n - 2 again, n - 2's value under a name of
+    /// its own; P-521's time [`nist_classes`] alone.  Every name is its
     /// own.
     #[test]
-    fn p384s_targets_add_a_placebo_and_n_minus_2_again() {
+    fn p256s_and_p384s_targets_add_a_placebo_and_n_minus_2_again() {
         for curve in [&P256, &P384, &P521] {
             let n = unhex(curve.order);
             let extremes = nist_classes(&n);
             let classes = nist_target_classes(curve);
             assert_eq!(classes[..extremes.len()], extremes, "{:?}", curve.group);
             let added = &classes[extremes.len()..];
-            if curve.group == NamedGroup::secp384r1 {
+            if curve.group != NamedGroup::secp521r1 {
                 let n_minus_2 = class(&classes, "n - 2");
                 assert_eq!(n_minus_2, plus(&n, -2));
                 assert_eq!(added, [(PLACEBO, Vec::new()), ("n - 2 again", n_minus_2)]);
@@ -2793,6 +2890,41 @@ mod tests {
                     "{:?}: {name}",
                     curve.scheme
                 );
+            }
+        }
+    }
+
+    /// Signing by the key fixes the key alone: a fixed class's inputs one
+    /// after another hold its key, each signs with its own hedge, and their
+    /// signatures verify under that key and differ in r, so RFC 6979's
+    /// nonce does not repeat with the class.
+    #[test]
+    fn signing_by_the_key_fixes_the_key_alone() {
+        for curve in [&P256, &P384, &P521] {
+            let name = format!("{:?}", curve.scheme);
+            let classes = nist_target_classes(curve);
+            let n_minus_2 = classes
+                .iter()
+                .position(|(class, _)| *class == "n - 2")
+                .expect("n - 2");
+            let public = exchange_with(curve.group, &classes[n_minus_2].1)
+                .expect("a scalar")
+                .pub_key()
+                .to_vec();
+            let mut build = by_key_inputs(curve, &classes);
+            let len = unhex(curve.order).len();
+            let mut rng = SplitMix64(0x6279_206b_6579_2121);
+            let mut rs: Vec<Vec<u8>> = Vec::new();
+            for _ in 0..4 {
+                let mut input = build(Some(n_minus_2), &mut rng);
+                assert_eq!(input.0.public(), public, "{name}");
+                let signature = sign_by_key(&mut input);
+                let (key, hedge) = &input;
+                assert_eq!(signature, key.sign_hedged(MESSAGE, hedge), "{name}");
+                assert!(ecdsa_verifies(curve.scheme, &public, &signature), "{name}");
+                let r = signature[..len].to_vec();
+                assert!(!rs.contains(&r), "{name}: r repeats");
+                rs.push(r);
             }
         }
     }

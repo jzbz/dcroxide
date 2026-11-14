@@ -882,10 +882,10 @@ pub(crate) fn ml_dsa_signed_with<P: MlDsaSet>(
 /// The timing check's hold on the signing keys (`crate::ct_check`,
 /// ADR-0015 T10), which must choose the secret each signature is made
 /// with: a key made from a secret the check picks, signing through this
-/// module's own code with the hedge or the nonce fixed.  An ECDSA
-/// signature comes back as r and s at their fixed size, not in DER: the
-/// encoding depends only on the public signature, but its path differs
-/// with r's and s's leading bytes, which a fixed class repeats.  The
+/// module's own code with the hedge or the nonce the check hands in.  An
+/// ECDSA signature comes back as r and s at their fixed size, not in DER:
+/// the encoding depends only on the public signature, but its path differs
+/// with r's and s's leading bytes, which a fixed nonce repeats.  The
 /// curves' trait and the key types stay private to this module; these two
 /// types hold them for the check.
 #[cfg(test)]

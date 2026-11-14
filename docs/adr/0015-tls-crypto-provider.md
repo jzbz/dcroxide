@@ -772,6 +772,17 @@ those runs.
   of n - 2 leaning together show that a lean follows the value. Each
   fixed class's share of P-384's samples falls from 1/24 to 1/28. The
   thresholds, the floor and the budgets are unchanged.)*
+  *(2026-11-14: P-256's four targets time the same two classes, built the
+  same way, and signing by the key on all three curves draws its hedge for
+  each sample, outside the timed region, so that a fixed class fixes the
+  key alone and not RFC 6979's nonce, r and s with it. P-256 signing by
+  the key failed the x86_64 nightly run of 2026-11-13 on the portable
+  backends on n - 2, about 11 ns an operation quicker than the random
+  class, an offset its earlier runs did not show; with the hedge fixed,
+  that target could not tell a lean on the key from one on the nonce or
+  the signature. Each fixed class's share of P-256's samples falls from
+  1/24 to 1/28. The thresholds, the floor and the budgets are
+  unchanged.)*
 - **The workflow,** `.github/workflows/constant-time.yml`, on pushes to
   `master` and pull requests that touch `crates/dcroxide-tlscrypto/**`,
   `crates/dcroxide-testutil/**`, `crates/dcroxide-crypto/**` (a normal
