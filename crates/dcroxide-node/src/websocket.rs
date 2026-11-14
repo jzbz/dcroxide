@@ -1208,7 +1208,7 @@ fn serve_ws_reads<S: Read + Write>(
         // teardown and is still selecting on the context when
         // `conn.serve` fires `w.cancelCtx()` after `ServeHTTP` returns --
         // unconditionally, before the `c.hijacked()` check
-        // (`net/http/server.go:2137-2140`).
+        // (`net/http/server.go:2157-2160`).
         //
         // This loop dispatches synchronously, so while a request runs
         // nothing is reading and a hangup cannot be noticed at all.  That

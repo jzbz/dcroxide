@@ -8,9 +8,9 @@
 //! but for ML-DSA's, which are TLS 1.3's alone.  For P-256
 //! and P-384 that is ring's choice (`:284-294`).  For P-521, which ring
 //! cannot sign with, it is `ECDSA_NISTP521_SHA512`, the scheme Go offers
-//! by default (`crypto/tls/defaults.go:52`) and the one its TLS 1.3 picks
-//! for a P-521 key (`crypto/tls/auth.go:208-209`); in TLS 1.2 Go signs
-//! with the first ECDSA scheme the peer lists (`:193-201`, `:263-267`),
+//! by default (`crypto/tls/defaults.go:63`) and the one its TLS 1.3 picks
+//! for a P-521 key (`crypto/tls/auth.go:226-227`); in TLS 1.2 Go signs
+//! with the first ECDSA scheme the peer lists (`:211-219`, `:292-296`),
 //! which PARITY.md records.  RSA keys are read and refused (ADR-0015, T6).
 //!
 //! * ECDSA signs with the curve's own hash, SHA-256, SHA-384 or SHA-512,

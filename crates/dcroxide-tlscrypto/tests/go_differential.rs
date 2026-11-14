@@ -334,7 +334,7 @@ fn go_type(algorithm: KeyAlgorithm) -> &'static str {
 /// which signs with no RSA key, reads their structure alone and refuses
 /// them with its own text.  Go loads the key with an additional prime: a
 /// key of more than two primes is checked through N, E and D alone
-/// (`crypto/rsa/rsa.go:571-572`, `:610-617`).
+/// (`crypto/rsa/rsa.go:590-591`, `:629-636`).
 const RSA_GO_REFUSES: &[&str] = &[
     "RSA, PKCS#1, a CRT exponent wrong",
     "RSA, PKCS#1, P negative",

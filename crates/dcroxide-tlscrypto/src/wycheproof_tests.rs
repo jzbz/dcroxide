@@ -693,7 +693,7 @@ const ACCEPTABLE_SIG: [(&str, Expect, &str); 3] = [
         "the DigestInfo of PKCS#1 v1.5 carries NULL parameters, and ring and Go \
          build the whole encoding with them and compare it \
          (`ring-0.17.14/src/rsa/padding/pkcs1.rs:51-93`, \
-         `crypto/internal/fips140/rsa/pkcs1v15.go:120-126`)",
+         `crypto/internal/fips140/rsa/pkcs1v15.go:126-132`)",
     ),
     (
         "SmallOrderPublicKey",

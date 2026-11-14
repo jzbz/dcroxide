@@ -2551,7 +2551,7 @@ fn the_first_authorization_header_decides() {
 /// (`rpcserver.go:5941`), so Go flushes the response in
 /// `finishRequest` and only then closes the body, and `body.Close`
 /// reads nothing at all when the request was closing
-/// (`net/http/transfer.go:996-998`).  Draining first instead means the
+/// (`net/http/transfer.go:1016-1018`).  Draining first instead means the
 /// handshake watchdog shuts the socket down before the 401 is written
 /// and the client is answered with silence.
 ///
@@ -2588,7 +2588,7 @@ fn an_undelivered_body_does_not_swallow_the_401() {
 }
 
 /// Every error dcrd's connection loop writes carries `errorHeaders`
-/// (`net/http/server.go:2064`) -- text/plain, no `Content-Length` --
+/// (`net/http/server.go:2084`) -- text/plain, no `Content-Length` --
 /// and a body that is the bare status text, never the server's own
 /// diagnosis.  Answering these as `application/json` mislabels them for
 /// every client that inspects the type.
@@ -2618,7 +2618,7 @@ fn connection_level_errors_are_go_shaped() {
         "the body is the status text, with no reason echoed: {response:?}"
     );
 
-    // A head past the cap is 431, not 400 (`server.go:2067-2076`).
+    // A head past the cap is 431, not 400 (`server.go:2087-2096`).
     // The *shape* is Go's; the threshold is not -- dcroxide caps at
     // `MAX_HEAD_SIZE` (8 KiB) where Go's default is a megabyte, so a
     // 9000-byte head that dcrd serves 200 is refused here.  That is a
@@ -2662,7 +2662,7 @@ fn connection_level_errors_are_go_shaped() {
 
 /// Go's silence is narrower than "the client went away".  A close
 /// before any byte arrives is `io.EOF`, which `isCommonNetReadError`
-/// forgives (`net/http/server.go:1915-1926`, used at `:2090-2091`), but
+/// forgives (`net/http/server.go:1935-1946`, used at `:2110-2111`), but
 /// a close *after* the head has started is rewritten to
 /// `io.ErrUnexpectedEOF` (`request.go:1108-1112`), which is not in that
 /// set and falls through to the bare 400.  So does a close inside a
@@ -2718,7 +2718,7 @@ fn transfer_encoding_outranks_the_version_gate() {
 
 /// An HTTP/1.1 request must name a host, and Go renders the reason into
 /// the status line as well as the body (`server.go:1069-1073` through
-/// the `statusError` arm at `:2094-2096`).  A second Host is refused
+/// the `statusError` arm at `:2114-2116`).  A second Host is refused
 /// outright (`request.go:1160-1162`).
 #[test]
 fn the_host_header_is_required_and_singular() {

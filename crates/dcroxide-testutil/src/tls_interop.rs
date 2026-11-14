@@ -20,12 +20,12 @@ use crate::{Oracle, REFERENCE_GO, hex, oracle_or_skip_with_env, require_referenc
 /// The `GODEBUG` the TLS interop tests run the oracle under: dcrd's
 /// settings at the parity pin, whose `debug.go` sets `//go:debug
 /// default=go1.26`, for the four crypto, `crypto/tls` and `crypto/x509`
-/// settings among the eight whose defaults differ from those of the oracle
-/// module's `go 1.24.0` line (Go 1.26.2's `internal/godebugs/table.go:32`,
-/// `:69`, `:70`, `:80`; the other four, `:31`, `:34`, `:72` and `:74`, are
-/// the runtime's and `net/url`'s).  With `tlssecpmlkem=1` Go's default key
-/// exchanges are dcrd's, the three hybrids first
-/// (`crypto/tls/defaults.go:29-33`); `tlssha1=0` drops SHA-1 from Go's
+/// settings among the nine whose defaults differ from those of the oracle
+/// module's `go 1.24.0` line (Go 1.27.3's `internal/godebugs/table.go:31`,
+/// `:66`, `:67`, `:79`; the other five, `:30`, `:33`, `:50`, `:72` and
+/// `:74`, are the runtime's, `net/http`'s and `net/url`'s).  With
+/// `tlssecpmlkem=1` Go's default key exchanges are dcrd's, the three hybrids
+/// first (`crypto/tls/defaults.go:23-43`); `tlssha1=0` drops SHA-1 from Go's
 /// TLS 1.2 signature schemes; `x509sha256skid=1` and `cryptocustomrand=0`
 /// are how dcrd makes certificates and draws randomness for them.  The
 /// other oracle tests keep the module's defaults.  The oracle's own TLS
@@ -345,9 +345,9 @@ impl ClientCertRefusal {
     /// The error Go's client reports for the refusal in `version`, `"TLS
     /// 1.3"` or `"TLS 1.2"`, under the reference Go.  In TLS 1.3 Go's
     /// client sends no certificate it cannot sign with under a scheme the
-    /// CertificateRequest lists (`crypto/tls/handshake_client.go:1264-1278`),
+    /// CertificateRequest lists (`crypto/tls/handshake_client.go:1274-1288`),
     /// and a P-521 key signs with ecdsa_secp521r1_sha512 alone
-    /// (`auth.go:203-209`), which ring's set lacks, so the server finds no
+    /// (`auth.go:221-227`), which ring's set lacks, so the server finds no
     /// certificate and says it requires one; every other refusal is of a
     /// certificate or signature the server cannot verify, a decrypt_error
     /// alert in rustls (`rustls-0.23.46/src/error.rs:647-651`).

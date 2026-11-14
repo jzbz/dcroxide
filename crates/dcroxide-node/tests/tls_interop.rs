@@ -148,7 +148,7 @@ const RSA_RPC_KEY_SERVED: bool = false;
 /// switch too, in ring's words, and refuses them now as every RSA key.
 /// Go's server, as dcrd's, serves each to Go's client, which takes a
 /// server key of up to 8192 bits
-/// (`crypto/tls/handshake_client.go:1085-1112`).
+/// (`crypto/tls/handshake_client.go:1091-1118`).
 const RSA_KEYS_RING_REFUSED: [&str; 3] = ["rsa1024", "rsa8192", "rsa2048-e3"];
 
 /// What the listener refuses every RSA key with (ADR-0015, T6), the
@@ -239,7 +239,7 @@ fn reference(
 /// Go's bytes are still unread there, its system sends a reset; a system
 /// that throws away what it has received when a reset arrives, as Go's
 /// `net/http` says of BSD systems and suspects of Windows
-/// (`net/http/server.go:1759-1764`), then shows Go the reset and not the
+/// (`net/http/server.go:1815-1820`), then shows Go the reset and not the
 /// alert.  On Linux, where these tests have run, the alert arrives, and
 /// Go's words are held to the reference Go's; elsewhere a reset passes
 /// too.

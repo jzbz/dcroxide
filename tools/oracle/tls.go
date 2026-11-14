@@ -99,7 +99,7 @@ func tlsDecode(data []byte, v any) error {
 // tlsCipherSuites are the suites tls.CipherSuiteName gives names, insecure
 // ones included, or none, crypto/tls's default, for an empty list. A TLS
 // 1.3 suite is refused: crypto/tls offers and takes its own TLS 1.3 suites
-// whatever Config.CipherSuites lists (crypto/tls/common.go:715-716), so
+// whatever Config.CipherSuites lists (crypto/tls/common.go:730-731), so
 // naming one would configure nothing while the answer said it had.
 func tlsCipherSuites(names []string) ([]uint16, error) {
 	if len(names) == 0 {
@@ -121,19 +121,20 @@ func tlsCipherSuites(names []string) ([]uint16, error) {
 }
 
 // tlsCurves are the key exchanges the TLS commands name by CurveID's
-// String: Go 1.26.2's default list, in its order
-// (crypto/tls/defaults.go:29-33).
+// String: Go's default list from Go 1.26 on (tlssecpmlkem=1), in its order
+// (crypto/tls/defaults.go:23-43).
 var tlsCurves = []tls.CurveID{
 	tls.X25519MLKEM768, tls.SecP256r1MLKEM768, tls.SecP384r1MLKEM1024,
 	tls.X25519, tls.CurveP256, tls.CurveP384, tls.CurveP521,
 }
 
 // tlsCurvePreferences are the key exchanges names name, or none,
-// crypto/tls's default list, for an empty list. crypto/tls keeps a
-// configured key exchange only if its default list has it, and in that
-// list's order (crypto/tls/common.go:1270-1286), so the hybrids
-// SecP256r1MLKEM768 and SecP384r1MLKEM1024 take effect only under
-// GODEBUG=tlssecpmlkem=1, which this module's go 1.24 line turns off.
+// crypto/tls's default list, for an empty list. crypto/tls keeps each
+// configured key exchange it implements, whether or not its default list
+// has it, and offers them in its own fixed order
+// (crypto/tls/common.go:1281-1308): GODEBUG=tlssecpmlkem=0, which this
+// module's go 1.24 line sets, drops the hybrids SecP256r1MLKEM768 and
+// SecP384r1MLKEM1024 from the default list only (defaults.go:23-34).
 func tlsCurvePreferences(names []string) ([]tls.CurveID, error) {
 	if len(names) == 0 {
 		return nil, nil
@@ -580,7 +581,7 @@ func tlsDialOnce(addr string, config *tls.Config, req *http.Request, deadline ti
 }
 
 // tlsClientHello is a ClientHello as a crypto/tls server's
-// ClientHelloInfo shows it (crypto/tls/common.go:435-496): the cipher
+// ClientHelloInfo shows it (crypto/tls/common.go:444-508): the cipher
 // suites, groups, signature schemes and versions by Go's names, in the
 // client's order, and the extensions' code points in wire order. A client
 // that sends no supported_versions extension gets the versions Go infers
@@ -656,7 +657,7 @@ var (
 // timeout, after which the listener is closed whether or not a client
 // came. The server's ClientHelloInfo is taken in GetConfigForClient, which
 // crypto/tls calls for the first ClientHello alone
-// (crypto/tls/handshake_server.go:167-174), and changes nothing.
+// (crypto/tls/handshake_server.go:166-176), and changes nothing.
 func tlsListen(data []byte) response {
 	var in struct {
 		tlsIdentity

@@ -13,7 +13,7 @@
 //!   minimally encoded; each length in the short form or in the long form
 //!   of one or two bytes, itself minimal.  Go's `crypto/x509` reads the
 //!   SEQUENCE more leniently, ignoring bytes after E and after the SEQUENCE
-//!   (`crypto/x509/parser.go:261-271`), so such a key verifies in Go and is
+//!   (`crypto/x509/parser.go:321-331`), so such a key verifies in Go and is
 //!   refused here, as ring refused it.
 //! * The modulus is odd and at least 256 bytes long, so 2041- to 2047-bit
 //!   moduli pass, as they do in ring, and at most 8192 bits
@@ -21,7 +21,7 @@
 //!   the exponent is odd, at least 3 and at most 2^33 - 1, in at most five
 //!   bytes (`public_exponent.rs:27-75`).  Go takes moduli from 1024 bits up
 //!   with no greatest length, and exponents up to 2^31 - 1
-//!   (`crypto/rsa/rsa.go:284-300`,
+//!   (`crypto/rsa/rsa.go:290-306`,
 //!   `crypto/internal/fips140/rsa/rsa.go:326-364`).  [`RING_LIMITS`] holds
 //!   ring's bounds until Go's arrive with Go's client-certificate set
 //!   (ADR-0015, T4).
@@ -36,7 +36,7 @@
 //!   hash and a salt as long as the hash, the one length TLS signs with
 //!   (RFC 8446 §4.2.3) and the one ring and Go's `crypto/tls` take
 //!   (`padding/pss.rs:102-191`; `rsa.PSSSaltLengthEqualsHash`,
-//!   `crypto/tls/auth.go:58`).
+//!   `crypto/tls/auth.go:70`).
 //!
 //! Key, message and signature are public, so the arithmetic runs in
 //! variable time: `num-bigint`'s `modpow`, which takes Montgomery

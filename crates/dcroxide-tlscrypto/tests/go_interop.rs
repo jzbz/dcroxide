@@ -13,7 +13,7 @@
 //!
 //! - TLS 1.3, each of the three suites, forced on the server, since a Go
 //!   client always offers all three in its own order
-//!   (`crypto/tls/handshake_client.go:128-139`), by each of the four
+//!   (`crypto/tls/handshake_client.go:129-140`), by each of the four
 //!   groups, the client's `curve_preferences` cut to it, by each server
 //!   key, P-256, P-384, P-521 and Ed25519: 48 cells.  TLS 1.2, each
 //!   ECDHE-ECDSA suite, both sides cut to it, by the same groups and keys:
@@ -303,7 +303,7 @@ fn bounded(tcp: &TcpStream) -> io::Result<()> {
 /// it closes, for about [`LINGER`].  A socket closed with data it has not
 /// read sends a reset, and a stack that throws away what it has received
 /// when a reset arrives, as Go's `net/http` says of BSD systems and
-/// suspects of Windows (`net/http/server.go:1759-1764`), would show the
+/// suspects of Windows (`net/http/server.go:1815-1820`), would show the
 /// peer the reset in place of the alert, which the refused cells compare.
 /// Go's client writes its request as soon as its TLS 1.3 handshake is
 /// done, before a server refuses its certificate.
@@ -631,8 +631,8 @@ fn refusal_error(refusal: ClientCertRefusal, version: Version) -> Error {
         // list lacks (`ClientCertRefusal::go_error`).
         (ClientCertRefusal::P521Key, "TLS 1.3") => Error::NoCertificatesPresented,
         // In TLS 1.2 an ECDSA scheme names no curve
-        // (`crypto/tls/auth.go:194-200`) and Go signs with the first the
-        // server lists (`:261-267`), ECDSA with SHA-384, which the
+        // (`crypto/tls/auth.go:212-218`) and Go signs with the first the
+        // server lists (`:290-296`), ECDSA with SHA-384, which the
         // provider takes from a P-256 or P-384 key alone.
         (ClientCertRefusal::P521Key, _) => Error::InvalidCertificate(
             CertificateError::UnsupportedSignatureAlgorithmForPublicKeyContext {

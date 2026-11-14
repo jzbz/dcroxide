@@ -91,7 +91,7 @@ pub const ALGORITHMS: [(&str, &str); 14] = [
 pub const GO_DIFFERS: [(&str, &str); 5] = [
     (
         "rsa-modulus-1024",
-        "Go takes RSA keys from 1024 bits (`crypto/rsa/rsa.go:284-300`); ring's least is \
+        "Go takes RSA keys from 1024 bits (`crypto/rsa/rsa.go:290-306`); ring's least is \
          256 whole bytes",
     ),
     (
@@ -111,7 +111,7 @@ pub const GO_DIFFERS: [(&str, &str); 5] = [
     (
         "rsa-key-trailing-data",
         "Go reads the RSAPublicKey's SEQUENCE and its two INTEGERs and ignores what \
-         follows each (`crypto/x509/parser.go:261-271`); ring refuses anything after them",
+         follows each (`crypto/x509/parser.go:321-331`); ring refuses anything after them",
     ),
 ];
 

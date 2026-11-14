@@ -5,9 +5,9 @@
 //! seed) and for every ephemeral key the key exchanges draw.
 //!
 //! Go's `crypto/tls` reads its standard library's `crypto/rand` for all of
-//! these (`Config.rand`, `crypto/tls/common.go:1167-1173`; the ephemeral
+//! these (`Config.rand`, `crypto/tls/common.go:1179-1185`; the ephemeral
 //! keys at `handshake_server_tls13.go:254` and `key_agreement.go:173`,
-//! `:312`), not dcrd's package generator, and ring's provider read the
+//! `:316`), not dcrd's package generator, and ring's provider read the
 //! kernel for them too (`rustls-0.23.46/src/crypto/ring/mod.rs:37`).
 //! Not the process-wide generator of `dcroxide_crypto::rand` either, for a
 //! reason of its own: an ephemeral scalar is the session's whole secret,

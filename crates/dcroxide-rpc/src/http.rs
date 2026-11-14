@@ -691,7 +691,7 @@ mod tests {
         );
     }
 
-    /// Go ignores a null for a string field (`decode.go:907`, "ignore
+    /// Go ignores a null for a string field (`decode.go:908`, "ignore
     /// null for primitives/string"), so an earlier duplicate key's value
     /// survives.  The port overwrote it with the empty string, turning a
     /// runnable request into "Invalid request: malformed".  Outputs from

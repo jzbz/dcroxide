@@ -126,7 +126,7 @@ pub static DEFAULT_KX_GROUPS: &[&dyn SupportedKxGroup] =
     &[kx_group::X25519, kx_group::SECP256R1, kx_group::SECP384R1];
 
 /// Every key exchange group this crate implements, in the order of Go's
-/// default preferences (`crypto/tls/defaults.go:29-32`) less the
+/// default preferences (`crypto/tls/defaults.go:23-43`) less the
 /// post-quantum hybrids ahead of them: X25519, P-256, P-384, P-521.
 pub static ALL_KX_GROUPS: &[&dyn SupportedKxGroup] = &[
     kx_group::X25519,

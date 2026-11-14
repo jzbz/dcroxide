@@ -1662,7 +1662,7 @@ func handle(req request) response {
 
 	case "ecdh":
 		// crypto/tls's agreement with a peer's key share
-		// (crypto/tls/key_schedule.go:127-141): the share through the
+		// (crypto/tls/key_schedule.go:157-171): the share through the
 		// curve's NewPublicKey, then ECDH with the local key, here a
 		// given one rather than a generated one.  A private key Go
 		// refuses is an error in the request; a share it refuses, or an
@@ -1771,7 +1771,7 @@ func handle(req request) response {
 		// TLS signature scheme or an x509 signature algorithm, named as
 		// tls.SignatureScheme's and x509.SignatureAlgorithm's String name
 		// them. Ed25519 signs the message itself, unhashed (directSigning,
-		// crypto/tls/auth.go:146), which is ed25519.Sign and deterministic,
+		// crypto/tls/auth.go:162), which is ed25519.Sign and deterministic,
 		// so a caller can compare its own signature byte for byte; ECDSA
 		// signs the digest with ecdsa.SignASN1, and RSA with crypto/rsa's
 		// SignPKCS1v15, or SignPSS with a salt the hash's length. An RSA
@@ -1863,7 +1863,7 @@ func handle(req request) response {
 		// Certificate.CheckSignature, as Go checks a certificate's
 		// signature, or for a TLS signature scheme what
 		// verifyHandshakeSignature does with a handshake's
-		// (crypto/tls/auth.go:22-66): ecdsa.VerifyASN1, ed25519.Verify,
+		// (crypto/tls/auth.go:23-78): ecdsa.VerifyASN1, ed25519.Verify,
 		// rsa.VerifyPKCS1v15, rsa.VerifyPSS with a salt the hash's
 		// length, or, under Go 1.27, mldsa.Verify after Go's TLS 1.3
 		// check that the scheme is the key's own (mldsa.go). A key Go
@@ -1912,7 +1912,7 @@ func handle(req request) response {
 		// exponent "e": primes from crypto/rand.Prime, half the bits each,
 		// each with p - 1 coprime to e, and d = e^-1 mod lcm(p - 1, q - 1),
 		// as crypto/rsa's own generator computes it
-		// (crypto/internal/fips140/rsa/keygen.go:61-79). Unlike
+		// (crypto/internal/fips140/rsa/keygen.go:68-86). Unlike
 		// rsa.GenerateKey it takes any odd e from 3 up, an exponent
 		// crypto/rsa refuses included, and any length from 64 bits, an odd
 		// one included. Run once, to make the caller's fixture.
@@ -2138,7 +2138,7 @@ func signWith(key crypto.Signer, alg sigAlgorithm, message []byte) ([]byte, erro
 	return nil, fmt.Errorf("a key of type %T for this algorithm", key)
 }
 
-// verifyHandshakeSignature is crypto/tls's (crypto/tls/auth.go:22-66) for
+// verifyHandshakeSignature is crypto/tls's (crypto/tls/auth.go:23-78) for
 // a key x509.ParsePKIXPublicKey gave.
 func verifyHandshakeSignature(alg sigAlgorithm, pub crypto.PublicKey, signed, sig []byte) error {
 	signed = digestOf(alg.hash, signed)

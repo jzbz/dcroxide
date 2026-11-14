@@ -4,7 +4,7 @@
 //!
 //! dcrd serves RPC through net/http, whose connection loop logs every
 //! failed handshake as `http: TLS handshake error from <addr>: <err>`
-//! (`net/http/server.go:1985`) to the server's `ErrorLog`, which dcrd
+//! (`net/http/server.go:2005`) to the server's `ErrorLog`, which dcrd
 //! forwards to the RPCS logger at error level (`logForwarder`,
 //! `internal/rpcserver/rpcserver.go:5885-5892`).  The port logged nothing
 //! for any of them.  The `<err>` is Go's own text for each failure here:

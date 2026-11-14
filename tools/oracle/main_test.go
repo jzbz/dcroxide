@@ -1297,7 +1297,7 @@ func TestSigVerify(t *testing.T) {
 		}
 	}
 	// An RSA key whose SubjectPublicKeyInfo lacks the NULL parameters, which
-	// x509.ParsePKIXPublicKey refuses (crypto/x509/parser.go:254-258).
+	// x509.ParsePKIXPublicKey refuses (crypto/x509/parser.go:314-318).
 	spki, err := x509.MarshalPKIXPublicKey(&rsaKey.PublicKey)
 	if err != nil {
 		t.Fatal(err)

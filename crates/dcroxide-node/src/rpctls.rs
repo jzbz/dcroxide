@@ -8,21 +8,21 @@
 //! (`newTLSConfig`, `server.go:3685-3699`; the outer config adds only
 //! `GetConfigForClient`, `:3818-3821`), so every negotiation choice is
 //! Go's default.  Go 1.26.2, the reference Go until the `46e9df48` move
-//! (ADR-0001's 2026-10-26 addendum on the reference Go) and the release
-//! the citations below are read in, makes these choices for that
-//! configuration, and Go 1.27, which built dcrd 2.1.7's published
-//! linux-amd64 binary and is the reference from that move on as
-//! go1.27.3, makes the same ones:
+//! (ADR-0001's 2026-10-26 addendum on the reference Go), makes these
+//! choices for that configuration, and Go 1.27, which built dcrd 2.1.7's
+//! published linux-amd64 binary and is the reference from that move on as
+//! go1.27.3, the release the citations below are read in, makes the same
+//! ones:
 //!
 //! * At `46e9df48`, the parity pin, as on master, dcrd's `debug.go` sets
 //!   `//go:debug default=go1.26`, and a build there offers X25519MLKEM768,
 //!   SecP256r1MLKEM768, SecP384r1MLKEM1024, X25519, P-256, P-384 and
-//!   P-521, in that order (`crypto/tls/defaults.go:29-33`), the hybrids in
+//!   P-521, in that order (`crypto/tls/defaults.go:23-43`), the hybrids in
 //!   TLS 1.3 only.  2.1.7's `debug.go` sets `default=go1.25`, which
 //!   restores Go 1.25's value of every setting changed since,
 //!   `tlssecpmlkem=0` among them (`internal/godebugs/table.go`), so 2.1.7
 //!   offers X25519MLKEM768 alone ahead of the classical groups
-//!   (`defaults.go:26-28`): Go 1.26 added the other two hybrids.
+//!   (`defaults.go:29-30`): Go 1.26 added the other two hybrids.
 //! * In TLS 1.3 it takes the first of those the client supports, after
 //!   moving the groups the client sent a key share for ahead of the rest
 //!   and the hybrids ahead of everything, and asks for a key share with a
@@ -33,9 +33,9 @@
 //!   AES-128-GCM, AES-256-GCM and then ChaCha20-Poly1305 when the machine
 //!   has AES-GCM hardware and the first suite of the client's that Go
 //!   knows is an AES-GCM one, and ChaCha20-Poly1305 first otherwise
-//!   (`defaults.go:61-112`, `cipher_suites.go:283-335`, `:369-406`;
+//!   (`defaults.go:69-118`, `cipher_suites.go:284-336`, `:361-398`;
 //!   applied in TLS 1.3 at `handshake_server_tls13.go:179-197` and in
-//!   TLS 1.2 at `handshake_server.go:396-429`).
+//!   TLS 1.2 at `handshake_server.go:398-422`).
 //!
 //! rustls picks the group, and by default the suite, in the client's
 //! order.  The port closes most of that gap in three parts.  The suites
@@ -61,7 +61,7 @@
 //! TLS 1.2 suite for the key and send `handshake_failure`.
 //!
 //! The handshake runs to completion before the request is read, as
-//! `conn.serve` runs it (`net/http/server.go:1924-1945`), and a failure
+//! `conn.serve` runs it (`net/http/server.go:1976-2007`), and a failure
 //! comes back as the text Go's error would print, for the
 //! `http: TLS handshake error` line the caller logs.
 //!
@@ -88,16 +88,15 @@ const SECP384R1_ID: u16 = 0x0018;
 const SECP521R1_ID: u16 = 0x0019;
 
 /// The key exchanges the RPC server offers, as IANA codes, in Go's
-/// preference order (1.26.2's `defaultCurvePreferences`,
-/// `crypto/tls/defaults.go:30-33`; 1.27's `curvePreferenceOrder` keeps
-/// it) less the post-quantum groups ahead of them, which the build cannot
+/// preference order (`curvePreferenceOrder`, `crypto/tls/defaults.go:38-43`)
+/// less the post-quantum groups ahead of them, which the build cannot
 /// offer.  [`rpc_kx_groups`] holds the implementations in the same order.
 const RPC_KX_GROUP_IDS: [u16; 4] = [X25519_ID, SECP256R1_ID, SECP384R1_ID, SECP521R1_ID];
 
 /// The key exchanges the RPC server offers, in the order of
 /// [`RPC_KX_GROUP_IDS`]: `dcroxide-tlscrypto`'s four, P-521 among them,
-/// which Go's server offers by default (`defaultCurvePreferences`,
-/// `crypto/tls/defaults.go:21-35`) and the provider's default list, kept
+/// which Go's server offers by default (`defaultCurveEnabled`,
+/// `crypto/tls/defaults.go:23-34`) and the provider's default list, kept
 /// to ring's three for the seeders' ClientHello, leaves out.
 ///
 /// Without P-521 a client that offers nothing else gets a
@@ -116,7 +115,7 @@ fn rpc_kx_groups() -> [&'static dyn SupportedKxGroup; 4] {
 
 /// Every TLS 1.0-1.2 cipher suite Go implements, disabled ones included:
 /// the suites `cipherSuiteByID` finds (`cipherSuites`,
-/// `crypto/tls/cipher_suites.go:151-174`), which are the ones
+/// `crypto/tls/cipher_suites.go:152-175`), which are the ones
 /// `isAESGCMPreferred` looks past the unknown ones for.
 const GO_TLS12_SUITE_IDS: [u16; 22] = [
     0xcca8, 0xcca9, 0xc02f, 0xc02b, 0xc030, 0xc02c, 0xc027, 0xc013, 0xc023, 0xc009, 0xc014, 0xc00a,
@@ -124,14 +123,14 @@ const GO_TLS12_SUITE_IDS: [u16; 22] = [
 ];
 
 /// The TLS 1.3 suites Go implements (`cipherSuitesTLS13`,
-/// `cipher_suites.go:213-217`).
+/// `cipher_suites.go:214-218`).
 const GO_TLS13_SUITE_IDS: [u16; 3] = [0x1301, 0x1302, 0x1303];
 
-/// The AES-GCM suites (`aesgcmCiphers`, `cipher_suites.go:379-388`).
+/// The AES-GCM suites (`aesgcmCiphers`, `cipher_suites.go:371-380`).
 const GO_AES_GCM_SUITE_IDS: [u16; 6] = [0xc02f, 0xc030, 0xc02b, 0xc02c, 0x1301, 0x1302];
 
 /// Whether Go would take this machine to have AES-GCM hardware
-/// (`hasAESGCMHardwareSupport`, `crypto/tls/cipher_suites.go:369-377`).
+/// (`hasAESGCMHardwareSupport`, `crypto/tls/cipher_suites.go:361-369`).
 ///
 /// Go asks for AES, PCLMULQDQ, SSE4.1 and SSSE3 on x86 (its check reads
 /// `cpu.X86`, which 386 fills as well as amd64), AES and PMULL on arm64,
@@ -166,7 +165,7 @@ fn go_has_aes_gcm_hardware() -> bool {
     }
 }
 
-/// Go's `isAESGCMPreferred` (`crypto/tls/cipher_suites.go:393-406`): the
+/// Go's `isAESGCMPreferred` (`crypto/tls/cipher_suites.go:385-398`): the
 /// hardware is there, and the first suite in the client's list that Go
 /// knows is an AES-GCM one, which Go reads as the client having the
 /// hardware too.  Suites Go does not know, GREASE and the signalling
@@ -182,8 +181,8 @@ fn go_aes_gcm_preferred(aes_gcm_hardware: bool, client_suites: &[u16]) -> bool {
 /// The suites the RPC server offers, in the order Go's server prefers
 /// them: `defaultCipherSuitesTLS13` and `cipherSuitesPreferenceOrder` when
 /// AES-GCM is preferred, `defaultCipherSuitesTLS13NoAES` and
-/// `cipherSuitesPreferenceOrderNoAES` otherwise (`crypto/tls/defaults.go:92-112`,
-/// `cipher_suites.go:283-335`), less Go's TLS 1.2 CBC suites, which rustls
+/// `cipherSuitesPreferenceOrderNoAES` otherwise (`crypto/tls/defaults.go:98-118`,
+/// `cipher_suites.go:284-336`), less Go's TLS 1.2 CBC suites, which rustls
 /// does not implement.  ECDSA ahead of RSA at each step, as Go lists them;
 /// the certificate decides which half applies.
 fn rpc_cipher_suites(aes_gcm_first: bool) -> Vec<SupportedCipherSuite> {
@@ -503,7 +502,7 @@ impl HelloFacts {
     /// Whether the client offers TLS 1.3, which is when Go and rustls
     /// both negotiate it: both take the highest version they share with
     /// the client's `supported_versions` (`mutualVersion`,
-    /// `crypto/tls/common.go:1294-1302`).
+    /// `crypto/tls/common.go:1312-1320`).
     fn offers_tls13(&self) -> bool {
         self.supported_versions
             .as_ref()
@@ -543,7 +542,7 @@ impl HelloFacts {
     }
 
     /// The versions Go reads the client as offering, for its refusal
-    /// (`readClientHello`, `crypto/tls/handshake_server.go:178-194`): the
+    /// (`readClientHello`, `crypto/tls/handshake_server.go:179-195`): the
     /// `supported_versions` extension, else every version up to
     /// `legacy_version`, capped at TLS 1.2.
     fn go_client_versions(&self) -> Vec<u16> {
@@ -659,7 +658,7 @@ impl HandshakeTap {
 /// plus 2048 (`maxCiphertext`, `crypto/tls/common.go`).
 const MAX_CIPHERTEXT: u16 = 18432;
 
-/// net/http's `tlsRecordHeaderLooksLikeHTTP` (`net/http/server.go:4058-4064`).
+/// net/http's `tlsRecordHeaderLooksLikeHTTP` (`net/http/server.go:4300-4306`).
 fn looks_like_http(header: &[u8; 5]) -> bool {
     matches!(header, b"GET /" | b"HEAD " | b"POST " | b"PUT /" | b"OPTIO")
 }
@@ -668,7 +667,7 @@ fn looks_like_http(header: &[u8; 5]) -> bool {
 #[derive(Debug, PartialEq)]
 enum FirstRecordRefusal {
     /// A plaintext HTTP request, which net/http answers with a 400 on the
-    /// bare connection (`net/http/server.go:1934-1939`).
+    /// bare connection (`net/http/server.go:1996-2001`).
     Http,
     /// Anything else that is not a TLS handshake or alert, refused with
     /// no answer at all.
@@ -869,13 +868,13 @@ fn refuse_tls12(sock: &mut TcpStream, (alert, text): (u8, &'static str)) -> Stri
 
 /// Run an accepted RPC connection's TLS handshake to completion, as Go's
 /// `conn.serve` does before it reads a request
-/// (`net/http/server.go:1924-1945`), under the deadline the connection's
+/// (`net/http/server.go:1976-2007`), under the deadline the connection's
 /// watchdog enforces.
 ///
 /// The ClientHello is read through `rustls::server::Acceptor`, and only
 /// then is `configs` asked for the configurations, which is where dcrd's
 /// `GetConfigForClient` runs (`readClientHello`,
-/// `crypto/tls/handshake_server.go:165-175`), so a client that never sends
+/// `crypto/tls/handshake_server.go:166-176`), so a client that never sends
 /// one does not reach the certificate reload check.
 ///
 /// On failure the error is the text Go's error would print, the `%v` of
@@ -968,7 +967,7 @@ pub(crate) fn handshake(
 const TLS13_ONLY_KEY_REFUSED: &str =
     "tls: ML-DSA certificates require TLS 1.3, but client negotiated TLS 1.2";
 
-/// Go's alert descriptions (`alertText`, `crypto/tls/alert.go:64-99`).
+/// Go's alert descriptions (`alertText`, `crypto/tls/alert.go:66-101`).
 const GO_ALERT_TEXT: [(u8, &str); 34] = [
     (0, "close notify"),
     (10, "unexpected message"),
@@ -1006,7 +1005,7 @@ const GO_ALERT_TEXT: [(u8, &str); 34] = [
     (121, "encrypted client hello required"),
 ];
 
-/// Go's `alert.String` (`crypto/tls/alert.go:101-107`).
+/// Go's `alert.String` (`crypto/tls/alert.go:103-109`).
 fn go_alert(code: u8) -> String {
     match GO_ALERT_TEXT.iter().find(|(known, _)| *known == code) {
         Some((_, text)) => format!("tls: {text}"),

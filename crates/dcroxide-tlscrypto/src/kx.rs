@@ -47,7 +47,7 @@ use crate::rand::kernel_fill;
 
 /// ECDHE over Curve25519 (RFC 7748): the first group ring's provider
 /// offers, and the first Go's offers after its post-quantum hybrids
-/// (`crypto/tls/defaults.go:29-32`).
+/// (`crypto/tls/defaults.go:23-43`).
 pub static X25519: &dyn SupportedKxGroup = &X25519Group;
 
 /// ECDHE over secp256r1 (NIST P-256).
@@ -57,7 +57,7 @@ pub static SECP256R1: &dyn SupportedKxGroup = &NistGroup::<p256::NistP256>(Phant
 pub static SECP384R1: &dyn SupportedKxGroup = &NistGroup::<p384::NistP384>(PhantomData);
 
 /// ECDHE over secp521r1 (NIST P-521), which Go's server offers by default
-/// (`crypto/tls/defaults.go:29-32`) and ring's provider does not
+/// (`crypto/tls/defaults.go:25-26`) and ring's provider does not
 /// (`rustls-0.23.46/src/crypto/ring/mod.rs:180-181`).
 pub static SECP521R1: &dyn SupportedKxGroup = &NistGroup::<p521::NistP521>(PhantomData);
 

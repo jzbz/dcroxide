@@ -4862,9 +4862,9 @@ pub const RSA_RPC_KEY_REFUSED: &str = "the RPC key is an RSA key, and dcroxide s
     curve, P-256 by default; gencerts writes P-256, P-384, P-521 and Ed25519 pairs)";
 
 /// The key block of an `rpc.key` as `tls.X509KeyPair` chooses it
-/// (`crypto/tls/tls.go:294-311`): the first block Go's `pem.Decode` finds
+/// (`crypto/tls/tls.go:286-303`): the first block Go's `pem.Decode` finds
 /// whose type is `PRIVATE KEY` or ends in ` PRIVATE KEY`, whatever its
-/// headers, or Go's text for a file with none (`:298-305`).  So a key
+/// headers, or Go's text for a file with none (`:290-297`).  So a key
 /// under a label of its own ending so is read, one under a label that
 /// runs into `PRIVATE KEY` with no space is skipped, and a first such
 /// block that does not parse, an `ENCRYPTED PRIVATE KEY` among them, is
@@ -5047,7 +5047,7 @@ fn disable_stateful_resumption(config: &mut rustls::ServerConfig) {
     // offers `psk_dhe_ke`. A rustls client offers it whenever it offers
     // TLS1.3 (`client/hs.rs:321-327`). A Go client offers it only when its
     // `tls.Config` has a `ClientSessionCache`
-    // (`crypto/tls/handshake_client.go:352-356`, `:364-368`), which dcrd's
+    // (`crypto/tls/handshake_client.go:357-361`, `:369-373`), which dcrd's
     // `rpcclient` does not set (`infrastructure.go:1234-1237`,
     // `:1265-1267`, v8.1.0); for a client that offers none, rustls
     // prepares no ticket already (`server/tls13.rs:341-349`). Each ticket
@@ -6180,7 +6180,7 @@ impl Drop for PreAuthSlot {
 
 /// Log a refused TLS handshake as dcrd does: net/http writes
 /// `http: TLS handshake error from %s: %v` to the server's `ErrorLog`
-/// (`net/http/server.go:1985`), which dcrd points at a writer that logs
+/// (`net/http/server.go:2005`), which dcrd points at a writer that logs
 /// each line at error level through the RPC server's logger, its trailing
 /// newline trimmed (`logForwarder`, `internal/rpcserver/rpcserver.go:5885-5892`,
 /// installed at `:5938`), and that logger is RPCS (`log.go:96`).
@@ -6683,7 +6683,7 @@ const POST_RESPONSE_DRAIN_LIMIT: usize = 256 << 10;
 /// (`ReadSlice` gives up with `ErrBufferFull` once the buffer holds no
 /// newline, which `readChunkLine` reports as "header line too long")
 /// and the trailer section, whose blank line `seeUpcomingDoubleCRLF`
-/// must find within it (`net/http/transfer.go:906-919`).
+/// must find within it (`net/http/transfer.go:913-926`).
 const CHUNK_BUFFER_SIZE: usize = 4096;
 
 /// `internal/chunked`'s `maxLineLength`, checked against a size line
@@ -6946,7 +6946,7 @@ impl<'a, S: Read + SocketTimeout> ChunkedReader<'a, S> {
     }
 
     /// The trailer after the last chunk, which Go reads with
-    /// `body.readTrailer` (`net/http/transfer.go:921-963`): a bare CRLF
+    /// `body.readTrailer` (`net/http/transfer.go:928-977`): a bare CRLF
     /// is the common case; anything else must bring its terminating
     /// `\r\n\r\n` within the reader's buffer -- the bound on an
     /// unbounded trailer -- and then parse as MIME header fields.  The
@@ -7028,7 +7028,7 @@ fn trim_linear_space(mut s: &[u8]) -> &[u8] {
 }
 
 /// The trailer fields as textproto's `readMIMEHeader` checks them
-/// (`net/textproto/reader.go:523-608`, with `readContinuedLineSlice`
+/// (`net/textproto/reader.go:523-610`, with `readContinuedLineSlice`
 /// folding continuation lines), over a section already known to hold
 /// its blank line.  Returns the bytes consumed through that line.
 fn parse_trailer_fields(section: &[u8]) -> Result<usize, ChunkError> {
@@ -7190,7 +7190,7 @@ fn read_chunked_body<S: Read + SocketTimeout>(
 }
 
 /// Go's `r.Body.Close()` after dcrd's limited read stopped a chunked
-/// body at the limit (`net/http/transfer.go:983-1019`).  The server
+/// body at the limit (`net/http/transfer.go:1003-1039`).  The server
 /// sets `doEarlyClose` on every request body, and a chunked one is not
 /// a `LimitedReader`, so `Close` reads on whatever the request's
 /// `Connection` header says: `io.CopyN(io.Discard, body,
@@ -7278,20 +7278,20 @@ fn body_framing(head: &HttpHead) -> BodyFraming {
 ///
 /// *Order*: Go discards only after the response is flushed --
 /// `finishRequest` writes, then closes the request body
-/// (`server.go:1701-1717`).  Discarding first instead makes a client
+/// (`server.go:1721-1737`).  Discarding first instead makes a client
 /// that declares a `Content-Length` and never sends it wait out the
 /// whole handshake budget, at which point the watchdog shuts the
 /// socket down and the answer is never written at all.  So the answer
 /// goes out first here too.
 ///
 /// *Cap*: `body.Close` gives up without reading a byte when more than
-/// `maxPostHandlerReadBytes` is still declared (`transfer.go:1002-1004`),
+/// `maxPostHandlerReadBytes` is still declared (`transfer.go:1022-1024`),
 /// which is what keeps an undelivered body from stalling the close.
 /// Reproduced exactly.
 ///
 /// The deliberate divergence is Go's third arm: when the request said
 /// `Connection: close`, `body.Close` reads nothing at all ("no point in
-/// reading to EOF", `transfer.go:996-998`).  Doing that here closes the
+/// reading to EOF", `transfer.go:1016-1018`).  Doing that here closes the
 /// socket over the unread body of every ordinary `dcrctl`-shaped
 /// request -- which sends `Connection: close` -- and the resulting TCP
 /// reset truncates away the error response the client is still
@@ -7371,11 +7371,11 @@ pub struct HttpHead {
 const MAX_HEAD_SIZE: usize = 1 << 13;
 
 /// Why a request head could not be served, and therefore which answer
-/// Go's connection loop gives (`net/http/server.go:2062-2101`).
+/// Go's connection loop gives (`net/http/server.go:2082-2121`).
 enum HeadError {
     /// Nothing is written at all.  Go's silent set is narrow:
-    /// `isCommonNetReadError` (`server.go:1915-1926`, used at
-    /// `:2090-2091`) forgives `io.EOF` and read timeouts, but a close
+    /// `isCommonNetReadError` (`server.go:1935-1946`, used at
+    /// `:2110-2111`) forgives `io.EOF` and read timeouts, but a close
     /// *after* the head has started is rewritten to
     /// `io.ErrUnexpectedEOF` (`request.go:1108-1112`) and falls through
     /// to the bare 400.  So only a connection that never sent a byte,
@@ -7384,20 +7384,20 @@ enum HeadError {
     /// The head outgrew a limit -- its size, Go 1.27's count of header
     /// values ([`MAX_HEADER_VALUES`]), or the 80 bytes textproto reads of
     /// a first field line it refuses -- which Go's `errTooLarge` answers
-    /// 431 (`server.go:2067-2076`, `request.go:1152-1157`).
+    /// 431 (`server.go:2087-2096`, `request.go:1152-1157`).
     TooLarge,
     /// A transfer encoding the server will not read, answered 501
-    /// (`server.go:2078-2088`).  Go decides this inside `readTransfer`,
+    /// (`server.go:2098-2108`).  Go decides this inside `readTransfer`,
     /// before the protocol version gate, but only for HTTP/1.1 and later:
     /// below that the header is ignored (`transfer.go:646-649`).  So a
     /// mis-framed HTTP/2.0 head is a 501 rather than a 505, while a
     /// mis-framed HTTP/0.9 one is the 505.
     UnsupportedTransferEncoding,
     /// Go's `statusError`: the reason is rendered into the status line
-    /// *and* repeated as the body (`server.go:2094-2096`).
+    /// *and* repeated as the body (`server.go:2114-2116`).
     Status(&'static str, &'static str),
     /// Anything else, which Go answers with a bare 400 carrying no
-    /// detail at all (`server.go:2098-2099`).
+    /// detail at all (`server.go:2118-2119`).
     Malformed,
 }
 
@@ -7754,9 +7754,9 @@ struct GoUrl {
     query: Option<String>,
 }
 
-/// `net/url`'s `parse` (`url.go:431-509` in Go 1.26.2, the same text in
-/// 1.27.1).  `via_request` is its `viaRequest`: `ParseRequestURI` allows
-/// only an absolute URL or a rooted path, `Parse` any reference.
+/// `net/url`'s `parse` (`url.go:432-510` in Go 1.27.3, the same text in
+/// 1.26.2 and 1.27.1).  `via_request` is its `viaRequest`: `ParseRequestURI`
+/// allows only an absolute URL or a rooted path, `Parse` any reference.
 fn go_url_parse(raw: &str, via_request: bool) -> Option<GoUrl> {
     // `stringContainsCTLByte`: any ASCII control byte, DEL included.
     if raw.bytes().any(|b| b < 0x20 || b == 0x7f) {
@@ -7886,8 +7886,8 @@ fn go_parse_authority(scheme: &str, authority: &str) -> Option<Vec<u8>> {
     Some(host)
 }
 
-/// `parseHost` (`url.go:548-639` in Go 1.26.2, the same text in 1.27.1):
-/// an IP literal in brackets must hold an IPv6 address, a port must be
+/// `parseHost` (`url.go:549-640` in Go 1.27.3, the same text in 1.26.2 and
+/// 1.27.1): an IP literal in brackets must hold an IPv6 address, a port must be
 /// digits, and the escapes a host may use are only those of non-ASCII
 /// bytes (and `%25`).  With more than one colon outside brackets, http
 /// and https take the port from the first (the `urlstrictcolons`
@@ -8216,7 +8216,7 @@ fn read_http_head<S: Read + SocketTimeout>(
     if parts.next().is_some() {
         return Err(HeadError::Malformed);
     }
-    // `validMethod` (`request.go:855`): a non-empty run of token
+    // `validMethod` (`request.go:854`): a non-empty run of token
     // octets, and case-sensitive -- a lowercase `get` is a method in
     // its own right, not a spelling of `GET`.
     if method.is_empty() || !method.bytes().all(is_token_octet) {
@@ -8282,7 +8282,7 @@ fn read_http_head<S: Read + SocketTimeout>(
     // space or tab before reading any field, and reads that line under
     // an 80-byte limit so it can quote it: a longer one overruns the
     // limit as textproto's "message too large", which `readRequestLimit`
-    // turns into the 431 (`net/textproto/reader.go:544-552`, `:60-81`;
+    // turns into the 431 (`net/textproto/reader.go:542-550`, `:60-81`;
     // `net/http/request.go:1152-1157`).
     if let Some(first) = lines.peek()
         && first.starts_with([' ', '\t'])
@@ -8295,7 +8295,7 @@ fn read_http_head<S: Read + SocketTimeout>(
     }
     while let Some(first) = lines.next() {
         // `readContinuedLineSlice` with `mustHaveFieldNameColon`
-        // (`reader.go:136-188`, `:617-622`): the field's first line must
+        // (`reader.go:136-188`, `:619-624`): the field's first line must
         // hold the colon, and a line with none is refused whole rather
         // than skipped.  Every later line that begins with a space or tab
         // continues the field (obs-fold): each line is trimmed of spaces
@@ -8313,7 +8313,7 @@ fn read_http_head<S: Read + SocketTimeout>(
         let Some((name, value)) = field.split_once(':') else {
             return Err(HeadError::Malformed);
         };
-        // `canonicalMIMEHeaderKey` (`reader.go:755-775`): the name must
+        // `canonicalMIMEHeaderKey` (`reader.go:757-777`): the name must
         // be a non-empty run of token bytes, a space tolerated; any other
         // byte is a bare 400.  `validHeaderValueByte`: no control byte in
         // the value but the tab.  Both classes were enumerated byte by
@@ -8325,7 +8325,7 @@ fn read_http_head<S: Read + SocketTimeout>(
             return Err(HeadError::Malformed);
         }
         // Counted once the field is known good, as `readMIMEHeader`
-        // counts it (`reader.go:575-578`).
+        // counts it (`reader.go:573-576`).
         values = values.saturating_add(1);
         if values > MAX_HEADER_VALUES {
             return Err(HeadError::TooLarge);
@@ -8385,8 +8385,8 @@ fn read_http_head<S: Read + SocketTimeout>(
         } else if name.eq_ignore_ascii_case("trailer") {
             trailer.push(value.to_string());
         } else if name.eq_ignore_ascii_case("expect") {
-            // `Header.get` returns the first copy (`server.go:2106`,
-            // `:2113`).
+            // `Header.get` returns the first copy (`server.go:2126`,
+            // `:2133`).
             if head.expect.is_none() {
                 head.expect = Some(value.to_string());
             }
@@ -9114,7 +9114,7 @@ fn serve_rpc_connection<S: Read + Write + SocketTimeout + Send>(
             return;
         }
         // Go folds the reason into the status line as well as the body
-        // for a `statusError` (`server.go:2095`).
+        // for a `statusError` (`server.go:2115`).
         Err(HeadError::Status(status, reason)) => {
             let rendered = format!("{status}: {reason}");
             let _ = write_protocol_error(&mut stream, &rendered, &rendered);
@@ -9127,7 +9127,7 @@ fn serve_rpc_connection<S: Read + Write + SocketTimeout + Send>(
     };
 
     // Go's connection loop settles `Expect` before any handler or the
-    // mux sees the request (`server.go:2104-2116`): `100-continue`, as
+    // mux sees the request (`server.go:2124-2136`): `100-continue`, as
     // a token of the first copy, is honoured when the body is read
     // (below), and any other non-empty expectation is refused with a
     // 417 whatever the target.
@@ -9162,7 +9162,7 @@ fn serve_rpc_connection<S: Read + Write + SocketTimeout + Send>(
     // dcrd's; closing over an unread body instead resets the connection
     // and can take the answer with it.  `OPTIONS *` is the one Go reads
     // part of first: the global options handler takes up to 4 KiB before
-    // answering (`server.go:4164-4175`), which only moves the same
+    // answering (`server.go:4187-4198`), which only moves the same
     // discard ahead of the 200 and is not reproduced.
     let route = route(&head);
     match &route {
@@ -9312,7 +9312,7 @@ fn serve_rpc_connection<S: Read + Write + SocketTimeout + Send>(
     // writes the interim response (`server.go:994-1009`), and the reader
     // is installed only for HTTP/1.1 and later with a body declared --
     // a `Content-Length` other than zero, or chunked
-    // (`server.go:2106-2112`).  The 503 and 401 above never read, so
+    // (`server.go:2126-2132`).  The 503 and 401 above never read, so
     // they never send it.
     if expects_continue && head.version >= (1, 1) && head.declares_body() {
         let _ = stream
@@ -9801,7 +9801,7 @@ fn write_json_response<S: Write>(
 /// The protocol in the status line of an answer written through Go's
 /// `ResponseWriter`, which mirrors the request's: `HTTP/1.1` from 1.1
 /// on, `HTTP/1.0` below (`writeStatusLine(..., w.req.ProtoAtLeast(1,
-/// 1), ...)`, `server.go:1228`, `:1586-1600`).  The connection loop's
+/// 1), ...)`, `server.go:1228`, `:1606-1620`).  The connection loop's
 /// own errors say `HTTP/1.1` whatever the request's protocol
 /// ([`write_protocol_error`]).
 fn response_proto(version: (u32, u32)) -> &'static str {
@@ -9814,7 +9814,7 @@ fn response_proto(version: (u32, u32)) -> &'static str {
 
 /// The `Content-Length` Go's `ResponseWriter` adds to an answer whose
 /// handler wrote no body (`chunkWriter.writeHeader`,
-/// `server.go:1382`): `0`, except on a HEAD, where no body written
+/// `server.go:1386`): `0`, except on a HEAD, where no body written
 /// cannot be told from a body left out, so there is none.
 fn empty_body_length(method: &str) -> &'static str {
     if method == "HEAD" {
@@ -9825,7 +9825,7 @@ fn empty_body_length(method: &str) -> &'static str {
 }
 
 /// Write Go's 417 for an expectation it cannot meet
-/// (`sendExpectationFailed`, `server.go:2260-2276`): through the
+/// (`sendExpectationFailed`, `server.go:2280-2296`): through the
 /// `ResponseWriter`, so the status line follows the request's protocol
 /// and the empty body gets a `Content-Length` (but for a HEAD), with the
 /// `Connection: close` it sets first.
@@ -9900,7 +9900,7 @@ pub(crate) fn http_date() -> String {
 
 /// Write the redirect `ServeMux` sends when cleaning changed the path.
 ///
-/// `http.Redirect` with `StatusTemporaryRedirect` (`server.go:2419-2471`)
+/// `http.Redirect` with `StatusTemporaryRedirect` (`server.go:2439-2491`)
 /// sets `Location` to `hexEscapeNonASCII(url)`.  Only a GET or HEAD
 /// also gets the HTML content type, and only a GET the little anchor
 /// body, built from the URL *before* hex escaping and HTML-escaped.  A
@@ -9947,7 +9947,7 @@ fn write_redirect<S: Write>(
 
 /// Write a bodiless answer: the 200 Go gives `OPTIONS *` from its
 /// global options handler, and the 400 the mux gives every other
-/// asterisk request (`server.go:4164-4175`, `:2889-2896`).  Neither
+/// asterisk request (`server.go:4187-4198`, `:2909-2916`).  Neither
 /// carries a content type or a body, and a `HEAD *` gets no
 /// `Content-Length` either.
 fn write_empty_ok<S: Write>(
@@ -9969,7 +9969,7 @@ fn write_empty_ok<S: Write>(
 /// Write an error Go's connection loop answers before any handler runs.
 ///
 /// `conn.serve` writes its own bytes for these, using one fixed header
-/// block -- `errorHeaders` at `net/http/server.go:2064` -- which carries
+/// block -- `errorHeaders` at `net/http/server.go:2084` -- which carries
 /// the content type and `Connection: close` and *no* `Content-Length`,
 /// so the body simply runs to the close.  There is no
 /// `X-Content-Type-Options` here; that one belongs to `http.Error`,
@@ -9983,7 +9983,7 @@ fn write_protocol_error<S: Write>(stream: &mut S, status: &str, body: &str) -> s
 }
 
 /// Write an error the way a Go handler does, through `http.Error`
-/// (`net/http/server.go:2353-2371`): the content type reset to
+/// (`net/http/server.go:2373-2391`): the content type reset to
 /// text/plain, the sniffing opt-out, and the message newline-terminated
 /// by its `Fprintln`.  The `Content-Length` is there because the
 /// response writer buffers a body this small and fills it in, and
@@ -9991,7 +9991,7 @@ fn write_protocol_error<S: Write>(stream: &mut S, status: &str, body: &str) -> s
 /// (`rpcserver.go:5941`).  The status line mirrors the request's
 /// protocol, and a HEAD gets the same `Content-Length` but no body: the
 /// writer measures what the handler wrote and then eats it
-/// (`server.go:377-384`, `:1382`).
+/// (`server.go:377-384`, `:1386`).
 fn write_handler_error<S: Write>(
     stream: &mut S,
     method: &str,

@@ -375,7 +375,7 @@ fn an_oversized_content_length_is_truncated_and_served() {
 
 /// A chunked body over the limit is cut at the limit the same way, and
 /// the rest of it is read before the answer, as Go's `body.Close`
-/// reads on through a chunked body (`transfer.go:999-1019`), so the
+/// reads on through a chunked body (`transfer.go:1019-1039`), so the
 /// connection closes cleanly instead of resetting over unread bytes.
 #[test]
 fn an_oversized_chunked_body_is_truncated_and_served() {
@@ -411,7 +411,7 @@ fn an_oversized_chunked_body_is_truncated_and_served() {
 /// A `Content-Length` body whose remainder past the limit is at most
 /// `maxPostHandlerReadBytes`, on a request that did not ask to close,
 /// is read to its end before the answer, as Go's `body.Close` reads it
-/// (`transfer.go:1002-1019`).  With `Connection: close`, or a larger
+/// (`transfer.go:1022-1039`).  With `Connection: close`, or a larger
 /// remainder, Go reads nothing more; the test above covers that.
 #[test]
 fn a_keep_alive_body_just_past_the_limit_is_read_to_its_end() {
