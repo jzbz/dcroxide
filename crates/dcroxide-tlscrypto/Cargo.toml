@@ -43,9 +43,11 @@ ecdsa = { version = "0.17", default-features = false, features = ["algorithm", "
 curve25519-dalek = "5"
 # X25519's all-zero check, made in constant time.
 subtle = "2.6"
-# RSA verification, public-key arithmetic alone (ADR-0015 T5, `src/rsa.rs`):
-# `modpow` on public values.  Locked at 0.5.1 already, for the standalone
-# difficulty math.
+# RSA verification, public-key arithmetic (ADR-0015 T5, `src/rsa.rs`):
+# `modpow` on public values; and Go's text for a SEC 1 scalar the key
+# reader refuses, zero or at or above the order, never a key
+# (`src/keys.rs`).  Locked at 0.5.1 already, for the standalone difficulty
+# math.
 num-bigint = { version = "0.5.1", default-features = false }
 # The kernel read behind every random byte the provider draws but one:
 # the handshake randoms and the ephemeral keys (`src/rand.rs`).

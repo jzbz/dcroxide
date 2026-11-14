@@ -58,14 +58,6 @@ pub const RSA_KEY_REFUSED: &str = "RSA private keys are not supported: this prov
 /// Go's text for a key none of its parsers reads (`crypto/tls/tls.go:382`).
 const UNPARSABLE: &str = "tls: failed to parse private key";
 
-/// Go's text for a PKCS#8 key of a type `crypto/tls` does not take, an
-/// X25519 key (`crypto/tls/tls.go:375`).
-const UNKNOWN_PKCS8_TYPE: &str = "tls: found unknown private key type in PKCS#8 wrapping";
-
-/// The text for a P-224 key, which Go loads and serves over TLS 1.2 only,
-/// and ring refused, as this provider does.
-const P224_REFUSED: &str = "unsupported private key: ECDSA P-224";
-
 /// What Go's `parsePrivateKey` reads a key as, when it is one of these.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -84,7 +76,7 @@ pub enum KeyAlgorithm {
 
 /// What Go's `parsePrivateKey` reads `der` as, whatever PEM label it came
 /// under: `None` for a key it does not read, and for a key of another
-/// type (P-224, X25519).
+/// type (P-224, X25519, ML-DSA).
 pub fn key_algorithm(der: &[u8]) -> Option<KeyAlgorithm> {
     Some(match keys::parse(der).ok()? {
         ParsedKey::EcdsaP256(_) => KeyAlgorithm::EcdsaP256,
@@ -105,9 +97,11 @@ pub fn load_der(der: &[u8]) -> Result<Arc<dyn SigningKey>, Error> {
         Ok(ParsedKey::EcdsaP521(key)) => Ok(Arc::new(EcdsaSigningKey::<p521::NistP521>::new(key))),
         Ok(ParsedKey::Ed25519(seed)) => Ok(Arc::new(Ed25519SigningKey::from_seed(&seed))),
         Ok(ParsedKey::Rsa) => refused(RSA_KEY_REFUSED),
-        Err(KeyError::UnknownPkcs8Type) => refused(UNKNOWN_PKCS8_TYPE),
-        Err(KeyError::P224) => refused(P224_REFUSED),
-        Err(KeyError::Unparsable) => refused(UNPARSABLE),
+        // Go 1.26's bare text still: without the cause Go 1.27.3 gives
+        // after it, and for an ML-DSA key, which Go loads, in place of the
+        // key's own text.
+        Err(KeyError::Unparsable(_) | KeyError::MlDsa(_)) => refused(UNPARSABLE),
+        Err(error @ (KeyError::UnknownPkcs8Type | KeyError::P224)) => refused(&error.to_string()),
     }
 }
 
@@ -1093,8 +1087,8 @@ mod tests {
     }
 
     /// Each refusal has its text: Go's for what Go refuses, this
-    /// provider's for the RSA and P-224 keys Go loads; and the type each
-    /// key reads as.
+    /// provider's for the RSA and P-224 keys Go loads, Go 1.26's bare text
+    /// still for an ML-DSA key; and the type each key reads as.
     #[test]
     fn each_refusal_has_its_text() {
         let text = |der: &[u8]| match load_der(der) {
@@ -1124,12 +1118,30 @@ mod tests {
             ]
             .concat(),
         );
+        // ML-DSA-65's seed form, which Go loads: the bare text still, as
+        // for a key that does not parse.
+        let ml_dsa = tlv(
+            0x30,
+            &[
+                tlv(0x02, &[0]),
+                tlv(
+                    0x30,
+                    &tlv(
+                        0x06,
+                        &[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x03, 0x12],
+                    ),
+                ),
+                tlv(0x04, &[&[0x80, 0x20][..], &[9; 32]].concat()),
+            ]
+            .concat(),
+        );
         assert_eq!(text(&rsa), RSA_KEY_REFUSED);
         assert_eq!(text(&p224), "unsupported private key: ECDSA P-224");
         assert_eq!(
             text(&x25519),
             "tls: found unknown private key type in PKCS#8 wrapping"
         );
+        assert_eq!(text(&ml_dsa), "tls: failed to parse private key");
         assert_eq!(text(b"not a key"), "tls: failed to parse private key");
         assert_eq!(text(&[]), "tls: failed to parse private key");
 
@@ -1150,7 +1162,7 @@ mod tests {
             key_algorithm(&ed25519_key(&[7; 32])),
             Some(KeyAlgorithm::Ed25519)
         );
-        for other in [p224, x25519, b"not a key".to_vec()] {
+        for other in [p224, x25519, ml_dsa, b"not a key".to_vec()] {
             assert_eq!(key_algorithm(&other), None, "{other:02x?}");
         }
     }
