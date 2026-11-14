@@ -30,19 +30,19 @@ dcrd tag" (§12's definition of done).
 carrying 294, 19, 19, 3, 31, 39 and 1 upstream commits, each move landing
 within six days of the upstream commit it pinned. Since the `036b7090`
 move each one has a PARITY.md section, titled by its commit range, that
-ports or accounts for every upstream commit in it (`docs/PARITY.md:228`,
-`:259`, `:488`, `:899`, `:926`), starting from `tools/pinbump`'s review
+ports or accounts for every upstream commit in it (`docs/PARITY.md:239`,
+`:270`, `:499`, `:910`, `:937`), starting from `tools/pinbump`'s review
 list (`tools/pinbump/main.go:3-31`). On 2026-10-25 the project owner made
 dcrd v2.2 the target: upstream has not released it, so the pin follows
 master until v2.2 is tagged, moving at upstream milestones and on the
 project owner's word (`docs/PARITY.md:5-7`; ADR-0001's addendum of that
 date). That cadence covers only the time until the tag. `3360ae4d` was
 master's head on 2026-10-25, with no `release-v2.2` branch
-(`docs/PARITY.md:230-231`) and no `release-v2.2` tag.
+(`docs/PARITY.md:241-242`) and no `release-v2.2` tag.
 
 **What the master pin cost.** A move shifts citations even when it changes
 little: the one-commit `3360ae4d` move moved 62 undated citations of
-`rpcserver.go` four lines (`docs/PARITY.md:253-257`). And the reference an
+`rpcserver.go` four lines (`docs/PARITY.md:264-268`). And the reference an
 operator runs is a release. The acceptance run of 2026-10-23 used the dcrd
 2.1.7 release binaries, and every reply that differed followed dcrd
 master's source at the pin of the day, came from a part not yet ported,
@@ -51,7 +51,7 @@ or matched a second dcrd in the same role
 PARITY.md keep master's behaviour where 2.1.7 differs: `addnode` and
 `node`, protocol version 12 against 11 and `debuglevel`'s subsystems in
 one, and the retry backoff for an unreachable `--connect` peer in the
-other (`docs/PARITY.md:2404-2459`).
+other (`docs/PARITY.md:2414-2469`).
 
 **How dcrd releases**, read from its repository as fetched on 2026-10-25:
 
@@ -79,7 +79,7 @@ other (`docs/PARITY.md:2404-2459`).
   shipped the same-block stake-spend rule without master's testnet3
   exception (`9b7ab54a`, 2026-08-19), which the release line took in
   v2.1.7 (`059742a9`, 2026-10-13); the port took both together
-  (`docs/PARITY.md:930-933`).
+  (`docs/PARITY.md:941-944`).
 - A tag drops the replace block. dcrd's `go.mod` has no `replace` at
   `release-v2.0.0`, `release-v2.1.0` or `release-v2.1.7`, against 28
   replace lines at master `3360ae4d`, and neither carries a `go.work`. A
@@ -98,8 +98,8 @@ other (`docs/PARITY.md:2404-2459`).
 things built for a master pin, whatever rule follows it:
 
 - The consistency test reads the `go.mod` header text after "dcrd master
-  commit " (`crates/dcroxide-testutil/src/lib.rs:1467-1473`) and fails when
-  no dcrd module is pinned by pseudo-version (`:1075-1078`). At a tag every
+  commit " (`crates/dcroxide-testutil/src/lib.rs:1489-1495`) and fails when
+  no dcrd module is pinned by pseudo-version (`:1097-1100`). At a tag every
   module would be pinned by tag.
 - The interop harness would refuse CI's own build. dcrd's note for
   maintainers sets the build metadata `release.local` on a release branch
@@ -110,8 +110,8 @@ things built for a master pin, whatever rule follows it:
   metadata is empty (`:161-177`). The harness's `assert_dcrd_revision`
   takes eight or more characters after a `+` for a stamped revision, and
   any revision but the pin's for a different specification
-  (`crates/dcroxide-testutil/src/lib.rs:712-754`, the check at
-  `:738-746`), so `release.local` is refused. Inference: the v2.2 tags
+  (`crates/dcroxide-testutil/src/lib.rs:734-776`, the check at
+  `:760-768`), so `release.local` is refused. Inference: the v2.2 tags
   follow the same documented process.
 - Nested modules. `tools/pinbump` lists the files a tree diff between the
   two refs changes (`tools/pinbump/main.go:166`), and the port's citations
@@ -127,7 +127,7 @@ things built for a master pin, whatever rule follows it:
 2. **Triggers.**
    - Each point release is pinned, at the project owner's timing.
    - A release that changes consensus, or one dcrd calls mandatory, is
-     pinned promptly. v2.1.6 was such a release (`docs/PARITY.md:933-934`).
+     pinned promptly. v2.1.6 was such a release (`docs/PARITY.md:944-945`).
 3. **Master is read ahead, not ported.** At each point release, or on the
    project owner's word, `tools/pinbump` runs from the pin to dcrd master's
    head, and the master commits in that range that touch consensus or
@@ -194,17 +194,17 @@ v2.2.0 and on each part below, which lands with that move or before it.
 
 - **The consistency test's tag shape.**
   `the_dcrd_pin_matches_ci_and_the_oracle`
-  (`crates/dcroxide-testutil/src/lib.rs:1436-1483`) has to read a header
+  (`crates/dcroxide-testutil/src/lib.rs:1458-1505`) has to read a header
   that names the tag and its commit in place of "dcrd master commit "
-  (`:1467-1473`), and the rule that at least one dcrd module is pinned by
-  pseudo-version (`:1075-1078`) has to go. It already refuses a `replace`
-  of a dcrd module (`:1067-1074`). Inference: at a tag it also refuses any
+  (`:1489-1495`), and the rule that at least one dcrd module is pinned by
+  pseudo-version (`:1097-1100`) has to go. It already refuses a `replace`
+  of a dcrd module (`:1089-1096`). Inference: at a tag it also refuses any
   pseudo-version, and whether each module sits at the tag's required
   version needs dcrd's `go.mod` at the tag, which the repository does not
   hold, so that half is checked at the move unless a CI job with a dcrd
   clone takes it on.
 - **The harness's revision check.** `assert_dcrd_revision`
-  (`crates/dcroxide-testutil/src/lib.rs:712-754`) has to accept a dcrd that
+  (`crates/dcroxide-testutil/src/lib.rs:734-776`) has to accept a dcrd that
   CI built from the tag's commit. Two ways are open, neither chosen
   (inference): read the revision from the binary's Go build information,
   which `-buildvcs=true` records whatever the version string says; or
@@ -302,7 +302,7 @@ not PARITY.md's range sections, which record what the port claims.
   dcrd's newest tag and master (CI already clones dcrd for the interop
   job, `.github/workflows/ci.yml:278`, and its scheduled jobs are the
   nightly fuzz and the nightly signature soak, `:7-10`, `:679-682`,
-  `:826-828`); and the harness and build-metadata choices above.
+  `:853-855`); and the harness and build-metadata choices above.
 
 ## Alternatives
 

@@ -45,12 +45,12 @@ certificate verification runs, and random numbers. rustls 0.23.46 is
 itself written in Rust with no C, and forbids `unsafe`
 (`rustls-0.23.46/src/lib.rs:332`); its provider in this node is `ring`
 0.17.14, about 151k lines of C and assembly
-(`docs/dependency-ledger.md:151`).
+(`docs/dependency-ledger.md:157`).
 
 `dcroxide-node` uses the provider in three places:
 
 1. **The RPC and websocket TLS listener.** `build_server_config`
-   (`crates/dcroxide-node/src/rpcrun.rs:4462`) loads `rpc.key` through
+   (`crates/dcroxide-node/src/rpcrun.rs:4923`) loads `rpc.key` through
    ring's key loader (`:4480` at `8e6ea23`), and `RpcTlsConfigs` builds
    one rustls configuration for each cipher-suite order and TLS 1.3 key
    exchange Go's server can settle on, each from ring's provider with its
@@ -64,7 +64,7 @@ itself written in Rust with no C, and forbids `unsafe`
    P-256 and P-384 (`rustls-0.23.46/src/crypto/ring/sign.rs:45-65`,
    `mod.rs:180-181`).
 2. **The RPC client-certificate verifier**, `GoClientCertVerifier`
-   (`rpcrun.rs:3518`), under `--authtype=clientcert`. Its replay of Go's
+   (`rpcrun.rs:3804`), under `--authtype=clientcert`. Its replay of Go's
    chain search checks signatures with ring's verification algorithms
    (`:4035-4037` at `8e6ea23`), and the handshake signature and webpki's
    path check go to a `WebPkiClientVerifier` made with
@@ -104,7 +104,7 @@ feature turns on `_ring`, that is `rustls?/ring`
 features across the build, so `ring` leaves only when both switches
 change; either alone brings it back. `fuzz/`, outside the workspace with
 a lock of its own, takes the node's whole tree through `dcroxide-node`
-(`fuzz/Cargo.toml:21-24`) and locks `ring` too (`fuzz/Cargo.lock:1367`).
+(`fuzz/Cargo.toml:21-24`) and locks `ring` too (`fuzz/Cargo.lock:1398`).
 
 ### The process default
 
@@ -130,19 +130,19 @@ server makes in the reference Go, 1.26.2 (ADR-0001's addendum of
 2026-10-26 on the reference Go):
 
 - **(a) Nine cipher suites, each addressable on its own**, so that both
-  of Go's suite orders can be built (`rpctls.rs:182-214`): TLS 1.3's
+  of Go's suite orders can be built (`rpctls.rs:188-220`): TLS 1.3's
   AES-128-GCM, AES-256-GCM and ChaCha20-Poly1305, and TLS 1.2's
   ECDHE-ECDSA and ECDHE-RSA with each of the three.
 - **(b) TLS 1.2** (rustls's `tls12` feature,
   `crates/dcroxide-node/Cargo.toml:68`).
 - **(c) Key exchange:** X25519, P-256, P-384 and P-521, as now
-  (`rpctls.rs:88-108`); and the three hybrids with ML-KEM,
+  (`rpctls.rs:94-114`); and the three hybrids with ML-KEM,
   X25519MLKEM768, SecP256r1MLKEM768 and SecP384r1MLKEM1024, which
   Go 1.26.2 puts ahead of the classical groups
   (`crypto/tls/defaults.go:30-33`), in TLS 1.3 only (`common.go:158-165`),
   and which dcrd at the parity pin `3360ae4d` leaves on
   (`rpctls.rs:17-25`). The node offers none of the three today
-  (`docs/PARITY.md:3065-3099`).
+  (`docs/PARITY.md:3173-3208`).
 - **(d) Server keys:** P-256, the default, and P-521 under `--tlscurve`;
   P-384 and Ed25519, which `gencerts` writes
   (`crates/dcroxide-certgen/src/gentool.rs:12-15`); and RSA, when an
@@ -154,7 +154,7 @@ server makes in the reference Go, 1.26.2 (ADR-0001's addendum of
   verifies more, among it P-521 keys, ECDSA with SHA-512, and RSA keys of
   1024 to 2040 bits (2047 as first written: ring's least is 256 whole
   bytes, `ring-0.17.14/src/rsa/public_modulus.rs:63-68`) and over 8192
-  (`PARITY.md:2918-2938`).
+  (`PARITY.md:2943-2959`).
 - **(f) RSA verification is mandatory.** The seeders' chains are checked
   with the same algorithms (use 3 above). The research found the
   certificates of `mainnet-seed-1.decred.org` and
@@ -165,7 +165,7 @@ server makes in the reference Go, 1.26.2 (ADR-0001's addendum of
   2026-10-26; this was not checked again for this record. A provider
   without RSA verification breaks HTTPS seeding.
 - **(g) The rest of a provider:** a `&'static` set of verification
-  algorithms, which `GoClientCertVerifier` holds (`rpcrun.rs:3524`), a key
+  algorithms, which `GoClientCertVerifier` holds (`rpcrun.rs:3810`), a key
   provider, and a source of random numbers.
 
 Go's four TLS 1.2 CBC suites (Go 1.26.2's
@@ -204,11 +204,11 @@ With any of them, the node would still own P-521 itself, as it does now.
 ### The client-certificate pre-check
 
 Commit `185b9d2` replays Go's chain search before webpki's for an RPC
-client (`go_build_chains`, `rpcrun.rs:3282`). The replay checks each
+client (`go_build_chains`, `rpcrun.rs:3561`). The replay checks each
 candidate's signature with `sig_algs`, ring's verification algorithms
 (`:3270-3282`, `:3519-3522`, `:4035-4037`, at `8e6ea23`), and takes a
 candidate whose signature Go verifies and ring cannot for a failed
-check. PARITY.md lists those cases one by one (`PARITY.md:2918-2938`),
+check. PARITY.md lists those cases one by one (`PARITY.md:2943-2959`),
 so the list follows the provider's verification set.
 
 ## Decision
@@ -262,7 +262,7 @@ and proven by interop with Go. In Go 1.26.2 they come first, in that order
 server sorts a hybrid the client supports ahead of every other group,
 even one the client sent a key share for
 (`handshake_server_tls13.go:201-231`), so `go_tls13_group`
-(`rpctls.rs:228`) takes that rule with them. rustls's own hybrid type is
+(`rpctls.rs:234`) takes that rule with them. rustls's own hybrid type is
 private to its aws-lc-rs module
 (`rustls-0.23.46/src/crypto/aws_lc_rs/pq/hybrid.rs:11`), so the provider
 writes its own, completing on the client's share in one step
@@ -281,7 +281,7 @@ hybrid shares and secrets are laid out as Go lays them out.
 The provider verifies Go's set: P-521 keys, ECDSA with SHA-512, and RSA
 keys from 1,024 bits, beyond ring's set in (e). That closes the
 client-certificate refusals PARITY.md records for those cases
-(`PARITY.md:3032-3043`): a P-521 client key; a chain whose issuer signs
+(`PARITY.md:3132-3143`): a P-521 client key; a chain whose issuer signs
 with ecdsa-with-SHA512, a P-256 client certificate under a P-521 CA among
 them; and an RSA client key below 2041 bits (2048 as first written; see
 (e)). Where the three cases leave a bound open, the largest RSA key for
@@ -303,7 +303,7 @@ was not taken: the line of it built on the RustCrypto generation in the
 lock was a prerelease when the research read it, its stable 0.9 line is
 built on the generation before (`digest` 0.10,
 `rsa-0.9.10/Cargo.toml:108-109`, where the lock has 0.11.3,
-`Cargo.lock:887-888`), and it carries RUSTSEC-2023-0071, the
+`Cargo.lock:890-891`), and it carries RUSTSEC-2023-0071, the
 timing advisory `gencerts` already cites (`gentool.rs:12-15`). That
 advisory concerns private-key operations, which verification does not
 run; this is the research's reading, and the advisory was not re-read for
@@ -346,7 +346,7 @@ unstable API.
 Afterwards one small in-tree client replaces both seeder clients. It
 closes the redirect gap PARITY.md records on the proxy path, whose client
 follows no redirects and decodes no chunked transfer encoding
-(`PARITY.md:1034`; `seeding.rs:157-163`), drops `ureq` and `ureq-proto`,
+(`PARITY.md:1045`; `seeding.rs:157-163`), drops `ureq` and `ureq-proto`,
 and ends the reliance on ureq's unstable provider API.
 
 ### T10 — assurance for the new cryptography
@@ -361,19 +361,19 @@ and ends the reliance on ureq's unstable provider API.
   against the reference Go. "Through the oracle" is the research's means;
   the approved text says "against Go". When this was accepted the oracle
   had no TLS command, its one X.509 command being `x509_verify_client`
-  (`tools/oracle/main.go:1595`).
+  (`tools/oracle/main.go:1612`).
 - **A constant-time check on the signing and key-exchange paths.** Its
   method is not set here.
 
 ### Known limits
 
 - **Go's four TLS 1.2 CBC suites stay a recorded gap**
-  (`PARITY.md:3101-3108`). rustls's TLS 1.2 key block has no place for a
+  (`PARITY.md:3210-3216`). rustls's TLS 1.2 key block has no place for a
   MAC key (`rustls-0.23.46/src/crypto/cipher.rs:110-134`), so no provider
   under rustls can offer them. Every client the Decred tools ship offers
-  an AES-GCM suite (`PARITY.md:3107-3108`).
+  an AES-GCM suite (`PARITY.md:3215-3216`).
 - **rustls 0.24 is unreleased.** The provider is written against 0.23,
-  the line the node is on (0.23.46, `Cargo.lock:1562-1563`), and is ported
+  the line the node is on (0.23.46, `Cargo.lock:1594-1595`), and is ported
   to 0.24 when that is stable. The research read 0.24.0-dev.2 as
   reshaping `CryptoProvider`, separate TLS 1.2 and TLS 1.3 suite lists
   among the changes, and estimated a modest port; it also found that
@@ -385,7 +385,7 @@ and ends the reliance on ureq's unstable provider API.
 ### Not decided here
 
 - The seeder clients' trust in the compiled-in `webpki-roots` alone,
-  where dcrd's client uses the platform's store (`PARITY.md:3110`), is a
+  where dcrd's client uses the platform's store (`PARITY.md:3218`), is a
   decision of its own.
 - Which source the provider's random numbers come from, where ring draws
   its own today.
@@ -394,7 +394,7 @@ and ends the reliance on ureq's unstable provider API.
 ## Consequences
 
 - **C leaves the network surface** with the switch. ring's ~151k lines
-  go (`dependency-ledger.md:151`), and with them `getrandom` 0.2 and
+  go (`dependency-ledger.md:157`), and with them `getrandom` 0.2 and
   `windows-sys` 0.52, which only ring pulls in, and `deny.toml`'s two
   skip entries for them (`deny.toml:42-48` at `8e6ea23`).
   `fuzz/Cargo.lock` changes with the workspace's.
@@ -403,8 +403,8 @@ and ends the reliance on ureq's unstable provider API.
   with the reference Go.
 - **Hybrids for Go clients.** Once T3 lands, a Go client such as dcrctl
   or dcrwallet negotiates a hybrid with the port as with dcrd. The
-  entries for the classical key exchange close (`PARITY.md:3065-3099`,
-  `SECURITY.md:157-173`), and with them the exposure they describe: RPC
+  entries for the classical key exchange close (`PARITY.md:3173-3208`,
+  `SECURITY.md:157-179`), and with them the exposure they describe: RPC
   sessions recorded on a non-local `--rpclisten` open to later
   decryption.
 - **The pre-check moves with the provider.** At the switch the replay's
@@ -412,7 +412,7 @@ and ends the reliance on ureq's unstable provider API.
   the whole pool take the provider's algorithms, and the comments that
   name ring (`:3270-3282`, `:3519-3522`, at `8e6ea23`) change with them.
   T4's wider set then changes which cases PARITY.md lists as ones Go
-  verifies and the port cannot (`PARITY.md:2918-2938`): P-521 keys, ECDSA
+  verifies and the port cannot (`PARITY.md:2943-2959`): P-521 keys, ECDSA
   with SHA-512 and RSA keys of 1024 to 2040 bits (2047 as first written;
   see (e)) leave that list, and what stays is outside the three named
   cases or outside the provider, such as a signature BIT STRING with

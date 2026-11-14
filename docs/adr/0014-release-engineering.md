@@ -59,7 +59,7 @@ check, docs, deny and fuzzing. No job builds the workspace's `release` or
 `codegen-units = 1`, `panic = "abort"`) has never been compiled in CI.
 Every timed sync ran on x86_64 machines (m1 to m3,
 `docs/bench-ledger.md:28-30`), none on Windows or macOS
-(`README.md:751-752`), and none on aarch64 of any OS. Ecosystem acceptance
+(`README.md:754-755`), and none on aarch64 of any OS. Ecosystem acceptance
 has been run once, on x86_64 Linux, without Decrediton's IPC lifecycle or
 config, IPC and service parity on Windows and macOS (the brief's status
 block), so the exit criterion that Decrediton launches, supervises and
@@ -343,17 +343,17 @@ recorded divergence in PARITY.md.
   distribution whose packaged rustc lags the pin cannot build the node
   with it.
 - Each promotion needs a sync timed on that architecture and OS, and none
-  has been timed on aarch64, Windows or macOS (`README.md:751-752`,
+  has been timed on aarch64, Windows or macOS (`README.md:754-755`,
   `docs/bench-ledger.md:28-30`): it needs such a machine, or a CI runner
   with room for a mainnet data directory, a median of 27.93 GiB after the
-  syncs of 2026-10-17 (`README.md:763-765`). Runner disk sizes were not
+  syncs of 2026-10-17 (`README.md:766-768`). Runner disk sizes were not
   checked.
 - Each release costs an LTO build per target off GitHub and two signatures
   by hand, and checking both the tag and the binaries takes two keys.
 - M5's "reproducible signed release" stays open until the first release
   made under this ADR.
 - Pending, none of it written: the fallback rule in `rust-toolchain.toml`'s
-  header; `docs/operating.md`'s `cargo build --release` (`:1892-1894`),
+  header; `docs/operating.md`'s `cargo build --release` (`:1897-1899`),
   where artifacts are cut from `dist`; `SECURITY.md`'s supported versions;
   the fingerprints and verification steps, wherever part 3's open question
   puts them; the brief's status block; `.github/workflows/release.yml`
