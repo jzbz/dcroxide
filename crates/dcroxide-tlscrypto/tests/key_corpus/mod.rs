@@ -23,6 +23,15 @@
 //! the P-224 key whose scalar is 1, so that its public key is the
 //! generator, an Ed25519 key, and the RSA key below.  Every run makes the
 //! same keys.
+//!
+//! Further cases give the shapes of Go 1.27.3's causes that show only
+//! inside PKCS#8, or that the rules above do not reach: ML-DSA keys, in
+//! the seed form Go loads and in the forms it refuses; inner SEC 1 keys
+//! with a bad BIT STRING and scalars at multiples of the order and past
+//! it; inner PKCS#1 keys with an unsupported version, a non-minimal
+//! integer and an additional prime that does not read; each format nested
+//! in another; tags in the high-tag form; and unknown algorithms in Go's
+//! dotted form.
 
 // Test-harness arithmetic over bounded lengths.
 #![allow(clippy::arithmetic_side_effects)]
@@ -384,6 +393,7 @@ pub fn cases() -> Vec<Case> {
     }
     ed25519_cases(&mut cases);
     rsa_cases(&mut cases);
+    cause_cases(&mut cases);
     cases
 }
 
@@ -1061,6 +1071,252 @@ fn rsa_cases(cases: &mut Vec<Case>) {
     );
     for label in ["PRIVATE KEY", "EC PRIVATE KEY"] {
         add(&format!("PKCS#1 under {label}"), key(&fields, &[]), label);
+    }
+}
+
+/// `a + b`, big-endian, at `a`'s length, which the sum must fit.
+fn add(a: &[u8], b: &[u8]) -> Vec<u8> {
+    assert_eq!(a.len(), b.len(), "two values at one length");
+    let mut out = vec![0; a.len()];
+    let mut carry = 0u16;
+    for at in (0..a.len()).rev() {
+        let sum = u16::from(a[at]) + u16::from(b[at]) + carry;
+        out[at] = sum as u8;
+        carry = sum >> 8;
+    }
+    assert_eq!(carry, 0, "the sum fits");
+    out
+}
+
+/// The cases for the shapes of Go's causes the other rules do not give,
+/// most of them inside PKCS#8, where `parsePrivateKey` reports the inner
+/// parser's error (`crypto/tls/tls.go:361-372`).  The ML-DSA keys are
+/// given against the Go-made P-256 key's certificate: Go reads a seed and
+/// then refuses it only as not that certificate's type.
+fn cause_cases(cases: &mut Vec<Case>) {
+    const PKCS8: &str = "PRIVATE KEY";
+    let bases = ec_bases();
+    let go = &bases[0];
+    let mut add_case = |label: String, der: Vec<u8>, cert: &[u8]| {
+        cases.push(Case {
+            label,
+            der,
+            pem_label: PKCS8,
+            cert: cert.to_vec(),
+        });
+    };
+
+    // ML-DSA: the seed form, 0x80 0x20 and 32 bytes, and each form or
+    // byte Go refuses (`crypto/x509/pkcs8.go:83-111`).
+    let mut seed = [0; 32];
+    SplitMix64(0x6d6c_6473_6120_2026).fill(&mut seed);
+    let ml_dsa = |set: u8| tlv(0x06, &[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x03, set]);
+    let seed_form = [&[0x80, 0x20][..], &seed].concat();
+    for (name, set) in [
+        ("ML-DSA-44", 0x11),
+        ("ML-DSA-65", 0x12),
+        ("ML-DSA-87", 0x13),
+    ] {
+        add_case(
+            format!("{name}, seed"),
+            pkcs8(&[0], &[&ml_dsa(set)], &seed_form, &[]),
+            &go.cert,
+        );
+    }
+    for (what, algorithm, key) in [
+        (
+            "NULL parameters",
+            vec![ml_dsa(0x12), vec![0x05, 0x00]],
+            seed_form.clone(),
+        ),
+        (
+            "the expanded key alone",
+            vec![ml_dsa(0x12)],
+            tlv(0x04, &[7; 64]),
+        ),
+        (
+            "seed and expanded key",
+            vec![ml_dsa(0x12)],
+            seq(&[&tlv(0x04, &seed), &tlv(0x04, &[7; 64])]),
+        ),
+        (
+            "a tag Go does not know",
+            vec![ml_dsa(0x12)],
+            [&[0x81, 0x20][..], &seed].concat(),
+        ),
+        (
+            "a seed of 31 bytes",
+            vec![ml_dsa(0x12)],
+            [&[0x80, 0x1f][..], &seed[..31]].concat(),
+        ),
+        (
+            "a seed's length wrong",
+            vec![ml_dsa(0x12)],
+            [&[0x80, 0x21][..], &seed].concat(),
+        ),
+        ("an empty key", vec![ml_dsa(0x12)], Vec::new()),
+    ] {
+        let algorithm: Vec<&[u8]> = algorithm.iter().map(Vec::as_slice).collect();
+        add_case(
+            format!("ML-DSA-65, {what}"),
+            pkcs8(&[0], &algorithm, &key, &[]),
+            &go.cert,
+        );
+    }
+
+    // Inner SEC 1 keys: a BIT STRING Go refuses, and scalars at zero, at
+    // multiples of the order and past them, whose texts differ
+    // (`crypto/ecdsa/ecdsa.go:246-271`).
+    let ec = tlv(0x06, EC_PUBLIC_KEY);
+    for base in bases.iter().filter(|base| base.name != "P-256") {
+        let params = tlv(0x06, curve_oid(base.curve));
+        let order = CURVES
+            .iter()
+            .find(|(curve, _, _)| *curve == base.curve)
+            .map(|(_, _, order)| unhex(order))
+            .expect("the base's curve");
+        let mut one = vec![0; order.len()];
+        *one.last_mut().expect("a scalar") = 1;
+        let mut scalars = vec![
+            ("zero", vec![0; order.len()]),
+            ("n", order.clone()),
+            ("n + 1", add(&order, &one)),
+        ];
+        if base.curve == "P-521" {
+            let twice = add(&order, &order);
+            scalars.push(("3n", add(&twice, &order)));
+            scalars.push(("2n + 1", add(&twice, &one)));
+            scalars.push(("2n", twice));
+        }
+        for (what, scalar) in scalars {
+            add_case(
+                format!("{}, PKCS#8, the inner scalar {what}", base.name),
+                pkcs8(&[0], &[&ec, &params], &sec1(&[1], &scalar, &[]), &[]),
+                &base.cert,
+            );
+        }
+        if base.name != "P-256 (Go's)" {
+            continue;
+        }
+        for (what, public) in [
+            ("an unused bit set", tlv(0xa1, &tlv(0x03, &[0x01, 0x01]))),
+            ("an empty BIT STRING", tlv(0xa1, &tlv(0x03, &[]))),
+        ] {
+            add_case(
+                format!("{}, PKCS#8, the inner [1] {what}", base.name),
+                pkcs8(
+                    &[0],
+                    &[&ec, &params],
+                    &sec1(&[1], &base.scalar, &[&public]),
+                    &[],
+                ),
+                &base.cert,
+            );
+        }
+    }
+
+    // Inner PKCS#1 keys, and each format inside another.
+    let rsa_cert = unhex(RSA2048_CERT);
+    let wrapped = unhex(RSA2048_KEY);
+    let pkcs1_der = content(elements(&wrapped)[2]).to_vec();
+    let fields: Vec<&[u8]> = elements(&pkcs1_der);
+    let rsa = |inner: &[u8]| {
+        pkcs8(
+            &[0],
+            &[&tlv(0x06, RSA_ENCRYPTION), &[0x05, 0x00]],
+            inner,
+            &[],
+        )
+    };
+    let int = |content: &[u8]| tlv(0x02, content);
+    let prime = seq(&[&int(&[3]), &int(&[1]), &int(&[1])]);
+    let n_not_minimal = int(&[&[0][..], content(fields[1])].concat());
+    for (what, inner) in [
+        (
+            "version 2",
+            seq(&[&[&int(&[2])[..]][..], &fields[1..]].concat()),
+        ),
+        (
+            "N not minimal",
+            seq(&[&[fields[0], &n_not_minimal][..], &fields[2..]].concat()),
+        ),
+        (
+            "a second additional prime of two values",
+            seq(&[
+                &[&int(&[1])[..]][..],
+                &fields[1..],
+                &[&seq(&[&prime, &seq(&[&int(&[3]), &int(&[1])])])[..]],
+            ]
+            .concat()),
+        ),
+        ("a PKCS#8 key", wrapped.clone()),
+    ] {
+        add_case(
+            format!("RSA, PKCS#8, the inner key {what}"),
+            rsa(&inner),
+            &rsa_cert,
+        );
+    }
+    let go_params = tlv(0x06, curve_oid(go.curve));
+    let go_pkcs8 = unhex(P256_KEY);
+    for (what, inner) in [
+        ("a PKCS#8 key", go_pkcs8.clone()),
+        ("a PKCS#1 key", pkcs1_der.clone()),
+    ] {
+        add_case(
+            format!("{}, PKCS#8, the inner key {what}", go.name),
+            pkcs8(&[0], &[&ec, &go_params], &inner, &[]),
+            &go.cert,
+        );
+    }
+
+    // Tags in the high-tag form, in place of the version: 2 there, which
+    // has a short form; 31, which has none; and 2^31, one past the largest
+    // Go's base-128 reader takes, 2^31 - 1
+    // (`encoding/asn1/asn1.go:324-325`).
+    let rest = &elements(&go_pkcs8)[1..].concat();
+    for (what, version) in [
+        ("tag 2 in the high-tag form", &[0x1f, 0x02, 0x01, 0x00][..]),
+        ("tag 31", &[0x1f, 0x1f, 0x01, 0x00]),
+        (
+            "a tag of 2^31",
+            &[0x1f, 0x88, 0x80, 0x80, 0x80, 0x00, 0x01, 0x00],
+        ),
+    ] {
+        add_case(
+            format!("{}, PKCS#8, the version {what}", go.name),
+            tlv(0x30, &[version, rest].concat()),
+            &go.cert,
+        );
+    }
+
+    // Algorithms Go does not know, which it names in its dotted form,
+    // the first byte split into two arcs as `encoding/asn1` splits it.
+    for (what, oid) in [
+        ("2.999.1", &[0x88, 0x37, 0x01][..]),
+        ("0.39", &[0x27]),
+        ("2.47", &[0x7f]),
+    ] {
+        add_case(
+            format!("{}, PKCS#8, the algorithm {what}", go.name),
+            pkcs8(&[0], &[&tlv(0x06, oid)], &tlv(0x04, &seed), &[]),
+            &go.cert,
+        );
+    }
+
+    // X25519 keys Go reads past their structure: 33 bytes, and the key
+    // an INTEGER.
+    let (_, ed_public) = ed25519_base();
+    let ed_cert = certificate(&ed25519_spki(&ed_public));
+    for (what, key) in [
+        ("33 bytes", tlv(0x04, &[&seed[..], &[0]].concat())),
+        ("the key an INTEGER", tlv(0x02, &seed)),
+    ] {
+        add_case(
+            format!("X25519, {what}"),
+            pkcs8(&[0], &[&tlv(0x06, X25519)], &key, &[]),
+            &ed_cert,
+        );
     }
 }
 

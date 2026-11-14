@@ -56,16 +56,19 @@
 //! given is always the PKCS#8 parser's, even for a key whose shape is
 //! plainly SEC 1 or PKCS#1, since `parsePrivateKey` drops the other two
 //! (`crypto/tls/tls.go:362-372`).  Those two show only inside PKCS#8.
-//! `tests/go_differential.rs` holds the verdicts to Go's
-//! `tls.X509KeyPair` on a corpus of keys mutated in each of these rules.
+//! `tests/go_differential.rs` holds the verdicts and the texts to Go's
+//! `tls.X509KeyPair` on a corpus of keys mutated in each of these rules,
+//! and on mutations of every key of it.
 //!
 //! The scalar and the seed are copied out of the input into buffers that
 //! are wiped when dropped; the key types they become wipe themselves.
 //! Only a scalar outside `[1, n)`, which is no key, is copied into an
 //! integer that is not wiped, to choose Go's text for it.
-//! No text echoes a byte of the key but Go's own for an ML-DSA key whose
-//! first byte is no tag it knows, which prints that byte
-//! (`crypto/x509/pkcs8.go:99`).
+//! A text for a key that does not parse carries what Go read where the
+//! parse failed: a header's class, tag and length, a version or a length,
+//! or, for an ML-DSA key whose first byte is no tag Go knows, that byte
+//! (`crypto/x509/pkcs8.go:99`).  In a damaged key these can be bytes of
+//! the scalar, as in Go's own text, which dcrd prints.
 
 use core::fmt;
 
@@ -192,7 +195,7 @@ pub(crate) enum KeyError {
     /// refused, as this provider does.
     P224,
     /// An ML-DSA key in the seed form, which Go loads
-    /// (`crypto/x509/pkcs8.go:83-112`) and this provider does not sign
+    /// (`crypto/x509/pkcs8.go:83-111`) and this provider does not sign
     /// with yet.
     MlDsa(MlDsa),
 }
@@ -456,7 +459,7 @@ fn named_curve(parameters: &[u8]) -> Option<&[u8]> {
 }
 
 /// Go's ML-DSA branch of `ParsePKCS8PrivateKey`
-/// (`crypto/x509/pkcs8.go:83-112`), on the key's bytes as they are: no
+/// (`crypto/x509/pkcs8.go:83-111`), on the key's bytes as they are: no
 /// parameters, a first byte that is the seed's implicit `[0]`, 34 bytes in
 /// all, and a seed's length in the second.  Go's `mldsa.NewPrivateKey`
 /// takes any 32-byte seed, so a key that passes is one Go loads.

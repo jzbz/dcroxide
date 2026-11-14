@@ -3274,10 +3274,10 @@ closing it would cost.
   P-224 key is refused where dcrd serves it over TLS 1.2.** Since ADR-0015's
   switch `build_server_config` takes the key block by Go's rule, the first block
   `pem.Decode` finds whose type is `PRIVATE KEY` or ends in ` PRIVATE KEY`, the
-  space included (`crypto/tls/tls.go:294-311`; `go_key_block` in `rpcrun.rs`),
-  with Go's three texts for a file with none (`tls.go:298-305`); reads its DER
-  whatever the label as Go's `parsePrivateKey` does, PKCS#1, then PKCS#8, then
-  SEC 1 (`tls.go:366-383`), through `dcroxide-tlscrypto`'s `sign::load_der`; and
+  space included (`crypto/tls/tls.go:286-303`; `go_key_block` in `rpcrun.rs`),
+  with Go's three texts for a file with none (`tls.go:291-297`); reads its DER
+  whatever the label as Go's `parsePrivateKey` does, PKCS#8, then PKCS#1, then
+  SEC 1 (`tls.go:361-379`), through `dcroxide-tlscrypto`'s `sign::load_der`; and
   checks the key against the certificate (`CertifiedKey::keys_match`). It parses
   the key before the client CA file, as `newTLSConfig` loads the pair first
   (`server.go:3680-3699`), but reads all three files before parsing any, where
@@ -3299,21 +3299,25 @@ closing it would cost.
   of the PKCS#8 prefix rustls tried it under
   (`rustls-0.23.46/src/crypto/ring/sign.rs:228`, `:245-286`) and Go refuses
   (`crypto/x509/sec1.go:102-110`). A key no parser reads is refused with Go's
-  `tls: failed to parse private key`, after `unable to build the RPC TLS
-  configuration: `, where ring's words were `failed to parse private key as RSA,
-  ECDSA, or EdDSA`. Two keys stay apart from dcrd: an RSA key, the next entry,
-  and a P-224 key, which Go loads and serves over TLS 1.2 only, every TLS 1.3
-  handshake failing with `tls: unsupported certificate curve (P-224)`
-  (`crypto/tls/auth.go:192-212`, `:248-250`), and which the port refuses at load
-  with `unsupported private key: ECDSA P-224`, as ring did. Pinned by
+  `tls: failed to parse private key: ` and the PKCS#8 parser's error, Go
+  1.27.3's text whole, after `unable to build the RPC TLS configuration: `,
+  where ring's words were `failed to parse private key as RSA, ECDSA, or EdDSA`.
+  Go's cause names what Go read where the parse failed, a header's class, tag
+  and length among them, so for a damaged key the text can carry bytes of the
+  scalar, in the port's startup error and reload warning, as in dcrd's. Two
+  keys stay apart from dcrd: an RSA key, the next entry, and a P-224 key, which
+  Go loads and serves over TLS 1.2 only, every TLS 1.3 handshake failing with
+  `tls: unsupported certificate curve (P-224)` (`crypto/tls/auth.go:192-212`,
+  `:248-250`), and which the port refuses at load with `unsupported private key:
+  ECDSA P-224`, as ring did. Pinned by
   `an_rpc_key_is_read_as_x509_key_pair_reads_it`,
   `a_key_builds_under_every_label_go_takes` and
   `a_key_without_its_public_key_builds_on_either_curve`
   (`crates/dcroxide-node/tests/rpctlsreload.rs`), each of whose key cases is
   held to Go's `tls.X509KeyPair` through the oracle's `x509_key_pair`, and by
-  `dcroxide-tlscrypto`'s `tests/go_differential.rs` over its key corpus. Closing
-  the P-224 gap would take a P-224 signer the provider does not carry, for a key
-  no Decred tool writes.
+  `dcroxide-tlscrypto`'s `tests/go_differential.rs` over its key corpus and
+  mutations of every key of it. Closing the P-224 gap would take a P-224 signer
+  the provider does not carry, for a key no Decred tool writes.
 
 - **The RPC listener refuses an RSA `rpc.key`, which dcrd serves.** dcrd
   loads the pair with `tls.LoadX509KeyPair` (`server.go:3680`) and serves any
@@ -3330,8 +3334,14 @@ closing it would cost.
   rotation by keeping the configuration already served, with a warning
   carrying the same words, where dcrd takes the new pair. The check reads
   the key's DER as Go's `parsePrivateKey` does, so a PKCS#1 key without its
-  CRT values, which dcrd serves, and one whose values Go's `Validate`
-  refuses, where dcrd prints that error, both get these words.
+  CRT values, which dcrd serves, and one whose values Go refuses both get these
+  words. For a key whose values Go refuses, dcrd prints Go's cause: the PKCS#8
+  parser's `x509: failed to parse private key (use ParsePKCS1PrivateKey instead
+  for this key format)` for a PKCS#1 key, and `x509: failed to parse RSA private
+  key embedded in PKCS#8: ` with `crypto/x509`'s or `crypto/rsa`'s error for one
+  inside PKCS#8 (`crypto/tls/tls.go:361-372`, `crypto/x509/pkcs8.go:46`,
+  `:51-54`). The port keeps its own words there rather than give Go's cause
+  (decided 2026-11-12).
   `dcroxide-tlscrypto`, the node's TLS provider, signs with no RSA key: the
   one pure-Rust RSA signer, the `rsa` crate, carries a timing advisory on
   its private-key operations (RUSTSEC-2023-0071), which is why `gencerts`
@@ -3371,23 +3381,14 @@ closing it would cost.
   port's own where Go gives its parser's error, and it is recorded rather
   than followed (decided 2026-11-12).
 
-- **A key the RPC key reader cannot parse is refused without the cause Go
-  1.27.3 gives.** Go 1.27's `tls.X509KeyPair` tries PKCS#8 first, then PKCS#1,
-  then SEC 1, and refuses a key none of them reads with `tls: failed to parse
-  private key: ` and the PKCS#8 parser's error (`crypto/tls/tls.go:361-379`):
-  `x509: failed to parse private key (use ParseECPrivateKey instead for this
-  key format)`, for one, or an `encoding/asn1` structure error with its dump
-  of the field's parameters. The port still words the refusal as Go 1.26.2
-  did, `tls: failed to parse private key` alone (`UNPARSABLE` in
-  `dcroxide-tlscrypto`'s `sign.rs`, and `dcroxide-certgen`'s key reader), and
-  the entry on the RPC key file above still gives Go 1.26.2's order. Only the
-  words differ: with the cause cut off, every key of `dcroxide-tlscrypto`'s
-  corpus and every case of `an_rpc_key_is_read_as_x509_key_pair_reads_it` gets
-  Go 1.27.3's answer, so the new order changes no verdict. Until the port
-  gives the cause, those two comparisons cut it off Go's answer
-  (`without_key_parse_cause` in `dcroxide-testutil`'s `tls_interop`), the one
-  place they no longer hold Go's text whole. This is interim: the changes that
-  complete the move to 1.27.3 bring the port's texts in line with Go's.
+- **gencerts refuses a CA key it cannot parse without the cause Go 1.27.3
+  gives.** dcrd's gencerts opens the CA pair with `tls.LoadX509KeyPair`
+  (`cmd/gencerts/gencerts.go:140`), which refuses a key none of Go's parsers
+  reads with `tls: failed to parse private key: ` and the PKCS#8 parser's error
+  (`crypto/tls/tls.go:361-379`). `dcroxide-certgen`'s key reader (`gentool.rs`)
+  still gives `tls: failed to parse private key` alone, as Go 1.26.2 did. This
+  is interim: the changes that complete the move to 1.27.3 read the CA key with
+  the TLS provider's reader.
 
 - **The port has no ML-DSA, which Go 1.27.3 reads, serves and verifies.** Go
   1.27 reads an ML-DSA private key in PKCS#8 seed form
@@ -3399,8 +3400,10 @@ closing it would cost.
   whose length is wrong when it parses a certificate
   (`crypto/x509/parser.go:366-374`). And its TLS 1.3 CertificateRequest lists
   ML-DSA-44, ML-DSA-65 and ML-DSA-87 first among the signature algorithms
-  (`crypto/tls/defaults.go:49-67`). The port refuses an ML-DSA key at load,
-  verifies no ML-DSA signature, and sends the provider's list. Its replay of
+  (`crypto/tls/defaults.go:49-67`). The port refuses an ML-DSA key in the seed
+  form at load with words of its own, `unsupported private key: ML-DSA-65` and
+  the like, where Go loads it, and the forms Go refuses with Go's text;
+  verifies no ML-DSA signature; and sends the provider's list. Its replay of
   Go's chain search already gives an ML-DSA key a key, as Go 1.27 does (the
   entry on `--authtype=clientcert` above), but checks neither the key's
   parameters nor its length. This is interim as well: the changes that

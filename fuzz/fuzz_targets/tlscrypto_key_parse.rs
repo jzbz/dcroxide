@@ -7,7 +7,10 @@
 //! holds it to `key_algorithm`: a key it loads is of the type that names,
 //! signs with that type's scheme, and, on the curves the provider
 //! verifies, gives a signature the provider's own verifier takes; a key it
-//! refuses as RSA is RSA, and any other it refuses has no type.
+//! refuses as RSA is RSA, and any other it refuses has no type and is
+//! refused with Go's "tls: failed to parse private key: " and a cause of
+//! one line, or with one of the fixed texts for the keys Go reads and the
+//! provider does not sign with.
 
 #![no_main]
 

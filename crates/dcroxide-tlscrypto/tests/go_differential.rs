@@ -12,10 +12,12 @@
 //!
 //! For key loading: `sign::load_der` reads each key of `key_corpus` as
 //! Go's `tls.X509KeyPair` reads it under its PEM label, the key and its
-//! type where Go loads it, Go's text where Go refuses it; the RSA and
-//! P-224 keys Go loads are refused with this crate's texts.  And Ed25519,
-//! which is deterministic, signs as Go's `ed25519.Sign` signs, byte for
-//! byte.
+//! type where Go loads it, Go's text where Go refuses it, the cause after
+//! "tls: failed to parse private key: " whole; the RSA, P-224 and ML-DSA
+//! keys Go reads are refused with this crate's texts.  Mutations of every
+//! key are held to Go's answers the same way, a sample of them in each run
+//! and all of them in the nightly job.  And Ed25519, which is
+//! deterministic, signs as Go's `ed25519.Sign` signs, byte for byte.
 //!
 //! For verification: each of the fourteen algorithms gives Go's verdict,
 //! through the oracle's `sig_verify`, on every generated case of the
@@ -42,7 +44,6 @@ mod sig_corpus;
 use std::collections::{BTreeMap, HashMap};
 
 use curve25519_dalek::montgomery::MontgomeryPoint;
-use dcroxide_testutil::tls_interop::without_key_parse_cause;
 use dcroxide_testutil::{Oracle, SplitMix64, hex, unhex};
 use dcroxide_tlscrypto::sign::{self, KeyAlgorithm};
 use p256::elliptic_curve::sec1::ToSec1Point;
@@ -249,9 +250,20 @@ fn pem(label: &str, der: &[u8]) -> String {
     out
 }
 
+/// Go's prefix for a key none of its parsers reads, before the PKCS#8
+/// parser's error (`crypto/tls/tls.go:371`).
+const UNPARSABLE: &str = "tls: failed to parse private key: ";
+
+/// Go's answers for a key it read and then found not to be the
+/// certificate's, of the certificate's type and of another
+/// (`crypto/tls/tls.go:318-353`).
+const GO_READ_ANOTHER_KEY: [&str; 2] = [
+    "refused: tls: private key does not match public key",
+    "refused: tls: private key type does not match public key type",
+];
+
 /// Go's verdict on a certificate and a key: `tls.X509KeyPair` on the
-/// certificate's PEM and the key's under `label`, without the cause Go
-/// gives for a key it cannot parse ([`without_key_parse_cause`]).
+/// certificate's PEM and the key's under `label`.
 fn go_key_pair(oracle: &mut Oracle, cert: &[u8], label: &str, key: &[u8]) -> String {
     let request = serde_json::json!({
         "cert_pem": pem("CERTIFICATE", cert),
@@ -259,10 +271,41 @@ fn go_key_pair(oracle: &mut Oracle, cert: &[u8], label: &str, key: &[u8]) -> Str
     });
     let response = oracle.call("x509_key_pair", request.to_string().as_bytes());
     dcroxide_testutil::require_reference_go(response["go_version"].as_str().unwrap_or_default());
-    let answer = response["result"]
+    response["result"]
         .as_str()
-        .unwrap_or_else(|| panic!("the oracle answered {response}"));
-    without_key_parse_cause(answer).to_owned()
+        .unwrap_or_else(|| panic!("the oracle answered {response}"))
+        .to_owned()
+}
+
+/// Go's verdicts on many keys, each under `label`, in order, through the
+/// oracle's `x509_key_pairs`: each against `cert`, or against the
+/// certificate of the same index in `certs` where one is given there.
+fn go_key_pairs(
+    oracle: &mut Oracle,
+    cert: &[u8],
+    label: &str,
+    keys: &[Vec<u8>],
+    certs: &[Option<Vec<u8>>],
+) -> Vec<String> {
+    let request = serde_json::json!({
+        "cert_pem": pem("CERTIFICATE", cert),
+        "label": label,
+        "keys": keys.iter().map(|key| hex(key)).collect::<Vec<_>>(),
+        "cert_pems": certs
+            .iter()
+            .map(|cert| cert.as_deref().map(|cert| pem("CERTIFICATE", cert)).unwrap_or_default())
+            .collect::<Vec<_>>(),
+    });
+    let response = oracle.call("x509_key_pairs", request.to_string().as_bytes());
+    dcroxide_testutil::require_reference_go(response["go_version"].as_str().unwrap_or_default());
+    let answers: Vec<String> = response["detail"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the oracle answered {response}"))
+        .iter()
+        .map(|answer| answer.as_str().expect("an answer").to_owned())
+        .collect();
+    assert_eq!(answers.len(), keys.len(), "an answer for each key");
+    answers
 }
 
 /// Go's name for a key's type, in `x509_key_pair`'s answer.
@@ -279,28 +322,66 @@ fn go_type(algorithm: KeyAlgorithm) -> &'static str {
 /// The RSA keys of the corpus Go refuses for their values: a CRT exponent
 /// `Validate` finds wrong (`crypto/internal/fips140/rsa/rsa.go:236-250`)
 /// and a prime `ParsePKCS1PrivateKey` finds negative
-/// (`crypto/x509/pkcs1.go:74-79`).  This crate, which signs with no RSA
-/// key, reads their structure alone and refuses them with its own text.
-/// Go loads the key with an additional prime: a key of more than two
-/// primes is checked through N, E and D alone
+/// (`crypto/x509/pkcs1.go:74-79`).  Both are PKCS#1, which Go then refuses
+/// with the PKCS#8 parser's error, [`RSA_GO_REFUSES_WITH`].  This crate,
+/// which signs with no RSA key, reads their structure alone and refuses
+/// them with its own text.  Go loads the key with an additional prime: a
+/// key of more than two primes is checked through N, E and D alone
 /// (`crypto/rsa/rsa.go:571-572`, `:610-617`).
 const RSA_GO_REFUSES: &[&str] = &[
     "RSA, PKCS#1, a CRT exponent wrong",
     "RSA, PKCS#1, P negative",
 ];
 
+/// Go's answer to the keys of [`RSA_GO_REFUSES`]: the PKCS#8 parser's
+/// hint for a PKCS#1 structure (`crypto/x509/pkcs8.go:46`), the error
+/// `parsePrivateKey` keeps (`crypto/tls/tls.go:362-372`).
+const RSA_GO_REFUSES_WITH: &str = "refused: tls: failed to parse private key: x509: failed to \
+                                   parse private key (use ParsePKCS1PrivateKey instead for \
+                                   this key format)";
+
+/// A refusal's cause as the corpus's tally counts it: Go's parameter dump,
+/// the same in every "tags don't match" text (`src/keys.rs`), as `{P}`,
+/// and each number that is not part of a name (`asn1`, `PKCS#8`,
+/// `ASN.1`) as `N`.
+fn shape(cause: &str) -> String {
+    const PARAMETERS: &str = "{optional:false explicit:false application:false private:false \
+                              defaultValue:<nil> tag:<nil> stringType:0 timeType:0 set:false \
+                              omitEmpty:false}";
+    let mut out = String::new();
+    let mut previous = ' ';
+    let mut number = false;
+    for c in cause.replace(PARAMETERS, "{P}").chars() {
+        let named = previous.is_ascii_alphanumeric() || previous == '#' || out.ends_with("ASN.");
+        if c.is_ascii_digit() && (number || !named) {
+            if !number {
+                out.push('N');
+            }
+            number = true;
+        } else {
+            out.push(c);
+            number = false;
+        }
+        previous = c;
+    }
+    out
+}
+
 /// `load_der` reads every key of the corpus as Go's `tls.X509KeyPair`
 /// does.  Where it loads a key, Go loads the same key, of the same type,
 /// under the key's PEM label against a certificate made for the key
 /// `load_der` gave, so a key Go reads with another scalar, on another
 /// curve or of another type does not match.  Where it refuses one with
-/// Go's text, Go refuses it with that text against the certificate of
-/// the key it was mutated from, which Go would load were the refusal
-/// wrong.  An RSA key it refuses with its own text is loaded by Go, or
-/// refused by Go's `Validate` (`RSA_GO_REFUSES`), and a P-224 key is
-/// loaded by Go as P-224.  The count of each verdict is pinned too, so
-/// that a corpus gone wrong, a case lost or sent to another verdict,
-/// cannot pass on agreement alone.
+/// Go's text, the PKCS#8 parser's error after Go's prefix among them, Go
+/// refuses it with that text, whole, against the certificate of the key
+/// it was mutated from, which Go would load were the refusal wrong.  An
+/// RSA key it refuses with its own text is loaded by Go, or refused by
+/// Go's `Validate` (`RSA_GO_REFUSES`); a P-224 key is loaded by Go as
+/// P-224; and an ML-DSA key, refused with this crate's interim text, is
+/// read by Go and refused only as not the certificate's type.  The count
+/// of each verdict is pinned too, a refusal's by the shape of its cause
+/// ([`shape`]), so that a corpus gone wrong, a case lost or sent to
+/// another verdict, cannot pass on agreement alone.
 #[test]
 fn keys_load_as_go_loads_them() {
     let Some(mut oracle) = dcroxide_testutil::oracle_or_skip() else {
@@ -328,17 +409,25 @@ fn keys_load_as_go_loads_them() {
                         Some(KeyAlgorithm::Rsa),
                         "{label}"
                     );
-                    if go != "ok RSA 2048" {
-                        assert_eq!(go, "refused: tls: failed to parse private key", "{label}");
+                    if go == "ok RSA 2048" {
+                        "RSA, which Go loads".to_owned()
+                    } else {
+                        assert_eq!(go, RSA_GO_REFUSES_WITH, "{label}");
                         rsa_refused.push(label.clone());
+                        "RSA, which Go refuses".to_owned()
                     }
-                    format!("RSA, which Go answers: {go}")
                 } else if text == "unsupported private key: ECDSA P-224" {
                     assert_eq!(go, "ok ECDSA P-224", "{label}");
                     text
+                } else if text.starts_with("unsupported private key: ML-DSA-") {
+                    assert_eq!(go, GO_READ_ANOTHER_KEY[1], "{label}");
+                    text
                 } else {
                     assert_eq!(go, format!("refused: {text}"), "{label}");
-                    text
+                    match text.strip_prefix(UNPARSABLE) {
+                        Some(cause) => shape(cause),
+                        None => text,
+                    }
                 }
             }
             Err(other) => panic!("{label}: {other:?}"),
@@ -347,23 +436,258 @@ fn keys_load_as_go_loads_them() {
     }
     assert_eq!(rsa_refused, RSA_GO_REFUSES, "the RSA keys Go refuses");
     let expected: BTreeMap<String, usize> = [
+        ("RSA, which Go loads", 12),
+        ("RSA, which Go refuses", 2),
+        ("asn1: structure error: base N integer too large", 1),
+        ("asn1: structure error: integer not minimally-encoded", 15),
+        ("asn1: structure error: non-minimal length", 3),
+        ("asn1: structure error: superfluous leading zeros in length", 2),
+        ("asn1: structure error: tags don't match (N vs {class:N tag:N length:N isCompound:false}) {P} AlgorithmIdentifier @N", 69),
+        ("asn1: structure error: tags don't match (N vs {class:N tag:N length:N isCompound:false}) {P} int @N", 1),
+        ("asn1: structure error: tags don't match (N vs {class:N tag:N length:N isCompound:true}) {P}  @N", 5),
+        ("asn1: structure error: tags don't match (N vs {class:N tag:N length:N isCompound:true}) {P} AlgorithmIdentifier @N", 5),
+        ("asn1: structure error: tags don't match (N vs {class:N tag:N length:N isCompound:true}) {P} pkcs8 @N", 5),
+        ("asn1: syntax error: indefinite length found (not DER)", 5),
+        ("asn1: syntax error: non-minimal tag", 1),
+        ("asn1: syntax error: truncated base N integer", 10),
+        ("crypto/ecdh: invalid private key size", 2),
         ("ok ECDSA P-256", 100),
         ("ok ECDSA P-384", 55),
         ("ok ECDSA P-521", 57),
         ("ok Ed25519", 9),
-        ("unsupported private key: ECDSA P-224", 48),
-        ("tls: failed to parse private key", 272),
         ("tls: found unknown private key type in PKCS#8 wrapping", 1),
-        ("RSA, which Go answers: ok RSA 2048", 12),
-        (
-            "RSA, which Go answers: refused: tls: failed to parse private key",
-            2,
-        ),
+        ("unsupported private key: ECDSA P-224", 48),
+        ("unsupported private key: ML-DSA-44", 1),
+        ("unsupported private key: ML-DSA-65", 1),
+        ("unsupported private key: ML-DSA-87", 1),
+        ("x509: ML-DSA private keys with both seed and expanded key are not supported, use e.g. \"openssl pkey -provparam ml-dsa.output_formats=seed-only\" to convert to a seed-only key", 1),
+        ("x509: PKCS#8 wrapping contained private key with unknown algorithm: N.N", 2),
+        ("x509: PKCS#8 wrapping contained private key with unknown algorithm: N.N.N", 1),
+        ("x509: PKCS#8 wrapping contained private key with unknown algorithm: N.N.N.N", 1),
+        ("x509: PKCS#8 wrapping contained private key with unknown algorithm: N.N.N.N.N", 5),
+        ("x509: failed to parse EC private key embedded in PKCS#8: ecdsa: invalid public key encoding", 10),
+        ("x509: failed to parse EC private key embedded in PKCS#8: input overflows the modulus", 5),
+        ("x509: failed to parse EC private key embedded in PKCS#8: x509: failed to parse EC private key: asn1: structure error: explicit tag has no child", 5),
+        ("x509: failed to parse EC private key embedded in PKCS#8: x509: failed to parse EC private key: asn1: syntax error: invalid padding bits in BIT STRING", 1),
+        ("x509: failed to parse EC private key embedded in PKCS#8: x509: failed to parse EC private key: asn1: syntax error: truncated base N integer", 5),
+        ("x509: failed to parse EC private key embedded in PKCS#8: x509: failed to parse EC private key: asn1: syntax error: zero length BIT STRING", 1),
+        ("x509: failed to parse EC private key embedded in PKCS#8: x509: failed to parse private key (use ParsePKCS1PrivateKey instead for this key format)", 1),
+        ("x509: failed to parse EC private key embedded in PKCS#8: x509: failed to parse private key (use ParsePKCS8PrivateKey instead for this key format)", 1),
+        ("x509: failed to parse EC private key embedded in PKCS#8: x509: invalid private key length", 7),
+        ("x509: failed to parse EC private key embedded in PKCS#8: x509: unknown EC private key version N", 5),
+        ("x509: failed to parse EC private key embedded in PKCS#8: x509: unknown elliptic curve", 15),
+        ("x509: failed to parse RSA private key embedded in PKCS#8: asn1: structure error: integer not minimally-encoded", 1),
+        ("x509: failed to parse RSA private key embedded in PKCS#8: asn1: syntax error: sequence truncated", 1),
+        ("x509: failed to parse RSA private key embedded in PKCS#8: asn1: syntax error: trailing data", 1),
+        ("x509: failed to parse RSA private key embedded in PKCS#8: x509: failed to parse private key (use ParseECPrivateKey instead for this key format)", 5),
+        ("x509: failed to parse RSA private key embedded in PKCS#8: x509: failed to parse private key (use ParsePKCS8PrivateKey instead for this key format)", 1),
+        ("x509: failed to parse RSA private key embedded in PKCS#8: x509: unsupported private key version", 1),
+        ("x509: failed to parse private key (use ParseECPrivateKey instead for this key format)", 92),
+        ("x509: failed to parse private key (use ParsePKCS1PrivateKey instead for this key format)", 2),
+        ("x509: invalid Ed25519 private key length: N", 3),
+        ("x509: invalid Ed25519 private key parameters", 2),
+        ("x509: invalid Ed25519 private key: asn1: structure error: length too large", 1),
+        ("x509: invalid Ed25519 private key: asn1: structure error: tags don't match (N vs {class:N tag:N length:N isCompound:false}) {P}  @N", 1),
+        ("x509: invalid Ed25519 private key: asn1: structure error: tags don't match (N vs {class:N tag:N length:N isCompound:true}) {P}  @N", 1),
+        ("x509: invalid ML-DSA private key ASN.1 encoding", 1),
+        ("x509: invalid ML-DSA private key length: N", 2),
+        ("x509: invalid ML-DSA private key parameters", 1),
+        ("x509: invalid ML-DSA private key: invalid ASN.1 tag N", 1),
+        ("x509: invalid X25519 private key parameters", 1),
+        ("x509: invalid X25519 private key: asn1: structure error: tags don't match (N vs {class:N tag:N length:N isCompound:false}) {P}  @N", 1),
+        ("x509: semi-expanded ML-DSA private keys without seed are not supported", 1),
     ]
     .into_iter()
     .map(|(verdict, count)| (verdict.to_owned(), count))
     .collect();
     assert_eq!(verdicts, expected, "the count of each verdict");
+}
+
+/// The mutations of a key the sweep makes, each with its name: every
+/// truncation, a zero byte appended, and each of the first 64 bytes and
+/// every seventh after them set in turn to 0x00, 0xff, itself with bit 5
+/// or bit 7 flipped, and itself plus and less one, where that changes it.
+fn mutations(der: &[u8]) -> Vec<(String, Vec<u8>)> {
+    let mut out: Vec<(String, Vec<u8>)> = (0..der.len())
+        .map(|len| (format!("trunc{len}"), der[..len].to_vec()))
+        .collect();
+    out.push(("append00".to_owned(), [der, &[0]].concat()));
+    for (at, &byte) in der.iter().enumerate() {
+        if at >= 64 && at % 7 != 0 {
+            continue;
+        }
+        let values = [
+            0x00,
+            0xff,
+            byte ^ 0x20,
+            byte ^ 0x80,
+            byte.wrapping_add(1),
+            byte.wrapping_sub(1),
+        ];
+        for value in values {
+            if value != byte {
+                let mut mutated = der.to_vec();
+                mutated[at] = value;
+                out.push((format!("set{at}={value:02x}"), mutated));
+            }
+        }
+    }
+    out
+}
+
+/// The crate's answer to a key of the sweep: for a key `load_der` loads,
+/// its type and a certificate made for the public key it gave, which Go
+/// loads the key against only if it reads the same key; for one it
+/// refuses, the text.
+type SweepAnswer = Result<(KeyAlgorithm, Vec<u8>), String>;
+
+/// `load_der`'s answer to `der`, as the sweep compares it.
+fn sweep_answer(der: &[u8]) -> SweepAnswer {
+    match sign::load_der(der) {
+        Ok(key) => {
+            let spki = key.public_key().expect("a public key");
+            let algorithm = sign::key_algorithm(der).expect("a key load_der loads");
+            Ok((algorithm, key_corpus::certificate(spki.as_ref())))
+        }
+        Err(rustls::Error::General(text)) => Err(text),
+        Err(other) => Err(format!("{other:?}")),
+    }
+}
+
+/// Whether Go's answer refuses an RSA key for its values, which is how
+/// Go refuses a key this crate refuses as RSA, reading its structure
+/// alone: the PKCS#8 parser's hint for a PKCS#1 key,
+/// [`RSA_GO_REFUSES_WITH`], or, for one inside PKCS#8, `crypto/rsa`'s
+/// error or `crypto/x509`'s for a value that is not positive
+/// (`crypto/x509/pkcs8.go:51-54`, `crypto/x509/pkcs1.go:74-79`, `:95-97`,
+/// `:104-119`).
+fn go_refuses_rsa_values(go: &str) -> bool {
+    const EMBEDDED: &str = "refused: tls: failed to parse private key: x509: failed to parse \
+                            RSA private key embedded in PKCS#8: ";
+    go == RSA_GO_REFUSES_WITH
+        || go.strip_prefix(EMBEDDED).is_some_and(|cause| {
+            cause.starts_with("crypto/rsa: ")
+                || cause.starts_with("x509: private key contains zero or negative ")
+        })
+}
+
+/// Whether the crate's answer to a key agrees with Go's, and in which
+/// class: a key it loads, one Go loads, of the same type, against a
+/// certificate made for the public key the crate gave; and against the
+/// certificate of the corpus case the key was mutated from, a refusal in
+/// Go's words, the same text; an RSA key, one Go reads, or refuses for
+/// its values ([`go_refuses_rsa_values`]), which Go checks and this
+/// crate does not; and the P-224 and ML-DSA keys it refuses with its own
+/// text, keys Go reads.  The text it gives is the error.
+fn sweep_class(ours: &SweepAnswer, go: &str) -> Result<&'static str, String> {
+    let read_another = GO_READ_ANOTHER_KEY.contains(&go);
+    match ours {
+        Ok((algorithm, _)) => {
+            if go.strip_prefix("ok ") == Some(go_type(*algorithm)) {
+                Ok("loaded, the key Go reads")
+            } else {
+                Err(format!("loaded as {algorithm:?}"))
+            }
+        }
+        Err(text) => {
+            let class = if text == sign::RSA_KEY_REFUSED {
+                if go.starts_with("ok RSA ") || go == GO_READ_ANOTHER_KEY[0] {
+                    Some("RSA, which Go reads")
+                } else if go_refuses_rsa_values(go) {
+                    Some("RSA, which Go refuses")
+                } else {
+                    None
+                }
+            } else if text == "unsupported private key: ECDSA P-224" {
+                (go == "ok ECDSA P-224" || read_another).then_some("P-224, which Go reads")
+            } else if text.starts_with("unsupported private key: ML-DSA-") {
+                (go == GO_READ_ANOTHER_KEY[1]).then_some("ML-DSA, which Go reads")
+            } else {
+                (go == format!("refused: {text}")).then_some("refused in Go's words")
+            };
+            class.ok_or_else(|| text.clone())
+        }
+    }
+}
+
+/// How many of the sweep's inputs one is compared:
+/// `DCROXIDE_KEY_SWEEP_EVERY`, one in ten by default, 1 for every input,
+/// as the nightly job runs it.
+fn sweep_every() -> u64 {
+    match std::env::var("DCROXIDE_KEY_SWEEP_EVERY") {
+        Ok(every) => {
+            let every = every.parse().expect("DCROXIDE_KEY_SWEEP_EVERY is a count");
+            assert!(every > 0, "DCROXIDE_KEY_SWEEP_EVERY is at least 1");
+            every
+        }
+        Err(_) => 10,
+    }
+}
+
+/// `load_der` answers mutations of every key of the corpus as Go's
+/// `tls.X509KeyPair` does ([`sweep_class`]), Go given each under its
+/// case's PEM label, through the oracle's `x509_key_pairs`, against a
+/// certificate made for the key `load_der` gave where it loads one and
+/// against its case's certificate where it refuses one: in every run a
+/// sample of one input in ten
+/// drawn from a fixed generator, the same sample each time, and in the
+/// nightly job every input (`DCROXIDE_KEY_SWEEP_EVERY`).  Go's answers
+/// come from the oracle as the test runs, so no answer is frozen in the
+/// tree.  The count of inputs is pinned, so that a generator gone wrong
+/// cannot pass on agreement alone, and each class must show.
+#[test]
+fn mutated_keys_load_as_go_loads_them() {
+    let Some(mut oracle) = dcroxide_testutil::oracle_or_skip() else {
+        return;
+    };
+    let every = sweep_every();
+    let mut rng = SplitMix64(0x6b65_7973_7765_6570);
+    let mut classes: BTreeMap<&str, usize> = BTreeMap::new();
+    let mut differ = Vec::new();
+    let mut inputs = 0;
+    for case in key_corpus::cases() {
+        let mutated = mutations(&case.der);
+        inputs += mutated.len();
+        let sample: Vec<(String, Vec<u8>)> = mutated
+            .into_iter()
+            .filter(|_| rng.below(every) == 0)
+            .collect();
+        if sample.is_empty() {
+            continue;
+        }
+        let ours: Vec<SweepAnswer> = sample.iter().map(|(_, der)| sweep_answer(der)).collect();
+        let keys: Vec<Vec<u8>> = sample.iter().map(|(_, der)| der.clone()).collect();
+        let certs: Vec<Option<Vec<u8>>> = ours
+            .iter()
+            .map(|ours| ours.as_ref().ok().map(|(_, cert)| cert.clone()))
+            .collect();
+        let answers = go_key_pairs(&mut oracle, &case.cert, case.pem_label, &keys, &certs);
+        for (((name, _), ours), go) in sample.iter().zip(&ours).zip(&answers) {
+            match sweep_class(ours, go) {
+                Ok(class) => *classes.entry(class).or_default() += 1,
+                Err(ours) => differ.push(format!("{}|{name}: {ours}; Go: {go}", case.label)),
+            }
+        }
+    }
+    let compared: usize = classes.values().sum::<usize>() + differ.len();
+    eprintln!("{compared} of {inputs} inputs compared, one in {every}: {classes:?}");
+    assert!(
+        differ.is_empty(),
+        "{} differ:\n{}",
+        differ.len(),
+        differ.join("\n")
+    );
+    assert_eq!(inputs, 385_653, "the sweep's inputs");
+    for class in [
+        "loaded, the key Go reads",
+        "RSA, which Go reads",
+        "RSA, which Go refuses",
+        "P-224, which Go reads",
+        "ML-DSA, which Go reads",
+        "refused in Go's words",
+    ] {
+        assert!(classes.contains_key(class), "no input of the class {class}");
+    }
 }
 
 /// Ed25519 signs as Go's `ed25519.Sign`, byte for byte, through the

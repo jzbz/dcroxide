@@ -26,9 +26,9 @@
 //!
 //! [`KEY_PROVIDER`] and [`load_der`] read a key as Go's `tls.X509KeyPair`
 //! does (`crate::keys`), with Go's texts for a key Go refuses and this
-//! provider's own for the RSA and P-224 keys Go loads and this provider
-//! does not sign with.  The secrets are wiped when the last handshake
-//! holding them drops them.
+//! provider's own for the keys it does not sign with: an RSA key, whether
+//! or not Go loads it, and the P-224 and ML-DSA keys Go loads.  The
+//! secrets are wiped when the last handshake holding them drops them.
 
 use core::fmt;
 use std::sync::Arc;
@@ -43,7 +43,7 @@ use rustls::{Error, SignatureAlgorithm, SignatureScheme};
 use sha2::{Digest, Sha512};
 use zeroize::{Zeroize, Zeroizing};
 
-use crate::keys::{self, KeyError, ParsedKey};
+use crate::keys::{self, ParsedKey};
 use crate::rand::ProcessRng;
 
 /// Go's `tls.X509KeyPair` key parsing, less RSA: the key provider whose
@@ -54,9 +54,6 @@ pub static KEY_PROVIDER: &dyn KeyProvider = &KeyLoader;
 /// [`KEY_PROVIDER`]'s and [`load_der`]'s text for an RSA key.
 pub const RSA_KEY_REFUSED: &str = "RSA private keys are not supported: this provider signs with \
                                    ECDSA (P-256, P-384, P-521) and Ed25519 keys";
-
-/// Go's text for a key none of its parsers reads (`crypto/tls/tls.go:382`).
-const UNPARSABLE: &str = "tls: failed to parse private key";
 
 /// What Go's `parsePrivateKey` reads a key as, when it is one of these.
 #[non_exhaustive]
@@ -97,11 +94,7 @@ pub fn load_der(der: &[u8]) -> Result<Arc<dyn SigningKey>, Error> {
         Ok(ParsedKey::EcdsaP521(key)) => Ok(Arc::new(EcdsaSigningKey::<p521::NistP521>::new(key))),
         Ok(ParsedKey::Ed25519(seed)) => Ok(Arc::new(Ed25519SigningKey::from_seed(&seed))),
         Ok(ParsedKey::Rsa) => refused(RSA_KEY_REFUSED),
-        // Go 1.26's bare text still: without the cause Go 1.27.3 gives
-        // after it, and for an ML-DSA key, which Go loads, in place of the
-        // key's own text.
-        Err(KeyError::Unparsable(_) | KeyError::MlDsa(_)) => refused(UNPARSABLE),
-        Err(error @ (KeyError::UnknownPkcs8Type | KeyError::P224)) => refused(&error.to_string()),
+        Err(error) => refused(&error.to_string()),
     }
 }
 
@@ -507,8 +500,10 @@ impl Signer for Ed25519Signer {
 /// `der` with that type's scheme, and, for the types this provider
 /// verifies, P-256, P-384 and Ed25519, gives a signature the provider's
 /// own verifier takes under the key's public key; a key it refuses as RSA
-/// is RSA, and any other it refuses has no type.  Returns whether the key
-/// loaded.
+/// is RSA, and any other it refuses has no type, and is refused with Go's
+/// "tls: failed to parse private key: " and a cause of one line, or with
+/// one of the fixed texts for the X25519, P-224 and ML-DSA keys Go reads.
+/// Returns whether the key loaded.
 #[doc(hidden)]
 pub fn fuzz_key_parse(der: &[u8]) -> bool {
     use rustls::pki_types::SignatureVerificationAlgorithm;
@@ -519,6 +514,20 @@ pub fn fuzz_key_parse(der: &[u8]) -> bool {
             let rsa = text == RSA_KEY_REFUSED;
             assert_eq!(rsa, algorithm == Some(KeyAlgorithm::Rsa), "{text}");
             assert!(rsa || algorithm.is_none(), "{text}, yet {algorithm:?}");
+            match text.strip_prefix("tls: failed to parse private key: ") {
+                Some(cause) => assert!(!cause.is_empty() && !cause.contains('\n'), "{text:?}"),
+                None => assert!(
+                    rsa || [
+                        "tls: found unknown private key type in PKCS#8 wrapping",
+                        "unsupported private key: ECDSA P-224",
+                        "unsupported private key: ML-DSA-44",
+                        "unsupported private key: ML-DSA-65",
+                        "unsupported private key: ML-DSA-87",
+                    ]
+                    .contains(&text.as_str()),
+                    "{text:?}"
+                ),
+            }
             return false;
         }
         Err(other) => panic!("load_der refused with {other:?}"),
@@ -1086,9 +1095,10 @@ mod tests {
         }
     }
 
-    /// Each refusal has its text: Go's for what Go refuses, this
-    /// provider's for the RSA and P-224 keys Go loads, Go 1.26's bare text
-    /// still for an ML-DSA key; and the type each key reads as.
+    /// Each refusal has its text: Go's for what Go refuses, the PKCS#8
+    /// parser's error after Go's prefix among them, and this provider's
+    /// for the RSA, P-224 and ML-DSA keys Go loads; and the type each key
+    /// reads as.
     #[test]
     fn each_refusal_has_its_text() {
         let text = |der: &[u8]| match load_der(der) {
@@ -1118,8 +1128,8 @@ mod tests {
             ]
             .concat(),
         );
-        // ML-DSA-65's seed form, which Go loads: the bare text still, as
-        // for a key that does not parse.
+        // ML-DSA-65's seed form, which Go loads, and this provider does not
+        // sign with yet.
         let ml_dsa = tlv(
             0x30,
             &[
@@ -1141,9 +1151,19 @@ mod tests {
             text(&x25519),
             "tls: found unknown private key type in PKCS#8 wrapping"
         );
-        assert_eq!(text(&ml_dsa), "tls: failed to parse private key");
-        assert_eq!(text(b"not a key"), "tls: failed to parse private key");
-        assert_eq!(text(&[]), "tls: failed to parse private key");
+        assert_eq!(text(&ml_dsa), "unsupported private key: ML-DSA-65");
+        // Go 1.27.3's texts, as `tools/oracle/main_test.go` pins the first.
+        assert_eq!(
+            text(b"not a key"),
+            "tls: failed to parse private key: asn1: structure error: tags don't match (16 vs \
+             {class:1 tag:14 length:111 isCompound:true}) {optional:false explicit:false \
+             application:false private:false defaultValue:<nil> tag:<nil> stringType:0 \
+             timeType:0 set:false omitEmpty:false} pkcs8 @2"
+        );
+        assert_eq!(
+            text(&[]),
+            "tls: failed to parse private key: asn1: syntax error: sequence truncated"
+        );
 
         assert_eq!(key_algorithm(&rsa), Some(KeyAlgorithm::Rsa));
         assert_eq!(

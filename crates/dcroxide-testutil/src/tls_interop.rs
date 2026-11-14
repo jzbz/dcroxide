@@ -37,23 +37,6 @@ pub const DCRD_TLS_GODEBUG: &str = "tlssecpmlkem=1,tlssha1=0,x509sha256skid=1,cr
 /// request and response, as the oracle's `timeout_ms`.
 pub const TIMEOUT_MS: u64 = 10_000;
 
-/// `tls.X509KeyPair`'s refusal of a key it cannot parse, as the oracle's
-/// `x509_key_pair` answers it.
-const KEY_UNPARSABLE: &str = "refused: tls: failed to parse private key";
-
-/// An `x509_key_pair` answer as the tests compare it for now: since Go 1.27
-/// the refusal of a key Go cannot parse goes on with `: ` and the PKCS#8
-/// parser's error (Go 1.27.3's `crypto/tls/tls.go:361-379`), which the
-/// port does not give yet, so that one cause is cut off and the refusal
-/// left as Go 1.26 worded it.  Every other answer is kept whole, a refusal
-/// with another prefix among them.  PARITY.md records the divergence.
-pub fn without_key_parse_cause(answer: &str) -> &str {
-    match answer.strip_prefix(KEY_UNPARSABLE) {
-        Some(cause) if cause.starts_with(": ") => KEY_UNPARSABLE,
-        _ => answer,
-    }
-}
-
 /// The oracle for the TLS interop tests: [`oracle_or_skip_with_env`] under
 /// [`DCRD_TLS_GODEBUG`], with the same skip-or-fail policy for an oracle
 /// whose Go builds none of its TLS commands, which need Go 1.26 or later
@@ -522,33 +505,6 @@ mod tests {
                 assert_eq!(served["curve_id"], want, "{served}");
             }
             assert_eq!(go.handshakes(), 1, "one connection, counted once");
-        }
-    }
-
-    /// Only the cause after the unparsable-key refusal is cut off.
-    #[test]
-    fn only_the_key_parse_cause_is_cut_off() {
-        for (answer, kept) in [
-            (
-                "refused: tls: failed to parse private key: asn1: structure error: tags \
-                 don't match",
-                "refused: tls: failed to parse private key",
-            ),
-            (
-                "refused: tls: failed to parse private key",
-                "refused: tls: failed to parse private key",
-            ),
-            (
-                "refused: tls: failed to parse private keys",
-                "refused: tls: failed to parse private keys",
-            ),
-            (
-                "refused: tls: private key does not match public key",
-                "refused: tls: private key does not match public key",
-            ),
-            ("ok ECDSA P-256", "ok ECDSA P-256"),
-        ] {
-            assert_eq!(without_key_parse_cause(answer), kept, "{answer}");
         }
     }
 

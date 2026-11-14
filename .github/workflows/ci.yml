@@ -5,8 +5,8 @@ on:
     branches: [master]
   pull_request:
   schedule:
-    # Nightly long-run fuzzing and the signature soak (the nightly-fuzz and
-    # nightly-sigsoak jobs).
+    # Nightly long-run fuzzing, the signature soak and the full RPC key
+    # sweep (the nightly-fuzz, nightly-sigsoak and nightly-key-sweep jobs).
     - cron: "0 3 * * *"
   workflow_dispatch:
     inputs:
@@ -14,7 +14,7 @@ on:
         description: >-
           A sigsoak master seed (hex) for the nightly-sigsoak legs to run
           again. Left empty, each leg draws a fresh one; given, nightly-fuzz
-          does not run.
+          and nightly-key-sweep do not run.
         type: string
         required: false
         default: ""
@@ -822,6 +822,33 @@ jobs:
           name: fuzz-artifacts-nightly
           path: fuzz/artifacts/
           if-no-files-found: ignore
+
+  nightly-key-sweep:
+    name: nightly RPC key sweep
+    # A dispatch that names a sigsoak seed is for the soak alone.
+    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.seed == '')
+    runs-on: ubuntu-latest
+    # The sweep itself takes a few minutes. The rest is the test build and
+    # the oracle; the bound is for an oracle that stops answering.
+    timeout-minutes: 30
+    # dcroxide-tlscrypto's mutated_keys_load_as_go_loads_them compares
+    # the key reader's answer with Go's tls.X509KeyPair on every mutation
+    # of its key corpus, where the test job compares one in ten. The
+    # variable is a test setting, read by that test alone.
+    env:
+      DCROXIDE_KEY_SWEEP_EVERY: "1"
+    steps:
+      - uses: actions/checkout@v7
+      # Toolchain comes from rust-toolchain.toml (see the lint job).
+      - run: rustup toolchain install
+      # The workflow-wide DCROXIDE_REQUIRE_ORACLE requires the reference
+      # Go, as in the test job.
+      - uses: actions/setup-go@v7
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: tools/oracle/go.sum
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p dcroxide-tlscrypto --test go_differential mutated_keys_load_as_go_loads_them
 
   nightly-sigsoak:
     name: nightly sigsoak (${{ matrix.leg }})

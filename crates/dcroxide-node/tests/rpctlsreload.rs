@@ -36,7 +36,7 @@ use dcroxide_node::rpcrun::{
 };
 use dcroxide_node::{ConfigEnv, load_config_from_argv};
 use dcroxide_testutil::REFERENCE_GO;
-use dcroxide_testutil::tls_interop::{TlsOracle, spec, without_key_parse_cause};
+use dcroxide_testutil::tls_interop::{TlsOracle, spec};
 use serde_json::json;
 
 /// Write a fresh self-signed pair at the two paths, replacing whatever
@@ -454,9 +454,8 @@ fn as_pkcs8(curve: Curve, sec1: &[u8]) -> Vec<u8> {
 /// Hold a pair to Go's `tls.X509KeyPair` through the oracle's
 /// `x509_key_pair`, when the oracle is present: `want` is its answer
 /// under the reference Go, `ok` and the key's type or `refused: ` and
-/// Go's error, compared whole there, but for the cause Go gives for a key
-/// it cannot parse ([`without_key_parse_cause`]), and as a verdict alone
-/// under another Go or where `want` is `refused: ` alone.
+/// Go's error, compared whole there, and as a verdict alone under another
+/// Go or where `want` is `refused: ` alone.
 fn assert_go_reads(
     go: Option<&mut TlsOracle>,
     what: &str,
@@ -474,8 +473,7 @@ fn assert_go_reads(
             "key_pem": String::from_utf8_lossy(key_pem),
         }),
     );
-    let answer =
-        without_key_parse_cause(answer["result"].as_str().expect("x509_key_pair's verdict"));
+    let answer = answer["result"].as_str().expect("x509_key_pair's verdict");
     if go.go_version() == REFERENCE_GO && want != "refused: " {
         assert_eq!(answer, want, "{what}: Go");
     } else {
@@ -516,9 +514,9 @@ fn a_key_without_its_public_key_builds_on_either_curve() {
 }
 
 /// The RPC server takes the key block by Go's rule, the first whose type
-/// is `PRIVATE KEY` or ends in ` PRIVATE KEY` (`crypto/tls/tls.go:294-311`),
+/// is `PRIVATE KEY` or ends in ` PRIVATE KEY` (`crypto/tls/tls.go:286-303`),
 /// and reads its DER whatever the label, as Go's `parsePrivateKey` does
-/// (`:366-383`), so a pair builds with its SEC 1 key under `EC PRIVATE KEY`,
+/// (`:361-379`), so a pair builds with its SEC 1 key under `EC PRIVATE KEY`,
 /// `RSA PRIVATE KEY` or a label of its own, and with its PKCS#8 form under
 /// `PRIVATE KEY` or a label of its own, on either curve, as in dcrd, and
 /// Go's own reading agrees through the oracle when it is present.
@@ -628,8 +626,10 @@ struct KeyCase {
 ///   under `TESTPRIVATE KEY`, which runs into `PRIVATE KEY` with no space,
 ///   it is skipped, refused alone with Go's text and served from a plain
 ///   block after it; an `ENCRYPTED PRIVATE KEY` block ahead of a plain key
-///   is the block read, which does not parse; and a file of a certificate
-///   alone, of no PEM, and of other blocks, each with Go's text.
+///   is the block read, which does not parse, refused with the PKCS#8
+///   parser's error for a first element that is not the version; and a
+///   file of a certificate alone, of no PEM, and of other blocks, each
+///   with Go's text.
 #[test]
 fn an_rpc_key_is_read_as_x509_key_pair_reads_it() {
     let (p256_cert, p256_sec1) = generated_pair(Curve::P256);
@@ -737,8 +737,16 @@ fn an_rpc_key_is_read_as_x509_key_pair_reads_it() {
         case(
             "an ENCRYPTED PRIVATE KEY block ahead of a plain key",
             [pem("ENCRYPTED PRIVATE KEY", &encrypted), pkcs8.clone()].concat(),
-            Some("tls: failed to parse private key"),
-            "refused: tls: failed to parse private key",
+            Some(
+                "tls: failed to parse private key: asn1: structure error: tags don't match (2 vs \
+                 {class:0 tag:16 length:11 isCompound:true}) {optional:false explicit:false \
+                 application:false private:false defaultValue:<nil> tag:<nil> stringType:0 \
+                 timeType:0 set:false omitEmpty:false} int @2",
+            ),
+            "refused: tls: failed to parse private key: asn1: structure error: tags don't match \
+             (2 vs {class:0 tag:16 length:11 isCompound:true}) {optional:false explicit:false \
+             application:false private:false defaultValue:<nil> tag:<nil> stringType:0 \
+             timeType:0 set:false omitEmpty:false} int @2",
         ),
         case(
             "a certificate alone",

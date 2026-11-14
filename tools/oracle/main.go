@@ -189,6 +189,14 @@
 //	                     <curve name>", "Ed25519" or "RSA <modulus bits>",
 //	                     or {"result": "refused: <error>"}, each with
 //	                     "go_version": runtime.Version()
+//	x509_key_pairs     → data is JSON {"cert_pem": string, "label":
+//	                     string, "keys": [hex DER], "cert_pems":
+//	                     [string]}; each key under a PEM block of that
+//	                     label, with that certificate, or with the one of
+//	                     the same index in "cert_pems" where that is given
+//	                     and not empty, as x509_key_pair answers it;
+//	                     {"detail": [answer]}, in the keys' order, with
+//	                     "go_version": runtime.Version()
 //	sig_sign           → data is JSON {"key_pkcs8": hex | "rsa": {"n",
 //	                     "e", "d", "p", "q": hex}, "scheme": name |
 //	                     "x509_alg": name, "message": hex, "raw": bool,
@@ -280,6 +288,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
@@ -1695,11 +1704,7 @@ func handle(req request) response {
 
 	case "x509_key_pair":
 		// crypto/tls's X509KeyPair, which dcrd loads rpc.cert and rpc.key
-		// with (tls.LoadX509KeyPair): the certificate's blocks, the first
-		// key block, the key as parsePrivateKey reads it, and the key
-		// checked against the certificate.  The key's type goes with the
-		// verdict, so that a key read as another type than the caller's
-		// shows.
+		// with (tls.LoadX509KeyPair): see x509KeyPair.
 		var in struct {
 			CertPEM string `json:"cert_pem"`
 			KeyPEM  string `json:"key_pem"`
@@ -1707,22 +1712,51 @@ func handle(req request) response {
 		if err := json.Unmarshal(data, &in); err != nil {
 			return errResp("x509_key_pair: %v", err)
 		}
-		pair, err := tls.X509KeyPair([]byte(in.CertPEM), []byte(in.KeyPEM))
+		answer, err := x509KeyPair([]byte(in.CertPEM), []byte(in.KeyPEM))
 		if err != nil {
-			return response{Result: "refused: " + err.Error(), GoVersion: runtime.Version()}
+			return errResp("x509_key_pair: %v", err)
 		}
-		var kind string
-		switch key := pair.PrivateKey.(type) {
-		case *stdecdsa.PrivateKey:
-			kind = "ECDSA " + key.Curve.Params().Name
-		case ed25519.PrivateKey:
-			kind = "Ed25519"
-		case *rsa.PrivateKey:
-			kind = fmt.Sprintf("RSA %d", key.N.BitLen())
-		default:
-			return errResp("x509_key_pair: a key of type %T", key)
+		return response{Result: answer, GoVersion: runtime.Version()}
+
+	case "x509_key_pairs":
+		// x509_key_pair over many keys against one certificate, or one
+		// of the caller's for some of them, each written as a PEM block
+		// of one label, so that a sweep of mutated keys takes one round
+		// trip per certificate.
+		var in struct {
+			CertPEM  string   `json:"cert_pem"`
+			Label    string   `json:"label"`
+			Keys     []string `json:"keys"`
+			CertPEMs []string `json:"cert_pems"`
 		}
-		return response{Result: "ok " + kind, GoVersion: runtime.Version()}
+		if err := json.Unmarshal(data, &in); err != nil {
+			return errResp("x509_key_pairs: %v", err)
+		}
+		if in.CertPEMs != nil && len(in.CertPEMs) != len(in.Keys) {
+			return errResp("x509_key_pairs: %d certificates for %d keys", len(in.CertPEMs), len(in.Keys))
+		}
+		answers := make([]string, 0, len(in.Keys))
+		for i, key := range in.Keys {
+			der, err := hex.DecodeString(key)
+			if err != nil {
+				return errResp("x509_key_pairs: key %d: %v", i, err)
+			}
+			certPEM := in.CertPEM
+			if in.CertPEMs != nil && in.CertPEMs[i] != "" {
+				certPEM = in.CertPEMs[i]
+			}
+			keyPEM := pem.EncodeToMemory(&pem.Block{Type: in.Label, Bytes: der})
+			answer, err := x509KeyPair([]byte(certPEM), keyPEM)
+			if err != nil {
+				return errResp("x509_key_pairs: key %d: %v", i, err)
+			}
+			answers = append(answers, answer)
+		}
+		detail, err := json.Marshal(answers)
+		if err != nil {
+			return errResp("x509_key_pairs: %v", err)
+		}
+		return response{Detail: detail, GoVersion: runtime.Version()}
 
 	case "sig_sign":
 		// The signature crypto/tls or crypto/x509 makes with a key for a
@@ -1990,6 +2024,29 @@ var sigX509Algorithms = map[x509.SignatureAlgorithm]sigAlgorithm{
 	x509.ECDSAWithSHA384:  {kind: sigECDSA, hash: crypto.SHA384},
 	x509.ECDSAWithSHA512:  {kind: sigECDSA, hash: crypto.SHA512},
 	x509.PureEd25519:      {kind: sigEd25519},
+}
+
+// x509KeyPair is crypto/tls's X509KeyPair, which dcrd loads rpc.cert and
+// rpc.key with (tls.LoadX509KeyPair): the certificate's blocks, the first
+// key block, the key as parsePrivateKey reads it, and the key checked
+// against the certificate. The answer is "ok " and the key's type, so
+// that a key read as another type than the caller's shows, or "refused: "
+// and Go's error; a key of a type it has no name for is an error.
+func x509KeyPair(certPEM, keyPEM []byte) (string, error) {
+	pair, err := tls.X509KeyPair(certPEM, keyPEM)
+	if err != nil {
+		return "refused: " + err.Error(), nil
+	}
+	switch key := pair.PrivateKey.(type) {
+	case *stdecdsa.PrivateKey:
+		return "ok ECDSA " + key.Curve.Params().Name, nil
+	case ed25519.PrivateKey:
+		return "ok Ed25519", nil
+	case *rsa.PrivateKey:
+		return fmt.Sprintf("ok RSA %d", key.N.BitLen()), nil
+	default:
+		return "", fmt.Errorf("a key of type %T", key)
+	}
 }
 
 // lookupSigAlgorithm finds the algorithm a TLS signature scheme or an

@@ -835,6 +835,115 @@ func TestX509KeyPair(t *testing.T) {
 	}
 }
 
+// TestX509KeyPairs checks that x509_key_pairs answers each key of a batch
+// as x509_key_pair answers it alone, in order: a key that loads, another
+// certificate's key, a key of another type, a PKCS#8 X25519 key and bytes
+// no parser reads, under one label; that a key given a certificate of its
+// own in "cert_pems" is held to that one, the others to "cert_pem"; that
+// an empty batch is an empty list; and that a key that is not hex, a
+// count of certificates that is not the count of keys, or a request that
+// is not JSON, is an error.
+func TestX509KeyPairs(t *testing.T) {
+	p256, err := stdecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p384, err := stdecdsa.GenerateKey(elliptic.P384(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, edKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	x25519, err := ecdh.X25519().GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keys := [][]byte{
+		pkcs8(t, p256), pkcs8(t, p384), pkcs8(t, edKey), pkcs8(t, x25519), []byte("not a key"),
+	}
+	var single, p384Single struct {
+		CertPEM string `json:"cert_pem"`
+	}
+	if err := json.Unmarshal(keyPairRequest(t, p256, nil, "PRIVATE KEY"), &single); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(keyPairRequest(t, p384, nil, "PRIVATE KEY"), &p384Single); err != nil {
+		t.Fatal(err)
+	}
+	batch := func(keys [][]byte, certs []string) []byte {
+		hexKeys := make([]string, len(keys))
+		for i, key := range keys {
+			hexKeys[i] = hex.EncodeToString(key)
+		}
+		request := map[string]any{
+			"cert_pem": single.CertPEM, "label": "PRIVATE KEY", "keys": hexKeys,
+		}
+		if certs != nil {
+			request["cert_pems"] = certs
+		}
+		data, err := json.Marshal(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return data
+	}
+	answers := func(resp response, n int) []string {
+		t.Helper()
+		var got []string
+		if resp.Error != "" || resp.GoVersion != runtime.Version() {
+			t.Fatalf("got %+v from %s", resp, runtime.Version())
+		}
+		if err := json.Unmarshal(resp.Detail, &got); err != nil {
+			t.Fatal(err)
+		}
+		if len(got) != n {
+			t.Fatalf("%d answers for %d keys: %q", len(got), n, got)
+		}
+		return got
+	}
+	got := answers(call("x509_key_pairs", batch(keys, nil)), len(keys))
+	for i, key := range keys {
+		data, err := json.Marshal(map[string]string{
+			"cert_pem": single.CertPEM,
+			"key_pem":  string(pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: key})),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := call("x509_key_pair", data)
+		if want.Error != "" || got[i] != want.Result {
+			t.Errorf("key %d: got %q, want %+v", i, got[i], want)
+		}
+	}
+	if got[0] != "ok ECDSA P-256" || !strings.HasPrefix(got[4], "refused: tls: failed to parse private key: ") {
+		t.Errorf("got %q", got)
+	}
+	own := answers(call("x509_key_pairs", batch(keys[:2], []string{"", p384Single.CertPEM})), 2)
+	if own[0] != "ok ECDSA P-256" || own[1] != "ok ECDSA P-384" {
+		t.Errorf("with a certificate of its own for the second key: got %q", own)
+	}
+	if resp := call("x509_key_pairs", batch(keys[:2], []string{""})); resp.Error == "" || len(resp.Detail) != 0 {
+		t.Errorf("one certificate for two keys: got %+v, want an error", resp)
+	}
+	if resp := call("x509_key_pairs", batch(nil, nil)); resp.Error != "" || string(resp.Detail) != "[]" {
+		t.Errorf("an empty batch: got %+v", resp)
+	}
+	bad, err := json.Marshal(map[string]any{
+		"cert_pem": single.CertPEM, "label": "PRIVATE KEY", "keys": []string{"zz"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp := call("x509_key_pairs", bad); resp.Error == "" || len(resp.Detail) != 0 {
+		t.Errorf("a key not hex: got %+v, want an error", resp)
+	}
+	if resp := call("x509_key_pairs", []byte("not JSON")); resp.Error == "" || len(resp.Detail) != 0 {
+		t.Errorf("not JSON: got %+v, want an error", resp)
+	}
+}
+
 // sigSignRequest is a sig_sign request's data, as JSON.
 func sigSignRequest(t *testing.T, key []byte, scheme, message string) []byte {
 	t.Helper()
