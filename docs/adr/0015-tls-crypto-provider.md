@@ -801,6 +801,12 @@ those runs.
   `lscpu` and `/proc/cpuinfo`, with whether an arm64 processor has DIT,
   and a target that passes prints each class's result below its row, as
   a failing one's message gives them.)*
+  *(2026-11-14: a dispatch can name one target, which then runs alone,
+  without the positive control unless it is the one named; set a budget
+  of its own, up to 90 seconds for every target and 1800 for one; and
+  pick the legs to run, a leg left out taking no runner. Left at its
+  defaults it runs as before, and pushes, pull requests and nightlies are
+  unchanged.)*
 
 It is statistical: it sees a difference large enough to show on a runner,
 fails only on one of 1 ns an operation or more, and a pass is not a

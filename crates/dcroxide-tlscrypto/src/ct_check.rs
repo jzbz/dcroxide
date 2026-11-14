@@ -99,14 +99,15 @@
 //! ```
 //!
 //! `.github/workflows/constant-time.yml` runs them so, with the processor's
-//! backends and with the portable ones, on x86_64 and arm64.  Each prints
-//! one row, marked `ct_check row |`, which the workflow takes from the log
-//! wherever on its line the test runner's own output leaves it and puts in
-//! the job's summary.  Below the row a target that passes prints each
-//! class's result, a line each, as a failure's message gives them, so that
-//! every run's log holds them and not only a failing one's.  The harness's
-//! own tests run in every `cargo test` and time nothing: they drive it
-//! with a simulated clock.
+//! backends and with the portable ones, on x86_64 and arm64; a dispatch of
+//! it can run one target alone, for a budget of its own, on the legs it
+//! picks.  Each target prints one row, marked `ct_check row |`, which the
+//! workflow takes from the log wherever on its line the test runner's own
+//! output leaves it and puts in the job's summary.  Below the row a target
+//! that passes prints each class's result, a line each, as a failure's
+//! message gives them, so that every run's log holds them and not only a
+//! failing one's.  The harness's own tests run in every `cargo test` and
+//! time nothing: they drive it with a simulated clock.
 //!
 //! It is statistical.  It sees a difference large enough to show on the
 //! machine that runs it, fails only on one of a nanosecond an operation or

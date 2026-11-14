@@ -15,6 +15,15 @@ name: Constant time
 # classes), dcroxide-crypto (a normal dependency of the crate, linked into
 # the timed binary, whose features on chacha20 merge with the AEAD's), and
 # this file.
+#
+# A dispatch can narrow the run, to time one target for longer on the
+# legs where it failed. Its inputs: a target, by its test name in
+# ct_check (empty runs every target, as pushes and nightlies do); the
+# seconds each target runs for (60 when empty); and the legs, all four by
+# default, where a leg left out takes no runner. Pushes, pull requests
+# and nightlies give no inputs and run as they always have. The inputs
+# reach the shell through the environment alone and are checked before
+# anything else runs.
 on:
   push:
     branches: [master]
@@ -38,6 +47,27 @@ on:
   schedule:
     - cron: "0 3 * * *"
   workflow_dispatch:
+    inputs:
+      target:
+        description: "One target by its test name, such as ecdh_p384_complete, run alone (the positive control runs only if it is the one named); empty runs every target"
+        type: string
+        default: ""
+      seconds:
+        description: "Each target's budget in whole seconds: up to 1800 for one target, up to 90 for every target"
+        type: string
+        default: "60"
+      legs:
+        description: "The legs to run"
+        type: choice
+        default: all
+        options:
+          - all
+          - arm64
+          - arm64-soft
+          - arm64 and arm64-soft
+          - x86_64
+          - x86_64-soft
+          - x86_64 and x86_64-soft
 
 env:
   CARGO_TERM_COLOR: always
@@ -46,59 +76,78 @@ jobs:
   constant-time:
     name: constant time (${{ matrix.leg }})
     # 27 targets, each running for its budget: at 10 s, about 5 minutes
-    # after the build; at 60 s, nightly and on dispatch, about 27.
+    # after the build; at 60 s, nightly and on dispatch, about 27. A
+    # dispatch's seconds are capped so that the same hour covers the run:
+    # 90 for every target, about 41 minutes, and 1800 for one.
     timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
-        include:
-          # The backends each crate picks for the processor. On x86_64, at
-          # run time: AES-NI, CLMUL, SSE2 or AVX2 for ChaCha20, AVX2 for
-          # Poly1305, and SHA-NI for SHA-256 and AVX2 for SHA-512. On
-          # arm64: the ARMv8 AES and PMULL instructions and the SHA-2 and
-          # SHA-3 extensions at run time, and NEON for ChaCha20, which
-          # chacha20 fixes at compile time. poly1305 has only its portable
-          # code on arm64, so there both legs run the same Poly1305.
-          - leg: x86_64
-            os: ubuntu-latest
-            rustflags: ""
-          # The portable ones, forced with each crate's own cfg as ci.yml's
-          # tls-soft-backends job forces them: aes's fixslice, polyval's
-          # software multiply, chacha20's and poly1305's portable code,
-          # whose constant-time claims are what this checks, and sha2's
-          # portable compression. dalek's cfg is kept from that job,
-          # though it switches only verification's double-base
-          # multiplication, which no target times.
-          - leg: x86_64-soft
-            os: ubuntu-latest
-            rustflags: >-
-              --cfg aes_backend="soft"
-              --cfg polyval_backend="soft"
-              --cfg chacha20_backend="soft"
-              --cfg poly1305_backend="soft"
-              --cfg sha2_backend="soft"
-              --cfg curve25519_dalek_backend="serial"
-          - leg: arm64
-            os: ubuntu-24.04-arm
-            rustflags: ""
-          - leg: arm64-soft
-            os: ubuntu-24.04-arm
-            rustflags: >-
-              --cfg aes_backend="soft"
-              --cfg polyval_backend="soft"
-              --cfg chacha20_backend="soft"
-              --cfg poly1305_backend="soft"
-              --cfg sha2_backend="soft"
-              --cfg curve25519_dalek_backend="serial"
-    runs-on: ${{ matrix.os }}
+        # Every leg, unless a dispatch picks some. Only the legs listed
+        # here get a job, so a leg a dispatch leaves out takes no runner.
+        leg: >-
+          ${{ fromJSON(
+          inputs.legs == 'arm64' && '["arm64"]'
+          || inputs.legs == 'arm64-soft' && '["arm64-soft"]'
+          || inputs.legs == 'arm64 and arm64-soft' && '["arm64","arm64-soft"]'
+          || inputs.legs == 'x86_64' && '["x86_64"]'
+          || inputs.legs == 'x86_64-soft' && '["x86_64-soft"]'
+          || inputs.legs == 'x86_64 and x86_64-soft' && '["x86_64","x86_64-soft"]'
+          || '["x86_64","x86_64-soft","arm64","arm64-soft"]') }}
+    # The runner and the backends follow from the leg's name, since a
+    # matrix's include would bring back, as a job of its own, a leg the
+    # list leaves out.
+    runs-on: ${{ startsWith(matrix.leg, 'arm64') && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
     env:
-      RUSTFLAGS: ${{ matrix.rustflags }}
+      # x86_64 and arm64 take the backends each crate picks for the
+      # processor. On x86_64, at run time: AES-NI, CLMUL, SSE2 or AVX2 for
+      # ChaCha20, AVX2 for Poly1305, and SHA-NI for SHA-256 and AVX2 for
+      # SHA-512. On arm64: the ARMv8 AES and PMULL instructions and the
+      # SHA-2 and SHA-3 extensions at run time, and NEON for ChaCha20,
+      # which chacha20 fixes at compile time. poly1305 has only its
+      # portable code on arm64, so there both legs run the same Poly1305.
+      #
+      # The -soft legs take the portable ones, forced with each crate's own
+      # cfg as ci.yml's tls-soft-backends job forces them: aes's fixslice,
+      # polyval's software multiply, chacha20's and poly1305's portable
+      # code, whose constant-time claims are what this checks, and sha2's
+      # portable compression. dalek's cfg is kept from that job, though it
+      # switches only verification's double-base multiplication, which no
+      # target times.
+      RUSTFLAGS: >-
+        ${{ endsWith(matrix.leg, '-soft') && '--cfg aes_backend="soft"
+        --cfg polyval_backend="soft"
+        --cfg chacha20_backend="soft"
+        --cfg poly1305_backend="soft"
+        --cfg sha2_backend="soft"
+        --cfg curve25519_dalek_backend="serial"' || '' }}
       # Each target's budget in seconds: a screen on pushes and pull
       # requests, and six times as long nightly and on dispatch, which
       # makes up for each fixed class's share of the samples, about
-      # 1/(2K) of them with K fixed classes.
-      DCROXIDE_CT_SECONDS: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '60' || '10' }}
+      # 1/(2K) of them with K fixed classes. A dispatch can set its own.
+      DCROXIDE_CT_SECONDS: ${{ github.event_name == 'workflow_dispatch' && (inputs.seconds || '60') || github.event_name == 'schedule' && '60' || '10' }}
+      # The one target a dispatch picks, or empty for every target.
+      CT_TARGET: ${{ inputs.target }}
     steps:
+      # A dispatch's inputs, before anything is built: the target a test
+      # name and nothing else, and the seconds a whole number within the
+      # cap. The patterns are matched in the C locale, where [a-z] is the
+      # 26 letters alone. The messages do not repeat what was given, and
+      # inputs that fail the check leave the run without a summary.
+      - name: Check the dispatch's inputs
+        id: inputs
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          export LC_ALL=C
+          if [ -n "$CT_TARGET" ] && ! [[ $CT_TARGET =~ ^[a-z][a-z0-9_]{0,63}$ ]]; then
+            echo "::error::target is not a test name such as ecdh_p384_complete"
+            exit 1
+          fi
+          if [ -n "$CT_TARGET" ]; then cap=1800; else cap=90; fi
+          if ! [[ $DCROXIDE_CT_SECONDS =~ ^[1-9][0-9]{0,4}$ ]] || [ "$DCROXIDE_CT_SECONDS" -gt "$cap" ]; then
+            echo "::error::seconds is not a whole number from 1 to $cap"
+            exit 1
+          fi
       - uses: actions/checkout@v7
       # Toolchain comes from rust-toolchain.toml (see ci.yml's lint job).
       - run: rustup toolchain install
@@ -140,11 +189,30 @@ jobs:
       # control fails unless its leak fails by the same rule. Every target
       # runs after one fails. Each prints its row and, when it passes,
       # each class's result below it, the lines a failure's message gives.
+      #
+      # When a dispatch picks a target, that target alone runs, matched by
+      # its whole name, and the positive control does not run unless it is
+      # the one picked. A filter that matches nothing runs no test and
+      # passes, so the picked name is first looked up in the list of
+      # targets, and the job fails if no target has it.
       - name: Time the targets
         run: |
           set -o pipefail
-          cargo test -p dcroxide-tlscrypto --release --lib --locked ct_check -- \
-            --ignored --test-threads=1 --nocapture 2>&1 | tee "$RUNNER_TEMP/ct-check.log"
+          if [ -n "$CT_TARGET" ]; then
+            filter="ct_check::$CT_TARGET"
+            exact=(--exact)
+            listed=$(cargo test -p dcroxide-tlscrypto --release --lib --locked "$filter" -- \
+              --ignored --list --exact)
+            if ! grep -qFx "$filter: test" <<< "$listed"; then
+              echo "::error::no ct_check target is named $CT_TARGET"
+              exit 1
+            fi
+          else
+            filter=ct_check
+            exact=()
+          fi
+          cargo test -p dcroxide-tlscrypto --release --lib --locked "$filter" -- \
+            --ignored --test-threads=1 --nocapture "${exact[@]}" 2>&1 | tee "$RUNNER_TEMP/ct-check.log"
       # Each target's row: the fixed class that decides it (of the
       # classes that fail, the one whose result has the largest |t|, or
       # else the largest |t| of all) and that class's result, which for a
@@ -160,12 +228,20 @@ jobs:
       # "reported (under the 1 ns floor)" for |t| above 10 on a smaller
       # difference, and "control found" for the positive control's. The
       # row is taken from wherever it falls on its line, which the test
-      # runner's own output may have begun.
+      # runner's own output may have begun. The heading names the leg, the
+      # budget and, when a dispatch picked one, the target. The step runs
+      # whatever became of the others, but not after the inputs' check
+      # failed (it is skipped, not failed, on every other event), so that
+      # the heading never holds a target that check refused.
       - name: Summarize the run
-        if: always()
+        if: always() && steps.inputs.outcome != 'failure'
         run: |
           {
-            echo "### ${{ matrix.leg }}, ${DCROXIDE_CT_SECONDS} s a target"
+            if [ -n "$CT_TARGET" ]; then
+              echo "### ${{ matrix.leg }}, ${CT_TARGET} alone, ${DCROXIDE_CT_SECONDS} s"
+            else
+              echo "### ${{ matrix.leg }}, ${DCROXIDE_CT_SECONDS} s a target"
+            fi
             echo
             echo "| target | t | effect | ns/op | difference | class | test | fixed | random | samples | batch | verdict |"
             echo "|---|---|---|---|---|---|---|---|---|---|---|---|"
