@@ -3401,13 +3401,23 @@ impl Chain {
         let tickets = match stake_hashes {
             // One hash per stake transaction: `assert_for` checked it
             // where the hashes were filed.
-            Some(hashes) if hashes.len() == block.stransactions.len() => block
-                .stransactions
-                .iter()
-                .zip(hashes)
-                .filter(|(stx, _)| dcroxide_stake::is_sstx(stx))
-                .map(|(_, hash)| *hash)
-                .collect(),
+            Some(hashes) if hashes.len() == block.stransactions.len() => {
+                // Room for as many purchases as the header counts, which
+                // a block that passed its sanity check holds, so the
+                // list is not copied as it grows.  The count is only
+                // room, and never more than the tree has transactions.
+                let room = usize::from(block.header.fresh_stake).min(hashes.len());
+                let mut tickets = Vec::with_capacity(room);
+                tickets.extend(
+                    block
+                        .stransactions
+                        .iter()
+                        .zip(hashes)
+                        .filter(|(stx, _)| dcroxide_stake::is_sstx(stx))
+                        .map(|(_, hash)| *hash),
+                );
+                tickets
+            }
             _ => ticket_purchase_hashes(block),
         };
         self.ticket_purchases.insert(hash, tickets);
@@ -11677,6 +11687,104 @@ mod tests {
         assert!(
             unlike_the_parent >= 10,
             "{unlike_the_parent} unlike the parent"
+        );
+    }
+
+    /// A block's ticket purchases are filed in room made for as many as
+    /// its header counts, so the list is not moved as it fills: under
+    /// the header's own count it has less room than the same hashes
+    /// collected into a list that grows are left with.  The count is
+    /// only room.  A header that counts more than the stake tree has
+    /// transactions is not given room for its count, one that counts
+    /// none leaves the list to grow, and either way the list is the
+    /// block's ticket purchases in block order, as it is when the
+    /// hashes are computed here.  Hashes that are not one for each
+    /// stake transaction are not used.  A block that is processed is
+    /// filed in room made the same way.
+    #[test]
+    fn a_blocks_ticket_purchases_are_filed_in_room_for_the_headers_count() {
+        let params = dcroxide_chaincfg::regnet_params();
+        let mut chain = Chain::new(&params, Hash::ZERO, false);
+        let (blocks, now) = battery_main_chain();
+        // A block with more ticket purchases than a list that grows
+        // starts with room for, and other stake transactions too.
+        let block = blocks
+            .iter()
+            .find(|block| {
+                let tickets = usize::from(block.header.fresh_stake);
+                tickets > 4 && block.stransactions.len() > tickets
+            })
+            .expect("a block with ticket purchases and votes");
+        let want = ticket_purchase_hashes(block);
+        assert_eq!(want.len(), usize::from(block.header.fresh_stake));
+        let tx_hashes = BlockTxHashes::compute(block);
+        let stake_hashes = tx_hashes.stake();
+        // The same hashes collected into a list that grows as it fills.
+        let grown: Vec<Hash> = block
+            .stransactions
+            .iter()
+            .zip(stake_hashes)
+            .filter(|(stx, _)| dcroxide_stake::is_sstx(stx))
+            .map(|(_, hash)| *hash)
+            .collect();
+        assert_eq!(grown, want);
+        assert!(grown.capacity() > want.len(), "{} tickets", want.len());
+        assert!(block.stransactions.len() < usize::from(u8::MAX));
+
+        let mut filed = |fresh_stake: u8, hashes: Option<&[Hash]>| {
+            let mut block = block.clone();
+            block.header.fresh_stake = fresh_stake;
+            let key = [0x11; 32];
+            chain.remember_ticket_purchases(key, &block, hashes, &params);
+            chain.ticket_purchases.remove(&key).expect("the list filed")
+        };
+
+        // The header's own count.
+        let list = filed(block.header.fresh_stake, Some(stake_hashes));
+        assert_eq!(list, want);
+        assert!(
+            list.capacity() < grown.capacity(),
+            "room for {}, {} when grown",
+            list.capacity(),
+            grown.capacity()
+        );
+
+        // A count past the stake tree's transactions.
+        let list = filed(u8::MAX, Some(stake_hashes));
+        assert_eq!(list, want);
+        assert!(
+            list.capacity() < usize::from(u8::MAX),
+            "room for {}",
+            list.capacity()
+        );
+
+        // A count of none, and no hashes to take the purchases' from.
+        assert_eq!(filed(0, Some(stake_hashes)), want);
+        assert_eq!(filed(block.header.fresh_stake, None), want);
+
+        // Hashes that are not one for each stake transaction: paired
+        // off in order, no purchase would be given its own hash.
+        let short = &stake_hashes[1..];
+        assert_eq!(filed(block.header.fresh_stake, Some(short)), want);
+
+        // Processed, the block hands in its hashes, and its purchases
+        // are filed in the room made for them.
+        let mut chain = Chain::new(&params, Hash::ZERO, false);
+        let hash = block.header.block_hash();
+        for block in &blocks {
+            let (_, errs) = chain.process_block(block, now, &params);
+            assert!(errs.is_empty(), "{errs:?}");
+            if block.header.block_hash() == hash {
+                break;
+            }
+        }
+        let list = &chain.ticket_purchases[&hash.0];
+        assert_eq!(list, &want);
+        assert!(
+            list.capacity() < grown.capacity(),
+            "room for {}, {} when grown",
+            list.capacity(),
+            grown.capacity()
         );
     }
 

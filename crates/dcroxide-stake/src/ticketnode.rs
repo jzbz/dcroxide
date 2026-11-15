@@ -774,6 +774,16 @@ impl Node {
                 }
             }
 
+            // Room for every entry pushed below but those of the tickets
+            // that expire, which are few and cannot be counted until the
+            // winners have left the live set.
+            #[allow(
+                clippy::arithmetic_side_effects,
+                reason = "the lengths of three in-memory slices, which cannot overflow usize"
+            )]
+            let moved = parent_winners.len() + revoked_tickets.len() + new_tickets.len();
+            self.database_undo_update.reserve_exact(moved);
+
             for ticket in parent_winners {
                 let k = ticket.0;
                 // A winner leaves the live set whether it voted or
@@ -862,6 +872,8 @@ impl Node {
             let mut state_buffer =
                 Vec::with_capacity((self.params.votes_per_block as usize + 1) * 32);
             let next_winner_keys = fetch_winners(&idxs, &self.live_tickets)?;
+            // The winners are as many as the keys.
+            self.next_winners.reserve_exact(next_winner_keys.len());
             for key in next_winner_keys {
                 let ticket_hash = Hash(key);
                 self.next_winners.push(ticket_hash);
@@ -1273,6 +1285,100 @@ mod tests {
             held(&parent.revoked_tickets)
         );
         assert_eq!(restored.winners(), [voter, absentee]);
+    }
+
+    /// The room a list is left with when its entries are pushed one by
+    /// one onto an empty list, which grows whenever it is full.
+    fn room_when_pushed<T: Copy>(list: &[T]) -> usize {
+        let mut pushed = Vec::new();
+        for entry in list {
+            pushed.push(*entry);
+        }
+        pushed.capacity()
+    }
+
+    /// A connect makes room for its undo data and for its winners before
+    /// it fills them, so neither list is moved as it grows: each ends
+    /// with less room than the same entries pushed onto an empty list
+    /// are left with.  A ticket that expires cannot be counted with the
+    /// rest, and its entry goes in where dcrd puts it all the same:
+    /// after the winners', ahead of the revocations' and the new
+    /// tickets'.  Through clones of the parent's treaps and in place.
+    #[test]
+    fn a_connect_makes_room_for_its_undo_data_and_its_winners_before_it_fills_them() {
+        let value = Value::new(HEIGHT - 10);
+        let was_missed = Value {
+            missed: true,
+            ..Value::new(HEIGHT - 20)
+        };
+        let winners = [ticket(1), ticket(2), ticket(3), ticket(4), ticket(5)];
+        let voted = [ticket(1), ticket(3), ticket(5)];
+        let (expiring, revokee) = (ticket(6), ticket(7));
+        let bought = [ticket(8), ticket(9)];
+        let mut live: Vec<(Hash, Value)> = winners.iter().map(|winner| (*winner, value)).collect();
+        live.extend((10..14).map(|n| (ticket(n), value)));
+        let missed = [(revokee, was_missed)];
+        let undo = |ticket_hash, v: Value, missed, revoked, spent, expired| UndoTicketData {
+            ticket_hash,
+            ticket_height: v.height,
+            missed,
+            revoked,
+            spent,
+            expired,
+        };
+        let bought_at = Value::new(HEIGHT + 1);
+        let mut want = vec![
+            undo(winners[0], value, false, false, true, false),
+            undo(winners[1], value, true, false, false, false),
+            undo(winners[2], value, false, false, true, false),
+            undo(winners[3], value, true, false, false, false),
+            undo(winners[4], value, false, false, true, false),
+            undo(revokee, was_missed, true, true, false, false),
+            undo(bought[0], bought_at, false, false, false, false),
+        ];
+        // Both lists, pushed, would be left with room to spare.
+        let undo_pushed = room_when_pushed(&want);
+        let winners_pushed = room_when_pushed(&[Hash::ZERO; LOTTERY.votes_per_block as usize]);
+        assert!(undo_pushed > want.len() && winners_pushed > LOTTERY.votes_per_block as usize);
+
+        // Nothing expires: every entry was counted.
+        let parent = |live: &[(Hash, Value)]| Node {
+            params: LOTTERY,
+            ..node_of(live, &missed, &[], &winners, &[])
+        };
+        let (in_place, _) = parent(&live)
+            .connect_in_place(IV, &voted, &[revokee], &bought[..1])
+            .expect("the block connects in place");
+        let by_clones = parent(&live)
+            .connect(IV, &voted, &[revokee], &bought[..1])
+            .expect("the block connects");
+        for connected in [&by_clones, &in_place] {
+            assert_eq!(connected.undo_data(), want);
+            let room = connected.database_undo_update.capacity();
+            assert!(room < undo_pushed, "room for {room} undo entries");
+            assert_eq!(connected.winners().len(), 3);
+            let room = connected.next_winners.capacity();
+            assert!(room < winners_pushed, "room for {room} winners");
+        }
+
+        // One ticket more is live and expires, and one more is bought.
+        live.push((expiring, Value::new(EXPIRING)));
+        want.insert(
+            5,
+            undo(expiring, Value::new(EXPIRING), true, false, false, true),
+        );
+        want.push(undo(bought[1], bought_at, false, false, false, false));
+        let (in_place, _) = parent(&live)
+            .connect_in_place(IV, &voted, &[revokee], &bought)
+            .expect("the block connects in place");
+        let by_clones = parent(&live)
+            .connect(IV, &voted, &[revokee], &bought)
+            .expect("the block connects");
+        for connected in [&by_clones, &in_place] {
+            assert_eq!(connected.undo_data(), want);
+            assert_eq!(connected.expired_by_block(), [expiring]);
+            assert_eq!(connected.winners().len(), 3);
+        }
     }
 
     fn undo_of(ticket: Hash, missed: bool, revoked: bool, spent: bool) -> UndoTicketData {
@@ -1938,6 +2044,43 @@ mod tests {
         refused_duplicate: usize,
         refused_lottery: usize,
         held_alone_kept: usize,
+        undo_room_made: usize,
+        winners_room_made: usize,
+    }
+
+    /// The undo data and the winners of a node a connect made were not
+    /// moved as they grew.  Where the list the connect by versions
+    /// filled by pushing was left with room to spare, the connect's has
+    /// less room than that: its winners always, and its undo data when
+    /// no ticket expired, since the expiring tickets are the ones the
+    /// connect cannot count beforehand (`counted` is the rest).  The
+    /// node is at or above the stake enable height, as every case here
+    /// is: below it a connect makes no room for its undo data.
+    fn assert_room_made(
+        got: &Node,
+        want: &Node,
+        counted: usize,
+        context: &str,
+        tally: &mut ConnectTally,
+    ) {
+        let pushed = want.database_undo_update.capacity();
+        if got.database_undo_update.len() == counted && pushed > counted {
+            let room = got.database_undo_update.capacity();
+            assert!(
+                room < pushed,
+                "{context}: room for {room} undo entries, {pushed} when pushed"
+            );
+            tally.undo_room_made += 1;
+        }
+        let pushed = want.next_winners.capacity();
+        if pushed > got.next_winners.len() {
+            let room = got.next_winners.capacity();
+            assert!(
+                room < pushed,
+                "{context}: room for {room} winners, {pushed} when pushed"
+            );
+            tally.winners_room_made += 1;
+        }
     }
 
     /// Every connect, through clones of the parent's treaps or in place,
@@ -1947,7 +2090,8 @@ mod tests {
     /// every ticket where it was, as it was; a parent held alone is
     /// changed where it stands, every ticket that stays put kept in the
     /// node it was in; and a holder that shares the parent's treaps sees
-    /// no change.
+    /// no change.  Either connect fills its undo data and its winners in
+    /// room it made beforehand.
     #[test]
     fn every_connect_makes_the_node_the_connect_by_versions_makes() {
         let mut rng =
@@ -1980,11 +2124,17 @@ mod tests {
                 },
             }
 
+            // The undo entries a connect can count before it makes any.
+            let counted = parent.next_winners.len() + block.revoked.len() + block.bought.len();
+
             // Through clones of the parent's treaps: the parent stays as
             // it was, node for node.
             let parent_shapes = shapes_of(&parent);
             match (connect(&parent), &want) {
-                (Ok(got), Ok(want)) => assert_same_node(&got, want, &context),
+                (Ok(got), Ok(want)) => {
+                    assert_same_node(&got, want, &context);
+                    assert_room_made(&got, want, counted, &context, &mut tally);
+                }
                 (Err(got), Err(want)) => assert_eq!(&got, want, "{context}"),
                 (got, want) => panic!(
                     "{context}: {:?} against {:?}",
@@ -2022,6 +2172,7 @@ mod tests {
                 match (made, &want) {
                     (Ok((child, restore)), Ok(want)) => {
                         assert_same_node(&child, want, &context);
+                        assert_room_made(&child, want, counted, &context, &mut tally);
                         if held_clone.is_none() {
                             // Every ticket the connect did not move is
                             // in the node it was in, where it stood.
@@ -2074,7 +2225,9 @@ mod tests {
                 && tally.refused_missing >= 100
                 && tally.refused_duplicate >= 100
                 && tally.refused_lottery >= 100
-                && tally.held_alone_kept >= 20_000,
+                && tally.held_alone_kept >= 20_000
+                && tally.undo_room_made >= 600
+                && tally.winners_room_made >= 900,
             "{tally:?}"
         );
     }

@@ -6356,7 +6356,17 @@ fn block_script_items<'a>(
     // (never by walking the two lists side by side, which would stop at
     // the shorter one and leave transactions unchecked).
     let (txs, hashes) = block_tree(block, tx_hashes, tx_tree_regular);
-    let mut items = Vec::new();
+    // Room for an item of every input that is not coinbase-style, so
+    // the list is not copied as it grows: every item collected below,
+    // and more only by the inputs of a revocation that is skipped.
+    // dcrd makes room for every input of the tree
+    // (scriptval.go:230-243), the coinbase-style ones included.
+    let room = txs
+        .iter()
+        .flat_map(|tx| &tx.tx_in)
+        .filter(|tx_in| tx_in.previous_out_point.index != u32::MAX)
+        .count();
+    let mut items = Vec::with_capacity(room);
     for (tx_idx, tx) in txs.iter().enumerate() {
         let tx_hash = hashes.map(|hashes| &hashes[tx_idx]);
         // Skip version 2+ revocations under the automatic revocations
@@ -8318,6 +8328,71 @@ mod tests {
                 ),
                 Ok(())
             );
+        }
+    }
+
+    /// The script items of a tree are collected into room counted
+    /// before the first item is: room for one item for every input of
+    /// the tree that is not coinbase-style, which is every item
+    /// collected and, under the automatic revocations agenda, the
+    /// skipped revocation's input besides.  The list holds every item,
+    /// has room for that count, and has less room than the same items
+    /// pushed onto an empty list are left with, so it was not moved as
+    /// it grew.  Both trees, with the agenda and without it.
+    #[test]
+    fn the_script_items_of_a_tree_are_collected_into_room_counted_beforehand() {
+        let (block, mut view) = signed_block();
+        // Without the agenda the revocation's input is looked up like
+        // any other.
+        let revocation = &block.stransactions[STAKE_LAST - 1];
+        view.insert_entry(
+            &revocation.tx_in[0].previous_out_point,
+            entry(vec![dcroxide_txscript::OP_TRUE], TxType::Regular, None),
+        );
+
+        for (regular, agenda, count) in [
+            (true, true, 30),
+            (true, false, 30),
+            (false, true, 6),
+            (false, false, 7),
+        ] {
+            let place = format!("regular tree: {regular}, agenda: {agenda}");
+            let txs = if regular {
+                &block.transactions
+            } else {
+                &block.stransactions
+            };
+            let inputs: usize = txs.iter().map(|tx| tx.tx_in.len()).sum();
+            let checked = txs
+                .iter()
+                .flat_map(|tx| &tx.tx_in)
+                .filter(|tx_in| tx_in.previous_out_point.index != u32::MAX)
+                .count();
+            // The tree has a coinbase-style input, which is not counted.
+            assert!(checked < inputs, "{place}");
+
+            let items = block_script_items(&block, None, &view, regular, agenda).expect("items");
+            assert_eq!(items.len(), count, "{place}");
+            assert_eq!(checked, if regular { 30 } else { 7 }, "{place}");
+            assert!(
+                items.capacity() >= checked,
+                "{place}: room for {}",
+                items.capacity()
+            );
+
+            let mut pushed = Vec::new();
+            for item in block_script_items(&block, None, &view, regular, agenda).expect("items") {
+                pushed.push(item);
+            }
+            assert!(
+                items.capacity() < pushed.capacity(),
+                "{place}: room for {}, {} when pushed",
+                items.capacity(),
+                pushed.capacity()
+            );
+            // Room for every input of the stake tree would be the room
+            // pushing leaves.
+            assert!(regular || inputs >= pushed.capacity(), "{place}");
         }
     }
 
