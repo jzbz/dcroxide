@@ -13,8 +13,8 @@ name: Constant time
 # manifest's release profile (codegen, which can turn a constant-time
 # select into a branch), dcroxide-testutil (the generator that draws the
 # classes), dcroxide-crypto (a normal dependency of the crate, linked into
-# the timed binary, whose features on chacha20 merge with the AEAD's), and
-# this file.
+# the timed binary, whose features on chacha20 merge with the AEAD's), the
+# DIT probe the arm64 jobs run (.github/dit-probe.rs), and this file.
 #
 # A dispatch can narrow the run, to time one target for longer on the
 # legs where it failed. Its inputs: a target, by its test name in
@@ -34,6 +34,7 @@ on:
       - "Cargo.lock"
       - "Cargo.toml"
       - "rust-toolchain.toml"
+      - ".github/dit-probe.rs"
       - ".github/workflows/constant-time.yml"
   pull_request:
     paths:
@@ -43,6 +44,7 @@ on:
       - "Cargo.lock"
       - "Cargo.toml"
       - "rust-toolchain.toml"
+      - ".github/dit-probe.rs"
       - ".github/workflows/constant-time.yml"
   schedule:
     - cron: "0 3 * * *"
@@ -165,9 +167,15 @@ jobs:
       # x86_64 the vendor, model, stepping and microcode). On arm64 also
       # the first CPU's features and whether they hold DIT, the mode in
       # which Arm promises that the timing of its listed instructions does
-      # not depend on their data. Linux leaves DIT off for user space, and
-      # nothing here turns it on. The step only describes, so it never
-      # fails the job.
+      # not depend on their data. A processor that has DIT can hide it from
+      # a guest, so the arm64 jobs then compile
+      # .github/dit-probe.rs with plain rustc, outside the workspace, whose
+      # ban on unsafe code it cannot meet, and run it: it sets PSTATE.DIT,
+      # reads it back and clears it, in a process of its own that ends
+      # there, and a processor without DIT ends it with SIGILL (status
+      # 132). Linux leaves DIT off for user space, and the timed targets
+      # run with it off. The step only describes, so it never fails the
+      # job.
       - name: Describe the processor
         continue-on-error: true
         run: |
@@ -181,6 +189,11 @@ jobs:
             else
               echo "DIT: not supported"
             fi
+            if rustc --edition 2024 -o "$RUNNER_TEMP/dit-probe" .github/dit-probe.rs; then
+              "$RUNNER_TEMP/dit-probe" || echo "DIT probe: exited with status $?"
+            else
+              echo "DIT probe: did not compile"
+            fi
           fi
       # One target at a time, in release mode, the way the module's doc
       # gives it. A target fails when a fixed class's |t| is above 10 and
@@ -189,6 +202,17 @@ jobs:
       # control fails unless its leak fails by the same rule. Every target
       # runs after one fails. Each prints its row and, when it passes,
       # each class's result below it, the lines a failure's message gives.
+      # Those lines end with the target's trace, which a failure's message
+      # carries too: a line marked "ct_check run |" with the fixed crop's
+      # name, the segments' length and the addresses of the harness's code
+      # and of the first chunk of inputs; one marked "ct_check random |"
+      # with the random class's mean nanoseconds an operation uncropped, in
+      # crop 32 (about nine tenths of the samples) and in each of six equal
+      # segments of the counted time (about 10 s each at 60 s); and for
+      # each fixed class one marked "ct_check class |" with its t and
+      # difference uncropped and in crop 32, whatever their |t|, and its t
+      # in each segment, "-" where a test had too few samples. The summary
+      # takes none of them.
       #
       # When a dispatch picks a target, that target alone runs, matched by
       # its whole name, and the positive control does not run unless it is

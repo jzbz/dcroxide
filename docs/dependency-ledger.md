@@ -121,6 +121,12 @@ dependency of `flate2` that nothing enables. A target that compiles one
 of these needs its entry here first, and the LoongArch routines cannot
 have one.
 
+Outside the rule's scope, the constant-time workflow's arm64 jobs compile
+`.github/dit-probe.rs` with plain `rustc` and run it. Its `asm!` reads
+aarch64's data-independent-timing flag, sets it and clears it, with `mrs`
+and `msr` alone. It is no workspace crate, ships in nothing and is not
+built by `cargo test`; it is named here so that review sees it.
+
 ## Test vectors taken from elsewhere
 
 `crates/dcroxide-tlscrypto/tests/data/wycheproof/` holds 33 of

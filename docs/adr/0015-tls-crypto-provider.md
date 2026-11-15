@@ -45,7 +45,7 @@ certificate verification runs, and random numbers. rustls 0.23.46 is
 itself written in Rust with no C, and forbids `unsafe`
 (`rustls-0.23.46/src/lib.rs:332`); its provider in this node is `ring`
 0.17.14, about 151k lines of C and assembly
-(`docs/dependency-ledger.md:157`).
+(`docs/dependency-ledger.md:163`).
 
 `dcroxide-node` uses the provider in three places:
 
@@ -394,7 +394,7 @@ and ends the reliance on ureq's unstable provider API.
 ## Consequences
 
 - **C leaves the network surface** with the switch. ring's ~151k lines
-  go (`dependency-ledger.md:157`), and with them `getrandom` 0.2 and
+  go (`dependency-ledger.md:163`), and with them `getrandom` 0.2 and
   `windows-sys` 0.52, which only ring pulls in, and `deny.toml`'s two
   skip entries for them (`deny.toml:42-48` at `8e6ea23`).
   `fuzz/Cargo.lock` changes with the workspace's.
@@ -807,6 +807,28 @@ those runs.
   pick the legs to run, a leg left out taking no runner. Left at its
   defaults it runs as before, and pushes, pull requests and nightlies are
   unchanged.)*
+  *(2026-11-14: each target also prints a trace, below its class results
+  when it passes and in its message when it fails: each class's t and
+  difference in the uncropped test and in crop 32, about nine tenths of
+  the samples, whatever their |t|; its t in each of six equal segments of
+  the run's counted time, about 10 s each at 60 s; the random class's mean
+  in those tests; and the addresses of one of the harness's functions and
+  of the first chunk of inputs on the heap. P-384's two failures were
+  shifts that lasted their runs; the segments tell such a shift from one
+  that comes and goes, and results pooled over runs no longer rest on each
+  class's largest |t| alone. The arm64 jobs also compile
+  `.github/dit-probe.rs` with plain `rustc` and run it, to set PSTATE.DIT
+  at EL0 and read it back, since a processor that has DIT can hide it from
+  a guest; pushes and pull requests that touch the probe run the workflow
+  too. It is no workspace crate, since it needs `asm!` and the workspace
+  forbids `unsafe`. Its `unsafe` is confined to it, an instrument that
+  never ships, kept outside the workspace as `fuzz/` is: the form
+  ADR-0012's reading of T9 sets out for the power-cut shim, which leaves
+  the brief's principle 4 as it stands for the node's crates. ADR-0012's
+  pure-Rust rule covers what ships and what `cargo test` builds, which the
+  probe is not, and its `mrs` and `msr` are the same switch
+  `constant_time_eq` makes. What is timed, the verdict, the thresholds,
+  the floor and the budgets are unchanged.)*
 
 It is statistical: it sees a difference large enough to show on a runner,
 fails only on one of 1 ns an operation or more, and a pass is not a

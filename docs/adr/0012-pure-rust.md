@@ -57,7 +57,7 @@ script.
   ECDSA signing of a hash at or above the order
   (`ecdsa.rs:388-437` at `0c4154d`).
 - **`ring` 0.17.14** (`Cargo.lock:1549`): ~151k lines of C and assembly
-  (`dependency-ledger.md:157`), the crypto provider of `rustls` 0.23.46.
+  (`dependency-ledger.md:163`), the crypto provider of `rustls` 0.23.46.
   `dcroxide-node` selects rustls's `ring` feature
   (`crates/dcroxide-node/Cargo.toml:59-69` at `8e6ea23`), `ureq` 3.4.2
   selects it through its default `rustls` feature, and `rustls-webpki`
@@ -381,7 +381,7 @@ which does not depend on the TLS answers, can start at once.
 
 - **The C leaves the consensus path and the network surface**: about 67k
   lines under the signature checks and 151k under TLS
-  (`dependency-ledger.md:43` at `0c4154d`; `:157`), with the FFI between them and the
+  (`dependency-ledger.md:43` at `0c4154d`; `:163`), with the FFI between them and the
   node. A source build compiles no C, though on Linux rustc still links
   through the system's `cc` driver.
 - **One secp256k1 stack**, `k256`, where ADR-0006 accepted two. ECDSA

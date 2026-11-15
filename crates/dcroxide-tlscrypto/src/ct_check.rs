@@ -89,6 +89,20 @@
 //!   each fixed class repeated one nonce, and so one r and s, on every
 //!   sample and in every run, and a lean on the key could not be told from
 //!   one on them.  Signing by the nonce times the nonce's own classes.
+//! * **A trace for reading a failure against other runs.**  P-384's two
+//!   failures held for whole runs, and a class's result is its largest |t|
+//!   over 101 tests, which pooled over runs is a statistic of a maximum.
+//!   So each target also prints, whatever its verdict, each class's t and
+//!   difference in the uncropped test and in one fixed crop, crop 32,
+//!   about nine tenths of the samples ([`FIXED_CROP`]), the same two tests
+//!   in every run; its t in each of six equal segments of the run's
+//!   counted time, about 10 s each in a nightly's 60 s ([`SEGMENTS`]),
+//!   which tell a lean that lasts the run from one that comes and goes;
+//!   the random class's mean in each of those tests, against which every
+//!   class is compared; and the address of one of the harness's functions
+//!   and of the first chunk of inputs on the heap, to read a failure
+//!   against where the run's code and data lay.  None of it changes what
+//!   is timed or the verdict.
 //!
 //! The targets are `#[ignore]` tests: they time code, so they run only when
 //! asked, one at a time and in release mode, each for `DCROXIDE_CT_SECONDS`
@@ -106,8 +120,13 @@
 //! output leaves it and puts in the job's summary.  Below the row a target
 //! that passes prints each class's result, a line each, as a failure's
 //! message gives them, so that every run's log holds them and not only a
-//! failing one's.  The harness's own tests run in every `cargo test` and
-//! time nothing: they drive it with a simulated clock.
+//! failing one's.  Those lines and a failure's message end with the
+//! trace, lines marked `ct_check run |`, `ct_check random |` and
+//! `ct_check class |` at their start ([`Report::trace_lines`]), which the
+//! summary does not take.  The workflow's arm64 jobs also check, in a
+//! program of their own outside the crate, whether user space can switch
+//! DIT on.  The harness's own tests run in every `cargo test` and time
+//! nothing: they drive it with a simulated clock.
 //!
 //! It is statistical.  It sees a difference large enough to show on the
 //! machine that runs it, fails only on one of a nanosecond an operation or
@@ -212,6 +231,21 @@ const MIN_FAIL_NANOS: f64 = 1.0;
 /// dudect's crops, in addition to the uncropped test.
 const CROPS: usize = 100;
 
+/// The crop whose comparison each class's trace line gives beside the
+/// uncropped test's, whatever their |t|: crop 32, which keeps the samples
+/// quicker than the warm-up's quantile 0.898, the nearest of dudect's to
+/// nine tenths.  A class's result is its largest |t| over every test, so
+/// results pooled over runs are statistics of a maximum; these two are
+/// the same tests in every run.
+const FIXED_CROP: usize = 32;
+
+/// The equal parts of a run's counted time, from the warm-up's end to the
+/// budget's, in each of which every fixed class is also compared with the
+/// random class, uncropped: a sixth of the run each, about 10 s in a
+/// nightly's 60 s and 50 s at 300 s.  A difference that lasts the whole
+/// run shows in every one; one that comes and goes, in some.
+const SEGMENTS: usize = 6;
+
 /// The fewest samples each side of a comparison needs, in the uncropped
 /// test or a crop, for its t to count.
 const MIN_SAMPLES: u64 = 100;
@@ -313,8 +347,19 @@ fn crop_thresholds(sorted: &[u64]) -> Vec<u64> {
         .collect()
 }
 
+/// The segment ([`SEGMENTS`]) of a sample that began at `began`, of the
+/// equal parts of the time from `from`, where the warm-up ended, to
+/// `until`, where the budget does: the last for a sample begun at `until`
+/// or later, and the first for one begun before `from`.
+fn segment(began: u64, from: u64, until: u64) -> usize {
+    let span = until.saturating_sub(from).max(1);
+    let at = began.saturating_sub(from);
+    (at.saturating_mul(SEGMENTS as u64) / span).min(SEGMENTS as u64 - 1) as usize
+}
+
 /// The comparisons of one target: for the uncropped samples and for each
-/// crop, every class's [`Moments`].
+/// crop, every class's [`Moments`], and for each segment of the run, every
+/// class's uncropped.
 struct Stats {
     /// Each crop's threshold in nanoseconds: a sample counts in crop i
     /// when it took less.
@@ -323,6 +368,9 @@ struct Stats {
     /// has a slot per class: the random class's is slot 0, and fixed class
     /// j's slot 1 + j.
     tests: Vec<Vec<Moments>>,
+    /// `segments[k]` counts every sample of segment k ([`segment`]), with
+    /// the slots of `tests`.
+    segments: Vec<Vec<Moments>>,
 }
 
 impl Stats {
@@ -333,11 +381,13 @@ impl Stats {
         Stats {
             thresholds: crop_thresholds(warm_up),
             tests: vec![vec![Moments::default(); 1 + fixed]; 1 + CROPS],
+            segments: vec![vec![Moments::default(); 1 + fixed]; SEGMENTS],
         }
     }
 
-    /// Counts a sample of `nanos` of the class in `slot`.
-    fn push(&mut self, slot: usize, nanos: u64) {
+    /// Counts a sample of `nanos` of the class in `slot`, which began in
+    /// segment `segment`.
+    fn push(&mut self, slot: usize, nanos: u64, segment: usize) {
         let x = nanos as f64;
         self.tests[0][slot].push(x);
         for (crop, &threshold) in self.tests[1..].iter_mut().zip(&self.thresholds) {
@@ -345,6 +395,34 @@ impl Stats {
                 crop[slot].push(x);
             }
         }
+        self.segments[segment][slot].push(x);
+    }
+
+    /// Each fixed class's t against the random class in each segment, in
+    /// the segments' order: `None` where a side has fewer than
+    /// [`MIN_SAMPLES`].
+    fn by_segment(&self) -> Vec<Vec<Option<f64>>> {
+        (1..self.tests[0].len())
+            .map(|slot| {
+                self.segments
+                    .iter()
+                    .map(|segment| {
+                        (segment[0].n >= MIN_SAMPLES && segment[slot].n >= MIN_SAMPLES)
+                            .then(|| welch_t(&segment[slot], &segment[0]))
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// The random class's moments in the tests the trace gives: the
+    /// uncropped test, [`FIXED_CROP`] and each segment, in that order.
+    fn random(&self) -> Vec<Moments> {
+        [&self.tests[0], &self.tests[1 + FIXED_CROP]]
+            .into_iter()
+            .chain(&self.segments)
+            .map(|test| test[0])
+            .collect()
     }
 
     /// Each fixed class's comparisons with the random class, one in each
@@ -458,6 +536,12 @@ struct Measured {
     warm_up: usize,
     /// The nanoseconds the whole run took, its building included.
     nanos: u64,
+    /// The clock's time when the warm-up ended, where the segments begin.
+    counted_from: u64,
+    /// The clock's time when the budget ends, where the segments end.
+    deadline: u64,
+    /// The address of the first chunk's inputs, on the heap.
+    inputs_at: usize,
 }
 
 /// Times `op` on inputs `build` makes, for `budget` nanoseconds of `clock`.
@@ -472,8 +556,10 @@ struct Measured {
 /// `black_box`.  An operation borrows its input, and its result is kept in
 /// a vector with room for the batch, so that neither is dropped until the
 /// clock has been read: the results after each sample, the inputs after
-/// their chunk.  The first samples warm up and set the crops; the run ends
-/// with the first sample to end past the budget.  `build` takes the class,
+/// their chunk.  The first samples warm up and set the crops; each later
+/// one is counted in the segment of the time left that it began in
+/// ([`segment`]); the run ends with the first sample to end past the
+/// budget.  `build` takes the class,
 /// `None` for the random class, and the generator, from which the random
 /// class's input is drawn.
 fn measure<I, R>(
@@ -507,6 +593,8 @@ fn measure<I, R>(
     let mut warm_up = Vec::new();
     let mut stats: Option<Stats> = None;
     let mut samples = 0;
+    let mut counted_from = start;
+    let mut inputs_at = None;
     loop {
         let classes: Vec<Option<usize>> = (0..chunk).map(|_| draw_class(rng, fixed)).collect();
         let mut inputs = Vec::with_capacity((chunk * batch) as usize);
@@ -515,6 +603,7 @@ fn measure<I, R>(
                 inputs.push(build(class, rng));
             }
         }
+        inputs_at.get_or_insert(inputs.as_ptr().addr());
         for (class, batch_inputs) in classes.into_iter().zip(inputs.chunks_mut(batch as usize)) {
             let began = clock.now();
             for input in batch_inputs {
@@ -524,12 +613,13 @@ fn measure<I, R>(
             results.clear();
             let nanos = ended.saturating_sub(began);
             if let Some(stats) = stats.as_mut() {
-                stats.push(slot(class), nanos);
+                stats.push(slot(class), nanos, segment(began, counted_from, deadline));
                 samples += 1;
             } else {
                 warm_up.push(nanos);
                 if warm_up.len() >= WARM_UP_SAMPLES || ended >= warm_up_end {
                     stats = Some(Stats::new(&mut warm_up, fixed));
+                    counted_from = ended;
                 }
             }
             if ended >= deadline {
@@ -539,6 +629,9 @@ fn measure<I, R>(
                     samples,
                     warm_up: warm_up.len(),
                     nanos: ended.saturating_sub(start),
+                    counted_from,
+                    deadline,
+                    inputs_at: inputs_at.unwrap_or_default(),
                 };
             }
         }
@@ -606,12 +699,35 @@ struct Report {
     samples: u64,
     warm_up: usize,
     seconds: f64,
+    trace: Trace,
+}
+
+/// What a target's trace lines give besides its verdict, so that a failure
+/// can be read against other runs: each fixed class's t in each segment,
+/// the random class's moments in the tests the trace gives, and where the
+/// run's code and inputs lay.
+#[derive(Debug, Default)]
+struct Trace {
+    /// Each fixed class's t in each segment ([`Stats::by_segment`]).
+    by_segment: Vec<Vec<Option<f64>>>,
+    /// The random class's moments in the uncropped test, [`FIXED_CROP`]
+    /// and each segment ([`Stats::random`]).
+    random: Vec<Moments>,
+    /// A segment's length in nanoseconds.
+    segment_nanos: u64,
+    /// The address of one of the harness's functions, `Stats::push`.  The
+    /// binary is mapped whole, so with its symbols every function's
+    /// address follows from this one.
+    code: usize,
+    /// The address of the run's first chunk of inputs, on the heap.
+    inputs: usize,
 }
 
 impl Report {
     /// The report of the target `target`, whose fixed classes are `names`,
     /// on what [`measure`] found.
     fn new(target: &str, names: Vec<&'static str>, measured: &Measured) -> Report {
+        let push: fn(&mut Stats, usize, u64, usize) = Stats::push;
         Report {
             target: target.to_owned(),
             names,
@@ -620,6 +736,14 @@ impl Report {
             samples: measured.samples,
             warm_up: measured.warm_up,
             seconds: measured.nanos as f64 / 1e9,
+            trace: Trace {
+                by_segment: measured.stats.by_segment(),
+                random: measured.stats.random(),
+                segment_nanos: measured.deadline.saturating_sub(measured.counted_from)
+                    / SEGMENTS as u64,
+                code: push as usize,
+                inputs: measured.inputs_at,
+            },
         }
     }
 
@@ -711,7 +835,7 @@ impl Report {
     }
 
     /// Every fixed class's deciding comparison and its verdict, a line
-    /// each, and the run.
+    /// each, and the run, followed by the trace ([`Report::trace_lines`]).
     fn detail(&self) -> String {
         let mut out = format!(
             "{} samples of {} operations after {} to warm up, in {:.1} s\n",
@@ -734,6 +858,75 @@ impl Report {
                 }
                 None => format!("  {name}: no test with {MIN_SAMPLES} samples on each side\n"),
             };
+        }
+        out + &self.trace_lines()
+    }
+
+    /// The trace, the same lines whatever the verdict, each marked at its
+    /// start and its columns split by ` | ` as the row's are, a `-` where
+    /// there is nothing to give:
+    ///
+    /// * `ct_check run |` the target, [`FIXED_CROP`]'s name, the segments
+    ///   and their length, and the addresses of the harness's code and of
+    ///   the first chunk's inputs;
+    /// * `ct_check random |` the target and the random class's mean
+    ///   nanoseconds an operation in the uncropped test, in
+    ///   [`FIXED_CROP`] and in each segment;
+    /// * `ct_check class |`, for each fixed class, the target, the class,
+    ///   its t and its difference in nanoseconds an operation in the
+    ///   uncropped test and in [`FIXED_CROP`], whatever their |t|, and its
+    ///   t in each segment.
+    fn trace_lines(&self) -> String {
+        let trace = &self.trace;
+        let mut out = format!(
+            "ct_check run | {} | {} | {SEGMENTS} segments of {:.1} s | code {:#x} | inputs {:#x} \
+             |\n",
+            self.target,
+            test_name(1 + FIXED_CROP),
+            trace.segment_nanos as f64 / 1e9,
+            trace.code,
+            trace.inputs
+        );
+        let batch = self.batch as f64;
+        let means: Vec<String> = (0..2 + SEGMENTS)
+            .map(|test| match trace.random.get(test) {
+                Some(m) if m.n > 0 => format!("{:.1}", m.mean / batch),
+                _ => "-".to_owned(),
+            })
+            .collect();
+        out += &format!(
+            "ct_check random | {} | {} |\n",
+            self.target,
+            means.join(" | ")
+        );
+        for (class, (name, comparisons)) in self.names.iter().zip(&self.by_class).enumerate() {
+            let mut columns = Vec::new();
+            for test in [0, 1 + FIXED_CROP] {
+                match comparisons.iter().find(|c| c.test == test) {
+                    Some(c) => {
+                        columns.push(format!("{:+.2}", c.t));
+                        columns.push(format!("{:+.2}", self.per_op(c).1));
+                    }
+                    None => columns.extend(["-".to_owned(), "-".to_owned()]),
+                }
+            }
+            for at in 0..SEGMENTS {
+                columns.push(
+                    match trace
+                        .by_segment
+                        .get(class)
+                        .and_then(|segments| segments.get(at).copied().flatten())
+                    {
+                        Some(t) => format!("{t:+.2}"),
+                        None => "-".to_owned(),
+                    },
+                );
+            }
+            out += &format!(
+                "ct_check class | {} | {name} | {} |\n",
+                self.target,
+                columns.join(" | ")
+            );
         }
         out
     }
@@ -1690,6 +1883,7 @@ fn positive_control() {
 
 mod tests {
     use std::cell::{Cell, RefCell};
+    use std::ops::Range;
 
     use ::hmac::{KeyInit, Mac};
     use curve25519_dalek::edwards::EdwardsPoint;
@@ -1867,6 +2061,7 @@ mod tests {
             samples: 10,
             warm_up: 0,
             seconds: 0.0,
+            trace: Trace::default(),
         };
         assert_eq!(
             report.row("pass"),
@@ -1895,9 +2090,9 @@ mod tests {
         assert_eq!(t.len(), CROPS);
         assert_eq!((t[0], t[1], t[2], t[9], t[99]), (67, 130, 188, 500, 999));
         assert!(t.windows(2).all(|pair| pair[0] <= pair[1]), "{t:?}");
-        stats.push(1, 67);
-        stats.push(0, 66);
-        stats.push(1, 999);
+        stats.push(1, 67, 0);
+        stats.push(0, 66, 0);
+        stats.push(1, 999, 0);
         let count = |slot: usize, test: usize| stats.tests[test][slot].n;
         assert_eq!((count(0, 0), count(1, 0)), (1, 2));
         assert_eq!(
@@ -1929,11 +2124,11 @@ mod tests {
         let mut stats = Stats::new(&mut warm_up, 3);
         let mut rng = SplitMix64(0x6374_5f63_6865_636b);
         for i in 0..4_000 {
-            stats.push(0, 1_000 + rng.below(100));
-            stats.push(1, 1_010 + rng.below(100));
-            stats.push(2, 1_000 + rng.below(100));
+            stats.push(0, 1_000 + rng.below(100), 0);
+            stats.push(1, 1_010 + rng.below(100), 0);
+            stats.push(2, 1_000 + rng.below(100), 0);
             if i < MIN_SAMPLES - 1 {
-                stats.push(3, 5_000);
+                stats.push(3, 5_000, 0);
             }
         }
         let by_class = stats.by_class();
@@ -2057,6 +2252,7 @@ mod tests {
             samples: 6_000,
             warm_up: 0,
             seconds: 0.0,
+            trace: Trace::default(),
         };
         let deciding = |report: &Report| report.deciding().map(|(class, _)| class);
         let mixed = report(vec![
@@ -2150,6 +2346,7 @@ mod tests {
             samples: 6_000,
             warm_up: 0,
             seconds: 0.0,
+            trace: Trace::default(),
         };
         let decided: Vec<(Verdict, usize, f64)> = report
             .by_class
@@ -2290,6 +2487,354 @@ mod tests {
             .sum();
         assert_eq!(measured.nanos, total);
         assert!(total >= budget && total - last < budget, "{total} {last}");
+    }
+
+    /// A sample's segment is the sixth of the time from the warm-up's end
+    /// to the budget's that it began in: the first from the start, the
+    /// next from a sixth of the way, the last up to the budget's end and
+    /// past it, and the first for a time before the start, which no
+    /// counted sample has; a span that does not divide by six still splits
+    /// at the sixths, and one of no time does not divide by zero.
+    #[test]
+    fn a_sample_falls_in_the_segment_it_began_in() {
+        for (began, want) in [
+            (1_000, 0),
+            (1_099, 0),
+            (1_100, 1),
+            (1_299, 2),
+            (1_300, 3),
+            (1_500, 5),
+            (1_599, 5),
+            (1_600, 5),
+            (50_000, 5),
+            (999, 0),
+        ] {
+            assert_eq!(segment(began, 1_000, 1_600), want, "{began}");
+        }
+        for (began, want) in [(0, 0), (1, 0), (2, 1), (5, 3), (8, 4), (9, 5)] {
+            assert_eq!(segment(began, 0, 10), want, "{began}");
+        }
+        assert_eq!(segment(5, 5, 5), 0);
+        assert_eq!(segment(7, 5, 5), SEGMENTS - 1);
+    }
+
+    /// [`simulate`]'s target, operations of 500 ns and up to 1,000 of
+    /// noise, for `budget`, in which fixed class 2 takes `leak` ns more in
+    /// each operation that begins within `window`: the run, and each
+    /// sample's class and the time it began, its first operation's.
+    fn simulate_episode(
+        budget: u64,
+        leak: u64,
+        window: Range<u64>,
+    ) -> (Measured, Vec<(Option<usize>, u64)>) {
+        let clock = Simulated(Cell::new(0));
+        let ran = RefCell::new(Vec::new());
+        let mut rng = SplitMix64(0x6570_6973_6f64_6573);
+        let measured = measure(
+            &clock,
+            &mut rng,
+            budget,
+            SIMULATED.len(),
+            |class, rng| (class, rng.below(1_000)),
+            |&mut (class, noise): &mut (Option<usize>, u64)| {
+                let now = clock.now();
+                ran.borrow_mut().push((class, now));
+                let extra = if class == Some(2) && window.contains(&now) {
+                    leak
+                } else {
+                    0
+                };
+                clock.advance(500 + noise + extra);
+            },
+        );
+        let batch = measured.batch as usize;
+        let began = ran.into_inner()[CALIBRATION_OPS..]
+            .chunks(batch)
+            .map(|ops| ops[0])
+            .collect();
+        (measured, began)
+    }
+
+    /// Each counted sample is compared in the segment it began in, a sixth
+    /// of the time from the warm-up's end to the budget's.  By the
+    /// simulation's own count, from the sixths' bounds, each segment holds
+    /// the samples of each class begun in it, and between them every
+    /// counted sample; in a run of classes alike each holds about a sixth.
+    /// A class 1,000 ns an operation slower in the fourth sixth alone is
+    /// above |t| 10 there and within 4.5 in the other five, and every other
+    /// class within 4.5 in all six.  The report keeps each t and the
+    /// segments' length.
+    #[test]
+    fn each_class_is_compared_in_each_segment_of_the_run() {
+        let budget = 40_000_000;
+        let counts = |measured: &Measured| -> Vec<Vec<u64>> {
+            measured
+                .stats
+                .segments
+                .iter()
+                .map(|segment| segment.iter().map(|m| m.n).collect())
+                .collect()
+        };
+        let (alike, _) = simulate_episode(budget, 0, 0..0);
+        let (from, until) = (alike.counted_from, alike.deadline);
+        assert!(from > 0 && until == budget, "{from} {until}");
+        let span = until - from;
+        let sixth = alike.samples as f64 / SEGMENTS as f64;
+        for segment in counts(&alike) {
+            let total = segment.iter().sum::<u64>() as f64;
+            assert!((total - sixth).abs() < 0.02 * sixth, "{total} {sixth}");
+        }
+
+        let bound = |k: u64| from + (k * span).div_ceil(SEGMENTS as u64);
+        let (episode, began) = simulate_episode(budget, 1_000, bound(3)..bound(4));
+        assert_eq!(episode.counted_from, from);
+        let mut want = vec![vec![0; 1 + SIMULATED.len()]; SEGMENTS];
+        for &(class, at) in &began[episode.warm_up..] {
+            let k = (1..SEGMENTS as u64).filter(|&k| bound(k) <= at).count();
+            want[k][slot(class)] += 1;
+        }
+        assert_eq!(counts(&episode), want);
+        let uncropped: Vec<u64> = episode.stats.tests[0].iter().map(|m| m.n).collect();
+        let summed: Vec<u64> = (0..=SIMULATED.len())
+            .map(|slot| want.iter().map(|segment| segment[slot]).sum())
+            .collect();
+        assert_eq!(summed, uncropped);
+
+        let by_segment = episode.stats.by_segment();
+        assert_eq!(by_segment.len(), SIMULATED.len());
+        for (class, segments) in by_segment.iter().enumerate() {
+            assert_eq!(segments.len(), SEGMENTS);
+            for (at, t) in segments.iter().enumerate() {
+                let t = t.unwrap_or_else(|| panic!("class {class}, segment {at}: too few"));
+                if (class, at) == (2, 3) {
+                    assert!(t > T_FAIL, "{by_segment:?}");
+                } else {
+                    assert!(t.abs() <= T_REPORT, "{by_segment:?}");
+                }
+            }
+        }
+        let report = Report::new("simulated", SIMULATED.to_vec(), &episode);
+        assert_eq!(report.trace.by_segment, by_segment);
+        assert_eq!(report.trace.segment_nanos, span / SEGMENTS as u64);
+    }
+
+    /// A class is compared in a segment only with [`MIN_SAMPLES`] on each
+    /// side: a segment one sample short on either side gives no t, one
+    /// with enough on both Welch's t of its moments, and an empty one none.
+    #[test]
+    fn a_segment_short_of_samples_on_either_side_gives_no_t() {
+        let mut warm_up: Vec<u64> = (1..=999).collect();
+        let mut stats = Stats::new(&mut warm_up, 1);
+        for i in 0..MIN_SAMPLES {
+            let (random, fixed) = (500 + i % 7, 510 + i % 5);
+            stats.push(0, random, 0);
+            stats.push(1, fixed, 2);
+            stats.push(0, random, 2);
+            if i > 0 {
+                stats.push(1, fixed, 0);
+                stats.push(0, random, 1);
+            }
+            stats.push(1, fixed, 1);
+        }
+        let by_segment = stats.by_segment();
+        assert_eq!(by_segment.len(), 1);
+        assert_eq!(by_segment[0][..2], [None, None]);
+        assert_eq!(
+            by_segment[0][2],
+            Some(welch_t(&stats.segments[2][1], &stats.segments[2][0]))
+        );
+        assert!(
+            by_segment[0][2].is_some_and(|t| t > T_FAIL),
+            "{by_segment:?}"
+        );
+        assert!(by_segment[0][3..].iter().all(Option::is_none));
+    }
+
+    /// The crop the trace gives beside the uncropped test is the one of
+    /// dudect's whose quantile is nearest nine tenths, crop 32.
+    #[test]
+    fn the_fixed_crop_is_dudects_nearest_to_nine_tenths() {
+        let off = |crop: usize| (crop_fraction(crop) - 0.9).abs();
+        assert!(
+            (0..CROPS).all(|crop| off(FIXED_CROP) <= off(crop)),
+            "{FIXED_CROP}"
+        );
+        assert_eq!(test_name(1 + FIXED_CROP), "crop 32 (89.8%)");
+    }
+
+    /// The random class's moments in each test the trace gives, by hand:
+    /// over warm-up times 1 to 999, crop 32 keeps the times under 898 (and
+    /// crop 31 those under 891), so of the random class's 100 and 300 in
+    /// the first segment and 894 and 902 in the last, every sample counts
+    /// 4 at a mean of 549, crop 32 three at 431.3, the first segment two at
+    /// 200 and the last two at 898, and the segments between none, though
+    /// the fixed class has a sample in the third.  The trace gives them an
+    /// operation, over a batch of 2, and a class without the samples to
+    /// compare a `-` in each column.  Ten
+    /// seconds a segment, from the warm-up's end at 1 s to the budget's at
+    /// 61 s; the code is `Stats::push`'s.
+    #[test]
+    fn the_trace_gives_the_random_class_in_each_test_it_names() {
+        let mut warm_up: Vec<u64> = (1..=999).collect();
+        let mut stats = Stats::new(&mut warm_up, 1);
+        assert_eq!(stats.thresholds[FIXED_CROP], 898);
+        stats.push(0, 100, 0);
+        stats.push(0, 300, 0);
+        stats.push(0, 894, SEGMENTS - 1);
+        stats.push(0, 902, SEGMENTS - 1);
+        stats.push(1, 50, 2);
+        let random = stats.random();
+        let ns: Vec<u64> = random.iter().map(|m| m.n).collect();
+        assert_eq!(ns, [4, 3, 2, 0, 0, 0, 0, 2]);
+        for (test, want) in [(0, 549.0), (1, 1_294.0 / 3.0), (2, 200.0), (7, 898.0)] {
+            assert!(
+                (random[test].mean - want).abs() < 1e-9,
+                "{test}: {random:?}"
+            );
+        }
+        let measured = Measured {
+            stats,
+            batch: 2,
+            samples: 5,
+            warm_up: 999,
+            nanos: 61_000_000_000,
+            counted_from: 1_000_000_000,
+            deadline: 61_000_000_000,
+            inputs_at: 0x7f00_0000_1000,
+        };
+        let report = Report::new("hand", vec!["x"], &measured);
+        let push: fn(&mut Stats, usize, u64, usize) = Stats::push;
+        assert_eq!(report.trace.code, push as usize);
+        assert_eq!(
+            report.trace_lines(),
+            format!(
+                "ct_check run | hand | crop 32 (89.8%) | 6 segments of 10.0 s | code {:#x} | \
+                 inputs 0x7f0000001000 |\n\
+                 ct_check random | hand | 274.5 | 215.7 | 100.0 | - | - | - | - | 449.0 |\n\
+                 ct_check class | hand | x | - | - | - | - | - | - | - | - | - | - |\n",
+                push as usize
+            )
+        );
+    }
+
+    /// The trace's lines by hand: each class's t and difference an
+    /// operation in the uncropped test and crop 32, over a batch of 2,
+    /// though another crop's |t| is larger and crop 31's sits beside it;
+    /// its t in each segment, `-` where a segment had too few; the random
+    /// class's means an operation, `-` where it had no sample; and a class
+    /// with no comparison at all.  They end the detail.
+    #[test]
+    fn the_trace_lines_answer_a_hand_computation() {
+        let comparison = |test: usize, t: f64, fixed_mean: f64, random_mean: f64| Comparison {
+            t,
+            test,
+            fixed: 100,
+            random: 400,
+            fixed_mean,
+            random_mean,
+        };
+        let moments = |n: u64, mean: f64| Moments { n, mean, m2: 0.0 };
+        let report = Report {
+            target: "hand".to_owned(),
+            names: vec!["x", "y"],
+            by_class: vec![
+                vec![
+                    comparison(0, -1.9, 3.0, 6.0),
+                    comparison(5, 9.0, 500.0, 400.0),
+                    comparison(1 + FIXED_CROP - 1, 7.77, 450.0, 400.0),
+                    comparison(1 + FIXED_CROP, 2.346, 410.0, 400.0),
+                ],
+                vec![],
+            ],
+            batch: 2,
+            samples: 1_000,
+            warm_up: 0,
+            seconds: 0.0,
+            trace: Trace {
+                by_segment: vec![
+                    vec![
+                        Some(1.234),
+                        None,
+                        Some(-0.5),
+                        Some(10.0),
+                        Some(-12.346),
+                        None,
+                    ],
+                    vec![None; SEGMENTS],
+                ],
+                random: vec![
+                    moments(10, 800.0),
+                    moments(9, 780.0),
+                    moments(2, 801.0),
+                    moments(0, 0.0),
+                    moments(1, 799.0),
+                    moments(3, 802.0),
+                    moments(4, 798.6),
+                    moments(5, 800.25),
+                ],
+                segment_nanos: 9_870_000_000,
+                code: 0x5555_0000_1234,
+                inputs: 0xffff_8000_0010,
+            },
+        };
+        let want = "ct_check run | hand | crop 32 (89.8%) | 6 segments of 9.9 s | code \
+                    0x555500001234 | inputs 0xffff80000010 |\n\
+                    ct_check random | hand | 400.0 | 390.0 | 400.5 | - | 399.5 | 401.0 | 399.3 | \
+                    400.1 |\n\
+                    ct_check class | hand | x | -1.90 | -1.50 | +2.35 | +5.00 | +1.23 | - | -0.50 \
+                    | +10.00 | -12.35 | - |\n\
+                    ct_check class | hand | y | - | - | - | - | - | - | - | - | - | - |\n";
+        assert_eq!(report.trace_lines(), want);
+        assert!(report.detail().ends_with(want), "{}", report.detail());
+    }
+
+    /// A run gives where its code and its first chunk's inputs lay, and
+    /// below its row, for every class, a trace line of ten columns, none
+    /// empty in a run with the samples for each.
+    #[test]
+    fn a_run_traces_its_code_its_inputs_and_every_class() {
+        let report = simulated_report(40_000_000, 0);
+        let push: fn(&mut Stats, usize, u64, usize) = Stats::push;
+        assert_eq!(report.trace.code, push as usize);
+        assert!(
+            report.trace.inputs != 0 && report.trace.inputs != report.trace.code,
+            "{:?}",
+            report.trace
+        );
+        let printed = report.assert_constant_time();
+        assert!(
+            printed.contains(&format!(
+                "\nct_check run | simulated | crop 32 (89.8%) | 6 segments of 0.0 s | code {:#x} \
+                 | inputs {:#x} |\n",
+                report.trace.code, report.trace.inputs
+            )),
+            "{printed}"
+        );
+        let random = printed
+            .lines()
+            .find(|line| line.starts_with("ct_check random | simulated | "))
+            .expect("the random class's line");
+        let columns: Vec<&str> = random
+            .strip_suffix(" |")
+            .expect("a closing bar")
+            .split(" | ")
+            .collect();
+        assert_eq!(columns.len(), 2 + 2 + SEGMENTS, "{random}");
+        assert!(!columns.contains(&"-"), "{random}");
+        for name in SIMULATED {
+            let prefix = format!("ct_check class | simulated | {name} | ");
+            let line = printed
+                .lines()
+                .find(|line| line.starts_with(&prefix))
+                .unwrap_or_else(|| panic!("{name}'s line in {printed}"));
+            let columns: Vec<&str> = line
+                .strip_suffix(" |")
+                .expect("a closing bar")
+                .split(" | ")
+                .collect();
+            assert_eq!(columns.len(), 3 + 4 + SEGMENTS, "{line}");
+            assert!(!columns.contains(&"-"), "{line}");
+        }
     }
 
     /// Every input is made the same way, whatever its class: each build
@@ -2527,6 +3072,14 @@ mod tests {
     #[test]
     #[should_panic(expected = "|t| above 10")]
     fn a_leak_fails_its_target() {
+        simulated_report(40_000_000, 100).assert_constant_time();
+    }
+
+    /// A target that fails gives its trace in its message, as it gives its
+    /// classes' results.
+    #[test]
+    #[should_panic(expected = "\nct_check class | simulated | c | +")]
+    fn a_failing_target_gives_its_trace_in_its_message() {
         simulated_report(40_000_000, 100).assert_constant_time();
     }
 
