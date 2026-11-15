@@ -285,12 +285,11 @@ struct TxState {
     /// Metadata deletions buffered until commit (dcrd
     /// `pendingRemove`).
     pending_removes: std::collections::BTreeSet<Vec<u8>>,
-    /// The metadata cache overlay as of transaction start (dcrd's
-    /// `dbCacheSnapshot`): a layer stack held by an `Arc` clone, taken
-    /// and dropped in O(1).  A writable transaction releases it at
-    /// commit, before the cache applies this transaction, so the
-    /// cache's newest layer is unshared and takes the write in place.
-    cache_snap: Arc<crate::dbcache::CacheSnapshot>,
+    /// The cache overlay as of transaction start (dcrd `dbCacheSnapshot`):
+    /// an `Arc` clone of the layer stack.  `None`, read as an overlay
+    /// holding no row, once closed, and from the point a commit lets it
+    /// go so that the cache's newest layer can be written in place.
+    cache_snap: Option<Arc<crate::dbcache::CacheSnapshot>>,
     /// The bucket index beneath this transaction's pending changes: the
     /// one the cache published when `cache_snap` was taken, under the
     /// same hold of the cache lock, so it holds what a read of the bucket
@@ -367,7 +366,7 @@ impl Transaction {
                 pending_index: HashMap::new(),
                 pending_keys: std::collections::BTreeMap::new(),
                 pending_removes: std::collections::BTreeSet::new(),
-                cache_snap,
+                cache_snap: Some(cache_snap),
                 buckets: Some(buckets),
                 staged_bucket_index: false,
                 #[cfg(test)]
@@ -440,9 +439,9 @@ impl Transaction {
     /// cache snapshot, then the store.
     fn fetch_committed(state: &TxState, key: &[u8]) -> Result<Option<Vec<u8>>, Error> {
         // A cached entry answers the lookup whether it holds a value or
-        // a pending deletion (`None`); only a key no layer knows falls
-        // through to the store.
-        if let Some(entry) = state.cache_snap.get(key) {
+        // a pending deletion (`None`); a key no layer knows, and every
+        // key once the snapshot is let go, falls through to the store.
+        if let Some(entry) = state.cache_snap.as_ref().and_then(|snap| snap.get(key)) {
             return Ok(entry.clone());
         }
         // `kv` is still consulted so a closed transaction reads as
@@ -662,7 +661,8 @@ impl Transaction {
         let mut store_head = next_store_row(&mut store, &mut out.store_error);
         let mut overlay = state
             .cache_snap
-            .merged_from(after.unwrap_or(prefix))
+            .iter()
+            .flat_map(|snap| snap.merged_from(after.unwrap_or(prefix)))
             .skip_while(|&(key, _)| after.is_some_and(|a| key <= a))
             .take_while(|&(key, _)| key.starts_with(prefix))
             .peekable();
@@ -1231,7 +1231,7 @@ impl Transaction {
         state.pending_index.clear();
         state.pending_keys.clear();
         state.pending_removes.clear();
-        state.cache_snap = Arc::new(crate::dbcache::CacheSnapshot::default());
+        state.cache_snap = None;
         state.buckets = None;
         // Unrun: whatever closed the transaction short of a successful
         // commit -- a rollback, a drop, a failed commit -- must not run
@@ -1488,7 +1488,7 @@ impl Transaction {
             // layer is unshared when it applies the changes below and
             // can take them in place (a snapshot naming that layer
             // forces the commit to seal a fresh layer instead).
-            state.cache_snap = Arc::new(crate::dbcache::CacheSnapshot::default());
+            state.cache_snap = None;
             // And its bucket index, so the cache changes its own map in
             // place when this transaction created or deleted a bucket.
             state.buckets = None;
@@ -2973,5 +2973,284 @@ mod pending_guard_tests {
             assert_eq!(searches, want, "ascending: {ascending}");
             tx.rollback().expect("rollback");
         }
+    }
+}
+
+#[cfg(test)]
+mod released_snapshot_tests {
+    //! A transaction holds the cache's snapshot from its start until a
+    //! commit lets it go or the transaction is closed, and nothing in
+    //! its place from then on.  A transaction with no snapshot reads the
+    //! store alone, as one holding a snapshot of no layer does.
+
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use std::sync::Arc;
+
+    use tempfile::TempDir;
+
+    use super::{Bucket, bucketized_key};
+    use crate::dbcache::CacheSnapshot;
+    use crate::{Database, ErrorKind, Options, Transaction};
+
+    /// simnet magic, matching the interface battery.
+    const NET: u32 = 0x1214_1c16;
+
+    /// A new store with an empty bucket `rows`.
+    fn new_db() -> (TempDir, Database) {
+        let dir = TempDir::new().expect("tempdir");
+        let opts = Options::new(dir.path().join("db"), NET);
+        let db = Database::create(&opts).expect("create");
+        let tx = db.begin(true).expect("begin");
+        tx.metadata().create_bucket(b"rows").expect("bucket");
+        tx.commit().expect("commit");
+        (dir, db)
+    }
+
+    /// Whether the transaction holds a snapshot of the overlay.
+    fn held(tx: &Transaction) -> bool {
+        tx.state.borrow().cache_snap.is_some()
+    }
+
+    /// The handles on the snapshot the cache has published: the cache's
+    /// own, and one for each transaction holding that snapshot.
+    fn handles(db: &Database) -> usize {
+        Arc::strong_count(&db.inner.cache.lock().expect("cache").cached)
+    }
+
+    /// The handles on the published snapshot at each release of the
+    /// writer semaphore that `act` makes, read by the probe the release
+    /// runs on this thread, [`crate::RELEASE_HOOK`].
+    fn handles_at_each_release(db: &Database, act: impl FnOnce()) -> Vec<usize> {
+        let snapshot = Arc::downgrade(&db.inner.cache.lock().expect("cache").cached);
+        let counts = Rc::new(RefCell::new(Vec::new()));
+        let seen = Rc::clone(&counts);
+        crate::RELEASE_HOOK.with(|hook| {
+            let count = move || seen.borrow_mut().push(snapshot.strong_count());
+            *hook.borrow_mut() = Some(Box::new(count));
+        });
+        act();
+        crate::RELEASE_HOOK.with(|hook| *hook.borrow_mut() = None);
+        counts.take()
+    }
+
+    /// Put one row in the bucket `rows`.
+    fn put(tx: &Transaction, key: &[u8], value: &[u8]) {
+        let bucket = tx.metadata().bucket(b"rows").expect("bucket");
+        bucket.put(key, value).expect("put");
+    }
+
+    /// A transaction holds a handle on the published snapshot while it
+    /// is open and none once it has ended, whichever way it ended: a
+    /// rollback, a commit, the commit a read-only transaction is
+    /// refused, or the end of a managed transaction's closure.  The
+    /// handle is let go by the end itself, with the transaction still in
+    /// scope, and nothing is held in its place: an ended transaction
+    /// holds no snapshot at all, not an empty one of its own.  A writer
+    /// rolled back still holds its handle as it releases the writer
+    /// semaphore and lets it go straight after, so whatever layers that
+    /// frees are freed with no other writer kept waiting.
+    #[test]
+    fn a_transaction_holds_no_snapshot_once_it_has_let_go() {
+        let (_dir, db) = new_db();
+        // A committed row no flush has written, so the snapshot names a
+        // layer.
+        db.update(|tx| {
+            put(tx, b"beneath", b"1");
+            Ok(())
+        })
+        .expect("update");
+        assert_eq!(handles(&db), 1);
+
+        for writable in [false, true] {
+            let tx = db.begin(writable).expect("begin");
+            assert!(held(&tx), "writable {writable}: open");
+            assert_eq!(handles(&db), 2, "writable {writable}: open");
+            let at_release = handles_at_each_release(&db, || tx.rollback().expect("rollback"));
+            // Only a writer has the semaphore to release.
+            let expected = if writable { vec![2] } else { vec![] };
+            assert_eq!(at_release, expected, "writable {writable}: at the release");
+            assert!(!held(&tx), "writable {writable}: rolled back");
+            assert_eq!(handles(&db), 1, "writable {writable}: rolled back");
+        }
+
+        let tx = db.begin(true).expect("begin");
+        put(&tx, b"committed", b"2");
+        assert!(held(&tx));
+        assert_eq!(handles(&db), 2);
+        tx.commit().expect("commit");
+        assert!(!held(&tx), "committed");
+        assert_eq!(handles(&db), 1, "committed");
+
+        let tx = db.begin(false).expect("begin");
+        assert_eq!(handles(&db), 2);
+        let refused = tx.commit().expect_err("a read-only commit");
+        assert_eq!(refused.kind, ErrorKind::TxNotWritable);
+        assert!(!held(&tx), "refused");
+        assert_eq!(handles(&db), 1, "refused");
+
+        db.view(|tx| {
+            assert!(held(tx), "in a view");
+            assert_eq!(handles(&db), 2, "in a view");
+            Ok(())
+        })
+        .expect("view");
+        assert_eq!(handles(&db), 1, "after a view");
+        db.update(|tx| {
+            put(tx, b"updated", b"3");
+            assert!(held(tx), "in an update");
+            assert_eq!(handles(&db), 2, "in an update");
+            Ok(())
+        })
+        .expect("update");
+        assert_eq!(handles(&db), 1, "after an update");
+    }
+
+    /// What a transaction reads beneath its pending changes for the keys
+    /// `a`, `b` and `c` of the bucket `rows`, and the rows a walk of the
+    /// bucket yields.
+    type Read = (Vec<Option<Vec<u8>>>, Vec<(Vec<u8>, Vec<u8>)>);
+
+    /// [`Read`] through the bucket's own `get` and `for_each`.
+    fn read(bucket: &Bucket) -> Read {
+        let values = [b"a", b"b", b"c"].map(|key| bucket.get(key)).to_vec();
+        let mut walked = Vec::new();
+        bucket
+            .for_each(|key, value| {
+                walked.push((key.to_vec(), value.to_vec()));
+                Ok(())
+            })
+            .expect("walk");
+        (values, walked)
+    }
+
+    /// One row of a walk.
+    fn row(key: &[u8], value: &[u8]) -> (Vec<u8>, Vec<u8>) {
+        (key.to_vec(), value.to_vec())
+    }
+
+    /// Fill the bucket `rows` so that the store and the overlay above it
+    /// differ on every key read: the store holds `a` and `b`, and the
+    /// overlay rewrites `a`, deletes `b` and adds `c`.
+    fn fill_store_and_overlay(db: &Database) {
+        db.update(|tx| {
+            put(tx, b"a", b"store-a");
+            put(tx, b"b", b"store-b");
+            Ok(())
+        })
+        .expect("update");
+        db.flush().expect("flush");
+        db.update(|tx| {
+            put(tx, b"a", b"overlay-a");
+            put(tx, b"c", b"overlay-c");
+            tx.metadata().bucket(b"rows").expect("bucket").delete(b"b")
+        })
+        .expect("update");
+    }
+
+    /// What [`fill_store_and_overlay`] leaves to read through the
+    /// overlay.
+    fn through_the_overlay() -> Read {
+        (
+            vec![
+                Some(b"overlay-a".to_vec()),
+                None,
+                Some(b"overlay-c".to_vec()),
+            ],
+            vec![row(b"a", b"overlay-a"), row(b"c", b"overlay-c")],
+        )
+    }
+
+    /// What [`fill_store_and_overlay`] leaves in the store.
+    fn the_store_alone() -> Read {
+        (
+            vec![Some(b"store-a".to_vec()), Some(b"store-b".to_vec()), None],
+            vec![row(b"a", b"store-a"), row(b"b", b"store-b")],
+        )
+    }
+
+    /// A transaction that holds no snapshot reads the store alone, row
+    /// by row and in a walk: a key the overlay had rewritten reads as
+    /// the store has it, one the overlay had deleted is back, and one
+    /// only the overlay held is absent.  That is what a transaction
+    /// holding a snapshot of no layer reads, which is what a commit and
+    /// a close used to leave in the snapshot's place.  No snapshot is
+    /// the state a commit is in between letting its snapshot go and
+    /// closing, with the store's read transaction still open; once that
+    /// is closed too, every key reads as absent and a scan yields
+    /// nothing.
+    #[test]
+    fn a_transaction_without_a_snapshot_reads_the_store_alone() {
+        let (_dir, db) = new_db();
+        fill_store_and_overlay(&db);
+
+        let reader = db.begin(false).expect("begin");
+        let bucket = reader.metadata().bucket(b"rows").expect("bucket");
+        assert_eq!(read(&bucket), through_the_overlay());
+
+        reader.state.borrow_mut().cache_snap = None;
+        assert_eq!(read(&bucket), the_store_alone(), "no snapshot");
+        reader.state.borrow_mut().cache_snap = Some(Arc::new(CacheSnapshot::default()));
+        assert_eq!(read(&bucket), the_store_alone(), "a snapshot of no layer");
+
+        // Closed: the bucket's own reads stop at the closed check, so
+        // the raw reads beneath them are asked as well.
+        reader.rollback().expect("rollback");
+        assert!(!held(&reader));
+        for key in [b"a", b"b", b"c"] {
+            assert_eq!(bucket.get(key), None, "closed, key {key:?}");
+            let raw = bucketized_key(bucket.id, key);
+            assert_eq!(reader.try_fetch_raw(&raw), Ok(None), "closed, key {key:?}");
+        }
+        let closed = bucket.for_each(|key, _| panic!("a closed walk yielded {key:?}"));
+        assert_eq!(closed.expect_err("closed").kind, ErrorKind::TxClosed);
+        let window = reader.scan_prefix_window(&bucket.id, None, None, true, true);
+        assert!(window.rows.is_empty() && window.store_error.is_none());
+    }
+
+    /// A commit lets its snapshot go before it hands its rows to the
+    /// cache and holds nothing in its place while it does.  The commit
+    /// here is stopped at the hand-over: its hook leaves the cache's
+    /// lock poisoned, and the hand-over is the commit's first use of
+    /// that lock after its hooks, so the commit panics there, after it
+    /// has let the snapshot go and before it closes.  The transaction is
+    /// then in a state no finished commit shows: open on the store,
+    /// holding no snapshot at all, with the cache's handle the only one
+    /// on the published snapshot.  It reads the store alone there.
+    /// Rolled back, it leaves the overlay as it found it.
+    #[test]
+    fn a_commit_holds_no_snapshot_as_it_hands_its_rows_to_the_cache() {
+        let (_dir, db) = new_db();
+        fill_store_and_overlay(&db);
+
+        let tx = db.begin(true).expect("begin");
+        put(&tx, b"d", b"never-handed-over");
+        let bucket = tx.metadata().bucket(b"rows").expect("bucket");
+        let inner = Arc::clone(&db.inner);
+        tx.on_commit(move || {
+            let holder = std::thread::spawn(move || {
+                let _cache = inner.cache.lock().expect("cache");
+                panic!("leave the cache's lock poisoned");
+            });
+            holder.join().expect_err("the lock's holder panics");
+        })
+        .expect("hook");
+        assert!(held(&tx), "open");
+        assert_eq!(handles(&db), 2, "open");
+
+        let stopped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| tx.commit()));
+        let panic = stopped.expect_err("the commit stops at the poisoned lock");
+        let text = panic.downcast_ref::<String>().cloned().unwrap_or_default();
+        assert!(text.contains("cache lock poisoned"), "{text}");
+        db.inner.cache.clear_poison();
+
+        assert!(!held(&tx), "at the hand-over");
+        assert_eq!(handles(&db), 1, "at the hand-over");
+        assert_eq!(read(&bucket), the_store_alone(), "at the hand-over");
+
+        tx.rollback().expect("rollback");
+        let reader = db.begin(false).expect("begin");
+        let bucket = reader.metadata().bucket(b"rows").expect("bucket");
+        assert_eq!(read(&bucket), through_the_overlay(), "after the rollback");
     }
 }

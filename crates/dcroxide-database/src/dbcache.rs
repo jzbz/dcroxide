@@ -3663,6 +3663,40 @@ mod tests {
         }
         tx.rollback().expect("rollback");
     }
+
+    /// A commit lets go of its transaction's snapshot before the cache
+    /// takes its rows.  With no reader open the cache then holds the
+    /// only handle on the snapshot it has published and on that
+    /// snapshot's one layer, so the rows go into that layer in place and
+    /// the stack is published in the snapshot that was there: the same
+    /// snapshot after the commit as before it, still of one layer, and
+    /// no entry walked from one layer into another.  A commit still
+    /// holding its snapshot at that point would find both shared, seal a
+    /// second layer for its rows and publish a snapshot of its own.
+    #[test]
+    fn a_commit_with_no_reader_publishes_into_the_snapshot_it_found() {
+        let (_dir, db) = new_db();
+        {
+            let tx = db.begin(true).expect("begin write");
+            tx.metadata().create_bucket(b"cache").expect("create");
+            tx.commit().expect("commit");
+        }
+        commit_one(&db, b"k1", b"v1");
+        // The published snapshot's address and how many layers it names.
+        let published = || {
+            let cache = db.inner.cache.lock().expect("cache");
+            (Arc::as_ptr(&cache.cached), cache.cached.layers.len())
+        };
+        let (found, layers) = published();
+        assert_eq!(layers, 1);
+        let merged = merge_inserts();
+
+        for (key, value) in [(b"k2", b"v2"), (b"k3", b"v3")] {
+            commit_one(&db, key, value);
+            let after = (published(), merge_inserts());
+            assert_eq!(after, ((found, 1), merged), "after {key:?}");
+        }
+    }
 }
 
 #[cfg(test)]
