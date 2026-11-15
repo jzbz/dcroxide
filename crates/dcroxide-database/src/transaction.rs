@@ -292,12 +292,28 @@ struct TxState {
     /// search through.
     #[cfg(test)]
     cross_searches: usize,
+    /// How many values a read has copied out for its caller, counted
+    /// where [`Transaction::try_fetch_raw`] and
+    /// [`Transaction::fetch_committed`] make the copy: of a pending
+    /// value, of a cached one and of a stored row.  The presence test
+    /// ([`Transaction::has_raw`]) goes through neither and adds none.
+    #[cfg(test)]
+    value_copies: std::cell::Cell<usize>,
     /// Closures to run once a commit's own flush has taken the rows it
     /// will write and before the commit's are published, in registration
     /// order (see
     /// [`Transaction::on_commit`]).  Dropped unrun by `close`, so a
     /// rollback, a drop or a failed commit runs none of them.
     on_commit: Vec<OnCommit>,
+}
+
+#[cfg(test)]
+impl TxState {
+    /// Count one value copied out for a caller (`value_copies`).
+    fn count_value_copy(&self) {
+        self.value_copies
+            .set(self.value_copies.get().saturating_add(1));
+    }
 }
 
 /// A closure registered with [`Transaction::on_commit`].
@@ -354,6 +370,8 @@ impl Transaction {
                 staged_bucket_index: false,
                 #[cfg(test)]
                 cross_searches: 0,
+                #[cfg(test)]
+                value_copies: std::cell::Cell::new(0),
                 on_commit: Vec::new(),
             }),
             writable,
@@ -413,6 +431,8 @@ impl Transaction {
             return Ok(None);
         }
         if let Some(v) = state.pending_keys.get(key) {
+            #[cfg(test)]
+            state.count_value_copy();
             return Ok(Some(v.clone()));
         }
         Self::fetch_committed(&state, key)
@@ -425,6 +445,12 @@ impl Transaction {
         // a pending deletion (`None`); a key no layer knows, and every
         // key once the snapshot is let go, falls through to the store.
         if let Some(entry) = state.cache_snap.as_ref().and_then(|snap| snap.get(key)) {
+            #[cfg(test)]
+            {
+                if entry.is_some() {
+                    state.count_value_copy();
+                }
+            }
             return Ok(entry.clone());
         }
         // `kv` is still consulted so a closed transaction reads as
@@ -436,14 +462,37 @@ impl Transaction {
         let Some(table) = state.table.as_ref() else {
             return Ok(None);
         };
-        Ok(table
-            .get(key)
-            .map_err(crate::storage_error)?
-            .map(|g| g.value().to_vec()))
+        Ok(table.get(key).map_err(crate::storage_error)?.map(|g| {
+            #[cfg(test)]
+            state.count_value_copy();
+            g.value().to_vec()
+        }))
     }
 
+    /// Whether [`Self::fetch_raw`] would find the key, answered without
+    /// copying the value it finds.  The walk is that of
+    /// [`Self::try_fetch_raw`] and [`Self::fetch_committed`], level by
+    /// level and in their order, and a store read error is absence, as
+    /// it is to `fetch_raw`.  The store is asked for the row exactly as
+    /// they ask for it, so a failing read leaves redb as theirs does.
     fn has_raw(&self, key: &[u8]) -> bool {
-        self.fetch_raw(key).is_some()
+        let state = self.state.borrow();
+        if state.pending_removes.contains(key) {
+            return false;
+        }
+        if state.pending_keys.contains_key(key) {
+            return true;
+        }
+        if let Some(entry) = state.cache_snap.as_ref().and_then(|snap| snap.get(key)) {
+            return entry.is_some();
+        }
+        if state.kv.is_none() {
+            return false;
+        }
+        let Some(table) = state.table.as_ref() else {
+            return false;
+        };
+        matches!(table.get(key), Ok(Some(_)))
     }
 
     /// Stage a put.  The key is taken owned, as every caller has just
@@ -1955,6 +2004,26 @@ impl<'tx> Bucket<'tx> {
         }
         self.tx
             .try_fetch_raw(bucketized_key(self.id, key).as_bytes())
+    }
+
+    /// Whether the bucket holds the key: what `self.get(key).is_some()`
+    /// answers, without the copy of the value that `get` hands back.
+    ///
+    /// dcrd's `Bucket` has no such method.  It stands for a `Get` whose
+    /// result dcrd only compares with `nil`, as `DbDeleteTicket` does
+    /// before it deletes a ticket's row
+    /// (`blockchain/stake/internal/ticketdb/chainio.go:612-613`), and
+    /// the read it makes is that `Get`'s: this transaction's pending
+    /// changes, then the cache snapshot, then the store, each asked only
+    /// when the one before holds no entry for the key.  A key with an
+    /// empty value is held.  A closed transaction and an empty key
+    /// answer `false`, and so does a store read error, each as
+    /// [`Self::get`] answers `None`.
+    pub fn contains(&self, key: &[u8]) -> bool {
+        if self.tx.check_closed().is_err() || key.is_empty() {
+            return false;
+        }
+        self.tx.has_raw(bucketized_key(self.id, key).as_bytes())
     }
 
     /// Remove the specified key from the bucket; deleting a key that
@@ -3710,5 +3779,300 @@ mod in_place_key_tests {
         let flushed: Vec<Row> = written.iter().filter(under_the_bucket).cloned().collect();
         assert_eq!(flushed, raw_rows);
         read_back("in the store");
+    }
+}
+
+#[cfg(test)]
+mod presence_tests {
+    //! [`Bucket::contains`] against [`Bucket::get`].  The presence test
+    //! copies no value, so it does not go through the read that does: it
+    //! walks the levels that read walks -- the transaction's pending
+    //! changes, the layers of the cache snapshot, the store -- in code
+    //! of its own.  The keys here are held in every way those levels can
+    //! hold one, and the two must answer alike for each.
+
+    use std::sync::Arc;
+
+    use super::bucketized_key;
+    use super::put_owned_tests::recording_db;
+    use crate::Transaction;
+    use crate::dbcache::CacheLayer;
+
+    /// What one level holds for a key.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Held {
+        /// No entry, so the level beneath answers.
+        Nothing,
+        /// A value of some bytes.
+        Value,
+        /// A value of no bytes.
+        Empty,
+        /// A deletion.
+        Deleted,
+    }
+
+    /// Every [`Held`]; the first three are what the store can hold.
+    const HELD: [Held; 4] = [Held::Nothing, Held::Value, Held::Empty, Held::Deleted];
+
+    /// The levels a key is held at, the one a read asks last first: the
+    /// store, the older and the newer layer of the overlay, and the
+    /// first and the second change the transaction stages for the key.
+    const LEVELS: usize = 5;
+
+    /// A key and what each level holds for it.
+    type Case = (Vec<u8>, [Held; LEVELS]);
+
+    /// A key for every combination of what the levels can hold, once
+    /// with a key short enough for its row's key to be held in place and
+    /// once with one too long for that.
+    fn cases() -> Vec<Case> {
+        let mut cases = Vec::new();
+        for long in [false, true] {
+            for n in 0..3 * 4 * 4 * 4 * 4usize {
+                let levels = [n / 256, n / 64 % 4, n / 16 % 4, n / 4 % 4, n % 4].map(|i| HELD[i]);
+                let mut key: Vec<u8> = levels.iter().map(|held| *held as u8).collect();
+                if long {
+                    key.resize(43, 0xee);
+                }
+                cases.push((key, levels));
+            }
+        }
+        cases
+    }
+
+    /// Stage, for every key, what the level holds for it.
+    fn stage(tx: &Transaction, cases: &[Case], level: usize) {
+        let bucket = tx.metadata().bucket(b"rows").expect("bucket");
+        for (key, levels) in cases {
+            match levels[level] {
+                Held::Nothing => {}
+                Held::Value => bucket.put(key, b"value").expect("put"),
+                Held::Empty => bucket.put(key, b"").expect("put"),
+                Held::Deleted => bucket.delete(key).expect("delete"),
+            }
+        }
+    }
+
+    /// The entry a level holds: none, a value or a deletion.
+    fn entry(held: Held) -> Option<Option<&'static [u8]>> {
+        match held {
+            Held::Nothing => None,
+            Held::Value => Some(Some(b"value")),
+            Held::Empty => Some(Some(b"")),
+            Held::Deleted => Some(None),
+        }
+    }
+
+    /// What a read through the levels finds, the level it asks last
+    /// first: the entry of the last level that holds one.
+    fn read(levels: &[Held]) -> Option<&'static [u8]> {
+        levels.iter().rev().find_map(|held| entry(*held)).flatten()
+    }
+
+    /// `contains` answers as `get(..).is_some()` does for a key held in
+    /// every way the store, two layers of the overlay and two changes
+    /// staged one after the other can hold it: no entry, a value, a value
+    /// of no bytes or a deletion at each level, so a put over a delete, a
+    /// delete over a put and a deletion cached over a stored row are all
+    /// among them.  The layers and the pending sets are read first, to
+    /// see that each key is held as its case says.  The same holds for a
+    /// transaction that has let its snapshot go, which reads its pending
+    /// changes and then the store.
+    ///
+    /// The copy is what `contains` is there to save, so it is counted:
+    /// `get` copies one value for every key it finds, at whichever level
+    /// it finds it, and `contains` copies none.  The count is kept where
+    /// the copying read makes its copies, so it shows that `contains`
+    /// does not go through that read, and not that it makes no copy of
+    /// its own.
+    #[test]
+    fn contains_answers_as_get_does_for_a_key_in_every_state() {
+        let (_dir, db, _, _) = recording_db();
+        db.update(|tx| tx.metadata().create_bucket(b"rows").map(|_| ()))
+            .expect("bucket");
+        let cases = cases();
+        let commit = |level: usize, filler: usize| {
+            let tx = db.begin(true).expect("begin");
+            stage(&tx, &cases, level);
+            let bucket = tx.metadata().bucket(b"rows").expect("bucket");
+            for i in 0..filler {
+                let key = [b"filler", &i.to_be_bytes()[..]].concat();
+                bucket.put(&key, b"").expect("put");
+            }
+            tx.commit().expect("commit");
+        };
+
+        commit(0, 0);
+        db.flush().expect("flush");
+        // A commit folds its layer into the one beneath unless that one
+        // has more than twice its rows, so the older layer is given rows
+        // of its own.  The reader holds the snapshot that names the
+        // older layer while the next commit is made, which therefore
+        // starts a layer instead of writing into that one.
+        commit(1, cases.len() * 2);
+        let reader = db.begin(false).expect("begin");
+        commit(2, 0);
+        reader.rollback().expect("rollback");
+
+        let layers = db
+            .inner
+            .cache
+            .lock()
+            .expect("cache")
+            .published_layers_for_test();
+        assert_eq!(
+            layers.len(),
+            2,
+            "the fixture no longer leaves two layers: a commit folded the newer one"
+        );
+        let layers: Vec<Arc<CacheLayer>> = layers
+            .iter()
+            .map(|layer| layer.upgrade().expect("a published layer"))
+            .collect();
+
+        let tx = db.begin(true).expect("begin");
+        stage(&tx, &cases, 3);
+        stage(&tx, &cases, 4);
+        let bucket = tx.metadata().bucket(b"rows").expect("bucket");
+        for (key, levels) in &cases {
+            let raw = bucketized_key(bucket.id, key);
+            // The layers are published newest first.
+            for (layer, held) in layers.iter().zip([levels[2], levels[1]]) {
+                let cached = layer.get(raw.as_bytes()).map(Option::as_deref);
+                assert_eq!(cached, entry(held), "{levels:?}");
+            }
+            let state = tx.state.borrow();
+            let put = state.pending_keys.get(raw.as_bytes()).map(Vec::as_slice);
+            let deleted = state.pending_removes.contains(raw.as_bytes());
+            let staged = levels[3..].iter().rev().find_map(|held| entry(*held));
+            assert_eq!(put, staged.flatten(), "{levels:?}");
+            assert_eq!(deleted, staged == Some(None), "{levels:?}");
+        }
+
+        // `get` copies the value it finds and `contains` copies none,
+        // wherever the key is held.
+        let copies = || tx.state.borrow().value_copies.get();
+        for (key, levels) in &cases {
+            let want = read(levels);
+            let before = copies();
+            assert_eq!(bucket.get(key).as_deref(), want, "{levels:?}");
+            let copied = copies().abs_diff(before);
+            assert_eq!(copied, usize::from(want.is_some()), "{levels:?}");
+            let before = copies();
+            assert_eq!(bucket.contains(key), want.is_some(), "{levels:?}");
+            assert_eq!(copies(), before, "a value copied, {levels:?}");
+        }
+
+        tx.state.borrow_mut().cache_snap = None;
+        for (key, levels) in &cases {
+            let want = read(&[levels[0], levels[3], levels[4]]);
+            let before = copies();
+            assert_eq!(bucket.get(key).as_deref(), want, "no snapshot, {levels:?}");
+            let copied = copies().abs_diff(before);
+            assert_eq!(
+                copied,
+                usize::from(want.is_some()),
+                "no snapshot, {levels:?}"
+            );
+            let before = copies();
+            let held = bucket.contains(key);
+            assert_eq!(held, want.is_some(), "no snapshot, {levels:?}");
+            assert_eq!(copies(), before, "no snapshot, a value copied, {levels:?}");
+        }
+    }
+
+    /// `contains` answers `false` for the empty key and for every key
+    /// once the transaction is closed, as `get` answers `None`.  The
+    /// walk beneath gives those answers by itself for any row a caller
+    /// can stage: `put` refuses the empty key, so no row is keyed by a
+    /// bucket's id alone, and a closed transaction holds nothing at any
+    /// level.  To show that `contains` checks both before it walks, as
+    /// `get` does, a row is staged under the bare id and another is put
+    /// back in the pending set of the closed transaction, each through
+    /// the raw keyspace, where the walk finds it.
+    #[test]
+    fn contains_answers_false_for_the_empty_key_and_in_a_closed_transaction() {
+        let (_dir, db, _, _) = recording_db();
+        db.update(|tx| tx.metadata().create_bucket(b"rows")?.put(b"stored", b"1"))
+            .expect("update");
+        db.flush().expect("flush");
+        db.update(|tx| {
+            let bucket = tx.metadata().bucket(b"rows").expect("bucket");
+            bucket.put(b"cached", b"2")
+        })
+        .expect("update");
+
+        let tx = db.begin(true).expect("begin");
+        let bucket = tx.metadata().bucket(b"rows").expect("bucket");
+        bucket.put(b"staged", b"3").expect("put");
+        let keys: [&[u8]; 3] = [b"stored", b"cached", b"staged"];
+        for key in keys {
+            assert!(bucket.get(key).is_some(), "open, key {key:?}");
+            assert!(bucket.contains(key), "open, key {key:?}");
+        }
+
+        assert_eq!(bucket.get(b""), None);
+        assert!(!bucket.contains(b""));
+        let bare = bucketized_key(bucket.id, b"");
+        tx.put_raw(bare.clone(), b"4".to_vec()).expect("put");
+        assert!(tx.has_raw(bare.as_bytes()));
+        assert_eq!(bucket.get(b""), None, "a row under the bare id");
+        assert!(!bucket.contains(b""), "a row under the bare id");
+
+        tx.rollback().expect("rollback");
+        for key in keys {
+            assert_eq!(bucket.get(key), None, "closed, key {key:?}");
+            assert!(!bucket.contains(key), "closed, key {key:?}");
+            let raw = bucketized_key(bucket.id, key);
+            assert!(!tx.has_raw(raw.as_bytes()), "closed, key {key:?}");
+        }
+        let raw = bucketized_key(bucket.id, b"staged");
+        let put_back = (raw.clone(), b"3".to_vec());
+        tx.state.borrow_mut().pending_keys.extend([put_back]);
+        assert!(tx.has_raw(raw.as_bytes()));
+        assert_eq!(bucket.get(b"staged"), None, "closed, a row put back");
+        assert!(!bucket.contains(b"staged"), "closed, a row put back");
+    }
+
+    /// `contains` reads the view its transaction began with, as `get`
+    /// does: a key committed after the transaction began is not held to
+    /// it, neither while the row is in the overlay nor once a flush has
+    /// written it to the store, and a later transaction holds it.  A
+    /// nested bucket's name is no key of the bucket that holds it, to
+    /// either.
+    #[test]
+    fn contains_reads_the_view_its_transaction_began_with() {
+        let (_dir, db, _, _) = recording_db();
+        db.update(|tx| {
+            let rows = tx.metadata().create_bucket(b"rows")?;
+            rows.create_bucket(b"nested").map(|_| ())
+        })
+        .expect("update");
+
+        let reader = db.begin(false).expect("begin");
+        let early = reader.metadata().bucket(b"rows").expect("bucket");
+        db.update(|tx| {
+            let rows = tx.metadata().bucket(b"rows").expect("bucket");
+            rows.put(b"later", b"1")
+        })
+        .expect("update");
+        assert_eq!(early.get(b"later"), None, "committed since");
+        assert!(!early.contains(b"later"), "committed since");
+        db.flush().expect("flush");
+        assert_eq!(early.get(b"later"), None, "written to the store since");
+        assert!(!early.contains(b"later"), "written to the store since");
+
+        assert!(early.bucket(b"nested").is_some());
+        assert_eq!(early.get(b"nested"), None);
+        assert!(!early.contains(b"nested"));
+        reader.rollback().expect("rollback");
+
+        let reader = db.begin(false).expect("begin");
+        let late = reader.metadata().bucket(b"rows").expect("bucket");
+        assert_eq!(late.get(b"later").as_deref(), Some(&b"1"[..]));
+        assert!(late.contains(b"later"));
+        assert!(late.bucket(b"nested").is_some());
+        assert!(!late.contains(b"nested"));
+        reader.rollback().expect("rollback");
     }
 }

@@ -221,7 +221,7 @@ pub fn db_delete_ticket(
 /// [`db_delete_ticket`] once the ticket bucket is in hand.
 fn delete_ticket(bucket: &Bucket<'_>, hash: &Hash) -> Result<(), StakeDbError> {
     // Check to see if the value exists before we delete it.
-    if bucket.get(&hash.0).is_none() {
+    if !bucket.contains(&hash.0) {
         return Err(ticket_db_error(
             TicketDbErrorKind::MissingKey,
             &format!("missing key {hash} to delete"),

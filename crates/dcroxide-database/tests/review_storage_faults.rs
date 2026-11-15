@@ -13,7 +13,7 @@
 //! every lookup reaches the backend -- except a tree's root, which redb
 //! holds for the transaction's life (`Btree::cached_root`).
 //!
-//! The four findings pinned here:
+//! The five findings pinned here:
 //!
 //! - a read error on a row dcrd keeps in its UTXO backend must come back
 //!   as an error, not as a missing row, and a `begin` that cannot open
@@ -21,6 +21,9 @@
 //! - a bucket walk must end at a store read error instead of spinning
 //!   on redb's repeated `PreviousIo`;
 //! - a walk reads each value once, and a cursor delete reads nothing;
+//! - a presence test reads a store error as absence, as the read it
+//!   stands for does, and reads no row for a key that the transaction's
+//!   pending changes or the overlay answer for;
 //! - a writer queued on the semaphore behind a failing flush is refused
 //!   by the fatal latch rather than re-running that flush.
 
@@ -200,6 +203,100 @@ fn a_utxo_row_read_error_is_an_error_not_a_missing_row() {
         Ok(())
     })
     .expect("view");
+}
+
+/// `Bucket::contains` reads the store without going through
+/// `Bucket::get`, and answers as `get(..).is_some()` does all the same:
+/// a row it cannot read is not held, whether the read itself failed or
+/// redb refused it after that failure, and neither is a panic.  The
+/// failed read is the one `get` makes: redb has latched it, so the read
+/// that reports errors fails on a disk that has recovered.
+#[test]
+fn a_presence_test_reads_a_store_error_as_absence() {
+    let (_dir, backend, db) = faulty_db(|_| {});
+    // Rows enough for a root that is a branch, as above.
+    fill_store(&db, 2000);
+
+    db.view(|tx| {
+        let bucket = tx.metadata().bucket(BUCKET).expect("bucket");
+        assert!(bucket.contains(&key(7)));
+        assert!(!bucket.contains(&key(1_000_000)));
+
+        backend.fail_reads.store(true, Ordering::SeqCst);
+        assert!(
+            !bucket.contains(&key(7)),
+            "a failed read is absence, as it is to get"
+        );
+        backend.fail_reads.store(false, Ordering::SeqCst);
+        let err = bucket
+            .try_get(&key(7))
+            .expect_err("the presence test's failed read is latched");
+        assert_eq!(err.kind, ErrorKind::Corruption, "{err}");
+        assert!(
+            !bucket.contains(&key(1500)),
+            "a read redb refuses is absence, as it is to get"
+        );
+        assert_eq!(bucket.get(&key(1500)), None);
+        Ok(())
+    })
+    .expect("view");
+}
+
+/// `Bucket::contains` asks the store only for a key that neither the
+/// transaction's pending changes nor the overlay hold an entry for, as
+/// `Bucket::get` does.  A put or a delete staged by the transaction and
+/// one committed and not yet flushed each answer without a read reaching
+/// the backend, while a row only the store holds is read from it.  With
+/// reads failing the answers are the same and none of them is a failed
+/// read: redb latches a failed read, and the read that reports errors
+/// succeeds afterwards.
+#[test]
+fn a_presence_test_answered_above_the_store_reads_no_row() {
+    let (_dir, backend, db) = faulty_db(|_| {});
+    // Rows enough for a root that is a branch, as above.
+    fill_store(&db, 2000);
+    // Committed and not flushed: a row the store does not hold, and the
+    // deletion of one it does.
+    db.update(|tx| {
+        let bucket = tx.metadata().bucket(BUCKET).expect("bucket");
+        bucket.put(&key(5000), &value(5000, 1))?;
+        bucket.delete(&key(8))
+    })
+    .expect("update");
+
+    let tx = db.begin(true).expect("begin");
+    let bucket = tx.metadata().bucket(BUCKET).expect("bucket");
+    bucket.put(&key(6000), &value(6000, 2)).expect("put");
+    bucket.delete(&key(9)).expect("delete");
+    let answered = [(5000, true), (6000, true), (8, false), (9, false)];
+
+    let reads = backend.reads.load(Ordering::SeqCst);
+    for (i, held) in answered {
+        assert_eq!(bucket.get(&key(i)).is_some(), held, "get, key {i}");
+        assert_eq!(bucket.contains(&key(i)), held, "key {i}");
+    }
+    assert_eq!(
+        backend.reads.load(Ordering::SeqCst),
+        reads,
+        "a key answered above the store is not read from it"
+    );
+    assert!(bucket.contains(&key(7)));
+    assert!(
+        backend.reads.load(Ordering::SeqCst) > reads,
+        "a row only the store holds is read from it"
+    );
+
+    backend.fail_reads.store(true, Ordering::SeqCst);
+    for (i, held) in answered {
+        assert_eq!(bucket.contains(&key(i)), held, "reads failing, key {i}");
+    }
+    backend.fail_reads.store(false, Ordering::SeqCst);
+    assert_eq!(
+        bucket.try_get(&key(7)),
+        Ok(Some(value(7, 0))),
+        "no read failed, so redb latched none"
+    );
+    tx.rollback().expect("rollback");
 }
 
 /// A `begin` whose metadata table cannot be opened used to succeed with

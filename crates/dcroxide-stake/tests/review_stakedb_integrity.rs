@@ -118,6 +118,87 @@ fn deleting_a_missing_ticket_row_fails_like_dcrd() {
     assert_eq!(description, format!("missing key {absent} to delete"));
 }
 
+/// `DbDeleteTicket` finds the row it is to delete wherever the database
+/// holds it: staged by the same transaction, committed and not yet
+/// written to the store, or in the store.  Once the row is deleted it
+/// fails with `ErrMissingKey` and dcrd's text, whether the delete was
+/// staged by the same transaction, is committed over a row the store
+/// still holds, or has reached the store.  dcrd reads the row to see
+/// that it exists; the port asks whether the bucket holds the key, which
+/// reads no value.
+#[test]
+fn a_ticket_row_is_found_wherever_it_is_held_and_is_missing_once_deleted() {
+    let dir = TempDir::new().expect("tempdir");
+    let db = open_db(&dir);
+    db.update(|tx| {
+        init_database_state(tx, PARAMS, &Hash([0x01; 32]), 0).expect("init");
+        Ok(())
+    })
+    .expect("init update");
+
+    type Tx = dcroxide_database::Transaction;
+    let put = |tx: &Tx, hash: &Hash| {
+        db_put_ticket(
+            tx,
+            LIVE_TICKETS_BUCKET_NAME,
+            hash,
+            7,
+            false,
+            false,
+            false,
+            false,
+        )
+    };
+    let delete = |tx: &Tx, hash: &Hash| db_delete_ticket(tx, LIVE_TICKETS_BUCKET_NAME, hash);
+    // Make one change to the bucket and commit it.
+    let commit = |change: &dyn Fn(&Tx) -> Result<(), StakeDbError>| {
+        db.update(|tx| {
+            change(tx).expect("a change to the bucket");
+            Ok(())
+        })
+        .expect("update");
+    };
+    let missing = |deleted: Result<(), StakeDbError>, hash: &Hash, when: &str| {
+        let (kind, description) = ticket_kind(deleted.expect_err(when));
+        assert_eq!(kind, TicketDbErrorKind::MissingKey, "{when}");
+        let text = format!("missing key {hash} to delete");
+        assert_eq!(description, text, "{when}");
+    };
+
+    // Staged by the transaction that deletes it.
+    let staged = Hash([0x51; 32]);
+    let again = in_update(&db, |tx| {
+        put(tx, &staged)?;
+        delete(tx, &staged).expect("deleting a staged row");
+        delete(tx, &staged)
+    });
+    missing(again, &staged, "staged, and deleted by the transaction");
+
+    // Committed, and no flush has written it.
+    let cached = Hash([0x52; 32]);
+    commit(&|tx| put(tx, &cached));
+    in_update(&db, |tx| delete(tx, &cached)).expect("deleting a committed row");
+    commit(&|tx| delete(tx, &cached));
+    let again = in_update(&db, |tx| delete(tx, &cached));
+    missing(again, &cached, "committed, and its delete committed");
+
+    // In the store.
+    let stored = Hash([0x53; 32]);
+    commit(&|tx| put(tx, &stored));
+    db.flush().expect("flush");
+    let again = in_update(&db, |tx| {
+        delete(tx, &stored).expect("deleting a stored row");
+        delete(tx, &stored)
+    });
+    missing(again, &stored, "stored, and deleted by the transaction");
+    commit(&|tx| delete(tx, &stored));
+    let again = in_update(&db, |tx| delete(tx, &stored));
+    missing(again, &stored, "stored, and its delete committed");
+    db.flush().expect("flush");
+    let again = in_update(&db, |tx| delete(tx, &stored));
+    missing(again, &stored, "deleted in the store");
+}
+
 /// A block that misses a winner the on-disk live bucket does not hold:
 /// dcrd's `WriteConnectedBestNode` fails the move from live to missed,
 /// so the block's update never commits.
