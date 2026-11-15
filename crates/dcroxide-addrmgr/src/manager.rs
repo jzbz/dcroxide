@@ -235,6 +235,7 @@ impl KnownAddress {
     /// which reads `time.Now()` itself): not tried in the last minute
     /// and from the future, unseen for a month, thrice-failed without
     /// success, or five-times failed in the last week.
+    #[allow(clippy::needless_bool)] // Keep dcrd's one case per reason, the last one included.
     pub fn is_bad(&self, now: GoTime) -> bool {
         // Wait a minute after the last check.
         if let Some(lastattempt) = self.lastattempt

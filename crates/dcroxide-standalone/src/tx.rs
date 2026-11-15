@@ -37,6 +37,7 @@ const TX_VERSION_TREASURY: u16 = 3;
 /// Whether or not a transaction is a coinbase: a special transaction
 /// created by miners with a single input whose previous output has the
 /// maximum index and a zero hash (dcrd `IsCoinBaseTx`).
+#[allow(clippy::needless_bool)] // Keep dcrd's early returns, the last one included.
 pub fn is_coin_base_tx(tx: &MsgTx, is_treasury_enabled: bool) -> bool {
     // A coinbase must be version 3 once the treasury agenda is active.
     if is_treasury_enabled && tx.version != TX_VERSION_TREASURY {

@@ -560,8 +560,8 @@ pub(crate) fn modinv64_var_capped(
         if g.v[0] == 0 {
             let mut cond: i64 = 0;
             // Check if the other limbs are also 0.
-            for j in 1..len {
-                cond |= g.v[j];
+            for &limb in &g.v[1..len] {
+                cond |= limb;
             }
             // If so, we're done.
             if cond == 0 {

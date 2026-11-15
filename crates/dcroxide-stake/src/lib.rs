@@ -743,6 +743,7 @@ pub fn check_sstx(tx: &MsgTx) -> Result<(), RuleError> {
 
     // Odd outputs are commitments, the rest of the even outputs are
     // OP_SSTXCHANGE tagged.
+    #[allow(clippy::needless_range_loop)] // dcrd's indexed loop; the index is in the errors too.
     for out_tx_index in 1..tx.tx_out.len() {
         let scr_version = tx.tx_out[out_tx_index].version;
         let raw_script: &[u8] = &tx.tx_out[out_tx_index].pk_script;
@@ -1128,6 +1129,7 @@ pub fn check_ssgen_votes(tx: &MsgTx) -> Result<Vec<TreasuryVoteTuple>, RuleError
     }
 
     // The remaining outputs must be OP_SSGEN tagged.
+    #[allow(clippy::needless_range_loop)] // dcrd's indexed loop; the index is in the errors too.
     for out_tx_index in 2..tx_out_len {
         let scr_version = tx.tx_out[out_tx_index].version;
         let raw_script: &[u8] = &tx.tx_out[out_tx_index].pk_script;
