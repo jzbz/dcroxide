@@ -45,7 +45,7 @@ certificate verification runs, and random numbers. rustls 0.23.46 is
 itself written in Rust with no C, and forbids `unsafe`
 (`rustls-0.23.46/src/lib.rs:332`); its provider in this node is `ring`
 0.17.14, about 151k lines of C and assembly
-(`docs/dependency-ledger.md:163`).
+(`docs/dependency-ledger.md:166`).
 
 `dcroxide-node` uses the provider in three places:
 
@@ -394,7 +394,7 @@ and ends the reliance on ureq's unstable provider API.
 ## Consequences
 
 - **C leaves the network surface** with the switch. ring's ~151k lines
-  go (`dependency-ledger.md:163`), and with them `getrandom` 0.2 and
+  go (`dependency-ledger.md:166`), and with them `getrandom` 0.2 and
   `windows-sys` 0.52, which only ring pulls in, and `deny.toml`'s two
   skip entries for them (`deny.toml:42-48` at `8e6ea23`).
   `fuzz/Cargo.lock` changes with the workspace's.
@@ -863,6 +863,36 @@ those runs.
   probe is not, and its `mrs` and `msr` are the same switch
   `constant_time_eq` makes. What is timed, the verdict, the thresholds,
   the floor and the budgets are unchanged.)*
+  *(2026-11-15: a dispatch can ask for DIT, which on the arm64 legs times
+  the targets with PSTATE.DIT set, to see whether ecdh_p384_complete's
+  lean, which followed the value, or any other goes with it; the x86_64
+  legs ignore it. `constant_time_eq`'s switch sets DIT only where the
+  kernel reports it, which these runners' kernels do not, though the probe
+  found that user space can set it there. So `.github/dit-on.rs`, compiled
+  with plain `rustc` as a shared library and kept outside the workspace on
+  the probe's terms, is loaded with `LD_PRELOAD` into the test binary
+  alone, through cargo's runner for the target. Its constructor, in
+  `.init_array`, sets PSTATE.DIT in the main thread before `main` and
+  reads it back there and in a thread it starts, and the library reads it
+  again at exit, each reading in a line marked `ct_check dit |`. A reading
+  of 0 after the switch stops the binary and a log without the readings
+  fails the step, so a run that asked for DIT never passes with DIT seen
+  off in the main thread or a new thread, and the summary's heading says
+  DIT on when the log shows it. The test runner's own threads are not
+  read: the design rests on Linux keeping PSTATE.DIT for each thread,
+  saved with the rest of PSTATE on each entry to the kernel and restored
+  on return, giving a new thread its parent's, and clearing it on exec,
+  which is why it is set after exec and not by a program that starts the
+  binary. That is read from the kernel's arm64 sources, not from the
+  runners' own kernels; whether the hypervisor keeps a guest's DIT across
+  its own exits is read from nowhere, and the readings in a new thread and
+  at exit are what a run shows of both. A run with DIT on also has the
+  library, with a copy of the standard library of its own, mapped into the
+  process beside the test binary's code, which does not move; a lean that
+  goes with DIT is read with that in mind. With DIT left off, as on
+  pushes, pull requests and nightlies, the jobs run as before and build
+  nothing more. What is timed, the verdict, the thresholds, the floor and
+  the budgets are unchanged.)*
 
 It is statistical: it sees a difference large enough to show on a runner,
 fails only on one of 1 ns an operation or more, and a pass is not a

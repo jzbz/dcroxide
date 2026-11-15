@@ -122,10 +122,13 @@ of these needs its entry here first, and the LoongArch routines cannot
 have one.
 
 Outside the rule's scope, the constant-time workflow's arm64 jobs compile
-`.github/dit-probe.rs` with plain `rustc` and run it. Its `asm!` reads
-aarch64's data-independent-timing flag, sets it and clears it, with `mrs`
-and `msr` alone. It is no workspace crate, ships in nothing and is not
-built by `cargo test`; it is named here so that review sees it.
+two files with plain `rustc`: `.github/dit-probe.rs`, which they run, and,
+on a dispatch that asks for DIT, `.github/dit-on.rs`, a shared library
+loaded into the timed test binary before its `main`. Their `asm!` reads
+aarch64's data-independent-timing flag and sets it, and the probe clears
+it again, with `mrs` and `msr` alone; the library's constructor is a
+pointer in `.init_array`. Neither is a workspace crate, ships in anything
+or is built by `cargo test`; they are named here so that review sees them.
 
 ## Test vectors taken from elsewhere
 

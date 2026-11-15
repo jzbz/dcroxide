@@ -141,8 +141,14 @@
 //! `ct_check class |` at their start ([`Report::trace_lines`]), which the
 //! summary does not take.  The workflow's arm64 jobs also check, in a
 //! program of their own outside the crate, whether user space can switch
-//! DIT on.  The harness's own tests run in every `cargo test` and time
-//! nothing: they drive it with a simulated clock.
+//! DIT on, and a dispatch can ask for the targets to be timed there with
+//! DIT on: a library outside the crate (`.github/dit-on.rs`), loaded
+//! into the test binary, sets it before `main` and prints its
+//! readings in lines marked `ct_check dit |`, the harness itself
+//! unchanged.  Linux keeps it for each thread and hands it to the threads
+//! a thread starts, the test runner's among them.  The harness's own
+//! tests run in every `cargo test` and time nothing: they drive it with a
+//! simulated clock.
 //!
 //! It is statistical.  It sees a difference large enough to show on the
 //! machine that runs it, fails only on one of a nanosecond an operation or

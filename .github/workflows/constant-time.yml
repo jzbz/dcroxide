@@ -14,16 +14,20 @@ name: Constant time
 # select into a branch), dcroxide-testutil (the generator that draws the
 # classes), dcroxide-crypto (a normal dependency of the crate, linked into
 # the timed binary, whose features on chacha20 merge with the AEAD's), the
-# DIT probe the arm64 jobs run (.github/dit-probe.rs), and this file.
+# DIT probe the arm64 jobs run (.github/dit-probe.rs), the library that
+# switches DIT on for a dispatch that asks for it (.github/dit-on.rs), and
+# this file.
 #
 # A dispatch can narrow the run, to time one target for longer on the
 # legs where it failed. Its inputs: a target, by its test name in
 # ct_check (empty runs every target, as pushes and nightlies do); the
-# seconds each target runs for (60 when empty); and the legs, all four by
-# default, where a leg left out takes no runner. Pushes, pull requests
-# and nightlies give no inputs and run as they always have. The inputs
-# reach the shell through the environment alone and are checked before
-# anything else runs.
+# seconds each target runs for (60 when empty); the legs, all four by
+# default, where a leg left out takes no runner; and DIT, off by default,
+# which on the arm64 legs runs the timed targets with PSTATE.DIT set and
+# on the x86_64 legs changes nothing. Pushes, pull requests and nightlies
+# give no inputs and run as they always have. The inputs reach the shell
+# through the environment alone and are checked before anything else
+# runs.
 on:
   push:
     branches: [master]
@@ -35,6 +39,7 @@ on:
       - "Cargo.toml"
       - "rust-toolchain.toml"
       - ".github/dit-probe.rs"
+      - ".github/dit-on.rs"
       - ".github/workflows/constant-time.yml"
   pull_request:
     paths:
@@ -45,6 +50,7 @@ on:
       - "Cargo.toml"
       - "rust-toolchain.toml"
       - ".github/dit-probe.rs"
+      - ".github/dit-on.rs"
       - ".github/workflows/constant-time.yml"
   schedule:
     - cron: "0 3 * * *"
@@ -70,6 +76,13 @@ on:
           - x86_64
           - x86_64-soft
           - x86_64 and x86_64-soft
+      dit:
+        description: "Arm's DIT for the timed targets on the arm64 legs; the x86_64 legs run as they would without it"
+        type: choice
+        default: "off"
+        options:
+          - "off"
+          - "on"
 
 env:
   CARGO_TERM_COLOR: always
@@ -130,11 +143,17 @@ jobs:
       DCROXIDE_CT_SECONDS: ${{ github.event_name == 'workflow_dispatch' && (inputs.seconds || '60') || github.event_name == 'schedule' && '60' || '10' }}
       # The one target a dispatch picks, or empty for every target.
       CT_TARGET: ${{ inputs.target }}
+      # "on" on an arm64 leg of a dispatch that asks for DIT, and "off"
+      # everywhere else, whatever the input holds.
+      CT_DIT: ${{ startsWith(matrix.leg, 'arm64') && inputs.dit == 'on' && 'on' || 'off' }}
     steps:
       # A dispatch's inputs, before anything is built: the target a test
       # name and nothing else, and the seconds a whole number within the
       # cap. The patterns are matched in the C locale, where [a-z] is the
-      # 26 letters alone. The messages do not repeat what was given, and
+      # 26 letters alone. The legs and DIT are choices, which need no
+      # pattern: only the values the matrix and CT_DIT compare with
+      # (without regard to case) change anything, and any other runs as
+      # the default does. The messages do not repeat what was given, and
       # inputs that fail the check leave the run without a summary.
       - name: Check the dispatch's inputs
         id: inputs
@@ -160,6 +179,15 @@ jobs:
       # Built first, so that the timed step compiles nothing.
       - name: Build the check
         run: cargo test -p dcroxide-tlscrypto --release --lib --locked --no-run
+      # With DIT asked for on an arm64 leg, .github/dit-on.rs, compiled with
+      # plain rustc as a shared library, outside the workspace for the
+      # probe's reason below. Loaded into the test binary before its main,
+      # it sets PSTATE.DIT in the main thread there, which the threads
+      # the test harness starts inherit; exec clears it, so it cannot be
+      # set by a program that starts the binary. Any other job skips this.
+      - name: Build the DIT switch
+        if: env.CT_DIT == 'on'
+        run: rustc --edition 2024 --crate-type cdylib -o "$RUNNER_TEMP/libdit-on.so" .github/dit-on.rs
       # The machine the job landed on, so that one run's timings can be
       # read against another's: lscpu, the kernel, and the processor as
       # /proc/cpuinfo names it, each distinct line once with its count of
@@ -174,8 +202,8 @@ jobs:
       # reads it back and clears it, in a process of its own that ends
       # there, and a processor without DIT ends it with SIGILL (status
       # 132). Linux leaves DIT off for user space, and the timed targets
-      # run with it off. The step only describes, so it never fails the
-      # job.
+      # run with it off unless a dispatch asks for it. The step only
+      # describes, so it never fails the job.
       - name: Describe the processor
         continue-on-error: true
         run: |
@@ -204,9 +232,9 @@ jobs:
       # which passes: P-256 signing by the nonce with every failing
       # comparison quicker than the random class by 40 ns an operation or
       # less, the pattern measured on AMD EPYC 7763 runners (ct_check's
-      # module doc). Every target
-      # runs after one fails. Each prints its row and, when it passes,
-      # each class's result below it, the lines a failure's message gives.
+      # module doc). Every target runs after one fails. Each prints its row
+      # and, when it passes, each class's result below it, the lines a
+      # failure's message gives.
       # Those lines end with the target's trace, which a failure's message
       # carries too: a line marked "ct_check run |" with the fixed crop's
       # name, the segments' length and the addresses of the harness's code
@@ -219,6 +247,18 @@ jobs:
       # in each segment, "-" where a test had too few samples. The summary
       # takes none of them.
       #
+      # With DIT on, cargo starts the test binary, and only it, with the
+      # switch in LD_PRELOAD, through the runner it takes for the target.
+      # The switch prints its readings in lines marked "ct_check dit |":
+      # PSTATE.DIT at load, once set, in a thread it starts, and at exit.
+      # It stops the binary if one after the switch reads 0, and the step
+      # fails if the log lacks the readings, as when the library did not
+      # load, so that a run that asked for DIT never passes with DIT seen
+      # off in the main thread or in a new thread; the test harness's own
+      # threads are not read. When the switch stops the lookup of a picked
+      # target, or a target fails, the step ends before that check, failed
+      # all the same, without its message.
+      #
       # When a dispatch picks a target, that target alone runs, matched by
       # its whole name, and the positive control does not run unless it is
       # the one picked. A filter that matches nothing runs no test and
@@ -227,6 +267,9 @@ jobs:
       - name: Time the targets
         run: |
           set -o pipefail
+          if [ "$CT_DIT" = on ]; then
+            export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER="env LD_PRELOAD=$RUNNER_TEMP/libdit-on.so"
+          fi
           if [ -n "$CT_TARGET" ]; then
             filter="ct_check::$CT_TARGET"
             exact=(--exact)
@@ -242,6 +285,11 @@ jobs:
           fi
           cargo test -p dcroxide-tlscrypto --release --lib --locked "$filter" -- \
             --ignored --test-threads=1 --nocapture "${exact[@]}" 2>&1 | tee "$RUNNER_TEMP/ct-check.log"
+          if [ "$CT_DIT" = on ] && ! { grep -q 'ct_check dit | PSTATE.DIT read [01] at load, 1 once set, 1 in a new thread' "$RUNNER_TEMP/ct-check.log" \
+              && grep -q 'ct_check dit | PSTATE.DIT read 1 at exit' "$RUNNER_TEMP/ct-check.log"; }; then
+            echo "::error::DIT was asked for, and the log does not show it on"
+            exit 1
+          fi
       # Each target's row: the fixed class that decides it (of the
       # classes that fail, the one whose result has the largest |t|, or
       # else the largest |t| of all) and that class's result, which for a
@@ -259,18 +307,29 @@ jobs:
       # report above, and "control found" for the positive control's. The
       # row is taken from wherever it falls on its line, which the test
       # runner's own output may have begun. The heading names the leg, the
-      # budget and, when a dispatch picked one, the target. The step runs
+      # budget, when a dispatch picked one, the target, and DIT when it
+      # was asked for: "DIT on" when the log shows the switch's readings,
+      # and "DIT asked for, not shown on" when it does not. The step runs
       # whatever became of the others, but not after the inputs' check
       # failed (it is skipped, not failed, on every other event), so that
       # the heading never holds a target that check refused.
       - name: Summarize the run
         if: always() && steps.inputs.outcome != 'failure'
         run: |
+          dit=
+          if [ "$CT_DIT" = on ]; then
+            if grep -q 'ct_check dit | PSTATE.DIT read [01] at load, 1 once set, 1 in a new thread' "$RUNNER_TEMP/ct-check.log" 2> /dev/null \
+              && grep -q 'ct_check dit | PSTATE.DIT read 1 at exit' "$RUNNER_TEMP/ct-check.log"; then
+              dit=", DIT on"
+            else
+              dit=", DIT asked for, not shown on"
+            fi
+          fi
           {
             if [ -n "$CT_TARGET" ]; then
-              echo "### ${{ matrix.leg }}, ${CT_TARGET} alone, ${DCROXIDE_CT_SECONDS} s"
+              echo "### ${{ matrix.leg }}, ${CT_TARGET} alone, ${DCROXIDE_CT_SECONDS} s${dit}"
             else
-              echo "### ${{ matrix.leg }}, ${DCROXIDE_CT_SECONDS} s a target"
+              echo "### ${{ matrix.leg }}, ${DCROXIDE_CT_SECONDS} s a target${dit}"
             fi
             echo
             echo "| target | t | effect | ns/op | difference | class | test | fixed | random | samples | batch | verdict |"

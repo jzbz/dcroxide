@@ -12,7 +12,8 @@
 //! `msr`, which have no stable intrinsic.  Nothing ships it and `cargo
 //! test` does not build it.  The process ends once it has printed, so the
 //! timed targets, which run in a process of their own, keep DIT as Linux
-//! leaves it, off.
+//! leaves it, off, unless a dispatch asks for DIT, which
+//! `.github/dit-on.rs` then switches on in the test binary itself.
 
 #[cfg(target_arch = "aarch64")]
 fn main() {
