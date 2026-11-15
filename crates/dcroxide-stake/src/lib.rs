@@ -804,8 +804,47 @@ pub fn check_sstx(tx: &MsgTx) -> Result<(), RuleError> {
     Ok(())
 }
 
+#[cfg(test)]
+std::thread_local! {
+    /// How many times a ticket, vote or revocation predicate
+    /// ([`is_sstx`], [`is_ssgen`], [`is_ssrtx`]) went on from its shape
+    /// test to its check on this thread.  It exists in this crate's
+    /// unit-test builds only, where the tests read it to tell that a
+    /// predicate that refuses a transaction by its shape does not run
+    /// the check.
+    static PREDICATE_CHECKS: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
+}
+
+/// Whether the transaction fails one of [`check_sstx`]'s first five
+/// tests: too many inputs, too many outputs, no outputs, an output
+/// script of another version, or a first output that is not a ticket
+/// purchase script (dcrd `CheckSStx`, `staketx.go:717-749`), with no
+/// message built.
+fn fails_sstx_shape(tx: &MsgTx) -> bool {
+    tx.tx_in.len() > MAX_INPUTS_PER_SSTX
+        || tx.tx_out.len() > MAX_OUTPUTS_PER_SSTX
+        || tx.tx_out.is_empty()
+        || tx
+            .tx_out
+            .iter()
+            .any(|tx_out| tx_out.version != CONSENSUS_VERSION)
+        || !is_ticket_purchase_script(tx.tx_out[0].version, &tx.tx_out[0].pk_script)
+}
+
 /// Whether the transaction is a ticket purchase (dcrd `IsSStx`).
+///
+/// The answer is that of `check_sstx(tx).is_ok()` (`staketx.go:816-818`).
+/// The check builds a message for every transaction it refuses, as it
+/// does every regular transaction, vote and revocation of a block, and
+/// the message would be dropped here; so the check's first five tests
+/// are made first, and only a transaction that passes them goes through
+/// the check.
 pub fn is_sstx(tx: &MsgTx) -> bool {
+    if fails_sstx_shape(tx) {
+        return false;
+    }
+    #[cfg(test)]
+    PREDICATE_CHECKS.set(PREDICATE_CHECKS.get().wrapping_add(1));
     check_sstx(tx).is_ok()
 }
 
@@ -1113,8 +1152,29 @@ pub fn check_ssgen(tx: &MsgTx) -> Result<(), RuleError> {
     check_ssgen_votes(tx).map(|_| ())
 }
 
+/// Whether the transaction fails one of [`check_ssgen_votes`]' first
+/// four tests: an input count other than two, too many outputs, fewer
+/// than two outputs, or a first input that is not a stakebase (dcrd
+/// `CheckSSGenVotes`, `staketx.go:992-1016`), with no message built.
+fn fails_ssgen_shape(tx: &MsgTx) -> bool {
+    tx.tx_in.len() != NUM_INPUTS_PER_SSGEN
+        || tx.tx_out.len() > MAX_OUTPUTS_PER_SSGEN
+        || tx.tx_out.len() < 2
+        || !is_stake_base(tx)
+}
+
 /// Whether the transaction is a vote (dcrd `IsSSGen`).
+///
+/// The answer is that of `check_ssgen(tx).is_ok()`
+/// (`staketx.go:1167-1169`), with the first four tests of
+/// [`check_ssgen_votes`], which that check runs, made first for the
+/// reason given at [`is_sstx`].
 pub fn is_ssgen(tx: &MsgTx) -> bool {
+    if fails_ssgen_shape(tx) {
+        return false;
+    }
+    #[cfg(test)]
+    PREDICATE_CHECKS.set(PREDICATE_CHECKS.get().wrapping_add(1));
     check_ssgen(tx).is_ok()
 }
 
@@ -1205,8 +1265,43 @@ pub fn check_ssrtx(tx: &MsgTx) -> Result<(), RuleError> {
     Ok(())
 }
 
+/// Whether the transaction fails one of [`check_ssrtx`]'s first six
+/// tests, which are all of them ahead of the rules for the automatic
+/// revocations version: an input count other than one, too many
+/// outputs, no outputs, an output script of another version, an input
+/// from outside the stake tree, or an output that is not a revocation
+/// script (dcrd `CheckSSRtx`, `staketx.go:1194-1239`), with no message
+/// built.  The sixth is here because it is where a ticket bought with
+/// one stake tree output is refused, with a formatted message.
+fn fails_ssrtx_shape(tx: &MsgTx) -> bool {
+    tx.tx_in.len() != NUM_INPUTS_PER_SSRTX
+        || tx.tx_out.len() > MAX_OUTPUTS_PER_SSRTX
+        || tx.tx_out.is_empty()
+        || tx
+            .tx_out
+            .iter()
+            .any(|tx_out| tx_out.version != CONSENSUS_VERSION)
+        || tx
+            .tx_in
+            .iter()
+            .any(|tx_in| tx_in.previous_out_point.tree != dcroxide_wire::TX_TREE_STAKE)
+        || tx
+            .tx_out
+            .iter()
+            .any(|tx_out| !is_revocation_script(tx_out.version, &tx_out.pk_script))
+}
+
 /// Whether the transaction is a revocation (dcrd `IsSSRtx`).
+///
+/// The answer is that of `check_ssrtx(tx).is_ok()`
+/// (`staketx.go:1266-1268`), with the check's first six tests made
+/// first for the reason given at [`is_sstx`].
 pub fn is_ssrtx(tx: &MsgTx) -> bool {
+    if fails_ssrtx_shape(tx) {
+        return false;
+    }
+    #[cfg(test)]
+    PREDICATE_CHECKS.set(PREDICATE_CHECKS.get().wrapping_add(1));
     check_ssrtx(tx).is_ok()
 }
 
@@ -1427,4 +1522,813 @@ pub fn create_revocation_from_ticket(
     revocation_tx.version = revocation_tx_version;
 
     Ok(revocation_tx)
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "test arithmetic over fixed fixtures and small counts"
+)]
+mod shape_tests {
+    //! The ticket, vote and revocation predicates against the checks
+    //! they stand for.
+    //!
+    //! Each predicate makes its check's leading tests before it runs
+    //! the check.  That is the same answer only while the shape test
+    //! holds exactly where the check fails at one of those tests, so
+    //! both are pinned here over every transaction of
+    //! `tests/data/staketx_vectors.txt`, valid tickets, votes and
+    //! revocations at the counts the checks draw their lines at, a
+    //! regular transaction, a coinbase and a treasurybase, each edited
+    //! one field at a time, two at a time, and a few at random.
+
+    use alloc::vec;
+
+    use dcroxide_testutil::{SplitMix64, unhex};
+    use dcroxide_txscript::{
+        OP_DATA_1, OP_DATA_12, OP_DATA_32, OP_DATA_33, OP_DATA_35, OP_DATA_64, OP_TADD, OP_TRUE,
+        OP_TSPEND,
+    };
+    use dcroxide_wire::{NULL_BLOCK_HEIGHT, NULL_BLOCK_INDEX, TX_TREE_REGULAR, TX_TREE_STAKE};
+
+    use super::*;
+
+    /// How `check_sstx` begins the message of its fourth test, an
+    /// output script of another version.
+    const SSTX_VERSION_TEXT: &str = "invalid script version found in txOut idx ";
+
+    /// The message of `check_sstx`'s fifth test, the first output's
+    /// script.
+    const SSTX_FIRST_OUTPUT_TEXT: &str =
+        "first SStx output should have been OP_SSTX tagged, but it was not";
+
+    /// `determine_tx_type` with each predicate replaced by its check
+    /// with the error dropped, which is what dcrd's predicates are
+    /// (dcrd `DetermineTxType`, `staketx.go:1272-1294`).
+    fn tx_type_by_checks(tx: &MsgTx) -> TxType {
+        if check_sstx(tx).is_ok() {
+            return TxType::SStx;
+        }
+        if check_ssgen(tx).is_ok() {
+            return TxType::SSGen;
+        }
+        if check_ssrtx(tx).is_ok() {
+            return TxType::SSRtx;
+        }
+        if tx.version >= TX_VERSION_TREASURY {
+            if check_tadd(tx).is_ok() {
+                return TxType::TAdd;
+            }
+            if check_tspend(tx).is_ok() {
+                return TxType::TSpend;
+            }
+            if check_treasury_base(tx).is_ok() {
+                return TxType::TreasuryBase;
+            }
+        }
+        TxType::Regular
+    }
+
+    /// An output of script version 0.
+    fn out(pk_script: Vec<u8>) -> TxOut {
+        TxOut {
+            value: 0,
+            version: 0,
+            pk_script,
+        }
+    }
+
+    /// A pay-to-script-hash script.
+    fn p2sh() -> Vec<u8> {
+        let mut script = vec![OP_HASH160, OP_DATA_20];
+        script.extend_from_slice(&[0x11; 20]);
+        script.push(OP_EQUAL);
+        script
+    }
+
+    /// A pay-to-pubkey-hash script.
+    fn p2pkh() -> Vec<u8> {
+        let mut script = vec![OP_DUP, OP_HASH160, OP_DATA_20];
+        script.extend_from_slice(&[0x22; 20]);
+        script.extend_from_slice(&[OP_EQUALVERIFY, OP_CHECKSIG]);
+        script
+    }
+
+    /// The script behind the given stake opcode.
+    fn tagged(tag: u8, mut script: Vec<u8>) -> Vec<u8> {
+        script.insert(0, tag);
+        script
+    }
+
+    /// An `OP_RETURN` followed by a direct push of `push_op` bytes.
+    fn null_data(push_op: u8) -> Vec<u8> {
+        let mut script = vec![OP_RETURN, push_op];
+        script.resize(2 + usize::from(push_op), 0x5a);
+        script
+    }
+
+    /// An `OP_RETURN` followed by an `OP_PUSHDATA1` push of `len`
+    /// bytes: a null data script whose second byte is no direct push.
+    fn long_push_null_data(len: u8) -> Vec<u8> {
+        let mut script = vec![OP_RETURN, OP_PUSHDATA1, len];
+        script.resize(3 + usize::from(len), 0x5a);
+        script
+    }
+
+    /// The null data script a vote carries its treasury votes in:
+    /// `OP_RETURN`, a direct push, `TV`, and for each vote a hash of
+    /// the given byte and the vote.
+    fn treasury_votes(votes: &[(u8, TreasuryVote)]) -> Vec<u8> {
+        let mut script = vec![OP_RETURN, (2 + 33 * votes.len()) as u8, b'T', b'V'];
+        for &(hash, vote) in votes {
+            script.extend_from_slice(&[hash; 32]);
+            script.push(vote);
+        }
+        script
+    }
+
+    /// An input that spends the first output of a transaction in the
+    /// given tree.
+    fn input(tree: i8) -> TxIn {
+        TxIn {
+            previous_out_point: OutPoint {
+                hash: Hash([0x77; 32]),
+                index: 0,
+                tree,
+            },
+            ..TxIn::default()
+        }
+    }
+
+    /// The input of a coinbase, a treasurybase and a vote's stakebase:
+    /// the null outpoint and the null fraud proof.
+    fn null_input() -> TxIn {
+        TxIn {
+            previous_out_point: OutPoint {
+                hash: Hash::ZERO,
+                index: u32::MAX,
+                tree: TX_TREE_REGULAR,
+            },
+            block_height: NULL_BLOCK_HEIGHT,
+            block_index: NULL_BLOCK_INDEX,
+            ..TxIn::default()
+        }
+    }
+
+    /// A ticket bought with the given number of inputs.  `check_sstx`
+    /// sets no least number, so a ticket with none passes it.
+    fn ticket(inputs: usize) -> MsgTx {
+        let mut tx_out = vec![out(tagged(OP_SSTX, p2pkh()))];
+        for _ in 0..inputs {
+            tx_out.push(out(null_data(OP_DATA_30)));
+            tx_out.push(out(tagged(OP_SSTXCHANGE, p2pkh())));
+        }
+        MsgTx {
+            tx_in: vec![input(TX_TREE_REGULAR); inputs],
+            tx_out,
+            ..MsgTx::default()
+        }
+    }
+
+    /// A vote that pays the given number of outputs.
+    fn vote(payouts: usize) -> MsgTx {
+        let mut tx_out = vec![out(null_data(OP_DATA_36)), out(null_data(OP_DATA_2))];
+        tx_out.resize(2 + payouts, out(tagged(OP_SSGEN, p2pkh())));
+        MsgTx {
+            tx_in: vec![null_input(), input(TX_TREE_STAKE)],
+            tx_out,
+            ..MsgTx::default()
+        }
+    }
+
+    /// A revocation of the given version that pays the given number
+    /// of outputs.
+    fn revocation(version: u16, outputs: usize) -> MsgTx {
+        MsgTx {
+            version,
+            tx_in: vec![input(TX_TREE_STAKE)],
+            tx_out: vec![out(tagged(OP_SSRTX, p2pkh())); outputs],
+            ..MsgTx::default()
+        }
+    }
+
+    /// A regular transaction with the given number of inputs.
+    fn regular(inputs: usize) -> MsgTx {
+        MsgTx {
+            tx_in: vec![input(TX_TREE_REGULAR); inputs],
+            tx_out: vec![out(p2pkh()), out(p2sh())],
+            ..MsgTx::default()
+        }
+    }
+
+    /// A coinbase of the treasury version: its one input carries a
+    /// signature script, and it pays one output after its `OP_RETURN`.
+    fn coinbase() -> MsgTx {
+        let mut tx_in = null_input();
+        tx_in.signature_script = vec![OP_TRUE, OP_TRUE];
+        MsgTx {
+            version: TX_VERSION_TREASURY,
+            tx_in: vec![tx_in],
+            tx_out: vec![out(null_data(OP_DATA_12)), out(p2pkh())],
+            ..MsgTx::default()
+        }
+    }
+
+    /// A treasurybase.
+    fn treasury_base() -> MsgTx {
+        MsgTx {
+            version: TX_VERSION_TREASURY,
+            tx_in: vec![null_input()],
+            tx_out: vec![out(vec![OP_TADD]), out(null_data(OP_DATA_12))],
+            ..MsgTx::default()
+        }
+    }
+
+    /// A treasury add with change.
+    fn treasury_add() -> MsgTx {
+        MsgTx {
+            version: TX_VERSION_TREASURY,
+            tx_in: vec![input(TX_TREE_REGULAR)],
+            tx_out: vec![out(vec![OP_TADD]), out(tagged(OP_SSTXCHANGE, p2pkh()))],
+            ..MsgTx::default()
+        }
+    }
+
+    /// A treasury spend with one payment.
+    fn treasury_spend() -> MsgTx {
+        let mut signature_script = vec![OP_DATA_64];
+        signature_script.extend_from_slice(&[0x33; 64]);
+        signature_script.extend_from_slice(&[OP_DATA_33, 0x02]);
+        signature_script.extend_from_slice(&[0x44; 32]);
+        signature_script.push(OP_TSPEND);
+        let mut tx_in = null_input();
+        tx_in.signature_script = signature_script;
+        MsgTx {
+            version: TX_VERSION_TREASURY,
+            tx_in: vec![tx_in],
+            tx_out: vec![out(null_data(OP_DATA_32)), out(tagged(OP_TGEN, p2sh()))],
+            ..MsgTx::default()
+        }
+    }
+
+    /// A vote of two outputs alone: its second output is both its vote
+    /// bits and its treasury votes.
+    fn two_output_vote() -> MsgTx {
+        let mut tx = vote(0);
+        tx.version = TX_VERSION_TREASURY;
+        tx.tx_out[1] = out(treasury_votes(&[(0xa1, TREASURY_VOTE_YES)]));
+        tx
+    }
+
+    /// A vote with treasury votes after its payouts.
+    fn treasury_vote() -> MsgTx {
+        let mut tx = vote(2);
+        tx.version = TX_VERSION_TREASURY;
+        tx.tx_out.push(out(treasury_votes(&[
+            (0xa1, TREASURY_VOTE_YES),
+            (0xa2, TREASURY_VOTE_NO),
+        ])));
+        tx
+    }
+
+    /// The transactions the edits start from: tickets, votes and
+    /// revocations with the fewest and the most inputs and outputs
+    /// their checks accept, a regular transaction, a coinbase, a
+    /// treasurybase, and every vector of dcrd's `staketx_test.go`.
+    fn bases() -> Vec<MsgTx> {
+        let mut signed_revocation = revocation(1, 1);
+        signed_revocation.tx_in[0].signature_script = vec![OP_TRUE];
+        let mut bases = vec![
+            ticket(0),
+            ticket(1),
+            ticket(2),
+            ticket(MAX_INPUTS_PER_SSTX),
+            two_output_vote(),
+            vote(3),
+            vote(MAX_OUTPUTS_PER_SSGEN - 2),
+            treasury_vote(),
+            signed_revocation,
+            revocation(TX_VERSION_AUTO_REVOCATIONS, 2),
+            revocation(1, MAX_OUTPUTS_PER_SSRTX),
+            regular(1),
+            coinbase(),
+            treasury_base(),
+        ];
+        assert!(bases[..4].iter().all(|tx| check_sstx(tx).is_ok()));
+        assert!(bases[4..8].iter().all(|tx| check_ssgen(tx).is_ok()));
+        assert!(bases[8..11].iter().all(|tx| check_ssrtx(tx).is_ok()));
+        assert_eq!(tx_type_by_checks(&bases[11]), TxType::Regular);
+        assert_eq!(tx_type_by_checks(&bases[12]), TxType::Regular);
+        assert_eq!(tx_type_by_checks(&bases[13]), TxType::TreasuryBase);
+
+        let vectors = include_str!("../tests/data/staketx_vectors.txt");
+        let before = bases.len();
+        for line in vectors.lines() {
+            let mut parts = line.split(' ');
+            if parts.next() != Some("tx") {
+                continue;
+            }
+            let tx_hex = parts.nth(1).expect("vector tx hex");
+            let (tx, _) = MsgTx::from_bytes(&unhex(tx_hex)).expect("vector tx deserializes");
+            bases.push(tx);
+        }
+        assert_eq!(bases.len() - before, 31, "every staketx_test.go vector");
+        bases
+    }
+
+    /// Bring the transaction to `count` outputs, each new one a copy of
+    /// its last.
+    fn resize_outputs(tx: &mut MsgTx, count: usize) {
+        let last = tx.tx_out.last().cloned().unwrap_or_default();
+        tx.tx_out.resize(count, last);
+    }
+
+    /// Give the output at `index` the script version.
+    fn set_version(tx: &mut MsgTx, index: usize, version: u16) {
+        if let Some(tx_out) = tx.tx_out.get_mut(index) {
+            tx_out.version = version;
+        }
+    }
+
+    /// Give the output at `index` the script, at version 0.
+    fn set_script(tx: &mut MsgTx, index: usize, pk_script: Vec<u8>) {
+        if let Some(tx_out) = tx.tx_out.get_mut(index) {
+            tx_out.version = 0;
+            tx_out.pk_script = pk_script;
+        }
+    }
+
+    /// Give the last output the script, at version 0.
+    fn set_last_script(tx: &mut MsgTx, pk_script: Vec<u8>) {
+        if let Some(last) = tx.tx_out.len().checked_sub(1) {
+            set_script(tx, last, pk_script);
+        }
+    }
+
+    /// Edit the input at `index`.
+    fn edit_input(tx: &mut MsgTx, index: usize, edit: impl FnOnce(&mut TxIn)) {
+        if let Some(tx_in) = tx.tx_in.get_mut(index) {
+            edit(tx_in);
+        }
+    }
+
+    /// Have the input at `index` spend an output of the given tree.
+    fn set_tree(tx: &mut MsgTx, index: usize, tree: i8) {
+        edit_input(tx, index, |tx_in| tx_in.previous_out_point.tree = tree);
+    }
+
+    /// The sum of the transaction's output values, as `check_ssrtx`
+    /// takes it.
+    fn output_sum(tx: &MsgTx) -> i64 {
+        tx.tx_out
+            .iter()
+            .fold(0i64, |sum, tx_out| sum.wrapping_add(tx_out.value))
+    }
+
+    /// One edit of a transaction.  An edit of a field the transaction
+    /// does not have leaves it alone.
+    type Edit = fn(&mut MsgTx);
+
+    /// The edits: the transaction versions the checks tell apart, every
+    /// count around the ones the checks draw their lines at, and one
+    /// edit or more for each later test of each check.
+    const EDITS: &[Edit] = &[
+        // The version.
+        |tx| tx.version = 1,
+        |tx| tx.version = TX_VERSION_AUTO_REVOCATIONS,
+        |tx| tx.version = TX_VERSION_TREASURY,
+        |tx| tx.version = 4,
+        // The number of inputs.
+        |tx| tx.tx_in.clear(),
+        |tx| tx.tx_in.truncate(1),
+        |tx| tx.tx_in.truncate(2),
+        |tx| tx.tx_in.push(input(TX_TREE_STAKE)),
+        |tx| tx.tx_in.insert(0, null_input()),
+        |tx| tx.tx_in.resize(MAX_INPUTS_PER_SSTX, input(TX_TREE_REGULAR)),
+        |tx| {
+            tx.tx_in
+                .resize(MAX_INPUTS_PER_SSTX + 1, input(TX_TREE_REGULAR))
+        },
+        // The number of outputs.
+        |tx| tx.tx_out.clear(),
+        |tx| tx.tx_out.truncate(1),
+        |tx| tx.tx_out.truncate(2),
+        |tx| tx.tx_out.push(out(tagged(OP_SSGEN, p2pkh()))),
+        |tx| tx.tx_out.push(out(tagged(OP_SSRTX, p2sh()))),
+        |tx| tx.tx_out.push(out(tagged(OP_SSTXCHANGE, p2pkh()))),
+        |tx| tx.tx_out.push(out(null_data(OP_DATA_30))),
+        |tx| resize_outputs(tx, MAX_OUTPUTS_PER_SSRTX),
+        |tx| resize_outputs(tx, MAX_OUTPUTS_PER_SSRTX + 1),
+        |tx| resize_outputs(tx, MAX_OUTPUTS_PER_SSGEN),
+        |tx| resize_outputs(tx, MAX_OUTPUTS_PER_SSGEN + 1),
+        |tx| resize_outputs(tx, MAX_OUTPUTS_PER_SSTX),
+        |tx| resize_outputs(tx, MAX_OUTPUTS_PER_SSTX + 1),
+        // The version of an output's script.
+        |tx| set_version(tx, 0, 1),
+        |tx| set_version(tx, 1, 1),
+        |tx| set_version(tx, 2, 1),
+        |tx| {
+            if let Some(tx_out) = tx.tx_out.last_mut() {
+                tx_out.version = 1;
+            }
+        },
+        // The first output: the tag of each stake form, a vote's block
+        // reference, one a byte short, one of the right length behind
+        // another push, and scripts of no stake form.
+        |tx| set_script(tx, 0, tagged(OP_SSTX, p2pkh())),
+        |tx| set_script(tx, 0, tagged(OP_SSTX, p2sh())),
+        |tx| set_script(tx, 0, tagged(OP_SSGEN, p2pkh())),
+        |tx| set_script(tx, 0, tagged(OP_SSRTX, p2pkh())),
+        |tx| set_script(tx, 0, tagged(OP_SSTXCHANGE, p2pkh())),
+        |tx| set_script(tx, 0, null_data(OP_DATA_36)),
+        |tx| set_script(tx, 0, null_data(OP_DATA_35)),
+        |tx| set_script(tx, 0, long_push_null_data(35)),
+        |tx| set_script(tx, 0, p2pkh()),
+        |tx| set_script(tx, 0, Vec::new()),
+        // The second output: a vote's vote bits, a ticket's commitment,
+        // a push too short for either, one behind another push,
+        // treasury votes, a change script, a revocation script, and
+        // scripts of no stake form.
+        |tx| set_script(tx, 1, null_data(OP_DATA_2)),
+        |tx| set_script(tx, 1, null_data(OP_DATA_30)),
+        |tx| set_script(tx, 1, null_data(OP_DATA_1)),
+        |tx| set_script(tx, 1, long_push_null_data(30)),
+        |tx| set_script(tx, 1, treasury_votes(&[(0xa1, TREASURY_VOTE_YES)])),
+        |tx| set_script(tx, 1, tagged(OP_SSTXCHANGE, p2pkh())),
+        |tx| set_script(tx, 1, tagged(OP_SSRTX, p2pkh())),
+        |tx| set_script(tx, 1, p2sh()),
+        |tx| set_script(tx, 1, Vec::new()),
+        // The last output: each tag, and treasury votes that are well
+        // formed, repeated, of an unknown value, absent, behind another
+        // discriminator, cut short, and behind a push that leaves no
+        // room for the discriminator.
+        |tx| set_last_script(tx, tagged(OP_SSGEN, p2sh())),
+        |tx| set_last_script(tx, tagged(OP_SSRTX, p2sh())),
+        |tx| set_last_script(tx, tagged(OP_SSTXCHANGE, p2sh())),
+        |tx| set_last_script(tx, p2pkh()),
+        |tx| set_last_script(tx, Vec::new()),
+        |tx| set_last_script(tx, treasury_votes(&[(0xa1, TREASURY_VOTE_YES)])),
+        |tx| {
+            set_last_script(
+                tx,
+                treasury_votes(&[(0xa1, TREASURY_VOTE_YES), (0xa2, TREASURY_VOTE_NO)]),
+            )
+        },
+        |tx| {
+            set_last_script(
+                tx,
+                treasury_votes(&[(0xa1, TREASURY_VOTE_YES), (0xa1, TREASURY_VOTE_NO)]),
+            )
+        },
+        |tx| set_last_script(tx, treasury_votes(&[(0xa1, 0x03)])),
+        |tx| set_last_script(tx, treasury_votes(&[])),
+        |tx| set_last_script(tx, null_data(OP_DATA_2)),
+        |tx| set_last_script(tx, vec![OP_RETURN]),
+        |tx| set_last_script(tx, long_push_null_data(1)),
+        // The first input: a stakebase or not by each field that makes
+        // one, its signature script, and its value at, above and below
+        // what the outputs pay.
+        |tx| edit_input(tx, 0, |tx_in| *tx_in = null_input()),
+        |tx| edit_input(tx, 0, |tx_in| tx_in.previous_out_point.hash.0[0] ^= 0x01),
+        |tx| edit_input(tx, 0, |tx_in| tx_in.previous_out_point.index = 0),
+        |tx| edit_input(tx, 0, |tx_in| tx_in.previous_out_point.index = u32::MAX),
+        |tx| set_tree(tx, 0, TX_TREE_STAKE),
+        |tx| set_tree(tx, 0, TX_TREE_REGULAR),
+        |tx| edit_input(tx, 0, |tx_in| tx_in.block_height = 1),
+        |tx| edit_input(tx, 0, |tx_in| tx_in.block_index = 0),
+        |tx| edit_input(tx, 0, |tx_in| tx_in.signature_script.clear()),
+        |tx| edit_input(tx, 0, |tx_in| tx_in.signature_script = vec![OP_TRUE]),
+        |tx| {
+            let sum = output_sum(tx);
+            edit_input(tx, 0, |tx_in| tx_in.value_in = sum);
+        },
+        |tx| {
+            let sum = output_sum(tx);
+            edit_input(tx, 0, |tx_in| tx_in.value_in = sum.wrapping_add(1));
+        },
+        |tx| {
+            let sum = output_sum(tx);
+            edit_input(tx, 0, |tx_in| tx_in.value_in = sum.wrapping_sub(1));
+        },
+        // The second input.
+        |tx| edit_input(tx, 1, |tx_in| tx_in.previous_out_point.index = 1),
+        |tx| set_tree(tx, 1, TX_TREE_REGULAR),
+        |tx| edit_input(tx, 1, |tx_in| *tx_in = input(TX_TREE_STAKE)),
+    ];
+
+    /// What the transactions compared so far covered.
+    #[derive(Default)]
+    struct Seen {
+        compared: usize,
+        tickets: usize,
+        votes: usize,
+        revocations: usize,
+        kinds: Vec<ErrorKind>,
+        /// Transactions `check_sstx` refused for an output's script
+        /// version, for the first output's script, and with the same
+        /// kind at a later test.
+        sstx_version_texts: usize,
+        sstx_first_output_texts: usize,
+        sstx_later_texts: usize,
+    }
+
+    impl Seen {
+        fn note(&mut self, kind: Option<ErrorKind>) {
+            if let Some(kind) = kind
+                && !self.kinds.contains(&kind)
+            {
+                self.kinds.push(kind);
+            }
+        }
+    }
+
+    /// A predicate, with its name and its shape test.
+    type Predicate = (&'static str, fn(&MsgTx) -> bool, fn(&MsgTx) -> bool);
+
+    /// The three predicates.
+    const PREDICATES: [Predicate; 3] = [
+        ("is_sstx", is_sstx, fails_sstx_shape),
+        ("is_ssgen", is_ssgen, fails_ssgen_shape),
+        ("is_ssrtx", is_ssrtx, fails_ssrtx_shape),
+    ];
+
+    /// The predicate's answer for the transaction, and how many times
+    /// it went on from its shape test to its check to give it.
+    fn answer_and_checks(predicate: fn(&MsgTx) -> bool, tx: &MsgTx) -> (bool, u64) {
+        let before = PREDICATE_CHECKS.get();
+        let answer = predicate(tx);
+        (answer, PREDICATE_CHECKS.get().wrapping_sub(before))
+    }
+
+    /// Hold one transaction's predicates to its checks.
+    fn compare(tx: &MsgTx, seen: &mut Seen) {
+        let sstx = check_sstx(tx).err();
+        let sstx_kind = sstx.as_ref().map(|e| e.kind);
+        let ssgen = check_ssgen_votes(tx).err().map(|e| e.kind);
+        let ssrtx = check_ssrtx(tx).err().map(|e| e.kind);
+
+        // The predicates answer as the checks do, and so does the type
+        // made of them.
+        assert_eq!(is_sstx(tx), sstx.is_none(), "is_sstx: {tx:?}");
+        assert_eq!(is_ssgen(tx), ssgen.is_none(), "is_ssgen: {tx:?}");
+        assert_eq!(
+            check_ssgen(tx).is_ok(),
+            ssgen.is_none(),
+            "check_ssgen: {tx:?}"
+        );
+        assert_eq!(is_ssrtx(tx), ssrtx.is_none(), "is_ssrtx: {tx:?}");
+        assert_eq!(
+            determine_tx_type(tx),
+            tx_type_by_checks(tx),
+            "determine_tx_type: {tx:?}"
+        );
+
+        // Each shape test holds exactly where its check fails at one of
+        // its leading tests, which are the kinds below and, for the one
+        // kind a ticket's later tests share, the two messages: a looser
+        // shape test would let the check build a message for the
+        // predicate to drop, a tighter one would refuse a transaction
+        // the check goes on to judge.
+        let sstx_version = sstx.as_ref().is_some_and(|e| {
+            e.kind == ErrorKind::SStxInvalidOutputs && e.description.starts_with(SSTX_VERSION_TEXT)
+        });
+        let sstx_first_output = sstx.as_ref().is_some_and(|e| {
+            e.kind == ErrorKind::SStxInvalidOutputs && e.description == SSTX_FIRST_OUTPUT_TEXT
+        });
+        assert_eq!(
+            fails_sstx_shape(tx),
+            matches!(
+                sstx_kind,
+                Some(
+                    ErrorKind::SStxTooManyInputs
+                        | ErrorKind::SStxTooManyOutputs
+                        | ErrorKind::SStxNoOutputs
+                )
+            ) || sstx_version
+                || sstx_first_output,
+            "ticket shape: {tx:?}"
+        );
+        assert_eq!(
+            fails_ssgen_shape(tx),
+            matches!(
+                ssgen,
+                Some(
+                    ErrorKind::SSGenWrongNumInputs
+                        | ErrorKind::SSGenTooManyOutputs
+                        | ErrorKind::SSGenNoOutputs
+                        | ErrorKind::SSGenNoStakebase
+                )
+            ),
+            "vote shape: {tx:?}"
+        );
+        assert_eq!(
+            fails_ssrtx_shape(tx),
+            matches!(
+                ssrtx,
+                Some(
+                    ErrorKind::SSRtxWrongNumInputs
+                        | ErrorKind::SSRtxTooManyOutputs
+                        | ErrorKind::SSRtxNoOutputs
+                        | ErrorKind::SSRtxBadOuts
+                        | ErrorKind::SSRtxWrongTxTree
+                )
+            ),
+            "revocation shape: {tx:?}"
+        );
+
+        // A predicate runs its check once on a transaction that passes
+        // its shape test and not at all on one that fails it, so no
+        // message of a leading test is built for the predicate to drop.
+        for (name, predicate, fails_shape) in PREDICATES {
+            let (_, checks) = answer_and_checks(predicate, tx);
+            assert_eq!(
+                checks,
+                u64::from(!fails_shape(tx)),
+                "{name} and its check: {tx:?}"
+            );
+        }
+
+        seen.compared += 1;
+        seen.tickets += usize::from(sstx.is_none());
+        seen.votes += usize::from(ssgen.is_none());
+        seen.revocations += usize::from(ssrtx.is_none());
+        seen.note(sstx_kind);
+        seen.note(ssgen);
+        seen.note(ssrtx);
+        seen.sstx_version_texts += usize::from(sstx_version);
+        seen.sstx_first_output_texts += usize::from(sstx_first_output);
+        seen.sstx_later_texts += usize::from(
+            sstx_kind == Some(ErrorKind::SStxInvalidOutputs) && !sstx_version && !sstx_first_output,
+        );
+    }
+
+    /// `is_sstx`, `is_ssgen` and `is_ssrtx` answer as `check_sstx`,
+    /// `check_ssgen` and `check_ssrtx` do, `determine_tx_type` names the
+    /// type the six checks give in dcrd's order, each shape test holds
+    /// for exactly the transactions its check refuses at one of its
+    /// leading tests, and each predicate runs its check for exactly the
+    /// transactions that pass its shape test: over every base, with
+    /// each edit, with each ordered pair of edits and with random runs
+    /// of three to six, which between them pass each check and fail it
+    /// with each of its kinds.
+    #[test]
+    fn the_stake_predicates_answer_as_their_checks_do() {
+        let bases = bases();
+        let mut seen = Seen::default();
+
+        // Every base as it is, with one edit, and with every ordered
+        // pair of edits.
+        for base in &bases {
+            compare(base, &mut seen);
+            for first in EDITS {
+                let mut once = base.clone();
+                first(&mut once);
+                compare(&once, &mut seen);
+                for second in EDITS {
+                    let mut twice = once.clone();
+                    second(&mut twice);
+                    compare(&twice, &mut seen);
+                }
+            }
+        }
+
+        // Longer runs of edits, at random.
+        let mut rng = SplitMix64::from_entropy("stake predicates");
+        for _ in 0..20_000 {
+            let mut tx = bases[rng.below(bases.len() as u64) as usize].clone();
+            for _ in 0..3 + rng.below(4) {
+                EDITS[rng.below(EDITS.len() as u64) as usize](&mut tx);
+            }
+            compare(&tx, &mut seen);
+        }
+
+        // The transactions reached every outcome of every check, so no
+        // comparison above held for want of a case.
+        assert!(seen.compared > 100_000, "{}", seen.compared);
+        assert!(seen.tickets > 100, "{} tickets", seen.tickets);
+        assert!(seen.votes > 100, "{} votes", seen.votes);
+        assert!(seen.revocations > 100, "{} revocations", seen.revocations);
+        for kind in [
+            ErrorKind::SStxTooManyInputs,
+            ErrorKind::SStxTooManyOutputs,
+            ErrorKind::SStxNoOutputs,
+            ErrorKind::SStxInvalidOutputs,
+            ErrorKind::SStxInOutProportions,
+            ErrorKind::SSGenWrongNumInputs,
+            ErrorKind::SSGenTooManyOutputs,
+            ErrorKind::SSGenNoOutputs,
+            ErrorKind::SSGenNoStakebase,
+            ErrorKind::SSGenWrongIndex,
+            ErrorKind::SSGenWrongTxTree,
+            ErrorKind::SSGenBadGenOuts,
+            ErrorKind::SSGenNoReference,
+            ErrorKind::SSGenBadReference,
+            ErrorKind::SSGenNoVotePush,
+            ErrorKind::SSGenBadVotePush,
+            ErrorKind::SSGenInvalidDiscriminatorLength,
+            ErrorKind::SSGenInvalidNullScript,
+            ErrorKind::SSGenUnknownDiscriminator,
+            ErrorKind::SSGenInvalidTVLength,
+            ErrorKind::SSGenInvalidTreasuryVote,
+            ErrorKind::SSGenDuplicateTreasuryVote,
+            ErrorKind::SSGenInvalidTxVersion,
+            ErrorKind::SSRtxWrongNumInputs,
+            ErrorKind::SSRtxTooManyOutputs,
+            ErrorKind::SSRtxNoOutputs,
+            ErrorKind::SSRtxBadOuts,
+            ErrorKind::SSRtxWrongTxTree,
+            ErrorKind::SSRtxInputHasSigScript,
+            ErrorKind::SSRtxInvalidFee,
+        ] {
+            assert!(
+                seen.kinds.contains(&kind),
+                "no transaction failed with {kind:?}"
+            );
+        }
+        assert!(
+            seen.sstx_version_texts > 100,
+            "{} tickets refused for a script version",
+            seen.sstx_version_texts
+        );
+        assert!(
+            seen.sstx_first_output_texts > 100,
+            "{} tickets refused for the first output",
+            seen.sstx_first_output_texts
+        );
+        assert!(
+            seen.sstx_later_texts > 100,
+            "{} tickets refused for a later output",
+            seen.sstx_later_texts
+        );
+    }
+
+    /// A predicate refuses the transactions of the other kinds a block
+    /// holds by its shape test and does not go on to its check, the one
+    /// place a message is built; it runs the check once, for a
+    /// transaction of its own kind.  The transactions are regular ones
+    /// with one input, with two, with more than a ticket may have and
+    /// with one input that spends a stake tree output; tickets bought
+    /// with a regular tree output, with a stake tree output and with
+    /// two outputs; votes with and without treasury votes; revocations
+    /// of both versions; a coinbase, a treasurybase, a treasury add and
+    /// a treasury spend.
+    #[test]
+    fn a_transaction_of_another_kind_is_refused_without_its_check() {
+        let mut stake_funded_ticket = ticket(1);
+        stake_funded_ticket.tx_in[0].previous_out_point.tree = TX_TREE_STAKE;
+        let mut stake_spend = regular(1);
+        stake_spend.tx_in[0].previous_out_point.tree = TX_TREE_STAKE;
+        let block = [
+            ("a regular transaction", regular(1), TxType::Regular),
+            (
+                "a regular transaction with two inputs",
+                regular(2),
+                TxType::Regular,
+            ),
+            (
+                "a regular transaction with 65 inputs",
+                regular(MAX_INPUTS_PER_SSTX + 1),
+                TxType::Regular,
+            ),
+            (
+                "a regular transaction that spends a stake tree output",
+                stake_spend,
+                TxType::Regular,
+            ),
+            ("a ticket", ticket(1), TxType::SStx),
+            (
+                "a ticket bought with a stake tree output",
+                stake_funded_ticket,
+                TxType::SStx,
+            ),
+            ("a ticket with two inputs", ticket(2), TxType::SStx),
+            ("a vote", vote(3), TxType::SSGen),
+            ("a vote with treasury votes", treasury_vote(), TxType::SSGen),
+            ("a revocation", revocation(1, 1), TxType::SSRtx),
+            (
+                "a revocation of the automatic revocations version",
+                revocation(TX_VERSION_AUTO_REVOCATIONS, 2),
+                TxType::SSRtx,
+            ),
+            ("a coinbase", coinbase(), TxType::Regular),
+            ("a treasurybase", treasury_base(), TxType::TreasuryBase),
+            ("a treasury add", treasury_add(), TxType::TAdd),
+            ("a treasury spend", treasury_spend(), TxType::TSpend),
+        ];
+        for (name, tx, tx_type) in &block {
+            assert_eq!(tx_type_by_checks(tx), *tx_type, "{name}");
+            for (predicate_name, predicate, fails_shape) in PREDICATES {
+                let (answer, checks) = answer_and_checks(predicate, tx);
+                assert!(
+                    answer || fails_shape(tx),
+                    "{name}: {predicate_name} refused it past its shape test"
+                );
+                assert_eq!(
+                    checks,
+                    u64::from(answer),
+                    "{name}: {predicate_name} went on to its check {checks} time(s)"
+                );
+            }
+        }
+    }
 }
