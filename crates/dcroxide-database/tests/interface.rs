@@ -7,7 +7,7 @@
 //! closing the transaction with `ErrTxNotWritable`, cursor exhaustion
 //! semantics).
 
-use dcroxide_database::{Database, Error, ErrorKind, Options};
+use dcroxide_database::{Database, Error, ErrorKind, Options, Transaction};
 use tempfile::TempDir;
 
 const NET: u32 = 0x12141c16; // simnet magic
@@ -461,6 +461,77 @@ fn update_rolls_back_on_error() {
     assert_eq!(result.err().map(kind_of), Some(ErrorKind::DriverSpecific));
     db.view(|tx| {
         assert!(tx.metadata().bucket(b"doomed").is_none());
+        Ok(())
+    })
+    .expect("view");
+}
+
+/// A key a transaction stages twice reads as it was staged last: inside
+/// the transaction, once it has committed and once the commit is
+/// durable.  A put after a delete leaves the row.  A delete after a put
+/// leaves none, though a commit applies its puts after its deletes.
+/// dcrd's `putKey` and `deleteKey` take each key they stage out of the
+/// other pending set (`ffldb/db.go:1061`, `:1098`); the port looks for
+/// it there only when that set can hold it.  Of the keys staged again
+/// here, one is the greatest key of the set it has to leave and one
+/// sorts below that, for a put and for a delete.  The tests of this
+/// file link the crate as it ships, without the count its unit tests
+/// keep beside those two removals.
+#[test]
+fn a_key_staged_twice_reads_as_it_was_staged_last() {
+    let (_dir, db) = new_db();
+    db.update(|tx| {
+        let bucket = tx.metadata().create_bucket(b"rows")?;
+        for key in [b"b", b"c", b"e", b"f"] {
+            bucket.put(key, b"beneath")?;
+        }
+        Ok(())
+    })
+    .expect("rows beneath");
+
+    let want: [(&[u8], Option<&[u8]>); 6] = [
+        (b"a", Some(b"again")),
+        (b"b", None),
+        (b"c", None),
+        (b"d", Some(b"once")),
+        (b"e", Some(b"again")),
+        (b"f", None),
+    ];
+    let check = |tx: &Transaction, when: &str| {
+        let bucket = tx.metadata().bucket(b"rows").expect("bucket");
+        for (key, value) in want {
+            assert_eq!(bucket.get(key).as_deref(), value, "{when}: key {key:?}");
+        }
+    };
+
+    let tx = db.begin(true).expect("begin rw");
+    {
+        let bucket = tx.metadata().bucket(b"rows").expect("bucket");
+        // Three deletes, then a put of the greatest key deleted and of
+        // the least.
+        for key in [b"a", b"c", b"e"] {
+            bucket.delete(key).expect("delete");
+        }
+        bucket.put(b"e", b"again").expect("put");
+        bucket.put(b"a", b"again").expect("put");
+        // Three puts, then a delete of the greatest key put and of one
+        // below it.
+        for key in [b"b", b"d", b"f"] {
+            bucket.put(key, b"once").expect("put");
+        }
+        bucket.delete(b"f").expect("delete");
+        bucket.delete(b"b").expect("delete");
+    }
+    check(&tx, "before the commit");
+    tx.commit().expect("commit");
+    db.view(|tx| {
+        check(tx, "after the commit");
+        Ok(())
+    })
+    .expect("view");
+    db.flush().expect("flush");
+    db.view(|tx| {
+        check(tx, "after the flush");
         Ok(())
     })
     .expect("view");

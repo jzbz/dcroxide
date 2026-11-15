@@ -148,6 +148,26 @@ fn bucketized_key(bucket_id: [u8; 4], key: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Whether a pending set whose greatest key is `last` can hold `key`:
+/// not when it is empty, and not when `key` sorts after `last`, which
+/// is to sort after every key the set holds.
+///
+/// [`Transaction::put_raw`] and [`Transaction::delete_raw`] keep the two
+/// pending sets disjoint by taking each key they stage out of the other
+/// one, as dcrd's `putKey` and `deleteKey` do (`ffldb/db.go:1061`,
+/// `:1098`).  That is a search of the other set for a key that is almost
+/// never there, while its greatest key is read without comparing any.
+/// A flush of the UTXO cache stages its rows in ascending key order,
+/// puts and deletes interleaved, so nearly every one of them sorts after
+/// everything staged before it and one comparison shows there is nothing
+/// to take out; a row that does not is searched for as before.  The
+/// removal of a key the set does not hold changes nothing, so leaving it
+/// out leaves both sets as the search would.
+#[inline]
+fn may_hold(last: Option<&Vec<u8>>, key: &[u8]) -> bool {
+    last.is_some_and(|last| last.as_slice() >= key)
+}
+
 /// Rows per window of a [`Bucket::for_each`] walk.  Small enough that a
 /// walk over the UTXO set holds a few hundred kilobytes instead of every
 /// key of the bucket, large enough that the per-window B-tree descent is
@@ -284,6 +304,12 @@ struct TxState {
     /// can hold a bucket's index row, and a bucket lookup is answered by
     /// `buckets` alone ([`Transaction::child_bucket_id`]).
     staged_bucket_index: bool,
+    /// How many times [`Transaction::put_raw`] and
+    /// [`Transaction::delete_raw`] went on to search the other pending
+    /// set for the key they staged, counted where [`may_hold`] lets the
+    /// search through.
+    #[cfg(test)]
+    cross_searches: usize,
     /// Closures to run once a commit's own flush has taken the rows it
     /// will write and before the commit's are published, in registration
     /// order (see
@@ -344,6 +370,8 @@ impl Transaction {
                 cache_snap,
                 buckets: Some(buckets),
                 staged_bucket_index: false,
+                #[cfg(test)]
+                cross_searches: 0,
                 on_commit: Vec::new(),
             }),
             writable,
@@ -448,7 +476,13 @@ impl Transaction {
         if key.starts_with(BUCKET_INDEX_PREFIX) {
             state.staged_bucket_index = true;
         }
-        state.pending_removes.remove(&key);
+        if may_hold(state.pending_removes.last(), &key) {
+            #[cfg(test)]
+            {
+                state.cross_searches = state.cross_searches.saturating_add(1);
+            }
+            state.pending_removes.remove(&key);
+        }
         state.pending_keys.insert(key, value);
         Ok(())
     }
@@ -462,7 +496,16 @@ impl Transaction {
         if key.starts_with(BUCKET_INDEX_PREFIX) {
             state.staged_bucket_index = true;
         }
-        state.pending_keys.remove(&key);
+        if may_hold(
+            state.pending_keys.last_key_value().map(|(last, _)| last),
+            &key,
+        ) {
+            #[cfg(test)]
+            {
+                state.cross_searches = state.cross_searches.saturating_add(1);
+            }
+            state.pending_keys.remove(&key);
+        }
         state.pending_removes.insert(key);
         Ok(())
     }
@@ -2360,7 +2403,7 @@ mod put_owned_tests {
     type Flushed = Arc<Mutex<Vec<(usize, u64)>>>;
 
     /// A new store that records what its flushes write and report.
-    fn recording_db() -> (TempDir, Database, Written, Flushed) {
+    pub(super) fn recording_db() -> (TempDir, Database, Written, Flushed) {
         let dir = TempDir::new().expect("tempdir");
         let written: Written = Arc::default();
         let flushed: Flushed = Arc::default();
@@ -2519,6 +2562,416 @@ mod put_owned_tests {
                 (owned.kind, &owned.description),
                 (borrowed.kind, &borrowed.description)
             );
+        }
+    }
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "test arithmetic over small counts"
+)]
+mod pending_guard_tests {
+    //! [`Transaction::put_raw`] and [`Transaction::delete_raw`] search
+    //! the other pending set only for a key it can hold ([`may_hold`]):
+    //! the two sets hold what they would if every key were searched for,
+    //! whatever order the keys come in, and rows staged in ascending key
+    //! order are searched for not at all.
+
+    use std::collections::{BTreeMap, BTreeSet};
+
+    use dcroxide_testutil::SplitMix64;
+
+    use super::may_hold;
+    use super::put_owned_tests::recording_db;
+    use crate::{Database, Transaction};
+
+    /// A set with no key holds nothing, and one whose greatest key
+    /// sorts before the key asked about does not hold it.  Every other
+    /// key may be held: the greatest key itself, a key below it, and a
+    /// key that is a prefix of it.  The order is that of the bytes, not
+    /// of the lengths.
+    #[test]
+    fn may_hold_is_false_only_above_the_last_key() {
+        let last = vec![0x05, 0x80, 0x01];
+        for key in [&[][..], &[0x00], &last] {
+            assert!(!may_hold(None, key), "no last key, key {key:02x?}");
+        }
+        let cases: [(&[u8], bool, &str); 9] = [
+            (&[0x05, 0x80, 0x02], false, "above the last key"),
+            (&[0x06], false, "shorter than the last key and above it"),
+            (&[0x05, 0x80, 0x01, 0x00], false, "the last key and more"),
+            (&[0x05, 0x80, 0x01], true, "the last key"),
+            (&[0x05, 0x80, 0x00], true, "below the last key"),
+            (&[0x05, 0x7f, 0xff, 0xff], true, "longer and below"),
+            (&[0x04], true, "shorter and below"),
+            (&[0x05, 0x80], true, "a prefix of the last key"),
+            (&[], true, "the empty key"),
+        ];
+        for (key, want, what) in cases {
+            assert_eq!(may_hold(Some(&last), key), want, "{what}");
+        }
+        // The empty key is the least there is.
+        assert!(may_hold(Some(&Vec::new()), &[]));
+        assert!(!may_hold(Some(&Vec::new()), &[0x00]));
+    }
+
+    /// The raw keys the model test stages, in ascending order: keys of
+    /// several lengths, some of them prefixes of others, so that the
+    /// longer of two keys is the lesser in some pairs and the greater in
+    /// others.
+    fn model_keys() -> Vec<Vec<u8>> {
+        let keys: [&[u8]; 16] = [
+            &[0xf5],
+            &[0xf5, 0x00],
+            &[0xf5, 0x00, 0x00],
+            &[0xf5, 0x00, 0x01],
+            &[0xf5, 0x01],
+            &[0xf5, 0x7f],
+            &[0xf5, 0x7f, 0xff],
+            &[0xf5, 0x80],
+            &[0xf5, 0x80, 0x00],
+            &[0xf5, 0x80, 0x00, 0x00],
+            &[0xf5, 0xff],
+            &[0xf5, 0xff, 0x7f],
+            &[0xf5, 0xff, 0x80, 0x80, 0x00],
+            &[0xf5, 0xff, 0xff],
+            &[0xf6],
+            &[0xf6, 0x00],
+        ];
+        assert!(keys.windows(2).all(|pair| pair[0] < pair[1]));
+        keys.iter().map(|key| key.to_vec()).collect()
+    }
+
+    /// Random puts, deletes and reporting deletes of a few raw keys,
+    /// drawn in ascending order, in descending order and at random, each
+    /// compared with a model in which the last operation on a key wins.
+    /// After every call the staged puts are the keys last put, with the
+    /// values they were put with, the staged deletes are the keys last
+    /// deleted, so no key is in both, and every key reads as the model
+    /// says, through to the rows committed beneath.  A reporting delete
+    /// reports what the model held.
+    #[test]
+    fn the_pending_sets_match_a_model_under_any_order() {
+        let mut rng = SplitMix64::from_entropy("pending sets against a model");
+        let (_dir, db, _, _) = recording_db();
+        let keys = model_keys();
+        // What the committed rows hold: every third key to begin with,
+        // then whatever the transactions that commit leave.
+        let mut beneath: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+        db.update(|tx| {
+            for key in keys.iter().step_by(3) {
+                tx.put_raw(key.clone(), b"beneath".to_vec())?;
+                beneath.insert(key.clone(), b"beneath".to_vec());
+            }
+            Ok(())
+        })
+        .expect("rows beneath");
+
+        for order in ["ascending", "descending", "random"] {
+            for round in 0..40u32 {
+                let tx = db.begin(true).expect("begin");
+                // The last operation on each key: the value put, or
+                // `None` for a delete.
+                let mut model: BTreeMap<Vec<u8>, Option<Vec<u8>>> = BTreeMap::new();
+                for step in 0..3 * keys.len() {
+                    let context = format!("{order}, round {round}, step {step}");
+                    let at = match order {
+                        "ascending" => step % keys.len(),
+                        "descending" => keys.len() - 1 - step % keys.len(),
+                        _ => rng.below(keys.len() as u64) as usize,
+                    };
+                    let key = &keys[at];
+                    match rng.below(5) {
+                        0 | 1 => {
+                            let value = rng.bytes(6);
+                            tx.put_raw(key.clone(), value.clone()).expect("put");
+                            model.insert(key.clone(), Some(value));
+                        }
+                        2 | 3 => {
+                            tx.delete_raw(key.clone()).expect("delete");
+                            model.insert(key.clone(), None);
+                        }
+                        _ => {
+                            let reported = tx.delete_raw_reporting(key).expect("delete");
+                            assert_eq!(reported, model.insert(key.clone(), None), "{context}");
+                        }
+                    }
+
+                    let puts: BTreeMap<Vec<u8>, Vec<u8>> = model
+                        .iter()
+                        .filter_map(|(key, staged)| Some((key.clone(), staged.clone()?)))
+                        .collect();
+                    let deletes: BTreeSet<Vec<u8>> = model
+                        .iter()
+                        .filter(|(_, staged)| staged.is_none())
+                        .map(|(key, _)| key.clone())
+                        .collect();
+                    {
+                        let state = tx.state.borrow();
+                        assert_eq!(state.pending_keys, puts, "{context}: puts");
+                        assert_eq!(state.pending_removes, deletes, "{context}: deletes");
+                    }
+                    for key in &keys {
+                        let want = match model.get(key) {
+                            Some(staged) => staged.clone(),
+                            None => beneath.get(key).cloned(),
+                        };
+                        assert_eq!(
+                            tx.try_fetch_raw(key).expect("read"),
+                            want,
+                            "{context}: key {key:02x?}"
+                        );
+                    }
+                }
+                if round % 2 == 0 {
+                    tx.rollback().expect("rollback");
+                    continue;
+                }
+                tx.commit().expect("commit");
+                for (key, staged) in model {
+                    match staged {
+                        Some(value) => beneath.insert(key, value),
+                        None => beneath.remove(&key),
+                    };
+                }
+            }
+        }
+    }
+
+    /// The rows of the content test in ascending key order, each a value
+    /// to put or `None` for a delete, two puts to every delete.  The
+    /// least key is put and the greatest is deleted.
+    fn content_rows() -> Vec<(Vec<u8>, Option<Vec<u8>>)> {
+        (0..200u16)
+            .map(|i| {
+                let staged = (i % 3 != 1).then(|| vec![i as u8; usize::from(i % 7) * 9]);
+                (i.to_be_bytes().to_vec(), staged)
+            })
+            .collect()
+    }
+
+    /// The least and the greatest key [`content_rows`] puts, and the
+    /// least and the greatest it deletes.
+    fn ends_put_and_deleted() -> ([Vec<u8>; 2], [Vec<u8>; 2]) {
+        let rows = content_rows();
+        let ends = |put: bool| {
+            let mut keys = rows
+                .iter()
+                .filter(|(_, staged)| staged.is_some() == put)
+                .map(|(key, _)| key.clone());
+            let least = keys.next().expect("a row of each kind");
+            [least, keys.next_back().expect("two rows of each kind")]
+        };
+        let (put, deleted) = (ends(true), ends(false));
+        assert!(put[0] < deleted[0] && put[1] < deleted[1]);
+        (put, deleted)
+    }
+
+    /// A key that sorts above every key of [`content_rows`].
+    fn key_above_the_rows() -> Vec<u8> {
+        200u16.to_be_bytes().to_vec()
+    }
+
+    /// The keys the content test reads: those of [`content_rows`] and
+    /// then [`key_above_the_rows`].
+    fn content_keys() -> Vec<Vec<u8>> {
+        let rows = content_rows();
+        let keys = rows.into_iter().map(|(key, _)| key);
+        keys.chain([key_above_the_rows()]).collect()
+    }
+
+    /// What every key of [`content_keys`] holds once [`stage_content`]
+    /// has staged its rows.
+    fn content_want() -> Vec<Option<Vec<u8>>> {
+        let (put, deleted) = ends_put_and_deleted();
+        let rows = content_rows().into_iter().map(|(key, staged)| {
+            if put.contains(&key) {
+                None
+            } else if deleted.contains(&key) {
+                Some(b"again".to_vec())
+            } else {
+                staged
+            }
+        });
+        rows.chain([None]).collect()
+    }
+
+    /// Over a bucket in which every other key already has a row, stage
+    /// [`content_rows`] in one transaction, in ascending or in descending
+    /// key order, then delete the least key put and put the least key
+    /// deleted, and the same for the greatest of each, which by then is
+    /// the greatest key of the set it has to leave.  Last, put
+    /// [`key_above_the_rows`] and delete it, which leaves the greatest
+    /// key staged as a put above the greatest staged as a delete, where
+    /// the rows leave them the other way round.  Returns the transaction
+    /// the rows are staged in.
+    fn stage_content(db: &Database, ascending: bool) -> Transaction {
+        let mut rows = content_rows();
+        db.update(|tx| {
+            let bucket = tx.metadata().create_bucket(b"rows")?;
+            for (key, _) in rows.iter().step_by(2) {
+                bucket.put(key, b"beneath")?;
+            }
+            Ok(())
+        })
+        .expect("rows beneath");
+
+        let tx = db.begin(true).expect("begin");
+        {
+            let bucket = tx.metadata().bucket(b"rows").expect("bucket");
+            if !ascending {
+                rows.reverse();
+            }
+            for (key, staged) in &rows {
+                match staged {
+                    Some(value) => bucket.put(key, value).expect("put"),
+                    None => bucket.delete(key).expect("delete"),
+                }
+            }
+            let (put, deleted) = ends_put_and_deleted();
+            for (put, deleted) in put.iter().zip(&deleted) {
+                bucket.delete(put).expect("delete");
+                bucket.put(deleted, b"again").expect("put");
+            }
+            let above = key_above_the_rows();
+            bucket.put(&above, b"above").expect("put");
+            bucket.delete(&above).expect("delete");
+        }
+        tx
+    }
+
+    /// Commit what [`stage_content`] stages and return what the
+    /// transaction read for every key of [`content_keys`] before it
+    /// committed.
+    fn write_content(db: &Database, ascending: bool) -> Vec<Option<Vec<u8>>> {
+        let tx = stage_content(db, ascending);
+        let read = {
+            let bucket = tx.metadata().bucket(b"rows").expect("bucket");
+            content_keys().iter().map(|key| bucket.get(key)).collect()
+        };
+        tx.commit().expect("commit");
+        read
+    }
+
+    /// What the store reads for every key of [`content_keys`].
+    fn read_content(db: &Database) -> Vec<Option<Vec<u8>>> {
+        let mut read = Vec::new();
+        db.view(|tx| {
+            let bucket = tx.metadata().bucket(b"rows").expect("bucket");
+            read = content_keys().iter().map(|key| bucket.get(key)).collect();
+            Ok(())
+        })
+        .expect("view");
+        read
+    }
+
+    /// Rows staged in ascending key order, none of which is searched
+    /// for, leave what the same rows leave staged in descending order,
+    /// all but the first of which is: in what the transaction reads
+    /// before it commits, in the cache overlay, in the keys and values
+    /// the flush hands the engine, in the entries and bytes it counts,
+    /// and in the durable store.  Both end with deletes of the least and
+    /// the greatest key put, puts of the least and the greatest key
+    /// deleted, and a put and then a delete of a key above them all, and
+    /// both read as the rows say.
+    #[test]
+    fn ascending_rows_leave_what_descending_rows_leave() {
+        let (_ascending_dir, ascending, ascending_written, ascending_flushed) = recording_db();
+        let (_descending_dir, descending, descending_written, descending_flushed) = recording_db();
+        let want = content_want();
+        assert!(want.iter().filter(|row| row.is_none()).count() >= 60);
+
+        // In the pending sets.
+        assert_eq!(write_content(&ascending, true), want);
+        assert_eq!(write_content(&descending, false), want);
+
+        // In the cache overlay.
+        assert_eq!(read_content(&ascending), want);
+        assert_eq!(read_content(&descending), want);
+
+        // In what the flush hands the engine and counts.
+        ascending.flush().expect("flush");
+        descending.flush().expect("flush");
+        let descending_written = descending_written.lock().expect("write log").clone();
+        assert!(
+            descending_written.len() >= 200,
+            "{}",
+            descending_written.len()
+        );
+        assert_eq!(
+            *ascending_written.lock().expect("write log"),
+            descending_written
+        );
+        let descending_flushed = descending_flushed.lock().expect("observations").clone();
+        assert_eq!(descending_flushed.len(), 1);
+        assert_eq!(
+            *ascending_flushed.lock().expect("observations"),
+            descending_flushed
+        );
+
+        // And in the durable store.
+        assert_eq!(read_content(&ascending), want);
+        assert_eq!(read_content(&descending), want);
+    }
+
+    /// Stage a thousand raw keys in the order given, a put of every
+    /// even one and a delete of every odd one, and return the
+    /// transaction they are staged in.
+    fn stage_alternating(db: &Database, order: impl Iterator<Item = u16>) -> Transaction {
+        let tx = db.begin(true).expect("begin");
+        for i in order {
+            let key = [&[0xf5][..], &i.to_be_bytes()].concat();
+            if i % 2 == 0 {
+                tx.put_raw(key, vec![0x01]).expect("put");
+            } else {
+                tx.delete_raw(key).expect("delete");
+            }
+        }
+        tx
+    }
+
+    /// The saving is taken: a thousand puts and deletes, interleaved and
+    /// in ascending key order as a flush of the UTXO cache stages its
+    /// rows, search the other pending set not once.  A put of the
+    /// greatest key deleted and then a delete of that key are each
+    /// searched for, and the same thousand rows in descending order are
+    /// searched for at every call but the first, which finds the other
+    /// set empty.  The count is kept where the guard lets a search
+    /// through, so it shows which calls the guard stops and not that
+    /// nothing else searches.
+    #[test]
+    fn an_ascending_run_makes_no_cross_search() {
+        let (_dir, db, _, _) = recording_db();
+        let searches = |tx: &Transaction| tx.state.borrow().cross_searches;
+
+        let tx = stage_alternating(&db, 0..1000);
+        assert_eq!(searches(&tx), 0, "ascending");
+        let greatest = [&[0xf5][..], &999u16.to_be_bytes()].concat();
+        tx.put_raw(greatest.clone(), vec![0x02]).expect("put");
+        assert_eq!(searches(&tx), 1, "a put of the greatest key deleted");
+        tx.delete_raw(greatest).expect("delete");
+        assert_eq!(searches(&tx), 2, "a delete of the greatest key put");
+        tx.rollback().expect("rollback");
+
+        let tx = stage_alternating(&db, (0..1000).rev());
+        assert_eq!(searches(&tx), 999, "descending");
+        tx.rollback().expect("rollback");
+    }
+
+    /// [`ascending_rows_leave_what_descending_rows_leave`] compares rows
+    /// staged without the search with rows staged with it.  Of the
+    /// ascending rows none is searched for and of the descending rows
+    /// all but the first, and of the six operations that end either,
+    /// all but the put of the key above every row.
+    #[test]
+    fn the_content_rows_are_staged_without_the_search_and_with_it() {
+        for (ascending, want) in [(true, 5), (false, 204)] {
+            let (_dir, db, _, _) = recording_db();
+            let tx = stage_content(&db, ascending);
+            let searches = tx.state.borrow().cross_searches;
+            assert_eq!(searches, want, "ascending: {ascending}");
+            tx.rollback().expect("rollback");
         }
     }
 }

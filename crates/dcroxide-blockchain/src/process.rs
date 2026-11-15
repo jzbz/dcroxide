@@ -11170,6 +11170,111 @@ mod tests {
         );
     }
 
+    /// A flush of the UTXO cache hands the database its rows in
+    /// ascending order of the keys they are stored under, the deletes
+    /// among the puts.  A database transaction stages a row whose key
+    /// sorts above every row it has staged without a search for that key
+    /// among them, so a flush is staged without those searches for as
+    /// long as this order holds.  The cache is walked by hash, then
+    /// output index, then tree, and a row's key is the hash, then the
+    /// tree, then the index, the last two as variable-length quantities
+    /// (dcrd `outpointKey`).  The two orders part only within one hash:
+    /// between index 16,511 and index 16,512, whose longer encoding
+    /// sorts below the shorter one, and between outputs in both trees.
+    #[test]
+    fn a_utxo_flush_stages_its_rows_in_ascending_key_order() {
+        use crate::utxoentry::{UTXO_STATE_FRESH, UTXO_STATE_MODIFIED};
+
+        let entry = |state: u8| {
+            let mut entry = UtxoEntry::new(
+                1_000,
+                alloc::vec![0x51],
+                10,
+                1,
+                0,
+                false,
+                false,
+                dcroxide_stake::TxType::Regular,
+                None,
+            );
+            entry.set_state_bits(state);
+            entry
+        };
+        let row_keys = |cache: &UtxoCacheMap| -> Vec<Vec<u8>> {
+            utxo_flush_rows(cache)
+                .map(|(outpoint, _)| crate::utxoio::outpoint_key(&outpoint))
+                .collect()
+        };
+
+        // Hashes that differ in their first byte, in their last and in
+        // between, each with outputs on both sides of every step in the
+        // length of an index's encoding below 16,512, and every hash in
+        // one tree.  The cache is filled from its greatest key down, in
+        // every state an entry can be flushed or passed over in.
+        let mut hashes = [
+            [0x00; 32], [0x00; 32], [0x00; 32], [0x7f; 32], [0x80; 32], [0xff; 32],
+        ];
+        hashes[1][31] = 0x01;
+        hashes[2][15] = 0x01;
+        let indices = [0u32, 1, 127, 128, 255, 256, 16_383, 16_384, 16_511];
+        let mut cache = UtxoCacheMap::default();
+        let (mut puts, mut deletes) = (0usize, 0usize);
+        for (h, hash) in hashes.iter().enumerate().rev() {
+            for (i, index) in indices.iter().enumerate().rev() {
+                let slot = match (h + i) % 5 {
+                    // A marker for an output the backend does not hold
+                    // and an entry as it was loaded: not rows.
+                    0 => None,
+                    1 => Some(entry(0)),
+                    2 => {
+                        deletes += 1;
+                        let mut spent = entry(0);
+                        spent.spend();
+                        Some(spent)
+                    }
+                    3 => {
+                        puts += 1;
+                        Some(entry(UTXO_STATE_MODIFIED))
+                    }
+                    _ => {
+                        puts += 1;
+                        Some(entry(UTXO_STATE_MODIFIED | UTXO_STATE_FRESH))
+                    }
+                };
+                cache.insert((*hash, *index, (h % 2) as i8), slot);
+            }
+        }
+        assert!(
+            puts >= 10 && deletes >= 10,
+            "{puts} puts, {deletes} deletes"
+        );
+        let rows: Vec<bool> = utxo_flush_rows(&cache)
+            .map(|(_, entry)| entry.is_some())
+            .collect();
+        assert_eq!(rows.iter().filter(|put| **put).count(), puts);
+        assert_eq!(rows.iter().filter(|put| !**put).count(), deletes);
+        let keys = row_keys(&cache);
+        assert_eq!(keys.len(), puts + deletes);
+        for pair in keys.windows(2) {
+            assert!(pair[0] < pair[1], "{:02x?} then {:02x?}", pair[0], pair[1]);
+        }
+
+        // Where the orders part, the later row sorts below the earlier.
+        let parted: [[OutPointKey; 2]; 2] = [
+            [([0x11; 32], 16_511, 0), ([0x11; 32], 16_512, 0)],
+            [([0x11; 32], 0, 1), ([0x11; 32], 1, 0)],
+        ];
+        for pair in parted {
+            let mut cache = UtxoCacheMap::default();
+            for key in pair {
+                cache.insert(key, Some(entry(UTXO_STATE_MODIFIED)));
+            }
+            let keys = row_keys(&cache);
+            assert_eq!(keys.len(), 2, "{pair:?}");
+            assert!(keys[0] > keys[1], "{pair:?}");
+        }
+    }
+
     /// A block that extends the tip is attached, and announced, as the
     /// `blocks` mirror's own copy, together with its parent's, not as
     /// fresh copies of either: dcrd shares one `*dcrutil.Block` from its
