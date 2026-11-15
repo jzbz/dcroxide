@@ -31,6 +31,7 @@ use dcroxide_chainhash::Hash;
 
 use crate::blockfile::{BLOCK_LOC_SIZE, BlockLocation, BlockRecord, serialize_write_row};
 use crate::bucketindex::BucketIndex;
+use crate::dbcache::LayerKey;
 use crate::error::{Error, ErrorKind, db_error};
 use crate::{DbInner, METADATA_TABLE};
 
@@ -93,16 +94,8 @@ pub(crate) fn serialized_block_height(raw: &[u8]) -> Option<u32> {
 /// height finds nothing.  The layout is dcroxide's own, and the chain
 /// database's version records it
 /// (`dcroxide_blockchain::chaindb::CURRENT_DATABASE_VERSION`, ADR-0010).
-#[allow(
-    clippy::arithmetic_side_effects,
-    reason = "constant lengths: 4 + 4 + 32 = 40"
-)]
-fn block_idx_key(hash: &Hash, height: u32) -> Vec<u8> {
-    let mut out = Vec::with_capacity(BLOCK_IDX_BUCKET_ID.len() + 4 + hash.0.len());
-    out.extend_from_slice(&BLOCK_IDX_BUCKET_ID);
-    out.extend_from_slice(&height.to_be_bytes());
-    out.extend_from_slice(&hash.0);
-    out
+fn block_idx_key(hash: &Hash, height: u32) -> LayerKey {
+    LayerKey::concat(&[&BLOCK_IDX_BUCKET_ID, &height.to_be_bytes(), &hash.0])
 }
 
 /// A particular region of a block, identified by hash, offset, and
@@ -123,29 +116,19 @@ pub struct BlockRegion {
 
 /// The key for storing and retrieving a child bucket in the bucket
 /// index (dcrd `bucketIndexKey`): `bidx<parent ID><name>`.
-#[allow(
-    clippy::arithmetic_side_effects,
-    reason = "4 + 4 plus a slice length, which is at most isize::MAX"
-)]
-fn bucket_index_key(parent_id: [u8; 4], key: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(BUCKET_INDEX_PREFIX.len() + 4 + key.len());
-    out.extend_from_slice(BUCKET_INDEX_PREFIX);
-    out.extend_from_slice(&parent_id);
-    out.extend_from_slice(key);
-    out
+fn bucket_index_key(parent_id: [u8; 4], key: &[u8]) -> LayerKey {
+    LayerKey::concat(&[BUCKET_INDEX_PREFIX, &parent_id, key])
 }
 
 /// The actual key for a key within a bucket (dcrd `bucketizedKey`):
 /// `<bucket ID><key>`.
-#[allow(
-    clippy::arithmetic_side_effects,
-    reason = "4 plus a slice length, which is at most isize::MAX"
-)]
-fn bucketized_key(bucket_id: [u8; 4], key: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(4 + key.len());
-    out.extend_from_slice(&bucket_id);
-    out.extend_from_slice(key);
-    out
+///
+/// The key is the one the pending sets and the cache overlay hold
+/// ([`LayerKey`]): a row's key of up to 46 bytes is built on the stack
+/// and moves from there into the set a put or a delete stages it in,
+/// and a lookup's is dropped where it was built, so neither allocates.
+fn bucketized_key(bucket_id: [u8; 4], key: &[u8]) -> LayerKey {
+    LayerKey::concat(&[&bucket_id, key])
 }
 
 /// Whether a pending set whose greatest key is `last` can hold `key`:
@@ -164,8 +147,8 @@ fn bucketized_key(bucket_id: [u8; 4], key: &[u8]) -> Vec<u8> {
 /// removal of a key the set does not hold changes nothing, so leaving it
 /// out leaves both sets as the search would.
 #[inline]
-fn may_hold(last: Option<&Vec<u8>>, key: &[u8]) -> bool {
-    last.is_some_and(|last| last.as_slice() >= key)
+fn may_hold(last: Option<&LayerKey>, key: &LayerKey) -> bool {
+    last.is_some_and(|last| last >= key)
 }
 
 /// Rows per window of a [`Bucket::for_each`] walk.  Small enough that a
@@ -281,10 +264,10 @@ struct TxState {
     pending_blocks: Vec<(Hash, u32, PendingBlock)>,
     pending_index: HashMap<[u8; 32], usize>,
     /// Metadata puts buffered until commit (dcrd `pendingKeys`).
-    pending_keys: std::collections::BTreeMap<Vec<u8>, Vec<u8>>,
+    pending_keys: std::collections::BTreeMap<LayerKey, Vec<u8>>,
     /// Metadata deletions buffered until commit (dcrd
     /// `pendingRemove`).
-    pending_removes: std::collections::BTreeSet<Vec<u8>>,
+    pending_removes: std::collections::BTreeSet<LayerKey>,
     /// The cache overlay as of transaction start (dcrd `dbCacheSnapshot`):
     /// an `Arc` clone of the layer stack.  `None`, read as an overlay
     /// holding no row, once closed, and from the point a commit lets it
@@ -467,12 +450,12 @@ impl Transaction {
     /// built it, and so is the value: both reach the pending set -- and
     /// from there the cache overlay -- without another copy.  A caller
     /// that holds a borrowed value copies it once, on the way in.
-    pub(crate) fn put_raw(&self, key: Vec<u8>, value: Vec<u8>) -> Result<(), Error> {
+    pub(crate) fn put_raw(&self, key: LayerKey, value: Vec<u8>) -> Result<(), Error> {
         let mut state = self.state.borrow_mut();
         if state.kv.is_none() || !self.writable {
             return Err(db_error(ErrorKind::TxNotWritable, "tx not writable"));
         }
-        if key.starts_with(BUCKET_INDEX_PREFIX) {
+        if key.as_bytes().starts_with(BUCKET_INDEX_PREFIX) {
             state.staged_bucket_index = true;
         }
         if may_hold(state.pending_removes.last(), &key) {
@@ -487,12 +470,12 @@ impl Transaction {
     }
 
     /// Stage a delete, taking the key owned as [`Self::put_raw`] does.
-    pub(crate) fn delete_raw(&self, key: Vec<u8>) -> Result<(), Error> {
+    pub(crate) fn delete_raw(&self, key: LayerKey) -> Result<(), Error> {
         let mut state = self.state.borrow_mut();
         if state.kv.is_none() || !self.writable {
             return Err(db_error(ErrorKind::TxNotWritable, "tx not writable"));
         }
-        if key.starts_with(BUCKET_INDEX_PREFIX) {
+        if key.as_bytes().starts_with(BUCKET_INDEX_PREFIX) {
             state.staged_bucket_index = true;
         }
         if may_hold(
@@ -530,7 +513,7 @@ impl Transaction {
             None if state.pending_removes.contains(key) => Some(None),
             None => None,
         };
-        state.pending_removes.insert(key.to_vec());
+        state.pending_removes.insert(LayerKey::concat(&[key]));
         Ok(prior)
     }
 
@@ -679,7 +662,7 @@ impl Transaction {
         while out.rows.len() < want {
             let store_key = store_head.as_ref().map(|(key, _)| key.value());
             let overlay_key = overlay.peek().map(|&(key, _)| key);
-            let pending_key = pending.peek().map(|&(key, _)| key.as_slice());
+            let pending_key = pending.peek().map(|&(key, _)| key.as_bytes());
             let Some(key) = [store_key, overlay_key, pending_key]
                 .into_iter()
                 .flatten()
@@ -709,8 +692,8 @@ impl Transaction {
             } else {
                 None
             };
-            while removed.next_if(|k| k.as_slice() < key.as_slice()).is_some() {}
-            let masked = removed.peek().is_some_and(|k| k.as_slice() == key);
+            while removed.next_if(|k| k.as_bytes() < key.as_slice()).is_some() {}
+            let masked = removed.peek().is_some_and(|k| k.as_bytes() == key);
 
             // Newest first: this transaction's puts, then its deletions,
             // then the overlay (a cached deletion included), then the
@@ -833,7 +816,7 @@ impl Transaction {
             .checked_add(1)
             .ok_or_else(|| db_error(ErrorKind::DriverSpecific, "bucket IDs exhausted"))?;
         let next_bytes = next.to_be_bytes();
-        self.put_raw(CUR_BUCKET_ID_KEY.to_vec(), next_bytes.to_vec())?;
+        self.put_raw(LayerKey::concat(&[CUR_BUCKET_ID_KEY]), next_bytes.to_vec())?;
         Ok(next_bytes)
     }
 
@@ -858,7 +841,7 @@ impl Transaction {
         if self.pending_block_index(hash, height).is_some() {
             return true;
         }
-        self.has_raw(&block_idx_key(hash, height))
+        self.has_raw(block_idx_key(hash, height).as_bytes())
     }
 
     /// Store the provided block (dcrd `StoreBlock`).  The block is
@@ -1045,12 +1028,13 @@ impl Transaction {
     }
 
     fn fetch_block_row(&self, hash: &Hash, height: u32) -> Result<Vec<u8>, Error> {
-        self.fetch_raw(&block_idx_key(hash, height)).ok_or_else(|| {
-            db_error(
-                ErrorKind::BlockNotFound,
-                format!("block {hash} does not exist"),
-            )
-        })
+        self.fetch_raw(block_idx_key(hash, height).as_bytes())
+            .ok_or_else(|| {
+                db_error(
+                    ErrorKind::BlockNotFound,
+                    format!("block {hash} does not exist"),
+                )
+            })
     }
 
     /// The position in the pending set of the block with the given hash
@@ -1307,7 +1291,7 @@ impl Transaction {
             std::ops::Bound::Included(&*prefix),
             std::ops::Bound::Unbounded,
         );
-        let under = |key: Option<&Vec<u8>>| key.is_some_and(|k| k.starts_with(&prefix));
+        let under = |key: Option<&LayerKey>| key.is_some_and(|k| k.as_bytes().starts_with(&prefix));
         let staged = under(
             state
                 .pending_keys
@@ -1587,7 +1571,9 @@ impl<'tx> Bucket<'tx> {
         if self.tx.check_closed().is_err() {
             return None;
         }
-        let child_id = self.tx.fetch_raw(&bucket_index_key(self.id, key))?;
+        let child_id = self
+            .tx
+            .fetch_raw(bucket_index_key(self.id, key).as_bytes())?;
         let id: [u8; 4] = child_id.as_slice().try_into().ok()?;
         Some(Bucket { tx: self.tx, id })
     }
@@ -1611,7 +1597,7 @@ impl<'tx> Bucket<'tx> {
 
         // Ensure the bucket does not already exist.
         let bidx_key = bucket_index_key(self.id, key);
-        if self.tx.has_raw(&bidx_key) {
+        if self.tx.has_raw(bidx_key.as_bytes()) {
             return Err(db_error(ErrorKind::BucketExists, "bucket already exists"));
         }
 
@@ -1660,7 +1646,7 @@ impl<'tx> Bucket<'tx> {
         }
 
         let bidx_key = bucket_index_key(self.id, key);
-        let child_id = self.tx.fetch_raw(&bidx_key).ok_or_else(|| {
+        let child_id = self.tx.fetch_raw(bidx_key.as_bytes()).ok_or_else(|| {
             db_error(
                 ErrorKind::BucketNotFound,
                 format!("bucket {:?} does not exist", String::from_utf8_lossy(key)),
@@ -1672,7 +1658,7 @@ impl<'tx> Bucket<'tx> {
         while let Some(child_id) = child_ids.pop() {
             // Delete all keys in the nested bucket.
             for raw_key in self.tx.scan_prefix_keys(&child_id) {
-                self.tx.delete_raw(raw_key)?;
+                self.tx.delete_raw(LayerKey::new(raw_key))?;
             }
 
             // Iterate through all nested buckets, pushing their IDs
@@ -1692,7 +1678,7 @@ impl<'tx> Bucket<'tx> {
                 .rows;
             for (raw_key, grandchild) in rows {
                 child_ids.push(grandchild);
-                self.tx.delete_raw(raw_key)?;
+                self.tx.delete_raw(LayerKey::new(raw_key))?;
             }
         }
 
@@ -1949,7 +1935,7 @@ impl<'tx> Bucket<'tx> {
         if self.tx.check_closed().is_err() || key.is_empty() {
             return None;
         }
-        self.tx.fetch_raw(&bucketized_key(self.id, key))
+        self.tx.fetch_raw(bucketized_key(self.id, key).as_bytes())
     }
 
     /// [`Self::get`], but a store read error is returned rather than
@@ -1967,7 +1953,8 @@ impl<'tx> Bucket<'tx> {
         if key.is_empty() {
             return Ok(None);
         }
-        self.tx.try_fetch_raw(&bucketized_key(self.id, key))
+        self.tx
+            .try_fetch_raw(bucketized_key(self.id, key).as_bytes())
     }
 
     /// Remove the specified key from the bucket; deleting a key that
@@ -2223,7 +2210,7 @@ impl Cursor<'_> {
         let seek_key = bucketized_key(self.bucket_id, seek);
         let idx = self
             .keys
-            .partition_point(|k| k.as_slice() < seek_key.as_slice());
+            .partition_point(|k| k.as_slice() < seek_key.as_bytes());
         if idx < self.keys.len() {
             self.pos = CursorPos::At(idx);
             if self.removed(idx) {
@@ -2310,6 +2297,7 @@ mod block_idx_key_tests {
         let hash = Hash(core::array::from_fn(|i| i as u8));
         for height in [0u32, 1, 255, 256, 0x0102_0304, u32::MAX] {
             let key = block_idx_key(&hash, height);
+            let key = key.as_bytes();
             assert_eq!(key.len(), 40);
             assert_eq!(key[..4], BLOCK_IDX_BUCKET_ID);
             assert_eq!(key[4..8], height.to_be_bytes());
@@ -2339,7 +2327,7 @@ mod block_idx_key_tests {
             (16_777_216, low),
         ];
         let mut by_key = pairs.clone();
-        by_key.sort_by_key(|(height, hash)| block_idx_key(hash, *height));
+        by_key.sort_by_key(|(height, hash)| block_idx_key(hash, *height).as_bytes().to_vec());
         pairs.sort();
         assert_eq!(by_key, pairs);
     }
@@ -2462,6 +2450,7 @@ mod put_owned_tests {
         // No pending value holds more than its bytes, whichever way it
         // came in.
         for (key, value) in &tx.state.borrow().pending_keys {
+            let key = key.as_bytes();
             assert_eq!(value.capacity(), value.len(), "key {key:02x?}");
         }
         let read = rows().iter().map(|(key, _)| bucket.get(key)).collect();
@@ -2584,18 +2573,22 @@ mod pending_guard_tests {
 
     use super::may_hold;
     use super::put_owned_tests::recording_db;
+    use crate::dbcache::LayerKey;
     use crate::{Database, Transaction};
 
     /// A set with no key holds nothing, and one whose greatest key
     /// sorts before the key asked about does not hold it.  Every other
     /// key may be held: the greatest key itself, a key below it, and a
     /// key that is a prefix of it.  The order is that of the bytes, not
-    /// of the lengths.
+    /// of the lengths, and not of where a key holds its bytes: a key too
+    /// long to be held in place is above or below one that is held so
+    /// as its bytes are.
     #[test]
     fn may_hold_is_false_only_above_the_last_key() {
-        let last = vec![0x05, 0x80, 0x01];
-        for key in [&[][..], &[0x00], &last] {
-            assert!(!may_hold(None, key), "no last key, key {key:02x?}");
+        let key_of = |bytes: &[u8]| LayerKey::concat(&[bytes]);
+        let last = key_of(&[0x05, 0x80, 0x01]);
+        for key in [&[][..], &[0x00], last.as_bytes()] {
+            assert!(!may_hold(None, &key_of(key)), "no last key, key {key:02x?}");
         }
         let cases: [(&[u8], bool, &str); 9] = [
             (&[0x05, 0x80, 0x02], false, "above the last key"),
@@ -2609,19 +2602,36 @@ mod pending_guard_tests {
             (&[], true, "the empty key"),
         ];
         for (key, want, what) in cases {
-            assert_eq!(may_hold(Some(&last), key), want, "{what}");
+            assert_eq!(may_hold(Some(&last), &key_of(key)), want, "{what}");
         }
         // The empty key is the least there is.
-        assert!(may_hold(Some(&Vec::new()), &[]));
-        assert!(!may_hold(Some(&Vec::new()), &[0x00]));
+        assert!(may_hold(Some(&key_of(&[])), &key_of(&[])));
+        assert!(!may_hold(Some(&key_of(&[])), &key_of(&[0x00])));
+        // A last key of fifty bytes, which is not held in place, and
+        // one of forty-six, which is.
+        let (long, short) = (key_of(&[0x05; 50]), key_of(&[0x05; 46]));
+        assert!(!long.lies_in_place() && short.lies_in_place());
+        assert!(may_hold(Some(&long), &short), "a prefix held in place");
+        assert!(may_hold(Some(&long), &long), "the last key, not in place");
+        assert!(
+            !may_hold(Some(&long), &key_of(&[0x06])),
+            "above it, in place"
+        );
+        assert!(!may_hold(Some(&short), &long), "the last key and more");
+        assert!(
+            may_hold(Some(&key_of(&[0x06])), &long),
+            "below one in place"
+        );
     }
 
     /// The raw keys the model test stages, in ascending order: keys of
     /// several lengths, some of them prefixes of others, so that the
     /// longer of two keys is the lesser in some pairs and the greater in
-    /// others.
+    /// others.  Four of them are alike in their first 45 bytes: one of
+    /// 46 bytes, which a pending set holds in place, that key with a
+    /// zero after it, and two more too long to be held so.
     fn model_keys() -> Vec<Vec<u8>> {
-        let keys: [&[u8]; 16] = [
+        let short: [&[u8]; 16] = [
             &[0xf5],
             &[0xf5, 0x00],
             &[0xf5, 0x00, 0x00],
@@ -2639,8 +2649,18 @@ mod pending_guard_tests {
             &[0xf6],
             &[0xf6, 0x00],
         ];
+        let mut keys: Vec<Vec<u8>> = short.iter().map(|key| key.to_vec()).collect();
+        let long = |tail: &[u8]| [&[0xf5][..], &[0x90; 44], tail].concat();
+        let long = [
+            long(&[1]),
+            long(&[1, 0]),
+            long(&[1, 1]),
+            long(&[2, 0, 0, 0]),
+        ];
+        assert_eq!(long.each_ref().map(Vec::len), [46, 47, 47, 49]);
+        keys.splice(10..10, long);
         assert!(keys.windows(2).all(|pair| pair[0] < pair[1]));
-        keys.iter().map(|key| key.to_vec()).collect()
+        keys
     }
 
     /// Random puts, deletes and reporting deletes of a few raw keys,
@@ -2661,7 +2681,7 @@ mod pending_guard_tests {
         let mut beneath: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
         db.update(|tx| {
             for key in keys.iter().step_by(3) {
-                tx.put_raw(key.clone(), b"beneath".to_vec())?;
+                tx.put_raw(key.clone().into(), b"beneath".to_vec())?;
                 beneath.insert(key.clone(), b"beneath".to_vec());
             }
             Ok(())
@@ -2685,11 +2705,11 @@ mod pending_guard_tests {
                     match rng.below(5) {
                         0 | 1 => {
                             let value = rng.bytes(6);
-                            tx.put_raw(key.clone(), value.clone()).expect("put");
+                            tx.put_raw(key.clone().into(), value.clone()).expect("put");
                             model.insert(key.clone(), Some(value));
                         }
                         2 | 3 => {
-                            tx.delete_raw(key.clone()).expect("delete");
+                            tx.delete_raw(key.clone().into()).expect("delete");
                             model.insert(key.clone(), None);
                         }
                         _ => {
@@ -2708,9 +2728,19 @@ mod pending_guard_tests {
                         .map(|(key, _)| key.clone())
                         .collect();
                     {
+                        // The sets as they are walked, against the
+                        // model's keys in the order of their bytes.
                         let state = tx.state.borrow();
-                        assert_eq!(state.pending_keys, puts, "{context}: puts");
-                        assert_eq!(state.pending_removes, deletes, "{context}: deletes");
+                        let staged = state.pending_keys.iter();
+                        let staged: Vec<_> =
+                            staged.map(|(key, value)| (key.as_bytes(), value)).collect();
+                        let want: Vec<_> =
+                            puts.iter().map(|(key, value)| (&key[..], value)).collect();
+                        assert_eq!(staged, want, "{context}: puts");
+                        let staged = state.pending_removes.iter();
+                        let staged: Vec<_> = staged.map(LayerKey::as_bytes).collect();
+                        let want: Vec<_> = deletes.iter().map(|key| &key[..]).collect();
+                        assert_eq!(staged, want, "{context}: deletes");
                     }
                     for key in &keys {
                         let want = match model.get(key) {
@@ -2921,7 +2951,7 @@ mod pending_guard_tests {
     fn stage_alternating(db: &Database, order: impl Iterator<Item = u16>) -> Transaction {
         let tx = db.begin(true).expect("begin");
         for i in order {
-            let key = [&[0xf5][..], &i.to_be_bytes()].concat();
+            let key = LayerKey::concat(&[&[0xf5], &i.to_be_bytes()]);
             if i % 2 == 0 {
                 tx.put_raw(key, vec![0x01]).expect("put");
             } else {
@@ -2947,7 +2977,7 @@ mod pending_guard_tests {
 
         let tx = stage_alternating(&db, 0..1000);
         assert_eq!(searches(&tx), 0, "ascending");
-        let greatest = [&[0xf5][..], &999u16.to_be_bytes()].concat();
+        let greatest = LayerKey::concat(&[&[0xf5], &999u16.to_be_bytes()]);
         tx.put_raw(greatest.clone(), vec![0x02]).expect("put");
         assert_eq!(searches(&tx), 1, "a put of the greatest key deleted");
         tx.delete_raw(greatest).expect("delete");
@@ -3200,7 +3230,8 @@ mod released_snapshot_tests {
         for key in [b"a", b"b", b"c"] {
             assert_eq!(bucket.get(key), None, "closed, key {key:?}");
             let raw = bucketized_key(bucket.id, key);
-            assert_eq!(reader.try_fetch_raw(&raw), Ok(None), "closed, key {key:?}");
+            let read = reader.try_fetch_raw(raw.as_bytes());
+            assert_eq!(read, Ok(None), "closed, key {key:?}");
         }
         let closed = bucket.for_each(|key, _| panic!("a closed walk yielded {key:?}"));
         assert_eq!(closed.expect_err("closed").kind, ErrorKind::TxClosed);
@@ -3252,5 +3283,432 @@ mod released_snapshot_tests {
         let reader = db.begin(false).expect("begin");
         let bucket = reader.metadata().bucket(b"rows").expect("bucket");
         assert_eq!(read(&bucket), through_the_overlay(), "after the rollback");
+    }
+}
+
+#[cfg(test)]
+mod in_place_key_tests {
+    //! A row's key is built once, where the row is staged, and is the
+    //! key the pending sets and the cache overlay hold ([`LayerKey`]):
+    //! its bytes are in the key itself up to 46 of them, the bucket id
+    //! included, and on the heap past that.  Rows on both sides of that
+    //! length are staged, read, walked and written as their bytes order.
+    //!
+    //! Two things are read here.  One is where a key's bytes lie once it
+    //! is built, staged or published, which does not show a buffer made
+    //! and dropped on the way.  The other is how many keys were built in
+    //! place and how many with a buffer ([`KEYS_BUILT`]), which shows a
+    //! buffer that went through a key and no other.
+
+    use dcroxide_chainhash::Hash;
+
+    use super::put_owned_tests::recording_db;
+    use super::{BUCKET_INDEX_PREFIX, block_idx_key, bucket_index_key, bucketized_key};
+    use crate::dbcache::{KEYS_BUILT, KeysBuilt, LayerKey};
+    use crate::{ErrorKind, Transaction};
+
+    /// The key each builder of a raw key returns is held in place up to
+    /// 46 bytes: a block's index row key, which has 40, a bucket's row
+    /// key for a key of up to 42, and a bucket's index key for a name of
+    /// up to 38.  One byte more and the key is on the heap.  Either way
+    /// its bytes are the parts in their order.
+    #[test]
+    fn a_key_built_for_a_lookup_is_held_in_place() {
+        let id = [0x00, 0x00, 0x00, 0x07];
+        assert!(block_idx_key(&Hash([0x9c; 32]), 7).lies_in_place());
+        let bytes: [u8; 64] = core::array::from_fn(|i| 0x60 ^ i as u8);
+        for len in 0..=bytes.len() {
+            let key = &bytes[..len];
+            let row = bucketized_key(id, key);
+            assert_eq!(row.as_bytes(), [&id[..], key].concat());
+            assert_eq!(row.lies_in_place(), len <= 42, "a key of {len} bytes");
+            let index = bucket_index_key(id, key);
+            assert_eq!(index.as_bytes(), [BUCKET_INDEX_PREFIX, &id, key].concat());
+            assert_eq!(index.lies_in_place(), len <= 38, "a name of {len} bytes");
+        }
+    }
+
+    /// The raw key of `key` in the bucket `rows`.
+    fn raw(tx: &Transaction, key: &[u8]) -> Vec<u8> {
+        let id = tx.metadata().bucket(b"rows").expect("bucket").raw_id();
+        [&id[..], key].concat()
+    }
+
+    /// A put, an owned put and a delete each leave their key in a
+    /// pending set held in place when the key, bucket id included, has
+    /// 46 bytes or fewer, and the commit leaves it so in the overlay's
+    /// layer.  A longer key is on the heap, and the layer's entry holds
+    /// the very buffer the pending set held, for a put and for a delete:
+    /// the commit moves each key into the layer and builds none.
+    #[test]
+    fn a_staged_key_reaches_the_overlay_without_being_rebuilt() {
+        let (_dir, db, _, _) = recording_db();
+        db.update(|tx| tx.metadata().create_bucket(b"rows").map(|_| ()))
+            .expect("bucket");
+
+        // Raw keys of 36, 37, 46, 60 and 61 bytes.
+        let (put, deleted, longest_in_place, long, long_deleted) =
+            ([0x11; 32], [0x22; 33], [0x33; 42], [0x44; 56], [0x55; 57]);
+        let tx = db.begin(true).expect("begin");
+        {
+            let bucket = tx.metadata().bucket(b"rows").expect("bucket");
+            bucket.put(&put, b"put").expect("put");
+            bucket.delete(&deleted).expect("delete");
+            bucket
+                .put_owned(&longest_in_place, b"owned".to_vec())
+                .expect("put");
+            bucket.put(&long, b"long").expect("put");
+            bucket.delete(&long_deleted).expect("delete");
+        }
+        let keys = [&put[..], &deleted, &longest_in_place, &long, &long_deleted];
+        let keys = keys.map(|key| raw(&tx, key));
+
+        // Where the bytes of each staged key lie: in the key, or at an
+        // address on the heap.
+        let on_the_heap: Vec<(Vec<u8>, usize)> = {
+            let state = tx.state.borrow();
+            let puts = state.pending_keys.keys();
+            let staged: Vec<&LayerKey> = puts.chain(&state.pending_removes).collect();
+            let lengths: Vec<usize> = staged.iter().map(|key| key.as_bytes().len()).collect();
+            assert_eq!(lengths, [36, 46, 60, 37, 61]);
+            for key in &staged {
+                let len = key.as_bytes().len();
+                assert_eq!(key.lies_in_place(), len <= 46, "staged, {len} bytes");
+            }
+            let long = staged.iter().filter(|key| !key.lies_in_place());
+            long.map(|key| (key.as_bytes().to_vec(), key.as_bytes().as_ptr().addr()))
+                .collect()
+        };
+        assert_eq!(on_the_heap.len(), 2);
+        tx.commit().expect("commit");
+
+        let layers = db
+            .inner
+            .cache
+            .lock()
+            .expect("cache")
+            .published_layers_for_test();
+        assert_eq!(layers.len(), 1);
+        let layer = layers[0].upgrade().expect("the published layer");
+        for key in &keys {
+            let (held, _) = layer.get_key_value(&key[..]).expect("the row's entry");
+            let len = key.len();
+            assert_eq!(held.as_bytes(), key, "in the layer, {len} bytes");
+            assert_eq!(held.lies_in_place(), len <= 46, "in the layer, {len} bytes");
+        }
+        for (key, staged_at) in &on_the_heap {
+            let (held, _) = layer.get_key_value(&key[..]).expect("the row's entry");
+            let len = key.len();
+            assert_eq!(held.as_bytes().as_ptr().addr(), *staged_at, "{len} bytes");
+        }
+    }
+
+    /// Staging a row whose key, bucket id included, has 46 bytes or
+    /// fewer builds one key, in place, and none with a buffer: by a put,
+    /// an owned put, a delete and a cursor's delete.  So does a lookup,
+    /// of a bucket's row by `get` and by `try_get` and of a block's
+    /// index row, whether or not it finds one.  The commit builds the
+    /// key of the write cursor's row and no other: every other key it
+    /// publishes is one the transaction staged.  A row whose key is
+    /// longer costs the one buffer its key keeps, staged or looked up.
+    ///
+    /// The count is kept where a key is built, so it shows that neither
+    /// a builder nor its caller reached a key by way of a buffer, and
+    /// not that nothing else allocates.
+    #[test]
+    fn a_row_staged_or_looked_up_builds_one_key_in_place_and_none_with_a_buffer() {
+        let (_dir, db, _, _) = recording_db();
+        db.update(|tx| tx.metadata().create_bucket(b"rows").map(|_| ()))
+            .expect("bucket");
+        let in_place = KeysBuilt {
+            in_place: 1,
+            with_a_buffer: 0,
+        };
+        let with_a_buffer = KeysBuilt {
+            in_place: 0,
+            with_a_buffer: 1,
+        };
+
+        let tx = db.begin(true).expect("begin");
+        {
+            let bucket = tx.metadata().bucket(b"rows").expect("bucket");
+            // Raw keys of 46 bytes, the longest held in place, and of 47.
+            let (put, owned, deleted, absent) = ([0x11; 42], [0x22; 42], [0x33; 42], [0x44; 42]);
+            let (reported, long) = (raw(&tx, &[0x55; 42]), [0x66; 43]);
+            let block = Hash([0x9c; 32]);
+            let calls: [(&str, KeysBuilt, &dyn Fn()); 13] = [
+                ("a put", in_place, &|| {
+                    bucket.put(&put, b"put").expect("put");
+                }),
+                ("an owned put", in_place, &|| {
+                    bucket.put_owned(&owned, b"owned".to_vec()).expect("put");
+                }),
+                ("a delete", in_place, &|| {
+                    bucket.delete(&deleted).expect("delete");
+                }),
+                ("a cursor's delete", in_place, &|| {
+                    assert_eq!(tx.delete_raw_reporting(&reported), Ok(None));
+                }),
+                ("a get of a row", in_place, &|| {
+                    assert_eq!(bucket.get(&put), Some(b"put".to_vec()));
+                }),
+                ("a get of no row", in_place, &|| {
+                    assert_eq!(bucket.get(&absent), None);
+                }),
+                ("a try_get of a row", in_place, &|| {
+                    assert_eq!(bucket.try_get(&owned), Ok(Some(b"owned".to_vec())));
+                }),
+                ("a try_get of a deleted row", in_place, &|| {
+                    assert_eq!(bucket.try_get(&deleted), Ok(None));
+                }),
+                ("a block looked for", in_place, &|| {
+                    assert_eq!(tx.has_block(&block, 7), Ok(false));
+                }),
+                ("a block's row read", in_place, &|| {
+                    let missing = tx.fetch_block_row(&block, 7).expect_err("no such block");
+                    assert_eq!(missing.kind, ErrorKind::BlockNotFound);
+                }),
+                ("a put of a long key", with_a_buffer, &|| {
+                    bucket.put(&long, b"long").expect("put");
+                }),
+                ("a get of a long key", with_a_buffer, &|| {
+                    assert_eq!(bucket.get(&long), Some(b"long".to_vec()));
+                }),
+                ("a delete of a long key", with_a_buffer, &|| {
+                    bucket.delete(&long).expect("delete");
+                }),
+            ];
+            for (what, want, call) in calls {
+                KEYS_BUILT.set(KeysBuilt::default());
+                call();
+                assert_eq!(KEYS_BUILT.get(), want, "{what}");
+            }
+        }
+        KEYS_BUILT.set(KeysBuilt::default());
+        tx.commit().expect("commit");
+        assert_eq!(KEYS_BUILT.get(), in_place, "the commit");
+    }
+
+    /// Deleting a bucket stages a delete of every row in it and in a
+    /// bucket nested in it, and of both buckets' index rows, on both
+    /// sides of the in-place limit: a key the scan handed over in a
+    /// buffer is held in place when it has 46 bytes or fewer, and is on
+    /// the heap when it has more.  The staged deletes are those keys and
+    /// no other, in the order of their bytes, and once they are
+    /// committed and flushed the store holds none of the rows.
+    #[test]
+    fn a_deleted_bucket_loses_its_rows_on_both_sides_of_the_in_place_limit() {
+        let (_dir, db, _, _) = recording_db();
+        // Keys of 41 to 60 bytes, 45 to 64 with a bucket's id, and a
+        // nested bucket whose name makes its index row's key 49 bytes.
+        let keys: [&[u8]; 4] = [&[0x11; 41], &[0x22; 42], &[0x33; 43], &[0x44; 60]];
+        let nested_name = [0x6e; 41];
+        let mut raw_keys: Vec<Vec<u8>> = Vec::new();
+        db.update(|tx| {
+            let meta = tx.metadata();
+            let rows = meta.create_bucket(b"rows")?;
+            let nested = rows.create_bucket(&nested_name)?;
+            for bucket in [&rows, &nested] {
+                for key in keys {
+                    bucket.put(key, b"row")?;
+                    raw_keys.push([&bucket.raw_id()[..], key].concat());
+                }
+            }
+            raw_keys.push([BUCKET_INDEX_PREFIX, &rows.raw_id(), &nested_name].concat());
+            raw_keys.push([BUCKET_INDEX_PREFIX, &meta.raw_id(), b"rows"].concat());
+            Ok(())
+        })
+        .expect("rows");
+        db.flush().expect("flush");
+        raw_keys.sort();
+        let lengths: Vec<usize> = raw_keys.iter().map(Vec::len).collect();
+        assert_eq!(lengths.iter().filter(|len| **len > 46).count(), 5);
+        assert_eq!(lengths.iter().filter(|len| **len <= 46).count(), 5);
+
+        let tx = db.begin(true).expect("begin");
+        for key in &raw_keys {
+            let row = tx.try_fetch_raw(key).expect("read");
+            assert!(row.is_some(), "before the delete, {key:02x?}");
+        }
+        tx.metadata().delete_bucket(b"rows").expect("delete");
+        {
+            let state = tx.state.borrow();
+            assert!(state.pending_keys.is_empty());
+            let staged = state.pending_removes.iter();
+            let staged: Vec<&[u8]> = staged.map(LayerKey::as_bytes).collect();
+            assert_eq!(staged, raw_keys);
+            for key in &state.pending_removes {
+                let len = key.as_bytes().len();
+                assert_eq!(key.lies_in_place(), len <= 46, "staged, {len} bytes");
+            }
+        }
+        tx.commit().expect("commit");
+        db.flush().expect("flush");
+        db.view(|tx| {
+            assert!(tx.metadata().bucket(b"rows").is_none());
+            for key in &raw_keys {
+                assert_eq!(tx.try_fetch_raw(key), Ok(None), "{key:02x?}");
+            }
+            Ok(())
+        })
+        .expect("view");
+    }
+
+    /// One row of the bucket `rows`: its key and what it holds, `None`
+    /// for a row that is deleted.
+    type Row = (Vec<u8>, Option<Vec<u8>>);
+
+    /// What a transaction reads of the bucket `rows`: each key of `rows`
+    /// through `get`, a walk by `for_each`, and the keys a cursor walks.
+    fn read(tx: &Transaction, rows: &[Row]) -> (Vec<Row>, Vec<Row>, Vec<Vec<u8>>) {
+        let bucket = tx.metadata().bucket(b"rows").expect("bucket");
+        let got = rows.iter().map(|(key, _)| (key.clone(), bucket.get(key)));
+        let mut walked = Vec::new();
+        bucket
+            .for_each(|key, value| {
+                walked.push((key.to_vec(), Some(value.to_vec())));
+                Ok(())
+            })
+            .expect("walk");
+        let mut cursor = bucket.cursor();
+        let mut keys = Vec::new();
+        let mut more = cursor.first();
+        while more {
+            keys.push(cursor.key().expect("a key"));
+            more = cursor.next();
+        }
+        (got.collect(), walked, keys)
+    }
+
+    /// Eight keys alike in their first 41 bytes, of 45 to 49 bytes with
+    /// the bucket id, so that four are held in place and four are not,
+    /// one of those four being the longest key held in place with a zero
+    /// after it.
+    ///
+    /// One transaction stages them out of order over rows the store
+    /// already holds for four of them: six puts, two of them of keys it
+    /// deleted first, and two deletes of keys it put first, a key held
+    /// in place and one on the heap each time.  What it leaves is the
+    /// last operation on each key in the order of the keys' bytes,
+    /// wherever a key holds them: in the two pending sets, which hold no
+    /// key in common, in what the transaction reads and walks before it
+    /// commits, in what a reader finds in the overlay after, in the
+    /// keys and values the flush hands the engine, deletions among
+    /// them, and in the store.
+    #[test]
+    fn rows_on_both_sides_of_the_in_place_limit_are_staged_read_walked_and_flushed_in_byte_order() {
+        let (_dir, db, written, _) = recording_db();
+        let key = |tail: &[u8]| [&[0x5a; 41][..], tail].concat();
+        let [a, g, b, c, d, e, h, f] = [
+            key(&[]),
+            key(&[6]),
+            key(&[7]),
+            key(&[7, 0]),
+            key(&[7, 1]),
+            key(&[7, 1, 9]),
+            key(&[7, 1, 9, 9]),
+            key(&[8]),
+        ];
+        db.update(|tx| {
+            let bucket = tx.metadata().create_bucket(b"rows")?;
+            for key in [&g, &d, &h, &f] {
+                bucket.put(key, b"beneath")?;
+            }
+            Ok(())
+        })
+        .expect("rows beneath");
+        db.flush().expect("flush");
+        written.lock().expect("write log").clear();
+
+        let steps: [(&Vec<u8>, Option<&[u8]>); 12] = [
+            (&e, Some(b"e")),
+            (&d, None),
+            (&g, Some(b"g")),
+            (&a, Some(b"a")),
+            (&f, None),
+            (&h, Some(b"h")),
+            (&c, Some(b"c")),
+            (&g, None),
+            (&f, Some(b"f")),
+            (&b, Some(b"b")),
+            (&h, None),
+            (&d, Some(b"d")),
+        ];
+        // Every key with what it is left holding, in the order of the
+        // keys' bytes, and the rows among them that are left.
+        let rows: Vec<Row> = [
+            (&a, Some(&b"a"[..])),
+            (&g, None),
+            (&b, Some(b"b")),
+            (&c, Some(b"c")),
+            (&d, Some(b"d")),
+            (&e, Some(b"e")),
+            (&h, None),
+            (&f, Some(b"f")),
+        ]
+        .map(|(key, value)| (key.clone(), value.map(<[u8]>::to_vec)))
+        .to_vec();
+        assert!(rows.windows(2).all(|pair| pair[0].0 < pair[1].0));
+        let live: Vec<Row> = rows.iter().filter(|row| row.1.is_some()).cloned().collect();
+        let live_keys: Vec<Vec<u8>> = live.iter().map(|(key, _)| key.clone()).collect();
+        let want = (rows.clone(), live, live_keys);
+
+        let tx = db.begin(true).expect("begin");
+        {
+            let bucket = tx.metadata().bucket(b"rows").expect("bucket");
+            for (key, value) in steps {
+                match value {
+                    Some(value) => bucket.put(key, value).expect("put"),
+                    None => bucket.delete(key).expect("delete"),
+                }
+            }
+        }
+        let raw_rows: Vec<Row> = rows
+            .iter()
+            .map(|(key, value)| (raw(&tx, key), value.clone()))
+            .collect();
+        {
+            // The pending sets: the puts and the deletes, each in the
+            // order of the keys' bytes, with three keys of the puts held
+            // in place and one of the deletes.
+            let state = tx.state.borrow();
+            let puts = state.pending_keys.iter();
+            let puts: Vec<Row> = puts
+                .map(|(key, value)| (key.as_bytes().to_vec(), Some(value.clone())))
+                .collect();
+            let deletes: Vec<Row> = state
+                .pending_removes
+                .iter()
+                .map(|key| (key.as_bytes().to_vec(), None))
+                .collect();
+            let staged = |put: bool| raw_rows.iter().filter(move |row| row.1.is_some() == put);
+            assert_eq!(puts, staged(true).cloned().collect::<Vec<_>>());
+            assert_eq!(deletes, staged(false).cloned().collect::<Vec<_>>());
+            let keys = state.pending_keys.keys().chain(&state.pending_removes);
+            let in_place: Vec<usize> = keys
+                .filter(|key| key.lies_in_place())
+                .map(|key| key.as_bytes().len())
+                .collect();
+            assert_eq!(in_place, [45, 46, 46, 46]);
+        }
+        assert_eq!(read(&tx, &rows), want, "before the commit");
+        tx.commit().expect("commit");
+
+        let read_back = |when: &str| {
+            db.view(|tx| {
+                assert_eq!(read(tx, &rows), want, "{when}");
+                Ok(())
+            })
+            .expect("view");
+        };
+        read_back("in the overlay");
+        db.flush().expect("flush");
+        // What the flush wrote under the bucket's id; the commit's
+        // write cursor row is in the log beside it.
+        let written = written.lock().expect("write log").clone();
+        let under_the_bucket = |row: &&Row| row.0.starts_with(&raw_rows[0].0[..4]);
+        let flushed: Vec<Row> = written.iter().filter(under_the_bucket).cloned().collect();
+        assert_eq!(flushed, raw_rows);
+        read_back("in the store");
     }
 }

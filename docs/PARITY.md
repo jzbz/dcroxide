@@ -1279,12 +1279,21 @@ against upstream and the port is faithful.
   before the fold. Each entry is counted at dcrd's treap node size:
   `nodeFieldsSize` (72) plus its key and value bytes, for tombstones as for
   live values. For a single layer that is exactly the figure dcrd's
-  `needsFlush` gates the 100 MiB ceiling on. The 72 is near this port's memory
-  without matching it: a `BTreeMap` overlay entry holds about 97 bytes beyond
-  its key and value, 74 before each key also held its first sixteen bytes
-  inline for the layer's searches (`LayerKey`, which compares those bytes as
-  two big-endian words and falls through to the whole key when they are equal,
-  an order identical to the bytes'). The counted figure stays dcrd's. Counting
+  `needsFlush` gates the 100 MiB ceiling on. The 72 is also the size of this
+  port's entry, without being its memory: on a 64-bit build an entry is a slot
+  of a `BTreeMap` layer, the 48 bytes of a `LayerKey` and the 24 of the handle
+  on its value, and a key of up to 46 bytes lies in the slot itself
+  (`a_key_is_48_bytes_and_a_layers_slot_72`,
+  `a_key_of_up_to_46_bytes_is_held_in_place`). Beyond its key and value such
+  an entry therefore holds 72 bytes less the key's length, and an entry whose
+  key is longer, and so on the heap, holds 72, before the slots a node holds
+  empty. `LayerKey` compares a key's first sixteen bytes as two big-endian
+  words and falls through to the whole key when they are equal, an order
+  identical to the bytes'. A transaction's pending sets are keyed by it as
+  well, so a row's key is built once, where the row is staged, and moves from
+  the pending set into the overlay
+  (`a_staged_key_reaches_the_overlay_without_being_rebuilt`). The counted
+  figure stays dcrd's. Counting
   a rewritten key once (as a single treap legitimately does) put the figure
   ~5× under the bytes actually held. Counting key and value bytes without the
   per-entry term put small-row overlays 2–4× under (an `existsaddridx` row was

@@ -32,8 +32,9 @@
 //! held a snapshot is stored once per layer it was written into, until
 //! a merge collapses the copies.  The size accounting counts those
 //! copies — see [`DbCache::total_size`] — so the size the flush gates on
-//! includes every copy, each at dcrd's node size, which is less than the
-//! memory an entry takes (see [`NODE_FIELDS_SIZE`]).
+//! includes every copy, each at dcrd's node size, which counts an entry's
+//! key and value and is not a measure of the memory the entry takes (see
+//! [`NODE_FIELDS_SIZE`]).
 //!
 //! Lookups walk the layers newest to oldest and stop at the first
 //! layer holding the key, whether it holds a value or a pending
@@ -69,9 +70,26 @@ pub(crate) const DEFAULT_FLUSH_SECS: u64 = 300;
 /// `None` for a pending deletion of a stored key.
 pub(crate) type CacheLayer = BTreeMap<LayerKey, Option<Vec<u8>>>;
 
-/// The key of an overlay entry: its bytes, with the first sixteen of
-/// them also held inline, where a search of the layer compares them
-/// without following the key's pointer.
+/// The longest key a [`LayerKey`] holds in place, in bytes.  A key that
+/// keeps its bytes on the heap takes 48 bytes on a 64-bit target: the
+/// two words of its first sixteen bytes, the three of its buffer and a
+/// tag.  A tag, a length and this many bytes held in place fill the
+/// same 48; one byte more would make every key 56, and every slot of a
+/// layer larger with it.  A UTXO row's key, the one a sync stages most,
+/// has 44 bytes at most: a bucket id, the two bytes `[3, 3]`, a hash, a
+/// byte of tree and up to five of output index.
+const INLINE_KEY_MAX: usize = 46;
+
+// A key held in place has its first sixteen bytes to read the words from
+// and keeps its length in a byte.
+const _: () = assert!(INLINE_KEY_MAX >= 16 && INLINE_KEY_MAX <= u8::MAX as usize);
+
+/// The key of a database row, in the pending sets of the transaction
+/// that stages it and in the overlay entry it becomes: its bytes, held
+/// in the key itself when there are no more than [`INLINE_KEY_MAX`] of
+/// them, and on the heap, with the first sixteen also beside the
+/// pointer, when there are more.  Either way a search compares the
+/// first sixteen bytes of two keys without following a pointer.
 ///
 /// A layer's searches run through the comparisons of [`KeyProbe`],
 /// which order keys exactly as their bytes order (`[u8]`'s `Ord`), so a
@@ -81,27 +99,115 @@ pub(crate) type CacheLayer = BTreeMap<LayerKey, Option<Vec<u8>>>;
 /// visited.  Overlay keys start with a four-byte bucket id, and a UTXO
 /// row's with the two bytes `[3, 3]` after it, so sixteen bytes still
 /// hold ten bytes of its hash: two keys a search compares go on to
-/// their heap bytes only when they share those eighty bits as well.
+/// the rest of their bytes only when they share those eighty bits as
+/// well.
 ///
-/// The words cost memory: an entry of a layer holds about 23 bytes more
-/// than with the bytes alone (see [`NODE_FIELDS_SIZE`]), which the size
-/// the flush gates on does not count, as dcrd's figure does not.
+/// A key held in place is built where its row is staged
+/// ([`LayerKey::concat`]) and moved from there into the transaction's
+/// pending set and on into the layer, so no allocation is made for it
+/// and none is freed when the layer is dropped.  With the bytes on the
+/// heap every staged row cost an allocation for its key, and a free
+/// when the layer that held it was dropped.
+///
+/// The key takes 48 bytes of a layer's slot whatever its length (see
+/// [`NODE_FIELDS_SIZE`]).  The size the flush gates on is taken from the
+/// key's length, as dcrd's is, and is the same whichever way the key
+/// holds its bytes.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct LayerKey(KeyProbe<'static>);
 
 impl LayerKey {
-    /// The key whose bytes are `bytes`.
+    /// The key whose bytes are `bytes`.  A key too long to hold in
+    /// place keeps the buffer as it is.
     pub(crate) fn new(bytes: Vec<u8>) -> LayerKey {
-        LayerKey(KeyProbe {
+        #[cfg(test)]
+        count_key_built(false);
+        match KeyRepr::in_place(&[&bytes]) {
+            Some(key) => LayerKey(KeyProbe(key)),
+            None => LayerKey::on_the_heap(bytes),
+        }
+    }
+
+    /// The key whose bytes are those of `parts`, one part after another,
+    /// built without a buffer for them when it is held in place.
+    #[inline]
+    pub(crate) fn concat(parts: &[&[u8]]) -> LayerKey {
+        let in_place = KeyRepr::in_place(parts);
+        #[cfg(test)]
+        count_key_built(in_place.is_some());
+        match in_place {
+            Some(key) => LayerKey(KeyProbe(key)),
+            None => LayerKey::on_the_heap(parts.concat()),
+        }
+    }
+
+    /// The key that keeps `bytes` on the heap.
+    fn on_the_heap(bytes: Vec<u8>) -> LayerKey {
+        LayerKey(KeyProbe(KeyRepr::Heap {
             head: head_words(&bytes),
-            bytes: std::borrow::Cow::Owned(bytes),
-        })
+            bytes,
+        }))
     }
 
     /// The key's bytes.
+    #[inline]
     pub(crate) fn as_bytes(&self) -> &[u8] {
-        &self.0.bytes
+        self.0.0.bytes()
     }
+
+    /// Whether the key's bytes lie inside the key itself, read from
+    /// where they are rather than from how the key says it holds them.
+    #[cfg(test)]
+    pub(crate) fn lies_in_place(&self) -> bool {
+        let key = std::ptr::from_ref(self).addr();
+        let bytes = self.as_bytes().as_ptr_range();
+        key <= bytes.start.addr() && bytes.end.addr() <= key.saturating_add(size_of::<LayerKey>())
+    }
+}
+
+impl From<Vec<u8>> for LayerKey {
+    fn from(bytes: Vec<u8>) -> LayerKey {
+        LayerKey::new(bytes)
+    }
+}
+
+/// How many keys a thread has built, each way a key is built
+/// ([`KEYS_BUILT`]).
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct KeysBuilt {
+    /// The keys [`LayerKey::concat`] built in place.
+    pub(crate) in_place: usize,
+    /// The keys built with a buffer: every one [`LayerKey::new`] was
+    /// handed, whether the key kept it or not, and every one
+    /// [`LayerKey::concat`] made for parts too long to hold in place.
+    pub(crate) with_a_buffer: usize,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The keys the calling thread has built, so a test can see that a
+    /// row staged or looked up builds one key, in place, and none with a
+    /// buffer.  It counts keys and not what the allocator is asked for:
+    /// a buffer made beside a key and never handed to one is not seen.
+    pub(crate) static KEYS_BUILT: std::cell::Cell<KeysBuilt> = const {
+        std::cell::Cell::new(KeysBuilt {
+            in_place: 0,
+            with_a_buffer: 0,
+        })
+    };
+}
+
+/// Count a key built in [`KEYS_BUILT`], in place or with a buffer.
+#[cfg(test)]
+fn count_key_built(in_place: bool) {
+    let mut built = KEYS_BUILT.get();
+    if in_place {
+        built.in_place = built.in_place.saturating_add(1);
+    } else {
+        built.with_a_buffer = built.with_a_buffer.saturating_add(1);
+    }
+    KEYS_BUILT.set(built);
 }
 
 impl<'a> std::borrow::Borrow<KeyProbe<'a>> for LayerKey {
@@ -110,9 +216,20 @@ impl<'a> std::borrow::Borrow<KeyProbe<'a>> for LayerKey {
     }
 }
 
+/// A set of keys is also searched by a key's bytes alone, which is sound
+/// because the keys order as their bytes do.  A transaction reads its
+/// pending sets this way: such a search compares whole byte strings,
+/// where one by a [`KeyProbe`] or by another key compares the words
+/// first.
+impl std::borrow::Borrow<[u8]> for LayerKey {
+    fn borrow(&self) -> &[u8] {
+        self.as_bytes()
+    }
+}
+
 /// A key as the searches of a layer compare it: the first sixteen bytes
 /// as two big-endian words, zero after the end of a shorter key, then
-/// the bytes.  A layer's [`LayerKey`]s own their bytes; a lookup borrows
+/// the bytes.  A layer's [`LayerKey`]s hold their bytes; a lookup borrows
 /// the caller's slice ([`KeyProbe::of`]), so it allocates nothing.
 ///
 /// The words decide every comparison they can, and they order keys as
@@ -121,26 +238,104 @@ impl<'a> std::borrow::Borrow<KeyProbe<'a>> for LayerKey {
 /// out, its zero is below the other's byte there, which is then not
 /// zero, and the shorter key is a prefix of the longer one.  Equal words
 /// fall through to the bytes.
+///
+/// Two keys are equal, and ordered, by their words and bytes alone,
+/// whichever way each holds them: a key held in place equals a probe
+/// borrowing the same bytes, and sorts among keys on the heap where its
+/// bytes put it.
 #[derive(Clone, Debug)]
-pub(crate) struct KeyProbe<'a> {
-    head: [u64; 2],
-    bytes: std::borrow::Cow<'a, [u8]>,
+pub(crate) struct KeyProbe<'a>(KeyRepr<'a>);
+
+/// How a key holds its bytes.  Nothing compares two of these but through
+/// [`KeyRepr::head`] and [`KeyRepr::bytes`]: an order or an equality of
+/// the variants themselves would set keys held one way apart from keys
+/// held another.
+#[derive(Clone, Debug)]
+enum KeyRepr<'a> {
+    /// The first `len` bytes of `bytes` are the key and the rest are
+    /// zero, so the first sixteen read as the words whatever `len` is.
+    Inline {
+        /// How many bytes the key has.
+        len: u8,
+        /// The key, then zeros.
+        bytes: [u8; INLINE_KEY_MAX],
+    },
+    /// A key longer than [`INLINE_KEY_MAX`] bytes, with its words.
+    Heap {
+        /// The words of `bytes`.
+        head: [u64; 2],
+        /// The key.
+        bytes: Vec<u8>,
+    },
+    /// The slice a lookup was handed, with its words.
+    Borrowed {
+        /// The words of `bytes`.
+        head: [u64; 2],
+        /// The key.
+        bytes: &'a [u8],
+    },
+}
+
+impl KeyRepr<'static> {
+    /// `parts`, one after another, as a key held in place, or `None`
+    /// when they come to more than [`INLINE_KEY_MAX`] bytes.
+    #[inline]
+    fn in_place(parts: &[&[u8]]) -> Option<KeyRepr<'static>> {
+        let mut bytes = [0u8; INLINE_KEY_MAX];
+        let mut len = 0usize;
+        for part in parts {
+            let end = len.checked_add(part.len())?;
+            bytes.get_mut(len..end)?.copy_from_slice(part);
+            len = end;
+        }
+        Some(KeyRepr::Inline {
+            len: u8::try_from(len).ok()?,
+            bytes,
+        })
+    }
+}
+
+impl KeyRepr<'_> {
+    /// The key's bytes.
+    #[inline]
+    fn bytes(&self) -> &[u8] {
+        match self {
+            KeyRepr::Inline { len, bytes } => bytes.get(..usize::from(*len)).unwrap_or(bytes),
+            KeyRepr::Heap { bytes, .. } => bytes,
+            KeyRepr::Borrowed { bytes, .. } => bytes,
+        }
+    }
+
+    /// The key's first sixteen bytes as two big-endian words, zero past
+    /// its end: [`head_words`] of [`Self::bytes`].
+    #[inline]
+    fn head(&self) -> [u64; 2] {
+        match self {
+            KeyRepr::Inline { bytes, .. } => {
+                let Some(first) = bytes.first_chunk::<16>() else {
+                    unreachable!("a key held in place has room for its words")
+                };
+                words(first)
+            }
+            KeyRepr::Heap { head, .. } | KeyRepr::Borrowed { head, .. } => *head,
+        }
+    }
 }
 
 impl<'a> KeyProbe<'a> {
     /// The probe for a lookup of `key`.
     pub(crate) fn of(key: &'a [u8]) -> KeyProbe<'a> {
-        KeyProbe {
+        KeyProbe(KeyRepr::Borrowed {
             head: head_words(key),
-            bytes: std::borrow::Cow::Borrowed(key),
-        }
+            bytes: key,
+        })
     }
 }
 
 impl PartialEq for KeyProbe<'_> {
     #[inline]
     fn eq(&self, other: &Self) -> bool {
-        self.head == other.head && *self.bytes == *other.bytes
+        self.0.head() == other.0.head() && *self.0.bytes() == *other.0.bytes()
     }
 }
 
@@ -156,9 +351,10 @@ impl PartialOrd for KeyProbe<'_> {
 impl Ord for KeyProbe<'_> {
     #[inline]
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.head
-            .cmp(&other.head)
-            .then_with(|| (*self.bytes).cmp(&*other.bytes))
+        self.0
+            .head()
+            .cmp(&other.0.head())
+            .then_with(|| (*self.0.bytes()).cmp(other.0.bytes()))
     }
 }
 
@@ -169,6 +365,12 @@ fn head_words(key: &[u8]) -> [u64; 2] {
     let mut head = [0u8; 16];
     let len = key.len().min(16);
     head[..len].copy_from_slice(&key[..len]);
+    words(&head)
+}
+
+/// Sixteen bytes as two big-endian words.
+#[inline]
+fn words(head: &[u8; 16]) -> [u64; 2] {
     let ([high, low], _) = head.as_chunks::<8>() else {
         unreachable!("sixteen bytes are two words")
     };
@@ -181,12 +383,14 @@ fn head_words(key: &[u8]) -> [u64; 2] {
 /// deletions alike: dcrd's `nodeSize` is this plus the key and value
 /// lengths, and `needsFlush` gates on the sum.
 ///
-/// dcrd sizes it from a treap node's fields, and it is near this port's
-/// own per-entry cost: 200,000 random-keyed `CacheLayer` entries hold
-/// about 97 bytes each beyond their keys and values (bytes requested
-/// from the allocator, before its own overhead), for live values and
-/// deletions alike; 74 before the keys held their first sixteen bytes
-/// inline ([`LayerKey`]).  Counting key and value bytes alone put the
+/// dcrd sizes it from a treap node's fields.  This port's entry is a
+/// slot of a [`CacheLayer`], 72 bytes as well on a 64-bit target: the
+/// 48 of a [`LayerKey`] and the 24 of the handle on its value, for live
+/// values and deletions alike.  A key of up to [`INLINE_KEY_MAX`] bytes
+/// lies in the slot, so beyond the entry's key and value the slot holds
+/// 72 bytes less the key's length; a longer key is on the heap, and the
+/// slot's 72 are all beyond it.  The slots a layer's nodes hold empty
+/// come on top of either.  Counting key and value bytes alone put the
 /// figure 2-4x under the memory held for the small rows that dominated
 /// this store then: before ADR-0011, an `existsaddridx` row went
 /// through the overlay as a 25-byte key and an empty value.
@@ -1077,10 +1281,14 @@ impl DbCache {
     /// the overlay change under one hold of the cache lock.  The map is
     /// copied first when a transaction still holds it, which leaves that
     /// transaction the bucket index it began with.
-    pub(crate) fn commit_pending(
+    ///
+    /// A key the transaction staged is the overlay's key already and
+    /// moves into the layer as it is; `K` is there for the tests, which
+    /// hold their keys as byte buffers.
+    pub(crate) fn commit_pending<K: Into<LayerKey>>(
         &mut self,
-        puts: BTreeMap<Vec<u8>, Vec<u8>>,
-        removes: impl Iterator<Item = Vec<u8>>,
+        puts: BTreeMap<K, Vec<u8>>,
+        removes: impl Iterator<Item = K>,
     ) {
         // Take the layer list out of the published snapshot when no
         // reader holds it; otherwise clone the (at most `MAX_LAYERS`)
@@ -1123,11 +1331,12 @@ impl DbCache {
         // `Put` onto an existing node does
         // (`database/internal/treap/immutable.go:164`).
         for key in removes {
-            if key.starts_with(BUCKET_INDEX_PREFIX) {
-                Arc::make_mut(&mut self.buckets).remove_row(&key);
+            let key: LayerKey = key.into();
+            if key.as_bytes().starts_with(BUCKET_INDEX_PREFIX) {
+                Arc::make_mut(&mut self.buckets).remove_row(key.as_bytes());
             }
-            let key_len = key.len();
-            match top.insert(LayerKey::new(key), None) {
+            let key_len = key.as_bytes().len();
+            match top.insert(key, None) {
                 // Replaced an entry in the mutable layer: the key stays,
                 // any value it held is freed.
                 Some(displaced) => {
@@ -1143,12 +1352,13 @@ impl DbCache {
             }
         }
         for (key, value) in puts {
-            if key.starts_with(BUCKET_INDEX_PREFIX) {
-                Arc::make_mut(&mut self.buckets).put_row(&key, &value);
+            let key: LayerKey = key.into();
+            if key.as_bytes().starts_with(BUCKET_INDEX_PREFIX) {
+                Arc::make_mut(&mut self.buckets).put_row(key.as_bytes(), &value);
             }
-            let key_len = key.len();
+            let key_len = key.as_bytes().len();
             let added = value.len() as u64;
-            match top.insert(LayerKey::new(key), Some(value)) {
+            match top.insert(key, Some(value)) {
                 Some(displaced) => {
                     self.total_size = self
                         .total_size
@@ -2277,6 +2487,22 @@ mod tests {
         // as moving a node between dcrd's two treaps does.
         cache.commit_pending(BTreeMap::new(), std::iter::once(utxo_key));
         assert_eq!(cache.total_size, 110 + 110);
+        assert_eq!(cache.total_size, retained_bytes(&cache));
+
+        // A key too long to be held in place is counted by its length
+        // as the shorter ones are, 50 bytes here, and not by the 48 a
+        // key takes of its slot: 132 with a ten-byte value, and 122 for
+        // its deletion as a fresh entry.
+        let long_key = vec![9u8; 50];
+        let mut cache = DbCache::new();
+        let mut puts = BTreeMap::new();
+        puts.insert(long_key.clone(), vec![1u8; 10]);
+        cache.commit_pending(puts, std::iter::empty());
+        assert_eq!(cache.total_size, 132);
+        assert_eq!(cache.total_size, retained_bytes(&cache));
+        let mut cache = DbCache::new();
+        cache.commit_pending(BTreeMap::new(), std::iter::once(long_key));
+        assert_eq!(cache.total_size, 122);
         assert_eq!(cache.total_size, retained_bytes(&cache));
     }
 
@@ -4028,11 +4254,32 @@ mod layer_key_tests {
 
     use super::{CacheLayer, CacheSnapshot, KeyProbe, LayerKey};
 
-    /// Keys that meet the edges of the inline words: empty and short keys,
+    /// On a 64-bit target a key is 48 bytes, whichever way it holds its
+    /// bytes, and a layer's slot, a key and the handle on a value, which
+    /// a node keeps in two arrays, is 72.  The figures in the comments on
+    /// [`super::INLINE_KEY_MAX`] and [`super::NODE_FIELDS_SIZE`] are
+    /// these.  A key that kept its words beside bytes held in place, or
+    /// one more field, would be 56 or more and grow every node of every
+    /// layer with it.  The layout is the compiler's to choose, so the
+    /// figures are those of the toolchain the workspace pins and are to
+    /// be read again when it moves.
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn a_key_is_48_bytes_and_a_layers_slot_72() {
+        assert_eq!(size_of::<LayerKey>(), 48);
+        assert_eq!(align_of::<LayerKey>(), 8);
+        assert_eq!(size_of::<LayerKey>() + size_of::<Option<Vec<u8>>>(), 72);
+    }
+
+    /// Keys that meet the edges of the words: empty and short keys,
     /// keys that are prefixes of others, zero bytes where a shorter key's
     /// words are padded with zeros, keys that differ only past the
     /// sixteenth byte, and keys shaped as the overlay's rows are, a bucket
-    /// id then a UTXO row's `[3, 3]` and a hash.
+    /// id then a UTXO row's `[3, 3]` and a hash.  And keys that meet the
+    /// edge of what a key holds in place: of 46 bytes and fewer, which
+    /// are, of 47 and more, which are not, a key of 46 with a zero after
+    /// it, which is where the bytes held in place are padded, and two
+    /// long keys alike in every byte a key could hold in place.
     fn edge_keys() -> Vec<Vec<u8>> {
         let mut keys: Vec<Vec<u8>> = vec![
             vec![],
@@ -4047,7 +4294,7 @@ mod layer_key_tests {
             b"abc".to_vec(),
         ];
         let sixteen: Vec<u8> = (1..=16).collect();
-        for len in [7usize, 8, 9, 15, 16, 17, 24, 40] {
+        for len in [7usize, 8, 9, 15, 16, 17, 24, 40, 45, 46, 47, 48, 64] {
             let mut key: Vec<u8> = (1..=len as u8).collect();
             keys.push(key.clone());
             // The same with its last byte one higher, and with a zero
@@ -4064,8 +4311,13 @@ mod layer_key_tests {
             key.extend_from_slice(tail);
             keys.push(key);
         }
+        for last in [1u8, 2] {
+            let mut key = vec![0x5a; 60];
+            key[59] = last;
+            keys.push(key);
+        }
         // Rows sharing the bucket id and `[3, 3]`, hashes alike in their
-        // first ten bytes and apart only past the inline words.
+        // first ten bytes and apart only past the words.
         let mut seed = 0x2545_f491_4f6c_dd1du64;
         let mut next = move || {
             seed ^= seed << 13;
@@ -4089,13 +4341,19 @@ mod layer_key_tests {
 
     /// A layer key and a probe order and compare as their bytes do, in
     /// every pair of the edge keys and either way round, an owned key
-    /// against a borrowing probe included: a layer's order, and so the
-    /// order every walk of the overlay and every flush writes in, is the
-    /// order of the bytes.
+    /// against a borrowing probe included, and a key held in place
+    /// against one that is not: a layer's order, and so the order every
+    /// walk of the overlay and every flush writes in, is the order of
+    /// the bytes.  So is the order of a transaction's pending sets, which
+    /// are searched by a key's bytes as well: what a key lends such a
+    /// search is its bytes and nothing after them.
     #[test]
     fn layer_keys_order_as_their_bytes_do() {
         let keys = edge_keys();
         assert!(keys.len() >= 64, "{} keys", keys.len());
+        let held = |key: &&Vec<u8>| LayerKey::new((*key).clone()).lies_in_place();
+        let in_place = keys.iter().filter(held).count();
+        assert!(in_place >= 60 && keys.len() - in_place >= 10, "{in_place}");
         for a in &keys {
             for b in &keys {
                 let want = a.cmp(b);
@@ -4108,15 +4366,53 @@ mod layer_key_tests {
                 assert_eq!(borrowed.cmp(&probe_b), want, "{a:02x?} against {b:02x?}");
                 assert_eq!(*borrowed == probe_b, a == b, "{a:02x?} against {b:02x?}");
             }
-            assert_eq!(LayerKey::new(a.clone()).as_bytes(), a.as_slice());
+            let owned = LayerKey::new(a.clone());
+            assert_eq!(owned.as_bytes(), a.as_slice());
+            let lent: &[u8] = std::borrow::Borrow::borrow(&owned);
+            assert_eq!(lent, a.as_slice());
+        }
+    }
+
+    /// A key of up to 46 bytes holds them in itself and a longer one
+    /// does not, however the key is built: from a buffer, from one
+    /// part, or from two, the first of four bytes as a bucket id is.
+    /// Either way its bytes are the buffer's, or the parts' in their
+    /// order.  Where the bytes lie is read from their address, which is
+    /// inside the key or is not.  A key built from a buffer too long to
+    /// hold in place keeps that buffer, and a copy of a key holds its
+    /// bytes the way the key does.
+    #[test]
+    fn a_key_of_up_to_46_bytes_is_held_in_place() {
+        assert_eq!(super::INLINE_KEY_MAX, 46);
+        for len in 0..=64usize {
+            let bytes: Vec<u8> = (0..len).map(|i| 0xa0 ^ i as u8).collect();
+            let (id, rest) = bytes.split_at(len.min(4));
+            let buffer = bytes.clone();
+            let allocation = buffer.as_ptr();
+            let from_buffer = LayerKey::new(buffer);
+            let keys = [
+                ("a copy of a key", from_buffer.clone()),
+                ("a buffer", from_buffer),
+                ("one part", LayerKey::concat(&[&bytes])),
+                ("two parts", LayerKey::concat(&[id, rest])),
+            ];
+            for (built, key) in &keys {
+                assert_eq!(key.as_bytes(), bytes, "{len} bytes from {built}");
+                assert_eq!(key.lies_in_place(), len <= 46, "{len} bytes from {built}");
+            }
+            if len > 46 {
+                assert_eq!(keys[1].1.as_bytes().as_ptr(), allocation, "{len} bytes");
+            }
         }
     }
 
     /// Lookups and walks of a layer agree with a map of byte keys: every
     /// key the layer holds is found with its entry, a key it does not
-    /// hold is not, whatever its inline words share with one it holds,
+    /// hold is not, whatever its words share with one it holds,
     /// and a walk from any key, held or not, a prefix of held keys or
-    /// past all of them, yields the same entries in the same order.
+    /// past all of them, yields the same entries in the same order.  The
+    /// same holds of a lookup and of a walk by a key's bytes alone, with
+    /// no words to compare first.
     #[test]
     fn a_layer_looks_up_and_walks_as_a_map_of_byte_keys() {
         let keys = edge_keys();
@@ -4132,8 +4428,16 @@ mod layer_key_tests {
         let snapshot = CacheSnapshot {
             layers: vec![Arc::new(layer)],
         };
+        let layer = &snapshot.layers[0];
         for key in &keys {
             assert_eq!(snapshot.get(key), want.get(key), "lookup of {key:02x?}");
+            // By the key's bytes alone, as a transaction searches its
+            // pending sets.
+            assert_eq!(
+                layer.get(&key[..]),
+                want.get(key),
+                "{key:02x?} by its bytes"
+            );
         }
         let mut starts = keys.clone();
         starts.extend(
@@ -4155,6 +4459,14 @@ mod layer_key_tests {
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect();
             assert_eq!(walked, expected, "a walk from {from:02x?}");
+            let by_bytes: Vec<(Vec<u8>, Option<Vec<u8>>)> = layer
+                .range::<[u8], _>((
+                    std::ops::Bound::Included(&from[..]),
+                    std::ops::Bound::Unbounded,
+                ))
+                .map(|(k, v)| (k.as_bytes().to_vec(), v.clone()))
+                .collect();
+            assert_eq!(by_bytes, expected, "a walk by bytes from {from:02x?}");
             assert_eq!(
                 snapshot.holds_prefix(from),
                 want.keys().any(|k| k.starts_with(from)),
