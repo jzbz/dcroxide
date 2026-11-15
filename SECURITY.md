@@ -385,6 +385,10 @@ evaluating this code.
   ECDSA and Ed25519 signing (ML-DSA is not timed), key exchange, record
   protection (sealing, a bad tag's refusal and AES-GCM's keying) and HMAC
   keying, which a pass does not prove constant-time (ADR-0015's addenda).
+  On x86_64, P-256 signing by the nonce passes as a known report while its
+  failing classes are at most 40 ns an operation quicker than the random
+  class, the pattern measured on one processor (ADR-0015's note of
+  2026-11-15).
   Stateless parsers still unfuzzed: the config-file and command-line
   parser, which takes the operator's input rather than a peer's, GCS
   filter decoding, and the ticket, index and address-manager stores.

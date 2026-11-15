@@ -722,6 +722,40 @@ those runs.
   leak of fewer than about 3 to 5 cycles on a secret-dependent path would:
   the target passes, and its row in the job's summary is marked as
   reported under the floor.
+  *(2026-11-15: P-256 signing by the nonce failed a 10 s push run and the
+  60 s nightly run of 2026-11-15 on the x86_64 leg, both at `8053abe` and
+  both on AMD EPYC 7763 runners: the classes 1, 2, 0xff and 2^64 - 1 were
+  14 to 18 ns an operation quicker than the random class, |t| up to 27 at
+  60 s, and in both runs every class's difference followed one line, about
+  0.27 ns quicker for each addition of the identity to the identity in the
+  basepoint walk, about one cycle each, against about 78.5 µs a signature.
+  The public-key target, which takes the same scalars through the same
+  `mul_by_generator`, showed no such line in the same runs, and neither
+  did other processors, while the earlier builds that ran on a 7763 showed
+  at most a sixth of it; a 300 s dispatch of `8053abe` the same day showed
+  it again on a 7763, 17.7 ns at |t| 68, while the x86_64-soft build of
+  the same commit, with the same P-256 code and stack layout but its code
+  placed differently, passed on 7763 runners twice, so the effect follows
+  where the build places the code rather than the host. No branch or
+  memory address in the timed code follows the nonce's value, in the
+  source or in a near-identical local build. Decided 2026-11-15: built for
+  x86_64, and so on both legs there, a failure of that target in which
+  every failing comparison has the fixed class quicker than the random
+  class by 40 ns an operation or less is a known report, which passes and
+  which its row and its classes' lines name; a class slower than the
+  random class, a difference beyond 40 ns, any other target and any other
+  architecture fail as before. The bound is more than twice the largest
+  difference measured, 17.8 ns, while a secret-dependent path in the walk,
+  such as a skipped addition, would change those classes' time by many
+  complete additions of hundreds of cycles each; what the bound gives up
+  is a quicker path of under 40 ns a signature in this target on x86_64, a
+  cycle or so for each window of the walk. The risk left to signing keys
+  is judged under one in a hundred: the effect needs an accumulator still
+  at the identity, so it touches only nonces whose leading radix-16 digits
+  are zero, about 0.4 ns for eight leading zero bits against a spread near
+  100 ns a signature, and the hedged RFC 6979 nonces never repeat, so no
+  one nonce can be averaged over. The thresholds, the floor, the budgets,
+  the classes and what is timed are unchanged.)*
 - **The targets,** 27 `#[ignore]` tests. ECDSA signing on P-256, P-384
   and P-521, by the key, with the message and the hedge fixed so that RFC
   6979's nonce follows the key, and by the nonce, with the key fixed,

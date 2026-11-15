@@ -199,7 +199,12 @@ jobs:
       # gives it. A target fails when a fixed class's |t| is above 10 and
       # its mean time differs from the random class's by 1 ns an operation
       # or more (the floor), or on too few samples to compare; the positive
-      # control fails unless its leak fails by the same rule. Every target
+      # control fails unless its leak fails by the same rule. On both
+      # x86_64 legs, and only there, one failure can be a known report,
+      # which passes: P-256 signing by the nonce with every failing
+      # comparison quicker than the random class by 40 ns an operation or
+      # less, the pattern measured on AMD EPYC 7763 runners (ct_check's
+      # module doc). Every target
       # runs after one fails. Each prints its row and, when it passes,
       # each class's result below it, the lines a failure's message gives.
       # Those lines end with the target's trace, which a failure's message
@@ -250,7 +255,8 @@ jobs:
       # side, the samples counted, the operations in each sample, and the
       # verdict: "reported" for |t| above 4.5,
       # "reported (under the 1 ns floor)" for |t| above 10 on a smaller
-      # difference, and "control found" for the positive control's. The
+      # difference, "known report (quicker by 40 ns or less)" for the known
+      # report above, and "control found" for the positive control's. The
       # row is taken from wherever it falls on its line, which the test
       # runner's own output may have begun. The heading names the leg, the
       # budget and, when a dispatch picked one, the target. The step runs
