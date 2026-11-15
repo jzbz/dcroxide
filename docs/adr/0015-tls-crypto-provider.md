@@ -142,7 +142,7 @@ server makes in the reference Go, 1.26.2 (ADR-0001's addendum of
   (`crypto/tls/defaults.go:30-33`), in TLS 1.3 only (`common.go:158-165`),
   and which dcrd at the parity pin `3360ae4d` leaves on
   (`rpctls.rs:17-25`). The node offers none of the three today
-  (`docs/PARITY.md:3173-3208`).
+  (`docs/PARITY.md:3182-3217`).
 - **(d) Server keys:** P-256, the default, and P-521 under `--tlscurve`;
   P-384 and Ed25519, which `gencerts` writes
   (`crates/dcroxide-certgen/src/gentool.rs:12-15`); and RSA, when an
@@ -154,7 +154,7 @@ server makes in the reference Go, 1.26.2 (ADR-0001's addendum of
   verifies more, among it P-521 keys, ECDSA with SHA-512, and RSA keys of
   1024 to 2040 bits (2047 as first written: ring's least is 256 whole
   bytes, `ring-0.17.14/src/rsa/public_modulus.rs:63-68`) and over 8192
-  (`PARITY.md:2943-2959`).
+  (`PARITY.md:2952-2968`).
 - **(f) RSA verification is mandatory.** The seeders' chains are checked
   with the same algorithms (use 3 above). The research found the
   certificates of `mainnet-seed-1.decred.org` and
@@ -208,7 +208,7 @@ client (`go_build_chains`, `rpcrun.rs:3561`). The replay checks each
 candidate's signature with `sig_algs`, ring's verification algorithms
 (`:3270-3282`, `:3519-3522`, `:4035-4037`, at `8e6ea23`), and takes a
 candidate whose signature Go verifies and ring cannot for a failed
-check. PARITY.md lists those cases one by one (`PARITY.md:2943-2959`),
+check. PARITY.md lists those cases one by one (`PARITY.md:2952-2968`),
 so the list follows the provider's verification set.
 
 ## Decision
@@ -281,7 +281,7 @@ hybrid shares and secrets are laid out as Go lays them out.
 The provider verifies Go's set: P-521 keys, ECDSA with SHA-512, and RSA
 keys from 1,024 bits, beyond ring's set in (e). That closes the
 client-certificate refusals PARITY.md records for those cases
-(`PARITY.md:3132-3143`): a P-521 client key; a chain whose issuer signs
+(`PARITY.md:3141-3152`): a P-521 client key; a chain whose issuer signs
 with ecdsa-with-SHA512, a P-256 client certificate under a P-521 CA among
 them; and an RSA client key below 2041 bits (2048 as first written; see
 (e)). Where the three cases leave a bound open, the largest RSA key for
@@ -368,10 +368,10 @@ and ends the reliance on ureq's unstable provider API.
 ### Known limits
 
 - **Go's four TLS 1.2 CBC suites stay a recorded gap**
-  (`PARITY.md:3210-3216`). rustls's TLS 1.2 key block has no place for a
+  (`PARITY.md:3219-3225`). rustls's TLS 1.2 key block has no place for a
   MAC key (`rustls-0.23.46/src/crypto/cipher.rs:110-134`), so no provider
   under rustls can offer them. Every client the Decred tools ship offers
-  an AES-GCM suite (`PARITY.md:3215-3216`).
+  an AES-GCM suite (`PARITY.md:3224-3225`).
 - **rustls 0.24 is unreleased.** The provider is written against 0.23,
   the line the node is on (0.23.46, `Cargo.lock:1594-1595`), and is ported
   to 0.24 when that is stable. The research read 0.24.0-dev.2 as
@@ -385,7 +385,7 @@ and ends the reliance on ureq's unstable provider API.
 ### Not decided here
 
 - The seeder clients' trust in the compiled-in `webpki-roots` alone,
-  where dcrd's client uses the platform's store (`PARITY.md:3218`), is a
+  where dcrd's client uses the platform's store (`PARITY.md:3227`), is a
   decision of its own.
 - Which source the provider's random numbers come from, where ring draws
   its own today.
@@ -403,7 +403,7 @@ and ends the reliance on ureq's unstable provider API.
   with the reference Go.
 - **Hybrids for Go clients.** Once T3 lands, a Go client such as dcrctl
   or dcrwallet negotiates a hybrid with the port as with dcrd. The
-  entries for the classical key exchange close (`PARITY.md:3173-3208`,
+  entries for the classical key exchange close (`PARITY.md:3182-3217`,
   `SECURITY.md:157-179`), and with them the exposure they describe: RPC
   sessions recorded on a non-local `--rpclisten` open to later
   decryption.
@@ -412,7 +412,7 @@ and ends the reliance on ureq's unstable provider API.
   the whole pool take the provider's algorithms, and the comments that
   name ring (`:3270-3282`, `:3519-3522`, at `8e6ea23`) change with them.
   T4's wider set then changes which cases PARITY.md lists as ones Go
-  verifies and the port cannot (`PARITY.md:2943-2959`): P-521 keys, ECDSA
+  verifies and the port cannot (`PARITY.md:2952-2968`): P-521 keys, ECDSA
   with SHA-512 and RSA keys of 1024 to 2040 bits (2047 as first written;
   see (e)) leave that list, and what stays is outside the three named
   cases or outside the provider, such as a signature BIT STRING with

@@ -410,19 +410,35 @@ transaction that freed them and releases keys strictly below `free_until`,
 which is `oldest_live_read.next()` when a read transaction is live and the
 committing transaction's own id otherwise (`transactions.rs:1936-1940`,
 `2129-2160`, `2200-2262`). The only steady-state writer to the metadata
-store is `DbCache::run_flush`. It is reached from `Transaction::commit_internal`
-(`transaction.rs:1372`), where the committing transaction's read snapshot
-sits at the last committed id `R` and the flush's own write lands at `R+1`.
-`free_until` is therefore `R+1` whether or not that reader exists: the
-transaction that triggers its own flush pins nothing.
+store is the flush `flush_locked` runs, which writes its rows with
+`DbCache::fill` and makes redb's commit with `DbCache::commit`
+(`write_and_commit`, `lib.rs:1669-1687`); `DbCache::run_flush`, which runs
+the same steps in one call, is now called only by tests
+(`dbcache.rs:1500-1507`). It is reached from `Transaction::commit_internal`
+(`transaction.rs:1372`). Made on the committing thread, as every commit is
+with `DCROXIDE_DB_SYNC_COMMIT` set, it has that transaction's read snapshot
+at the last committed id `R` open beside it, and its own write lands at
+`R+1`. Without that variable the daemon hands the commit to the store's
+commit thread, where it can land after the committing transaction has
+ended; it then holds a read snapshot of its own, taken before its rows are
+written and so also at `R` (`lib.rs:1621-1630`, `Options::commit_snapshot`).
+`free_until` is therefore `R+1` whether or not the committing transaction is
+still open: the transaction that triggers its own flush pins nothing, unless
+it began while the flush before it was in flight and outlives this commit,
+when its older snapshot holds back that flush's freed pages.
 
 The second path is closed by locking rather than arithmetic.
 `Database::begin` takes the cache mutex and holds it across `begin_read()`
 (`lib.rs:3269-3297`, in `begin_seed`). It no longer holds it across the flush:
-since `d5aa17f` (2026-08-16) `flush_locked` takes the cache lock only to
-`begin_flush` and `finish_flush`, releasing it across `DbCache::run_flush` and
-redb's commit (`lib.rs:400-421`), so a *new* reader can now come into existence
-while a flush is running. The in-flight layers stay published for the duration
+since `d5aa17f` (2026-08-16) `flush_locked` releases the cache lock across the
+writing of the rows and redb's commit, on its own thread or the commit
+thread (`lib.rs:1639-1661`), and takes it only to decide whether to flush,
+to capture with `begin_flush` and, for an observed flush, to read the
+overlay's size (`:1480-1485`, `:1500-1515`, `:1613-1618`); the retirement
+takes it again, through `DbCache::retire` in `finish`, on whichever thread
+made the commit (`:2220-2224`), and `finish_flush` is now a copy of that
+rule for tests. So a *new* reader can now come into existence while a flush
+is running. The in-flight layers stay published for the duration
 instead, which preserves what a reader sees but not this argument.
 
 What remains is a read-only ffldb transaction opened on another thread

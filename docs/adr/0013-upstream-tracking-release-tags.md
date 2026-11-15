@@ -51,7 +51,7 @@ or matched a second dcrd in the same role
 PARITY.md keep master's behaviour where 2.1.7 differs: `addnode` and
 `node`, protocol version 12 against 11 and `debuglevel`'s subsystems in
 one, and the retry backoff for an unreachable `--connect` peer in the
-other (`docs/PARITY.md:2414-2469`).
+other (`docs/PARITY.md:2423-2478`).
 
 **How dcrd releases**, read from its repository as fetched on 2026-10-25:
 
@@ -301,8 +301,9 @@ not PARITY.md's range sections, which record what the port claims.
   or skipped; whether a scheduled CI job runs `tools/pinbump` against
   dcrd's newest tag and master (CI already clones dcrd for the interop
   job, `.github/workflows/ci.yml:278`, and its scheduled jobs are the
-  nightly fuzz and the nightly signature soak, `:7-10`, `:679-682`,
-  `:853-855`); and the harness and build-metadata choices above.
+  nightly fuzz, the nightly signature soak and the nightly RPC key sweep,
+  `:7-10`, `:679-682`, `:853-855`, `:826-829`); and the harness and
+  build-metadata choices above.
 
 ## Alternatives
 
