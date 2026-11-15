@@ -411,7 +411,7 @@ which is `oldest_live_read.next()` when a read transaction is live and the
 committing transaction's own id otherwise (`transactions.rs:1936-1940`,
 `2129-2160`, `2200-2262`). The only steady-state writer to the metadata
 store is `DbCache::run_flush`. It is reached from `Transaction::commit_internal`
-(`transaction.rs:1296`), where the committing transaction's read snapshot
+(`transaction.rs:1372`), where the committing transaction's read snapshot
 sits at the last committed id `R` and the flush's own write lands at `R+1`.
 `free_until` is therefore `R+1` whether or not that reader exists: the
 transaction that triggers its own flush pins nothing.
