@@ -235,23 +235,37 @@ fn reference(
 
 /// [`TlsOracle::assert_refused`] for a refusal the node makes of Go's end,
 /// which Go may see as a reset in place of the node's alert.  The node
-/// closes a failed connection at once, as Go's own server does, and when
-/// Go's bytes are still unread there, its system sends a reset; a system
-/// that throws away what it has received when a reset arrives, as Go's
-/// `net/http` says of BSD systems and suspects of Windows
+/// closes a refused connection at once, as Go's own server does after a
+/// failed handshake (`net/http/server.go:1993-2006`), and Go's end may
+/// still be writing: the oracle's client sends its request as soon as its
+/// handshake returns (`tools/oracle/tls.go:562-570`), which in TLS 1.3 is
+/// once its last flight is sent, before it reads the node's answer to it.
+/// Bytes of Go's still unread at the close make the node's system send a
+/// reset, and bytes that arrive after it draw one from the closed socket.
+/// A system that throws away what it has received when a reset arrives,
+/// as Go's `net/http` says of BSD systems and suspects of Windows
 /// (`net/http/server.go:1815-1820`), then shows Go the reset and not the
-/// alert.  On Linux, where these tests have run, the alert arrives, and
-/// Go's words are held to the reference Go's; elsewhere a reset passes
-/// too.
+/// alert.  Windows names it "forcibly closed by the remote host" or, it
+/// seems when Go's bytes reach the already closed socket, "aborted by the
+/// software in your host machine", and Go takes the two alike
+/// (`net/http/internal/http2/server.go:617-627`).  On Linux, where the
+/// alert arrives either way, Go's words are held to the reference Go's;
+/// elsewhere a reset ([`reads_as_reset`]) passes too.
 fn assert_refused_by_the_node(go: &TlsOracle, what: &str, detail: &Value, error: &str) {
     let text = detail["error"].as_str().unwrap_or_default();
-    let reset = text.ends_with("connection reset by peer")
-        || text.contains("forcibly closed by the remote host");
-    if cfg!(target_os = "linux") || !reset {
+    if cfg!(target_os = "linux") || !reads_as_reset(text) {
         go.assert_refused(what, detail, error);
     } else {
         assert_eq!(detail["ok"], false, "{what}: Go's end {detail}");
     }
+}
+
+/// Whether an error, in Go's words or Rust's, is a reset of the
+/// connection: ECONNRESET, or on Windows WSAECONNRESET or WSAECONNABORTED.
+fn reads_as_reset(error: &str) -> bool {
+    error.contains("reset by peer")
+        || error.contains("forcibly closed by the remote host")
+        || error.contains("aborted by the software in your host machine")
 }
 
 /// The TLS 1.2 suites of an ECDSA or Ed25519 key, by Go's names.
@@ -1176,7 +1190,6 @@ fn a_tls12_client_with_an_ml_dsa_key_is_refused_as_go_refuses_it() {
         }
     };
     let illegal = "received fatal alert: IllegalParameter";
-    let reset = |err: &str| err.contains("reset by peer") || err.contains("forcibly closed");
 
     let clients_pem = ca.cert_pem.clone();
     let listening = listen_rpc(&server, Some(&clients_pem)).expect("a clientcert listener");
@@ -1184,7 +1197,7 @@ fn a_tls12_client_with_an_ml_dsa_key_is_refused_as_go_refuses_it() {
     listening.listener.shutdown();
     let ours = ours.expect("the listener refuses the client");
     assert!(
-        ours.contains(illegal) || (!cfg!(target_os = "linux") && reset(&ours)),
+        ours.contains(illegal) || (!cfg!(target_os = "linux") && reads_as_reset(&ours)),
         "the listener: {ours}"
     );
 
@@ -1200,7 +1213,7 @@ fn a_tls12_client_with_an_ml_dsa_key_is_refused_as_go_refuses_it() {
     let theirs = connect(&addr).expect("Go's server refuses the client");
     let served = go.served(&id);
     assert!(
-        theirs.contains(illegal) || reset(&theirs),
+        theirs.contains(illegal) || reads_as_reset(&theirs),
         "Go's server: {theirs}"
     );
     go.assert_refused(
@@ -1625,5 +1638,37 @@ fn a_client_hello_is_held_to_its_description() {
         ("a group fewer", with("supported_curves", json!(["X25519"]))),
     ] {
         assert!(!matches(&changed), "{what}");
+    }
+}
+
+/// [`reads_as_reset`] takes a reset in each system's words, Go's and
+/// Rust's, Windows' "aborted" among them, which Go's client has read on
+/// Windows in place of the node's alert, and nothing else a refusal
+/// shows: the check the reset allowance rests on, run without the oracle.
+#[test]
+fn a_reset_reads_as_one_in_each_systems_words() {
+    for reset in [
+        "read tcp 127.0.0.1:54021->127.0.0.1:53689: read: connection reset by peer",
+        "read tcp 127.0.0.1:54021->127.0.0.1:53689: wsarecv: An existing connection was \
+         forcibly closed by the remote host.",
+        "read tcp 127.0.0.1:54021->127.0.0.1:53689: wsarecv: An established connection was \
+         aborted by the software in your host machine.",
+        "Connection reset by peer (os error 104)",
+        "Connection reset by peer (os error 54)",
+        "An existing connection was forcibly closed by the remote host. (os error 10054)",
+        "An established connection was aborted by the software in your host machine. \
+         (os error 10053)",
+    ] {
+        assert!(reads_as_reset(reset), "{reset}");
+    }
+    for refusal in [
+        "remote error: tls: certificate required",
+        "remote error: tls: error decrypting message",
+        "received fatal alert: IllegalParameter",
+        "EOF",
+        "read tcp 127.0.0.1:54021->127.0.0.1:53689: i/o timeout",
+        "",
+    ] {
+        assert!(!reads_as_reset(refusal), "{refusal}");
     }
 }
