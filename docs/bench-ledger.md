@@ -8065,3 +8065,158 @@ flush logs. For B's earlier runs, its two plain rows each
 in `alloc-ceiling-lan.jsonl` and `build-arms-lan.jsonl` and its plain
 row in `alloc-profiled-lan.jsonl`, with their 10 s samples and flush
 logs; and the flush logs of the section above's four runs.
+
+## Unprofiled syncs of `f711927`, `ea1e7bf` and `dea35ab` (2026-11-16)
+
+Twelve default syncs from the LAN server, a dcrd v2.1.7 node, ran on m3
+on 2026-11-16 from 04:19 to 06:14, one every 10 minutes, the first about
+10 minutes after the machine restarted. None carried a profiler. Three
+builds ran four times each, in the order F E D D F E E D F F D E. F is
+`f711927`, the parent of `ea1e7bf`; E is `ea1e7bf`, the change the
+section above measured; D is `dea35ab`, the last of the six commits the
+section before it measured. Unlike those sections' patched builds, these
+are the commits themselves: each was built in release from the commit's
+tree with Rust 1.99.1, and each run's record carries the start of the
+binary's hash. From E to D the node's code changes only by the six; the
+other two commits there re-point citations (`b6de3d7`) and add a trace
+to the constant-time checks, which only the tests build (`8053abe`).
+Master, `a4c036a`, differs from D in the node's code by lint attributes
+and one loop in the variable-time modular inverse, which reads the same
+limbs from a slice; it was not synced. All twelve runs exited cleanly,
+reached the target's hash and were not flagged as disturbed; none was
+repeated and no build was running.
+
+| run | build | started | wall | height at the stop | wall at 1,116,035 | block-thread user at 1,116,035 | commit-thread user at 1,116,035 | peak memory when the clock stops |
+|---|---|---|---|---|---|---|---|---|
+| 1 | F | 04:19:45 | 228.5 s | 1,117,069 | 228.00 s | 190.44 s | 54.02 s | 2,516 MiB |
+| 2 | E | 04:29:56 | 224.0 s | 1,116,897 | 223.58 s | 185.44 s | 54.11 s | 2,522 MiB |
+| 3 | D | 04:40:04 | 213.3 s | 1,116,134 | 213.23 s | 174.25 s | 49.85 s | 2,466 MiB |
+| 4 | D | 04:50:02 | 214.5 s | 1,117,981 | 213.38 s | 174.24 s | 49.75 s | 2,455 MiB |
+| 5 | F | 05:00:01 | 228.1 s | 1,117,270 | 227.44 s | 189.04 s | 54.17 s | 2,521 MiB |
+| 6 | E | 05:10:12 | 221.5 s | 1,116,371 | 221.32 s | 183.56 s | 54.79 s | 2,506 MiB |
+| 7 | E | 05:20:17 | 220.1 s | 1,117,564 | 219.31 s | 183.50 s | 53.91 s | 2,543 MiB |
+| 8 | D | 05:30:21 | 213.9 s | 1,117,985 | 213.03 s | 174.03 s | 50.04 s | 2,497 MiB |
+| 9 | F | 05:40:19 | 227.5 s | 1,116,616 | 227.12 s | 188.79 s | 54.73 s | 2,521 MiB |
+| 10 | F | 05:50:29 | 230.2 s | 1,117,988 | 229.14 s | 189.66 s | 54.21 s | 2,520 MiB |
+| 11 | D | 06:00:42 | 216.0 s | 1,117,983 | 214.99 s | 176.69 s | 49.64 s | 2,490 MiB |
+| 12 | E | 06:10:42 | 221.9 s | 1,116,086 | 221.87 s | 182.25 s | 54.19 s | 2,538 MiB |
+
+No 10 s sample reached the target's height, 1,116,035, so times at it
+are interpolated linearly between each run's last sample below it and
+its end record, which came 1.3 to 9.5 s later. They are estimates. The
+95% intervals come from a t test on the two builds' pooled standard
+deviation, with 6 degrees of freedom.
+
+At equal height the wall was 227.93 s for F (standard deviation 0.89 s),
+221.52 s for E (1.76 s) and 213.66 s for D (0.90 s). **The kept buffers
+took 6.4 s, 2.8%, off the wall, and the six later commits another 7.9 s,
+3.5%**: 6.40 s (3.99 to 8.82 s) and 7.86 s (5.44 to 10.28 s). From F to
+D the wall fell 14.27 s, 6.3% (12.72 to 15.82 s). Every run of the
+faster build in each pair beat every run of the slower, by at least
+3.5 s (E over F) and 4.3 s (D over E). As recorded, the walls fell
+6.70 s and 7.45 s.
+
+The block thread's user time at equal height fell 5.79 s from F to E
+(3.95 to 7.63 s) and 8.88 s from E to D (6.66 to 11.11 s). The commit
+thread's fell 0.04 s from F to E (0.64 s less to 0.57 s more) and fell
+4.43 s from E to D (3.92 to 4.94 s). As recorded, the block thread's
+time on the CPU fell 6.50 and 8.65 s, against 6.70 and 7.45 s of wall,
+and it waited off the CPU 20.4 to 22.9 s a run in every build. From E to
+D the wall fell 1.2 s less than that time; D's block thread spent 0.36 s
+more in the run queue (0.16 to 0.57 s) and 0.84 s more off the CPU
+(0.51 s less to 2.19 s more), less than the 2.85 and 2.54 s rise in the
+profiled syncs of 2026-11-15. It made 17% fewer voluntary context
+switches, against 19% and 16% fewer there. The node waited for flushes
+0.03 to 0.73 s a run, so the commit thread's saving seems not to reach
+the wall; that is a guess.
+
+Most of both gains were made before height 950,000, which the runs
+reached after 146 to 161 s: by then the wall had fallen 5.94 and 7.31 s,
+and from there to the target only 0.46 and 0.55 s more, both intervals
+taking in zero, while the block thread's user time fell 1.18 and 1.50 s
+more, both intervals clear of zero (estimates from the 10 s samples).
+The profiled syncs of 2026-11-15 showed the same.
+
+Profiled, the syncs of 2026-11-14 put the kept buffers' block-thread
+gain at 4.4 s (2.6 to 6.3 s), and those of 2026-11-15 put the seven
+changes' at 8.5 s (6.7 to 10.3 s), about 7.9 s of it estimated for the
+six committed. Unprofiled the gains are 5.8 and 8.9 s, 1.4 and 1.0 s
+more, and each figure lies inside the other's interval. Runs of one
+build here scatter more in block-thread user time, with a pooled
+standard deviation of 1.13 s against the 0.86 s those sections used. The
+abandoned seventh change is in no build here. The commit thread's 4.4 s
+matches the 4.6 and 4.4 s profiled.
+
+The block thread's system time fell 0.60 s from F to D (0.29 to 0.91 s),
+all four D runs below all four F runs; from F to E it read 0.52 s lower,
+with an interval that takes in zero, where the profiled pairs of
+2026-11-14 read 0.25 and 0.58 s higher. Commit-thread system time did
+not differ: from E to D it read 0.03 s lower (1.93 s lower to 1.86 s
+higher), with no sign of the 4.64 s fall in the first profiled pair of
+2026-11-15. Peak memory was 50 MiB, 2.0%, lower in D than in E (19 to
+82 MiB); E read 8 MiB above F, from 13 MiB below to 28 MiB above.
+
+The block-file fsync was fast again: a median of 57 to 94 ms a flush and
+3.05 to 5.00 s a run, against 290 to 309 ms and 15.2 to 17.2 s in the
+profiled syncs of 2026-11-14 and 2026-11-15, whose block threads waited
+35.7 to 45.4 s. That fits the slow state belonging to the boot the
+restart ended, but only as a guess: every slow run carried the `perf`
+recorders, updated after the fast profiled run of 2026-11-13, and no run
+here did, so these runs cannot tell the boot from the recorders. Three F
+runs and the first E run had medians of 81 to 94 ms, the rest 57 to
+64 ms. That does not explain F's longer wall: the F run at 60.5 ms had
+F's longest, and the flushes' foreground parts took 2.0 to 2.5 s a run
+in every build.
+
+F also kept close to the pace of `2a56236`'s four unprofiled syncs of
+2026-11-13, which ran in an earlier boot with medians of 68 to 103 ms
+and share F's `dcroxide-blockchain`, `dcroxide-database` and
+`dcroxide-gcs` crates. At equal height F's wall was 2.29 s shorter
+(4.90 s shorter to 0.31 s longer), its block-thread user time 0.86 s
+higher (0.49 s lower to 2.21 s higher) and its block-thread system time
+0.59 s lower (0.29 to 0.88 s).
+
+Nothing drifted: within builds the wall moved 0.06 s an hour (standard
+error 0.66 s an hour). The first run started with 5,121 MiB of page
+cache, the rest with 9,812 to 11,614 MiB, and read 600 MB from disk
+against 0 to 6 MB, yet its 228.00 s at equal height was typical of F.
+Without it, E gains 6.38 s on F; without it and the first E run, which
+still had the cache warming, 7.07 s, with D 7.18 s ahead of E.
+Extrapolating each run from its last sample at the rate of the 10 s
+before it, in place of interpolating, moves single runs by up to about
+1 s and gives 5.98 and 8.06 s.
+
+**What it shows.** In unprofiled default syncs on m3 the kept buffers
+take about 6.4 s, 2.8%, off the wall, and the six later commits another
+7.9 s, 3.5%, with no overlap between the builds' runs. That is the wall
+time the two sections above left open, for one machine state. The wall
+falls by nearly as much as the block thread's CPU time, and the block
+thread's gains are in line with the profiled syncs. The six also take
+4.4 s off the commit thread's user time and about 50 MiB off peak
+memory.
+
+**What it does not show.** A second machine state: all twelve runs were
+in one boot, 10 minutes to about two hours after a restart, with a fast
+block-file fsync. Whether the commit thread's saving reaches the wall
+when flushes are slower; either answer is a guess. A wall gain past
+height 950,000, still inside the noise. The LAN server's own load, reads
+and cache, which were not recorded. Where in the code the gains come
+from: no run carried a profiler, so the split by function rests on the
+profiled sections above. The share of each of the six commits: no build
+held fewer than all six, so the split by commit rests on the profiled
+syncs of 2026-11-15. Master, which was not synced. The size of the block
+thread's system-time fall beyond this session, since F's own sat 0.59 s
+below that of `2a56236` on 2026-11-13. Whether the kept buffers raise
+memory: a rise of up to about 28 MiB, about 1%, is not excluded (an
+estimate), down from the 45 MiB of the section above. The cause of the
+slow fsync of 2026-11-14 and 2026-11-15, and whether it belonged to that
+boot or came with the updated recorders. Reorganizations, the mempool,
+block templates and other platforms were not run.
+
+Raw: `wall-unprofiled-lan.jsonl`'s rows labelled `w16-F-1` to `w16-F-4`,
+`w16-E-1` to `w16-E-4` and `w16-D-1` to `w16-D-4`, the harness's
+records, with each thread's counters; each run's 10 s samples; the node
+logs and the flush logs; each build's record of its commit, hash and
+compiler. For `2a56236`, its two plain rows each in
+`alloc-ceiling-lan.jsonl` and `build-arms-lan.jsonl`, with their 10 s
+samples and flush logs; and the flush logs of the two sections above.
