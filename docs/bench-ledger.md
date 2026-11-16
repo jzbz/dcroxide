@@ -7928,3 +7928,140 @@ Raw: `next7-profiled-lan.jsonl`'s rows labelled `pp15-N7-plain-1`,
 `pp15-M0-plain-1`, `pp15-M0-plain-2` and `pp15-N7-plain-2`, the
 harness's records, with each thread's counters; each run's two `perf`
 recordings and their logs; the node logs and the flush logs.
+
+## Kept attach buffers on `2a56236` in profiled syncs, since committed as `ea1e7bf` (2026-11-14)
+
+Four default syncs from the LAN server, a dcrd v2.1.7 node, ran on m3 on
+2026-11-14 in two pairs, in opposite orders: K then B at 15:12 and
+15:23, minutes after the machine restarted, and B then K at 16:09 and
+16:20. That was the day before the syncs of the section above, in the
+same boot. All four exited cleanly and reached the target's hash; none
+was repeated and no build was running. Both runs of the second pair were
+flagged as disturbed: other programs took 0.6% of the machine in each,
+against 0.3% in the first pair, a browser making up most of the rise.
+Every run carried two `perf` recorders, a flat one at 499 Hz and a
+call-graph one at 49 Hz; each call-graph recording lost one chunk by
+`perf`'s count, which the sample counts put at a few samples at most (an
+estimate). B is a release build of `2a56236`. K is `2a56236` with the
+change later committed as `ea1e7bf`, built the same way; the patch kept
+with K's build gives `ea1e7bf`'s `dcroxide-blockchain` crate byte for
+byte. The commits between `2a56236` and `ea1e7bf`'s parent, `f711927`,
+change the TLS provider, the RPC server's TLS handling, the certificate
+generator, Go's table of printable characters where `dcroxide-txscript`
+and `dcroxide-dcrjson` each keep it, tests, comments, documents and
+tools outside the node, and add the `ml-dsa` crate with its
+dependencies, but not `dcroxide-blockchain`, `dcroxide-database` or
+`dcroxide-gcs`. No build of `ea1e7bf` was synced, so the measured build
+K is not any commit.
+
+| run | build | started | wall | height at the stop | block-thread user | the same at 1,116,035 | commit-thread user | commit-thread system | peak memory when the clock stops |
+|---|---|---|---|---|---|---|---|---|---|
+| pair 1, first | K | 15:12:48 | 244.3 s | 1,116,985 | 184.87 s | 184.54 s | 54.67 s | 39.37 s | 2,532 MiB |
+| pair 1, second | B | 15:23:18 | 251.9 s | 1,117,108 | 189.34 s | 188.96 s | 53.86 s | 39.85 s | 2,505 MiB |
+| pair 2, first | B | 16:09:50 | 247.6 s | 1,116,776 | 190.81 s | 190.52 s | 54.61 s | 40.11 s | 2,540 MiB |
+| pair 2, second | K | 16:20:23 | 246.4 s | 1,118,003 | 186.74 s | 186.06 s | 55.03 s | 42.25 s | 2,538 MiB |
+
+Times at the target's height, 1,116,035, are interpolated between each
+run's last 10 s sample below it and its end, and are estimates.
+
+The change keeps six vectors that each block's attach allocated and
+freed again: the outpoints a view asks its resolver for, the resolver's
+answers, the entries a commit hands to the cache, the two the assertion
+over the connected view fills, and the spend journal. In B's call-graph
+recordings they held 192 and 211 of the block thread's allocator
+samples, standing for about 3.70 and 4.07 s (estimates, with sampling
+standard deviations of 0.27 and 0.28 s). In K's recordings none was
+sampled, which puts what is left of them under about 0.06 s (95%).
+
+At equal height K's block thread used **4.4 s, 2.3%, less user time**
+than B's: 4.42 s less in the first pair and 4.46 s in the second. As
+recorded the falls are 4.47 and 4.07 s; the second K run stopped
+1,227 blocks after its pair's B run. Both builds used about 1.5 s more
+in the second pair than in the first. Seven runs of B are on record:
+four unprofiled default syncs from the LAN server and one profiled one
+on 2026-11-13, and the two here. Their block-thread user time as
+recorded has a mean of 189.43 s and a standard deviation of 0.90 s; the
+profiled three average 189.88 s and the others 189.09 s. Five syncs of B
+with another allocator preloaded are left out. Both K runs fall below
+all seven. The section above's standard deviation of 0.86 s for runs of
+one binary (14 degrees of freedom, from the LAN syncs since 2026-11-13)
+takes in these seven and the two K runs; with it, the mean of the two
+pairs puts the gain between 2.6 and 6.3 s (95%).
+
+The gain is allocator time. At 499 Hz the block thread's allocator took
+3.90 and 4.38 s less (sampling standard deviation 0.28 s each), so at
+most about 0.3 s of what the six buffers held came back at other
+requests. Some of the allocator's work moved rather than vanished. The
+filter's entries list, `gcs/blockcf2.rs:311`, cost 0.3 to 0.4 s more in
+both pairs, going from 11 to 27 samples at 49 Hz and from 12 to 30. Most
+of it is in what looks like glibc's best-fit search and unsorted-bin
+scan, work the six buffers' requests used to do; the stage names are a
+guess. Cheaper bin sorting elsewhere offsets it, most visibly in the
+view map's node allocation, about 0.5 s less per pair; in all, about
+0.8 s rose at some sites and as much fell at others. Both builds of the
+section above hold the change, so the sites of that section's filter
+change carry this rise. `commit_view`'s own code read 1.10 and 1.18 s
+lower. The change rewrote the function, so its code was generated
+afresh; both pairs ran the same two binaries, and in the second pair the
+rest of the node's own code read 1.2 s higher as recorded, about 0.9 s
+at equal height. The fall is not counted on top of the allocator's and
+may come from this build's code generation.
+
+**What it shows.** Keeping the six buffers takes about 4.4 s, 2.3%, off
+the block thread's user time in a profiled default sync, in either
+order. It is allocator time at the buffers the change aimed at, and at
+most about 0.3 s of it came back at other requests. Peak memory stayed
+inside the unpatched build's range.
+
+**What it does not show.** Wall time: it read 7.6 and 1.2 s lower, but
+every run carried both recorders and the disk was slow. Since the
+restart a flush's block-file fsync took a median of 293 to 303 ms,
+against 68 to 103 ms in B's five syncs of 2026-11-13: 15.3 to 16.0 s per
+run against 4.1 to 5.5 s, for the same bytes written. The block thread
+waited 40.0 to 45.4 s, against 22.0 to 28.0 s in those five. The four
+syncs of the section above, in the same boot, had medians of 290 to
+309 ms, 15.2 to 17.2 s per run, and block threads that waited 35.7 to
+39.8 s. Pair 1's fall splits into 4.22 s of block-thread CPU and 3.58 s
+of waiting, with 0.20 s more in the run queue; in pair 2 CPU fell 3.49 s
+and waiting rose 2.21 s. Pair 2's 1.2 s is inside one run's noise, so
+neither the size nor, strictly, the sign of a wall change is
+established. The cause of the slow fsync was not found. No earlier
+session in the records since 2026-10-18 shows it: the slowest, on
+2026-11-10, took 3.4 to 5.4 s a default sync and 7.7 s with
+`DCROXIDE_DB_SYNC_COMMIT=1`, and the sessions of 2026-10-18 to
+2026-10-25, most under IO pressure nearly as high as here, 1.1 to 3.3 s.
+Besides the restart, the system's packages, `perf` among them, were
+updated after B's profiled run of 2026-11-13, and the records cannot
+separate the two; that the state belongs to one boot of the machine is a
+guess. The build itself: that K was built from the kept patch rests on
+the build's script, file times and the source lines its profiles resolve
+to, not on a recorded hash. A rise in memory: peak memory was inside the
+range of B's seven runs, 2,504 to 2,540 MiB, but a rise of up to about
+45 MiB, under 2%, is not excluded (an estimate). Between heights 500,000
+and 800,000 the first K run was 24 to 27 MiB above every B run; the
+second was among the B runs. A change in system time: the block thread's
+system time read 0.25 and 0.58 s higher, with both K runs inside B's
+range of 14.02 to 15.88 s, a range in which profiled runs carry about
+0.9 s more than unprofiled ones. The block thread made 25% and 15% more
+heap-extension (`mprotect`) calls for the same 0.7 to 0.8 GiB of heap
+growth: it extends the heap in smaller steps now that the large requests
+are gone, and no extra trimming is shown. The commit thread's user time
+read 0.81 and 0.42 s higher, with both K runs inside the range of B's
+seven, 53.86 to 55.08 s, and its system time 0.48 s lower and 2.14 s
+higher; at equal height they read 0.89 and 0.44 s higher, and 0.46 s
+lower and 2.20 s higher (estimates). All four runs here had less
+commit-thread system time than B's five of 2026-11-13, 39.37 to 42.25 s
+against 42.27 to 46.03 s, as did the four of the section above, 35.45 to
+41.40 s; the second pair's 2.14 s rise has no counterpart in the first,
+and its cause was not traced. Unprofiled timing, a session with
+block-file syncs as fast as those of 2026-11-13, reorganizations, the
+mempool, block templates and other platforms were not run.
+
+Raw: `c1-profiled-lan.jsonl`'s rows labelled `pp14-C1-plain-1`,
+`pp14-A0-plain-1`, `pp14-A0-plain-2` and `pp14-C1-plain-2`, the
+harness's records, with each thread's counters; each run's 10 s samples;
+each run's two `perf` recordings and their logs; the node logs and the
+flush logs. For B's earlier runs, its two plain rows each
+in `alloc-ceiling-lan.jsonl` and `build-arms-lan.jsonl` and its plain
+row in `alloc-profiled-lan.jsonl`, with their 10 s samples and flush
+logs; and the flush logs of the section above's four runs.
