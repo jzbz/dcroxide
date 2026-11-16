@@ -7807,3 +7807,124 @@ Machine state as in the section above.
 
 Raw: `m2-synccommit.jsonl`, the harness's records, the node logs and
 the flush logs.
+
+## Seven changes on `8053abe` in profiled syncs, six of them since committed (2026-11-15)
+
+Four default syncs from the LAN server, a dcrd v2.1.7 node, ran on m3 on
+2026-11-15 in two back-to-back pairs, in opposite orders: P then M at
+00:09 and 00:20, and M then P at 01:10 and 01:21. All four exited
+cleanly, reached the target's hash and were not flagged as disturbed;
+none was repeated and no build was running. Every run carried two `perf`
+recorders, a flat one at 499 Hz and a call-graph one at 49 Hz. M is
+master `8053abe`. P is `8053abe` with seven changes applied. Six were
+committed after the runs, as `8980168`, `c47be58`, `ee693f4`, `4d23ee5`,
+`99dc097` and `dea35ab`, with the citations they moved re-pointed in
+`75e7c91`. The seventh built a block's filter by hashing its entries as
+they were found, into a buffer the chain keeps. It was abandoned and is
+in no commit, so the measured build P is not any commit. Apart from that
+change's lines, in the `dcroxide-gcs` crate and the filter's buffer in
+`process.rs` and `validate.rs`, the patch kept with P's build gives the
+Rust sources of `dea35ab`.
+
+| run | build | started | wall | height at the stop | block-thread user | the same at 1,116,035 | commit-thread user | commit-thread system | peak memory when the clock stops |
+|---|---|---|---|---|---|---|---|---|---|
+| pair 1, first | P | 00:09:50 | 233.9 s | 1,117,547 | 176.94 s | 176.41 s | 50.27 s | 35.45 s | 2,456 MiB |
+| pair 1, second | M | 00:20:08 | 239.9 s | 1,116,072 | 184.76 s | 184.75 s | 54.77 s | 40.09 s | 2,523 MiB |
+| pair 2, first | M | 01:10:59 | 238.6 s | 1,116,624 | 183.98 s | 183.78 s | 54.45 s | 40.16 s | 2,520 MiB |
+| pair 2, second | P | 01:21:22 | 231.1 s | 1,117,663 | 175.68 s | 175.11 s | 50.22 s | 41.40 s | 2,486 MiB |
+
+The P runs stopped 1,475 and 1,039 blocks later than their pairs' M
+runs, so times are also given at the target's height, 1,116,035, by
+taking off each run's cost per block over its last stretch for the
+blocks past it. Those figures are estimates.
+
+At equal height P's block thread used **8.5 s, 4.6%, less user time**
+than M's: 8.34 s less in the first pair and 8.66 s in the second. Runs
+of one binary scatter with a standard deviation of 0.86 s (14 degrees of
+freedom, from the LAN syncs since 2026-11-13), so the mean of the two
+pairs puts the gain between 6.7 and 10.3 s (95%). The two orders agree
+to 0.3 s, although P started with 10,866 MiB more page cache than M in
+the first pair and 25,271 MiB less in the second. The gain is allocator
+and comparison time: at 499 Hz the allocator took 6.04 and 6.38 s less
+and `memcmp` 3.61 and 3.67 s less, while `memcpy` did not change. About
+0.76 s is given back. The faster block thread overtook signature
+pre-verification more often, leaving it about 238,000 and 220,000 more
+inputs to check itself at equal height, and spent 0.88 and 0.63 s more
+checking signatures, more than any of six unpatched runs.
+
+The commit thread used 4.63 and 4.35 s less user time at equal height,
+in the same places in both pairs: the frees of a flushed layer's keys,
+the first page fetch for each row and key comparisons while layers are
+merged. All threads together used 13.1 s less user time. Block-thread
+system time was 0.93 and 1.23 s lower, though both P runs fall inside
+the range of the six unpatched runs since the machine last booted, M's
+two among them (14.93 to 16.29 s), and the block thread made 19% and 16%
+fewer voluntary context switches, below all 53 unpatched runs since
+2026-11-07. Memory at the 52 flushes was lower than in each of seven
+unpatched profiled runs at 52 and 51 of them, by a median of 45 and
+50 MiB against their mean, about 2%. Under profiling the wall at equal
+height was 6.78 and 8.00 s shorter; with a standard deviation of 2.0 s
+for runs of one binary in one session, the mean supports 3.0 to 11.8 s.
+All of it was made before height 950,000: from there to 1,100,000 the
+two builds took the same wall, although P's block thread used 1.2 to
+1.6 s less CPU.
+
+By change, on the block thread: samples at 49 Hz at the code each change
+removes, and its net: the share of the thread's user time those samples
+carry, less what the change added, read from the 499 Hz tables where it
+changed code. Each commit's message gives its own sites.
+
+| change | samples at its sites, M -> P (pair 1; pair 2) | net, pair 1 | net, pair 2 | mean |
+|---|---|---|---|---|
+| `8980168`, the search of the other pending set | 111 -> 4; 92 -> 4 | 1.93 s | 1.50 s | 1.71 s |
+| `c47be58`, the empty cache snapshots | 28 -> 0; 23 -> 0 | 0.58 s | 0.72 s | 0.65 s |
+| `ee693f4`, row keys held in place | 181 -> 0; 170 -> 0 | 4.09 s | 4.22 s | 4.15 s |
+| `4d23ee5`, the ticket delete's copying read | 21 -> 0; 14 -> 0 | 0.40 s | 0.26 s | 0.33 s |
+| `99dc097`, the predicates' error text | 35 -> 0; 41 -> 0 | 0.92 s | 0.87 s | 0.89 s |
+| `dea35ab`, four lists sized ahead | 44 -> 1; 58 -> 3 | 0.57 s | 0.76 s | 0.66 s |
+| the filter change, in no commit | 45 -> 0; 37 -> 0 | 0.49 s | 0.71 s | 0.60 s |
+
+`c47be58`'s nets include 0.04 and 0.28 s on the index thread. The nets
+sum to about 9.0 s, 8.8 s on the block thread alone, against the 8.5 s
+measured, which fits once the 0.76 s given back is counted; one stacked
+build cannot split the gain more finely than its site counts do. Unlike
+the others, the filter change's net takes off a guessed share of
+allocator work that may have come back at other requests; its sites held
+0.87 and 0.71 s. Taking its 0.6 s (0.49 to 0.79 s) off the measured gain
+leaves about 7.9 s for the six committed changes, 7.85 and 7.95 s by
+pair. That is an estimate from site counts, not a measurement: it also
+assumes the six give without the filter change what they gave beside it.
+
+**What it shows.** The six committed changes and the abandoned seventh
+together take about 8.5 s, 4.6%, off the block thread's user time and
+4.5 s off the commit thread's in a profiled default sync, in either
+order and with the page cache tilted either way. Nearly all of it is
+allocator and comparison time, at the sites the changes aimed at. Under
+profiling the wall falls about 7 s, all of it before height 950,000, and
+memory at the flushes about 2%.
+
+**What it does not show.** Wall time without the profiler: every run
+carried both recorders, and P gives them 3 to 4% fewer records to
+handle. A wall gain past height 950,000, a stretch that takes in the
+blocks after the assume-valid block, 1,026,597, whose scripts are
+checked: the block thread's off-CPU time rose 2.85 and 2.54 s in P, and
+the cause was not traced. A fall in the block thread's system time
+beyond this session. The six commits alone: no build of `dea35ab` was
+synced, and that P was built from the kept patch rests on the build's
+script and file times, not on a recorded hash. Whether the faster block
+thread causes the signature checking given back: that is a guess. The
+commit thread's system time, 4.64 s lower in the first pair and 1.24 s
+higher in the second; the first pair's fall came from 14 cheap flushes
+in that P run, against 1, 2 and 2 in the other three, a state whose
+cause was not found, and about 0.6 s less in the release of layers is
+all of it that repeats. The size of the falls in process system time,
+the commit thread's voluntary context switches and peak memory, which
+did not repeat. The M call-graph recordings lost 53 and 1,851 records by
+`perf`'s count, with no gap in the sample times; the 499 Hz tables lost
+none. Reorganizations, the mempool, block templates and other platforms
+were not run.
+
+Raw: `next7-profiled-lan.jsonl`'s rows labelled `pp15-N7-plain-1`,
+`pp15-M0-plain-1`, `pp15-M0-plain-2` and `pp15-N7-plain-2`, the
+harness's records, with each thread's counters; each run's two `perf`
+recordings and their logs; the node logs and the flush logs.
