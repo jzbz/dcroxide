@@ -3,6 +3,13 @@ all-features = true
 
 [advisories]
 yanked = "deny"
+# chrono is unmaintained (RUSTSEC-2026-0543), with no release to move to.
+# It is a notice, not a vulnerability: dcroxide-node takes from it only the
+# local UTC offset its log lines are stamped with and the current UTC time,
+# and replacing it is recorded in docs/dependency-ledger.md.
+ignore = [
+    { id = "RUSTSEC-2026-0543", reason = "chrono unmaintained; replacement recorded in docs/dependency-ledger.md" },
+]
 
 [licenses]
 allow = [
