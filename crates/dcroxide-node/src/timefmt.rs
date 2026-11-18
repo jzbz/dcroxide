@@ -52,9 +52,8 @@ fn push_year(out: &mut String, year: i64) {
 /// `YYYY-MM-DD hh:mm:ss.sss`, the milliseconds truncated, as slog's
 /// `formatHeader` writes `time.Now()` (decred/slog@v1.2.0
 /// `log.go:217-237`, with `itoa` at `:197-211`).
-pub(crate) fn slog_timestamp(secs: i64, nanos: u32, offset: i32) -> String {
-    let (year, month, day, hour, min, sec) =
-        civil_from_unix(secs.saturating_add(i64::from(offset)));
+pub(crate) fn slog_timestamp(secs: i64, nanos: u32, offset: i64) -> String {
+    let (year, month, day, hour, min, sec) = civil_from_unix(secs.saturating_add(offset));
     let millis = nanos / 1_000_000;
     let mut out = String::with_capacity(23);
     push_year(&mut out, year);
@@ -99,7 +98,7 @@ pub(crate) fn http_date(secs: i64) -> String {
 /// An offset east of UTC as `+hh:mm`, or `+hh:mm:ss` when it has
 /// seconds, the label the startup banner has always printed after
 /// `UTC`.
-pub(crate) fn offset_label(offset: i32) -> String {
+pub(crate) fn offset_label(offset: i64) -> String {
     let sign = if offset < 0 { '-' } else { '+' };
     let abs = offset.unsigned_abs();
     let (hours, minutes, seconds) = (abs / 3600, abs / 60 % 60, abs % 60);
@@ -195,7 +194,8 @@ mod tests {
             (-43_200, "-12:00"),
             (3_661, "+01:01:01"),
             (-34, "-00:00:34"),
-            (i32::MIN, "-596523:14:08"),
+            (i64::from(i32::MIN), "-596523:14:08"),
+            (i64::MIN, "-2562047788015215:30:08"),
         ] {
             assert_eq!(offset_label(offset), label, "{offset}");
         }
@@ -281,7 +281,7 @@ mod tests {
         for ((secs, nanos, offset), line) in cases.iter().zip(lines) {
             let ours = format!(
                 "{}\t{}",
-                slog_timestamp(*secs, *nanos, *offset),
+                slog_timestamp(*secs, *nanos, i64::from(*offset)),
                 http_date(*secs)
             );
             assert_eq!(ours, line, "secs {secs}, nanos {nanos}, offset {offset}");

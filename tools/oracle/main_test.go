@@ -743,6 +743,66 @@ func TestTimeFormat(t *testing.T) {
 	}
 }
 
+// TestZoneOffsets pins the record layouts of local_offsets and
+// tzif_offsets: the offsets of time.Local, with its name ahead of them,
+// and of a TZif file whose footer alone gives it daylight saving, a
+// file Go refuses answered with its error.
+func TestZoneOffsets(t *testing.T) {
+	instants := func(secs ...int64) []byte {
+		var b []byte
+		for _, s := range secs {
+			b = binary.BigEndian.AppendUint64(b, uint64(s))
+		}
+		return b
+	}
+	var want []string
+	for _, s := range []int64{0, 1772953200} {
+		_, offset := time.Unix(s, 0).In(time.Local).Zone()
+		want = append(want, strconv.Itoa(offset))
+	}
+	resp := call("local_offsets", instants(0, 1772953200))
+	if wantResult := time.Local.String() + " " + strings.Join(want, ","); resp.Error != "" || resp.Result != wantResult {
+		t.Errorf("local_offsets: got %+v, want result %q", resp, wantResult)
+	}
+	if resp := call("local_offsets", make([]byte, 7)); resp.Error == "" {
+		t.Errorf("local_offsets, 7 bytes: got %+v, want an error", resp)
+	}
+
+	// Version 2: an empty version 1 block, then one standard type, no
+	// transitions, and the footer.
+	tzif := func(version byte, footer string) []byte {
+		block := func(b []byte) []byte {
+			b = append(b, "TZif"...)
+			b = append(b, version)
+			b = append(b, make([]byte, 15)...)
+			for _, n := range []uint32{0, 0, 0, 0, 1, 4} {
+				b = binary.BigEndian.AppendUint32(b, n)
+			}
+			b = binary.BigEndian.AppendUint32(b, uint32(0xffffb9b0)) // -18000
+			return append(b, 0, 0, 'E', 'S', 'T', 0)
+		}
+		return append(block(block(nil)), footer...)
+	}
+	file := func(data []byte) []byte {
+		return binary.BigEndian.AppendUint32(nil, uint32(len(data)))
+	}
+	ny := tzif('2', "\nEST5EDT,M3.2.0,M11.1.0\n")
+	resp = call("tzif_offsets", file(ny), ny, instants(1772953199, 1772953200))
+	if resp.Error != "" || resp.Result != "-18000,-14400" {
+		t.Errorf("tzif_offsets: got %+v, want result %q", resp, "-18000,-14400")
+	}
+	bad := tzif('4', "\nEST5EDT,M3.2.0,M11.1.0\n")
+	resp = call("tzif_offsets", file(bad), bad, instants(0))
+	if resp.Error != "" || resp.Result != "err malformed time zone information" {
+		t.Errorf("tzif_offsets, version 4: got %+v", resp)
+	}
+	for _, data := range [][]byte{nil, file(ny), append(file(ny), ny[:len(ny)-1]...), append(append(file(ny), ny...), 0)} {
+		if resp := call("tzif_offsets", data); resp.Error == "" {
+			t.Errorf("tzif_offsets, %d bytes: got %+v, want an error", len(data), resp)
+		}
+	}
+}
+
 // keyPairRequest is an x509_key_pair request's data: a self-signed
 // certificate for cert's public key and key's PEM block under keyType, as
 // JSON.

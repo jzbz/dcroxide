@@ -125,53 +125,62 @@ fn render(timestamp: &str, level: LogLevel, subsys: &str, msg: &str) -> String {
     format!("{timestamp} [{}] {subsys}: {msg}", level.three_letter())
 }
 
-/// The process's local UTC offset, resolved once.
+/// The process's local time zone, read once.
 ///
-/// Go's `time.Local` is a single process-wide `*Location` initialised
-/// lazily and then reused, so every line dcrd writes is in the same zone.
-/// `chrono::Local` is not equivalent: it caches the zone PER THREAD, and
-/// a thread whose first lookup cannot open `/etc/localtime` — a daemon
-/// holding many peer sockets and RPC handler threads can transiently run
-/// out of descriptors — silently caches UTC for the rest of its life.
-/// The result is one log file carrying two different zones with no
-/// indication, which is exactly what happened on a twenty-hour mainnet
-/// run: every line in local time until the shutdown lines, emitted from a
-/// thread whose first timestamp call landed during descriptor pressure,
-/// appeared four hours in the future.  That is worse than either zone
-/// alone, because it silently invents gaps — it had me chasing a
-/// four-hour stall that never occurred.
+/// slog stamps each line with `time.Now()`, which is in Go's `time.Local`:
+/// one process-wide zone, read from the environment on first use and
+/// kept, whose offset each line works out at its own time
+/// ([`crate::zoneinfo`] ports how Go reads it).  So a daemon running
+/// across a daylight saving change follows it, as dcrd does, and every
+/// line comes from the one zone.
 ///
-/// Resolving once, process-wide, reproduces Go's single-zone property and
-/// cannot be poisoned by a later failed lookup.
-static LOCAL_OFFSET: OnceLock<i32> = OnceLock::new();
+/// Reading the zone once matters as much as reading it as Go does.  The
+/// chrono `Local` this replaced kept the zone per thread, and a thread
+/// whose first lookup could not open `/etc/localtime`, as a daemon short
+/// of descriptors can fail to, kept UTC for good: one twenty-hour mainnet
+/// log had its shutdown lines four hours ahead of every line before them,
+/// which reads as a stall that never happened.  A zone read once for the
+/// process cannot change under it, whatever a later read would do.
+static LOCAL_ZONE: OnceLock<crate::zoneinfo::LocalZone> = OnceLock::new();
 
-/// The offset every line is rendered in, in seconds east of UTC,
-/// resolved on first use.
-///
-/// Deliberate divergence: Go's `time.Local` holds the zone's transition
-/// rules, so dcrd follows a daylight-saving change while running; this
-/// holds the offset that was in effect when logging started, so a process
-/// running across a DST boundary keeps the earlier offset until it is
-/// restarted.  One zone for the life of the process is the property worth
-/// having — a reader can trust that two lines an hour apart really are an
-/// hour apart — and the alternative on offer was two zones in one file.
-fn local_offset() -> i32 {
-    *LOCAL_OFFSET.get_or_init(|| chrono::Local::now().offset().local_minus_utc())
+/// The zone every line is rendered in, read on first use.
+fn local_zone() -> &'static crate::zoneinfo::LocalZone {
+    LOCAL_ZONE.get_or_init(|| crate::zoneinfo::local(crate::timefmt::now().0))
 }
 
-/// The local-time timestamp slog writes: zero-padded
-/// `YYYY-MM-DD hh:mm:ss` with milliseconds (slog formats
+/// The timestamp slog writes for an instant in a zone: zero-padded
+/// `YYYY-MM-DD hh:mm:ss` with milliseconds, at the zone's offset for
+/// that instant.
+fn timestamp_in(zone: &crate::zoneinfo::Location, secs: i64, nanos: u32) -> String {
+    crate::timefmt::slog_timestamp(secs, nanos, zone.offset(secs))
+}
+
+/// The local-time timestamp slog writes for now (slog formats
 /// `time.Now()`, which is local time).
 fn timestamp() -> String {
     let (secs, nanos) = crate::timefmt::now();
-    crate::timefmt::slog_timestamp(secs, nanos, local_offset())
+    timestamp_in(&local_zone().location, secs, nanos)
 }
 
-/// The offset log timestamps are rendered in, as `+hh:mm`, for the
-/// startup banner: a log whose zone is fixed for the process should say
-/// which zone, so a reader never has to guess.
-pub fn local_offset_label() -> String {
-    crate::timefmt::offset_label(local_offset())
+/// The startup banner's line on the zone log timestamps are in, so a
+/// reader never has to guess it: the local zone and its offset now, or
+/// UTC, with the reason when the local zone could not be read, where Go
+/// falls back to UTC without a word.
+pub fn timestamp_zone_line() -> String {
+    zone_line(local_zone(), crate::timefmt::now().0)
+}
+
+/// [`timestamp_zone_line`] for a given zone and Unix second.
+fn zone_line(zone: &crate::zoneinfo::LocalZone, now: i64) -> String {
+    let label = crate::timefmt::offset_label(zone.location.offset(now));
+    match (&zone.unread, zone.name.as_str()) {
+        (Some(why), _) => {
+            format!("Log timestamps are UTC{label}: the local time zone could not be read ({why})")
+        }
+        (None, "UTC") => format!("Log timestamps are UTC{label}"),
+        (None, "Local") => format!("Log timestamps are local time, now UTC{label}"),
+        (None, name) => format!("Log timestamps are local time in {name}, now UTC{label}"),
+    }
 }
 
 /// The exit status a shell reports for a process `SIGPIPE` killed
@@ -414,70 +423,90 @@ mod tests {
         );
     }
 
-    /// The process must render every line in one zone, and there must be
-    /// exactly one source of that zone.
-    ///
-    /// `chrono::Local` caches the timezone PER THREAD, so a thread whose
-    /// first lookup cannot open `/etc/localtime` — a daemon holding many
-    /// peer sockets and RPC handler threads can transiently exhaust its
-    /// descriptors — silently caches UTC for the rest of its life. On a
-    /// twenty-hour mainnet run that put the shutdown lines four hours in
-    /// the future while every earlier line was local, and it had me chasing
-    /// a stall that never happened.
-    ///
-    /// Be clear about what this test is: it pins that all threads agree and
-    /// that the offset comes from the single process-wide `LOCAL_OFFSET`.
-    /// It does NOT reproduce the failure. Reproducing it needs the
-    /// timezone read to fail, which needs a descriptor limit low enough to
-    /// exhaust — under this machine's 524288 the starvation loop is far too
-    /// expensive to run in a unit test. It was reproduced out of tree with
-    /// `ulimit -n 64`: a thread's first `Local::now()` under exhaustion
-    /// returns UTC and stays UTC, while its parent keeps local time.
-    ///
-    /// What actually prevents a recurrence is structural: there is one
-    /// offset for the process, resolved once, so two threads cannot
-    /// disagree regardless of what any later lookup does.
+    /// The process renders every line in one zone, read once into
+    /// `LOCAL_ZONE`, so no thread has a zone of its own: the property the
+    /// per-thread chrono zone lacked (see `LOCAL_ZONE`).  This pins that
+    /// every thread gets the one zone; it does not reproduce a failed
+    /// read, which needs the descriptors exhausted.
     #[test]
     fn one_zone_for_the_whole_process() {
-        let from_main = local_offset();
-        let stamp_main = timestamp();
-
-        let seen: Vec<i32> = (0..8)
-            .map(|_| std::thread::spawn(local_offset))
+        let from_main = std::ptr::from_ref(local_zone()).addr();
+        let seen: Vec<usize> = (0..8)
+            .map(|_| std::thread::spawn(|| std::ptr::from_ref(local_zone()).addr()))
             .map(|h| h.join().expect("thread"))
             .collect();
-        for off in &seen {
-            assert_eq!(
-                *off, from_main,
-                "a thread resolved a different offset ({off}) than the main \
-                 thread ({from_main}); the process must have exactly one"
-            );
+        for zone in &seen {
+            assert_eq!(*zone, from_main, "a thread read a zone of its own");
         }
+        assert!(
+            LOCAL_ZONE.get().is_some(),
+            "the zone must be read once into LOCAL_ZONE, so no later read can \
+             change it"
+        );
+    }
 
-        // And the rendered zone field agrees, which is what a reader sees.
-        let stamps: Vec<String> = (0..8)
-            .map(|_| std::thread::spawn(timestamp))
-            .map(|h| h.join().expect("thread"))
-            .collect();
-        for s in &stamps {
-            assert_eq!(
-                &s[..13],
-                &stamp_main[..13],
-                "threads rendered different hours: {s} against {stamp_main}"
-            );
+    /// A zone of New York's rules, whose daylight saving comes from the
+    /// footer alone.
+    fn new_york() -> crate::zoneinfo::Location {
+        crate::zoneinfo::footer_zone(-18_000, "EST5EDT,M3.2.0,M11.1.0")
+    }
+
+    /// Each line is stamped at its own instant's offset in the zone it
+    /// is given, so a dropped or frozen offset shows on a UTC host too.
+    #[test]
+    fn lines_take_their_own_instants_offset() {
+        let kathmandu = crate::zoneinfo::footer_zone(20_700, "<+0545>-5:45");
+        assert_eq!(
+            timestamp_in(&kathmandu, 1_496_327_525, 123_456_789),
+            "2017-06-01 20:17:05.123"
+        );
+        // 2026-03-08 07:00 UTC, when New York's clocks go to 03:00, and
+        // 2026-11-01 06:00 UTC, when they go back to 01:00.
+        let ny = new_york();
+        for (secs, want) in [
+            (1_772_953_199, "2026-03-08 01:59:59.999"),
+            (1_772_953_200, "2026-03-08 03:00:00.999"),
+            (1_793_512_799, "2026-11-01 01:59:59.999"),
+            (1_793_512_800, "2026-11-01 01:00:00.999"),
+            (1_794_916_800, "2026-11-17 07:00:00.999"),
+        ] {
+            assert_eq!(timestamp_in(&ny, secs, 999_999_999), want, "{secs}");
         }
+    }
 
-        // The offset really is memoised, not re-derived per call.
-        assert!(
-            LOCAL_OFFSET.get().is_some(),
-            "the offset must be resolved once into LOCAL_OFFSET, so no later \
-             failed lookup can change it"
-        );
-        assert!(
-            local_offset_label().starts_with('+') || local_offset_label().starts_with('-'),
-            "the banner label must carry a signed offset, got {}",
-            local_offset_label()
-        );
+    /// The banner names the zone and its offset now, or says why the
+    /// local zone could not be read.
+    #[test]
+    fn the_banner_names_the_zone() {
+        use crate::zoneinfo::{LocalZone, Location};
+        let zone = |name: &str, location, unread: Option<&str>| LocalZone {
+            name: name.to_owned(),
+            location,
+            unread: unread.map(str::to_owned),
+        };
+        let july = 1_782_907_200;
+        for (zone, want) in [
+            (
+                zone("Local", new_york(), None),
+                "Log timestamps are local time, now UTC-04:00",
+            ),
+            (
+                zone("America/New_York", new_york(), None),
+                "Log timestamps are local time in America/New_York, now UTC-04:00",
+            ),
+            (
+                zone("UTC", Location::utc(), None),
+                "Log timestamps are UTC+00:00",
+            ),
+            (
+                zone("UTC", Location::utc(), Some("unknown time zone EST5")),
+                "Log timestamps are UTC+00:00: the local time zone could not be read \
+                 (unknown time zone EST5)",
+            ),
+        ] {
+            assert_eq!(zone_line(&zone, july), want);
+        }
+        assert!(timestamp_zone_line().starts_with("Log timestamps are "));
     }
 
     #[test]
@@ -498,14 +527,14 @@ mod tests {
         }
     }
 
-    /// A line's timestamp is the current time in the process's offset,
-    /// to the minute (a second attempt covers a minute ending between
+    /// A line's timestamp is the current time at the process zone's
+    /// offset, to the minute (a second attempt covers a minute ending between
     /// the two readings).
     #[test]
     fn timestamp_is_now_in_the_local_offset() {
         let agrees = || {
             let (secs, _) = crate::timefmt::now();
-            let want = crate::timefmt::slog_timestamp(secs, 0, local_offset());
+            let want = crate::timefmt::slog_timestamp(secs, 0, local_zone().location.offset(secs));
             let got = timestamp();
             (got[..16] == want[..16]).then_some(()).ok_or((got, want))
         };

@@ -382,3 +382,18 @@ error. What it cannot see is an agent built from a `Config` whose
 `TlsConfig` names no provider, which falls back the same way; the node's
 `tests/no_process_provider.rs` covers that at run time. Nothing else in
 the lint policy changes, and the file holds no other setting.
+
+## Addendum, 2026-11-17 — a fourth unsafe block, for the time zone
+
+`dcroxide-winsvc` writes a fourth unsafe block: `GetTimeZoneInformation`,
+in `timezone.rs`, which Go's Windows `initLocal` calls to build
+`time.Local` and which std does not wrap. The node's log timestamps follow
+that zone as dcrd's do; `dcroxide-node` builds it from the call's result
+in safe code (`zoneinfo.rs`), and the call adds the `Win32_System_Time`
+feature to the crate's `windows-sys` 0.61.2, which adds no package. The
+block sits under its own `#[allow(unsafe_code)]` with a `// SAFETY:`
+comment, and the crate documentation lists it beside the other three, as
+the addendum of 2026-09-25 requires. `cargo clippy --target
+x86_64-pc-windows-msvc -p dcroxide-winsvc --all-targets -- -D warnings`
+checks it from Linux; CI's Windows test job is the first to run it.
+`dcroxide-node` still forbids unsafe code.

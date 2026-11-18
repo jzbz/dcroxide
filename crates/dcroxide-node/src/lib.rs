@@ -75,6 +75,7 @@ pub mod txmempool;
 pub mod version;
 pub mod websocket;
 pub mod wsframe;
+mod zoneinfo;
 
 pub use config::{
     AUTH_TYPE_BASIC, AUTH_TYPE_CLIENT_CERT, Assignment, Config, ConfigEnv, DialSelection,

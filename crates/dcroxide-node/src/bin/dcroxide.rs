@@ -482,14 +482,11 @@ fn run_node(cfg: Config, profiler: &dcroxide_node::profiler::ProfileServer) -> E
         version::version_string(),
         std::env::consts::OS
     ));
-    // The zone every timestamp in this log is rendered in.  It is fixed
-    // for the life of the process (see `logging::local_offset`), so saying
-    // it once means a reader never has to infer it — and would have made
-    // the mixed-zone bug this replaced obvious on sight.
-    log_info(&format!(
-        "Log timestamps are UTC{}",
-        dcroxide_node::logging::local_offset_label()
-    ));
+    // The zone every timestamp in this log is rendered in, read once for
+    // the life of the process (see `logging::LOCAL_ZONE`), and its offset
+    // now, or why it could not be read: said once, so a reader never has
+    // to infer it.
+    log_info(&dcroxide_node::logging::timestamp_zone_line());
     log_info(&format!("Home dir: {}", cfg.home_dir));
     if cfg.no_file_logging {
         log_info("File logging disabled");

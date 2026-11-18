@@ -24,30 +24,33 @@
 //! or shutdown until the daemon has shut down ([`install_console_handler`],
 //! [`shutdown_complete`]), and the adoption of an inherited
 //! `--piperx`/`--pipetx` pipe handle ([`adopt_inherited_handle`], dcrd's
-//! `os.NewFile`).
+//! `os.NewFile`), and the time zone settings Go's `time` package asks
+//! Windows for when it builds `time.Local` ([`time_zone_information`]).
 //!
 //! On other platforms every entry point is a stub: dcrd's
 //! `runServiceCommand` hook is nil off Windows, so the `--service`
 //! flag parses but does nothing, and the service detection reports
 //! interactive mode; there are no console control events to handle,
-//! and no handles to adopt.
+//! no handles to adopt, and no zone to ask Windows for.
 //!
 //! # Unsafe code
 //!
 //! The workspace forbids `unsafe_code`; this crate only denies it, and
 //! is the one audited exception.  The `windows-service` entry macro
 //! expands an FFI shim with an unsafe block into the crate, and the
-//! console handler and the handle adoption call Windows directly
-//! through `windows-sys`, since std wraps neither.  Every unsafe block
-//! written here is Windows-only, sits under its own
-//! `#[allow(unsafe_code)]` at the narrowest scope, and carries a
+//! console handler, the handle adoption and the time zone query call
+//! Windows directly through `windows-sys`, since std wraps none of
+//! them.  Every unsafe block written here is Windows-only, sits under
+//! its own `#[allow(unsafe_code)]` at the narrowest scope, and carries a
 //! `// SAFETY:` comment stating the invariants it relies on:
 //!
 //! - registering the console handler (`SetConsoleCtrlHandler`), in
 //!   `console.rs`;
 //! - duplicating the inherited handle (`GetCurrentProcess`,
 //!   `DuplicateHandle`), and taking ownership of the duplicate
-//!   (`OwnedHandle::from_raw_handle`), in `pipe.rs`.
+//!   (`OwnedHandle::from_raw_handle`), in `pipe.rs`;
+//! - reading the time zone settings (`GetTimeZoneInformation`), in
+//!   `timezone.rs`.
 //!
 //! Anything else that needs unsafe code fails the `deny` until it is
 //! reviewed and allowed the same way.  No other crate in the workspace
@@ -57,9 +60,11 @@
 #[cfg_attr(not(windows), allow(dead_code))]
 mod console;
 mod pipe;
+mod timezone;
 
 pub use console::{SHUTDOWN_WAIT, Terminate, install_console_handler, shutdown_complete};
 pub use pipe::adopt_inherited_handle;
+pub use timezone::{TimeZoneInformation, ZoneDate, time_zone_information};
 
 /// The name of the dcrd service (dcrd `svcName`), the "real" name used
 /// to control the service.

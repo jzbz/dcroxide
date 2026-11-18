@@ -3,13 +3,6 @@ all-features = true
 
 [advisories]
 yanked = "deny"
-# chrono is unmaintained (RUSTSEC-2026-0543), with no release to move to.
-# It is a notice, not a vulnerability: dcroxide-node takes from it only the
-# local UTC offset its log lines are stamped with and the current UTC time,
-# and replacing it is recorded in docs/dependency-ledger.md.
-ignore = [
-    { id = "RUSTSEC-2026-0543", reason = "chrono unmaintained; replacement recorded in docs/dependency-ledger.md" },
-]
 
 [licenses]
 allow = [
@@ -68,14 +61,12 @@ multiple-versions = "deny"
 # which left when secp256k1 moved to k256, is refused by name as well.
 # A ban lets a crate through only when every crate that takes it
 # directly is one of its wrappers, so a new crate that takes cc fails
-# the check.  In cargo-deny's graph cc's only takers are its two
-# wrappers (the lock's ring, which no build takes, lists it too):
-# blake3, whose build script still asks the C compiler about two
-# AVX-512 flags, and warns when none answers, until BLAKE3 is ported
-# into the tree, and whose features are held to `pure` below; and
-# iana-time-zone-haiku, which compiles C++ for Haiku alone, a target
-# the project does not build for, kept in view here.  A wrapper goes
-# with its crate, since cargo-deny warns of one it does not meet.
+# the check.  In cargo-deny's graph cc's only taker is its wrapper
+# (the lock's ring, which no build takes, lists it too): blake3, whose
+# build script still asks the C compiler about two AVX-512 flags, and
+# warns when none answers, until BLAKE3 is ported into the tree, and
+# whose features are held to `pure` below.  A wrapper goes with its
+# crate, since cargo-deny warns of one it does not meet.
 # A ban that matches nothing is doing its job, unlike an unmatched skip.
 # Only this workspace is read: fuzz/, with its own lock, keeps
 # libFuzzer's C++, one of ADR-0012's two exceptions.  CI's
@@ -86,7 +77,7 @@ deny = [
     { crate = "aws-lc-rs", reason = "binds aws-lc-sys, C and assembly; the node's TLS runs on dcroxide-tlscrypto (ADR-0012, ADR-0015)" },
     { crate = "aws-lc-sys", reason = "C and assembly; the node's TLS runs on dcroxide-tlscrypto (ADR-0012, ADR-0015)" },
     { crate = "secp256k1-sys", reason = "libsecp256k1's C; secp256k1 runs on k256 and dcroxide-secp256k1-vartime (ADR-0012, ADR-0017)" },
-    { crate = "cc", wrappers = ["blake3", "iana-time-zone-haiku"], reason = "runs a C or C++ compiler from a build script (ADR-0012)" },
+    { crate = "cc", wrappers = ["blake3"], reason = "runs a C or C++ compiler from a build script (ADR-0012)" },
     { crate = "cmake", reason = "drives a C or C++ build through CMake (ADR-0012)" },
     { crate = "pkg-config", reason = "finds a system C library for a build script to link (ADR-0012)" },
     { crate = "vcpkg", reason = "finds or builds a C or C++ library to link (ADR-0012)" },
@@ -106,7 +97,7 @@ reason = "only `pure` keeps blake3's C and assembly out of a build (ADR-0012)"
 
 [[bans.skip]]
 crate = "syn:2"
-reason = "the ecosystem is mid-migration to syn 3: serde_derive and wasm-bindgen-macro-support are on 3, while curve25519-dalek-derive, windows-implement and windows-interface still pin 2 -- both majors are present until the laggards move, and neither side is this workspace's to choose"
+reason = "the ecosystem is mid-migration to syn 3: serde_derive is on 3, while curve25519-dalek-derive still pins 2 -- both majors are present until it moves, and neither side is this workspace's to choose"
 
 [sources]
 unknown-registry = "deny"

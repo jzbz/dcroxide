@@ -56,12 +56,12 @@ script.
   beside it (`Cargo.toml:38` at `0c4154d`) for EC-Schnorr-DCRv0 and for
   ECDSA signing of a hash at or above the order
   (`ecdsa.rs:388-437` at `0c4154d`).
-- **`ring` 0.17.14** (`Cargo.lock:1549`): ~151k lines of C and assembly
+- **`ring` 0.17.14** (`Cargo.lock:1451`): ~151k lines of C and assembly
   (`dependency-ledger.md:166`), the crypto provider of `rustls` 0.23.46.
   `dcroxide-node` selects rustls's `ring` feature
   (`crates/dcroxide-node/Cargo.toml:59-69` at `8e6ea23`), `ureq` 3.4.2
   selects it through its default `rustls` feature, and `rustls-webpki`
-  0.103.16 depends on it (`Cargo.lock:1617-1625`). It runs the RPC and
+  0.103.16 depends on it (`Cargo.lock:1519-1527`). It runs the RPC and
   websocket TLS listener, the RPC client-certificate verifier
   (`rpcrun::GoClientCertVerifier`, which hands `rustls-webpki` ring's
   signature algorithms) and both TLS clients of the HTTPS seeder
@@ -78,7 +78,7 @@ script.
   accepts two AVX-512 flags (`build.rs:161-175`), and asks before it reads
   `pure` (`:343-344`).
 - **`iana-time-zone-haiku` 0.1.2**, reached through `chrono`'s `clock`
-  feature (`crates/dcroxide-node/Cargo.toml:28`) and `iana-time-zone`
+  feature (`crates/dcroxide-node/Cargo.toml:28` at `4267dd2`) and `iana-time-zone`
   0.1.65, which depends on it only when the target OS is Haiku. There its
   build script compiles C++. The project builds for no Haiku target.
 
@@ -93,7 +93,7 @@ makes a skip of either a failure (`.github/workflows/ci.yml:26-35`).
 **Inline assembly in Rust crates.** Crates already in the node's build
 carry `asm!`, which rustc assembles itself, with no C toolchain: the
 system calls of `rustix` 1.1.5, which `dcroxide-node` takes on Unix
-(`crates/dcroxide-node/Cargo.toml:120`) and whose build script picks its
+(`crates/dcroxide-node/Cargo.toml:119`) and whose build script picks its
 Linux backend there (`build.rs:101-122`); the optimization barrier of
 `zeroize` 1.9.0 (`src/barrier.rs:69`); the constant-time moves of `cmov`
 0.5.4; and a few more, which the dependency ledger lists.
@@ -194,7 +194,7 @@ C that cgo links into the oracle included:
   builds and runs (`.github/workflows/ci.yml:232-287`).
 - **cargo-fuzz's libFuzzer**, which has no pure-Rust drop-in. `fuzz/` is
   outside the workspace (the root `Cargo.toml:40`) with its own lock, and
-  `libfuzzer-sys` 0.4.13 (`fuzz/Cargo.lock:1109-1110`) compiles
+  `libfuzzer-sys` 0.4.13 (`fuzz/Cargo.lock:1017-1018`) compiles
   libFuzzer's C++ with `cc` under its default `link_libfuzzer` feature
   (`build.rs:24-38`, `:43-44`).
 
@@ -415,7 +415,7 @@ which does not depend on the TLS answers, can start at once.
   `find-msvc-tools`, after the other three removals, for as long as
   `chrono`'s `clock` feature takes `iana-time-zone`; the node uses it for
   the local offset of its log timestamps
-  (`crates/dcroxide-node/src/logging.rs:158-159`). No build for a target
+  (`crates/dcroxide-node/src/logging.rs:157-158` at `4267dd2`). No build for a target
   the project builds for compiles it. `cc` would leave the lock only with
   a `chrono` setup that does without `iana-time-zone`, which nothing here
   decides.
@@ -590,3 +590,24 @@ remains (Enforcement).
   words as dated text. The rule is met only once all four breaches are
   gone and both checks run and pass (Enforcement); blake3's probe and
   the shim remain.
+
+## Addendum, 2026-11-17 — chrono leaves, and with it the Haiku crate
+
+`chrono` left the build: the node's log timestamps are formatted in tree,
+and their local zone is read by a port of Go 1.27.3's own reading of
+`time.Local` (`crates/dcroxide-node/src/zoneinfo.rs`; the dependency
+ledger's `chrono` paragraph). `iana-time-zone` and `iana-time-zone-haiku`
+left both lock files with it, so what this record says of the Haiku crate
+is history from this date: Context's fourth crate that takes `cc`,
+Enforcement's reading that kept it among `cc`'s wrappers, the
+Consequences' account of `cc` in `Cargo.lock`, and the addenda of
+2026-10-31 and 2026-11-06 where they name it or count two takers of
+`cc`. `deny.toml` drops it from `cc`'s wrappers, leaving `blake3`, since
+cargo-deny warns of a wrapper it does not meet.
+
+`cc` stays in `Cargo.lock`, with `shlex` and `find-msvc-tools`: blake3's
+build script takes it in every build, and `ring`'s lock-only entry lists
+it. `cargo tree -i cc --all-features --target all -e all --workspace`
+gives it blake3 as its one dependent. cargo-deny was not run on the
+change; CI's deny job is the first to check it. No crate that builds C
+came in.

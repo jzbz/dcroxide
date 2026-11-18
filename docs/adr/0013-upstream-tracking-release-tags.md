@@ -51,7 +51,7 @@ or matched a second dcrd in the same role
 PARITY.md keep master's behaviour where 2.1.7 differs: `addnode` and
 `node`, protocol version 12 against 11 and `debuglevel`'s subsystems in
 one, and the retry backoff for an unreachable `--connect` peer in the
-other (`docs/PARITY.md:2423-2478`).
+other (`docs/PARITY.md:2459-2514`).
 
 **How dcrd releases**, read from its repository as fetched on 2026-10-25:
 

@@ -287,6 +287,16 @@
 //	                     in a fixed zone of that offset as
 //	                     "2006-01-02 15:04:05.000", a tab, and the instant
 //	                     in net/http's TimeFormat}
+//	local_offsets      → data is Unix seconds (8 BE, signed) each;
+//	                     {"result": time.Local's name, a space, and its
+//	                     offset east of UTC in seconds at each instant,
+//	                     joined by ","}: the zone this process read from
+//	                     its own TZ, or /etc/localtime with TZ unset
+//	tzif_offsets       → data is a TZif file's length (4 BE) || the file
+//	                     || Unix seconds (8 BE, signed) each; {"result":
+//	                     the offsets east of UTC, joined by ",", of
+//	                     time.LoadLocationFromTZData's location at each
+//	                     instant, or "err " and its error}
 package main
 
 import (
@@ -2010,9 +2020,43 @@ func handle(req request) response {
 		}
 		return response{Result: strings.Join(lines, "\n")}
 
+	case "local_offsets":
+		// The zone decred/slog's time.Now() lines are in: time.Local,
+		// which Go reads once, on first use, from this process's
+		// environment.
+		if len(data)%8 != 0 {
+			return errResp("local_offsets: want 8-byte instants, got %d bytes", len(data))
+		}
+		return response{Result: time.Local.String() + " " + zoneOffsets(time.Local, data)}
+
+	case "tzif_offsets":
+		if len(data) < 4 {
+			return errResp("tzif_offsets: want a 4-byte length, got %d bytes", len(data))
+		}
+		n := binary.BigEndian.Uint32(data)
+		if uint64(len(data)-4) < uint64(n) || (uint64(len(data)-4)-uint64(n))%8 != 0 {
+			return errResp("tzif_offsets: %d bytes do not hold a %d-byte file and 8-byte instants", len(data)-4, n)
+		}
+		loc, err := time.LoadLocationFromTZData("x", data[4:4+n])
+		if err != nil {
+			return response{Result: "err " + err.Error()}
+		}
+		return response{Result: zoneOffsets(loc, data[4+n:])}
+
 	default:
 		return errResp("unknown cmd: %s", req.Cmd)
 	}
+}
+
+// zoneOffsets is loc's offset east of UTC, in seconds, at each of the
+// 8-byte big-endian Unix seconds in instants, joined by ",".
+func zoneOffsets(loc *time.Location, instants []byte) string {
+	offsets := make([]string, 0, len(instants)/8)
+	for ; len(instants) > 0; instants = instants[8:] {
+		_, offset := time.Unix(int64(binary.BigEndian.Uint64(instants)), 0).In(loc).Zone()
+		offsets = append(offsets, strconv.Itoa(offset))
+	}
+	return strings.Join(offsets, ",")
 }
 
 // sigKind is how a signature is made.
