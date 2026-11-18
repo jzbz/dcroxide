@@ -154,7 +154,9 @@ pub fn utc_time(unix: i64) -> Vec<u8> {
     tlv(0x17, s.as_bytes())
 }
 
-/// Convert a unix timestamp to UTC civil fields.
+/// Convert a unix timestamp to UTC civil fields: year, month (1–12),
+/// day (1–31), hour, minute and second, in the proleptic Gregorian
+/// calendar Go's `time` package uses, before 1970 included.
 pub fn civil_from_unix(unix: i64) -> (i64, u32, u32, u32, u32, u32) {
     let days = unix.div_euclid(86_400);
     let secs = unix.rem_euclid(86_400);

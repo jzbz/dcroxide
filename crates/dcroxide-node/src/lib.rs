@@ -69,6 +69,7 @@ pub mod server;
 pub mod socks;
 pub mod socktimeout;
 pub mod sync;
+mod timefmt;
 pub mod transport;
 pub mod txmempool;
 pub mod version;

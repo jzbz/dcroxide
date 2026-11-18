@@ -169,14 +169,13 @@ BLAKE-256 was and none of these are.
 
 `chrono` is unmaintained (RUSTSEC-2026-0543), and no release fixes that,
 so `deny.toml` ignores the advisory, which is a notice and not a
-vulnerability. `dcroxide-node` takes three things from it: the local UTC
+vulnerability. `dcroxide-node` takes one thing from it: the local UTC
 offset its log lines are stamped with, read once
-(`crates/dcroxide-node/src/logging.rs`), the current UTC time for those
-lines, and the current UTC time for the `Date` header of the RPC server's
-responses (`src/rpcrun.rs`). Replacing it is the plan: the UTC half is a
-few lines in tree, and the local offset needs either a reader of the
-system's zone files or a maintained crate that has one, which would be a
-dependency decision of its own.
+(`crates/dcroxide-node/src/logging.rs`). The calendar text of those
+lines and of the `Date` header of the RPC server's responses is
+formatted in tree (`src/timefmt.rs`). Replacing the offset is the plan,
+decided 2026-11-17: a port of Go's own reading of the local time zone,
+with no new crate.
 
 ## Maintaining this
 

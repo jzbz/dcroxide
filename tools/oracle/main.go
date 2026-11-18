@@ -280,6 +280,13 @@
 //	build_info         → takes no data; {"go_version": runtime.Version(),
 //	                      "modules": {"<module path>": "<version>"}} for the
 //	                     secp256k1/v4 and edwards/v2 modules linked in
+//	time_format        → data is 16-byte records, each Unix seconds (8 BE,
+//	                     signed) || nanoseconds (4 BE) || offset east of
+//	                     UTC in seconds (4 BE, signed); {"result": one
+//	                     line per record, joined by "\n", of the instant
+//	                     in a fixed zone of that offset as
+//	                     "2006-01-02 15:04:05.000", a tab, and the instant
+//	                     in net/http's TimeFormat}
 package main
 
 import (
@@ -300,6 +307,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"runtime"
 	"runtime/debug"
@@ -1981,6 +1989,26 @@ func handle(req request) response {
 			}
 		}
 		return response{GoVersion: runtime.Version(), Modules: modules}
+
+	case "time_format":
+		// The calendar text dcroxide-node writes: decred/slog's
+		// formatHeader timestamp, whose milliseconds are truncated as
+		// the ".000" layout truncates them, and the Date header
+		// net/http's server writes with
+		// time.Now().UTC().AppendFormat(..., TimeFormat).
+		if len(data)%16 != 0 {
+			return errResp("time_format: want 16-byte records, got %d bytes", len(data))
+		}
+		lines := make([]string, 0, len(data)/16)
+		for rec := data; len(rec) > 0; rec = rec[16:] {
+			secs := int64(binary.BigEndian.Uint64(rec[0:8]))
+			nanos := int64(binary.BigEndian.Uint32(rec[8:12]))
+			offset := int(int32(binary.BigEndian.Uint32(rec[12:16])))
+			t := time.Unix(secs, nanos).In(time.FixedZone("", offset))
+			lines = append(lines, t.Format("2006-01-02 15:04:05.000")+"\t"+
+				t.UTC().Format(http.TimeFormat))
+		}
+		return response{Result: strings.Join(lines, "\n")}
 
 	default:
 		return errResp("unknown cmd: %s", req.Cmd)

@@ -22,6 +22,7 @@ mod punycode;
 mod x509;
 
 pub use certgen::{CertEnv, CertPair, Curve, new_ed25519_tls_cert_pair, new_tls_cert_pair};
+pub use der::civil_from_unix;
 
 #[doc(hidden)]
 pub use certgen::{CertParts, new_ed25519_tls_cert_pair_parts, new_tls_cert_pair_parts};

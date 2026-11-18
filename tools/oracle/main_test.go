@@ -17,6 +17,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/asn1"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
@@ -713,6 +714,32 @@ func TestECDH(t *testing.T) {
 		if resp.Error == "" || resp.Result != "" {
 			t.Errorf("%s: got %+v, want an error", name, resp)
 		}
+	}
+}
+
+// TestTimeFormat pins time_format's record layout and its two
+// layouts on instants whose text is known, a millisecond truncated and
+// an offset carrying the date back across midnight included.
+func TestTimeFormat(t *testing.T) {
+	record := func(secs int64, nanos uint32, offset int32) []byte {
+		b := binary.BigEndian.AppendUint64(nil, uint64(secs))
+		b = binary.BigEndian.AppendUint32(b, nanos)
+		return binary.BigEndian.AppendUint32(b, uint32(offset))
+	}
+	resp := call("time_format",
+		record(784111777, 0, 0),
+		record(1496327525, 123999999, 0),
+		record(0, 0, -18000),
+		record(-62135596800, 999999999, 20700))
+	want := "1994-11-06 08:49:37.000\tSun, 06 Nov 1994 08:49:37 GMT\n" +
+		"2017-06-01 14:32:05.123\tThu, 01 Jun 2017 14:32:05 GMT\n" +
+		"1969-12-31 19:00:00.000\tThu, 01 Jan 1970 00:00:00 GMT\n" +
+		"0001-01-01 05:45:00.999\tMon, 01 Jan 0001 00:00:00 GMT"
+	if resp.Error != "" || resp.Result != want {
+		t.Errorf("got %+v, want result %q", resp, want)
+	}
+	if resp := call("time_format", make([]byte, 15)); resp.Error == "" {
+		t.Errorf("15 bytes: got %+v, want an error", resp)
 	}
 }
 

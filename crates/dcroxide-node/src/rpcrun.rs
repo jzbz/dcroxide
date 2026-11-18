@@ -9886,16 +9886,15 @@ fn write_unauthorized<S: Write>(
 
 /// The `Date` every response written through Go's `ResponseWriter`
 /// carries, in the one format `net/http` uses
-/// (`TimeFormat = "Mon, 02 Jan 2006 15:04:05 GMT"`).
+/// (`TimeFormat = "Mon, 02 Jan 2006 15:04:05 GMT"`), formatted by
+/// [`crate::timefmt::http_date`].
 ///
 /// It is deliberately absent from [`write_protocol_error`]: those
 /// answers are written straight to the socket by Go's connection loop,
 /// which never touches the header map, so a parse-level 400, a 501 and
 /// a 505 all arrive without one.
 pub(crate) fn http_date() -> String {
-    chrono::Utc::now()
-        .format("%a, %d %b %Y %H:%M:%S GMT")
-        .to_string()
+    crate::timefmt::http_date(crate::timefmt::now().0)
 }
 
 /// Write the redirect `ServeMux` sends when cleaning changed the path.

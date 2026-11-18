@@ -143,9 +143,10 @@ fn render(timestamp: &str, level: LogLevel, subsys: &str, msg: &str) -> String {
 ///
 /// Resolving once, process-wide, reproduces Go's single-zone property and
 /// cannot be poisoned by a later failed lookup.
-static LOCAL_OFFSET: OnceLock<chrono::FixedOffset> = OnceLock::new();
+static LOCAL_OFFSET: OnceLock<i32> = OnceLock::new();
 
-/// The offset every line is rendered in, resolved on first use.
+/// The offset every line is rendered in, in seconds east of UTC,
+/// resolved on first use.
 ///
 /// Deliberate divergence: Go's `time.Local` holds the zone's transition
 /// rules, so dcrd follows a daylight-saving change while running; this
@@ -154,25 +155,23 @@ static LOCAL_OFFSET: OnceLock<chrono::FixedOffset> = OnceLock::new();
 /// restarted.  One zone for the life of the process is the property worth
 /// having — a reader can trust that two lines an hour apart really are an
 /// hour apart — and the alternative on offer was two zones in one file.
-fn local_offset() -> chrono::FixedOffset {
-    *LOCAL_OFFSET.get_or_init(|| *chrono::Local::now().offset())
+fn local_offset() -> i32 {
+    *LOCAL_OFFSET.get_or_init(|| chrono::Local::now().offset().local_minus_utc())
 }
 
 /// The local-time timestamp slog writes: zero-padded
 /// `YYYY-MM-DD hh:mm:ss` with milliseconds (slog formats
 /// `time.Now()`, which is local time).
 fn timestamp() -> String {
-    chrono::Utc::now()
-        .with_timezone(&local_offset())
-        .format("%Y-%m-%d %H:%M:%S%.3f")
-        .to_string()
+    let (secs, nanos) = crate::timefmt::now();
+    crate::timefmt::slog_timestamp(secs, nanos, local_offset())
 }
 
 /// The offset log timestamps are rendered in, as `+hh:mm`, for the
 /// startup banner: a log whose zone is fixed for the process should say
 /// which zone, so a reader never has to guess.
 pub fn local_offset_label() -> String {
-    local_offset().to_string()
+    crate::timefmt::offset_label(local_offset())
 }
 
 /// The exit status a shell reports for a process `SIGPIPE` killed
@@ -443,7 +442,7 @@ mod tests {
         let from_main = local_offset();
         let stamp_main = timestamp();
 
-        let seen: Vec<chrono::FixedOffset> = (0..8)
+        let seen: Vec<i32> = (0..8)
             .map(|_| std::thread::spawn(local_offset))
             .map(|h| h.join().expect("thread"))
             .collect();
@@ -496,6 +495,22 @@ mod tests {
                 19 => assert_eq!(*b, b'.', "{ts}"),
                 _ => assert!(b.is_ascii_digit(), "{ts}"),
             }
+        }
+    }
+
+    /// A line's timestamp is the current time in the process's offset,
+    /// to the minute (a second attempt covers a minute ending between
+    /// the two readings).
+    #[test]
+    fn timestamp_is_now_in_the_local_offset() {
+        let agrees = || {
+            let (secs, _) = crate::timefmt::now();
+            let want = crate::timefmt::slog_timestamp(secs, 0, local_offset());
+            let got = timestamp();
+            (got[..16] == want[..16]).then_some(()).ok_or((got, want))
+        };
+        if let Err((got, want)) = agrees().or_else(|_| agrees()) {
+            panic!("timestamp {got} is not now in the local offset, {want}");
         }
     }
 
