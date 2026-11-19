@@ -96,7 +96,10 @@ unless a request from a peer or an RPC client was still reading the store
 as the process exited: the file stays open until the last such read has
 ended, so the mark then stays, and the next start loads the saved state
 without a repair, as before. Open a copy if the node may start meanwhile,
-since the node locks the file while it runs.
+since the node locks the file while it runs. On Linux a dcroxide build
+from before 2026-09-18 does not see that lock (ADR-0004's addendum of
+2026-11-19), so do not point one at a data directory a current node may
+have open.
 
 The chain then replays the blocks the UTXO set had not yet flushed. As in
 dcrd, that replay runs between the CHAN lines "UTXO cache initializing (max
@@ -1339,7 +1342,7 @@ suggests, and the opposite of what two microbenchmarks of 2026-07
 predicted: the 500,000-key insert loop that was the premise of ADR-0004's
 lever (b), and the 2,000,000-write grid reported when the knob was added,
 which the source comments still carry, marked superseded. There is no
-fixed split to reason from: redb 4.5.0
+fixed split to reason from: redb 5.0.0
 keeps a single cache figure and partitions it on demand, holding the write
 buffer at or below half of it, best effort, and letting the read cache grow
 into all of it. The advice rests on the full-chain measurement, not on a

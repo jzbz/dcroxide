@@ -6,7 +6,7 @@
 //! that can be told to fail reads or writes and that counts reads, with
 //! redb's page cache set to zero.  The zero cache is what makes the
 //! faults reachable: a read-cache hit skips redb's failure check
-//! (redb-4.5.0 `cached_file.rs:690-698`), so with a warm cache a test
+//! (redb-5.0.0 `cached_file.rs:796-804`), so with a warm cache a test
 //! would only ever exercise whichever pages it happened not to touch
 //! first.  With no room to keep a page, each page a small store spreads
 //! across the cache's 131 stripes is evicted as soon as it is read, so
@@ -85,13 +85,13 @@ impl FaultyBackend {
 }
 
 impl redb::StorageBackend for FaultyBackend {
-    fn len(&self) -> Result<u64, std::io::Error> {
+    fn len(&self) -> Result<u64, redb::BackendError> {
         self.inner.len()
     }
 
-    fn read(&self, offset: u64, out: &mut [u8]) -> Result<(), std::io::Error> {
+    fn read(&self, offset: u64, out: &mut [u8]) -> Result<(), redb::BackendError> {
         if self.fail_reads.load(Ordering::SeqCst) {
-            return Err(Self::injected("read"));
+            return Err(Self::injected("read").into());
         }
         let limited = self
             .reads_left
@@ -101,23 +101,23 @@ impl redb::StorageBackend for FaultyBackend {
                 n => Some(n),
             });
         if limited.is_err() {
-            return Err(Self::injected("read"));
+            return Err(Self::injected("read").into());
         }
         self.reads.fetch_add(1, Ordering::SeqCst);
         self.inner.read(offset, out)
     }
 
-    fn set_len(&self, len: u64) -> Result<(), std::io::Error> {
+    fn set_len(&self, len: u64) -> Result<(), redb::BackendError> {
         self.write_fault()?;
         self.inner.set_len(len)
     }
 
-    fn sync_data(&self) -> Result<(), std::io::Error> {
+    fn sync_data(&self) -> Result<(), redb::BackendError> {
         self.write_fault()?;
         self.inner.sync_data()
     }
 
-    fn write(&self, offset: u64, data: &[u8]) -> Result<(), std::io::Error> {
+    fn write(&self, offset: u64, data: &[u8]) -> Result<(), redb::BackendError> {
         self.write_fault()?;
         self.inner.write(offset, data)
     }
@@ -352,7 +352,7 @@ fn finishes<T: Send + 'static>(what: &str, f: impl FnOnce() -> T + Send + 'stati
 }
 
 /// redb's range iterator returns `PreviousIo` on every `next()` once it
-/// has failed and never `None` (redb-4.5.0
+/// has failed and never `None` (redb-5.0.0
 /// `btree_cursor_range.rs:208-216`), so a walk that skipped errors never
 /// ended.  ffldb's cursor ends where its goleveldb iterator goes
 /// invalid and carries on with the cached entries, and `ForEach` never

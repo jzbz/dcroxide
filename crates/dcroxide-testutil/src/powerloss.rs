@@ -164,22 +164,22 @@ impl PowerLossBackend {
 }
 
 impl redb::StorageBackend for PowerLossBackend {
-    fn len(&self) -> Result<u64, std::io::Error> {
+    fn len(&self) -> Result<u64, redb::BackendError> {
         Ok(self.file.lock().expect("file lock").metadata()?.len())
     }
 
-    fn read(&self, offset: u64, out: &mut [u8]) -> Result<(), std::io::Error> {
+    fn read(&self, offset: u64, out: &mut [u8]) -> Result<(), redb::BackendError> {
         let mut file = self.file.lock().expect("file lock");
         file.seek(SeekFrom::Start(offset))?;
-        file.read_exact(out)
+        Ok(file.read_exact(out)?)
     }
 
-    fn set_len(&self, len: u64) -> Result<(), std::io::Error> {
+    fn set_len(&self, len: u64) -> Result<(), redb::BackendError> {
         self.admit()?;
-        self.file.lock().expect("file lock").set_len(len)
+        Ok(self.file.lock().expect("file lock").set_len(len)?)
     }
 
-    fn sync_data(&self) -> Result<(), std::io::Error> {
+    fn sync_data(&self) -> Result<(), redb::BackendError> {
         self.admit()?;
         if !self.honest_sync {
             // Acknowledge without persisting: the failure mode under test.
@@ -195,7 +195,7 @@ impl redb::StorageBackend for PowerLossBackend {
         Ok(())
     }
 
-    fn write(&self, offset: u64, data: &[u8]) -> Result<(), std::io::Error> {
+    fn write(&self, offset: u64, data: &[u8]) -> Result<(), redb::BackendError> {
         self.admit()?;
         let mut file = self.file.lock().expect("file lock");
         let len = file.metadata()?.len();
@@ -213,6 +213,6 @@ impl redb::StorageBackend for PowerLossBackend {
                 .push((offset, previous));
         }
         file.seek(SeekFrom::Start(offset))?;
-        file.write_all(data)
+        Ok(file.write_all(data)?)
     }
 }

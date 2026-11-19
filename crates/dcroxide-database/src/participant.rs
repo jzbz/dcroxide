@@ -387,11 +387,7 @@ impl<'a, 'txn> FlushWriter<'a, 'txn> {
         bounds: (Bound<&[u8]>, Bound<&[u8]>),
     ) -> Result<Vec<crate::RawRow>, Error> {
         let mut rows = Vec::new();
-        for entry in self
-            .table
-            .range::<&[u8]>(bounds)
-            .map_err(crate::storage_error)?
-        {
+        for entry in self.table.range(bounds).map_err(crate::storage_error)? {
             let (key, value) = entry.map_err(crate::storage_error)?;
             rows.push((key.value().to_vec(), value.value().to_vec()));
         }

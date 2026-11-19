@@ -21,8 +21,8 @@
 //! from its first read to its last, against a fresh store each time:
 //! redb latches a read failure, and every later uncached read fails with
 //! `PreviousIo` until the database is reopened.  redb gets no page cache,
-//! because a cache hit skips its failure check (redb-4.5.0
-//! `cached_file.rs:690-698`) and would hide the very pages under test.
+//! because a cache hit skips its failure check (redb-5.0.0
+//! `cached_file.rs:796-804`) and would hide the very pages under test.
 
 // Test-harness arithmetic over bounded row counts.
 #![allow(clippy::arithmetic_side_effects)]
@@ -35,7 +35,7 @@ use dcroxide_blockchain::UtxoSetState;
 use dcroxide_blockchain::chaindb::{self, ChainDbError, UTXO_SET_BUCKET_NAME};
 use dcroxide_blockchain::process::{Chain, UtxoStats};
 use dcroxide_chainhash::{Hash, hash_h};
-use dcroxide_database::{Database, Options, SharedBackend, StorageBackend};
+use dcroxide_database::{BackendError, Database, Options, SharedBackend, StorageBackend};
 use dcroxide_stake::TxType;
 use dcroxide_wire::OutPoint;
 use tempfile::TempDir;
@@ -85,11 +85,11 @@ impl FailingStore {
 }
 
 impl StorageBackend for FailingStore {
-    fn len(&self) -> Result<u64, std::io::Error> {
+    fn len(&self) -> Result<u64, BackendError> {
         Ok(self.bytes.lock().expect("store lock").len() as u64)
     }
 
-    fn read(&self, offset: u64, out: &mut [u8]) -> Result<(), std::io::Error> {
+    fn read(&self, offset: u64, out: &mut [u8]) -> Result<(), BackendError> {
         let allowed = self
             .reads_left
             .try_update(Ordering::SeqCst, Ordering::SeqCst, |left| match left {
@@ -99,7 +99,7 @@ impl StorageBackend for FailingStore {
             });
         if allowed.is_err() {
             self.refused.store(true, Ordering::SeqCst);
-            return Err(std::io::Error::other("injected read failure"));
+            return Err(std::io::Error::other("injected read failure").into());
         }
         let bytes = self.bytes.lock().expect("store lock");
         let range = Self::range(bytes.len(), offset, out.len())?;
@@ -107,18 +107,18 @@ impl StorageBackend for FailingStore {
         Ok(())
     }
 
-    fn set_len(&self, len: u64) -> Result<(), std::io::Error> {
+    fn set_len(&self, len: u64) -> Result<(), BackendError> {
         let len = usize::try_from(len)
             .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
         self.bytes.lock().expect("store lock").resize(len, 0);
         Ok(())
     }
 
-    fn sync_data(&self) -> Result<(), std::io::Error> {
+    fn sync_data(&self) -> Result<(), BackendError> {
         Ok(())
     }
 
-    fn write(&self, offset: u64, data: &[u8]) -> Result<(), std::io::Error> {
+    fn write(&self, offset: u64, data: &[u8]) -> Result<(), BackendError> {
         let mut bytes = self.bytes.lock().expect("store lock");
         let range = Self::range(bytes.len(), offset, data.len())?;
         bytes[range].copy_from_slice(data);

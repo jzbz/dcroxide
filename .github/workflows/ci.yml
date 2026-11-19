@@ -363,9 +363,10 @@ jobs:
     # build redb with redb's default `std` feature, and stake fails on
     # redb. So each needs `default-features = false` on its dcroxide-*
     # path dependencies plus a `std` feature that re-enables them, and
-    # redb's `std` dealt with. Turning redb's default features off is not
-    # enough on its own: 4.5.0 builds without `std` only when `std` is
-    # off and its `experimental-api-5` preview is on (`build.rs:5-13`).
+    # redb's `std` dealt with. 5.0.0 builds without `std` once its `std`
+    # feature is off, with no preview feature as 4.5.0 needed, as long as
+    # panics abort (redb-5.0.0 `src/lib.rs:118-127`), which they do on
+    # x86_64-unknown-none; no build here has tried it yet.
     # txscript failed here on secp256k1-sys and nothing else, and
     # dcroxide-dcrec no longer takes it, so txscript may now pass; that
     # is untested, and it is not listed until a run shows it.

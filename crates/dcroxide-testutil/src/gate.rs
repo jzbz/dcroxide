@@ -23,7 +23,7 @@
 //!
 //! **A commit held while it lengthens the file holds up every
 //! transaction.**  redb grows its file, and syncs the longer file, under
-//! the lock of its allocator state (redb-4.5.0 `page_manager.rs`, `grow`),
+//! the lock of its allocator state (redb-5.0.0 `page_manager.rs`, `grow`),
 //! and a transaction that begins takes that lock to find the newest
 //! commit (`latest_committed_snapshot`).  With real storage that is a
 //! wait of one `ftruncate` and one `fsync`.  At a gate it lasts until the
@@ -147,25 +147,25 @@ impl GateBackend {
 }
 
 impl redb::StorageBackend for GateBackend {
-    fn len(&self) -> Result<u64, std::io::Error> {
+    fn len(&self) -> Result<u64, redb::BackendError> {
         self.inner.len()
     }
 
-    fn read(&self, offset: u64, out: &mut [u8]) -> Result<(), std::io::Error> {
+    fn read(&self, offset: u64, out: &mut [u8]) -> Result<(), redb::BackendError> {
         self.inner.read(offset, out)
     }
 
-    fn set_len(&self, len: u64) -> Result<(), std::io::Error> {
+    fn set_len(&self, len: u64) -> Result<(), redb::BackendError> {
         self.pass(true);
         self.inner.set_len(len)
     }
 
-    fn sync_data(&self) -> Result<(), std::io::Error> {
+    fn sync_data(&self) -> Result<(), redb::BackendError> {
         self.pass(false);
         self.inner.sync_data()
     }
 
-    fn write(&self, offset: u64, data: &[u8]) -> Result<(), std::io::Error> {
+    fn write(&self, offset: u64, data: &[u8]) -> Result<(), redb::BackendError> {
         self.pass(false);
         self.inner.write(offset, data)
     }
@@ -184,25 +184,25 @@ mod tests {
     }
 
     impl redb::StorageBackend for Counting {
-        fn len(&self) -> Result<u64, std::io::Error> {
+        fn len(&self) -> Result<u64, redb::BackendError> {
             Ok(0)
         }
 
-        fn read(&self, _: u64, _: &mut [u8]) -> Result<(), std::io::Error> {
+        fn read(&self, _: u64, _: &mut [u8]) -> Result<(), redb::BackendError> {
             Ok(())
         }
 
-        fn set_len(&self, _: u64) -> Result<(), std::io::Error> {
+        fn set_len(&self, _: u64) -> Result<(), redb::BackendError> {
             self.ops.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
 
-        fn sync_data(&self) -> Result<(), std::io::Error> {
+        fn sync_data(&self) -> Result<(), redb::BackendError> {
             self.ops.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
 
-        fn write(&self, _: u64, _: &[u8]) -> Result<(), std::io::Error> {
+        fn write(&self, _: u64, _: &[u8]) -> Result<(), redb::BackendError> {
             self.ops.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }

@@ -49,7 +49,7 @@
 //!
 //! That disk need not be failing reads.  From the first read, write or
 //! sync of its file that fails, redb refuses every read of a page it does
-//! not hold (redb-4.5.0 `cached_file.rs:195-258`), so the difference is
+//! not hold (redb-5.0.0 `cached_file.rs:263-327`), so the difference is
 //! there for the rest of a handle's life after a failed flush as well.
 //!
 //! Creating and deleting a bucket still read its row, and read such an
@@ -63,6 +63,7 @@ use std::collections::BTreeMap;
 use std::ops::Bound;
 
 use redb::ReadableDatabase as _;
+use redb::ReadableTable as _;
 
 use crate::METADATA_TABLE;
 use crate::error::Error;
@@ -161,7 +162,7 @@ impl BucketIndex {
             None => Bound::Unbounded,
         };
         let rows = table
-            .range::<&[u8]>((Bound::Included(BUCKET_INDEX_PREFIX), upper))
+            .range((Bound::Included(BUCKET_INDEX_PREFIX), upper))
             .map_err(crate::storage_error)?;
         for row in rows {
             let (key, value) = row.map_err(crate::storage_error)?;
@@ -1724,11 +1725,11 @@ mod tests {
     }
 
     impl redb::StorageBackend for ReadFaults {
-        fn len(&self) -> Result<u64, std::io::Error> {
+        fn len(&self) -> Result<u64, redb::BackendError> {
             redb::StorageBackend::len(&*self.inner)
         }
 
-        fn read(&self, offset: u64, out: &mut [u8]) -> Result<(), std::io::Error> {
+        fn read(&self, offset: u64, out: &mut [u8]) -> Result<(), redb::BackendError> {
             let admitted = self
                 .reads_left
                 .try_update(Ordering::SeqCst, Ordering::SeqCst, |left| match left {
@@ -1738,21 +1739,21 @@ mod tests {
                 });
             if admitted.is_err() {
                 self.refused.store(true, Ordering::SeqCst);
-                return Err(std::io::Error::other("injected read failure"));
+                return Err(std::io::Error::other("injected read failure").into());
             }
             self.reads.fetch_add(1, Ordering::SeqCst);
             redb::StorageBackend::read(&*self.inner, offset, out)
         }
 
-        fn set_len(&self, len: u64) -> Result<(), std::io::Error> {
+        fn set_len(&self, len: u64) -> Result<(), redb::BackendError> {
             redb::StorageBackend::set_len(&*self.inner, len)
         }
 
-        fn sync_data(&self) -> Result<(), std::io::Error> {
+        fn sync_data(&self) -> Result<(), redb::BackendError> {
             redb::StorageBackend::sync_data(&*self.inner)
         }
 
-        fn write(&self, offset: u64, data: &[u8]) -> Result<(), std::io::Error> {
+        fn write(&self, offset: u64, data: &[u8]) -> Result<(), redb::BackendError> {
             redb::StorageBackend::write(&*self.inner, offset, data)
         }
     }

@@ -65,6 +65,37 @@ struct Node {
     gate: Arc<GateBackend>,
 }
 
+/// Grow a new store past the size redb 5 starts a file at, 64 KiB usable
+/// where redb 4 started near 1 MiB, so that the commit a test holds at its
+/// first write finds free pages and starts with a page write rather than a
+/// length change (`GateBackend::holds_a_length_change`).  256 KiB of
+/// rows is committed and deleted, and one more commit follows so that redb
+/// has freed its pages by the time the test commits; none of it is left.
+fn make_room(db: &Database) {
+    let key = |i: u32| [b"room".as_slice(), &i.to_be_bytes()].concat();
+    db.update(|tx| {
+        let meta = tx.metadata();
+        for i in 0..256 {
+            meta.put(&key(i), &[0u8; 1024])?;
+        }
+        Ok(())
+    })
+    .expect("the room rows");
+    db.flush().expect("flush the room rows");
+    db.update(|tx| {
+        let meta = tx.metadata();
+        for i in 0..256 {
+            meta.delete(&key(i))?;
+        }
+        meta.put(&key(u32::MAX), b"x")
+    })
+    .expect("delete the room rows");
+    db.flush().expect("flush their deletion");
+    db.update(|tx| tx.metadata().delete(&key(u32::MAX)))
+        .expect("a commit that frees the room rows' pages");
+    db.flush().expect("flush it");
+}
+
 impl Node {
     fn new() -> Node {
         let params = dcroxide_chaincfg::regnet_params();
@@ -80,6 +111,7 @@ impl Node {
         // flush.
         opts.cache_max_size = 64 * 1024;
         let db = Database::create(&opts).expect("create database");
+        make_room(&db);
         let chain = Arc::new(Mutex::new(
             Chain::open(db.clone(), &params, params.assume_valid, false, 0).expect("open chain"),
         ));

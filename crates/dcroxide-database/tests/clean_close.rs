@@ -2,10 +2,10 @@
 //! What a close leaves in the metadata store's header.
 //!
 //! redb sets a recovery flag in the header of its file when it opens the
-//! file for writing (redb-4.5.0 `page_manager.rs:1479-1486`, from
-//! `db.rs:1781`), and clears it only in its close, which runs when its
-//! `Database` handle is dropped (`db.rs:2097-2168`,
-//! `page_manager.rs:2507-2523`).  A file with the flag set is one whose
+//! file for writing (redb-5.0.0 `page_manager.rs:1474-1481`, from
+//! `db.rs:1815`), and clears it only in its close, which runs when its
+//! `Database` handle is dropped (`db.rs:2131-2202`,
+//! `page_manager.rs:2508-2524`).  A file with the flag set is one whose
 //! writer did not shut down: a writable open recovers it, and a read-only
 //! open refuses it with "Database repair aborted"
 //! (`page_manager.rs:905-909`).
@@ -69,7 +69,7 @@ fn metadata_file(dir: &Path) -> PathBuf {
 
 /// Whether the header of the metadata file at `dir` has redb's recovery
 /// flag set: bit 1 of the byte after the nine-byte magic number
-/// (redb-4.5.0 `header.rs:46-62`).
+/// (redb-5.0.0 `header.rs:46-62`).
 fn recovery_flag(dir: &Path) -> bool {
     let header = std::fs::read(metadata_file(dir)).expect("read the metadata file");
     header[9] & 0b10 != 0
@@ -263,9 +263,7 @@ fn a_close_with_a_flush_still_committing_waits_for_it_and_clears_the_flag() {
         .truncate(false)
         .open(metadata_file(&path))
         .expect("open the metadata file");
-    let gate = GateBackend::new(Arc::new(
-        redb::backends::FileBackend::new(file).expect("redb's file backend"),
-    ));
+    let gate = GateBackend::new(Arc::new(redb::backends::FileBackend::new(file)));
     let (db, threads) = daemon_like_on(&path, Some(Arc::clone(&gate) as SharedBackend));
 
     fill(&db, 2);

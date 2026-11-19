@@ -12,7 +12,7 @@ repository.workspace = true
 dcroxide-chainhash = { path = "../dcroxide-chainhash" }
 dcroxide-wire = { path = "../dcroxide-wire" }
 crc = "3.4"
-redb = "4"
+redb = "5"
 
 [dev-dependencies]
 crc = "3.4"

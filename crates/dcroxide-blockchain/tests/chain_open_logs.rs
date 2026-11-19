@@ -27,7 +27,7 @@ use dcroxide_blockchain::process::{Chain, OpenConfig};
 use dcroxide_blockchain::thresholdstate::current_deployment_version;
 use dcroxide_chaincfg::{Params, regnet_params, simnet_params};
 use dcroxide_chainhash::Hash;
-use dcroxide_database::{Database, Options, SharedBackend, StorageBackend};
+use dcroxide_database::{BackendError, Database, Options, SharedBackend, StorageBackend};
 use dcroxide_testutil::unhex;
 use dcroxide_wire::MsgBlock;
 use tempfile::TempDir;
@@ -367,18 +367,18 @@ impl FailingWrites {
 }
 
 impl StorageBackend for FailingWrites {
-    fn len(&self) -> Result<u64, std::io::Error> {
+    fn len(&self) -> Result<u64, BackendError> {
         Ok(self.bytes.lock().expect("store lock").len() as u64)
     }
 
-    fn read(&self, offset: u64, out: &mut [u8]) -> Result<(), std::io::Error> {
+    fn read(&self, offset: u64, out: &mut [u8]) -> Result<(), BackendError> {
         let bytes = self.bytes.lock().expect("store lock");
         let range = Self::range(bytes.len(), offset, out.len())?;
         out.copy_from_slice(&bytes[range]);
         Ok(())
     }
 
-    fn set_len(&self, len: u64) -> Result<(), std::io::Error> {
+    fn set_len(&self, len: u64) -> Result<(), BackendError> {
         self.check()?;
         let len = usize::try_from(len)
             .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
@@ -386,11 +386,11 @@ impl StorageBackend for FailingWrites {
         Ok(())
     }
 
-    fn sync_data(&self) -> Result<(), std::io::Error> {
-        self.check()
+    fn sync_data(&self) -> Result<(), BackendError> {
+        Ok(self.check()?)
     }
 
-    fn write(&self, offset: u64, data: &[u8]) -> Result<(), std::io::Error> {
+    fn write(&self, offset: u64, data: &[u8]) -> Result<(), BackendError> {
         self.check()?;
         let mut bytes = self.bytes.lock().expect("store lock");
         let range = Self::range(bytes.len(), offset, data.len())?;

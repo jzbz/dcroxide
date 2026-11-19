@@ -37,7 +37,7 @@ use chain::{
 };
 use dcroxide_chaincfg::{Params, simnet_params};
 use dcroxide_chainhash::Hash;
-use dcroxide_database::{Database, Options, SharedBackend, StorageBackend};
+use dcroxide_database::{BackendError, Database, Options, SharedBackend, StorageBackend};
 use dcroxide_indexers::{
     CONNECT_NTFN, DISCONNECT_NTFN, EXISTS_ADDR_INDEX_KEY, EXISTS_ADDRESS_INDEX_NAME,
     ExistsAddrIndex, ExistsAddrPolicy, IdxError, IndexNtfn, IndexSubscriber, Indexer, Interrupt,
@@ -1243,11 +1243,11 @@ impl FailingStore {
 }
 
 impl StorageBackend for FailingStore {
-    fn len(&self) -> Result<u64, std::io::Error> {
+    fn len(&self) -> Result<u64, BackendError> {
         Ok(self.bytes.lock().expect("store").len() as u64)
     }
 
-    fn read(&self, offset: u64, out: &mut [u8]) -> Result<(), std::io::Error> {
+    fn read(&self, offset: u64, out: &mut [u8]) -> Result<(), BackendError> {
         let allowed = self
             .reads_left
             .try_update(Ordering::SeqCst, Ordering::SeqCst, |left| match left {
@@ -1257,7 +1257,7 @@ impl StorageBackend for FailingStore {
             });
         if allowed.is_err() {
             self.refused.store(true, Ordering::SeqCst);
-            return Err(std::io::Error::other("injected read failure"));
+            return Err(std::io::Error::other("injected read failure").into());
         }
         let bytes = self.bytes.lock().expect("store");
         let range = Self::range(bytes.len(), offset, out.len())?;
@@ -1265,18 +1265,18 @@ impl StorageBackend for FailingStore {
         Ok(())
     }
 
-    fn set_len(&self, len: u64) -> Result<(), std::io::Error> {
+    fn set_len(&self, len: u64) -> Result<(), BackendError> {
         let len = usize::try_from(len)
             .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
         self.bytes.lock().expect("store").resize(len, 0);
         Ok(())
     }
 
-    fn sync_data(&self) -> Result<(), std::io::Error> {
+    fn sync_data(&self) -> Result<(), BackendError> {
         Ok(())
     }
 
-    fn write(&self, offset: u64, data: &[u8]) -> Result<(), std::io::Error> {
+    fn write(&self, offset: u64, data: &[u8]) -> Result<(), BackendError> {
         let mut bytes = self.bytes.lock().expect("store");
         let range = Self::range(bytes.len(), offset, data.len())?;
         bytes[range].copy_from_slice(data);

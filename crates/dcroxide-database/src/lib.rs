@@ -90,8 +90,12 @@ use crate::dbcache::{DbCache, FillJob, FlushBatch, FlushOutcome, Opened};
 use crate::error::db_error;
 
 // redb 4 moved `begin_read` onto a trait; importing it keeps the call
-// sites unchanged. See the ADR-0004 upgrade note for why we are on 4.x.
+// sites unchanged. See the ADR-0004 upgrade notes for why we are on 5.x.
 use redb::ReadableDatabase as _;
+// redb 5 dropped `ReadOnlyTable`'s own `get` and `range`, which handed
+// back guards and iterators that outlived the table; the trait's
+// borrow the table and walk the same B-tree.
+use redb::ReadableTable as _;
 
 /// The single redb table holding the entire ffldb-layout keyspace.
 pub(crate) const METADATA_TABLE: redb::TableDefinition<'static, &'static [u8], &'static [u8]> =
@@ -439,8 +443,8 @@ pub(crate) struct DbInner {
     ///
     /// redb clears the recovery flag that its writable open set in the
     /// file's header only in its close, which its handle's drop runs
-    /// (redb-4.5.0 `page_manager.rs:1479-1486`, `db.rs:2097-2168`,
-    /// `page_manager.rs:2507-2523`), and until then the file reads as one
+    /// (redb-5.0.0 `page_manager.rs:1474-1481`, `db.rs:2131-2202`,
+    /// `page_manager.rs:2508-2524`), and until then the file reads as one
     /// whose writer did not stop: every open recovers it, and a read-only
     /// open is refused.  So the handle has to be dropped for a clean close
     /// to leave a clean file, and the drop of the last [`Database`] clone
@@ -451,7 +455,7 @@ pub(crate) struct DbInner {
     /// whichever thread lets go last.  A flush holds one while it opens
     /// its write transaction; the close lets go only once no flush is in
     /// flight, and redb would leave its close to the end of a write
-    /// transaction still open in any case (redb-4.5.0 `db.rs:855-871`).
+    /// transaction still open in any case (redb-5.0.0 `db.rs:857-873`).
     /// Asked for once it is `None`, it answers [`ErrorKind::DbNotOpen`].
     /// The lock is a leaf: nothing else is locked while it is held.
     kv: Mutex<Option<Arc<redb::Database>>>,
@@ -1112,15 +1116,15 @@ pub struct Options {
     /// by ffldb's own write cache, whereas redb caches pages of the
     /// single metadata file. It is a ceiling filled on demand, not an
     /// allocation: the LRU stripes start empty
-    /// (redb-4.5.0 `cached_file.rs:344-349`) and a miss that would carry
+    /// (redb-5.0.0 `cached_file.rs:414-419`) and a miss that would carry
     /// the total past the limit evicts a page's worth before returning
-    /// (`:768-790`), so a small database never pays for a large setting
+    /// (`:874-896`), so a small database never pays for a large setting
     /// and the resident cost is bounded by the file size.
     ///
-    /// redb 4.5.0 keeps one cache figure and partitions it dynamically
-    /// (`db.rs:2318-2321`, `cached_file.rs:282-297`): the write buffer
-    /// is held at or below 50% of it, flushing the excess to disk best
-    /// effort (`:943-978`), and the read cache may grow to 100% when no
+    /// redb 5.0.0, like 4.x, keeps one cache figure and partitions it
+    /// dynamically (`db.rs:2365-2368`, `cached_file.rs:352-367`): the write
+    /// buffer is held at or below 50% of it, flushing the excess to disk
+    /// best effort (`:1047-1084`), and the read cache may grow to 100% when no
     /// write is in flight. Once a commit's dirty set exceeds the write buffer,
     /// redb writes the spilled pages, re-reads them to finalize
     /// checksums, then writes the buffer again — measured against the
@@ -1130,7 +1134,7 @@ pub struct Options {
     /// default, 62,323 dirty pages cost 124,430 pwrites and 98,221
     /// preads, against 62,323 and 4 with the buffer large enough to hold
     /// them. The mechanism survives the upgrade; the counts were taken
-    /// at a write buffer five times smaller than 4.5.0 permits.
+    /// at a write buffer five times smaller than 4.5.0 and 5.0.0 permit.
     pub db_cache_bytes: usize,
     /// Called after every metadata flush, when set.
     ///
@@ -1233,11 +1237,11 @@ pub struct Options {
     /// transaction has ended, and with no reader open redb takes another
     /// path.  It frees the pages the commit replaced at once, in a second
     /// commit that is not synced and whose pages it keeps in its write
-    /// buffer (redb-4.5.0 `transactions.rs:2182-2263`,
-    /// `page_manager.rs:1904-1918`).  From then until the next durable
+    /// buffer (redb-5.0.0 `transactions.rs:2090-2171`,
+    /// `page_manager.rs:1905-1919`).  From then until the next durable
     /// commit has emptied that buffer, a read that misses redb's page
     /// cache while the cache is full makes room by writing a buffered
-    /// page to the file (`cached_file.rs:737-751`), and the buffer by
+    /// page to the file (`cached_file.rs:843-857`), and the buffer by
     /// then holds the pages of the next flush's write transaction: each
     /// is written when it is evicted, read back when its commit needs it
     /// and written again.  The snapshot keeps a handed-over commit on the
@@ -1270,6 +1274,11 @@ pub type SharedBackend = Arc<dyn redb::StorageBackend>;
 /// the chain -- does not need a `redb` dependency of its own.
 pub use redb::StorageBackend;
 
+/// The error a [`StorageBackend`]'s methods return, re-exported for the
+/// same reason.  An `std::io::Error` converts into it with `?` or `into`,
+/// and redb reports it as the I/O error it carries.
+pub use redb::BackendError;
+
 /// Adapts a [`SharedBackend`] to the by-value `impl StorageBackend` that
 /// `redb::Builder::create_with_backend` takes.  Every method on the
 /// trait takes `&self`, so sharing costs one pointer hop and no
@@ -1278,23 +1287,23 @@ pub use redb::StorageBackend;
 struct SharedBackendHandle(SharedBackend);
 
 impl redb::StorageBackend for SharedBackendHandle {
-    fn len(&self) -> Result<u64, std::io::Error> {
+    fn len(&self) -> Result<u64, redb::BackendError> {
         self.0.len()
     }
 
-    fn read(&self, offset: u64, out: &mut [u8]) -> Result<(), std::io::Error> {
+    fn read(&self, offset: u64, out: &mut [u8]) -> Result<(), redb::BackendError> {
         self.0.read(offset, out)
     }
 
-    fn set_len(&self, len: u64) -> Result<(), std::io::Error> {
+    fn set_len(&self, len: u64) -> Result<(), redb::BackendError> {
         self.0.set_len(len)
     }
 
-    fn sync_data(&self) -> Result<(), std::io::Error> {
+    fn sync_data(&self) -> Result<(), redb::BackendError> {
         self.0.sync_data()
     }
 
-    fn write(&self, offset: u64, data: &[u8]) -> Result<(), std::io::Error> {
+    fn write(&self, offset: u64, data: &[u8]) -> Result<(), redb::BackendError> {
         self.0.write(offset, data)
     }
 }
@@ -2292,15 +2301,15 @@ fn finish(
 ///
 /// Every flush commits one-phase with no allocator state, so an open
 /// after anything but redb's own close runs a full repair -- "3 full
-/// scans" of the file (redb-4.5.0 `db.rs:1556`) -- because only that
+/// scans" of the file (redb-5.0.0 `db.rs:1590`) -- because only that
 /// close records the state.  `Database::close` makes it itself
 /// before it lets go of redb's handle, so a failure is reported by the
 /// close, which redb's drop cannot do, and a clean close leaves a store
 /// that opens without a full repair even when a transaction still open
 /// keeps the handle, and with it the recovery flag, past the end of the
 /// process.  redb's own version of this commit is
-/// `ensure_allocator_state_table_and_trim` (`db.rs:2046-2088`), which its
-/// close runs from `close_database` (`db.rs:2097`) before it clears the
+/// `ensure_allocator_state_table_and_trim` (`db.rs:2080-2122`), which its
+/// close runs from `close_database` (`db.rs:2131`) before it clears the
 /// flag.  Per-commit quick-repair would cover unclean stops too, at a
 /// second fsync on every flush; that is unmeasured and not done here.
 fn record_allocator_state(kv: &redb::Database) -> Result<(), Error> {
@@ -2365,12 +2374,12 @@ fn open_metadata(
 ///
 /// With `report_repair` and a log sink, redb's repair of a store that
 /// was not shut down cleanly is logged as it runs.  That repair reads
-/// the whole metadata file up to three times (redb-4.5.0 `db.rs:1556`)
+/// the whole metadata file up to three times (redb-5.0.0 `db.rs:1590`)
 /// and would otherwise be a silent stall after "Loading block database
 /// from '...'".  redb calls back at the start and at each scan
-/// boundary (`db.rs:1557`, `:1575`, `:1622`, `:1759`), so this is a
+/// boundary (`db.rs:1591`, `:1609`, `:1656`, `:1793`), so this is a
 /// handful of lines.  `create` leaves it off: a file it makes has no
-/// commit, and redb repairs no such file (`db.rs:1743-1748`), where
+/// commit, and redb repairs no such file (`db.rs:1777-1782`), where
 /// before 4.4.0 it repaired every new file once, a fresh header
 /// recording no allocator state, which is not an unclean shutdown.
 /// dcrd has no line for this -- goleveldb replays its journal instead
@@ -2617,20 +2626,20 @@ impl RawStats {
 /// damaged metadata page reaches here.  Since 4.2.0 redb reports as
 /// `Corrupted` three malformed structures that used to abort the process,
 /// so they now arrive here as [`ErrorKind::Corruption`]: a branch cycle
-/// or over-deep chain, cut off at depth 128 (redb #1332; redb-4.5.0
-/// `btree.rs:1089-1110`, `btree_cursor.rs:169-173`), an oversized page
-/// order (#1331, `page_manager.rs:1269-1278`), and a corrupt freed-page
+/// or over-deep chain, cut off at depth 128 (redb #1332; redb-5.0.0
+/// `btree.rs:1095-1116`, `btree_cursor.rs:169-173`), an oversized page
+/// order (#1331, `page_manager.rs:1285-1294`), and a corrupt freed-page
 /// entry met while rebuilding the allocator (#1333,
-/// `page_manager.rs:1585-1606`); 4.5.0 adds a malformed allocator state
+/// `page_manager.rs:1586-1607`); 4.5.0 added a malformed allocator state
 /// met by an open and some damage met by repair, `check_integrity` or a
-/// commit (its `CHANGELOG.md:101`, `:106`), but only in a build without
+/// commit (5.0.0's `CHANGELOG.md:161`, `:166`), but only in a build without
 /// debug assertions or with `--cfg fuzzing`: it makes those errors
 /// through `StorageError::unreachable`, which panics first otherwise,
-/// as in the test profile (`error.rs:84-94`).  A page whose type byte is
+/// as in the test profile (`error.rs:133-143`).  A page whose type byte is
 /// neither leaf nor branch still hits `unreachable!()` in the descent
-/// (`btree.rs:1104`) and aborts the process under this workspace's
+/// (`btree.rs:1110`) and aborts the process under this workspace's
 /// `panic = "abort"`.  No read compares a page's checksum either: redb
-/// does that only when verifying whole trees (`db.rs:877-926`), which
+/// does that only when verifying whole trees (`db.rs:879-928`), which
 /// `check_integrity` and repair do, so damage that leaves a page
 /// well-formed comes back as data.  The issues are recorded in
 /// `docs/adr/0004-storage-backend.md`.  What does reach here is the
@@ -2656,14 +2665,15 @@ pub(crate) fn storage_error<E: Into<redb::Error>>(e: E) -> Error {
 /// redb locks the metadata file exclusively and reports
 /// `DatabaseAlreadyOpen` when another process already holds the lock,
 /// which is what stops two daemons from sharing one data directory.
-/// redb-4.5.0 takes it before reading anything from the file
-/// (`page_manager.rs:692-693`, `:1131`): in its default
+/// redb-5.0.0 takes it before reading anything from the file
+/// (`page_manager.rs:699-700`, `:1147`): in its default
 /// `ConcurrencyMode::ExclusiveWriter`, byte-range locks on the open
 /// file description on Linux and Apple targets
-/// (`file_backend/range_lock.rs:397-412`), `LockFileEx` range locks on
-/// Windows (`:95-307`), and on Linux also a best-effort whole-file
-/// `flock`, the lock redb before 4.3 takes
-/// (`file_backend/optimized.rs:122-140`).  That has to surface as
+/// (`file_backend/range_lock.rs:397-412`) and `LockFileEx` range locks
+/// on Windows (`:95-307`).  On Linux it no longer takes the whole-file
+/// `flock` that redb before 4.3 takes, as 4.x did; it only refuses the
+/// lock when another process holds one
+/// (`file_backend/optimized.rs:81-96`).  That has to surface as
 /// [`ErrorKind::DbAlreadyOpen`] — dcrd's `ErrDbAlreadyOpen` —
 /// rather than a generic driver error, both because the operator needs an
 /// actionable message and because the lock is acquired before the flat
@@ -2992,7 +3002,7 @@ impl Database {
         let mut agg: std::collections::BTreeMap<[u8; 4], (u64, u64, u64, [u64; 40])> =
             std::collections::BTreeMap::new();
 
-        let iter = redb::ReadableTable::range::<&[u8]>(&table, ..).map_err(storage_error)?;
+        let iter = redb::ReadableTable::range(&table, ..).map_err(storage_error)?;
         for entry in iter {
             let (k, v) = entry.map_err(storage_error)?;
             let key = k.value();
@@ -3809,10 +3819,10 @@ mod raw_stats_tests {
     /// `(leaf_pages + branch_pages) * page_size` reports 8.46 GiB against
     /// the true 9.79, because `leaf_pages` counts leaf *nodes* while the
     /// allocator rounds each node to a power-of-two run of pages
-    /// (`required_order = ceil_log2`, redb-4.5.0 `page_manager.rs:2235`),
+    /// (`required_order = ceil_log2`, redb-5.0.0 `page_manager.rs:2236`),
     /// so a single row too large to share a leaf can occupy 2, 4 or 32
     /// pages and still be counted once. Not overflow pages: redb has no
-    /// such mechanism in 2.6.3, 4.1.0, 4.3.0 or 4.5.0. See
+    /// such mechanism in 2.6.3, 4.1.0, 4.3.0, 4.5.0 or 5.0.0. See
     /// [`RawStats::live_tree_bytes`].
     #[test]
     fn derived_figures_match_the_adr_0004_decomposition() {
@@ -4323,6 +4333,7 @@ mod background_commit_tests {
                 lines.lock().expect("log").push((level, msg.to_string()));
             }));
             let db = Database::create(&opts).expect("create");
+            make_room(&db);
             db.update(|tx| tx.metadata().create_bucket(b"rows").map(|_| ()))
                 .expect("the bucket");
             db.flush().expect("flush");
@@ -4455,6 +4466,37 @@ mod background_commit_tests {
                 .map(|path| std::fs::metadata(&path).expect("metadata").len())
                 .sum()
         }
+    }
+
+    /// Grow a new store past the size redb 5 starts a file at, 64 KiB usable
+    /// where redb 4 started near 1 MiB, so that the commit a test holds at its
+    /// first write finds free pages and starts with a page write rather than a
+    /// length change (`GateBackend::holds_a_length_change`).  256 KiB of
+    /// rows is committed and deleted, and one more commit follows so that redb
+    /// has freed its pages by the time the test commits; none of it is left.
+    fn make_room(db: &Database) {
+        let key = |i: u32| [b"room".as_slice(), &i.to_be_bytes()].concat();
+        db.update(|tx| {
+            let meta = tx.metadata();
+            for i in 0..256 {
+                meta.put(&key(i), &[0u8; 1024])?;
+            }
+            Ok(())
+        })
+        .expect("the room rows");
+        db.flush().expect("flush the room rows");
+        db.update(|tx| {
+            let meta = tx.metadata();
+            for i in 0..256 {
+                meta.delete(&key(i))?;
+            }
+            meta.put(&key(u32::MAX), b"x")
+        })
+        .expect("delete the room rows");
+        db.flush().expect("flush their deletion");
+        db.update(|tx| tx.metadata().delete(&key(u32::MAX)))
+            .expect("a commit that frees the room rows' pages");
+        db.flush().expect("flush it");
     }
 
     /// Commit 48 rows of a kibibyte under `tag` to `db`'s bucket `rows`:
@@ -6696,6 +6738,92 @@ mod storage_error_tests {
             Ok(_) => panic!("a store with a damaged header must not open"),
         };
         assert_eq!(err.kind, ErrorKind::Corruption, "{err}");
+    }
+
+    /// The offsets of redb's two commit slots in the file header, and of
+    /// the file format version within each (redb-5.0.0
+    /// `tree_store/page_store/header.rs:27-28`, `:42`, `:55-57`, `:71`; the same
+    /// in 4.5.0).
+    const COMMIT_SLOT_OFFSETS: [u64; 2] = [64, 64 + 128];
+
+    /// The store is written in redb file format 3, the format redb 4.5.0
+    /// wrote and the only one it read, so the move to redb 5 changed the
+    /// engine and not the file: a store written before it opens as it
+    /// stands, and one written after it opens under 4.5.0.  Should a
+    /// later redb write another format, this fails, and the question of
+    /// what an existing store does across the bump (ADR-0004, addendum of
+    /// 2026-11-19) has to be answered again before the bump lands.
+    #[test]
+    fn the_store_is_written_in_redb_file_format_3() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let path = tmp.path().join("blocks_redb");
+        let opts = Options::new(&path, 0x0709_1101);
+        let db = Database::create(&opts).expect("create");
+        db.close().expect("close");
+        drop(db);
+
+        let header = std::fs::read(path.join(METADATA_FILE)).expect("read the metadata file");
+        assert_eq!(
+            header.get(..9),
+            Some(&b"redb\x1a\x0a\xa9\x0d\x0a"[..]),
+            "redb's magic number"
+        );
+        for slot in COMMIT_SLOT_OFFSETS {
+            let version = usize::try_from(slot)
+                .ok()
+                .and_then(|at| header.get(at))
+                .copied();
+            assert_eq!(
+                version,
+                Some(3),
+                "format version of the commit slot at {slot}"
+            );
+        }
+    }
+
+    /// A store in a redb file format older than 3 -- written by redb 2.x
+    /// or earlier, never by a released dcroxide -- is refused at open
+    /// with the typed error that tells the operator to remove it and
+    /// sync again, not as corruption and never by a panic.  redb 5, like
+    /// 4, reads the format version before anything else in a commit
+    /// slot and reports versions 1 and 2 as `UpgradeRequired`
+    /// (redb-5.0.0 `tree_store/page_store/header.rs:549-553`).  No old
+    /// redb is linked to write such a file: the version bytes of a
+    /// fresh store are set to 2, the one field that check reads.
+    #[test]
+    fn a_store_in_an_older_redb_file_format_is_refused_with_the_resync_remedy() {
+        use std::io::{Seek, SeekFrom, Write};
+
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let path = tmp.path().join("blocks_redb");
+        let opts = Options::new(&path, 0x0709_1101);
+        let db = Database::create(&opts).expect("create");
+        db.close().expect("close");
+        drop(db);
+
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(path.join(METADATA_FILE))
+            .expect("open metadata file");
+        for slot in COMMIT_SLOT_OFFSETS {
+            file.seek(SeekFrom::Start(slot))
+                .expect("seek to a commit slot");
+            file.write_all(&[2]).expect("write format version 2");
+        }
+        drop(file);
+
+        let err = match Database::open(&opts) {
+            Err(e) => e,
+            Ok(_) => panic!("a store in redb file format 2 must not open"),
+        };
+        assert_eq!(err.kind, ErrorKind::Invalid, "{err}");
+        assert!(
+            err.description.contains("redb file format 2")
+                && err
+                    .description
+                    .contains("remove the data directory and sync again"),
+            "{err}"
+        );
     }
 
     /// A store whose metadata table was never created -- power lost

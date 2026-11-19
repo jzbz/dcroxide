@@ -19,9 +19,9 @@ const NET: u32 = 0x12141c16; // simnet magic
 
 /// The configured cache size must actually reach redb.
 ///
-/// redb 4.5.0 takes one `set_cache_size` figure (`db.rs:2318`) and
-/// partitions it dynamically: the write buffer is held at or below 50% of
-/// the total, best effort (`cached_file.rs:284-286`), and the read cache
+/// redb 5.0.0, as 4.x did, takes one `set_cache_size` figure (`db.rs:2365`)
+/// and partitions it dynamically: the write buffer is held at or below 50%
+/// of the total, best effort (`cached_file.rs:354-356`), and the read cache
 /// may grow to 100% when no write is in flight. When a commit's dirty set
 /// exceeds the write buffer, redb spills those pages to the file,
 /// re-reads them to finalize checksums, and writes the buffer again — so

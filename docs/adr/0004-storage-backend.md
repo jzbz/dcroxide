@@ -81,9 +81,10 @@ believed and points at the evidence; nothing below it has been rewritten.
 > default median and the larger overlay no faster. See the second addendum
 > of 2026-10-10 at the end.
 
-**The metadata store now runs redb 4** (addendum, 2026-08-13, which took
-4.1.0; `Cargo.lock` now pins 4.5.0). The on-disk format changed with it:
-redb 4 reads only format 3 and returns
+**The metadata store now runs redb 5** (the addendum of 2026-08-13 took
+redb 4, at 4.1.0; `Cargo.lock` pinned 4.5.0 until the addendum of
+2026-11-19 took 5.0.0, which kept the file format). The on-disk format
+changed with redb 4: redb 4, and redb 5 after it, reads only format 3 and returns
 `UpgradeRequired` for a 2.x file, mapped here to a typed error that names
 redb 2.x — a data directory written before 2026-08-13 is refused rather
 than misread, and has to be re-synced or re-imported; the chain data itself
@@ -94,7 +95,7 @@ half of it holds: 4.1.0 reproduces the 2.6.3 tree to four decimals on a
 free-page retention, which is the one row above that a 4.1.0 store reports
 smaller. None of these figures has been re-measured under 4.3.0, which
 shortens the branch keys of `&[u8]`-keyed tables, this crate's one table
-among them, to minimal separators, or under 4.5.0.
+among them, to minimal separators, or under 4.5.0 or 5.0.0.
 
 **The engine is now measured against candidates, and redb loses on this
 workload.** Handed the identical engine-level journal, fjall 3.1.8 holds
@@ -1868,3 +1869,178 @@ and the levers this ADR closed are unchanged.
 > controls, so the figures of the two are not to be subtracted
 > ([bench-ledger.md](../bench-ledger.md), "`88c46c3`, the background
 > commit as committed, dcrd v2.1.7 and two preloaded allocators").
+
+## Addendum, 2026-11-19 — redb 4.5.0 to 5.0.0, with no change of file format
+
+The metadata store moves from redb 4.5.0 to 5.0.0, the only 5.x release,
+published the day before. The reason is not the engine: the wallet that is
+being built beside the node takes redb 5, and two majors of one crate in a
+dependency graph are refused (`deny.toml`, `multiple-versions = "deny"`),
+so the node and the wallet have to share one. It is a dependency bump, like
+the addendum of 2026-08-13, and changes nothing this ADR decided.
+
+**A store written before the move opens after it, as it stands.** redb
+5.0.0 writes the same file format as 4.5.0, format 3, and reads only that
+one (redb-5.0.0 `tree_store/page_store/page_manager.rs:70`,
+`header.rs:537-559`, against 4.5.0's `page_manager.rs:68`,
+`header.rs:532-554`); the header's layout and flag bits are unchanged, and
+there is no upgrade step in either direction. 5.0.0's one change of
+encoding, that of `Option<&str>`, `Option<String>`, `Option<bool>` and
+`Option<char>` (its `CHANGELOG.md:5-18`), does not reach the store, whose
+one table maps `&[u8]` to `&[u8]` and whose type names are unchanged. This
+was checked on a generated store, not a real data directory: the daemon
+built from `5c6742f`, on redb 4.5.0, mined a simnet chain of 126 blocks into
+a new data directory, and copies of it were opened by the daemon built with
+this change, on redb 5.0.0, after a clean stop and after the 4.5.0 daemon
+had been killed with `SIGKILL` while the store was open, which left the
+recovery flag set and made 5.0.0 repair the file. Both reported the same
+tip and the same `gettxoutsetinfo` (serialized hash
+`5b71a459…e39da0`, 128 outputs) as the 4.5.0 daemon on its own store,
+and the 4.5.0 daemon then opened, with the same answers, a store 5.0.0 had
+written and one 5.0.0 had been killed on. Each commit slot's format byte
+read 3 throughout.
+
+So no store has to be removed or synced again for this move. None would
+have had to be kept either: dcroxide has not been released, so no deployed
+node holds a store in any format, and had redb changed its format the
+answer would have been the one this ADR already gives, to refuse the old
+store with a typed error and sync again. No upgrade path, compatibility
+code or old-format fixture was written. What redb does refuse, a file of
+format 1 or 2 (redb 2.x or earlier), it still reports as `UpgradeRequired`
+(`header.rs:549-553`), which the store maps, as before, to
+`ErrorKind::Invalid` with the text that says the store was written by an
+older dcroxide and is to be removed and synced again. A test now drives
+that through `Database::open` on a store whose two commit slots carry
+format version 2 (`a_store_in_an_older_redb_file_format_is_refused_with_the_resync_remedy`);
+the daemon prints it as "Unable to load block database: unable to open
+database: the metadata store is redb file format 2, which this build cannot
+read -- …". A second test fails if a fresh store's commit slots stop
+reading format 3 (`the_store_is_written_in_redb_file_format_3`), so a
+later redb that changes the format cannot be taken without this question
+being asked again.
+
+**Nothing the store does changes.** Every commit is still
+`Durability::Immediate`, set in the one place that begins a write
+(`begin_durable_write`), and the close still makes one quick-repair
+commit; redb 5.0.0's `Durability` is the same two variants with the same
+mapping onto its internal levels, and the code from `set_durability` to
+`set_quick_repair`, the commit itself and the durable and non-durable commit
+paths is line for line 4.5.0's (redb-5.0.0 `transactions.rs:1410-1514`,
+`:1680-1768`, `:1971-2174`), as are the page manager's commit and the file
+backend's `sync_data`, still `File::sync_data`. The cache is still one
+`set_cache_size` figure, default 1 GiB, partitioned as before. The error
+classification is untouched: corruption, `PreviousIo` and an aborted repair
+are still `ErrorKind::Corruption`, a closed engine `DbNotOpen`, an I/O error
+`DriverSpecific`, and an I/O error a storage backend returns still reaches
+redb as `StorageError::Io`. 5.0.0 adds `StorageError::Backend`, for a
+backend error that is not an I/O error; no backend in the tree makes one,
+and it would be classed `DriverSpecific`. The port is the API's: a
+backend's I/O methods return `redb::BackendError` (re-exported as
+`dcroxide_database::BackendError`), `ReadOnlyTable`'s own `get` and
+`range`, which handed back results that outlived the table, give way to
+`ReadableTable`'s, which borrow it and run the same B-tree code, `range`
+takes no key type, and `FileBackend::new` cannot fail.
+
+**The lock no longer keeps redb 4.2 or earlier out on Linux.** A redb
+5.0.0 writer holds byte-range locks alone. In
+`ConcurrencyMode::ExclusiveWriter`, the mode the store opens in, it locks
+every byte of the file but a few reserved for the backend, with
+open-file-description `fcntl` locks on Linux and Apple targets and
+`LockFileEx` range locks on Windows (redb-5.0.0 `page_manager.rs:712-790`,
+`file_backend/range_lock.rs:96-307`, `:397-445`), and falls back to a
+whole-file lock only where a platform has no byte-range locks
+(`page_manager.rs:756-775`). That keeps out every other process of redb 4.3
+or later, whatever its mode, and on the fallback platforms everything that
+takes a whole-file lock. It does not keep out a redb 4.2 or earlier process
+on Linux, which locks with the whole-file `flock` alone and does not see
+byte-range locks. 4.3 to 4.5 also held that `flock` for such processes;
+5.0.0 only tries it and releases it at once, before its first range, and
+refuses the open if another process holds it
+(`file_backend/optimized.rs:81-96`). So the direction runs one way: the
+store will not open a file a redb 4.2 or earlier process holds, but such a
+process, a dcroxide build from 2026-08-13 to 2026-09-18 (redb 4.1.0 or
+4.2.0) among them, that opens a store a 5.0.0 node has open is not
+refused, and the two would share the file (its `CHANGELOG.md:60-63`).
+Nothing else in the node closes that: redb's lock is its only guard
+against a second process on a data directory (`open_error` in
+`dcroxide-database`'s `lib.rs`). The exposure
+is a development build of that period pointed at a current data directory
+while a node runs on it; dcroxide has never been released, and
+[operating.md](../operating.md) says not to. The compatibility `flock` was
+never compiled for the Apple targets or Windows, and the changelog's
+warning names Linux alone; whether a redb 4.2 process and a 5.0.0 one
+exclude each other there has not been tried.
+
+**What else 5.0.0 brings**, from its changelog and the source: 4.6.0's
+fixes, among them a repair that no longer falls back to a commit slot whose
+checksum fails, which could open a damaged store as an empty one, and a
+close that waits for reads and writes in progress; and a new file that
+starts at 64 KiB usable rather than about 1 MiB (`page_manager.rs:53-55`).
+Reads still compare no page checksum, and a page whose type byte is neither
+leaf nor branch still reaches `unreachable!()` (`btree.rs:1110`).
+
+**A `.0`, taken on purpose.** redb 5.0.0 was published on 2026-11-18 and
+taken the next day. It is a `.0` release and has no patch release yet. It
+was chosen deliberately, because the node and the wallet have to share one
+redb major, not on any finding that it is ready; its riskiest changes for
+this node are the lock rewrite, the re-vendored checksum code and the
+write buffer's handling of a panic, none of which the tests below exercise
+on another platform than x86_64 Linux. When a 5.0.x patch release appears,
+the store moves to it, once its release notes have been read for anything
+that reaches the lock, the commit path, the file format or the store's
+API.
+
+**One thing the tests met.** The smaller start changes which operation a
+young store's commit begins with: the background-commit rigs, which hold a
+handed-over commit at its first write and require that write not to be a
+length change (a commit held while it grows the file holds up every
+transaction, `GateBackend::holds_a_length_change`), failed 28 tests: 26 on
+finding the held commit growing the file first, where under 4.5.0 the same
+commit found room in the file it started with, and two others that pass
+once it does not. The three rigs
+(`dcroxide-database`'s internal one and its `tests/background_commit.rs`,
+and `dcroxide-node`'s `tests/background_commit_latch.rs`) now commit and
+delete 256 KiB of rows as they create their store, before anything they
+observe, so the held commit finds free pages again. The daemon's store
+does the same few extra length changes and syncs early in its life, which
+nothing depends on.
+
+**Measured, on generated data only**, and recorded in the bench ledger
+([bench-ledger.md](../bench-ledger.md), "redb 4.5.0 against 5.0.0 on six
+generated simnet corpora (2026-11-19)"), which gives the builds, the six
+corpora's digests, the commands, the run order and every figure. Release
+builds of `5c6742f` and of `5c6742f` with this change ran on m3, pinned
+to the ledger's CPUs, alternately on the same six 126-block simnet
+corpora, five runs a corpus and version: each replayed a corpus into a new
+store (`dcroxide-bench replay --statsevery 1`, one durable commit per
+block), then ran `dcroxide-bench pinprobe --writes 4000000 --commits 16`
+on that store. A snapshot:
+
+| | redb 4.5.0 | redb 5.0.0 |
+|---|---:|---:|
+| pinprobe wall, median of 30 | 15.07 s | 15.02 s |
+| pinprobe process CPU time, median of 30 | 12.33 s | 12.62 s |
+| replay commit, median of 30 runs' medians | 5.40 ms | 5.41 ms |
+| allocated bytes after pinprobe, six corpora | 1,113,710,592–1,114,923,008 B | 4.5.0's, on each corpus |
+| `metadata.redb` length after pinprobe, six corpora | 1.290–1.292 GB | 1.141–2.114 GB |
+
+No difference in time was resolved: over the 30 pairs every 5.0.0 /
+4.5.0 ratio's range spans 1 (pinprobe wall 1.009 at the median, 0.783
+to 1.193), and the machine carried a load average of 2.6 to 6.2 from
+other work. The trees are the same to the byte on every corpus. The file
+holding them is not: on this workload, below one full 4 GiB region,
+5.0.0's file after the probe was larger than 4.5.0's on five corpora, by
+1.32x to 1.64x, and smaller on one, at 0.88x, with free-page bytes
+moving the same way, while 4.5.0's lengths lay within 0.2% of each other
+across all six. redb's growth code is the same in both versions; the
+start is not (64 KiB usable against 1 MiB), and where 5.0.0's file ends
+moves with the corpus. A figure from one corpus, such as the
+2,054,217,728 B against 1,291,587,584 B an earlier run of this day took
+from one (c1 in the ledger), belongs to that corpus, not to the version.
+Above one full
+region both versions add whole regions, so a store the size of
+mainnet's should not see this; that was not measured. The time figures
+measure commits of small simnet blocks and scattered bulk writes, not a
+sync: a mainnet sync and the full replays of the ledger's rows need
+mainnet blocks, which these runs did not use, and neither has been run
+on 5.0.0.

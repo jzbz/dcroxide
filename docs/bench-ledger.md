@@ -8220,3 +8220,126 @@ logs and the flush logs; each build's record of its commit, hash and
 compiler. For `2a56236`, its two plain rows each in
 `alloc-ceiling-lan.jsonl` and `build-arms-lan.jsonl`, with their 10 s
 samples and flush logs; and the flush logs of the two sections above.
+
+## redb 4.5.0 against 5.0.0 on six generated simnet corpora (2026-11-19)
+
+ADR-0004's addendum of 2026-11-19 moves the metadata store from redb
+4.5.0 to 5.0.0. A first measurement that day used one generated corpus
+and put 5.0.0's file after the probe below at 2,054,217,728 B against
+1,291,587,584 B; a review rerun on a second corpus put it at
+1,140,789,248 B, smaller than 4.5.0's. Which of the two a corpus gives
+says nothing about the version, so this section runs both versions on
+the same six corpora and is the record the addendum cites. It is
+generated data only: no mainnet block and no real data directory.
+
+**Builds.** Release builds of two trees, each with Rust 1.99.1, the
+toolchain `5c6742f` pins: the 4.5.0 arm is `5c6742f` itself, exported
+whole from the commit; the 5.0.0 arm is `5c6742f` with the change that
+takes redb 5.0.0 applied, uncommitted when it ran, the code of the
+commit that adds this section. `cargo build --release --locked -p
+dcroxide-bench -p dcroxide-node --bin dcroxide --bin dcroxide-bench`
+for each. The `dcroxide-bench` binaries' SHA-256 begin `a53701c71e16`
+(4.5.0) and `e134c2256801` (5.0.0); the 4.5.0 one is byte-identical to
+the build the first measurement used.
+
+**Corpora.** Six chains of 126 blocks on simnet, each mined into a new
+data directory by the 4.5.0 daemon (`dcroxide --simnet --noseeders
+--nolisten --notls`, an RPC listener on loopback, `--miningaddr
+SsYqGcZW399MhXfCx4YJRRJEHHZSSgzRZ39`) through 126 `generate 1` RPC calls
+and a `stop`, then exported with `dcroxide-bench export --net simnet`.
+Every corpus is 55,629 bytes; they differ in their blocks' timestamps
+and so in every hash. c1 is the first measurement's corpus and c2 the
+review's, both mined the same way the evening before; c3 to c6 were
+mined for this run. Their SHA-256:
+
+| corpus | SHA-256 |
+|---|---|
+| c1 | `6aaefc9fcc590f802dce85f06e82d4503aa5a3854eea734b44fccaec9d35de85` |
+| c2 | `5c0fc298e1661b56ae45fd5a1b95f1ff6ce890ea881b8582e92adb9bef898420` |
+| c3 | `4b8200e67f612849b7a08516e41a37d2bdec25c7fd4cf5d18b2db0f62ecab98a` |
+| c4 | `40f73b97e8887056119bab543f7a2fb4a7524e171fb96a504d04d280f7fee49f` |
+| c5 | `3432ec30568aea713b4ba375da08ffeb4e27f9fbbadfd2ff69805e5037ce86ab` |
+| c6 | `af74e62017b9c4cad9bed2a5471497b39060d39121d93bcc724436b0000b38b0` |
+
+**A run** is two processes, each pinned with `taskset -c 0-7,16-23`:
+
+```
+dcroxide-bench replay --in c1.corpus --net simnet --workdir run \
+    --flushlog run.flush.jsonl --statsevery 1
+dcroxide-bench pinprobe --appdata run --net simnet --writes 4000000 --commits 16
+```
+
+The replay makes one durable commit per block, 127 in all, and takes the
+full decomposition at every flush; the probe then applies four million
+scattered metadata writes over 16 commits to that store. Wall time,
+process CPU time and peak resident memory come from `wait4` on each
+process, the file's length from `blocks_ffldb/metadata.redb` after each,
+and allocated bytes, live tree, fill and free-page bytes from the last
+record each process prints. The work directory is deleted after the run.
+
+**Order.** On m3, on 2026-11-19 from 02:25 to 02:45, on the machine
+table's filesystem. One warm-up run per arm on c1, left out below; then
+five repetitions, each running all six corpora under both arms, the
+corpus order rotated by one each repetition, the two arms on a corpus
+back to back, and the arm that went first alternating from pair to pair:
+62 runs, 30 a version measured. The machine was not quiet: the load
+average stood at 2.6 to 6.2 as runs started (median 4.3), another
+process holding a CPU busy throughout, so the times are marked
+disturbed.
+
+**Storage, after the probe.** Every figure was the same in every run of
+a corpus under a version, five runs (six for c1), so one value stands
+for each:
+
+| corpus | allocated | live tree, fill | 4.5.0 length | 5.0.0 length | 5.0.0 / 4.5.0 | 4.5.0 free-page bytes | 5.0.0 free-page bytes |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| c1 | 1,113,763,840 B | 420,347,904 B, 0.6878 | 1,291,587,584 B | 2,054,217,728 B | 1.590 | 168,026,399 B | 956,555,551 B |
+| c2 | 1,113,710,592 B | 419,397,632 B, 0.6893 | 1,291,837,440 B | 1,140,789,248 B | 0.883 | 168,473,122 B | 17,478,178 B |
+| c3 | 1,114,923,008 B | 420,278,272 B, 0.6879 | 1,291,280,384 B | 1,921,159,168 B | 1.488 | 166,696,796 B | 888,117,084 B |
+| c4 | 1,114,923,008 B | 420,278,272 B, 0.6879 | 1,291,231,232 B | 1,921,159,168 B | 1.488 | 166,696,796 B | 888,117,084 B |
+| c5 | 1,113,792,512 B | 420,364,288 B, 0.6877 | 1,290,133,504 B | 2,113,933,312 B | 1.639 | 167,997,727 B | 990,081,311 B |
+| c6 | 1,114,767,360 B | 420,462,592 B, 0.6876 | 1,291,431,936 B | 1,710,489,600 B | 1.324 | 166,751,004 B | 586,181,404 B |
+
+Allocated bytes, live tree and fill are the same under both versions on
+every corpus, after the replay as after the probe, so the trees match.
+After the replay, allocation was 229,376 B at a fill of 0.5795 (233,472
+B and 0.5673 on c5); 4.5.0's file was 319,488 B on all six and 5.0.0's
+249,856 to 282,624 B on five and 421,888 B on c6.
+
+**Time**, medians of the 30 runs a version, with their ranges, and the
+5.0.0 / 4.5.0 ratio over the 30 pairs (a corpus in one repetition):
+
+| | redb 4.5.0 | redb 5.0.0 | ratio, median (range) | 5.0.0 higher |
+|---|---:|---:|---:|---:|
+| replay wall | 2.601 s (1.511–5.618) | 2.324 s (1.502–8.026) | 0.960 (0.518–2.243) | 12 of 30 |
+| replay commit, median of each run's 127 | 5.40 ms (5.26–17.24) | 5.41 ms (5.28–18.06) | 1.000 (0.508–3.348) | 15 of 30 |
+| pinprobe wall | 15.07 s (12.93–17.69) | 15.02 s (12.39–17.63) | 1.009 (0.783–1.193) | 16 of 30 |
+| pinprobe process CPU time | 12.33 s (11.08–13.97) | 12.62 s (11.27–14.53) | 1.016 (0.825–1.102) | 19 of 30 |
+| pinprobe flush time, sum | 13.02 s (10.89–15.64) | 12.94 s (10.33–15.50) | 1.009 (0.749–1.228) | 16 of 30 |
+| pinprobe peak resident memory | 1,150 MiB (1,149–1,151) | 1,150 MiB (1,149–1,151) | | |
+
+**What it shows.** On this workload the trees the two versions build
+are the same to the byte, and the file they hold them in is not: 4.5.0's
+ended within 1.290 to 1.292 GB on all six corpora, 5.0.0's between 1.141
+and 2.114 GB, larger than 4.5.0's on five corpora, by 1.32x to 1.64x,
+and smaller on one, at 0.88x. The difference is in length and free-page
+bytes, not in what is stored. redb's growth code is the same in both
+versions (`grow` in `page_manager.rs`: below one full 4 GiB region the
+usable space at least doubles); the start is not, 64 KiB usable in 5.0.0
+against 1 MiB (`MIN_DESIRED_USABLE_BYTES`), and where 5.0.0's file ends
+moves with the corpus far more than 4.5.0's. No difference in time was
+resolved: every ratio's range spans 1, the medians lie within 4% of it,
+and the replay figures carry the load's scatter.
+
+**What it does not show.** A store past one full region: both versions
+then add whole regions, so a mainnet-sized store should not see the
+difference, which was not measured. Any mainnet block: a sync and the
+full replays of the rows above need them, and neither has been run on
+5.0.0. Why a corpus lands where it does under 5.0.0; the runs show only
+that it does so the same way every time. A quiet machine, other
+platforms or other filesystems. The compiler a later tree builds with.
+
+Raw: `results.jsonl`, one record per run with its corpus, arm, binary
+hash, start time and load average; each run's replay log, flush log and
+pinprobe output; the build logs, the compiler's version and the
+binaries' hashes; the mining and export logs.
