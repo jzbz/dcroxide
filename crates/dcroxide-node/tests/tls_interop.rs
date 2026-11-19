@@ -69,8 +69,10 @@
 //!   each CertificateRequest lists, as Go's client reads them, compared;
 //!   and a rustls client that signs a TLS 1.2 handshake with its ML-DSA
 //!   key all the same, refused by both with `illegal_parameter`, Go's
-//!   server in Go's words.  Under an oracle older than Go 1.27 these skip,
-//!   unless `DCROXIDE_REQUIRE_ORACLE` is set.
+//!   server in Go's words.  A client chain of over 32 KiB, a leaf under
+//!   six ML-DSA-87 authorities, is accepted by the listener and by Go's
+//!   server in TLS 1.3 and TLS 1.2.  Under an oracle older than Go 1.27
+//!   these skip, unless `DCROXIDE_REQUIRE_ORACLE` is set.
 //! - **The seeder clients against Go's HTTPS server**, serving seeder
 //!   JSON under a chain from `tls_pki` whose root the transports' test
 //!   constructors take in place of `webpki-roots`, the provider hand-off
@@ -178,7 +180,7 @@ const CLIENTCERT_GAP: &str = "PARITY.md, \"Under `--authtype=clientcert` webpki 
                               provider still decide part of a client chain\"";
 
 /// The listener's classical groups, Go's default list less the hybrids
-/// (`rpctls.rs`'s `RPC_KX_GROUP_IDS`), by Go's names.
+/// (`dcroxide-gotls`'s `RPC_KX_GROUP_IDS`), by Go's names.
 const CLASSICAL: [&str; 4] = ["X25519", "CurveP256", "CurveP384", "CurveP521"];
 
 /// Go's client dialing `addr` with `fields`, naming localhost, trusting
@@ -763,6 +765,77 @@ fn go_clients_and_an_ml_dsa_rpc_key() {
     );
 }
 
+/// Go's client held to TLS 1.0 and 1.1, and to TLS 1.0 alone, against the
+/// RPC listener on each key it generates, refused as Go's server holding
+/// the same pair refuses it: with `protocol_version`, first of all
+/// (`readClientHello`, `crypto/tls/handshake_server.go:178-194`), and Go's
+/// server with its words for the versions it read.  Such a client sends
+/// no signature_algorithms, which rustls alone would refuse with
+/// `handshake_failure` before it looked at the versions; the listener's
+/// own words for it are held to Go's by `rpctls_handshake_log.rs` and by
+/// `dcroxide-gotls`'s unit tests.
+#[test]
+fn go_clients_below_tls12_are_refused_as_go_refuses_them() {
+    let Some(mut go) = TlsOracle::start() else {
+        return;
+    };
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let pairs = [
+        Pair::certgen("P-256 from certgen", &dir, Curve::P256),
+        Pair::certgen("P-521 from certgen", &dir, Curve::P521),
+        Pair::gencerts("P-384 from gencerts", "P-384"),
+        Pair::gencerts("Ed25519 from gencerts", "Ed25519"),
+    ];
+    let clients = [
+        (
+            "TLS 1.0 and 1.1",
+            json!({ "min_version": "TLS 1.0", "max_version": "TLS 1.1" }),
+            "[302 301]",
+        ),
+        (
+            "TLS 1.0",
+            json!({ "min_version": "TLS 1.0", "max_version": "TLS 1.0" }),
+            "[301]",
+        ),
+    ];
+    let request = getblockcount(true);
+    let refused = "remote error: tls: protocol version not supported";
+    for pair in &pairs {
+        let listening = listen_rpc(pair, None).expect("the listener");
+        for (version, fields, versions) in &clients {
+            let what = format!("{}, {version}", pair.name);
+            let detail = dial(&mut go, &listening.addr, &pair.cert, fields, &request);
+            assert_refused_by_the_node(&go, &what, &detail, refused);
+            assert_eq!(detail["http_status"], 0, "{what}: the listener {detail}");
+            let (addr, id) = listen(
+                &mut go,
+                json!({ "chain": [hex(&pair.cert)], "key_pkcs8": hex(&pair.key_pkcs8) }),
+            );
+            let theirs = dial(&mut go, &addr, &pair.cert, fields, &request);
+            go.assert_refused(&what, &theirs, refused);
+            // On Linux the listener's alert always arrives
+            // (`assert_refused_by_the_node`), so the two are held to one
+            // error under any Go.
+            if cfg!(target_os = "linux") {
+                assert_eq!(detail["error"], theirs["error"], "{what}: Go's client");
+            }
+            let served = go.served(&id);
+            go.assert_refused(
+                &what,
+                &served,
+                &format!("tls: client offered only unsupported versions: {versions}"),
+            );
+        }
+        listening.listener.shutdown();
+    }
+    go.report("go_clients_below_tls12_are_refused_as_go_refuses_them");
+    assert_eq!(
+        go.handshakes(),
+        pairs.len() * clients.len() * 2,
+        "every client with the listener and with Go's server"
+    );
+}
+
 /// `--authtype=clientcert`: each client certificate cell, in each version,
 /// presented by Go's client to the listener, through
 /// `GoClientCertVerifier`, and to Go's server requiring and verifying
@@ -853,6 +926,122 @@ fn go_client_certificates_under_clientcert_auth() {
     assert_eq!(
         go.handshakes(),
         2 * clients.cells.len() * 2,
+        "every cell in two versions, with the listener and with Go's server"
+    );
+}
+
+/// `--authtype=clientcert` with a `clients.pem` holding a valid
+/// authority, an expired one, one not yet valid and a server-only one:
+/// Go's client presenting a certificate Go's chain search refuses for the
+/// authority or a usage is refused by the listener as by Go's server, and
+/// with the alert Go sends where rustls has it.  A leaf under the expired
+/// or the future authority hears `certificate_expired` from both, Go's
+/// search ending on that authority's `isValid` refusal, where the
+/// listener used to pass the authority over and send `unknown_ca`.  A
+/// server-only leaf under the valid authority, and a client leaf under the
+/// server-only one, hear `unsupported_certificate` from the listener and
+/// `bad_certificate` from Go's server, as PARITY.md's clientcert entry
+/// records; the listener logs Go's words for them, which
+/// `dcroxide-gotls`'s tests hold to Go's.
+#[test]
+fn authorities_and_usages_gos_search_refuses_under_clientcert_auth() {
+    let Some(mut go) = TlsOracle::start() else {
+        return;
+    };
+    let now = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("the clock")
+            .as_secs(),
+    )
+    .expect("a time");
+    let day = 86_400;
+    let authority = |name: &str, window: Option<(i64, i64)>, eku: Option<&str>| {
+        let mut ca = spec(name, "P-256", None, "ca");
+        if let Some((not_before, not_after)) = window {
+            ca["not_before"] = json!(not_before);
+            ca["not_after"] = json!(not_after);
+        }
+        if let Some(eku) = eku {
+            ca["eku"] = json!([eku]);
+        }
+        ca
+    };
+    let leaf = |name: &str, issuer: &str, eku: &str| {
+        let mut leaf = spec(name, "P-256", Some((issuer, "ECDSA-SHA256")), "client");
+        leaf["eku"] = json!([eku]);
+        leaf
+    };
+    let pki = go.pki(&[
+        authority("ca", None, None),
+        authority("expired-ca", Some((now - 10 * day, now - day)), None),
+        authority("future-ca", Some((now + day, now + 10 * day)), None),
+        authority("server-ca", None, Some("server_auth")),
+        leaf("under-expired-ca", "expired-ca", "client_auth"),
+        leaf("under-future-ca", "future-ca", "client_auth"),
+        leaf("server-leaf", "ca", "server_auth"),
+        leaf("under-server-ca", "server-ca", "client_auth"),
+    ]);
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let server = Pair::certgen("P-256 from certgen", &dir, Curve::P256);
+    let cas = ["ca", "expired-ca", "future-ca", "server-ca"];
+    let clients_pem: Vec<u8> = cas
+        .iter()
+        .flat_map(|ca| pki[*ca].cert_pem.clone())
+        .collect();
+    let client_cas: Vec<String> = cas.iter().map(|ca| hex(&pki[*ca].cert)).collect();
+    let listening = listen_rpc(&server, Some(&clients_pem)).expect("a clientcert listener");
+    let request = getblockcount(false);
+    let expired = "remote error: tls: expired certificate";
+    let cells = [
+        ("under-expired-ca", expired, expired),
+        ("under-future-ca", expired, expired),
+        (
+            "server-leaf",
+            "remote error: tls: unsupported certificate",
+            "remote error: tls: bad certificate",
+        ),
+        (
+            "under-server-ca",
+            "remote error: tls: unsupported certificate",
+            "remote error: tls: bad certificate",
+        ),
+    ];
+    for (version, fields) in [
+        ("TLS 1.3", json!({ "min_version": "TLS 1.3" })),
+        ("TLS 1.2", json!({ "max_version": "TLS 1.2" })),
+    ] {
+        for (name, ours_hears, theirs_hears) in cells {
+            let what = format!("{version}, {name}");
+            let mut fields = fields.clone();
+            fields["client_cert"] = pki[name].identity(&[]);
+            let detail = dial(&mut go, &listening.addr, &server.cert, &fields, &request);
+            assert_refused_by_the_node(&go, &what, &detail, ours_hears);
+            if cfg!(target_os = "linux") {
+                assert_eq!(detail["error"], ours_hears, "{what}: the listener");
+            }
+            assert_eq!(detail["http_status"], 0, "{what}: the listener {detail}");
+            let (addr, id) = listen(
+                &mut go,
+                json!({
+                    "chain": [hex(&server.cert)],
+                    "key_pkcs8": hex(&server.key_pkcs8),
+                    "client_auth": "RequireAndVerifyClientCert",
+                    "client_cas": client_cas,
+                }),
+            );
+            let theirs = dial(&mut go, &addr, &server.cert, &fields, &request);
+            assert_eq!(theirs["ok"], false, "{what}: Go's server {theirs}");
+            assert_eq!(theirs["error"], theirs_hears, "{what}: Go's server");
+            let served = go.served(&id);
+            assert_eq!(served["ok"], false, "{what}: Go's server {served}");
+        }
+    }
+    listening.listener.shutdown();
+    go.report("authorities_and_usages_gos_search_refuses_under_clientcert_auth");
+    assert_eq!(
+        go.handshakes(),
+        2 * cells.len() * 2,
         "every cell in two versions, with the listener and with Go's server"
     );
 }
@@ -1025,6 +1214,90 @@ fn go_ml_dsa_client_certificates_under_clientcert_auth() {
         go.handshakes(),
         2 * cells.len() * 2,
         "every cell in two versions, with the listener and with Go's server"
+    );
+}
+
+/// `--authtype=clientcert` with a client chain of over 32 KiB: a leaf
+/// under six ML-DSA-87 authorities, of some 7.5 KB each, below the
+/// ML-DSA-87 root in `clients.pem`, presented by Go's client, an
+/// ML-DSA-87 leaf in TLS 1.3 and a P-256 one in TLS 1.3 and TLS 1.2 (Go's
+/// client sends no ML-DSA certificate in TLS 1.2).  The listener answers
+/// each, and Go's server, under the same root, accepts each and verifies
+/// it to the root.  A Certificate message that long fills rustls's buffer
+/// unless each read is processed before the next is given to rustls
+/// (`dcroxide-gotls`'s `handshake`), which the listener did before the
+/// crate and the crate did not at first; `dcroxide-gotls`'s
+/// `tests/certificate_size.rs` holds the sizes up to the limits.
+#[test]
+fn a_go_client_chain_over_32_kib_under_clientcert_auth() {
+    let Some(mut go) = TlsOracle::start_ml_dsa() else {
+        return;
+    };
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let server = Pair::certgen("P-256 from certgen", &dir, Curve::P256);
+    let authorities = ["ca 1", "ca 2", "ca 3", "ca 4", "ca 5", "ca 6"];
+    let mut specs = vec![spec("root", "ML-DSA-87", None, "ca")];
+    let mut issuer = "root";
+    for name in authorities {
+        specs.push(spec(name, "ML-DSA-87", Some((issuer, "ML-DSA-87")), "ca"));
+        issuer = name;
+    }
+    for key in ["ML-DSA-87", "P-256"] {
+        specs.push(spec(
+            &format!("leaf {key}"),
+            key,
+            Some((issuer, "ML-DSA-87")),
+            "client",
+        ));
+    }
+    let pki = go.pki(&specs);
+    let root = &pki["root"];
+    let listening = listen_rpc(&server, Some(&root.cert_pem)).expect("a clientcert listener");
+    let request = getblockcount(false);
+    let mut cells = 0;
+    for (version, fields, leaf) in [
+        (
+            "TLS 1.3",
+            json!({ "min_version": "TLS 1.3" }),
+            "leaf ML-DSA-87",
+        ),
+        ("TLS 1.3", json!({ "min_version": "TLS 1.3" }), "leaf P-256"),
+        ("TLS 1.2", json!({ "max_version": "TLS 1.2" }), "leaf P-256"),
+    ] {
+        let rest: Vec<&Issued> = authorities.iter().rev().map(|name| &pki[*name]).collect();
+        let sent: usize = pki[leaf].cert.len() + rest.iter().map(|ca| ca.cert.len()).sum::<usize>();
+        assert!(sent > 32 * 1024 + 2048, "{leaf}: {sent} bytes of chain");
+        let what = format!("{version}, {leaf}, {sent} bytes of chain");
+        let mut fields = fields.clone();
+        fields["client_cert"] = pki[leaf].identity(&rest);
+        let detail = dial(&mut go, &listening.addr, &server.cert, &fields, &request);
+        assert!(answered(&detail), "{what}: the listener {detail}");
+        let (addr, id) = listen(
+            &mut go,
+            json!({
+                "chain": [hex(&server.cert)],
+                "key_pkcs8": hex(&server.key_pkcs8),
+                "client_auth": "RequireAndVerifyClientCert",
+                "client_cas": [hex(&root.cert)],
+            }),
+        );
+        let theirs = dial(&mut go, &addr, &server.cert, &fields, &request);
+        let served = go.served(&id);
+        assert_eq!(theirs["ok"], true, "{what}: Go's client {theirs}");
+        assert_eq!(served["ok"], true, "{what}: Go's server {served}");
+        assert_eq!(
+            served["verified_chains"][0].as_array().map_or(0, Vec::len),
+            rest.len() + 2,
+            "{what}: Go's server verified the chain to the root"
+        );
+        cells += 1;
+    }
+    listening.listener.shutdown();
+    go.report("a_go_client_chain_over_32_kib_under_clientcert_auth");
+    assert_eq!(
+        go.handshakes(),
+        2 * cells,
+        "each with the listener and Go's server"
     );
 }
 

@@ -18,6 +18,11 @@ dcroxide-chainhash = { path = "../crates/dcroxide-chainhash" }
 dcroxide-crypto = { path = "../crates/dcroxide-crypto" }
 dcroxide-dcrec = { path = "../crates/dcroxide-dcrec" }
 dcroxide-dcrjson = { path = "../crates/dcroxide-dcrjson" }
+# For rpc_client_cert and rpc_record_checks: the RPC listener's client
+# certificate verifier and its checks on a client's records, which the
+# node takes from this crate.  It joins this lock as a path
+# package; every crate it depends on is locked here already.
+dcroxide-gotls = { path = "../crates/dcroxide-gotls" }
 # For http_head_parse and ws_frame_read.  It brings the node's whole tree
 # (rustls on dcroxide-tlscrypto's provider, ureq) into the fuzz build,
 # every crate of it pinned in the workspace lockfile at the same version.
@@ -211,6 +216,13 @@ bench = false
 [[bin]]
 name = "rpc_client_cert"
 path = "fuzz_targets/rpc_client_cert.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rpc_record_checks"
+path = "fuzz_targets/rpc_record_checks.rs"
 test = false
 doc = false
 bench = false

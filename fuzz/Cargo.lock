@@ -474,6 +474,7 @@ dependencies = [
  "dcroxide-crypto",
  "dcroxide-dcrec",
  "dcroxide-dcrjson",
+ "dcroxide-gotls",
  "dcroxide-node",
  "dcroxide-rpc",
  "dcroxide-rpctypes",
@@ -498,6 +499,16 @@ dependencies = [
  "dcroxide-txscript",
  "dcroxide-wire",
  "siphasher",
+]
+
+[[package]]
+name = "dcroxide-gotls"
+version = "0.1.0"
+dependencies = [
+ "dcroxide-tlscrypto",
+ "rustls",
+ "rustls-webpki",
+ "zeroize",
 ]
 
 [[package]]
@@ -584,6 +595,7 @@ dependencies = [
  "dcroxide-database",
  "dcroxide-dcrjson",
  "dcroxide-fees",
+ "dcroxide-gotls",
  "dcroxide-indexers",
  "dcroxide-mempool",
  "dcroxide-mining",
@@ -605,12 +617,10 @@ dependencies = [
  "rustix",
  "rustls",
  "rustls-pki-types",
- "rustls-webpki",
  "sha1",
  "socket2",
  "ureq",
  "webpki-roots",
- "zeroize",
 ]
 
 [[package]]

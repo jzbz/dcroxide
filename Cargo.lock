@@ -549,6 +549,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "dcroxide-gotls"
+version = "0.1.0"
+dependencies = [
+ "dcroxide-certgen",
+ "dcroxide-testutil",
+ "dcroxide-tlscrypto",
+ "getrandom 0.4.3",
+ "libc",
+ "rustls",
+ "rustls-webpki",
+ "serde_json",
+ "zeroize",
+]
+
+[[package]]
 name = "dcroxide-indexers"
 version = "0.1.0"
 dependencies = [
@@ -640,6 +655,7 @@ dependencies = [
  "dcroxide-dcrec",
  "dcroxide-dcrjson",
  "dcroxide-fees",
+ "dcroxide-gotls",
  "dcroxide-indexers",
  "dcroxide-mempool",
  "dcroxide-mining",
@@ -670,7 +686,6 @@ dependencies = [
  "tempfile",
  "ureq",
  "webpki-roots",
- "zeroize",
 ]
 
 [[package]]

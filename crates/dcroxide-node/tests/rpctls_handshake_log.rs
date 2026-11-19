@@ -10,7 +10,9 @@
 //! for any of them.  The `<err>` is Go's own text for each failure here:
 //! a client that closes without a word, one that speaks plain HTTP (which
 //! net/http also answers with a 400), one that rejects the certificate,
-//! one with no key exchange in common, and one offering only TLS 1.1.
+//! one with no key exchange in common, and two offering only TLS 1.1: a
+//! TLS 1.2 ClientHello rewritten to offer TLS 1.1, and one as a real TLS
+//! 1.1 client sends it, without signature_algorithms.
 
 #![cfg(target_os = "linux")]
 // Test-harness arithmetic over a fixed deadline.
@@ -305,6 +307,58 @@ fn refused_tls_handshakes_are_logged_as_dcrd_logs_them() {
         ),
     );
 
+    // A ClientHello as a real TLS 1.1 client sends it, Go's with
+    // `MaxVersion` TLS 1.1 or OpenSSL's `-tls1_1`: `legacy_version`
+    // 0x0302 and neither supported_versions nor signature_algorithms,
+    // which rustls alone refuses with `handshake_failure` before it looks
+    // at the versions.  Go refuses the versions first, in a TLS 1.0
+    // record.
+    let tls11_hello = {
+        let suites: [u8; 6] = [0xc0, 0x13, 0xc0, 0x14, 0x00, 0x2f];
+        // supported_groups (X25519, P-256) and ec_point_formats
+        // (uncompressed).
+        let extensions: [u8; 16] = [
+            0x00, 0x0a, 0x00, 0x06, 0x00, 0x04, 0x00, 0x1d, 0x00, 0x17, 0x00, 0x0b, 0x00, 0x02,
+            0x01, 0x00,
+        ];
+        let mut body = vec![0x03, 0x02];
+        body.extend_from_slice(&[0x5a; 32]);
+        body.push(0);
+        body.extend_from_slice(&u16::try_from(suites.len()).expect("short").to_be_bytes());
+        body.extend_from_slice(&suites);
+        body.extend_from_slice(&[1, 0]);
+        body.extend_from_slice(
+            &u16::try_from(extensions.len())
+                .expect("short")
+                .to_be_bytes(),
+        );
+        body.extend_from_slice(&extensions);
+        let body_len = u32::try_from(body.len()).expect("short").to_be_bytes();
+        let mut message = vec![1];
+        message.extend_from_slice(&body_len[1..]);
+        message.extend_from_slice(&body);
+        let mut record = vec![22, 3, 1];
+        record.extend_from_slice(&u16::try_from(message.len()).expect("short").to_be_bytes());
+        record.extend_from_slice(&message);
+        record
+    };
+    let mut tls11 = TcpStream::connect(&addr).expect("connect");
+    tls11
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .expect("timeout");
+    let client_addr = tls11.local_addr().expect("local addr").to_string();
+    tls11.write_all(&tls11_hello).expect("send the ClientHello");
+    let mut alert = Vec::new();
+    let _ = tls11.read_to_end(&mut alert);
+    assert_eq!(alert, [0x15, 0x03, 0x01, 0x00, 0x02, 0x02, 0x46]);
+    wait_for(
+        &collected,
+        &handshake_error(
+            &client_addr,
+            "tls: client offered only unsupported versions: [302 301]",
+        ),
+    );
+
     // And a client that completes its handshake is not logged at all,
     // even when it then leaves without a request, which Go passes over in
     // silence too.
@@ -320,7 +374,7 @@ fn refused_tls_handshakes_are_logged_as_dcrd_logs_them() {
     let out = collected.lock().expect("sink").clone();
     assert_eq!(
         out.matches("TLS handshake error").count(),
-        5,
+        6,
         "one line per refused handshake: {out}"
     );
 }

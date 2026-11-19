@@ -516,6 +516,25 @@ work). Currently implemented:
   floor, evidence and not a proof of constant time); every rustls
   configuration the node builds names it, and the node installs no
   process default
+- `dcroxide-gotls` — Go's `crypto/tls` server as dcrd and dcrwallet
+  configure it, over rustls and `dcroxide-tlscrypto` (no dcrd package of
+  its own; Go's standard library), shared by the node's RPC listener and
+  dcr-purse's listeners: the client certificate verifier that replays
+  Go's `x509` chain search, budget and policy rules before webpki's
+  (`GoClientCertVerifier`, over a `ClientCaPool` filled as Go's
+  `CertPool` is, empty included); the configurations a certificate pair is
+  served with, one for each cipher-suite order and TLS 1.3 key exchange
+  Go's server can settle on, chosen per ClientHello by a handshake that
+  reads the raw ClientHello, with Go's texts for its failures, and holds
+  the records after it to Go's record layer and a second ClientHello to
+  Go's TLS 1.3 server (`GoRecordChecks`); Go's
+  `pem.Decode` and `tls.X509KeyPair` reading; and what dcrwallet's two
+  listeners set where dcrd's does not, client authentication over a shared
+  pool, ALPN, and grpc-go's credentials on the gRPC listener
+  (`GoServerOptions::dcrwallet_jsonrpc`, `dcrwallet_grpc`); pinned by the
+  tests that moved with it from the node, against Go through the oracle,
+  and by dcrwallet's settings against Go's server configured as
+  dcrwallet's, under dcrwallet's `GODEBUG`
 - `dcroxide-ratelimit` — dcrd 2.2's `internal/ratelimit` token bucket:
   a bucket seeded with `burst` tokens refilling at a fixed rate,
   reproducing dcrd's `f64` operations in dcrd's order — including

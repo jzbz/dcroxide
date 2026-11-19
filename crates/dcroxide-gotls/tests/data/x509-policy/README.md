@@ -10,7 +10,7 @@ licence, under which Go distributes them. Go 1.27.3, the reference Go
 (ADR-0001's first 2026-11-12 addendum), and Go 1.26.2 carry the same 27
 files, byte for byte, and the same two tests.
 
-`rpcrun.rs`'s `go_policies_valid_matches_gos_vectors` replays Go's
+`go_policies_valid_matches_gos_vectors`, in `src/clientcert.rs`, replays Go's
 `TestPoliciesValid` table over them, and
 `policies_go_refuses_to_parse_are_refused` its `TestParsePolicies`, with the
 three unread intermediates, which Go's parser refuses too.

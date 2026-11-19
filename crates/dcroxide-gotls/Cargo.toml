@@ -1,0 +1,58 @@
+[package]
+name = "dcroxide-gotls"
+description = "Go's crypto/tls server as dcrd and dcrwallet configure it, over rustls and dcroxide-tlscrypto: the client certificate verifier, the per-ClientHello suite and group choice, and Go's PEM and key reading"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# The in-tree rustls crypto provider (ADR-0015): every configuration this
+# crate builds names it, its suites and groups make up Go's two suite
+# orders and its per-group configurations, its loader reads the server
+# key, and its `RPC_SIG_ALGS` verifies client certificates.
+dcroxide-tlscrypto = { path = "../dcroxide-tlscrypto" }
+# No provider of rustls's own: default features would pull aws-lc-rs, and
+# `ring` is C and assembly too (ADR-0012).  `custom-provider` turns off
+# rustls's fallback to a provider its crate features name, so every
+# configuration names `dcroxide-tlscrypto`'s and none takes a process
+# default.  The node's features, so the build unifies to one rustls.
+rustls = { version = "0.23.46", default-features = false, features = [
+    "std",
+    "tls12",
+    "logging",
+    "custom-provider",
+] }
+# The webpki rustls verifies certificates with, called directly by
+# `GoClientCertVerifier` for the path callback and extended key usage
+# check rustls's own client verifier does not take.  Already in the tree
+# through rustls at this version; 0.103.16 is also the floor
+# RUSTSEC-2026-0382 sets.
+rustls-webpki = { version = "0.103.16", default-features = false, features = ["std"] }
+# Wipes the server key block's DER once the provider has loaded it
+# (`go_key_block`), as the provider's `KEY_PROVIDER` wipes a key.  Locked
+# already, by the provider and rustls.
+zeroize = "1.9"
+
+[dev-dependencies]
+# Certificates and keys for the tests: certgen's dcrd pairs and gencerts'
+# authorities and issued certificates, and `generate_key` for test keys.
+dcroxide-certgen = { path = "../dcroxide-certgen" }
+# The Go oracle and its TLS harness, which the verifier's and the
+# handshake's tests check Go's verdicts and texts through.
+dcroxide-testutil = { path = "../dcroxide-testutil" }
+# Random key material for the certgen environment of the tests.
+getrandom = "0.4"
+# The JSON the oracle's commands take, the version `dcroxide-testutil`
+# locks already.
+serde_json = "1"
+
+# `ECONNRESET`, for the test of Go's text for a reset read.  Locked
+# already, through the node and socket2.
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2"
+
+[lints]
+workspace = true

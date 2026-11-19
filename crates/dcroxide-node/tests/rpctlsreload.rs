@@ -252,6 +252,81 @@ fn a_reload_does_not_restore_stateful_resumption() {
     }
 }
 
+/// A ClientHello refused for its compression methods still runs the
+/// reload check, and a rotation is picked up then: Go calls dcrd's
+/// `GetConfigForClient` as soon as it has read the ClientHello
+/// (`readClientHello`, `crypto/tls/handshake_server.go:166-177`), before
+/// `processClientHello` refuses a client without null compression, and
+/// the handshake asks `config_for_client` at that point for every
+/// ClientHello it reads, the ones rustls refuses included.
+#[test]
+fn a_client_hello_refused_for_its_compression_runs_the_reload_check() {
+    use std::io::{Read, Write};
+    use std::sync::Mutex;
+    use std::time::Instant;
+    let (dir, reloadable) = reloader(Duration::ZERO);
+    let cert = dir.path().join("rpc.cert");
+    let key = dir.path().join("rpc.key");
+    let before = reloadable.config_for_client();
+    write_pair(&cert, &key, 9);
+
+    // A TLS 1.2 ClientHello whose one compression method is DEFLATE.
+    let sigalgs = [0x00, 0x0d, 0x00, 0x04, 0x00, 0x02, 0x04, 0x03];
+    let groups = [0x00, 0x0a, 0x00, 0x04, 0x00, 0x02, 0x00, 0x1d];
+    let extensions = [&sigalgs[..], &groups[..]].concat();
+    let extensions_len = u16::try_from(extensions.len())
+        .expect("short")
+        .to_be_bytes();
+    let body = [
+        &[0x03, 0x03][..],
+        &[0x5a; 32],
+        &[0],
+        &[0x00, 0x02, 0xc0, 0x2b],
+        &[0x01, 0x01],
+        &extensions_len,
+        &extensions,
+    ]
+    .concat();
+    let body_len = u32::try_from(body.len()).expect("short").to_be_bytes();
+    let message = [&[1][..], &body_len[1..], &body].concat();
+    let message_len = u16::try_from(message.len()).expect("short").to_be_bytes();
+    let hello = [&[22, 3, 1][..], &message_len, &message].concat();
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let mut client =
+        std::net::TcpStream::connect(listener.local_addr().expect("addr")).expect("connect");
+    let (sock, _) = listener.accept().expect("accept");
+    client.write_all(&hello).expect("send the ClientHello");
+    let seen = Mutex::new(Vec::new());
+    let refused = dcroxide_gotls::handshake(
+        sock,
+        Instant::now()
+            .checked_add(Duration::from_secs(10))
+            .expect("a deadline"),
+        Duration::from_millis(50),
+        || {
+            let configs = reloadable.config_for_client();
+            seen.lock().expect("unpoisoned").push(Arc::clone(&configs));
+            configs
+        },
+    )
+    .map(|_| ())
+    .expect_err("no null compression");
+    assert_eq!(
+        refused,
+        "tls: client does not support uncompressed connections"
+    );
+    let mut answer = Vec::new();
+    let _ = client.read_to_end(&mut answer);
+    assert_eq!(answer, [0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 0x2f]);
+    let seen = seen.into_inner().expect("unpoisoned");
+    assert_eq!(seen.len(), 1, "the reload check runs once");
+    assert!(
+        !Arc::ptr_eq(&before, &seen[0]),
+        "the rotated pair is reloaded for the refused client"
+    );
+}
+
 /// dcrd accepts `--tlscurve=P-521` and serves TLS with the resulting
 /// certificate, and so does the port. The pair builds a configuration,
 /// and so does the reloader, which shares the builder. The key is SEC1

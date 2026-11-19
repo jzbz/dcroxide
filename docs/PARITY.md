@@ -2263,12 +2263,20 @@ against upstream and the port is faithful.
   up to one interval late. The listener now reads the ClientHello through
   `rustls::server::Acceptor` before it chooses a configuration -- it has to,
   to pick the cipher suite and key exchange as Go does (next entry) -- and
-  asks `config_for_client` at that point. The one sliver left is a
-  ClientHello that rustls refuses before handing it over, for want of null
-  compression or for a server name rustls finds malformed and Go's parser
-  does not: Go would already have run the callback for it, the port does
-  not. What is cached is now a set of configurations built from the same
-  files, which reload together.
+  asks `config_for_client` at that point. Since 2026-11-19 it also asks it
+  for a ClientHello that rustls refuses as incompatible as it reads it, once
+  the port has read the hello itself: one without null compression, one
+  offering neither TLS 1.2 nor TLS 1.3, one without `signature_algorithms`.
+  Go runs the callback for each before it refuses it, and so a refused
+  client can now advance the clock and pick up a rotation, as in dcrd, where
+  until then only the last kind did (`dcroxide-gotls`'s `handshake`; pinned
+  by `a_client_hello_refused_for_its_compression_runs_the_reload_check`,
+  `crates/dcroxide-node/tests/rpctlsreload.rs`, and by
+  `the_configurations_are_asked_for_once_a_client_hello_is_read`). The one
+  sliver left is a ClientHello rustls refuses as malformed where Go's parser
+  takes it, a server name rustls finds malformed among them: Go would already
+  have run the callback for it, the port does not. What is cached is now a
+  set of configurations built from the same files, which reload together.
 
   Upstream since `488b8163` (2023-07-10), first carried by a dcrd release in
   2.0.0.
@@ -2346,7 +2354,8 @@ against upstream and the port is faithful.
   `negotiates_the_key_exchange_in_gos_order` and
   `negotiates_the_cipher_suite_in_gos_order`
   (`crates/dcroxide-node/tests/rpclisten.rs`), by the unit tests in
-  `crates/dcroxide-node/src/rpctls.rs`, and for the P-521 group by those of
+  `crates/dcroxide-gotls/src/server.rs` (in the node's `rpctls.rs` until
+  2026-11-19), and for the P-521 group by those of
   `crates/dcroxide-tlscrypto`; not yet re-run side by side with the dcrd
   binary.
 
@@ -2370,8 +2379,11 @@ against upstream and the port is faithful.
   (`net/http/server.go:1996-2001`); `remote error: tls: <alert>` under
   Go's alert names; and Go's own refusals for no suite or no key exchange
   in common, naming the suite first in TLS 1.3 as Go, which picks it
-  first, does; versions it does not support; a missing client certificate
-  or one signed by an unknown authority; an invalid key share in TLS 1.3
+  first, does; versions it does not support, refused ahead of rustls, which
+  would refuse a real TLS 1.0 or 1.1 client's hello first for want of
+  signature_algorithms (the open entry below); a missing client
+  certificate, one signed by an unknown authority, and one whose chain or
+  own extended key usage leaves out client authentication; an invalid key share in TLS 1.3
   and an invalid ClientKeyExchange in TLS 1.2; and a few more
   (`go_error_text`). Every refusal is logged, unthrottled, as dcrd logs
   it, like the authentication-failure warning and unlike the shed lines.
@@ -2386,6 +2398,149 @@ against upstream and the port is faithful.
   `eviction_prefers_a_connection_that_has_not_sent_a_request`
   (`crates/dcroxide-node/src/rpcrun.rs`). The refusals whose text still
   differs are an open entry below.
+- **The listener's TLS code is a library shared with dcr-purse, which
+  expresses dcrwallet's server beside dcrd's.** Since 2026-11-19 the
+  configurations, the handshake, the client certificate verifier and the
+  PEM and key reading above live in `dcroxide-gotls`, which the node and
+  the wallet both build their listeners on, and every entry here that names
+  them holds for the crate as it holds for the node. The move itself left
+  the node as it was; the review fixes made with it change the node's
+  alerts and logged words toward Go's, and none of its verdicts for a client
+  that keeps to the protocol: for a client offering only TLS 1.0 or 1.1
+  (the open entry on handshake error texts), for a client certificate Go's
+  search builds no chain for or drops every chain of for its usage or
+  policies (the `--authtype=clientcert` entry), and for the reload check a
+  refused ClientHello now runs (the reload entry). They also refuse, as Go
+  does, a client that breaks the protocol after its first ClientHello, by
+  the version of its records or by changing its ClientHello after a
+  HelloRetryRequest, which the node accepted (the record entry below).
+  That no verdict changed for a client keeping to the protocol is held by
+  the node's Go interop matrix, which runs through the crate, and, for the
+  one place where the crate reads the socket itself, by
+  `a_client_chain_over_32_kib_is_verified_and_accepted_as_go_accepts_it`
+  and `client_certificate_messages_near_the_limits_against_gos`
+  (`crates/dcroxide-gotls/tests/certificate_size.rs`) and the node's
+  `a_go_client_chain_over_32_kib_under_clientcert_auth`: a first version of
+  that reading gave rustls a whole read before processing any of it, which
+  fills rustls's buffer while it is one record long, and refused a client
+  certificate message past some 16 KiB with rustls's `message buffer full`,
+  where the node, as Go, accepted it (the record entry below).
+  dcrwallet's servers (`startRPCServers`, `rpcserver.go:252-330`, at the
+  wallet's pin) differ from dcrd's in what
+  the crate's `GoServerOptions` holds, and Go decides each: a `ClientCAs`
+  pool that may be empty under `RequireAndVerifyClientCert`, a client CA
+  file that adds nothing only warning, and that `--issueclientcert` fills
+  with `CertPool.AddCert` (`ClientCaPool`, `GoClientCertVerifier::new`);
+  the JSON-RPC listener asking for a certificate only under
+  `--jsonrpcauthtype=clientcert` (`GoServerOptions::dcrwallet_jsonrpc`);
+  and the gRPC listener's configuration passed through grpc-go v1.83.2's
+  `credentials.NewTLS` and `ServerHandshake` (`GoServerOptions::dcrwallet_grpc`,
+  `grpc`), which adds `h2`, names the suites `tls.CipherSuites()` less
+  those HTTP/2 forbids, and closes a completed handshake that negotiated
+  no protocol with grpc-go's error (`GRPC_MISSING_ALPN`). The suites
+  grpc-go leaves are Go's six TLS 1.2 ECDHE AEAD suites, the ones the set
+  offers, so on the gRPC listener the CBC half of the classical key exchange
+  entry below does not apply: a
+  client offering only ECDHE CBC suites is refused by both, where dcrd's
+  default server and dcrwallet's JSON-RPC listener serve it. An empty
+  pool asks for a certificate, names no authority, and refuses every
+  certificate sent as Go does: one outside its validity or with an
+  unhandled critical extension for that, as Go's `isValid(leafCertificate)`
+  does before its chain search, and every other with `unknown_ca` and
+  `x509: certificate signed by unknown authority`, its extended key usage
+  whatever it is, since Go's search builds no chain and `Verify` returns
+  before it looks at a usage (until 2026-11-19 the port refused a leaf
+  whose extended key usage leaves out client authentication for that, with
+  `unsupported_certificate`, as webpki checks a leaf's usage before it
+  looks for an issuer; the clientcert entry below); the
+  CertificateRequest's schemes and the TLS 1.2 refusal of a client
+  without a certificate differ from Go's as the `--authtype=clientcert` entries
+  below record, for an empty pool as for any other. ALPN takes the server's
+  order, serves a client offering `http/1.1` to an `h2` server as though
+  it had sent no ALPN extension, and refuses a client sharing no protocol
+  with `no_application_protocol` and Go's text, which prints the client's
+  protocols as Go's `%q` does (`tls: client requested unsupported
+  application protocols (["spdy/3"])`); the port's quoting keeps a
+  character above ASCII that Go's `unicode.IsPrint` refuses as a format
+  character or an unassigned code point, where Go escapes it, which no
+  ALPN protocol in use holds and no test compares. In TLS 1.2 Go refuses
+  the protocols before it looks at the suites, the point formats or an
+  ML-DSA key, and rustls would choose the suite first, so the port makes
+  that refusal before rustls sees the ClientHello, in Go's order behind
+  a non-empty renegotiation_info. In TLS 1.3 both refuse after the suite,
+  the group, any HelloRetryRequest and the key share, but Go sends the
+  alert in the clear in place of its ServerHello and rustls sends its
+  ServerHello first and the alert under the handshake keys: Go's client
+  reports the same `remote error: tls: no application protocol` either
+  way, and a client that reads the wire differs. The exception is a TLS 1.3
+  hello without `signature_algorithms`, which rustls refuses as it reads
+  it, before ALPN, and Go after ALPN: the open entry on handshake error
+  texts records it. dcrwallet's
+  `--issueclientcert` pair, made from its templates on each `--tlscurve`,
+  is accepted as Go accepts it on Ed25519, its default, P-256 and P-384,
+  and refused on P-521, as the `--authtype=clientcert` entry's P-521
+  and SHA-512 cells are, until ADR-0015's T4. Pinned against Go's server configured
+  as dcrwallet's, under dcrwallet's `GODEBUG`, in TLS 1.3 and TLS 1.2,
+  through the oracle (`crates/dcroxide-gotls/tests/wallet_interop.rs`):
+  the empty pool, a pool filled by `AddCert`, basic authentication with
+  and without a client's ALPN, the issued pair on both listeners and each
+  curve, and the gRPC listener's ALPN cases, its suites and the order of
+  its ALPN and suite refusals, with the version, suite and group compared
+  where the client is cut to classical groups; and by the crate's unit
+  tests (`the_grpc_listener_is_grpc_gos`, `tls12_refusals_follow_gos_order`,
+  `go_quote_is_strconv_quote`, `next_protos_negotiate_as_gos_alpn`). What
+  Go's client reads after grpc-go's close, a close_notify or a reset as
+  its request races the close, is compared by verdict alone, and the
+  bytes after a handshake are HTTP/1.1 on both sides where grpc-go would
+  speak HTTP/2.
+- **After the first ClientHello, the listener holds the client's records to
+  Go's record layer, and a second ClientHello to Go's TLS 1.3 server, ahead
+  of rustls.** Once Go's server has read the first ClientHello it refuses
+  any record whose version is not TLS 1.2's `0x0303`, with
+  `protocol_version` and `tls: received record with version 301 when
+  expecting version 303`, and any record longer than it reads (2^14 + 2048
+  bytes, 2^14 + 256 in TLS 1.3), with `record_overflow` and `tls: oversized
+  record received with length N` (`readRecordOrCCS`,
+  `crypto/tls/conn.go:652-675`). After a HelloRetryRequest its TLS 1.3
+  server requires the second ClientHello to carry one key share, for the
+  group it named, and no early_data, and every field
+  `illegalClientHelloChange` compares unchanged (the versions, suites,
+  groups, signature algorithms, ALPN, random, session id, compression
+  methods, server name, point formats, status request, session ticket,
+  renegotiation info, SCT, cookie and PSK modes), refusing otherwise with
+  `illegal_parameter` and `tls: client didn't send one key share in second
+  ClientHello`, `tls: client sent unexpected key share in second
+  ClientHello`, `tls: client indicated early data in second ClientHello` or
+  `tls: client illegally modified second ClientHello`
+  (`handshake_server_tls13.go:629-714`). rustls 0.23.46 takes a record of
+  any version `0x03XX`, as RFC 8446 §5.1 asks of a receiver, and of a
+  second ClientHello checks only its early_data and PSK offer
+  (`server/tls13.rs:195-218`), so until 2026-11-19 the port, the node with
+  it, answered every one of these clients with a ServerHello where Go
+  refuses it. `dcroxide-gotls`'s `handshake` now reads the client's bytes
+  after the first ClientHello itself and runs them through
+  `GoRecordChecks` before rustls is given them, a read at a time, each
+  `read_tls` processed before the next, as when rustls read the socket
+  itself (rustls's buffer holds one record until the records it has
+  processed start a longer handshake message), so that rustls processes
+  the records ahead of a refused one, as Go does, and never the refused one:
+  in TLS 1.3 from the end of the first ClientHello to the end of the second
+  after a HelloRetryRequest, and in TLS 1.2 up to the client's Finished, the
+  stretch in which Go's alert goes out in the clear, a TLS 1.2 record. Every
+  such client breaks the protocol (RFC 8446 §4.1.2 and §5.1, RFC 5246
+  §6.2.1); no Go or rustls client is one. Pinned against Go's server
+  configured as dcrwallet's listeners, under dcrwallet's `GODEBUG`, over
+  hand-written ClientHellos, by
+  `a_client_breaking_the_protocol_after_its_hello_is_refused_as_go_does`
+  (`crates/dcroxide-gotls/tests/wallet_interop.rs`), alert and Go's
+  words, which were compared under Go 1.27.4, whose `crypto/tls` is the
+  reference Go 1.27.3's byte for byte in the files concerned; by the
+  module's unit tests (`crates/dcroxide-gotls/src/records.rs`), Go's
+  `clientHelloMsg.unmarshal` rules for the comparison among them; and, for a
+  client keeping to the protocol through a HelloRetryRequest, by
+  `a_client_keeping_to_the_protocol_completes_a_retry`. What is left, the
+  same checks where Go's alert would go out encrypted, is an open entry
+  below.
 - **`generate 0` cancels an in-flight discrete mining call.** dcrd keeps a
   `generateCancelFn` while discrete mining is active and invokes it on the
   `n == 0` path (`internal/mining/cpuminer/cpuminer.go:159-163`, `:845-851`),
@@ -2715,8 +2870,8 @@ closing it would cost.
   (`:139`, documented at `:127` as available on resumed handshakes) and
   `ClientCertVerifier::verify_client_cert` (`verify.rs:219`) are all public,
   and the port already holds a client verifier exactly where it would need
-  one (`GoClientCertVerifier`, which `build_server_config` in `rpcrun.rs`
-  installs over webpki's). `serves_tls_with_a_generated_certificate` --
+  one (`GoClientCertVerifier`, from `dcroxide-gotls`, which
+  `build_server_config` in `rpcrun.rs` installs over webpki's). `serves_tls_with_a_generated_certificate` --
   the test this entry already cites as pinning the behaviour -- calls
   `handshake_kind()` itself (`rpclisten.rs:826`) to assert the second
   connection was `Full`, so the tree used the API the entry called absent.
@@ -2874,7 +3029,8 @@ closing it would cost.
 - **Under `--authtype=clientcert` webpki and the TLS provider still decide
   part of a client chain: a few certificates dcrd accepts get no handshake,
   and some chains dcrd refuses verify.** The client chain
-  is decided by `GoClientCertVerifier` (`build_server_config` in `rpcrun.rs`),
+  is decided by `GoClientCertVerifier` (`dcroxide-gotls`'s `clientcert.rs`,
+  installed by `build_server_config` in `rpcrun.rs`),
   which follows Go's `x509.Certificate.Verify` for
   `RequireAndVerifyClientCert` wherever webpki would decide otherwise. A
   presented certificate that is itself in the `--clientcafile` pool is its own
@@ -2887,7 +3043,12 @@ closing it would cost.
   inside its validity window, with no critical extension Go leaves unhandled,
   an extended key usage admitting clientAuth, and a `pathLenConstraint` the
   chain's intermediates stay within. webpki's trust anchors keep none of these
-  properties.
+  properties. A client refused because its only issuer in the pool fails one
+  of them is refused for the same reason as by Go (the replay of Go's search,
+  below): an authority outside its validity with `certificate_expired`, one
+  with an unhandled critical extension or a path length constraint the chain
+  breaks with Go's words, and one whose usage leaves out clientAuth as Go's
+  `IncompatibleUsage`.
 
   The pool loads with `AppendCertsFromPEM`'s skip rules over a port of
   `pem.Decode`, and fails only with dcrd's `no certificates found in %q`;
@@ -2925,7 +3086,7 @@ closing it would cost.
   which keep ring's set (ADR-0015), still decide the rest.
   `GoClientCertVerifier` builds each chain it anchors with webpki's
   `EndEntityCert::verify_for_usage`, called directly, for which
-  `rustls-webpki` is a direct dependency of `dcroxide-node`: one search
+  `rustls-webpki` is a direct dependency of `dcroxide-gotls`: one search
   over the roots Go would accept, with each path the search builds held to
   its root's `pathLenConstraint` in webpki's path callback and each
   certificate on it to Go's extended key usage rule (`GoClientAuthUsage`),
@@ -2938,7 +3099,43 @@ closing it would cost.
   ranks higher, on a signature, a validity window or a usage, whose error
   is reported instead, where Go reports the constraint's. The alert rustls
   sends with it is `certificate_unknown`, where Go sends
-  `bad_certificate`.
+  `bad_certificate`. A chain Go's search builds and then drops for its key
+  usage, the leaf's, an intermediate's or the root's, and a pooled leaf
+  whose own usage leaves out client authentication, are logged in Go's words,
+  `x509: certificate specifies an incompatible key usage`
+  (`IncompatibleUsage`, `verify.go:653-662`), with rustls's
+  `unsupported_certificate`, where Go sends `bad_certificate`: a verifier can
+  make rustls send `bad_certificate` only with errors that mean something
+  else (a bad encoding, an unhandled critical extension, a name). The root's
+  usage is held to Go's rule in the path callback, after the policies, where
+  `checkChainForKeyUsage` holds it, once the replay below has built the
+  chain; until 2026-11-19 a root whose usage leaves out client
+  authentication was left out of the search instead, and the chain was
+  refused as signed by an unknown authority, with `unknown_ca`, where Go
+  reports the usage. Before that date the port logged rustls's words for a
+  usage refusal (`invalid peer certificate: certificate does not allow
+  extended key usage for client authentication, ...`). When the chains Go's
+  search built are all dropped by `policiesValid` or, after it,
+  `checkChainForKeyUsage`, the two checks `Verify` makes first of each chain
+  (`verify.go:630-650`), Go's error is decided by those two alone, and the
+  verifier returns it before webpki's search, wherever the replay below
+  followed Go's search throughout: `IncompatibleUsage` when no chain was
+  dropped for its policies, `x509: no valid chains built: N candidate chains
+  with invalid policies` when none was dropped for its usage, and `x509: no
+  valid chains built: N candidate chains with incompatible key usage, M
+  candidate chains with invalid policies` otherwise (`DroppedChains`).
+  webpki's search, given a root such a chain ends at as an anchor, can reach
+  it through a path Go never built and rank that path's signature failure
+  above the usage, and the client was then logged as `BadSignature` with
+  `decrypt_error`; and with chains dropped for both reasons the port reported
+  the policies' count alone. Pinned, against Go's `x509_verify_client`, by
+  `a_chain_go_drops_for_its_usage_is_refused_for_it`
+  (`crates/dcroxide-gotls/src/clientcert.rs`), over the chain in
+  `crates/dcroxide-gotls/tests/data/key-usage-chain` and over chains made in
+  the test. Where some chain Go built passes both, the verdict and the error
+  are still webpki's search and the path callback's, and the ranking caveat
+  above, for a signature, a validity window or a usage outranking the
+  callback's refusal, still holds there.
 
   The search keeps webpki's budgets, 100 signature checks, 200,000
   path-building steps and 250,000 name constraint comparisons, where Go keeps
@@ -2976,10 +3173,49 @@ closing it would cost.
   matches first, so intermediates the pool's roots signed that Go passes over
   (for a key usage without certificate signing, which webpki ignores), or
   forged copies of the right intermediate sent ahead of it, used to spend it
-  before webpki reached the chain Go builds. When the replay builds no chain
-  webpki still searches everything, for the error it ranks, and a budget it
-  runs out of is reported as an unknown issuer, Go's search having ended for
-  another reason. The replay holds a root to `CheckSignatureFrom` as well: a
+  before webpki reached the chain Go builds. When the replay builds no chain,
+  the client is refused, since 2026-11-19, with the error Go's search ended
+  with, which `Verify` returns before it looks at any chain's key usage
+  (`GoChainError`): each candidate whose signature checks writes its
+  `isValid` result to `buildChains`' named result, and each intermediate that
+  passes writes the search above it there (`crypto/x509/verify.go:764-790`),
+  so the error is the one the last such candidate left, `UnknownAuthorityError`
+  when it left none. An unknown authority is logged in Go's words, without the
+  hint (below), with `unknown_ca`; a root or intermediate outside its validity
+  with `certificate_expired`, as Go sends it, in rustls's words (`certificate
+  expired: verification time ...`), since Go prints the time in the server's
+  local zone (`current time ...` in RFC 3339 with the zone's offset); an
+  unhandled critical extension in Go's words with `bad_certificate`; a path
+  length constraint in Go's words with `certificate_unknown`; and an
+  intermediate whose basic constraints do not assert cA, which Go's
+  `CheckSignatureFrom` lets sign only as a version 1 or 2 certificate, in Go's
+  words (`x509: certificate is not authorized to sign other certificates`)
+  with `certificate_unknown`; Go sends `bad_certificate` for the last two.
+  Before that change webpki searched everything for the error it ranked: a
+  leaf whose extended key usage leaves out client authentication and that
+  chains to nothing was refused for its usage, with `unsupported_certificate`
+  and rustls's words, as webpki checks a leaf's usage before it looks for an
+  issuer, where Go says `unknown_ca` and `x509: certificate signed by unknown
+  authority`; a leaf whose only issuer in the pool is outside its validity got
+  `unknown_ca`, the root having been left out of the search, where Go sends
+  `certificate_expired`; and a failed signature at one root ranked above
+  another root's path length constraint, where Go reports the constraint. The
+  replay vouches for Go's error only when it followed Go's search throughout:
+  a candidate whose signature Go may verify where the provider cannot (no
+  algorithm of the provider's names the signature and the key, a signature or
+  key it cannot read, or an RSA key whose signature fails, which ring's key
+  sizes can cause; `SignatureCheck::Unverifiable`) leaves the refusal to
+  webpki's search as before, which refuses every path, and a budget webpki
+  runs out of there is reported as an unknown issuer, Go's search having ended
+  for another reason. Such a chain is one Go may accept, where the port
+  refuses it in any case (the T4 gaps below). The errors are held to Go's own
+  `Verify` through the oracle's `x509_verify_client`, and the alerts to the
+  ones Go's `processCertsFromClient` sends
+  (`a_search_without_a_chain_is_refused_with_gos_error`); and over the wire
+  to Go's server under dcrd's and dcrwallet's `GODEBUG`
+  (`authorities_and_usages_gos_search_refuses_under_clientcert_auth`,
+  `authorities_and_usages_gos_search_refuses_are_refused_as_go_does`). The
+  replay holds a root to `CheckSignatureFrom` as well: a
   version 3 root without basic constraints, one whose basic constraints do not
   assert cA, and one whose key usage leaves out certificate signing anchor
   nothing, where webpki's anchors, which check none of this, anchored them;
@@ -3027,7 +3263,7 @@ closing it would cost.
   parser refuses for one of them, such as one listing a policy twice or giving
   a length in more octets than it needs, is refused too. The port replays Go's
   own `TestPoliciesValid` table, with its options, over Go's vectors
-  (`tests/data/x509-policy`). A path the validation refuses sends the search on
+  (`crates/dcroxide-gotls/tests/data/x509-policy`). A path the validation refuses sends the search on
   to another, as Go drops a chain and keeps the rest. A path holding a
   certificate that Go's `alreadyInChain` takes for its root is refused before
   that, and not counted: Go passes over such a root before checking its
@@ -3060,8 +3296,9 @@ closing it would cost.
   callback, for their key usage or a name constraint, both of which Go checks
   only after the policies. So a chain that fails the policies and one of those is a policy
   failure to Go and never reaches the policy check here: when every chain that
-  fails the policies fails the key usage too, the port logs rustls's usage
-  error, with `unsupported_certificate`, where Go logs the invalid policies; Go
+  fails the policies fails the key usage too, the port logs Go's usage error,
+  `x509: certificate specifies an incompatible key usage`, with
+  `unsupported_certificate`, where Go logs the invalid policies; Go
   also names in the same error the chains it dropped for their key usage alone;
   and when a chain that passes the policies and the key usage breaks a name
   constraint, Go reports that, `x509: a root or intermediate certificate is not
@@ -3076,11 +3313,13 @@ closing it would cost.
   before the search, as Go's `isValid(leafCertificate)` refuses it before its
   own, and logged as Go's `x509: unhandled critical extension`. A path through
   an intermediate carrying one is refused in the path callback, so the search
-  goes on without it as Go's does. Which error a refused chain is then logged
-  with follows webpki's ranking of the errors its search met, keeping the
-  earlier of two that rank alike, where Go reports the error of the last
-  candidate whose signature checked; they agree when that intermediate is the
-  only path, and can differ when several paths fail. An intermediate on the
+  goes on without it as Go's does. When Go's search, replayed, then builds no
+  chain, the refusal is the error it ended with, the error of the last
+  candidate whose signature checked (above); only when the replay cannot vouch
+  for that does the logged error follow webpki's ranking of the errors its
+  search met, keeping the earlier of two that rank alike, which agrees with
+  Go's when that intermediate is the only path and can differ when several
+  paths fail. An intermediate on the
   path that carries a critical extension webpki does not support is refused by
   webpki itself, logged in rustls's words with `certificate_unknown`, where Go
   logs `x509: unhandled critical extension` with `bad_certificate`. Every
@@ -3332,7 +3571,8 @@ closing it would cost.
   P-224 key is refused where dcrd serves it over TLS 1.2.** Since ADR-0015's
   switch `build_server_config` takes the key block by Go's rule, the first block
   `pem.Decode` finds whose type is `PRIVATE KEY` or ends in ` PRIVATE KEY`, the
-  space included (`crypto/tls/tls.go:286-303`; `go_key_block` in `rpcrun.rs`),
+  space included (`crypto/tls/tls.go:286-303`; `go_key_block` in
+  `dcroxide-gotls`'s `pem.rs`, in `rpcrun.rs` until 2026-11-19),
   with Go's three texts for a file with none (`tls.go:291-297`); reads its DER
   whatever the label as Go's `parsePrivateKey` does, PKCS#8, then PKCS#1, then
   SEC 1 (`tls.go:361-379`), through `dcroxide-tlscrypto`'s `sign::load_der`; and
@@ -3537,7 +3777,18 @@ closing it would cost.
     (`crypto/tls/common.go:72`, `conn.go:1100-1107`). An ML-DSA-87
     certificate is about 7.5 KB, so a client chain of nine or so, which Go
     reads, the port refuses. The limit predates ML-DSA, whose certificates
-    bring it within reach.
+    bring it within reach, and the extraction into `dcroxide-gotls`: the
+    node had it before. Pinned against Go's server requiring and verifying
+    client certificates, in TLS 1.3 and TLS 1.2, by
+    `client_certificate_messages_near_the_limits_against_gos`
+    (`crates/dcroxide-gotls/tests/certificate_size.rs`): a valid chain with
+    unneeded valid certificates after it, in a message within 600 bytes
+    under rustls's limit, is accepted by both; one within 600 bytes under
+    Go's is accepted by Go and refused by the port, with `decode_error`
+    and `local error: tls: error decoding message`, before its verifier
+    runs; and one within 600 bytes over Go's is refused by both, Go's
+    server with `internal_error` and `tls: handshake message of length N
+    bytes exceeds maximum of 262144 bytes`.
   - The seeders keep ring's verification set, and `gencerts` refuses an
     ML-DSA CA key, both decided 2026-11-12 (the seeders' entry above, and
     the daemon row).
@@ -3901,7 +4152,7 @@ closing it would cost.
 - **Some refused RPC TLS handshakes are logged with rustls's description where
   dcrd logs Go's.** The line is dcrd's (the accepted entry on the listener's
   TLS handshake), but its `<err>` is Go's text only where the two stacks
-  refuse for the same reason and `rpctls::go_error_text` knows the
+  refuse for the same reason and `dcroxide-gotls`'s `go_error_text` knows the
   correspondence. Elsewhere it is rustls's own description of its error. That
   covers a handshake message out of order, which Go reports as `tls: received
   unexpected handshake message of type <Go type> when waiting for <Go type>`;
@@ -3927,7 +4178,7 @@ closing it would cost.
   message's capital, where the port writes `read` or `write` and lower-cases
   it. Closing the rest is a longer table in `go_error_text`, case by case.
 
-  Four ClientHello refusals differ in more than words. A hello with a
+  Three ClientHello refusals differ in more than words. A hello with a
   non-empty `renegotiation_info` completes the handshake in TLS 1.3 with any
   key, and in TLS 1.2 with an `rpc.key` of any kind but ML-DSA, whose refusals
   the port makes ahead of rustls (the ML-DSA entry above), where Go refuses it
@@ -3936,17 +4187,67 @@ closing it would cost.
   TLS 1.2 hello with compressed point formats alone gets rustls's
   `illegal_parameter`, where Go sends `missing_extension`
   (`handshake_server.go:287-291`), in the same logged words; and a TLS 1.2
-  hello without `signature_algorithms` is refused by rustls as it reads the
-  hello, with `handshake_failure` and `peer is incompatible:
-  SignatureAlgorithmsExtensionRequired`, where Go, under the `tlssha1=0` that
-  dcrd's `default=go1.26` gives it, refuses it later, after its ServerHello
-  and Certificate, as it picks a signature scheme, with the same
-  `handshake_failure` and `tls: missing signature_algorithms from TLS 1.2
-  peer` (`crypto/tls/auth.go:280-286`). With any key, rustls's
-  `protocol_version` alert goes out in a record of version 0x0303, where Go's
-  carries 0x0301. Each sits in rustls's reading of the hello, and closing it
-  would take a check ahead of rustls for every key, like the one an ML-DSA key
-  has; they stay open.
+  hello that offers TLS 1.2 without `signature_algorithms` is refused by
+  rustls as it reads the hello, with `handshake_failure` and `peer is
+  incompatible: SignatureAlgorithmsExtensionRequired`, where Go, under the
+  `tlssha1=0` that dcrd's `default=go1.26` gives it, refuses it later, after
+  its ServerHello and Certificate, as it picks a signature scheme, with the
+  same `handshake_failure` and `tls: missing signature_algorithms from TLS 1.2
+  peer` (`crypto/tls/auth.go:280-286`). Each sits in rustls's reading of the
+  hello, and closing it would take a check ahead of rustls for every key, like
+  the one an ML-DSA key has; they stay open. A TLS 1.3 hello without
+  `signature_algorithms` differs the same way, on every listener: rustls
+  refuses it as it reads it, with `handshake_failure` and `peer is
+  incompatible: SignatureAlgorithmsExtensionRequired`, where Go, after the
+  suite, the group, any HelloRetryRequest and the key share, refuses first
+  a client that shares no protocol with `NextProtos`, with
+  `no_application_protocol` and its ALPN text, and otherwise sends
+  `missing_extension`, `local error: tls: missing extension`, as it picks
+  the certificate (`handshake_server_tls13.go:260-264`, `:474-484`). Making
+  that refusal ahead of rustls would mean answering Go's HelloRetryRequest
+  for such a client too, which only rustls can send, so it stays open; it
+  was found by the review of 2026-11-19, against dcrwallet's gRPC listener
+  with `h2` and with `spdy/3` alone, and no test pins it.
+
+  A hello that offers neither TLS 1.2 nor TLS 1.3 is refused ahead of rustls,
+  since 2026-11-19, as Go's `readClientHello` refuses it before anything else
+  (`crypto/tls/handshake_server.go:178-194`): `protocol_version` in a record of
+  version 0x0301 and `tls: client offered only unsupported versions: [302
+  301]`, the versions as Go reads them from `supported_versions` or, without
+  it, from `legacy_version` (`HelloFacts::go_version_refusal`). A real TLS 1.0
+  or 1.1 client, Go's with `MaxVersion` below TLS 1.2 or OpenSSL's `-tls1`,
+  sends no `signature_algorithms` (`handshake_client.go:122-123`), and rustls
+  alone refused its hello for that first, with `handshake_failure` and
+  `peer is incompatible: SignatureAlgorithmsExtensionRequired`; a hello that
+  carried `signature_algorithms` reached rustls's version check and got Go's
+  words, with `protocol_version` in a record of version 0x0303. The refusal is
+  held to Go's server, alert record and words, over hand-written hellos
+  (`a_client_without_tls12_is_refused_as_go_refuses_it`, `dcroxide-gotls`),
+  and to Go's client held to TLS 1.0 and 1.1 against the node's listener on
+  each key it generates (`go_clients_below_tls12_are_refused_as_go_refuses_them`,
+  `crates/dcroxide-node/tests/tls_interop.rs`) and against each of
+  dcrwallet's listeners (`a_tls10_or_tls11_client_is_refused_as_go_does`,
+  `crates/dcroxide-gotls/tests/wallet_interop.rs`); the node's log line by
+  `rpctls_handshake_log.rs`.
+
+- **Go's record-layer checks are not made where Go's alert would go out
+  encrypted.** The accepted entry on the listener's record checks holds the
+  client's records to Go's version and length only while Go would refuse
+  them in the clear: in TLS 1.3 up to the second ClientHello after a
+  HelloRetryRequest, in TLS 1.2 up to the client's Finished. Past those
+  points Go's server has keys in use and sends its `protocol_version` or
+  `record_overflow` alert encrypted, which only rustls could do, and rustls
+  takes a record of any version `0x03XX` and, in TLS 1.3 as in TLS 1.2, of
+  up to 2^14 + 2048 bytes (`msgs/message/mod.rs:258`), where Go's TLS 1.3
+  limit is 2^14 + 256. So in TLS 1.3 a client's
+  Certificate, CertificateVerify or Finished, and in either version any
+  record after the handshake, in another version than `0x0303` is taken by
+  the port where Go refuses it, after the handshake from net/http's read
+  rather than in the handshake (Go's own `TestRecordBadVersionTLS13`,
+  `crypto/tls/conn_test.go`, is that case, and is not ported). A client
+  that sends records out of turn, before the server's first flight, is
+  checked once that flight is seen, but rustls has already been given those
+  records. Every client this concerns breaks the protocol; no test pins it.
 
 - **The RPC server does not log a websocket client's arrival or departure.**
   dcrd's `internal/rpcserver` logs through a package logger that the daemon

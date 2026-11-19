@@ -15,8 +15,9 @@
 //!   the outbound connection driver, seeding, SOCKS dialing, and the
 //!   netsync, mempool, mixing pool and chain notification seams;
 //! - the RPC server's HTTP and websocket serving (`rpcrun`,
-//!   `websocket`, `wsframe`) and its TLS handshake as Go's server
-//!   negotiates it (`rpctls`), the profile server manager's address
+//!   `websocket`, `wsframe`), whose TLS handshake runs on
+//!   `dcroxide-gotls` as Go's server negotiates it, the profile server
+//!   manager's address
 //!   checks (`profiler`), the CPU miner and block template glue, and
 //!   the optional indexes;
 //! - process plumbing: the pipe IPC protocol and runtime (`ipc`,
@@ -61,7 +62,6 @@ pub mod progresslog;
 pub mod readahead;
 pub mod rebroadcast;
 pub mod rpcrun;
-mod rpctls;
 pub mod runtime;
 pub mod secretfile;
 pub mod seeding;

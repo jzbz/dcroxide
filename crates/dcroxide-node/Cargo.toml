@@ -50,10 +50,13 @@ dcroxide-peer = { path = "../dcroxide-peer" }
 dcroxide-rpc = { path = "../dcroxide-rpc" }
 dcroxide-txscript = { path = "../dcroxide-txscript" }
 dcroxide-wire = { path = "../dcroxide-wire" }
+# Go's crypto/tls server as dcrd configures it: the RPC listener's
+# configurations, its handshake and its client-certificate verifier
+# (`rpcrun`), shared with dcr-purse's listeners.
+dcroxide-gotls = { path = "../dcroxide-gotls" }
 # The in-tree rustls crypto provider (ADR-0015), the one the node's TLS
-# runs on: the RPC listener's configurations (`rpctls`), its key loading
-# and client-certificate verifier (`rpcrun`), and both seeder clients
-# (`seeding`) each name it.
+# runs on: both seeder clients (`seeding`) name it, and the RPC
+# listener's configurations take it through `dcroxide-gotls`.
 dcroxide-tlscrypto = { path = "../dcroxide-tlscrypto" }
 # No provider of rustls's own: default features would pull aws-lc-rs, a
 # 68 MB C and assembly crypto library in a workspace that otherwise
@@ -70,12 +73,6 @@ rustls = { version = "0.23.45", default-features = false, features = [
 ] }
 sha1 = { version = "0.11", default-features = false }
 rustls-pki-types = "1"
-# The webpki rustls verifies certificates with, called directly by the
-# RPC client certificate verifier (`rpcrun::GoClientCertVerifier`) for
-# the path callback and extended key usage check rustls's own client
-# verifier does not take.  Already in the tree through rustls at this
-# version; 0.103.16 is also the floor RUSTSEC-2026-0382 sets.
-rustls-webpki = { version = "0.103.16", default-features = false, features = ["std"] }
 # Gzips the log file's rolls, as dcrd's rotator does with Go's
 # `compress/gzip` (`logrotate.rs`).  Already in the tree with its
 # default features through ureq's gzip support, so it adds no crate.
@@ -95,10 +92,6 @@ ureq = { version = "=3.5.1", default-features = false, features = [
 ] }
 webpki-roots = "1.0.10"
 socket2 = "0.6.4"
-# Wipes the `rpc.key` block's DER, not the PEM text it came from, once
-# the provider has loaded it (`rpcrun::go_key_block`), as its
-# `KEY_PROVIDER` wipes a key.  Locked already, by the provider and rustls.
-zeroize = "1.9"
 
 # Already in the tree via socket2 and getrandom; taken directly for
 # MSG_DONTWAIT, which lets the request-cancellation watchdog peek at a
@@ -138,6 +131,12 @@ rustix = { version = "1.1.4", default-features = false, features = ["std", "even
 
 [dev-dependencies]
 dcroxide-dcrec = { path = "../dcroxide-dcrec" }
+# The webpki rustls verifies certificates with, for the seeder tests'
+# trust anchors (`seeding`).  The client certificate verifier that called
+# it directly moved to `dcroxide-gotls`.  Already in the tree through
+# rustls at this version; 0.103.16 is also the floor RUSTSEC-2026-0382
+# sets.
+rustls-webpki = { version = "0.103.16", default-features = false, features = ["std"] }
 dcroxide-testutil = { path = "../dcroxide-testutil" }
 # The same crate as above, with its counter of hashed headers for the
 # test that a block's hash travels with it from its reader to the chain.

@@ -33,6 +33,19 @@ use crate::{Oracle, REFERENCE_GO, hex, oracle_or_skip_with_env, require_referenc
 /// and a test here holds the two equal.
 pub const DCRD_TLS_GODEBUG: &str = "tlssecpmlkem=1,tlssha1=0,x509sha256skid=1,cryptocustomrand=0";
 
+/// The `GODEBUG` the wallet's TLS interop tests run the oracle under:
+/// dcrwallet's settings at its pin, whose `debug.go` sets `//go:debug
+/// default=go1.25`, for the same four settings as [`DCRD_TLS_GODEBUG`].
+/// Go 1.25's values differ from Go 1.26's in two of them
+/// (`internal/godebugs/table.go:31`, `:66`): `tlssecpmlkem=0`, so Go's
+/// default key exchanges offer X25519MLKEM768 alone among the hybrids;
+/// and `cryptocustomrand=1`, so the random source dcrwallet passes when it
+/// generates keys and certificates is the one used, which changes nothing
+/// a handshake shows.  `tlssha1=0` and `x509sha256skid=1` are Go 1.25's as
+/// well as Go 1.26's.
+pub const DCRWALLET_TLS_GODEBUG: &str =
+    "tlssecpmlkem=0,tlssha1=0,x509sha256skid=1,cryptocustomrand=1";
+
 /// How long any of Go's connections may take, its accept, handshake,
 /// request and response, as the oracle's `timeout_ms`.
 pub const TIMEOUT_MS: u64 = 10_000;
@@ -41,8 +54,8 @@ pub const TIMEOUT_MS: u64 = 10_000;
 /// [`DCRD_TLS_GODEBUG`], with the same skip-or-fail policy for an oracle
 /// whose Go builds none of its TLS commands, which need Go 1.26 or later
 /// (`tools/oracle/tls.go`, and `tls_old.go` under an older Go).
-fn tls_oracle_or_skip() -> Option<Oracle> {
-    let mut oracle = oracle_or_skip_with_env(&[("GODEBUG", DCRD_TLS_GODEBUG)])?;
+fn tls_oracle_or_skip(godebug: &str) -> Option<Oracle> {
+    let mut oracle = oracle_or_skip_with_env(&[("GODEBUG", godebug)])?;
     let response = oracle.call("build_info", b"");
     let go_version = response["go_version"].as_str().unwrap_or_default();
     if go_builds_tls_commands(go_version) {
@@ -74,7 +87,8 @@ fn go_builds_tls_commands(go_version: &str) -> bool {
     }
 }
 
-/// The oracle under dcrd's `GODEBUG` as a matrix runs it: the Go that
+/// The oracle under dcrd's `GODEBUG` as a matrix runs it, or under
+/// dcrwallet's ([`TlsOracle::start_dcrwallet`]): the Go that
 /// answers, and the handshakes the matrix has made, each connection
 /// counted once, as Go's client made it or, when its client is the code
 /// under test, as Go's server served it.
@@ -92,8 +106,20 @@ impl TlsOracle {
     /// The oracle, or `None` where the tests skip: no oracle, or one whose
     /// Go is older than 1.26, unless `DCROXIDE_REQUIRE_ORACLE` is set.
     pub fn start() -> Option<TlsOracle> {
+        TlsOracle::start_under(DCRD_TLS_GODEBUG)
+    }
+
+    /// [`TlsOracle::start`] under dcrwallet's `GODEBUG`
+    /// ([`DCRWALLET_TLS_GODEBUG`]), for the tests that hold the code under
+    /// test to dcrwallet's server rather than dcrd's.
+    pub fn start_dcrwallet() -> Option<TlsOracle> {
+        TlsOracle::start_under(DCRWALLET_TLS_GODEBUG)
+    }
+
+    /// The oracle under `godebug`, with [`TlsOracle::start`]'s policy.
+    fn start_under(godebug: &str) -> Option<TlsOracle> {
         Some(TlsOracle {
-            oracle: tls_oracle_or_skip()?,
+            oracle: tls_oracle_or_skip(godebug)?,
             go_version: String::new(),
             handshakes: 0,
             listening: HashMap::new(),
@@ -529,6 +555,44 @@ mod tests {
                 assert_eq!(served["curve_id"], want, "{served}");
             }
             assert_eq!(go.handshakes(), 1, "one connection, counted once");
+        }
+    }
+
+    /// Under dcrwallet's `GODEBUG` Go's default server offers
+    /// X25519MLKEM768 and not SecP256r1MLKEM768, which it offers under
+    /// dcrd's: a Go client cut to each dials a Go server on Go's defaults.
+    #[test]
+    fn dcrwallets_godebug_offers_one_hybrid() {
+        let Some(mut dcrd) = TlsOracle::start() else {
+            return;
+        };
+        let Some(mut wallet) = TlsOracle::start_dcrwallet() else {
+            return;
+        };
+        let server = dcrd.pki(&[spec("server", "P-256", None, "server")])["server"].clone();
+        for (wallet_side, hybrid, served) in [
+            (false, "SecP256r1MLKEM768", true),
+            (true, "SecP256r1MLKEM768", false),
+            (false, "X25519MLKEM768", true),
+            (true, "X25519MLKEM768", true),
+        ] {
+            let go = if wallet_side { &mut wallet } else { &mut dcrd };
+            let (addr, id) = go.listen(server.identity(&[]));
+            let dial = go.dial(json!({
+                "addr": addr, "server_name": "localhost", "roots": [hex(&server.cert)],
+                "curve_preferences": [hybrid],
+            }));
+            let result = go.served(&id);
+            assert_eq!(dial["ok"], served, "{hybrid}: {dial}");
+            if served {
+                // The dial sends no request, so the server's read ends at
+                // EOF after the handshake; the group is what is compared.
+                assert_eq!(dial["curve_id"], hybrid, "{dial}");
+                assert_eq!(result["curve_id"], hybrid, "{result}");
+            } else {
+                assert_eq!(result["ok"], false, "{hybrid}: {result}");
+                assert_eq!(result["version"], "", "{hybrid}: no handshake {result}");
+            }
         }
     }
 
