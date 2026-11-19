@@ -442,6 +442,7 @@ dependencies = [
  "dcroxide-secp256k1-vartime",
  "hmac",
  "k256",
+ "primeorder",
  "sha2",
  "zeroize",
 ]

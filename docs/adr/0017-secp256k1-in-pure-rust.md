@@ -11,7 +11,9 @@
   merge.
 - **Date:** 2026-11-09, 2026-11-10 (addendum: the extra soak legs, the
   merge-bar run and the witness vectors; second addendum: the merge),
-  2026-11-18 (addendum: HD derivation's entry points)
+  2026-11-18 (addendum: HD derivation's entry points), 2026-11-19
+  (addendum: secret generator multiplication through `k256`'s basepoint
+  table)
 
 ## Context
 
@@ -388,3 +390,74 @@ record's line between public data and secrets.
 The rest of the Decision stands as written: dcrd's rules stay in dcrec in
 front of both stacks, dcrec names the owned crate in one module, and no
 signing function reaches it.
+
+## Addendum, 2026-11-19 — secret generator multiplication through `k256`'s basepoint table
+
+dcrec's secret generator multiplications now read `k256`'s precomputed
+basepoint table. The wallet that consumes dcrec asked for it: signing
+there took about 1.72 times Go's time, against a criterion of at most
+1.15 times. The Decision's "Secrets, constant time, on `k256`" said
+`precomputed-tables` and `std` were off and that both signers and
+`PrivateKey::public_key` multiplied as `GENERATOR * k` through `lincomb`.
+That held for this record's date. dcrec's manifest and the dependency
+ledger's `k256` row gave the reason: nothing called `mul_by_generator`,
+the only constant-time reader of the table, so the table bought nothing.
+
+**What changes.**
+
+- Every multiplication of the generator by a secret goes through one
+  function, `mul_secret_by_generator` (`src/secp256k1.rs`): the public key
+  dG of `PrivateKey::public_key` (and with it
+  `ReducedPrivateKey::public_point` and the public key of an HD private
+  child), ECDSA signing's kG (and so compact signing's), and
+  EC-Schnorr-DCRv0 signing's R = kG. It calls `k256`'s `mul_by_generator`.
+- dcrec gains one feature, `precomputed-tables`, on by default. It turns
+  on `k256/precomputed-tables` and `primeorder/std`, which the table's
+  one-time initialisation needs (`primeorder` 0.14.0
+  `src/tables/basepoint.rs:5-19`: `std` or `critical-section`). `std` is
+  chosen over `critical-section`. It uses `std::sync::LazyLock` and adds
+  no package. `critical-section` adds `once_cell`, `critical-section` and
+  `portable-atomic`, and needs an implementation linked into every
+  binary, which on a host is `critical-section/std`. `k256/std` is not
+  taken, since it also enables `getrandom`. The lock gains one edge,
+  dcrec to `primeorder`, and no package.
+- With the feature, `mul_by_generator` recodes the scalar, without
+  branching, into 65 signed radix-16 digits. Each digit selects in
+  constant time one entry of 33 tables of eight multiples (digit 64 from
+  table 32, digits 2i and 2i+1 from table i). The 65 entries are summed
+  into two accumulators by 64 additions, the odd-digit accumulator is
+  doubled four times, and one final addition joins the two. Without it,
+  `k256` computes `GENERATOR * k` through `lincomb`, the path every build
+  took before. The no_std check builds dcrec without default features, so
+  without the table and without `std`. Both paths add table entries
+  chosen by `primeorder`'s `LookupTable::select`, the identity among them
+  for a zero digit. The table walk therefore brings no kind of selection
+  or addition that `lincomb` did not already make.
+- The points are the same. `mul_secret_by_generator_matches_the_plain_multiply`
+  holds the table against `lincomb` for 0, 1 to 64 and N - 1 to N - 64
+  (those also against repeated addition), every 2^i and 2^i - 1, each
+  byte value repeated, the low-S boundary and 4,096 random scalars. dcrd's
+  vectors and the oracle differentials pass unchanged with the feature
+  on, and CI runs dcrec's whole suite once more without it. ECDSA, compact
+  and Schnorr signatures, and public keys, equal Go's byte for byte with
+  and without the table in the microbenchmark's 8,192 cases.
+- Measured on m3 (docs/bench-ledger.md, "Secret generator multiplication
+  through k256's basepoint table (2026-11-19)"), the public key fell from
+  37.8 µs to 19.7 µs, ECDSA signing from 42.8 µs to 24.7 µs and Schnorr
+  signing from 38.9 µs to 21.0 µs. Against dcrd at the oracle's pin,
+  signing went from 1.57 to 1.63 times Go's time to 0.85 to 0.95 times.
+  Verification and recovery moved by under 0.6%. The table is built on
+  the first call, which takes about 90 µs longer than one without it.
+  Without the feature the change runs at the old speed.
+- Verification, recovery, key parsing and HD derivation's public tweak sum
+  are untouched. They run on the owned crate, with `k256`'s combined
+  variable-time multiply as their fallback, and read no table.
+
+**What is not done.** dcrec has no timing check of its own like
+`dcroxide-tlscrypto`'s dudect targets (ADR-0015 T10), with the table or
+without it. The constant-time claim rests on reading `k256` 0.14.0 and
+`primeorder` 0.14.0. Neither path wipes the scalar's recoding or the
+intermediate points it leaves on the stack, and neither did before.
+
+The rest of the Decision stands. dcrd's rules stay in dcrec in front of
+both stacks, and no signing function reaches the owned crate.

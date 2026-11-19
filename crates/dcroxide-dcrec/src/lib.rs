@@ -25,8 +25,17 @@
 //! differential-tested against dcrd's own code via `tools/oracle`.
 //!
 //! Like the codec crates this one is `no_std` outside its own tests, and
-//! needs `alloc` (the DER `Vec`).  It has no features, and it compiles no
-//! C: every dependency it builds is Rust.
+//! needs `alloc` (the DER `Vec`).  It compiles no C: every dependency it
+//! builds is Rust.
+//!
+//! One feature, `precomputed-tables`, on by default: secret generator
+//! multiplication (a private key's public key, the nonce point of both
+//! signers) reads k256's basepoint table, built once on first use, in
+//! constant time.  The table's one-time initialisation takes `std`
+//! (through `primeorder/std`, `std::sync::LazyLock`), though this crate's
+//! own code stays `no_std`; a no_std build turns default features off
+//! and multiplies through k256's `lincomb`, also in constant time, with
+//! the same points.  The crate's manifest records the choice.
 
 #![cfg_attr(not(test), no_std)]
 // This crate holds no hashed containers: every map and set in it is

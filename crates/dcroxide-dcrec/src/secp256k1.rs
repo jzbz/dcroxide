@@ -328,6 +328,33 @@ impl PublicKey {
     }
 }
 
+/// kG for a secret scalar k, in constant time: every multiplication of the
+/// generator by a secret goes through here, the public key from a private
+/// key and the nonce point of ECDSA and EC-Schnorr-DCRv0 signing.  dcrd
+/// computes these with `ScalarBaseMultNonConst`, in variable time; the
+/// point is the same.
+///
+/// It is k256's `mul_by_generator`.  With the crate's `precomputed-tables`
+/// feature, on by default, that walks k256's basepoint table, built once
+/// on first use.  A recoding of k that has no branch on k gives 65 signed
+/// radix-16 digits; each selects, in constant time, one entry of 33
+/// tables of eight precomputed multiples (digit 64 from table 32, digits
+/// 2i and 2i+1 from table i).  The 65 entries are summed into two
+/// accumulators by 64 additions, the odd-digit one is doubled four
+/// times, and one final addition joins them.  Without the feature, as in
+/// the no_std build, k256 computes it as `GENERATOR * k`, its
+/// constant-time `lincomb`.  Neither
+/// branches on k or indexes memory by it; neither wipes the recoding or
+/// the intermediate points it leaves on the stack.
+///
+/// The public paths, verification, recovery and HD derivation's public
+/// tweak sum, never come here: they run in variable time on
+/// dcroxide-secp256k1-vartime (ADR-0016).
+#[must_use]
+pub(crate) fn mul_secret_by_generator(k: &Scalar) -> ProjectivePoint {
+    ProjectivePoint::mul_by_generator(k)
+}
+
 /// A secp256k1 private key in the range `[1, N-1]`, held as a
 /// `k256::SecretKey`, which wipes the key when dropped.
 ///
@@ -359,20 +386,20 @@ impl PrivateKey {
             .map(|inner| PrivateKey { inner })
     }
 
-    /// The corresponding public key, dG.  The multiplication is k256's
-    /// constant-time `GENERATOR * d` and the scalar copy is wiped; the
-    /// product is public, and enters the public key type once, through the
-    /// vartime crate's curve check.
+    /// The corresponding public key, dG.  The multiplication is the
+    /// crate's `mul_secret_by_generator`, constant time on d (k256's
+    /// basepoint table, or its `lincomb` without the `precomputed-tables`
+    /// feature), and the scalar copy is wiped; the product is public, and
+    /// enters the public key type once, through the vartime crate's curve
+    /// check.
     ///
     /// # Panics
     ///
     /// Only if that curve check refuses the point k256 computed, a fault
     /// in one of the two crates: there is no correct key to return then.
-    // The flagged operator is k256 point multiplication, a group operation.
-    #[allow(clippy::arithmetic_side_effects)]
     pub fn public_key(&self) -> PublicKey {
         let mut d = Scalar::from(self.inner.as_scalar_value());
-        let point = (ProjectivePoint::GENERATOR * d).to_affine();
+        let point = mul_secret_by_generator(&d).to_affine();
         d.zeroize();
         // dG is never the identity for d in [1, N-1], and k256's affine
         // coordinates are below P and on the curve, so only a fault in the
@@ -554,8 +581,8 @@ impl ReducedPrivateKey {
     }
 
     /// The public point, dG (dcrd's `PubKey`): [`PrivateKey::public_key`],
-    /// k256's constant-time `GENERATOR * d`, for a key, and the point at
-    /// infinity for `Zero`.  `public_point().serialize_compressed()` is
+    /// constant time on d, for a key, and the point at infinity for
+    /// `Zero`.  `public_point().serialize_compressed()` is
     /// dcrd's `PrivKeyFromBytes(b).PubKey().SerializeCompressed()`, the
     /// bytes hdkeychain's `pubKeyBytes` gives a private extended key.
     ///
@@ -1268,6 +1295,92 @@ mod tests {
         assert_eq!(even, key(alloc::format!("02{x}")));
         assert_eq!(odd, key(alloc::format!("07{x}{y_odd}")));
         assert_eq!(even, key(alloc::format!("06{x}{y_even}")));
+    }
+
+    /// The secret paths' multiply, k256's basepoint table under the
+    /// default `precomputed-tables` feature, gives the point k256's plain
+    /// constant-time `GENERATOR * k` (`lincomb`, no table) gives, over
+    /// scalars aimed at the table walk and over random ones.  The table
+    /// walk recodes k into 65 signed radix-16 digits in [-8, 8), with a
+    /// carry out of each nibble of 8 or more; the edge scalars are those
+    /// where the recoding or the walk could go wrong: 0 (refused before it
+    /// reaches here, but the walk must still give the identity), 1 to 64
+    /// and N - 1 to N - 64 (checked also against repeated addition, which
+    /// uses no multiply), every power of two and every 2^i - 1 (reduced
+    /// mod N past 255 bits), each byte value repeated over all 32 bytes
+    /// (0x88... and 0x77... carry through every digit or none), and
+    /// (N - 1) / 2 and its neighbours, the low-S boundary.  Then 4,096
+    /// random scalars, a quarter of them with the top bit forced on.
+    /// Without the feature both sides are `lincomb` and the test is
+    /// trivially true; the no_std build's arithmetic is what it was.
+    #[test]
+    #[allow(clippy::arithmetic_side_effects)]
+    fn mul_secret_by_generator_matches_the_plain_multiply() {
+        use k256::elliptic_curve::ops::Reduce;
+        let reduce = |b: [u8; 32]| <Scalar as Reduce<FieldBytes>>::reduce(&b.into());
+        let check = |k: &Scalar, what: &dyn fmt::Display| {
+            let table = mul_secret_by_generator(k).to_affine();
+            let plain = (ProjectivePoint::GENERATOR * *k).to_affine();
+            assert_eq!(table, plain, "kG differs for {what}");
+        };
+
+        // 0, and 1..=64 and N - 1..=N - 64 against repeated addition.
+        assert_eq!(
+            mul_secret_by_generator(&Scalar::ZERO),
+            ProjectivePoint::IDENTITY,
+            "0G is the identity"
+        );
+        check(&Scalar::ZERO, &"0");
+        let mut sum = ProjectivePoint::IDENTITY;
+        for j in 1u64..=64 {
+            sum += ProjectivePoint::GENERATOR;
+            let k = Scalar::from(j);
+            assert_eq!(mul_secret_by_generator(&k), sum, "{j}G by addition");
+            assert_eq!(mul_secret_by_generator(&-k), -sum, "(N - {j})G by addition");
+            check(&k, &j);
+            check(&-k, &alloc::format!("N - {j}"));
+        }
+
+        // Every 2^i and 2^i - 1 (the latter reduced mod N from i = 256).
+        for i in 0..256usize {
+            let mut b = [0u8; 32];
+            b[31 - i / 8] = 1 << (i % 8);
+            check(&reduce(b), &alloc::format!("2^{i}"));
+            let mut m = [0u8; 32];
+            for bit in 0..i {
+                m[31 - bit / 8] |= 1 << (bit % 8);
+            }
+            check(&reduce(m), &alloc::format!("2^{i} - 1"));
+        }
+        check(&reduce([0xff; 32]), &"2^256 - 1 mod N");
+
+        // Each byte value over all 32 bytes, reduced mod N.
+        for v in 0..=255u8 {
+            check(&reduce([v; 32]), &alloc::format!("{v:#04x} repeated"));
+        }
+
+        // (N - 1) / 2, the largest low S, and its neighbours.
+        let half = reduce(HALF_GROUP_ORDER);
+        for (k, what) in [
+            (half - Scalar::ONE, "(N - 1) / 2 - 1"),
+            (half, "(N - 1) / 2"),
+            (half + Scalar::ONE, "(N + 1) / 2"),
+            (half + Scalar::from(2u64), "(N + 3) / 2"),
+        ] {
+            check(&k, &what);
+        }
+
+        // Random scalars, a quarter with the top bit on.
+        let mut rng = dcroxide_testutil::SplitMix64::from_entropy("mul_secret_by_generator");
+        for n in 0..4096u32 {
+            let mut b = [0u8; 32];
+            rng.fill(&mut b);
+            if n % 4 == 0 {
+                b[0] |= 0x80;
+            }
+            let k = reduce(b);
+            check(&k, &alloc::format!("random case {n}, {k:?}"));
+        }
     }
 
     /// The public key type keeps the traits its users rely on: copying,

@@ -21,7 +21,11 @@ dcroxide-testutil = { path = "../dcroxide-testutil" }
 # The generators' and models' own arithmetic, at the versions and features
 # dcroxide-dcrec takes, so the workspace builds no second copy or feature set:
 # secp256k1 on k256, Ed25519 on curve25519-dalek with SHA-512 for its
-# challenge.
+# challenge.  dcroxide-dcrec's default `precomputed-tables` adds k256's
+# `precomputed-tables` (and `primeorder/std`), which Cargo unifies into
+# this k256 too; the models multiply the generator with `GENERATOR * k`,
+# `lincomb`, which never reads the table, so they stay a reference
+# independent of dcrec's `mul_by_generator`.
 k256 = { version = "0.14", default-features = false, features = ["arithmetic"] }
 curve25519-dalek = "5"
 sha2 = { version = "0.11", default-features = false, features = ["zeroize"] }

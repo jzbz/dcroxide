@@ -513,6 +513,7 @@ dependencies = [
  "dcroxide-testutil",
  "hmac",
  "k256",
+ "primeorder",
  "sha2",
  "zeroize",
 ]

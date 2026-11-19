@@ -8,6 +8,48 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+default = ["precomputed-tables"]
+# Secret generator multiplication through k256's basepoint table: the
+# public key from a private key (`PrivateKey::public_key`), and the nonce
+# point kG of ECDSA and EC-Schnorr-DCRv0 signing, all through one
+# function, `mul_secret_by_generator` (`src/secp256k1.rs`), which calls
+# k256's `mul_by_generator`.  With the feature that is k256's
+# constant-time table walk: k recoded into 65 signed radix-16 digits,
+# each selecting in constant time one entry of 33 tables of eight
+# precomputed multiples (digit 64 from table 32, digits 2i and 2i+1 from
+# table i), the entries summed into two accumulators by 64 additions,
+# the odd-digit one doubled four times, then one final addition
+# (`primeorder` 0.14.0 `src/tables/lookup.rs:43-65`, `k256` 0.14.0
+# `src/arithmetic/mul.rs:180-203`); without it, k256 computes the same
+# point as `GENERATOR * k`, its constant-time `lincomb` (`:199-202`), the
+# path every build took before the feature.  The points are equal either
+# way, which `mul_secret_by_generator_matches_the_plain_multiply` checks.
+# Verification, recovery and public keys never read the table: they run
+# on dcroxide-secp256k1-vartime, with k256's combined variable-time
+# multiply as the fallback, as before.
+#
+# The table is computed on first use and kept in a static, and
+# `primeorder` refuses to build it without `std` or `critical-section`
+# for that one-time initialisation (`src/tables/basepoint.rs:5-19`).
+# `primeorder/std` is chosen: `std::sync::LazyLock`, one acquire load per
+# multiply once the table is built, and no package the graph lacks
+# (`primeorder` is k256's own dependency, taken directly only to name
+# that feature, at the version k256 0.14.0 requires).  `k256/std` is
+# not, since at 0.14.0 it also turns on `getrandom` (`Cargo.toml:129-135`)
+# in a crate that draws no randomness.  `k256/critical-section` is not
+# either: it adds `once_cell`, `critical-section` and `portable-atomic`,
+# takes a critical section to build the table (`once_cell` 1.21.4
+# `src/imp_cs.rs:43-56`), and needs a `critical-section`
+# implementation linked into every binary, which on a host means
+# `critical-section/std`, so std again.
+#
+# On by default so that the node, the wallet and every crate that takes
+# this one with its defaults gets the table.  `std` comes with it, so the
+# no_std build (CI's x86_64-unknown-none check) turns default features
+# off and multiplies through `lincomb`, in constant time as well.
+precomputed-tables = ["k256/precomputed-tables", "dep:primeorder", "primeorder/std"]
+
 [dependencies]
 # Pure-Rust secp256k1 arithmetic: private keys, ECDSA and EC-Schnorr-DCRv0
 # signing, and the fallbacks of verification, recovery and key parsing,
@@ -15,17 +57,13 @@ repository.workspace = true
 # ADR-0012).  The variable-time arithmetic of ECDSA verification, compact
 # recovery and Schnorr verification, and public keys, is
 # dcroxide-secp256k1-vartime's, below, with k256's as its fallback.
-#
-# k256's `std` and `precomputed-tables` are deliberately left off.  ECDSA
-# and Schnorr signing, and `PrivateKey::public_key`, multiply with
-# `ProjectivePoint::GENERATOR * k` (or `* d`), which goes through
-# `lincomb`.  The seam's fallbacks use k256's combined multiply
-# `mul_by_generator_and_mul_add_vartime`.  None reads k256's basepoint
-# table -- only `mul_by_generator` and `mul_by_generator_vartime` do, and
-# this crate calls neither -- so k256's tables would buy nothing, and from
-# 0.14 `k256/std` also pulls an OS RNG (getrandom) into a crate that never
-# draws randomness.
+# `precomputed-tables` and the table's `std` come from this crate's
+# feature of that name, above; k256's own `std` stays off.
 k256 = { version = "0.14", default-features = false, features = ["arithmetic"] }
+# Named only for its `std` feature, under `precomputed-tables` above:
+# the lazily built basepoint table needs `std` or `critical-section`.
+# Already in the graph as k256's dependency; no code here calls it.
+primeorder = { version = "0.14", default-features = false, optional = true }
 # RFC6979 nonce generation (dcrd's exact variant, ported in this crate).
 # `zeroize` on both: each HMAC the nonce's DRBG runs holds two SHA-2
 # states keyed by its K and a block buffer the private key's bytes pass

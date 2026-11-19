@@ -8343,3 +8343,117 @@ Raw: `results.jsonl`, one record per run with its corpus, arm, binary
 hash, start time and load average; each run's replay log, flush log and
 pinprobe output; the build logs, the compiler's version and the
 binaries' hashes; the mining and export logs.
+
+## Secret generator multiplication through k256's basepoint table (2026-11-19)
+
+ADR-0017's addendum of 2026-11-19 moves dcroxide-dcrec's secret
+generator multiplications, the public key from a private key and the
+nonce point of ECDSA and EC-Schnorr-DCRv0 signing, from `k256`'s
+`lincomb` to its constant-time basepoint table (`mul_by_generator` under
+dcrec's default `precomputed-tables` feature). The wallet that consumes
+dcrec asked for it. It had measured the public key at 36.8 µs without the
+table and 19.2 µs with it, and signing at 1.72 times Go's time, against a
+criterion of at most 1.15 times. This section is the record the addendum
+and the dependency ledger cite.
+
+**The program.** An out-of-tree program, not in the tree, built once per
+arm with Rust 1.100.0 at the workspace's release profile (thin LTO, one
+codegen unit, `panic = "abort"`, overflow checks off), offline, against
+the `Cargo.lock` of `f4b3d2e`. There are three Rust arms, each linking a
+different dcroxide-dcrec. **base** is `f4b3d2e` itself, exported whole
+from the commit. **tables** is `f4b3d2e` with the change applied,
+uncommitted when it ran, at the code of the commit that adds this
+section, with dcrec's default features. **lincomb** is the same tree
+with dcrec's default features off, the no_std build's arithmetic. A
+fourth arm, **go**, is a Go program with the same cases on dcrd's
+`dcrec/secp256k1/v4` at the oracle's pin (v4.4.2-0.20261106175134-46e9df48109a),
+built with go1.27.4. That is not the reference Go of ADR-0001's addendum
+(1.27.3), nor the Go dcrd's release image builds with. The binaries'
+SHA-256 begin `b0c62bc1ce3c` (base), `b3ce18276743` (tables),
+`0da9f19e319b` (lincomb) and `724f792baef4` (go).
+
+Each process draws 8,192 cases from one fixed seed with SplitMix64, the
+same seed in Rust and Go: a private key, retried until it lies in
+[1, N-1], and a 32-byte hash. It times its first public key on its own,
+which in the tables arm includes building the table. Then, untimed, it
+makes each case's public key, ECDSA signature, compact signature and
+Schnorr signature. Three rounds follow, each timing every operation over
+all 8,192 cases in turn: the public key, ECDSA signing (RFC6979), compact
+signing, Schnorr signing, ECDSA verification, Schnorr verification and
+compact recovery. Each operation's outputs are folded into an FNV-1a
+digest outside the timed loop. Every operation gave the same digest in
+every round of every process of all four arms. So the three Rust arms
+computed the same keys, signatures and verdicts, and these equal dcrd's
+byte for byte.
+
+**Order.** On m3, on 2026-11-19. Seven runs of each arm, the four arms
+back to back in each run and the order rotated by one from run to run,
+28 processes, each pinned with `taskset -c 3`. Three sessions ran. The
+first (03:41 to 03:45, five runs) and the second (04:01 to 04:06, seven
+runs) ran while other builds loaded the machine: the 1-minute load
+average stood at 2.0 to 17.5 as the first session's processes started
+and at 16.9 to 62.0 in the second. A process's median, divided by the
+least process median of its arm and operation, reached 2.45 in the
+first session (lincomb, Schnorr signing) and 4.46 in the second (go,
+the public key), where every arm passed 2.4. They are disturbed and not
+used below. Their least figures agree with the third's within 3.1% for
+every arm and operation. The third session, 04:07 to 04:11, is the
+record. The 1-minute load average stood at 4.7 to 11.9 as its 28
+processes started, falling from the earlier builds (the 5-minute
+average, 15.2 to 28.6). One-second samples of `/proc/stat` taken just
+before each process put 0.1 to 12.3 CPUs busy, median 2.4. Transparent
+huge pages were at `always`, with the `powersave`
+governor under `amd_pstate` in active mode.
+
+**Time per operation**, third session: the median of each process's
+median over its three rounds, then the median over the seven processes,
+with their range, in µs:
+
+| operation | base | lincomb | tables | go | tables / base | tables / go | base / go |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| public key from private key | 37.78 (37.55–49.91) | 37.64 (37.50–38.63) | 19.70 (19.60–19.86) | 22.98 (22.90–23.19) | 0.521 | 0.857 | 1.644 |
+| ECDSA signing, RFC6979 | 42.78 (42.60–44.61) | 42.78 (42.50–43.45) | 24.71 (24.56–25.01) | 26.37 (26.22–26.72) | 0.578 | 0.937 | 1.623 |
+| compact signing | 42.81 (42.62–43.14) | 43.11 (42.54–50.15) | 24.76 (24.57–24.90) | 26.22 (26.11–26.69) | 0.578 | 0.945 | 1.633 |
+| EC-Schnorr-DCRv0 signing | 38.93 (38.83–39.74) | 38.83 (38.77–55.37) | 21.02 (20.84–21.21) | 24.85 (24.72–25.23) | 0.540 | 0.846 | 1.567 |
+| ECDSA verification | 24.80 (24.67–25.65) | 24.82 (24.70–44.39) | 24.72 (24.62–25.18) | 99.44 (98.91–100.14) | 0.997 | 0.249 | 0.249 |
+| EC-Schnorr-DCRv0 verification | 25.09 (24.88–25.37) | 25.08 (24.93–33.64) | 24.93 (24.86–25.32) | 105.49 (104.67–106.94) | 0.994 | 0.236 | 0.238 |
+| compact recovery | 28.77 (28.61–28.91) | 28.86 (28.65–29.86) | 28.61 (28.59–29.38) | 113.76 (112.84–115.34) | 0.994 | 0.251 | 0.253 |
+
+The least figure over every round and process gave the same ratios
+within 0.01, and tables / base for the three verification rows at 0.999
+to 1.000. The first public key of a process, the medians: 52.4 µs (base),
+51.6 µs (lincomb), 141.1 µs (tables, the table's construction included)
+and 3,865 µs (go, whose first call loads dcrd's own precomputed tables).
+
+**What it shows.**
+
+- The table roughly halves every secret generator multiplication. The
+  public key falls to 0.52 of base, ECDSA and compact signing to 0.58,
+  and Schnorr signing to 0.54. Against dcrd at the pin, signing goes from
+  1.57 to 1.63 times Go's time to 0.85 to 0.95 times, and the public key
+  from 1.64 to 0.86. That is inside the wallet's criterion of 1.15.
+- Verification and recovery are unchanged, within 0.6%. They never read
+  the table.
+- lincomb, the change without its feature, runs at base's speed. Routing
+  the multiplications through `mul_secret_by_generator` costs nothing,
+  and the no_std build's arithmetic is what it was.
+- The table costs about 90 µs more than the first multiplication without
+  it, once per process.
+
+**What it does not show.** Whether the table walk stays as constant-time
+in timing as `lincomb` on real hardware. dcrec has no dudect check like
+`dcroxide-tlscrypto`'s, and the claim rests on reading `k256` 0.14.0 and
+`primeorder` 0.14.0. It also does not show the cost to anything but these
+operations one at a time on one thread: no wallet or node workload was
+run. Go's verification times are dcrd's `Verify`, `schnorr.Verify` and
+`RecoverCompact` as linked here, built with go1.27.4; they are not
+compared with any other measurement of dcrd. Other machines, other thread
+counts and other compilers were not measured.
+
+Raw: `bench-run-3/` with each process's output (`<run>-<arm>.txt` and
+`.err`), `state.txt` (each process's start time, load average and busy
+CPUs), `build.txt` (the binaries' hashes, the compiler's and Go's
+versions, the CPU's name) and `machine.txt`; `bench-run-1/` and
+`bench-run-2/`, the two disturbed sessions; the program's `main.rs`, the
+three arms' `Cargo.toml`, the Go program's `main.go`, `go.mod` and
+`go.sum`, and `analyze.py`.

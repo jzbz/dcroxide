@@ -20,13 +20,13 @@
 
 use core::fmt;
 
+use k256::Scalar;
 use k256::elliptic_curve::PrimeField;
 use k256::elliptic_curve::sec1::ToSec1Point;
-use k256::{ProjectivePoint, Scalar};
 use zeroize::{Zeroize, Zeroizing};
 
 use super::nonce::nonce_rfc6979;
-use super::{FIELD_PRIME_BYTES, GROUP_ORDER_BYTES, PrivateKey, PublicKey};
+use super::{FIELD_PRIME_BYTES, GROUP_ORDER_BYTES, PrivateKey, PublicKey, mul_secret_by_generator};
 
 /// The size of an encoded EC-Schnorr-DCRv0 signature in bytes.
 pub const SIGNATURE_SIZE: usize = 64;
@@ -155,7 +155,7 @@ impl Signature {
         // coordinates by one inversion, normalized before anything reads
         // them, as dcrd's `ToAffine` does.  A zero s, which parsing allows,
         // leaves only e*Q.  Signing keeps the constant-time
-        // `GENERATOR * k`, since its nonce is secret.
+        // `mul_secret_by_generator`, since its nonce is secret.
         let Some((x, y_is_odd)) =
             super::backend::schnorr_mul_g_add(&self.s, &e.to_repr().into(), pub_key)
         else {
@@ -218,9 +218,9 @@ fn sign_with_nonce(
     nonce: &[u8; 32],
     hash: &[u8; 32],
 ) -> Result<Signature, Error> {
-    // Step 4: R = kG.
+    // Step 4: R = kG, in constant time on the secret k.
     let mut k = Scalar::from_repr((*nonce).into()).expect("nonce is a valid scalar");
-    let big_r = (ProjectivePoint::GENERATOR * k).to_affine();
+    let big_r = mul_secret_by_generator(&k).to_affine();
     let encoded = big_r.to_sec1_point(false);
 
     // Step 5: negate k if R.y is odd.
@@ -328,6 +328,7 @@ pub fn parse_pub_key(serialized: &[u8]) -> Result<PublicKey, PubKeyError> {
 mod tests {
     use super::*;
     use dcroxide_testutil::unhex;
+    use k256::ProjectivePoint;
 
     fn key(hex: &str) -> PrivateKey {
         let bytes: [u8; 32] = unhex(hex).try_into().expect("32 bytes");

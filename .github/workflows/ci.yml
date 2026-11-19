@@ -146,7 +146,8 @@ jobs:
     # so its invariant checks see every case). Its digest tests pin
     # constants the dev builds must reproduce. dcrec's ECDSA, recovery and
     # Schnorr branch signatures and its key cases run here, judged by dcrd,
-    # and its unit tests' release arms (the seam's fallbacks) run here only.
+    # and its unit tests' release arms (the seam's fallbacks) run here only,
+    # as does its whole suite without its default `precomputed-tables`.
     steps:
       - uses: actions/checkout@v7
       - run: rustup toolchain install
@@ -163,6 +164,12 @@ jobs:
       - run: cargo test --profile soak-asserts -p dcroxide-dcrec --test vartime_ecdsa_branches --test vartime_recovery_schnorr_branches --test vartime_pubkey_branches
         env:
           DCROXIDE_VARTIME_CASES: "1000000"
+      # Every other test run builds dcrec with its default
+      # `precomputed-tables`, so secret generator multiplication reads
+      # k256's basepoint table. This runs dcrec's whole suite, vectors and
+      # oracle differentials included, once without it, as the no_std
+      # build multiplies (k256's `lincomb`).
+      - run: cargo test -p dcroxide-dcrec --no-default-features
 
   tls-soft-backends:
     name: TLS provider (software backends, no ring)
@@ -350,13 +357,17 @@ jobs:
     # the claim. This job checks them on a no-OS target so a dependency
     # or cfg mistake that drags std into a consensus core fails CI.
     #
-    # dcrec has no features and compiles no C, its secp256k1 arithmetic
-    # being k256's and dcroxide-secp256k1-vartime's, and it is no_std
-    # outside its tests in every build, so any job already rejects a `use
-    # std::` in it. What only this job catches for dcrec is a dependency
-    # that needs std, such as one taken with default features that turn std
-    # on. `cargo check` never links. secp256k1-vartime has no dependencies
-    # and needs core alone, without alloc.
+    # dcrec compiles no C, its secp256k1 arithmetic being k256's and
+    # dcroxide-secp256k1-vartime's, and its own code is no_std outside its
+    # tests in every build, so any job already rejects a `use std::` in
+    # it. Its one feature, `precomputed-tables`, on by default, takes std
+    # through `primeorder/std` for k256's lazily built basepoint table;
+    # `--no-default-features` below turns it off, so this job checks the
+    # build without it, which multiplies through k256's `lincomb`. What
+    # only this job catches for dcrec is a dependency that needs std, such
+    # as one taken with default features that turn std on. `cargo check`
+    # never links. secp256k1-vartime has no dependencies and needs core
+    # alone, without alloc.
     #
     # Not yet listed: blockchain, fees, gcs, mempool, mining, stake, and
     # txscript. The six that reach dcroxide-database (all but txscript)
@@ -367,9 +378,17 @@ jobs:
     # feature is off, with no preview feature as 4.5.0 needed, as long as
     # panics abort (redb-5.0.0 `src/lib.rs:118-127`), which they do on
     # x86_64-unknown-none; no build here has tried it yet.
-    # txscript failed here on secp256k1-sys and nothing else, and
-    # dcroxide-dcrec no longer takes it, so txscript may now pass; that
-    # is untested, and it is not listed until a run shows it.
+    # txscript no longer fails here on secp256k1-sys, which dcroxide-dcrec
+    # no longer takes, but it does not pass either. Its own code calls
+    # `f64::log2` (`src/stdaddr.rs`), which core lacks. And it takes
+    # dcroxide-dcrec with default features, whose `precomputed-tables`
+    # turns on `primeorder/std` and through it std in elliptic-curve,
+    # sec1 and der, so the check stops in der before it reaches txscript.
+    # Listing it needs both fixed: `default-features = false` on its
+    # dcroxide-dcrec dependency plus a feature of its own that turns
+    # `precomputed-tables` back on for the node and the wallet, and a
+    # base 2 logarithm core has. Any consensus crate added here later
+    # takes dcroxide-dcrec the same way.
     steps:
       - uses: actions/checkout@v7
       - run: rustup toolchain install

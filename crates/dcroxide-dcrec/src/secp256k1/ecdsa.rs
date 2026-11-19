@@ -12,7 +12,7 @@ use core::fmt;
 use super::nonce::nonce_rfc6979;
 use super::{
     GROUP_ORDER_BYTES, HALF_GROUP_ORDER, PRIME_MINUS_ORDER_BYTES, PrivateKey, PublicKey,
-    add_group_order, is_zero, negate_mod_n,
+    add_group_order, is_zero, mul_secret_by_generator, negate_mod_n,
 };
 
 /// The ASN.1 identifier for a sequence.
@@ -514,7 +514,9 @@ pub fn recover_compact(signature: &[u8], hash: &[u8; 32]) -> Result<(PublicKey, 
 ///
 /// `k` and `d` are secret, so this runs in constant time where dcrd uses
 /// its variable-time `ScalarBaseMultNonConst` and `InverseValNonConst`:
-/// k256's `GENERATOR * k`, `invert` and `to_affine`, the same values.
+/// [`mul_secret_by_generator`] (k256's basepoint table, or its `lincomb`
+/// without the `precomputed-tables` feature) and k256's `invert` and
+/// `to_affine`, the same values.
 /// dcrd branches on whether s is above half the order; the negation and
 /// the recovery code's oddness flip here are selected, not branched on,
 /// with the same result.  The only branches left are dcrd's retries on a
@@ -531,11 +533,11 @@ fn sign_with_nonce(
     use k256::elliptic_curve::point::AffineCoordinates;
     use k256::elliptic_curve::scalar::IsHigh;
     use k256::elliptic_curve::subtle::{Choice, ConditionallySelectable};
-    use k256::{FieldBytes, ProjectivePoint, Scalar};
+    use k256::{FieldBytes, Scalar};
     use zeroize::Zeroize;
 
     // Step 2: kG, in affine coordinates.
-    let kg = (ProjectivePoint::GENERATOR * *k).to_affine();
+    let kg = mul_secret_by_generator(k).to_affine();
 
     // Step 3: r = kG.x mod N (dcrd `fieldToModNScalar`), retrying when
     // zero; overflow records whether kG.x was at or above N.
