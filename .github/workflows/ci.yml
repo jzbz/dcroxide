@@ -547,14 +547,19 @@ jobs:
           fi
           # While blake3 is locked, its build script's compiler probe must have
           # found none. Build scripts write under the build directory, which is
-          # the target directory unless configured apart.
+          # the target directory unless configured apart. Where in it a build
+          # script's output lands is cargo's layout, not an interface: up to
+          # cargo 1.99 `debug/build/blake3-<hash>/output`, from cargo 1.100
+          # `debug/build/blake3/<hash>/run/stdout`.
           if grep -qx 'name = "blake3"' Cargo.lock; then
             meta=$(env -i "${keep[@]}" cargo metadata --locked --no-deps --format-version 1)
             build=$(sed -n 's/.*"build_directory":"\([^"]*\)".*/\1/p' <<< "$meta")
             if [ -z "$build" ]; then
               build=$(sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p' <<< "$meta")
             fi
-            if ! grep -l 'No C compiler' "$build"/debug/build/blake3-*/output; then
+            mapfile -t outputs < <(find "$build/debug/build" -type f \
+              \( -path '*/blake3-*/output' -o -path '*/blake3/*/run/stdout' \))
+            if [ "${#outputs[@]}" -eq 0 ] || ! grep -l 'No C compiler' "${outputs[@]}"; then
               echo "blake3's build script did not report a missing compiler" >&2
               exit 1
             fi

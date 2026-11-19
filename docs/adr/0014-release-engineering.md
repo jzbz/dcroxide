@@ -15,7 +15,7 @@
 - **Date:** 2026-10-26 (accepted), 2026-10-31 (addendum: `ring`'s part),
   2026-11-09 (addendum: `secp256k1-sys`'s part and the D3 gate soak),
   2026-11-10 (addendum: the extra soak legs; status: the merge),
-  2026-11-12 (status: the pin's move)
+  2026-11-12 (status: the pin's move), 2026-11-19 (addendum: Rust 1.100.0)
 
 ## Context
 
@@ -411,3 +411,172 @@ so the merge waits only on the project owner's word. The rest of the
 first condition, and the third and fourth, are unchanged. The citations
 of `README.md` and `docs/operating.md` above are renumbered for the same
 day's text in both on the background commit.
+
+## Addendum, 2026-11-19 — the toolchain moves to Rust 1.100.0 before its point release
+
+**The move.** `rust-toolchain.toml`'s `channel` and the workspace
+`rust-version` move from 1.99.1 to 1.100.0 in one change, as part 1 has
+every move do. 1.100.0 is the newest stable release: its compiler's
+commit is dated 2026-11-09, and the release was announced on 2026-11-12,
+the date of the channel manifest rustup installs with it (the toolchain
+ships no release notes). No 1.100.1 exists on 2026-11-19.
+
+**Outside part 1's rule, at the project owner's direction.** Part 1 takes
+a point release, and its fallback makes a `.0` eligible only once the next
+minor ships without a point release for it, so 1.100.0 is not eligible
+until 1.100.1 ships or 1.101.0 ships without one. The project owner
+directed the move ahead of that, provided no blocker was found: a known
+miscompilation or soundness regression in 1.100.0 that could reach this
+code, or a test failure, behavioural difference or build failure under it
+that could not be fixed without changing behaviour. The exception is this
+move's alone and leaves the rule as it stands for later moves; a comment
+below the pin in `rust-toolchain.toml` and the comment on `rust-version`
+say so. The rule's reason stands too: 1.97.0, 1.98.0 and 1.99.0 each
+shipped a miscompilation that its `.1` fixed within fourteen days.
+
+**What was checked in place of the wait**, on an x86_64 Linux desktop,
+on the tree with the move applied, and with 1.99.1 run on the same tree
+(`--ignore-rust-version`) wherever the two compilers were compared:
+
+- **Dependencies.** `Cargo.lock` and `fuzz/Cargo.lock` resolve unchanged
+  under the new `rust-version`: `cargo metadata --locked` passes for both
+  workspaces, and `cargo update --workspace --dry-run` locks nothing. The
+  MSRV-aware resolver would now admit six versions it held back for
+  1.99.1, `ctrlc` 3.5.3, `nix` 0.31.4 and 0.32.0, `rand` 0.10.4, `redb`
+  4.6.0 and `regex-syntax` 0.8.12. None is taken here; each is for the
+  dependency update to weigh, `redb` against ADR-0004 and the dependency
+  ledger.
+- **Formatting, lints and docs.** rustfmt 1.11.0 leaves the workspace as
+  it is; in `fuzz/`, which CI does not format, it would rewrap the same
+  four statements as 1.10.0. clippy 0.1.100 over every target with
+  `-D warnings`, and `cargo doc` with `-D warnings`, report nothing. The
+  one new diagnostic is cargo 1.100's own `unused_dependencies` lint, a
+  warning that fails no job: `dcroxide-netsync` lists `dcroxide-chaincfg`
+  as a normal dependency, which only its tests use. Moving it to the
+  dev-dependencies would drop it from `fuzz/Cargo.lock`, where netsync is
+  not a member, so it is left for a change of its own.
+- **Tests on 1.100.0.** The workspace in the dev profile with fault
+  injection required: 3,370 pass in 491 suites, 29 ignored. Again with
+  overflow checks off as `test-wrapping` runs it, and that job's second
+  step with debug assertions off as well: all pass. `cargo test
+  --workspace --release`: all pass but eight tests of `sigsoak_cli`,
+  which run a `sigsoak` built with release's `panic = "abort"` and
+  refused by it, as it refuses any such build; the same eight fail the
+  same way on 1.99.1. Every step of `test-vartime-release`, with its
+  10^6 cases in soak-asserts, passes on both compilers.
+  `tls-soft-backends`' test step, `dcroxide-tlscrypto` on its portable
+  backends, passes on 1.100.0. The consensus crates' suites in release
+  under one fixed seed (blockchain, txscript, stake, standalone,
+  uint256, dcrec, secp256k1-vartime, wire, gcs, crypto, chainhash,
+  sigdiff and testutil, 1,258 tests) give the same verdict test for test
+  on both. The oracle was built with go1.27.4, not the reference
+  go1.27.3, so these ran without `DCROXIDE_REQUIRE_ORACLE`, which
+  refuses another release.
+- **Signatures.** The fixed-seed record of the nightly soak job, 10^4
+  cases a class under master seed `0x6e696768746c7931` (762,940 cases),
+  built in the soak profile by each compiler, has every digest of all 82
+  classes equal between the two (`sigsoak compare --exploratory`: the tree
+  was uncommitted, so neither run is gate-eligible), at generator
+  fingerprint `c21c897e`. On 1.100.0 every canary was caught, a budget
+  soak of every class ran 141,344,060 cases in 30 minutes and a
+  soak-checked one 63,564,092 in 10, each with no disagreement, panic or
+  oracle fault.
+- **Arithmetic beyond the soak.** An out-of-tree program, built in
+  release with the node's code generation by each compiler, put fixed
+  inputs through key generation, ECDSA signing, verification and
+  recovery, Schnorr, key parsing, Ed25519, `Uint256`'s operations, the
+  compact and work conversions, `calc_asert_diff` and script numbers, and
+  printed one digest per group: all nine are the same under both.
+- **ADR-0017's LLVM crash.** The soak profile built with `-C
+  target-feature=+avx512ifma,+avx512vl` still crashes rustc 1.99.1 (SIGILL
+  inside LLVM while compiling `sigsoak`), and builds on 1.100.0, whose
+  LLVM is 23.1.5 to 1.99.1's 23.1.1. That binary runs `curve25519-dalek`'s
+  AVX-512 IFMA backend and its record names it, where the 2026-11-10 leg's
+  had to name `avx2`, and the 16 Ed25519 classes of its fixed-seed record
+  equal 1.99.1's default build's. The crash was worked around in that
+  leg's build alone, never in the tree, so nothing in the tree changes.
+- **The node.** `release` and `dist` builds of `dcroxide` succeed on
+  both. The `dist` binary is 12,001,904 bytes on 1.100.0 against
+  11,999,232 on 1.99.1 (+0.02%), its `.text` 8,083,031 bytes against
+  8,079,894 (+0.04%). A cold `release` build of the node took 48.3 s
+  against 50.4 s, the mean of four builds on each, alternated. The
+  out-of-tree program's single-thread timings, each the least of six runs
+  on a machine other work was loading, put 1.100.0 at 0.986 of 1.99.1 for
+  an ECDSA verification, 0.992 for a Schnorr one, 1.001 for a compact
+  recovery, 1.036 for RFC6979 signing and 0.981 for an Ed25519
+  verification, which rules out a gross regression and measures nothing
+  finer. No sync was timed, so none of this is a bench ledger row.
+- **Cargo 1.100's build directory.** Cargo 1.100 lays out the build
+  directory anew, and two things read the old layout. CI's no-C-compiler
+  job looked for blake3's build-script output at
+  `debug/build/blake3-<hash>/output`, which cargo 1.100 writes to
+  `debug/build/blake3/<hash>/run/stdout`, so the job would fail; it now
+  takes either, and the job's script passes run locally on 1.100.0.
+  `dcroxide-testutil` found the profile directory above a test binary by
+  its `deps/`, which is gone, so each test binary built the oracle in its
+  own directory, 50 copies (642 MB) in one workspace run; it now knows
+  both layouts. `dcroxide-sigdiff`'s `profile_name` has the same blind
+  spot, so a test binary's run records name `out` as its profile; the
+  `sigsoak` binary is not affected, since cargo still puts it in
+  `<target-dir>/soak/`, and that is left for a change of its own.
+- **Not run here:** the no_std job, whose `x86_64-unknown-none` target is
+  not installed for either compiler on that machine; clippy for the
+  Windows target; the live dcrd interop test; cargo-deny; the test job on
+  macOS, Windows and arm64; the constant-time workflow, which
+  `rust-toolchain.toml` changing triggers; and the fuzz jobs, which build
+  on nightly.
+
+**Upstream, as checked on 2026-11-19.** No point release is in
+preparation: rust-lang/rust has no pull request against `stable` after
+"[stable] prepare Rust 1.100.0" (#165710), no issue or pull request names
+1.100.1, and static.rust-lang.org serves no channel manifest for it. None
+of the miscompilation or soundness issues filed since 2026-11-09 is
+reported as new in 1.100.0; each is either a regression from an earlier
+stable release or needs code the workspace does not have (`unsafe` code,
+which it forbids outside the Windows service crate, or a
+`repr(align(4096))` local). 1.100.0 stays on LLVM 23, at 23.1.5 to
+1.99.1's 23.1.1. Reproducers rebuilt from the upstream reports were
+compiled by both compilers with the release profile's code generation
+(opt-level 3, one codegen unit, thin LTO, `panic = "abort"`) and at
+opt-levels 0 to 2:
+
+- **Fixed in 1.100.0, wrong on 1.99.1:** rust-lang/rust#165828
+  (`if t < C { t.max(k) } else { C }`, from opt-level 1), #164825
+  (`checked_pow` beside a `u128` `abs_diff`, from opt-level 2; the
+  workspace calls `checked_pow` in `crates/dcroxide-blockchain/src/validate.rs`
+  and `crates/dcroxide-dcrjson/src/gojson.rs`) and #164736 (a `cmp::max`
+  fold, once the call is inlined into constant input, from opt-level 1).
+- **Open, and the same on both:** #164295 (a loop counter off by one
+  after a vectorised loop) is wrong at opt-level 2 and with the release
+  profile's code generation; #165528 (DFA jump threading) at opt-level 2
+  only; #164667 (`i128` stack colouring) at opt-level 1 only; #165544 and
+  #165785 (the loop vectoriser) only with `-C target-cpu=x86-64-v3` or
+  `haswell`, which no build or CI job here sets, though dependencies
+  compile their run-time-dispatched AVX2 and AVX-512 functions with those
+  features. The move neither adds nor removes them. A search for
+  #164295's shape, a loop index advanced by a `bool` and read after the
+  loop, found none in the workspace, which does not rule it out.
+- **Soundness:** #165323, a diverging constant in `[C; 0]` treated as
+  diverging code, carries 1.100.0's workaround: its reproducer panics on
+  the bounds check, as it should.
+- **Reproducibility:** in 1.100.0 the crate hash can depend on whether
+  rustc itself runs on x86_64 or on aarch64 (#164379; its fix, #164507,
+  is in 1.101.0). While 1.100.0 is the pin, part 4's builds are to be
+  made by x86_64 rustc on both sides; builds made on one host
+  architecture are unaffected.
+
+The release has gone seven days with no regression reported, where
+1.97.0's, 1.98.0's and 1.99.0's were reported on days 0, 1 and 6: weak
+evidence that none is coming. The check is to be made again before any
+release build, and around 2026-11-26, two weeks after the release.
+
+**When 1.100.1 ships,** read its release notes for a fix that reaches this
+code: code generation the node uses, or the release profile's settings
+(thin LTO, one codegen unit, `panic = "abort"`, overflow checks off). Then
+move the `channel` and the workspace `rust-version` to it in one change, as
+part 1 has every move do; run the release-profile suites, the fixed-seed
+record and the digest comparison above again against a 1.100.0 build; and
+take the exception out of `rust-toolchain.toml`'s header and the comment
+on `rust-version`. A fix that reaches this code is reason to move the day
+it ships. If 1.101.0 ships first with no 1.100.1, 1.100.0 becomes eligible
+under the fallback and the exception lapses.

@@ -46,9 +46,9 @@ edition = "2024"
 # The pinned build toolchain itself (rust-toolchain.toml), not an older
 # floor: the two are bumped together, so the MSRV-aware resolver
 # (`resolver = "3"`) chooses dependency versions for the compiler that
-# actually builds the node.  Patch-level because the `.0` before it
-# miscompiled; see rust-toolchain.toml.
-rust-version = "1.99.1"
+# actually builds the node.  Patch-level as a rule, because recent `.0`s
+# miscompiled; 1.100.0 is a recorded exception, see rust-toolchain.toml.
+rust-version = "1.100.0"
 license = "ISC"
 repository = "https://github.com/jzbz/dcroxide"
 

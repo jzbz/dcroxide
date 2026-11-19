@@ -338,23 +338,23 @@ fn repo_root() -> &'static Path {
         .expect("crate lives two levels below the repo root")
 }
 
-/// The directory the oracle is built into: `oracle/` in the running test
-/// binary's profile directory, `<target-dir>/<profile>/oracle/`.
-///
-/// Derived from the test binary's own location rather than the source tree,
-/// so the build lands wherever cargo's target directory is configured to be
-/// (`CARGO_TARGET_DIR`, `build.target-dir`) and `cargo clean` removes it.
-/// Test and bench harnesses run from `<profile>/deps`, one level down.
+/// Where the oracle is built: `oracle/` in the running test binary's profile
+/// directory, so it lands wherever cargo's target directory is configured to
+/// be (`CARGO_TARGET_DIR`, `build.target-dir`) and `cargo clean` removes it.
 fn oracle_dir() -> PathBuf {
     let exe = env::current_exe().expect("locate the running test binary");
-    let mut dir = exe
-        .parent()
-        .expect("test binary lives in a directory")
-        .to_path_buf();
-    if dir.file_name().is_some_and(|name| name == "deps") {
-        dir.pop();
-    }
-    dir.join("oracle")
+    profile_dir(exe.parent().expect("test binary lives in a directory")).join("oracle")
+}
+
+/// The profile directory above a test harness in `dir`: `<profile>/deps/` up
+/// to cargo 1.99, `<profile>/build/<package>/<hash>/out/` from cargo 1.100.
+fn profile_dir(dir: &Path) -> &Path {
+    let up = match dir.iter().rev().collect::<Vec<_>>()[..] {
+        [d, ..] if d == "deps" => 1,
+        [o, _, _, b, ..] if o == "out" && b == "build" => 4,
+        _ => 0,
+    };
+    dir.ancestors().nth(up).unwrap_or(dir)
 }
 
 /// How many times this process has run `go build` for the oracle.
@@ -1828,5 +1828,26 @@ mod tests {
         assert_eq!(der_integer(&[0x7f]), [0x02, 0x01, 0x7f]);
         assert_eq!(der_integer(&[0x80]), [0x02, 0x02, 0x00, 0x80]);
         assert_eq!(key.oracle_json()["e"], "03");
+    }
+
+    /// The oracle's profile directory under both of cargo's build-directory
+    /// layouts, and the directory itself otherwise.
+    #[test]
+    fn the_profile_directory_is_found_in_both_layouts() {
+        for (dir, want) in [
+            ("/t/debug/deps", "/t/debug"),
+            ("/t/release/build/dcroxide-dcrec/0123abcd/out", "/t/release"),
+            ("/t/soak", "/t/soak"),
+            ("/t/debug/x/out", "/t/debug/x/out"),
+            ("/t/debug/build/out", "/t/debug/build/out"),
+        ] {
+            assert_eq!(profile_dir(Path::new(dir)), Path::new(want), "{dir}");
+        }
+        // And for the running binary, whichever layout built it: the
+        // profile directory, never the binary's own `deps/` or `out/`.
+        let exe = env::current_exe().expect("test binary path");
+        let profile = profile_dir(exe.parent().expect("a directory"));
+        assert!(exe.starts_with(profile));
+        assert!(!profile.ends_with("deps") && !profile.ends_with("out"));
     }
 }
