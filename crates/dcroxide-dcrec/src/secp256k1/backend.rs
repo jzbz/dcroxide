@@ -5,9 +5,9 @@
 //! backend, k256's code before it or a libsecp256k1 binding, slots in, as
 //! code, by changing this module alone.  Only the verification, recovery
 //! and key-parsing functions name this module, with the public key's
-//! field and the conversion of a private key's public point, so no
-//! signing function reaches it; `tests/vartime_boundary.rs` holds both
-//! rules.
+//! field, the conversion of a private key's public point and the public
+//! key's tweak addition of HD derivation ([`add_tweak`]), so no signing
+//! function reaches it; `tests/vartime_boundary.rs` holds both rules.
 //!
 //! Every function here takes public values only, and none can panic: when
 //! the vartime crate declines (its safegcd loop past an iteration cap, a
@@ -37,7 +37,7 @@ use k256::elliptic_curve::point::{AffineCoordinates, BatchNormalize, DecompressP
 use k256::elliptic_curve::subtle::Choice;
 use k256::{AffinePoint, FieldBytes, ProjectivePoint, Scalar};
 
-use super::PublicKey;
+use super::{PublicKey, PublicPoint};
 
 /// A public key's point on the vartime crate: on the curve, never
 /// infinity, both coordinates normalized.  dcrec's `PublicKey` holds it,
@@ -547,6 +547,88 @@ fn k256_decompress(x: &[u8; 32], odd: bool) -> Option<AffinePoint> {
         &(*x).into(),
         Choice::from(u8::from(odd)),
     ))
+}
+
+/// t*G + Q, HD public derivation's child key, for t in [1, N-1], as the
+/// caller (`add_public_tweak`) has checked, given big-endian: the key, or
+/// infinity when Q = -t*G.  On the vartime crate: one pass of its Straus
+/// loop, `ecmult_var` with 1 for the key and t for G, the key being the
+/// crate's point as it is, and one field inversion, x and y normalized as
+/// dcrd's `ToAffine` does.  dcrd forms t*G and the sum separately
+/// (`ScalarBaseMultNonConst`, then `AddNonConst`); the group's sum is the
+/// same point.
+///
+/// Should the vartime crate decline (t not below N, the wNAF builder's
+/// guard, the inverse's cap; none happens for valid inputs), the answer is
+/// k256's instead, and debug builds assert.  Builds with debug assertions
+/// also compute k256's answer every time and stop unless both agree; that
+/// check only reads.  `None` only when the vartime crate declined and
+/// k256's sum then failed the key type's curve check, two faults: there is
+/// no answer, and the caller stops.
+pub(crate) fn add_tweak(tweak: &[u8; 32], q: &PublicKey) -> Option<PublicPoint> {
+    if !forced_fallback() {
+        let v = vartime_add_tweak(tweak, q).filter(|_| !forced_decline());
+        debug_assert!(v.is_some(), "the vartime crate declined the tweak sum");
+        if let Some(v) = v {
+            #[cfg(debug_assertions)]
+            assert_eq!(
+                Some(v),
+                k256_add_tweak(tweak, q),
+                "the tweak sum differs from k256's"
+            );
+            return Some(v);
+        }
+    }
+    k256_add_tweak(tweak, q)
+}
+
+/// t*G + Q on the vartime crate; `None` wherever it declines.
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "the vartime crate's Scalar operators are arithmetic mod N"
+)]
+fn vartime_add_tweak(tweak: &[u8; 32], q: &PublicKey) -> Option<PublicPoint> {
+    let t = vartime::Scalar::from_be_bytes(tweak)?;
+    #[cfg(test)]
+    let t = if skewed_sum() { t + vt_one() } else { t };
+    let mut one = [0u8; 32];
+    one[31] = 1;
+    let one = vartime::Scalar::reduce_be_bytes(&one);
+    match vt_to_affine(&vartime::ecmult_var(&q.point.0, &one, &t)?) {
+        Ok(None) => Some(PublicPoint::Infinity),
+        Ok(Some(a)) => Some(PublicPoint::Key(PublicKey { point: KeyPoint(a) })),
+        Err(vartime::Fallback) => None,
+    }
+}
+
+/// t*G + Q on k256, the fallback and the reference: its combined multiply
+/// `mul_by_generator_and_mul_add_vartime` with 1 for the key and one
+/// `batch_normalize_vartime`, on the key converted to k256's point, the
+/// sum entering the key type through [`key_from_k256`].  `None` when t is
+/// not below N, which the caller rules out, or when either conversion
+/// fails, which takes a fault in one of the two curve checks on top of the
+/// decline that sent the seam here; debug builds assert on each.
+fn k256_add_tweak(tweak: &[u8; 32], q: &PublicKey) -> Option<PublicPoint> {
+    let Some(t) = Option::<Scalar>::from(Scalar::from_repr((*tweak).into())) else {
+        debug_assert!(false, "k256_add_tweak: the tweak is not below N");
+        return None;
+    };
+    let Some(q) = k256_key(q) else {
+        debug_assert!(false, "k256 refused a key the vartime crate holds");
+        return None;
+    };
+    let x = ProjectivePoint::mul_by_generator_and_mul_add_vartime(&t, &Scalar::ONE, &q);
+    if bool::from(x.is_identity()) {
+        return Some(PublicPoint::Infinity);
+    }
+    let [a] =
+        <ProjectivePoint as BatchNormalize<[ProjectivePoint; 1]>>::batch_normalize_vartime(&[x]);
+    let point = key_from_k256(&a);
+    debug_assert!(
+        point.is_some(),
+        "the vartime crate refused a key k256 computed"
+    );
+    point.map(|point| PublicPoint::Key(PublicKey { point }))
 }
 
 #[cfg(test)]
@@ -2159,6 +2241,184 @@ mod tests {
             assert_eq!(ssig.verify_detailed(&hash, &pk), Ok(()));
             for k in [&compressed[..], &uncompressed[..], &hybrid[..]] {
                 assert_eq!(PublicKey::parse(k), Ok(pk));
+            }
+        });
+    }
+
+    // ---------------------------------------------------------------------
+    // HD public derivation's tweak sum, t*G + Q.
+
+    /// k256's t*G + Q for a key, the reference: its own multiply and
+    /// addition, `None` at infinity.
+    fn reference_tweak(t: &Scalar, q: &PublicKey) -> Option<([u8; 32], [u8; 32])> {
+        let q = k256_key(q).expect("a key k256 takes");
+        let sum = ProjectivePoint::GENERATOR * t + q;
+        if bool::from(sum.is_identity()) {
+            None
+        } else {
+            Some(bytes_of(&sum.to_affine()))
+        }
+    }
+
+    /// The seam's answer as the reference's shape.
+    fn tweak_shape(p: Option<PublicPoint>) -> Option<([u8; 32], [u8; 32])> {
+        match p.expect("an answer") {
+            PublicPoint::Key(k) => Some(k.point.to_be_bytes()),
+            PublicPoint::Infinity => None,
+        }
+    }
+
+    /// (t, Q) pairs: t at 1, 2, N-1 and N-2 and random, against keys of 1,
+    /// N-1 and random ones, with Q = t*G (a doubling) and Q = -t*G (the
+    /// sum at infinity) for each t.
+    fn tweak_cases() -> Vec<(Scalar, PublicKey)> {
+        let mut rng = SplitMix64(0xbac4_e2d0_0007);
+        let key = |d: &Scalar| {
+            crate::secp256k1::PrivateKey::from_bytes(&d.to_repr().into())
+                .expect("nonzero")
+                .public_key()
+        };
+        let mut ts = vec![
+            Scalar::ONE,
+            Scalar::from(2u64),
+            -Scalar::ONE,
+            -Scalar::from(2u64),
+        ];
+        let mut ds = vec![Scalar::ONE, -Scalar::ONE];
+        for _ in 0..24 {
+            ts.push(rand_scalar(&mut rng));
+            ds.push(rand_scalar(&mut rng));
+        }
+        let mut out = Vec::new();
+        for t in &ts {
+            for d in &ds {
+                out.push((*t, key(d)));
+            }
+            out.push((*t, key(t)));
+            out.push((*t, key(&-*t)));
+        }
+        out
+    }
+
+    /// The seam's tweak sum equals k256's own t*G + Q, point for point and
+    /// infinity for infinity, through the vartime crate, through the
+    /// forced fallback and through a decline at the affine conversion's
+    /// cap.
+    #[test]
+    fn tweak_sum_matches_k256_on_both_paths() {
+        let mut infinities = 0u32;
+        for (t, q) in &tweak_cases() {
+            let tb: [u8; 32] = t.to_repr().into();
+            let want = reference_tweak(t, q);
+            infinities += u32::from(want.is_none());
+            assert_eq!(tweak_shape(add_tweak(&tb, q)), want, "vartime path");
+            assert_eq!(
+                tweak_shape(force_fallback(|| add_tweak(&tb, q))),
+                want,
+                "forced path"
+            );
+            let capped = force_cap(|| vartime_add_tweak(&tb, q));
+            if want.is_some() {
+                assert_eq!(capped, None, "a capped conversion declines");
+            } else {
+                assert_eq!(capped, Some(PublicPoint::Infinity));
+            }
+        }
+        // One per t, Q = -t*G, and t = 1 and t = N-1 against the keys of
+        // N-1 and 1.
+        assert_eq!(infinities, 30, "the sums at infinity");
+    }
+
+    /// A tweak sum the vartime crate declines is k256's instead: builds
+    /// with debug assertions stop on the decline; without them the answer
+    /// is k256's.
+    #[test]
+    #[cfg_attr(
+        debug_assertions,
+        should_panic(expected = "the vartime crate declined the tweak sum")
+    )]
+    fn a_declined_tweak_sum_falls_back() {
+        for (t, q) in tweak_cases().iter().take(16) {
+            let tb: [u8; 32] = t.to_repr().into();
+            let declined = force_decline(|| add_tweak(&tb, q));
+            assert_eq!(declined, force_fallback(|| add_tweak(&tb, q)));
+            assert_eq!(tweak_shape(declined), reference_tweak(t, q));
+        }
+    }
+
+    /// The debug cross-check stops a vartime tweak sum that differs from
+    /// k256's: here the vartime crate is given t + 1.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "the tweak sum differs from k256's")]
+    fn the_cross_check_catches_a_skewed_tweak_sum() {
+        let (t, q) = &tweak_cases()[0];
+        let tb: [u8; 32] = t.to_repr().into();
+        let _ = skew_sum(|| add_tweak(&tb, q));
+    }
+
+    /// The forced fallback really skips the vartime crate's tweak sum:
+    /// with t skewed for the vartime crate only, the forced path still
+    /// gives k256's answer and the debug cross-check never runs.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn the_forced_fallback_skips_the_vartime_tweak_sum() {
+        for (t, q) in tweak_cases().iter().take(16) {
+            let tb: [u8; 32] = t.to_repr().into();
+            assert_eq!(
+                tweak_shape(force_fallback(|| skew_sum(|| add_tweak(&tb, q)))),
+                reference_tweak(t, q)
+            );
+        }
+    }
+
+    /// A tweak at N, which `add_public_tweak` never passes, is no answer
+    /// on the k256 arm and never a panic in release; builds with debug
+    /// assertions stop on the decline.
+    #[test]
+    #[cfg_attr(debug_assertions, should_panic(expected = "declined"))]
+    fn an_out_of_range_tweak_reaches_no_answer() {
+        let (_, q) = &tweak_cases()[0];
+        assert_eq!(add_tweak(&GROUP_ORDER_BYTES, q), None);
+        assert_eq!(force_fallback(|| add_tweak(&GROUP_ORDER_BYTES, q)), None);
+    }
+
+    /// The fallback whose conversion of a key fails as well, two faults,
+    /// has no answer, so `add_public_tweak` stops, in every profile,
+    /// rather than return a wrong key.  Builds with debug assertions stop
+    /// at the refusal itself.
+    #[test]
+    #[cfg_attr(
+        debug_assertions,
+        should_panic(expected = "k256 refused a key the vartime crate holds")
+    )]
+    #[cfg_attr(
+        not(debug_assertions),
+        should_panic(expected = "the tweak sum passes the curve check")
+    )]
+    fn a_refused_conversion_stops_the_public_tweak() {
+        let (t, q) = &tweak_cases()[0];
+        let tb: [u8; 32] = t.to_repr().into();
+        assert_eq!(
+            force_fallback(|| refuse_conversion(|| add_tweak(&tb, q))),
+            None
+        );
+        let _ = force_fallback(|| refuse_conversion(|| crate::secp256k1::add_public_tweak(&tb, q)));
+    }
+
+    /// Release's tweak sum converts no key: with every conversion refused
+    /// it still gives k256's answers, so it never reached one.  (Builds
+    /// with debug assertions run the k256 arm beside it for the
+    /// cross-check, which does convert.)
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn the_vartime_tweak_sum_converts_no_key() {
+        let cases = tweak_cases();
+        let want: Vec<_> = cases.iter().map(|(t, q)| reference_tweak(t, q)).collect();
+        refuse_conversion(|| {
+            for ((t, q), want) in cases.iter().zip(&want) {
+                let tb: [u8; 32] = t.to_repr().into();
+                assert_eq!(tweak_shape(add_tweak(&tb, q)), *want);
             }
         });
     }

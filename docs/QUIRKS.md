@@ -927,3 +927,36 @@ Entry format:
   with no address.
 - **How found:** reading `Start` while wiring the daemon's manager, then
   confirmed against dcrd's own `Start` over an interface with no address.
+
+## QK-0033 — a zero private key and a sum at infinity serialize as `02` and 32 zero bytes
+
+- **Where:** dcrd `dcrec/secp256k1/v4` `PrivKeyFromBytes`, `PubKey`,
+  `JacobianPoint.ToAffine`, `NewPublicKey` and `SerializeCompressed`, as
+  `hdkeychain` v3.1.3 uses them (`extendedkey.go:166-167`, `:298-302`,
+  `:317-341`) / dcroxide-dcrec `ReducedPrivateKey`, `PublicPoint`,
+  `add_private_tweak`, `add_public_tweak`
+- **What:** `PrivKeyFromBytes` accepts a key that reduces to zero, and
+  hdkeychain's private child returns the zero key when `Il + parent` is N,
+  rather than reject it as BIP32 says. The public key of the zero key, and
+  the public child whose sum `Il*G + parent` is the point at infinity
+  (BIP32 again says to reject it), go through `ToAffine`, which inverts a
+  zero Z to zero and so turns infinity into (0, 0), and `NewPublicKey`,
+  which takes (0, 0) unchecked; `SerializeCompressed` then writes 0x02 and
+  32 zero bytes. Those bytes are no key: `ParsePubKey` refuses them with
+  `ErrPubKeyNotOnCurve`, since no point has x = 0.
+- **Why reproduced:** a wallet's derived keys, fingerprints and addresses
+  must equal dcrd's for every index, the degenerate ones (about 1 in 2^127
+  each) included. dcrec reports the zero key as `ReducedPrivateKey::Zero`,
+  which no signing function takes, and the sum at infinity as
+  `PublicPoint::Infinity`, and gives dcrd's bytes for both through
+  `serialize` and `serialize_compressed`; what to do with them is the
+  caller's.
+- **Pinned by:** `committed_hd_tweak_vectors_hold` (the lines labelled
+  `sum0/…`, `tweak1/N-1`, `tweak2/1`, `tweak2/pub1`, `tweak1/pubN-1`,
+  `infinity/…`, `ff*0`, `N-prefix*32` and `bad-parent/infinity-bytes`) and
+  `random_cases_match_dcrd` in
+  `crates/dcroxide-dcrec/tests/hd_tweak_differential.rs`, and
+  `zero_key_shapes` there.
+- **How found:** reading `ToAffine` and hdkeychain's `child` while adding
+  dcrec's HD derivation entry points, then confirmed through
+  `tools/oracle`.

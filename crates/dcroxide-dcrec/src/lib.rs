@@ -14,10 +14,11 @@
 //! arithmetic, and Ed25519 on `curve25519-dalek`'s.
 //! The variable-time arithmetic of ECDSA verification, compact recovery
 //! and EC-Schnorr-DCRv0 verification, and public keys (their parsing,
-//! curve check, decompression and serialization), run on
-//! `dcroxide-secp256k1-vartime`, owned in tree and ported from
-//! libsecp256k1, behind one seam module with k256 as its fallback
-//! (ADR-0016); keys from secrets and signing stay on k256.
+//! curve check, decompression and serialization) and HD derivation's
+//! public tweak sum, run on `dcroxide-secp256k1-vartime`, owned in tree
+//! and ported from libsecp256k1, behind one seam module with k256 as its
+//! fallback (ADR-0016); keys from secrets, the scalar arithmetic of HD
+//! derivation's private side and signing stay on k256.
 //! Everything dcrd-behavior-specific — DER signature acceptance, public
 //! key format acceptance, low-S serialization, the order of compact
 //! recovery's checks, error identities — is implemented here and

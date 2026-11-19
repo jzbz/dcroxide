@@ -65,6 +65,24 @@
 //	pubkey_parse       → {"result": "<hex uncompressed>",
 //	                      "compressed": "<hex compressed>"} or
 //	                     {"error": ..., "kind": "ErrPubKey..."}
+//	modn_set_bytes     → data is any number of bytes, through
+//	                     ModNScalar.SetByteSlice; {"result": "<hex 32-byte
+//	                     reduced value>", "detail": {"overflow": bool,
+//	                     "zero": bool}}
+//	privkey_from_bytes → data is any number of bytes, through
+//	                     PrivKeyFromBytes, zero accepted; {"result": "<hex
+//	                     32-byte Serialize>", "compressed": "<hex
+//	                     PubKey().SerializeCompressed()>"}
+//	privkey_tweak_add  → data is 32-byte tweak || parent key of any
+//	                     length; hdkeychain's private child sum;
+//	                     {"result": "<hex 32-byte sum>", "compressed":
+//	                      "<hex compressed public key of the sum>"} or
+//	                     {"error": ..., "kind": "overflow"|"zero"}
+//	pubkey_tweak_add   → data is 32-byte tweak || parent public key in
+//	                     any format ParsePubKey takes; hdkeychain's public
+//	                     child sum; {"result": "<hex compressed sum>"} or
+//	                     {"error": ..., "kind": "overflow"|"zero"|
+//	                      "intermediate"|"ErrPubKey..."}
 //	schnorr_parse      → {"result": "<hex 64-byte r||s>"} or
 //	                     {"error": ..., "kind": "ErrSig..."}
 //	schnorr_sign       → data is 32-byte privkey || 32-byte hash;
@@ -620,6 +638,108 @@ func handle(req request) response {
 			Result:     hex.EncodeToString(pubKey.SerializeUncompressed()),
 			Compressed: hex.EncodeToString(pubKey.SerializeCompressed()),
 		}
+
+	case "modn_set_bytes":
+		// data: any number of bytes.  ModNScalar.SetByteSlice truncates
+		// them to their first 32, left-pads a shorter slice with zeros and
+		// reduces the value modulo N; its overflow flag is the truncated
+		// value's.  hdkeychain's checks on a master key, a parsed private
+		// key and Il are `overflow || IsZero` on these two flags.
+		var s secp256k1.ModNScalar
+		overflow := s.SetByteSlice(data)
+		reduced := s.Bytes()
+		detail, err := json.Marshal(struct {
+			Overflow bool `json:"overflow"`
+			Zero     bool `json:"zero"`
+		}{overflow, s.IsZero()})
+		if err != nil {
+			return errResp("modn_set_bytes: %v", err)
+		}
+		return response{Result: hex.EncodeToString(reduced[:]), Detail: detail}
+
+	case "privkey_from_bytes":
+		// data: any number of bytes, as PrivKeyFromBytes takes them
+		// (SetByteSlice, as modn_set_bytes), a key that reduces to zero
+		// included.  The key as Serialize writes it, and its public key as
+		// PubKey().SerializeCompressed() writes it: for a zero key, the
+		// point at infinity, which ToAffine turns into (0, 0), that is
+		// 0x02 and 32 zero bytes.
+		privKey := secp256k1.PrivKeyFromBytes(data)
+		return response{
+			Result:     hex.EncodeToString(privKey.Serialize()),
+			Compressed: hex.EncodeToString(privKey.PubKey().SerializeCompressed()),
+		}
+
+	case "privkey_tweak_add":
+		// data: tweak(32) || parent key (any length).  hdkeychain v3.1.3's
+		// private child (extendedkey.go:278, :298-302), composed of the
+		// secp256k1 calls it makes: the tweak Il through SetByteSlice,
+		// refused when it overflows or else is zero, as hdkeychain refuses
+		// it with ErrInvalidChild; the parent key through SetByteSlice, its
+		// overflow ignored; then ModNScalar.Add.  A zero sum is returned,
+		// as hdkeychain returns it, with its public key as
+		// privkey_from_bytes gives it.
+		if len(data) < 32 {
+			return errResp("privkey_tweak_add: want >= 32 bytes "+
+				"(tweak || parent), got %d", len(data))
+		}
+		var il, parent secp256k1.ModNScalar
+		if overflow := il.SetByteSlice(data[:32]); overflow {
+			return response{Error: "privkey_tweak_add: tweak >= group order",
+				Kind: "overflow"}
+		}
+		if il.IsZero() {
+			return response{Error: "privkey_tweak_add: tweak is zero", Kind: "zero"}
+		}
+		parent.SetByteSlice(data[32:])
+		il.Add(&parent)
+		sum := il.Bytes()
+		childKey := secp256k1.PrivKeyFromBytes(sum[:])
+		return response{
+			Result:     hex.EncodeToString(sum[:]),
+			Compressed: hex.EncodeToString(childKey.PubKey().SerializeCompressed()),
+		}
+
+	case "pubkey_tweak_add":
+		// data: tweak(32) || parent public key in any format ParsePubKey
+		// takes.  hdkeychain v3.1.3's public child (extendedkey.go:278,
+		// :317-341), composed of the secp256k1 calls it makes: the tweak
+		// checked as privkey_tweak_add checks it; Il*G by
+		// ScalarBaseMultNonConst and ToAffine, refused with the kind
+		// "intermediate" should either coordinate be zero, as hdkeychain
+		// refuses it with ErrInvalidChild; the parent through ParsePubKey,
+		// its error passed on; then AddNonConst, ToAffine and
+		// NewPublicKey's SerializeCompressed, which for a sum at infinity,
+		// (0, 0) after ToAffine, is 0x02 and 32 zero bytes.
+		if len(data) < 32 {
+			return errResp("pubkey_tweak_add: want >= 32 bytes "+
+				"(tweak || parent key), got %d", len(data))
+		}
+		var il secp256k1.ModNScalar
+		if overflow := il.SetByteSlice(data[:32]); overflow {
+			return response{Error: "pubkey_tweak_add: tweak >= group order",
+				Kind: "overflow"}
+		}
+		if il.IsZero() {
+			return response{Error: "pubkey_tweak_add: tweak is zero", Kind: "zero"}
+		}
+		var imPubKey secp256k1.JacobianPoint
+		secp256k1.ScalarBaseMultNonConst(&il, &imPubKey)
+		imPubKey.ToAffine()
+		if imPubKey.X.IsZero() || imPubKey.Y.IsZero() {
+			return response{Error: "pubkey_tweak_add: tweak*G has a zero coordinate",
+				Kind: "intermediate"}
+		}
+		pubKey, err := secp256k1.ParsePubKey(data[32:])
+		if err != nil {
+			return errKindResp(err)
+		}
+		var parentPoint, child secp256k1.JacobianPoint
+		pubKey.AsJacobian(&parentPoint)
+		secp256k1.AddNonConst(&imPubKey, &parentPoint, &child)
+		child.ToAffine()
+		childKey := secp256k1.NewPublicKey(&child.X, &child.Y)
+		return response{Result: hex.EncodeToString(childKey.SerializeCompressed())}
 
 	case "schnorr_parse":
 		sig, err := schnorr.ParseSignature(data)

@@ -337,6 +337,8 @@ impl PublicKey {
 /// N; this constructor rejects them instead. The daemon's consensus paths
 /// never construct private keys from untrusted bytes, so the difference is
 /// not an observable-compatibility surface (tracked in `PARITY.md`).
+/// [`ReducedPrivateKey::from_bytes`] is dcrd's `PrivKeyFromBytes`, for
+/// callers that need its reduction (HD keys).
 #[derive(Clone)]
 pub struct PrivateKey {
     inner: k256::SecretKey,
@@ -386,6 +388,306 @@ impl PrivateKey {
     pub(crate) fn secret_bytes(&self) -> Zeroizing<[u8; 32]> {
         Zeroizing::new(self.inner.to_bytes().into())
     }
+
+    /// The key's 32 big-endian bytes, leading zeros kept (dcrd's
+    /// `PrivateKey.Serialize`), for a caller that stores or encodes the
+    /// key, such as an HD key's serialization.  The returned copy is
+    /// wiped when dropped; the intermediate encoding k256's `to_bytes`
+    /// returns, and stack copies the compiler leaves, are not.  The key's
+    /// `Debug` still prints no key material.
+    pub fn serialize(&self) -> Zeroizing<[u8; 32]> {
+        self.secret_bytes()
+    }
+}
+
+/// Why 32 bytes are not a usable private scalar: dcrd's
+/// `overflow || IsZero` after `ModNScalar.SetByteSlice`, the check
+/// hdkeychain makes on a master key (`ErrUnusableSeed`), on the private
+/// key of a parsed extended key (`ErrUnusableSeed`) and on a derivation's
+/// intermediate key Il (`ErrInvalidChild`).  dcrd reports the two cases
+/// alike; they are told apart here only because it costs nothing, the
+/// overflow taking precedence, as dcrd's `||` does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScalarError {
+    /// The value is at or above the group order N (`SetByteSlice`'s
+    /// overflow).
+    Overflow,
+    /// The value is zero.
+    Zero,
+}
+
+impl fmt::Display for ScalarError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            ScalarError::Overflow => "scalar is not below the group order",
+            ScalarError::Zero => "scalar is zero",
+        })
+    }
+}
+
+impl core::error::Error for ScalarError {}
+
+/// The scalar of 32 big-endian bytes in [1, N-1], or why it is not one.
+/// The range and zero tests are k256's constant-time `from_repr` and
+/// `is_zero`; only the verdict is branched on.  The encoding and the
+/// scalar this holds are `Zeroizing`, wiped on drop; the copy k256's
+/// `from_repr` takes by value, k256's internal copies, and stack copies
+/// the compiler leaves when values move are not wiped, so the value can
+/// remain in freed stack memory.
+fn nonzero_scalar(bytes: &[u8; 32]) -> Result<Zeroizing<Scalar>, ScalarError> {
+    use k256::elliptic_curve::PrimeField;
+    let repr = Zeroizing::new(FieldBytes::from(*bytes));
+    let parsed = Scalar::from_repr(*repr);
+    let in_range = parsed.is_some();
+    let scalar = Zeroizing::new(parsed.unwrap_or(Scalar::ZERO));
+    let zero = scalar.is_zero();
+    if !bool::from(in_range) {
+        Err(ScalarError::Overflow)
+    } else if bool::from(zero) {
+        Err(ScalarError::Zero)
+    } else {
+        Ok(scalar)
+    }
+}
+
+/// Whether 32 big-endian bytes are a usable private scalar, in [1, N-1]:
+/// dcrd's `overflow || IsZero` after `ModNScalar.SetByteSlice`, which
+/// hdkeychain's `NewMaster` and `NewKeyFromString` apply to a private key
+/// (`ErrUnusableSeed`) and `Child` to Il (`ErrInvalidChild`).  Constant
+/// time in the value; only the verdict is branched on.  The `Zeroizing`
+/// copies this crate makes are wiped on drop; copies inside k256's
+/// `from_repr`, and stack copies the compiler leaves when values move, are
+/// not.
+///
+/// `PrivateKey::from_bytes(b).is_some()` gives the same verdict; this
+/// names the case and builds no key.
+pub fn check_scalar(bytes: &[u8; 32]) -> Result<(), ScalarError> {
+    nonzero_scalar(bytes).map(|_| ())
+}
+
+/// Up to 32 big-endian bytes reduced modulo N, as dcrd's
+/// `ModNScalar.SetByteSlice` reduces them: a longer slice is truncated to
+/// its first 32 bytes, a shorter one left-padded with zeros, and the
+/// overflow flag dropped.  Constant time in the bytes' values (the
+/// reduction is k256's conditional subtraction).  The padded encoding and
+/// the result this holds are `Zeroizing`, wiped on drop; k256's internal
+/// copies inside `reduce`, and stack copies the compiler leaves when
+/// values move, are not wiped.
+fn reduce_slice(bytes: &[u8]) -> Zeroizing<Scalar> {
+    use k256::elliptic_curve::ops::Reduce;
+    let taken = bytes.get(..32).unwrap_or(bytes);
+    let mut repr = Zeroizing::new(FieldBytes::default());
+    repr[32usize.saturating_sub(taken.len())..].copy_from_slice(taken);
+    Zeroizing::new(<Scalar as Reduce<FieldBytes>>::reduce(&repr))
+}
+
+/// A private key as dcrd's `PrivKeyFromBytes` makes one: any value modulo
+/// N, zero included.  dcrd's `PrivateKey` holds a `ModNScalar` and takes
+/// zero; this crate's [`PrivateKey`] does not, so that every key it signs
+/// with is in [1, N-1], and the zero dcrd lets through is a variant of its
+/// own here, explicit at every use, rather than a key.
+///
+/// Why a separate type and not a wider `PrivateKey`: dcrd signs with a
+/// zero key (ECDSA then signs for the point at infinity, and never returns
+/// over a hash that is zero modulo N, `tools/oracle`'s `ecdsa_sign` notes),
+/// behaviour no caller wants reproduced; keeping zero out of `PrivateKey`
+/// keeps signing with it impossible, as it has been, and leaves every
+/// existing constructor and signer unchanged.  What dcrd does observably
+/// with a zero key, outside signing, is serialize it (32 zero bytes,
+/// [`serialize`](Self::serialize)) and give its public key, the point at
+/// infinity, which `PubKey().SerializeCompressed()` writes as 0x02 and 32
+/// zero bytes ([`public_point`](Self::public_point),
+/// [`PublicPoint::serialize_compressed`]); both are reproduced here.
+///
+/// hdkeychain reaches zero two ways: a private child whose sum
+/// `Il + parent` is N ([`add_private_tweak`]), and a stored key
+/// that is zero, which `pubKeyBytes` passes to `PrivKeyFromBytes`.
+///
+/// `Debug` prints `Key(PrivateKey(..))` or `Zero`: whether the key is
+/// zero, and no other key material.
+#[derive(Clone, Debug)]
+pub enum ReducedPrivateKey {
+    /// A nonzero value, a key in [1, N-1].
+    Key(PrivateKey),
+    /// Zero: dcrd's zero `ModNScalar`, whose public key is the point at
+    /// infinity.
+    Zero,
+}
+
+impl ReducedPrivateKey {
+    /// dcrd's `PrivKeyFromBytes`: at most the first 32 bytes, left-padded
+    /// with zeros when shorter, reduced modulo N, zero accepted.  The bytes
+    /// are hdkeychain's stored private key, which `Child` strips of its
+    /// leading zeros, or an imported key.  Constant time in the bytes'
+    /// values; the slice's length is public, and so is whether the
+    /// result is zero, the variant.  The encodings and scalar this crate
+    /// holds on the way are `Zeroizing`, wiped on drop, and the key wipes
+    /// itself when dropped; k256's internal copies inside `reduce` and
+    /// `SecretKey::from_bytes`, and stack copies the compiler leaves when
+    /// values move, are not wiped, so the bytes can remain in freed stack
+    /// memory.
+    pub fn from_bytes(bytes: &[u8]) -> ReducedPrivateKey {
+        ReducedPrivateKey::from_scalar(&reduce_slice(bytes))
+    }
+
+    /// The key of a scalar below N, or `Zero`.  The encoding is
+    /// `Zeroizing`, wiped on drop (k256's internal copies are not); k256's
+    /// `SecretKey::from_bytes` refuses only zero here, since the scalar is
+    /// below N.
+    fn from_scalar(scalar: &Scalar) -> ReducedPrivateKey {
+        use k256::elliptic_curve::PrimeField;
+        let repr = Zeroizing::new(scalar.to_repr());
+        match k256::SecretKey::from_bytes(&repr) {
+            Ok(inner) => ReducedPrivateKey::Key(PrivateKey { inner }),
+            Err(_) => ReducedPrivateKey::Zero,
+        }
+    }
+
+    /// The value's 32 big-endian bytes, leading zeros kept (dcrd's
+    /// `PrivateKey.Serialize`, or `ModNScalar.Bytes`), 32 zero bytes for
+    /// `Zero`; wiped when dropped.
+    pub fn serialize(&self) -> Zeroizing<[u8; 32]> {
+        match self {
+            ReducedPrivateKey::Key(key) => key.serialize(),
+            ReducedPrivateKey::Zero => Zeroizing::new([0; 32]),
+        }
+    }
+
+    /// The public point, dG (dcrd's `PubKey`): [`PrivateKey::public_key`],
+    /// k256's constant-time `GENERATOR * d`, for a key, and the point at
+    /// infinity for `Zero`.  `public_point().serialize_compressed()` is
+    /// dcrd's `PrivKeyFromBytes(b).PubKey().SerializeCompressed()`, the
+    /// bytes hdkeychain's `pubKeyBytes` gives a private extended key.
+    ///
+    /// # Panics
+    ///
+    /// As [`PrivateKey::public_key`] does, only on a fault in k256 or in
+    /// dcroxide-secp256k1-vartime's curve check.
+    pub fn public_point(&self) -> PublicPoint {
+        match self {
+            ReducedPrivateKey::Key(key) => PublicPoint::Key(key.public_key()),
+            ReducedPrivateKey::Zero => PublicPoint::Infinity,
+        }
+    }
+}
+
+/// A point dcrd's arithmetic can return where a public key is expected: a
+/// key, or the point at infinity, which [`PublicKey`] never holds.  dcrd's
+/// `ToAffine` turns infinity into (0, 0), which `NewPublicKey` accepts
+/// unchecked and `SerializeCompressed` writes as 0x02 and 32 zero bytes;
+/// [`serialize_compressed`](Self::serialize_compressed) gives the same
+/// bytes.  Those bytes do not parse back: x = 0 is on no point, so
+/// [`PublicKey::parse`] refuses them with `ErrPubKeyNotOnCurve`, as dcrd's
+/// `ParsePubKey` does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PublicPoint {
+    /// A public key.
+    Key(PublicKey),
+    /// The point at infinity.
+    Infinity,
+}
+
+impl PublicPoint {
+    /// The 33-byte compressed serialization dcrd gives the point:
+    /// [`PublicKey::serialize_compressed`] for a key, and 0x02 followed by
+    /// 32 zero bytes for infinity.
+    pub fn serialize_compressed(&self) -> [u8; PUB_KEY_BYTES_LEN_COMPRESSED] {
+        match self {
+            PublicPoint::Key(key) => key.serialize_compressed(),
+            PublicPoint::Infinity => {
+                let mut out = [0u8; PUB_KEY_BYTES_LEN_COMPRESSED];
+                out[0] = PUB_KEY_FORMAT_COMPRESSED_EVEN;
+                out
+            }
+        }
+    }
+}
+
+/// The private child's key of HD derivation, `(Il + parent) mod N`
+/// (hdkeychain's `Child` on a private key, `extendedkey.go:278` and
+/// `:298-302`), constant time in both values.
+///
+/// `tweak` is Il, which must be in [1, N-1]: else `Err`, the `overflow ||
+/// IsZero` for which hdkeychain returns `ErrInvalidChild`.  `parent` is
+/// reduced exactly as [`ReducedPrivateKey::from_bytes`] reduces a slice
+/// (dcrd's `SetByteSlice`, overflow ignored), so hdkeychain's stored key,
+/// stripped of leading zeros or not, and zero included, is passed as
+/// stored.  The sum is k256's constant-time addition modulo N.
+///
+/// What is wiped: the `Zeroizing` scalars and encodings this crate holds
+/// (Il's, the parent's and the sum's) are wiped on drop, and the returned
+/// key wipes itself.  What is not: the copies k256 makes inside
+/// `from_repr`, `reduce` and the addition, and stack copies the compiler
+/// leaves when values move, so Il and the parent can remain in freed stack
+/// memory.
+///
+/// A sum of zero, `Il = N - parent`, is not an error: it is
+/// [`ReducedPrivateKey::Zero`], since dcrd's `Child` returns that key
+/// (stripped to an empty key by the Decred variant, 32 zero bytes by
+/// `ChildBIP32Std`), and what to do with it is the caller's to decide.
+/// Whether the sum is zero is the one fact about it the result's variant
+/// shows.
+pub fn add_private_tweak(
+    tweak: &[u8; 32],
+    parent: &[u8],
+) -> Result<ReducedPrivateKey, ScalarError> {
+    let tweak = nonzero_scalar(tweak)?;
+    let parent = reduce_slice(parent);
+    // k256's addition modulo N, constant time.
+    #[allow(clippy::arithmetic_side_effects)]
+    let sum = Zeroizing::new(*tweak + *parent);
+    Ok(ReducedPrivateKey::from_scalar(&sum))
+}
+
+/// The public child's key of HD derivation, `Il*G + parent` (hdkeychain's
+/// `Child` on a public key, `extendedkey.go:278` and `:317-341`), on public
+/// values and in variable time, as dcrd computes it with
+/// `ScalarBaseMultNonConst` and `AddNonConst`.
+///
+/// `tweak` is Il, which must be in [1, N-1]: else `Err`, the `overflow ||
+/// IsZero` for which hdkeychain returns `ErrInvalidChild`.  The range check
+/// is [`check_scalar`]'s, made before any point arithmetic, so hdkeychain's
+/// order, Il's check before the parent key's parse, is kept by a caller
+/// that calls [`check_scalar`] on Il before [`PublicKey::parse`] on the
+/// parent, or this with a parent already parsed.
+///
+/// hdkeychain's second check, that `Il*G` has no zero coordinate after
+/// `ToAffine`, never fires for Il in [1, N-1]: `Il*G` is then a point of
+/// the group, never infinity, and no point has x = 0 (7 is not a square
+/// modulo P) or y = 0 (the group's order is odd).  So it has no outcome of
+/// its own here.  A sum at infinity, `parent = -Il*G`, is not an error:
+/// it is [`PublicPoint::Infinity`], since dcrd's `Child` returns the key
+/// 0x02 and 32 zero bytes for it, which the caller gets from
+/// [`PublicPoint::serialize_compressed`].
+///
+/// The sum is dcroxide-secp256k1-vartime's Straus loop, `ecmult_var`,
+/// computing 1*parent + Il*G with the parent as the crate's affine point,
+/// and the result's affine coordinates by one field inversion, normalized
+/// as dcrd's `ToAffine` does; k256's combined multiply is the fallback
+/// should the vartime crate decline (ADR-0016), and builds with debug
+/// assertions compute both and require the same answer.
+///
+/// # Security
+///
+/// Both inputs are treated as public and are computed on in variable
+/// time: on the vartime crate's path, and with k256's
+/// `mul_by_generator_and_mul_add_vartime` on the fallback and in builds
+/// with debug assertions.  Timing can leak them.  The only tweak this may
+/// be given is the Il of a non-hardened child of an extended public key,
+/// HMAC-SHA512 over the chain code, the public key and the index: data the
+/// extended public key already gives away.  Never pass a secret: not a
+/// hardened child's Il, and not any private key or scalar.  For a child of
+/// a private extended key, hardened or not, use [`add_private_tweak`].
+///
+/// # Panics
+///
+/// Only if the vartime crate declines and k256's answer then fails the
+/// key type's curve check, two independent faults: there is no correct key
+/// to return, as for [`PrivateKey::public_key`].
+pub fn add_public_tweak(tweak: &[u8; 32], parent: &PublicKey) -> Result<PublicPoint, ScalarError> {
+    check_scalar(tweak)?;
+    Ok(backend::add_tweak(tweak, parent)
+        .expect("the tweak sum passes the curve check: k256 refused, after a decline"))
 }
 
 #[cfg(test)]

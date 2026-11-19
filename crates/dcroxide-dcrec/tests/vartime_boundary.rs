@@ -9,8 +9,9 @@
 //!   hide it from the source scans below;
 //! - inside dcroxide-dcrec only `src/secp256k1/backend.rs`, the seam, may
 //!   name it; only the functions in [`MAY_USE_SEAM`] (ECDSA and Schnorr
-//!   verification, compact recovery, key parsing and the conversion of a
-//!   private key's public point) may name the seam, and the public key's
+//!   verification, compact recovery, key parsing, the conversion of a
+//!   private key's public point and the public key's tweak addition of HD
+//!   derivation, all on public values) may name the seam, and the public key's
 //!   field its type ([`MAY_NAME_SEAM_TYPE`]), so the signing functions
 //!   (ECDSA's `sign*`, Schnorr's `sign`, the nonce) reach neither, and
 //!   `PrivateKey::public_key` reaches the seam only through that
@@ -44,12 +45,13 @@ const MAY_DEPEND: [&str; 3] = [
 
 /// The functions of dcrec's `src/` that may name the seam module, `backend`
 /// (file under `src/`, function name).  Each must exist and name it.
-const MAY_USE_SEAM: [(&str, &str); 5] = [
+const MAY_USE_SEAM: [(&str, &str); 6] = [
     ("secp256k1/ecdsa.rs", "verify_detailed"),
     ("secp256k1/ecdsa.rs", "recover_compact"),
     ("secp256k1/schnorr.rs", "verify_detailed"),
     ("secp256k1.rs", "parse"),
     ("secp256k1.rs", "from_k256_point"),
+    ("secp256k1.rs", "add_public_tweak"),
 ];
 
 /// The structs of dcrec's `src/` whose fields may name the seam's types

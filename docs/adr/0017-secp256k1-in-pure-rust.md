@@ -10,7 +10,8 @@
   vectors, were met that day (first addendum of 2026-11-10), before the
   merge.
 - **Date:** 2026-11-09, 2026-11-10 (addendum: the extra soak legs, the
-  merge-bar run and the witness vectors; second addendum: the merge)
+  merge-bar run and the witness vectors; second addendum: the merge),
+  2026-11-18 (addendum: HD derivation's entry points)
 
 ## Context
 
@@ -344,3 +345,46 @@ first item (`:211-216`), whose "once it merges" and "once the port
 merges" are now past, and their last (`:227-230`). The first addendum
 of this date keeps its words, its "complete on the port's branch"
 (`:301-302`) included: that soak is the one master now has.
+
+## Addendum, 2026-11-18 — HD derivation's entry points
+
+dcrec gains the secp256k1 entry points of HD key derivation (dcrd's
+`hdkeychain` v3.1.3), so that a port of that package outside dcrec
+touches no `k256` type; [ADR-0016](0016-secp256k1-vartime-arithmetic.md)'s
+addendum of this date records the split and the tests. They follow this
+record's line between public data and secrets.
+
+**What this corrects.**
+
+- "Public data, variable time, on the owned crate" gains the HD public
+  child's sum Il·G + Q (`add_public_tweak`), on public values only: its
+  tweak is the Il of a non-hardened child of an extended public key, which
+  that key already gives away, and its documentation forbids a secret
+  tweak.
+- "Secrets, constant time, on `k256`" gains the range check of a 32-byte
+  scalar (`check_scalar`, dcrd's `overflow || IsZero`), the reduction
+  modulo N of `PrivKeyFromBytes` (`ReducedPrivateKey::from_bytes`, a key
+  that reduces to zero being its own variant, `ReducedPrivateKey::Zero`,
+  which no signing function takes), the private child's sum
+  `(Il + parent) mod N` (`add_private_tweak`), and the read-out of a
+  private key's bytes (`PrivateKey::serialize`). The public key of a
+  reduced key is `PrivateKey::public_key`'s product, unchanged. The
+  `Zeroizing` values dcrec holds are wiped on drop; copies inside
+  `k256` and stack copies the compiler leaves are not, as for the signers'
+  key copies.
+- "The fallback": `k256`'s combined multiply
+  (`mul_by_generator_and_mul_add_vartime`) and one
+  `batch_normalize_vartime` now also serve `add_public_tweak` should the
+  owned crate decline, and builds with debug assertions compute `k256`'s
+  answer for it on every call, as for verification, recovery and Schnorr
+  verification, and stop on any difference. A fallback whose conversion of
+  the key also fails, two faults, has no answer here, unlike verification's
+  rejection, so `add_public_tweak` stops, as `PrivateKey::public_key`
+  does.
+- The Consequence on the dependency ledger: `k256` is narrowed to keys,
+  signing, the nonce, the scalar arithmetic of HD derivation's private
+  side and the fallbacks.
+
+The rest of the Decision stands as written: dcrd's rules stay in dcrec in
+front of both stacks, dcrec names the owned crate in one module, and no
+signing function reaches it.

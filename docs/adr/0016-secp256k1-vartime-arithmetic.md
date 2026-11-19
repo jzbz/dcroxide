@@ -18,7 +18,8 @@
   [ADR-0012](0012-pure-rust.md)'s rule.
 - **Date:** 2026-11-08 (proposed), 2026-11-09 (accepted; addendum: the
   measured results, the merge bar pending), 2026-11-10 (addendum: the
-  merge-bar run passed, criteria 8 and 9 met; second addendum: the merge)
+  merge-bar run passed, criteria 8 and 9 met; second addendum: the merge),
+  2026-11-18 (addendum: HD derivation's public tweak sum)
 
 ## Context
 
@@ -883,3 +884,45 @@ after "The run passes" (`:819-820`). "The merge bar" (`:476-479`), whose
 rule the merge followed, the addendum of 2026-11-09, its "What remains
 before the merge" (`:768-773`) included, and the rest of the first
 addendum of this date keep their words.
+
+## Addendum, 2026-11-18 — HD derivation's public tweak sum
+
+dcrec gains the secp256k1 entry points of HD key derivation (dcrd's
+`hdkeychain` v3.1.3), so that a port of that package outside dcrec
+touches no `k256` type and dcrd's acceptance rules stay in dcrec. One of
+them runs on this crate, the rest on `k256`, and the line between the
+two is this record's, public values against secrets:
+
+- **On `dcroxide-secp256k1-vartime`:** `add_public_tweak`, the public
+  child's key Il·G + Q, which dcrd computes with the variable-time
+  `ScalarBaseMultNonConst` and `AddNonConst`
+  (`hdkeychain/v3@v3.1.3/extendedkey.go:318`, `:338`). Both inputs are
+  public: Q is a public key, and Il, for a non-hardened child, follows
+  from the extended public key. The seam computes it as
+  `ecmult_var(Q, 1, Il)` and one `to_affine_var`, the key being the
+  crate's point as it is, and returns a key or the point at infinity;
+  `k256`'s combined multiply and normalization are the fallback should
+  the crate decline, builds with debug assertions compute both and
+  require the same answer, and a fallback whose conversion also fails,
+  two faults, has no answer, so the function stops, as
+  `PrivateKey::public_key` does.
+- **On `k256`, constant time:** the range check of a 32-byte scalar
+  (dcrd's `overflow || IsZero`), the reduction of up to 32 bytes modulo N
+  (`PrivKeyFromBytes`), the private child's sum `(Il + parent) mod N`,
+  the read-out of a private key's bytes, and the public key of a reduced
+  key, through `PrivateKey::public_key`. A key that reduces to zero is a
+  variant of its own, `ReducedPrivateKey::Zero`, never a `PrivateKey`, so
+  no signing function can take it.
+
+**What this corrects.** The Scope's list of operations on public values
+gains the public tweak sum. The Layout's workspace test now allows one
+more function of dcrec's `src/` to name the seam, `add_public_tweak`
+(`tests/vartime_boundary.rs`, `MAY_USE_SEAM`); the signing functions
+still reach neither the crate nor the seam. The new operations are held
+to dcrd's code through `tools/oracle`'s `modn_set_bytes`,
+`privkey_from_bytes`, `privkey_tweak_add` and `pubkey_tweak_add`, live
+and through the committed `tests/data/hd_tweak_vectors.txt`, and the
+seam's paths (the vartime crate's, the forced fallback, a decline, the
+capped conversion and a refused conversion) by unit tests in
+`src/secp256k1/backend.rs`. The soaks and the timed runs above did not
+cover this operation, and none was run for it.

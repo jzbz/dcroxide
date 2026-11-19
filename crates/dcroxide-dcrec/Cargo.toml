@@ -40,7 +40,8 @@ zeroize = { version = "1.9", default-features = false }
 # compact recovery's steps 4-10 and Schnorr verification's steps 7-10
 # (scalars, the Straus loop over static generator tables, the x check and
 # the affine conversion), and public keys: compressed keys' decompression
-# by the 5x52 field's square root, the curve check and serialization.
+# by the 5x52 field's square root, the curve check and serialization,
+# and HD derivation's public tweak sum, Il*G + Q (`add_public_tweak`).
 # Only `src/secp256k1/backend.rs` names it, and k256's path stays behind
 # it as the fallback.  It has no dependencies of its own and needs only
 # core; its licence is ISC AND MIT (its NOTICE).
