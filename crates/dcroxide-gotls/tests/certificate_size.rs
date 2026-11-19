@@ -314,14 +314,18 @@ fn a_client_chain_over_32_kib_is_verified_and_accepted_as_go_accepts_it() {
 /// with most of it still to come, read `alert` or a reset: the server
 /// closes once it refuses, and the client's bytes still unread there, or
 /// arriving after the close, draw a reset from its system, which may
-/// reach the client before the alert does.
+/// reach the client before the alert does.  Windows names the reset
+/// "forcibly closed by the remote host" (WSAECONNRESET) or "aborted by
+/// the software in your host machine" (WSAECONNABORTED).
 fn assert_alert_or_reset(what: &str, detail: &Value, alert: &str) {
     assert_eq!(detail["ok"], false, "{what}: Go's client {detail}");
     let error = detail["error"].as_str().unwrap_or_default();
     assert!(
         error == alert
             || error.ends_with("connection reset by peer")
-            || error.ends_with("broken pipe"),
+            || error.ends_with("broken pipe")
+            || error.contains("forcibly closed by the remote host")
+            || error.contains("aborted by the software in your host machine"),
         "{what}: Go's client read {error}, not {alert} or a reset"
     );
 }
