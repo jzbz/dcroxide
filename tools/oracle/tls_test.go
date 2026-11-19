@@ -590,3 +590,170 @@ func TestTLSListenAndDial(t *testing.T) {
 		t.Errorf("%d servers left", left)
 	}
 }
+
+// TestTLSPKIDcrwallet makes dcrwallet's --issueclientcert authority and
+// client certificate on each --tlscurve and checks them against
+// dcrwallet's templates at its pin (rpcserver.go:133-209): the subject
+// names, the validity, the authority's certificate signing alone and the
+// client's lack of every usage and constraint, the signature algorithm
+// CreateCertificate defaults to, and the client verifying to the authority
+// as crypto/tls verifies a client certificate. A request that also sets a
+// field the template sets, an authority with an issuer and a client under
+// anything but a dcrwallet authority of the request are refused.
+func TestTLSPKIDcrwallet(t *testing.T) {
+	now := time.Now()
+	for curve, sigAlg := range map[string]x509.SignatureAlgorithm{
+		"Ed25519": x509.PureEd25519,
+		"P-256":   x509.ECDSAWithSHA256,
+		"P-384":   x509.ECDSAWithSHA384,
+		"P-521":   x509.ECDSAWithSHA512,
+	} {
+		pki := tlsPKIOf(t,
+			map[string]any{"name": "ca", "key": curve, "dcrwallet": "ca"},
+			map[string]any{"name": "client", "key": curve, "issuer": "ca", "dcrwallet": "client"},
+		)
+		// parsed holds the common name to the name it is given, which is
+		// dcrwallet's for both.
+		ca, _ := parsed(t, "dcrwallet", pki["ca"])
+		client, _ := parsed(t, "dcrwallet", pki["client"])
+		for what, ok := range map[string]bool{
+			"authority's names": ca.Subject.CommonName == "dcrwallet" &&
+				slices.Equal(ca.Subject.Organization, []string{"dcrwallet"}) &&
+				slices.Equal(ca.Subject.OrganizationalUnit, []string{"dcrwallet certificate authority"}),
+			"client's names": client.Subject.CommonName == "dcrwallet" &&
+				slices.Equal(client.Subject.Organization, []string{"dcrwallet"}) &&
+				slices.Equal(client.Subject.OrganizationalUnit, []string{"dcrwallet client certificate"}) &&
+				len(client.DNSNames) == 0 && len(client.IPAddresses) == 0,
+			"authority's constraints": ca.BasicConstraintsValid && ca.IsCA &&
+				ca.KeyUsage == x509.KeyUsageCertSign && len(ca.ExtKeyUsage) == 0,
+			"client's constraints": !client.BasicConstraintsValid && !client.IsCA &&
+				client.KeyUsage == 0 && len(client.ExtKeyUsage) == 0,
+			"authority's validity": ca.NotBefore.Before(now.Add(-23*time.Hour)) &&
+				ca.NotBefore.After(now.Add(-25*time.Hour)) &&
+				ca.NotAfter.Sub(ca.NotBefore) > 3650*24*time.Hour &&
+				ca.NotAfter.Sub(ca.NotBefore) < 3652*24*time.Hour,
+			"client's validity": client.NotAfter.Equal(ca.NotAfter) &&
+				client.NotBefore.Before(now.Add(-23*time.Hour)),
+			"signatures": ca.SignatureAlgorithm == sigAlg && client.SignatureAlgorithm == sigAlg,
+			"serials":    ca.SerialNumber.BitLen() <= 128 && client.SerialNumber.BitLen() <= 128,
+		} {
+			if !ok {
+				t.Errorf("%s: %s, authority %+v, client %+v", curve, what, ca, client)
+			}
+		}
+		roots := x509.NewCertPool()
+		roots.AddCert(ca)
+		if _, err := client.Verify(x509.VerifyOptions{
+			Roots: roots, KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+		}); err != nil {
+			t.Errorf("%s: the client does not verify to the authority: %v", curve, err)
+		}
+	}
+	for name, certs := range map[string][]map[string]any{
+		"a field the template sets": {{"name": "a", "key": "P-256", "dcrwallet": "ca", "ca": true}},
+		"an authority with an issuer": {
+			{"name": "a", "key": "P-256", "dcrwallet": "ca"},
+			{"name": "b", "key": "P-256", "dcrwallet": "ca", "issuer": "a"},
+		},
+		"a client under no authority": {{"name": "a", "key": "P-256", "dcrwallet": "client"}},
+		"a client under another authority": {
+			{"name": "a", "key": "P-256", "ca": true},
+			{"name": "b", "key": "P-256", "dcrwallet": "client", "issuer": "a"},
+		},
+		"an unknown template": {{"name": "a", "key": "P-256", "dcrwallet": "server"}},
+	} {
+		resp := call("tls_pki", jsonRequest(t, map[string]any{"certs": certs}))
+		if resp.Error == "" || len(resp.Detail) != 0 {
+			t.Errorf("%s: got %+v, want an error", name, resp)
+		}
+	}
+}
+
+// TestTLSALPNAndGRPC serves tls_listen's servers with next_protos and with
+// grpc to tls_dial's clients with next_protos: a protocol in common is
+// negotiated in the server's order and reported at both ends; an
+// http/1.1 client of an h2 server negotiates none, as crypto/tls lets it;
+// a client sharing no protocol is refused with no_application_protocol;
+// grpc adds h2 and drops the ECDHE CBC suites, which a plain server on
+// Go's defaults still takes; and a grpc server closes a completed
+// handshake that negotiated no protocol with grpc-go's error, while a
+// plain one answers it.
+func TestTLSALPNAndGRPC(t *testing.T) {
+	t.Setenv("GODEBUG", tlsGODEBUG)
+	pki := tlsPKIOf(t, map[string]any{
+		"name": "server", "key": "P-256", "eku": []string{"server_auth"},
+		"dns": []string{"localhost"}, "ip": []string{"127.0.0.1"},
+	})
+	request := map[string]any{"method": "POST", "path": "/", "body": "ping"}
+	serve := func(listen, dial map[string]any) (tlsDialDetail, tlsListenDetail) {
+		t.Helper()
+		listen["chain"], listen["key_pkcs8"] = []string{pki["server"].Cert}, pki["server"].KeyPKCS8
+		listen["response_body"] = "ok"
+		addr, id := tlsListenOf(t, listen)
+		dial["addr"], dial["server_name"], dial["request"] = addr, "localhost", request
+		dial["roots"] = []string{pki["server"].Cert}
+		return tlsDialOf(t, dial), tlsListenResultOf(t, id)
+	}
+	for _, tc := range []struct {
+		what         string
+		listen, dial map[string]any
+		ok           bool
+		protocol     string
+		dialError    string
+		listenError  string
+	}{
+		{"server order", map[string]any{"next_protos": []string{"b", "a"}},
+			map[string]any{"next_protos": []string{"a", "b"}}, true, "b", "", ""},
+		{"http/1.1 to h2", map[string]any{"next_protos": []string{"h2"}},
+			map[string]any{"next_protos": []string{"http/1.1"}}, true, "", "", ""},
+		{"none in common", map[string]any{"next_protos": []string{"h2"}},
+			map[string]any{"next_protos": []string{"spdy/3"}}, false, "",
+			"remote error: tls: no application protocol",
+			`tls: client requested unsupported application protocols (["spdy/3"])`},
+		{"grpc adds h2", map[string]any{"grpc": true},
+			map[string]any{"next_protos": []string{"h2"}}, true, "h2", "", ""},
+		{"grpc, no ALPN", map[string]any{"grpc": true}, map[string]any{}, false, "", "", tlsGRPCMissingALPN},
+		{"grpc, http/1.1", map[string]any{"grpc": true},
+			map[string]any{"next_protos": []string{"http/1.1"}}, false, "", "", tlsGRPCMissingALPN},
+		{"plain, no ALPN", map[string]any{}, map[string]any{}, true, "", "", ""},
+		{"grpc, a CBC suite", map[string]any{"grpc": true}, map[string]any{
+			"next_protos": []string{"h2"}, "max_version": "TLS 1.2",
+			"cipher_suites": []string{"TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA"},
+		}, false, "", "remote error: tls: handshake failure",
+			"tls: no cipher suite supported by both client and server; client offered: [c009]"},
+		{"plain, a CBC suite", map[string]any{}, map[string]any{
+			"max_version": "TLS 1.2", "cipher_suites": []string{"TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA"},
+		}, true, "", "", ""},
+	} {
+		got, served := serve(tc.listen, tc.dial)
+		if got.OK != tc.ok || served.OK != tc.ok || got.NegotiatedProtocol != tc.protocol ||
+			served.NegotiatedProtocol != tc.protocol {
+			t.Errorf("%s: dial %+v, listen %+v", tc.what, got, served)
+		}
+		if tc.dialError != "" && got.Error != tc.dialError {
+			t.Errorf("%s: dial error %q, want %q", tc.what, got.Error, tc.dialError)
+		}
+		if tc.listenError != "" && served.Error != tc.listenError {
+			t.Errorf("%s: listen error %q, want %q", tc.what, served.Error, tc.listenError)
+		}
+		// The grpc server's refusal comes after a completed handshake.
+		if tc.listenError == tlsGRPCMissingALPN && (got.Version == "" || served.Version == "") {
+			t.Errorf("%s: dial %+v, listen %+v, want a completed handshake", tc.what, got, served)
+		}
+	}
+	for name, fields := range map[string]map[string]any{
+		"listen: grpc not a bool":        {"grpc": "yes"},
+		"listen: next_protos not a list": {"next_protos": "h2"},
+	} {
+		fields["chain"], fields["key_pkcs8"] = []string{pki["server"].Cert}, pki["server"].KeyPKCS8
+		if resp := call("tls_listen", jsonRequest(t, fields)); resp.Error == "" {
+			t.Errorf("%s: got %+v, want an error", name, resp)
+		}
+	}
+	tlsListenersMu.Lock()
+	left := len(tlsListeners)
+	tlsListenersMu.Unlock()
+	if left != 0 {
+		t.Errorf("%d servers left", left)
+	}
+}

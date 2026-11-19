@@ -257,7 +257,10 @@
 //	                     "sig_alg": x509 name, "ca": bool, "eku":
 //	                     ["server_auth" | "client_auth" | "any"], "dns":
 //	                     [name], "ip": [address], "not_before",
-//	                     "not_after": unix seconds}]}; each certificate
+//	                     "not_after": unix seconds, "dcrwallet": "ca" |
+//	                     "client", dcrwallet's own --issueclientcert
+//	                     template in place of the other fields but "key"
+//	                     and, for a client, "issuer"}]}; each certificate
 //	                     made by x509.CreateCertificate, in order, over
 //	                     a key generated here or, for RSA, the caller's;
 //	                     {"detail": {name: {"cert", "key_pkcs8": hex,
@@ -268,6 +271,7 @@
 //	                     "max_version": tls.VersionName, "cipher_suites":
 //	                     [tls.CipherSuiteName of TLS 1.2 or earlier],
 //	                     "curve_preferences": [CurveID name],
+//	                     "next_protos": [ALPN protocol],
 //	                     "client_cert": {"chain": [hex DER], "key_pkcs8":
 //	                     hex}, only with "request": {"method", "path",
 //	                     "headers": {name: value}, "body"}, "timeout_ms"};
@@ -275,13 +279,18 @@
 //	                     HTTP request over it, "ok" true only if both
 //	                     succeed; {"detail": {"ok", "error", "version",
 //	                     "cipher_suite", "curve_id", "hello_retry_request",
+//	                     "negotiated_protocol" (when one was),
 //	                     "did_resume", "http_status", "http_body"}} with
 //	                     "go_version": runtime.Version()
 //	tls_listen         → data is JSON {"chain": [hex DER], "key_pkcs8":
 //	                     hex, "min_version", "max_version",
-//	                     "cipher_suites", "curve_preferences" as tls_dial
-//	                     takes them, "client_auth": tls.ClientAuthType
-//	                     name, "client_cas": [hex DER], "response_body",
+//	                     "cipher_suites", "curve_preferences",
+//	                     "next_protos" as tls_dial takes them,
+//	                     "client_auth": tls.ClientAuthType
+//	                     name, "client_cas": [hex DER], "grpc": bool,
+//	                     the configuration passed through grpc-go's
+//	                     credentials.NewTLS and its ServerHandshake's
+//	                     ALPN check, "response_body",
 //	                     "timeout_ms"}; a crypto/tls server on loopback
 //	                     that serves one connection in the background;
 //	                     {"result": "<host:port>", "detail": {"id"}} with
@@ -289,6 +298,7 @@
 //	tls_listen_result  → data is JSON {"id"}; once that server is done,
 //	                     {"detail": {"ok", "error", "version",
 //	                     "cipher_suite", "curve_id", "hello_retry_request",
+//	                     "negotiated_protocol" (when one was),
 //	                     "peer_certificates", "verified_chains",
 //	                     "client_hello": {"cipher_suites",
 //	                     "supported_curves", "signature_schemes",

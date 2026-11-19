@@ -247,6 +247,7 @@ type tlsPKICert struct {
 	IP        []string       `json:"ip"`
 	NotBefore int64          `json:"not_before"`
 	NotAfter  int64          `json:"not_after"`
+	Dcrwallet string         `json:"dcrwallet"`
 }
 
 // tlsPKIEntry is a certificate tls_pki made, with its key.
@@ -345,11 +346,80 @@ func tlsPKITemplate(c tlsPKICert, now time.Time) (*x509.Certificate, error) {
 	return template, nil
 }
 
+// tlsPKIDcrwalletEndOfTime is dcrwallet's endOfTime, the latest NotAfter
+// its authority takes (rpcserver.go:124-125 at the wallet's pin,
+// decred.org/dcrwallet/v5 v5.0.1-0.20261105142009-54b85b336077).
+var tlsPKIDcrwalletEndOfTime = time.Date(2049, 12, 31, 23, 59, 59, 0, time.UTC)
+
+// tlsPKIDcrwalletTemplate is the template dcrwallet's --issueclientcert
+// makes a certificate from, at the wallet's pin: for "ca" the authority's
+// of generateAuthority (rpcserver.go:133-160), self-signed, valid from a
+// day ago for ten years capped at endOfTime, with certificate signing as
+// its only key usage, explicit basic constraints and no extended key
+// usage; for "client" the client certificate's of createSignedClientCert
+// (:193-203), valid from a day ago until its authority's NotAfter, with no
+// key usage, no extended key usage, no basic constraints and no names. The
+// serial is randomX509SerialNumber's, below 2^128 (:118-122), and the
+// signature algorithm x509.CreateCertificate's default for the issuer's
+// key, as dcrwallet leaves it. Every other field of the request must be
+// empty, since dcrwallet sets none of them, but "key", the --tlscurve
+// both keys are generated on, and "issuer", which a client must name and
+// which must be a "ca" of this request.
+func tlsPKIDcrwalletTemplate(c tlsPKICert, issuer *x509.Certificate, now time.Time) (*x509.Certificate, error) {
+	if c.RSA != nil || c.SigAlg != "" || c.CA || len(c.EKU) != 0 || len(c.DNS) != 0 || len(c.IP) != 0 ||
+		c.NotBefore != 0 || c.NotAfter != 0 {
+		return nil, errors.New("dcrwallet: a field dcrwallet's template sets")
+	}
+	serial, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
+	if err != nil {
+		return nil, err
+	}
+	switch c.Dcrwallet {
+	case "ca":
+		if c.Issuer != "" {
+			return nil, errors.New("dcrwallet: an authority is self-signed")
+		}
+		validUntil := now.Add(time.Hour * 24 * 365 * 10)
+		if validUntil.After(tlsPKIDcrwalletEndOfTime) {
+			validUntil = tlsPKIDcrwalletEndOfTime
+		}
+		return &x509.Certificate{
+			SerialNumber: serial,
+			Subject: pkix.Name{
+				CommonName:         "dcrwallet",
+				Organization:       []string{"dcrwallet"},
+				OrganizationalUnit: []string{"dcrwallet certificate authority"},
+			},
+			NotBefore:             now.Add(-time.Hour * 24),
+			NotAfter:              validUntil,
+			KeyUsage:              x509.KeyUsageCertSign,
+			BasicConstraintsValid: true,
+			IsCA:                  true,
+		}, nil
+	case "client":
+		if issuer == nil {
+			return nil, errors.New("dcrwallet: a client certificate's issuer is a dcrwallet authority of this request")
+		}
+		return &x509.Certificate{
+			SerialNumber: serial,
+			NotBefore:    now.Add(-time.Hour * 24),
+			NotAfter:     issuer.NotAfter,
+			Subject: pkix.Name{
+				CommonName:         "dcrwallet",
+				Organization:       []string{"dcrwallet"},
+				OrganizationalUnit: []string{"dcrwallet client certificate"},
+			},
+		}, nil
+	}
+	return nil, fmt.Errorf("dcrwallet: unknown template %q", c.Dcrwallet)
+}
+
 // tlsPKI answers tls_pki: the certificates in the order given, each signed
 // by its issuer, an earlier certificate of the request, or by its own key
 // when it names none, with the issuer's signature algorithm sig_alg or
 // x509.CreateCertificate's default for the key. Each certificate and key
-// comes back in hex DER and in PEM.
+// comes back in hex DER and in PEM. A certificate naming a dcrwallet
+// template is made from it instead (tlsPKIDcrwalletTemplate).
 func tlsPKI(data []byte) response {
 	var in struct {
 		Certs []tlsPKICert `json:"certs"`
@@ -358,8 +428,9 @@ func tlsPKI(data []byte) response {
 		return errResp("tls_pki: %v", err)
 	}
 	type made struct {
-		cert *x509.Certificate
-		key  crypto.Signer
+		cert      *x509.Certificate
+		key       crypto.Signer
+		dcrwallet string
 	}
 	byName := make(map[string]made, len(in.Certs))
 	out := make(map[string]tlsPKIEntry, len(in.Certs))
@@ -375,7 +446,16 @@ func tlsPKI(data []byte) response {
 		if err != nil {
 			return errResp("tls_pki: %s: %v", c.Name, err)
 		}
-		template, err := tlsPKITemplate(c, now)
+		var template *x509.Certificate
+		if c.Dcrwallet != "" {
+			var walletCA *x509.Certificate
+			if issuer, ok := byName[c.Issuer]; ok && issuer.dcrwallet == "ca" {
+				walletCA = issuer.cert
+			}
+			template, err = tlsPKIDcrwalletTemplate(c, walletCA, now)
+		} else {
+			template, err = tlsPKITemplate(c, now)
+		}
 		if err != nil {
 			return errResp("tls_pki: %s: %v", c.Name, err)
 		}
@@ -399,7 +479,7 @@ func tlsPKI(data []byte) response {
 		if err != nil {
 			return errResp("tls_pki: %s: %v", c.Name, err)
 		}
-		byName[c.Name] = made{cert, key}
+		byName[c.Name] = made{cert, key, c.Dcrwallet}
 		out[c.Name] = tlsPKIEntry{
 			Cert:     hex.EncodeToString(der),
 			CertPEM:  string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})),
@@ -424,8 +504,9 @@ type tlsRequest struct {
 
 // tlsDialDetail is tls_dial's answer: whether the handshake and the
 // request, when there is one, both succeeded, the first error otherwise,
-// the connection's state, the signature schemes of the server's
-// CertificateRequest by Go's names, as Go's client reads them in
+// the connection's state, the application protocol it negotiated once its
+// handshake completed, left out when none was, the signature schemes of
+// the server's CertificateRequest by Go's names, as Go's client reads them in
 // CertificateRequestInfo.SignatureSchemes, or null when it sent none, and
 // the response. In TLS 1.3 that is the list as sent; in TLS 1.2 Go keeps,
 // in their order, only the schemes it knows that fit the request's
@@ -435,6 +516,7 @@ type tlsDialDetail struct {
 	OK    bool   `json:"ok"`
 	Error string `json:"error"`
 	tlsState
+	NegotiatedProtocol string   `json:"negotiated_protocol,omitempty"`
 	DidResume          bool     `json:"did_resume"`
 	CertificateRequest []string `json:"certificate_request"`
 	HTTPStatus         int      `json:"http_status"`
@@ -462,6 +544,7 @@ func tlsDial(data []byte) response {
 		MaxVersion       string       `json:"max_version"`
 		CipherSuites     []string     `json:"cipher_suites"`
 		CurvePreferences []string     `json:"curve_preferences"`
+		NextProtos       []string     `json:"next_protos"`
 		ClientCert       *tlsIdentity `json:"client_cert"`
 		Request          *tlsRequest  `json:"request"`
 		TimeoutMS        int64        `json:"timeout_ms"`
@@ -480,7 +563,7 @@ func tlsDial(data []byte) response {
 	if err != nil {
 		return errResp("tls_dial: %v", err)
 	}
-	config := &tls.Config{ServerName: in.ServerName}
+	config := &tls.Config{ServerName: in.ServerName, NextProtos: in.NextProtos}
 	if config.RootCAs, err = tlsCertPool(in.Roots); err != nil {
 		return errResp("tls_dial: roots: %v", err)
 	}
@@ -562,6 +645,9 @@ func tlsDialOnce(addr string, config *tls.Config, req *http.Request, deadline ti
 	err = conn.Handshake()
 	state := conn.ConnectionState()
 	detail.tlsState = tlsStateOf(state)
+	if state.HandshakeComplete {
+		detail.NegotiatedProtocol = state.NegotiatedProtocol
+	}
 	detail.DidResume = state.DidResume
 	if err != nil || req == nil {
 		return err
@@ -623,24 +709,81 @@ func tlsClientHelloOf(chi *tls.ClientHelloInfo) *tlsClientHello {
 
 // tlsListenDetail is tls_listen_result's answer: whether the connection
 // was accepted, its handshake completed and its one HTTP request answered,
-// the first error otherwise, the connection's state, the client's
-// certificates and the chains Go verified them to, in hex DER, and the
-// client's first ClientHello.
+// the first error otherwise, the connection's state, the application
+// protocol it negotiated once its handshake completed, left out when none
+// was, the client's certificates and the chains Go verified them to, in
+// hex DER, and the client's first ClientHello.
 type tlsListenDetail struct {
 	OK    bool   `json:"ok"`
 	Error string `json:"error"`
 	tlsState
-	PeerCertificates []string        `json:"peer_certificates"`
-	VerifiedChains   [][]string      `json:"verified_chains"`
-	ClientHello      *tlsClientHello `json:"client_hello"`
+	NegotiatedProtocol string          `json:"negotiated_protocol,omitempty"`
+	PeerCertificates   []string        `json:"peer_certificates"`
+	VerifiedChains     [][]string      `json:"verified_chains"`
+	ClientHello        *tlsClientHello `json:"client_hello"`
 }
 
 // tlsListener is a tls_listen server: its detail is written by its
-// goroutine alone, and read once done is closed.
+// goroutine alone, and read once done is closed. grpc says whether it
+// makes grpc-go's ALPN check after the handshake (tlsGRPCServerHandshake).
 type tlsListener struct {
 	done   chan struct{}
 	detail tlsListenDetail
+	grpc   bool
 }
+
+// tlsGRPCForbiddenSuites are the suites grpc-go removes from
+// tls.CipherSuites() when a configuration names none, those RFC 7540
+// Appendix A forbids for HTTP/2 (tls12ForbiddenCipherSuites,
+// google.golang.org/grpc v1.83.2 credentials/tls.go:207-217, the version
+// dcrwallet's go.mod requires at its pin).
+var tlsGRPCForbiddenSuites = []uint16{
+	tls.TLS_RSA_WITH_AES_128_CBC_SHA,
+	tls.TLS_RSA_WITH_AES_256_CBC_SHA,
+	tls.TLS_RSA_WITH_AES_128_GCM_SHA256,
+	tls.TLS_RSA_WITH_AES_256_GCM_SHA384,
+	tls.TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA,
+	tls.TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA,
+	tls.TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA,
+	tls.TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA,
+}
+
+// tlsGRPCDefaults applies to config what grpc-go v1.83.2's
+// credentials.NewTLS does to the tls.Config dcrwallet's gRPC listener
+// passes it (applyDefaults, credentials/tls.go:236-256): "h2" appended to
+// NextProtos unless it is there (internal/credentials/util.go:28-37);
+// MinVersion TLS 1.2 when neither bound is set below it; and, when no
+// suites are named, tls.CipherSuites() less tlsGRPCForbiddenSuites, which
+// leaves the six ECDHE suites with AES-GCM or ChaCha20-Poly1305 for TLS
+// 1.2 and drops Go's default ECDHE CBC suites. crypto/tls still orders
+// the suites by its own preference (Config.cipherSuites,
+// crypto/tls/common.go). NewTLS works on a shallow copy, which changes
+// nothing here, where the configuration is the server's alone.
+func tlsGRPCDefaults(config *tls.Config) {
+	if !slices.Contains(config.NextProtos, "h2") {
+		config.NextProtos = append(slices.Clip(config.NextProtos), "h2")
+	}
+	if config.MinVersion == 0 && (config.MaxVersion == 0 || config.MaxVersion >= tls.VersionTLS12) {
+		config.MinVersion = tls.VersionTLS12
+	}
+	if config.CipherSuites == nil {
+		for _, cs := range tls.CipherSuites() {
+			if !slices.Contains(tlsGRPCForbiddenSuites, cs.ID) {
+				config.CipherSuites = append(config.CipherSuites, cs.ID)
+			}
+		}
+	}
+}
+
+// tlsGRPCMissingALPN is the error grpc-go v1.83.2's ServerHandshake
+// returns, after closing the connection, for a handshake that negotiated
+// no application protocol, with GRPC_ENFORCE_ALPN_ENABLED at its default
+// of true (credentials/tls.go:35, :168-185;
+// internal/envconfig/envconfig.go:53).
+const tlsGRPCMissingALPN = "credentials: cannot check peer: missing selected ALPN property. " +
+	"If you upgraded from a grpc-go version earlier than 1.67, your TLS connections may have " +
+	"stopped working due to ALPN enforcement. For more details, see: " +
+	"https://github.com/grpc/grpc-go/issues/434"
 
 // The servers tls_listen started whose results tls_listen_result has not
 // taken, by id.
@@ -657,7 +800,11 @@ var (
 // timeout, after which the listener is closed whether or not a client
 // came. The server's ClientHelloInfo is taken in GetConfigForClient, which
 // crypto/tls calls for the first ClientHello alone
-// (crypto/tls/handshake_server.go:166-176), and changes nothing.
+// (crypto/tls/handshake_server.go:166-176), and changes nothing. With grpc
+// the configuration is first passed through what grpc-go's
+// credentials.NewTLS does to it (tlsGRPCDefaults), and a completed
+// handshake that negotiated no protocol is closed as grpc-go's
+// ServerHandshake closes it.
 func tlsListen(data []byte) response {
 	var in struct {
 		tlsIdentity
@@ -665,8 +812,10 @@ func tlsListen(data []byte) response {
 		MaxVersion       string   `json:"max_version"`
 		CipherSuites     []string `json:"cipher_suites"`
 		CurvePreferences []string `json:"curve_preferences"`
+		NextProtos       []string `json:"next_protos"`
 		ClientAuth       string   `json:"client_auth"`
 		ClientCAs        []string `json:"client_cas"`
+		GRPC             bool     `json:"grpc"`
 		ResponseBody     string   `json:"response_body"`
 		TimeoutMS        int64    `json:"timeout_ms"`
 	}
@@ -681,7 +830,7 @@ func tlsListen(data []byte) response {
 	if err != nil {
 		return errResp("tls_listen: %v", err)
 	}
-	config := &tls.Config{Certificates: []tls.Certificate{cert}}
+	config := &tls.Config{Certificates: []tls.Certificate{cert}, NextProtos: in.NextProtos}
 	if config.MinVersion, err = tlsVersion(in.MinVersion); err != nil {
 		return errResp("tls_listen: min_version: %v", err)
 	}
@@ -700,9 +849,13 @@ func tlsListen(data []byte) response {
 	if config.ClientCAs, err = tlsCertPool(in.ClientCAs); err != nil {
 		return errResp("tls_listen: client_cas: %v", err)
 	}
+	if in.GRPC {
+		tlsGRPCDefaults(config)
+	}
 	l := &tlsListener{
 		done:   make(chan struct{}),
 		detail: tlsListenDetail{PeerCertificates: []string{}, VerifiedChains: [][]string{}},
+		grpc:   in.GRPC,
 	}
 	config.GetConfigForClient = func(chi *tls.ClientHelloInfo) (*tls.Config, error) {
 		l.detail.ClientHello = tlsClientHelloOf(chi)
@@ -758,6 +911,9 @@ func (l *tlsListener) serveOne(ln *net.TCPListener, config *tls.Config, body str
 	err = conn.Handshake()
 	state := conn.ConnectionState()
 	l.detail.tlsState = tlsStateOf(state)
+	if state.HandshakeComplete {
+		l.detail.NegotiatedProtocol = state.NegotiatedProtocol
+	}
 	for _, cert := range state.PeerCertificates {
 		l.detail.PeerCertificates = append(l.detail.PeerCertificates, hex.EncodeToString(cert.Raw))
 	}
@@ -770,6 +926,14 @@ func (l *tlsListener) serveOne(ln *net.TCPListener, config *tls.Config, body str
 	}
 	if err != nil {
 		return err
+	}
+	// grpc-go's ServerHandshake: a handshake that negotiated no protocol
+	// is closed, which the deferred Close does, with close_notify. grpc-go
+	// then reads HTTP/2 over a connection it keeps; this server reads the
+	// HTTP/1.1 request tls_dial sends whatever was negotiated, so only the
+	// TLS ends are grpc-go's.
+	if l.grpc && state.NegotiatedProtocol == "" {
+		return errors.New(tlsGRPCMissingALPN)
 	}
 	req, err := http.ReadRequest(bufio.NewReader(conn))
 	if err != nil {
