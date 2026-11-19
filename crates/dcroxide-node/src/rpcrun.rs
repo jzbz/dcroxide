@@ -7263,7 +7263,7 @@ mod tests {
             v4(8, 1, [127, 0, 0, 1]),
             // A down link keeps its address, which the local table drops.
             v4(24, 2, [10, 0, 0, 95]),
-            v4(32, 5, [100, 79, 193, 115]),
+            v4(32, 5, [198, 51, 100, 5]),
             // A point-to-point peer is skipped for the local address.
             netlink_msg(
                 netlink::RTM_NEWADDR,
@@ -7294,7 +7294,7 @@ mod tests {
             [
                 "127.0.0.1/8",
                 "10.0.0.95/24",
-                "100.79.193.115/32",
+                "198.51.100.5/32",
                 "10.0.0.1/32",
                 "::1/128",
                 "fe80::7/64",
