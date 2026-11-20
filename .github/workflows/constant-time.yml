@@ -1,8 +1,10 @@
 name: Constant time
 
 # dcroxide-tlscrypto's timing check (ADR-0015 T10): dudect's fixed-against-
-# random t-test, in tree in crates/dcroxide-tlscrypto/src/ct_check.rs, on
-# ECDSA and Ed25519 signing, the four key exchanges, the three AEADs,
+# random t-test, its targets in tree in
+# crates/dcroxide-tlscrypto/src/ct_check.rs on the shared harness in
+# crates/dcroxide-testutil/src/ct.rs (ADR-0015's addendum of 2026-11-20),
+# on ECDSA and Ed25519 signing, the four key exchanges, the three AEADs,
 # AES-GCM's keying and HMAC, with a positive control that must be found. A
 # workflow of its own, apart from ci.yml: it times code, so its jobs run
 # nothing else, and a change to the provider runs it without waiting on the
@@ -11,9 +13,10 @@ name: Constant time
 # The paths are what changes the timed binary or the harness: the crate,
 # the lock (a dependency's version), the pinned compiler and the root
 # manifest's release profile (codegen, which can turn a constant-time
-# select into a branch), dcroxide-testutil (the generator that draws the
-# classes), dcroxide-crypto (a normal dependency of the crate, linked into
-# the timed binary, whose features on chacha20 merge with the AEAD's), the
+# select into a branch), dcroxide-testutil (the harness and the generator
+# that draws the classes), dcroxide-crypto (a normal dependency of the
+# crate, linked into the timed binary, whose features on chacha20 merge
+# with the AEAD's), the
 # DIT probe the arm64 jobs run (.github/dit-probe.rs), the library that
 # switches DIT on for a dispatch that asks for it (.github/dit-on.rs), and
 # this file.
@@ -173,8 +176,9 @@ jobs:
         --cfg curve25519_dalek_backend="serial"' || '' }}
       # Each target's budget in seconds: a screen on pushes and pull
       # requests, and six times as long nightly and on dispatch, which
-      # makes up for each fixed class's share of the samples, about
-      # 1/(2K) of them with K fixed classes. A dispatch can set its own.
+      # makes up for each fixed class's share of the samples, 1/(K + 1) of
+      # them with K fixed classes, the random class's share too. A
+      # dispatch can set its own.
       DCROXIDE_CT_SECONDS: ${{ github.event_name == 'workflow_dispatch' && (inputs.seconds || '60') || github.event_name == 'schedule' && '60' || '10' }}
       # The one target a dispatch picks, or empty for every target.
       CT_TARGET: ${{ inputs.target }}
@@ -278,8 +282,9 @@ jobs:
       # failure's message gives.
       # Those lines end with the target's trace, which a failure's message
       # carries too: a line marked "ct_check run |" with the fixed crop's
-      # name, the segments' length and the addresses of the harness's code
-      # and of the first chunk of inputs; one marked "ct_check random |"
+      # name, the segments' length, the addresses of the harness's code
+      # and of the first chunk of inputs, and the processors the thread
+      # may run on; one marked "ct_check random |"
       # with the random class's mean nanoseconds an operation uncropped, in
       # crop 32 (about nine tenths of the samples) and in each of six equal
       # segments of the counted time (about 10 s each at 60 s); and for
@@ -411,14 +416,14 @@ jobs:
       # pull requests, 60 s nightly and on dispatch unless it says. At
       # 10 s the harness takes about 600,000 samples of the 15 µs
       # multiply on an x86_64 desktop (about 485,000 at 19 µs on a busy
-      # one), and 230,000 to 400,000 of a 25 to 40 µs signature. dcrec's
-      # copy of the harness gives the random class and each fixed class
-      # the same share, so each of the multiply's 25 classes (24 fixed,
-      # the placebo among them) gets about 24,000 samples: a comparison
-      # of 24,000 against 24,000 is as precise as the 12,500 against
-      # 300,000 of half the samples random, and a neighbour's bursts on
-      # the pinned processor cannot lean a small class against a large
-      # one. The planted leaks of ADR-0017's second addendum of
+      # one), and 230,000 to 400,000 of a 25 to 40 µs signature. The
+      # shared harness gives the random class and each fixed class the
+      # same share, in both jobs, so each of the multiply's 25 classes
+      # (24 fixed, the placebo among them) gets about 24,000 samples: a
+      # comparison of 24,000 against 24,000 is as precise as the 12,500
+      # against 300,000 of half the samples random, and a neighbour's
+      # bursts on the pinned processor cannot lean a small class against
+      # a large one. The planted leaks of ADR-0017's second addendum of
       # 2026-11-19 measure what that finds, and the nightly's six times
       # as many samples see differences about 2.4 times smaller. The
       # control's |t| follows a run's load more than its budget: about 50

@@ -1,16 +1,14 @@
 // SPDX-License-Identifier: ISC
 //! dudect's fixed-against-random timing test (Reparaz, Balasch and
 //! Verbauwhede, "Dude, is my code constant time?", 2017), shared by the
-//! crates that time their secret-dependent code: `dcroxide-dcrec`'s
-//! `ct_check` module times its secp256k1 and Ed25519 secrets on it.  It is
-//! `dcroxide-tlscrypto`'s harness (`crates/dcroxide-tlscrypto/src/ct_check.rs`,
-//! ADR-0015 T10) with that crate's targets and its one known report left
-//! there, so that each crate keeps its own targets and classes and the
-//! measurement and the verdict are one piece of code with one set of tests.
-//! `dcroxide-tlscrypto` still has its own copy; folding it onto this one
-//! needs the known report as a parameter of [`Report`].  That copy still
-//! gives the random class half of the samples, which the equal shares
-//! below replace here.
+//! crates that time their secret-dependent code: `dcroxide-tlscrypto`'s
+//! `ct_check` module (ADR-0015 T10) times its provider's secrets on it,
+//! and `dcroxide-dcrec`'s its secp256k1 and Ed25519 secrets.  It began as
+//! `dcroxide-tlscrypto`'s own harness, which gave the random class half of
+//! the samples; each crate keeps its own targets and classes, and the
+//! measurement and the verdict are one piece of code with one set of
+//! tests.  A target known to report on one architecture says so through
+//! [`Report::with_known_report`].
 //!
 //! An operation is timed with `std::time::Instant` on inputs of fixed
 //! classes and of a random class, interleaved, and Welch's t-test asks
@@ -65,6 +63,14 @@
 //!   reported as under the floor, and above [`T_REPORT`], 4.5, it is
 //!   reported; both pass.  A positive control must fail by the same rule
 //!   ([`Report::assert_leak_found`]), or the run fails.
+//! * **A known report.**  A crate can name, for one target, a failure it
+//!   has measured and judged ([`KnownReport`]): on the architecture the
+//!   binary is built for, a failure in which every comparison that fails
+//!   has the fixed class quicker than the random class, by the report's
+//!   bound or less, passes, and its row and its failing classes' lines
+//!   say so where they would say LEAK.  A class slower than the random
+//!   class, a difference beyond the bound, any other architecture and any
+//!   target that names no known report fail as before.
 //! * **A trace for reading a failure against other runs.**  Each target
 //!   prints, whatever its verdict, each class's t and difference in the
 //!   uncropped test and in crop 32 ([`FIXED_CROP`]), its t in each of six
@@ -551,6 +557,11 @@ enum Verdict {
     /// A |t| above [`T_FAIL`] on a difference of [`MIN_FAIL_NANOS`] an
     /// operation or more.
     Leak,
+    /// A leak that is the target's known report ([`Report::is_known_report`]):
+    /// every comparison that fails is quicker than the random class by the
+    /// bound it carries, in nanoseconds an operation, or less.  Reported,
+    /// and a pass.
+    Known(u32),
     /// No comparison had [`MIN_SAMPLES`] on each side.
     TooFew,
 }
@@ -563,6 +574,7 @@ impl Verdict {
             Verdict::Reported => "reported".to_owned(),
             Verdict::UnderFloor => format!("reported (under the {MIN_FAIL_NANOS} ns floor)"),
             Verdict::Leak => "LEAK".to_owned(),
+            Verdict::Known(bound) => format!("known report (quicker by {bound} ns or less)"),
             Verdict::TooFew => "TOO FEW SAMPLES".to_owned(),
         }
     }
@@ -586,6 +598,22 @@ fn verdict(t: f64, difference: f64) -> Verdict {
     }
 }
 
+/// A failure a target is known to show on one architecture, measured and
+/// judged by the crate that times it, which passes when it keeps to its
+/// pattern: every comparison that fails has the fixed class quicker than
+/// the random class, its t and its difference both below zero, by
+/// `bound_nanos` an operation or less ([`Report::with_known_report`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KnownReport {
+    /// The architecture the binary must be built for, as
+    /// `std::env::consts::ARCH` names it.
+    pub arch: &'static str,
+    /// How much quicker than the random class, in whole nanoseconds an
+    /// operation, a failing comparison can be and still be the known
+    /// report.
+    pub bound_nanos: u32,
+}
+
 /// A target's result: each fixed class's comparisons, and the run, from
 /// [`time_target`] or [`time_inputs`].  [`Report::assert_constant_time`]
 /// judges a target and [`Report::assert_leak_found`] a positive control.
@@ -601,6 +629,11 @@ pub struct Report {
     warm_up: usize,
     seconds: f64,
     trace: Trace,
+    /// The architecture the run's binary was built for,
+    /// `std::env::consts::ARCH`, against which a known report's is matched.
+    arch: &'static str,
+    /// The target's known report, if it names one.
+    known: Option<KnownReport>,
 }
 
 /// What a target's trace lines give besides its verdict, so that a failure
@@ -663,7 +696,23 @@ impl Report {
                 inputs: measured.inputs_at,
                 cpus: allowed_cpus(fs::read_to_string("/proc/self/status").ok().as_deref()),
             },
+            arch: env::consts::ARCH,
+            known: None,
         }
+    }
+
+    /// The report with `known` as its target's known report, or with none
+    /// for `None`: a leak keeps to it when the binary was built for its
+    /// architecture and every comparison of every class that fails has the
+    /// fixed class quicker than the random class, its t and its difference
+    /// both below zero, by its bound or less; such a leak then passes under
+    /// a verdict of its own, which the row and the failing classes' lines
+    /// give.  A comparison of a t or a difference that is not a number is
+    /// never quicker.
+    #[must_use]
+    pub fn with_known_report(mut self, known: Option<KnownReport>) -> Report {
+        self.known = known;
+        self
     }
 
     /// The comparison that decides the verdict of the fixed class whose
@@ -707,10 +756,43 @@ impl Report {
     }
 
     /// The target's verdict: that of the comparison that decides it
-    /// ([`Report::deciding`]).
+    /// ([`Report::deciding`]), as [`Report::known`] gives it.
     fn verdict(&self) -> Verdict {
-        self.deciding()
-            .map_or(Verdict::TooFew, |(_, c)| self.verdict_of(&c))
+        self.known(
+            self.deciding()
+                .map_or(Verdict::TooFew, |(_, c)| self.verdict_of(&c)),
+        )
+    }
+
+    /// `verdict`, but a leak is [`Verdict::Known`] when the report is its
+    /// target's known report ([`Report::is_known_report`]).
+    fn known(&self, verdict: Verdict) -> Verdict {
+        match self.known {
+            Some(known) if verdict == Verdict::Leak && self.is_known_report() => {
+                Verdict::Known(known.bound_nanos)
+            }
+            _ => verdict,
+        }
+    }
+
+    /// Whether a failure of this report is its target's known report: the
+    /// target names one ([`Report::with_known_report`]), the binary was
+    /// built for its architecture, and every comparison of every class
+    /// that fails, not only those that decide a class, has the fixed class
+    /// quicker than the random class, t and difference both below zero, by
+    /// the report's bound an operation or less.  A comparison of a t or a
+    /// difference that is not a number is never quicker.
+    fn is_known_report(&self) -> bool {
+        self.known.is_some_and(|known| {
+            let bound = f64::from(known.bound_nanos);
+            self.arch == known.arch
+                && self
+                    .by_class
+                    .iter()
+                    .flatten()
+                    .filter(|c| self.verdict_of(c) == Verdict::Leak)
+                    .all(|c| c.t < 0.0 && (-bound..0.0).contains(&self.per_op(c).1))
+        })
     }
 
     /// The verdict on `c`, its t and its difference an operation.
@@ -756,7 +838,8 @@ impl Report {
     }
 
     /// Every fixed class's deciding comparison and its verdict, a line
-    /// each, and the run, followed by the trace
+    /// each, a class that fails marked as the known report when the target
+    /// is one ([`Report::known`]), and the run, followed by the trace
     /// ([`Report::trace_lines`]).
     fn detail(&self) -> String {
         let mut out = format!(
@@ -775,7 +858,7 @@ impl Report {
                         test_name(c.test),
                         c.fixed,
                         c.random,
-                        self.verdict_of(&c).word()
+                        self.known(self.verdict_of(&c)).word()
                     )
                 }
                 None => format!("  {name}: no test with {MIN_SAMPLES} samples on each side\n"),
@@ -867,8 +950,9 @@ impl Report {
 
     /// Prints the row, and the detail when the target passes, and fails
     /// when a fixed class has a comparison of |t| above [`T_FAIL`] on a
-    /// difference of [`MIN_FAIL_NANOS`] an operation or more, or when no
-    /// comparison had the samples to count.  Returns what it printed.
+    /// difference of [`MIN_FAIL_NANOS`] an operation or more, unless that
+    /// is the target's known report ([`Report::with_known_report`]), or when
+    /// no comparison had the samples to count.  Returns what it printed.
     ///
     /// # Panics
     ///
@@ -878,12 +962,12 @@ impl Report {
         let verdict = self.verdict();
         let passed = matches!(
             verdict,
-            Verdict::Pass | Verdict::Reported | Verdict::UnderFloor
+            Verdict::Pass | Verdict::Reported | Verdict::UnderFloor | Verdict::Known(_)
         );
         let printed = self.printed(&verdict.word(), passed);
         print!("{printed}");
         match verdict {
-            Verdict::Pass | Verdict::Reported | Verdict::UnderFloor => printed,
+            Verdict::Pass | Verdict::Reported | Verdict::UnderFloor | Verdict::Known(_) => printed,
             Verdict::Leak => panic!(
                 "{}: a fixed class's time differs from the random class's, |t| above {T_FAIL} \
                  and by {MIN_FAIL_NANOS} ns an operation or more\n{}",
@@ -1312,6 +1396,8 @@ mod tests {
             warm_up: 0,
             seconds: 0.0,
             trace: Trace::default(),
+            arch: "x86_64",
+            known: None,
         };
         assert_eq!(
             report.row("pass"),
@@ -1581,6 +1667,8 @@ mod tests {
             warm_up: 0,
             seconds: 0.0,
             trace: Trace::default(),
+            arch: "x86_64",
+            known: None,
         };
         let deciding = |report: &Report| report.deciding().map(|(class, _)| class);
         let mixed = report(vec![
@@ -1675,6 +1763,8 @@ mod tests {
             warm_up: 0,
             seconds: 0.0,
             trace: Trace::default(),
+            arch: "x86_64",
+            known: None,
         };
         let decided: Vec<(Verdict, usize, f64)> = report
             .by_class
@@ -1723,6 +1813,192 @@ mod tests {
         ] {
             assert!(detail.contains(line), "{line}{detail}");
         }
+    }
+
+    /// The known report the tests name: built for x86_64, quicker by 40 ns
+    /// an operation or less, as `dcroxide-tlscrypto`'s P-256 signing by the
+    /// nonce names it.
+    const KNOWN: KnownReport = KnownReport {
+        arch: "x86_64",
+        bound_nanos: 40,
+    };
+
+    /// The report, with `known` as its known report, on a simulated run
+    /// built for `arch`, in which each operation takes 1,000 ns, or
+    /// `fixed`'s nanoseconds for a fixed class, and its input's noise,
+    /// drawn up to 100 ns.
+    fn known_report(known: Option<KnownReport>, arch: &'static str, fixed: [u64; 4]) -> Report {
+        let (measured, _) = simulate_with(40_000_000, 100, |class, noise| {
+            class.map_or(1_000, |class| fixed[class]) + noise
+        });
+        let mut report =
+            Report::new("simulated", SIMULATED.to_vec(), &measured).with_known_report(known);
+        assert_eq!(report.arch, env::consts::ARCH);
+        report.arch = arch;
+        report
+    }
+
+    /// A known report: built for its architecture, with two classes 15 ns
+    /// an operation quicker than the random class, as `dcroxide-tlscrypto`
+    /// measured them, it passes under a verdict of its own, which its row
+    /// and those two classes' lines give, while the other classes pass as
+    /// before.
+    #[test]
+    fn a_known_report_passes_under_its_own_verdict() {
+        let report = known_report(Some(KNOWN), "x86_64", [985, 985, 1_000, 1_000]);
+        let (class, deciding) = report.deciding().expect("comparisons");
+        assert!(class < 2 && deciding.t < -T_FAIL, "{}", report.detail());
+        assert_eq!(report.verdict_of(&deciding), Verdict::Leak);
+        assert_eq!(report.verdict(), Verdict::Known(40), "{}", report.detail());
+        let word = "known report (quicker by 40 ns or less)";
+        assert_eq!(Verdict::Known(40).word(), word);
+        let printed = report.assert_constant_time();
+        let (row, detail) = printed.split_once('\n').expect("a row and a detail");
+        assert!(row.ends_with(&format!(" | {word} |")), "{row}");
+        for name in ["a", "b"] {
+            let line = detail
+                .lines()
+                .find(|line| line.starts_with(&format!("  {name}: t -")))
+                .expect("the class's line");
+            assert!(line.ends_with(&format!(", {word}")), "{line}");
+        }
+        for name in ["c", "d"] {
+            let line = detail
+                .lines()
+                .find(|line| line.starts_with(&format!("  {name}: t ")))
+                .expect("the class's line");
+            assert!(line.ends_with(", pass"), "{line}");
+        }
+    }
+
+    /// Anything outside the known report fails as before: a class slower
+    /// than the random class beside two quicker ones, a quicker class
+    /// beyond the bound, the same pattern in a target that names no known
+    /// report, and the same pattern built for another architecture than
+    /// the known report's.
+    #[test]
+    fn only_the_known_pattern_is_a_known_report() {
+        for (known, arch, fixed) in [
+            (Some(KNOWN), "x86_64", [985, 985, 1_015, 1_000]),
+            (Some(KNOWN), "x86_64", [985, 950, 1_000, 1_000]),
+            (None, "x86_64", [985, 985, 1_000, 1_000]),
+            (Some(KNOWN), "aarch64", [985, 985, 1_000, 1_000]),
+        ] {
+            let report = known_report(known, arch, fixed);
+            assert_eq!(
+                report.verdict(),
+                Verdict::Leak,
+                "{known:?} {arch} {fixed:?}\n{}",
+                report.detail()
+            );
+            assert!(
+                !report.detail().contains("known report"),
+                "{}",
+                report.detail()
+            );
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "|t| above 10 and by 1 ns an operation or more")]
+    fn a_slower_class_fails_a_target_with_a_known_report() {
+        known_report(Some(KNOWN), "x86_64", [985, 985, 1_015, 1_000]).assert_constant_time();
+    }
+
+    #[test]
+    #[should_panic(expected = "|t| above 10 and by 1 ns an operation or more")]
+    fn the_known_pattern_fails_on_another_architecture() {
+        known_report(Some(KNOWN), "aarch64", [985, 985, 1_000, 1_000]).assert_constant_time();
+    }
+
+    /// A known report does not find a positive control: a control whose
+    /// leak keeps to a known report it was given is not found.
+    #[test]
+    #[should_panic(expected = "does not see a leak")]
+    fn a_control_under_a_known_report_is_not_found() {
+        known_report(Some(KNOWN), "x86_64", [985, 985, 1_000, 1_000]).assert_leak_found();
+    }
+
+    /// The known report's bound, on comparisons built by hand: quicker by
+    /// 40 ns an operation is within it and by more is not; every failing
+    /// comparison counts, not only the one that decides its class, so a
+    /// class that fails quicker in one crop and slower in another is no
+    /// known report; a comparison quicker in its means but of a positive t,
+    /// or in its t but not its means, or of a t or a difference that is not
+    /// a number, is not quicker; and comparisons that do not fail, slower
+    /// or far quicker, leave a known report as it is.  Without a known
+    /// report each failure is a leak.
+    #[test]
+    fn the_known_report_holds_every_failing_comparison_to_its_bound() {
+        // Test `test`'s comparison of `t`, its fixed class `difference` ns
+        // an operation slower, in samples of four operations.
+        let comparison = |test: usize, t: f64, difference: f64| Comparison {
+            t,
+            test,
+            fixed: 1_000,
+            random: 3_000,
+            fixed_mean: 40_000.0 + 4.0 * difference,
+            random_mean: 40_000.0,
+        };
+        let report = |by_class: Vec<Vec<Comparison>>, known: Option<KnownReport>| Report {
+            target: "hand".to_owned(),
+            names: vec!["x", "y"],
+            by_class,
+            batch: 4,
+            samples: 6_000,
+            warm_up: 0,
+            seconds: 0.0,
+            trace: Trace::default(),
+            arch: "x86_64",
+            known,
+        };
+        let quiet = vec![comparison(0, 2.0, 3.0)];
+        let known = Verdict::Known(40);
+        for (failing, want) in [
+            (vec![comparison(0, -12.0, -15.0)], known),
+            (vec![comparison(0, -30.0, -40.0)], known),
+            (vec![comparison(0, -30.0, -40.01)], Verdict::Leak),
+            (vec![comparison(0, -30.0, -1.0)], known),
+            (vec![comparison(0, 12.0, 15.0)], Verdict::Leak),
+            (
+                vec![comparison(0, -20.0, -15.0), comparison(12, 11.0, 1.5)],
+                Verdict::Leak,
+            ),
+            (
+                vec![comparison(0, -20.0, -15.0), comparison(12, -11.0, -41.0)],
+                Verdict::Leak,
+            ),
+            (vec![comparison(0, 12.0, -15.0)], Verdict::Leak),
+            (vec![comparison(0, -12.0, 15.0)], Verdict::Leak),
+            (vec![comparison(0, f64::NAN, -15.0)], Verdict::Leak),
+            (vec![comparison(0, -12.0, f64::NAN)], Verdict::Leak),
+            (
+                vec![
+                    comparison(0, -20.0, -15.0),
+                    comparison(12, 9.0, 3.0),
+                    comparison(19, -9.0, -80.0),
+                    comparison(31, 40.0, 0.5),
+                ],
+                known,
+            ),
+        ] {
+            let both = report(vec![failing.clone(), quiet.clone()], Some(KNOWN));
+            assert_eq!(both.verdict(), want, "{failing:?}\n{}", both.detail());
+            let two = report(
+                vec![failing.clone(), vec![comparison(0, -11.0, -20.0)]],
+                Some(KNOWN),
+            );
+            assert_eq!(two.verdict(), want, "{failing:?}\n{}", two.detail());
+            let none = report(vec![failing.clone(), quiet.clone()], None);
+            assert_eq!(
+                none.verdict(),
+                Verdict::Leak,
+                "{failing:?}\n{}",
+                none.detail()
+            );
+        }
+        let passing = report(vec![quiet.clone(), quiet], Some(KNOWN));
+        assert_eq!(passing.verdict(), Verdict::Pass);
     }
 
     /// The budget: ten seconds unset, else a whole number of seconds above
@@ -2105,6 +2381,8 @@ mod tests {
                 inputs: 0xffff_8000_0010,
                 cpus: "3".to_owned(),
             },
+            arch: "x86_64",
+            known: None,
         };
         let want = "ct_check run | hand | crop 32 (89.8%) | 6 segments of 9.9 s | code \
                     0x555500001234 | inputs 0xffff80000010 | cpus 3 |\n\

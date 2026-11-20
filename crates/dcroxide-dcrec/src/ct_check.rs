@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: ISC
 //! The timing check of this crate's secrets: dudect's fixed-against-random
 //! t-test, on `dcroxide-testutil`'s harness ([`dcroxide_testutil::ct`],
-//! made from the copy `dcroxide-tlscrypto` runs as ADR-0015 T10, with
+//! which `dcroxide-tlscrypto`'s check of ADR-0015 T10 shares, with
 //! every class an equal share of the samples), over every entry
 //! point that computes on a secret.  ADR-0017's second addendum of
 //! 2026-11-19 records what it shows and what it does not.

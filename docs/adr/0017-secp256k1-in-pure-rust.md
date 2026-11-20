@@ -482,7 +482,9 @@ gives the random class half; "The class shares" below says why, and
 what the earlier draw did. The trace line of each target also names the
 processors its thread was allowed, from `/proc/self/status`, so a run
 shows whether it was pinned. `dcroxide-tlscrypto` keeps its own copy for
-now; it is not touched here.
+now; it is not touched here. *(2026-11-20: no longer; its targets run on
+this harness, with their known report as a parameter of the harness's
+report, and its copy is gone: ADR-0015's addendum of 2026-11-20.)*
 
 **The entry points.** Every public item of dcrec that computes on a
 secret, and the one internal function they share, has a target: the
@@ -679,7 +681,9 @@ processor and cannot keep other work off it.
 The harness now gives every class, the random one included, a share of
 1/(K + 1) with K fixed classes (`crates/dcroxide-testutil/src/ct.rs`;
 `dcroxide-tlscrypto`'s own copy is unchanged and still draws half of its
-samples random). A class that misses its outliers then leans by about
+samples random; *2026-11-20: that copy is gone, and its targets draw
+equal shares on this harness, ADR-0015's addendum of that date*).
+A class that misses its outliers then leans by about
 -√k with k its own expected count, and t follows the difference of two
 counts of the same expectation, about a standard normal. For a leak on
 one class the shares cost no precision when the noise dominates: the

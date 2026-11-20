@@ -23,7 +23,8 @@
   (addenda: ML-DSA's key expansion, outside the constant-time check; the
   reference Go at go1.27.3), 2026-11-19 (addenda: the Go server code in
   `dcroxide-gotls`, and where T3 and T4 stand; T4's ECDSA, P-521 and
-  SHA-512)
+  SHA-512), 2026-11-20 (addendum: the constant-time check on the shared
+  harness)
 
 ## Context
 
@@ -694,6 +695,13 @@ those runs.
   tests drive it with a simulated clock and time nothing, so they run in
   every `cargo test`, beside tests that each fixed class is the extreme it
   is named for and reaches the code it is timed through.
+  *(2026-11-20: the targets now run on `dcroxide-testutil`'s harness,
+  `crates/dcroxide-testutil/src/ct.rs`, which `dcroxide-dcrec`'s check
+  shares, and this crate's copy is gone. Every class, the random one
+  included, draws an equal share of the samples there, where each sample
+  above was of the random class with probability 1/2; the known report of
+  2026-11-15 is a parameter the target hands the harness. The addendum of
+  2026-11-20 records it.)*
 - **The 1 ns floor** changes the verdict the provider's design gave (its
   section 11.2, approved with the method on 2026-10-26), which failed a
   target on |t| above 10 for any fixed class alone. The project owner
@@ -1735,3 +1743,122 @@ run after the review's fixes (about 73,000 inputs); the
 (about 53,000 inputs), both on an x86_64 Linux desktop without a failure;
 and the crate on any system but an x86_64 Linux desktop before CI runs
 it.
+
+## Addendum, 2026-11-20 — the constant-time check on the shared harness
+
+The project owner decided on 2026-11-20 that this crate's constant-time
+check (T10, addendum of 2026-10-31) runs on `dcroxide-testutil`'s
+harness, `crates/dcroxide-testutil/src/ct.rs`, which `dcroxide-dcrec`'s
+timing check has used since ADR-0017's second addendum of 2026-11-19;
+that the known report of 2026-11-15 becomes a parameter the target hands
+that harness; and that the crate's own copy of the harness goes. This
+records what moved, what the move changes, and a local run.
+
+**What moved.** `crates/dcroxide-tlscrypto/src/ct_check.rs` keeps its 26
+targets and its positive control, 27 `#[ignore]` tests under the same
+names, every class list, what each target times, and the class lists'
+fifteen tests. The measurement, the verdict, the trace and the
+harness's own tests are `dcroxide-testutil`'s alone; the tests of the
+known report, which only this crate's copy had, moved there, written
+against the parameter. The shared harness had been made from this
+crate's copy and differed from it in three things only, read from the
+two files side by side: the class shares, a processor column in the
+trace, and the known report, which it lacked.
+
+**The class shares.** Each sample was of the random class with
+probability 1/2 and else of a fixed class chosen uniformly; now each of
+the K fixed classes and the random class draws 1/(K + 1). On P-256 and
+P-384, whose targets time fourteen fixed classes (the twelve extremes,
+the placebo and n - 2 again), each fixed class's share rises from 1/28
+to 1/15 and the random class's falls from 1/2 to 1/15; on P-521, of
+eleven, from 1/22 to 1/12. When the machine's noise dominates, a
+comparison's precision is unchanged: the variance of the difference of
+the two means, σ²(1/n_fixed + 1/n_random), is 2(K + 1)σ²/N of N samples
+under either draw. The reason is ADR-0017's "The class shares": with
+half of the samples random, a fixed class that drew none of a run's few
+slow outliers leaned by about -√k for the k the random class drew, k
+being K times the fixed class's own expected count, and a burst of 1 ms
+every 42 ms on the pinned processor drove such a class past |t| 10 on
+unchanged code in 4 of 25 dcrec runs. The P-384 and P-256 leans of
+2026-11-10 to 11-13, a few fixed classes quicker than the random class,
+were of that sign; whether the old draw caused them was not measured and
+is not claimed.
+
+**The trace.** The `ct_check run |` line of each target now ends with
+the processors its thread may run on, from `Cpus_allowed_list` in
+`/proc/self/status` (`-` where there is none). The workflow's summary
+takes only the rows, which are unchanged.
+
+**The known report as a parameter.** `ct::KnownReport` holds an
+architecture, as `std::env::consts::ARCH` names it, and a bound in whole
+nanoseconds an operation; `Report::with_known_report` hands one to a
+target's report. The rule is the one decided on 2026-11-15: built for
+that architecture, a failure in which every comparison of every class
+that fails has the fixed class quicker than the random class, t and
+difference both below zero, by the bound or less, passes, under the
+verdict "known report (quicker by 40 ns or less)" in its row and its
+failing classes' lines; a slower class, a difference beyond the bound,
+a t or a difference that is not a number, and any other architecture
+fail as before. P-256 signing by the nonce hands x86_64 and 40 ns, and
+no other target hands any, which a test of the crate holds; where the
+copy matched the target by its name, the target is now the one that
+hands the report over. A positive control handed a known report that
+its leak keeps to is not found, which a harness test holds; no control
+is handed one.
+
+**The workflow** runs as before: the same command, legs, dispatch
+inputs and budgets, 10 s a target on pushes and pull requests and 60 s
+nightly and on dispatch, and its paths already include
+`crates/dcroxide-testutil/**`. Its comments now give the shares as
+1/(K + 1) and name the shared harness.
+
+**A local run,** on an x86_64 Linux desktop, of the workflow's x86_64
+leg as its step writes it, processor backends, with `taskset -c` pinning
+each run to one processor, on cores of their own: once at the push
+budget, 10 s, and once at the nightly's, 60 s, the two running at the
+same time on different cores, at load averages from about 2 to 70 from
+other work on the machine. All 27 tests passed in both. Both ran one
+build, made before a last edit of `crates/dcroxide-testutil/src/ct.rs`,
+so it may differ from this change in the harness's own code. The
+deciding |t| of each target, 10 s then 60 s:
+
+| target | 10 s | 60 s |
+|---|---:|---:|
+| `aes_128_gcm_key` | 1.69 | 2.41 |
+| `aes_128_gcm_open_bad_tag` | 2.03 | 1.52 |
+| `aes_128_gcm_seal` | 26.72, under the floor (-0.04 ns) | 39.09, under the floor (+0.02 ns) |
+| `aes_256_gcm_key` | 1.79 | 2.35 |
+| `aes_256_gcm_open_bad_tag` | 1.75 | 2.61 |
+| `aes_256_gcm_seal` | 1.54 | 32.57, under the floor (+0.04 ns) |
+| `chacha20_poly1305_open_bad_tag` | 2.34 | 2.18 |
+| `chacha20_poly1305_seal` | 2.49 | 1.55 |
+| `ecdh_p256_complete` | 3.11 | 2.31 |
+| `ecdh_p256_public_key` | 2.94 | 2.44 |
+| `ecdh_p384_complete` | 2.69 | 5.82, reported (1, -168 ns of 537 µs) |
+| `ecdh_p384_public_key` | 2.36 | 2.87 |
+| `ecdh_p521_complete` | 2.34 | 2.93 |
+| `ecdh_p521_public_key` | 3.22 | 3.07 |
+| `ecdsa_p256_signing_by_key` | 2.51 | 2.94 |
+| `ecdsa_p256_signing_by_nonce` | 3.21 | 3.22 |
+| `ecdsa_p384_signing_by_key` | 3.49 | 4.18 |
+| `ecdsa_p384_signing_by_nonce` | 2.39 | 4.22 |
+| `ecdsa_p521_signing_by_key` | 2.85 | 2.82 |
+| `ecdsa_p521_signing_by_nonce` | 3.34 | 2.56 |
+| `ed25519_signing_by_key` | 2.82 | 3.11 |
+| `ed25519_signing_by_nonce` | 1.87 | 4.76, reported (+0.25 ns) |
+| `hmac_sha256_key` | 7.27, reported (-0.02 ns) | 27.10, under the floor (-0.02 ns) |
+| `hmac_sha384_key` | 1.66 | 4.04 |
+| `x25519_complete` | 1.91 | 2.06 |
+| `x25519_public_key` | 2.04 | 2.48 |
+| `positive_control` | 16,376.87, found | 29,561.22, found |
+
+The comparisons above 10, on AES-GCM's seal and HMAC-SHA256's keying,
+differ by hundredths of a nanosecond an operation, the kind of difference
+the 1 ns floor was set for. P-256 signing by the nonce did not fail on
+this processor, so the known report was not exercised by a timed run,
+only by the harness's tests.
+
+**Not tested here:** the x86_64-soft and both arm64 legs; the workflow
+itself in CI; runs repeated on unchanged code to compare the reported
+rate under the two draws; and a timed run in which the known report
+applies.
