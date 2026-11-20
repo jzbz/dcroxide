@@ -16,7 +16,8 @@
   table; second addendum: a timing test of the secrets; third addendum:
   a micro benchmark of the secrets, and what each claim rests on),
   2026-11-20 (addendum: EC-Schnorr-DCRv0's nonce negation selected, not
-  branched on)
+  branched on; second addendum: Ed25519's secret key keeps what signing
+  derives)
 
 ## Context
 
@@ -853,7 +854,10 @@ comparison is of the two libraries as they are, not of like algorithms.
   signature, where dcrd's key carries the one `PrivKeyFromSecret` made:
   25.1 µs against 12.9 µs through `sign_with_pub_key_bytes` with the key
   supplied. Holding the expanded key and its public key in `SecretKey`
-  would halve it. Nothing here changes it.
+  would halve it. Nothing here changes it. *(2026-11-20: the second
+  addendum of that date does: the key keeps its scalar, its nonce prefix
+  and its public key, and Ed25519 signing with a key made ahead took
+  11.6 µs against 23.1 µs before.)*
 
 **What each claim rests on.** Two kinds of evidence stand behind dcrec's
 secrets, and they are not interchangeable.
@@ -997,8 +1001,11 @@ both builds.
 
 **What this does not show.** One machine, one day, five runs a build at
 the nightly budget; arm64 was not timed. The rest of the dcrec suite was
-not run again: no other target's code changed. The machine code of the
-select was read on x86_64 only (below); arm64's was not inspected.
+not run again: no other target's code changed. *(Later that day the
+second addendum of this date changed the Ed25519 code that
+`ed25519_public_key` and `ed25519_signing` time, and those two targets
+were run again there; the rest of the suite was not.)* The machine code
+of the select was read on x86_64 only (below); arm64's was not inspected.
 Nothing wipes the negated temporary, as nothing wiped the old one.
 
 **The machine code.** `subtle` supplies only the trait, the `Choice` and
@@ -1024,6 +1031,110 @@ that compiler, those versions and that target; a different compiler
 release can compile it differently, and nothing in CI reads the machine
 code.
 
+**Speed.** Under `dcroxide-bench dcrec` (docs/bench-ledger.md, "Ed25519's
+kept public key and EC-Schnorr-DCRv0's selected negation (2026-11-20)"),
+EC-Schnorr-DCRv0 signing took 19,529.6 ns after the change against
+19,515.9 ns before (each the median over eight processes of a process's
+median, ranges 19,480.9 to 19,577.1 and 19,467.8 to 19,874.8 ns), 13.6 ns
+apart and inside both ranges, and 0.824 times dcrd's time in both arms:
+the select costs nothing this benchmark can see.
+
 The third addendum's last item read in the sources, that the branch
 leaks nothing about the nonce, no longer applies: there is no branch. The
 rest of the Decision stands.
+
+## Addendum, 2026-11-20 (second) — Ed25519's secret key keeps what signing derives
+
+The third addendum of 2026-11-19 found that `edwards::sign` derived the
+public key from the seed again for every signature, where dcrd's key
+carries the one `PrivKeyFromSecret` made, and left it. On 2026-11-20 the
+project owner decided that `edwards::SecretKey` keep what signing
+derives, with every signature unchanged.
+
+**What changes.** `SecretKey::from_seed` hashes the seed with SHA-512 once
+and keeps the clamped secret scalar, the nonce prefix (the digest's upper
+half) and the public key, scalar·B, as dcrd's `PrivKeyFromSecret` keeps
+its public key. `public_key` returns the kept copy, `sign` hashes it as
+A, and `sign_with_pub_key_bytes` signs from the kept scalar and prefix
+without hashing the seed again. The seed is not kept: nothing reads it
+once the three are derived. The key held the plain seed before and wiped
+nothing; it now wipes its scalar and prefix when it is dropped, each
+clone its own copy, and `from_seed` wipes its internal copy of the seed,
+the digest and the scalar's bytes through `zeroize`. Copies the compiler
+makes when it passes or moves the seed and the derived values are not
+wiped: in an x86_64 release build with Rust 1.100.0, read with
+`objdump`, the seed argument's memory and one copy of the scalar and
+prefix in `from_seed`'s frame keep their bytes (the doc of `from_seed`).
+`Debug`, which the key did not implement, prints `SecretKey(..)` and
+nothing it holds.
+
+**A new entry point.** `SecretKey::from_bytes` takes dcrd's 64-byte
+seed ‖ pubkey form (`edwards.PrivKeyFromBytes`): it expands the seed for
+the scalar and prefix and keeps the trailing 32 bytes, parsed by
+`parse_pub_key`'s rules and canonically re-serialized, as the key's
+public key, the one `sign` hashes as A. Nothing checks it against the
+seed, as dcrd does not, and bytes `parse_pub_key` refuses make no key,
+where dcrd's returns none. txscript's Ed25519 signing
+(`crates/dcroxide-txscript/src/sign.rs`, `ed25519_secret`) takes its
+64-byte keys this way, for the signature and for the public key it
+reads from the key. Through `from_seed` it would derive a public key
+only to discard it for the embedded one, a basepoint multiplication on
+every signature and every public key read; it signed with the embedded
+key before, through `sign_with_pub_key_bytes`, and its signatures and
+its error text, "invalid privkey", are unchanged.
+
+**What holds it.** `a_kept_derivation_signs_as_one_from_scratch` holds
+`sign`, `sign_with_pub_key_bytes`, a key from `from_bytes` and a clone
+to a derivation from scratch, the module's code before the change, over
+256 seeds; `from_bytes_carries_the_embedded_key` holds that a key whose
+embedded public key is another seed's signs with that key, that a
+non-canonical encoding is kept re-serialized, and that `parse_pub_key`'s
+refusals make no key; `debug_prints_no_secret` holds the `Debug` text.
+RFC 8032's known answer and the Ed25519 differentials against the
+oracle pass unchanged.
+
+**The timing targets.** `ed25519_public_key` timed `public_key` on a key
+made untimed. With the key keeping its public key that is a copy, so the
+target now times `from_seed` and `public_key` together, the derivation,
+on the same seed classes. `ed25519_signing` is unchanged in its code and
+now times signing from the kept scalar and prefix. Each ran once at the
+nightly budget, 60 s, with the table and without it, the four runs at
+once on the machine of the first addendum of this date, each pinned with
+`taskset` to its own processor, at a load average of 2.10 as they
+started. The binaries were release builds of dcrec's unit tests from the
+change's code as it is here but for comments, on the harness as it stood
+before ADR-0015's addendum of 2026-11-20 changed it:
+
+| target | table: t, class | difference, ns/op | verdict | no table: t, class | difference, ns/op | verdict |
+|---|---|---|---|---|---|---|
+| `ed25519_public_key` | +2.52, all zeros | +0.23 of 11,902.4 | pass | +2.22, all ones | +0.19 of 11,271.5 | pass |
+| `ed25519_signing` | -2.51, 0x55 and 0xaa | -0.68 of 11,808.1 | pass | -3.13, all zeros | -2.12 of 11,604.7 | pass |
+
+The columns are the second addendum of 2026-11-19's. The runs took
+4,822,368 and 5,043,244 samples of the public key, with the table and
+without it, and 2,490,393 and 2,493,123 of signing, one operation a
+sample. All four passed, and none was reported: the largest |t| was 3.13,
+under 4.5. Signing's random class took 11,808.1 and 11,604.7 ns an
+operation in the deciding crop, where that addendum recorded 25,839.4 and
+25,307.9 ns before the change: signing no longer derives the public key.
+
+**Speed.** Under `dcroxide-bench dcrec` (docs/bench-ledger.md, "Ed25519's
+kept public key and EC-Schnorr-DCRv0's selected negation (2026-11-20)"),
+Ed25519 signing with a key made ahead took 11,615.0 ns against 23,053.2
+ns before, 0.395 times dcrd's time against 0.785, the arms' ranges
+disjoint; with the public key supplied it took 11,654.0 against 11,806.7
+ns, no longer hashing the seed; `from_seed` and `public_key` together
+took 11,280.1 against 11,219.6 ns, the ranges overlapping. A key made for
+one signature and dropped costs what the old `sign` did, a derivation and
+a signature, which no row times apart.
+
+**What this does not show.** One run a build, one machine, one day;
+arm64 was not timed. Only the two Ed25519 targets ran again; the rest of
+dcrec's suite did not. Nothing measured whether the wipes cost time, and
+the machine code of the new paths was read only for `from_seed`'s copies,
+not for branches on the secret. txscript's signing through `from_bytes`
+was not timed. The first addendum of this date's builds after the change,
+for its timing runs and for the benchmark, already held this change; the
+Schnorr target does not reach the Ed25519 code.
+
+The rest of the Decision stands.

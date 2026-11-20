@@ -19,8 +19,8 @@
 //! | `schnorr::sign` | the key; the nonce | `schnorr_signing_by_key`; `schnorr_signing_by_nonce` |
 //! | `nonce::nonce_rfc6979` | the key's bytes | `rfc6979_nonce_by_key` |
 //! | `add_private_tweak`, and in it `ReducedPrivateKey::from_bytes`'s reduction and `ReducedPrivateKey::serialize` | Il; the parent key | `hd_private_child_by_tweak`; `hd_private_child_by_parent` |
-//! | `edwards::SecretKey::public_key` | the seed | `ed25519_public_key` |
-//! | `edwards::sign`, `edwards::sign_with_pub_key_bytes` | the seed | `ed25519_signing` |
+//! | `edwards::SecretKey::from_seed`, which derives the scalar, the nonce prefix and the public key once (`SecretKey::public_key` returns the copy it keeps), and in it the seed's expansion that `SecretKey::from_bytes` also runs | the seed | `ed25519_public_key` |
+//! | `edwards::sign`, `edwards::sign_with_pub_key_bytes`, from the scalar and prefix the key keeps | the seed's scalar and prefix | `ed25519_signing` |
 //!
 //! Nothing else computes on a secret.  Verification, compact recovery,
 //! key parsing and serialization take public values, and
@@ -464,8 +464,8 @@ fn ed25519_public_key() {
         &target("ed25519_public_key"),
         &seed_classes(),
         |rng| random_bytes(rng, 32),
-        |seed| edwards::SecretKey::from_seed(array(seed)),
-        |secret| secret.public_key(),
+        array,
+        |seed| edwards::SecretKey::from_seed(*seed).public_key(),
     )
     .assert_constant_time();
 }

@@ -331,9 +331,10 @@ fn ed25519_public_key(cases: &[Case]) -> Pass {
     }
 }
 
-/// `edwards::sign` over the case's hash as the message.  It derives the
-/// public key from the seed again for every signature, where dcrd's key
-/// carries the one `PrivKeyFromSecret` computed.
+/// `edwards::sign` over the case's hash as the message, the keys made
+/// untimed.  The key carries the public key `SecretKey::from_seed`
+/// derived, as dcrd's carries the one `PrivKeyFromSecret` computed; until
+/// 2026-11-20 `edwards::sign` derived it again for every signature.
 fn ed25519_sign(cases: &[Case]) -> Pass {
     let secrets: Vec<_> = cases
         .iter()
@@ -355,7 +356,8 @@ fn ed25519_sign(cases: &[Case]) -> Pass {
 }
 
 /// `edwards::sign_with_pub_key_bytes` with the public key computed
-/// untimed, as dcrd's key carries it.
+/// untimed, as dcrd's key carries it.  Since `edwards::sign` reads the
+/// key's own copy, the two rows time the same work.
 fn ed25519_sign_known_key(cases: &[Case]) -> Pass {
     let secrets: Vec<_> = cases
         .iter()

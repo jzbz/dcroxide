@@ -232,18 +232,14 @@ fn secp_priv_key(key: &[u8]) -> Result<dcroxide_dcrec::secp256k1::PrivateKey, Si
 }
 
 /// Parse a 64-byte Ed25519 `seed ‖ pubkey` key (dcrd
-/// `edwards.PrivKeyFromBytes`), returning the seed-derived secret and the
-/// canonical re-serialization of the embedded public key. The trailing 32
-/// bytes must decode as a valid curve point or the key is rejected.
-fn ed25519_secret(key: &[u8]) -> Result<(dcroxide_dcrec::edwards::SecretKey, [u8; 32]), SignError> {
+/// `edwards.PrivKeyFromBytes`, `SecretKey::from_bytes`): the secret from
+/// the seed, carrying the embedded public key rather than one derived from
+/// the seed, which is what it signs with and returns, canonically
+/// re-serialized. The trailing 32 bytes must decode as a valid curve point
+/// or the key is rejected.
+fn ed25519_secret(key: &[u8]) -> Result<dcroxide_dcrec::edwards::SecretKey, SignError> {
     let key: [u8; 64] = key.try_into().map_err(|_| sign_error("invalid privkey"))?;
-    let seed: [u8; 32] = key[..32].try_into().expect("32 bytes");
-    let pub_key = dcroxide_dcrec::edwards::parse_pub_key(&key[32..])
-        .map_err(|_| sign_error("invalid privkey"))?;
-    Ok((
-        dcroxide_dcrec::edwards::SecretKey::from_seed(seed),
-        pub_key.serialize(),
-    ))
+    dcroxide_dcrec::edwards::SecretKey::from_bytes(&key).map_err(|_| sign_error("invalid privkey"))
 }
 
 /// The signature hash the sign package signs and merges against (dcrd
@@ -309,8 +305,8 @@ pub fn raw_tx_in_signature(
             dcroxide_dcrec::secp256k1::ecdsa::sign(&priv_key, &hash).serialize()
         }
         SignatureType::Ed25519 => {
-            let (secret, pub_bytes) = ed25519_secret(key)?;
-            dcroxide_dcrec::edwards::sign_with_pub_key_bytes(&secret, &pub_bytes, &hash)
+            let secret = ed25519_secret(key)?;
+            dcroxide_dcrec::edwards::sign(&secret, &hash)
                 .serialize()
                 .to_vec()
         }
@@ -343,8 +339,7 @@ fn pk_data(key: &[u8], sig_type: SignatureType, compress: bool) -> Result<Vec<u8
             // dcrd returns the canonical re-serialization of the embedded
             // public key (its `pub.Serialize()`), not one derived from the
             // seed.
-            let (_, pub_bytes) = ed25519_secret(key)?;
-            pub_bytes.to_vec()
+            ed25519_secret(key)?.public_key().serialize().to_vec()
         }
         SignatureType::SchnorrSecp256k1 => {
             let priv_key = secp_priv_key(key)?;

@@ -8637,3 +8637,88 @@ CPUs) and `build.txt` (the binaries' hashes, the compiler's and Go's
 versions, the CPU's name, the huge-page and governor settings);
 `copy-1/` to `copy-3/`, the same for the table-copy runs; `bench.sh`,
 `copy.sh`, `busy.py` and `analyze.py`.
+
+## Ed25519's kept public key and EC-Schnorr-DCRv0's selected negation (2026-11-20)
+
+Two changes to dcrec's signing, measured with the section above's program,
+`dcroxide-bench dcrec`, before and after. `edwards::SecretKey` now derives
+its secret scalar, nonce prefix and public key once, in `from_seed`, and
+`edwards::sign` reads them, where it derived the public key from the seed
+again for every signature; `SecretKey::from_bytes` (dcrd's
+`PrivKeyFromBytes`, which `txscript`'s signing now uses) parses the
+embedded key and derives none. EC-Schnorr-DCRv0 signing negates its nonce
+by a constant-time select instead of a branch (ADR-0017, addendum of
+2026-11-20). Every output is the same: every pass of every operation in
+all 16 processes below gave dcrd's digest, in both arms.
+
+**The build.** `cargo build --release --locked -p dcroxide-bench`, Rust
+1.100.0 at the workspace's release profile, on m3. Before: the tree of
+`6272357`, exported unchanged (SHA-256 of the binary begins
+`13e9a6164668`). After: the same tree with the two changes (`4d1682db04bd`).
+The oracle, `go build` of `tools/oracle` with Go 1.27.3 at the parity pin
+of the section above (`35c24b25d151`).
+
+**Order.** Eight processes an arm, 8,192 cases from the default seed, a
+warm-up pass and five rounds each, all pinned with `taskset -c 26` (the
+oracle inherits the pin). The arms alternated before, after, after,
+before and so on, and `--start` alternated by pair of processes, so each
+arm ran four processes Rust first and four Go first. One session, 02:47
+to 02:55 on 2026-11-20, load averages 1.6 to 6.4 as the processes started;
+transparent huge pages at `always`, the `powersave` governor under
+`amd_pstate` in active mode.
+
+**Time per operation** in ns: the median over an arm's eight processes of
+each process's median over its five rounds, with their range; the Rust /
+Go column is the median over the arm's 40 pairs of each pair's ratio.
+
+| operation | before | after | after - before | before / Go | after / Go |
+|---|---:|---:|---:|---:|---:|
+| `generator_table` | 14,359.3 (14,314.2–14,620.5) | 14,351.5 (14,327.3–14,420.5) | -7.8 | 0.969 | 0.967 |
+| `generator_lincomb` | 31,187.3 (31,139.2–31,335.0) | 31,241.2 (31,134.5–31,313.8) | +53.9 | 2.096 | 2.095 |
+| `public_key` | 18,347.9 (18,271.9–18,380.3) | 18,334.2 (18,258.3–18,403.5) | -13.7 | 0.848 | 0.849 |
+| `key_from_bytes` | 16.7 (16.6–16.9) | 16.8 (16.7–16.9) | +0.0 | 0.755 | 0.753 |
+| `ecdsa_sign` | 23,085.0 (23,023.3–24,263.8) | 23,081.0 (23,017.2–23,125.0) | -4.0 | 0.927 | 0.926 |
+| `schnorr_sign` | 19,515.9 (19,467.8–19,874.8) | 19,529.6 (19,480.9–19,577.1) | +13.6 | 0.824 | 0.824 |
+| `rfc6979_nonce` | 848.2 (827.8–869.6) | 836.8 (831.8–876.6) | -11.3 | 0.667 | 0.671 |
+| `hd_private_child` | 66.0 (65.5–67.2) | 66.1 (65.9–66.3) | +0.1 | 1.181 | 1.181 |
+| `ed25519_public_key` | 11,219.6 (11,172.3–11,304.7) | 11,280.1 (11,227.9–11,391.6) | +60.5 | 0.155 | 0.156 |
+| `ed25519_sign` | 23,053.2 (23,003.4–23,663.9) | 11,615.0 (11,555.1–11,723.0) | -11,438.2 | 0.785 | 0.395 |
+| `ed25519_sign_known_key` | 11,806.7 (11,756.5–11,901.1) | 11,654.0 (11,556.7–11,720.5) | -152.7 | 0.400 | 0.393 |
+
+dcrd's own times moved by 1.5% or less between the arms on every row
+(`key_from_bytes`, 22.35 and 22.69 ns, the most; `ed25519_sign` 29,345.3
+and 29,478.1 ns).
+
+**What it shows.**
+
+- Ed25519 signing with a key made ahead, `ed25519_sign`, halved: 23.1 µs
+  to 11.6 µs, from 0.785 to 0.395 times dcrd's time, the two arms' ranges
+  disjoint. It now costs what signing with a supplied public key costs.
+- `ed25519_sign_known_key` fell by 153 ns (1.3%), the ranges disjoint:
+  `sign_with_pub_key_bytes` no longer hashes the seed with SHA-512 for
+  every signature, since the key keeps the scalar and prefix.
+- `ed25519_public_key`, `from_seed` and `public_key` timed together, did
+  the same work before and after (one SHA-512 and one basepoint
+  multiplication) and moved by +60.5 ns (0.5%), the ranges overlapping.
+  `from_seed` now wipes its internal copy of the seed, the digest and the
+  scalar bytes it computes, and the key wipes its scalar and prefix when
+  dropped, which the timed loop includes; whether those wipes are the
+  60 ns was not measured. Copies the compiler makes when it passes or
+  moves the seed and the derived values are not wiped (in the x86_64
+  release build the seed argument's memory and one copy of the scalar
+  and prefix in `from_seed`'s frame keep their bytes).
+- EC-Schnorr-DCRv0 signing moved by +13.6 ns (0.07%), inside both arms'
+  ranges: the selected negation costs nothing visible here. Every other
+  row moved by less than either arm's spread.
+
+**What it does not show.** A key made for one signature and dropped:
+`from_seed` followed by one `sign` costs what the old `sign` did, a
+derivation and a signature, which no row times apart. `txscript`'s
+signing path through `SecretKey::from_bytes` was not timed; it no longer
+calls `from_seed`, which would now derive a public key it does not use.
+One machine, one session, one compiler and one Go; the arm64 build was
+not measured.
+
+Raw: `s1/`, each process's summary (`<n>-<arm>-<start>.txt`), JSON lines
+(`.jsonl`) and progress (`.err`), and `state.txt` (each process's start
+time and load average); `bench.sh` and `analyze.py`.

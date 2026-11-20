@@ -34,6 +34,7 @@ use curve25519_dalek::constants::ED25519_BASEPOINT_TABLE;
 use curve25519_dalek::edwards::{CompressedEdwardsY, EdwardsPoint};
 use curve25519_dalek::scalar::Scalar;
 use sha2::{Digest, Sha512};
+use zeroize::{Zeroize, Zeroizing};
 
 /// The length of a serialized public key in bytes.
 pub const PUB_KEY_BYTES_LEN: usize = 32;
@@ -238,49 +239,118 @@ pub fn verify_raw(pub_key: &PublicKey, message: &[u8], sig: &[u8; SIGNATURE_SIZE
     r_prime.compress().as_bytes() == &sig[..32]
 }
 
-/// A standard Ed25519 secret: the 32-byte seed (dcrd `PrivKeyFromSecret`).
+/// A standard Ed25519 secret made from a 32-byte seed (dcrd
+/// `PrivKeyFromSecret`), held as what signing derives from the seed: the
+/// clamped secret scalar, the hash prefix the nonces come from, and the
+/// public key.  [`SecretKey::from_seed`] derives all three once, as dcrd's
+/// `PrivKeyFromSecret` derives its key's public key once, so that [`sign`]
+/// does not compute the public key again for every signature.  The seed
+/// itself is not kept: nothing reads it once the three are derived.
 /// The scalar-based signing flavor dcrd also carries (`PrivKeyFromScalar`,
 /// `SignFromScalar`) is wallet-side legacy and intentionally not
 /// implemented; see PARITY.md.
+///
+/// The scalar and the prefix are wiped when the key is dropped (each
+/// clone wipes its own copy).  Copies left behind when a key is moved are
+/// not wiped.  `Debug` prints neither.
 #[derive(Clone)]
 pub struct SecretKey {
-    seed: [u8; 32],
+    scalar: Scalar,
+    prefix: [u8; 32],
+    public: PublicKey,
+}
+
+impl fmt::Debug for SecretKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("SecretKey(..)")
+    }
+}
+
+impl Drop for SecretKey {
+    fn drop(&mut self) {
+        self.scalar.zeroize();
+        self.prefix.zeroize();
+    }
 }
 
 impl SecretKey {
-    /// Wrap a 32-byte seed.
+    /// Wrap a 32-byte seed, deriving its secret scalar, its nonce prefix
+    /// and its public key (`A = clamp(SHA-512(seed)[..32])·B`) once.
+    /// This function wipes its internal copy of the seed, the digest and
+    /// the scalar bytes it computes.  Copies the compiler makes when it
+    /// passes or moves the seed and the derived values are not wiped: in
+    /// the x86_64 release build examined (rustc 1.100.0) the by-value
+    /// seed arrives by pointer and is copied out, so the argument's
+    /// memory keeps the seed, and a copy of the scalar and prefix stays in
+    /// this function's dead stack frame.  That is a limit of `zeroize`
+    /// under moves; the caller's seed is the caller's to wipe.
     pub fn from_seed(seed: [u8; 32]) -> SecretKey {
-        SecretKey { seed }
-    }
-
-    /// The corresponding public key (`A = clamp(SHA-512(seed)[..32])·B`).
-    pub fn public_key(&self) -> PublicKey {
-        let (a, _) = self.expand();
-        let point = ED25519_BASEPOINT_TABLE * &a;
-        PublicKey {
-            point,
-            compressed: point.compress().to_bytes(),
+        let seed = Zeroizing::new(seed);
+        let (scalar, prefix) = expand(&seed);
+        let point = ED25519_BASEPOINT_TABLE * &scalar;
+        SecretKey {
+            scalar,
+            prefix,
+            public: PublicKey {
+                point,
+                compressed: point.compress().to_bytes(),
+            },
         }
     }
 
-    /// The clamped secret scalar and the hash prefix used for nonces.
-    fn expand(&self) -> (Scalar, [u8; 32]) {
-        let digest: [u8; 64] = Sha512::digest(self.seed).into();
-        let mut a_bytes: [u8; 32] = digest[..32].try_into().expect("32 bytes");
-        a_bytes[0] &= 248;
-        a_bytes[31] &= 127;
-        a_bytes[31] |= 64;
-        let prefix: [u8; 32] = digest[32..].try_into().expect("32 bytes");
-        (Scalar::from_bytes_mod_order(a_bytes), prefix)
+    /// A key from dcrd's 64-byte `seed || pubkey` form (dcrd
+    /// `edwards.PrivKeyFromBytes`): the trailing 32 bytes are parsed as a
+    /// public key by [`parse_pub_key`]'s rules, and that key, not one
+    /// derived from the seed, is what [`SecretKey::public_key`] returns and
+    /// what [`sign`] hashes as `A`, canonically re-serialized, as dcrd's
+    /// key does.  Nothing checks that it matches the seed; dcrd does not
+    /// either.  No public key is derived, so this costs one SHA-512 and the
+    /// key's decompression.
+    ///
+    /// # Errors
+    ///
+    /// [`parse_pub_key`]'s, for trailing bytes it rejects, where dcrd's
+    /// `PrivKeyFromBytes` returns no key.
+    pub fn from_bytes(bytes: &[u8; 64]) -> Result<SecretKey, Error> {
+        let public = parse_pub_key(&bytes[32..])?;
+        let seed: Zeroizing<[u8; 32]> = Zeroizing::new(bytes[..32].try_into().expect("32 bytes"));
+        let (scalar, prefix) = expand(&seed);
+        Ok(SecretKey {
+            scalar,
+            prefix,
+            public,
+        })
     }
+
+    /// The corresponding public key: the one [`SecretKey::from_seed`]
+    /// derived, or the one [`SecretKey::from_bytes`] parsed.
+    pub fn public_key(&self) -> PublicKey {
+        self.public
+    }
+}
+
+/// The clamped secret scalar and the hash prefix used for nonces, from
+/// `SHA-512(seed)`.  The digest and the scalar's bytes are wiped here; the
+/// hasher wipes its own state (`sha2`'s `zeroize` feature).  The scalar
+/// and prefix returned are moved to the caller, and copies a move leaves
+/// behind are not wiped.
+fn expand(seed: &[u8; 32]) -> (Scalar, [u8; 32]) {
+    let digest: Zeroizing<[u8; 64]> = Zeroizing::new(Sha512::digest(seed).into());
+    let mut a_bytes: Zeroizing<[u8; 32]> =
+        Zeroizing::new(digest[..32].try_into().expect("32 bytes"));
+    a_bytes[0] &= 248;
+    a_bytes[31] &= 127;
+    a_bytes[31] |= 64;
+    let prefix: [u8; 32] = digest[32..].try_into().expect("32 bytes");
+    (Scalar::from_bytes_mod_order(*a_bytes), prefix)
 }
 
 /// Produce a standard (RFC 8032) Ed25519 signature over the message,
 /// byte-compatible with dcrd's seed-based `edwards.Sign` path (verified
-/// differentially).
+/// differentially).  The public key it hashes as `A` is the key's own,
+/// derived or parsed when the key was made.
 pub fn sign(secret: &SecretKey, message: &[u8]) -> Signature {
-    let pub_bytes = secret.public_key().compressed;
-    sign_with_pub_key_bytes(secret, &pub_bytes, message)
+    sign_with_pub_key_bytes(secret, &secret.public.compressed, message)
 }
 
 /// Sign with an explicitly provided public key encoding used as `A` in the
@@ -289,17 +359,16 @@ pub fn sign(secret: &SecretKey, message: &[u8]) -> Signature {
 /// `edwards.PrivKeyFromBytes` + `Sign` takes, where the embedded public
 /// key (canonically re-serialized) participates rather than one derived
 /// from the seed. With a matching public key this is identical to
-/// [`sign`].
+/// [`sign`]; a key from [`SecretKey::from_bytes`] signs the same way
+/// through [`sign`].
 pub fn sign_with_pub_key_bytes(
     secret: &SecretKey,
     pub_bytes: &[u8; 32],
     message: &[u8],
 ) -> Signature {
-    let (a, prefix) = secret.expand();
-
     // r = SHA-512(prefix || m) mod L; R = r·B.
     let mut h = Sha512::new();
-    h.update(prefix);
+    h.update(secret.prefix);
     h.update(message);
     let r = Scalar::from_bytes_mod_order_wide(&h.finalize().into());
     let big_r = (ED25519_BASEPOINT_TABLE * &r).compress().to_bytes();
@@ -310,7 +379,7 @@ pub fn sign_with_pub_key_bytes(
     h.update(pub_bytes);
     h.update(message);
     let k = Scalar::from_bytes_mod_order_wide(&h.finalize().into());
-    let s = k * a + r;
+    let s = k * secret.scalar + r;
 
     Signature {
         r: big_r,
@@ -384,6 +453,144 @@ mod tests {
         // Round trip through parse.
         let parsed = parse_signature(&sig.serialize()).expect("own signature parses");
         assert_eq!(parsed, sig);
+    }
+
+    /// Ed25519 signing as this module computed it before the key kept its
+    /// derived values: the seed expanded and, without `pub_bytes`, the
+    /// public key derived again for every signature.
+    fn sign_from_scratch(
+        seed: &[u8; 32],
+        pub_bytes: Option<&[u8; 32]>,
+        message: &[u8],
+    ) -> [u8; 64] {
+        let digest: [u8; 64] = Sha512::digest(seed).into();
+        let mut a_bytes: [u8; 32] = digest[..32].try_into().expect("32 bytes");
+        a_bytes[0] &= 248;
+        a_bytes[31] &= 127;
+        a_bytes[31] |= 64;
+        let a = Scalar::from_bytes_mod_order(a_bytes);
+        let derived = (ED25519_BASEPOINT_TABLE * &a).compress().to_bytes();
+        let pub_bytes = pub_bytes.copied().unwrap_or(derived);
+        let mut h = Sha512::new();
+        h.update(&digest[32..]);
+        h.update(message);
+        let r = Scalar::from_bytes_mod_order_wide(&h.finalize().into());
+        let big_r = (ED25519_BASEPOINT_TABLE * &r).compress().to_bytes();
+        let mut h = Sha512::new();
+        h.update(big_r);
+        h.update(pub_bytes);
+        h.update(message);
+        let k = Scalar::from_bytes_mod_order_wide(&h.finalize().into());
+        let mut out = [0u8; 64];
+        out[..32].copy_from_slice(&big_r);
+        out[32..].copy_from_slice(&(k * a + r).to_bytes());
+        out
+    }
+
+    /// The key's kept scalar, prefix and public key sign exactly as a
+    /// derivation from scratch does, through `sign`, through
+    /// `sign_with_pub_key_bytes` and from dcrd's 64-byte form, and a clone
+    /// signs as the original.
+    #[test]
+    fn a_kept_derivation_signs_as_one_from_scratch() {
+        let mut rng = dcroxide_testutil::SplitMix64(0x0ed2_5519);
+        for i in 0..256usize {
+            let mut seed = [0u8; 32];
+            rng.fill(&mut seed);
+            let mut message = vec![0u8; i % 97];
+            rng.fill(&mut message);
+            let secret = SecretKey::from_seed(seed);
+            let want = sign_from_scratch(&seed, None, &message);
+            assert_eq!(sign(&secret, &message).serialize(), want, "seed {i}");
+            let public = secret.public_key().serialize();
+            assert_eq!(
+                sign_with_pub_key_bytes(&secret, &public, &message).serialize(),
+                want,
+                "seed {i}, the key supplied"
+            );
+            let mut bytes = [0u8; 64];
+            bytes[..32].copy_from_slice(&seed);
+            bytes[32..].copy_from_slice(&public);
+            let from_bytes = SecretKey::from_bytes(&bytes).expect("a derived key parses");
+            assert_eq!(from_bytes.public_key(), secret.public_key(), "seed {i}");
+            assert_eq!(
+                sign(&from_bytes, &message).serialize(),
+                want,
+                "seed {i}, 64 bytes"
+            );
+            assert_eq!(
+                sign(&secret.clone(), &message).serialize(),
+                want,
+                "seed {i}, a clone"
+            );
+        }
+    }
+
+    /// dcrd's `PrivKeyFromBytes`: the embedded public key, not the seed's,
+    /// is the key's public key and what it signs with, re-serialized
+    /// canonically, and bytes `parse_pub_key` rejects make no key.
+    #[test]
+    fn from_bytes_carries_the_embedded_key() {
+        let seed = [3u8; 32];
+        let other = SecretKey::from_seed([4u8; 32]).public_key().serialize();
+        let mut bytes = [0u8; 64];
+        bytes[..32].copy_from_slice(&seed);
+        bytes[32..].copy_from_slice(&other);
+        let secret = SecretKey::from_bytes(&bytes).expect("a valid point");
+        assert_eq!(secret.public_key().serialize(), other);
+        assert_eq!(
+            sign(&secret, b"mismatch").serialize(),
+            sign_from_scratch(&seed, Some(&other), b"mismatch")
+        );
+        assert_eq!(
+            sign(&secret, b"mismatch"),
+            sign_with_pub_key_bytes(&SecretKey::from_seed(seed), &other, b"mismatch")
+        );
+
+        // y = p + 1 encodes the identity non-canonically: it parses, and the
+        // canonical encoding is what the key returns and hashes.
+        let mut noncanonical = [0xffu8; 32];
+        noncanonical[0] = 0xee;
+        noncanonical[31] = 0x7f;
+        let mut identity = [0u8; 32];
+        identity[0] = 1;
+        bytes[32..].copy_from_slice(&noncanonical);
+        let secret = SecretKey::from_bytes(&bytes).expect("non-canonical y parses");
+        assert_eq!(secret.public_key().serialize(), identity);
+        assert_eq!(
+            sign(&secret, b"m").serialize(),
+            sign_from_scratch(&seed, Some(&identity), b"m")
+        );
+
+        // x = 0 with the sign bit set, and a y off the curve, are refused
+        // as `parse_pub_key` refuses them.
+        let mut bad = identity;
+        bad[31] |= 0x80;
+        bytes[32..].copy_from_slice(&bad);
+        assert_eq!(
+            SecretKey::from_bytes(&bytes).err(),
+            Some(Error::PubKeyXTooBig)
+        );
+        let off_curve = (2u8..)
+            .map(|y| {
+                let mut enc = [0u8; 32];
+                enc[0] = y;
+                enc
+            })
+            .find(|enc| parse_pub_key(enc).is_err())
+            .expect("some small y is off the curve");
+        bytes[32..].copy_from_slice(&off_curve);
+        assert_eq!(
+            SecretKey::from_bytes(&bytes).err(),
+            Some(Error::PointNotOnCurve)
+        );
+    }
+
+    /// `Debug` names the type and nothing it holds.
+    #[test]
+    fn debug_prints_no_secret() {
+        let secret = SecretKey::from_seed([0x5a; 32]);
+        assert_eq!(format!("{secret:?}"), "SecretKey(..)");
     }
 
     #[test]
