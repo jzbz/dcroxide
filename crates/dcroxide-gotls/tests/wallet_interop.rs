@@ -153,6 +153,27 @@ fn versions() -> [(&'static str, Value); 2] {
     ]
 }
 
+/// Whether what Go's client read is a reset of the connection:
+/// ECONNRESET, or on Windows WSAECONNRESET or WSAECONNABORTED.
+fn reads_as_reset(error: &Value) -> bool {
+    let error = error.as_str().unwrap_or_default();
+    error.contains("reset by peer")
+        || error.contains("forcibly closed by the remote host")
+        || error.contains("aborted by the software in your host machine")
+}
+
+/// Assert that Go's client was refused and read `alert`.  Off Linux a
+/// reset may reach it before the alert does (see [`assert_agree`]), and
+/// then only the refusal is held.
+fn assert_hears(go: &TlsOracle, what: &str, detail: &Value, alert: &str) {
+    if cfg!(target_os = "linux") || !reads_as_reset(&detail["error"]) {
+        go.assert_refused(what, detail, alert);
+        assert_eq!(detail["error"], alert, "{what}");
+    } else {
+        assert_eq!(detail["ok"], false, "{what}: Go's client {detail}");
+    }
+}
+
 /// Hold the crate's server to Go's: one verdict, the same error at Go's
 /// client, the same protocol at both of Go's ends, and under the reference
 /// Go the crate's handshake error in Go's server's words.
@@ -179,7 +200,14 @@ fn assert_agree(go: &TlsOracle, what: &str, outcome: &Outcome) {
     // request crossed the close, is the race of two sockets, not the
     // servers', so only the verdict is compared.
     let closed_after_the_handshake = ours_error.as_deref() == Some(GRPC_MISSING_ALPN);
-    if !tls12_without_a_certificate && !closed_after_the_handshake {
+    // A server that refuses closes with Go's bytes still unread or still
+    // to come, which draws a reset from its system.  Linux delivers the
+    // alert all the same; a system that throws away what it has received
+    // when a reset arrives, as Windows does, may show Go's client the
+    // reset instead, so there only the verdict is compared.
+    let reset_before_the_alert = !cfg!(target_os = "linux")
+        && (reads_as_reset(&ours["error"]) || reads_as_reset(&theirs["error"]));
+    if !tls12_without_a_certificate && !closed_after_the_handshake && !reset_before_the_alert {
         assert_eq!(
             ours["error"], theirs["error"],
             "{what}: Go's client's error"
@@ -623,12 +651,15 @@ fn authorities_and_usages_gos_search_refuses_are_refused_as_go_does() {
                 } else {
                     (ours_hears, theirs_hears, go_words, our_words)
                 };
-                go.assert_refused(&what, &outcome.ours, ours_hears);
-                go.assert_refused(&what, &outcome.theirs, theirs_hears);
                 // The alerts are compared under any Go, which sends them
                 // as the reference does.
-                assert_eq!(outcome.ours["error"], ours_hears, "{what}: the crate");
-                assert_eq!(outcome.theirs["error"], theirs_hears, "{what}: Go");
+                assert_hears(
+                    &go,
+                    &format!("{what}: the crate"),
+                    &outcome.ours,
+                    ours_hears,
+                );
+                assert_hears(&go, &format!("{what}: Go"), &outcome.theirs, theirs_hears);
                 let text = outcome.ours_error.clone().unwrap_or_default();
                 assert!(
                     text.starts_with(our_words),
