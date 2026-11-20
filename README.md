@@ -259,7 +259,11 @@ work). Currently implemented:
   and treasury outputs), all differentially matched against dcrd across
   every network
 - `dcroxide-base58` — modified base58 and Decred base58check from
-  decred/base58, vector- and differentially-tested
+  decred/base58, vector- and differentially-tested; its conversion
+  works in limbs of several digits (ten digits a step when decoding,
+  four bytes when encoding), where Go's takes one digit or byte a
+  step, and is fuzzed against a port of Go's per-digit algorithm, with
+  every output Go's
 - `dcroxide-stake` — the stake transaction primitives from dcrd's
   `blockchain/stake`: ticket/vote/revocation/treasury format checks and
   classification with all 72 of dcrd's error kinds, commitment and vote
@@ -608,11 +612,13 @@ work). Currently implemented:
   where a network sync skips connect validation up to the
   assume-valid block — reporting throughput at a fixed block
   interval, so an optimization is measured on the same blocks before
-  and after; and `dcrec`, a micro benchmark of `dcroxide-dcrec`'s
+  and after; `dcrec`, a micro benchmark of `dcroxide-dcrec`'s
   operations on secrets (public keys, signing, the RFC 6979 nonce, HD
   derivation's private child, Ed25519) against dcrd's through the
   oracle, which checks that both sides computed the same outputs on
-  every pass
+  every pass; and `base58`, the same for `dcroxide-base58`'s `decode`,
+  `check_decode`, `encode` and `check_encode` against `decred/base58`,
+  on addresses, extended public keys and 1,000-character strings
 - `tools/oracle` — Go shim linking dcrd's own packages (pinned to the
   parity pin, master `46e9df48`: each dcrd module at that commit's
   pseudo-version or at a tag whose source is byte-identical to it, as the

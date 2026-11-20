@@ -200,6 +200,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "base58_reference"
+path = "fuzz_targets/base58_reference.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "db_record_decode"
 path = "fuzz_targets/db_record_decode.rs"
 test = false

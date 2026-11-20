@@ -8722,3 +8722,179 @@ not measured.
 Raw: `s1/`, each process's summary (`<n>-<arm>-<start>.txt`), JSON lines
 (`.jsonl`) and progress (`.err`), and `state.txt` (each process's start
 time and load average); `bench.sh` and `analyze.py`.
+
+## dcroxide-base58's limb-based conversion against decred/base58 (2026-11-20)
+
+dcr-purse's Phase 1 row asks for base58check decoding no slower than Go's,
+and its ledger found dcroxide-base58's `check_decode` at parity with
+`github.com/decred/base58`, half of it BLAKE-256. This entry times the
+crate's four functions against Go's before and after a change to its
+digit conversion: `decode` now looks each character up in a table,
+checks every character before it allocates, folds ten base58 digits into
+one word and multiplies 64-bit limbs by 58^10 once per group, where Go
+(and the crate before) multiplies 32-bit words by 58 once per character
+and the crate found each character by a linear search of the alphabet;
+`encode` multiplies limbs in base 58^5 by 2^32 once per four input bytes,
+where Go multiplies base58 digits by 256 once per byte. `check_decode`
+also no longer copies the payload into a second vector. Every output is
+Go's: every pass of every row in all 48 processes below gave Go's digest,
+in both arms. BLAKE-256 did not change.
+
+**The program.** `dcroxide-bench base58` (`crates/dcroxide-bench/src/base58.rs`),
+with Go's side in the oracle's `base58_bench` command
+(`tools/oracle/base58bench.go`), shaped like `dcroxide-bench dcrec`: each
+process draws its strings from one fixed seed with SplitMix64, sends them
+to the oracle as they are, and for each row each side prepares its inputs
+untimed, times one pass over every string keeping each result, and folds a
+serialization of the results into a 64-bit FNV-1a digest; a difference
+stops the process. Go's side is timed with `time.Now` in the oracle's
+process. Three shapes of string, all valid: 16,384 mainnet
+pay-to-pubkey-hash addresses (35 characters), 16,384 extended public keys
+in hdkeychain's layout (`dpub`, 111 characters; `check_decode` reads the
+first two of the four version bytes as the version, and its checksum is
+the one hdkeychain checks) and 1,024 check-encoded strings of exactly
+1,000 characters. For each shape: `decode` and `check_decode` of each
+string, `encode` of each string's decoding and `check_encode` of each
+string's payload and version. Each string is different, so the per-byte
+work is not replayed from a branch predictor's memory; dcr-purse's harness
+decodes one address again and again.
+
+**The build.** `cargo build --release --locked -p dcroxide-bench`, Rust
+1.100.0 at the workspace's release profile (thin LTO, one codegen unit,
+`panic = "abort"`, overflow checks off), on m3. Before: the tree of
+`f00809d` with the benchmark added and the library unchanged (SHA-256 of
+the binary begins `13d0de215edc`). After: the tree of the commit that adds
+this section (`500863d0bf65`). The final tree's library differs from the
+measured one only in doc comments, corrected after review, and tests: a
+rebuild with the doc comments as measured gave the same hash, and the
+final tree's own rebuild (`cf07c05bd455`) differs only because the
+longer comments move source lines, whose numbers the binary's debug
+information and panic messages carry. The oracle, `go build` of `tools/oracle` with Go 1.27.3, linking
+`decred/base58` v1.0.6 and `crypto/blake256` as `tools/oracle/go.mod`
+requires them (SHA-256 of the oracle binary begins `110068bf85ab`);
+blake256's amd64 compression is assembly (AVX, SSE4.1 or SSE2, chosen
+at run time; m3 has AVX).
+
+**Order.** Sixteen processes a session, eight an arm, the default seed, a
+warm-up pass and five rounds each. The arms alternated before, after,
+after, before and so on, and `--start` alternated by pair of processes, so
+each arm ran four processes Rust first and four Go first, and every row
+40 pairs an arm. One process ran at a time, pinned with `taskset` to one
+logical processor that the oracle, its child, inherits; each side waits
+on the pipe while the other runs. Three sessions ran back to back on
+2026-11-20, each on its own core, all three on the CCD without the stacked
+cache: session 1 on processor 10 (16:37 to 16:40), session 2 on 12
+(16:40 to 16:44), session 3 on 14 (16:44 to 16:47). Before each process
+the 1-minute load average stood at 0.94 to 2.63 across the three
+sessions, one-second samples of `/proc/stat` put 0.1 to 1.9 CPUs busy
+machine-wide (median 0.2 to 0.3 per session), and the pinned processor
+and its SMT sibling were each at most 7% busy in the same second. What
+else ran, from one `top` snapshot before each process (its five busiest
+processes): interactive desktop applications and background services,
+none above 67% of one CPU in a snapshot but one, which took 157% before
+session 2's process 8, the same second that gave the 1.9 busy CPUs
+above; what it was doing was not checked. A snapshot is one short
+sample, and the `/proc/stat` figures are the measure of load. No build,
+test or other benchmark showed in any snapshot. A process's median over the least
+process median of its row, arm and side reached 1.08 in session 2, 1.10 in
+session 3 and 1.28 in session 1, where one after-arm process's
+`encode` of addresses ran at 86.9 ns against 68.1 to 69.6 for the
+other seven; session 2 is the record. Transparent huge pages at
+`always`, the `powersave` governor under `amd_pstate` in active mode,
+boost on.
+
+**Time per operation**, session 2, in ns: the median over an arm's eight
+processes of each process's median over its five rounds, with their
+range; Go is its median in the after arm; Rust / Go is the median over the
+arm's 40 pairs of each pair's ratio, the two passes run back to back, with
+its quartiles for the after arm. Every row's before and after ranges are
+disjoint, in all three sessions.
+
+| row | before | after | Go | before / Go | after / Go (quartiles) |
+|---|---:|---:|---:|---:|---:|
+| `decode`, address | 325.8 (315.4–340.8) | 37.4 (37.0–38.2) | 111.9 | 2.916 | 0.336 (0.329–0.345) |
+| `check_decode`, address | 570.3 (565.8–591.4) | 292.9 (284.4–306.6) | 370.2 | 1.544 | 0.799 (0.767–0.827) |
+| `encode`, address | 400.1 (398.4–409.0) | 68.6 (68.4–69.8) | 468.4 | 0.882 | 0.147 (0.143–0.153) |
+| `check_encode`, address | 650.6 (648.0–672.7) | 319.7 (318.9–321.1) | 696.9 | 0.932 | 0.461 (0.451–0.465) |
+| `decode`, xpub | 1,230.9 (1,216.0–1,244.9) | 96.7 (96.1–97.5) | 646.0 | 1.898 | 0.150 (0.148–0.151) |
+| `check_decode`, xpub | 1,583.0 (1,571.8–1,602.7) | 445.5 (444.1–446.5) | 1,002.0 | 1.587 | 0.445 (0.443–0.447) |
+| `encode`, xpub | 4,168.3 (4,164.7–4,194.8) | 305.5 (304.3–317.9) | 4,384.2 | 0.951 | 0.070 (0.070–0.070) |
+| `check_encode`, xpub | 4,555.3 (4,537.0–4,584.2) | 692.2 (681.6–696.7) | 4,751.9 | 0.958 | 0.146 (0.142–0.147) |
+| `decode`, 1,000 chars | 43,250.8 (43,122.6–43,432.6) | 2,317.0 (2,306.8–2,321.9) | 40,361.0 | 1.069 | 0.057 (0.057–0.058) |
+| `check_decode`, 1,000 chars | 44,839.7 (44,498.6–45,237.4) | 3,807.3 (3,755.5–3,952.4) | 41,475.6 | 1.078 | 0.092 (0.091–0.095) |
+| `encode`, 1,000 chars | 356,511.7 (356,149.7–357,876.0) | 21,045.5 (20,956.2–21,125.9) | 357,555.2 | 0.996 | 0.059 (0.059–0.059) |
+| `check_encode`, 1,000 chars | 358,050.0 (357,812.3–360,158.2) | 22,409.2 (22,369.6–22,557.1) | 359,291.2 | 0.996 | 0.062 (0.062–0.063) |
+
+Go's own medians moved by 2.6% or less between the arms on every row
+(`encode` of addresses, 456.6 and 468.4 ns, the most). The pair medians of
+all three sessions, before / Go and after / Go:
+
+| row | before / Go, sessions 1, 2, 3 | after / Go, sessions 1, 2, 3 |
+|---|---|---|
+| `decode`, address | 2.914, 2.916, 2.965 | 0.332, 0.336, 0.343 |
+| `check_decode`, address | 1.548, 1.544, 1.527 | 0.783, 0.799, 0.789 |
+| `encode`, address | 0.864, 0.882, 0.874 | 0.151, 0.147, 0.150 |
+| `check_encode`, address | 0.931, 0.932, 0.932 | 0.460, 0.461, 0.456 |
+| `decode`, xpub | 1.888, 1.898, 1.880 | 0.150, 0.150, 0.149 |
+| `check_decode`, xpub | 1.576, 1.587, 1.571 | 0.444, 0.445, 0.446 |
+| `encode`, xpub | 0.951, 0.951, 0.949 | 0.070, 0.070, 0.069 |
+| `check_encode`, xpub | 0.958, 0.958, 0.957 | 0.146, 0.146, 0.146 |
+| `decode`, 1,000 chars | 1.069, 1.069, 1.065 | 0.057, 0.057, 0.057 |
+| `check_decode`, 1,000 chars | 1.077, 1.078, 1.074 | 0.091, 0.092, 0.091 |
+| `encode`, 1,000 chars | 0.997, 0.996, 0.996 | 0.059, 0.059, 0.059 |
+| `check_encode`, 1,000 chars | 0.996, 0.996, 0.996 | 0.062, 0.062, 0.062 |
+
+Two earlier sessions the same afternoon, with every process pinned to
+processor 26 (the sibling of 10) while other work ran, agree. The first,
+with the 1-minute load average at 3.0 to 7.3 before its processes and
+its spread at most 1.14, gave pair medians within 0.031 of session 2's
+on every row (`decode` of addresses, 2.947 before), and 0.786 and 0.446
+for `check_decode` after. The second ran with the load average at 5.6 to
+18.5 (8.0 to 18.5 before its first twelve processes) and up to 28.9 CPUs
+busy, a spread of 2.08, and is disturbed. A `perf
+record` of the before build's `check_decode` over addresses put 50% of the
+samples in `decode`, nearly all of them in the per-character
+multiplication loop, and 35% in BLAKE-256's compression and finalization.
+
+**What it shows.**
+
+- Before the change, with a different string each time, `decode` of an
+  address cost 2.9 times Go's time and `check_decode` 1.53 to 1.55 times:
+  the parity dcr-purse measured holds only for one string decoded again
+  and again. The crate's character lookup was a linear search of the
+  alphabet, whose branches a repeated string trains; Go's is a table.
+- After it, `check_decode` costs 0.78 to 0.80 times Go's time on an
+  address and 0.44 to 0.45 on an extended key across the three sessions,
+  against the 0.85 this change aimed for. `decode` alone is 0.33 to 0.34
+  and 0.15.
+- What is left of an address's `check_decode` is the checksum: Go's
+  `check_decode` less its `decode` is about 258 ns in session 2, and the
+  crate's about 256 ns; on an extended key, 356 and 349 ns. Portable
+  BLAKE-256 is level with Go's assembly at these lengths (two
+  compressions of a 64-byte block for an address, one a pass, and three
+  for an extended key, whose 78 bytes take two), and the margin
+  comes from the conversion alone, so BLAKE-256 was left unchanged. A
+  faster compression would move the address's ratio most: at the measured
+  split, every 10% off the crate's checksum is about 0.07 off its ratio
+  (inference, not measured).
+- Encoding is 0.15 (address) to 0.07 (extended key) times Go's time, and
+  `check_encode` 0.46 and 0.15; on 1,000 characters every function costs
+  0.06 to 0.09 times Go's.
+
+**What it does not show.** dcr-purse's own harness and machine were not
+run; its row is decided there. One machine, one compiler and one Go, on
+one CCD of it; the arm64 build and 32-bit targets were not measured.
+Strings with leading '1's and invalid strings are not timed (the batch
+differential in `crates/dcroxide-base58/tests/oracle_differential.rs`
+holds their outputs to Go's). Go's times are its library's in the
+oracle's process, Go's garbage collector included, with whatever that
+process's runtime threads do on the same processor.
+
+Raw: `t1/`, `t2/` and `t3/`, each with every process's summary
+(`<n>-<arm>-<start>.txt`), JSON lines (`.jsonl`) and progress (`.err`),
+`state.txt` (each process's start time, load averages, busy CPUs and the
+pinned processor's and its sibling's busy fraction), `top.txt` and
+`build.txt` (the binaries' hashes, the compiler's and Go's versions, the
+CPU's name, the processor and its sibling, the huge-page, governor and
+boost settings); `s1/` and `s2/`, the earlier sessions; the profile;
+`bench.sh`, `bench2.sh`, `analyze.py` and `analyze2.py`.
