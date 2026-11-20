@@ -2,11 +2,15 @@
 //! Go-made vectors for the nine ECDSA pairs of the RPC set (ADR-0015, T4):
 //! P-256, P-384 and P-521, each with SHA-256, SHA-384 and SHA-512, the
 //! five pairs ring lacked among them.  Wycheproof's P-521 and SHA-512
-//! ECDSA files are not in the tree (`tests/data/wycheproof/SOURCE` lists
-//! what is), and no copy of them was found on the machine that made these,
-//! so the known answers come from the reference Go through the oracle
-//! instead, and are frozen in `tests/data/ecdsa-go/cases.json.gz` with
-//! their count and hash (`tests/data/ecdsa-go/SOURCE`).
+//! ECDSA files were not in the tree when these were made, and no copy of
+//! them was found on the machine that made them, so the known answers come
+//! from the reference Go through the oracle instead, and are frozen in
+//! `tests/data/ecdsa-go/cases.json.gz` with their count and hash
+//! (`tests/data/ecdsa-go/SOURCE`).  Since 2026-11-20 Wycheproof's files
+//! for P-256, P-384 and P-521 with SHA-512 are in the tree as well
+//! (`tests/data/wycheproof/SOURCE` lists them), so its files there cover
+//! six of the nine pairs; none covers P-256 with SHA-384 or P-521 with
+//! SHA-256 or SHA-384, which these vectors alone cover.
 //!
 //! Each case is a key, a message, a signature and the algorithm it is
 //! checked under, by webpki's name, with its class and Go's verdict, as

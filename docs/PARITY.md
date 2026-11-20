@@ -3536,8 +3536,13 @@ closing it would cost.
   of the three hashes, a P-256 client under a P-521 authority among them.
   An `rpc.cert` generated with `--tlscurve=P-521` and used with
   `gencerts -C` was not run itself; its chain is a P-521 authority signing
-  with ecdsa-with-SHA512, which those tests cover. Wycheproof's P-521 and
-  SHA-512 ECDSA vectors are not in the tree.
+  with ecdsa-with-SHA512, which those tests cover. Wycheproof's ECDSA
+  files for P-256, P-384 and P-521 with SHA-512, 1,638 cases with no
+  `acceptable` one, are in the tree since 2026-11-20 and every case gets
+  Wycheproof's verdict and Go's, through the oracle, as a certificate's
+  signature (`src/wycheproof_tests.rs`), so its files in the tree cover
+  six of the nine pairs; Wycheproof has no file for P-256 with SHA-384 or
+  P-521 with SHA-256 or SHA-384, which the Go-made vectors alone cover.
   The seeders' set, `SUPPORTED_SIG_ALGS`, stays ring's (the seeder entry).
 
   A client CertificateVerify Go's server refuses is refused with Go's alert

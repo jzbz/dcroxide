@@ -7,6 +7,14 @@ Fetched:     2026-10-26, from raw.githubusercontent.com at that commit; each
              file's git blob hash and size matched the repository's listing
              at the commit.  The six mldsa_*_test.json files were
              fetched the same way, at the same commit, on 2026-11-12.
+             The three ecdsa_secp*_sha512_test.json files were fetched
+             from raw.githubusercontent.com at the same commit on
+             2026-11-20; their git blob hashes below were computed from
+             the fetched bytes (git hash-object), not compared with a
+             listing.  ecdsa_secp384r1_sha384_test.json, fetched again at
+             the commit that day, matched its SHA-256 below, and each of
+             the four files was byte-identical to the same path on the
+             repository's main branch that day.
 Licence:     Apache License 2.0, the repository's LICENSE, copied unchanged
              beside this file.
 
@@ -33,12 +41,21 @@ ecdh_secp521r1_ecpoint_test.json
 ecdsa_secp256r1_sha256_test.json
                               327156   182db4f3e230f6f9fa9f800d2a614dede30284b8e8438bbfe1171905402e9332
                                        19c951dbd3b6e33ed5e28d9bbbeea30e5f0350d3
+ecdsa_secp256r1_sha512_test.json
+                              354250   8e940baad7c6172c58c8f354b10366d307be43a3cb82a5880cb46686c3e8f858
+                                       816a843aa0f401650c6dbe237202658ed0992e55
 ecdsa_secp384r1_sha256_test.json
                               361096   660c948e5433279ecdf966e8a1386b69ecec618efc1ff00269e85aa9dc84f0a6
                                        32891e5ffb7342fd6183c7c68cff2aac753f4ae2
 ecdsa_secp384r1_sha384_test.json
                               375442   8a5b3ae1760975143414811f13588c24d951d9d8c904195087ba327591dfe9cc
                                        19df1b5614d68af884d9d197b0d123cc5d22807d
+ecdsa_secp384r1_sha512_test.json
+                              393091   f44bae32e419fc75c5b5af751cff4e35145cfbcc24944e378d5f30889d310513
+                                       c236b49ec7f7ea012b698cc38949843a5664c156
+ecdsa_secp521r1_sha512_test.json
+                              455046   0fa3bb09a2319242253028b53d555fb8ec2081d891271321205cdaeabb3eef3e
+                                       f831d74e92498539cfbc1285d7cc584fa16f9472
 ed25519_test.json             172628   ea80ffebac085e21cb9d3e903e7fa2b448d96702da5b31f061d0b83b430b74b3
                                        3f991dd56496129e3a99b6b486408ef8f3df6945
 hkdf_sha256_test.json          92505   bb2b462a38b251cb52a2aede706d6d4b62b26864f4e80c95497507ddb07c5f1e
@@ -104,4 +121,4 @@ x25519_test.json              253890   35c3f5231cf25cc640b524d403461deee9e49441d
 LICENSE                        11357   58d1e17ffe5109a7ae296caafcadfdbe6a7d176f0bc4ab01e12a689b0499d8bd
                                        7a4a3ea2424c09fbe48d455aed1eaa94d9124835
 
-Compressed, the 33 vector files are 5,179,739 bytes, from 14,647,118.
+Compressed, the 36 vector files are 5,366,263 bytes, from 15,849,505.

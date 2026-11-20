@@ -1,9 +1,12 @@
 // SPDX-License-Identifier: ISC
 //! The nine ECDSA pairs of the RPC set give the verdicts the reference Go
 //! gave on the frozen vectors of `tests/ecdsa_go` (ADR-0015, T4), with no
-//! oracle: the known answers for P-521 and for SHA-512, which Wycheproof's
-//! files in the tree do not cover.  `tests/go_differential.rs` asks Go for
-//! the same verdicts again where an oracle runs.
+//! oracle: the known answers for P-521 and for SHA-512.  Wycheproof's
+//! files in the tree cover six of the nine pairs, P-256, P-384 and P-521
+//! with SHA-512 among them (`src/wycheproof_tests.rs`), and not P-256
+//! with SHA-384 or P-521 with SHA-256 or SHA-384, for which Wycheproof
+//! has no file.  `tests/go_differential.rs` asks Go for the same verdicts
+//! again where an oracle runs.
 
 // Test-harness arithmetic over bounded lengths.
 #![allow(clippy::arithmetic_side_effects)]

@@ -5,9 +5,10 @@
 //! through the `seal` and `open` every record goes through; HMAC as rustls
 //! asks for a tag; HKDF as rustls builds it on that HMAC; each key
 //! exchange group's `complete`, from the case's private key; the
-//! verification algorithms of `SUPPORTED_SIG_ALGS` and ML-DSA's three, on
-//! the key as a certificate's SubjectPublicKeyInfo carries it; and
-//! ML-DSA's key, loaded from its seed, and its handshake signer.  The
+//! verification algorithms of `SUPPORTED_SIG_ALGS`, the RPC set's three
+//! ECDSA pairs with SHA-512 that Wycheproof has files for and ML-DSA's
+//! three, on the key as a certificate's SubjectPublicKeyInfo carries it;
+//! and ML-DSA's key, loaded from its seed, and its handshake signer.  The
 //! files, their commit and their hashes are in
 //! `tests/data/wycheproof/SOURCE`.
 //!
@@ -879,6 +880,50 @@ fn ecdsa_p384_sha384_answers_wycheproof() {
     let run = (verify::ECDSA_P384_SHA384, "ECDSA-SHA384", None);
     let file = "ecdsa_secp384r1_sha384_test.json";
     ecdsa_answers_wycheproof(file, "secp384r1", "SHA-384", run, expected);
+}
+
+// The three SHA-512 pairs below are in the RPC listener's set,
+// `RPC_SIG_ALGS`, alone (ADR-0015's second addendum of 2026-11-19, T4),
+// and Go's x509 takes each of them from a certificate.  None of the three
+// files has an `acceptable` case.
+
+#[test]
+fn ecdsa_p256_sha512_answers_wycheproof() {
+    let expected = Tally {
+        valid: 243,
+        invalid: 311,
+        acceptable: 0,
+        skipped: 0,
+    };
+    let run = (verify::ECDSA_P256_SHA512, "ECDSA-SHA512", None);
+    let file = "ecdsa_secp256r1_sha512_test.json";
+    ecdsa_answers_wycheproof(file, "secp256r1", "SHA-512", run, expected);
+}
+
+#[test]
+fn ecdsa_p384_sha512_answers_wycheproof() {
+    let expected = Tally {
+        valid: 231,
+        invalid: 311,
+        acceptable: 0,
+        skipped: 0,
+    };
+    let run = (verify::ECDSA_P384_SHA512, "ECDSA-SHA512", None);
+    let file = "ecdsa_secp384r1_sha512_test.json";
+    ecdsa_answers_wycheproof(file, "secp384r1", "SHA-512", run, expected);
+}
+
+#[test]
+fn ecdsa_p521_sha512_answers_wycheproof() {
+    let expected = Tally {
+        valid: 232,
+        invalid: 310,
+        acceptable: 0,
+        skipped: 0,
+    };
+    let run = (verify::ECDSA_P521_SHA512, "ECDSA-SHA512", None);
+    let file = "ecdsa_secp521r1_sha512_test.json";
+    ecdsa_answers_wycheproof(file, "secp521r1", "SHA-512", run, expected);
 }
 
 #[test]

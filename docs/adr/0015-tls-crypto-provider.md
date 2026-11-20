@@ -1325,7 +1325,8 @@ are accepted as Go accepts them. The verification is small: the
 provider's ECDSA verifier is generic over the curve and the hash and
 `p521` is a dependency already, so P-521 and SHA-512 are table entries in
 `RPC_SIG_ALGS` and in the CertificateRequest's schemes, with Wycheproof's
-P-521 vectors (not in the tree yet) and the RSA lower bound in `rsa.rs`;
+P-521 vectors (not in the tree yet; *in it since 2026-11-20*) and the
+RSA lower bound in `rsa.rs`;
 estimated at 200 to 400 lines with tests. It changes the node's verdicts,
 the three client-certificate cells `dcroxide-testutil`'s `tls_interop`
 holds as refused, and the wallet's P-521 cells, so it lands in a change of
@@ -1565,6 +1566,32 @@ key solved for) verifies under each hash, as Go verifies it: the length is
 in the long form from 128 content bytes up, where an honestly made P-521
 signature almost always falls, not for every P-521 signature.
 
+*(2026-11-20: the project owner decided on 2026-11-20 that Wycheproof's
+ECDSA files for P-521 with SHA-512, and for P-256 and P-384 with SHA-512,
+join the crate's Wycheproof run. They were fetched from C2SP/wycheproof
+at `d17cc89f`, the commit the other 33 files come from, and are frozen
+gzipped in `crates/dcroxide-tlscrypto/tests/data/wycheproof` with their
+sizes, SHA-256 and git blob hashes in its `SOURCE`. Only the DER files
+are taken: the verifier reads a signature only as DER
+(`Signature::from_der`), and no code path takes IEEE P1363's form; no
+SHA-3 file, since no algorithm of the provider hashes with SHA-3.
+`src/wycheproof_tests.rs`'s `ecdsa_p256_sha512_answers_wycheproof`,
+`ecdsa_p384_sha512_answers_wycheproof` and
+`ecdsa_p521_sha512_answers_wycheproof` run every case of the three
+files, 554, 542 and 542 (243, 231 and 232 valid; 311, 311 and 310
+invalid; none `acceptable`, so no flag needs a policy), through
+`ECDSA_P256_SHA512`, `ECDSA_P384_SHA512` and `ECDSA_P521_SHA512` on the
+group's uncompressed key, and hold each verdict to Wycheproof's and,
+through the oracle, to Go's as `Certificate.CheckSignature` gives it
+under ECDSA-SHA512. All 1,638 cases agree with both under go1.27.3 on an
+x86_64 Linux desktop, among them the P-256 and P-384 files'
+`Untruncatedhash` cases, each a signature made over the whole 64-byte
+digest without cutting it to the order's length, which both refuse.
+With them Wycheproof's files in the tree cover six of the nine pairs.
+Wycheproof has no file for P-256 with SHA-384 or for P-521 with SHA-256
+or SHA-384 at that commit, so those three pairs stay held by the
+Go-made vectors alone, which are kept for all nine pairs.)*
+
 **What remains of T4.** RSA client keys of 1024 to 2040 bits, which Go
 accepts and the provider refuses, ring's 256-byte floor kept by `rsa.rs`
 and the `RSA_*_2048_8192` algorithms, and with it Go's other RSA rules
@@ -1731,7 +1758,10 @@ per-listener choice of hybrids for the wallet, the constant-time check
 over the new path and Go interop cells, the wallet's under its
 `GODEBUG`. Nothing of it was started here.
 
-**Not tested here:** P-521 and SHA-512 against Wycheproof's vectors; the
+**Not tested here:** P-521 and SHA-512 against Wycheproof's vectors
+*(run since 2026-11-20, Wycheproof's P-256, P-384 and P-521 files with
+SHA-512, as the note under "How it is held to Go" records; it has no
+file for P-256 with SHA-384 or P-521 with SHA-256 or SHA-384)*; the
 seeders with the wider set, which they do not use; broken signatures by
 an RSA or ML-DSA client key over the wire, whose words stay rustls's;
 dcrwallet's gRPC listener and the node's `--authtype=clientcert` listener

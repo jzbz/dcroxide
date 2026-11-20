@@ -502,8 +502,8 @@ work). Currently implemented:
   tree on `num-bigint`, within ring's limits, with ML-DSA's three and the
   ECDSA pairs ring lacked (P-256 and P-384 with SHA-512, P-521 with
   SHA-256, SHA-384 and SHA-512) beside them for the RPC listener's client
-  certificates, P-521 and SHA-512 held to Go-made vectors where Wycheproof's
-  are not in the tree; pinned by Wycheproof's
+  certificates, all nine pairs held to Go-made vectors, and the three with
+  SHA-512 also to Wycheproof's; pinned by Wycheproof's
   vectors on hardware and portable backends, by RFC 6979's and RFC 8032's
   known answers, by a corpus of signatures whose verdicts it gives as ring
   gave them, recorded while ring was in the tree, and as Go gives them but
