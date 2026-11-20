@@ -8,7 +8,9 @@
 //! The tool exists so every optimization piece lands with a number:
 //! run `replay` on the same corpus before and after a change.  `dcrec`
 //! (the `dcrec` module) is a micro benchmark of dcroxide-dcrec's
-//! operations on secrets against dcrd's, through the oracle.
+//! operations on secrets against dcrd's, through the oracle, and `base58`
+//! (the `base58` module) one of dcroxide-base58's functions against
+//! decred/base58's.
 
 use std::io::{BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -26,6 +28,7 @@ use dcroxide_indexers::{
 };
 use dcroxide_wire::{BlockHeader, MsgBlock};
 
+mod base58;
 mod dcrec;
 
 /// The command-line help.
@@ -255,6 +258,20 @@ Usage:
       one JSON line per pair.  The summary gives each op's median and
       least time per operation over the rounds, and the ratio of the
       medians.
+
+  dcroxide-bench base58 [--oracle <path>|none] [--cases <n>] [--rounds <n>]
+                        [--seed <hex>] [--start rust|go] [--ops <a,b,...>]
+                        [--shapes <a,b,...>] [--out <file>]
+      Time dcroxide-base58's decode, check_decode, encode and
+      check_encode against decred/base58's, the package dcrd and
+      dcrwallet link, on three shapes of string: a mainnet
+      pay-to-pubkey-hash address (35 characters), an extended public key
+      (111) and a 1,000-character check-encoded string.  Go's side is the
+      oracle's base58_bench, timed in the oracle's process; --oracle and
+      the order of passes are as for dcrec.  <cases> strings (default
+      16384) of the first two shapes and a sixteenth as many long ones
+      are drawn from --seed (default fixed).  Every pass's outputs are
+      folded into a digest on both sides, and a difference stops the run.
 
   --net is one of mainnet, testnet, simnet, regnet (default mainnet).
 ";
@@ -1758,6 +1775,13 @@ fn main() -> std::process::ExitCode {
             &["cases", "rounds", "seed", "start", "ops", "out", "oracle"],
         )
         .and_then(|a| dcrec::cmd_dcrec(&a)),
+        "base58" => Args::parse(
+            rest,
+            &[
+                "cases", "rounds", "seed", "start", "ops", "shapes", "out", "oracle",
+            ],
+        )
+        .and_then(|a| base58::cmd_base58(&a)),
         "indexcatchup" => Args::parse(
             rest,
             &["workdir", "net", "txindex", "addrindex", "metacache"],

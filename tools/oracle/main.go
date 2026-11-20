@@ -335,6 +335,15 @@
 //	                     (bench.go has the ops); {"detail": {"ns": elapsed
 //	                     nanoseconds, "digest": "<hex 64-bit FNV-1a of the
 //	                     outputs, concatenated>"}}
+//	base58_bench       → data is name_len(1) || op name || zero or more
+//	                     cases, each length(4 BE) || string bytes; times
+//	                     decred/base58's decode, check_decode, encode or
+//	                     check_encode over every case once, in process,
+//	                     for dcroxide-bench base58 and dcroxide-base58's
+//	                     batch differential (base58bench.go has the ops
+//	                     and the output serialization); {"detail": {"ns":
+//	                     elapsed nanoseconds, "cases": count, "digest":
+//	                     "<hex 64-bit FNV-1a of the outputs>"}}
 //	build_info         → takes no data; {"go_version": runtime.Version(),
 //	                      "modules": {"<module path>": "<version>"}} for the
 //	                     secp256k1/v4 and edwards/v2 modules linked in
@@ -2182,6 +2191,11 @@ func handle(req request) response {
 	case "secp_bench":
 		// dcrd's side of dcroxide-bench's dcrec micro benchmark (bench.go).
 		return secpBench(data)
+
+	case "base58_bench":
+		// decred/base58's side of dcroxide-bench's base58 micro benchmark,
+		// and dcroxide-base58's batch differential (base58bench.go).
+		return base58Bench(data)
 
 	case "build_info":
 		// What a recorded comparison ran against: the toolchain, and the

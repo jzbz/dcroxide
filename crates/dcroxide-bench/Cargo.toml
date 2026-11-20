@@ -1,6 +1,6 @@
 [package]
 name = "dcroxide-bench"
-description = "Development-only benchmark harness: replay bootstrap-format block corpora through the live chain engine with timing (no dcrd counterpart), and time dcroxide-dcrec's operations on secrets against dcrd's through the oracle"
+description = "Development-only benchmark harness: replay bootstrap-format block corpora through the live chain engine with timing (no dcrd counterpart), and time dcroxide-dcrec's operations on secrets and dcroxide-base58's functions against Go's through the oracle"
 version.workspace = true
 authors.workspace = true
 edition.workspace = true
@@ -9,6 +9,8 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+# The `base58` micro benchmark (src/base58.rs).
+dcroxide-base58 = { path = "../dcroxide-base58" }
 dcroxide-blockchain = { path = "../dcroxide-blockchain", features = ["std"] }
 dcroxide-chaincfg = { path = "../dcroxide-chaincfg" }
 dcroxide-chainhash = { path = "../dcroxide-chainhash" }

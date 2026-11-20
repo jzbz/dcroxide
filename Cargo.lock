@@ -394,6 +394,7 @@ dependencies = [
 name = "dcroxide-bench"
 version = "0.1.0"
 dependencies = [
+ "dcroxide-base58",
  "dcroxide-blockchain",
  "dcroxide-chaincfg",
  "dcroxide-chainhash",

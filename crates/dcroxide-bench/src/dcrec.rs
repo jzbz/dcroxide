@@ -136,7 +136,7 @@ pub(crate) struct Pass {
 }
 
 /// The nanoseconds since `start`, saturating.
-fn since(start: Instant) -> u64 {
+pub(crate) fn since(start: Instant) -> u64 {
     u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX)
 }
 
@@ -476,7 +476,7 @@ pub(crate) fn rust_first(round: usize, op: usize, start_go: bool) -> bool {
 
 /// The processors this process may run on, from /proc/self/status, or
 /// "unknown".
-fn allowed_cpus() -> String {
+pub(crate) fn allowed_cpus() -> String {
     std::fs::read_to_string("/proc/self/status")
         .ok()
         .and_then(|s| {
@@ -488,7 +488,7 @@ fn allowed_cpus() -> String {
 }
 
 /// The first three fields of /proc/loadavg, or "unknown".
-fn load_average() -> String {
+pub(crate) fn load_average() -> String {
     std::fs::read_to_string("/proc/loadavg")
         .ok()
         .map(|s| s.split_whitespace().take(3).collect::<Vec<_>>().join(" "))
@@ -500,13 +500,13 @@ fn load_average() -> String {
     clippy::cast_precision_loss,
     reason = "nanosecond totals and case counts far below 2^52"
 )]
-fn per_op(ns: u64, cases: usize) -> f64 {
+pub(crate) fn per_op(ns: u64, cases: usize) -> f64 {
     ns as f64 / cases.max(1) as f64
 }
 
 /// The oracle binary: `--oracle`, else `DCROXIDE_ORACLE_BIN`; `none`
 /// leaves dcrd out.
-fn oracle_path(args: &Args) -> Option<PathBuf> {
+pub(crate) fn oracle_path(args: &Args) -> Option<PathBuf> {
     let named = args
         .get("oracle")
         .map(str::to_string)
