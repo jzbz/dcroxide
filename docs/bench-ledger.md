@@ -8524,7 +8524,7 @@ from operation to operation and round to round, and the process's
 alternating, each pinned with `taskset -c 3`; the oracle, a child,
 inherits the pin, and each side waits on the pipe while the other runs.
 Every operation ran 20 pairs Rust first and 20 Go first in each session.
-Three sessions ran back to back. Other agents' builds and tests kept the
+Three sessions ran back to back. Other builds and tests kept the
 machine busy throughout, and nothing kept them off processor 3. In the
 first session (17:53 to 18:00) the 1-minute load average stood at 22.7 to
 54.6 as its processes started, and a process's median over the least
