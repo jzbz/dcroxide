@@ -163,41 +163,52 @@
 //!   new key exchange path; and the Go interop cells, the wallet's under
 //!   its `GODEBUG`.  Estimated at 1,000 to 1,500 lines with tests, several
 //!   days of work, not prototyped.
-//! - **T4, Go's client certificate set, is not done.**  The provider
-//!   verifies ECDSA on P-256 and P-384 with SHA-256 or SHA-384 only, and
-//!   RSA keys of 2041 to 8192 bits (a modulus of at least 256 whole
-//!   bytes, ring's floor), so a P-521 client key, a chain whose issuer
-//!   signs with ecdsa-with-SHA512, and an RSA client key below 2041 bits,
-//!   which Go accepts from 1024, are refused where Go accepts them
-//!   (PARITY.md's clientcert entry).  For the wallet that is `--issueclientcert` under
-//!   `--tlscurve=P-521`: dcrwallet's P-521 authority signs its client
-//!   with ECDSA-SHA512 and the client's key is P-521, so the pair dcrwallet
-//!   would accept is refused (`tests/wallet_interop.rs` holds the refusal
-//!   beside Go's acceptance); the default Ed25519 pair and the P-256 and
-//!   P-384 ones are accepted as Go accepts them.  The verification itself
-//!   is small: the provider's ECDSA verifier is generic over the curve and
-//!   the hash, and `p521` is already a dependency, so P-521 and SHA-512
-//!   are table entries in `RPC_SIG_ALGS` and the scheme list of the
-//!   CertificateRequest, with Wycheproof's P-521 vectors, which are not
-//!   in the tree, and the RSA lower bound in `rsa.rs`; estimated at 200 to
-//!   400 lines with tests.  It changes the node's verdicts, so it lands
-//!   with the matrix cells it flips (the client-certificate verdicts
-//!   `dcroxide-testutil`'s `tls_interop` holds, and the P-521 cells
-//!   here), the PARITY entries it closes, and ADR-0015's record of it, in
-//!   a change of its own.  It was left out of the change that made this
-//!   crate, which changes no verdict of the node's for a client that
-//!   keeps to the protocol: the node's Go interop matrix runs through the
-//!   crate with its earlier cells unchanged, and `tests/certificate_size.rs`
-//!   and the node's `a_go_client_chain_over_32_kib_under_clientcert_auth`
-//!   hold client certificate messages up to rustls's limit (64 KiB less
-//!   one byte of wire data, record headers and AEAD overhead included),
-//!   the node's before the crate as well, which a first version of
-//!   [`handshake`]'s own reading refused past some 16 KiB.  That change
-//!   does change the node: its review fixes move the node's alerts and logged words toward Go's for a few
-//!   refusals, and refuse, as Go does, a client that sends a record of
-//!   another version than TLS 1.2's during the handshake, or changes its
-//!   ClientHello after a HelloRetryRequest, which the node accepted
-//!   (ADR-0015's addendum of 2026-11-19, its review fixes).
+//! - **T4, Go's client certificate set, is done for ECDSA and not for
+//!   RSA.**  The provider's RPC set verifies ECDSA on P-256, P-384 and
+//!   P-521, each with SHA-256, SHA-384 and SHA-512, as Go does, and lists
+//!   `ecdsa_secp521r1_sha512` last in the CertificateRequest, where Go
+//!   lists it (ADR-0015's second addendum of 2026-11-19).  For the wallet
+//!   that is `--issueclientcert` under `--tlscurve=P-521`: dcrwallet's
+//!   P-521 authority signs its client with ECDSA-SHA512 and the client's
+//!   key is P-521, and the pair is accepted as Go accepts it, in TLS 1.3
+//!   and TLS 1.2, on both listeners (`tests/wallet_interop.rs`), as are
+//!   the default Ed25519 pair and the P-256 and P-384 ones.  What remains
+//!   of T4 is RSA: the provider verifies RSA keys of 2041 to 8192 bits (a
+//!   modulus of at least 256 whole bytes, ring's floor), so an RSA client
+//!   key below 2041 bits, which Go accepts from 1024, is refused where Go
+//!   accepts it (PARITY.md's clientcert entry); dcrwallet generates no RSA
+//!   key.  The change that made this crate changed no verdict of the
+//!   node's for a client that keeps to the protocol: the node's Go interop
+//!   matrix ran through the crate with its earlier cells unchanged, and
+//!   `tests/certificate_size.rs` and the node's
+//!   `a_go_client_chain_over_32_kib_under_clientcert_auth` hold client
+//!   certificate messages up to rustls's limit (64 KiB less one byte of
+//!   wire data, record headers and AEAD overhead included), the node's
+//!   before the crate as well, which a first version of [`handshake`]'s
+//!   own reading refused past some 16 KiB.  That change did change the
+//!   node: its review fixes move the node's alerts and logged words toward
+//!   Go's for a few refusals, and refuse, as Go does, a client that sends a
+//!   record of another version than TLS 1.2's during the handshake, or
+//!   changes its ClientHello after a HelloRetryRequest, which the node
+//!   accepted (ADR-0015's addendum of 2026-11-19, its review fixes).  T4's
+//!   ECDSA part changed the node's verdicts as it changed the wallet's: a
+//!   P-521 client key and an ECDSA-SHA512 issuer are accepted under
+//!   `--authtype=clientcert`; and a client CertificateVerify Go refuses is
+//!   refused with Go's alert, a TLS 1.3 scheme that does not fit the
+//!   leaf's key with `illegal_parameter` where webpki sent
+//!   `decrypt_error`, and in Go's words where the key is ECDSA or Ed25519
+//!   (`tests/wallet_interop.rs`, the broken and mismatched signature
+//!   cells on every `--tlscurve`, which run dcrwallet's JSON-RPC listener:
+//!   the node's listener, on the same verifier and [`handshake`], has no
+//!   such cell of its own).  A client certificate whose key Go's `x509`
+//!   refuses, an ECDSA point compressed or off its curve or a key on a
+//!   curve it does not read among them, is refused when it is read, used
+//!   or not, as Go refuses to parse it, in Go's words with
+//!   `bad_certificate` where Go sends `decode_error`; an RSA key of more
+//!   than 8192 bits in any certificate sent, and a leaf on a DSA or X25519
+//!   key, are refused as Go refuses them, alert and words; and a TLS 1.2
+//!   client on P-224, which Go accepts, is refused in rustls's words
+//!   (PARITY.md, the clientcert entry).
 
 mod clientcert;
 mod pem;

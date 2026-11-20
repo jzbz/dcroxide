@@ -16,9 +16,14 @@
 //! over the authority's key, or as a handshake signature by the leaf
 //! (`dcroxide_gotls::fuzz_client_cert`); every key in those chains is a valid key
 //! of zero bytes and every signature one that decodes, so the input
-//! reaches the lattice arithmetic as well as the decoders.  A key of zero
-//! bytes is one anyone can sign for, so an input that is accepted is no
-//! failure.
+//! reaches the lattice arithmetic as well as the decoders.  A handshake
+//! signature may instead be by a leaf on the P-256, P-384 or P-521
+//! generator or on an Ed25519 key, under any scheme of the listener's
+//! list, P-521's and the SHA-512 pairs among them, or under one it
+//! refuses, so the input reaches the check of a scheme against the key,
+//! the ECDSA and Ed25519 decoders and arithmetic, and the refusal's
+//! wording.  A key of zero bytes, or of the secret scalar 1, is one
+//! anyone can sign for, so an input that is accepted is no failure.
 
 #![no_main]
 

@@ -50,11 +50,13 @@
 //!   provider's matrix (`dcroxide_testutil::tls_interop::ClientCerts`),
 //!   each key alone and under each kind of CA, in each version, through
 //!   `GoClientCertVerifier`: every cell the provider's matrix completes is
-//!   accepted by the listener and by Go's server, and the three refused
-//!   today, a P-521 client key, an issuer signing with ECDSA-SHA512 and an
-//!   RSA-1024 client key, are refused by the listener in its handshake,
-//!   with the alert Go's client reports for each and no HTTP answer, where
-//!   the reference Go's server accepts them ([`CLIENTCERT_GAP`]).  The
+//!   accepted by the listener and by Go's server, and so are a P-521
+//!   client key and an issuer signing with ECDSA-SHA512, which the
+//!   provider's matrix, on ring's set, refuses and the listener's set
+//!   verifies since Go's client-certificate set (ADR-0015, T4); an
+//!   RSA-1024 client key is refused by the listener in its handshake,
+//!   with the alert Go's client reports and no HTTP answer, where the
+//!   reference Go's server accepts it ([`CLIENTCERT_GAP`]).  The
 //!   count of cells the listener accepts is asserted, and under the
 //!   reference Go the count Go's server accepts, so a `tls_pki` chain
 //!   every verifier refused would fail the test rather than pass each
@@ -128,7 +130,9 @@ use dcroxide_node::seeding::{ProxySeederTransport, UreqTransport};
 use dcroxide_rpc::helpers::NoInterfaces;
 use dcroxide_rpc::server::{Config, Server};
 use dcroxide_standalone::SubsidyCache;
-use dcroxide_testutil::tls_interop::{ClientCerts, Issued, Negotiated, TlsOracle, spec};
+use dcroxide_testutil::tls_interop::{
+    ClientCerts, Issued, Negotiated, TlsOracle, reads_as_reset, spec,
+};
 use dcroxide_testutil::{REFERENCE_GO, hex};
 use dcroxide_wire::PROTOCOL_VERSION;
 use rustls::pki_types::pem::PemObject;
@@ -173,9 +177,9 @@ const HYBRID_GAP: &str = "PARITY.md, \"The RPC listener's TLS key exchange is cl
                           dcrd's is hybrid post-quantum\"";
 
 /// The PARITY.md entry the listener's refusals of client certificates Go
-/// accepts belong to: P-521 keys, ECDSA with SHA-512 and RSA keys under
-/// 2041 bits, which the provider's verification set, ring's, lacks and
-/// Go's client-certificate set (ADR-0015, T4) adds.
+/// accepts belong to: RSA keys under 2041 bits, which the listener's
+/// verification set keeps from ring's and the rest of Go's
+/// client-certificate set (ADR-0015, T4) is to lower.
 const CLIENTCERT_GAP: &str = "PARITY.md, \"Under `--authtype=clientcert` webpki and the TLS \
                               provider still decide part of a client chain\"";
 
@@ -260,14 +264,6 @@ fn assert_refused_by_the_node(go: &TlsOracle, what: &str, detail: &Value, error:
     } else {
         assert_eq!(detail["ok"], false, "{what}: Go's end {detail}");
     }
-}
-
-/// Whether an error, in Go's words or Rust's, is a reset of the
-/// connection: ECONNRESET, or on Windows WSAECONNRESET or WSAECONNABORTED.
-fn reads_as_reset(error: &str) -> bool {
-    error.contains("reset by peer")
-        || error.contains("forcibly closed by the remote host")
-        || error.contains("aborted by the software in your host machine")
 }
 
 /// The TLS 1.2 suites of an ECDSA or Ed25519 key, by Go's names.
@@ -886,7 +882,9 @@ fn go_client_certificates_under_clientcert_auth() {
                     "{what}: Go's server"
                 );
             }
-            match refusal {
+            // A P-521 key and an ECDSA-SHA512 issuer, which ring's set
+            // refuses, are accepted by the listener's set, as by Go.
+            match refusal.filter(|refusal| refusal.refused_by_rpc_set()) {
                 None => {
                     assert!(ours, "{what}: the listener {detail}");
                     assert!(theirs, "{what}: Go's server {served}");
@@ -914,13 +912,14 @@ fn go_client_certificates_under_clientcert_auth() {
     listening.listener.shutdown();
     go.report("go_client_certificates_under_clientcert_auth");
     assert_eq!(
-        ours_accepted, 48,
-        "four keys alone and under five authorities in two versions, accepted by the listener"
+        ours_accepted, 52,
+        "four keys alone and under five authorities, the P-521 key and the ECDSA-SHA512 \
+         issuer, in two versions, accepted by the listener"
     );
     if go.go_version() == REFERENCE_GO {
         assert_eq!(
             theirs_accepted, 54,
-            "those and the three refused today, in two versions, accepted by Go's server"
+            "those and the RSA-1024 key, in two versions, accepted by Go's server"
         );
     }
     assert_eq!(
@@ -1049,10 +1048,9 @@ fn authorities_and_usages_gos_search_refuses_under_clientcert_auth() {
 /// The signature schemes the listener's CertificateRequest lists in TLS
 /// 1.3, by Go's names: `dcroxide_tlscrypto::RPC_SIG_ALGS`, Go 1.27.3's
 /// default list (`crypto/tls/defaults.go:49-67`) in Go's order, less the
-/// SHA-1 schemes dcrd's `tlssha1=0` turns off and P-521's, which the
-/// provider lacks, with PKCS#1 v1.5's three, which Go leaves out of TLS 1.3
-/// (`crypto/tls/common.go:1821-1827`).
-const OUR_TLS13_REQUEST: [&str; 12] = [
+/// SHA-1 schemes dcrd's `tlssha1=0` turns off, with PKCS#1 v1.5's three,
+/// which Go leaves out of TLS 1.3 (`crypto/tls/common.go:1821-1827`).
+const OUR_TLS13_REQUEST: [&str; 13] = [
     "MLDSA44",
     "MLDSA65",
     "MLDSA87",
@@ -1065,6 +1063,7 @@ const OUR_TLS13_REQUEST: [&str; 12] = [
     "PKCS1WithSHA384",
     "PKCS1WithSHA512",
     "ECDSAWithP384AndSHA384",
+    "ECDSAWithP521AndSHA512",
 ];
 
 /// The PARITY.md entry the listener's differences from Go on ML-DSA
@@ -1129,15 +1128,15 @@ fn go_ml_dsa_client_certificates_under_clientcert_auth() {
     let client_cas: Vec<String> = trusted.iter().map(|name| hex(&pki[*name].cert)).collect();
     let listening = listen_rpc(&server, Some(&clients_pem)).expect("a clientcert listener");
     let request = getblockcount(false);
+    // In TLS 1.2 the listener lists Go's schemes exactly, ML-DSA's left
+    // out by both; in TLS 1.3 it adds PKCS#1 v1.5's three.
     let our_tls12: Vec<&str> = OUR_TLS13_REQUEST[3..].to_vec();
-    let mut go_tls12 = our_tls12.clone();
-    go_tls12.push("ECDSAWithP521AndSHA512");
-    let mut go_tls13: Vec<&str> = OUR_TLS13_REQUEST
+    let go_tls12 = our_tls12.clone();
+    let go_tls13: Vec<&str> = OUR_TLS13_REQUEST
         .iter()
         .copied()
         .filter(|scheme| !scheme.starts_with("PKCS1"))
         .collect();
-    go_tls13.push("ECDSAWithP521AndSHA512");
     for (version, fields, ours_requested, go_requested) in [
         (
             "TLS 1.3",
@@ -1911,37 +1910,5 @@ fn a_client_hello_is_held_to_its_description() {
         ("a group fewer", with("supported_curves", json!(["X25519"]))),
     ] {
         assert!(!matches(&changed), "{what}");
-    }
-}
-
-/// [`reads_as_reset`] takes a reset in each system's words, Go's and
-/// Rust's, Windows' "aborted" among them, which Go's client has read on
-/// Windows in place of the node's alert, and nothing else a refusal
-/// shows: the check the reset allowance rests on, run without the oracle.
-#[test]
-fn a_reset_reads_as_one_in_each_systems_words() {
-    for reset in [
-        "read tcp 127.0.0.1:54021->127.0.0.1:53689: read: connection reset by peer",
-        "read tcp 127.0.0.1:54021->127.0.0.1:53689: wsarecv: An existing connection was \
-         forcibly closed by the remote host.",
-        "read tcp 127.0.0.1:54021->127.0.0.1:53689: wsarecv: An established connection was \
-         aborted by the software in your host machine.",
-        "Connection reset by peer (os error 104)",
-        "Connection reset by peer (os error 54)",
-        "An existing connection was forcibly closed by the remote host. (os error 10054)",
-        "An established connection was aborted by the software in your host machine. \
-         (os error 10053)",
-    ] {
-        assert!(reads_as_reset(reset), "{reset}");
-    }
-    for refusal in [
-        "remote error: tls: certificate required",
-        "remote error: tls: error decrypting message",
-        "received fatal alert: IllegalParameter",
-        "EOF",
-        "read tcp 127.0.0.1:54021->127.0.0.1:53689: i/o timeout",
-        "",
-    ] {
-        assert!(!reads_as_reset(refusal), "{refusal}");
     }
 }

@@ -24,13 +24,15 @@
 //! Each cell is served once by a [`GoServerConfigs`] through [`handshake`]
 //! and once by Go's server, to the same Go client, in TLS 1.3 and in TLS
 //! 1.2, and the two are held to one verdict, to the same error at Go's
-//! client, to the same protocol and, where a cell says so, the same
+//! client (unless Go's client, refused by Go's server, met a reset when it
+//! wrote its request, a race [`assert_agree`] describes), to the same
+//! protocol and, where a cell says so, the same
 //! version, suite and group, and, when the oracle runs the reference Go,
 //! to Go's server's words in the crate's handshake error.  The signature
 //! schemes of the crate's CertificateRequest differ from Go's as
-//! PARITY.md's ML-DSA entry records (no P-521, and PKCS#1 v1.5 in TLS
-//! 1.3), so an empty pool's are held to those of a pool with an authority
-//! in it, the list dcrd's port sends.  The cells of a client that breaks
+//! PARITY.md's ML-DSA entry records (PKCS#1 v1.5 in TLS 1.3), so an empty
+//! pool's are held to those of a pool with an authority in it, the list
+//! dcrd's port sends.  The cells of a client that breaks
 //! the protocol after its first ClientHello send hand-written records in
 //! place of Go's client and compare the server's answer record by record.
 //!
@@ -52,7 +54,7 @@ use dcroxide_gotls::{
 };
 use dcroxide_testutil::REFERENCE_GO;
 use dcroxide_testutil::hex;
-use dcroxide_testutil::tls_interop::{ClientCertRefusal, Issued, Negotiated, TlsOracle, spec};
+use dcroxide_testutil::tls_interop::{Issued, Negotiated, TlsOracle, reads_as_reset, spec};
 use serde_json::{Value, json};
 
 /// The request each cell's client sends, which a TLS 1.3 server's refusal
@@ -153,24 +155,35 @@ fn versions() -> [(&'static str, Value); 2] {
     ]
 }
 
-/// Whether what Go's client read is a reset of the connection:
-/// ECONNRESET, or on Windows WSAECONNRESET or WSAECONNABORTED.
-fn reads_as_reset(error: &Value) -> bool {
-    let error = error.as_str().unwrap_or_default();
-    error.contains("reset by peer")
-        || error.contains("forcibly closed by the remote host")
-        || error.contains("aborted by the software in your host machine")
+/// Whether Go's client, as `detail` reports it, read a reset of the
+/// connection ([`reads_as_reset`]) off Linux, where a refusing server's
+/// alert was due.  A server that refuses closes with Go's bytes still
+/// unread or still to come, which draws a reset from its system.  Linux
+/// delivers the alert all the same; a system that throws away what it
+/// has received when a reset arrives, as Windows does, may show Go's
+/// client the reset instead.
+fn reset_in_place_of_the_alert(detail: &Value) -> bool {
+    !cfg!(target_os = "linux") && reads_as_reset(detail["error"].as_str().unwrap_or_default())
 }
 
-/// Assert that Go's client was refused and read `alert`.  Off Linux a
-/// reset may reach it before the alert does (see [`assert_agree`]), and
-/// then only the refusal is held.
-fn assert_hears(go: &TlsOracle, what: &str, detail: &Value, alert: &str) {
-    if cfg!(target_os = "linux") || !reads_as_reset(&detail["error"]) {
-        go.assert_refused(what, detail, alert);
-        assert_eq!(detail["error"], alert, "{what}");
-    } else {
+/// [`TlsOracle::assert_refused`] for what Go's client read: off Linux a
+/// reset may reach it before the alert does
+/// ([`reset_in_place_of_the_alert`]), and then only the refusal is held.
+fn assert_client_refused(go: &TlsOracle, what: &str, detail: &Value, alert: &str) {
+    if reset_in_place_of_the_alert(detail) {
         assert_eq!(detail["ok"], false, "{what}: Go's client {detail}");
+    } else {
+        go.assert_refused(what, detail, alert);
+    }
+}
+
+/// Assert that Go's client was refused and read `alert`, under any Go.
+/// Off Linux a reset may reach it before the alert does (see
+/// [`assert_agree`]), and then only the refusal is held.
+fn assert_hears(go: &TlsOracle, what: &str, detail: &Value, alert: &str) {
+    assert_client_refused(go, what, detail, alert);
+    if !reset_in_place_of_the_alert(detail) {
+        assert_eq!(detail["error"], alert, "{what}");
     }
 }
 
@@ -195,6 +208,15 @@ fn assert_agree(go: &TlsOracle, what: &str, outcome: &Outcome) {
     let tls12_without_a_certificate = ours["error"] == "remote error: tls: certificate required"
         && theirs["error"] == "remote error: tls: handshake failure"
         && ours_error.as_deref() == Some("tls: client didn't provide a certificate");
+    // A client certificate Go's parser refuses is refused here with
+    // rustls's bad encoding, `bad_certificate`, where Go sends
+    // `decode_error`, which no error a rustls verifier returns is answered
+    // with, as PARITY.md's clientcert entry records; the words are Go's.
+    let unparsable_certificate = ours["error"] == "remote error: tls: bad certificate"
+        && theirs["error"] == "remote error: tls: error decoding message"
+        && ours_error
+            .as_deref()
+            .is_some_and(|text| text.starts_with("tls: failed to parse client certificate: "));
     // grpc-go closes a completed handshake that negotiated no protocol;
     // what Go's client then reads, a close_notify or a reset after its
     // request crossed the close, is the race of two sockets, not the
@@ -205,9 +227,35 @@ fn assert_agree(go: &TlsOracle, what: &str, outcome: &Outcome) {
     // alert all the same; a system that throws away what it has received
     // when a reset arrives, as Windows does, may show Go's client the
     // reset instead, so there only the verdict is compared.
-    let reset_before_the_alert = !cfg!(target_os = "linux")
-        && (reads_as_reset(&ours["error"]) || reads_as_reset(&theirs["error"]));
-    if !tls12_without_a_certificate && !closed_after_the_handshake && !reset_before_the_alert {
+    let reset_before_the_alert =
+        reset_in_place_of_the_alert(ours) || reset_in_place_of_the_alert(theirs);
+    // Go's client writes its request as soon as its TLS 1.3 handshake
+    // returns, before the server has judged its certificate
+    // (`tools/oracle/tls.go`'s `tlsDialOnce`), and Go's server closes a
+    // refused handshake at once (`serveOne`'s deferred `Close`), with what
+    // is left of the client's flight possibly unread, so its system may
+    // answer with a reset that reaches the client before it writes: the
+    // write fails and the alert goes unread.  That is the race of two
+    // sockets, not Go's server's verdict, so the crate's side is held to
+    // an alert, but for a reset in its place off Linux (above), and Go's
+    // server's words are compared below as ever.
+    let gos_request_met_a_reset = request_met_a_reset(theirs);
+    if gos_request_met_a_reset {
+        assert_eq!(theirs["ok"], false, "{what}: Go's {theirs}");
+        assert!(
+            reset_in_place_of_the_alert(ours)
+                || ours["error"]
+                    .as_str()
+                    .is_some_and(|error| error.starts_with("remote error: tls: ")),
+            "{what}: the crate's server's alert, ours {ours}"
+        );
+    }
+    if !tls12_without_a_certificate
+        && !closed_after_the_handshake
+        && !reset_before_the_alert
+        && !gos_request_met_a_reset
+        && !unparsable_certificate
+    {
         assert_eq!(
             ours["error"], theirs["error"],
             "{what}: Go's client's error"
@@ -228,6 +276,52 @@ fn assert_agree(go: &TlsOracle, what: &str, outcome: &Outcome) {
     {
         assert_eq!(served["error"], json!(text), "{what}: Go's server's words");
     }
+}
+
+/// Whether Go's client, as `detail` reports it, was refused at the write
+/// of its request by a reset ([`reads_as_reset`]) or, the reset already
+/// taken, a broken pipe: Go names the failed operation first, `write`.
+fn request_met_a_reset(detail: &Value) -> bool {
+    let error = detail["error"].as_str().unwrap_or_default();
+    detail["ok"] == false
+        && error.starts_with("write ")
+        && (reads_as_reset(error) || error.ends_with("broken pipe"))
+}
+
+/// [`request_met_a_reset`] takes Go's words for a request written into a
+/// reset, on Linux and on Windows, and nothing a refusal's alert or a
+/// reset read during the handshake shows, run without the oracle.
+#[test]
+fn a_request_written_into_a_reset_is_told_from_an_alert() {
+    for (error, met) in [
+        (
+            "write tcp 127.0.0.1:50650->127.0.0.1:42553: write: connection reset by peer",
+            true,
+        ),
+        (
+            "write tcp 127.0.0.1:50650->127.0.0.1:42553: write: broken pipe",
+            true,
+        ),
+        (
+            "write tcp 127.0.0.1:50650->127.0.0.1:42553: wsasend: An existing connection was \
+             forcibly closed by the remote host.",
+            true,
+        ),
+        ("remote error: tls: error decrypting message", false),
+        ("remote error: tls: illegal parameter", false),
+        (
+            "read tcp 127.0.0.1:50650->127.0.0.1:42553: read: connection reset by peer",
+            false,
+        ),
+        ("EOF", false),
+    ] {
+        assert_eq!(
+            request_met_a_reset(&json!({ "ok": false, "error": error })),
+            met,
+            "{error}"
+        );
+    }
+    assert!(!request_met_a_reset(&json!({ "ok": true, "error": "" })));
 }
 
 /// The `tls_pki` specs of dcrwallet's `--issueclientcert` pair on `curve`:
@@ -397,13 +491,13 @@ fn no_client_cert_asks_for_none_as_go_does() {
 /// dcrwallet's `--issueclientcert` pair on each `--tlscurve`, made from
 /// dcrwallet's templates, trusted by `AddCert` alone, on the gRPC listener
 /// and on the JSON-RPC listener under clientcert: the client is accepted,
-/// as Go accepts it, on Ed25519, dcrwallet's default, on P-256 and on
-/// P-384.  On P-521 Go accepts it and the crate refuses it, as PARITY.md's
-/// clientcert entry records until ADR-0015's T4: the client's key is
-/// P-521 and its authority signs with ECDSA-SHA512, and in TLS 1.3 Go's
-/// client finds no scheme in the CertificateRequest it can sign with and
-/// sends no certificate.  Go's client is cut to classical groups, so the
-/// version, suite and group are compared too.
+/// as Go accepts it, on Ed25519, dcrwallet's default, on P-256, on P-384
+/// and on P-521, whose authority signs with ECDSA-SHA512 and whose client
+/// key signs its CertificateVerify with `ecdsa_secp521r1_sha512` in TLS
+/// 1.3 and, in TLS 1.2, with the first ECDSA scheme the server lists,
+/// `ecdsa_secp256r1_sha256`, which Go's server and the crate both take
+/// from a P-521 key (ADR-0015, T4).  Go's client is cut to classical
+/// groups, so the version, suite and group are compared too.
 #[test]
 fn issued_client_certificates_verify_as_go_does() {
     let Some(mut go) = TlsOracle::start_dcrwallet() else {
@@ -451,15 +545,6 @@ fn issued_client_certificates_verify_as_go_does() {
                     "{what}: Go's {}",
                     outcome.theirs
                 );
-                if curve == "P-521" {
-                    go.assert_refused(
-                        &what,
-                        &outcome.ours,
-                        ClientCertRefusal::P521Key.go_error(version),
-                    );
-                    assert!(outcome.ours_error.is_some(), "{what}");
-                    continue;
-                }
                 assert_agree(&go, &what, &outcome);
                 assert_eq!(
                     Negotiated::of_go(&outcome.ours),
@@ -470,6 +555,523 @@ fn issued_client_certificates_verify_as_go_does() {
         }
     }
     go.report("issued_client_certificates_verify_as_go_does");
+}
+
+/// dcrwallet's `--issueclientcert` client on each `--tlscurve` with its
+/// key written as Go's `crypto/x509` refuses to parse it (the oracle's
+/// `tls_pki` `spki`): an ECDSA point compressed, in the hybrid form or off
+/// its curve, an Ed25519 key with NULL parameters or of 31 bytes; such a
+/// certificate sent after the client's own, which no chain uses; a leaf
+/// on an X25519 or a DSA key, which Go parses and its TLS takes no
+/// signature from; and an RSA key of 8200 bits sent after the client's
+/// own.  Go's client sends each as it is (`client_unchecked`), to
+/// dcrwallet's JSON-RPC listener under clientcert, in TLS 1.3 and 1.2,
+/// and both servers refuse it, in Go's words: `tls: failed to parse
+/// client certificate: ` and the parser's error, `tls: client certificate
+/// contains an unsupported public key of type ` and the key's, or `tls:
+/// client sent certificate containing RSA key larger than 8192 bits`.
+/// The alerts are Go's, `unsupported_certificate` and `bad_certificate`,
+/// but for a certificate that does not parse, which the crate answers
+/// with `bad_certificate` and Go with `decode_error` ([`assert_agree`]).
+#[test]
+fn client_keys_go_does_not_parse_or_take_are_refused_as_go_does() {
+    let Some(mut go) = TlsOracle::start_dcrwallet() else {
+        return;
+    };
+    let curves = ["Ed25519", "P-256", "P-384", "P-521"];
+    let mut specs = vec![spec("server", "Ed25519", None, "server")];
+    let mut cells: Vec<(&str, String, Vec<String>, &str)> = Vec::new();
+    let parse = "tls: failed to parse client certificate: ";
+    for curve in curves {
+        specs.extend(issued_specs(curve, curve));
+        let broken: &[(&str, &str)] = if curve == "Ed25519" {
+            &[
+                (
+                    "ed25519_params",
+                    "x509: Ed25519 key encoded with illegal parameters",
+                ),
+                ("ed25519_short", "x509: wrong Ed25519 public key size"),
+            ]
+        } else {
+            &[
+                ("compressed", "ecdsa: invalid uncompressed public key"),
+                ("hybrid", "ecdsa: invalid uncompressed public key"),
+                ("off_curve", ""),
+            ]
+        };
+        for &(mode, words) in broken {
+            let name = format!("{curve}-{mode}");
+            let mut client = issued_specs(curve, curve)[1].clone();
+            client["name"] = json!(name);
+            client["spki"] = json!(mode);
+            specs.push(client);
+            let words = if mode == "off_curve" {
+                format!("{parse}{} point not on curve", curve.replace('-', ""))
+            } else {
+                format!("{parse}{words}")
+            };
+            cells.push((curve, words.clone(), vec![name.clone()], "leaf"));
+            cells.push((
+                curve,
+                words,
+                vec![format!("{curve}-client"), name],
+                "unused",
+            ));
+        }
+    }
+    for (mode, words) in [
+        (
+            "x25519",
+            "tls: client certificate contains an unsupported public key of type <nil>",
+        ),
+        (
+            "dsa",
+            "tls: client certificate contains an unsupported public key of type *dsa.PublicKey",
+        ),
+    ] {
+        let name = format!("P-256-{mode}");
+        let mut client = issued_specs("P-256", "P-256")[1].clone();
+        client["name"] = json!(name);
+        client["spki"] = json!(mode);
+        specs.push(client);
+        cells.push(("P-256", words.to_string(), vec![name], "leaf"));
+    }
+    let mut rsa = issued_specs("P-256", "P-256")[1].clone();
+    rsa["name"] = json!("P-256-rsa_8200");
+    rsa["spki"] = json!("rsa_8200");
+    specs.push(rsa);
+    cells.push((
+        "P-256",
+        "tls: client sent certificate containing RSA key larger than 8192 bits".to_string(),
+        vec!["P-256-client".to_string(), "P-256-rsa_8200".to_string()],
+        "unused",
+    ));
+    let pki = go.pki(&specs);
+    let server = &pki["server"];
+    for (curve, words, chain, role) in &cells {
+        let (options, go_server) = clientcert_listener(&pki[&format!("{curve}-ca")]);
+        for (version, fields) in versions() {
+            let what = format!("{chain:?} ({role}), {version}");
+            let mut fields = fields.clone();
+            fields["client_cert"] = json!({
+                "chain": chain.iter().map(|name| hex(&pki[name].cert)).collect::<Vec<_>>(),
+                "key_pkcs8": hex(&pki[&chain[0]].key_pkcs8),
+            });
+            fields["client_unchecked"] = json!(true);
+            fields["curve_preferences"] = json!(["X25519", "CurveP256"]);
+            let outcome = cell(&mut go, server, &options, &go_server, &fields);
+            assert_eq!(outcome.ours["ok"], false, "{what}: ours {}", outcome.ours);
+            assert_eq!(
+                outcome.ours_error.as_deref(),
+                Some(words.as_str()),
+                "{what}: the crate's words"
+            );
+            assert_agree(&go, &what, &outcome);
+        }
+    }
+    go.report("client_keys_go_does_not_parse_or_take_are_refused_as_go_does");
+}
+
+/// Go's words for a client CertificateVerify under a scheme its server
+/// refuses before it verifies anything: one its list lacks, or in TLS 1.3
+/// one that does not fit the leaf's key (`handshake_server.go:779-782`,
+/// `handshake_server_tls13.go:1086-1092`), sent with `illegal_parameter`.
+const SCHEME_REFUSED: &str = "tls: client certificate used with invalid signature algorithm";
+
+/// The start of Go's words for a client CertificateVerify whose signature
+/// does not verify (`handshake_server.go:796-797`,
+/// `handshake_server_tls13.go:1101-1104`), sent with `decrypt_error`.
+const SIGNATURE_FAILED: &str = "tls: invalid signature by the client certificate: ";
+
+/// dcrwallet's JSON-RPC listener under clientcert, its pool holding
+/// `ca` alone, as the crate's options and as Go's server's fields.
+fn clientcert_listener(ca: &Issued) -> (GoServerOptions, Value) {
+    let mut pool = ClientCaPool::new();
+    assert!(pool.add_cert(ca.cert.clone()));
+    let verifier = Arc::new(GoClientCertVerifier::new(pool).expect("the verifier"));
+    (
+        GoServerOptions::dcrwallet_jsonrpc(&verifier, true),
+        json!({ "client_auth": "RequireAndVerifyClientCert", "client_cas": [hex(&ca.cert)] }),
+    )
+}
+
+/// dcrwallet's `--issueclientcert` client on each `--tlscurve`, signing
+/// its CertificateVerify as the oracle's `client_signer` breaks it, against
+/// dcrwallet's JSON-RPC listener under clientcert, in TLS 1.3 and 1.2: a
+/// signature with a bit flipped, a byte short, a byte long, empty, or made
+/// by another key of the same curve, and, for an ECDSA key, re-encoded
+/// with r zero or the order, with a needless leading zero on r, with the
+/// SEQUENCE's length in a longer form than DER's, or as r and s side by
+/// side without DER, is refused by both servers with `decrypt_error` and
+/// Go's words, `ECDSA verification failure` or `Ed25519 verification
+/// failure`; a signature whose s is replaced by n-s is accepted by both,
+/// as Go's `ecdsa.VerifyASN1` accepts it.  The handshake's version, suite
+/// and group are compared where it completes.
+#[test]
+fn broken_client_signatures_are_refused_as_go_does() {
+    let Some(mut go) = TlsOracle::start_dcrwallet() else {
+        return;
+    };
+    let curves = ["Ed25519", "P-256", "P-384", "P-521"];
+    let mut specs = vec![spec("server", "Ed25519", None, "server")];
+    for curve in curves {
+        specs.extend(issued_specs(curve, curve));
+    }
+    let pki = go.pki(&specs);
+    let server = &pki["server"];
+    let any_key = ["flip", "truncate", "trailing_byte", "empty", "other_key"];
+    let ecdsa_only = [
+        "zero_r",
+        "r_is_n",
+        "leading_zero",
+        "long_length",
+        "raw",
+        "high_s",
+    ];
+    let mut compared = 0;
+    for curve in curves {
+        let (options, go_server) = clientcert_listener(&pki[&format!("{curve}-ca")]);
+        let client = &pki[&format!("{curve}-client")];
+        let (modes, failure) = if curve == "Ed25519" {
+            (any_key.to_vec(), "Ed25519 verification failure")
+        } else {
+            (
+                [&any_key[..], &ecdsa_only[..]].concat(),
+                "ECDSA verification failure",
+            )
+        };
+        for mode in modes {
+            for (version, fields) in versions() {
+                let what = format!("{curve}, {mode}, {version}");
+                let mut fields = fields.clone();
+                fields["client_cert"] = client.identity(&[]);
+                fields["client_signer"] = json!(mode);
+                fields["curve_preferences"] = json!(["X25519", "CurveP256"]);
+                let outcome = cell(&mut go, server, &options, &go_server, &fields);
+                assert_agree(&go, &what, &outcome);
+                if mode == "high_s" {
+                    assert_eq!(outcome.ours["ok"], true, "{what}: {}", outcome.ours);
+                    assert_eq!(
+                        Negotiated::of_go(&outcome.ours),
+                        Negotiated::of_go(&outcome.theirs),
+                        "{what}: what was negotiated"
+                    );
+                } else {
+                    assert_client_refused(
+                        &go,
+                        &what,
+                        &outcome.ours,
+                        "remote error: tls: error decrypting message",
+                    );
+                    assert_eq!(
+                        outcome.ours_error,
+                        Some(format!("{SIGNATURE_FAILED}{failure}")),
+                        "{what}: the crate's words"
+                    );
+                }
+                compared += 1;
+            }
+        }
+    }
+    go.report("broken_client_signatures_are_refused_as_go_does");
+    assert_eq!(compared, 2 * (5 + 3 * 11), "every mode on each curve");
+}
+
+/// One row of [`client_schemes_for_another_key_are_judged_as_go_does`]:
+/// what the client is told, the version, and Go's refusal, the alert at
+/// Go's client and Go's server's words, or none for an acceptance.
+type SchemeRow<'a> = (Value, &'a str, Option<(&'a str, String)>);
+
+/// dcrwallet's `--issueclientcert` client on each `--tlscurve`, signing
+/// its CertificateVerify under a scheme for another key than its own
+/// (the oracle's `client_public`, the public key Go's client chooses the
+/// scheme by) or under a scheme it is held to (`client_sig_algs`),
+/// against dcrwallet's JSON-RPC listener under clientcert.  In TLS 1.3 a
+/// scheme of another curve or kind than the leaf's key, a P-521 key's
+/// signature under ecdsa_secp256r1_sha256 or ecdsa_secp384r1_sha384 among
+/// them, is refused by both with `illegal_parameter` and Go's words, the
+/// crate's verifier making Go's check of the key (ADR-0015, T4).  In TLS
+/// 1.2, where Go does not tie an ECDSA scheme to a curve, an ECDSA key
+/// signing under the first ECDSA scheme listed, or held to any one of the
+/// three, is accepted by both, P-256 with SHA-512 and P-521 with SHA-256
+/// among them; and a scheme of another kind than the key is refused by
+/// both with `decrypt_error` and Go's words naming the key's type.
+#[test]
+fn client_schemes_for_another_key_are_judged_as_go_does() {
+    let Some(mut go) = TlsOracle::start_dcrwallet() else {
+        return;
+    };
+    let curves = ["Ed25519", "P-256", "P-384", "P-521"];
+    let mut specs = vec![spec("server", "Ed25519", None, "server")];
+    for curve in curves {
+        specs.extend(issued_specs(curve, curve));
+    }
+    let pki = go.pki(&specs);
+    let server = &pki["server"];
+    let ecdsa_schemes = [
+        "ECDSAWithP256AndSHA256",
+        "ECDSAWithP384AndSHA384",
+        "ECDSAWithP521AndSHA512",
+    ];
+    let mut compared = 0;
+    for curve in curves {
+        let (options, go_server) = clientcert_listener(&pki[&format!("{curve}-ca")]);
+        let client = &pki[&format!("{curve}-client")];
+        // Each row: what the client is told, the version, and Go's
+        // refusal, the alert at Go's client and Go's server's words, or
+        // none for an acceptance.
+        let mut rows: Vec<SchemeRow<'_>> = Vec::new();
+        for public in curves.iter().filter(|&&public| public != curve) {
+            rows.push((
+                json!({ "client_public": public }),
+                "TLS 1.3",
+                Some((
+                    "remote error: tls: illegal parameter",
+                    SCHEME_REFUSED.into(),
+                )),
+            ));
+            let kind = |key: &str| if key == "Ed25519" { "Ed25519" } else { "ECDSA" };
+            let tls12 = (kind(public) != kind(curve)).then(|| {
+                let got = if curve == "Ed25519" {
+                    "ed25519.PublicKey"
+                } else {
+                    "*ecdsa.PublicKey"
+                };
+                (
+                    "remote error: tls: error decrypting message",
+                    format!(
+                        "{SIGNATURE_FAILED}expected an {} public key, got {got}",
+                        kind(public)
+                    ),
+                )
+            });
+            rows.push((json!({ "client_public": public }), "TLS 1.2", tls12));
+        }
+        if curve != "Ed25519" {
+            for scheme in ecdsa_schemes {
+                rows.push((json!({ "client_sig_algs": [scheme] }), "TLS 1.2", None));
+            }
+        }
+        for (extra, version, refusal) in rows {
+            let what = format!("{curve}, {extra}, {version}");
+            let mut fields = if version == "TLS 1.3" {
+                json!({ "min_version": "TLS 1.3" })
+            } else {
+                json!({ "max_version": "TLS 1.2" })
+            };
+            for (key, value) in extra.as_object().expect("fields") {
+                fields[key] = value.clone();
+            }
+            fields["client_cert"] = client.identity(&[]);
+            fields["curve_preferences"] = json!(["X25519", "CurveP256"]);
+            let outcome = cell(&mut go, server, &options, &go_server, &fields);
+            assert_agree(&go, &what, &outcome);
+            match refusal {
+                Some((alert, words)) => {
+                    assert_client_refused(&go, &what, &outcome.ours, alert);
+                    assert_eq!(outcome.ours_error, Some(words.clone()), "{what}");
+                    go.assert_refused(&what, &outcome.served, &words);
+                }
+                None => {
+                    assert_eq!(outcome.ours["ok"], true, "{what}: {}", outcome.ours);
+                    assert_eq!(
+                        Negotiated::of_go(&outcome.ours),
+                        Negotiated::of_go(&outcome.theirs),
+                        "{what}: what was negotiated"
+                    );
+                }
+            }
+            compared += 1;
+        }
+    }
+    go.report("client_schemes_for_another_key_are_judged_as_go_does");
+    assert_eq!(compared, 4 * 3 * 2 + 3 * 3, "every row on each curve");
+}
+
+/// What the crate's handshake reports for a TLS 1.2 client whose P-224
+/// key signed its CertificateVerify under ecdsa_secp256r1_sha256: rustls's
+/// words for a signature algorithm, ecdsa-with-SHA256, the provider has
+/// none of for that key, id-ecPublicKey on secp224r1, since Go, which
+/// verifies the signature, has none to give (PARITY.md, the clientcert
+/// entry).
+const P224_REFUSED: &str = "invalid peer certificate: \
+     UnsupportedSignatureAlgorithmForPublicKeyContext { signature_algorithm_id: [6, 8, 42, 134, \
+     72, 206, 61, 4, 3, 2], public_key_algorithm_id: [6, 7, 42, 134, 72, 206, 61, 2, 1, 6, 5, \
+     43, 129, 4, 0, 33] }";
+
+/// A client certificate on a P-224 key, which no `--tlscurve` offers and
+/// Go's `x509` reads, issued by a P-256 authority dcrwallet's JSON-RPC
+/// listener trusts under clientcert.  In TLS 1.2 Go's server verifies the
+/// client's ECDSA signature with it and accepts the client, and the
+/// crate's refuses it with `decrypt_error`, the provider having no P-224
+/// algorithm: the divergence PARITY.md's clientcert entry records, in
+/// rustls's words ([`P224_REFUSED`]), not words Go never prints.  In TLS
+/// 1.3, where Go's client has no scheme for the key and sends no
+/// certificate, both refuse it alike.
+#[test]
+fn a_p224_client_key_is_judged_as_recorded() {
+    let Some(mut go) = TlsOracle::start_dcrwallet() else {
+        return;
+    };
+    let pki = go.pki(&[
+        spec("server", "Ed25519", None, "server"),
+        spec("ca", "P-256", None, "ca"),
+        spec("client", "P-224", Some(("ca", "ECDSA-SHA256")), "client"),
+    ]);
+    let (options, go_server) = clientcert_listener(&pki["ca"]);
+    for (version, fields) in versions() {
+        let what = format!("P-224, {version}");
+        let mut fields = fields.clone();
+        fields["client_cert"] = pki["client"].identity(&[]);
+        fields["curve_preferences"] = json!(["X25519", "CurveP256"]);
+        let outcome = cell(&mut go, &pki["server"], &options, &go_server, &fields);
+        if version == "TLS 1.3" {
+            assert_agree(&go, &what, &outcome);
+            assert_eq!(
+                outcome.ours_error.as_deref(),
+                Some("tls: client didn't provide a certificate"),
+                "{what}"
+            );
+            continue;
+        }
+        assert_eq!(
+            outcome.theirs["ok"], true,
+            "{what}: Go's {}",
+            outcome.theirs
+        );
+        assert_eq!(
+            outcome.served["ok"], true,
+            "{what}: Go's server {}",
+            outcome.served
+        );
+        assert_client_refused(
+            &go,
+            &what,
+            &outcome.ours,
+            "remote error: tls: error decrypting message",
+        );
+        assert_eq!(outcome.ours_error.as_deref(), Some(P224_REFUSED), "{what}");
+    }
+    go.report("a_p224_client_key_is_judged_as_recorded");
+}
+
+/// dcrwallet's `--issueclientcert` client on each `--tlscurve` whose
+/// certificate's signature, its authority's, was tampered with, its last
+/// byte flipped, against dcrwallet's JSON-RPC listener under clientcert,
+/// in TLS 1.3 and 1.2: refused by both with `unknown_ca`, Go's search
+/// building no chain, in Go's words, which Go's server follows with the
+/// hint naming the signature's failure that the crate does not render
+/// (PARITY.md, the clientcert entry).
+#[test]
+fn tampered_client_chains_are_refused_as_go_does() {
+    let Some(mut go) = TlsOracle::start_dcrwallet() else {
+        return;
+    };
+    let curves = ["Ed25519", "P-256", "P-384", "P-521"];
+    let mut specs = vec![spec("server", "Ed25519", None, "server")];
+    for curve in curves {
+        specs.extend(issued_specs(curve, curve));
+    }
+    let pki = go.pki(&specs);
+    let server = &pki["server"];
+    let unknown =
+        "tls: failed to verify certificate: x509: certificate signed by unknown authority";
+    for curve in curves {
+        let (options, go_server) = clientcert_listener(&pki[&format!("{curve}-ca")]);
+        let client = &pki[&format!("{curve}-client")];
+        let mut tampered = client.cert.clone();
+        if let Some(last) = tampered.last_mut() {
+            *last ^= 1;
+        }
+        for (version, fields) in versions() {
+            let what = format!("{curve}, {version}");
+            let mut fields = fields.clone();
+            fields["client_cert"] =
+                json!({ "chain": [hex(&tampered)], "key_pkcs8": hex(&client.key_pkcs8) });
+            let outcome = cell(&mut go, server, &options, &go_server, &fields);
+            let alert = "remote error: tls: unknown certificate authority";
+            assert_client_refused(&go, &what, &outcome.ours, alert);
+            assert_client_refused(&go, &what, &outcome.theirs, alert);
+            if !reset_in_place_of_the_alert(&outcome.ours)
+                && !reset_in_place_of_the_alert(&outcome.theirs)
+            {
+                assert_eq!(outcome.ours["error"], outcome.theirs["error"], "{what}");
+            }
+            assert_eq!(outcome.ours_error.as_deref(), Some(unknown), "{what}");
+            assert_eq!(outcome.served["ok"], false, "{what}: Go's server");
+            if go.go_version() == REFERENCE_GO {
+                let served = outcome.served["error"].as_str().unwrap_or_default();
+                assert!(
+                    served.starts_with(&format!("{unknown} (possibly because of ")),
+                    "{what}: Go's words {served}"
+                );
+            }
+        }
+    }
+    go.report("tampered_client_chains_are_refused_as_go_does");
+}
+
+/// A client certificate on P-256 or P-521 issued by an authority on each
+/// of P-256, P-384 and P-521 signing with each of ECDSA-SHA256, -SHA384
+/// and -SHA512, against dcrwallet's JSON-RPC listener under clientcert,
+/// in TLS 1.3 and 1.2: every chain is accepted by both, as Go's
+/// `crypto/x509` verifies an ECDSA signature with any of the three hashes
+/// on any of the three curves (ADR-0015, T4), and the version, suite and
+/// group are compared.
+#[test]
+fn issuers_on_each_curve_and_hash_verify_as_go_does() {
+    let Some(mut go) = TlsOracle::start_dcrwallet() else {
+        return;
+    };
+    let curves = ["P-256", "P-384", "P-521"];
+    let hashes = ["ECDSA-SHA256", "ECDSA-SHA384", "ECDSA-SHA512"];
+    let leaves = ["P-256", "P-521"];
+    let mut specs = vec![spec("server", "Ed25519", None, "server")];
+    for ca in curves {
+        specs.push(spec(&format!("{ca}-ca"), ca, None, "ca"));
+        for hash in hashes {
+            for leaf in leaves {
+                specs.push(spec(
+                    &format!("{leaf} under {ca} {hash}"),
+                    leaf,
+                    Some((&format!("{ca}-ca"), hash)),
+                    "client",
+                ));
+            }
+        }
+    }
+    let pki = go.pki(&specs);
+    let server = &pki["server"];
+    let mut compared = 0;
+    for ca in curves {
+        let (options, go_server) = clientcert_listener(&pki[&format!("{ca}-ca")]);
+        for hash in hashes {
+            for leaf in leaves {
+                let client = &pki[&format!("{leaf} under {ca} {hash}")];
+                for (version, fields) in versions() {
+                    let what = format!("{leaf} under {ca} {hash}, {version}");
+                    let mut fields = fields.clone();
+                    fields["client_cert"] = client.identity(&[]);
+                    fields["curve_preferences"] = json!(["X25519", "CurveP256"]);
+                    let outcome = cell(&mut go, server, &options, &go_server, &fields);
+                    assert_eq!(
+                        outcome.theirs["ok"], true,
+                        "{what}: Go's {}",
+                        outcome.theirs
+                    );
+                    assert_agree(&go, &what, &outcome);
+                    assert_eq!(
+                        Negotiated::of_go(&outcome.ours),
+                        Negotiated::of_go(&outcome.theirs),
+                        "{what}: what was negotiated"
+                    );
+                    compared += 1;
+                }
+            }
+        }
+    }
+    go.report("issuers_on_each_curve_and_hash_verify_as_go_does");
+    assert_eq!(compared, 3 * 3 * 2 * 2, "every chain in two versions");
 }
 
 /// The `tls_pki` spec of an authority `name` on P-256 valid from

@@ -1,0 +1,25 @@
+ECDSA vectors made by the reference Go
+
+Made:        2026-11-19, by `regenerate_ecdsa_go_vectors` in
+             tests/go_differential.rs, through the oracle built from
+             tools/oracle with go1.27.3 (dcroxide-testutil's REFERENCE_GO),
+             on an x86_64 Linux desktop.
+What:        216 cases of the nine ECDSA pairs of RPC_SIG_ALGS, P-256,
+             P-384 and P-521 each with SHA-256, SHA-384 and SHA-512, 24 for
+             each pair: Go's signatures (crypto/ecdsa's SignASN1, through
+             the oracle's sig_sign) and their mutations, each with Go's
+             verdict as crypto/x509 checks a certificate's signature
+             (the oracle's sig_verify).  tests/ecdsa_go/mod.rs says what
+             each class is and how it was made.
+Why:         Wycheproof's P-521 and SHA-512 ECDSA files are not in
+             tests/data/wycheproof, and were not fetched for this
+             (ADR-0015, T4).
+
+The file is the generator's JSON, pretty-printed with one trailing newline,
+compressed with flate2's GzBuilder at its best level, which stores no name
+and a zero time.  Go's ECDSA signatures are randomized, so a regeneration
+writes other signatures and so another hash, while the count changes only
+with the generator; both are pinned in tests/ecdsa_go/mod.rs.
+
+file             cases   JSON bytes   SHA-256 of the JSON
+cases.json.gz    216     139941       806e98dad4b25d4f2e7dd2f3f7e8e67b5b11aee7c062faca05ab61a660f0b0db

@@ -25,10 +25,12 @@
 //!   trusts and a leaf under each kind of CA, P-256, P-384 signing with
 //!   ECDSA-SHA384, RSA-4096 signing with SHA256-RSA and with
 //!   SHA256-RSAPSS, and Ed25519, in each version: 48 cells.  Three are
-//!   refused today, as ring refused them, and Go's client-certificate set
-//!   (ADR-0015, T4) is what makes them complete: a P-521 client key, an
-//!   issuer signing with ECDSA-SHA512 and an RSA-1024 client key, in each
-//!   version.
+//!   refused, as ring refused them, since the provider's default set,
+//!   which this matrix runs, is ring's: a P-521 client key, an issuer
+//!   signing with ECDSA-SHA512 and an RSA-1024 client key, in each
+//!   version.  The RPC listener's set, `RPC_SIG_ALGS`, takes the first two
+//!   (ADR-0015's second addendum of 2026-11-19, T4), which the node's
+//!   matrix and `dcroxide-gotls`'s wallet cells hold.
 //! - Refused by rustls itself, whatever the provider: ECDHE-RSA suites
 //!   alone against an ECDSA key and a CBC suite alone, in TLS 1.2, and no
 //!   group in common, in each version.
@@ -38,8 +40,8 @@
 //! - TLS 1.3, each suite, forced on the client, by each group by each
 //!   server key, P-256, P-384, Ed25519, RSA-2048, RSA-3072 and RSA-4096:
 //!   72 cells.  A P-521 server key is refused in each version, since the
-//!   provider verifies no P-521 signature until T4, where Go would serve
-//!   it.  TLS 1.2, each ECDHE-ECDSA suite by each group by the three EC
+//!   provider's default set, the seeders', verifies no P-521 signature,
+//!   where Go would serve it.  TLS 1.2, each ECDHE-ECDSA suite by each group by the three EC
 //!   and Edwards keys, and each ECDHE-RSA suite by each group by the three
 //!   RSA keys: 72.
 //! - Each RSA signature scheme alone, the client's verifier offering only

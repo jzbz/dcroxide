@@ -98,6 +98,16 @@ impl<'a> DerReader<'a> {
         }
     }
 
+    /// The next element, whatever its tag, with its content and the
+    /// whole element, as cryptobyte's `ReadAnyASN1Element` reads it.
+    // The element is the prefix of the input the read consumed.
+    #[allow(clippy::arithmetic_side_effects)]
+    fn read_any_raw(&mut self) -> Option<(u8, &'a [u8], &'a [u8])> {
+        let before = self.data;
+        let (tag, content) = self.read()?;
+        Some((tag, content, &before[..before.len() - self.data.len()]))
+    }
+
     /// [`DerReader::read_tag`], with the whole element as well.
     // The element is the prefix of the input the read consumed.
     #[allow(clippy::arithmetic_side_effects)]
@@ -185,39 +195,196 @@ const ML_DSA_KEYS: [(&[u8], usize); 3] = [
     ),
 ];
 
-/// Whether a subject public key info, the whole element, names one of the
-/// three ML-DSA parameter sets as its algorithm.
-fn is_ml_dsa_spki(spki: &[u8]) -> bool {
-    DerReader::new(spki)
-        .read_tag(0x30)
-        .and_then(|content| DerReader::new(content).read_tag(0x30))
-        .and_then(|algorithm| DerReader::new(algorithm).read_tag(0x06))
-        .is_some_and(|oid| ML_DSA_KEYS.iter().any(|&(known, _)| known == oid))
+/// DSA's key algorithm, 1.2.840.10040.4.1, as DER object identifier
+/// contents.
+const DSA_KEY: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x38, 0x04, 0x01];
+
+/// Whether `content`, an INTEGER's, is one cryptobyte's `ReadASN1Integer`
+/// reads (`checkASN1Integer`): at least one octet, minimally encoded.
+fn go_asn1_integer_ok(content: &[u8]) -> bool {
+    match content {
+        [] => false,
+        [0x00, next, ..] => next & 0x80 != 0,
+        [0xff, next, ..] => next & 0x80 == 0,
+        _ => true,
+    }
 }
 
-/// Whether Go 1.27.3's `parsePublicKey` takes the key of a subject
-/// public key info whose algorithm is ML-DSA (`crypto/x509/parser.go:366-374`):
-/// nothing after the object identifier, which `parseAI` would read as
-/// parameters, and a key of the set's length, which `mldsa.NewPublicKey`
-/// checks and nothing else; `true` for every other algorithm.  The key's
-/// length is the BIT STRING's bytes, as `RightAlign` leaves them.
-fn go_ml_dsa_key_ok(spki: &[u8]) -> bool {
-    let mut spki = DerReader::new(spki);
-    let Some(mut algorithm) = spki.read_tag(0x30).map(DerReader::new) else {
-        return true;
-    };
-    let Some(&(_, len)) = algorithm
-        .read_tag(0x06)
-        .and_then(|oid| ML_DSA_KEYS.iter().find(|&&(known, _)| known == oid))
-    else {
-        return true;
-    };
-    algorithm.is_empty()
-        && spki
-            .read_tag(0x03)
-            .and_then(go_bit_string)
-            .is_some_and(|(_, key)| key.len() == len)
+/// Whether a minimally encoded INTEGER's content ([`go_asn1_integer_ok`])
+/// is above zero, as Go's `Sign() > 0` asks of the value it holds.
+fn go_asn1_integer_positive(content: &[u8]) -> bool {
+    content.first().is_some_and(|first| first & 0x80 == 0) && content != [0x00]
 }
+
+/// A BIT STRING's bits as Go's `asn1.BitString.RightAlign` gives them,
+/// which `parsePublicKey` reads a key from (`crypto/x509/parser.go:309-312`):
+/// the octets as they are when no bit is unused, and otherwise shifted
+/// right by the unused count, the same number of octets.
+// A shift of one to seven.
+#[allow(clippy::arithmetic_side_effects)]
+fn go_right_align(unused: u8, bytes: &[u8]) -> std::borrow::Cow<'_, [u8]> {
+    if unused == 0 || bytes.is_empty() {
+        return std::borrow::Cow::Borrowed(bytes);
+    }
+    let shift = u32::from(unused);
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut carry = 0u8;
+    for &b in bytes {
+        out.push(carry | (b >> shift));
+        carry = b.checked_shl(8 - shift).unwrap_or(0);
+    }
+    std::borrow::Cow::Owned(out)
+}
+
+/// Go 1.27.3's refusal of a certificate's subject public key info, the
+/// contents of its SEQUENCE, in Go's words (`parseCertificate` and
+/// `parsePublicKey`, `crypto/x509/parser.go:1071-1099`, `:309-411`), or
+/// `None` where Go reads the key or, for an algorithm it does not know
+/// (`getPublicKeyAlgorithmFromOID`, X25519's among them), leaves
+/// `PublicKey` nil and reads nothing more.  The structure first: an
+/// AlgorithmIdentifier SEQUENCE ("x509: malformed public key algorithm
+/// identifier") that `parseAI` reads, an OBJECT IDENTIFIER cryptobyte
+/// takes ("x509: malformed OID") and, if anything follows it, one element
+/// as the parameters ("x509: malformed parameters"); then the key's BIT
+/// STRING ("x509: malformed subjectPublicKey").  Then the key, its bits
+/// right-aligned ([`go_right_align`]), by its algorithm:
+///
+/// * RSA: NULL parameters, then an `RSAPublicKey` SEQUENCE of a modulus
+///   and an exponent, each an INTEGER cryptobyte reads, the exponent into
+///   an `int`, at most eight octets on the 64-bit builds dcrd ships, and
+///   each above zero; bytes after either are not read.
+/// * DSA: the key an INTEGER, the parameters a SEQUENCE of three, all
+///   above zero.
+/// * ECDSA: parameters that read as an OBJECT IDENTIFIER, naming P-224,
+///   P-256, P-384 or P-521, and a point `ecdsa.ParseUncompressedPublicKey`
+///   takes on it (`dcroxide_tlscrypto::point`), so that a compressed or
+///   hybrid point, one off its curve and one with a coordinate at or above
+///   p are refused here, before any signature is checked with them.
+/// * Ed25519: no parameters, and 32 bytes.
+/// * ML-DSA: no parameters, and the set's length (`mldsa.NewPublicKey`
+///   checks no more).
+fn go_public_key_refusal(spki: &[u8]) -> Option<&'static str> {
+    let mut spki = DerReader::new(spki);
+    let Some(algorithm) = spki.read_tag(0x30) else {
+        return Some("x509: malformed public key algorithm identifier");
+    };
+    let mut ai = DerReader::new(algorithm);
+    let Some(oid) = ai.read_tag(0x06).filter(|oid| go_oid_ok(oid)) else {
+        return Some("x509: malformed OID");
+    };
+    let params: &[u8] = if ai.is_empty() {
+        &[]
+    } else {
+        match ai.read_any_raw() {
+            Some((_, _, element)) => element,
+            None => return Some("x509: malformed parameters"),
+        }
+    };
+    let Some((unused, bits)) = spki.read_tag(0x03).and_then(go_bit_string) else {
+        return Some("x509: malformed subjectPublicKey");
+    };
+    let data = go_right_align(unused, bits);
+    let data = data.as_ref();
+    if oid == RSA_ENCRYPTION {
+        if params != [0x05, 0x00] {
+            return Some("x509: RSA key missing NULL parameters");
+        }
+        let Some(mut key) = DerReader::new(data).read_tag(0x30).map(DerReader::new) else {
+            return Some("x509: invalid RSA public key");
+        };
+        let Some(modulus) = key.read_tag(0x02).filter(|n| go_asn1_integer_ok(n)) else {
+            return Some("x509: invalid RSA modulus");
+        };
+        let Some(exponent) = key.read_tag(0x02).filter(|e| go_asn1_int64(e).is_some()) else {
+            return Some("x509: invalid RSA public exponent");
+        };
+        if !go_asn1_integer_positive(modulus) {
+            return Some("x509: RSA modulus is not a positive number");
+        }
+        if !go_asn1_integer_positive(exponent) {
+            return Some("x509: RSA public exponent is not a positive number");
+        }
+        return None;
+    }
+    if oid == EC_PUBLIC_KEY {
+        let Some(curve) = DerReader::new(params)
+            .read_tag(0x06)
+            .filter(|curve| go_oid_ok(curve))
+        else {
+            return Some("x509: invalid ECDSA parameters");
+        };
+        let Some(curve) = dcroxide_tlscrypto::point::NistCurve::from_oid(curve) else {
+            return Some("x509: unsupported elliptic curve");
+        };
+        return dcroxide_tlscrypto::point::go_parse_uncompressed_public_key(curve, data).err();
+    }
+    if oid == ED25519_KEY {
+        if !params.is_empty() {
+            return Some("x509: Ed25519 key encoded with illegal parameters");
+        }
+        if data.len() != 32 {
+            return Some("x509: wrong Ed25519 public key size");
+        }
+        return None;
+    }
+    if let Some(&(_, len)) = ML_DSA_KEYS.iter().find(|&&(known, _)| known == oid) {
+        if !params.is_empty() {
+            return Some("x509: ML-DSA key encoded with illegal parameters");
+        }
+        if data.len() != len {
+            return Some("mldsa: invalid public key length");
+        }
+        return None;
+    }
+    if oid == DSA_KEY {
+        let Some(y) = DerReader::new(data)
+            .read_tag(0x02)
+            .filter(|y| go_asn1_integer_ok(y))
+        else {
+            return Some("x509: invalid DSA public key");
+        };
+        let mut group = DerReader::new(params).read_tag(0x30).map(DerReader::new);
+        let mut next = || {
+            group
+                .as_mut()?
+                .read_tag(0x02)
+                .filter(|v| go_asn1_integer_ok(v))
+        };
+        let (Some(p), Some(q), Some(g)) = (next(), next(), next()) else {
+            return Some("x509: invalid DSA parameters");
+        };
+        if ![y, p, q, g].into_iter().all(go_asn1_integer_positive) {
+            return Some("x509: zero or negative DSA parameter");
+        }
+        return None;
+    }
+    None
+}
+
+/// The bit length of an RSA key's modulus, as Go's `N.BitLen()` gives it
+/// to `checkKeySize` (`crypto/tls/handshake_server.go:952-957`), for the
+/// subject public key info, the whole element, of a certificate Go
+/// parses; `None` for a key of another algorithm.
+// Bit counts of a slice's length, which fits.
+#[allow(clippy::arithmetic_side_effects)]
+fn go_rsa_modulus_bits(spki: &[u8]) -> Option<usize> {
+    let mut spki = DerReader::new(DerReader::new(spki).read_tag(0x30)?);
+    let mut algorithm = DerReader::new(spki.read_tag(0x30)?);
+    if algorithm.read_tag(0x06)? != RSA_ENCRYPTION {
+        return None;
+    }
+    let (unused, bits) = go_bit_string(spki.read_tag(0x03)?)?;
+    let data = go_right_align(unused, bits);
+    let modulus = DerReader::new(DerReader::new(data.as_ref()).read_tag(0x30)?).read_tag(0x02)?;
+    let digits = modulus.strip_prefix(&[0x00]).unwrap_or(modulus);
+    let first = digits.first()?;
+    Some(digits.len() * 8 - first.leading_zeros() as usize)
+}
+
+/// The largest RSA key Go's TLS takes in a certificate a client sends,
+/// `defaultMaxRSAKeySize` (`crypto/tls/handshake_client.go:1086-1101`),
+/// which no `GODEBUG` dcrd or dcrwallet sets changes.
+const GO_MAX_RSA_KEY_BITS: usize = 8192;
 
 /// Unix seconds from a proleptic Gregorian civil date and time.
 // Calendar arithmetic over four-digit years.
@@ -714,12 +881,12 @@ impl CertFacts {
     /// subject alternative name and name constraints extensions, the IP
     /// addresses and the rfc822Name constraints are read as Go 1.27.3
     /// reads them ([`go_san_ip_ok`], [`go_ip_constraint_ok`],
-    /// [`go_email_constraint_ok`]), and so is an ML-DSA public key
-    /// ([`go_ml_dsa_key_ok`]).  Go's other checks (the serial number, the
-    /// subject and issuer names, the other names of those two
-    /// extensions, the other public keys, and the contents of other
-    /// extensions) are not ported, so `Some` does not promise Go parses
-    /// the certificate.
+    /// [`go_email_constraint_ok`]), and so is the subject public key
+    /// info, whole, by Go's `parsePublicKey` rules for each algorithm
+    /// ([`go_public_key_refusal`]).  Go's other checks (the serial
+    /// number, the subject and issuer names, the other names of those two
+    /// extensions, and the contents of other extensions) are not ported,
+    /// so `Some` does not promise Go parses the certificate.
     /// The four policy extensions are among those read, with Go's rules,
     /// though only [`CertFacts::parse_all`] keeps what they say.
     fn parse(der: &[u8]) -> Option<CertFacts> {
@@ -734,12 +901,23 @@ impl CertFacts {
 
     /// [`CertFacts::parse_all`], with what Go's `buildChains` reads to
     /// place the certificate in a chain ([`ChainLinks`]).
-    // The version is at most 2 before the increment, and a bit index is
-    // below nine.
-    #[allow(clippy::arithmetic_side_effects)]
     fn parse_full(
         der: &[u8],
     ) -> Option<(CertFacts, PolicyFacts, ChainIdentity<'_>, ChainLinks<'_>)> {
+        Self::parse_noting(der, &mut None)
+    }
+
+    /// [`CertFacts::parse_full`], noting in `refusal` Go's words for a
+    /// certificate it refuses for its key, Go's first refusal of it
+    /// among those this reads ([`go_public_key_refusal`]); `refusal` is
+    /// left as it was when the certificate is refused for anything else.
+    // The version is at most 2 before the increment, and a bit index is
+    // below nine.
+    #[allow(clippy::arithmetic_side_effects)]
+    fn parse_noting<'d>(
+        der: &'d [u8],
+        refusal: &mut Option<&'static str>,
+    ) -> Option<(CertFacts, PolicyFacts, ChainIdentity<'d>, ChainLinks<'d>)> {
         // The certificate policies, policy mappings, policy constraints
         // and inhibit any policy extensions, as DER OID contents.
         const POLICIES: &[u8] = &[0x55, 0x1d, 0x20];
@@ -771,18 +949,16 @@ impl CertFacts {
         // algorithm identifiers don't match") and read as `parseAI`
         // reads it, and the signature, a BIT STRING cryptobyte's
         // `ReadASN1BitString` reads.
+        //
+        // Go reads the TBSCertificate through the subject public key info
+        // before it reads what follows the TBSCertificate, so the checks
+        // here run in that order, and the key's, whose words are known
+        // ([`go_public_key_refusal`]), come before the others whose words
+        // are not.
         let mut whole = DerReader::new(der);
         let certificate = whole.read_tag(0x30)?;
-        if !whole.is_empty() {
-            return None;
-        }
         let mut outer = DerReader::new(certificate);
         let (_, tbs_content, tbs_element) = outer.read_raw(0x30)?;
-        let (_, signature_algorithm, outer_algorithm) = outer.read_raw(0x30)?;
-        let signature = go_bit_string(outer.read_tag(0x03)?)?;
-        if !go_parse_ai(signature_algorithm) {
-            return None;
-        }
         let mut tbs = DerReader::new(tbs_content);
         // `ReadOptionalASN1Integer`: the [0] holds the INTEGER and
         // nothing after it ("x509: malformed version").
@@ -800,7 +976,8 @@ impl CertFacts {
             1
         };
         tbs.read_tag(0x02)?; // serialNumber
-        if tbs.read_raw(0x30)?.2 != outer_algorithm {
+        let (_, inner_content, inner_algorithm) = tbs.read_raw(0x30)?;
+        if !go_parse_ai(inner_content) {
             return None;
         }
         let issuer = tbs.read_tag(0x30)?;
@@ -811,7 +988,13 @@ impl CertFacts {
         let not_after = parse_asn1_time(tag, content)?;
         let subject = tbs.read_tag(0x30)?;
         let (_, spki_content, spki) = tbs.read_raw(0x30)?;
-        if !go_ml_dsa_key_ok(spki_content) {
+        if let Some(words) = go_public_key_refusal(spki_content) {
+            *refusal = Some(words);
+            return None;
+        }
+        let (_, signature_algorithm, outer_algorithm) = outer.read_raw(0x30)?;
+        let signature = go_bit_string(outer.read_tag(0x03)?)?;
+        if !whole.is_empty() || outer_algorithm != inner_algorithm {
             return None;
         }
 
@@ -1261,7 +1444,8 @@ enum SignatureCheck {
 /// chains built by then.
 ///
 /// The signature is verified with `sig_algs`, the algorithms webpki uses,
-/// the listener's set of `dcroxide-tlscrypto` (ring's and ML-DSA's), by
+/// the listener's set of `dcroxide-tlscrypto` (ring's, ML-DSA's and the
+/// ECDSA pairs ring lacked), by
 /// the first one naming both the child's signature algorithm and the
 /// parent's key algorithm, as webpki picks it, after the RSA public
 /// exponent limit Go's verification applies and ring's set does not
@@ -1269,10 +1453,12 @@ enum SignatureCheck {
 /// 1.27.3's `checkSignature` verifies it, with an empty context, and an
 /// ML-DSA signature algorithm identifier with parameters, or of another
 /// set than the key's, finds no algorithm, as Go refuses both
-/// (`crypto/x509/x509.go:433-444`, `:1115-1136`).  Go verifies some
-/// signatures the set cannot, among them RSA keys of 1024 to 2040 bits or
-/// over 8192, P-224 and P-521 keys, ECDSA with SHA-512, a signature
-/// algorithm identifier Go matches by its OID alone, and a signature or
+/// (`crypto/x509/x509.go:433-444`, `:1115-1136`).  ECDSA on P-256, P-384
+/// and P-521, each with SHA-256, SHA-384 or SHA-512, is verified as Go
+/// verifies it (ADR-0015, T4).  Go verifies some signatures the set
+/// cannot, among them RSA keys of 1024 to 2040 bits or over 8192, P-224
+/// keys, a signature algorithm identifier Go matches by its OID alone,
+/// and a signature or
 /// key BIT STRING with unused bits, which Go right-aligns, an ML-DSA key
 /// with them being a key whenever its octets are its set's length; such a
 /// candidate is taken here as failing its signature check, where Go would
@@ -2523,7 +2709,8 @@ impl GoClientCertVerifier {
 
     /// webpki's client verifier over the given anchors, on
     /// `dcroxide-tlscrypto`'s provider with the listener's verification
-    /// set, `RPC_SIG_ALGS`, which adds ML-DSA to ring's set and lists the
+    /// set, `RPC_SIG_ALGS`, which adds ML-DSA and the ECDSA pairs ring
+    /// lacked, P-521's among them, to ring's set and lists the
     /// schemes in Go's order, and so is the list the CertificateRequest
     /// offers.
     fn webpki_over(
@@ -2539,35 +2726,19 @@ impl GoClientCertVerifier {
         .build()
         .map_err(|e| format!("unable to build the RPC client verifier: {e}"))
     }
-}
 
-impl rustls::server::danger::ClientCertVerifier for GoClientCertVerifier {
-    fn offer_client_auth(&self) -> bool {
-        self.all.offer_client_auth()
-    }
-
-    fn client_auth_mandatory(&self) -> bool {
-        self.all.client_auth_mandatory()
-    }
-
-    fn root_hint_subjects(&self) -> &[rustls::DistinguishedName] {
-        self.all.root_hint_subjects()
-    }
-
-    fn verify_client_cert(
+    /// Go's `certs[0].Verify(opts)` over the pool, with the client's
+    /// other certificates as intermediates and client authentication as
+    /// the usage (`crypto/tls/handshake_server.go:970-998`), for
+    /// certificates [`go_read_client_certificates`] has read.
+    fn verify_chain(
         &self,
         end_entity: &rustls::pki_types::CertificateDer<'_>,
         intermediates: &[rustls::pki_types::CertificateDer<'_>],
         now: rustls::pki_types::UnixTime,
     ) -> Result<rustls::server::danger::ClientCertVerified, rustls::Error> {
         let now_secs = i64::try_from(now.as_secs()).unwrap_or(i64::MAX);
-
-        // Go parses every certificate the client sends before it checks
-        // any (`processCertsFromClient`), and a certificate
-        // `ParseCertificate` refuses ends the handshake, used or not.
-        // Each is read here as the pool's certificates are, which covers
-        // that parse as far as [`CertFacts::parse`] goes, and gives the
-        // facts Go's `isValid` reads below.
+        // The facts Go's `isValid` reads below.
         let Some((leaf_facts, leaf_policies, leaf_identity)) =
             CertFacts::parse_all(end_entity.as_ref())
         else {
@@ -2575,14 +2746,6 @@ impl rustls::server::danger::ClientCertVerifier for GoClientCertVerifier {
                 rustls::CertificateError::BadEncoding,
             ));
         };
-        if intermediates
-            .iter()
-            .any(|cert| CertFacts::parse(cert.as_ref()).is_none())
-        {
-            return Err(rustls::Error::InvalidCertificate(
-                rustls::CertificateError::BadEncoding,
-            ));
-        }
 
         // A certificate in the pool is its own chain: Go checks it with
         // `isValid(leafCertificate)` and the key usage walk over `[c]`,
@@ -2980,6 +3143,95 @@ impl rustls::server::danger::ClientCertVerifier for GoClientCertVerifier {
             err => go_pki_error(err),
         })
     }
+}
+
+/// Go's reading of the certificates a client sends, before it checks any
+/// (`processCertsFromClient`, `crypto/tls/handshake_server.go:943-958`):
+/// each in turn, the leaf first, is parsed ([`CertFacts::parse`], as the
+/// pool's certificates are), and a certificate `ParseCertificate` refuses
+/// ends the handshake, used by a chain or not, as does an RSA key of more
+/// than [`GO_MAX_RSA_KEY_BITS`] in any of them, checked as each is read.
+/// The refusal is rustls's bad encoding either way, with Go's words noted
+/// where they are known ([`take_client_refusal`]): the parser's error for
+/// a certificate refused for its key ([`go_public_key_refusal`]) and
+/// Go's for the RSA limit.
+fn go_read_client_certificates(
+    end_entity: &rustls::pki_types::CertificateDer<'_>,
+    intermediates: &[rustls::pki_types::CertificateDer<'_>],
+) -> Result<(), rustls::Error> {
+    let refused = || rustls::Error::InvalidCertificate(rustls::CertificateError::BadEncoding);
+    for cert in std::iter::once(end_entity).chain(intermediates) {
+        let mut words = None;
+        let Some((_, _, identity, _)) = CertFacts::parse_noting(cert.as_ref(), &mut words) else {
+            note_client_refusal(words.map(ClientRefusal::Unparsable));
+            return Err(refused());
+        };
+        if go_rsa_modulus_bits(identity.spki).is_some_and(|bits| bits > GO_MAX_RSA_KEY_BITS) {
+            note_client_refusal(Some(ClientRefusal::RsaTooLarge));
+            return Err(refused());
+        }
+    }
+    Ok(())
+}
+
+/// The Go type of a client's leaf key, as `%T` prints it, when the key is
+/// of none of the kinds Go's TLS takes a client's signature from, ECDSA,
+/// RSA, Ed25519 and ML-DSA, which Go refuses once the chain has verified
+/// and before it reads a CertificateVerify, with
+/// `unsupported_certificate` (`crypto/tls/handshake_server.go:1005-1016`):
+/// `*dsa.PublicKey` for a DSA key, and `<nil>` for an algorithm Go's
+/// `x509` gives no key, X25519's among them; `None` otherwise, and for a
+/// leaf [`CertFacts::parse`] refuses.
+fn go_unsupported_leaf_key(der: &[u8]) -> Option<&'static str> {
+    let (_, _, identity) = CertFacts::parse_all(der)?;
+    if ClientKey::of_spki(identity.spki).is_some() {
+        return None;
+    }
+    let oid = DerReader::new(DerReader::new(identity.spki).read_tag(0x30)?)
+        .read_tag(0x30)
+        .and_then(|algorithm| DerReader::new(algorithm).read_tag(0x06));
+    Some(if oid == Some(DSA_KEY) {
+        "*dsa.PublicKey"
+    } else {
+        "<nil>"
+    })
+}
+
+impl rustls::server::danger::ClientCertVerifier for GoClientCertVerifier {
+    fn offer_client_auth(&self) -> bool {
+        self.all.offer_client_auth()
+    }
+
+    fn client_auth_mandatory(&self) -> bool {
+        self.all.client_auth_mandatory()
+    }
+
+    fn root_hint_subjects(&self) -> &[rustls::DistinguishedName] {
+        self.all.root_hint_subjects()
+    }
+
+    // Go's `processCertsFromClient` (`crypto/tls/handshake_server.go:943-1016`)
+    // as far as a certificate verifier sees it: every certificate read
+    // (`go_read_client_certificates`), the chain verified
+    // (`GoClientCertVerifier::verify_chain`), and the leaf's key held to
+    // the kinds Go's TLS takes a signature from (`go_unsupported_leaf_key`).
+    fn verify_client_cert(
+        &self,
+        end_entity: &rustls::pki_types::CertificateDer<'_>,
+        intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::server::danger::ClientCertVerified, rustls::Error> {
+        clear_client_refusal();
+        go_read_client_certificates(end_entity, intermediates)?;
+        let verified = self.verify_chain(end_entity, intermediates, now)?;
+        if let Some(go_type) = go_unsupported_leaf_key(end_entity.as_ref()) {
+            note_client_refusal(Some(ClientRefusal::UnsupportedKey(go_type)));
+            return Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::InvalidPurpose,
+            ));
+        }
+        Ok(verified)
+    }
 
     /// Go refuses a client whose certificate has an ML-DSA key in TLS 1.2,
     /// asking only of the leaf, after its chain checks
@@ -2991,27 +3243,55 @@ impl rustls::server::danger::ClientCertVerifier for GoClientCertVerifier {
     /// never offered, with the same alert
     /// (`rustls-0.23.46/src/webpki/verify.rs:161-163`), and any other as a
     /// scheme that does not fit the key, with `decrypt_error`.
+    ///
+    /// Go's TLS 1.2 server asks no more of a scheme than that its own
+    /// CertificateRequest listed it (`handshake_server.go:779-782`), which
+    /// rustls asks too, with the same alert and error as
+    /// `CLIENT_SCHEME_REFUSED`; an ECDSA scheme is then verified with a
+    /// key on any curve, as here.  A signature that fails, or whose
+    /// scheme is of another kind than the key, is noted in Go's words for
+    /// the handshake's error (`note_client_signature_refusal`).
     fn verify_tls12_signature(
         &self,
         message: &[u8],
         cert: &rustls::pki_types::CertificateDer<'_>,
         dss: &rustls::DigitallySignedStruct,
     ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        if CertFacts::parse_all(cert.as_ref())
-            .is_some_and(|(_, _, identity)| is_ml_dsa_spki(identity.spki))
-        {
+        let key = ClientKey::of_leaf(cert.as_ref());
+        if matches!(key, Some(ClientKey::MlDsa(_))) {
             return Err(rustls::Error::PeerMisbehaved(ML_DSA_CLIENT_KEY_IN_TLS12));
         }
-        self.all.verify_tls12_signature(message, cert, dss)
+        self.all
+            .verify_tls12_signature(message, cert, dss)
+            .inspect_err(|err| note_client_signature_refusal(err, key, dss.scheme))
     }
 
+    /// Go's TLS 1.3 server takes a CertificateVerify only under a scheme
+    /// its own list has and that fits the leaf's key, the one scheme of an
+    /// ECDSA, Ed25519 or ML-DSA key (`signatureSchemesForPublicKey`,
+    /// `crypto/tls/auth.go:208-255`), and refuses any other with
+    /// `illegal_parameter` and `tls: client certificate used with invalid
+    /// signature algorithm` before it verifies anything
+    /// (`handshake_server_tls13.go:1086-1092`).  This makes the key's half
+    /// of that check first (`ClientKey::fits_tls13`), refusing with
+    /// `CLIENT_SCHEME_REFUSED`, which rustls answers with Go's alert and
+    /// raises itself for the list's half.  webpki alone would try the
+    /// scheme's algorithm on the key and refuse a misfit with
+    /// `decrypt_error`.  A signature that fails is noted in Go's words for
+    /// the handshake's error (`note_client_signature_refusal`).
     fn verify_tls13_signature(
         &self,
         message: &[u8],
         cert: &rustls::pki_types::CertificateDer<'_>,
         dss: &rustls::DigitallySignedStruct,
     ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        self.all.verify_tls13_signature(message, cert, dss)
+        let key = ClientKey::of_leaf(cert.as_ref());
+        if key.is_some_and(|key| !key.fits_tls13(dss.scheme)) {
+            return Err(rustls::Error::PeerMisbehaved(CLIENT_SCHEME_REFUSED));
+        }
+        self.all
+            .verify_tls13_signature(message, cert, dss)
+            .inspect_err(|err| note_client_signature_refusal(err, key, dss.scheme))
     }
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
@@ -3030,6 +3310,310 @@ impl rustls::server::danger::ClientCertVerifier for GoClientCertVerifier {
 pub(crate) const ML_DSA_CLIENT_KEY_IN_TLS12: rustls::PeerMisbehaved =
     rustls::PeerMisbehaved::SignedKxWithWrongAlgorithm;
 
+/// The refusal of a client CertificateVerify under a scheme Go's server
+/// refuses before it verifies anything: one its list lacks, in either
+/// version, or, in TLS 1.3, one that does not fit the leaf's key
+/// (`GoClientCertVerifier::verify_tls13_signature`).  It is the error
+/// rustls's webpki functions raise for a scheme the mapping lacks or TLS
+/// 1.3 forbids (`rustls-0.23.46/src/webpki/verify.rs:95-104`, `:161-163`,
+/// `:198-200`), which rustls's server raises nowhere else, so the RPC log
+/// reads it as Go's text for all of those, `tls: client certificate used
+/// with invalid signature algorithm`, and rustls sends
+/// `illegal_parameter` for it, Go's alert
+/// (`rustls-0.23.46/src/common_state.rs:622-631`).
+pub(crate) const CLIENT_SCHEME_REFUSED: rustls::PeerMisbehaved =
+    rustls::PeerMisbehaved::SignedHandshakeWithUnadvertisedSigScheme;
+
+/// id-ecPublicKey, as DER object identifier contents.
+const EC_PUBLIC_KEY: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01];
+
+/// Ed25519's key algorithm, as DER object identifier contents.
+const ED25519_KEY: &[u8] = &[0x2b, 0x65, 0x70];
+
+/// The three curves Go's `x509` gives an ECDSA key on and `crypto/tls`
+/// signs a TLS 1.3 handshake with, as DER object identifier contents,
+/// with each one's scheme there (`crypto/tls/auth.go:221-230`).
+const ECDSA_CURVES: [(&[u8], rustls::SignatureScheme); 3] = [
+    (
+        &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07],
+        rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
+    ),
+    (
+        &[0x2b, 0x81, 0x04, 0x00, 0x22],
+        rustls::SignatureScheme::ECDSA_NISTP384_SHA384,
+    ),
+    (
+        &[0x2b, 0x81, 0x04, 0x00, 0x23],
+        rustls::SignatureScheme::ECDSA_NISTP521_SHA512,
+    ),
+];
+
+/// A client certificate's key as Go's `crypto/tls` sorts it when it
+/// checks a CertificateVerify, read from the leaf's subject public key
+/// info by its algorithm alone; the key itself is the provider's to read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ClientKey {
+    /// An ECDSA key, with its curve's TLS 1.3 scheme, or none for a curve
+    /// Go's `crypto/tls` names no scheme for: P-224, the one such curve a
+    /// leaf that parses ([`go_public_key_refusal`]) can carry, whose key Go
+    /// verifies a TLS 1.2 signature with and the provider does not.
+    Ecdsa(Option<rustls::SignatureScheme>),
+    /// An Ed25519 key.
+    Ed25519,
+    /// An RSA key.
+    Rsa,
+    /// An ML-DSA key, with its parameter set's scheme.
+    MlDsa(rustls::SignatureScheme),
+}
+
+impl ClientKey {
+    /// The key of `der`, a leaf certificate, or none when the certificate
+    /// does not parse or its key is of another algorithm.
+    pub(crate) fn of_leaf(der: &[u8]) -> Option<ClientKey> {
+        let (_, _, identity) = CertFacts::parse_all(der)?;
+        ClientKey::of_spki(identity.spki)
+    }
+
+    /// The key of `spki`, a whole subject public key info element.
+    fn of_spki(spki: &[u8]) -> Option<ClientKey> {
+        use rustls::SignatureScheme as S;
+        let mut algorithm = DerReader::new(DerReader::new(spki).read_tag(0x30)?)
+            .read_tag(0x30)
+            .map(DerReader::new)?;
+        let oid = algorithm.read_tag(0x06)?;
+        if oid == EC_PUBLIC_KEY {
+            let curve = algorithm.read_tag(0x06);
+            let scheme = ECDSA_CURVES
+                .iter()
+                .find(|&&(known, _)| Some(known) == curve)
+                .map(|&(_, scheme)| scheme);
+            return Some(ClientKey::Ecdsa(scheme));
+        }
+        if oid == ED25519_KEY {
+            return Some(ClientKey::Ed25519);
+        }
+        if oid == RSA_ENCRYPTION {
+            return Some(ClientKey::Rsa);
+        }
+        let sets = [S::ML_DSA_44, S::ML_DSA_65, S::ML_DSA_87];
+        ML_DSA_KEYS
+            .iter()
+            .zip(sets)
+            .find(|&(&(known, _), _)| known == oid)
+            .map(|(_, scheme)| ClientKey::MlDsa(scheme))
+    }
+
+    /// Whether Go's TLS 1.3 server takes `scheme` from this key
+    /// (`signatureSchemesForPublicKey`, `crypto/tls/auth.go:208-255`): an
+    /// ECDSA, Ed25519 or ML-DSA key its one scheme; an RSA key every RSA
+    /// scheme Go lists for its size, which for the keys the provider
+    /// verifies, 2048 bits and up, is every one, PKCS#1 v1.5's included,
+    /// which Go's list for TLS 1.3 then refuses, as rustls does.
+    fn fits_tls13(self, scheme: rustls::SignatureScheme) -> bool {
+        use rustls::SignatureScheme as S;
+        match self {
+            ClientKey::Ecdsa(own) => own == Some(scheme),
+            ClientKey::Ed25519 => scheme == S::ED25519,
+            ClientKey::MlDsa(own) => own == scheme,
+            ClientKey::Rsa => matches!(
+                scheme,
+                S::RSA_PSS_SHA256
+                    | S::RSA_PSS_SHA384
+                    | S::RSA_PSS_SHA512
+                    | S::RSA_PKCS1_SHA256
+                    | S::RSA_PKCS1_SHA384
+                    | S::RSA_PKCS1_SHA512
+            ),
+        }
+    }
+
+    /// The key's kind as Go's `verifyHandshakeSignature` names the kind
+    /// a scheme expects (`crypto/tls/auth.go:23-78`).
+    fn go_kind(self) -> &'static str {
+        match self {
+            ClientKey::Ecdsa(_) => "ECDSA",
+            ClientKey::Ed25519 => "Ed25519",
+            ClientKey::Rsa => "RSA",
+            ClientKey::MlDsa(_) => "ML-DSA",
+        }
+    }
+
+    /// The key's Go type as `%T` prints it.
+    fn go_type(self) -> &'static str {
+        match self {
+            ClientKey::Ecdsa(_) => "*ecdsa.PublicKey",
+            ClientKey::Ed25519 => "ed25519.PublicKey",
+            ClientKey::Rsa => "*rsa.PublicKey",
+            ClientKey::MlDsa(_) => "*mldsa.PublicKey",
+        }
+    }
+}
+
+/// Why Go's server refuses a client's certificates or its handshake
+/// signature, in Go's words, where rustls's error lacks what the words
+/// name: a certificate Go's `ParseCertificate` refuses for its key, or an
+/// RSA key over Go's limit in any certificate sent, and a leaf whose key
+/// Go's TLS takes no signature from (`processCertsFromClient`,
+/// `crypto/tls/handshake_server.go:943-1016`); and, as Go's
+/// `verifyHandshakeSignature` says it (`crypto/tls/auth.go:23-78`), the
+/// two failures of a signature whose words do not depend on the
+/// signature: a signature an ECDSA or Ed25519 key does not verify, and,
+/// in TLS 1.2, where Go does not match the scheme to the key, a scheme of
+/// another kind than the key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ClientRefusal {
+    /// A certificate Go fails to parse, with `ParseCertificate`'s error.
+    Unparsable(&'static str),
+    /// A certificate with an RSA key over [`GO_MAX_RSA_KEY_BITS`].
+    RsaTooLarge,
+    /// A leaf whose key is of none of the four kinds Go's TLS signs with,
+    /// with the key's Go type as `%T` prints it.
+    UnsupportedKey(&'static str),
+    /// `ECDSA verification failure` or `Ed25519 verification failure`.
+    Failed(&'static str),
+    /// `expected an <kind> public key, got <type>`.
+    Mismatch {
+        /// The scheme's kind: `ECDSA`, `Ed25519` or `RSA`.
+        expected: &'static str,
+        /// The key's Go type ([`ClientKey::go_type`]).
+        got: &'static str,
+    },
+}
+
+thread_local! {
+    /// The last client refusal noted on this thread
+    /// ([`note_client_refusal`], [`note_client_signature_refusal`]).
+    /// rustls calls the verifier
+    /// from the `process_new_packets` that then fails, on the thread that
+    /// runs the handshake, so the handshake reads it there
+    /// ([`take_client_refusal`]), having cleared it when it
+    /// began ([`clear_client_refusal`]).
+    static CLIENT_REFUSAL: std::cell::Cell<Option<ClientRefusal>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Note in Go's words why a client's handshake signature under `scheme`
+/// by `key` failed with `err`, where Go's words are known: rustls's
+/// error carries the reason but not the key, which Go's words name.  A
+/// signature an RSA or ML-DSA key does not verify is left to rustls's
+/// words: Go gives the RSA or ML-DSA package's error there, which
+/// depends on the signature.  So is a scheme of the key's own kind that
+/// the provider has no algorithm for with that key, as for an ECDSA key
+/// on P-224: Go's type assertion passes there and Go goes on to verify
+/// (`crypto/tls/auth.go:33-40`), so `expected an ECDSA public key, got
+/// *ecdsa.PublicKey` is no text Go prints, and the refusal itself is the
+/// port's (PARITY.md, the clientcert entry).
+fn note_client_signature_refusal(
+    err: &rustls::Error,
+    key: Option<ClientKey>,
+    scheme: rustls::SignatureScheme,
+) {
+    use rustls::CertificateError as C;
+    use rustls::SignatureScheme as S;
+    let noted = match (err, key) {
+        (rustls::Error::InvalidCertificate(C::BadSignature), Some(ClientKey::Ecdsa(_))) => {
+            Some(ClientRefusal::Failed("ECDSA verification failure"))
+        }
+        (rustls::Error::InvalidCertificate(C::BadSignature), Some(ClientKey::Ed25519)) => {
+            Some(ClientRefusal::Failed("Ed25519 verification failure"))
+        }
+        (
+            rustls::Error::InvalidCertificate(
+                C::UnsupportedSignatureAlgorithmForPublicKeyContext { .. },
+            ),
+            Some(key),
+        ) => {
+            let expected = match scheme {
+                S::ECDSA_NISTP256_SHA256 | S::ECDSA_NISTP384_SHA384 | S::ECDSA_NISTP521_SHA512 => {
+                    Some("ECDSA")
+                }
+                S::ED25519 => Some("Ed25519"),
+                S::RSA_PSS_SHA256
+                | S::RSA_PSS_SHA384
+                | S::RSA_PSS_SHA512
+                | S::RSA_PKCS1_SHA256
+                | S::RSA_PKCS1_SHA384
+                | S::RSA_PKCS1_SHA512 => Some("RSA"),
+                _ => None,
+            };
+            expected
+                .filter(|&expected| expected != key.go_kind())
+                .map(|expected| ClientRefusal::Mismatch {
+                    expected,
+                    got: key.go_type(),
+                })
+        }
+        _ => None,
+    };
+    note_client_refusal(noted);
+}
+
+/// Note `refusal` as the last client refusal on this thread, or, with
+/// `None`, forget any noted before.
+fn note_client_refusal(refusal: Option<ClientRefusal>) {
+    CLIENT_REFUSAL.with(|cell| cell.set(refusal));
+}
+
+/// Forget any client refusal noted on this thread, as a handshake
+/// begins.
+pub(crate) fn clear_client_refusal() {
+    note_client_refusal(None);
+}
+
+/// Go's text for a handshake rustls refused with `err`, when `err` is the
+/// error of a client refusal this thread noted in Go's words
+/// ([`ClientRefusal`]); the note is taken either way.  A certificate Go
+/// fails to parse is `tls: failed to parse client certificate: ` and the
+/// parser's error (`handshake_server.go:947-951`), refused with rustls's
+/// bad encoding, which rustls answers with `bad_certificate`, where Go
+/// sends `decode_error` (PARITY.md, the clientcert entry); an RSA key
+/// over the limit is `tls: client sent certificate containing RSA key
+/// larger than 8192 bits` (`:952-957`), refused the same way, Go's
+/// `bad_certificate` too; a leaf of a key Go's TLS does not take is `tls:
+/// client certificate contains an unsupported public key of type ` and
+/// the type (`:1005-1016`), refused with rustls's invalid purpose, which
+/// rustls answers with `unsupported_certificate`, Go's alert
+/// (`rustls-0.23.46/src/error.rs:625-660`).  A client signature's refusal
+/// is `tls: invalid signature by the client certificate: ` and the reason
+/// (`handshake_server.go:796-797`, `handshake_server_tls13.go:1101-1104`),
+/// which Go sends `decrypt_error` for, as rustls does for both errors it
+/// is noted with.
+pub(crate) fn take_client_refusal(err: &rustls::Error) -> Option<String> {
+    use rustls::CertificateError as C;
+    let noted = CLIENT_REFUSAL.with(std::cell::Cell::take)?;
+    let rustls::Error::InvalidCertificate(err) = err else {
+        return None;
+    };
+    let reason = match (noted, err) {
+        (ClientRefusal::Unparsable(words), C::BadEncoding) => {
+            return Some(format!("tls: failed to parse client certificate: {words}"));
+        }
+        (ClientRefusal::RsaTooLarge, C::BadEncoding) => {
+            return Some(format!(
+                "tls: client sent certificate containing RSA key larger than \
+                 {GO_MAX_RSA_KEY_BITS} bits"
+            ));
+        }
+        (ClientRefusal::UnsupportedKey(go_type), C::InvalidPurpose) => {
+            return Some(format!(
+                "tls: client certificate contains an unsupported public key of type {go_type}"
+            ));
+        }
+        (
+            ClientRefusal::Failed(reason),
+            C::BadSignature | C::UnsupportedSignatureAlgorithmForPublicKeyContext { .. },
+        ) => reason.to_string(),
+        (
+            ClientRefusal::Mismatch { expected, got },
+            C::BadSignature | C::UnsupportedSignatureAlgorithmForPublicKeyContext { .. },
+        ) => format!("expected an {expected} public key, got {got}"),
+        _ => return None,
+    };
+    Some(format!(
+        "tls: invalid signature by the client certificate: {reason}"
+    ))
+}
+
 /// The time the client-certificate fuzz body verifies at, inside its
 /// certificates' validity, 2024 through 2049.
 const FUZZ_CLIENT_CERT_NOW: u64 = 1_790_000_000;
@@ -3041,10 +3625,15 @@ const FUZZ_CLIENT_CERT_NOW: u64 = 1_790_000_000;
 /// set's key of zero bytes, which is a key (its t1 zero), and every
 /// signature the set's signature that decodes with z zero and no hints
 /// (`dcroxide_tlscrypto::verify::fuzz_ml_dsa_signature`), so each check
-/// runs whole.
+/// runs whole.  Beside them, for the handshake signature checks alone,
+/// are leaves on an ECDSA key on P-256, P-384 and P-521 and on an Ed25519
+/// key, issued by the root under a signature that is not checked there:
+/// each ECDSA key is the curve's generator, the key of the secret scalar
+/// 1, and the Ed25519 key that of the seed of 32 zero bytes.
 struct FuzzClientCerts {
     verifier: GoClientCertVerifier,
     chains: Vec<FuzzClientChain>,
+    handshake_leaves: Vec<Vec<u8>>,
 }
 
 /// One of [`FuzzClientCerts`]' chains, with where its leaf's signature
@@ -3103,17 +3692,24 @@ impl FuzzClientCerts {
                 ],
             )],
         );
-        // A certificate on `set`'s zero key for `subject`, issued by
-        // `issuer` with `issuer_set`'s algorithm, and where its key and
-        // its signature start.
+        let algorithm = |oid: &[u8]| fuzz_der(0x30, &[&fuzz_der(0x06, &[oid])]);
+        // `set`'s zero key, as a subject public key info, and its length.
+        let ml_dsa_spki = |set: usize| -> Option<(Vec<u8>, usize)> {
+            let (key_oid, key_len) = *ML_DSA_KEYS.get(set)?;
+            let key = vec![0u8; key_len];
+            let spki = fuzz_der(0x30, &[&algorithm(key_oid), &fuzz_der(0x03, &[&[0], &key])]);
+            Some((spki, key_len))
+        };
+        // A certificate on `spki`, whose key is its last `key_len` bytes,
+        // for `subject`, issued by `issuer` with `issuer_set`'s algorithm,
+        // and where its key and its signature start.
         let certificate = |serial: u8,
                            subject: &[u8],
-                           set: usize,
+                           (spki, key_len): (Vec<u8>, usize),
                            issuer: &[u8],
                            issuer_set: usize,
                            extensions: &[u8]|
          -> Option<(Vec<u8>, usize, usize)> {
-            let (key_oid, key_len) = *ML_DSA_KEYS.get(set)?;
             let (signature_oid, _) = *ML_DSA_KEYS.get(issuer_set)?;
             let name = |cn: &[u8]| {
                 fuzz_der(
@@ -3130,9 +3726,6 @@ impl FuzzClientCerts {
                     )],
                 )
             };
-            let algorithm = |oid: &[u8]| fuzz_der(0x30, &[&fuzz_der(0x06, &[oid])]);
-            let key = vec![0u8; key_len];
-            let spki = fuzz_der(0x30, &[&algorithm(key_oid), &fuzz_der(0x03, &[&[0], &key])]);
             let validity = fuzz_der(
                 0x30,
                 &[
@@ -3167,14 +3760,33 @@ impl FuzzClientCerts {
             let signature_at = der.len().checked_sub(signature.len())?;
             Some((der, key_at, signature_at))
         };
-        let (root, _, _) = certificate(1, b"root", 0, b"root", 0, &authority_extensions)?;
+        let (root, _, _) = certificate(
+            1,
+            b"root",
+            ml_dsa_spki(0)?,
+            b"root",
+            0,
+            &authority_extensions,
+        )?;
         let verifier = GoClientCertVerifier::from_certificates(vec![root]).ok()?;
         let mut chains = Vec::new();
         for (set, serial) in [(0usize, 2u8), (1, 4), (2, 6)] {
-            let (authority, authority_key_at, _) =
-                certificate(serial, b"authority", set, b"root", 0, &authority_extensions)?;
-            let (leaf, _, leaf_signature_at) =
-                certificate(serial.checked_add(1)?, b"leaf", set, b"authority", set, &[])?;
+            let (authority, authority_key_at, _) = certificate(
+                serial,
+                b"authority",
+                ml_dsa_spki(set)?,
+                b"root",
+                0,
+                &authority_extensions,
+            )?;
+            let (leaf, _, leaf_signature_at) = certificate(
+                serial.checked_add(1)?,
+                b"leaf",
+                ml_dsa_spki(set)?,
+                b"authority",
+                set,
+                &[],
+            )?;
             chains.push(FuzzClientChain {
                 authority,
                 authority_key_at,
@@ -3182,9 +3794,73 @@ impl FuzzClientCerts {
                 leaf_signature_at,
             });
         }
-        Some(FuzzClientCerts { verifier, chains })
+        // The handshake leaves' keys, from PKCS#8 keys of the secret
+        // scalar 1 on each curve and of the zero Ed25519 seed, as the
+        // provider gives their subject public key infos.
+        let ecdsa_pkcs8 = |curve: &[u8], width: usize| {
+            let mut scalar = vec![0u8; width];
+            if let Some(last) = scalar.last_mut() {
+                *last = 1;
+            }
+            fuzz_der(
+                0x30,
+                &[
+                    &fuzz_der(0x02, &[&[0]]),
+                    &fuzz_der(
+                        0x30,
+                        &[&fuzz_der(0x06, &[EC_PUBLIC_KEY]), &fuzz_der(0x06, &[curve])],
+                    ),
+                    &fuzz_der(
+                        0x04,
+                        &[&fuzz_der(
+                            0x30,
+                            &[&fuzz_der(0x02, &[&[1]]), &fuzz_der(0x04, &[&scalar])],
+                        )],
+                    ),
+                ],
+            )
+        };
+        let ed25519_pkcs8 = fuzz_der(
+            0x30,
+            &[
+                &fuzz_der(0x02, &[&[0]]),
+                &algorithm(ED25519_KEY),
+                &fuzz_der(0x04, &[&fuzz_der(0x04, &[&[0u8; 32]])]),
+            ],
+        );
+        let mut handshake_leaves = Vec::new();
+        for (serial, pkcs8) in [
+            (8u8, ecdsa_pkcs8(ECDSA_CURVES[0].0, 32)),
+            (9, ecdsa_pkcs8(ECDSA_CURVES[1].0, 48)),
+            (10, ecdsa_pkcs8(ECDSA_CURVES[2].0, 66)),
+            (11, ed25519_pkcs8),
+        ] {
+            let spki = dcroxide_tlscrypto::sign::load_der(&pkcs8)
+                .ok()?
+                .public_key()?
+                .as_ref()
+                .to_vec();
+            let (leaf, _, _) = certificate(serial, b"leaf", (spki, 0), b"root", 0, &[])?;
+            handshake_leaves.push(leaf);
+        }
+        Some(FuzzClientCerts {
+            verifier,
+            chains,
+            handshake_leaves,
+        })
     }
 }
+
+/// Signature schemes the client-certificate fuzz body's handshake
+/// signatures name beside the listener's: SHA-1's two, which Go's list
+/// leaves out, Ed448, which neither side verifies, and a code point no
+/// scheme has.
+const FUZZ_REFUSED_SCHEMES: [rustls::SignatureScheme; 4] = [
+    rustls::SignatureScheme::ECDSA_SHA1_Legacy,
+    rustls::SignatureScheme::RSA_PKCS1_SHA1,
+    rustls::SignatureScheme::ED448,
+    rustls::SignatureScheme::Unknown(0x0a0a),
+];
 
 /// `bytes` laid over `template` from `at`, cut where `template` ends.
 fn fuzz_lay(template: &[u8], at: usize, bytes: &[u8]) -> Vec<u8> {
@@ -3217,10 +3893,16 @@ fn fuzz_lay(template: &[u8], at: usize, bytes: &[u8]) -> Vec<u8> {
 ///   and in webpki's search;
 /// - 2: the set's chain, with the rest laid over its authority's key, so
 ///   that the leaf's signature is checked with that key;
-/// - 3: a handshake signature by the set's leaf, its scheme the one the
-///   rest's first byte picks of the listener's list, modulo its length,
-///   and its signature what follows, laid over the set's signature when
-///   the scheme is ML-DSA, checked as TLS 1.3 and as TLS 1.2 check it.
+/// - 3: a handshake signature by a leaf, the set's when the first byte
+///   divided by twelve is 0 modulo five and otherwise the P-256, P-384,
+///   P-521 or Ed25519 handshake leaf, for 1 to 4; its scheme the one the
+///   rest's first byte picks, modulo their number, of the listener's list
+///   followed by four schemes the listener refuses (SHA-1's two, Ed448
+///   and a code point no scheme has); and its signature what follows,
+///   laid over the set's signature when the scheme is ML-DSA, checked as
+///   TLS 1.3 and as TLS 1.2 check it, so that the key's fit to the
+///   scheme, the ECDSA and Ed25519 signature decoders and verifiers, and
+///   the notes of a refusal in Go's words all run.
 ///
 /// For the `rpc_client_cert` fuzz target only; not part of the API.
 #[doc(hidden)]
@@ -3280,10 +3962,15 @@ pub fn fuzz_client_cert(data: &[u8]) -> bool {
             let Some((&scheme_pick, signature)) = rest.split_first() else {
                 return false;
             };
-            let mapping = dcroxide_tlscrypto::RPC_SIG_ALGS.mapping;
-            let Some(&(scheme, _)) = usize::from(scheme_pick)
-                .checked_rem(mapping.len())
-                .and_then(|at| mapping.get(at))
+            let schemes: Vec<rustls::SignatureScheme> = dcroxide_tlscrypto::RPC_SIG_ALGS
+                .mapping
+                .iter()
+                .map(|&(scheme, _)| scheme)
+                .chain(FUZZ_REFUSED_SCHEMES)
+                .collect();
+            let Some(&scheme) = usize::from(scheme_pick)
+                .checked_rem(schemes.len())
+                .and_then(|at| schemes.get(at))
             else {
                 return false;
             };
@@ -3310,7 +3997,16 @@ pub fn fuzz_client_cert(data: &[u8]) -> bool {
             let Ok(dss) = rustls::DigitallySignedStruct::read(&mut Reader::init(&encoded)) else {
                 return false;
             };
-            let leaf = CertificateDer::from(chain.leaf.as_slice());
+            // The rest of the first byte picks the signing leaf: the set's,
+            // or one of the handshake leaves.
+            let leaf = match usize::from(pick / 12) % 5 {
+                0 => chain.leaf.as_slice(),
+                at => match fixture.handshake_leaves.get(at.saturating_sub(1)) {
+                    Some(leaf) => leaf.as_slice(),
+                    None => return false,
+                },
+            };
+            let leaf = CertificateDer::from(leaf);
             let message = b"the client's handshake transcript";
             let tls13 = fixture
                 .verifier
@@ -3329,6 +4025,16 @@ pub fn fuzz_client_cert(data: &[u8]) -> bool {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    /// The four curves Go 1.27.3's `x509` gives an ECDSA key on
+    /// (`namedCurveFromOID`, `crypto/x509/x509.go:583-595`), P-224, P-256,
+    /// P-384 and P-521, as DER object identifier contents.
+    const GO_X509_CURVES: [&[u8]; 4] = [
+        &[0x2b, 0x81, 0x04, 0x00, 0x21],
+        &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07],
+        &[0x2b, 0x81, 0x04, 0x00, 0x22],
+        &[0x2b, 0x81, 0x04, 0x00, 0x23],
+    ];
 
     /// cryptobyte's UTCTime and GeneralizedTime readers, as Go's
     /// certificate parser reads the validity window.  Every row is Go
@@ -3389,7 +4095,8 @@ mod tests {
     }
 
     /// A certificate skeleton carrying the given version and extensions
-    /// (the fact reader checks no signature or key).
+    /// (the fact reader checks no signature), its key an X25519 key, an
+    /// algorithm Go's `x509` parses without reading the key.
     fn der_certificate(version: Option<u8>, extensions: &[Vec<u8>]) -> Vec<u8> {
         der_certificate_until(version, der_tlv(0x18, b"20500101000000Z"), extensions)
     }
@@ -3417,7 +4124,14 @@ mod tests {
             &[der_tlv(0x17, b"240101000000Z"), not_after].concat(),
         ));
         tbs.extend(der_tlv(0x30, &[]));
-        tbs.extend(der_tlv(0x30, &[]));
+        tbs.extend(der_tlv(
+            0x30,
+            &[
+                der_tlv(0x30, &der_tlv(0x06, &[0x2b, 0x65, 0x6e])),
+                der_tlv(0x03, &[0u8; 33]),
+            ]
+            .concat(),
+        ));
         if !extensions.is_empty() {
             tbs.extend(der_tlv(0xa3, &der_tlv(0x30, &extensions.concat())));
         }
@@ -4038,9 +4752,10 @@ mod tests {
     /// extension; and a `pathlen:0` root behind another of its name whose
     /// signature fails.  A chain Go builds and drops for a usage, the
     /// leaf's or the root's, is Go's `IncompatibleUsage`, in Go's words
-    /// with rustls's `unsupported_certificate`.  And a search that met a
-    /// signature Go may verify where the provider cannot is left to
-    /// webpki, as before.
+    /// with rustls's `unsupported_certificate`.  And a leaf whose issuer's
+    /// signature fails under ecdsa-with-SHA512, which the provider
+    /// verifies since Go's client-certificate set (ADR-0015, T4) and whose
+    /// refusal was left to webpki before it, is Go's unknown authority.
     #[test]
     fn a_search_without_a_chain_is_refused_with_gos_error() {
         use dcroxide_certgen::gentool::generate_key;
@@ -4088,6 +4803,28 @@ mod tests {
         let pathlen0 =
             signed_p256_certificate(1, "root", &root_key, "root", &root_key, &authority(Some(0)));
         let critical = der_extension(&[0x2a, 0x03, 0x04], true, &[0x05, 0x00]);
+
+        // A leaf whose signature algorithm, in its TBS and outside it, is
+        // patched from ecdsa-with-SHA256 to ecdsa-with-SHA512, so that its
+        // issuer's SHA-256 signature is checked as a SHA-512 one and fails.
+        // The provider verifies ecdsa-with-SHA512 as Go does (ADR-0015,
+        // T4), so the replay followed Go's search throughout and vouches
+        // for Go's error, where before T4 it left the refusal to webpki,
+        // which named the algorithm.
+        let mut sha512 = issued("root", CLIENT_AUTH);
+        let sha256_oid = [0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x02];
+        let mut patched = 0;
+        let mut at_byte = 0;
+        while let Some(found) = sha512[at_byte..]
+            .windows(sha256_oid.len())
+            .position(|window| window == sha256_oid)
+        {
+            let end = at_byte + found + sha256_oid.len();
+            sha512[end - 1] = 0x04;
+            at_byte = end;
+            patched += 1;
+        }
+        assert_eq!(patched, 2, "the TBS and outer signature algorithms");
 
         let unknown = "x509: certificate signed by unknown authority";
         let usage = "x509: certificate specifies an incompatible key usage";
@@ -4193,6 +4930,15 @@ mod tests {
                 true,
                 A::UnsupportedCertificate,
             ),
+            (
+                "an ecdsa-with-SHA512 signature that does not verify",
+                vec![root(&root_key, vec![])],
+                sha512,
+                vec![],
+                unknown,
+                true,
+                A::UnknownCA,
+            ),
         ];
         let at = |secs: i64| {
             rustls::pki_types::UnixTime::since_unix_epoch(Duration::from_secs(
@@ -4256,43 +5002,92 @@ mod tests {
                 }
             }
         }
+    }
 
-        // A leaf whose issuer signs with ecdsa-with-SHA512, which the
-        // provider cannot verify and Go can: the replay does not vouch for
-        // Go's error, and webpki's search reports the algorithm, as before.
-        let mut sha512 = issued("root", CLIENT_AUTH);
-        let sha256_oid = [0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x02];
-        let mut patched = 0;
-        let mut at_byte = 0;
-        while let Some(found) = sha512[at_byte..]
-            .windows(sha256_oid.len())
-            .position(|window| window == sha256_oid)
-        {
-            let end = at_byte + found + sha256_oid.len();
-            sha512[end - 1] = 0x04;
-            at_byte = end;
-            patched += 1;
-        }
-        assert_eq!(patched, 2, "the TBS and outer signature algorithms");
-        let mut cas = ClientCaPool::new();
-        assert!(cas.add_cert(root(&root_key, vec![])));
-        let err = GoClientCertVerifier::new(cas)
-            .expect("the verifier")
-            .verify_client_cert(
-                &rustls::pki_types::CertificateDer::from(sha512.as_slice()),
-                &[],
-                at(now),
-            )
-            .expect_err("ecdsa-with-SHA512");
-        assert!(
-            matches!(
-                err,
-                rustls::Error::InvalidCertificate(
-                    rustls::CertificateError::UnsupportedSignatureAlgorithmContext { .. }
-                )
+    /// A leaf whose only issuer in the pool signed it under a key Go
+    /// verifies with and the provider does not, a P-224 key or an RSA-1024
+    /// one (`tests/data/unverifiable-issuer`), is accepted by Go's `Verify`
+    /// and refused here, as PARITY.md's clientcert entry records.  The
+    /// replay of Go's search cannot check that signature
+    /// (`SignatureCheck::Unverifiable`, the arm of an RSA key the provider
+    /// refuses and the arm of a key no algorithm takes), so it does not
+    /// vouch for Go's unknown authority, which Go would not give, and the
+    /// refusal is webpki's, in rustls's words.  Go's acceptance is held
+    /// through the oracle when it is present.
+    #[test]
+    fn a_search_through_an_issuer_the_provider_cannot_verify_is_left_to_webpki() {
+        use rustls::server::danger::ClientCertVerifier;
+        let now: u64 = 1_790_000_000;
+        let at = rustls::pki_types::UnixTime::since_unix_epoch(Duration::from_secs(now));
+        let mut oracle = dcroxide_testutil::oracle_or_skip();
+        let one = |pem: &[u8]| -> Vec<u8> {
+            let (block, rest) = crate::pem::go_pem_decode(pem).expect("a PEM block");
+            assert!(crate::pem::go_pem_decode(rest).is_none(), "one block");
+            block.bytes
+        };
+        let unknown = "tls: failed to verify certificate: x509: certificate signed by unknown \
+                       authority";
+        for (what, root, leaf) in [
+            (
+                "a P-224 issuer",
+                one(include_bytes!(
+                    "../tests/data/unverifiable-issuer/p224-root.pem"
+                )),
+                one(include_bytes!(
+                    "../tests/data/unverifiable-issuer/p224-leaf.pem"
+                )),
             ),
-            "{err:?}"
-        );
+            (
+                "an RSA-1024 issuer",
+                one(include_bytes!(
+                    "../tests/data/unverifiable-issuer/rsa1024-root.pem"
+                )),
+                one(include_bytes!(
+                    "../tests/data/unverifiable-issuer/rsa1024-leaf.pem"
+                )),
+            ),
+        ] {
+            // The replay itself: one candidate, whose check is
+            // unverifiable, so the search is uncertain and built nothing.
+            let roots = [ChainCandidate::parse(&root).expect("the root")];
+            let leaf_candidate = ChainCandidate::parse(&leaf).expect("the leaf");
+            assert_eq!(
+                go_check_signature_from(
+                    &leaf_candidate,
+                    &roots[0],
+                    dcroxide_tlscrypto::RPC_SIG_ALGS.all
+                ),
+                SignatureCheck::Unverifiable,
+                "{what}"
+            );
+
+            let mut cas = ClientCaPool::new();
+            assert!(cas.add_cert(root.clone()), "{what}: the pool");
+            let err = GoClientCertVerifier::new(cas)
+                .expect("the verifier")
+                .verify_client_cert(
+                    &rustls::pki_types::CertificateDer::from(leaf.as_slice()),
+                    &[],
+                    at,
+                )
+                .expect_err(what);
+            let rustls::Error::InvalidCertificate(certificate_error) = &err else {
+                panic!("{what}: {err:?}");
+            };
+            assert_ne!(
+                rustls::AlertDescription::from(certificate_error.clone()),
+                rustls::AlertDescription::UnknownCA,
+                "{what}: {err:?}"
+            );
+            assert_ne!(
+                crate::server::go_error_text_for_tests(&err),
+                unknown,
+                "{what}: {err:?}"
+            );
+            if let Some(go) = go_client_verdict(&mut oracle, &[&root], &leaf, &[], now) {
+                assert_eq!(go.verdict, "ok", "{what}: Go accepts the chain");
+            }
+        }
     }
 
     /// When Go's search builds chains and `Verify` drops every one for its
@@ -6654,6 +7449,925 @@ mod tests {
         }
     }
 
+    /// A client key is sorted by its subject public key info's algorithm
+    /// as Go's `crypto/tls` sorts it, and fits in TLS 1.3 the schemes
+    /// Go's `signatureSchemesForPublicKey` gives it
+    /// (`crypto/tls/auth.go:208-255`): an ECDSA key on P-256, P-384 or
+    /// P-521 its curve's one scheme, one on another curve or none named
+    /// no scheme, an Ed25519 or ML-DSA key its own, an RSA key every RSA
+    /// scheme; an algorithm Go gives no key, or an element that does not
+    /// parse, is no client key.
+    #[test]
+    fn client_keys_fit_the_tls13_schemes_go_takes_from_them() {
+        use rustls::SignatureScheme as S;
+        let spki = |algorithm: Vec<u8>| {
+            der_tlv(
+                0x30,
+                &[der_tlv(0x30, &algorithm), der_tlv(0x03, &[0, 4, 1, 2])].concat(),
+            )
+        };
+        let ec = |curve: Option<&[u8]>| {
+            let mut algorithm = der_tlv(0x06, EC_PUBLIC_KEY);
+            if let Some(curve) = curve {
+                algorithm.extend(der_tlv(0x06, curve));
+            }
+            spki(algorithm)
+        };
+        let all = [
+            S::ECDSA_NISTP256_SHA256,
+            S::ECDSA_NISTP384_SHA384,
+            S::ECDSA_NISTP521_SHA512,
+            S::ED25519,
+            S::ML_DSA_44,
+            S::ML_DSA_65,
+            S::ML_DSA_87,
+            S::RSA_PSS_SHA256,
+            S::RSA_PSS_SHA384,
+            S::RSA_PSS_SHA512,
+            S::RSA_PKCS1_SHA256,
+            S::RSA_PKCS1_SHA384,
+            S::RSA_PKCS1_SHA512,
+            S::ECDSA_SHA1_Legacy,
+            S::RSA_PKCS1_SHA1,
+        ];
+        let rsa = &all[7..13];
+        // What each case is, its key, its sort, the schemes it fits and
+        // its Go type.
+        type Case<'a> = (&'a str, Vec<u8>, Option<ClientKey>, &'a [S], &'a str);
+        let cases: Vec<Case<'_>> = vec![
+            (
+                "P-256",
+                ec(Some(ECDSA_CURVES[0].0)),
+                Some(ClientKey::Ecdsa(Some(S::ECDSA_NISTP256_SHA256))),
+                &all[0..1],
+                "*ecdsa.PublicKey",
+            ),
+            (
+                "P-384",
+                ec(Some(ECDSA_CURVES[1].0)),
+                Some(ClientKey::Ecdsa(Some(S::ECDSA_NISTP384_SHA384))),
+                &all[1..2],
+                "*ecdsa.PublicKey",
+            ),
+            (
+                "P-521",
+                ec(Some(ECDSA_CURVES[2].0)),
+                Some(ClientKey::Ecdsa(Some(S::ECDSA_NISTP521_SHA512))),
+                &all[2..3],
+                "*ecdsa.PublicKey",
+            ),
+            (
+                "P-224",
+                ec(Some(GO_X509_CURVES[0])),
+                Some(ClientKey::Ecdsa(None)),
+                &[],
+                "*ecdsa.PublicKey",
+            ),
+            (
+                "secp256k1",
+                ec(Some(&[0x2b, 0x81, 0x04, 0x00, 0x0a])),
+                Some(ClientKey::Ecdsa(None)),
+                &[],
+                "*ecdsa.PublicKey",
+            ),
+            (
+                "no curve",
+                ec(None),
+                Some(ClientKey::Ecdsa(None)),
+                &[],
+                "*ecdsa.PublicKey",
+            ),
+            (
+                "Ed25519",
+                spki(der_tlv(0x06, ED25519_KEY)),
+                Some(ClientKey::Ed25519),
+                &all[3..4],
+                "ed25519.PublicKey",
+            ),
+            (
+                "RSA",
+                spki([der_tlv(0x06, RSA_ENCRYPTION), der_tlv(0x05, &[])].concat()),
+                Some(ClientKey::Rsa),
+                rsa,
+                "*rsa.PublicKey",
+            ),
+            (
+                "ML-DSA-44",
+                spki(der_tlv(0x06, ML_DSA_KEYS[0].0)),
+                Some(ClientKey::MlDsa(S::ML_DSA_44)),
+                &all[4..5],
+                "*mldsa.PublicKey",
+            ),
+            (
+                "ML-DSA-65",
+                spki(der_tlv(0x06, ML_DSA_KEYS[1].0)),
+                Some(ClientKey::MlDsa(S::ML_DSA_65)),
+                &all[5..6],
+                "*mldsa.PublicKey",
+            ),
+            (
+                "ML-DSA-87",
+                spki(der_tlv(0x06, ML_DSA_KEYS[2].0)),
+                Some(ClientKey::MlDsa(S::ML_DSA_87)),
+                &all[6..7],
+                "*mldsa.PublicKey",
+            ),
+            (
+                "Ed448",
+                spki(der_tlv(0x06, &[0x2b, 0x65, 0x71])),
+                None,
+                &[],
+                "",
+            ),
+            ("not DER", vec![0x30, 0x05, 0x30], None, &[], ""),
+        ];
+        for (label, spki, want, fits, go_type) in cases {
+            let key = ClientKey::of_spki(&spki);
+            assert_eq!(key, want, "{label}");
+            let Some(key) = key else {
+                continue;
+            };
+            for scheme in all {
+                assert_eq!(
+                    key.fits_tls13(scheme),
+                    fits.contains(&scheme),
+                    "{label}, {scheme:?}"
+                );
+            }
+            assert_eq!(key.go_type(), go_type, "{label}");
+            let go_kind = match go_type {
+                "*ecdsa.PublicKey" => "ECDSA",
+                "ed25519.PublicKey" => "Ed25519",
+                "*rsa.PublicKey" => "RSA",
+                _ => "ML-DSA",
+            };
+            assert_eq!(key.go_kind(), go_kind, "{label}");
+        }
+    }
+
+    /// A certificate whose ECDSA key is on a curve Go's `x509` does not
+    /// give a key on, or names no curve, is refused when it is read, as
+    /// Go's `ParseCertificate` refuses it (`x509: unsupported elliptic
+    /// curve`, `x509: invalid ECDSA parameters`), so a client presenting
+    /// one is refused before its CertificateVerify, with rustls's bad
+    /// encoding and Go's words, `tls: failed to parse client certificate:
+    /// ...` (PARITY.md, the clientcert entry); a pool skips one as Go's
+    /// `AppendCertsFromPEM` does.  A leaf on P-224, which Go parses,
+    /// chains, and in TLS 1.2 is refused under an ECDSA scheme, the
+    /// provider having no P-224 algorithm where Go verifies the signature:
+    /// that refusal stays in rustls's words, since Go's `expected an ECDSA
+    /// public key` is for a key of another kind, which a scheme of another
+    /// kind than the key's still is noted as.  In TLS 1.3 an ECDSA scheme
+    /// does not fit a P-224 key, as in Go.  Where the oracle runs, Go's
+    /// own parse of each certificate is compared.
+    #[test]
+    fn an_ecdsa_key_go_does_not_parse_refuses_its_certificate() {
+        use dcroxide_certgen::gentool::generate_key;
+        use rustls::SignatureScheme as S;
+        use rustls::pki_types::CertificateDer;
+        use rustls::server::danger::ClientCertVerifier;
+        let now = rustls::pki_types::UnixTime::since_unix_epoch(Duration::from_secs(1_790_000_000));
+        let mut oracle = dcroxide_testutil::oracle_or_skip();
+        let root_key = generate_key("P-256").expect("key");
+        let root =
+            signed_p256_certificate(1, "root", &root_key, "root", &root_key, &ca_extensions());
+        let leaf_key = generate_key("P-256").expect("key");
+        let spki = |algorithm: Vec<u8>, point: Vec<u8>| {
+            der_tlv(
+                0x30,
+                &[
+                    der_tlv(0x30, &algorithm),
+                    der_tlv(0x03, &[&[0u8][..], &point].concat()),
+                ]
+                .concat(),
+            )
+        };
+        let ec_with = |params: &[u8]| [der_tlv(0x06, EC_PUBLIC_KEY), params.to_vec()].concat();
+        // The generator of P-224 and of secp256k1, uncompressed: points on
+        // their curves.
+        let p224_g = dcroxide_testutil::unhex(
+            "04b70e0cbd6bb4bf7f321390b94a03c1d356c21122343280d6115c1d21bd376388b5f723fb4c22dfe6\
+             cd4375a05a07476444d5819985007e34",
+        );
+        let secp256k1_g = dcroxide_testutil::unhex(
+            "0479be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798483ada7726a3c465\
+             5da4fbfc0e1108a8fd17b448a68554199c47d08ffb10d4b8",
+        );
+        let p256_point = leaf_key.public_bytes();
+        // Each case: what it is, the leaf's subject public key info, and
+        // whether Go parses it.
+        let cases = [
+            (
+                "P-256",
+                spki(
+                    ec_with(&der_tlv(0x06, GO_X509_CURVES[1])),
+                    p256_point.clone(),
+                ),
+                true,
+            ),
+            (
+                "P-224",
+                spki(ec_with(&der_tlv(0x06, GO_X509_CURVES[0])), p224_g.clone()),
+                true,
+            ),
+            (
+                "secp256k1",
+                spki(
+                    ec_with(&der_tlv(0x06, &[0x2b, 0x81, 0x04, 0x00, 0x0a])),
+                    secp256k1_g,
+                ),
+                false,
+            ),
+            ("no curve", spki(ec_with(&[]), p256_point.clone()), false),
+            (
+                "NULL parameters",
+                spki(ec_with(&der_tlv(0x05, &[])), p256_point.clone()),
+                false,
+            ),
+            (
+                "a curve given by its parameters",
+                spki(
+                    ec_with(&der_tlv(0x30, &der_tlv(0x02, &[1]))),
+                    p256_point.clone(),
+                ),
+                false,
+            ),
+        ];
+        let verifier = GoClientCertVerifier::from_pem(&certificate_pem(&root)).expect("verifier");
+        for (label, spki, go_parses_it) in cases {
+            let leaf = signed_certificate_with_spki(
+                2,
+                "leaf",
+                spki,
+                "root",
+                &root_key,
+                der_tlv(0x17, b"491231235959Z"),
+                &[],
+            );
+            assert_eq!(CertFacts::parse(&leaf).is_some(), go_parses_it, "{label}");
+            if let Some(go) = go_parses(&mut oracle, &leaf) {
+                assert_eq!(go, go_parses_it, "{label}: Go's parse");
+            }
+            let verified =
+                verifier.verify_client_cert(&CertificateDer::from(leaf.as_slice()), &[], now);
+            if go_parses_it {
+                verified.unwrap_or_else(|err| panic!("{label}: {err:?}"));
+            } else {
+                assert_eq!(
+                    verified.expect_err(label),
+                    rustls::Error::InvalidCertificate(rustls::CertificateError::BadEncoding),
+                    "{label}"
+                );
+                // A pool takes no such certificate as an authority.
+                let mut pool = ClientCaPool::new();
+                assert!(!pool.add_cert(leaf.clone()), "{label}: the pool");
+            }
+        }
+
+        // The P-224 leaf's handshake signatures.
+        let p224_leaf = signed_certificate_with_spki(
+            3,
+            "leaf",
+            spki(ec_with(&der_tlv(0x06, GO_X509_CURVES[0])), p224_g),
+            "root",
+            &root_key,
+            der_tlv(0x17, b"491231235959Z"),
+            &[],
+        );
+        let p224_leaf = CertificateDer::from(p224_leaf.as_slice());
+        let message = b"a handshake transcript";
+        // A well-formed signature, r = 1 and s = 1, which the provider
+        // never gets to verify.
+        let signature = [0x30, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x01];
+        for scheme in [
+            S::ECDSA_NISTP256_SHA256,
+            S::ECDSA_NISTP384_SHA384,
+            S::ECDSA_NISTP521_SHA512,
+        ] {
+            clear_client_refusal();
+            let err = verifier
+                .verify_tls12_signature(message, &p224_leaf, &digitally_signed(scheme, &signature))
+                .expect_err("no P-224 algorithm");
+            assert!(
+                matches!(
+                    err,
+                    rustls::Error::InvalidCertificate(
+                        rustls::CertificateError::UnsupportedSignatureAlgorithmForPublicKeyContext {
+                            ..
+                        }
+                    )
+                ),
+                "TLS 1.2, {scheme:?}: {err:?}"
+            );
+            assert_eq!(
+                take_client_refusal(&err),
+                None,
+                "TLS 1.2, {scheme:?}: no Go words for the port's refusal"
+            );
+            let words = crate::server::go_error_text_for_tests(&err);
+            assert!(
+                !words.contains("expected an ECDSA public key"),
+                "TLS 1.2, {scheme:?}: {words}"
+            );
+            let err = verifier
+                .verify_tls13_signature(message, &p224_leaf, &digitally_signed(scheme, &signature))
+                .expect_err("no scheme fits a P-224 key");
+            assert_eq!(
+                err,
+                rustls::Error::PeerMisbehaved(CLIENT_SCHEME_REFUSED),
+                "TLS 1.3, {scheme:?}"
+            );
+        }
+        clear_client_refusal();
+        let err = verifier
+            .verify_tls12_signature(
+                message,
+                &p224_leaf,
+                &digitally_signed(S::ED25519, &signature),
+            )
+            .expect_err("an Ed25519 scheme from an ECDSA key");
+        assert_eq!(
+            take_client_refusal(&err),
+            Some(
+                "tls: invalid signature by the client certificate: expected an Ed25519 public \
+                 key, got *ecdsa.PublicKey"
+                    .to_string()
+            )
+        );
+    }
+
+    /// Go's words for a certificate its `ParseCertificate` refuses, as the
+    /// oracle's `x509_verify_client` gives them, or `None` where Go parses
+    /// it or the oracle does not run.
+    fn go_parse_error(
+        oracle: &mut Option<dcroxide_testutil::Oracle>,
+        der: &[u8],
+    ) -> Option<String> {
+        let hex: String = der.iter().map(|b| format!("{b:02x}")).collect();
+        let request = format!(r#"{{"roots":[],"leaf":"{hex}","intermediates":[],"time":0}}"#);
+        let response = oracle
+            .as_mut()?
+            .call("x509_verify_client", request.as_bytes());
+        response["error"]
+            .as_str()
+            .and_then(|err| err.strip_prefix("x509_verify_client: leaf: "))
+            .map(str::to_string)
+    }
+
+    /// A subject public key info of `algorithm`, an AlgorithmIdentifier's
+    /// contents, and `key`, a BIT STRING's.
+    fn spki_of(algorithm: &[u8], key: &[u8]) -> Vec<u8> {
+        der_tlv(
+            0x30,
+            &[der_tlv(0x30, algorithm), der_tlv(0x03, key)].concat(),
+        )
+    }
+
+    /// An RSA subject public key info whose `RSAPublicKey` holds
+    /// `modulus` and `exponent`, INTEGER contents as given.
+    fn rsa_spki(modulus: &[u8], exponent: &[u8]) -> Vec<u8> {
+        let key = der_tlv(
+            0x30,
+            &[der_tlv(0x02, modulus), der_tlv(0x02, exponent)].concat(),
+        );
+        spki_of(
+            &[der_tlv(0x06, RSA_ENCRYPTION), der_tlv(0x05, &[])].concat(),
+            &[&[0u8][..], &key].concat(),
+        )
+    }
+
+    /// A positive modulus of `bits` bits, 2^(bits-1) + 1, as INTEGER
+    /// contents: no RSA key, but one Go's parser reads, which checks only
+    /// that the modulus is above zero.
+    // Byte and bit arithmetic over a length of at least one byte.
+    #[allow(clippy::arithmetic_side_effects)]
+    fn modulus_of_bits(bits: usize) -> Vec<u8> {
+        let len = bits.div_ceil(8);
+        let mut modulus = vec![0u8; len];
+        modulus[0] = 1 << ((bits - 1) % 8);
+        modulus[len - 1] |= 1;
+        if modulus[0] & 0x80 != 0 {
+            modulus.insert(0, 0);
+        }
+        modulus
+    }
+
+    /// A client certificate is refused when it is read, as Go's
+    /// `ParseCertificate` refuses it, for every way Go's `parsePublicKey`
+    /// and the reading of the subject public key info before it refuse a
+    /// key (`crypto/x509/parser.go:309-411`, `:1071-1099`), and Go's words
+    /// for it are the handshake's error: `tls: failed to parse client
+    /// certificate: ` and the parser's (`handshake_server.go:947-951`).
+    /// So is a client sending such a certificate after a leaf that
+    /// verifies, which no chain uses, as Go parses every certificate a
+    /// client sends; a pool takes none of them, as Go's
+    /// `AppendCertsFromPEM` skips them.  Each key Go takes is taken, its
+    /// leaf verifying under the root, but for one of a kind Go's TLS takes
+    /// no signature from, refused once its chain verifies with Go's words
+    /// and `unsupported_certificate`'s error (`handshake_server.go:1005-1016`).
+    /// The texts are written out, and where the oracle runs each is
+    /// compared with Go's own parse of the certificate.  The P-256 text for
+    /// a coordinate at or above p is that of Go's assembly P-256, which
+    /// x86_64 builds.
+    #[test]
+    fn public_keys_go_does_not_parse_refuse_their_certificates() {
+        use dcroxide_certgen::gentool::generate_key;
+        use rustls::pki_types::CertificateDer;
+        use rustls::server::danger::ClientCertVerifier;
+        let now = rustls::pki_types::UnixTime::since_unix_epoch(Duration::from_secs(1_790_000_000));
+        let mut oracle = dcroxide_testutil::oracle_or_skip();
+        let root_key = generate_key("P-256").expect("key");
+        let root =
+            signed_p256_certificate(1, "root", &root_key, "root", &root_key, &ca_extensions());
+        let verifier = GoClientCertVerifier::from_pem(&certificate_pem(&root)).expect("verifier");
+        let good_key = generate_key("P-256").expect("key");
+        let good_leaf = signed_p256_certificate(2, "good", &good_key, "root", &root_key, &[]);
+
+        let ec = |curve: Option<&[u8]>| {
+            let mut algorithm = der_tlv(0x06, EC_PUBLIC_KEY);
+            if let Some(curve) = curve {
+                algorithm.extend(der_tlv(0x06, curve));
+            }
+            algorithm
+        };
+        let bits = |key: &[u8]| [&[0u8][..], key].concat();
+        let p256 = generate_key("P-256").expect("key").public_bytes();
+        let p384 = generate_key("P-384").expect("key").public_bytes();
+        let p521 = generate_key("P-521").expect("key").public_bytes();
+        let p224_g = dcroxide_testutil::unhex(
+            "04b70e0cbd6bb4bf7f321390b94a03c1d356c21122343280d6115c1d21bd376388b5f723fb4c22dfe6\
+             cd4375a05a07476444d5819985007e34",
+        );
+        let ed25519 = generate_key("Ed25519").expect("key").public_bytes();
+        let mut compressed = p256[..33].to_vec();
+        compressed[0] = 2 | (p256[64] & 1);
+        let mut hybrid = p256.clone();
+        hybrid[0] = 6 | (p256[64] & 1);
+        let mut p256_y_is_p = p256.clone();
+        p256_y_is_p[33..].copy_from_slice(&[
+            0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0xff, 0xff, 0xff, 0xff,
+        ]);
+        let mut p521_x_is_p = p521.clone();
+        p521_x_is_p[1..67].fill(0xff);
+        p521_x_is_p[1] = 0x01;
+        let mut p224_off = p224_g.clone();
+        p224_off[56] ^= 1;
+        // P-224's generator ends in 0x34, two zero bits: its bits read with
+        // two unused, which Go right-aligns to a first octet of 0x01.
+        let p224_unused = [&[2u8][..], &p224_g].concat();
+        let p384_short = &p384[..p384.len() - 1];
+        let secp256k1: &[u8] = &[0x2b, 0x81, 0x04, 0x00, 0x0a];
+        let ed = der_tlv(0x06, ED25519_KEY);
+        let ml_dsa_44 = der_tlv(0x06, ML_DSA_KEYS[0].0);
+        let ml_dsa_key = vec![0u8; 1 + 1312];
+        let dsa_params = der_tlv(
+            0x30,
+            &[
+                der_tlv(0x02, &[23]),
+                der_tlv(0x02, &[11]),
+                der_tlv(0x02, &[4]),
+            ]
+            .concat(),
+        );
+        let dsa = |params: &[u8], y: &[u8]| {
+            spki_of(
+                &[der_tlv(0x06, DSA_KEY), params.to_vec()].concat(),
+                &bits(y),
+            )
+        };
+        let modulus = modulus_of_bits(2048);
+        let mut padded_modulus = modulus.clone();
+        padded_modulus.insert(0, 0);
+        let rsa_trailing = {
+            let key = der_tlv(
+                0x30,
+                &[
+                    der_tlv(0x02, &modulus),
+                    der_tlv(0x02, &[1, 0, 1]),
+                    vec![0x05, 0x00],
+                ]
+                .concat(),
+            );
+            spki_of(
+                &[der_tlv(0x06, RSA_ENCRYPTION), der_tlv(0x05, &[])].concat(),
+                &bits(&key),
+            )
+        };
+        let invalid_point = "ecdsa: invalid uncompressed public key";
+        let cases: Vec<(&str, Vec<u8>, Option<&str>)> = vec![
+            (
+                "P-256",
+                spki_of(&ec(Some(GO_X509_CURVES[1])), &bits(&p256)),
+                None,
+            ),
+            (
+                "P-384",
+                spki_of(&ec(Some(GO_X509_CURVES[2])), &bits(&p384)),
+                None,
+            ),
+            (
+                "P-521",
+                spki_of(&ec(Some(GO_X509_CURVES[3])), &bits(&p521)),
+                None,
+            ),
+            (
+                "P-224",
+                spki_of(&ec(Some(GO_X509_CURVES[0])), &bits(&p224_g)),
+                None,
+            ),
+            (
+                "compressed",
+                spki_of(&ec(Some(GO_X509_CURVES[1])), &bits(&compressed)),
+                Some(invalid_point),
+            ),
+            (
+                "hybrid",
+                spki_of(&ec(Some(GO_X509_CURVES[1])), &bits(&hybrid)),
+                Some(invalid_point),
+            ),
+            (
+                "an empty point",
+                spki_of(&ec(Some(GO_X509_CURVES[1])), &[0]),
+                Some(invalid_point),
+            ),
+            (
+                "unused bits",
+                spki_of(&ec(Some(GO_X509_CURVES[0])), &p224_unused),
+                Some(invalid_point),
+            ),
+            (
+                "a P-384 point a byte short",
+                spki_of(&ec(Some(GO_X509_CURVES[2])), &bits(p384_short)),
+                Some("invalid P384 point encoding"),
+            ),
+            (
+                "P-256's y = p",
+                spki_of(&ec(Some(GO_X509_CURVES[1])), &bits(&p256_y_is_p)),
+                Some("invalid P256 element encoding"),
+            ),
+            (
+                "P-521's x = p",
+                spki_of(&ec(Some(GO_X509_CURVES[3])), &bits(&p521_x_is_p)),
+                Some("invalid P521Element encoding"),
+            ),
+            (
+                "off P-224",
+                spki_of(&ec(Some(GO_X509_CURVES[0])), &bits(&p224_off)),
+                Some("P224 point not on curve"),
+            ),
+            (
+                "a P-384 point on P-256",
+                spki_of(&ec(Some(GO_X509_CURVES[1])), &bits(&p384)),
+                Some("invalid P256 point encoding"),
+            ),
+            (
+                "no curve",
+                spki_of(&ec(None), &bits(&p256)),
+                Some("x509: invalid ECDSA parameters"),
+            ),
+            (
+                "NULL parameters",
+                spki_of(&[ec(None), der_tlv(0x05, &[])].concat(), &bits(&p256)),
+                Some("x509: invalid ECDSA parameters"),
+            ),
+            (
+                "a curve OID cryptobyte refuses",
+                spki_of(
+                    &[ec(None), der_tlv(0x06, &[0x80, 0x01])].concat(),
+                    &bits(&p256),
+                ),
+                Some("x509: invalid ECDSA parameters"),
+            ),
+            (
+                "secp256k1",
+                spki_of(&ec(Some(secp256k1)), &bits(&p256)),
+                Some("x509: unsupported elliptic curve"),
+            ),
+            ("Ed25519", spki_of(&ed, &bits(&ed25519)), None),
+            (
+                "Ed25519 with NULL parameters",
+                spki_of(&[ed.clone(), der_tlv(0x05, &[])].concat(), &bits(&ed25519)),
+                Some("x509: Ed25519 key encoded with illegal parameters"),
+            ),
+            (
+                "Ed25519 of 31 bytes",
+                spki_of(&ed, &bits(&ed25519[..31])),
+                Some("x509: wrong Ed25519 public key size"),
+            ),
+            (
+                "Ed25519 of 33 bytes",
+                spki_of(&ed, &bits(&[&ed25519[..], &[0]].concat())),
+                Some("x509: wrong Ed25519 public key size"),
+            ),
+            ("RSA", rsa_spki(&modulus, &[1, 0, 1]), None),
+            ("RSA with bytes after its exponent", rsa_trailing, None),
+            (
+                "RSA without NULL parameters",
+                spki_of(
+                    &der_tlv(0x06, RSA_ENCRYPTION),
+                    &bits(&der_tlv(
+                        0x30,
+                        &[der_tlv(0x02, &modulus), der_tlv(0x02, &[1, 0, 1])].concat(),
+                    )),
+                ),
+                Some("x509: RSA key missing NULL parameters"),
+            ),
+            (
+                "RSA, no SEQUENCE",
+                spki_of(
+                    &[der_tlv(0x06, RSA_ENCRYPTION), der_tlv(0x05, &[])].concat(),
+                    &bits(&der_tlv(0x02, &modulus)),
+                ),
+                Some("x509: invalid RSA public key"),
+            ),
+            (
+                "RSA, a modulus with a needless zero",
+                rsa_spki(&padded_modulus, &[1, 0, 1]),
+                Some("x509: invalid RSA modulus"),
+            ),
+            (
+                "RSA, an exponent of nine bytes",
+                rsa_spki(&modulus, &[1, 0, 0, 0, 0, 0, 0, 0, 1]),
+                Some("x509: invalid RSA public exponent"),
+            ),
+            (
+                "RSA, a negative modulus",
+                rsa_spki(&modulus[1..], &[1, 0, 1]),
+                Some("x509: RSA modulus is not a positive number"),
+            ),
+            (
+                "RSA, a zero modulus",
+                rsa_spki(&[0], &[1, 0, 1]),
+                Some("x509: RSA modulus is not a positive number"),
+            ),
+            (
+                "RSA, an exponent of -1",
+                rsa_spki(&modulus, &[0xff]),
+                Some("x509: RSA public exponent is not a positive number"),
+            ),
+            ("DSA", dsa(&dsa_params, &der_tlv(0x02, &[2])), None),
+            (
+                "DSA, a key that is no INTEGER",
+                dsa(&dsa_params, &der_tlv(0x04, &[2])),
+                Some("x509: invalid DSA public key"),
+            ),
+            (
+                "DSA without parameters",
+                dsa(&[], &der_tlv(0x02, &[2])),
+                Some("x509: invalid DSA parameters"),
+            ),
+            (
+                "DSA, g zero",
+                dsa(
+                    &der_tlv(
+                        0x30,
+                        &[
+                            der_tlv(0x02, &[23]),
+                            der_tlv(0x02, &[11]),
+                            der_tlv(0x02, &[0]),
+                        ]
+                        .concat(),
+                    ),
+                    &der_tlv(0x02, &[2]),
+                ),
+                Some("x509: zero or negative DSA parameter"),
+            ),
+            ("ML-DSA-44", spki_of(&ml_dsa_44, &ml_dsa_key), None),
+            (
+                "ML-DSA-44 with NULL parameters",
+                spki_of(
+                    &[ml_dsa_44.clone(), der_tlv(0x05, &[])].concat(),
+                    &ml_dsa_key,
+                ),
+                Some("x509: ML-DSA key encoded with illegal parameters"),
+            ),
+            (
+                "ML-DSA-44 a byte short",
+                spki_of(&ml_dsa_44, &ml_dsa_key[..1312]),
+                Some("mldsa: invalid public key length"),
+            ),
+            (
+                "X25519",
+                spki_of(&der_tlv(0x06, &[0x2b, 0x65, 0x6e]), &bits(&[9; 32])),
+                None,
+            ),
+            (
+                "an algorithm that is no SEQUENCE",
+                der_tlv(
+                    0x30,
+                    &[der_tlv(0x06, ED25519_KEY), der_tlv(0x03, &bits(&ed25519))].concat(),
+                ),
+                Some("x509: malformed public key algorithm identifier"),
+            ),
+            (
+                "an empty algorithm OID",
+                spki_of(&der_tlv(0x06, &[]), &bits(&ed25519)),
+                Some("x509: malformed OID"),
+            ),
+            (
+                "parameters cut short",
+                spki_of(&[ed.clone(), vec![0x05]].concat(), &bits(&ed25519)),
+                Some("x509: malformed parameters"),
+            ),
+            (
+                "no key",
+                der_tlv(0x30, &der_tlv(0x30, &ed)),
+                Some("x509: malformed subjectPublicKey"),
+            ),
+            (
+                "eight unused bits",
+                spki_of(&ed, &[&[8u8][..], &ed25519].concat()),
+                Some("x509: malformed subjectPublicKey"),
+            ),
+        ];
+        let mut serial = 3u8;
+        for (label, spki, words) in cases {
+            serial = serial.wrapping_add(1);
+            let leaf = signed_certificate_with_spki(
+                serial,
+                "leaf",
+                spki.clone(),
+                "root",
+                &root_key,
+                der_tlv(0x17, b"491231235959Z"),
+                &[],
+            );
+            let spki_content = DerReader::new(&spki).read_tag(0x30).expect("an spki");
+            assert_eq!(go_public_key_refusal(spki_content), words, "{label}");
+            assert_eq!(
+                CertFacts::parse(&leaf).is_none(),
+                words.is_some(),
+                "{label}"
+            );
+            if oracle.is_some() {
+                assert_eq!(
+                    go_parse_error(&mut oracle, &leaf).as_deref(),
+                    words,
+                    "{label}: Go's parse"
+                );
+            }
+            let leaf_der = CertificateDer::from(leaf.as_slice());
+            let good = CertificateDer::from(good_leaf.as_slice());
+            let mut pool = ClientCaPool::new();
+            assert_eq!(
+                pool.add_cert(leaf.clone()),
+                words.is_none(),
+                "{label}: the pool"
+            );
+            if let Some(words) = words {
+                let text = format!("tls: failed to parse client certificate: {words}");
+                for chain in [
+                    (&leaf_der, &[][..]),
+                    (&good, std::slice::from_ref(&leaf_der)),
+                ] {
+                    let err = verifier
+                        .verify_client_cert(chain.0, chain.1, now)
+                        .expect_err(label);
+                    assert_eq!(
+                        err,
+                        rustls::Error::InvalidCertificate(rustls::CertificateError::BadEncoding),
+                        "{label}"
+                    );
+                    assert_eq!(take_client_refusal(&err), Some(text.clone()), "{label}");
+                }
+                continue;
+            }
+            let verified = verifier.verify_client_cert(&leaf_der, &[], now);
+            match ClientKey::of_leaf(&leaf) {
+                Some(_) => {
+                    verified.unwrap_or_else(|err| panic!("{label}: {err:?}"));
+                }
+                None => {
+                    let err = verified.expect_err(label);
+                    assert_eq!(
+                        err,
+                        rustls::Error::InvalidCertificate(rustls::CertificateError::InvalidPurpose),
+                        "{label}"
+                    );
+                    let go_type = if label == "DSA" {
+                        "*dsa.PublicKey"
+                    } else {
+                        "<nil>"
+                    };
+                    assert_eq!(
+                        take_client_refusal(&err),
+                        Some(format!(
+                            "tls: client certificate contains an unsupported public key of type \
+                             {go_type}"
+                        )),
+                        "{label}"
+                    );
+                }
+            }
+            // A good leaf with this one after it, unused.
+            verifier
+                .verify_client_cert(&good, std::slice::from_ref(&leaf_der), now)
+                .unwrap_or_else(|err| panic!("{label}, unused: {err:?}"));
+        }
+    }
+
+    /// Go refuses a client that sends a certificate with an RSA key of
+    /// more than 8192 bits, used or not, as it reads each certificate,
+    /// with `bad_certificate` and its words
+    /// (`crypto/tls/handshake_server.go:952-957`), which this does with
+    /// rustls's bad encoding, rustls's `bad_certificate`, and Go's words;
+    /// 8192 bits are taken.  A pool takes such a key, as Go's does, the
+    /// limit being on what a client sends.  A certificate that fails to
+    /// parse after one over the limit is refused for the limit, as Go
+    /// checks each certificate as it reads it.
+    #[test]
+    fn a_client_rsa_key_over_8192_bits_is_refused_as_go_refuses_it() {
+        use dcroxide_certgen::gentool::generate_key;
+        use rustls::pki_types::CertificateDer;
+        use rustls::server::danger::ClientCertVerifier;
+        let now = rustls::pki_types::UnixTime::since_unix_epoch(Duration::from_secs(1_790_000_000));
+        let root_key = generate_key("P-256").expect("key");
+        let root =
+            signed_p256_certificate(1, "root", &root_key, "root", &root_key, &ca_extensions());
+        let verifier = GoClientCertVerifier::from_pem(&certificate_pem(&root)).expect("verifier");
+        let good_key = generate_key("P-256").expect("key");
+        let good_leaf = signed_p256_certificate(2, "good", &good_key, "root", &root_key, &[]);
+        let good = CertificateDer::from(good_leaf.as_slice());
+        let rsa_leaf = |serial: u8, bits: usize| {
+            signed_certificate_with_spki(
+                serial,
+                "rsa",
+                rsa_spki(&modulus_of_bits(bits), &[1, 0, 1]),
+                "root",
+                &root_key,
+                der_tlv(0x17, b"491231235959Z"),
+                &[],
+            )
+        };
+        let unparsable = signed_certificate_with_spki(
+            3,
+            "unparsable",
+            spki_of(&der_tlv(0x06, ED25519_KEY), &[0, 1, 2]),
+            "root",
+            &root_key,
+            der_tlv(0x17, b"491231235959Z"),
+            &[],
+        );
+        let unparsable = CertificateDer::from(unparsable.as_slice());
+        let too_large = "tls: client sent certificate containing RSA key larger than 8192 bits";
+        for (bits, refused) in [(8192, false), (8193, true), (16384, true)] {
+            let rsa = rsa_leaf(4, bits);
+            let spki = CertFacts::parse_all(&rsa).expect("parses").2.spki;
+            assert_eq!(go_rsa_modulus_bits(spki), Some(bits));
+            let rsa = CertificateDer::from(rsa.as_slice());
+            let mut pool = ClientCaPool::new();
+            assert!(pool.add_cert(rsa.to_vec()), "{bits}: the pool");
+            for chain in [
+                (&rsa, &[][..]),
+                (&good, std::slice::from_ref(&rsa)),
+                (&rsa, std::slice::from_ref(&unparsable)),
+            ] {
+                let verified = verifier.verify_client_cert(chain.0, chain.1, now);
+                if refused {
+                    let err = verified.expect_err("over the limit");
+                    assert_eq!(
+                        err,
+                        rustls::Error::InvalidCertificate(rustls::CertificateError::BadEncoding),
+                        "{bits}"
+                    );
+                    assert_eq!(
+                        take_client_refusal(&err).as_deref(),
+                        Some(too_large),
+                        "{bits}"
+                    );
+                } else if chain.1.first() == Some(&unparsable) {
+                    let err = verified.expect_err("an unparsable certificate after it");
+                    assert_eq!(
+                        take_client_refusal(&err).as_deref(),
+                        Some(
+                            "tls: failed to parse client certificate: x509: wrong Ed25519 public key size"
+                        ),
+                        "{bits}"
+                    );
+                } else {
+                    verified.unwrap_or_else(|err| panic!("{bits}: {err:?}"));
+                }
+            }
+        }
+        assert_eq!(
+            go_rsa_modulus_bits(CertFacts::parse_all(&good_leaf).expect("parses").2.spki),
+            None
+        );
+    }
+
+    /// Go's `BitString.RightAlign`: the octets as they are with no bit
+    /// unused, and shifted right by the unused count otherwise.
+    #[test]
+    fn bit_strings_are_right_aligned_as_go_aligns_them() {
+        assert_eq!(go_right_align(0, &[0x12, 0x34]).as_ref(), &[0x12, 0x34]);
+        assert_eq!(go_right_align(4, &[0x12, 0x30]).as_ref(), &[0x01, 0x23]);
+        assert_eq!(go_right_align(1, &[0x81, 0x02]).as_ref(), &[0x40, 0x81]);
+        assert_eq!(go_right_align(7, &[0x80]).as_ref(), &[0x01]);
+        assert_eq!(go_right_align(3, &[]).as_ref(), &[] as &[u8]);
+    }
+
     /// An ML-DSA client key signs a TLS 1.3 handshake with its own set's
     /// scheme alone, as Go checks it (`crypto/tls/handshake_server_tls13.go:1086-1100`),
     /// and is refused in TLS 1.2 whatever the scheme and whether or not the
@@ -6661,7 +8375,7 @@ mod tests {
     /// (`handshake_server.go:1005-1012`), which keys on the leaf alone: a
     /// P-256 leaf under ML-DSA authorities signs a TLS 1.2 handshake.  The
     /// schemes the CertificateRequest lists are the listener's set's, Go
-    /// 1.27.3's in Go's order but P-521's, with PKCS#1 v1.5's three, which
+    /// 1.27.3's in Go's order, P-521's last, with PKCS#1 v1.5's three, which
     /// Go's TLS 1.3 list leaves out (PARITY.md, the ML-DSA entry).
     #[test]
     fn an_ml_dsa_client_key_signs_in_tls13_alone() {
@@ -6733,22 +8447,54 @@ mod tests {
                 &digitally_signed(S::ML_DSA_87, &ml87_signature),
             )
             .expect("the leaf's own scheme in TLS 1.3");
-        for (label, scheme, message) in [
-            ("another set's scheme", S::ML_DSA_65, &message[..]),
-            ("the first set's scheme", S::ML_DSA_44, &message[..]),
-            ("an ECDSA scheme", S::ECDSA_NISTP256_SHA256, &message[..]),
-            ("another message", S::ML_DSA_87, &b"another transcript"[..]),
+        // A scheme that does not fit the key is refused as Go refuses it,
+        // before anything is verified; the leaf's own scheme over another
+        // message fails as a bad signature, which is left to rustls's
+        // words for an ML-DSA key.
+        for (label, scheme, message, misfit) in [
+            ("another set's scheme", S::ML_DSA_65, &message[..], true),
+            ("the first set's scheme", S::ML_DSA_44, &message[..], true),
+            (
+                "an ECDSA scheme",
+                S::ECDSA_NISTP256_SHA256,
+                &message[..],
+                true,
+            ),
+            (
+                "a PKCS#1 v1.5 scheme",
+                S::RSA_PKCS1_SHA256,
+                &message[..],
+                true,
+            ),
+            (
+                "another message",
+                S::ML_DSA_87,
+                &b"another transcript"[..],
+                false,
+            ),
         ] {
-            assert!(
-                verifier
-                    .verify_tls13_signature(
-                        message,
-                        &leaf,
-                        &digitally_signed(scheme, &ml87_signature)
-                    )
-                    .is_err(),
-                "TLS 1.3, {label}"
-            );
+            clear_client_refusal();
+            let err = verifier
+                .verify_tls13_signature(message, &leaf, &digitally_signed(scheme, &ml87_signature))
+                .expect_err("refused");
+            if misfit {
+                assert_eq!(
+                    err,
+                    rustls::Error::PeerMisbehaved(CLIENT_SCHEME_REFUSED),
+                    "TLS 1.3, {label}"
+                );
+                assert_eq!(
+                    crate::server::go_error_text_for_tests(&err),
+                    "tls: client certificate used with invalid signature algorithm"
+                );
+            } else {
+                assert_eq!(
+                    err,
+                    rustls::Error::InvalidCertificate(rustls::CertificateError::BadSignature),
+                    "TLS 1.3, {label}"
+                );
+            }
+            assert_eq!(take_client_refusal(&err), None, "TLS 1.3, {label}");
         }
         for scheme in [S::ML_DSA_87, S::ECDSA_NISTP256_SHA256] {
             let err = verifier
@@ -6775,6 +8521,70 @@ mod tests {
             )
             .expect("a P-256 leaf under ML-DSA authorities in TLS 1.2");
 
+        // The P-256 leaf's refusals in Go's words: in TLS 1.3 a P-521
+        // scheme, which does not fit the key, and its own scheme over
+        // another message, an ECDSA signature that fails; in TLS 1.2,
+        // where an ECDSA scheme is not tied to a curve, the Ed25519 scheme,
+        // which is of another kind than the key.
+        let p256_signature = sign(&p256_key, S::ECDSA_NISTP256_SHA256);
+        let err = verifier
+            .verify_tls13_signature(
+                message,
+                &p256_leaf,
+                &digitally_signed(S::ECDSA_NISTP521_SHA512, &p256_signature),
+            )
+            .expect_err("a P-521 scheme from a P-256 key in TLS 1.3");
+        assert_eq!(err, rustls::Error::PeerMisbehaved(CLIENT_SCHEME_REFUSED));
+        let failed = "tls: invalid signature by the client certificate: ";
+        for (version, scheme, words) in [
+            (
+                "TLS 1.3",
+                S::ECDSA_NISTP256_SHA256,
+                "ECDSA verification failure",
+            ),
+            (
+                "TLS 1.2",
+                S::ECDSA_NISTP256_SHA256,
+                "ECDSA verification failure",
+            ),
+            (
+                "TLS 1.2",
+                S::ED25519,
+                "expected an Ed25519 public key, got *ecdsa.PublicKey",
+            ),
+        ] {
+            clear_client_refusal();
+            let dss = digitally_signed(scheme, &p256_signature);
+            let other = b"another transcript";
+            let err = if version == "TLS 1.3" {
+                verifier.verify_tls13_signature(other, &p256_leaf, &dss)
+            } else {
+                verifier.verify_tls12_signature(other, &p256_leaf, &dss)
+            }
+            .expect_err("refused");
+            assert_eq!(
+                take_client_refusal(&err),
+                Some(format!("{failed}{words}")),
+                "{version}, {scheme:?}"
+            );
+            // The note is taken once, and a note is not read for another
+            // error than the one it was noted for.
+            assert_eq!(take_client_refusal(&err), None);
+        }
+        clear_client_refusal();
+        let err = verifier
+            .verify_tls13_signature(
+                b"another transcript",
+                &p256_leaf,
+                &digitally_signed(S::ECDSA_NISTP256_SHA256, &p256_signature),
+            )
+            .expect_err("refused");
+        assert_eq!(
+            take_client_refusal(&rustls::Error::PeerMisbehaved(CLIENT_SCHEME_REFUSED)),
+            None
+        );
+        assert_eq!(take_client_refusal(&err), None, "taken already");
+
         assert_eq!(
             verifier.supported_verify_schemes(),
             [
@@ -6790,6 +8600,7 @@ mod tests {
                 S::RSA_PKCS1_SHA384,
                 S::RSA_PKCS1_SHA512,
                 S::ECDSA_NISTP384_SHA384,
+                S::ECDSA_NISTP521_SHA512,
             ]
         );
     }
@@ -6860,6 +8671,109 @@ mod tests {
                 "{:02x?}",
                 &input[..input.len().min(8)]
             );
+        }
+    }
+
+    /// The client-certificate fuzz body's handshake leaves are what it
+    /// says: on the P-256, P-384 and P-521 generators and the zero seed's
+    /// Ed25519 key, picked by the first byte divided by twelve, so that a
+    /// handshake signature by the key of the secret scalar 1, or of the
+    /// zero seed, under the leaf's own scheme, picked from the list, is
+    /// accepted, and one under another curve's scheme, one under a scheme
+    /// the listener refuses, or one with a bit flipped, is not.
+    #[test]
+    fn the_client_cert_fuzz_body_reaches_ecdsa_and_ed25519() {
+        use rustls::SignatureScheme as S;
+        let fixture = FuzzClientCerts::new().expect("the fixture");
+        let ecdsa = |curve: &[u8], width: usize| {
+            let mut scalar = vec![0u8; width];
+            scalar[width - 1] = 1;
+            der_tlv(
+                0x30,
+                &[
+                    der_tlv(0x02, &[0]),
+                    der_tlv(
+                        0x30,
+                        &[der_tlv(0x06, EC_PUBLIC_KEY), der_tlv(0x06, curve)].concat(),
+                    ),
+                    der_tlv(
+                        0x04,
+                        &der_tlv(
+                            0x30,
+                            &[der_tlv(0x02, &[1]), der_tlv(0x04, &scalar)].concat(),
+                        ),
+                    ),
+                ]
+                .concat(),
+            )
+        };
+        let ed25519 = der_tlv(
+            0x30,
+            &[
+                der_tlv(0x02, &[0]),
+                der_tlv(0x30, &der_tlv(0x06, ED25519_KEY)),
+                der_tlv(0x04, &der_tlv(0x04, &[0u8; 32])),
+            ]
+            .concat(),
+        );
+        let leaves = [
+            (ecdsa(ECDSA_CURVES[0].0, 32), S::ECDSA_NISTP256_SHA256),
+            (ecdsa(ECDSA_CURVES[1].0, 48), S::ECDSA_NISTP384_SHA384),
+            (ecdsa(ECDSA_CURVES[2].0, 66), S::ECDSA_NISTP521_SHA512),
+            (ed25519, S::ED25519),
+        ];
+        assert_eq!(fixture.handshake_leaves.len(), leaves.len());
+        let schemes: Vec<S> = dcroxide_tlscrypto::RPC_SIG_ALGS
+            .mapping
+            .iter()
+            .map(|&(scheme, _)| scheme)
+            .chain(FUZZ_REFUSED_SCHEMES)
+            .collect();
+        let at = |scheme: S| {
+            u8::try_from(schemes.iter().position(|&s| s == scheme).expect("listed")).expect("few")
+        };
+        for (n, ((pkcs8, scheme), leaf)) in leaves.iter().zip(&fixture.handshake_leaves).enumerate()
+        {
+            let key = ClientKey::of_leaf(leaf).expect("a client key");
+            let want = if *scheme == S::ED25519 {
+                ClientKey::Ed25519
+            } else {
+                ClientKey::Ecdsa(Some(*scheme))
+            };
+            assert_eq!(key, want, "leaf {n}");
+            let signature = dcroxide_tlscrypto::sign::load_der(pkcs8)
+                .expect("the key")
+                .choose_scheme(&[*scheme])
+                .expect("its scheme")
+                .sign(b"the client's handshake transcript")
+                .expect("signed");
+            // Mode 3 with the leaf picked: 12 (n + 1) + 9.
+            let pick = u8::try_from(12 * (n + 1) + 9).expect("a byte");
+            let input = |scheme: S, signature: &[u8]| [&[pick, at(scheme)][..], signature].concat();
+            assert!(fuzz_client_cert(&input(*scheme, &signature)), "leaf {n}");
+            let mut flipped = signature.clone();
+            *flipped.last_mut().expect("a byte") ^= 1;
+            assert!(
+                !fuzz_client_cert(&input(*scheme, &flipped)),
+                "leaf {n}, flipped"
+            );
+            let another = if *scheme == S::ECDSA_NISTP384_SHA384 {
+                S::ECDSA_NISTP521_SHA512
+            } else {
+                S::ECDSA_NISTP384_SHA384
+            };
+            // In TLS 1.2 an ECDSA key takes another curve's scheme, whose
+            // hash its signature was not made over.
+            assert!(
+                !fuzz_client_cert(&input(another, &signature)),
+                "leaf {n}, {another:?}"
+            );
+            for refused in FUZZ_REFUSED_SCHEMES {
+                assert!(
+                    !fuzz_client_cert(&input(refused, &signature)),
+                    "leaf {n}, {refused:?}"
+                );
+            }
         }
     }
 

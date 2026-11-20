@@ -14,9 +14,11 @@ import (
 	"crypto/ed25519"
 	"crypto/rsa"
 	"crypto/x509"
+	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
+	"math/big"
 	"net"
 	"reflect"
 	"runtime"
@@ -109,6 +111,7 @@ func TestTLSPKI(t *testing.T) {
 		},
 		map[string]any{"name": "p384", "key": "P-384", "eku": []string{"any"}},
 		map[string]any{"name": "p521", "key": "P-521", "sig_alg": "ECDSA-SHA512", "ca": true},
+		map[string]any{"name": "p224", "key": "P-224", "eku": []string{"client_auth"}},
 	)
 	now := time.Now()
 	type want struct {
@@ -124,6 +127,7 @@ func TestTLSPKI(t *testing.T) {
 		"leaf":  {"Ed25519", x509.SHA256WithRSAPSS, false, []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth}},
 		"p384":  {"ECDSA P-384", x509.ECDSAWithSHA384, false, []x509.ExtKeyUsage{x509.ExtKeyUsageAny}},
 		"p521":  {"ECDSA P-521", x509.ECDSAWithSHA512, true, nil},
+		"p224":  {"ECDSA P-224", x509.ECDSAWithSHA256, false, []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}},
 	} {
 		cert, key := parsed(t, name, pki[name])
 		certs[name] = cert
@@ -186,7 +190,7 @@ func TestTLSPKI(t *testing.T) {
 	for name, certs := range map[string][]map[string]any{
 		"no name":               {{"key": "P-256"}},
 		"a name twice":          {{"name": "a", "key": "P-256"}, {"name": "a", "key": "P-256"}},
-		"an unknown key":        {{"name": "a", "key": "P-224"}},
+		"an unknown key":        {{"name": "a", "key": "secp256k1"}},
 		"no key":                {{"name": "a"}},
 		"key and rsa":           {{"name": "a", "key": "P-256", "rsa": rsaKey}},
 		"an RSA key Go refuses": {{"name": "a", "rsa": big31}},
@@ -755,5 +759,272 @@ func TestTLSALPNAndGRPC(t *testing.T) {
 	tlsListenersMu.Unlock()
 	if left != 0 {
 		t.Errorf("%d servers left", left)
+	}
+}
+
+// TestTLSClientSigner checks tls_dial's client_signer, client_public and
+// client_sig_algs against Go's own server under dcrd's GODEBUG: each
+// broken CertificateVerify is refused by Go in TLS 1.3 and 1.2 with its
+// alert and words, the high-s signature is accepted, a P-521 key reporting
+// a P-256 public key signs under ecdsa_secp256r1_sha256, which Go's TLS 1.3
+// server refuses for the key and its TLS 1.2 server takes, an Ed25519
+// scheme on an ECDSA key is refused in TLS 1.2 for its kind, a P-256 key
+// held to ecdsa_secp521r1_sha512 signs a TLS 1.2 handshake Go takes; the
+// ECDSA re-encodings are what they say; and requests the command cannot
+// meet are errors.
+func TestTLSClientSigner(t *testing.T) {
+	t.Setenv("GODEBUG", tlsGODEBUG)
+	pki := tlsPKIOf(t,
+		map[string]any{"name": "server", "key": "P-256", "dns": []string{"localhost"}},
+		map[string]any{"name": "ca", "key": "P-256", "ca": true},
+		map[string]any{"name": "p521", "key": "P-521", "issuer": "ca", "eku": []string{"client_auth"}},
+		map[string]any{"name": "p256", "key": "P-256", "issuer": "ca", "eku": []string{"client_auth"}},
+		map[string]any{"name": "ed25519", "key": "Ed25519", "issuer": "ca", "eku": []string{"client_auth"}},
+	)
+	request := map[string]any{"method": "GET", "path": "/", "body": ""}
+	run := func(version, client string, fields map[string]any) (tlsDialDetail, tlsListenDetail) {
+		t.Helper()
+		addr, id := tlsListenOf(t, map[string]any{
+			"chain": []string{pki["server"].Cert}, "key_pkcs8": pki["server"].KeyPKCS8,
+			"client_auth": "RequireAndVerifyClientCert", "client_cas": []string{pki["ca"].Cert},
+		})
+		fields["addr"], fields["server_name"], fields["request"] = addr, "localhost", request
+		fields["roots"] = []string{pki["server"].Cert}
+		fields["client_cert"] = map[string]any{"chain": []string{pki[client].Cert}, "key_pkcs8": pki[client].KeyPKCS8}
+		if version == "TLS 1.3" {
+			fields["min_version"] = version
+		} else {
+			fields["max_version"] = version
+		}
+		return tlsDialOf(t, fields), tlsListenResultOf(t, id)
+	}
+	const (
+		invalid = "tls: client certificate used with invalid signature algorithm"
+		failed  = "tls: invalid signature by the client certificate: "
+	)
+	for _, version := range []string{"TLS 1.3", "TLS 1.2"} {
+		for _, tc := range []struct {
+			client string
+			fields map[string]any
+			alert  string
+			words  string
+		}{
+			{"p521", map[string]any{}, "", ""},
+			{"p521", map[string]any{"client_signer": "high_s"}, "", ""},
+			{"p521", map[string]any{"client_signer": "flip"}, "error decrypting message", failed + "ECDSA verification failure"},
+			{"p521", map[string]any{"client_signer": "other_key"}, "error decrypting message", failed + "ECDSA verification failure"},
+			{"p521", map[string]any{"client_signer": "leading_zero"}, "error decrypting message", failed + "ECDSA verification failure"},
+			{"p521", map[string]any{"client_signer": "long_length"}, "error decrypting message", failed + "ECDSA verification failure"},
+			{"p521", map[string]any{"client_signer": "raw"}, "error decrypting message", failed + "ECDSA verification failure"},
+			{"p521", map[string]any{"client_signer": "r_is_n"}, "error decrypting message", failed + "ECDSA verification failure"},
+			{"ed25519", map[string]any{"client_signer": "truncate"}, "error decrypting message", failed + "Ed25519 verification failure"},
+			{"ed25519", map[string]any{"client_signer": "empty"}, "error decrypting message", failed + "Ed25519 verification failure"},
+		} {
+			what := fmt.Sprintf("%s, %s, %v", version, tc.client, tc.fields)
+			got, served := run(version, tc.client, tc.fields)
+			if tc.alert == "" {
+				if !got.OK || !served.OK {
+					t.Errorf("%s: dial %+v, listen %+v, want both ok", what, got, served)
+				}
+				continue
+			}
+			if got.OK || got.Error != "remote error: tls: "+tc.alert || served.Error != tc.words {
+				t.Errorf("%s: dial %q, listen %q, want %q and %q", what, got.Error, served.Error, tc.alert, tc.words)
+			}
+		}
+	}
+	for _, tc := range []struct {
+		version, client string
+		fields          map[string]any
+		ok              bool
+		words           string
+	}{
+		{"TLS 1.3", "p521", map[string]any{"client_public": "P-256"}, false, invalid},
+		{"TLS 1.2", "p521", map[string]any{"client_public": "P-256"}, true, ""},
+		{"TLS 1.3", "p256", map[string]any{"client_public": "Ed25519"}, false, invalid},
+		{"TLS 1.2", "p256", map[string]any{"client_public": "Ed25519"}, false,
+			failed + "expected an Ed25519 public key, got *ecdsa.PublicKey"},
+		{"TLS 1.2", "ed25519", map[string]any{"client_public": "P-256"}, false,
+			failed + "expected an ECDSA public key, got ed25519.PublicKey"},
+		{"TLS 1.2", "p256", map[string]any{"client_sig_algs": []string{"ECDSAWithP521AndSHA512"}}, true, ""},
+	} {
+		what := fmt.Sprintf("%s, %s, %v", tc.version, tc.client, tc.fields)
+		got, served := run(tc.version, tc.client, tc.fields)
+		if got.OK != tc.ok || served.OK != tc.ok || served.Error != tc.words {
+			t.Errorf("%s: dial %+v, listen %+v, want ok %v and %q", what, got, served, tc.ok, tc.words)
+		}
+	}
+
+	// The re-encodings, checked on a signature with a known r and s.
+	r, s := big.NewInt(0x80), big.NewInt(0x7f)
+	for _, tc := range []struct {
+		what string
+		got  []byte
+		want string
+	}{
+		{"DER", tlsECDSASignature(r, s, false, false), "30070202008002017f"},
+		{"padded r", tlsECDSASignature(r, s, true, false), "3008020300008002017f"},
+		{"long length", tlsECDSASignature(r, s, false, true), "3081070202008002017f"},
+		{"zero r", tlsECDSASignature(new(big.Int), s, false, false), "300602010002017f"},
+	} {
+		if got := hex.EncodeToString(tc.got); got != tc.want {
+			t.Errorf("%s: %s, want %s", tc.what, got, tc.want)
+		}
+	}
+	if got := hex.EncodeToString(tlsDERLength(200, true)); got != "8200c8" {
+		t.Errorf("a long length of 200: %s", got)
+	}
+
+	ed := map[string]any{"chain": []string{pki["ed25519"].Cert}, "key_pkcs8": pki["ed25519"].KeyPKCS8}
+	for name, fields := range map[string]map[string]any{
+		"an unknown signer":               {"client_cert": ed, "client_signer": "bend", "request": request},
+		"an ECDSA re-encoding of Ed25519": {"client_cert": ed, "client_signer": "high_s", "request": request},
+		"an unknown public key":           {"client_cert": ed, "client_public": "P-192", "request": request},
+		"an unknown scheme":               {"client_cert": ed, "client_sig_algs": []string{"Ed448"}, "request": request},
+		"a signer without a client":       {"client_signer": "flip"},
+		"schemes without a client":        {"client_sig_algs": []string{"Ed25519"}},
+	} {
+		fields["addr"] = "127.0.0.1:1"
+		if resp := call("tls_dial", jsonRequest(t, fields)); resp.Error == "" {
+			t.Errorf("%s: got %+v, want an error", name, resp)
+		}
+	}
+}
+
+// TestTLSPKISPKI checks tls_pki's spki: each subject public key info put
+// in a certificate is one x509 refuses with the words a client's server
+// logs for it, or reads as the key it names, under its issuer's signature
+// made again; tls_dial's client_unchecked sends such a chain, which Go's
+// server refuses as it refuses it from any client; and requests it cannot
+// meet are errors.
+func TestTLSPKISPKI(t *testing.T) {
+	t.Setenv("GODEBUG", tlsGODEBUG)
+	rsaKey, _ := testRSAKey(t, 2048, 65537)
+	client := func(name, key, spki string) map[string]any {
+		return map[string]any{"name": name, "key": key, "issuer": "ca", "eku": []string{"client_auth"}, "spki": spki}
+	}
+	pki := tlsPKIOf(t,
+		map[string]any{"name": "server", "key": "P-256", "dns": []string{"localhost"}},
+		map[string]any{"name": "ca", "key": "P-256", "ca": true},
+		map[string]any{"name": "edca", "key": "Ed25519", "ca": true},
+		client("p256", "P-256", ""),
+		client("compressed", "P-256", "compressed"),
+		client("hybrid", "P-384", "hybrid"),
+		client("off_curve", "P-521", "off_curve"),
+		client("ed25519_params", "Ed25519", "ed25519_params"),
+		client("ed25519_short", "Ed25519", "ed25519_short"),
+		client("x25519", "P-256", "x25519"),
+		client("dsa", "P-256", "dsa"),
+		client("rsa_8200", "P-256", "rsa_8200"),
+		map[string]any{"name": "under_ed", "key": "P-256", "issuer": "edca", "spki": "x25519"},
+	)
+	ca, _ := parsed(t, "ca", pki["ca"])
+	edca, _ := parsed(t, "edca", pki["edca"])
+	for _, tc := range []struct {
+		name, err string
+		issuer    *x509.Certificate
+		key       string
+	}{
+		{"compressed", "ecdsa: invalid uncompressed public key", ca, ""},
+		{"hybrid", "ecdsa: invalid uncompressed public key", ca, ""},
+		{"off_curve", "P521 point not on curve", ca, ""},
+		{"ed25519_params", "x509: Ed25519 key encoded with illegal parameters", ca, ""},
+		{"ed25519_short", "x509: wrong Ed25519 public key size", ca, ""},
+		{"x25519", "", ca, "<nil>"},
+		{"dsa", "", ca, "*dsa.PublicKey"},
+		{"rsa_8200", "", ca, "*rsa.PublicKey"},
+		{"under_ed", "", edca, "<nil>"},
+	} {
+		cert, err := x509.ParseCertificate(hexToBytes(pki[tc.name].Cert))
+		if tc.err != "" {
+			if err == nil || err.Error() != tc.err {
+				t.Errorf("%s: parse error %v, want %q", tc.name, err, tc.err)
+			}
+			continue
+		}
+		if err != nil {
+			t.Fatalf("%s: %v", tc.name, err)
+		}
+		if got := fmt.Sprintf("%T", cert.PublicKey); got != tc.key {
+			t.Errorf("%s: a key of type %s, want %s", tc.name, got, tc.key)
+		}
+		if err := cert.CheckSignatureFrom(tc.issuer); err != nil {
+			t.Errorf("%s: %v", tc.name, err)
+		}
+		if tc.name == "rsa_8200" {
+			if n := cert.PublicKey.(*rsa.PublicKey).N.BitLen(); n != 8200 {
+				t.Errorf("rsa_8200: a modulus of %d bits", n)
+			}
+		}
+	}
+
+	request := map[string]any{"method": "GET", "path": "/", "body": ""}
+	for _, tc := range []struct {
+		chain []string
+		alert string
+		words string
+	}{
+		{[]string{"p256"}, "", ""},
+		{[]string{"compressed"}, "error decoding message",
+			"tls: failed to parse client certificate: ecdsa: invalid uncompressed public key"},
+		{[]string{"p256", "ed25519_params"}, "error decoding message",
+			"tls: failed to parse client certificate: x509: Ed25519 key encoded with illegal parameters"},
+		{[]string{"p256", "rsa_8200"}, "bad certificate",
+			"tls: client sent certificate containing RSA key larger than 8192 bits"},
+		{[]string{"x25519"}, "unsupported certificate",
+			"tls: client certificate contains an unsupported public key of type <nil>"},
+		{[]string{"dsa"}, "unsupported certificate",
+			"tls: client certificate contains an unsupported public key of type *dsa.PublicKey"},
+	} {
+		for _, version := range []string{"TLS 1.3", "TLS 1.2"} {
+			addr, id := tlsListenOf(t, map[string]any{
+				"chain": []string{pki["server"].Cert}, "key_pkcs8": pki["server"].KeyPKCS8,
+				"client_auth": "RequireAndVerifyClientCert", "client_cas": []string{pki["ca"].Cert},
+			})
+			var chain []string
+			for _, name := range tc.chain {
+				chain = append(chain, pki[name].Cert)
+			}
+			fields := map[string]any{
+				"addr": addr, "server_name": "localhost", "roots": []string{pki["server"].Cert}, "request": request,
+				"client_cert":      map[string]any{"chain": chain, "key_pkcs8": pki[tc.chain[0]].KeyPKCS8},
+				"client_unchecked": true,
+			}
+			if version == "TLS 1.3" {
+				fields["min_version"] = version
+			} else {
+				fields["max_version"] = version
+			}
+			got, served := tlsDialOf(t, fields), tlsListenResultOf(t, id)
+			what := fmt.Sprintf("%s, %v", version, tc.chain)
+			if tc.alert == "" {
+				if !got.OK || !served.OK {
+					t.Errorf("%s: dial %+v, listen %+v, want both ok", what, got, served)
+				}
+				continue
+			}
+			if got.OK || served.OK || served.Error != tc.words {
+				t.Errorf("%s: dial %+v, listen %q, want %q", what, got, served.Error, tc.words)
+			}
+			// Go's client may meet a reset in place of the alert when it
+			// writes its request after a TLS 1.3 handshake.
+			if got.Error != "remote error: tls: "+tc.alert && !strings.HasPrefix(got.Error, "write ") {
+				t.Errorf("%s: dial %q, want the alert %q", what, got.Error, tc.alert)
+			}
+		}
+	}
+
+	for name, certs := range map[string][]map[string]any{
+		"an unknown spki":          {{"name": "ca", "key": "P-256", "ca": true}, client("c", "P-256", "bent")},
+		"a compressed Ed25519 key": {{"name": "ca", "key": "P-256", "ca": true}, client("c", "Ed25519", "compressed")},
+		"short of an ECDSA key":    {{"name": "ca", "key": "P-256", "ca": true}, client("c", "P-256", "ed25519_short")},
+		"an RSA issuer":            {{"name": "ca", "rsa": rsaKey, "ca": true}, client("c", "P-256", "x25519")},
+	} {
+		if resp := call("tls_pki", jsonRequest(t, map[string]any{"certs": certs})); resp.Error == "" {
+			t.Errorf("%s: got %+v, want an error", name, resp)
+		}
+	}
+	if resp := call("tls_dial", jsonRequest(t, map[string]any{"addr": "127.0.0.1:1", "client_unchecked": true})); resp.Error == "" {
+		t.Errorf("client_unchecked without a client: got %+v, want an error", resp)
 	}
 }

@@ -41,6 +41,7 @@
 // Test-harness arithmetic over bounded lengths.
 #![allow(clippy::arithmetic_side_effects)]
 
+mod ecdsa_go;
 mod key_corpus;
 mod kx_shares;
 mod sig_corpus;
@@ -760,6 +761,7 @@ fn go_scheme(scheme: rustls::SignatureScheme) -> &'static str {
     match scheme {
         S::ECDSA_NISTP256_SHA256 => "ECDSAWithP256AndSHA256",
         S::ECDSA_NISTP384_SHA384 => "ECDSAWithP384AndSHA384",
+        S::ECDSA_NISTP521_SHA512 => "ECDSAWithP521AndSHA512",
         S::ED25519 => "Ed25519",
         S::RSA_PKCS1_SHA256 => "PKCS1WithSHA256",
         S::RSA_PKCS1_SHA384 => "PKCS1WithSHA384",
@@ -1297,4 +1299,129 @@ fn ml_dsa_verifies_as_go_verifies() {
     }
     assert_eq!(seen.len(), 15, "{seen:?}");
     assert_eq!((cases, taken), (234, 72), "cases, and those taken");
+}
+
+/// The schemes of the RPC set's mapping that serve the algorithm webpki
+/// names `name`.
+fn rpc_schemes_serving(name: &str) -> Vec<rustls::SignatureScheme> {
+    dcroxide_tlscrypto::RPC_SIG_ALGS
+        .mapping
+        .iter()
+        .filter(|(_, algorithms)| algorithms.iter().any(|a| format!("{a:?}") == name))
+        .map(|(scheme, _)| *scheme)
+        .collect()
+}
+
+/// The nine ECDSA pairs of the RPC set, P-521's and SHA-512's among them
+/// (ADR-0015, T4), against Go through the oracle: every frozen case of
+/// `tests/ecdsa_go` is still given Go's recorded verdict by Go, as
+/// `crypto/x509` checks a certificate's signature, and the same verdict
+/// as its `crypto/tls` checks a handshake signature under each scheme the
+/// RPC set maps the pair to (which, as in Go's TLS 1.2, does not tie the
+/// scheme's curve to the key's); and fresh Go signatures of messages a
+/// fixed generator draws, under each pair's x509 name and under each such
+/// scheme, verify under the pair's algorithm.  Go's ECDSA signatures are
+/// randomized, so the fresh ones differ from run to run.  The counts are
+/// pinned.
+#[test]
+fn ecdsa_p521_and_sha512_verify_as_go_verifies() {
+    let Some(mut oracle) = dcroxide_testutil::oracle_or_skip() else {
+        return;
+    };
+    let (mut frozen, mut handshakes) = (0, 0);
+    for case in ecdsa_go::cases() {
+        let curve = &ecdsa_go::CURVES[case.curve];
+        let hash = ["SHA256", "SHA384", "SHA512"]
+            .iter()
+            .position(|hash| case.algorithm.ends_with(hash))
+            .expect("a hash");
+        let go = ecdsa_go::go_verifies(
+            &mut oracle,
+            curve,
+            true,
+            ecdsa_go::HASHES[hash],
+            &case.key,
+            &case.message,
+            &case.signature,
+        );
+        assert_eq!(go, case.go, "{}: Go's verdict, as recorded", case.label);
+        for scheme in rpc_schemes_serving(&case.algorithm) {
+            let handshake = ecdsa_go::go_verifies(
+                &mut oracle,
+                curve,
+                false,
+                go_scheme(scheme),
+                &case.key,
+                &case.message,
+                &case.signature,
+            );
+            assert_eq!(
+                handshake, go,
+                "{}: Go's verdict under {scheme:?}",
+                case.label
+            );
+            handshakes += 1;
+        }
+        frozen += 1;
+    }
+    assert_eq!(
+        (frozen, handshakes),
+        (216, 216),
+        "frozen cases, handshake verdicts"
+    );
+    let mut rng = SplitMix64(0xec5a_2026_1119);
+    let mut fresh = 0;
+    for (c, curve) in ecdsa_go::CURVES.iter().enumerate() {
+        let key = curve.public();
+        for (h, hash) in ecdsa_go::HASHES.iter().enumerate() {
+            let algorithm = ecdsa_go::algorithm(c, h);
+            let name = format!("{algorithm:?}");
+            let schemes = rpc_schemes_serving(&name);
+            assert_eq!(schemes.len(), 1, "{name}: one scheme");
+            for _ in 0..4 {
+                let message = rng.bytes(300);
+                let signatures = [
+                    ecdsa_go::go_signs(&mut oracle, curve, true, hash, &message),
+                    ecdsa_go::go_signs(&mut oracle, curve, false, go_scheme(schemes[0]), &message),
+                ];
+                for signature in signatures {
+                    assert!(
+                        algorithm
+                            .verify_signature(&key, &message, &signature)
+                            .is_ok(),
+                        "{name}: Go's signature of {}",
+                        hex(&message)
+                    );
+                    fresh += 1;
+                }
+            }
+        }
+    }
+    assert_eq!(fresh, 72, "fresh Go signatures");
+}
+
+/// Makes `tests/data/ecdsa-go/cases.json.gz` again through the oracle, as
+/// `ecdsa_go::generate` makes it, and prints its count and hash, which go
+/// into `ecdsa_go::COUNT` and `ecdsa_go::SHA256` and the directory's
+/// `SOURCE`.  Go's ECDSA signatures are randomized, so each run writes
+/// other signatures and another hash.  Run it with the reference Go's
+/// oracle and `--ignored`.
+#[test]
+#[ignore = "rewrites tests/data/ecdsa-go/cases.json.gz through the oracle"]
+fn regenerate_ecdsa_go_vectors() {
+    use std::io::Write;
+    let mut oracle = dcroxide_testutil::oracle_or_skip().expect("an oracle");
+    let json = ecdsa_go::generate(&mut oracle);
+    let count = json["cases"].as_array().map_or(0, Vec::len);
+    let text = serde_json::to_string_pretty(&json).expect("JSON") + "\n";
+    let path = format!("{}/{}", env!("CARGO_MANIFEST_DIR"), ecdsa_go::PATH);
+    let file = std::fs::File::create(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
+    let mut gz = flate2::GzBuilder::new().write(file, flate2::Compression::best());
+    gz.write_all(text.as_bytes()).expect("written");
+    gz.finish().expect("finished");
+    println!(
+        "{path}: {count} cases, {} bytes of JSON, SHA-256 {}",
+        text.len(),
+        ecdsa_go::sha256(&text)
+    );
 }

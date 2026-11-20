@@ -2478,14 +2478,18 @@ against upstream and the port is faithful.
   it, before ALPN, and Go after ALPN: the open entry on handshake error
   texts records it. dcrwallet's
   `--issueclientcert` pair, made from its templates on each `--tlscurve`,
-  is accepted as Go accepts it on Ed25519, its default, P-256 and P-384,
-  and refused on P-521, as the `--authtype=clientcert` entry's P-521
-  and SHA-512 cells are, until ADR-0015's T4. Pinned against Go's server configured
+  is accepted as Go accepts it on Ed25519, its default, P-256, P-384 and
+  P-521, whose authority signs with ECDSA-SHA512 and whose client key signs
+  TLS 1.2's CertificateVerify with `ecdsa_secp256r1_sha256`, as Go's client
+  does (ADR-0015, T4; the `--authtype=clientcert` entry). Pinned against Go's server configured
   as dcrwallet's, under dcrwallet's `GODEBUG`, in TLS 1.3 and TLS 1.2,
   through the oracle (`crates/dcroxide-gotls/tests/wallet_interop.rs`):
   the empty pool, a pool filled by `AddCert`, basic authentication with
   and without a client's ALPN, the issued pair on both listeners and each
-  curve, and the gRPC listener's ALPN cases, its suites and the order of
+  curve, the issued pair on each curve signing a broken CertificateVerify
+  or one under a scheme for another key, and with its authority's
+  signature tampered with, refused with Go's alert and words (the
+  `--authtype=clientcert` entry), and the gRPC listener's ALPN cases, its suites and the order of
   its ALPN and suite refusals, with the version, suite and group compared
   where the client is cut to classical groups; and by the crate's unit
   tests (`the_grpc_listener_is_grpc_gos`, `tls12_refusals_follow_gos_order`,
@@ -3023,9 +3027,8 @@ closing it would cost.
   (`crypto/ring/sign.rs:284-294`), and the provider's keeps that, where Go
   would also sign with the other ECDSA hashes.
 
-  One thing stays open past it. A P-521 *client* certificate is refused under
-  `--authtype=clientcert`; it is recorded with the other client certificates
-  webpki and the provider refuse in the next entry.
+  A P-521 *client* certificate, refused under `--authtype=clientcert` until
+  ADR-0015's T4, is accepted as Go accepts it (the next entry).
 
 - **Under `--authtype=clientcert` webpki and the TLS provider still decide
   part of a client chain: a few certificates dcrd accepts get no handshake,
@@ -3230,13 +3233,17 @@ closing it would cost.
   least being 256 whole bytes (`ring-0.17.14/src/rsa/public_modulus.rs:63-68`),
   or over 8192, an `RSAPublicKey` with bytes after its two INTEGERs or after its
   SEQUENCE, which Go ignores (`crypto/x509/parser.go:321-331`) and ring's parse,
-  which the provider keeps, refuses, a P-224 or P-521 key, ECDSA with SHA-512, a
+  which the provider keeps, refuses, a P-224 key, a
   signature algorithm identifier Go matches by its OID alone, such as
   ecdsa-with-SHA256 with NULL parameters, and a signature or a key whose BIT
   STRING has unused bits, which Go right-aligns, an ML-DSA key with them being
   a key whenever its octets are its set's length) counts as a failed check
   where Go would go on through it; such a chain does not verify here in any
-  case, but the checks Go would spend beyond that candidate are not spent. The
+  case, but the checks Go would spend beyond that candidate are not spent,
+  and the replay does not vouch for Go's error, leaving the refusal to
+  webpki's words
+  (`a_search_through_an_issuer_the_provider_cannot_verify_is_left_to_webpki`,
+  a P-224 and an RSA-1024 authority Go made, whose chains Go accepts). The
   replay verifies an ML-DSA signature as Go 1.27.3 does (the ML-DSA entry
   below). The verdicts are checked against Go's own `x509.Verify` through the
   oracle's `x509_verify_client`
@@ -3324,19 +3331,76 @@ closing it would cost.
   path that carries a critical extension webpki does not support is refused by
   webpki itself, logged in rustls's words with `certificate_unknown`, where Go
   logs `x509: unhandled critical extension` with `bad_certificate`. Every
-  certificate a client presents goes through that reader first, and the
-  handshake is refused if one fails, used or not, as Go's
-  `processCertsFromClient` refuses it when `ParseCertificate` fails; Go logs
-  `tls: failed to parse client certificate: ...` with a `decode_error` alert,
-  where the port reports rustls's bad encoding with `bad_certificate`. The
-  reader covers the version, the validity times, the extension list and the
-  extensions whose facts it keeps, and an ML-DSA public key's parameters and
-  length, but not the names inside a subject alternative name or name
-  constraints extension beyond their forms, IP addresses and rfc822Name
-  constraints aside, nor Go's other parse checks, so a certificate Go refuses
-  to parse only for those, such as one with a negative serial number or a
-  dNSName that is not ASCII in its subject alternative name, can still
-  verify.
+  certificate a client presents goes through that reader first, in the
+  order sent, and the handshake is refused if one fails, used by a chain or
+  not, as Go's `processCertsFromClient` refuses it when `ParseCertificate`
+  fails (`crypto/tls/handshake_server.go:943-951`); Go sends a
+  `decode_error` alert there, where the port sends rustls's
+  `bad_certificate`, since no error a rustls certificate verifier returns
+  is answered with `decode_error` (`rustls-0.23.46/src/common_state.rs:622-631`,
+  `error.rs:625-660`). The reader covers the version, the validity times,
+  the extension list and the extensions whose facts it keeps, and the
+  subject public key info whole, by Go 1.27.3's `parsePublicKey` rules
+  (`go_public_key_refusal`, `crypto/x509/parser.go:309-411`, `:1071-1099`):
+  the algorithm identifier and the key's BIT STRING, whose bits are
+  right-aligned as Go aligns them; an RSA key's NULL parameters,
+  `RSAPublicKey` SEQUENCE, modulus and exponent (the exponent fitting
+  Go's 64-bit `int`), both above zero; a DSA key and its three
+  parameters, all above zero; an ECDSA key's curve, one of P-224, P-256,
+  P-384 and P-521, and its point, which must be uncompressed, at the
+  field's length, with coordinates below p and on the curve, as
+  `ecdsa.ParseUncompressedPublicKey` takes it
+  (`dcroxide_tlscrypto::point`); an Ed25519 key with no parameters and 32
+  bytes; and an ML-DSA key with no parameters at its set's length. For a
+  certificate refused for its key the handshake's error is Go's words,
+  `tls: failed to parse client certificate: ` and the parser's error
+  (`ecdsa: invalid uncompressed public key`, `P521 point not on curve`,
+  `x509: Ed25519 key encoded with illegal parameters`, `x509: unsupported
+  elliptic curve` and so on); the P-256 text for a coordinate at or above
+  p, `invalid P256 element encoding`, is that of Go's assembly P-256,
+  which amd64, arm64, ppc64le and s390x build, where a Go built `purego`
+  or for another architecture says `invalid P256Element encoding`. For a
+  certificate refused for anything else the error stays rustls's, `invalid
+  peer certificate: BadEncoding`. The key is checked before what follows
+  the TBSCertificate, in Go's order, so the words are Go's whenever the
+  key is Go's first refusal among the checks the reader makes. Until T4's
+  second review a compressed, hybrid or off-curve ECDSA point and an
+  Ed25519 key with parameters or of another length were taken by the
+  reader: such a leaf passed the chain check and was refused at its
+  CertificateVerify with `decrypt_error` and Go's words for a failed
+  signature, which Go never prints for it, and such a certificate sent
+  after a leaf that verifies, which no chain uses, was accepted where Go
+  refuses the handshake. As each certificate is read, an RSA key of more
+  than 8192 bits refuses the handshake with `bad_certificate` and `tls:
+  client sent certificate containing RSA key larger than 8192 bits`, as
+  Go's `checkKeySize` does (`handshake_server.go:952-957`), used or not; a
+  pool takes such a key, the limit being Go's on what a client sends. The
+  reader does not cover the names inside a subject alternative name or
+  name constraints extension beyond their forms, IP addresses and
+  rfc822Name constraints aside, nor Go's other parse checks (the serial
+  number, the subject and issuer names, the contents of the other
+  extensions), so a certificate Go refuses to parse only for those, such
+  as one with a negative serial number or a dNSName that is not ASCII in
+  its subject alternative name, can still verify, and one Go refuses for
+  those before its key is logged in rustls's words.
+
+  Once the chain verifies, a leaf whose key is of none of the kinds Go's
+  TLS takes a client's signature from, ECDSA, RSA, Ed25519 and ML-DSA, is
+  refused before its CertificateVerify, as Go refuses it
+  (`handshake_server.go:1005-1016`), with `unsupported_certificate` and
+  `tls: client certificate contains an unsupported public key of type `
+  and the type as Go's `%T` prints it: `*dsa.PublicKey` for a DSA key and
+  `<nil>` for an algorithm Go's `x509` gives no key, X25519's among them
+  (`go_unsupported_leaf_key`). Until T4's second review such a leaf was
+  refused at its CertificateVerify with `decrypt_error` and rustls's
+  words. The cells are `client_keys_go_does_not_parse_or_take_are_refused_as_go_does`
+  in `crates/dcroxide-gotls/tests/wallet_interop.rs` (every `--tlscurve`,
+  TLS 1.3 and 1.2, against Go's server through the oracle's `tls_pki`
+  `spki` and `tls_dial` `client_unchecked`), and
+  `public_keys_go_does_not_parse_refuse_their_certificates` and
+  `a_client_rsa_key_over_8192_bits_is_refused_as_go_refuses_it` in
+  `clientcert.rs`, the first comparing each key's verdict and words with
+  Go's own `ParseCertificate`.
 
   Name constraints on a chain are webpki's to check, and webpki evaluates
   only those on DNS names and IP addresses. A subtree of another form,
@@ -3415,15 +3479,10 @@ closing it would cost.
   which is not in the tree.
 
   Every handshake signature goes to a `WebPkiClientVerifier`
-  (`GoClientCertVerifier::webpki_over`), and client certificates of these
-  kinds that dcrd accepts are refused, each failing closed. A P-521 client key
-  is refused because the handshake signature is checked with the provider's
-  verification algorithms (`webpki/client_verifier.rs:274-295`), which keep
-  ring's, beside ML-DSA's three (the ML-DSA entry below), and stop at P-384
-  (`crypto/ring/mod.rs:109-112`). So is any chain whose issuer signs with
-  ecdsa-with-SHA512, which the provider cannot verify, including a P-256
-  client certificate issued by a P-521 CA, such as an `rpc.cert` generated
-  with `--tlscurve=P-521` and used with `gencerts -C`. So is an RSA client key
+  (`GoClientCertVerifier::webpki_over`), with the provider's RPC set,
+  `RPC_SIG_ALGS` (`webpki/client_verifier.rs:274-295`), and client
+  certificates of these kinds that dcrd accepts are refused, each failing
+  closed. An RSA client key
   below 2041 bits: the provider keeps ring's `RSA_*_2048_8192`, whose least is
   256 whole bytes, where Go 1.24 and later accept 1024 bits and up. So is an
   RSA key in the chain, the client's own among them, whose `RSAPublicKey` has
@@ -3445,15 +3504,106 @@ closing it would cost.
   verification refuses, signs a CertificateVerify the provider verifies: the
   replay applies Go's limit to a chain's parents, and webpki checks the
   client's own key with the provider's algorithms. The cases the provider
-  decides close with Go's client-certificate set (ADR-0015, T4), which brings
-  Go's RSA rules with it; the rest need leaving webpki.
+  decides close with the rest of Go's client-certificate set (ADR-0015, T4),
+  Go's RSA rules; the rest need leaving webpki.
 
-  Two refusals send another alert than Go's for a client key of any kind (the
-  ML-DSA entry below has the details): a TLS 1.2 client that sends no
+  ECDSA is verified as Go verifies it since T4's first part (ADR-0015's
+  second addendum of 2026-11-19): a P-521 client key, refused before because
+  ring's set stopped at P-384 (`crypto/ring/mod.rs:109-112`), and a chain
+  whose issuer signs with ecdsa-with-SHA512, such as a P-256 client
+  certificate issued by a P-521 CA (an `rpc.cert` generated with
+  `--tlscurve=P-521` and used with `gencerts -C`, or dcrwallet's
+  `--issueclientcert` pair on `--tlscurve=P-521`), are accepted. The RPC set
+  holds ECDSA on P-256, P-384 and P-521, each with SHA-256, SHA-384 and
+  SHA-512, as Go's `crypto/x509` takes any of the three hashes from a key on
+  any of the three curves (`crypto/x509/x509.go:1099-1106`), and maps each
+  TLS 1.2 ECDSA scheme to its hash on all three curves, as Go's server takes
+  a TLS 1.2 scheme from a key on any curve (`crypto/tls/auth.go:210-220`): a
+  Go client with a P-521 key signs TLS 1.2's CertificateVerify with
+  `ecdsa_secp256r1_sha256`, the first ECDSA scheme the CertificateRequest
+  lists. In TLS 1.3 only the scheme's own curve is taken, as in Go. The
+  digest is read as Go's `hashToNat` reads it, cut to P-256's or P-384's
+  order and taken whole under P-521. The verdicts are held to Go's
+  (`crates/dcroxide-tlscrypto/tests/ecdsa_go_vectors.rs`, frozen Go-made
+  vectors, with no oracle, and `ecdsa_p521_and_sha512_verify_as_go_verifies`
+  in `tests/go_differential.rs`, through the oracle, the frozen verdicts and
+  fresh Go signatures as a certificate's and as a handshake signature's),
+  and over the wire to Go's server by the node's
+  `go_client_certificates_under_clientcert_auth` and `dcroxide-gotls`'s
+  `issued_client_certificates_verify_as_go_does`, in TLS 1.3 and 1.2, and
+  by `issuers_on_each_curve_and_hash_verify_as_go_does`, a P-256 or P-521
+  client under an authority on each of the three curves signing with each
+  of the three hashes, a P-256 client under a P-521 authority among them.
+  An `rpc.cert` generated with `--tlscurve=P-521` and used with
+  `gencerts -C` was not run itself; its chain is a P-521 authority signing
+  with ecdsa-with-SHA512, which those tests cover. Wycheproof's P-521 and
+  SHA-512 ECDSA vectors are not in the tree.
+  The seeders' set, `SUPPORTED_SIG_ALGS`, stays ring's (the seeder entry).
+
+  A client CertificateVerify Go's server refuses is refused with Go's alert
+  and, for a client key on any of the three curves or Ed25519, in Go's
+  words, since T4's ECDSA part (ADR-0015's second addendum of 2026-11-19),
+  the key being one Go's parser takes: a certificate whose key it refuses
+  never reaches a CertificateVerify, refused when it is read (above):
+  one under a scheme the listener's list lacks, in either version, or in
+  TLS 1.3 under a scheme that does not fit the leaf's key, a P-521 key's
+  signature under `ecdsa_secp256r1_sha256` among them, with
+  `illegal_parameter` and `tls: client certificate used with invalid
+  signature algorithm` (`handshake_server.go:779-782`,
+  `handshake_server_tls13.go:1086-1092`), the client certificate verifier
+  making Go's check of the key before webpki verifies (`ClientKey`); one
+  whose signature does not verify, a bit flipped, a byte short or long,
+  empty, by another key, or an ECDSA signature whose DER Go's
+  `ecdsa.VerifyASN1` refuses (r zero or the order, a needless leading zero,
+  a SEQUENCE length in a longer form than DER's, no DER at all), with
+  `decrypt_error` and `tls: invalid signature by the client certificate:
+  ECDSA verification failure` or `... Ed25519 verification failure`; and,
+  in TLS 1.2, where Go ties neither an ECDSA scheme to a curve nor any
+  scheme to the key's kind, one under a scheme of another kind than the
+  key with `decrypt_error` and `... expected an Ed25519 public key, got
+  *ecdsa.PublicKey` or its like (`crypto/tls/auth.go:23-78`). A high-s
+  ECDSA signature is accepted, as Go accepts it, and in TLS 1.2 an ECDSA
+  key signing under any ECDSA scheme, P-256 with SHA-512 and P-521 with
+  SHA-256 among them. rustls's error carries the reason but not the key
+  Go's words name, so the verifier notes the reason in Go's words on the
+  thread the handshake runs on, which reads it when rustls fails the
+  handshake. Held to Go's server, dcrwallet's pair on each `--tlscurve` in
+  TLS 1.3 and 1.2 with the oracle's `client_signer`, `client_public` and
+  `client_sig_algs`, by `broken_client_signatures_are_refused_as_go_does`
+  and `client_schemes_for_another_key_are_judged_as_go_does`
+  (`crates/dcroxide-gotls/tests/wallet_interop.rs`). Until then the TLS 1.3
+  misfit got webpki's `decrypt_error`, and every failed signature
+  rustls's words (`invalid peer certificate: BadSignature`). A signature by
+  an RSA or ML-DSA key that does not verify still gets rustls's words with
+  Go's `decrypt_error`, where Go gives the RSA or ML-DSA package's error,
+  which depends on the signature; and a TLS 1.3 scheme an RSA key below
+  2048 bits is too small for in Go's table is not checked for its size,
+  the provider refusing such a key anyway (T4's RSA part). A client
+  certificate whose authority's signature was tampered with is refused by
+  both with `unknown_ca`, in Go's words without the hint
+  (`tampered_client_chains_are_refused_as_go_does`). These cells run
+  dcrwallet's JSON-RPC listener, which shares the verifier and the
+  handshake with the node's `--authtype=clientcert` listener and
+  dcrwallet's gRPC listener; neither of those has a broken- or
+  mismatched-signature cell of its own.
+
+  A TLS 1.2 client whose leaf is on P-224, a curve Go's `x509` reads and
+  Go's server verifies a TLS 1.2 ECDSA signature with, is refused with
+  `decrypt_error` where Go accepts it: the provider has no P-224 algorithm.
+  The refusal is logged in rustls's words, `invalid peer certificate:
+  UnsupportedSignatureAlgorithmForPublicKeyContext { .. }`, since Go,
+  which verifies, has none to give, and its `expected an ECDSA public key,
+  got *ecdsa.PublicKey` is for a key of another kind than the scheme's,
+  which the verifier notes only then. In TLS 1.3 Go's client has no
+  scheme for the key and sends no certificate, and both refuse it alike.
+  Held to Go's server by `a_p224_client_key_is_judged_as_recorded`
+  (`crates/dcroxide-gotls/tests/wallet_interop.rs`), with a P-224 client
+  under a P-256 authority; no `--tlscurve` offers P-224.
+
+  One refusal sends another alert than Go's for a client key of any kind
+  (the ML-DSA entry below has the details): a TLS 1.2 client that sends no
   certificate gets rustls's `certificate_required`, where Go sends
-  `handshake_failure`, and a TLS 1.3 CertificateVerify under a scheme that
-  does not fit the leaf's key gets `decrypt_error`, where Go sends
-  `illegal_parameter`.
+  `handshake_failure`.
 
 - **The RPC listener's TLS key exchange is classical where dcrd's is hybrid
   post-quantum, and its TLS 1.2 offer lacks Go's CBC suites.** dcrd's
@@ -3531,8 +3681,11 @@ closing it would cost.
   (`crypto/internal/fips140/rsa/rsa.go:360-362`); and a P-521 key or ECDSA
   with SHA-512, which Go verifies, the port does not. The Decred seeders
   serve an RSA-2048 chain (ADR-0015, requirement (f)), inside every one of
-  those bounds. They close with Go's client-certificate set (ADR-0015, T4),
-  whose RSA rules and algorithms the seeders' check takes too. ML-DSA, which
+  those bounds. ADR-0015 read Go's client-certificate set (T4) as closing
+  them, its RSA rules and algorithms taken by the seeders' check too; the
+  P-521 and SHA-512 ECDSA that T4's first part added went to the RPC
+  listener's set alone, and the seeders' set stays ring's until the owner
+  decides otherwise (ADR-0015's second addendum of 2026-11-19). ML-DSA, which
   the RPC listener's client-certificate verifier takes, stays out of the
   seeders' set (decided 2026-11-12): Go 1.27's client offers ML-DSA-44, -65
   and -87 first among its signature algorithms (`crypto/tls/defaults.go:49-67`)
@@ -3740,29 +3893,33 @@ closing it would cost.
     `certificate_required`, the same text in its log, `tls: client didn't
     provide a certificate`.
   - A certificate whose ML-DSA key Go cannot parse is refused with rustls's
-    bad encoding and `bad_certificate`, where Go logs `tls: failed to parse
-    client certificate: x509: ML-DSA key encoded with illegal parameters`,
-    or `... mldsa: invalid public key length`, with `decode_error`, as for
-    every certificate the reader refuses (the entry on
-    `--authtype=clientcert` above). An ML-DSA signature on a chain that
+    `bad_certificate`, where Go sends `decode_error`, as for every
+    certificate the reader refuses, in Go's words, `tls: failed to parse
+    client certificate: x509: ML-DSA key encoded with illegal parameters`
+    or `... mldsa: invalid public key length`, as for every key the reader
+    refuses (the entry on `--authtype=clientcert` above; until T4's second
+    review in rustls's). An ML-DSA signature on a chain that
     does not verify is logged in webpki's words, where Go names `x509:
-    ML-DSA verification failure: ...` in its unknown authority hint; and a
-    TLS 1.3 CertificateVerify under another scheme than the leaf's own gets
-    webpki's refusal and `decrypt_error`, where Go sends
-    `illegal_parameter` and `tls: client certificate used with invalid
-    signature algorithm` (`crypto/tls/handshake_server_tls13.go:1086-1092`),
-    as for a scheme that does not fit a key of any other kind. One under the
-    leaf's own scheme that does not verify gets `decrypt_error`, as Go sends
-    it, logged in rustls's words, where Go logs `tls: invalid signature by
-    the client certificate: mldsa: invalid signature`, or its `invalid
-    signature length` or `invalid signature encoding` (`:1101-1104`).
+    ML-DSA verification failure: ...` in its unknown authority hint. A TLS
+    1.3 CertificateVerify under another scheme than the leaf's own is
+    refused as Go refuses it, with `illegal_parameter` and `tls: client
+    certificate used with invalid signature algorithm`
+    (`crypto/tls/handshake_server_tls13.go:1086-1092`), as for a scheme that
+    does not fit a key of any other kind (the entry on
+    `--authtype=clientcert` above); until T4's ECDSA part it got webpki's
+    refusal and `decrypt_error`. One under the leaf's own scheme that does
+    not verify gets `decrypt_error`, as Go sends it, logged in rustls's
+    words, where Go logs `tls: invalid signature by the client certificate:
+    ML-DSA verification failure: mldsa: invalid signature`, or with
+    `invalid signature length` or `invalid signature encoding` in place of
+    the last two words (`:1101-1104`, `crypto/tls/auth.go:49-56`).
   - The TLS 1.3 CertificateRequest's `signature_algorithms` are
     `RPC_SIG_ALGS`' schemes, ML-DSA-44, -65 and -87 first and then Go
-    1.27.3's order (`crypto/tls/defaults.go:49-67`), less ECDSA with P-521,
-    which the provider lacks (the entry on `--authtype=clientcert` above),
-    and with PKCS#1 v1.5's three, which Go leaves out of TLS 1.3
-    (`crypto/tls/common.go:1821-1827`); the TLS 1.2 list, from which rustls
-    drops the ML-DSA schemes as Go does, lacks only P-521's. The tests
+    1.27.3's order (`crypto/tls/defaults.go:49-67`), ECDSA with P-521 last,
+    as in Go since ADR-0015's T4, and with PKCS#1 v1.5's three, which Go
+    leaves out of TLS 1.3 (`crypto/tls/common.go:1821-1827`); the TLS 1.2
+    list, from which rustls drops the ML-DSA schemes as Go does, is Go's.
+    The tests
     compare both lists as Go's client reads them, which in TLS 1.2 keeps only
     the schemes Go knows that fit the request's certificate types
     (`crypto/tls/handshake_client.go:1251-1271`), so an ML-DSA scheme the
@@ -4169,7 +4326,10 @@ closing it would cost.
   entry), a path length constraint, an unhandled critical extension on the leaf or of a
   subject alternative name or name constraints form, invalid policies, or the
   signature check limit, where Go prints x509's error with its times and
-  names. It also covers the refusals dcrd never makes, because it would have
+  names; and a client CertificateVerify by an RSA or ML-DSA key whose
+  signature does not verify, where Go prints its RSA or ML-DSA package's
+  error (one by an ECDSA or Ed25519 key, and one under a scheme Go
+  refuses, are logged in Go's words, see the clientcert entry). It also covers the refusals dcrd never makes, because it would have
   served the client: a TLS 1.2 client without `ecdsa_secp521r1_sha512` against
   a P-521 key (`unexpected error: incompatible signing key`, see the P-521
   entry). A CBC-only or hybrid-only client is refused in Go's words for no

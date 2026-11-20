@@ -921,8 +921,9 @@ fn serves_tls_with_a_p521_certificate() {
         }
     }
 
-    /// Offers the schemes the provider verifies, ring's set, none of
-    /// which is 0x0603 until ADR-0015's T4.
+    /// Offers the schemes the provider's default set verifies, ring's,
+    /// none of which is 0x0603 (the RPC listener's client-certificate set
+    /// has it since ADR-0015's T4; this client stands for one without it).
     #[derive(Debug)]
     struct ProviderSchemesOnly(Vec<rustls::SignatureScheme>);
     impl ServerCertVerifier for ProviderSchemesOnly {

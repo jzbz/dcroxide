@@ -1177,9 +1177,10 @@ fn refuse(sock: &mut TcpStream, refusal: &GoRefusal) -> String {
 /// deadline, a reset, a first record that is not TLS (with net/http's 400
 /// for a plaintext HTTP request), an alert from the client, a client that
 /// offers only TLS 1.0 or 1.1 ([`HelloFacts::go_version_refusal`]), an
-/// ML-DSA key's refusal of a client that would negotiate TLS 1.2, and the
-/// refusals Go and rustls share; anything else carries rustls's own
-/// description of it.
+/// ML-DSA key's refusal of a client that would negotiate TLS 1.2, a client
+/// CertificateVerify under a scheme Go refuses or whose ECDSA or Ed25519
+/// signature fails (`GoClientCertVerifier`), and the refusals Go and
+/// rustls share; anything else carries rustls's own description of it.
 ///
 /// After the ClientHello the client's bytes are read here and run through
 /// [`GoRecordChecks`] before rustls is given them: a record in another
@@ -1199,6 +1200,7 @@ pub fn handshake(
     configs: impl FnOnce() -> Arc<GoServerConfigs>,
 ) -> Result<rustls::StreamOwned<rustls::ServerConnection, TcpStream>, String> {
     let name = GoConnName::of(&sock);
+    crate::clientcert::clear_client_refusal();
     let mut tap = HandshakeTap::default();
     let mut acceptor = rustls::server::Acceptor::default();
     let accepted = loop {
@@ -1303,7 +1305,11 @@ pub fn handshake(
             if let Err(err) = conn.process_new_packets() {
                 // rustls queues the alert Go would send for most refusals.
                 let _ = flush_tls(&mut conn, &mut sock, &name, &mut checks);
-                return Err(go_error_text(&err, Some(&hello)));
+                // A client's handshake signature that failed was noted in
+                // Go's words by the verifier, rustls's error lacking the
+                // key they name.
+                return Err(crate::clientcert::take_client_refusal(&err)
+                    .unwrap_or_else(|| go_error_text(&err, Some(&hello))));
             }
         }
         if let Some((_, refusal)) = refused {
@@ -1490,6 +1496,14 @@ pub fn go_error_text(err: &rustls::Error, hello: Option<&HelloFacts>) -> String 
             if *misbehaved == crate::clientcert::ML_DSA_CLIENT_KEY_IN_TLS12 =>
         {
             "tls: client certificate uses ML-DSA, which requires TLS 1.3".to_string()
+        }
+        // A client CertificateVerify under a scheme the listener's list
+        // lacks, or in TLS 1.3 one that does not fit the leaf's key
+        // (`handshake_server.go:779-782`, `handshake_server_tls13.go:1086-1092`).
+        Error::PeerMisbehaved(misbehaved)
+            if *misbehaved == crate::clientcert::CLIENT_SCHEME_REFUSED =>
+        {
+            "tls: client certificate used with invalid signature algorithm".to_string()
         }
         Error::InvalidCertificate(CertificateError::UnknownIssuer) => {
             "tls: failed to verify certificate: x509: certificate signed by unknown authority"

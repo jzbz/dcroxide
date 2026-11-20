@@ -39,7 +39,7 @@ use dcroxide_gotls::{
     ClientAuth, GoClientCertVerifier, GoServerConfigs, GoServerOptions, KeyPair, handshake,
 };
 use dcroxide_testutil::hex;
-use dcroxide_testutil::tls_interop::{Issued, TlsOracle, spec};
+use dcroxide_testutil::tls_interop::{Issued, TlsOracle, reads_as_reset, spec};
 use serde_json::{Value, json};
 
 /// The request each cell's client sends, which a TLS 1.3 server's refusal
@@ -321,11 +321,7 @@ fn assert_alert_or_reset(what: &str, detail: &Value, alert: &str) {
     assert_eq!(detail["ok"], false, "{what}: Go's client {detail}");
     let error = detail["error"].as_str().unwrap_or_default();
     assert!(
-        error == alert
-            || error.ends_with("connection reset by peer")
-            || error.ends_with("broken pipe")
-            || error.contains("forcibly closed by the remote host")
-            || error.contains("aborted by the software in your host machine"),
+        error == alert || reads_as_reset(error) || error.ends_with("broken pipe"),
         "{what}: Go's client read {error}, not {alert} or a reset"
     );
 }

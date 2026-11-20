@@ -499,8 +499,11 @@ work). Currently implemented:
   TLS 1.3 alone) signing keys, loaded by Go's `tls.X509KeyPair` rules
   with RSA keys refused; and ring's fourteen verification algorithms,
   ECDSA, Ed25519 by Go's rules and RSA PKCS#1 v1.5 and PSS verified in
-  tree on `num-bigint`, within ring's limits, with ML-DSA's three beside
-  them for the RPC listener's client certificates; pinned by Wycheproof's
+  tree on `num-bigint`, within ring's limits, with ML-DSA's three and the
+  ECDSA pairs ring lacked (P-256 and P-384 with SHA-512, P-521 with
+  SHA-256, SHA-384 and SHA-512) beside them for the RPC listener's client
+  certificates, P-521 and SHA-512 held to Go-made vectors where Wycheproof's
+  are not in the tree; pinned by Wycheproof's
   vectors on hardware and portable backends, by RFC 6979's and RFC 8032's
   known answers, by a corpus of signatures whose verdicts it gives as ring
   gave them, recorded while ring was in the tree, and as Go gives them but
@@ -522,7 +525,12 @@ work). Currently implemented:
   dcr-purse's listeners: the client certificate verifier that replays
   Go's `x509` chain search, budget and policy rules before webpki's
   (`GoClientCertVerifier`, over a `ClientCaPool` filled as Go's
-  `CertPool` is, empty included); the configurations a certificate pair is
+  `CertPool` is, empty included), that reads every certificate a client
+  sends, its key included, as Go's parser does, refusing one Go refuses
+  in Go's words, and that checks a client's CertificateVerify as Go does,
+  a TLS 1.3 scheme against the leaf's key and a failed ECDSA or Ed25519
+  signature refused in Go's words; the
+  configurations a certificate pair is
   served with, one for each cipher-suite order and TLS 1.3 key exchange
   Go's server can settle on, chosen per ClientHello by a handshake that
   reads the raw ClientHello, with Go's texts for its failures, and holds
@@ -534,7 +542,9 @@ work). Currently implemented:
   (`GoServerOptions::dcrwallet_jsonrpc`, `dcrwallet_grpc`); pinned by the
   tests that moved with it from the node, against Go through the oracle,
   and by dcrwallet's settings against Go's server configured as
-  dcrwallet's, under dcrwallet's `GODEBUG`
+  dcrwallet's, under dcrwallet's `GODEBUG`, dcrwallet's
+  `--issueclientcert` pair on every `--tlscurve` with broken and
+  mismatched client signatures among them
 - `dcroxide-ratelimit` — dcrd 2.2's `internal/ratelimit` token bucket:
   a bucket seeded with `burst` tokens refilling at a fixed rate,
   reproducing dcrd's `f64` operations in dcrd's order — including

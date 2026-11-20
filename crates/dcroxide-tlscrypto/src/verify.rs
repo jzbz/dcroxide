@@ -31,6 +31,30 @@
 //!   identifiers a certificate may name each by, and PSS with each, in this
 //!   tree (`src/rsa.rs`, ADR-0015 T5).
 //!
+//! Beside them, and in no set ring had, the rest of the ECDSA set Go
+//! verifies (ADR-0015, T4): P-256 and P-384 with SHA-512, and P-521 with
+//! each of SHA-256, SHA-384 and SHA-512, under the names and identifiers
+//! `webpki::aws_lc_rs` gives them (`rustls-webpki-0.103.16/src/
+//! aws_lc_rs_algs.rs:92-139`).  They are the same verifier on the same
+//! rules: the key uncompressed alone, at P-521's 66-byte coordinates, each
+//! below p and on the curve, as Go's `ecdsa.ParseUncompressedPublicKey`
+//! reads one; the signature strict DER with r and s in [1, n), in a
+//! SEQUENCE whose length is in the short form below 128 content bytes and
+//! in the long form from 128 up, where an honestly made P-521 signature's
+//! almost always falls (one whose r and s are both small enough, which no
+//! honest signer makes in practice, is in the short form and verifies as
+//! it does in Go); and the digest cut to the
+//! order's length where it is longer, a SHA-512 digest under P-256 or
+//! P-384, and taken whole where it is shorter, any digest under P-521,
+//! whose order is 521 bits, which is Go's `hashToNat`
+//! (`crypto/internal/fips140/ecdsa/ecdsa.go:407-422`).  Go's
+//! `crypto/x509` takes ecdsa-with-SHA256, -SHA384 and -SHA512 from a key
+//! on any of the three curves (`crypto/x509/x509.go:1099-1106`), and its
+//! `crypto/tls` a TLS 1.2 ECDSA scheme from a key on any of them
+//! (`crypto/tls/auth.go:210-220`), so all nine pairs are needed.
+//! [`crate::RPC_SIG_ALGS`] lists them; [`crate::SUPPORTED_SIG_ALGS`], ring's
+//! set, does not.
+//!
 //! Beside them, and in no set ring had, ML-DSA-44, -65 and -87 (FIPS 204),
 //! which Go 1.27 verifies in a certificate and in a TLS 1.3
 //! CertificateVerify, on the `ml-dsa` crate, under the names and
@@ -99,6 +123,59 @@ pub static ECDSA_P384_SHA384: &dyn SignatureVerificationAlgorithm =
         name: "ECDSA_P384_SHA384",
         public_key_alg_id: alg_id::ECDSA_P384,
         signature_alg_id: alg_id::ECDSA_SHA384,
+        types: PhantomData,
+    };
+
+/// ECDSA signatures using the P-256 curve and SHA-512, its digest cut to
+/// 256 bits.  Not in ring's set; Go verifies it.
+pub static ECDSA_P256_SHA512: &dyn SignatureVerificationAlgorithm =
+    &EcdsaVerify::<p256::NistP256, Sha512> {
+        name: "ECDSA_P256_SHA512",
+        public_key_alg_id: alg_id::ECDSA_P256,
+        signature_alg_id: alg_id::ECDSA_SHA512,
+        types: PhantomData,
+    };
+
+/// ECDSA signatures using the P-384 curve and SHA-512, its digest cut to
+/// 384 bits.  Not in ring's set; Go verifies it.
+pub static ECDSA_P384_SHA512: &dyn SignatureVerificationAlgorithm =
+    &EcdsaVerify::<p384::NistP384, Sha512> {
+        name: "ECDSA_P384_SHA512",
+        public_key_alg_id: alg_id::ECDSA_P384,
+        signature_alg_id: alg_id::ECDSA_SHA512,
+        types: PhantomData,
+    };
+
+/// ECDSA signatures using the P-521 curve and SHA-256, the digest taken
+/// whole.  Not in ring's set; Go verifies it.
+pub static ECDSA_P521_SHA256: &dyn SignatureVerificationAlgorithm =
+    &EcdsaVerify::<p521::NistP521, Sha256> {
+        name: "ECDSA_P521_SHA256",
+        public_key_alg_id: alg_id::ECDSA_P521,
+        signature_alg_id: alg_id::ECDSA_SHA256,
+        types: PhantomData,
+    };
+
+/// ECDSA signatures using the P-521 curve and SHA-384, the digest taken
+/// whole.  Not in ring's set; Go verifies it.
+pub static ECDSA_P521_SHA384: &dyn SignatureVerificationAlgorithm =
+    &EcdsaVerify::<p521::NistP521, Sha384> {
+        name: "ECDSA_P521_SHA384",
+        public_key_alg_id: alg_id::ECDSA_P521,
+        signature_alg_id: alg_id::ECDSA_SHA384,
+        types: PhantomData,
+    };
+
+/// ECDSA signatures using the P-521 curve and SHA-512, the digest taken
+/// whole: what a P-521 key signs with in TLS 1.3
+/// (`ecdsa_secp521r1_sha512`), and what Go's `crypto/x509` signs with by
+/// default for a P-521 authority, dcrwallet's under `--tlscurve=P-521`
+/// among them.  Not in ring's set; Go verifies it.
+pub static ECDSA_P521_SHA512: &dyn SignatureVerificationAlgorithm =
+    &EcdsaVerify::<p521::NistP521, Sha512> {
+        name: "ECDSA_P521_SHA512",
+        public_key_alg_id: alg_id::ECDSA_P521,
+        signature_alg_id: alg_id::ECDSA_SHA512,
         types: PhantomData,
     };
 
@@ -226,7 +303,7 @@ const RSA_PKCS1_SHA512_ABSENT_PARAMS: AlgorithmIdentifier = AlgorithmIdentifier:
 /// for each curve, so the crates' trait bounds stay out of the algorithm,
 /// as `sign.rs` and `kx.rs` keep them out of theirs.
 trait VerifyingCurve: 'static + Send + Sync {
-    /// The length of a field element: 32 or 48 bytes.
+    /// The length of a field element: 32, 48 or 66 bytes.
     const FIELD_LEN: usize;
 
     /// Whether `signature`, DER, is a signature of the digest `prehash`
@@ -257,6 +334,7 @@ macro_rules! verifying_curve {
 
 verifying_curve!(p256::NistP256);
 verifying_curve!(p384::NistP384);
+verifying_curve!(p521::NistP521);
 
 /// ECDSA on the curve `C` with the hash `D`.
 struct EcdsaVerify<C: VerifyingCurve, D: Digest> {
@@ -433,18 +511,19 @@ impl<P: MlDsaParams> SignatureVerificationAlgorithm for MlDsaVerify<P> {
 }
 
 /// The body of the `tlscrypto_verify` fuzz target, not part of the API:
-/// each of the seventeen algorithms of [`crate::RPC_SIG_ALGS`], ring's
-/// fourteen and ML-DSA's three, on a key, a message and a signature cut
-/// from `data`, none of which may panic, and the number that accept.
+/// each of the twenty-two algorithms of [`crate::RPC_SIG_ALGS`], ring's
+/// fourteen, ML-DSA's three and the five ECDSA pairs ring lacked, on a key,
+/// a message and a signature cut from `data`, none of which may panic, and
+/// the number that accept.
 ///
 /// `data` is a byte that picks the key, the message's length in two bytes,
 /// big-endian, and then, for a key taken from `data`, the key's length in
 /// two more and the key; what follows is the message and then the
 /// signature, each cut short where `data` ends.  The picking byte takes a
-/// key from `data` but for 1 to 7, which put in a key the parsers take, so
+/// key from `data` but for 1 to 8, which put in a key the parsers take, so
 /// that arbitrary signatures reach the arithmetic as well as the parsers:
-/// 1, 2 and 3 the P-256 and P-384 generators, uncompressed, and Ed25519's
-/// base point, each the public key of the secret scalar 1; 4 an
+/// 1, 2, 8 and 3 the P-256, P-384 and P-521 generators, uncompressed, and
+/// Ed25519's base point, each the public key of the secret scalar 1; 4 an
 /// `RSAPublicKey` of e = 65537 and a 2048-bit odd modulus, the next 256
 /// bytes of `data` (`fuzz_rsa_key`), under which a signature of 256
 /// bytes below the modulus is raised and both paddings are checked; and 5,
@@ -492,6 +571,12 @@ pub fn fuzz_verify(data: &[u8]) -> usize {
         }
         (2, _) => {
             fixed = p384::PublicKey::from_affine(p384::AffinePoint::GENERATOR)
+                .map(|key| key.to_sec1_point(false).as_bytes().to_vec())
+                .unwrap_or_default();
+            (&fixed, rest)
+        }
+        (8, _) => {
+            fixed = p521::PublicKey::from_affine(p521::AffinePoint::GENERATOR)
                 .map(|key| key.to_sec1_point(false).as_bytes().to_vec())
                 .unwrap_or_default();
             (&fixed, rest)
@@ -684,24 +769,40 @@ mod tests {
         assert_eq!(format!("{ECDSA_P384_SHA256:?}"), "ECDSA_P384_SHA256");
     }
 
-    /// The RPC set is ring's fourteen algorithms and ML-DSA's three, the
-    /// mapping in Go 1.27.3's order of preference less P-521 and SHA-1
-    /// (`crypto/tls/defaults.go:49-67`), each of ring's schemes mapped to
-    /// the algorithms ring's mapping gives it; and each ML-DSA algorithm
-    /// carries its set's bare OID as both identifiers, with no
+    /// The RPC set is ring's fourteen algorithms, ML-DSA's three and the
+    /// five ECDSA pairs ring lacked, the mapping in Go 1.27.3's order of
+    /// preference less SHA-1 (`crypto/tls/defaults.go:49-67`), each of
+    /// ring's schemes mapped to the algorithms ring's mapping gives it and,
+    /// for the two ECDSA schemes, P-521's after them, and P-521's scheme to
+    /// its hash on P-521 first and then on P-256 and P-384; each new ECDSA
+    /// algorithm carries webpki's identifiers for its name; and each ML-DSA
+    /// algorithm carries its set's bare OID as both identifiers, with no
     /// parameters, a pair of its own.
     #[test]
-    fn the_rpc_set_is_rings_and_ml_dsa_in_gos_order() {
+    fn the_rpc_set_is_rings_ml_dsa_and_p521_in_gos_order() {
         use rustls::SignatureScheme as S;
         let name = |algorithm: &&dyn SignatureVerificationAlgorithm| format!("{algorithm:?}");
         let ml_dsa = [ML_DSA_44, ML_DSA_65, ML_DSA_87];
+        let added = [
+            (ECDSA_P256_SHA512, alg_id::ECDSA_P256, alg_id::ECDSA_SHA512),
+            (ECDSA_P384_SHA512, alg_id::ECDSA_P384, alg_id::ECDSA_SHA512),
+            (ECDSA_P521_SHA256, alg_id::ECDSA_P521, alg_id::ECDSA_SHA256),
+            (ECDSA_P521_SHA384, alg_id::ECDSA_P521, alg_id::ECDSA_SHA384),
+            (ECDSA_P521_SHA512, alg_id::ECDSA_P521, alg_id::ECDSA_SHA512),
+        ];
         let all: Vec<String> = crate::RPC_SIG_ALGS.all.iter().map(name).collect();
         let expected: Vec<String> = ml_dsa
             .iter()
             .chain(crate::SUPPORTED_SIG_ALGS.all)
+            .chain(added.iter().map(|(algorithm, ..)| algorithm))
             .map(name)
             .collect();
         assert_eq!(all, expected);
+        for (algorithm, public_key, signature) in added {
+            assert_eq!(algorithm.public_key_alg_id(), public_key, "{algorithm:?}");
+            assert_eq!(algorithm.signature_alg_id(), signature, "{algorithm:?}");
+        }
+        assert_eq!(format!("{ECDSA_P521_SHA512:?}"), "ECDSA_P521_SHA512");
         let schemes: Vec<S> = crate::RPC_SIG_ALGS
             .mapping
             .iter()
@@ -722,6 +823,7 @@ mod tests {
                 S::RSA_PKCS1_SHA384,
                 S::RSA_PKCS1_SHA512,
                 S::ECDSA_NISTP384_SHA384,
+                S::ECDSA_NISTP521_SHA512,
             ]
         );
         for (scheme, algorithms) in crate::RPC_SIG_ALGS.mapping {
@@ -731,7 +833,21 @@ mod tests {
                 .iter()
                 .find(|(ring, _)| ring == scheme)
             {
-                Some((_, ring)) => ring.iter().map(name).collect(),
+                Some((_, ring)) => {
+                    let mut ring: Vec<String> = ring.iter().map(name).collect();
+                    match *scheme {
+                        S::ECDSA_NISTP256_SHA256 => ring.push(name(&ECDSA_P521_SHA256)),
+                        S::ECDSA_NISTP384_SHA384 => ring.push(name(&ECDSA_P521_SHA384)),
+                        _ => {}
+                    }
+                    ring
+                }
+                None if *scheme == S::ECDSA_NISTP521_SHA512 => {
+                    [ECDSA_P521_SHA512, ECDSA_P256_SHA512, ECDSA_P384_SHA512]
+                        .iter()
+                        .map(name)
+                        .collect()
+                }
                 // An ML-DSA scheme, to its algorithm of the same name.
                 None => vec![format!("{scheme:?}")],
             };
@@ -1008,6 +1124,253 @@ mod tests {
         }
     }
 
+    /// The nine ECDSA pairs of the RPC set, each curve's key with each
+    /// hash: a key's signature of a message's digest verifies under the
+    /// algorithm of its curve and that hash alone.  The digest is read as
+    /// Go's `hashToNat` reads it: a SHA-512 digest cut to P-256's and
+    /// P-384's lengths, so a signature of its first 32 or 48 bytes is one
+    /// of the digest, and a shorter digest taken whole under P-521, so a
+    /// signature of the digest padded with zeros on the left to 66 bytes is
+    /// one of the digest.  A P-521 key is refused compressed, in the hybrid
+    /// form, a byte long or short, and with a coordinate at or above p
+    /// (bits set above the field's 521); a P-521 signature, whose SEQUENCE
+    /// length is in the long form for an honestly made one, is refused with
+    /// that length in two bytes, with a byte after it, with r or s at n or
+    /// zero, with a leading zero r does not need, and for another message.
+    /// A P-521 signature with r = 1 and s = 5, made by solving for the key
+    /// ([`P521_SHORT_FORM`]), whose SEQUENCE length is in the short form,
+    /// verifies under each hash, as Go 1.27.3's `ecdsa.VerifyASN1` verifies
+    /// it, and is refused with that length in the long form, which DER does
+    /// not allow below 128.
+    #[test]
+    fn ecdsa_takes_each_curve_with_each_hash() {
+        let message = b"a TLS 1.3 CertificateVerify's content";
+        let digests = [
+            Sha256::digest(message).to_vec(),
+            Sha384::digest(message).to_vec(),
+            Sha512::digest(message).to_vec(),
+        ];
+        let p256 = p256::ecdsa::SigningKey::from_slice(&[7; 32]).expect("a key");
+        let p384 = p384::ecdsa::SigningKey::from_slice(&[7; 48]).expect("a key");
+        let mut scalar = [7; 66];
+        scalar[0] = 1;
+        let p521 = p521::ecdsa::SigningKey::from_slice(&scalar).expect("a key");
+        // Each curve: its key, its field's length, and its signature of a
+        // prehash.
+        type Signer = Box<dyn Fn(&[u8]) -> Vec<u8>>;
+        let curves: [(Vec<u8>, usize, Signer); 3] = [
+            (
+                p256.verifying_key()
+                    .to_sec1_point(false)
+                    .as_bytes()
+                    .to_vec(),
+                32,
+                Box::new(move |prehash: &[u8]| {
+                    PrehashSigner::<p256::ecdsa::Signature>::sign_prehash(&p256, prehash)
+                        .expect("signed")
+                        .to_der()
+                        .as_bytes()
+                        .to_vec()
+                }),
+            ),
+            (
+                p384.verifying_key()
+                    .to_sec1_point(false)
+                    .as_bytes()
+                    .to_vec(),
+                48,
+                Box::new(move |prehash: &[u8]| {
+                    PrehashSigner::<p384::ecdsa::Signature>::sign_prehash(&p384, prehash)
+                        .expect("signed")
+                        .to_der()
+                        .as_bytes()
+                        .to_vec()
+                }),
+            ),
+            (
+                p521.verifying_key()
+                    .to_sec1_point(false)
+                    .as_bytes()
+                    .to_vec(),
+                66,
+                Box::new(move |prehash: &[u8]| {
+                    PrehashSigner::<p521::ecdsa::Signature>::sign_prehash(&p521, prehash)
+                        .expect("signed")
+                        .to_der()
+                        .as_bytes()
+                        .to_vec()
+                }),
+            ),
+        ];
+        // The nine, by curve and then by hash.
+        let algorithms = [
+            [ECDSA_P256_SHA256, ECDSA_P256_SHA384, ECDSA_P256_SHA512],
+            [ECDSA_P384_SHA256, ECDSA_P384_SHA384, ECDSA_P384_SHA512],
+            [ECDSA_P521_SHA256, ECDSA_P521_SHA384, ECDSA_P521_SHA512],
+        ];
+        for (curve, (key, field, sign)) in curves.iter().enumerate() {
+            assert_eq!(key.len(), 1 + 2 * field);
+            for (hash, digest) in digests.iter().enumerate() {
+                // The prehash `hashToNat` reads the digest as.
+                let read = if digest.len() >= *field {
+                    digest[..*field].to_vec()
+                } else {
+                    [vec![0; field - digest.len()], digest.clone()].concat()
+                };
+                for (what, signature) in [
+                    ("the digest", sign(digest)),
+                    ("the digest as Go reads it", sign(&read)),
+                ] {
+                    for (other_curve, row) in algorithms.iter().enumerate() {
+                        for (other_hash, other) in row.iter().enumerate() {
+                            assert_eq!(
+                                other.verify_signature(key, message, &signature).is_ok(),
+                                (other_curve, other_hash) == (curve, hash),
+                                "{:?}'s signature of {what} under {other:?}",
+                                algorithms[curve][hash]
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        // P-521's key and its SHA-512 signature, mutated.
+        let (key, _, sign) = &curves[2];
+        let algorithm = ECDSA_P521_SHA512;
+        let signature = sign(&digests[2]);
+        assert!(algorithm.verify_signature(key, message, &signature).is_ok());
+        assert_eq!(&signature[..2], [0x30, 0x81], "the long form");
+        let mut compressed = vec![0x02 | (key[132] & 1)];
+        compressed.extend_from_slice(&key[1..67]);
+        let mut hybrid = key.clone();
+        hybrid[0] = 0x06 | (key[132] & 1);
+        let long = [key.clone(), vec![0]].concat();
+        let short = key[..132].to_vec();
+        // x with a bit above the field's 521 set, which is at or above p.
+        let mut x_high = key.clone();
+        x_high[1] |= 0x02;
+        let mut y_high = key.clone();
+        y_high[67] |= 0x80;
+        for (what, wrong) in [
+            ("compressed", &compressed),
+            ("hybrid", &hybrid),
+            ("a byte long", &long),
+            ("a byte short", &short),
+            ("x at or above p", &x_high),
+            ("y at or above p", &y_high),
+        ] {
+            assert!(
+                algorithm
+                    .verify_signature(wrong, message, &signature)
+                    .is_err(),
+                "{what}"
+            );
+        }
+        // r and s, read back from the DER.
+        let content = &signature[3..];
+        let r_len = usize::from(content[1]);
+        let r = &content[2..2 + r_len];
+        let s = &content[2 + r_len + 2..];
+        let integer = |value: &[u8]| {
+            let mut tlv = vec![0x02, value.len() as u8];
+            tlv.extend_from_slice(value);
+            tlv
+        };
+        let der = |r: &[u8], s: &[u8]| {
+            let content = [integer(r), integer(s)].concat();
+            let mut out = if content.len() > 127 {
+                vec![0x30, 0x81, content.len() as u8]
+            } else {
+                vec![0x30, content.len() as u8]
+            };
+            out.extend_from_slice(&content);
+            out
+        };
+        assert_eq!(der(r, s), signature, "the DER rebuilt");
+        // P-521's order, 521 bits, as a minimal positive INTEGER's bytes.
+        let n = unhex(
+            "01ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\
+             fa51868783bf2f966b7fcc0148f709a5d03bb5c9b8899c47aebb6fb71e91386409",
+        );
+        let two_byte_length = [&[0x30, 0x82, 0x00, signature[2]][..], &signature[3..]].concat();
+        let trailing = [signature.clone(), vec![0]].concat();
+        let padded_r = [vec![0], r.to_vec()].concat();
+        for (what, wrong) in [
+            ("its length in two bytes", two_byte_length),
+            ("a byte after it", trailing),
+            ("r at n", der(&n, s)),
+            ("s at n", der(r, &n)),
+            ("r zero", der(&[0], s)),
+            ("s zero", der(r, &[0])),
+            ("r with a needless leading zero", der(&padded_r, s)),
+        ] {
+            assert!(
+                algorithm.verify_signature(key, message, &wrong).is_err(),
+                "{what}"
+            );
+        }
+        assert!(
+            algorithm
+                .verify_signature(key, b"another", &signature)
+                .is_err()
+        );
+        // A short-form P-521 signature under each hash, and the same with
+        // its length in the long form.
+        let short_form = [0x30, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x05];
+        let long_form = [0x30, 0x81, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x05];
+        for (algorithm, key) in [ECDSA_P521_SHA256, ECDSA_P521_SHA384, ECDSA_P521_SHA512]
+            .into_iter()
+            .zip(P521_SHORT_FORM.keys)
+        {
+            let key = unhex(key);
+            assert!(
+                algorithm
+                    .verify_signature(&key, P521_SHORT_FORM.message, &short_form)
+                    .is_ok(),
+                "{algorithm:?}, the short form"
+            );
+            assert!(
+                algorithm
+                    .verify_signature(&key, P521_SHORT_FORM.message, &long_form)
+                    .is_err(),
+                "{algorithm:?}, the short form's length in the long form"
+            );
+        }
+    }
+
+    /// A P-521 signature whose SEQUENCE length is in DER's short form:
+    /// r = 1 and s = 5 over [`ShortFormVectors::message`], with the key
+    /// solved for under each hash, Q = (R - u1 G) / u2 for a point R whose
+    /// x is 1 modulo n, by a generator kept outside the repository during
+    /// the review of ADR-0015's T4.  Go 1.27.3's `ecdsa.VerifyASN1`, with
+    /// each key read by `ecdsa.ParseUncompressedPublicKey`, verified each
+    /// under its hash.
+    struct ShortFormVectors {
+        /// The message signed.
+        message: &'static [u8],
+        /// The uncompressed keys, in hex, under SHA-256, SHA-384 and SHA-512.
+        keys: [&'static str; 3],
+    }
+
+    /// The vectors [`ShortFormVectors`] describes.
+    const P521_SHORT_FORM: ShortFormVectors = ShortFormVectors {
+        message: b"edge-case message",
+        keys: [
+            "040146624a297c110c4a16dce982bd099f92da8ca5ff50da2c6305c3e4e7a493f64901d81697049\
+             37b62eae4a56ea818e34b688f15e9fa486f62342851888d98d49e730028586efc2cf7fcb7555f7cd8\
+             d79e08ecff42932f69d14d61468adae63944c9b1bd61bde27f1402a3689a9322f667872363c86115\
+             8fe830b7f19459b933bd85208d",
+            "0401866cc9b970f153f97e95d8170867000b66ef2a5d9c36f8219b82222a8c0716ca73da1b03a2e\
+             7595850b230cf33a0b493e6943c6980fb54e3105d720610e8fc925700b8128bf1d3af0a3c8882b511\
+             ea20d7b65b7aeeb86d716c439616614d02681d3a45e197c4404b0acd2baf7fb93ad2306e5b39864dd\
+             40617b833204b552c82dfacd0",
+            "0400f3b2159f4cd51b6e549391a7df9b8ce6f7afb05ce1770106fbb27061f61b8fd346740a98c07\
+             448d19f157becc09df1c7ac643d8be17fbb7fa7bde1a70b78c469d400d9aa4908ec8ed4609d064d6a\
+             69ff8042ff49d2bdf33bcb1b4596fba30262c4d5c794d989bb6f4f08896cb30cdeb5bcaabf65734d1\
+             76c779ad7af6e4b4eeebee3fb",
+        ],
+    };
+
     /// Ed25519 as Go verifies it: RFC 8032's first three tests verify; S
     /// at or above L is refused; the identity as the key, in its canonical
     /// encoding, with the sign bit of its zero x set, and with y written as
@@ -1154,11 +1517,11 @@ mod tests {
     /// follows the message over a signature that decodes, so that z and the
     /// hints are checked and the arithmetic reached whatever the data's
     /// length.  And over inputs from a fixed generator, nothing panics:
-    /// eight in nine cut as it cuts them, with a key from the data or each
+    /// nine in ten cut as it cuts them, with a key from the data or each
     /// pick's, and signatures of any length and of each algorithm's shape,
     /// 64 bytes with S below L, a DER SEQUENCE of two INTEGERs at the
     /// curve's length, the RSA modulus's 256 bytes and ML-DSA bytes up to
-    /// the set's length, so that many reach the arithmetic; and the ninth
+    /// the set's length, so that many reach the arithmetic; and the tenth
     /// of any shape, so that lengths run past the end of the data.
     #[test]
     fn the_fuzz_body_counts_what_accepts() {
@@ -1185,6 +1548,15 @@ mod tests {
                 .to_der()
                 .as_bytes()
                 .to_vec();
+        let mut one66 = [0; 66];
+        one66[65] = 1;
+        let p521 = p521::ecdsa::SigningKey::from_slice(&one66).expect("1");
+        let p521_signature =
+            PrehashSigner::<p521::ecdsa::Signature>::sign_prehash(&p521, &Sha512::digest(&message))
+                .expect("signed")
+                .to_der()
+                .as_bytes()
+                .to_vec();
         let ed25519_signature = {
             let r = Scalar::from_bytes_mod_order([3; 32]);
             let big_r = EdwardsPoint::mul_base(&r).compress().to_bytes();
@@ -1201,6 +1573,7 @@ mod tests {
         for (pick, signature) in [
             (1, &p256_signature),
             (2, &p384_signature),
+            (8, &p521_signature),
             (3, &ed25519_signature),
         ] {
             assert_eq!(fuzz_verify(&input(pick, signature)), 1, "pick {pick}");
@@ -1291,7 +1664,7 @@ mod tests {
             let mut data = vec![pick];
             data.extend_from_slice(&u16::try_from(message.len()).expect("short").to_be_bytes());
             match pick {
-                1..=3 | 5..=7 => {}
+                1..=3 | 5..=8 => {}
                 4 => data.extend(random(rng, 256)),
                 _ => {
                     let key = rng.bytes(600);
@@ -1313,30 +1686,41 @@ mod tests {
                     signature[63] &= 0x0f;
                     signature
                 }
-                // r and s positive at P-384's length for its pick and
-                // P-256's for the others, below either order.
+                // r and s positive at P-384's length for its pick, at
+                // P-521's, its top byte below 2, for its own, and at
+                // P-256's for the others, below each order, P-521's in a
+                // SEQUENCE whose length takes the long form.
                 2 => {
-                    let len = if pick == 2 { 48 } else { 32 };
+                    let len = match pick {
+                        2 => 48,
+                        8 => 66,
+                        _ => 32,
+                    };
                     let integer = |rng: &mut SplitMix64| {
                         let mut value = random(rng, len);
-                        value[0] &= 0x7f;
+                        value[0] &= if len == 66 { 0x01 } else { 0x7f };
                         [&[0x02, len as u8][..], &value].concat()
                     };
                     let content = [integer(rng), integer(rng)].concat();
-                    [&[0x30, content.len() as u8][..], &content].concat()
+                    let header = if content.len() > 127 {
+                        vec![0x30, 0x81, content.len() as u8]
+                    } else {
+                        vec![0x30, content.len() as u8]
+                    };
+                    [&header[..], &content].concat()
                 }
                 _ => random(rng, 256),
             };
             data.extend_from_slice(&signature);
             data
         };
-        for case in 0..1800u64 {
-            // Every ninth input is bytes of any shape, whose lengths
+        for case in 0..2000u64 {
+            // Every tenth input is bytes of any shape, whose lengths
             // mostly run past the bytes that follow them.
-            let data = if case % 9 == 8 {
+            let data = if case % 10 == 9 {
                 rng.bytes(600)
             } else {
-                shaped(&mut rng, (case % 9) as u8)
+                shaped(&mut rng, (case % 10) as u8)
             };
             assert!(
                 fuzz_verify(&data) <= crate::RPC_SIG_ALGS.all.len(),
@@ -1346,5 +1730,6 @@ mod tests {
         assert_eq!(fuzz_verify(&[]), 0);
         assert_eq!(fuzz_verify(&[1]), 0);
         assert_eq!(fuzz_verify(&[4]), 0);
+        assert_eq!(fuzz_verify(&[8]), 0);
     }
 }

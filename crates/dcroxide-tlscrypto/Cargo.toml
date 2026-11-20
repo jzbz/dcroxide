@@ -53,9 +53,11 @@ subtle = "2.6"
 # `zeroize` wipes the expanded key and the SHAKE state.
 ml-dsa = { version = "=0.1.2", default-features = false, features = ["alloc", "zeroize", "rand_core"] }
 # RSA verification, public-key arithmetic (ADR-0015 T5, `src/rsa.rs`):
-# `modpow` on public values; and Go's text for a SEC 1 scalar the key
-# reader refuses, zero or at or above the order, never a key
-# (`src/keys.rs`).  Locked at 0.5.1 already, for the standalone difficulty
+# `modpow` on public values; Go's text for a SEC 1 scalar the key reader
+# refuses, zero or at or above the order, never a key (`src/keys.rs`);
+# and the curve equation a certificate's ECDSA point is checked against,
+# P-224's included, as Go's `ecdsa.ParseUncompressedPublicKey` checks it
+# (`src/point.rs`).  Locked at 0.5.1 already, for the standalone difficulty
 # math.
 num-bigint = { version = "0.5.1", default-features = false }
 # The kernel read behind every random byte the provider draws but one:

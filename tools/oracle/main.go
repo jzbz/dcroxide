@@ -272,10 +272,10 @@
 //	                     that public exponent; {"detail": {"n", "e", "d",
 //	                     "p", "q": hex}} with "go_version":
 //	                     runtime.Version()
-//	tls_pki            → data is JSON {"certs": [{"name", "key": "P-256" |
-//	                     "P-384" | "P-521" | "Ed25519" | "ML-DSA-44" |
-//	                     "ML-DSA-65" | "ML-DSA-87" (Go 1.27 and later,
-//	                     mldsa.go) | "rsa": {"n",
+//	tls_pki            → data is JSON {"certs": [{"name", "key": "P-224" |
+//	                     "P-256" | "P-384" | "P-521" | "Ed25519" |
+//	                     "ML-DSA-44" | "ML-DSA-65" | "ML-DSA-87" (Go 1.27
+//	                     and later, mldsa.go) | "rsa": {"n",
 //	                     "e", "d", "p", "q": hex}, "issuer": name,
 //	                     "sig_alg": x509 name, "ca": bool, "eku":
 //	                     ["server_auth" | "client_auth" | "any"], "dns":

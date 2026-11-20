@@ -17,13 +17,16 @@ import (
 	"bufio"
 	"bytes"
 	"crypto"
+	"crypto/ecdh"
 	stdecdsa "crypto/ecdsa"
 	"crypto/ed25519"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/asn1"
 	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
@@ -210,6 +213,200 @@ func (id *tlsIdentity) certificate() (tls.Certificate, error) {
 	return tls.X509KeyPair(chain, pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: key}))
 }
 
+// unchecked is the identity as a crypto/tls client sends it when nothing
+// checks the chain or the key against it, as tls.X509KeyPair would: the
+// chain as given, which a server under test is to refuse, and the key
+// read from PKCS#8, which signs the CertificateVerify.
+func (id *tlsIdentity) unchecked() (tls.Certificate, error) {
+	var cert tls.Certificate
+	for i, h := range id.Chain {
+		der, err := hex.DecodeString(h)
+		if err != nil {
+			return tls.Certificate{}, fmt.Errorf("chain %d: %v", i, err)
+		}
+		cert.Certificate = append(cert.Certificate, der)
+	}
+	der, err := hex.DecodeString(id.KeyPKCS8)
+	if err != nil {
+		return tls.Certificate{}, fmt.Errorf("key_pkcs8: %v", err)
+	}
+	if cert.PrivateKey, err = x509.ParsePKCS8PrivateKey(der); err != nil {
+		return tls.Certificate{}, fmt.Errorf("key_pkcs8: %v", err)
+	}
+	return cert, nil
+}
+
+// tlsClientSigners are the ways tls_dial's client_signer breaks the
+// signature of a client's CertificateVerify, each as a server under test
+// would receive it: "flip" flips the low bit of its last byte, "truncate"
+// drops that byte, "trailing_byte" adds a zero byte after it, "empty"
+// sends no signature, and "other_key" signs with a fresh key of the leaf
+// key's kind and curve. The rest take an ECDSA signature's r and s apart
+// and encode them again: "high_s" with s replaced by n-s, which Go's
+// verifier accepts; "zero_r" with r zero; "r_is_n" with r the order;
+// "leading_zero" with a needless leading zero byte on r; "long_length"
+// with the SEQUENCE's length one byte longer than DER allows; and "raw"
+// as r and s side by side, each the order's width, with no DER at all.
+var tlsClientSigners = map[string]bool{
+	"flip": false, "truncate": false, "trailing_byte": false, "empty": false, "other_key": false,
+	"high_s": true, "zero_r": true, "r_is_n": true, "leading_zero": true, "long_length": true, "raw": true,
+}
+
+// tlsSignatureSchemes are the schemes tls_dial's client_sig_algs names by
+// SignatureScheme's String.
+var tlsSignatureSchemes = []tls.SignatureScheme{
+	tls.PKCS1WithSHA256, tls.PKCS1WithSHA384, tls.PKCS1WithSHA512,
+	tls.PSSWithSHA256, tls.PSSWithSHA384, tls.PSSWithSHA512,
+	tls.ECDSAWithP256AndSHA256, tls.ECDSAWithP384AndSHA384, tls.ECDSAWithP521AndSHA512,
+	tls.Ed25519, tls.PKCS1WithSHA1, tls.ECDSAWithSHA1,
+}
+
+// tlsClientSigner is the private key of tls_dial's client certificate when
+// the request asks for a CertificateVerify crypto/tls would not send: it
+// signs with the leaf's key, or another (other_key), breaks the signature
+// as mode names it (tlsClientSigners), and reports public as its public
+// key, which crypto/tls chooses the scheme by
+// (crypto/tls/auth.go:261-266), so that a public key of another kind or
+// curve than the leaf's has crypto/tls sign under a scheme that does not
+// fit the leaf's key. Asked for a hashed signature, an Ed25519 key signs
+// the digest as its message; asked for an unhashed one, under Ed25519's
+// scheme, an ECDSA key signs the message's SHA-256: neither verifies, and
+// the server's refusal is what is being looked at.
+type tlsClientSigner struct {
+	key    crypto.Signer
+	public crypto.PublicKey
+	mode   string
+}
+
+// newTLSClientSigner is the signer for key, the leaf's, under mode and
+// with the public key of the kind public names, or key's own for "".
+func newTLSClientSigner(key crypto.Signer, mode, public string) (*tlsClientSigner, error) {
+	ecdsaOnly, ok := tlsClientSigners[mode]
+	if !ok && mode != "" {
+		return nil, fmt.Errorf("unknown client_signer %q", mode)
+	}
+	_, isECDSA := key.(*stdecdsa.PrivateKey)
+	if ecdsaOnly && !isECDSA {
+		return nil, fmt.Errorf("client_signer %q: an ECDSA key's alone", mode)
+	}
+	s := &tlsClientSigner{key: key, public: key.Public(), mode: mode}
+	if mode == "other_key" {
+		var err error
+		switch k := key.(type) {
+		case *stdecdsa.PrivateKey:
+			s.key, err = stdecdsa.GenerateKey(k.Curve, rand.Reader)
+		case ed25519.PrivateKey:
+			_, s.key, err = ed25519.GenerateKey(rand.Reader)
+		default:
+			err = fmt.Errorf("client_signer %q: a key of type %T", mode, key)
+		}
+		if err != nil {
+			return nil, err
+		}
+	}
+	if public != "" {
+		other, err := tlsPKIKey(tlsPKICert{Key: public})
+		if err != nil {
+			return nil, fmt.Errorf("client_public: %v", err)
+		}
+		s.public = other.Public()
+	}
+	return s, nil
+}
+
+// Public is the public key crypto/tls chooses the scheme by.
+func (s *tlsClientSigner) Public() crypto.PublicKey { return s.public }
+
+// Sign signs digest as the leaf's key would, with the signer's key, and
+// breaks the signature as the mode says.
+func (s *tlsClientSigner) Sign(r io.Reader, digest []byte, opts crypto.SignerOpts) ([]byte, error) {
+	var sig []byte
+	var err error
+	switch k := s.key.(type) {
+	case ed25519.PrivateKey:
+		sig = ed25519.Sign(k, digest)
+	case *stdecdsa.PrivateKey:
+		if opts.HashFunc() == 0 {
+			sum := sha256.Sum256(digest)
+			digest = sum[:]
+		}
+		sig, err = stdecdsa.SignASN1(r, k, digest)
+	default:
+		sig, err = s.key.Sign(r, digest, opts)
+	}
+	if err != nil {
+		return nil, err
+	}
+	switch s.mode {
+	case "", "other_key":
+		return sig, nil
+	case "flip":
+		sig[len(sig)-1] ^= 1
+		return sig, nil
+	case "truncate":
+		return sig[:len(sig)-1], nil
+	case "trailing_byte":
+		return append(sig, 0), nil
+	case "empty":
+		return []byte{}, nil
+	}
+	var rs struct{ R, S *big.Int }
+	if rest, err := asn1.Unmarshal(sig, &rs); err != nil || len(rest) != 0 {
+		return nil, fmt.Errorf("client_signer: crypto/ecdsa's signature does not parse: %v", err)
+	}
+	n := s.key.(*stdecdsa.PrivateKey).Curve.Params().N
+	switch s.mode {
+	case "high_s":
+		return tlsECDSASignature(rs.R, new(big.Int).Sub(n, rs.S), false, false), nil
+	case "zero_r":
+		return tlsECDSASignature(new(big.Int), rs.S, false, false), nil
+	case "r_is_n":
+		return tlsECDSASignature(n, rs.S, false, false), nil
+	case "leading_zero":
+		return tlsECDSASignature(rs.R, rs.S, true, false), nil
+	case "long_length":
+		return tlsECDSASignature(rs.R, rs.S, false, true), nil
+	case "raw":
+		width := (n.BitLen() + 7) / 8
+		return append(rs.R.FillBytes(make([]byte, width)), rs.S.FillBytes(make([]byte, width))...), nil
+	}
+	return nil, fmt.Errorf("client_signer: unknown mode %q", s.mode)
+}
+
+// tlsDERLength is a DER length of n, the shortest form, or with long a
+// form one byte longer than that, which DER forbids.
+func tlsDERLength(n int, long bool) []byte {
+	switch {
+	case n < 0x80 && !long:
+		return []byte{byte(n)}
+	case n < 0x80, n < 0x100 && !long:
+		return []byte{0x81, byte(n)}
+	default:
+		return []byte{0x82, byte(n >> 8), byte(n)}
+	}
+}
+
+// tlsDERInteger is v as a DER INTEGER, v not negative, with one needless
+// leading zero byte more when pad is set.
+func tlsDERInteger(v *big.Int, pad bool) []byte {
+	b := v.Bytes()
+	if len(b) == 0 || b[0]&0x80 != 0 {
+		b = append([]byte{0}, b...)
+	}
+	if pad {
+		b = append([]byte{0}, b...)
+	}
+	return append(append([]byte{0x02}, tlsDERLength(len(b), false)...), b...)
+}
+
+// tlsECDSASignature is an ECDSA-Sig-Value of r and s, r with a needless
+// leading zero when padR is set and the SEQUENCE's length in a longer
+// form than DER's when longSeq is.
+func tlsECDSASignature(r, s *big.Int, padR, longSeq bool) []byte {
+	body := append(tlsDERInteger(r, padR), tlsDERInteger(s, false)...)
+	return append(append([]byte{0x30}, tlsDERLength(len(body), longSeq)...), body...)
+}
+
 // tlsState is what the TLS commands report of a connection: its version,
 // cipher suite and key exchange by Go's names, and whether the server
 // asked for a key share with a HelloRetryRequest. All four are empty until
@@ -248,6 +445,7 @@ type tlsPKICert struct {
 	NotBefore int64          `json:"not_before"`
 	NotAfter  int64          `json:"not_after"`
 	Dcrwallet string         `json:"dcrwallet"`
+	SPKI      string         `json:"spki"`
 }
 
 // tlsPKIEntry is a certificate tls_pki made, with its key.
@@ -277,6 +475,10 @@ func tlsPKIKey(c tlsPKICert) (crypto.Signer, error) {
 		return c.RSA.privateKey()
 	}
 	switch c.Key {
+	case "P-224":
+		// A curve x509 parses a key on and crypto/tls names no scheme
+		// for, which Go's TLS 1.2 still verifies a signature with.
+		return stdecdsa.GenerateKey(elliptic.P224(), rand.Reader)
 	case "P-256":
 		return stdecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	case "P-384":
@@ -414,12 +616,175 @@ func tlsPKIDcrwalletTemplate(c tlsPKICert, issuer *x509.Certificate, now time.Ti
 	return nil, fmt.Errorf("dcrwallet: unknown template %q", c.Dcrwallet)
 }
 
+// tlsPKISPKIs are the subject public key infos tls_pki's spki puts in a
+// certificate in place of its key's, each one crypto/x509 refuses to
+// parse or crypto/tls refuses to take a client's signature from:
+// "compressed", "hybrid" (0x06 or 0x07 and both coordinates) and
+// "off_curve" (the last byte of y flipped) are the certificate's own ECDSA
+// key so written; "ed25519_params" is its Ed25519 key with NULL
+// parameters and "ed25519_short" the key's first 31 bytes; "x25519" is a
+// fresh X25519 key, an algorithm x509 gives no key; "dsa" is a DSA key
+// x509 reads, y = 2 in the group p = 23, q = 11, g = 4, which no check
+// there refuses; and "rsa_8200" an RSA key with an 8200-bit modulus,
+// 2^8199 + 1, and exponent 65537, which x509 reads and crypto/tls refuses
+// in a certificate a client sends (crypto/tls/handshake_server.go:952-957).
+var tlsPKISPKIs = map[string]bool{
+	"compressed": true, "hybrid": true, "off_curve": true, "ed25519_params": true,
+	"ed25519_short": true, "x25519": true, "dsa": true, "rsa_8200": true,
+}
+
+// tlsPKISPKI is the subject public key info tls_pki's spki names
+// (tlsPKISPKIs) for a certificate on key.
+func tlsPKISPKI(mode string, key crypto.Signer) ([]byte, error) {
+	var (
+		ecdsaAlg   = asn1.ObjectIdentifier{1, 2, 840, 10045, 2, 1}
+		ed25519Alg = asn1.ObjectIdentifier{1, 3, 101, 112}
+		null       = asn1.RawValue{FullBytes: asn1.NullBytes}
+	)
+	type spki struct {
+		Algorithm pkix.AlgorithmIdentifier
+		Key       asn1.BitString
+	}
+	marshal := func(alg pkix.AlgorithmIdentifier, bits []byte) ([]byte, error) {
+		return asn1.Marshal(spki{alg, asn1.BitString{Bytes: bits, BitLength: 8 * len(bits)}})
+	}
+	switch mode {
+	case "compressed", "hybrid", "off_curve":
+		pub, ok := key.Public().(*stdecdsa.PublicKey)
+		if !ok {
+			return nil, fmt.Errorf("%s: a key of type %T", mode, key.Public())
+		}
+		oid, ok := map[elliptic.Curve]asn1.ObjectIdentifier{
+			elliptic.P224(): {1, 3, 132, 0, 33}, elliptic.P256(): {1, 2, 840, 10045, 3, 1, 7},
+			elliptic.P384(): {1, 3, 132, 0, 34}, elliptic.P521(): {1, 3, 132, 0, 35},
+		}[pub.Curve]
+		if !ok {
+			return nil, fmt.Errorf("%s: an unknown curve", mode)
+		}
+		params, err := asn1.Marshal(oid)
+		if err != nil {
+			return nil, err
+		}
+		point, err := pub.Bytes()
+		if err != nil {
+			return nil, err
+		}
+		switch mode {
+		case "compressed":
+			point = elliptic.MarshalCompressed(pub.Curve, pub.X, pub.Y)
+		case "hybrid":
+			point[0] = 6 | byte(pub.Y.Bit(0))
+		case "off_curve":
+			point[len(point)-1] ^= 1
+		}
+		return marshal(pkix.AlgorithmIdentifier{Algorithm: ecdsaAlg, Parameters: asn1.RawValue{FullBytes: params}}, point)
+	case "ed25519_params", "ed25519_short":
+		pub, ok := key.Public().(ed25519.PublicKey)
+		if !ok {
+			return nil, fmt.Errorf("%s: a key of type %T", mode, key.Public())
+		}
+		if mode == "ed25519_params" {
+			return marshal(pkix.AlgorithmIdentifier{Algorithm: ed25519Alg, Parameters: null}, pub)
+		}
+		return marshal(pkix.AlgorithmIdentifier{Algorithm: ed25519Alg}, pub[:31])
+	case "x25519":
+		x, err := ecdh.X25519().GenerateKey(rand.Reader)
+		if err != nil {
+			return nil, err
+		}
+		return marshal(pkix.AlgorithmIdentifier{Algorithm: asn1.ObjectIdentifier{1, 3, 101, 110}}, x.PublicKey().Bytes())
+	case "dsa":
+		params, err := asn1.Marshal(struct{ P, Q, G *big.Int }{big.NewInt(23), big.NewInt(11), big.NewInt(4)})
+		if err != nil {
+			return nil, err
+		}
+		y, err := asn1.Marshal(big.NewInt(2))
+		if err != nil {
+			return nil, err
+		}
+		return marshal(pkix.AlgorithmIdentifier{
+			Algorithm: asn1.ObjectIdentifier{1, 2, 840, 10040, 4, 1}, Parameters: asn1.RawValue{FullBytes: params},
+		}, y)
+	case "rsa_8200":
+		n := new(big.Int).Add(new(big.Int).Lsh(big.NewInt(1), 8199), big.NewInt(1))
+		pub, err := asn1.Marshal(struct {
+			N *big.Int
+			E int
+		}{n, 65537})
+		if err != nil {
+			return nil, err
+		}
+		return marshal(pkix.AlgorithmIdentifier{Algorithm: asn1.ObjectIdentifier{1, 2, 840, 113549, 1, 1, 1}, Parameters: null}, pub)
+	}
+	return nil, fmt.Errorf("unknown spki %q", mode)
+}
+
+// tlsPKIReplaceSPKI is cert with its subject public key info replaced by
+// the one tls_pki's spki names (tlsPKISPKI), signed again by its issuer's
+// key, parentKey, under the same signature algorithm, which must be ECDSA
+// or Ed25519.
+func tlsPKIReplaceSPKI(cert *x509.Certificate, mode string, key, parentKey crypto.Signer) ([]byte, error) {
+	if !tlsPKISPKIs[mode] {
+		return nil, fmt.Errorf("unknown spki %q", mode)
+	}
+	replacement, err := tlsPKISPKI(mode, key)
+	if err != nil {
+		return nil, err
+	}
+	var tbs asn1.RawValue
+	if rest, err := asn1.Unmarshal(cert.RawTBSCertificate, &tbs); err != nil || len(rest) != 0 {
+		return nil, fmt.Errorf("the TBSCertificate: %v", err)
+	}
+	i := bytes.Index(tbs.Bytes, cert.RawSubjectPublicKeyInfo)
+	if i < 0 || bytes.Index(tbs.Bytes[i+1:], cert.RawSubjectPublicKeyInfo) >= 0 {
+		return nil, errors.New("the subject public key info is not in the TBSCertificate once")
+	}
+	content := slices.Concat(tbs.Bytes[:i], replacement, tbs.Bytes[i+len(cert.RawSubjectPublicKeyInfo):])
+	newTBS, err := asn1.Marshal(asn1.RawValue{Tag: asn1.TagSequence, IsCompound: true, Bytes: content})
+	if err != nil {
+		return nil, err
+	}
+	var signature []byte
+	switch cert.SignatureAlgorithm {
+	case x509.ECDSAWithSHA256, x509.ECDSAWithSHA384, x509.ECDSAWithSHA512:
+		hash := map[x509.SignatureAlgorithm]crypto.Hash{
+			x509.ECDSAWithSHA256: crypto.SHA256, x509.ECDSAWithSHA384: crypto.SHA384, x509.ECDSAWithSHA512: crypto.SHA512,
+		}[cert.SignatureAlgorithm]
+		h := hash.New()
+		h.Write(newTBS)
+		signature, err = parentKey.Sign(rand.Reader, h.Sum(nil), hash)
+	case x509.PureEd25519:
+		signature, err = parentKey.Sign(rand.Reader, newTBS, crypto.Hash(0))
+	default:
+		return nil, fmt.Errorf("an issuer signing with %v", cert.SignatureAlgorithm)
+	}
+	if err != nil {
+		return nil, err
+	}
+	var outer struct {
+		TBS       asn1.RawValue
+		Algorithm asn1.RawValue
+		Signature asn1.BitString
+	}
+	if rest, err := asn1.Unmarshal(cert.Raw, &outer); err != nil || len(rest) != 0 {
+		return nil, fmt.Errorf("the certificate: %v", err)
+	}
+	return asn1.Marshal(struct {
+		TBS       asn1.RawValue
+		Algorithm asn1.RawValue
+		Signature asn1.BitString
+	}{asn1.RawValue{FullBytes: newTBS}, outer.Algorithm, asn1.BitString{Bytes: signature, BitLength: 8 * len(signature)}})
+}
+
 // tlsPKI answers tls_pki: the certificates in the order given, each signed
 // by its issuer, an earlier certificate of the request, or by its own key
 // when it names none, with the issuer's signature algorithm sig_alg or
 // x509.CreateCertificate's default for the key. Each certificate and key
 // comes back in hex DER and in PEM. A certificate naming a dcrwallet
-// template is made from it instead (tlsPKIDcrwalletTemplate).
+// template is made from it instead (tlsPKIDcrwalletTemplate), and one
+// naming an spki carries that subject public key info in place of its
+// key's (tlsPKIReplaceSPKI), its key_pkcs8 still the key it was made for;
+// it is not to be an issuer.
 func tlsPKI(data []byte) response {
 	var in struct {
 		Certs []tlsPKICert `json:"certs"`
@@ -474,6 +839,11 @@ func tlsPKI(data []byte) response {
 		cert, err := x509.ParseCertificate(der)
 		if err != nil {
 			return errResp("tls_pki: %s: %v", c.Name, err)
+		}
+		if c.SPKI != "" {
+			if der, err = tlsPKIReplaceSPKI(cert, c.SPKI, key, parentKey); err != nil {
+				return errResp("tls_pki: %s: spki: %v", c.Name, err)
+			}
 		}
 		pkcs8, err := x509.MarshalPKCS8PrivateKey(key)
 		if err != nil {
@@ -534,7 +904,17 @@ type tlsDialDetail struct {
 // refusal of a TLS 1.3 client's certificate arrives after the client's
 // handshake is done, so it shows as the request's error, and a
 // client_cert without a request is refused: its ok would cover the
-// client's handshake alone and read a refusal as an acceptance.
+// client's handshake alone and read a refusal as an acceptance. With
+// client_signer or client_public the client certificate's key signs its
+// CertificateVerify as tlsClientSigner does, broken as client_signer
+// names it, under the scheme crypto/tls chooses for a public key of the
+// kind client_public names ("P-256", "P-384", "P-521" or "Ed25519");
+// client_sig_algs, schemes by Go's names, is the certificate's
+// SupportedSignatureAlgorithms, which leaves crypto/tls only those of the
+// schemes it would sign with (crypto/tls/auth.go:266-271). With
+// client_unchecked the client_cert is sent whatever its certificates hold,
+// a chain whose leaf x509 cannot parse among them, and its key signs as
+// crypto/tls signs with a key of its kind (tlsIdentity.unchecked).
 func tlsDial(data []byte) response {
 	var in struct {
 		Addr             string       `json:"addr"`
@@ -546,6 +926,10 @@ func tlsDial(data []byte) response {
 		CurvePreferences []string     `json:"curve_preferences"`
 		NextProtos       []string     `json:"next_protos"`
 		ClientCert       *tlsIdentity `json:"client_cert"`
+		ClientSigner     string       `json:"client_signer"`
+		ClientPublic     string       `json:"client_public"`
+		ClientSigAlgs    []string     `json:"client_sig_algs"`
+		ClientUnchecked  bool         `json:"client_unchecked"`
 		Request          *tlsRequest  `json:"request"`
 		TimeoutMS        int64        `json:"timeout_ms"`
 	}
@@ -580,20 +964,47 @@ func tlsDial(data []byte) response {
 		return errResp("tls_dial: curve_preferences: %v", err)
 	}
 	if in.ClientCert != nil {
-		cert, err := in.ClientCert.certificate()
+		certificate := in.ClientCert.certificate
+		if in.ClientUnchecked {
+			certificate = in.ClientCert.unchecked
+		}
+		cert, err := certificate()
 		if err != nil {
 			return errResp("tls_dial: client_cert: %v", err)
+		}
+		if in.ClientSigner != "" || in.ClientPublic != "" {
+			key, ok := cert.PrivateKey.(crypto.Signer)
+			if !ok {
+				return errResp("tls_dial: client_cert: a key of type %T", cert.PrivateKey)
+			}
+			signer, err := newTLSClientSigner(key, in.ClientSigner, in.ClientPublic)
+			if err != nil {
+				return errResp("tls_dial: %v", err)
+			}
+			cert.PrivateKey = signer
+		}
+		for _, name := range in.ClientSigAlgs {
+			i := slices.IndexFunc(tlsSignatureSchemes, func(s tls.SignatureScheme) bool { return s.String() == name })
+			if i < 0 {
+				return errResp("tls_dial: client_sig_algs: unknown scheme %q", name)
+			}
+			cert.SupportedSignatureAlgorithms = append(cert.SupportedSignatureAlgorithms, tlsSignatureSchemes[i])
 		}
 		config.Certificates = []tls.Certificate{cert}
 		if in.Request == nil {
 			return errResp("tls_dial: client_cert without a request, which alone shows a TLS 1.3 server's refusal of it")
 		}
+	} else if in.ClientSigner != "" || in.ClientPublic != "" || len(in.ClientSigAlgs) != 0 || in.ClientUnchecked {
+		return errResp("tls_dial: client_signer, client_public, client_sig_algs or client_unchecked without a client_cert")
 	}
 	var detail tlsDialDetail
 	config.GetClientCertificate = func(cri *tls.CertificateRequestInfo) (*tls.Certificate, error) {
 		detail.CertificateRequest = []string{}
 		for _, scheme := range cri.SignatureSchemes {
 			detail.CertificateRequest = append(detail.CertificateRequest, scheme.String())
+		}
+		if in.ClientUnchecked {
+			return &config.Certificates[0], nil
 		}
 		for i := range config.Certificates {
 			if cri.SupportsCertificate(&config.Certificates[i]) == nil {

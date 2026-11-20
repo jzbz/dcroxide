@@ -4,8 +4,9 @@
 //! matrices, `dcroxide-tlscrypto`'s `tests/go_interop.rs` and
 //! `dcroxide-node`'s `tests/tls_interop.rs`, share: certificates from
 //! `tls_pki`, Go's report of what a connection negotiated, and the
-//! client-certificate cells with each one's verdict today, so that Go's
-//! client-certificate set (ADR-0015, T4) changes them in one place.  None
+//! client-certificate cells with each one's verdict under ring's set and
+//! under the RPC listener's, so that Go's client-certificate set
+//! (ADR-0015, T4) changes them in one place.  None
 //! of it touches rustls: each matrix drives its own TLS ends.
 
 use std::collections::HashMap;
@@ -252,6 +253,21 @@ impl TlsOracle {
     }
 }
 
+/// Whether an error, in Go's words or Rust's, is a reset of the
+/// connection: ECONNRESET, or on Windows WSAECONNRESET or WSAECONNABORTED.
+/// A server that closes a refused handshake with the client's bytes still
+/// unread, or before more arrive, draws a reset from its system, which can
+/// reach the client before the alert it sent does, or before the client
+/// writes.  Windows names it "forcibly closed by the remote host" or, it
+/// seems when the client's bytes reach the already closed socket, "aborted
+/// by the software in your host machine", and Go takes the two alike
+/// (`net/http/internal/http2/server.go:617-627`).
+pub fn reads_as_reset(error: &str) -> bool {
+    error.contains("reset by peer")
+        || error.contains("forcibly closed by the remote host")
+        || error.contains("aborted by the software in your host machine")
+}
+
 /// [`TlsOracle::assert_refused`] for the Go that `go_version` names.
 fn assert_refused_under(go_version: &str, what: &str, detail: &Value, error: &str) {
     assert_eq!(detail["ok"], false, "{what}: Go's end {detail}");
@@ -353,10 +369,12 @@ impl Negotiated {
     }
 }
 
-/// Why a server on ring's verification set, the provider's today and,
-/// with ML-DSA beside it, the RPC listener's, refuses a client certificate
-/// Go's server accepts: no P-521 or SHA-512 ECDSA and no RSA key under
-/// 2041 bits until Go's client-certificate set (ADR-0015, T4).
+/// Why a server on ring's verification set, `dcroxide-tlscrypto`'s
+/// `SUPPORTED_SIG_ALGS`, refuses a client certificate Go's server accepts:
+/// no P-521 or SHA-512 ECDSA and no RSA key under 2041 bits.  The RPC
+/// listener's set, `RPC_SIG_ALGS`, verifies P-521 and SHA-512 ECDSA since
+/// Go's client-certificate set (ADR-0015, T4), and refuses the RSA key
+/// alone ([`ClientCertRefusal::refused_by_rpc_set`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ClientCertRefusal {
     /// A P-521 client key.
@@ -368,6 +386,13 @@ pub enum ClientCertRefusal {
 }
 
 impl ClientCertRefusal {
+    /// Whether the RPC listener's verification set refuses the certificate
+    /// too: the RSA-1024 key alone, whose bound ADR-0015's T4 has yet to
+    /// bring; the P-521 key and the ECDSA-SHA512 issuer it verifies.
+    pub fn refused_by_rpc_set(self) -> bool {
+        matches!(self, ClientCertRefusal::Rsa1024Key)
+    }
+
     /// The error Go's client reports for the refusal in `version`, `"TLS
     /// 1.3"` or `"TLS 1.2"`, under the reference Go.  In TLS 1.3 Go's
     /// client sends no certificate it cannot sign with under a scheme the
@@ -387,15 +412,15 @@ impl ClientCertRefusal {
 
 /// The client-certificate cells both matrices run: client keys P-256,
 /// P-384, Ed25519 and RSA-2048, each a self-signed leaf the server trusts
-/// and a leaf under each kind of authority, and the three refused today
-/// ([`ClientCertRefusal`]), each to be presented in each version.
+/// and a leaf under each kind of authority, and the three ring's set
+/// refuses ([`ClientCertRefusal`]), each to be presented in each version.
 pub struct ClientCerts {
     /// What the server trusts: the authorities, which are P-256, P-384,
     /// RSA-4096 twice, Ed25519, and P-384 again for the leaf it signs with
     /// ECDSA-SHA512, then the leaves that stand alone.
     pub trusted: Vec<Issued>,
-    /// Each cell: its name, the client's certificate, and why the server
-    /// refuses it today, if it does.
+    /// Each cell: its name, the client's certificate, and why a server on
+    /// ring's set refuses it, if it does.
     pub cells: Vec<(String, Issued, Option<ClientCertRefusal>)>,
 }
 
@@ -410,11 +435,11 @@ impl ClientCerts {
         ("ca-ed25519", "Ed25519", "Ed25519"),
     ];
 
-    /// The client keys of the cells accepted today.
+    /// The client keys of the cells both sets accept.
     pub const KEYS: [&'static str; 4] = ["P-256", "P-384", "Ed25519", "rsa2048"];
 
-    /// The cells refused today, each a name, the client's key, its issuer,
-    /// the issuer's signature algorithm and why.
+    /// The cells ring's set refuses, each a name, the client's key, its
+    /// issuer, the issuer's signature algorithm and why.
     pub const REFUSED: [(
         &'static str,
         &'static str,
@@ -449,7 +474,7 @@ impl ClientCerts {
     const SHA512_CA: &'static str = "ca-p384-sha512";
 
     /// What [`ClientCerts::make`] asks `tls_pki` for, and the cells, each a
-    /// name and why it is refused today, if it is.
+    /// name and why ring's set refuses it, if it does.
     fn specs() -> (Vec<Value>, Vec<(String, Option<ClientCertRefusal>)>) {
         let mut specs: Vec<Value> = Self::CAS
             .iter()
@@ -504,6 +529,41 @@ impl ClientCerts {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// [`reads_as_reset`] takes a reset in each system's words, Go's and
+    /// Rust's, Windows' "aborted" among them, which Go's client has read on
+    /// Windows in place of the node's alert, and Go's write of a request
+    /// that met one, and nothing else a refusal shows: the check the reset
+    /// allowances rest on, run without the oracle.
+    #[test]
+    fn a_reset_reads_as_one_in_each_systems_words() {
+        for reset in [
+            "read tcp 127.0.0.1:54021->127.0.0.1:53689: read: connection reset by peer",
+            "write tcp 127.0.0.1:50650->127.0.0.1:42553: write: connection reset by peer",
+            "read tcp 127.0.0.1:54021->127.0.0.1:53689: wsarecv: An existing connection was \
+             forcibly closed by the remote host.",
+            "read tcp 127.0.0.1:54021->127.0.0.1:53689: wsarecv: An established connection was \
+             aborted by the software in your host machine.",
+            "Connection reset by peer (os error 104)",
+            "Connection reset by peer (os error 54)",
+            "An existing connection was forcibly closed by the remote host. (os error 10054)",
+            "An established connection was aborted by the software in your host machine. \
+             (os error 10053)",
+        ] {
+            assert!(reads_as_reset(reset), "{reset}");
+        }
+        for refusal in [
+            "remote error: tls: certificate required",
+            "remote error: tls: error decrypting message",
+            "received fatal alert: IllegalParameter",
+            "EOF",
+            "read tcp 127.0.0.1:54021->127.0.0.1:53689: i/o timeout",
+            "write tcp 127.0.0.1:50650->127.0.0.1:42553: write: broken pipe",
+            "",
+        ] {
+            assert!(!reads_as_reset(refusal), "{refusal}");
+        }
+    }
 
     /// The oracle runs with the environment it is given and this process's
     /// besides: a Go client cut to SecP256r1MLKEM768 dials a Go server on
@@ -661,8 +721,9 @@ mod tests {
     }
 
     /// The client-certificate cells: four keys alone and under five
-    /// authorities, accepted today, and the three refused, each named
-    /// once; the server trusts the six authorities and the four leaves
+    /// authorities, accepted by both sets, and the three ring's set
+    /// refuses, each named once, the RSA-1024 key alone refused by the RPC
+    /// set too; the server trusts the six authorities and the four leaves
     /// that stand alone; and each refused cell's Go error is the decrypt
     /// error but for the P-521 key in TLS 1.3.
     #[test]
@@ -684,6 +745,8 @@ mod tests {
                 ClientCertRefusal::Rsa1024Key,
             ]
         );
+        let by_rpc: Vec<bool> = refused.iter().map(|r| r.refused_by_rpc_set()).collect();
+        assert_eq!(by_rpc, [false, false, true], "refused by the RPC set too");
         let names: std::collections::BTreeSet<&str> = specs
             .iter()
             .filter_map(|spec| spec["name"].as_str())

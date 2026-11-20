@@ -34,7 +34,9 @@
 //! ring's verdicts, listed with ring's mapping to TLS signature schemes in
 //! [`SUPPORTED_SIG_ALGS`].  [`default_provider`] puts them together with
 //! the kernel's random numbers.  ML-DSA-44, -65 and -87, which Go 1.27
-//! verifies and ring never had, are three more on the `ml-dsa` crate, in a
+//! verifies and ring never had, are three more on the `ml-dsa` crate, and
+//! the ECDSA pairs ring lacked, P-256 and P-384 with SHA-512 and P-521
+//! with each hash, five more on the curve crates (ADR-0015, T4), all in a
 //! second set, [`RPC_SIG_ALGS`], which the RPC listener verifies client
 //! certificates with.
 //!
@@ -57,6 +59,7 @@ mod hash;
 mod hmac;
 mod keys;
 mod kx;
+pub mod point;
 mod rand;
 mod rsa;
 pub mod sign;
@@ -148,9 +151,11 @@ pub mod kx_group {
 /// mapping's schemes in its order, in a ClientHello and a
 /// CertificateRequest, and TLS 1.3 tries only the first algorithm of a
 /// scheme (`rustls-0.23.46/src/webpki/verify.rs:68-92`, `:202`).  Neither
-/// list has P-521 or SHA-512 ECDSA, which ring lacks; Go verifies both, as
-/// PARITY.md records, and they come with Go's client-certificate set
-/// (ADR-0015, T4).
+/// list has P-521 or SHA-512 ECDSA, which ring lacks and Go verifies:
+/// they are in [`RPC_SIG_ALGS`], the RPC listener's set, with Go's
+/// client-certificate set (ADR-0015, T4), and the seeders, which verify
+/// with this set, refuse them where Go's client takes them, as PARITY.md
+/// records.
 pub static SUPPORTED_SIG_ALGS: WebPkiSupportedAlgorithms = WebPkiSupportedAlgorithms {
     all: &[
         verify::ECDSA_P256_SHA256,
@@ -209,24 +214,34 @@ pub static SUPPORTED_SIG_ALGS: WebPkiSupportedAlgorithms = WebPkiSupportedAlgori
 };
 
 /// The verification set for the RPC listener, which follows Go: ring's
-/// fourteen algorithms of [`SUPPORTED_SIG_ALGS`] and ML-DSA-44, -65 and
-/// -87 ([`verify`]), with the mapping in the order of Go 1.27.3's default
-/// signature schemes (`crypto/tls/defaults.go:49-67`), less the schemes
-/// ring's algorithms do not serve: ECDSA with P-521 and SHA-512, and the
-/// two SHA-1 schemes, which TLS 1.3 refuses and dcrd's `go1.26` defaults
-/// refuse in TLS 1.2 (`crypto/tls/common.go:1821-1833`).  rustls offers a
+/// fourteen algorithms of [`SUPPORTED_SIG_ALGS`], ML-DSA-44, -65 and -87,
+/// and the five ECDSA pairs ring lacked and Go verifies, P-256 and P-384
+/// with SHA-512 and P-521 with SHA-256, SHA-384 and SHA-512 ([`verify`];
+/// ADR-0015, T4), with the mapping in the order of Go 1.27.3's default
+/// signature schemes (`crypto/tls/defaults.go:49-67`), less the two SHA-1
+/// schemes, which TLS 1.3 refuses and the `go1.26` defaults of dcrd and
+/// the `go1.25` defaults of dcrwallet refuse in TLS 1.2
+/// (`crypto/tls/common.go:1792-1836`, `tlssha1`).  rustls offers a
 /// mapping's schemes in its order; a TLS 1.2 CertificateRequest drops
 /// those that name no TLS 1.2 algorithm, as the three ML-DSA schemes do
 /// (`rustls-0.23.46/src/server/tls12.rs:410-411`, `enums.rs:524-542`),
 /// and a TLS 1.3 one drops none (`server/tls13.rs:759-765`).  So a
-/// CertificateRequest built on this set lists Go's schemes but P-521's in
-/// TLS 1.2, and in TLS 1.3 those with PKCS#1 v1.5's three as well, which
-/// Go's TLS 1.3 list leaves out.  In a TLS 1.2 handshake the ECDSA
-/// schemes take either curve's key, and in TLS 1.3 the first algorithm
-/// is the one tried, as in [`SUPPORTED_SIG_ALGS`].  The RPC listener
-/// verifies client certificates and their handshake signatures with it.
-/// [`SUPPORTED_SIG_ALGS`] and [`default_provider`] stay ring's, so the
-/// seeders offer what they did.
+/// CertificateRequest built on this set lists Go's schemes in Go's order,
+/// in TLS 1.2 exactly, and in TLS 1.3 with PKCS#1 v1.5's three as well,
+/// which Go's TLS 1.3 list leaves out (`common.go:1821-1827`).  In a TLS
+/// 1.2 handshake an ECDSA scheme names a hash and not a curve, and Go
+/// takes it from a key on any of the three curves
+/// (`crypto/tls/auth.go:210-220`, `handshake_server.go:777-797`), so each
+/// ECDSA scheme maps to its hash on all three, the curve it names first;
+/// in TLS 1.3 the first algorithm is the one tried, which is the curve
+/// the scheme names, as Go requires there (`handshake_server_tls13.go:
+/// 1085-1092`).  A Go client with a P-521 key in TLS 1.2 signs with the
+/// first ECDSA scheme the server lists, `ecdsa_secp256r1_sha256`
+/// (`auth.go:290-296`), which this set takes from the P-521 key as Go's
+/// server does.  The RPC listener verifies client certificates and their
+/// handshake signatures with it.  [`SUPPORTED_SIG_ALGS`] and
+/// [`default_provider`] stay ring's, so the seeders offer and verify what
+/// they did.
 pub static RPC_SIG_ALGS: WebPkiSupportedAlgorithms = WebPkiSupportedAlgorithms {
     all: &[
         verify::ML_DSA_44,
@@ -246,6 +261,11 @@ pub static RPC_SIG_ALGS: WebPkiSupportedAlgorithms = WebPkiSupportedAlgorithms {
         verify::RSA_PKCS1_2048_8192_SHA256_ABSENT_PARAMS,
         verify::RSA_PKCS1_2048_8192_SHA384_ABSENT_PARAMS,
         verify::RSA_PKCS1_2048_8192_SHA512_ABSENT_PARAMS,
+        verify::ECDSA_P256_SHA512,
+        verify::ECDSA_P384_SHA512,
+        verify::ECDSA_P521_SHA256,
+        verify::ECDSA_P521_SHA384,
+        verify::ECDSA_P521_SHA512,
     ],
     mapping: &[
         (SignatureScheme::ML_DSA_44, &[verify::ML_DSA_44]),
@@ -257,7 +277,11 @@ pub static RPC_SIG_ALGS: WebPkiSupportedAlgorithms = WebPkiSupportedAlgorithms {
         ),
         (
             SignatureScheme::ECDSA_NISTP256_SHA256,
-            &[verify::ECDSA_P256_SHA256, verify::ECDSA_P384_SHA256],
+            &[
+                verify::ECDSA_P256_SHA256,
+                verify::ECDSA_P384_SHA256,
+                verify::ECDSA_P521_SHA256,
+            ],
         ),
         (SignatureScheme::ED25519, &[verify::ED25519]),
         (
@@ -282,7 +306,19 @@ pub static RPC_SIG_ALGS: WebPkiSupportedAlgorithms = WebPkiSupportedAlgorithms {
         ),
         (
             SignatureScheme::ECDSA_NISTP384_SHA384,
-            &[verify::ECDSA_P384_SHA384, verify::ECDSA_P256_SHA384],
+            &[
+                verify::ECDSA_P384_SHA384,
+                verify::ECDSA_P256_SHA384,
+                verify::ECDSA_P521_SHA384,
+            ],
+        ),
+        (
+            SignatureScheme::ECDSA_NISTP521_SHA512,
+            &[
+                verify::ECDSA_P521_SHA512,
+                verify::ECDSA_P256_SHA512,
+                verify::ECDSA_P384_SHA512,
+            ],
         ),
     ],
 };
