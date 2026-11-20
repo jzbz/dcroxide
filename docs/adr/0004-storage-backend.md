@@ -2217,9 +2217,87 @@ type.
 
 Not done: `dcroxide-stake`, `dcroxide-gcs` and `dcroxide-fees` without
 storage are still not checked on a no-OS target (`dcroxide-rpc` is a
-std crate). Their own code needs only `core` and `alloc`, fees'
+std crate). *(Done since: the addendum of 2026-11-20 below puts all three
+on CI's no_std check.)* Their own code needs only `core` and `alloc`, fees'
 `f64::round` aside, but each takes `dcroxide-txscript` with its default
 `precomputed-tables`, which brings std back in (the no_std job's comment
 says what listing them takes). The wallet's own build was not
 tried against this change, only the scratch consumer above; the graph the
 wallet would see is the one the job checks.
+
+## Addendum, 2026-11-20 — stake, gcs and fees on the no_std check
+
+The project owner decided on 2026-11-20 that `dcroxide-stake` and
+`dcroxide-gcs` join CI's no_std check, and `dcroxide-fees` with them if
+its one std-only call could be replaced exactly and in a few lines; it
+could, so all three are on the list. The decision of this ADR is
+unchanged. The second addendum above left them off because, with
+`storage` off, the one thing that still brought std in was
+`dcroxide-txscript`'s default `precomputed-tables` feature, which turns on
+`dcroxide-dcrec`'s, and through it k256's basepoint table and
+`primeorder/std` (ADR-0017).
+
+**What changed.** `dcroxide-stake` and `dcroxide-gcs` take
+`dcroxide-txscript` with `default-features = false`, as txscript takes
+dcrec, and each gains a feature named `precomputed-tables`, on by
+default, that turns txscript's back on (gcs's turns on stake's as well).
+`dcroxide-fees`, which reaches txscript only through stake, gains the same
+feature, turning on stake's. None of the three signs anything, so the
+feature changes no result in them; it exists so that a build naming them
+with their defaults, the node's or any of them built alone, keeps the
+table as before, while `--no-default-features` leaves it out. Fees' one
+std-only call was `f64::round`, for `EstimateFee`'s
+`math.Round` of the median rate (`internal/fees/estimator.go:729`).
+`crates/dcroxide-fees/src/round.rs` replaces it with Go's `math.Round`
+ported line for line. Go writes `math.Round` in Go on the double's bits
+(`math/floor.go`; unlike `Floor`, `Ceil` and `Trunc` it has no assembly
+form), and the go1.27.3 compiler replaces the call with one rounding
+instruction on arm64, ppc64 and s390x
+(`cmd/compile/internal/ssagen/intrinsics.go:759-763`), which also rounds
+half away from zero; `round` is the Go function line for line. Both
+functions round half away from zero and are exact, so they agree on
+every input. The module's tests hold the port to
+Go's `TestRound` vectors (go1.27.3's `math/all_test.go`), to std's
+`f64::round` on every biased exponent of both signs with fractions at
+and next to each bit that decides a rounding, and to it again on ten
+million pseudo-random bit patterns. The estimator's frozen vectors (425
+rows from dcrd's package) pass unchanged.
+
+**The node is unchanged but for the features' names.** `cargo tree
+--target all -f '{p}|{f}'`, run on `6272357` and on this change, gives
+the same distinct packages, 157 for `dcroxide-node` and 161 for the whole
+workspace (`-e normal,build`), 175 for the workspace with
+dev-dependencies (`-e normal,build,dev`) and 164 for `fuzz/` (166 package
+and feature-set pairs), each with the same features, except that
+`dcroxide-stake` shows `precomputed-tables` beside `default` and
+`storage`, and `dcroxide-gcs` and `dcroxide-fees` show `default` and
+`precomputed-tables` where they showed none. The same holds for each
+workspace member's own tree (`cargo tree -p <member> -e
+normal,build,dev`) with its default features, and without them for every
+member but these three. For stake, gcs and fees built alone with their
+defaults, txscript shows `precomputed-tables` without `default`: the same
+features under another name, since txscript's `default` holds that one
+feature alone. Without default features those three crates' trees lose
+the table, k256 without `precomputed-tables`, `primeorder` without
+`basepoint-table` and `std`, and `elliptic-curve`, `der` and `sec1`
+without `std`, and keep the same packages (60 for stake, 62 for gcs and
+61 for fees under the `storage-gate` job's first query, whose checks all
+pass as before). That job's four-crate test build without default
+features still has the table, since `dcroxide-rpc` takes txscript with
+its defaults.
+
+**Checked** on an x86_64 Linux desktop: the no_std job as `ci.yml` writes
+it, now thirteen crates, on `x86_64-unknown-none`; the `build-alone` and
+`storage-gate` jobs as written; the workspace's tests; and the three
+crates' tests together without default features, so with txscript
+multiplying through k256's `lincomb` (86 passed, none failed, the oracle
+differentials among them). Before this change, `cargo tree` of stake
+without default features showed `primeorder` with `std`, which is what
+kept the three off.
+
+Not done: the jobs ran locally, not in CI. Fees' rounding is not compared
+with dcrd through the oracle on its own: it is held to Go's vectors and
+to std's `f64::round`, which rounds half away from zero as Go's
+`math.Round` is documented to. `dcroxide-blockchain`, `dcroxide-mempool`
+and `dcroxide-mining` stay off the list, for the reasons the job's
+comment gives.

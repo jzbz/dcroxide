@@ -385,17 +385,20 @@ jobs:
     # `f64::log2` (`src/stdaddr.rs`, `fee_limit_exponent`). Any consensus
     # crate added here later takes dcroxide-dcrec the same way.
     #
-    # Not yet listed: blockchain, fees, gcs, mempool, mining and stake.
-    # Stake, gcs and fees no longer reach dcroxide-database once stake's
-    # default `storage` feature is off, which gcs and fees do (the
-    # storage-gate job). What keeps those three out now is txscript's
-    # default `precomputed-tables`: stake and gcs take txscript with its
-    # defaults, so the table's std comes back in for all three. Stake and
-    # gcs each need `default-features = false` on their dcroxide-txscript
-    # dependency plus a feature that turns `precomputed-tables` back on,
-    # as txscript does for dcrec; fees reaches txscript only through
-    # stake, and also needs a core-only form of its `f64::round`
-    # (`src/estimator.rs`). The other three reach
+    # stake and gcs take dcroxide-txscript in turn with
+    # `default-features = false` and a default `precomputed-tables`
+    # feature of their own that turns txscript's back on, and fees, which
+    # reaches txscript only through stake, has one that turns stake's on;
+    # the node's resolved packages and features are unchanged but for
+    # those features' names (ADR-0004's addendum of 2026-11-20).
+    # `--no-default-features` below also turns off stake's `storage`,
+    # which gcs and fees never take, so none of the three reaches
+    # dcroxide-database or redb here (the storage-gate job checks that
+    # graph). Fees rounds its estimate with a port of Go's `math.Round`
+    # on the double's bits (`src/round.rs`), since core has no
+    # `f64::round`.
+    #
+    # Not yet listed: blockchain, mempool and mining. They reach
     # dcroxide-database directly or through blockchain, and so build redb
     # with redb's default `std` feature; stake without `storage` does not
     # help them. So each needs `default-features = false` on its
@@ -415,7 +418,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Check the no_std crates on a no-OS target
         run: |
-          for c in base58 chaincfg chainhash crypto dcrec secp256k1-vartime standalone txscript uint256 wire; do
+          for c in base58 chaincfg chainhash crypto dcrec fees gcs secp256k1-vartime stake standalone txscript uint256 wire; do
             cargo check -p "dcroxide-$c" --no-default-features --target x86_64-unknown-none
           done
 

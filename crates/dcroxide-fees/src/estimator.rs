@@ -14,6 +14,8 @@ use alloc::vec::Vec;
 use dcroxide_chainhash::Hash;
 use dcroxide_stake::TxType;
 
+use crate::round::round;
+
 /// The default multiplier used to find the largest fee bucket,
 /// starting at the minimum fee (dcrd `DefaultMaxBucketFeeMultiplier`).
 pub const DEFAULT_MAX_BUCKET_FEE_MULTIPLIER: i64 = 100;
@@ -422,7 +424,8 @@ impl Estimator {
     pub fn estimate_fee(&self, target_confs: i32) -> Result<i64, EstimateFeeError> {
         let mut rate = self.estimate_median_fee(target_confs, 0.95)?;
 
-        rate = rate.round();
+        // Go's `math.Round`; `f64::round` is std's (see `round`).
+        rate = round(rate);
         if rate < self.bucket_fee_bounds[0] {
             // Prevent the public facing api from ever returning
             // something lower than the minimum fee.

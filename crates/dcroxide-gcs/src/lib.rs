@@ -10,11 +10,19 @@
 //!
 //! [`blockcf2`] classifies stake outputs through `dcroxide-stake`, which
 //! this crate takes without its `storage` feature, so it reaches neither
-//! `dcroxide-database` nor redb and has no features of its own: a wallet
-//! that links it for filter matching links no part of the node's store.
-//! dcrd's package reaches its `database` through `blockchain/stake`; see
-//! PARITY.md, the `gcs` row, and ADR-0004's second addendum of
-//! 2026-11-19.
+//! `dcroxide-database` nor redb: a wallet that links it for filter
+//! matching links no part of the node's store. dcrd's package reaches its
+//! `database` through `blockchain/stake`; see PARITY.md, the `gcs` row,
+//! and ADR-0004's second addendum of 2026-11-19.
+//!
+//! The crate's one feature, `precomputed-tables`, on by default, turns
+//! on the feature of that name of `dcroxide-txscript` and of
+//! `dcroxide-stake`, both taken without their defaults: k256's basepoint
+//! table for secret generator multiplication, which takes std with it.
+//! Nothing here signs, so the feature changes no result; it only passes
+//! the choice through. Without it the build needs no std, and CI's
+//! no_std job checks the crate that way on `x86_64-unknown-none`
+//! (ADR-0004's addendum of 2026-11-20).
 
 #![cfg_attr(not(test), no_std)]
 #![forbid(unsafe_code)]

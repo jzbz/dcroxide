@@ -571,7 +571,6 @@ dependencies = [
 name = "dcroxide-netsync"
 version = "0.1.0"
 dependencies = [
- "dcroxide-chaincfg",
  "dcroxide-chainhash",
  "dcroxide-containers",
  "dcroxide-peer",

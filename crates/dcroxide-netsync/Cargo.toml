@@ -9,7 +9,6 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-dcroxide-chaincfg = { path = "../dcroxide-chaincfg" }
 dcroxide-chainhash = { path = "../dcroxide-chainhash" }
 dcroxide-containers = { path = "../dcroxide-containers" }
 dcroxide-peer = { path = "../dcroxide-peer" }
@@ -18,6 +17,9 @@ dcroxide-wire = { path = "../dcroxide-wire" }
 
 [dev-dependencies]
 dcroxide-blockchain = { path = "../dcroxide-blockchain" }
+# Only `tests/netsync_vectors.rs` names it, for the networks' parameters;
+# the manager takes the few values it needs as plain fields.
+dcroxide-chaincfg = { path = "../dcroxide-chaincfg" }
 dcroxide-testutil = { path = "../dcroxide-testutil" }
 # The same crate as above, with its counter of hashed headers for the
 # test that the manager takes a block's hash from the chain's block type.

@@ -9,7 +9,7 @@ license.workspace = true
 repository.workspace = true
 
 [features]
-default = ["storage"]
+default = ["storage", "precomputed-tables"]
 # The `stakedb` module: dcrd's `Db*` functions and the entry points that
 # read and write the node's ticket database (`InitDatabaseState`,
 # `LoadBestNode`, `WriteConnectedBestNode`, `WriteDisconnectedBestNode`),
@@ -28,11 +28,21 @@ default = ["storage"]
 # `revoked_treap`, `from_database_state`); no public item outside
 # `stakedb` changes.
 storage = ["dep:dcroxide-database"]
+# dcroxide-txscript's default feature, and through it dcroxide-dcrec's:
+# k256's basepoint table for secret generator multiplication, which takes
+# std with it.  On by default, so every build that names this crate with
+# its defaults is unchanged; `--no-default-features` (CI's no_std check,
+# with `storage` off too) leaves the table's std out, with the same
+# results.  The crate signs nothing itself: the feature only passes the
+# choice through, as dcroxide-txscript does for dcroxide-dcrec.
+precomputed-tables = ["dcroxide-txscript/precomputed-tables"]
 
 [dependencies]
 dcroxide-chainhash = { path = "../dcroxide-chainhash" }
 dcroxide-database = { path = "../dcroxide-database", optional = true }
-dcroxide-txscript = { path = "../dcroxide-txscript" }
+# Default features off so a no_std build can leave out the table's std;
+# `precomputed-tables` above turns it back on.
+dcroxide-txscript = { path = "../dcroxide-txscript", default-features = false }
 dcroxide-uint256 = { path = "../dcroxide-uint256" }
 dcroxide-wire = { path = "../dcroxide-wire" }
 

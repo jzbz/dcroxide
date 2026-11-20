@@ -38,13 +38,19 @@
 //! that already passed the corresponding `Is*` check keep dcrd's exact
 //! panic-on-malformed-input behavior rather than adding new error paths.
 //!
-//! The `no_std` attribute below covers this crate's own code only.
-//! With `storage`, `stakedb` reaches the std-only `dcroxide-database`.
-//! Without it the crate's own code still needs only `core` and `alloc`,
-//! but it takes `dcroxide-txscript` with its default features, whose
-//! `precomputed-tables` brings std back in, so the CI no_std job does
-//! not list this crate in either configuration (its comment says what
-//! listing it takes).
+//! # The `precomputed-tables` feature, and no_std
+//!
+//! The crate's own code needs only `core` and `alloc`. It takes
+//! `dcroxide-txscript` without that crate's default features, and its own
+//! `precomputed-tables` feature, on by default, turns txscript's feature
+//! of that name back on: k256's basepoint table for secret generator
+//! multiplication, which takes std with it. The crate signs nothing, so
+//! the feature changes no result here; it only passes the choice
+//! through, as txscript does for `dcroxide-dcrec`. With both defaults
+//! off, `storage` and `precomputed-tables`, nothing in the build needs
+//! std, and CI's no_std job checks this crate that way on
+//! `x86_64-unknown-none`. With `storage`, `stakedb` reaches the std-only
+//! `dcroxide-database`.
 
 #![cfg_attr(not(test), no_std)]
 // This crate holds no hashed containers: every map and set in it is

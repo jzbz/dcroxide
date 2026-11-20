@@ -8,6 +8,18 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+default = ["precomputed-tables"]
+# dcroxide-stake's feature of the same name, and through it
+# dcroxide-txscript's and dcroxide-dcrec's: k256's basepoint table for
+# secret generator multiplication, which takes std with it.  On by
+# default, so every build that names this crate with its defaults is
+# unchanged; `--no-default-features` (CI's no_std check) leaves the
+# table's std out, with the same results.  The crate signs nothing: the
+# feature only passes the choice through, as dcroxide-txscript does for
+# dcroxide-dcrec.
+precomputed-tables = ["dcroxide-stake/precomputed-tables"]
+
 [dependencies]
 dcroxide-chainhash = { path = "../dcroxide-chainhash" }
 # Without its `storage` feature: the estimator takes only `TxType` and

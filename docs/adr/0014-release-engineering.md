@@ -454,7 +454,12 @@ on the tree with the move applied, and with 1.99.1 run on the same tree
   warning that fails no job: `dcroxide-netsync` lists `dcroxide-chaincfg`
   as a normal dependency, which only its tests use. Moving it to the
   dev-dependencies would drop it from `fuzz/Cargo.lock`, where netsync is
-  not a member, so it is left for a change of its own.
+  not a member, so it is left for a change of its own. *(Done since
+  2026-11-20, as the project owner decided that day: `dcroxide-chaincfg`
+  is one of netsync's dev-dependencies, which only
+  `tests/netsync_vectors.rs` uses, and its line under netsync in
+  `fuzz/Cargo.lock` is gone; building netsync and its tests prints no
+  warning.)*
 - **Tests on 1.100.0.** The workspace in the dev profile with fault
   injection required: 3,370 pass in 491 suites, 29 ignored. Again with
   overflow checks off as `test-wrapping` runs it, and that job's second

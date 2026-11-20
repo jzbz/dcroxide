@@ -8,6 +8,21 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+default = ["precomputed-tables"]
+# dcroxide-txscript's default feature, and through it dcroxide-dcrec's:
+# k256's basepoint table for secret generator multiplication, which takes
+# std with it.  On by default, so every build that names this crate with
+# its defaults is unchanged; `--no-default-features` (CI's no_std check)
+# leaves the table's std out, with the same results.  The crate signs
+# nothing itself: the feature only passes the choice through, to
+# txscript and to stake's feature of the same name, as dcroxide-txscript
+# does for dcroxide-dcrec.
+precomputed-tables = [
+    "dcroxide-stake/precomputed-tables",
+    "dcroxide-txscript/precomputed-tables",
+]
+
 [dependencies]
 dcroxide-chainhash = { path = "../dcroxide-chainhash" }
 # Without its `storage` feature: the filters call only stake
@@ -18,7 +33,9 @@ dcroxide-chainhash = { path = "../dcroxide-chainhash" }
 # defaults (dcroxide-node, dcroxide-mempool, dcroxide-mining,
 # dcroxide-indexers), so this changes nothing there.
 dcroxide-stake = { path = "../dcroxide-stake", default-features = false }
-dcroxide-txscript = { path = "../dcroxide-txscript" }
+# Default features off so a no_std build can leave out the table's std;
+# `precomputed-tables` above turns it back on.
+dcroxide-txscript = { path = "../dcroxide-txscript", default-features = false }
 dcroxide-wire = { path = "../dcroxide-wire" }
 siphasher = { version = "1", default-features = false }
 

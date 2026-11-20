@@ -16,6 +16,14 @@
 //! crate's `storage` feature, so this crate reaches neither
 //! `dcroxide-database` nor redb (ADR-0004's second addendum of
 //! 2026-11-19).
+//!
+//! The crate's one feature, `precomputed-tables`, on by default, turns on
+//! `dcroxide-stake`'s feature of that name, and through it k256's
+//! basepoint table, which takes std with it; nothing here signs, so it
+//! changes no result. Without it the build needs no std, and CI's no_std
+//! job checks the crate that way on `x86_64-unknown-none`. The estimate's
+//! rounding is Go's `math.Round` ported to the double's bits, since core
+//! has no `f64::round` (ADR-0004's addendum of 2026-11-20).
 
 #![cfg_attr(not(test), no_std)]
 #![forbid(unsafe_code)]
@@ -30,6 +38,7 @@
 extern crate alloc;
 
 mod estimator;
+mod round;
 
 pub use estimator::{
     DEFAULT_FEE_RATE_STEP, DEFAULT_MAX_BUCKET_FEE_MULTIPLIER, DEFAULT_MAX_CONFIRMATIONS,
