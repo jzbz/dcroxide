@@ -6,7 +6,9 @@
 //! file from a synced data directory; `replay` measures.
 //!
 //! The tool exists so every optimization piece lands with a number:
-//! run `replay` on the same corpus before and after a change.
+//! run `replay` on the same corpus before and after a change.  `dcrec`
+//! (the `dcrec` module) is a micro benchmark of dcroxide-dcrec's
+//! operations on secrets against dcrd's, through the oracle.
 
 use std::io::{BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -23,6 +25,8 @@ use dcroxide_indexers::{
     CONNECT_NTFN, ChainQueryer, ExistsAddrIndex, IndexNtfn, IndexSubscriber, Interrupt, TxIndex,
 };
 use dcroxide_wire::{BlockHeader, MsgBlock};
+
+mod dcrec;
 
 /// The command-line help.
 const HELP: &str = "\
@@ -226,6 +230,31 @@ Usage:
       first arm's.  Prefer that to the medians: disjoint ranges are a
       claim about every observation, where a median difference smaller
       than the drift is a claim about nothing.
+
+  dcroxide-bench dcrec [--oracle <path>|none] [--cases <n>] [--rounds <n>]
+                       [--seed <hex>] [--start rust|go] [--ops <a,b,...>]
+                       [--out <file>]
+      Time dcroxide-dcrec's operations on secrets against dcrd's: the
+      generator's multiplication by a secret through k256's basepoint
+      table (generator_table) and through its lincomb (generator_lincomb,
+      what dcrec builds without default features), the public key, the
+      private key's range check, ECDSA and EC-Schnorr-DCRv0 signing, the
+      RFC 6979 nonce, HD derivation's private child sum, and Ed25519's
+      public key and signing (ed25519_sign_known_key: with the public
+      key computed ahead, as dcrd's key carries it).  dcrd's side is the
+      oracle's secp_bench, timed in the oracle's process; --oracle
+      defaults to DCROXIDE_ORACLE_BIN, and none runs the Rust side alone.
+
+      <cases> cases (default 8192) are drawn from --seed (default fixed).
+      One warm-up pass of every op, then <rounds> rounds (default 5); in
+      each, every op runs once on each side, the side going first
+      alternating by op and by round, --start go reversing the pattern.
+      Every pass's outputs are folded into a digest on both sides, and a
+      difference stops the run.  The oracle inherits this process's CPU
+      affinity, so run it under taskset to pin both sides.  --out writes
+      one JSON line per pair.  The summary gives each op's median and
+      least time per operation over the rounds, and the ratio of the
+      medians.
 
   --net is one of mainnet, testnet, simnet, regnet (default mainnet).
 ";
@@ -1724,6 +1753,11 @@ fn main() -> std::process::ExitCode {
             ],
         )
         .and_then(|a| cmd_sweep(&a)),
+        "dcrec" => Args::parse(
+            rest,
+            &["cases", "rounds", "seed", "start", "ops", "out", "oracle"],
+        )
+        .and_then(|a| dcrec::cmd_dcrec(&a)),
         "indexcatchup" => Args::parse(
             rest,
             &["workdir", "net", "txindex", "addrindex", "metacache"],

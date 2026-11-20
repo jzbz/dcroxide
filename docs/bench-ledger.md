@@ -8457,3 +8457,183 @@ versions, the CPU's name) and `machine.txt`; `bench-run-1/` and
 `bench-run-2/`, the two disturbed sessions; the program's `main.rs`, the
 three arms' `Cargo.toml`, the Go program's `main.go`, `go.mod` and
 `go.sum`, and `analyze.py`.
+
+## dcrec's operations on secrets against dcrd's, in tree (2026-11-19)
+
+The section above ran an out-of-tree program. ADR-0017's third addendum
+of 2026-11-19 moves the measurement into the tree, beside the timing test
+of its second addendum, for the same operations: `dcroxide-bench dcrec`
+(`crates/dcroxide-bench/src/dcrec.rs`), with dcrd's side in the oracle's
+`secp_bench` command (`tools/oracle/bench.go`). It ran on m3 on
+2026-11-19, between 17:53 and 18:14.
+
+**The program.** Each process draws 8,192 cases from one fixed seed with
+SplitMix64: a private key and an HD tweak, each drawn again until it lies
+in [1, N-1], a 32-byte hash (Ed25519's message too), an HD parent of any
+32 bytes and an Ed25519 seed. The cases go to the oracle as they are, so
+both sides compute on the same bytes. For each operation each side
+prepares its inputs untimed (keys parsed, scalars decoded), times one pass
+over every case, keeping each result, and serializes the results untimed.
+Both fold the serialization into a 64-bit FNV-1a digest, and the process
+stops on any difference. Every pass of every operation in all 24
+processes below gave dcrd's digest: dcrec's keys, signatures, nonces and
+sums equal dcrd's byte for byte over these cases, and the two generator
+rows equal each other. dcrd's side is timed with `time.Now` inside the
+oracle's process, so neither side's time includes the pipe. The rows and
+their dcrd counterparts:
+
+| row | dcrec | dcrd |
+|---|---|---|
+| `generator_table` | k256's `mul_by_generator`, the basepoint table's walk (dcrec's `mul_secret_by_generator` with its default feature), projective | `ScalarBaseMultNonConst`, Jacobian |
+| `generator_lincomb` | k256's `GENERATOR * k`, `lincomb` (the same function without the feature) | the same |
+| `public_key` | `PrivateKey::public_key` | `PrivateKey.PubKey` |
+| `key_from_bytes` | `PrivateKey::from_bytes` (refuses 0 and N or more) | `PrivKeyFromBytes` (reduces modulo N, refuses nothing) |
+| `ecdsa_sign` | `ecdsa::sign` | `ecdsa.Sign` |
+| `schnorr_sign` | `schnorr::sign` | `schnorr.Sign` |
+| `rfc6979_nonce` | `nonce_rfc6979`, no extra data or version | `NonceRFC6979` |
+| `hd_private_child` | `add_private_tweak` | hdkeychain's private child sum as the oracle's `privkey_tweak_add` composes it: `SetByteSlice` twice, the overflow and zero checks, `ModNScalar.Add` |
+| `ed25519_public_key` | `edwards::SecretKey::from_seed` and `public_key` | `edwards.PrivKeyFromSecret` |
+| `ed25519_sign` | `edwards::sign` | `edwards.Sign`, the key from `PrivKeyFromSecret` |
+| `ed25519_sign_known_key` | `edwards::sign_with_pub_key_bytes`, the public key computed untimed | the same as `ed25519_sign` |
+
+dcrd's generator multiplication, in `PubKey` and both signers, is its
+variable-time `ScalarBaseMultNonConst` (its name, and docs/PARITY.md's
+EC-Schnorr-DCRv0 row); dcrec's is constant time. The comparison is of
+what each library does, not of like algorithms. `dcroxide-bench` takes
+dcrec with its default feature, and Cargo unifies it into every k256 of
+the workspace build, so dcrec's no-table build cannot be linked into it;
+the `generator_lincomb` row times that build's multiplication directly,
+and what the other rows would cost without the table is an inference from
+it, not a measurement.
+
+**The build.** `cargo build --release --locked -p dcroxide-bench`, Rust
+1.100.0 at the workspace's release profile (thin LTO, one codegen unit,
+`panic = "abort"`, overflow checks off), at the code of the commit that
+adds this section, on `8797e39`; `k256` 0.14.0 and `primeorder` 0.14.0 as
+locked. The oracle, `go build` of `tools/oracle` with Go 1.27.3, the
+reference Go of ADR-0001's addendum, links `dcrec/secp256k1/v4` and
+`dcrec/edwards/v2` at the parity pin (v4.4.2-0.20261106175134-46e9df48109a,
+v2.0.5-0.20261106175134-46e9df48109a). SHA-256 of the binaries begin
+`681b7705a5ea` (dcroxide-bench) and `511e861a3692` (oracle).
+
+**Order.** A process makes one warm-up pass of every operation on each
+side, which builds k256's table and dcrd's, then five rounds; in each,
+every operation runs once on each side, the side going first alternating
+from operation to operation and round to round, and the process's
+`--start` reversing the pattern. Eight processes a session, `--start`
+alternating, each pinned with `taskset -c 3`; the oracle, a child,
+inherits the pin, and each side waits on the pipe while the other runs.
+Every operation ran 20 pairs Rust first and 20 Go first in each session.
+Three sessions ran back to back. Other agents' builds and tests kept the
+machine busy throughout, and nothing kept them off processor 3. In the
+first session (17:53 to 18:00) the 1-minute load average stood at 22.7 to
+54.6 as its processes started, and a process's median over the least
+process median of its operation and side reached 3.25; it is disturbed.
+The second (18:01 to 18:06) reached 1.66, at load averages of 9.0 to
+19.5. The third, 18:07 to 18:12, is the record: load averages of 9.8 to
+15.6 as its processes started, one-second samples of `/proc/stat` just
+before each putting 2.4 to 15.8 CPUs busy (median 4.3), and that spread
+at most 1.28 (`key_from_bytes` on Go's side; `generator_table`'s
+sides 1.13 and 1.09, `key_from_bytes`'s Rust side 1.09, every other
+1.07 or less). Transparent huge pages were at
+`always`, with the `powersave` governor under `amd_pstate` in active mode.
+
+**Time per operation**, third session, in ns: the median over the eight
+processes of each process's median over its five rounds, with their
+range; Rust / Go is the median over the 40 pairs of each pair's ratio,
+the two passes run back to back, with its quartiles. The first two
+sessions' pair medians agree with the third's within 0.035 for every row
+but `key_from_bytes` (0.771, 0.746 and 0.711).
+
+| operation | dcrec | dcrd | Rust / Go (quartiles) |
+|---|---:|---:|---:|
+| `generator_table` | 15,599.5 (15,456.1–16,900.8) | 16,012.2 (15,780.4–17,767.1) | 0.976 (0.961–0.982) |
+| `generator_lincomb` | 33,985.0 (33,382.3–34,872.1) | 16,111.6 (15,744.1–16,502.1) | 2.121 (2.108–2.132) |
+| `public_key` | 19,885.6 (19,664.5–20,258.9) | 23,222.2 (22,865.8–23,724.9) | 0.855 (0.850–0.861) |
+| `key_from_bytes` | 17.87 (17.24–18.84) | 24.47 (23.34–29.87) | 0.711 (0.615–0.790) |
+| `ecdsa_sign` | 25,005.6 (24,694.2–25,457.6) | 26,894.3 (26,069.0–27,275.8) | 0.937 (0.926–0.946) |
+| `schnorr_sign` | 21,118.4 (20,927.6–21,444.2) | 25,552.1 (25,006.1–25,859.4) | 0.834 (0.825–0.843) |
+| `rfc6979_nonce` | 905.9 (889.9–930.8) | 1,362.9 (1,329.7–1,414.6) | 0.668 (0.650–0.687) |
+| `hd_private_child` | 72.18 (70.95–73.27) | 60.94 (60.15–62.47) | 1.186 (1.168–1.207) |
+| `ed25519_public_key` | 12,324.0 (12,233.9–12,421.8) | 77,511.1 (76,896.2–79,343.7) | 0.159 (0.156–0.160) |
+| `ed25519_sign` | 25,090.5 (25,002.0–25,582.0) | 31,374.6 (31,037.5–32,083.9) | 0.804 (0.797–0.810) |
+| `ed25519_sign_known_key` | 12,882.4 (12,845.8–13,098.8) | 31,466.8 (30,868.7–32,861.0) | 0.411 (0.405–0.414) |
+
+The least passes of the session, Rust's over Go's, gave the same ratios
+within 0.02, but for `key_from_bytes` (0.881). The two fastest
+rows are a pass of 0.15 to 0.6 ms each, where one interruption moves a
+pass by a sizeable fraction; their quartiles are wide accordingly.
+
+**The table copy.** `k256` 0.14.0's `mul_by_generator` starts with `let
+table = *BASEPOINT_TABLE;` (`src/arithmetic/mul.rs:184`). In this build it
+compiles to a call of `memcpy` of 0x7bc0 bytes, 31,680, the 33 tables of
+eight 120-byte points, onto the stack, on every call (read from the
+disassembly of `mul_by_generator` in the binary above). To price it, a
+scratch copy of the tree, never the repository, patched `k256` through
+`[patch.crates-io]` with the one change `let table = &*BASEPOINT_TABLE;`
+at `:184` and `:211`; that binary (SHA-256 `4a88031f4e80`) has no such
+call in `mul_by_generator`, and the two `memcpy`s of that size left are in
+the table's one-time initialisation. The two builds ran Rust alone, four
+operations, seven rounds a process, processes alternating copy, borrow,
+borrow, copy and so on, pinned to processor 3, in three runs. The third,
+eight processes an arm from 18:12 to 18:14 at load averages of 9.2 to
+30.0 falling, with 2.0 to 14.6 CPUs busy (median 4.1), is the record; the
+first (five an arm) agrees with it, and the second ran at 8 to 20 CPUs
+busy and is disturbed. The median over processes of each process's
+median, in ns:
+
+| operation | copy | borrow | difference | borrow medians below the least copy median |
+|---|---:|---:|---:|---|
+| `generator_table` | 15,520.8 | 15,088.1 | -432.7 (2.8%) | 7 of 8 |
+| `public_key` | 19,818.3 | 19,431.3 | -387.0 | 7 of 8 |
+| `ecdsa_sign` | 24,914.2 | 24,503.0 | -411.2 | 5 of 8 |
+| `schnorr_sign` | 21,159.9 | 20,677.6 | -482.3 | 6 of 8 |
+
+The first run's differences were -347 to -697 ns, and the least passes of
+all three runs -194 to -479 ns. So the copy costs about 0.4 µs, near 3% of
+the table walk and 2% of a signature, on this machine. It is not a timing
+leak: the copy does not depend on the scalar.
+
+**What it shows.**
+
+- With the table, dcrec signs in 0.94 (ECDSA) and 0.83 (EC-Schnorr-DCRv0)
+  times dcrd's time and derives the public key in 0.86 times, inside the
+  wallet's criterion of 1.15 that the section above already met; these
+  agree with that section's 0.937, 0.846 and 0.857 at go1.27.4 to within
+  0.012. Its generator multiplication alone costs 0.98 times dcrd's
+  variable-time one.
+- Without the table the generator multiplication costs 2.12 times dcrd's,
+  about 18.4 µs more than with it, which added to the rows above puts
+  no-table signing at 1.55 (Schnorr) to 1.61 (ECDSA) times dcrd's
+  (inference; the section above measured 1.57 to 1.63).
+- Ed25519 signing derives the public key again from the seed on every
+  signature (`edwards::sign` calls `public_key`), where dcrd's key carries
+  it: 25.1 µs against 12.9 µs with the key supplied. Even so it is 0.80
+  times dcrd's. dcrd's own `PrivKeyFromSecret` costs 6.3 times dcrec's
+  public key.
+- HD derivation's private child sum is the one row slower than dcrd's,
+  1.19 times, by about 11 ns: `add_private_tweak` checks Il's range, reduces
+  the parent, adds, and then builds a `k256::SecretKey` from the sum,
+  which checks its range again, with `Zeroizing` wipes on the way, where
+  dcrd's composition stops at the sum. Which of those costs the 11 ns was
+  not measured.
+- `k256`'s per-call copy of its table costs about 0.4 µs a multiplication.
+
+**What it does not show.** Anything about constant time: that is the
+timing test's (ADR-0017's second addendum of this date), and a fast
+operation is not a constant-time one. Nor the no-table build's signing,
+measured only through its multiplication here. One machine, one thread,
+one compiler and one Go; a machine kept busy by other work, against which
+the pin, the alternation and the medians over processes are the guards,
+not a quiet machine. dcrd's times are its library's in the oracle's
+process, Go's garbage collector included, with whatever that process's
+runtime threads do on the same processor. No wallet or node workload was
+run, and the arm64 build was not measured.
+
+Raw: `session-1/`, `session-2/` and `session-3/`, each with every
+process's summary (`<n>-<start>.txt`), JSON lines (`.jsonl`) and progress
+(`.err`), `state.txt` (each process's start time, load average and busy
+CPUs) and `build.txt` (the binaries' hashes, the compiler's and Go's
+versions, the CPU's name, the huge-page and governor settings);
+`copy-1/` to `copy-3/`, the same for the table-copy runs; `bench.sh`,
+`copy.sh`, `busy.py` and `analyze.py`.

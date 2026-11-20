@@ -598,7 +598,11 @@ work). Currently implemented:
   where a network sync skips connect validation up to the
   assume-valid block — reporting throughput at a fixed block
   interval, so an optimization is measured on the same blocks before
-  and after
+  and after; and `dcrec`, a micro benchmark of `dcroxide-dcrec`'s
+  operations on secrets (public keys, signing, the RFC 6979 nonce, HD
+  derivation's private child, Ed25519) against dcrd's through the
+  oracle, which checks that both sides computed the same outputs on
+  every pass
 - `tools/oracle` — Go shim linking dcrd's own packages (pinned to the
   parity pin, master `46e9df48`: each dcrd module at that commit's
   pseudo-version or at a tag whose source is byte-identical to it, as the

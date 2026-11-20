@@ -213,7 +213,7 @@ pub fn parse_signature(sig: &[u8]) -> Result<Signature, Error> {
 /// `schnorrSign`); fails with [`Error::SchnorrHashValue`] when the challenge
 /// overflows, which the public [`sign`] retries with the next nonce.  The
 /// nonce scalar is wiped on both paths, as dcrd zeroes `k`.
-fn sign_with_nonce(
+pub(crate) fn sign_with_nonce(
     priv_scalar: &Scalar,
     nonce: &[u8; 32],
     hash: &[u8; 32],

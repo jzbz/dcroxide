@@ -328,6 +328,13 @@
 //	                     "supported_versions", "extensions"}}} with
 //	                     "go_version": runtime.Version(); each of the four
 //	                     TLS commands refuses a field it does not name
+//	secp_bench         → data is name_len(1) || op name || one or more
+//	                     160-byte cases (key || hash || tweak || parent ||
+//	                     seed, 32 bytes each); times dcrd's op over every
+//	                     case once, in process, for dcroxide-bench dcrec
+//	                     (bench.go has the ops); {"detail": {"ns": elapsed
+//	                     nanoseconds, "digest": "<hex 64-bit FNV-1a of the
+//	                     outputs, concatenated>"}}
 //	build_info         → takes no data; {"go_version": runtime.Version(),
 //	                      "modules": {"<module path>": "<version>"}} for the
 //	                     secp256k1/v4 and edwards/v2 modules linked in
@@ -2171,6 +2178,10 @@ func handle(req request) response {
 	case "tls_listen_result":
 		// What that server saw, once its connection is done.
 		return tlsListenResult(data)
+
+	case "secp_bench":
+		// dcrd's side of dcroxide-bench's dcrec micro benchmark (bench.go).
+		return secpBench(data)
 
 	case "build_info":
 		// What a recorded comparison ran against: the toolchain, and the

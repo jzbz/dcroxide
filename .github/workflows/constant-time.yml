@@ -18,16 +18,37 @@ name: Constant time
 # switches DIT on for a dispatch that asks for it (.github/dit-on.rs), and
 # this file.
 #
+# dcroxide-dcrec's timing check (ADR-0017's second addendum of
+# 2026-11-19), in tree in crates/dcroxide-dcrec/src/ct_check.rs on the
+# shared harness in crates/dcroxide-testutil/src/ct.rs, on every entry
+# point of dcrec that computes on a secret: the generator's
+# multiplication by a secret
+# scalar, the public key from a private key, ECDSA and EC-Schnorr-DCRv0
+# signing by the key and by the nonce, the RFC 6979 nonce, the key's
+# range check, HD derivation's private child by Il and by the parent, and
+# Ed25519's public key and signing, with a positive control (k256's
+# variable-time multiply) that must be found. It is the second job, apart
+# from the first, since dcrec times twice, with the precomputed basepoint
+# table and without it, and has no backends to force. Its paths are the
+# crate, dcroxide-secp256k1-vartime (the curve check every public key
+# from a private key passes, inside the timed region) and, with the
+# first job's, dcroxide-crypto (BLAKE-256, in Schnorr signing),
+# dcroxide-testutil (the harness), the lock, the compiler, the release
+# profile and this file. Either job's paths run both jobs.
+#
 # A dispatch can narrow the run, to time one target for longer on the
-# legs where it failed. Its inputs: a target, by its test name in
-# ct_check (empty runs every target, as pushes and nightlies do); the
-# seconds each target runs for (60 when empty); the legs, all four by
-# default, where a leg left out takes no runner; and DIT, off by default,
-# which on the arm64 legs runs the timed targets with PSTATE.DIT set and
-# on the x86_64 legs changes nothing. Pushes, pull requests and nightlies
-# give no inputs and run as they always have. The inputs reach the shell
-# through the environment alone and are checked before anything else
-# runs.
+# legs where it failed. Its inputs: the suite, both jobs by default, or
+# one of them; a target, by its test name in that suite's ct_check (empty
+# runs every target, as pushes and nightlies do, and a target needs one
+# suite picked); the seconds each target runs for (60 when empty); the
+# legs, all four by default, where a leg left out takes no runner; and
+# DIT, off by default, which on the arm64 legs runs the timed targets
+# with PSTATE.DIT set and on the x86_64 legs changes nothing. dcrec's job
+# takes only the architecture from the legs, having no -soft build: an
+# x86_64 leg picks x86_64, an arm64 leg arm64, and all both. Pushes, pull
+# requests and nightlies give no inputs and run as they always have. The
+# inputs reach the shell through the environment alone and are checked
+# before anything else runs.
 on:
   push:
     branches: [master]
@@ -35,6 +56,8 @@ on:
       - "crates/dcroxide-tlscrypto/**"
       - "crates/dcroxide-testutil/**"
       - "crates/dcroxide-crypto/**"
+      - "crates/dcroxide-dcrec/**"
+      - "crates/dcroxide-secp256k1-vartime/**"
       - "Cargo.lock"
       - "Cargo.toml"
       - "rust-toolchain.toml"
@@ -46,6 +69,8 @@ on:
       - "crates/dcroxide-tlscrypto/**"
       - "crates/dcroxide-testutil/**"
       - "crates/dcroxide-crypto/**"
+      - "crates/dcroxide-dcrec/**"
+      - "crates/dcroxide-secp256k1-vartime/**"
       - "Cargo.lock"
       - "Cargo.toml"
       - "rust-toolchain.toml"
@@ -56,8 +81,16 @@ on:
     - cron: "0 3 * * *"
   workflow_dispatch:
     inputs:
+      suite:
+        description: "The suite: both, or dcroxide-tlscrypto's or dcroxide-dcrec's alone; a target needs one"
+        type: choice
+        default: both
+        options:
+          - both
+          - tlscrypto
+          - dcrec
       target:
-        description: "One target by its test name, such as ecdh_p384_complete, run alone (the positive control runs only if it is the one named); empty runs every target"
+        description: "One target by its test name in the suite picked, such as ecdh_p384_complete or public_key, run alone (the positive control runs only if it is the one named); empty runs every target"
         type: string
         default: ""
       seconds:
@@ -90,6 +123,8 @@ env:
 jobs:
   constant-time:
     name: constant time (${{ matrix.leg }})
+    # dcroxide-tlscrypto's targets, unless a dispatch picks dcrec's alone.
+    if: inputs.suite != 'dcrec'
     # 27 targets, each running for its budget: at 10 s, about 5 minutes
     # after the build; at 60 s, nightly and on dispatch, about 27. A
     # dispatch's seconds are capped so that the same hour covers the run:
@@ -143,6 +178,8 @@ jobs:
       DCROXIDE_CT_SECONDS: ${{ github.event_name == 'workflow_dispatch' && (inputs.seconds || '60') || github.event_name == 'schedule' && '60' || '10' }}
       # The one target a dispatch picks, or empty for every target.
       CT_TARGET: ${{ inputs.target }}
+      # The suite a dispatch picks, which with a target must be one.
+      CT_SUITE: ${{ inputs.suite }}
       # "on" on an arm64 leg of a dispatch that asks for DIT, and "off"
       # everywhere else, whatever the input holds.
       CT_DIT: ${{ startsWith(matrix.leg, 'arm64') && inputs.dit == 'on' && 'on' || 'off' }}
@@ -162,6 +199,10 @@ jobs:
           export LC_ALL=C
           if [ -n "$CT_TARGET" ] && ! [[ $CT_TARGET =~ ^[a-z][a-z0-9_]{0,63}$ ]]; then
             echo "::error::target is not a test name such as ecdh_p384_complete"
+            exit 1
+          fi
+          if [ -n "$CT_TARGET" ] && [ "$CT_SUITE" = both ]; then
+            echo "::error::a target needs the suite it belongs to, tlscrypto or dcrec"
             exit 1
           fi
           if [ -n "$CT_TARGET" ]; then cap=1800; else cap=90; fi
@@ -330,6 +371,178 @@ jobs:
               echo "### ${{ matrix.leg }}, ${CT_TARGET} alone, ${DCROXIDE_CT_SECONDS} s${dit}"
             else
               echo "### ${{ matrix.leg }}, ${DCROXIDE_CT_SECONDS} s a target${dit}"
+            fi
+            echo
+            echo "| target | t | effect | ns/op | difference | class | test | fixed | random | samples | batch | verdict |"
+            echo "|---|---|---|---|---|---|---|---|---|---|---|---|"
+            if [ -f "$RUNNER_TEMP/ct-check.log" ]; then
+              sed -n 's/.*ct_check row //p' "$RUNNER_TEMP/ct-check.log"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  dcrec:
+    name: constant time, dcrec (${{ matrix.arch }}, ${{ matrix.tables }})
+    # dcroxide-dcrec's targets, unless a dispatch picks tlscrypto's alone.
+    if: inputs.suite != 'tlscrypto'
+    # 13 targets, each running for its budget, twice per architecture (the
+    # matrix's two builds): at 10 s, about 2.5 minutes a job after the
+    # build; at 60 s, nightly and on dispatch, about 14. A dispatch's cap of
+    # 90 s for every target takes about 20 minutes, and 1800 s for one
+    # about 31, within the hour.
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        # The architectures the legs name: all of them unless a dispatch
+        # picks some, x86_64 for any x86_64 leg and arm64 for any arm64 one.
+        # dcrec has no backend to force, so a -soft leg is its plain one.
+        arch: >-
+          ${{ fromJSON(
+          contains(inputs.legs, 'x86_64') && '["x86_64"]'
+          || contains(inputs.legs, 'arm64') && '["arm64"]'
+          || '["x86_64","arm64"]') }}
+        # With the precomputed basepoint table, dcrec's default, and
+        # without it, where k256 multiplies by `lincomb`: the two paths a
+        # secret scalar can take to the generator's multiple.
+        tables: [table, no-table]
+    runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
+    env:
+      # The budget, as the first job sets it: 10 s a target on pushes and
+      # pull requests, 60 s nightly and on dispatch unless it says. At
+      # 10 s the harness takes about 600,000 samples of the 15 µs
+      # multiply on an x86_64 desktop (about 485,000 at 19 µs on a busy
+      # one), and 230,000 to 400,000 of a 25 to 40 µs signature. dcrec's
+      # copy of the harness gives the random class and each fixed class
+      # the same share, so each of the multiply's 25 classes (24 fixed,
+      # the placebo among them) gets about 24,000 samples: a comparison
+      # of 24,000 against 24,000 is as precise as the 12,500 against
+      # 300,000 of half the samples random, and a neighbour's bursts on
+      # the pinned processor cannot lean a small class against a large
+      # one. The planted leaks of ADR-0017's second addendum of
+      # 2026-11-19 measure what that finds, and the nightly's six times
+      # as many samples see differences about 2.4 times smaller. The
+      # control's |t| follows a run's load more than its budget: about 50
+      # to 2,700 at 10 s on that desktop.
+      DCROXIDE_CT_SECONDS: ${{ github.event_name == 'workflow_dispatch' && (inputs.seconds || '60') || github.event_name == 'schedule' && '60' || '10' }}
+      CT_TARGET: ${{ inputs.target }}
+      CT_SUITE: ${{ inputs.suite }}
+      CT_DIT: ${{ matrix.arch == 'arm64' && inputs.dit == 'on' && 'on' || 'off' }}
+      # dcrec's default features, or none: `precomputed-tables` is its one
+      # feature.
+      CT_FEATURES: ${{ matrix.tables == 'no-table' && '--no-default-features' || '' }}
+    steps:
+      # The first job's check, the same patterns and caps.
+      - name: Check the dispatch's inputs
+        id: inputs
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          export LC_ALL=C
+          if [ -n "$CT_TARGET" ] && ! [[ $CT_TARGET =~ ^[a-z][a-z0-9_]{0,63}$ ]]; then
+            echo "::error::target is not a test name such as public_key"
+            exit 1
+          fi
+          if [ -n "$CT_TARGET" ] && [ "$CT_SUITE" = both ]; then
+            echo "::error::a target needs the suite it belongs to, tlscrypto or dcrec"
+            exit 1
+          fi
+          if [ -n "$CT_TARGET" ]; then cap=1800; else cap=90; fi
+          if ! [[ $DCROXIDE_CT_SECONDS =~ ^[1-9][0-9]{0,4}$ ]] || [ "$DCROXIDE_CT_SECONDS" -gt "$cap" ]; then
+            echo "::error::seconds is not a whole number from 1 to $cap"
+            exit 1
+          fi
+      - uses: actions/checkout@v7
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: dcrec-${{ matrix.arch }}-${{ matrix.tables }}
+      # Built first, so that the timed step compiles nothing. CT_FEATURES
+      # is one flag or none, so it is left unquoted.
+      - name: Build the check
+        run: cargo test -p dcroxide-dcrec --release --lib --locked $CT_FEATURES --no-run
+      - name: Build the DIT switch
+        if: env.CT_DIT == 'on'
+        run: rustc --edition 2024 --crate-type cdylib -o "$RUNNER_TEMP/libdit-on.so" .github/dit-on.rs
+      # The machine, as the first job describes it, without the DIT probe,
+      # which that job's arm64 legs already run on the same runner image.
+      - name: Describe the processor
+        continue-on-error: true
+        run: |
+          lscpu
+          uname -r
+          nproc
+          grep -E '^(CPU (implementer|architecture|variant|part|revision)|vendor_id|cpu family|model|model name|stepping|microcode)[[:space:]]*:' /proc/cpuinfo | sort | uniq -c
+      # One target at a time, in release mode, as the first job runs its
+      # own, by the same rule: a target fails when a fixed class's |t| is
+      # above 10 on a difference of 1 ns an operation or more, or on too
+      # few samples, and the control fails unless its leak fails so. There
+      # is no known report here. Each target's row names the
+      # multiplication path, "(table)" or "(no table)".
+      #
+      # Pinned to the runner's last processor with taskset: the test binary
+      # and its threads may run there only, so the scheduler never moves a
+      # timed operation from one processor to another mid-sample, and each
+      # target's trace line "ct_check run |" ends with the processors the
+      # thread was allowed, one when the pin held. The pin does not keep
+      # other work off that processor: whatever else the scheduler puts
+      # there lands in the timed samples, as rare slow outliers. What
+      # keeps those from failing a class is the harness: it interleaves
+      # the classes sample by sample, so an outlier falls on a class by
+      # chance, and gives every class an equal share, so a class that
+      # happens to get none of them does not lean far from the random
+      # class (crates/dcroxide-testutil/src/ct.rs says why, and ADR-0017's
+      # second addendum of 2026-11-19 gives the runs that showed it). The
+      # crops do not guard against them, since the uncropped test and the
+      # crops whose threshold is the warm-up's slowest times keep them
+      # and still count.
+      #
+      # A dispatch's target is looked up first, as in the first job, in
+      # dcrec's own list.
+      - name: Time the targets
+        run: |
+          set -o pipefail
+          if [ "$CT_DIT" = on ]; then
+            export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER="env LD_PRELOAD=$RUNNER_TEMP/libdit-on.so"
+          fi
+          if [ -n "$CT_TARGET" ]; then
+            filter="ct_check::$CT_TARGET"
+            exact=(--exact)
+            listed=$(cargo test -p dcroxide-dcrec --release --lib --locked $CT_FEATURES "$filter" -- \
+              --ignored --list --exact)
+            if ! grep -qFx "$filter: test" <<< "$listed"; then
+              echo "::error::no dcrec ct_check target is named $CT_TARGET"
+              exit 1
+            fi
+          else
+            filter=ct_check
+            exact=()
+          fi
+          cpu=$(( $(nproc) - 1 ))
+          taskset -c "$cpu" cargo test -p dcroxide-dcrec --release --lib --locked $CT_FEATURES "$filter" -- \
+            --ignored --test-threads=1 --nocapture "${exact[@]}" 2>&1 | tee "$RUNNER_TEMP/ct-check.log"
+          if [ "$CT_DIT" = on ] && ! { grep -q 'ct_check dit | PSTATE.DIT read [01] at load, 1 once set, 1 in a new thread' "$RUNNER_TEMP/ct-check.log" \
+              && grep -q 'ct_check dit | PSTATE.DIT read 1 at exit' "$RUNNER_TEMP/ct-check.log"; }; then
+            echo "::error::DIT was asked for, and the log does not show it on"
+            exit 1
+          fi
+      # The first job's summary, its columns the same, under a heading
+      # that names the build.
+      - name: Summarize the run
+        if: always() && steps.inputs.outcome != 'failure'
+        run: |
+          dit=
+          if [ "$CT_DIT" = on ]; then
+            if grep -q 'ct_check dit | PSTATE.DIT read [01] at load, 1 once set, 1 in a new thread' "$RUNNER_TEMP/ct-check.log" 2> /dev/null \
+              && grep -q 'ct_check dit | PSTATE.DIT read 1 at exit' "$RUNNER_TEMP/ct-check.log"; then
+              dit=", DIT on"
+            else
+              dit=", DIT asked for, not shown on"
+            fi
+          fi
+          {
+            if [ -n "$CT_TARGET" ]; then
+              echo "### dcrec, ${{ matrix.arch }}, ${{ matrix.tables }}, ${CT_TARGET} alone, ${DCROXIDE_CT_SECONDS} s${dit}"
+            else
+              echo "### dcrec, ${{ matrix.arch }}, ${{ matrix.tables }}, ${DCROXIDE_CT_SECONDS} s a target${dit}"
             fi
             echo
             echo "| target | t | effect | ns/op | difference | class | test | fixed | random | samples | batch | verdict |"

@@ -7,11 +7,13 @@
 //! crate's differential tests share one implementation, the power-loss
 //! storage rig the crash suites cut power under ([`powerloss`]), the gate
 //! that holds a metadata commit running on a thread of its own
-//! ([`gate`]), and the TLS interop tests' harness around the oracle's TLS
-//! commands ([`tls_interop`]).
+//! ([`gate`]), the TLS interop tests' harness around the oracle's TLS
+//! commands ([`tls_interop`]), and dudect's timing test for code that
+//! handles secrets ([`ct`]).
 //!
 //! This crate is a dev-dependency only and is never published.
 
+pub mod ct;
 pub mod gate;
 pub mod powerloss;
 pub mod tls_interop;

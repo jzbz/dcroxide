@@ -399,8 +399,11 @@ dependencies = [
  "dcroxide-chainhash",
  "dcroxide-crypto",
  "dcroxide-database",
+ "dcroxide-dcrec",
  "dcroxide-indexers",
+ "dcroxide-testutil",
  "dcroxide-wire",
+ "k256",
 ]
 
 [[package]]

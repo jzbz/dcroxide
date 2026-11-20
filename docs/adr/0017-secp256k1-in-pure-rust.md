@@ -13,7 +13,8 @@
   merge-bar run and the witness vectors; second addendum: the merge),
   2026-11-18 (addendum: HD derivation's entry points), 2026-11-19
   (addendum: secret generator multiplication through `k256`'s basepoint
-  table)
+  table; second addendum: a timing test of the secrets; third addendum:
+  a micro benchmark of the secrets, and what each claim rests on)
 
 ## Context
 
@@ -461,3 +462,445 @@ intermediate points it leaves on the stack, and neither did before.
 
 The rest of the Decision stands. dcrd's rules stay in dcrec in front of
 both stacks, and no signing function reaches the owned crate.
+
+## Addendum, 2026-11-19 (second) — a timing test of the secrets
+
+The first addendum of this date left dcrec without a timing check of its
+own, with the table or without it. dcrec now has one:
+`crates/dcroxide-dcrec/src/ct_check.rs`, dudect's fixed-against-random
+t-test, run by `.github/workflows/constant-time.yml` in a job of its own.
+
+**The harness.** `dcroxide-tlscrypto`'s (ADR-0015 T10) with that crate's
+targets and its one known report left out, now
+`crates/dcroxide-testutil/src/ct.rs`, with its own tests: classes
+interleaved sample by sample, inputs built ahead the same way for every
+class, operations under 2 µs batched, dudect's 100 crops besides the
+uncropped test, and a class failing on |t| above 10 with a difference of
+1 ns an operation or more. Every class, the random one included, now
+draws an equal share of the samples, where `dcroxide-tlscrypto`'s copy
+gives the random class half; "The class shares" below says why, and
+what the earlier draw did. The trace line of each target also names the
+processors its thread was allowed, from `/proc/self/status`, so a run
+shows whether it was pinned. `dcroxide-tlscrypto` keeps its own copy for
+now; it is not touched here.
+
+**The entry points.** Every public item of dcrec that computes on a
+secret, and the one internal function they share, has a target: the
+generator's multiplication by a secret scalar (`mul_secret_by_generator`,
+k256's `mul_by_generator`), `PrivateKey::public_key` (and with it
+`ReducedPrivateKey::public_point` and an HD private child's public key),
+the range checks and read-out of `PrivateKey::from_bytes`,
+`check_scalar` and `PrivateKey::serialize`, ECDSA signing by the key
+(`ecdsa::sign`, whose signer `ecdsa::sign_compact` shares) and by the
+nonce (`sign_with_nonce`, from kG to the low-S signature),
+EC-Schnorr-DCRv0 signing by the key and by the nonce, the RFC 6979 nonce
+by the key, `add_private_tweak` by Il and by the parent (the parent's
+reduction modulo n included), and Ed25519's public key and signing by
+the seed: 12 targets and a positive control. Verification, recovery,
+parsing, serialization of public keys and `add_public_tweak` take public
+values and are not timed. The module's documentation holds the table of
+entry points and targets.
+
+**The classes.** A scalar's: 1, 2, 0xff, 2^64 - 1, the top bit alone,
+n - 1, n - 2, (n - 1)/2, n - 1 with its bottom or its top half zero,
+eight bits set and eight cleared, n - 1 with every 4-bit window but the
+top one zero, and a placebo. A scalar that reaches the generator's
+multiplication adds five classes of the table walk's signed radix-16
+recoding: every digit 1, every digit 7, every digit -8 (the largest
+entry of every table, negated), the even digits zero (all 33 of the
+selects for the walk's first accumulator give the identity, the one
+that starts it and the 32 it adds) and the odd digits zero (the second
+accumulator, which starts from the identity, adds it 32 times). Those
+are the table path's shapes only. Without the table, `lincomb` first
+splits the scalar by the GLV endomorphism into two halves of at most 128
+bits, k = r1 + r2·λ modulo n, and recodes each half into 33 digits:
+there 1, 2, 0xff, 2^64 - 1, n - 1 and n - 2 have r2 = 0 and an r1 of
+mostly zero digits, the top bit alone has an r1 of 32 bits (28 of its
+33 digits zero) beside a full-width r2, and the top window alone and the
+five walk classes split into halves whose digits look like a random
+scalar's. So the multiplication's targets also take five classes of the
+split: λ, 2λ and (2^64 - 1)λ, whose r1 is 0 and r2 is 1, 2 and
+2^64 - 1, and the two scalars whose halves are equal and every digit 7,
+or every digit -8 below a top digit of 1 (31 digits each; halves of 32
+digits of 7 are longer than the split gives, and it splits their scalar
+otherwise). No other class has r1 = 0. These were added after the
+review of this work, so the calibration and the 60 s measurement below
+ran without them; the runs that had them follow the measurement. An HD
+parent adds n, 0, n + 1 and 2^256 - 1; an Ed25519 seed has three fixed
+seeds, since SHA-512 stands between it and the arithmetic. Signing by
+the key draws a fresh hash for each sample for every class, so that a
+fixed key does not also fix the nonce and the signature. The class
+lists are tested in every `cargo test`, the walk's digits against a port
+of `primeorder`'s recoding and the split's halves against a port of
+k256's `glv::decompose_scalar`, which is held to k256's bound of 2^128
+on 2,000 random scalars.
+
+**The control** is k256's variable-time multiply, `mul_vartime` on the
+generator, on the multiplication's classes. It must fail, and it has
+failed in every run, but by a margin that follows the machine's load:
+over the 10 s runs on the desktop below, its |t| ranged from about 50 to
+about 2,700 (twelve runs of a review of this work, six for each build,
+gave 52 to 2,734, six of them below 500; this work's own runs gave 495
+to 1,837), and over four 60 s runs from 167 to 6,840: a larger budget
+does not by itself give a larger |t|. That is still five times the
+threshold of 10 at its lowest, but a control |t| near 50 marks a run
+whose power was low, and the planted leaks below are what measure it.
+
+**CI.** The new `dcrec` job runs on x86_64 and arm64, each with the
+default `precomputed-tables` feature and with `--no-default-features`
+(k256's `lincomb`), four jobs, each target's name in its row carrying the
+path, `(table)` or `(no table)`. The budgets are the first job's: 10 s a
+target on pushes and pull requests, about 2.5 minutes a job; 60 s
+nightly, about 14. The run is pinned to the runner's last processor with
+`taskset`. A dispatch picks a suite, `tlscrypto` or `dcrec` or both, and
+a target needs one. The thresholds are the harness's, unchanged.
+
+**The calibration.** Each leak below was planted in a scratch copy of
+the tree, never in the repository, and timed by `generator_multiply`,
+`public_key` and signing by the nonce, both ECDSA and Schnorr, pinned to
+one processor of an x86_64 Linux desktop (a 16-core Zen 4 processor)
+that other processes kept busy throughout, load averages 9 to 52 on 32
+logical processors. Each difference is the deciding comparison's, in
+nanoseconds an operation:
+
+| planted leak | 10 s, table | 10 s, no table | 60 s, table | 60 s, no table |
+|---|---|---|---|---|
+| A: one point addition for each nonzero 4-bit window, as a walk that skips zero windows | 4 of 4 found, \|t\| 36 to 377 | 4 of 4, \|t\| 51 to 128 | - | - |
+| E: ECDSA's nonce inverted by k256's `invert_vartime`, about 1 µs | found, \|t\| 108 | found, \|t\| 58 | - | - |
+| B: one point addition unless the top window is zero, 350 to 440 ns | 0 of 4, all reported at \|t\| 6.8 to 9.4 | 3 of 4 | 3 of 4 | 0 of 4, all reported at \|t\| 6.8 to 9.6 |
+| D: four scalar multiplications unless the top window is zero, 100 to 230 ns as measured | 3 of 4 | 3 of 4 | 4 of 4, \|t\| 18 to 27 | 3 of 4 |
+| C: one scalar multiplication unless the top window is zero, 19 to 30 ns as measured | 1 of 4 (`generator_multiply`, \|t\| 24.6) | 2 of 4 | 1 of 4 | 2 of 4 |
+
+("Found" is the harness's LEAK, which fails a target; "reported" is |t|
+above 4.5, which passes.) Every leak was found by some target in some
+run at the CI budget, A and E by every target that reaches them. The
+table shows more than that: the power of a run on a shared machine
+follows the load more than the budget. B, the larger of the
+top-window leaks, was only reported in the first 10 s run, while the
+operation's mean doubled under a load average of 52, and in the 60 s run
+without the table; C, ten times smaller, was found by
+`generator_multiply` at 10 s in a quieter hour and missed by it at 60 s.
+The 60 s runs of B and C overlapped, in part, a workspace build and
+test of this work's own checks. In the failing runs every class with a zero top window was
+the one quicker, and in dudect's quickest crops the other classes showed
+as slower instead, since the random class's quick samples are its
+zero-top-window draws: both are the planted leak, not noise.
+
+**The measurement.** Every target at the nightly budget, 60 s, pinned,
+with the table and without it, on the same desktop:
+
+| target | table: t, class | difference, ns/op | verdict | no table: t, class | difference, ns/op | verdict |
+|---|---|---|---|---|---|---|
+| `generator_multiply` | -3.64, 0xff | -43.26 of 16,349.4 | pass | -4.67, n - 1 | -213.64 of 35,021.9 | reported |
+| `public_key` | +3.20, placebo | +14.51 of 19,723.9 | pass | -4.16, 1 | -338.75 of 46,643.8 | pass |
+| `key_from_bytes` | -2.71, bottom half zero | -0.03 of 49.5 | pass | -4.60, 2^64 - 1 | -0.12 of 32.8 | reported |
+| `ecdsa_signing_by_key` | -3.77, 2 | -172.22 of 26,288.5 | pass | -2.76, n - 1 | -154.92 of 47,773.6 | pass |
+| `ecdsa_signing_by_nonce` | -3.63, top window alone | -1.16 of 22,275.4 | pass | -3.78, top half zero | -622.66 of 55,267.4 | pass |
+| `schnorr_signing_by_key` | +3.50, 1 | +3.42 of 19,852.3 | pass | -2.74, (n - 1)/2 | -38.94 of 39,233.3 | pass |
+| `schnorr_signing_by_nonce` | -3.53, 0xff | -613.88 of 28,837.0 | pass | -4.30, every digit 7 | -1024.35 of 49,201.8 | pass |
+| `rfc6979_nonce_by_key` | +2.74, bottom half zero | +0.35 of 996.6 | pass | -3.03, (n - 1)/2 | -0.35 of 1,046.1 | pass |
+| `hd_private_child_by_tweak` | -2.97, top half zero | -0.01 of 76.0 | pass | +2.55, top window alone | +0.00 of 70.9 | pass |
+| `hd_private_child_by_parent` | -2.76, low weight | -0.03 of 77.7 | pass | -5.21, placebo | -0.11 of 78.0 | reported |
+| `ed25519_public_key` | -2.32, 0x55 and 0xaa | -4.20 of 11,748.5 | pass | +2.45, all ones | +3.08 of 11,844.8 | pass |
+| `ed25519_signing` | +2.46, 0x55 and 0xaa | +20.99 of 25,839.4 | pass | +2.16, all zeros | +17.72 of 25,307.9 | pass |
+| `vartime_multiply_control` | -624.66, 2 | -33172.50 of 38,672.1 | control found | -167.25, 2 | -34126.37 of 39,639.2 | control found |
+
+Each row gives the class that decides the target, its largest |t| over
+the uncropped test and the 100 crops, and its difference from the random
+class against the random class's mean, in nanoseconds an operation. The
+targets took 1.1 to 4.6 million samples of the operations of 12 µs and
+more, one to a sample, and 15 to 38 million of those of 1 µs and less,
+in batches of 2 to 40, each fixed class a 1/38 to 1/6 share of them and
+the random class half, as the harness then drew them. Every target
+passed, in both builds: no class reached |t| 10 anywhere, the largest
+|t| of any target was 5.21, and three targets were reported above 4.5,
+one of them on the placebo, all three negative. They were not chance
+maxima of symmetric noise: a small fixed class that drew fewer than its
+share of the run's rare slow outliers leans negative against the large
+random class, as "The class shares" below measures. Every target's
+thread was pinned to one processor, as its trace
+line shows. The load averages over the two runs were 20 to 43. The
+control was found at |t| 625 and 167.
+
+**With the split's classes.** After the five classes of the GLV split
+were added, every target ran again on the same desktop, pinned, both
+builds at once on two processors, at 10 s and then at 60 s, load
+averages 11 to 35. Every target passed in all four runs. At 10 s the
+largest |t| of a target was 5.29 (`generator_multiply` without the
+table, 2^64 - 1, reported), and of a split class 4.54 (the same target,
+both halves every digit 7, reported) and 3.79 with the table; the
+control was found at |t| 1,837 and 1,114. At 60 s the largest |t| was
+7.89, `generator_multiply` without the table on the class 2, reported:
+a difference of -1,163 ns on a mean of 39,267 ns in the uncropped test,
+which came from one of the six segments of the run, -7.89 there against
+-2.92 to +0.85 in the others, in the minute of the run's highest load
+average, 35, while crop 32 gave the class -0.12 (-5 ns). In the earlier
+runs the class with the largest |t| on that target was another each
+time (n - 1, 2^64 - 1). It was the machine's noise in the slow tail, not
+a leak, and it took that sign and size because of the class shares: a
+class of 1/48 of the samples that drew none or few of that minute's
+slow outliers, against a random class of half of them that drew its
+share ("The class shares" below). The split classes' largest |t| at 60 s was
+4.29 (`generator_multiply` with the table, (2^64 - 1)λ) and 3.04
+without it, where they mean something (ECDSA signing by the nonce, both
+halves every digit -8). The control was found at |t| 6,840 and 5,603,
+so at 60 s too its |t| spans more than a factor of 40 between runs.
+
+**The class shares, and a false leak they caused.** Everything above
+ran on the harness as it then drew its classes: half of the samples
+random, and each fixed class an equal share of the other half, 1/48 each
+for the multiplication's 24. The review of this work counted the rows
+of every clean dcrec run of this work and of its first review: 288 rows,
+189 of them negative, and of the 24 above 4.5, 23 negative, almost all
+in the uncropped test or in crops 82 to 99. Symmetric noise gives 23 or
+more of 24 of one sign with probability about 3·10^-6. The cause is the
+shares together with Welch's t, which estimates each side's variance
+from that side's samples alone. A run's slow tail is rare outliers that
+fall on whichever sample they hit. A fixed class that gets none of the
+few its share should bring has a lower mean than the random class and a
+far smaller variance, and its t comes out near -√k for the k outliers
+the random class got, k being 24 times a fixed class's expected count.
+The crops do not remove them: the uncropped test counts, and the
+thresholds of crops 98 and 99 are the warm-up's slowest times, which
+keep them. A neighbour pinned to the timed processor showed what that
+does. A data-independent Python loop that spins for 1 ms after each
+sleep of an exponential interval of mean 42 ms, about 2.4% of the
+processor, failed unchanged code: the review counted 4 false leaks in 25
+runs of `generator_multiply`, `ecdsa_signing_by_nonce` and the table's
+full suite, its verification 3 in 14, each negative, at |t| 10.1 to
+11.2 on differences of 330 to 660 ns, in the uncropped test or crop 99,
+while crop 32 gave the same class |t| under 3 and each segment about -4
+to -5, the -√k a sixth of the run predicts. Without the neighbour, none
+of ten such runs failed. The neighbour is artificial, but it stands for
+anything that shares the pinned processor in bursts, as other work can
+on a shared CI runner, where the job pins to the runner's last
+processor and cannot keep other work off it.
+
+The harness now gives every class, the random one included, a share of
+1/(K + 1) with K fixed classes (`crates/dcroxide-testutil/src/ct.rs`;
+`dcroxide-tlscrypto`'s own copy is unchanged and still draws half of its
+samples random). A class that misses its outliers then leans by about
+-√k with k its own expected count, and t follows the difference of two
+counts of the same expectation, about a standard normal. For a leak on
+one class the shares cost no precision when the noise dominates: the
+variance of the difference of the means is σ²(1/n_fixed + 1/n_random),
+2(K + 1)σ²/N of N samples either way. They cost |t| only where the
+random class's spread comes from the leak itself, a leak large enough
+to be found far above 10 either way. A harness test,
+`a_bursty_neighbour_does_not_fail_a_class`, simulates 60 fixed classes
+alike with an outlier of 100 µs in one operation of 100, drawn whatever
+the class: with the draw put back to half random it fails at t -12.3,
+as -√150 predicts, and with equal shares it passes under three seeds.
+
+On the same desktop, after the change, at load averages 1.4 to 19:
+
+- With the same neighbour on the same processor, 16 runs of
+  `generator_multiply` and `ecdsa_signing_by_nonce` with the table at
+  10 s gave no leak, the largest |t| 4.80; the old harness's binary, run
+  at the same time on another processor of the same cache domain with a
+  neighbour of its own, gave 4 false leaks in its 16 (|t| 10.40 to 10.66,
+  all negative, all crop 99) and two more rows at -7.02 and -9.99. The
+  full suite with the neighbour, both builds at 10 s, passed, the
+  largest |t| 5.39, the control found at |t| 171 and 183.
+- Without a neighbour, the full suite at the CI budget, 10 s, and at
+  the nightly's, 60 s, in both builds, passed: the largest |t| was 5.52
+  at 10 s (`ed25519_signing` with the table, 0x55 and 0xaa, positive) and
+  5.51 at 60 s (`schnorr_signing_by_nonce` with the table, class 2), the
+  control found at |t| 612 and 806 at 10 s and 2,898 and 2,435 at 60 s.
+  Over all 96 rows of the new runs, control left out, 55 were negative
+  and 4 above 4.5 (3 of them negative), their tests spread over the
+  crops rather than gathered in the slow tail.
+- Plants 1 to 6, 9 and 10 of the review's calibration and the clean
+  build, on the four targets at 10 s, each paired with the old harness
+  run at the same time on a neighbouring processor: 22 of 56 found by
+  each. By plant: an addition skipped for every zero digit, the table
+  read by a variable-time select, r2's zero digits skipped and an extra
+  addition when r1 is 0, 4 of 4 each by both; an extra doubling for an
+  odd scalar 4 of 4 by the new harness and 3 of 4 by the old with the
+  table, 2 of 4 by each without it; a field multiplication for an odd
+  scalar, about 6 ns, 0 of 4 by the new harness and 1 of 4 by the old
+  (|t| 12.65) with the table, 0 of 4 by each without it; a negation for a
+  high scalar and a four-limb subtraction for an odd one were found by
+  neither in either build, though reported above 4.5 in some runs of
+  each; and no clean run of either failed. For the largest leaks the new |t| was lower, 313 to
+  815 against 595 to 4,760 for the zero-digit walk, where the random
+  class's spread is the leak's own. One run of each pairing: the power
+  is the same within what one run can tell, not measured more finely.
+
+The calibration table above is the old harness's and is left as it was
+measured; the repeat in the last item is the new harness's.
+
+**What this shows, and what it does not.** On one x86_64 processor, on
+one day, no class of any target differed from the random class by the
+harness's rule. Planted leaks of a microsecond or more (an addition
+skipped for every zero window, a variable-time inversion, the control's
+variable-time multiply) were found by every target that reaches them.
+Leaks of 100 to 440 ns on one window were found by most targets in most
+runs, and by none in two runs on a busy machine; leaks of 20 to 30 ns
+were found by one or two targets of four in each run. A neighbour that
+takes the pinned processor in bursts made the harness fail clean code
+before every class had an equal share, and did not in the 18 runs after;
+other shapes of noise, such as a neighbour that keeps the processor for
+seconds at a time and so lands within one segment, were not tried. That is evidence,
+not proof. It does not show the
+absence of a smaller difference: at these operations' spreads, tens of
+microseconds with the machine's noise, |t| 10 needs tens to hundreds of
+nanoseconds, many cycles; a leak of a few cycles in a 15 µs
+multiplication is below what a minute can see. It says nothing of arm64,
+which CI runs and which was not run here, nor of other x86_64
+processors, compilers or builds; nothing of cache timing seen from
+another process or core, of power or electromagnetic leakage, or of a
+remote attacker's view; and nothing of the wiping of secrets, which the
+first addendum of this date already leaves open. The CI job has not run
+yet: its first runs are its own evidence, and its budgets may need
+revisiting once they have. A pass by this test does not make a
+dependency update safe without its own run.
+
+**Read while doing this.** `k256` 0.14.0's `mul_by_generator` begins with
+`let table = *BASEPOINT_TABLE;` (`src/arithmetic/mul.rs:184`), which
+copies the whole table, 33 tables of eight points, about 31 KB, to the
+stack on every call. It is not a timing leak, since the copy does not
+depend on the scalar, but it is work the walk does not need; whether it
+costs measurable time is for the benchmark of this work's second stage.
+EC-Schnorr-DCRv0 signing negates the nonce with a branch on R's y
+parity (`src/secp256k1/schnorr.rs`, `if y[31] & 1 == 1`), as dcrd does.
+The parity is not published, but it tells only whether the RFC 6979
+nonce or its negation became the nonce that signs, whose point is
+public, so it gives nothing about that nonce. Its cost is not below
+what the test can see, as this addendum first said. In
+`schnorr_signing_by_nonce` with the table, in a run at the CI budget
+after the class shares were made equal, crop 32 split the 23 fixed
+classes by the parity of their R alone: the 11 whose R has an even y
+were quicker than the random class, by 0.74 to 1.46 ns an operation at
+|t| 3.1 to 6.1, and the 12 whose R has an odd y slower, by 0.72 to
+1.22 ns at |t| 3.0 to 5.2, about 2 ns, some ten cycles, between them
+(the parities from a probe of each class's kG, not kept). The target's
+row was -9.01 (top bit alone, an even R, crop 49, -3.06 ns), reported,
+not failed. The other runs of the target lean the same way less
+clearly (crop 32 at 60 s gave the even classes -0.9 to -1.5 ns, the
+odd ones -0.5 to +0.8), and without the table more weakly still. It is
+the negation's branch, which a fixed nonce takes the same way every
+time and the random class half the time, and it is a timing dependence
+on the nonce's point, not on the key: it tells only which of k and -k
+the RFC 6979 nonce was, as above. A run with more samples, or a quieter
+machine, can carry it past |t| 10 on a difference above the 1 ns floor
+and fail the target. A constant-time conditional negation (k256's
+`Scalar::conditional_select` on the parity, as ECDSA's low-S
+normalization already does) would remove it; dcrec's code is unchanged
+here.
+
+The rest of the Decision stands. dcrec's code paths are unchanged:
+`ecdsa::sign_with_nonce` and `schnorr::sign_with_nonce` are now visible
+to the crate (`pub(crate)`) for the targets that time them, and nothing
+else moved.
+
+## Addendum, 2026-11-19 (third) — a micro benchmark of the secrets, and what each claim rests on
+
+The first addendum of this date measured the table with a program outside
+the tree. The same operations, the ones the second addendum's timing test
+times, now have an in-tree micro benchmark against dcrd:
+`dcroxide-bench dcrec` (`crates/dcroxide-bench/src/dcrec.rs`), with dcrd's
+side in the oracle's `secp_bench` command (`tools/oracle/bench.go`).
+
+**The benchmark.** Both sides take the same cases, 8,192 by default from
+a fixed seed: a key, a hash, an HD tweak and parent, an Ed25519 seed. Each
+times one pass of an operation over every case in its own process, dcrd's
+in the oracle's, and both fold the outputs into a digest; a difference
+stops the run, so each pass is a differential as well. A warm-up pass
+builds both libraries' tables. The side that goes first alternates by
+operation and by round, and a flag reverses it from process to process;
+`taskset` on the benchmark pins the oracle with it, since the child
+inherits the pin. The workspace build cannot link dcrec without its
+default feature (Cargo unifies it into every `k256`), so the no-table
+path is timed as its multiplication, k256's `GENERATOR * k`, beside the
+table's. A unit test, `every_operation_matches_dcrd`, runs every
+operation against the oracle in each `cargo test` that has one, which CI
+requires.
+
+**Measured on m3, 2026-11-19** (docs/bench-ledger.md, "dcrec's operations
+on secrets against dcrd's, in tree (2026-11-19)"; three sessions of eight
+processes, the third the record, on a machine other work kept busy),
+each figure the median over 40 back-to-back pairs of Rust's time over
+dcrd's: ECDSA signing 0.94, EC-Schnorr-DCRv0 signing 0.83, the public key
+0.86, the generator multiplication through the table 0.98 and through
+`lincomb` 2.12, the RFC 6979 nonce 0.67, the private key's range check
+0.71, Ed25519's public key 0.16 and signing 0.80, and HD derivation's
+private child sum 1.19, about 11 ns slower than dcrd's composition of the
+same calls. The signing and public-key figures agree with the first
+addendum's within 0.012. Every pass of every operation gave dcrd's
+outputs, byte for byte. dcrd's generator multiplication is its
+variable-time `ScalarBaseMultNonConst`; dcrec's is constant time, so the
+comparison is of the two libraries as they are, not of like algorithms.
+
+**Two costs the benchmark found.**
+
+- `k256` 0.14.0's `mul_by_generator` copies its whole table to the stack
+  on every call, `let table = *BASEPOINT_TABLE;` (`src/arithmetic/mul.rs:184`,
+  and `:211` in the variable-time twin that dcrec never calls). In the
+  release build that is a `memcpy` of 31,680 bytes, read from the
+  binary's disassembly. A scratch copy of the tree with `k256` patched to
+  borrow the table (`&*BASEPOINT_TABLE`) ran 0.39 to 0.48 µs faster per
+  multiplication, in the public key and both signers alike, about 3% of the
+  walk. It is not a leak: the copy is the same for every scalar. The
+  change belongs upstream, not in a vendored `k256`.
+- `edwards::sign` derives the public key from the seed again for every
+  signature, where dcrd's key carries the one `PrivKeyFromSecret` made:
+  25.1 µs against 12.9 µs through `sign_with_pub_key_bytes` with the key
+  supplied. Holding the expanded key and its public key in `SecretKey`
+  would halve it. Nothing here changes it.
+
+**What each claim rests on.** Two kinds of evidence stand behind dcrec's
+secrets, and they are not interchangeable.
+
+Measured, on one x86_64 desktop (m3), on one day, with Rust 1.100.0 and
+Go 1.27.3:
+
+- that dcrec's keys, signatures, nonces, HD sums and Ed25519 keys and
+  signatures equal dcrd's over the benchmark's cases, as over the
+  differential suites' and the soaks' far larger ones;
+- the speeds above, and the cost of the table copy;
+- that the release build copies the table on every call (the
+  disassembly of that one function, not of anything else);
+- that no class of the timing test's 12 targets differed from random
+  inputs by its rule, with the table or without it, in 60 s a target, and
+  that leaks planted in a scratch copy, of a microsecond down to tens of
+  nanoseconds, were found as the second addendum's calibration table
+  records. That is statistical evidence on one processor, not proof of
+  constant time.
+
+Read in the sources, not measured, and not inspected in the compiled
+code:
+
+- that `primeorder` 0.14.0's recoding of a scalar into signed radix-16
+  digits, which k256 calls, has no branch on the scalar: nibbles, then a
+  carry by arithmetic shifts (`src/tables/radix16.rs:31-55`);
+- that `primeorder` 0.14.0's `LookupTable::select` reads all eight
+  entries of a table for every digit and keeps one by `subtle`'s
+  conditional assignment, then negates by another
+  (`src/tables/lookup.rs:43-65`), so that no memory address depends on
+  the scalar. The timing test times an operation from inside its own
+  process; it cannot see which cache lines a walk touches from another
+  process or core. That the walk touches the same ones for every scalar
+  rests on this reading alone;
+- that k256's point addition is the complete formula of Renes, Costello
+  and Batina without a branch on its inputs (`src/arithmetic/projective.rs`,
+  its comments at `:97`, `:143`, `:190`), and that `lincomb`, the scalar
+  range checks, the reduction modulo N and the addition modulo N are
+  constant time;
+- that the compiler keeps all of that branch-free. dcrd's module says it
+  inspects its generated machine code for this; dcroxide has not
+  inspected k256's, beyond the `memcpy` above;
+- that EC-Schnorr-DCRv0's branch on R's y parity
+  (`src/secp256k1/schnorr.rs`) leaks nothing about the nonce, as the
+  second addendum argues.
+
+A leak below the timing test's resolution, of a few cycles in a 15 µs
+multiplication, is excluded by neither kind. arm64, which CI times and
+nothing here measured, other x86_64 processors, other compilers, power
+and electromagnetic leakage, and the wiping of secrets, which the first
+addendum of this date leaves open, are outside both.
+
+The rest of the Decision stands. No shipped code changes in this
+addendum: `dcroxide-bench` gains dcrec, `k256` and `dcroxide-testutil` as
+dependencies, packages the lock already held, and the oracle gains one
+command.

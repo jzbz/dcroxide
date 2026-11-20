@@ -1,6 +1,6 @@
 [package]
 name = "dcroxide-bench"
-description = "Development-only benchmark harness: replay bootstrap-format block corpora through the live chain engine with timing (no dcrd counterpart)"
+description = "Development-only benchmark harness: replay bootstrap-format block corpora through the live chain engine with timing (no dcrd counterpart), and time dcroxide-dcrec's operations on secrets against dcrd's through the oracle"
 version.workspace = true
 authors.workspace = true
 edition.workspace = true
@@ -16,6 +16,20 @@ dcroxide-crypto = { path = "../dcroxide-crypto" }
 dcroxide-database = { path = "../dcroxide-database" }
 dcroxide-indexers = { path = "../dcroxide-indexers" }
 dcroxide-wire = { path = "../dcroxide-wire" }
+# The `dcrec` micro benchmark (src/dcrec.rs).  dcroxide-dcrec with its
+# `precomputed-tables` feature named, the node's build; Cargo unifies it
+# into every k256 of the workspace, so the no-table build cannot be
+# linked here and its multiplication is timed directly instead.
+dcroxide-dcrec = { path = "../dcroxide-dcrec", features = ["precomputed-tables"] }
+# The generator's multiplication by a secret, timed on its own: k256's
+# `mul_by_generator` (the table) and `GENERATOR * k` (`lincomb`, dcrec's
+# no-table path).  The version and features dcroxide-dcrec takes, so the
+# lock gains no package and the build no second feature set.
+k256 = { version = "0.14", default-features = false, features = ["arithmetic"] }
+# The oracle client and its binary's environment variable, SplitMix64 for
+# the cases and its seed parser, as dcroxide-sigdiff takes them.  An
+# internal crate, never published; this one is development-only too.
+dcroxide-testutil = { path = "../dcroxide-testutil" }
 
 [lints]
 workspace = true

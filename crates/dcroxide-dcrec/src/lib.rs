@@ -48,5 +48,7 @@
 
 extern crate alloc;
 
+#[cfg(test)]
+mod ct_check;
 pub mod edwards;
 pub mod secp256k1;

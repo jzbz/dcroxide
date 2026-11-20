@@ -523,7 +523,7 @@ pub fn recover_compact(signature: &[u8], hash: &[u8; 32]) -> Result<(PublicKey, 
 /// zero r or s.
 // The flagged operators are k256 scalar arithmetic, modular by definition.
 #[allow(clippy::arithmetic_side_effects)]
-fn sign_with_nonce(
+pub(crate) fn sign_with_nonce(
     d: &k256::Scalar,
     k: &k256::Scalar,
     e: &k256::Scalar,
