@@ -548,7 +548,7 @@ Cargo workspace mirroring dcrd's package graph so that parity auditing is mechan
 | `dcroxide-dcrutil` | `dcrutil` | Amounts, addresses (extend dcr-rs to all standard address kinds), app-dir resolution, block/tx convenience wrappers |
 | `dcroxide-base58` / `dcroxide-bech32` | `base58` (separate repo dep in Go), `bech32` | Encodings with Decred checksums |
 | `dcroxide-txscript` | `txscript` (+ `stdaddr`, `sign`) | Script engine, opcodes incl. stake opcodes, standardness, sighash (from dcr-rs), tokenizer |
-| `dcroxide-stake` | `blockchain/stake` | Stake tx classification (SStx/SSGen/SSRtx/treasury), ticket lottery (`Hash256PRNG`), live-ticket state, treasury rules |
+| `dcroxide-stake` | `blockchain/stake` | Stake tx classification (SStx/SSGen/SSRtx/treasury), ticket lottery (`Hash256PRNG`), live-ticket state, treasury rules; the ticket database (`stakedb`) behind the default `storage` feature, so the rest links without `dcroxide-database` (ADR-0004, second addendum of 2026-11-19) |
 | `dcroxide-standalone` | `blockchain/standalone` | Pure functions: merkle roots, PoW checks (BLAKE-256 & BLAKE3 + ASERT), subsidy schedule incl. all split changes, inclusion proofs, tspend math |
 | `dcroxide-gcs` | `gcs` | Version-2 Golomb-coded sets, SipHash-keyed, filter building/matching |
 | `dcroxide-database` | `database` (+ `ffldb`) | Storage abstraction + chosen backend(s); optional ffldb-compat reader |

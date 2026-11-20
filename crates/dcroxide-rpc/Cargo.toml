@@ -15,7 +15,14 @@ dcroxide-crypto = { path = "../dcroxide-crypto", features = ["rand"] }
 dcroxide-dcrec = { path = "../dcroxide-dcrec" }
 dcroxide-dcrjson = { path = "../dcroxide-dcrjson" }
 dcroxide-rpctypes = { path = "../dcroxide-rpctypes" }
-dcroxide-stake = { path = "../dcroxide-stake" }
+# Without its `storage` feature: the handlers call stake's
+# classification, rule checks and revocation and commitment helpers,
+# never the ticket database, so this crate reaches neither
+# dcroxide-database nor redb.  The node's build turns the feature on
+# through dcroxide-blockchain and the crates that take stake with its
+# defaults (dcroxide-node, dcroxide-mempool, dcroxide-mining,
+# dcroxide-indexers), so this changes nothing there.
+dcroxide-stake = { path = "../dcroxide-stake", default-features = false }
 dcroxide-standalone = { path = "../dcroxide-standalone" }
 dcroxide-txscript = { path = "../dcroxide-txscript" }
 dcroxide-uint256 = { path = "../dcroxide-uint256" }

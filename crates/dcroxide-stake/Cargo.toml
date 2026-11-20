@@ -8,9 +8,30 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+default = ["storage"]
+# The `stakedb` module: dcrd's `Db*` functions and the entry points that
+# read and write the node's ticket database (`InitDatabaseState`,
+# `LoadBestNode`, `WriteConnectedBestNode`, `WriteDisconnectedBestNode`),
+# and with it the one dependency on dcroxide-database, and through that
+# on redb.  On by default, so every build that names this crate as it
+# always has is unchanged; dcroxide-blockchain, which calls `stakedb`,
+# also asks for it by name.  Off (`default-features = false`), the crate
+# is the storage-free part of dcrd's package: transaction classification
+# and rule checks, the treasury checks, commitment and vote extraction,
+# reward calculation, the ticket lottery, and the in-memory ticket
+# treap, row formats and stake node.  dcroxide-gcs, dcroxide-fees and
+# dcroxide-rpc take it that way, and so can a wallet: everything
+# dcrwallet imports from `blockchain/stake` is in it.  The feature adds
+# one public module, `stakedb`, and with it three crate-private
+# `ticketnode::Node` helpers that only `stakedb` calls (`missed_treap`,
+# `revoked_treap`, `from_database_state`); no public item outside
+# `stakedb` changes.
+storage = ["dep:dcroxide-database"]
+
 [dependencies]
 dcroxide-chainhash = { path = "../dcroxide-chainhash" }
-dcroxide-database = { path = "../dcroxide-database" }
+dcroxide-database = { path = "../dcroxide-database", optional = true }
 dcroxide-txscript = { path = "../dcroxide-txscript" }
 dcroxide-uint256 = { path = "../dcroxide-uint256" }
 dcroxide-wire = { path = "../dcroxide-wire" }
@@ -19,6 +40,21 @@ dcroxide-wire = { path = "../dcroxide-wire" }
 tempfile = "3"
 dcroxide-chaincfg = { path = "../dcroxide-chaincfg" }
 dcroxide-testutil = { path = "../dcroxide-testutil" }
+
+# The three test targets that open a ticket database through `stakedb`.
+# Every other target builds and runs with `--no-default-features`, as
+# CI's storage-gate job runs them.
+[[test]]
+name = "review_stake_height_gates"
+required-features = ["storage"]
+
+[[test]]
+name = "review_stakedb_integrity"
+required-features = ["storage"]
+
+[[test]]
+name = "stakedb_vectors"
+required-features = ["storage"]
 
 [lints]
 workspace = true

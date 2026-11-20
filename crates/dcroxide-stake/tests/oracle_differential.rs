@@ -832,3 +832,84 @@ fn treasurybase_null_outpoint_precedence() {
     let err = stake::check_treasury_base(&tx).expect_err("bad second output");
     assert_eq!(err.kind.kind_name(), "ErrTreasuryBaseInvalidOpcode1");
 }
+
+/// The ticket commitment helpers dcrwallet calls,
+/// `AddrFromSStxPkScrCommitment` and `AmountFromSStxPkScrCommitment`,
+/// against dcrd.  The oracle has no command for either, so the check
+/// goes round through dcrd's `stdaddr`: dcrd decodes the address the
+/// port extracts from a commitment script and builds the commitment
+/// script for it from the amount and fee limits the script was built
+/// with, which must give back the same script, and the amount the port
+/// extracts must be the one built in.  Amounts include zero, one, the
+/// largest the flag bit leaves and the 21 million coin supply; fee
+/// limits include zero and values that are not powers of two, which
+/// the script stores as rounded exponents.
+#[test]
+fn commitment_extraction_round_trips_through_dcrd() {
+    let Some(mut oracle) = oracle_or_skip() else {
+        return;
+    };
+    let mut rng = SplitMix64::from_entropy("stake-commitment-round-trip");
+    let networks = [
+        mainnet_params(),
+        dcroxide_chaincfg::testnet3_params(),
+        dcroxide_chaincfg::simnet_params(),
+    ];
+
+    const ROUNDS: usize = 300;
+    for round in 0..ROUNDS {
+        let params = &networks[rng.below(networks.len() as u64) as usize];
+        let addr = random_stake_addr(&mut rng, params);
+        let amount: i64 = match rng.below(6) {
+            0 => 0,
+            1 => 1,
+            2 => i64::MAX,
+            3 => 21_000_000 * 100_000_000,
+            _ => rng.below(1 << 51) as i64,
+        };
+        let mut fee_limit = || -> i64 {
+            match rng.below(4) {
+                0 => 0,
+                1 => 1 << rng.below(40),
+                _ => rng.below(1 << 40) as i64,
+            }
+        };
+        let (vote_fee, revoke_fee) = (fee_limit(), fee_limit());
+        let (_, script) = addr
+            .reward_commitment_script(amount, vote_fee, revoke_fee)
+            .expect("stake address");
+
+        let extracted =
+            stake::addr_from_sstx_pk_scr_commitment(&script, params).expect("commitment address");
+        assert_eq!(extracted.to_string(), addr.to_string(), "round {round}");
+        assert_eq!(
+            stake::amount_from_sstx_pk_scr_commitment(&script).expect("commitment amount"),
+            amount,
+            "round {round}"
+        );
+
+        let mut req = vec![params.name.len() as u8];
+        req.extend_from_slice(params.name.as_bytes());
+        req.extend_from_slice(&(amount as u64).to_be_bytes());
+        req.extend_from_slice(&(vote_fee as u64).to_be_bytes());
+        req.extend_from_slice(&(revoke_fee as u64).to_be_bytes());
+        req.extend_from_slice(extracted.to_string().as_bytes());
+        let dump = String::from_utf8(unhex(&oracle.call_ok("stdaddr_decode", &req)))
+            .expect("dump is UTF-8");
+        let field = |name: &str| -> Option<&str> {
+            dump.lines()
+                .find_map(|line| line.strip_prefix(name)?.strip_prefix('='))
+        };
+        assert_eq!(
+            field("string"),
+            Some(extracted.to_string().as_str()),
+            "round {round}"
+        );
+        assert_eq!(
+            field("rewardcommitment"),
+            Some(format!("0:{}", hex(&script)).as_str()),
+            "round {round}: dcrd builds another commitment for {extracted} \
+             (amount {amount}, fee limits {vote_fee} and {revoke_fee})"
+        );
+    }
+}

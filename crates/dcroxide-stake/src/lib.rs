@@ -18,14 +18,33 @@
 //! database-coupled `Db*` functions and entry points (`stakedb`); see
 //! PARITY.md.
 //!
+//! # The `storage` feature
+//!
+//! `stakedb` is the one module that touches storage, and it exists only
+//! with the `storage` feature, which is on by default and is the only
+//! thing that brings in `dcroxide-database` and, through it, redb.
+//! Three crate-private `ticketnode::Node` helpers that only `stakedb`
+//! calls (`missed_treap`, `revoked_treap`, `from_database_state`) sit
+//! behind the feature with it; no public item outside `stakedb` changes.
+//! Built with `default-features = false`, the crate is the storage-free
+//! part of dcrd's package, with every other public module and item
+//! unchanged: what `dcroxide-gcs`, `dcroxide-fees` and `dcroxide-rpc`
+//! take, and what a wallet links without the node's ticket database.  Everything dcrwallet imports
+//! from `blockchain/stake` is in that part (PARITY.md, the
+//! `blockchain/stake` row).  The node's crates take the feature, so
+//! the node's build is the same with it as before it existed.
+//!
 //! Extraction helpers documented by dcrd as only safe on transactions
 //! that already passed the corresponding `Is*` check keep dcrd's exact
 //! panic-on-malformed-input behavior rather than adding new error paths.
 //!
-//! The `no_std` attribute below covers this crate's own code only:
-//! `stakedb` reaches the std-only `dcroxide-database`, so the crate as a
-//! whole builds only with std, which is why the CI no_std job does not
-//! list it.
+//! The `no_std` attribute below covers this crate's own code only.
+//! With `storage`, `stakedb` reaches the std-only `dcroxide-database`.
+//! Without it the crate's own code still needs only `core` and `alloc`,
+//! but it takes `dcroxide-txscript` with its default features, whose
+//! `precomputed-tables` brings std back in, so the CI no_std job does
+//! not list this crate in either configuration (its comment says what
+//! listing it takes).
 
 #![cfg_attr(not(test), no_std)]
 // This crate holds no hashed containers: every map and set in it is
@@ -53,6 +72,7 @@ use dcroxide_wire::{MsgBlock, MsgTx, OutPoint, TxIn, TxOut, TxSerializeType};
 
 pub mod error;
 pub mod lottery;
+#[cfg(feature = "storage")]
 pub mod stakedb;
 pub mod ticketdb;
 pub mod ticketnode;

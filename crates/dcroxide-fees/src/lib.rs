@@ -11,6 +11,11 @@
 //! `estimatesmartfee` errors until it has seen enough mined
 //! transactions where dcrd answers from its saved history.  Only the
 //! row serialization format is pinned here; see PARITY.md.
+//!
+//! The estimator takes only `TxType` from `dcroxide-stake`, without that
+//! crate's `storage` feature, so this crate reaches neither
+//! `dcroxide-database` nor redb (ADR-0004's second addendum of
+//! 2026-11-19).
 
 #![cfg_attr(not(test), no_std)]
 #![forbid(unsafe_code)]

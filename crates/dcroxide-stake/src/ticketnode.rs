@@ -524,18 +524,22 @@ impl Node {
     }
 
     /// The missed ticket treap (used by the ticket database layer).
+    #[cfg(feature = "storage")]
     pub(crate) fn missed_treap(&self) -> &Immutable {
         &self.missed_tickets
     }
 
     /// The revoked ticket treap (used by the ticket database layer).
+    #[cfg(feature = "storage")]
     pub(crate) fn revoked_treap(&self) -> &Immutable {
         &self.revoked_tickets
     }
 
     /// Reconstruct a node from database state, recomputing the final
     /// lottery state from the tip header exactly like dcrd
-    /// `LoadBestNode` does.
+    /// `LoadBestNode` does.  Only `stakedb` calls it, so it exists only
+    /// with the `storage` feature.
+    #[cfg(feature = "storage")]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn from_database_state(
         height: u32,

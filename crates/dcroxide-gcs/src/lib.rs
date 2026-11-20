@@ -7,6 +7,14 @@
 //!
 //! SipHash-2-4 comes from the `siphasher` crate, matching the
 //! dchest/siphash implementation dcrd links.
+//!
+//! [`blockcf2`] classifies stake outputs through `dcroxide-stake`, which
+//! this crate takes without its `storage` feature, so it reaches neither
+//! `dcroxide-database` nor redb and has no features of its own: a wallet
+//! that links it for filter matching links no part of the node's store.
+//! dcrd's package reaches its `database` through `blockchain/stake`; see
+//! PARITY.md, the `gcs` row, and ADR-0004's second addendum of
+//! 2026-11-19.
 
 #![cfg_attr(not(test), no_std)]
 #![forbid(unsafe_code)]

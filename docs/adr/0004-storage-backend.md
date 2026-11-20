@@ -2044,3 +2044,182 @@ measure commits of small simnet blocks and scattered bulk writes, not a
 sync: a mainnet sync and the full replays of the ledger's rows need
 mainnet blocks, which these runs did not use, and neither has been run
 on 5.0.0.
+
+## Addendum, 2026-11-19 (second) — the storage-free part of dcroxide-stake
+
+The wallet built on these crates links `dcroxide-stake`, for dcrd's ticket
+and vote checks, treasury checks and the commitment helpers, and
+`dcroxide-gcs`, for compact filter matching. Until now either one linked
+this ADR's store as well: `dcroxide-stake` depended on `dcroxide-database`
+unconditionally, for one module, `stakedb`, and `dcroxide-gcs`,
+`dcroxide-fees` and `dcroxide-rpc` reached it through `dcroxide-stake`
+and by no other path. Nothing a wallet calls
+needs it. The decision of this ADR is unchanged; what changes is which
+crates reach the store.
+
+**The gate.** `dcroxide-stake` has one feature, `storage`, on by default.
+It makes the `dcroxide-database` dependency (and so redb) optional, and
+puts behind it the `stakedb` module: dcrd's `Db*` functions and the four
+entry points that read and write the ticket database
+(`InitDatabaseState`, `LoadBestNode`, `WriteConnectedBestNode`,
+`WriteDisconnectedBestNode`). Three
+crate-private helpers on `ticketnode::Node` that only `stakedb` calls
+(`missed_treap`, `revoked_treap`, `from_database_state`) sit behind it as
+well, so the crate builds without dead code either way. Nothing else moved
+and no item changed: the gate is `cfg` attributes and manifest lines, and
+no code went from one crate to another. A move was considered (`stakedb`
+into `dcroxide-blockchain`, its only caller) and not made: it would have
+split the port of one dcrd package over two crates, and its tests and
+vectors with it, for the same graph a feature gives.
+
+Without the feature, `dcroxide-stake` is the storage-free part of dcrd's
+`blockchain/stake`: classification and the rule checks, the treasury
+checks, commitment and vote extraction, reward calculation, the ticket
+lottery, and the in-memory ticket treap, row formats and stake node. Those
+last three are the node's live-ticket state and no wallet calls them; they
+stay outside the gate because they touch no storage, and a feature named
+for storage that hid them would describe them wrongly. A wallet that does
+not call them does not link their code into its binary either.
+
+**Who takes what.** `dcroxide-gcs`, `dcroxide-fees` and `dcroxide-rpc`
+take `dcroxide-stake` with `default-features = false`: the filters call
+only the script classifiers and `determine_tx_type`, the estimator only
+`TxType`, and the RPC handlers `determine_tx_type`, `is_ssgen`, `is_sstx`,
+`is_tspend`, `check_sstx`, `check_ssrtx`, `create_revocation_from_ticket`,
+`sstx_null_output_amounts`, the two commitment helpers, `TxType`,
+`MinimalOutput`, `MAX_AMOUNT` and `TX_VERSION_AUTO_REVOCATIONS`, none of
+them in `stakedb`. With their own defaults, then, none
+of the three reaches `dcroxide-database` or redb, so a wallet that links
+`dcroxide-gcs` as it is gets filter matching without the store. For
+`dcroxide-rpc`, whose normal and build graph `dcroxide-stake` was the only
+path to the store, that graph loses `dcroxide-database`, redb, `crc` and
+`crc-catalog` (68 distinct packages, itself included, where it had 72). `dcroxide-blockchain`,
+which calls `stakedb`, names `storage` in its manifest rather than relying
+on the default. The other crates that take `dcroxide-stake` keep its
+defaults, since they reach the store anyway: `dcroxide-indexers` depends
+on `dcroxide-database` directly, and `dcroxide-mempool`, `dcroxide-mining`
+and `dcroxide-node` through `dcroxide-blockchain`.
+
+**The node is unchanged.** Cargo builds one copy of a crate per build with
+the union of the features any crate in it asks for, and every build of the
+node includes `dcroxide-blockchain`, so `dcroxide-stake` compiles with
+`stakedb` as before, from the same source. `cargo tree --target all` with
+each package's features (`-f '{p} {f}'`), run on `8797e39` and on this
+change, gives the same distinct packages: 157 for `dcroxide-node` and 161
+for the whole workspace (`-e normal,build`), 175 for the workspace with
+dev-dependencies (`-e normal,build,dev`) and 164 for `fuzz/` (166
+package and feature-set pairs there, `getrandom` and `libc` each
+appearing with two feature sets because normal and build edges resolve
+separately). Each has the same features on both sides, except that
+`dcroxide-stake` now shows `default` and `storage` where it showed none.
+These are counts of distinct packages, repeated `(*)` lines removed and
+the root packages included; the consumer's count below is the same
+measure without its root. The workspace's test suite
+passes with default features, as before.
+
+**What a wallet links**, by dcrwallet's imports at the commit the wallet
+pins (`decred.org/dcrwallet/v5
+v5.0.1-0.20261105142009-54b85b336077`), test files included:
+
+| dcrwallet names | dcroxide item |
+|---|---|
+| `stake.AddrFromSStxPkScrCommitment`, `AmountFromSStxPkScrCommitment` | `dcroxide_stake::addr_from_sstx_pk_scr_commitment`, `amount_from_sstx_pk_scr_commitment` |
+| `stake.CalculateRewards`, `SStxNullOutputAmounts`, `TxSStxStakeOutputInfo` | `calculate_rewards`, `sstx_null_output_amounts`, `tx_sstx_stake_output_info` |
+| `stake.CheckSStx`, `CheckTSpend`, `DetermineTxType` | `check_sstx`, `check_tspend`, `determine_tx_type` |
+| `stake.IsSSGen`, `IsSSRtx`, `IsSStx`, `IsTSpend`, `IsStakeCommitmentTxOut` | `is_ssgen`, `is_ssrtx`, `is_sstx`, `is_tspend`, `is_stake_commitment_tx_out` |
+| `stake.SSGenBlockVotedOn`, `VoteBits` | `ssgen_block_voted_on`, `VoteBits` |
+| `stake.TreasuryVoteT`, `TreasuryVoteInvalid`, `TreasuryVoteYes`, `TreasuryVoteNo` | `TreasuryVote`, `TREASURY_VOTE_INVALID`, `TREASURY_VOTE_YES`, `TREASURY_VOTE_NO` |
+| `stake.TxType`, `TxTypeRegular`, `TxTypeSStx`, `TxTypeSSGen`, `TxTypeSSRtx` | `TxType` and its variants |
+| `gcs.FilterV2` and its `Bytes`, `MatchAny`, `N`, `Hash`; `gcs.FromBytesV2`; `gcs.KeySize` | `dcroxide_gcs::FilterV2` and its `bytes`, `matches_any`, `n`, `hash`; `FilterV2::from_bytes`; `KEY_SIZE` |
+| `gcs.NewFilter` (test data only) | `FilterV1::new` |
+| `blockcf2.B`, `M`, `Key`, `Entries` and its `AddRegularPkScript`, `PrevScripter`, `Regular` | `dcroxide_gcs::blockcf2::B`, `M`, `key`, `Entries` and its `add_regular_pk_script`, `PrevScripter`, `regular` |
+
+Each is named, at its full type, by a `wallet_surface` test target in
+`dcroxide-stake` and in `dcroxide-gcs`, so a change that moves one behind
+the gate or changes its signature fails to compile there.
+
+**Checked in CI** by the `storage-gate` job, in three parts. First,
+`cargo tree --target all -e normal,build` of `dcroxide-stake` without
+default features, and of `dcroxide-gcs`, `dcroxide-fees` and
+`dcroxide-rpc` with and without theirs, shows neither `dcroxide-database`
+nor redb. Second, the same four crates' tree with dev-dependencies
+(`-e normal,build,dev`, the selection the next steps build) shows
+`dcroxide-stake` without `storage` and no `dcroxide-database`; redb is
+expected there, through `dcroxide-testutil`. That second query is needed
+because Cargo unifies a dev-dependency's features into the one copy of
+`dcroxide-stake` that `clippy --all-targets` and `cargo test` build: a
+dev-dependency of one of these crates that took `dcroxide-stake` with its
+defaults would turn `storage` back on for those steps, with the lockfile
+and the first query unchanged, and the job would test the node's
+configuration while reporting the wallet's. Each query is first shown to
+find what it looks for under `dcroxide-stake`'s defaults, so a change in
+the tool's output cannot pass it vacuously, and each one's output is
+captured before it is searched, so a `cargo tree` that fails fails the
+step instead of reading as a graph without storage. Third, clippy,
+rustdoc and the four crates' tests run without default features, the
+oracle differentials and frozen vectors among them, with
+`DCROXIDE_STAKE_EXPECT_STORAGE=0`, under which `dcroxide-stake`'s
+`storage_gate` target fails unless the crate was compiled in that build
+without the feature. The three test targets of `dcroxide-stake` that open
+a ticket database declare `required-features = ["storage"]` and are
+skipped there; they run in every other job. Both failure modes were tried
+on scratch copies of the tree: a dev-dependency on `dcroxide-stake` with
+defaults added to `dcroxide-gcs` (and, separately, to `dcroxide-rpc`)
+fails the second query and the `storage_gate` test, and a renamed
+`dcroxide-fees` package fails the first part on `cargo tree`'s error.
+
+Two of the functions the wallet calls, `addr_from_sstx_pk_scr_commitment`
+and `amount_from_sstx_pk_scr_commitment`, had dcrd's vectors but no live
+differential, the oracle having no command for them. `dcroxide-stake`'s
+`commitment_extraction_round_trips_through_dcrd` now sends each address
+it extracts from a commitment script to dcrd's `stdaddr` through the
+oracle's `stdaddr_decode`, which must rebuild the same commitment script
+from it with the amount and fee limits the script was built with, on
+mainnet, testnet3 and simnet; the extracted amount must be the one built
+in. It runs in the `storage-gate` job with the other differentials.
+
+**A consumer outside the workspace.** On 2026-11-19 a scratch crate
+outside the workspace, never committed, took `dcroxide-stake` and
+`dcroxide-gcs` by path with `default-features = false`, as a wallet's
+manifest would, and called every item in the table above. Its `cargo
+tree --target all -e normal,build` held 62 packages besides its own,
+neither `dcroxide-database` nor redb among them, and neither was in its
+lockfile, resolved from this workspace's. Built and run on an x86_64
+Linux desktop against the oracle, it agreed with dcrd on 600 analysis
+dumps (`stake_analyze`: tickets, votes, revocations, treasury spends and
+regular transactions, a third of them mutated) together with each `is_*`
+classifier against dcrd's type, on 119 commitment outputs through
+`stdaddr_decode` as above, on 300 `calculate_rewards` cases, on 150
+filters (`FilterV2::from_bytes` of dcrd's bytes and `FilterV2::new`,
+`n`, `hash`, `bytes` and `matches_any`, with `blockcf2::key`, `B`, `M`
+and `Entries::add_regular_pk_script`; every third a version 1 filter
+from `FilterV1::new`), and on `blockcf2::regular` for the mainnet,
+testnet3 and simnet genesis blocks. That is dcrwallet's only call of
+`blockcf2.Regular` outside its tests (`wallet/udb/upgrades.go`), with a
+`PrevScripter` that knows no output, but not its only call: its reorg
+tests (`wallet/reorg_test.go`) build the filters of chaingen blocks with
+one that returns chaingen's p2sh `OP_TRUE` script for every input, so
+those filters hold previous output scripts, which a genesis filter never
+does. The scratch consumer did not exercise that path. In the crate,
+`dcroxide-gcs`'s `wallet_surface` target builds both shapes against dcrd
+through the oracle: the three genesis filters, and for each network a
+block whose regular transactions spend only outputs paying to that p2sh
+script and pay to other scripts themselves, where it also checks that
+the filter matches the p2sh script. `blockcf2_differential` in
+`tests/oracle_differential.rs` covers blocks of every transaction kind
+with arbitrary previous scripts and the missing-script error.
+`sstx_null_output_amounts` and `is_stake_commitment_tx_out`, which no
+oracle command covers, were checked in the scratch consumer only against
+their dcrd definitions; in the crate the first is pinned by
+`tests/review_stake_amount_math.rs`, and the second, dcrd's odd-index
+test, by `wallet_surface`, which now asserts its values as well as its
+type.
+
+Not done: `dcroxide-stake`, `dcroxide-gcs` and `dcroxide-fees` without
+storage are still not checked on a no-OS target (`dcroxide-rpc` is a
+std crate). Their own code needs only `core` and `alloc`, fees'
+`f64::round` aside, but each takes `dcroxide-txscript` with its default
+`precomputed-tables`, which brings std back in (the no_std job's comment
+says what listing them takes). The wallet's own build was not
+tried against this change, only the scratch consumer above; the graph the
+wallet would see is the one the job checks.

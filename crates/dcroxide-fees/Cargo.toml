@@ -10,7 +10,13 @@ repository.workspace = true
 
 [dependencies]
 dcroxide-chainhash = { path = "../dcroxide-chainhash" }
-dcroxide-stake = { path = "../dcroxide-stake" }
+# Without its `storage` feature: the estimator takes only `TxType` and
+# never opens the ticket database, so this crate reaches neither
+# dcroxide-database nor redb.  The node's build turns the feature on
+# through dcroxide-blockchain and the crates that take stake with its
+# defaults (dcroxide-node, dcroxide-mempool, dcroxide-mining,
+# dcroxide-indexers), so this changes nothing there.
+dcroxide-stake = { path = "../dcroxide-stake", default-features = false }
 
 [dev-dependencies]
 dcroxide-testutil = { path = "../dcroxide-testutil" }

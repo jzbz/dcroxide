@@ -14,6 +14,12 @@
 //! for byte, including QK-0005: the usage cache holds a single string
 //! regardless of whether websocket commands were requested, so
 //! whichever variant is requested first is returned for both.
+//!
+//! The handlers take `dcroxide-stake` without its `storage` feature, so
+//! this crate reaches neither `dcroxide-database` nor redb on its own;
+//! the node's build, which includes `dcroxide-blockchain`, compiles
+//! stake with the feature as before (ADR-0004's second addendum of
+//! 2026-11-19).
 
 pub mod dispatch;
 pub mod handlers;

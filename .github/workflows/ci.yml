@@ -386,19 +386,28 @@ jobs:
     # crate added here later takes dcroxide-dcrec the same way.
     #
     # Not yet listed: blockchain, fees, gcs, mempool, mining and stake.
-    # All six reach dcroxide-database, which builds redb with redb's
-    # default `std` feature, and stake fails on redb. So each needs
-    # `default-features = false` on its dcroxide-* path dependencies plus
-    # a `std` feature that re-enables them, and redb's `std` dealt with.
-    # 5.0.0 builds without `std` once its `std` feature is off, with no
-    # preview feature as 4.5.0 needed, as long as panics abort
-    # (redb-5.0.0 `src/lib.rs:118-127`), which they do on
-    # x86_64-unknown-none; no build here has tried it yet. Two of them
-    # also call a float method core lacks, which resolves today only
-    # because redb links std: fees' `f64::round` (`src/estimator.rs`) and
-    # blockchain's `f64::ceil` (`src/process.rs`,
-    # `calc_eviction_height`). Each needs a core-only form before its
-    # crate can be listed.
+    # Stake, gcs and fees no longer reach dcroxide-database once stake's
+    # default `storage` feature is off, which gcs and fees do (the
+    # storage-gate job). What keeps those three out now is txscript's
+    # default `precomputed-tables`: stake and gcs take txscript with its
+    # defaults, so the table's std comes back in for all three. Stake and
+    # gcs each need `default-features = false` on their dcroxide-txscript
+    # dependency plus a feature that turns `precomputed-tables` back on,
+    # as txscript does for dcrec; fees reaches txscript only through
+    # stake, and also needs a core-only form of its `f64::round`
+    # (`src/estimator.rs`). The other three reach
+    # dcroxide-database directly or through blockchain, and so build redb
+    # with redb's default `std` feature; stake without `storage` does not
+    # help them. So each needs `default-features = false` on its
+    # dcroxide-* path dependencies plus a `std` feature that re-enables
+    # them, and redb's `std` dealt with. 5.0.0 builds without `std` once
+    # its `std` feature is off, with no preview feature as 4.5.0 needed,
+    # as long as panics abort (redb-5.0.0 `src/lib.rs:118-127`), which
+    # they do on x86_64-unknown-none; no build here has tried it yet.
+    # Blockchain also calls a float method core lacks, which resolves
+    # today only because redb links std: `f64::ceil` (`src/process.rs`,
+    # `calc_eviction_height`). It needs a core-only form before it can be
+    # listed.
     steps:
       - uses: actions/checkout@v7
       - run: rustup toolchain install
@@ -460,6 +469,115 @@ jobs:
             echo "crates that do not build alone:$failed" >&2
             exit 1
           fi
+
+  storage-gate:
+    name: stake without storage (the wallet's build)
+    runs-on: ubuntu-latest
+    # dcroxide-stake's `storage` feature, on by default, is all that
+    # brings in dcroxide-database and redb (the `stakedb` module); gcs,
+    # fees and rpc take stake without it. A wallet links stake and gcs
+    # that way, for the transaction checks and filter matching, without
+    # the node's ticket database (ADR-0004's second addendum of
+    # 2026-11-19). Every other job builds the workspace, where
+    # dcroxide-blockchain names the feature and dcroxide-node, mempool,
+    # mining and indexers take stake's defaults, so nothing else ever
+    # builds stake without it. This job
+    # (1) fails if a normal or build dependency of stake without default
+    # features, or of gcs, fees or rpc as they are, on any target, is
+    # dcroxide-database or redb;
+    # (2) fails if the four crates' test build, dev-dependencies included,
+    # turns stake's `storage` back on or reaches dcroxide-database (redb
+    # is expected there: dcroxide-testutil links it). Cargo unifies a
+    # dev-dependency's features into the one copy of stake that clippy
+    # --all-targets and cargo test build, so a dev-dependency taking
+    # stake with its defaults would test the node's configuration here
+    # while (1) still passed;
+    # (3) runs clippy, rustdoc and the four crates' tests in that
+    # configuration, the oracle differentials and the `wallet_surface`
+    # targets among them, which name every identifier dcrwallet imports
+    # from `blockchain/stake`, `gcs` and `gcs/blockcf2`; stake's
+    # `storage_gate` target fails there unless stake really was compiled
+    # without the feature. Stake's three test targets that open a ticket
+    # database declare `required-features = ["storage"]` and are skipped.
+    # Each query in (1) and (2) is first shown to find what it looks for
+    # under stake's defaults, so a change in cargo tree's output cannot
+    # pass it vacuously, and each one's output is captured by a plain
+    # assignment before it is searched, so a cargo tree that fails (a
+    # renamed package, a bad flag) fails the step under `set -e` rather
+    # than reading as a graph with no storage in it.
+    steps:
+      - uses: actions/checkout@v7
+      - run: rustup toolchain install
+      - uses: actions/setup-go@v7
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: tools/oracle/go.sum
+      - uses: Swatinem/rust-cache@v2
+      - name: No dcroxide-database or redb below the gate
+        run: |
+          set -euo pipefail
+          tree() {
+            cargo tree --locked --target all --prefix none "$@"
+          }
+          fail() {
+            echo "$1" >&2
+            exit 1
+          }
+          # The features each `dcroxide-stake` line of a `{p}|{f}` tree lists.
+          stake_features() {
+            awk -F'|' '$1 ~ /^dcroxide-stake v/ { print $2 }'
+          }
+          gated="-p dcroxide-stake -p dcroxide-gcs -p dcroxide-fees -p dcroxide-rpc"
+
+          # (1) Normal and build edges.
+          out=$(tree -e normal,build -p dcroxide-stake)
+          for d in dcroxide-database redb; do
+            grep -q "^$d v" <<< "$out" ||
+              fail "dcroxide-stake's default build no longer shows $d: fix the check"
+          done
+          status=0
+          for args in "-p dcroxide-stake --no-default-features" \
+            "-p dcroxide-gcs" "-p dcroxide-gcs --no-default-features" \
+            "-p dcroxide-fees" "-p dcroxide-fees --no-default-features" \
+            "-p dcroxide-rpc" "-p dcroxide-rpc --no-default-features"; do
+            # shellcheck disable=SC2086 # the arguments are split on purpose
+            out=$(tree -e normal,build $args)
+            if grep -E '^(dcroxide-database|redb) v' <<< "$out"; then
+              echo "cargo tree $args reaches storage" >&2
+              status=1
+            fi
+          done
+
+          # (2) The test build, dev edges included, as clippy and test below
+          # resolve it.
+          # shellcheck disable=SC2086
+          out=$(tree -e normal,build,dev -f '{p}|{f}' $gated)
+          features=$(stake_features <<< "$out")
+          grep -qw storage <<< "$features" ||
+            fail "stake's default test build no longer shows its storage feature: fix the check"
+          grep -q '^dcroxide-database v' <<< "$out" ||
+            fail "stake's default test build no longer shows dcroxide-database: fix the check"
+          # shellcheck disable=SC2086
+          out=$(tree -e normal,build,dev -f '{p}|{f}' $gated --no-default-features)
+          features=$(stake_features <<< "$out")
+          [ -n "$features" ] ||
+            fail "the test build's tree shows no dcroxide-stake line: fix the check"
+          if grep -w storage <<< "$features"; then
+            echo "the gated crates' test build turns dcroxide-stake's storage feature on" >&2
+            status=1
+          fi
+          if grep '^dcroxide-database v' <<< "$out"; then
+            echo "the gated crates' test build reaches dcroxide-database" >&2
+            status=1
+          fi
+          exit "$status"
+      - run: cargo clippy --locked -p dcroxide-stake -p dcroxide-gcs -p dcroxide-fees -p dcroxide-rpc --no-default-features --all-targets -- -D warnings
+      - run: cargo doc --locked --no-deps -p dcroxide-stake -p dcroxide-gcs -p dcroxide-fees -p dcroxide-rpc --no-default-features
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+      - run: cargo test --locked -p dcroxide-stake -p dcroxide-gcs -p dcroxide-fees -p dcroxide-rpc --no-default-features
+        env:
+          DCROXIDE_STAKE_EXPECT_STORAGE: "0"
 
   no-c-compiler:
     name: build with no C compiler

@@ -9,6 +9,9 @@
 //! database serialization vectors.  The one departure is the per-height
 //! rows' keys, which are big-endian where dcrd's are little-endian (see
 //! [`height_key`]).
+//!
+//! The module exists only with the crate's `storage` feature, on by
+//! default; it is the only code in the crate that needs it.
 
 use alloc::format;
 use alloc::string::String;
