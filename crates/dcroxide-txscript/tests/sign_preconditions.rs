@@ -80,7 +80,13 @@ fn assert_dcrd_overflows(case: &Case) {
     drop(limited);
     let text = std::fs::read_to_string(&log).expect("read the oracle's log");
     let _ = std::fs::remove_file(&log);
-    assert!(why.contains("exit status: 2"), "{}: {why}", case.name);
+    // Rust's ExitStatus reads "exit status: 2" on Unix and "exit code: 2"
+    // on Windows.
+    assert!(
+        why.contains("exit status: 2") || why.contains("exit code: 2"),
+        "{}: {why}",
+        case.name
+    );
     assert!(
         text.contains("fatal error: stack overflow"),
         "{}: the oracle wrote {:?}",
