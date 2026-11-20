@@ -14,7 +14,9 @@
   2026-11-18 (addendum: HD derivation's entry points), 2026-11-19
   (addendum: secret generator multiplication through `k256`'s basepoint
   table; second addendum: a timing test of the secrets; third addendum:
-  a micro benchmark of the secrets, and what each claim rests on)
+  a micro benchmark of the secrets, and what each claim rests on),
+  2026-11-20 (addendum: EC-Schnorr-DCRv0's nonce negation selected, not
+  branched on)
 
 ## Context
 
@@ -88,7 +90,7 @@ zeroing the copies of the key they make, as dcrd does; and dcrd's RFC6979
 nonce, ported, its result taken as a `k256` scalar. Schnorr verification
 also checks its challenge e < N with `k256`'s `Scalar::from_repr`, in the
 function signing shares
-(`crates/dcroxide-dcrec/src/secp256k1/schnorr.rs:181-187`); it reads a
+(`crates/dcroxide-dcrec/src/secp256k1/schnorr.rs:182-188`); it reads a
 public hash and no point.
 
 **The fallback.** `k256`'s combined multiply, normalization,
@@ -908,3 +910,120 @@ The rest of the Decision stands. No shipped code changes in this
 addendum: `dcroxide-bench` gains dcrec, `k256` and `dcroxide-testutil` as
 dependencies, packages the lock already held, and the oracle gains one
 command.
+
+## Addendum, 2026-11-20 — EC-Schnorr-DCRv0's nonce negation selected, not branched on
+
+The second addendum of 2026-11-19 found that EC-Schnorr-DCRv0 signing's
+time depended, by about 2 ns, on the parity of the nonce point's y, through
+the branch that negates the nonce (`src/secp256k1/schnorr.rs`,
+`if y[31] & 1 == 1 { k = -k; }`), and left the code unchanged. On
+2026-11-20 the project owner decided to replace the branch with a
+constant-time conditional negation, keeping the output byte-identical to
+dcrd's.
+
+**What dcrd does.** At the oracle's pin, `schnorrSign` (`schnorr/signature.go`
+of `dcrec/secp256k1/v4` v4.4.2-0.20261106175134-46e9df48109a, lines 284-292)
+converts R = kG to affine coordinates and branches:
+`if R.Y.IsOdd() { k.Negate() }`. Its R comes from the variable-time
+`ScalarBaseMultNonConst` anyway, so the branch adds nothing there that the
+multiplication does not already do; dcrec's R is constant time (the first
+addendum of 2026-11-19), and the branch was the one nonce-dependent step
+left on that path.
+
+**What changes.** Step 5 of `sign_with_nonce` now reads the parity as a
+`subtle::Choice` (`Choice::from(y[31] & 1)`) and selects
+`Scalar::conditional_select(&k, &-k, y_is_odd)`, as ECDSA's low-S
+normalization already selects its negation of s. `subtle` is reached
+through k256's re-export (`k256::elliptic_curve::subtle`), so no
+dependency is added. The selected nonce is the one the branch chose, so
+every signature is the same: dcrd's eleven signing vectors (eight RFC 6979
+rows and three explicit nonces, five of the eleven with an odd R, so both
+sides of the select are pinned), the oracle differentials and the frozen
+vectors pass unchanged with and without `precomputed-tables`, and a new
+test, `a_nonce_and_its_negation_sign_alike`, holds that k and -k give the
+same signature for 256 random nonces of both parities. The rest of the
+path is unchanged: the parity is read from the uncompressed encoding of R,
+as before, and the identity check before it (`expect` on R's y) is a
+check of the encoding's tag, which no nonce in [1, N - 1] takes.
+
+**The measurement.** `schnorr_signing_by_nonce`, the dcrec timing target
+of signing by the nonce, at 60 s a run, built in release as
+`.github/workflows/constant-time.yml` builds it, the code before the change
+(`6272357`) against the code after (a tree that also held a change to
+Ed25519's key, which this target does not reach), with the table and
+without it. Five rounds on an x86_64 Linux desktop (a 16-core Zen 4
+processor, the same machine as the second addendum of 2026-11-19), each
+round the four builds at once, each process pinned with `taskset` to its
+own processor (the trace line of every run shows one), 1.2 to 3.1
+million samples a run, one operation a sample, at load averages of 7.9
+to 29.9 as the rounds started, other builds and tests sharing the
+machine. Each cell gives the
+target's row, its deciding |t| and class, and then the parity split: in
+crop 32, the mean difference from the random class of the 12 classes whose
+R has an odd y less that of the 11 whose R has an even y, in nanoseconds an
+operation, and the split statistic z, the mean crop-32 t of the even
+classes less that of the odd, over √(1/11 + 1/12). Without a dependence on
+the parity z centres on zero; it is a summary, not a calibrated test,
+since the classes' t values are not independent draws. (The parities are
+those of a probe of each class's kG run for this measurement and not
+kept: the even ones are 1, 2, the top bit alone, low and high weight, the
+top window alone, every digit -8, the odd digits zero, λ, 2λ and both
+halves every digit -8; the placebo has none.)
+
+| round | before, table | after, table | before, no table | after, no table |
+|---|---|---|---|---|
+| 1 | 4.06 (2), +1.93 ns, z -2.20 | 2.71 (2^64 - 1), -0.10 ns, z +0.12 | 3.11 (low weight), -1.31 ns, z +0.56 | 3.07 (bottom half zero), -1.64 ns, z +0.53 |
+| 2 | 3.61 (2), +5.70 ns, z -2.85 | 2.37 (placebo), +1.39 ns, z -1.07 | 2.64 (even digits zero), -3.08 ns, z +0.27 | 2.82 (placebo), +11.67 ns, z -1.04 |
+| 3 | **6.31** (top window alone, reported), +2.51 ns, z -14.87 | 3.44 (both halves every digit -8), +0.10 ns, z -0.58 | 2.94 (bottom half zero), +2.20 ns, z -4.09 | 3.63 (n - 1), -0.25 ns, z +0.41 |
+| 4 | 3.85 (both halves every digit 7), +3.67 ns, z -9.16 | 3.39 (every digit 1), -0.23 ns, z +0.56 | 3.17 (bottom half zero), +2.12 ns, z -1.92 | 3.34 (n - 1), +0.81 ns, z -0.75 |
+| 5 | **9.46** (every digit 1, reported), +2.61 ns, z -31.22 | 4.39 (top bit alone), +0.04 ns, z -0.41 | 4.45 (every digit 7), +2.74 ns, z -10.23 | 2.72 (0xff), +0.26 ns, z -1.15 |
+
+Every run passed by the harness's rule (no class above |t| 10 on 1 ns or
+more). Before the change, with the table, two of five runs were reported
+(|t| above 4.5), at 6.31 and 9.46, the second on a class with an odd R,
+and in every run the odd classes were the slower, by 1.9 to 5.7 ns in crop
+32, z from -2.2 to -31.2; without the table the rows stayed under 4.5 (the
+largest 4.45), and the split leaned the same way in three runs of five,
+z -1.92, -4.09 and -10.23, and the other way, weakly, in two (z +0.27 and
++0.56), as the second addendum saw it weaker there. After the change no run
+was reported, the largest |t| 4.39 on an even class with the table and
+3.63 without it, and z lay between -1.15 and +0.56 in all ten runs, the
+odd classes' crop-32 difference within 1.7 ns of the even ones' in nine
+of them (the tenth, 11.67 ns in round 2 without the table, the round that
+started at the highest load average, has z -1.04: its classes' t values
+did not split by parity). So the parity
+dependence the second addendum found is gone from this target's view, in
+both builds.
+
+**What this does not show.** One machine, one day, five runs a build at
+the nightly budget; arm64 was not timed. The rest of the dcrec suite was
+not run again: no other target's code changed. The machine code of the
+select was read on x86_64 only (below); arm64's was not inspected.
+Nothing wipes the negated temporary, as nothing wiped the old one.
+
+**The machine code.** `subtle` supplies only the trait, the `Choice` and
+`Choice::from`'s `black_box::<u8>`; the select itself is k256 0.14.0's
+`Scalar::conditional_select` (`src/arithmetic/scalar.rs:449-452`), which
+forwards to crypto-bigint 0.7.10's `Uint` select (`src/uint/ct.rs:78-81`,
+its `ct_select`), and through it to ctutils 0.4.8 and cmov 0.5.4, the
+versions the lock file pins. The negation is crypto-bigint's. A release
+build of dcrec's unit tests for x86_64 with Rust 1.100.0
+(`cargo test -p dcroxide-dcrec --release --lib --no-run`, with and
+without `--no-default-features`), disassembled with `objdump -d -l`, has
+no branch on the parity in `sign_with_nonce`: `Choice::from` is a call to
+`subtle::black_box::<u8>`, whose body is a byte stored to the stack and
+loaded back; the negation is straight-line subtraction with borrow, its
+zero check `sete`; and the select is four `test; cmovne`, one for each
+64-bit limb, from cmov's x86 backend. With the table, the only
+conditional jumps from the end of R's affine conversion to the select are
+on the SEC1 tag byte of R's encoding, which is public. Without the table
+the compiler moves the four `cmovne` past the challenge and its e < N
+check, whose jump depends only on the public hash, and keeps the choice
+on the stack until then; still no jump reads the parity. That holds for
+that compiler, those versions and that target; a different compiler
+release can compile it differently, and nothing in CI reads the machine
+code.
+
+The third addendum's last item read in the sources, that the branch
+leaks nothing about the nonce, no longer applies: there is no branch. The
+rest of the Decision stands.

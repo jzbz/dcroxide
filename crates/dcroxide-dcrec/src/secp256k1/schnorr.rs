@@ -23,6 +23,7 @@ use core::fmt;
 use k256::Scalar;
 use k256::elliptic_curve::PrimeField;
 use k256::elliptic_curve::sec1::ToSec1Point;
+use k256::elliptic_curve::subtle::{Choice, ConditionallySelectable};
 use zeroize::{Zeroize, Zeroizing};
 
 use super::nonce::nonce_rfc6979;
@@ -223,11 +224,15 @@ pub(crate) fn sign_with_nonce(
     let big_r = mul_secret_by_generator(&k).to_affine();
     let encoded = big_r.to_sec1_point(false);
 
-    // Step 5: negate k if R.y is odd.
+    // Step 5: negate k if R.y is odd.  dcrd branches on the parity
+    // (`if R.Y.IsOdd() { k.Negate() }`); here the negation is selected,
+    // not branched on, as ECDSA's low-S negation is, with the same k
+    // either way.  The parity says only which of the RFC 6979 nonce and its
+    // negation signs, but a branch on it made signing's time depend on the
+    // nonce's point (ADR-0017, addendum of 2026-11-20).
     let y = encoded.y().expect("kG is never the identity for k != 0");
-    if y[31] & 1 == 1 {
-        k = -k;
-    }
+    let y_is_odd = Choice::from(y[31] & 1);
+    k = Scalar::conditional_select(&k, &-k, y_is_odd);
 
     // Step 6: r = R.x.
     let x = encoded.x().expect("affine point has x");
@@ -469,6 +474,46 @@ mod tests {
             );
             assert!(sig.verify(&hash, &priv_key.public_key()), "{name}: verify");
         }
+    }
+
+    /// Step 5 makes k and -k the same signing nonce: kG and -kG share their
+    /// x, one of them has an odd y, and the selected negation turns that
+    /// one into the other, so both sign alike.  Over random nonces both
+    /// parities occur, so both sides of the select are taken; of dcrd's
+    /// eleven signing vectors above, five have an odd R.
+    #[test]
+    fn a_nonce_and_its_negation_sign_alike() {
+        use k256::elliptic_curve::point::AffineCoordinates;
+        let d = Scalar::from_repr(
+            arr32("a1becef2069444a9dc6331c3247e113c3ee142edda683db8643f9cb0af7cbe33").into(),
+        )
+        .expect("valid scalar");
+        let hash = arr32("4a6c419a1e25c85327115c4ace586decddfe2990ed8f3d4d801871158338501d");
+        let mut rng = dcroxide_testutil::SplitMix64(0x5c40_0dd5);
+        let mut odd = 0usize;
+        for _ in 0..256 {
+            let mut bytes = [0u8; 32];
+            rng.fill(&mut bytes);
+            let Some(k) = Option::<Scalar>::from(Scalar::from_repr(bytes.into())) else {
+                continue;
+            };
+            if bool::from(k.is_zero()) {
+                continue;
+            }
+            let neg: [u8; 32] = (-k).to_repr().into();
+            let y_is_odd = bool::from(mul_secret_by_generator(&k).to_affine().y_is_odd());
+            odd += usize::from(y_is_odd);
+            assert_eq!(
+                sign_with_nonce(&d, &bytes, &hash),
+                sign_with_nonce(&d, &neg, &hash),
+                "nonce {}",
+                dcroxide_testutil::hex(&bytes)
+            );
+        }
+        assert!(
+            (64..=192).contains(&odd),
+            "{odd} of 256 nonces had an odd R"
+        );
     }
 
     #[test]
