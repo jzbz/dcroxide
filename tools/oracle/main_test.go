@@ -23,6 +23,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"io"
+	"math"
 	"math/big"
 	"os"
 	"reflect"
@@ -35,6 +36,7 @@ import (
 	"github.com/decred/dcrd/crypto/blake256"
 	"github.com/decred/dcrd/dcrec/secp256k1/v4"
 	"github.com/decred/dcrd/dcrec/secp256k1/v4/ecdsa"
+	"github.com/decred/dcrd/wire"
 )
 
 // These mirror unexported constants of dcrd's ecdsa package, which the rows
@@ -1666,5 +1668,65 @@ func TestPanickingRequest(t *testing.T) {
 	want := `{"id":1,"result":"` + hex.EncodeToString(digest[:]) + `"}` + "\n"
 	if got := out.String(); got != want {
 		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
+// TestRewardCommitLimits checks stdaddr_reward_commit_limits answers with
+// the fee limit bytes of dcrd's reward commitment scripts, in request order,
+// among them a limit just above 2^49, whose exponent math.Log2 rounds down
+// to 49, and refuses a request that is not whole pairs.
+func TestRewardCommitLimits(t *testing.T) {
+	pair := func(vote, revoke int64) []byte {
+		b := binary.BigEndian.AppendUint64(nil, uint64(vote))
+		return binary.BigEndian.AppendUint64(b, uint64(revoke))
+	}
+	resp := call("stdaddr_reward_commit_limits", pair(0, 0), pair(1, 2),
+		pair(1<<49+1, 1<<49+2), pair(-1, math.MaxInt64))
+	if want := "0000" + "4041" + "7172" + "407f"; resp.Error != "" || resp.Result != want {
+		t.Errorf("got %+v, want result %s", resp, want)
+	}
+	resp = call("stdaddr_reward_commit_limits", make([]byte, 15))
+	if resp.Error == "" {
+		t.Errorf("a partial pair: got %+v, want an error", resp)
+	}
+}
+
+// TestRawTxInSigIndexPastInputs checks that raw_txin_sig answers
+// RawTxInSignature's panic for an input index past the inputs under
+// SigHashAnyOneCanPay as an error of kind panic, without ending the oracle,
+// and that dcrd checks the script parses before it slices the inputs, so an
+// unparsable script at the same index is its parse error instead.
+func TestRawTxInSigIndexPastInputs(t *testing.T) {
+	tx := wire.NewMsgTx()
+	tx.AddTxIn(wire.NewTxIn(&wire.OutPoint{}, 0, nil))
+	tx.AddTxOut(wire.NewTxOut(0, []byte{0x51}))
+	var buf bytes.Buffer
+	if err := tx.Serialize(&buf); err != nil {
+		t.Fatal(err)
+	}
+	key := bytes.Repeat([]byte{1}, 32)
+	req := func(hashType byte, idx uint32, sub []byte) []byte {
+		b := []byte{0, hashType}
+		b = binary.BigEndian.AppendUint32(b, idx)
+		b = append(b, byte(len(key)))
+		b = append(b, key...)
+		b = binary.BigEndian.AppendUint32(b, uint32(len(sub)))
+		b = append(b, sub...)
+		return append(b, buf.Bytes()...)
+	}
+
+	resp := call("raw_txin_sig", req(0x81, 1, []byte{0x51}))
+	if resp.Kind != "panic" || !strings.Contains(resp.Error, "out of range") {
+		t.Errorf("parsable script past the inputs: got %+v, want a panic", resp)
+	}
+	resp = call("raw_txin_sig", req(0x81, 1, []byte{0x4c}))
+	if resp.Kind != "" || resp.Result != "" ||
+		!strings.Contains(resp.Error, "OP_PUSHDATA1") {
+		t.Errorf("unparsable script past the inputs: got %+v, want the "+
+			"parse error", resp)
+	}
+	resp = call("raw_txin_sig", req(0x01, 1, []byte{0x51}))
+	if resp.Error != "" || resp.Result == "" {
+		t.Errorf("SigHashAll past the inputs: got %+v, want a signature", resp)
 	}
 }

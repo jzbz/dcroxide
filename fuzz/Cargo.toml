@@ -179,6 +179,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "txscript_sign_tx_output"
+path = "fuzz_targets/txscript_sign_tx_output.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "rpc_request_parse"
 path = "fuzz_targets/rpc_request_parse.rs"
 test = false

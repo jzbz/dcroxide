@@ -165,13 +165,13 @@ fn ours_sign(
     let mut kdb = |addr: &Address| -> Result<(Vec<u8>, SignatureType, bool), SignError> {
         match keys.get(&addr.encode()) {
             Some(entry) => Ok((entry.key.clone(), entry.sig_type, entry.compressed)),
-            None => Err(SignError(format!("no key for {}", addr.encode()))),
+            None => Err(SignError::new(format!("no key for {}", addr.encode()))),
         }
     };
     let mut sdb = |addr: &Address| -> Result<Vec<u8>, SignError> {
         match scripts.get(&addr.encode()) {
             Some(script) => Ok(script.clone()),
-            None => Err(SignError(format!("no script for {}", addr.encode()))),
+            None => Err(SignError::new(format!("no script for {}", addr.encode()))),
         }
     };
     sign_tx_output(

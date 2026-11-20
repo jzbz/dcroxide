@@ -92,13 +92,13 @@ fn single_key_db(
         if a.encode() == addr {
             Ok((key.clone(), sig_type, compressed))
         } else {
-            Err(SignError(format!("no key for {}", a.encode())))
+            Err(SignError::new(format!("no key for {}", a.encode())))
         }
     }
 }
 
 fn no_script_db() -> impl FnMut(&Address) -> Result<Vec<u8>, SignError> {
-    |a: &Address| Err(SignError(format!("no script for {}", a.encode())))
+    |a: &Address| Err(SignError::new(format!("no script for {}", a.encode())))
 }
 
 /// Signing a NULLDATA script fails with dcrd's exact message.
@@ -107,7 +107,7 @@ fn sign_nulldata_errors() {
     let params = mainnet_params();
     let pk_script = stdscript::provably_pruneable_script_v0(b"hello").expect("builds");
     let tx = spending_tx(&pk_script);
-    let mut kdb = |_: &Address| Err(SignError("unused".into()));
+    let mut kdb = |_: &Address| Err(SignError::new("unused"));
     let mut sdb = no_script_db();
     let err = sign_tx_output(
         &params,
@@ -121,7 +121,7 @@ fn sign_nulldata_errors() {
         false,
     )
     .expect_err("nulldata cannot be signed");
-    assert_eq!(err.0, "can't sign NULLDATA transactions");
+    assert_eq!(err.to_string(), "can't sign NULLDATA transactions");
 }
 
 /// Signing a nonstandard script fails with dcrd's exact message.
@@ -131,7 +131,7 @@ fn sign_nonstandard_errors() {
     // OP_TRUE alone is nonstandard for signing purposes.
     let pk_script = vec![0x51];
     let tx = spending_tx(&pk_script);
-    let mut kdb = |_: &Address| Err(SignError("unused".into()));
+    let mut kdb = |_: &Address| Err(SignError::new("unused"));
     let mut sdb = no_script_db();
     let err = sign_tx_output(
         &params,
@@ -145,7 +145,7 @@ fn sign_nonstandard_errors() {
         false,
     )
     .expect_err("nonstandard cannot be signed");
-    assert_eq!(err.0, "can't sign unknown transactions");
+    assert_eq!(err.to_string(), "can't sign unknown transactions");
 }
 
 /// A missing key propagates the KeyDb error rather than signing.
@@ -161,7 +161,7 @@ fn sign_missing_key_errors() {
     let (_, pk_script) = addr.payment_script();
     let tx = spending_tx(&pk_script);
     // KeyDb that never has the key.
-    let mut kdb = |a: &Address| Err(SignError(format!("no key for {}", a.encode())));
+    let mut kdb = |a: &Address| Err(SignError::new(format!("no key for {}", a.encode())));
     let mut sdb = no_script_db();
     let err = sign_tx_output(
         &params,
@@ -175,7 +175,7 @@ fn sign_missing_key_errors() {
         false,
     )
     .expect_err("missing key errors");
-    assert!(err.0.starts_with("no key for"), "got: {}", err.0);
+    assert!(err.to_string().starts_with("no key for"), "got: {err}");
 }
 
 /// A basic P2PKH sign-then-verify round trip, independent of the oracle.

@@ -377,26 +377,28 @@ jobs:
     # never links. secp256k1-vartime has no dependencies and needs core
     # alone, without alloc.
     #
-    # Not yet listed: blockchain, fees, gcs, mempool, mining, stake, and
-    # txscript. The six that reach dcroxide-database (all but txscript)
-    # build redb with redb's default `std` feature, and stake fails on
-    # redb. So each needs `default-features = false` on its dcroxide-*
-    # path dependencies plus a `std` feature that re-enables them, and
-    # redb's `std` dealt with. 5.0.0 builds without `std` once its `std`
-    # feature is off, with no preview feature as 4.5.0 needed, as long as
-    # panics abort (redb-5.0.0 `src/lib.rs:118-127`), which they do on
-    # x86_64-unknown-none; no build here has tried it yet.
-    # txscript no longer fails here on secp256k1-sys, which dcroxide-dcrec
-    # no longer takes, but it does not pass either. Its own code calls
-    # `f64::log2` (`src/stdaddr.rs`), which core lacks. And it takes
-    # dcroxide-dcrec with default features, whose `precomputed-tables`
-    # turns on `primeorder/std` and through it std in elliptic-curve,
-    # sec1 and der, so the check stops in der before it reaches txscript.
-    # Listing it needs both fixed: `default-features = false` on its
-    # dcroxide-dcrec dependency plus a feature of its own that turns
-    # `precomputed-tables` back on for the node and the wallet, and a
-    # base 2 logarithm core has. Any consensus crate added here later
-    # takes dcroxide-dcrec the same way.
+    # txscript takes dcroxide-dcrec with `default-features = false` and a
+    # default `precomputed-tables` feature of its own that turns dcrec's
+    # back on for the node and the wallet, so `--no-default-features`
+    # below leaves out the table's std as it does for dcrec. Its fee limit
+    # exponent is computed from a double's bits, since core has no
+    # `f64::log2` (`src/stdaddr.rs`, `fee_limit_exponent`). Any consensus
+    # crate added here later takes dcroxide-dcrec the same way.
+    #
+    # Not yet listed: blockchain, fees, gcs, mempool, mining and stake.
+    # All six reach dcroxide-database, which builds redb with redb's
+    # default `std` feature, and stake fails on redb. So each needs
+    # `default-features = false` on its dcroxide-* path dependencies plus
+    # a `std` feature that re-enables them, and redb's `std` dealt with.
+    # 5.0.0 builds without `std` once its `std` feature is off, with no
+    # preview feature as 4.5.0 needed, as long as panics abort
+    # (redb-5.0.0 `src/lib.rs:118-127`), which they do on
+    # x86_64-unknown-none; no build here has tried it yet. Two of them
+    # also call a float method core lacks, which resolves today only
+    # because redb links std: fees' `f64::round` (`src/estimator.rs`) and
+    # blockchain's `f64::ceil` (`src/process.rs`,
+    # `calc_eviction_height`). Each needs a core-only form before its
+    # crate can be listed.
     steps:
       - uses: actions/checkout@v7
       - run: rustup toolchain install
@@ -404,9 +406,60 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Check the no_std crates on a no-OS target
         run: |
-          for c in base58 chaincfg chainhash crypto dcrec secp256k1-vartime standalone uint256 wire; do
+          for c in base58 chaincfg chainhash crypto dcrec secp256k1-vartime standalone txscript uint256 wire; do
             cargo check -p "dcroxide-$c" --no-default-features --target x86_64-unknown-none
           done
+
+  build-alone:
+    name: each workspace crate built alone
+    runs-on: ubuntu-latest
+    # Every other job builds the workspace as one, and Cargo unifies the
+    # features of a dependency across every member a command selects, so
+    # a crate that compiles only because some other member turns on a
+    # feature it needs (of a shared dependency, or of a dcroxide crate)
+    # passes there and fails for whoever builds it alone: `cargo test
+    # -p` on one crate, or a downstream user such as dcr-purse taking it
+    # with its defaults. This builds each member by itself with its
+    # default features, its library and binaries and then, with
+    # `--no-run`, its tests and examples with its dev-dependencies, which
+    # change the feature set again. The list comes from cargo metadata,
+    # so a new member is covered without editing this job.
+    #
+    # It does not catch a `no_std` crate calling a float method only std
+    # has (`f64::log2`, `round`, `ceil`): such a method resolves whenever
+    # anything in the crate graph links std, and the default builds of
+    # the crates at risk do (txscript's `precomputed-tables` reaches
+    # `primeorder/std`, the database crates reach redb's `std`), as does
+    # every test build, where `cfg(test)` drops `no_std`. Only the no_std job above catches
+    # that, and only for the crates it lists.
+    steps:
+      - uses: actions/checkout@v7
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: Build each workspace crate alone
+        run: |
+          set -euo pipefail
+          # A plain assignment, so a failing cargo metadata or jq fails
+          # the step; the count check catches a list that comes back
+          # empty or short of Cargo.toml's members.
+          members=$(cargo metadata --locked --no-deps --format-version 1 | jq -r '.packages[].name')
+          listed=$(wc -w <<<"$members")
+          declared=$(sed -n '/^members = \[/,/^\]/p' Cargo.toml | grep -c '"crates/')
+          if [ "$listed" -eq 0 ] || [ "$listed" -ne "$declared" ]; then
+            echo "cargo metadata listed $listed members; Cargo.toml declares $declared" >&2
+            exit 1
+          fi
+          # Every crate is tried even after one fails, so one run names
+          # them all.
+          failed=""
+          for c in $members; do
+            cargo build --locked -p "$c" || failed="$failed $c(build)"
+            cargo test --locked -p "$c" --no-run || failed="$failed $c(test --no-run)"
+          done
+          if [ -n "$failed" ]; then
+            echo "crates that do not build alone:$failed" >&2
+            exit 1
+          fi
 
   no-c-compiler:
     name: build with no C compiler

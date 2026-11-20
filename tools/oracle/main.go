@@ -130,9 +130,32 @@
 //	stdscript_analyze  → data is net_len(1) || net name || version(2 BE) ||
 //	                     script; {"result": "<hex of canonical analysis>"}
 //	raw_txin_sig       → raw input signature across the three suites;
-//	                     see the handler for the field layout
+//	                     see the handler for the field layout; a panic in
+//	                     RawTxInSignature is answered with {"error":
+//	                     "panic: <value>", "kind": "panic"}
 //	sign_tx_output     → full SignTxOutput with explicit key/script DBs;
-//	                     see the handler for the field layout
+//	                     see the handler for the field layout; a panic in
+//	                     SignTxOutput is answered with {"error": "panic:
+//	                     <value>", "kind": "panic"}, and DCROXIDE_ORACLE_
+//	                     MAX_STACK (bytes) lowers the stack limit for the
+//	                     inputs on which it recurses until the process dies
+//	stdaddr_reward_commit_limits → data is pairs of votefee(8 BE) ||
+//	                     revokefee(8 BE); {"result": "<hex>"}, the two
+//	                     fee limit bytes RewardCommitmentScript ends each
+//	                     pair's script with, in request order
+//	stdscript_is_null_data → data is version(2 BE) || script;
+//	                     {"result": "true"|"false"} from stdscript's
+//	                     IsNullDataScript
+//	rand_draws         → data is seed(32) || operations, each code(1) ||
+//	                     argument(8 BE), on dcrd's crypto/rand PRNG keyed
+//	                     as dcroxide's Prng::from_seed keys its own
+//	                     (cryptorand.go); {"result": one line per
+//	                     operation, its value in decimal, a Read's bytes in
+//	                     hex, or "panic: <value>", then "next=" and one
+//	                     more Uint64}; a Read over 65536 bytes answers an
+//	                     "error: " line, and a request whose draws reach
+//	                     dcrd's 4 MiB rekey is refused, as the stream
+//	                     past it depends on kernel entropy
 //	tspend_sig         → data is key(32) || serialized tx;
 //	                     {"result": "<hex signature script>"}
 //	stake_analyze      → data is a serialized tx; {"result": "<hex of the
@@ -1101,12 +1124,18 @@ func handle(req request) response {
 		if err := tx.Deserialize(bytes.NewReader(rest[4+subLen:])); err != nil {
 			return errResp("raw_txin_sig: bad tx: %v", err)
 		}
-		sig, err := sign.RawTxInSignature(&tx, idx, subScript, hashType, key,
-			sigType)
-		if err != nil {
-			return response{Error: err.Error()}
-		}
-		return response{Result: hex.EncodeToString(sig)}
+		// RawTxInSignature panics for an index past the inputs under
+		// SigHashAnyOneCanPay once the script parses, which dcroxide
+		// answers with an error; the panic is answered here rather than
+		// ending the oracle, so the differential can compare those cases.
+		return recoverAsResponse(func() response {
+			sig, err := sign.RawTxInSignature(&tx, idx, subScript, hashType,
+				key, sigType)
+			if err != nil {
+				return response{Error: err.Error()}
+			}
+			return response{Result: hex.EncodeToString(sig)}
+		})
 
 	case "sign_tx_output":
 		// data: net_len(1) || net || hash_type(1) || treasury(1) ||
@@ -1218,12 +1247,54 @@ func handle(req request) response {
 			return script, nil
 		})
 
-		sigScript, err := sign.SignTxOutput(params, &tx, idx, pkScript,
-			hashType, kdb, sdb, prevScript, isTreasuryEnabled)
-		if err != nil {
-			return response{Error: err.Error()}
+		// SignTxOutput panics on some inputs (a pay-to-pubkey script whose
+		// key does not parse, an input index past the inputs under
+		// SigHashAnyOneCanPay), which dcroxide answers with an error; the
+		// panic is answered here rather than ending the oracle, so the
+		// differential can compare those cases too.
+		return recoverAsResponse(func() response {
+			sigScript, err := sign.SignTxOutput(params, &tx, idx, pkScript,
+				hashType, kdb, sdb, prevScript, isTreasuryEnabled)
+			if err != nil {
+				return response{Error: err.Error()}
+			}
+			return response{Result: hex.EncodeToString(sigScript)}
+		})
+
+	case "stdaddr_reward_commit_limits":
+		// data: pairs of votefee(8 BE) || revokefee(8 BE). Each pair goes
+		// through RewardCommitmentScript of one fixed P2PKH address, and
+		// the result is the last two bytes of each script (the fee
+		// limits, little endian, as calcRewardCommitScriptLimits encoded
+		// them), concatenated in request order.
+		if len(data)%16 != 0 {
+			return errResp("stdaddr_reward_commit_limits: request is not whole pairs")
 		}
-		return response{Result: hex.EncodeToString(sigScript)}
+		addr, err := stdaddr.NewAddressPubKeyHashEcdsaSecp256k1V0(
+			make([]byte, 20), chaincfg.MainNetParams())
+		if err != nil {
+			return errResp("stdaddr_reward_commit_limits: %v", err)
+		}
+		limits := make([]byte, 0, len(data)/8)
+		for off := 0; off < len(data); off += 16 {
+			voteFee := int64(binary.BigEndian.Uint64(data[off : off+8]))      // nolint:gosec
+			revokeFee := int64(binary.BigEndian.Uint64(data[off+8 : off+16])) // nolint:gosec
+			_, script := addr.RewardCommitmentScript(0, voteFee, revokeFee)
+			limits = append(limits, script[len(script)-2:]...)
+		}
+		return response{Result: hex.EncodeToString(limits)}
+
+	case "stdscript_is_null_data":
+		// data: version(2 BE) || script
+		if len(data) < 2 {
+			return errResp("stdscript_is_null_data: truncated request")
+		}
+		version := binary.BigEndian.Uint16(data[0:2])
+		return response{Result: strconv.FormatBool(
+			stdscript.IsNullDataScript(version, data[2:]))}
+
+	case "rand_draws":
+		return randDraws(data)
 
 	case "tspend_sig":
 		// data: key(32) || serialized tx
@@ -2805,6 +2876,29 @@ func dumpParams(p *chaincfg.Params) (string, error) {
 	return w.String(), nil
 }
 
+// recoverAsResponse runs f and answers a panic it raises with an error
+// response of kind "panic" whose error is "panic: " and the panic's value.
+// It is for commands whose dcrd function panics on inputs dcroxide answers
+// with an error, so that a test can compare those inputs without ending
+// the oracle.  A fatal runtime error, such as a stack overflow, is not a
+// panic and still ends the process.
+func recoverAsResponse(f func() response) (resp response) {
+	defer func() {
+		if r := recover(); r != nil {
+			resp = response{Error: fmt.Sprintf("panic: %v", r), Kind: "panic"}
+		}
+	}()
+	return f()
+}
+
+// maxStackVar names an environment variable holding a goroutine stack
+// limit in bytes, which main applies with debug.SetMaxStack when it is set.
+// A test that sends a request on which dcrd recurses without end sets it
+// low, so that the oracle dies of the stack overflow in well under a
+// second rather than after growing a stack to Go's default limit of 1 GB
+// on 64-bit targets.  It changes only when the overflow is reported.
+const maxStackVar = "DCROXIDE_ORACLE_MAX_STACK"
+
 // handleLine answers one request line, echoing its id.
 func handleLine(line []byte) response {
 	var req request
@@ -2903,6 +2997,15 @@ func serve(in *bufio.Reader, out *bufio.Writer, answer func(line []byte) respons
 }
 
 func main() {
+	if limit := os.Getenv(maxStackVar); limit != "" {
+		n, err := strconv.Atoi(limit)
+		if err != nil || n <= 0 {
+			fmt.Fprintf(os.Stderr, "dcrd-oracle: %s=%q is not a positive "+
+				"byte count\n", maxStackVar, limit)
+			os.Exit(1)
+		}
+		debug.SetMaxStack(n)
+	}
 	in := bufio.NewReaderSize(os.Stdin, 1<<20)
 	out := bufio.NewWriterSize(os.Stdout, 1<<20)
 	if err := serve(in, out, handleLine); err != nil {

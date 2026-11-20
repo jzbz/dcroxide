@@ -401,14 +401,72 @@ fn calc_reward_commit_script_limits(vote_fee_limit: i64, revocation_fee_limit: i
     // in the low byte, revocation in the high byte.
     let mut limits: u16 = 0;
     if vote_fee_limit != 0 {
-        let exp = (vote_fee_limit as f64).log2().ceil() as u16;
+        let exp = fee_limit_exponent(vote_fee_limit);
         limits |= exp | 0x40;
     }
     if revocation_fee_limit != 0 {
-        let exp = (revocation_fee_limit as f64).log2().ceil() as u16;
+        let exp = fee_limit_exponent(revocation_fee_limit);
         limits |= (exp | 0x40) << 8;
     }
     limits
+}
+
+/// The largest fraction field of a double at or above 2^32 whose base 2
+/// logarithm dcrd's `math.Log2` rounds down to the exponent (built for
+/// amd64; see [`fee_limit_exponent`]).
+const LAST_FRACTION_ROUNDED_DOWN: u64 = 11;
+
+/// dcrd's `uint16(math.Ceil(math.Log2(float64(limit))))` from
+/// `calcRewardCommitScriptLimits`, computed from the bits of
+/// `float64(limit)` instead, since `core` has no logarithm and the crate
+/// is `no_std` without its `std` feature.
+///
+/// It is not the exact ceiling of the base 2 logarithm of `limit`, and
+/// must not become one: dcrd takes the logarithm of the double nearest
+/// `limit` and rounds that logarithm to a double before the ceiling, so
+/// both roundings show (QK-0037). `limit as f64` rounds to nearest, ties
+/// to even, as Go's `float64(int64)` does. Write the double as
+/// `2^k * (1 + f / 2^52)`, `k` its exponent and `f` its 52-bit fraction
+/// field:
+///
+/// - `f == 0`, a power of two: `math.Log2` returns `k` exactly (its
+///   `frac == 0.5` case), and so does this.
+/// - `1 <= k <= 31`: an integer's fraction field is a multiple of
+///   `2^(52 - k)`, so a nonzero one makes the logarithm exceed `k` by at
+///   least `2^-31`, far beyond half an ulp of `k` (at most `2^-49`), and
+///   the ceiling is `k + 1`.
+/// - `32 <= k <= 63`: half an ulp of `k` is `2^-48`, and the excess,
+///   about `f / (2^52 ln 2)`, is 0.992 of it at `f == 11` and 1.082 of it
+///   at `f == 12`. dcrd built for amd64 rounds the sum down to `k` for
+///   `f <= 11` and up for `f >= 12`, as a correctly rounded logarithm
+///   does; a limit just above `2^49` (`f == 8`) is the smallest that
+///   shows it. The margin at `f == 11` is under one percent of half an
+///   ulp, below what argument about `math.Log2`'s error can settle, so
+///   that row is held to dcrd by test for every such `k` rather than by
+///   this reasoning. dcrd built for arm64, where Go fuses `math.log2`'s
+///   multiply and add, rounds `f == 11` up instead; this follows the
+///   unfused source on every architecture (QK-0037).
+///
+/// A limit of zero or below has no logarithm (`-Inf` or `NaN`), and Go's
+/// conversion of either to `uint16` is implementation-defined; at the
+/// reference Go on amd64 it is 0, which the float form this replaces
+/// (Rust's saturating cast) also gave, and which this returns.
+/// `calc_reward_commit_script_limits` never passes zero.
+fn fee_limit_exponent(limit: i64) -> u16 {
+    if limit <= 0 {
+        return 0;
+    }
+    let bits = (limit as f64).to_bits();
+    // A positive limit is a normal double in [1, 2^63]: the sign bit is
+    // clear and the biased exponent is 1023..=1086, so neither operation
+    // below wraps.
+    let exp = ((bits >> 52) as u16).wrapping_sub(1023);
+    let fraction = bits & ((1 << 52) - 1);
+    if fraction <= LAST_FRACTION_ROUNDED_DOWN {
+        exp
+    } else {
+        exp.wrapping_add(1)
+    }
 }
 
 /// Build the shared `RETURN <hash || amount || limits>` ticket commitment
@@ -1245,5 +1303,90 @@ mod goquote {
         assert_eq!(table("IS_NOT_PRINT16"), widen(&IS_NOT_PRINT16));
         assert_eq!(table("IS_PRINT32"), IS_PRINT32);
         assert_eq!(table("IS_NOT_PRINT32"), widen(&IS_NOT_PRINT32));
+    }
+}
+
+/// The exponent against the float form it replaces, which a test build
+/// (with std) still has.
+#[cfg(test)]
+mod fee_limit_exponent_tests {
+    use super::fee_limit_exponent;
+
+    /// `(limit as f64).log2().ceil() as u16`, the form this crate used
+    /// before.
+    fn float_form(limit: i64) -> u16 {
+        (limit as f64).log2().ceil() as u16
+    }
+
+    /// Every limit within 300 representable steps of each power of two,
+    /// on both sides, and the extremes.
+    #[test]
+    fn matches_the_float_form_around_every_power_of_two() {
+        for k in 0..63u32 {
+            let base = 1i64 << k;
+            let step = if k > 52 { 1i64 << (k - 52) } else { 1 };
+            for m in -300i64..=300 {
+                for limit in [
+                    base.wrapping_add(m.wrapping_mul(step)),
+                    base.wrapping_add(m),
+                ] {
+                    assert_eq!(
+                        fee_limit_exponent(limit),
+                        float_form(limit),
+                        "limit {limit}"
+                    );
+                }
+            }
+        }
+        for limit in [
+            i64::MIN,
+            i64::MIN + 1,
+            -1,
+            0,
+            1,
+            2,
+            3,
+            i64::MAX - 1,
+            i64::MAX,
+        ] {
+            assert_eq!(
+                fee_limit_exponent(limit),
+                float_form(limit),
+                "limit {limit}"
+            );
+        }
+    }
+
+    /// Random limits, spread over every magnitude and both signs.
+    #[test]
+    fn matches_the_float_form_on_random_limits() {
+        let mut state: u64 = 0x6665_6520_6c69_6d69;
+        for _ in 0..1_000_000 {
+            // SplitMix64.
+            state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            let mut z = state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            z ^= z >> 31;
+            let limit = (z >> (z & 63)) as i64 ^ if z & 64 != 0 { i64::MIN } else { 0 };
+            assert_eq!(
+                fee_limit_exponent(limit),
+                float_form(limit),
+                "limit {limit}"
+            );
+        }
+    }
+
+    /// The rows that differ from the exact ceiling of the logarithm.
+    #[test]
+    fn rounds_as_dcrd_above_2_pow_49() {
+        assert_eq!(fee_limit_exponent((1 << 49) + 1), 49);
+        assert_eq!(fee_limit_exponent((1 << 49) + 2), 50);
+        assert_eq!(fee_limit_exponent((1 << 52) + 11), 52);
+        assert_eq!(fee_limit_exponent((1 << 52) + 12), 53);
+        // Rounds to 2^62 as a double.
+        assert_eq!(fee_limit_exponent((1 << 62) + 1), 62);
+        assert_eq!(fee_limit_exponent((1 << 62) + (11 << 10)), 62);
+        assert_eq!(fee_limit_exponent((1 << 62) + (12 << 10)), 63);
     }
 }

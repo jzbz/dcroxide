@@ -9,17 +9,26 @@ license.workspace = true
 repository.workspace = true
 
 [features]
+default = ["precomputed-tables"]
 # Enables the signature verification cache (it needs std's HashMap
 # and RwLock; the crate is no_std without it and the cache compiles
 # as an inert stub — results are identical either way).
 std = []
+# dcroxide-dcrec's default feature, k256's basepoint table for secret
+# generator multiplication, which takes std with it.  On by default, so
+# the node and dcr-purse build as before; `--no-default-features` (CI's
+# no_std check) leaves dcrec multiplying through `lincomb`, with the same
+# results.
+precomputed-tables = ["dcroxide-dcrec/precomputed-tables"]
 
 [dependencies]
 dcroxide-base58 = { path = "../dcroxide-base58" }
 dcroxide-chaincfg = { path = "../dcroxide-chaincfg" }
 dcroxide-chainhash = { path = "../dcroxide-chainhash" }
 dcroxide-crypto = { path = "../dcroxide-crypto" }
-dcroxide-dcrec = { path = "../dcroxide-dcrec" }
+# Default features off so a no_std build can leave out the table's std;
+# `precomputed-tables` above turns it back on.
+dcroxide-dcrec = { path = "../dcroxide-dcrec", default-features = false }
 dcroxide-wire = { path = "../dcroxide-wire" }
 sha1 = { version = "0.11", default-features = false }
 sha2 = { version = "0.11", default-features = false }

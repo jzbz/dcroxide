@@ -19,17 +19,29 @@
 //!
 //! Ported: `maxCipherRead` (`prng.go:20`), `nonce.inc` (`:26-40`),
 //! `NewPRNG` (`:55-63`), `PRNG.seed` (`:67-81`), `PRNG.Read` including
-//! its mid-buffer split loop (`:85-105`); `uniform.go`'s `PRNG.Uint64`
-//! (`:54-58`), `PRNG.Uint64N` (`:102-148`), `PRNG.Duration`
+//! its mid-buffer split loop (`:85-105`); `uniform.go`'s `PRNG.Uint32`
+//! (`:47-51`), `PRNG.Uint64` (`:54-58`), `PRNG.Uint32N` (`:61-97`),
+//! `PRNG.Uint64N` (`:102-148`), `PRNG.Int32` (`:152-154`),
+//! `PRNG.Int32N` (`:159-164`), `PRNG.Int64` (`:168-170`),
+//! `PRNG.Int64N` (`:175-180`), `PRNG.Int` (`:183-185`), `PRNG.IntN`
+//! (`:190-195`), `PRNG.UintN` (`:198-200`), `PRNG.Duration`
 //! (`:202-209`) and `PRNG.Shuffle` (`:214-230`); and the package
 //! globals -- `lockingPRNG`
 //! (`prng.go:111-114`), the `init` that seeds it (`:116-122`), and the
-//! `default.go` entry points the daemon's draws go through:
-//! `Uint64` (`default.go:37-42`) and `ShuffleSlice` (`:144-148`) over
-//! `Shuffle` (`:136-141`) for the peer module, `IntN` (`:109-114`)
-//! for the mining package's address pick, `Duration` (`:126-131`) for
-//! the seeder's backdating, the rebroadcast timer and the inventory
-//! trickle, and `Read` (`:22-26`) for the RPC server's auth HMAC key.
+//! `default.go` entry points over each of those methods, each holding
+//! the lock for the whole call as dcrd's do: `Read` (`default.go:22-26`),
+//! `Uint32` (`:29-34`), `Uint64` (`:37-42`), `Uint32N` (`:45-50`),
+//! `Uint64N` (`:53-58`), `Int32` (`:62-67`), `Int32N` (`:72-77`),
+//! `Int64` (`:81-86`), `Int64N` (`:91-96`), `Int` (`:99-104`), `IntN`
+//! (`:109-114`), `UintN` (`:117-122`), `Duration` (`:126-131`) and
+//! `ShuffleSlice` (`:144-148`) over `Shuffle` (`:136-141`).  The daemon
+//! draws through `Uint64` and `ShuffleSlice` for the peer module, `IntN`
+//! for the mining package's address pick, `Duration` for the seeder's
+//! backdating, the rebroadcast timer and the inventory trickle, and
+//! `Read` for the RPC server's auth HMAC key; the rest serve library
+//! consumers such as a wallet, whose change-position draw is
+//! dcrwallet's `rand.Int32N` in `RandomizeOutputPosition`
+//! (`wallet/txauthor`).
 //!
 //! The globals are ported because dcrd's peer module reaches
 //! randomness through nothing else: `rand.Uint64()` for the ping and
@@ -46,24 +58,33 @@
 //!   at `:86-95`).  The byte budget alone removes the panic the rekey
 //!   exists to prevent, and a duration would put a clock read on every
 //!   draw.  Unobservable outside the process; recorded in PARITY.md.
-//! * `uniform.go`'s `Uint32N` and the `is32bit` delegation to it
-//!   (`:61-97`, `:99`, `:103-104`).  Go's own comment says the 32-bit
-//!   arithmetic is there "to preserve the exact output sequence
-//!   observed on 64-bit machines" (`:69-71`), so the 64-bit
-//!   [`Prng::uint64n`] ported here yields the same values on every
-//!   target and the split is a Go performance detail.
+//! * The 32-bit arithmetic inside `uniform.go`'s `Uint32N` (`:80-95`)
+//!   and the `is32bit` delegation of `Uint64N` to it (`:99`,
+//!   `:103-104`).  Go's own comment says the 32-bit form is there "to
+//!   preserve the exact output sequence observed on 64-bit machines"
+//!   (`:68-70`).  That comment came from `math/rand/v2`, where the
+//!   form runs on 32-bit machines only; dcrd's `Uint32N` has no
+//!   `is32bit` test and runs it on every target.  It computes the high
+//!   word and the low 64 bits of the 96-bit product `x * n` from
+//!   32-bit halves.  [`Prng::uint32n`]
+//!   computes the same two quantities with one 128-bit product, through
+//!   [`Prng::uint64n`]; its documentation gives the argument that the
+//!   values and the draw count are Go's, `tests/rand_uniform.rs` checks
+//!   it against the 32-bit form written out, and
+//!   `tests/rand_oracle_differential.rs` against dcrd itself.
 //! * `Shuffle`'s `(n, swap)` callback form (`uniform.go:214-230`,
 //!   `default.go:136-141`).  Go needs a swap closure because it cannot
 //!   name a generic slice-element swap; `<[T]>::swap` is that closure,
 //!   so the two Go functions collapse into [`shuffle_slice`].
-//! * The `default.go` entry points no consumer reaches: `Reader`,
-//!   `Uint32`, `Uint32N`, `Uint64N`, and the remaining
-//!   `Int*`/`UintN`/`BigInt`/`Float64` wrappers.  Each is two lines
-//!   over [`Prng`] when a consumer appears -- which is how `IntN`
-//!   arrived with the mining-address pick and `Duration` with the
-//!   seeder's backdating; the rebroadcast timer and the inventory
-//!   trickle period (`peer/peer.go:1628-1631`) have since drawn on
-//!   it too.
+//! * `Reader` (`default.go:16-18`), `BigInt` (`uniform.go:232-236`,
+//!   `default.go:151-156`) and the generic `N` (`default.go:161-166`).
+//!   `Reader` hands out the global as a Go `io.Reader`, which [`read`]
+//!   already is in substance; `BigInt` needs an arbitrary-precision
+//!   integer type and Go's `crypto/rand.Int` sampling over it, which no
+//!   consumer of this crate has asked for; and `N` is Go's way of
+//!   spelling one function for every integer type, which the typed
+//!   functions here already are for the types that have consumers.
+//!   Each is a small addition over [`Prng`] when a consumer appears.
 //! * The OpenBSD `arc4random` build variant
 //!   (`crypto/rand/prng_arc4random.go`), a Go-toolchain fallback.
 //!
@@ -275,6 +296,127 @@ impl Prng {
         u64::from_le_bytes(buf)
     }
 
+    /// A uniform random `u32` (dcrd `PRNG.Uint32`,
+    /// `crypto/rand/uniform.go:47-51`).
+    ///
+    /// Four stream bytes, little-endian, as Go's
+    /// `binary.LittleEndian.Uint32` of a four-byte read: half the
+    /// stream [`Prng::uint64`] consumes.  That is observable through a
+    /// shared stream, so it is reproduced rather than taken as the low
+    /// half of an eight-byte draw.
+    pub fn uint32(&mut self) -> u32 {
+        let mut buf = [0u8; 4];
+        self.read(&mut buf);
+        u32::from_le_bytes(buf)
+    }
+
+    /// A uniform random `u32` in `[0, n)` without modulo bias (dcrd
+    /// `PRNG.Uint32N`, `crypto/rand/uniform.go:61-97`).
+    ///
+    /// The values and the number of eight-byte draws are Go's for every
+    /// `n`, zero included, because this is [`Prng::uint64n`] of the same
+    /// bound, and Go's two functions agree draw for draw whenever the
+    /// bound fits in 32 bits:
+    ///
+    /// * A power of two, and zero, masks one draw in both (`:62-64`,
+    ///   `:106-108`).  `n - 1` fits in 32 bits, so masking the whole
+    ///   draw and masking its low half give the same value; for a zero
+    ///   bound Go's `uint32(x) & 0xffffffff` is the low half of the
+    ///   unconstrained draw `uint64n(0)` returns.
+    /// * Otherwise Go's `hi` and `lo1:lo0` are the high word and the low
+    ///   64 bits of the 96-bit product `x * n` (`:80-84`), which for
+    ///   `n < 2^32` are exactly `Mul64(x, n)`'s high and low words.  Go's
+    ///   `lo1 == 0 && lo0 < n` is then `lo < n`, and its
+    ///   `uint32(-n64 % n64)` threshold is `Uint64N`'s `-n % n`, which is
+    ///   below `n` and so survives the narrowing, so both functions enter
+    ///   the rejection loop on the same draws and leave it on the same
+    ///   draws (`:85-95`, `:141-146`).
+    ///
+    /// dcrd computes `Uint32N` from 32-bit halves on every target, the
+    /// form `math/rand/v2` keeps for 32-bit machines only.  The comment
+    /// dcrd inherited with it (`:65-67`) still says 64-bit systems take
+    /// the `uint64` code, but dcrd's `Uint32N` has no `is32bit` branch:
+    /// that constant is read only by `Uint64N` (`:99`, `:103`).  One
+    /// 128-bit product gives the same high word and low 64 bits as the
+    /// halves, so this port spells it that way, and the oracle
+    /// differential (`tests/rand_oracle_differential.rs`) runs dcrd's
+    /// halves directly, whatever the oracle host's word size.
+    pub fn uint32n(&mut self, n: u32) -> u32 {
+        // Below `n`, or for a zero bound the low half of the draw, so the
+        // narrowing is exact; see the doc comment.
+        self.uint64n(u64::from(n)) as u32
+    }
+
+    /// A random non-negative `i32`, 31 uniform bits (dcrd `PRNG.Int32`,
+    /// `crypto/rand/uniform.go:152-154`): the low 31 bits of a four-byte
+    /// [`Prng::uint32`] draw.
+    pub fn int32(&mut self) -> i32 {
+        (self.uint32() & 0x7fff_ffff) as i32
+    }
+
+    /// A uniform random `i32` in `[0, n)` without modulo bias (dcrd
+    /// `PRNG.Int32N`, `crypto/rand/uniform.go:159-164`): Go's
+    /// `int32(p.Uint32N(uint32(n)))`.
+    ///
+    /// # Panics
+    ///
+    /// For `n <= 0`, with dcrd's message, before anything is drawn
+    /// (`:160-162`), as [`Prng::int_n`] and [`Prng::duration`] do for
+    /// their bounds.  A caller that cannot rule such a bound out checks
+    /// it first, as a caller of dcrd's must.
+    pub fn int32n(&mut self, n: i32) -> i32 {
+        assert!(n > 0, "rand: invalid argument to Int32N");
+        // `n` is positive, so it converts to `u32` exactly, and the draw,
+        // being below it, converts back exactly.
+        self.uint32n(n as u32) as i32
+    }
+
+    /// A random non-negative `i64`, 63 uniform bits (dcrd `PRNG.Int64`,
+    /// `crypto/rand/uniform.go:168-170`): the low 63 bits of a
+    /// [`Prng::uint64`] draw.
+    pub fn int64(&mut self) -> i64 {
+        (self.uint64() & 0x7fff_ffff_ffff_ffff) as i64
+    }
+
+    /// A uniform random `i64` in `[0, n)` without modulo bias (dcrd
+    /// `PRNG.Int64N`, `crypto/rand/uniform.go:175-180`): Go's
+    /// `int64(p.Uint64N(uint64(n)))`.
+    ///
+    /// # Panics
+    ///
+    /// For `n <= 0`, with dcrd's message, before anything is drawn
+    /// (`:176-178`).
+    pub fn int64n(&mut self, n: i64) -> i64 {
+        assert!(n > 0, "rand: invalid argument to Int64N");
+        // As in `int32n`: positive, so both conversions are exact.
+        self.uint64n(n as u64) as i64
+    }
+
+    /// A random non-negative `isize`, uniform in every bit of the word
+    /// but the sign (dcrd `PRNG.Int`, `crypto/rand/uniform.go:183-185`).
+    ///
+    /// Go's `int(uint(p.Uint64()) << 1 >> 1)` narrows the draw to the
+    /// machine word before clearing its top bit, so a 32-bit target keeps
+    /// 31 bits of the draw's low half and a 64-bit one 63 bits; `usize`
+    /// and `isize` are Go's `uint` and `int` in that respect.  One
+    /// eight-byte draw is consumed on both, as in Go.
+    pub fn int(&mut self) -> isize {
+        ((self.uint64() as usize) << 1 >> 1) as isize
+    }
+
+    /// A uniform random `usize` in `[0, n)` without modulo bias (dcrd
+    /// `PRNG.UintN`, `crypto/rand/uniform.go:198-200`): Go's
+    /// `uint(p.Uint64N(uint64(n)))`.
+    ///
+    /// Unlike the signed forms this has no guard, as Go's has none: a
+    /// zero bound takes [`Prng::uint64n`]'s mask branch and yields an
+    /// unconstrained draw narrowed to the word.
+    pub fn uint_n(&mut self, n: usize) -> usize {
+        // Below `n` for a nonzero bound; for a zero one, Go's `uint()`
+        // conversion of the whole draw, which this cast is.
+        self.uint64n(n as u64) as usize
+    }
+
     /// A uniform random `u64` in `[0, n)` without modulo bias (dcrd
     /// `PRNG.Uint64N`, `crypto/rand/uniform.go:102-148`).
     ///
@@ -454,6 +596,76 @@ pub fn uint64() -> u64 {
     locked().uint64()
 }
 
+/// A uniform random `u32` from the process-wide generator (dcrd
+/// `rand.Uint32`, `crypto/rand/default.go:29-34`).
+pub fn uint32() -> u32 {
+    locked().uint32()
+}
+
+/// A uniform random `u32` in `[0, n)` from the process-wide generator
+/// (dcrd `rand.Uint32N`, `crypto/rand/default.go:45-50`).
+///
+/// The lock is held across every draw of the call, rejected ones
+/// included, as dcrd holds it, so no other thread's draw can fall
+/// between two draws of one reduction.
+pub fn uint32n(n: u32) -> u32 {
+    locked().uint32n(n)
+}
+
+/// A uniform random `u64` in `[0, n)` from the process-wide generator
+/// (dcrd `rand.Uint64N`, `crypto/rand/default.go:53-58`), the lock held
+/// for the whole call.
+pub fn uint64n(n: u64) -> u64 {
+    locked().uint64n(n)
+}
+
+/// A random non-negative `i32` from the process-wide generator (dcrd
+/// `rand.Int32`, `crypto/rand/default.go:62-67`).
+pub fn int32() -> i32 {
+    locked().int32()
+}
+
+/// A uniform random `i32` in `[0, n)` from the process-wide generator
+/// (dcrd `rand.Int32N`, `crypto/rand/default.go:72-77`), the lock held
+/// for the whole call.
+///
+/// # Panics
+///
+/// For `n <= 0`, as [`Prng::int32n`] does.
+pub fn int32n(n: i32) -> i32 {
+    locked().int32n(n)
+}
+
+/// A random non-negative `i64` from the process-wide generator (dcrd
+/// `rand.Int64`, `crypto/rand/default.go:81-86`).
+pub fn int64() -> i64 {
+    locked().int64()
+}
+
+/// A uniform random `i64` in `[0, n)` from the process-wide generator
+/// (dcrd `rand.Int64N`, `crypto/rand/default.go:91-96`), the lock held
+/// for the whole call.
+///
+/// # Panics
+///
+/// For `n <= 0`, as [`Prng::int64n`] does.
+pub fn int64n(n: i64) -> i64 {
+    locked().int64n(n)
+}
+
+/// A random non-negative `isize` from the process-wide generator (dcrd
+/// `rand.Int`, `crypto/rand/default.go:99-104`).
+pub fn int() -> isize {
+    locked().int()
+}
+
+/// A uniform random `usize` in `[0, n)` from the process-wide generator
+/// (dcrd `rand.UintN`, `crypto/rand/default.go:117-122`), the lock held
+/// for the whole call.
+pub fn uint_n(n: usize) -> usize {
+    locked().uint_n(n)
+}
+
 /// A uniform index in `[0, n)` from the process-wide generator (dcrd
 /// `rand.IntN`, `crypto/rand/default.go:109-114`).
 pub fn int_n(n: usize) -> usize {
@@ -482,4 +694,90 @@ pub fn duration(n: i64) -> i64 {
 /// answered (`serverPeer.addrsSent`).
 pub fn shuffle_slice<T>(s: &mut [T]) {
     locked().shuffle(s);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Prng, locked};
+
+    /// Each process-wide function is one call of the matching [`Prng`]
+    /// method on the global generator, as each of dcrd's `default.go`
+    /// entry points is one `globalRand` method call under the lock: the
+    /// global, keyed as a twin `Prng::from_seed` is, gives the twin's
+    /// value from every function and leaves both streams at the same
+    /// place, which the eight-byte draw after each call pins.  A function
+    /// that drew a different width, reduced by modulo or post-processed
+    /// the method's answer would part the two.
+    ///
+    /// This is the only test in the crate's library that touches the
+    /// global, so nothing else draws from it between the calls; the
+    /// integration tests run in processes of their own.
+    #[test]
+    fn the_global_functions_are_the_prng_methods() {
+        let seed = [0x5a; 32];
+        *locked() = Prng::from_seed(seed);
+        let mut twin = Prng::from_seed(seed);
+        let step = |what: &str, global: u64, method: u64, twin: &mut Prng| {
+            assert_eq!(global, method, "{what}");
+            assert_eq!(super::uint64(), twin.uint64(), "stream after {what}");
+        };
+        // Bounds that reject now and then (just above a power of two,
+        // and near the top of the range) as well as plain ones.
+        let bounds32 = [1, 2, 3, 7, 1 << 20, (1 << 31) + 1, u32::MAX - 1];
+        let bounds64 = [1, 3, 1 << 40, (1 << 63) + 1, u64::MAX];
+        for _ in 0..16 {
+            step("uint64", super::uint64(), twin.uint64(), &mut twin);
+            step(
+                "uint32",
+                super::uint32().into(),
+                twin.uint32().into(),
+                &mut twin,
+            );
+            step(
+                "int32",
+                super::int32() as u64,
+                twin.int32() as u64,
+                &mut twin,
+            );
+            step(
+                "int64",
+                super::int64() as u64,
+                twin.int64() as u64,
+                &mut twin,
+            );
+            step("int", super::int() as u64, twin.int() as u64, &mut twin);
+            for n in bounds32 {
+                let g = super::uint32n(n).into();
+                step("uint32n", g, twin.uint32n(n).into(), &mut twin);
+                let n = (n >> 1).max(1) as i32;
+                let g = super::int32n(n) as u64;
+                step("int32n", g, twin.int32n(n) as u64, &mut twin);
+            }
+            for n in bounds64 {
+                step("uint64n", super::uint64n(n), twin.uint64n(n), &mut twin);
+                let n = (n >> 1).max(1) as i64;
+                let g = super::int64n(n) as u64;
+                step("int64n", g, twin.int64n(n) as u64, &mut twin);
+                let g = super::duration(n) as u64;
+                step("duration", g, twin.duration(n) as u64, &mut twin);
+                let n = n as usize;
+                let g = super::uint_n(n) as u64;
+                step("uint_n", g, twin.uint_n(n) as u64, &mut twin);
+                let g = super::int_n(n) as u64;
+                step("int_n", g, twin.int_n(n) as u64, &mut twin);
+            }
+            let (mut a, mut b) = ([0u8; 37], [0u8; 37]);
+            super::read(&mut a);
+            twin.read(&mut b);
+            assert_eq!(a, b, "read");
+            let (mut a, mut b) = ([0u16; 40], [0u16; 40]);
+            for (i, (x, y)) in a.iter_mut().zip(b.iter_mut()).enumerate() {
+                (*x, *y) = (i as u16, i as u16);
+            }
+            super::shuffle_slice(&mut a);
+            twin.shuffle(&mut b);
+            assert_eq!(a, b, "shuffle_slice");
+            step("after read and shuffle", 0, 0, &mut twin);
+        }
+    }
 }

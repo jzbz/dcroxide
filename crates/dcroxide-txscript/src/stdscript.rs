@@ -553,6 +553,22 @@ pub fn is_null_data_script_v0(script: &[u8]) -> bool {
         && is_canonical_push_v0(tokenizer.opcode(), tokenizer.data())
 }
 
+/// Whether the script is a standard null data script for its version
+/// (dcrd `IsNullDataScript`, `stdscript/script.go:345-357`).
+///
+/// Version 0 is the only supported version, so this is
+/// [`is_null_data_script_v0`] for version 0 and `false` for every other
+/// version, as in dcrd.  It is the form to call with an output's own
+/// script version: a version 1 output whose script reads `OP_RETURN` is
+/// not null data, and a caller passing it to the version 0 test would
+/// treat it as such.
+pub fn is_null_data_script(script_version: u16, script: &[u8]) -> bool {
+    match script_version {
+        0 => is_null_data_script_v0(script),
+        _ => false,
+    }
+}
+
 /// Extract the pubkey hash from a stake-tagged P2PKH script with the given
 /// tag (dcrd `extractStakePubKeyHashV0`).
 fn extract_stake_pub_key_hash_v0_tagged(script: &[u8], stake_opcode: u8) -> Option<&[u8]> {

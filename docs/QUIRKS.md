@@ -960,3 +960,164 @@ Entry format:
 - **How found:** reading `ToAffine` and hdkeychain's `child` while adding
   dcrec's HD derivation entry points, then confirmed through
   `tools/oracle`.
+
+## QK-0034 — `SignTxOutput` panics on a pay-to-pubkey script whose key does not parse
+
+- **Where:** dcrd `txscript/v4/sign` `sign` (`sign/sign.go:222-250`), over
+  `stdscript.ExtractAddrsV0` / dcroxide-txscript `sign::sign_tx_output`
+- **What:** `stdscript` classifies a pay-to-pubkey script by its shape (a
+  33- or 65-byte push of the right prefix and `OP_CHECKSIG`, or a 32- or
+  33-byte push, the signature type and `OP_CHECKSIGALT`) without parsing
+  the key, while `ExtractAddrsV0` drops a key that does not parse. `sign`
+  then calls `kdb.GetKey(addresses[0])` on the empty list and panics with
+  "index out of range [0] with length 0", for such a previous output
+  script or for the redeem script of a pay-to-script-hash output, plain or
+  stake-tagged, after that redeem script's lookup.
+- **What this port does:** returns `cannot sign a pay-to-pubkey script
+  whose public key is not valid` at the point of the panic: before any
+  lookup for a previous output script, after the redeem script's lookup
+  for a pay-to-script-hash one. The port had indexed the same way and
+  panicked, which aborts a release build. PARITY.md, *SignTxOutput
+  preconditions*.
+- **Pinned by:** `invalid_pubkey_scripts_are_errors` and
+  `invalid_pubkey_scripts_panic_in_dcrd` in
+  `crates/dcroxide-txscript/tests/sign_preconditions.rs` (the four shapes,
+  each signed directly and as plain and stake-tagged redeem scripts, dcrd's
+  panic answered by the oracle with kind `panic`), and the lines of
+  `tests/data/sign_precondition_vectors.txt` whose verdict is `panicked
+  runtime error: index out of range [0] with length 0`.
+- **How found:** dcr-purse's wallet port, which carries a guard of its own
+  for it, asked for one here; confirmed through `tools/oracle`.
+
+## QK-0035 — an input index past the inputs panics under `SigHashAnyOneCanPay`
+
+- **Where:** dcrd `txscript/v4` `calcSignatureHash` (`sighash.go:248-252`),
+  reached from `sign.RawTxInSignature` and `sign`'s `mergeMultiSig` /
+  dcroxide-txscript `sign::raw_tx_in_signature`, `sign::sign_tx_output`
+- **What:** under `SigHashAnyOneCanPay` the hash takes
+  `tx.TxIn[idx : idx+1]` with no check of `idx`, after checking only that
+  the script parses and, for `SigHashSingle`, that an output sits at `idx`
+  (`:236-241`). An index at or past the inputs panics with "slice bounds
+  out of range" when the slice has no spare capacity, as a decoded
+  transaction's has none, and otherwise reads past the slice's end into
+  its backing array: a nil pointer dereference, or an input a caller
+  truncated away. `SignTxOutput` gets there from the caller's hash type
+  and also from the hash type byte of any signature already in the
+  previous script when it merges multisig signatures, whatever hash type
+  the caller signs with. Without `SigHashAnyOneCanPay` the same index is
+  defined: the hash commits the script to no input and covers the
+  zero-padded witness buffer, and dcrd signs over it.
+- **What this port does:** returns `cannot sign input <idx> of a
+  transaction with <n> inputs: the input index is out of range` where dcrd
+  slices, after dcrd's two errors, and passes it up from the places where
+  dcrd skips a failed signature or hash, since dcrd does not carry on past
+  a panic. Every index without `SigHashAnyOneCanPay` signs as dcrd does.
+  `calc_signature_hash_checked` itself still panics there, as it
+  documents; only the sign module's callers of it are guarded. PARITY.md,
+  *SignTxOutput preconditions*.
+- **Pinned by:** `index_cases_match_dcrd` and
+  `index_cases_return_without_panicking` in
+  `crates/dcroxide-txscript/tests/sign_preconditions.rs` (ten hash types,
+  eight shapes and two merges whose earlier signature carries
+  `SigHashAnyOneCanPay`, at indexes inside and past the inputs of
+  transactions of one to three inputs and outputs; the test requires that
+  the cases reach a signature past the inputs, an error and a panic);
+  `raw_signature_index_cases_match_dcrd` in the same file, which holds
+  `raw_tx_in_signature` to `RawTxInSignature` through the oracle's
+  `raw_txin_sig` (answering a panic with kind `panic`) on 1,200 cases of
+  every suite, ten hash types and six sub-scripts, three of which do not
+  parse, at indexes inside and past the inputs of transactions with more,
+  fewer and as many outputs as inputs, and requires that they reach dcrd's
+  parse error past the inputs under `SigHashAnyOneCanPay`, a panic and a
+  signature past the inputs; `raw_signature_parses_before_it_checks_the_index`
+  and `the_index_error_counts_the_inputs`, which pin without Go that the
+  parse check comes first and that the error names the input count; and
+  the battery's `panicked` lines with "out of range" in
+  `tests/data/sign_precondition_vectors.txt`.
+- **How found:** reading `calcSignatureHash` for the input-index guard
+  dcr-purse asked for, then confirmed through `tools/oracle`. Whether any
+  dcrwallet path passes such an index was not checked.
+
+## QK-0036 — merging into a nested pay-to-script-hash signature script recurses until the stack overflows
+
+- **Where:** dcrd `txscript/v4/sign` `mergeScripts` (`sign/sign.go:507-540`)
+  / dcroxide-txscript `sign::sign_tx_output`
+- **What:** for a pay-to-script-hash output `mergeScripts` takes the last
+  push of the new signature script as the redeem script, classifies it,
+  and recurses with the same two signature scripts. When that push is
+  itself a plain pay-to-script-hash script, the recursion takes the same
+  push again with the same arguments and never ends; Go's runtime stops it
+  with "fatal error: stack overflow", which ends the process and is not a
+  recoverable panic. It is reached when the output's redeem script R1 is
+  pay-to-script-hash (plain or stake-tagged, which `handleStakeOutSign`
+  signs by returning the script it looks up), both scripts are known, the
+  new signature script ends in a push of a plain pay-to-script-hash script
+  and parses, and the previous signature script is nonempty and parses. A
+  stake-tagged final push takes the default branch and returns.
+- **What this port does:** returns `cannot merge signature scripts of a
+  pay-to-script-hash input whose redeem script is itself
+  pay-to-script-hash` exactly where dcrd would recurse a second time, after
+  both script lookups. The recursion is otherwise one level deep, so the
+  check is the whole condition rather than a depth bound. The port had
+  recursed the same way and overflowed its own stack, an abort under any
+  profile. PARITY.md, *SignTxOutput preconditions*.
+- **Pinned by:** `nested_script_hash_merges_return` and
+  `nested_script_hash_merges_match_dcrd` in
+  `crates/dcroxide-txscript/tests/sign_preconditions.rs` (each case dcroxide
+  refuses kills an oracle started with `DCROXIDE_ORACLE_MAX_STACK` at
+  16 MiB, exit status 2; the six nested cases dcrd returns from match byte
+  for byte), the battery's `died` lines in
+  `tests/data/sign_precondition_vectors.txt`, and the
+  `txscript_sign_tx_output` fuzz target.
+- **How found:** dcr-purse's wallet port, which carries a guard of its own
+  for it, asked for a bound here; confirmed through `tools/oracle`.
+
+## QK-0037 — a ticket's fee limit exponent is rounded twice, and differently on arm64
+
+- **Where:** dcrd `txscript/v4/stdaddr` `calcRewardCommitScriptLimits`
+  (`stdaddr/addressv0.go:606-621`) and Go's `math.log2`
+  (`math/log10.go:29-37`) / dcroxide-txscript `stdaddr`
+  `fee_limit_exponent`
+- **What:** the vote and revocation fee limits of a reward commitment are
+  encoded as `uint16(math.Ceil(math.Log2(float64(limit))))`, described as
+  "the closest base 2 exponent". It is not the ceiling of the limit's
+  base 2 logarithm: the limit is rounded to a double, and the logarithm,
+  `Log(frac)*(1/Ln2) + float64(exp)`, is rounded to a double before the
+  ceiling. Above 2^32 half an ulp of the exponent is 2^-48, and the
+  logarithm's excess over the exponent falls below it for a double whose
+  52-bit fraction field is 11 or less, so the ceiling is the exponent
+  itself: 2^49 + 1 encodes 49 (a limit of 2^49, below the one asked
+  for), 2^50 + 1 and + 2 encode 50, 2^51 + 1 to + 5 encode 51, 2^52 + 1
+  to + 11 encode 52, and above 2^52 every limit whose double is within
+  11 ulps above 2^k encodes k. Built for amd64 or 386, Go multiplies and
+  adds separately, and the fraction field 11 rounds down; built for
+  arm64, go1.27.3 fuses the two into one `FMADDD` (in the disassembly of
+  `math.log2`, at `log10.go:36`), whose single rounding takes the
+  fraction field 11 up to the next exponent. So dcrd on arm64 encodes
+  2^52 + 11, and every limit whose double is 2^k + 11·2^(k-52) for k from
+  53 to 62, one exponent higher than dcrd on amd64. A negative limit's
+  `NaN` converts to 0 on amd64 (Go leaves the conversion to the
+  implementation); `calcRewardCommitScriptLimits` never passes zero.
+- **Why reproduced:** the commitment script is what a wallet signs into a
+  ticket and what dcrd's RPC returns, so the port must encode the limits
+  dcrd encodes. Since dcrd's own answer depends on the architecture, the
+  port follows the unfused source, as amd64 and 386 compute it, on every
+  architecture, as QK-0006 follows the portable `math.Exp`; it agrees with
+  dcrd on arm64 everywhere except those limits. The rule is computed from
+  the bits of `limit as f64` (the exponent, plus one when the fraction
+  field exceeds 11), which needs no logarithm, so the crate builds with
+  `core` alone; it equals the float form it replaced on every limit
+  tested.
+- **Pinned by:** `reward_commit_limits_match_dcrd`,
+  `committed_reward_commit_limit_vectors_hold` and
+  `committed_reward_commit_limit_vectors_regenerate` in
+  `crates/dcroxide-txscript/tests/reward_commit_limits_differential.rs`
+  (on aarch64 the first expects dcrd one exponent higher on exactly the
+  fraction-11 limits, and the third takes that back out before comparing
+  with the amd64 battery), and `rounds_as_dcrd_above_2_pow_49` in
+  `crates/dcroxide-txscript/src/stdaddr.rs`.
+- **How found:** replacing `f64::log2`, which `core` lacks, at the call
+  site. The amd64 and 386 answers were confirmed through `tools/oracle`
+  and a 386 build run on an x86_64 Linux desktop; the arm64 answer comes
+  from the disassembly and an emulation of the fused arithmetic with
+  `math.FMA`, and has not been run on arm64.
