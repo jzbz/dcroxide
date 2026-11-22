@@ -9,7 +9,8 @@
 //! and [`write_out_point`].
 //!
 //! Implemented: variable-length integers, transactions ([`MsgTx`])
-//! with all three serialization types and their BLAKE-256 hashes, the
+//! with all three serialization types, their BLAKE-256 hashes and the
+//! offsets of their output scripts ([`MsgTx::pk_script_locs`]), the
 //! 180-byte [`BlockHeader`], and all 41 protocol-12 message types
 //! behind the [`Message`] enum, with the framing that carries them.
 //!
@@ -104,9 +105,10 @@ pub use msg_mix::{
 pub use msgtx::{
     DEFAULT_PK_SCRIPT_VERSION, MAX_PREV_OUT_INDEX, MAX_TX_IN_PER_MESSAGE, MAX_TX_IN_SEQUENCE_NUM,
     MAX_TX_OUT_PER_MESSAGE, MsgTx, NO_EXPIRY_VALUE, NULL_BLOCK_HEIGHT, NULL_BLOCK_INDEX,
-    NULL_VALUE_IN, OutPoint, SEQUENCE_LOCK_TIME_DISABLED, SEQUENCE_LOCK_TIME_GRANULARITY,
-    SEQUENCE_LOCK_TIME_IS_SECONDS, SEQUENCE_LOCK_TIME_MASK, TX_TREE_REGULAR, TX_TREE_STAKE,
-    TX_TREE_UNKNOWN, TX_VERSION, TxIn, TxOut, TxSerializeType, read_out_point, write_out_point,
+    NULL_VALUE_IN, OutPoint, PkScriptLocs, SEQUENCE_LOCK_TIME_DISABLED,
+    SEQUENCE_LOCK_TIME_GRANULARITY, SEQUENCE_LOCK_TIME_IS_SECONDS, SEQUENCE_LOCK_TIME_MASK,
+    TX_TREE_REGULAR, TX_TREE_STAKE, TX_TREE_UNKNOWN, TX_VERSION, TxIn, TxOut, TxSerializeType,
+    read_out_point, write_out_point,
 };
 pub use netaddress::{
     MAX_NET_ADDRESS_PAYLOAD, MAX_NET_ADDRESS_PAYLOAD_V2, NetAddress, NetAddressType, NetAddressV2,

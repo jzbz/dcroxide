@@ -1,14 +1,144 @@
 // SPDX-License-Identifier: ISC
 //! Property tests for the codec laws (project brief §7 layer 2):
 //! `encode(decode(bytes)) == consumed prefix` and decode-never-panics for
-//! arbitrary input, plus varint round-trips. These run without the oracle,
-//! so they hold on machines without a Go toolchain too.
+//! arbitrary input, plus varint round-trips, and the law of
+//! `MsgTx::pk_script_locs`: each output's script is the bytes at its
+//! offset. These run without the oracle, so they hold on machines without
+//! a Go toolchain too.
+
+// Test-harness arithmetic over offsets within in-memory serializations.
+#![allow(clippy::arithmetic_side_effects)]
 
 use proptest::prelude::*;
 
 use dcroxide_wire::{
-    BlockHeader, Cursor, MsgTx, read_var_int, var_int_serialize_size, write_var_int,
+    BlockHeader, Cursor, MsgTx, OutPoint, TxIn, TxOut, TxSerializeType, read_var_int,
+    var_int_serialize_size, write_var_int,
 };
+
+/// An input with every field drawn.
+fn arb_tx_in() -> impl Strategy<Value = TxIn> {
+    (
+        any::<[u8; 32]>(),
+        any::<u32>(),
+        0i8..=i8::MAX,
+        any::<u32>(),
+        any::<i64>(),
+        any::<u32>(),
+        any::<u32>(),
+        proptest::collection::vec(any::<u8>(), 0..40),
+    )
+        .prop_map(
+            |(hash, index, tree, sequence, value_in, block_height, block_index, sig)| TxIn {
+                previous_out_point: OutPoint {
+                    hash: dcroxide_chainhash::Hash(hash),
+                    index,
+                    tree,
+                },
+                sequence,
+                value_in,
+                block_height,
+                block_index,
+                signature_script: sig,
+            },
+        )
+}
+
+/// An output whose script is short, or as long as a one-byte script
+/// length allows and just past it.
+fn arb_tx_out() -> impl Strategy<Value = TxOut> {
+    let len = prop_oneof![4 => 0usize..40, 1 => 0xfa_usize..0x102];
+    (
+        any::<i64>(),
+        any::<u16>(),
+        len.prop_flat_map(|n| proptest::collection::vec(any::<u8>(), n)),
+    )
+        .prop_map(|(value, version, pk_script)| TxOut {
+            value,
+            version,
+            pk_script,
+        })
+}
+
+/// A transaction of any serialization type whose input and output counts
+/// are small or straddle the one-byte varint's last value.
+fn arb_tx() -> impl Strategy<Value = MsgTx> {
+    let count = || prop_oneof![8 => 0usize..6, 1 => 0xfb_usize..0xff];
+    (
+        0u16..3,
+        any::<u16>(),
+        count().prop_flat_map(|n| proptest::collection::vec(arb_tx_in(), n)),
+        count().prop_flat_map(|n| proptest::collection::vec(arb_tx_out(), n)),
+        any::<u32>(),
+        any::<u32>(),
+    )
+        .prop_map(|(ser, version, tx_in, tx_out, lock_time, expiry)| MsgTx {
+            ser_type: TxSerializeType::from_u16(ser).expect("0, 1 or 2"),
+            version,
+            tx_in,
+            tx_out,
+            lock_time,
+            expiry,
+        })
+}
+
+proptest! {
+    // A case can serialize 254 inputs and 254 outputs of up to 257 bytes
+    // several times; fewer cases than the default 256 keep the debug build
+    // quick.
+    #![proptest_config(ProptestConfig::with_cases(128))]
+
+    /// In both serializations that carry outputs, each output's script is
+    /// the bytes at its offset, the offsets rise by at least an output's
+    /// smallest encoding, and the last script ends where the lock time
+    /// begins; the offsets do not depend on the serialization type, and
+    /// the iterator yields the list.
+    #[test]
+    fn pk_script_locs_locate_each_script(tx in arb_tx()) {
+        let locs = tx.pk_script_locs();
+        prop_assert_eq!(locs.len(), tx.tx_out.len());
+        prop_assert_eq!(tx.pk_script_locs_iter().collect::<Vec<_>>(), locs.clone());
+        let mut typed = tx.clone();
+        for ser_type in [TxSerializeType::Full, TxSerializeType::NoWitness] {
+            typed.ser_type = ser_type;
+            prop_assert_eq!(typed.pk_script_locs(), locs.clone());
+            let bytes = typed.serialize();
+            for (&loc, out) in locs.iter().zip(&tx.tx_out) {
+                let end = loc + out.pk_script.len();
+                prop_assert_eq!(&bytes[loc..end], out.pk_script.as_slice());
+            }
+            for (pair, out) in locs.windows(2).zip(&tx.tx_out) {
+                prop_assert!(pair[0] + out.pk_script.len() + 11 <= pair[1]);
+            }
+        }
+        // `typed` is now the prefix serialization.
+        if let (Some(&loc), Some(out)) = (locs.last(), tx.tx_out.last()) {
+            prop_assert_eq!(loc + out.pk_script.len(), typed.serialize_size() - 8);
+        }
+    }
+
+    /// A decoded transaction finds its scripts at its offsets in the very
+    /// bytes it was decoded from, trailing bytes after it included; a
+    /// witness-only decode has no outputs and no offsets.
+    #[test]
+    fn pk_script_locs_index_the_decoded_bytes(
+        tx in arb_tx(),
+        trailing in proptest::collection::vec(any::<u8>(), 0..8),
+    ) {
+        let mut bytes = tx.serialize();
+        bytes.extend_from_slice(&trailing);
+        let (decoded, consumed) = MsgTx::from_bytes(&bytes).expect("decodes");
+        prop_assert_eq!(consumed, bytes.len() - trailing.len());
+        let locs = decoded.pk_script_locs();
+        if tx.ser_type == TxSerializeType::OnlyWitness {
+            prop_assert!(locs.is_empty());
+        }
+        prop_assert_eq!(locs.len(), decoded.tx_out.len());
+        for (&loc, out) in locs.iter().zip(&decoded.tx_out) {
+            prop_assert_eq!(&bytes[loc..loc + out.pk_script.len()], out.pk_script.as_slice());
+        }
+    }
+}
 
 proptest! {
     #[test]

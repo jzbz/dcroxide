@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: ISC
 //! Transaction decoder fuzz target: must never panic, and any accepted input
 //! must re-encode byte-identically to its consumed prefix (canonical-encoding
-//! law). Hash computation is exercised on every accepted transaction.
+//! law). Hash computation is exercised on every accepted transaction, and
+//! each output's script must be the input bytes at the offset
+//! `pk_script_locs` gives it (dcrd `PkScriptLocs`), with no offsets for a
+//! witness-only decode, which has no outputs.
 //!
 //! Every accepted transaction is then classified by the stake crate, as
 //! relay and block validation classify every transaction they see (dcrd
@@ -100,6 +103,14 @@ fuzz_target!(|data: &[u8]| {
         assert_eq!(tx.serialize().as_slice(), &data[..consumed]);
         assert_eq!(tx.serialize_size(), consumed);
         let _ = tx.tx_hash_full();
+        let locs = tx.pk_script_locs();
+        assert_eq!(locs.len(), tx.tx_out.len());
+        for (&loc, out) in locs.iter().zip(&tx.tx_out) {
+            assert_eq!(
+                data.get(loc..loc + out.pk_script.len()),
+                Some(&out.pk_script[..])
+            );
+        }
         classify(&tx);
     }
 });

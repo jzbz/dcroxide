@@ -75,3 +75,8 @@ mis = "mis"
 # tests; renaming them means regenerating every affected vector set.
 prfix = "prfix"
 sems = "sems"
+
+[default.extend-identifiers]
+# The field of dcrd's `wire.MsgTx` that holds its serialization type,
+# which tools/oracle sets and QUIRKS.md names (QK-0038).
+SerType = "SerType"

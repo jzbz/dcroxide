@@ -1121,3 +1121,34 @@ Entry format:
   and a 386 build run on an x86_64 Linux desktop; the arm64 answer comes
   from the disassembly and an emulation of the fused arithmetic with
   `math.FMA`, and has not been run on arm64.
+
+## QK-0038 — `PkScriptLocs` gives full-serialization offsets whatever the serialization type
+
+- **Where:** dcrd `wire` (v1.8.0) `MsgTx.PkScriptLocs`
+  (`wire/msgtx.go:1119-1157`) / dcroxide-wire `MsgTx::pk_script_locs` and
+  `pk_script_locs_iter` (`msgtx.rs`)
+- **What:** the function is documented as returning "the start of each
+  public key script within the raw serialized transaction", with a TODO
+  to make it work for every serialization type, "not just the full
+  serialization type". It never reads `SerType`: the offsets are always
+  computed from the version field, the input and output counts and the
+  prefix inputs, so they are the full serialization's, which are also the
+  prefix-only serialization's, since the prefix leads both. A witness-only
+  decode leaves the outputs empty and gets nil, but a transaction that
+  holds outputs and has `TxSerializeOnlyWitness` set, which only one built
+  or changed in memory can be, gets offsets into a serialization it does
+  not have: its own witness-only serialization carries no outputs, and the
+  offsets may lie past its end.
+- **Why reproduced:** a wallet's transaction store records each credit's
+  script offset from this function against the full serialization it
+  keeps, so the port gives dcrd's offsets for every transaction, and the
+  serialization type is not consulted here either.
+- **Pinned by:** `pk_script_locs_ignore_the_serialization_type` in
+  `crates/dcroxide-wire/src/msgtx.rs`; `generated_transactions_match_dcrd`,
+  `varint_edges_match_dcrd` and `committed_pkscriptlocs_vectors_hold` (the
+  lines of type `02` whose last field is `false`) in
+  `crates/dcroxide-wire/tests/pkscriptlocs_differential.rs`, where the
+  oracle sets the type after decoding the full serialization and reports
+  whether each script lies at its offset in the bytes it serializes.
+- **How found:** porting the function, whose TODO names the limitation;
+  confirmed through `tools/oracle`.

@@ -41,6 +41,12 @@
 //	hash_string        → data is 32 hash bytes; {"result": "<display string>"}
 //	msgtx_decode       → {"txid": ..., "witness_hash": ..., "full_hash": ...,
 //	                      "reencoded": "<hex>"}
+//	msgtx_pkscriptlocs → data is type(1) || serialized tx; the tx decoded
+//	                     with FromBytes, its SerType then set to type
+//	                     unless that is 0xff (pkscriptlocs.go);
+//	                     {"result": PkScriptLocs in decimal joined by
+//	                      "," or "nil", "detail": {"len": ..., "blake256":
+//	                      ..., "located": bool}} of Bytes() under that type
 //	blockheader_decode → {"block_hash": ..., "reencoded": "<hex>"}
 //	ecdsa_parse_der    → {"result": "<hex 64-byte R||S>"} or
 //	                     {"error": ..., "kind": "ErrSig..."}
@@ -542,6 +548,9 @@ func handle(req request) response {
 			FullHash:    fullHash.String(),
 			Reencoded:   hex.EncodeToString(reencoded),
 		}
+
+	case "msgtx_pkscriptlocs":
+		return msgTxPkScriptLocs(data)
 
 	case "blockheader_decode":
 		var h wire.BlockHeader

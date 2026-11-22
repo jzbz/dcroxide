@@ -659,7 +659,110 @@ impl MsgTx {
         buf[32..].copy_from_slice(self.tx_hash_witness().as_bytes());
         hash_h(&buf)
     }
+
+    /// The byte offset of each output's public key script within the
+    /// serialized transaction, one per output in order (dcrd
+    /// `MsgTx.PkScriptLocs`, `wire/msgtx.go:1119-1157`).
+    ///
+    /// Output `i`'s script occupies
+    /// `bytes[locs[i]..locs[i] + tx.tx_out[i].pk_script.len()]` of the
+    /// transaction's serialization `bytes`, so a store that keeps the
+    /// serialized transaction can record where each script lies without
+    /// serializing it again.  The prefix leads both serializations that
+    /// carry outputs, so the offsets are the same for
+    /// [`TxSerializeType::Full`] and [`TxSerializeType::NoWitness`], and a
+    /// transaction decoded by [`Self::from_bytes`] from either finds its
+    /// scripts at these offsets in the very bytes it was decoded from:
+    /// decoding is canonical, so those bytes are its serialization.
+    ///
+    /// A transaction without outputs gets an empty list, where dcrd
+    /// returns a nil slice.  A witness-only decode leaves the outputs
+    /// empty, so it gets one too.
+    ///
+    /// As in dcrd, [`Self::ser_type`] is not consulted: the offsets are
+    /// always those of the serialization with a prefix.  A transaction
+    /// that holds outputs but has [`TxSerializeType::OnlyWitness`] set,
+    /// which only one assembled or modified in memory can be, gets the
+    /// offsets its outputs would have in the full serialization, and they
+    /// do not locate its scripts in its own witness-only serialization,
+    /// which carries none (QUIRKS QK-0038).
+    ///
+    /// This allocates the list once, at its exact length, and not at all
+    /// for a transaction without outputs; [`Self::pk_script_locs_iter`]
+    /// yields the same offsets without allocating.
+    pub fn pk_script_locs(&self) -> Vec<usize> {
+        // `collect` would round a short list's capacity up to four.
+        let mut locs = Vec::with_capacity(self.tx_out.len());
+        locs.extend(self.pk_script_locs_iter());
+        locs
+    }
+
+    /// [`Self::pk_script_locs`] as an iterator, which allocates nothing:
+    /// the same offsets, in output order, computed as they are taken.
+    /// `pk_script_locs_iter().nth(i)` is output `i`'s offset alone, in
+    /// time linear in `i`.
+    pub fn pk_script_locs_iter(&self) -> PkScriptLocs<'_> {
+        PkScriptLocs::new(self)
+    }
 }
+
+/// The offsets of a transaction's output scripts within its serialization,
+/// from [`MsgTx::pk_script_locs_iter`]: one `usize` per output, in output
+/// order, each the offset [`MsgTx::pk_script_locs`] lists at that index.
+#[derive(Debug, Clone)]
+pub struct PkScriptLocs<'a> {
+    /// The outputs not yet visited.
+    outputs: core::slice::Iter<'a, TxOut>,
+    /// The offset at which the next output's encoding begins.
+    next_output_at: usize,
+}
+
+impl<'a> PkScriptLocs<'a> {
+    /// The first output's encoding begins after the version field, the
+    /// input count, the output count and every prefix input, as dcrd's
+    /// `PkScriptLocs` computes it; the witness, which follows the prefix,
+    /// does not move it.
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "a constant, two varint sizes (at most 9 each) and 41 bytes per in-memory input, bounded by the transaction's allocation"
+    )]
+    fn new(tx: &'a MsgTx) -> Self {
+        let next_output_at = 4
+            + var_int_serialize_size(tx.tx_in.len() as u64)
+            + var_int_serialize_size(tx.tx_out.len() as u64)
+            + PREFIX_TX_IN_SIZE * tx.tx_in.len();
+        PkScriptLocs {
+            outputs: tx.tx_out.iter(),
+            next_output_at,
+        }
+    }
+}
+
+impl Iterator for PkScriptLocs<'_> {
+    type Item = usize;
+
+    /// The next output's script begins after its value (8 bytes), its
+    /// script version (2) and its script length's varint.
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "offsets within the serialization of an in-memory transaction, whose size its allocation bounds"
+    )]
+    fn next(&mut self) -> Option<usize> {
+        let out = self.outputs.next()?;
+        let len = out.pk_script.len();
+        let loc = self.next_output_at + 8 + 2 + var_int_serialize_size(len as u64);
+        self.next_output_at = loc + len;
+        Some(loc)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.outputs.size_hint()
+    }
+}
+
+impl ExactSizeIterator for PkScriptLocs<'_> {}
+
+impl core::iter::FusedIterator for PkScriptLocs<'_> {}
 
 #[cfg(test)]
 mod tests {
@@ -754,6 +857,220 @@ mod tests {
         let (tx, consumed) = MsgTx::from_bytes(&bytes).expect("decode multiTx");
         assert_eq!(consumed, bytes.len());
         assert_eq!(tx, multi_tx());
+    }
+
+    /// dcrd's `multiTxPkScriptLocs` (`wire/msgtx_test.go:1233-1235`).
+    const MULTI_TX_PK_SCRIPT_LOCS: [usize; 2] = [58, 136];
+
+    /// dcrd's check after each `PkScriptLocs` comparison: output `j`'s
+    /// script is `buf[loc : loc+len(PkScript)]` of the serialization.
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "test arithmetic over offsets and lengths within in-memory serializations"
+    )]
+    fn assert_scripts_at_locs(tx: &MsgTx, buf: &[u8], locs: &[usize], ctx: &str) {
+        assert_eq!(locs.len(), tx.tx_out.len(), "{ctx}: one offset per output");
+        for (j, (&loc, out)) in locs.iter().zip(&tx.tx_out).enumerate() {
+            let end = loc + out.pk_script.len();
+            assert_eq!(buf[loc..end], out.pk_script[..], "{ctx}: output {j}");
+        }
+    }
+
+    /// The `PkScriptLocs` checks of dcrd's `TestTxSerialize`,
+    /// `TestTxSerializePrefix` and `TestTxSerializeWitness`
+    /// (`wire/msgtx_test.go:348-624`): no offsets for the empty
+    /// transaction in each serialization type, `multiTxPkScriptLocs` for
+    /// `multiTx` and `multiTxPrefix`, and none for `multiTxWitness`,
+    /// whose outputs are empty, with each script found at its offset in
+    /// the reference bytes.  dcrd's nil slices are empty lists here.
+    #[test]
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "test arithmetic over offsets and lengths within in-memory serializations"
+    )]
+    fn pk_script_locs_match_dcrd_tests() {
+        for ser_type in [
+            TxSerializeType::Full,
+            TxSerializeType::NoWitness,
+            TxSerializeType::OnlyWitness,
+        ] {
+            let no_tx = MsgTx {
+                ser_type,
+                ..MsgTx::default()
+            };
+            assert_eq!(no_tx.pk_script_locs(), [0usize; 0], "noTx {ser_type:?}");
+            assert_eq!(no_tx.pk_script_locs_iter().len(), 0);
+        }
+
+        // TestTxSerialize: multiTx and multiTxEncoded.
+        let tx = multi_tx();
+        let locs = tx.pk_script_locs();
+        assert_eq!(locs, MULTI_TX_PK_SCRIPT_LOCS);
+        assert_scripts_at_locs(&tx, &multi_tx_encoded(), &locs, "multiTx");
+
+        // TestTxSerializePrefix: multiTxPrefix, whose witness fields are
+        // zero, and multiTxPrefixEncoded, which is multiTxEncoded with
+        // serialization type 1 and without the witness.
+        let mut prefix = multi_tx();
+        prefix.ser_type = TxSerializeType::NoWitness;
+        prefix.tx_in[0] = TxIn {
+            previous_out_point: prefix.tx_in[0].previous_out_point,
+            sequence: prefix.tx_in[0].sequence,
+            ..TxIn::default()
+        };
+        let mut prefix_encoded = multi_tx_encoded();
+        prefix_encoded[2] = 0x01;
+        prefix_encoded.truncate(prefix_encoded.len() - (1 + 8 + 4 + 4 + 1 + 7));
+        assert_eq!(prefix.serialize(), prefix_encoded);
+        let locs = prefix.pk_script_locs();
+        assert_eq!(locs, MULTI_TX_PK_SCRIPT_LOCS);
+        assert_scripts_at_locs(&prefix, &prefix_encoded, &locs, "multiTxPrefix");
+
+        // TestTxSerializeWitness: multiTxWitness has no outputs.
+        let witness = MsgTx {
+            ser_type: TxSerializeType::OnlyWitness,
+            tx_in: alloc::vec![TxIn {
+                value_in: 0x1212121212121212,
+                block_height: 0x15151515,
+                block_index: 0x34343434,
+                signature_script: alloc::vec![0x04, 0x31, 0xdc, 0x00, 0x1b, 0x01, 0x62],
+                ..TxIn::default()
+            }],
+            ..MsgTx::default()
+        };
+        assert_eq!(witness.pk_script_locs(), [0usize; 0]);
+        let (decoded, _) = MsgTx::from_bytes(&witness.serialize()).expect("decode");
+        assert_eq!(decoded.pk_script_locs(), [0usize; 0]);
+    }
+
+    /// As in dcrd, the serialization type is not consulted: every type
+    /// gets the full serialization's offsets.  For a witness-only
+    /// transaction that holds outputs, which only memory can produce,
+    /// those offsets lie in a serialization it does not have (QK-0038).
+    #[test]
+    fn pk_script_locs_ignore_the_serialization_type() {
+        let mut tx = multi_tx();
+        for ser_type in [TxSerializeType::NoWitness, TxSerializeType::OnlyWitness] {
+            tx.ser_type = ser_type;
+            assert_eq!(tx.pk_script_locs(), MULTI_TX_PK_SCRIPT_LOCS, "{ser_type:?}");
+        }
+        // Its own witness-only serialization is 29 bytes, short of the
+        // first offset, and the full one holds the scripts there.
+        assert_eq!(tx.serialize().len(), 29);
+        assert_scripts_at_locs(&tx, &multi_tx_encoded(), &tx.pk_script_locs(), "full");
+    }
+
+    /// The iterator yields the list's offsets, reports its exact length as
+    /// it goes, stays exhausted, and `nth` reaches an offset alone.
+    #[test]
+    fn pk_script_locs_iter_is_the_list() {
+        let tx = multi_tx();
+        let mut it = tx.pk_script_locs_iter();
+        assert_eq!(it.len(), 2);
+        assert_eq!(it.next(), Some(58));
+        assert_eq!(it.size_hint(), (1, Some(1)));
+        assert_eq!(it.next(), Some(136));
+        assert_eq!(it.len(), 0);
+        assert_eq!(it.next(), None);
+        assert_eq!(it.next(), None);
+        assert_eq!(tx.pk_script_locs_iter().nth(1), Some(136));
+        assert_eq!(tx.pk_script_locs_iter().nth(2), None);
+        let locs = tx.pk_script_locs();
+        assert_eq!(locs.capacity(), locs.len());
+    }
+
+    /// Every width of varint that a decodable transaction can carry moves
+    /// the offsets as the encoding does: input and output counts and
+    /// script lengths at 0xfc, the last one-byte value, at 0xfd and
+    /// 0xffff, the first and last three-byte values, and at 0x10000, the
+    /// first five-byte value.  Each script is found at its offset in both
+    /// serializations that carry it.  The nine-byte width starts at 2^32,
+    /// past what a 32 MiB message can hold of either and past what a test
+    /// can allocate, and is not exercised.
+    #[test]
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "test arithmetic over offsets and lengths within in-memory serializations"
+    )]
+    fn pk_script_locs_cross_every_varint_width() {
+        const EDGES: [usize; 5] = [0xfc, 0xfd, 0xfe, 0xffff, 0x10000];
+        let script =
+            |len: usize, tag: u8| -> Vec<u8> { (0..len).map(|i| (i as u8) ^ tag).collect() };
+        let output = |len: usize, tag: u8| TxOut {
+            value: 1,
+            version: 0,
+            pk_script: script(len, tag),
+        };
+        let mut cases = Vec::new();
+        for n in EDGES {
+            // n inputs before two outputs.
+            cases.push(MsgTx {
+                tx_in: alloc::vec![TxIn::default(); n],
+                tx_out: alloc::vec![output(3, 1), output(0, 2)],
+                ..MsgTx::default()
+            });
+            // n outputs, the scripts of varied short lengths.
+            cases.push(MsgTx {
+                tx_in: alloc::vec![TxIn::default()],
+                tx_out: (0..n).map(|i| output(i % 3, i as u8)).collect(),
+                ..MsgTx::default()
+            });
+            // A script of n bytes between two short ones.
+            cases.push(MsgTx {
+                tx_out: alloc::vec![output(1, 3), output(n, 4), output(2, 5)],
+                ..MsgTx::default()
+            });
+        }
+        for mut tx in cases {
+            for ser_type in [TxSerializeType::Full, TxSerializeType::NoWitness] {
+                tx.ser_type = ser_type;
+                let bytes = tx.serialize();
+                let locs = tx.pk_script_locs();
+                let ctx = alloc::format!(
+                    "{ser_type:?}, {} inputs, {} outputs",
+                    tx.tx_in.len(),
+                    tx.tx_out.len()
+                );
+                assert_scripts_at_locs(&tx, &bytes, &locs, &ctx);
+                // The last script ends where the lock time begins.
+                let last = tx.tx_out.last().expect("outputs");
+                let prefix_end = tx.serialize_size_with_type(TxSerializeType::NoWitness);
+                assert_eq!(
+                    locs.last().expect("offsets") + last.pk_script.len(),
+                    prefix_end - 8,
+                    "{ctx}"
+                );
+            }
+        }
+    }
+
+    /// The largest script the decoder accepts, `MAX_MESSAGE_PAYLOAD`
+    /// bytes, is found at its offset in the bytes it was decoded from.
+    #[test]
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "test arithmetic over offsets and lengths within in-memory serializations"
+    )]
+    fn pk_script_locs_locate_the_largest_decodable_script() {
+        let len = MAX_MESSAGE_PAYLOAD as usize;
+        let tx = MsgTx {
+            ser_type: TxSerializeType::NoWitness,
+            tx_out: alloc::vec![TxOut {
+                value: 0,
+                version: 0,
+                pk_script: alloc::vec![0xa5; len],
+            }],
+            ..MsgTx::default()
+        };
+        let bytes = tx.serialize();
+        let (decoded, consumed) = MsgTx::from_bytes(&bytes).expect("decode");
+        assert_eq!(consumed, bytes.len());
+        let locs = decoded.pk_script_locs();
+        // Version 4, counts 1 and 1, value 8, script version 2, and the
+        // script length's five-byte varint.
+        assert_eq!(locs, [4 + 1 + 1 + 8 + 2 + 5]);
+        assert_eq!(locs[0] + len, bytes.len() - 8);
+        assert!(bytes[locs[0]..locs[0] + len].iter().all(|&b| b == 0xa5));
     }
 
     #[test]
