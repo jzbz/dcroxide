@@ -308,8 +308,8 @@ evaluating this code.
   connection is then read as dcrd reads, and no frame is kept. Details
   are in PARITY.md, *Reading ahead of the block handler*.
 - **Fuzzing reaches the stateless parsers, not the state machines.**
-  Twenty-seven `cargo-fuzz` targets run for 60 seconds apiece on every
-  push to `master` and every pull request, and for ten minutes apiece
+  Every `cargo-fuzz` target under `fuzz/` runs for 60 seconds on every
+  push to `master` and every pull request, and for ten minutes
   nightly: wire framing, decoded at every protocol version a peer can
   negotiate (9 through 12); the `tx` and `blockheader` decoders, with
   stake classification (`DetermineTxType` and the `Check*`/`Is*`
@@ -400,8 +400,10 @@ evaluating this code.
   and the port writes a plain operator fails them even though the
   release build wraps; that is the point, since such a site makes
   debug and test builds disagree with the shipped binary. No corpus is
-  committed (`fuzz/corpus` is ignored); the nightly job keeps one in
-  CI's cache, which the next night and the 60-second runs start from,
+  committed (`fuzz/corpus` is ignored); the nightly jobs keep one in
+  CI's cache, where every shard of the nightly matrix restores the
+  whole of it and one job merges what the shards found and saves it,
+  and the next night and the 60-second runs start from it,
   so a target starts cold, and has to rediscover structure inside its
   budget, only before a night has kept its corpus or after the cache has
   expired. Each night the six signature targets also read seed inputs,

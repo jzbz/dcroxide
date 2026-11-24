@@ -6,7 +6,7 @@ on:
   pull_request:
   schedule:
     # Nightly long-run fuzzing, the signature soak and the full RPC key
-    # sweep (the nightly-fuzz, nightly-sigsoak and nightly-key-sweep jobs).
+    # sweep (the nightly-fuzz jobs, nightly-sigsoak and nightly-key-sweep).
     - cron: "0 3 * * *"
   workflow_dispatch:
     inputs:
@@ -802,8 +802,9 @@ jobs:
           go build -o "$RUNNER_TEMP/dcrd-oracle" .
           echo "DCROXIDE_ORACLE_BIN=$RUNNER_TEMP/dcrd-oracle" >> "$GITHUB_ENV"
       - run: cargo install cargo-fuzz --locked
-      # The corpus nightly-fuzz keeps, restored and never saved from here:
-      # every target starts from what the nightly runs found.
+      # The corpus the nightly fuzz jobs keep (nightly-fuzz-corpus saves
+      # it), restored and never saved from here: every target starts from
+      # what the nightly runs found.
       - name: Restore the nightly corpus
         uses: actions/cache/restore@v6
         with:
@@ -883,18 +884,76 @@ jobs:
           path: fuzz/artifacts/
           if-no-files-found: ignore
 
-  nightly-fuzz:
-    name: nightly fuzz (10m per target)
-    # A dispatch that names a sigsoak seed is for the soak alone.
+  # The nightly fuzzing runs as three jobs. A single job ran every target
+  # in turn until twenty-nine targets of ten minutes no longer fitted in
+  # its 295 minutes (from 2026-11-20 it skipped one or two a night).
+  # This job shares the targets out, nightly-fuzz runs each share as a
+  # shard of a matrix, and nightly-fuzz-corpus merges what the shards
+  # found into the one cached corpus and checks that every target ran.
+  nightly-fuzz-plan:
+    name: nightly fuzz (share out the targets)
+    # A dispatch that names a sigsoak seed is for the soak alone. The
+    # shards and the corpus job need this one and are skipped with it.
     if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.seed == '')
     runs-on: ubuntu-latest
-    # The run step starts a target only while twelve minutes remain of the
-    # 295 minutes it gives itself, which leaves the steps around it the
-    # rest.
-    timeout-minutes: 330
+    timeout-minutes: 15
     env:
       # See fuzz-smoke: the root pin reaches into fuzz/ and must be overridden.
       RUSTUP_TOOLCHAIN: nightly
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      shards: ${{ steps.plan.outputs.shards }}
+      targets: ${{ steps.plan.outputs.targets }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@nightly
+      - run: cargo install cargo-fuzz --locked
+      - name: Share the targets out
+        id: plan
+        run: |
+          # See the smoke job: an empty or short list must fail the step.
+          targets=$(cargo fuzz list)
+          declared=$(grep -c '^\[\[bin\]\]' fuzz/Cargo.toml)
+          listed=$(wc -w <<<"$targets")
+          if [ "$listed" -eq 0 ] || [ "$listed" -ne "$declared" ]; then
+            echo "cargo fuzz list gave $listed targets; fuzz/Cargo.toml declares $declared" >&2
+            exit 1
+          fi
+          # A shard takes at most eight targets, which fit its run step's
+          # budget at the longest times the single job measured (see
+          # nightly-fuzz), so a new target needs no edit here: one beyond
+          # a multiple of eight adds a shard. The targets are dealt round
+          # the shards in the list's order, so no two shards differ by more
+          # than one target.
+          per_shard=8
+          shards=$(((listed + per_shard - 1) / per_shard))
+          matrix=$(jq -Rnc --argjson n "$shards" '[inputs | select(length > 0)] as $t
+            | {include: [range($n) as $s | {shard: ($s + 1),
+                targets: ([range($s; $t | length; $n) as $i | $t[$i]] | join(" "))}]}' <<<"$targets")
+          {
+            echo "shards=$shards"
+            echo "targets=$(paste -sd ' ' <<<"$targets")"
+            echo "matrix=$matrix"
+          } >> "$GITHUB_OUTPUT"
+
+  nightly-fuzz:
+    name: nightly fuzz (10m per target, shard ${{ matrix.shard }} of ${{ needs.nightly-fuzz-plan.outputs.shards }})
+    needs: nightly-fuzz-plan
+    runs-on: ubuntu-latest
+    # The run step starts a target only while twelve minutes remain of the
+    # 100 minutes it gives itself, which leaves the steps around it the
+    # rest.
+    timeout-minutes: 135
+    strategy:
+      # Every shard runs even after one fails, as every target does
+      # within a shard, so one crash does not hide the rest.
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.nightly-fuzz-plan.outputs.matrix) }}
+    env:
+      # See fuzz-smoke: the root pin reaches into fuzz/ and must be overridden.
+      RUSTUP_TOOLCHAIN: nightly
+      # This shard's share of the targets, from nightly-fuzz-plan.
+      FUZZ_TARGETS: ${{ matrix.targets }}
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@nightly
@@ -910,7 +969,9 @@ jobs:
           echo "DCROXIDE_ORACLE_BIN=$RUNNER_TEMP/dcrd-oracle" >> "$GITHUB_ENV"
       - run: cargo install cargo-fuzz --locked
       # Each night starts from the corpus the last one saved, so coverage
-      # accumulates instead of every run starting cold.
+      # accumulates instead of every run starting cold. Every shard
+      # restores the whole of it, about 15 MB compressed, since a target
+      # changes shard whenever a target is added before it.
       - name: Restore the corpus
         uses: actions/cache/restore@v6
         with:
@@ -928,33 +989,32 @@ jobs:
         run: |
           env -u RUSTUP_TOOLCHAIN rustup toolchain install
           env -u RUSTUP_TOOLCHAIN cargo run --locked -p dcroxide-sigdiff --bin sigsoak -- fuzz-seeds --out "$RUNNER_TEMP/fuzz-seeds"
-      - name: Run every fuzz target for 10 minutes
+      - name: Run this shard's fuzz targets for 10 minutes each
         run: |
-          # See the smoke job: an empty or short list must fail the step.
-          targets=$(cargo fuzz list)
-          declared=$(grep -c '^\[\[bin\]\]' fuzz/Cargo.toml)
-          listed=$(wc -w <<<"$targets")
-          if [ "$listed" -eq 0 ] || [ "$listed" -ne "$declared" ]; then
-            echo "cargo fuzz list gave $listed targets; fuzz/Cargo.toml declares $declared" >&2
-            exit 1
-          fi
           # libFuzzer counts -max_total_time from its start but checks it
           # only once it has run the corpus it was given, so a target takes
           # its ten minutes or that pass, whichever is longer, plus its
-          # build and its exit. The step gives itself 295 minutes and starts
-          # a target only while twelve of them remain; the targets that do
-          # not fit are listed and fail the job, the sign that it needs
-          # splitting into a matrix. As in the smoke job every target that
-          # fits runs, and each one's wall time and corpus size go to the
-          # job summary.
-          deadline=$((SECONDS + 295 * 60))
+          # build and its exit. The single job measured at most 236 seconds
+          # from the step's start to its first target, the build of every
+          # dependency, and at most 641 seconds from one target's start to
+          # the next's, the longest for a target whose own link took half a
+          # minute; eight targets at those times start within 79 minutes.
+          # The step gives itself 100 minutes and starts a target only while
+          # twelve of them remain; the targets that do not fit are listed
+          # and fail the job, the sign that nightly-fuzz-plan gives a shard
+          # too many. As in the smoke job every target that fits runs, and
+          # each one's wall time and corpus size go to the job summary.
+          # Each target that ran is written to the list nightly-fuzz-corpus
+          # checks.
+          deadline=$((SECONDS + 100 * 60))
+          mkdir -p "$RUNNER_TEMP/fuzz-shard"
           failed=""
           skipped=""
           {
             echo "| target | seconds | corpus files |"
             echo "|---|---|---|"
           } >> "$GITHUB_STEP_SUMMARY"
-          for t in $targets; do
+          for t in $FUZZ_TARGETS; do
             if [ $((SECONDS + 720)) -gt "$deadline" ]; then
               skipped="$skipped $t"
               continue
@@ -1000,9 +1060,10 @@ jobs:
             pkill -KILL -x dcrd-oracle || true
             files=$(find "$corpus" -type f | wc -l)
             echo "| $t | $((SECONDS - start)) | $files |" >> "$GITHUB_STEP_SUMMARY"
+            echo "$t" >> "$RUNNER_TEMP/fuzz-shard/ran"
           done
           if [ -n "$skipped" ]; then
-            echo "not run, for want of time:$skipped; nightly-fuzz needs a matrix" >&2
+            echo "not run, for want of time:$skipped; nightly-fuzz-plan gives a shard too many" >&2
           fi
           if [ -n "$failed" ]; then
             echo "fuzz targets that failed:$failed" >&2
@@ -1010,25 +1071,119 @@ jobs:
           if [ -n "$failed$skipped" ]; then
             exit 1
           fi
-      # A cache key is never overwritten, so each night (and each re-run of
-      # one) saves under its own and the next restores the newest by
-      # prefix. It saves after a failure too: libFuzzer writes a failing
-      # input to fuzz/artifacts, never into the corpus.
-      - name: Save the corpus
-        if: always() && hashFiles('fuzz/corpus/**') != ''
-        uses: actions/cache/save@v6
+      # A cache key is never overwritten and the shards run at once, so no
+      # shard can save the night's corpus: each passes its own targets'
+      # directories to nightly-fuzz-corpus, with the list of the targets
+      # it ran, and that job saves one cache. It is packed after a failure
+      # too: libFuzzer writes a failing input to fuzz/artifacts, never
+      # into the corpus. The artifact lives a day, long enough for the job
+      # that merges it and for a re-run the same day; a later re-run finds
+      # the other shards' artifacts gone and reports their targets as not
+      # run, with their corpus kept from the restored one.
+      - name: Pack this shard's corpus
+        if: always()
+        run: |
+          mkdir -p "$RUNNER_TEMP/fuzz-shard" fuzz/corpus
+          touch "$RUNNER_TEMP/fuzz-shard/ran"
+          dirs=()
+          for t in $FUZZ_TARGETS; do
+            if [ -d "fuzz/corpus/$t" ]; then
+              dirs+=("$t")
+            fi
+          done
+          tar -cf "$RUNNER_TEMP/fuzz-shard/corpus.tar" -C fuzz/corpus -T /dev/null "${dirs[@]}"
+      - name: Upload this shard's corpus
+        if: always()
+        uses: actions/upload-artifact@v7
         with:
-          path: fuzz/corpus
-          key: fuzz-corpus-${{ github.run_id }}-${{ github.run_attempt }}
+          name: fuzz-corpus-shard-${{ matrix.shard }}
+          path: ${{ runner.temp }}/fuzz-shard/
+          # A re-run of the shard replaces the upload of the attempt before.
+          overwrite: true
+          retention-days: 1
+          if-no-files-found: error
       # See the smoke job: a nightly crash is the one most likely to be
       # noticed hours later, so the reproducer has to outlive the runner.
       - name: Upload crash artifacts
         if: failure() || cancelled()
         uses: actions/upload-artifact@v7
         with:
-          name: fuzz-artifacts-nightly
+          name: fuzz-artifacts-nightly-${{ matrix.shard }}
           path: fuzz/artifacts/
           if-no-files-found: ignore
+
+  nightly-fuzz-corpus:
+    name: nightly fuzz (merge the corpus, check every target ran)
+    needs: [nightly-fuzz-plan, nightly-fuzz]
+    # After failed and cancelled shards too, since the corpus is saved
+    # after a failure; never when the plan did not run.
+    if: always() && needs.nightly-fuzz-plan.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      # The base the shards' directories go over: a target whose shard
+      # sent nothing keeps what the last night saved.
+      - name: Restore the corpus
+        uses: actions/cache/restore@v6
+        with:
+          path: fuzz/corpus
+          key: fuzz-corpus-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: fuzz-corpus-
+      - name: Download the shards' corpora
+        uses: actions/download-artifact@v8
+        with:
+          pattern: fuzz-corpus-shard-*
+          path: ${{ runner.temp }}/fuzz-shards
+      - name: Merge the shards' corpora and check every target ran
+        if: always()
+        env:
+          FUZZ_TARGETS: ${{ needs.nightly-fuzz-plan.outputs.targets }}
+        run: |
+          # libFuzzer names a corpus file by its input's SHA-1 and never
+          # removes one, so unpacking a shard's directories over the
+          # restored ones only adds to them.
+          mkdir -p fuzz/corpus
+          mapfile -t lists < <(find "$RUNNER_TEMP/fuzz-shards" -type f -name ran)
+          unpacked=""
+          for list in "${lists[@]}"; do
+            if ! tar -xf "${list%/ran}/corpus.tar" -C fuzz/corpus; then
+              unpacked="$unpacked ${list%/ran}"
+            fi
+          done
+          # Every target the plan shared out must have run in exactly one
+          # shard. A shard that never started, or was cancelled before its
+          # targets ran, fails no step that lists them; this one does.
+          missing=""
+          twice=""
+          for t in $FUZZ_TARGETS; do
+            n=$(cat /dev/null "${lists[@]}" | grep -cx "$t" || true)
+            case "$n" in
+              0) missing="$missing $t" ;;
+              1) ;;
+              *) twice="$twice $t" ;;
+            esac
+          done
+          if [ -n "$unpacked" ]; then
+            echo "shard corpora that did not unpack:$unpacked" >&2
+          fi
+          if [ -n "$missing" ]; then
+            echo "fuzz targets no shard ran:$missing" >&2
+          fi
+          if [ -n "$twice" ]; then
+            echo "fuzz targets more than one shard ran:$twice" >&2
+          fi
+          if [ -n "$unpacked$missing$twice" ]; then
+            exit 1
+          fi
+      # A cache key is never overwritten, so each night (and each re-run of
+      # one) saves under its own and the next restores the newest by
+      # prefix, as do the shards and the smoke job.
+      - name: Save the corpus
+        if: always() && hashFiles('fuzz/corpus/**') != ''
+        uses: actions/cache/save@v6
+        with:
+          path: fuzz/corpus
+          key: fuzz-corpus-${{ github.run_id }}-${{ github.run_attempt }}
 
   nightly-key-sweep:
     name: nightly RPC key sweep
